@@ -5110,6 +5110,501 @@ try {
         } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
     }
 
+    function Get-XbCi7BaselineTokenMetadata {
+        param([Parameter(Mandatory)]$Token)
+        if ($null -eq ("XbCi7BaselineTokenMetadata" -as [type])) {
+            Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+
+public static class XbCi7BaselineTokenMetadata
+{
+    private const int ErrorInsufficientBuffer = 122;
+    private const int TokenUser = 1;
+    private const int TokenGroups = 2;
+    private const int TokenPrivileges = 3;
+    private const int TokenRestrictedSids = 11;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LuidAndAttributes { public Luid Luid; public uint Attributes; }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(
+        IntPtr token, int informationClass, IntPtr information, uint informationLength, out uint returnedLength);
+
+    [DllImport("advapi32.dll", EntryPoint = "LookupPrivilegeNameW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeName(
+        string systemName, ref Luid luid, StringBuilder name, ref uint nameLength);
+
+    private static void Zero(IntPtr buffer, int length)
+    {
+        if (buffer == IntPtr.Zero) return;
+        for (int index = 0; index < length; index++) Marshal.WriteByte(buffer, index, 0);
+    }
+
+    private static IntPtr ReadInformation(IntPtr token, int informationClass, out uint returnedLength)
+    {
+        uint requiredLength = 0;
+        bool firstSucceeded = GetTokenInformation(token, informationClass, IntPtr.Zero, 0, out requiredLength);
+        int firstError = Marshal.GetLastWin32Error();
+        if (firstSucceeded || firstError != ErrorInsufficientBuffer || requiredLength == 0 || requiredLength > 1048576)
+            throw new InvalidOperationException("baseline_token_metadata_unproven");
+
+        IntPtr buffer = Marshal.AllocHGlobal((int)requiredLength);
+        try
+        {
+            if (!GetTokenInformation(token, informationClass, buffer, requiredLength, out returnedLength) ||
+                returnedLength == 0 || returnedLength > requiredLength)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return buffer;
+        }
+        catch
+        {
+            Zero(buffer, (int)requiredLength);
+            Marshal.FreeHGlobal(buffer);
+            throw;
+        }
+    }
+
+    private static string ReadUserSid(IntPtr token)
+    {
+        uint length;
+        IntPtr buffer = ReadInformation(token, TokenUser, out length);
+        try
+        {
+            if (length < (uint)Marshal.SizeOf(typeof(SidAndAttributes))) throw new InvalidOperationException("baseline_token_metadata_unproven");
+            SidAndAttributes user = (SidAndAttributes)Marshal.PtrToStructure(buffer, typeof(SidAndAttributes));
+            if (user.Sid == IntPtr.Zero) throw new InvalidOperationException("baseline_token_metadata_unproven");
+            return new SecurityIdentifier(user.Sid).Value;
+        }
+        finally { Zero(buffer, (int)length); Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static List<string> GroupAttributeNames(uint attributes)
+    {
+        List<string> names = new List<string>();
+        if ((attributes & 0x00000001) != 0) names.Add("SE_GROUP_MANDATORY");
+        if ((attributes & 0x00000002) != 0) names.Add("SE_GROUP_ENABLED_BY_DEFAULT");
+        if ((attributes & 0x00000004) != 0) names.Add("SE_GROUP_ENABLED");
+        if ((attributes & 0x00000008) != 0) names.Add("SE_GROUP_OWNER");
+        if ((attributes & 0x00000010) != 0) names.Add("SE_GROUP_USE_FOR_DENY_ONLY");
+        if ((attributes & 0x00000020) != 0) names.Add("SE_GROUP_INTEGRITY");
+        if ((attributes & 0x00000040) != 0) names.Add("SE_GROUP_INTEGRITY_ENABLED");
+        if ((attributes & 0x20000000) != 0) names.Add("SE_GROUP_RESOURCE");
+        if ((attributes & 0xC0000000) == 0xC0000000) names.Add("SE_GROUP_LOGON_ID");
+        return names;
+    }
+
+    private static List<Dictionary<string, object>> ReadSids(IntPtr token, int informationClass)
+    {
+        uint length;
+        IntPtr buffer = ReadInformation(token, informationClass, out length);
+        try
+        {
+            int count = Marshal.ReadInt32(buffer);
+            if (count < 0 || count > 2048) throw new InvalidOperationException("baseline_token_metadata_unproven");
+            int offset = ((sizeof(int) + IntPtr.Size - 1) / IntPtr.Size) * IntPtr.Size;
+            int stride = Marshal.SizeOf(typeof(SidAndAttributes));
+            if (length < sizeof(int) || (count > 0 && (long)offset + ((long)count * stride) > length))
+                throw new InvalidOperationException("baseline_token_metadata_unproven");
+            List<Dictionary<string, object>> groups = new List<Dictionary<string, object>>();
+            for (int index = 0; index < count; index++)
+            {
+                IntPtr entryAddress = new IntPtr(buffer.ToInt64() + offset + ((long)index * stride));
+                SidAndAttributes group = (SidAndAttributes)Marshal.PtrToStructure(entryAddress, typeof(SidAndAttributes));
+                if (group.Sid == IntPtr.Zero) throw new InvalidOperationException("baseline_token_metadata_unproven");
+                groups.Add(new Dictionary<string, object>
+                {
+                    { "sid", new SecurityIdentifier(group.Sid).Value },
+                    { "attributes", group.Attributes },
+                    { "attributes_hex", String.Format("0x{0:X8}", group.Attributes) },
+                    { "attribute_names", GroupAttributeNames(group.Attributes).ToArray() }
+                });
+            }
+            return groups;
+        }
+        finally { Zero(buffer, (int)length); Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static string ReadPrivilegeName(Luid luid)
+    {
+        StringBuilder name = new StringBuilder(256);
+        uint length = (uint)name.Capacity;
+        if (!LookupPrivilegeName(null, ref luid, name, ref length))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return name.ToString();
+    }
+
+    private static List<Dictionary<string, object>> ReadPrivileges(IntPtr token)
+    {
+        uint length;
+        IntPtr buffer = ReadInformation(token, TokenPrivileges, out length);
+        try
+        {
+            int count = Marshal.ReadInt32(buffer);
+            int offset = sizeof(int);
+            int stride = Marshal.SizeOf(typeof(LuidAndAttributes));
+            if (count < 0 || count > 1024 || (long)offset + ((long)count * stride) > length)
+                throw new InvalidOperationException("baseline_token_metadata_unproven");
+            List<Dictionary<string, object>> privileges = new List<Dictionary<string, object>>();
+            for (int index = 0; index < count; index++)
+            {
+                IntPtr entryAddress = new IntPtr(buffer.ToInt64() + offset + ((long)index * stride));
+                LuidAndAttributes privilege = (LuidAndAttributes)Marshal.PtrToStructure(entryAddress, typeof(LuidAndAttributes));
+                privileges.Add(new Dictionary<string, object>
+                {
+                    { "name", ReadPrivilegeName(privilege.Luid) },
+                    { "attributes", privilege.Attributes },
+                    { "attributes_hex", String.Format("0x{0:X8}", privilege.Attributes) },
+                    { "enabled", (privilege.Attributes & 0x00000002) != 0 },
+                    { "enabled_by_default", (privilege.Attributes & 0x00000001) != 0 },
+                    { "removed", (privilege.Attributes & 0x00000004) != 0 }
+                });
+            }
+            return privileges;
+        }
+        finally { Zero(buffer, (int)length); Marshal.FreeHGlobal(buffer); }
+    }
+
+    public static Dictionary<string, object> Read(IntPtr token)
+    {
+        if (token == IntPtr.Zero) throw new InvalidOperationException("baseline_token_metadata_unproven");
+        return new Dictionary<string, object>
+        {
+            { "user_sid", ReadUserSid(token) },
+            { "group_sids_and_attributes", ReadSids(token, TokenGroups) },
+            { "restricting_sids", ReadSids(token, TokenRestrictedSids) },
+            { "privileges", ReadPrivileges(token) }
+        };
+    }
+}
+"@ -ErrorAction Stop
+        }
+        $flags = [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::NonPublic
+        $tokenField = $Token.GetType().GetField("token", $flags)
+        if ($null -eq $tokenField) { throw "baseline_token_metadata_unproven" }
+        $tokenHandle = [IntPtr]$tokenField.GetValue($Token)
+        $metadata = [XbCi7BaselineTokenMetadata]::Read($tokenHandle)
+        if ([string]$metadata["user_sid"] -cne [string]$Token.UserSid) { throw "baseline_token_metadata_unproven" }
+        return ,$metadata
+    }
+
+    function Get-XbCi7BaselinePathClassification {
+        param([Parameter(Mandatory)][string]$Path)
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+        $normalized = if ($fullPath -ceq $pathRoot) { $pathRoot } else { $fullPath.TrimEnd('\') }
+        $isSameOrChild = {
+            param([string]$BasePath)
+            if ([string]::IsNullOrWhiteSpace($BasePath)) { return $false }
+            $baseFull = [IO.Path]::GetFullPath($BasePath)
+            $baseRoot = [IO.Path]::GetPathRoot($baseFull)
+            $base = if ($baseFull -ceq $baseRoot) { $baseRoot } else { $baseFull.TrimEnd('\') }
+            return $normalized.Equals($base, [StringComparison]::OrdinalIgnoreCase) -or
+                $normalized.StartsWith(($base.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)
+        }
+        $configRoot = Join-Path $RuntimeRoot "config"
+        if ((& $isSameOrChild $InstallRoot) -or (& $isSameOrChild $configRoot)) { return "protected root" }
+        if ($null -ne $state.temp_redirect -and (& $isSameOrChild $state.temp_redirect)) { return "harness-created parent" }
+        if ($normalized.Equals([IO.Path]::GetFullPath($programFilesParent).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or
+            $normalized.Equals([IO.Path]::GetFullPath($programDataParent).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or
+            $normalized.Equals([IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+            return "installer-created parent/root"
+        }
+        return "OS ancestor"
+    }
+
+    function Add-XbCi7BaselineDenyRecord {
+        param(
+            [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Denials,
+            [Parameter(Mandatory)][int]$SequenceIndex,
+            [Parameter(Mandatory)][string]$Surface,
+            [Parameter(Mandatory)][int]$PathSequenceIndex,
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][uint32]$DesiredAccess,
+            [Parameter(Mandatory)][string]$SymbolicRight,
+            [Parameter(Mandatory)]$AccessResult
+        )
+        if ($Denials.Count -ge 512) { throw "baseline_diagnostic_trace_limit" }
+        [void]$Denials.Add([ordered]@{
+            sequence_index = $SequenceIndex
+            surface = $Surface
+            path_sequence_index = $PathSequenceIndex
+            exact_path = $Path
+            desired_mask = ("0x{0:X8}" -f $DesiredAccess)
+            symbolic_right = $SymbolicRight
+            Allowed = [bool]$AccessResult.Allowed
+            GrantedAccess = [uint32]$AccessResult.GrantedAccess
+        })
+    }
+
+    function Get-XbCi7BaselineAccessEvidence {
+        param(
+            [Parameter(Mandatory)]$Object,
+            [Parameter(Mandatory)]$Token,
+            [Parameter(Mandatory)][string]$Surface,
+            [Parameter(Mandatory)][int]$SequenceIndex,
+            [Parameter(Mandatory)][int]$PathSequenceIndex,
+            [Parameter(Mandatory)][string]$Path,
+            [AllowNull()]$Request,
+            [AllowNull()]$AccessResult,
+            [Parameter(Mandatory)][string]$Condition
+        )
+        $descriptorBytes = $Object.GetSecurityDescriptorBytes()
+        try {
+            $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($descriptorBytes, 0)
+            if ($null -eq $descriptor.Owner -or $null -eq $descriptor.Group) { throw "baseline_descriptor_unproven" }
+            if ([string]$descriptor.Owner.Value -cne [string]$Object.OwnerSid) { throw "baseline_descriptor_unproven" }
+            $dacl = $descriptor.DiscretionaryAcl
+            $daclCount = if ($null -eq $dacl) { 0 } else { [int]$dacl.Count }
+            $maximumAces = 256
+            $orderedAces = New-Object System.Collections.Generic.List[object]
+            if ($null -ne $dacl) {
+                $aceLimit = [Math]::Min($daclCount, $maximumAces)
+                for ($aceIndex = 0; $aceIndex -lt $aceLimit; $aceIndex++) {
+                    $ace = $dacl[$aceIndex]
+                    $aceRecord = [ordered]@{
+                        index = $aceIndex
+                        ace_type = [string]$ace.AceType
+                        ace_flags = [int]$ace.AceFlags
+                        ace_flags_hex = ("0x{0:X8}" -f [uint32]$ace.AceFlags)
+                        qualifier = $null
+                        security_identifier = $null
+                        access_mask = $null
+                        access_mask_hex = $null
+                        object_ace_flags = $null
+                        object_type_guid = $null
+                        inherited_object_type_guid = $null
+                    }
+                    if ($ace -is [Security.AccessControl.QualifiedAce]) {
+                        $aceRecord.qualifier = [string]$ace.AceQualifier
+                        if ($null -ne $ace.SecurityIdentifier) { $aceRecord.security_identifier = [string]$ace.SecurityIdentifier.Value }
+                        $aceRecord.access_mask = [int]$ace.AccessMask
+                        $aceRecord.access_mask_hex = "0x{0:X8}" -f [uint32]$ace.AccessMask
+                    }
+                    if ($ace -is [Security.AccessControl.ObjectAce]) {
+                        $aceRecord.object_ace_flags = [int]$ace.ObjectAceFlags
+                        if (([int]$ace.ObjectAceFlags -band 1) -ne 0) { $aceRecord.object_type_guid = [string]$ace.ObjectAceType }
+                        if (([int]$ace.ObjectAceFlags -band 2) -ne 0) { $aceRecord.inherited_object_type_guid = [string]$ace.InheritedObjectAceType }
+                    }
+                    [void]$orderedAces.Add($aceRecord)
+                }
+            }
+            $tokenMetadata = Get-XbCi7BaselineTokenMetadata -Token $Token
+            $result = [ordered]@{
+                surface = $Surface
+                sequence_index = $SequenceIndex
+                path_sequence_index = $PathSequenceIndex
+                exact_path = [IO.Path]::GetFullPath($Path)
+                path_classification = Get-XbCi7BaselinePathClassification -Path $Path
+                condition = $Condition
+                desired_mask = if ($null -eq $Request) { $null } else { "0x{0:X8}" -f [uint32]$Request.Mask }
+                symbolic_right = if ($null -eq $Request) { "OWNER_SID_POLICY" } else { [string]$Request.SymbolicRight }
+                Allowed = if ($null -eq $AccessResult) { $null } else { [bool]$AccessResult.Allowed }
+                GrantedAccess = if ($null -eq $AccessResult) { $null } else { [uint32]$AccessResult.GrantedAccess }
+                granted_access_mask_hex = if ($null -eq $AccessResult) { $null } else { "0x{0:X8}" -f [uint32]$AccessResult.GrantedAccess }
+                held_object_file_identity = [string]$Object.FileIdentity
+                held_object_security_descriptor_sha256 = [string]$Object.SecurityDescriptorSha256
+                owner_sid = [string]$descriptor.Owner.Value
+                primary_group_sid = [string]$descriptor.Group.Value
+                dacl_is_null = ($null -eq $dacl)
+                dacl_ace_count = $daclCount
+                ordered_dacl_aces = @($orderedAces.ToArray())
+                dacl_truncated = ($daclCount -gt $maximumAces)
+                token_user_sid = [string]$tokenMetadata["user_sid"]
+                token_group_sids_and_attributes = @($tokenMetadata["group_sids_and_attributes"])
+                token_restricting_sids = @($tokenMetadata["restricting_sids"])
+                token_privileges = @($tokenMetadata["privileges"])
+                capture_complete = ($daclCount -le $maximumAces)
+            }
+            return $result
+        }
+        finally { [Array]::Clear($descriptorBytes, 0, $descriptorBytes.Length) }
+    }
+
+    function Invoke-XbCi7BaselineRightsDiagnostic {
+        param([Parameter(Mandatory)]$Token)
+        $denials = New-Object System.Collections.Generic.List[object]
+        $sequenceIndex = 0
+        $first = $null
+        $stopReason = "all_baseline_prohibited_access_checks_denied"
+        $directoryRequests = @(
+            [pscustomobject]@{ Mask = [uint32]0x00000002; SymbolicRight = "FILE_ADD_FILE" }
+            [pscustomobject]@{ Mask = [uint32]0x00000004; SymbolicRight = "FILE_ADD_SUBDIRECTORY" }
+            [pscustomobject]@{ Mask = [uint32]0x00000010; SymbolicRight = "FILE_WRITE_EA" }
+            [pscustomobject]@{ Mask = [uint32]0x00000040; SymbolicRight = "DELETE_CHILD" }
+            [pscustomobject]@{ Mask = [uint32]0x00000100; SymbolicRight = "FILE_WRITE_ATTRIBUTES" }
+            [pscustomobject]@{ Mask = [uint32]0x00010000; SymbolicRight = "DELETE" }
+            [pscustomobject]@{ Mask = [uint32]0x00040000; SymbolicRight = "WRITE_DAC" }
+            [pscustomobject]@{ Mask = [uint32]0x00080000; SymbolicRight = "WRITE_OWNER" }
+        )
+        $leafProhibitedRequests = @(
+            [pscustomobject]@{ Mask = [uint32]0x00000002; SymbolicRight = "FILE_ADD_FILE" }
+            [pscustomobject]@{ Mask = [uint32]0x00000004; SymbolicRight = "FILE_ADD_SUBDIRECTORY" }
+            [pscustomobject]@{ Mask = [uint32]0x00000010; SymbolicRight = "FILE_WRITE_EA" }
+            [pscustomobject]@{ Mask = [uint32]0x00000100; SymbolicRight = "FILE_WRITE_ATTRIBUTES" }
+            [pscustomobject]@{ Mask = [uint32]0x00010000; SymbolicRight = "DELETE" }
+            [pscustomobject]@{ Mask = [uint32]0x00040000; SymbolicRight = "WRITE_DAC" }
+            [pscustomobject]@{ Mask = [uint32]0x00080000; SymbolicRight = "WRITE_OWNER" }
+        )
+        $leafExceededRightNames = @(
+            [pscustomobject]@{ Mask = [uint32]0x00000002; SymbolicRight = "FILE_ADD_FILE" }
+            [pscustomobject]@{ Mask = [uint32]0x00000004; SymbolicRight = "FILE_ADD_SUBDIRECTORY" }
+            [pscustomobject]@{ Mask = [uint32]0x00000010; SymbolicRight = "FILE_WRITE_EA" }
+            [pscustomobject]@{ Mask = [uint32]0x00000040; SymbolicRight = "DELETE_CHILD" }
+            [pscustomobject]@{ Mask = [uint32]0x00000100; SymbolicRight = "FILE_WRITE_ATTRIBUTES" }
+            [pscustomobject]@{ Mask = [uint32]0x00010000; SymbolicRight = "DELETE" }
+            [pscustomobject]@{ Mask = [uint32]0x00040000; SymbolicRight = "WRITE_DAC" }
+            [pscustomobject]@{ Mask = [uint32]0x00080000; SymbolicRight = "WRITE_OWNER" }
+        )
+        try {
+            $configRoot = Join-Path $RuntimeRoot "config"
+            $surfaces = @(
+                [pscustomobject]@{ Name = "install_chain"; Path = [IO.Path]::GetFullPath($InstallRoot) }
+                [pscustomobject]@{ Name = "config_chain"; Path = [IO.Path]::GetFullPath($configRoot) }
+            )
+            $stop = $false
+            foreach ($surface in $surfaces) {
+                $chain = [string[]]@(Get-XbNativePathChain -Path $surface.Path)
+                for ($pathIndex = 0; $pathIndex -lt $chain.Count; $pathIndex++) {
+                    if ($stop) { break }
+                    $directoryPath = [IO.Path]::GetFullPath($chain[$pathIndex])
+                    $heldObject = $null
+                    try {
+                        $heldObject = [XbWorkerProtectedObject]::Open($directoryPath, $true, $false)
+                        foreach ($request in $directoryRequests) {
+                            $sequenceIndex++
+                            $access = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$request.Mask)
+                            if ($access.Allowed) {
+                                $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $surface.Name -SequenceIndex $sequenceIndex -PathSequenceIndex $pathIndex -Path $directoryPath -Request $request -AccessResult $access -Condition "directory_right_allowed"
+                                $stopReason = "first_baseline_directory_right_allowed"
+                                $stop = $true
+                                break
+                            }
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $surface.Name -PathSequenceIndex $pathIndex -Path $directoryPath -DesiredAccess ([uint32]$request.Mask) -SymbolicRight $request.SymbolicRight -AccessResult $access
+                        }
+                    }
+                    finally { if ($null -ne $heldObject) { $heldObject.Dispose() } }
+                }
+                if ($stop) { break }
+            }
+
+            if ($null -eq $first) {
+                $leafTargets = New-Object System.Collections.Generic.List[object]
+                foreach ($name in $packageFiles) {
+                    [void]$leafTargets.Add([pscustomobject]@{
+                        Surface = "install_leaf"
+                        Path = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$name)))
+                        AllowedMask = [uint32]0x001200A9
+                        RequiredMask = [uint32]0x001200A9
+                    })
+                }
+                [void]$leafTargets.Add([pscustomobject]@{
+                    Surface = "install_leaf"
+                    Path = [IO.Path]::GetFullPath((Join-Path $InstallRoot "installation-manifest.json"))
+                    AllowedMask = [uint32]0x001200A9
+                    RequiredMask = [uint32]0x00120089
+                })
+                $configInventory = Get-XbCi7DirectoryInventory -Path $configRoot
+                foreach ($item in $configInventory.Items) {
+                    [void]$leafTargets.Add([pscustomobject]@{
+                        Surface = "config_leaf"
+                        Path = [IO.Path]::GetFullPath((Join-Path $configRoot ([string]$item.Name)))
+                        AllowedMask = [uint32]0x00120089
+                        RequiredMask = [uint32]0x00120089
+                    })
+                }
+
+                $trustedOwners = @("S-1-5-18", "S-1-5-32-544")
+                $maximumAllowedRequest = [pscustomobject]@{ Mask = [uint32]0x02000000; SymbolicRight = "MAXIMUM_ALLOWED" }
+                for ($leafIndex = 0; $leafIndex -lt $leafTargets.Count; $leafIndex++) {
+                    if ($null -ne $first) { break }
+                    $leaf = $leafTargets[$leafIndex]
+                    $heldObject = $null
+                    try {
+                        $heldObject = [XbWorkerProtectedObject]::Open([string]$leaf.Path, $false, $true)
+                        if ([string]$heldObject.OwnerSid -cnotin $trustedOwners) {
+                            $sequenceIndex++
+                            $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $leaf.Surface -SequenceIndex $sequenceIndex -PathSequenceIndex $leafIndex -Path $leaf.Path -Request $null -AccessResult $null -Condition "leaf_owner_sid_disallowed"
+                            $stopReason = "first_baseline_leaf_owner_condition"
+                            break
+                        }
+
+                        $sequenceIndex++
+                        $maximum = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$maximumAllowedRequest.Mask)
+                        $outsideMask = [uint32]([uint32]$maximum.GrantedAccess -band ([uint32]::MaxValue -bxor [uint32]$leaf.AllowedMask))
+                        if (-not $maximum.Allowed) {
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path $leaf.Path -DesiredAccess ([uint32]$maximumAllowedRequest.Mask) -SymbolicRight $maximumAllowedRequest.SymbolicRight -AccessResult $maximum
+                        }
+                        if ($outsideMask -ne 0) {
+                            $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $leaf.Surface -SequenceIndex $sequenceIndex -PathSequenceIndex $leafIndex -Path $leaf.Path -Request $maximumAllowedRequest -AccessResult $maximum -Condition "maximum_allowed_outside_leaf_allow_mask"
+                            $first.granted_access_outside_allowed_mask = "0x{0:X8}" -f $outsideMask
+                            $exceededRights = @(
+                                foreach ($request in $leafExceededRightNames) {
+                                    if (($outsideMask -band [uint32]$request.Mask) -ne 0) {
+                                        [ordered]@{ desired_mask = "0x{0:X8}" -f [uint32]$request.Mask; symbolic_right = [string]$request.SymbolicRight }
+                                    }
+                                }
+                            )
+                            $first.exceeded_rights = $exceededRights
+                            if ($exceededRights.Count -gt 0) { $first.first_exceeded_right = $exceededRights[0] }
+                            $stopReason = "first_baseline_leaf_maximum_allowed_exceeded"
+                            break
+                        }
+
+                        $sequenceIndex++
+                        $required = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$leaf.RequiredMask)
+                        if (-not $required.Allowed) {
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path $leaf.Path -DesiredAccess ([uint32]$leaf.RequiredMask) -SymbolicRight "REQUIRED_LEAF_READ_MASK" -AccessResult $required
+                            $stopReason = "baseline_leaf_required_access_denied_before_exceeded"
+                            break
+                        }
+
+                        foreach ($request in $leafProhibitedRequests) {
+                            $sequenceIndex++
+                            $access = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$request.Mask)
+                            if ($access.Allowed) {
+                                $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $leaf.Surface -SequenceIndex $sequenceIndex -PathSequenceIndex $leafIndex -Path $leaf.Path -Request $request -AccessResult $access -Condition "leaf_prohibited_right_allowed"
+                                $stopReason = "first_baseline_leaf_right_allowed"
+                                break
+                            }
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path $leaf.Path -DesiredAccess ([uint32]$request.Mask) -SymbolicRight $request.SymbolicRight -AccessResult $access
+                        }
+                    }
+                    finally { if ($null -ne $heldObject) { $heldObject.Dispose() } }
+                }
+            }
+            $rightObserved = ($null -ne $first -and $null -ne $first.Allowed -and [bool]$first.Allowed)
+            return [ordered]@{
+                status = if ($rightObserved) { "first_baseline_right_observed" } else { "no_baseline_right_observed" }
+                trace_complete = $true
+                stop_reason = $stopReason
+                all_directory_requests_denied = ($null -eq $first -or [string]$first.surface -notin @("install_chain", "config_chain"))
+                first_exceeded = $first
+                preceding_denials = @($denials.ToArray())
+            }
+        }
+        catch {
+            return [ordered]@{
+                status = "baseline_diagnostic_capture_failed"
+                trace_complete = $false
+                stop_reason = "bounded_handle_trace_or_metadata_unproven"
+                capture_error = "baseline_diagnostic_capture_failed"
+                preceding_denials = @($denials.ToArray())
+            }
+        }
+    }
+
     Invoke-XbBoundaryCase -Name "install_then_uninstall" -PreserveIncrementally -Body {
         param($case)
         $ci7 = [ordered]@{
@@ -5214,6 +5709,7 @@ try {
             $ci7.child_delete = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00010000)
 
             $verification = $null
+            $ci7.baseline_rights_diagnostic = Invoke-XbCi7BaselineRightsDiagnostic -Token $nativeToken
             try {
                 $verification = Invoke-XbInstallVerifier -TaskCredential $credential
                 $ci7.verify_outcome = "pass"
@@ -5774,6 +6270,58 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
             with self.subTest(cleanup_field=field):
                 self.assertIn(f"cleanup.{field}", cleanup_helper)
         self.assertIn("throw", cleanup_helper)
+
+    def test_hosted_ci7_baseline_diagnostic_is_handle_bound_and_precedes_verifier(self) -> None:
+        harness = _HOSTED_TASK_BOUNDARY_HARNESS
+        diagnostic_start = harness.index("function Get-XbCi7BaselineTokenMetadata")
+        case_start = harness.index('Invoke-XbBoundaryCase -Name "install_then_uninstall"', diagnostic_start)
+        helper = harness[diagnostic_start:case_start]
+        diagnostic_call = harness.index("$ci7.baseline_rights_diagnostic = Invoke-XbCi7BaselineRightsDiagnostic -Token $nativeToken")
+        verifier_call = harness.index("$verification = Invoke-XbInstallVerifier -TaskCredential $credential", diagnostic_call)
+        upgrade_call = harness.index("Invoke-XbWorkerUpgrade", verifier_call)
+        self.assertLess(diagnostic_call, verifier_call)
+        self.assertLess(verifier_call, upgrade_call)
+        self.assertIn("[XbWorkerProtectedObject]::Open", helper)
+        self.assertIn("Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token", helper)
+        self.assertIn("GetSecurityDescriptorBytes()", helper)
+        self.assertIn("RawSecurityDescriptor", helper)
+        self.assertIn("token_group_sids_and_attributes", helper)
+        self.assertIn("token_restricting_sids", helper)
+        self.assertIn("token_privileges", helper)
+        self.assertNotIn("Get-Acl", helper)
+        self.assertNotIn("GetNetworkCredential", helper)
+        self.assertNotIn("PSCredential", helper)
+        directory_requests = helper[
+            helper.index("$directoryRequests = @(") : helper.index("$leafProhibitedRequests = @(")
+        ]
+        request_markers = (
+            "SymbolicRight = \"FILE_ADD_FILE\"",
+            "SymbolicRight = \"FILE_ADD_SUBDIRECTORY\"",
+            "SymbolicRight = \"FILE_WRITE_EA\"",
+            "SymbolicRight = \"DELETE_CHILD\"",
+            "SymbolicRight = \"FILE_WRITE_ATTRIBUTES\"",
+            "SymbolicRight = \"DELETE\"",
+            "SymbolicRight = \"WRITE_DAC\"",
+            "SymbolicRight = \"WRITE_OWNER\"",
+        )
+        marker_positions = [directory_requests.index(marker) for marker in request_markers]
+        self.assertEqual(marker_positions, sorted(marker_positions))
+        self.assertLess(
+            harness.index('Name = "install_chain"', diagnostic_start),
+            harness.index('Name = "config_chain"', diagnostic_start),
+        )
+        for mask in (
+            "0x00000002",
+            "0x00000004",
+            "0x00000010",
+            "0x00000040",
+            "0x00000100",
+            "0x00010000",
+            "0x00040000",
+            "0x00080000",
+        ):
+            with self.subTest(mask=mask):
+                self.assertIn(mask, helper)
 
     def test_synthetic_config_teardown_is_identity_gated_before_uninstall(self) -> None:
         start = _HOSTED_TASK_BOUNDARY_HARNESS.index(
