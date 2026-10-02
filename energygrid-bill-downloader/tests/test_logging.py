@@ -10,7 +10,7 @@ import uuid
 from energygrid_bill_downloader import cli
 from energygrid_bill_downloader import portal as portal_module
 from energygrid_bill_downloader.cli import SafeLogger, redact_sensitive
-from energygrid_bill_downloader.config import RuntimeConfig
+from energygrid_bill_downloader.config import MAX_INVENTORY_CEILING, RuntimeConfig
 from energygrid_bill_downloader.reconcile import reconcile_inventory
 from energygrid_bill_downloader.state import StateStore
 
@@ -42,11 +42,11 @@ class LoggingTests(unittest.TestCase):
                 status="NO_NEW_BILLS",
                 inventory_count=0,
                 filename="private-filename.pdf",
-                support_ref="synthetic-ref",
+                support_ref="EG_SYNTHETIC_REF",
             )
             content = logger.log_path.read_text(encoding="utf-8")
             self.assertNotIn("private-filename.pdf", content)
-            self.assertIn("synthetic-ref", content)
+            self.assertIn("EG_SYNTHETIC_REF", content)
             self.assertNotIn("cookie", content.casefold())
 
 
@@ -182,7 +182,7 @@ class InvoiceFailureLogFieldTests(unittest.TestCase):
                 inventory_count=1,
                 delivered_count=1,
                 handled_count=1,
-                drive_staged_count=10_001,
+                drive_staged_count=MAX_INVENTORY_CEILING + 1,
                 tenant_id="PRIVATE-TENANT",
                 source_filename="PRIVATE.pdf",
             )

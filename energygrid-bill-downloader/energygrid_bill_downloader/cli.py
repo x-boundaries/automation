@@ -466,8 +466,10 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
     """
 
     try:
-        if list_only:
-            with StateStore(config.state_path, read_only=True) as state:
+        with RunLock(config.state_path.parent):
+            if not list_only:
+                cleanup_stale_owned_temp(config.temp_root)
+            with StateStore(config.state_path, read_only=list_only) as state:
                 if config.direct_http is None:
                     raise ConfigError("direct_http settings are missing")
                 source = DirectHttpSource(config.direct_http, config.timeout_seconds, config.max_attempts)
@@ -477,23 +479,8 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
                     state=state,
                     logger=logger,
                     run_id=run_id,
-                    list_only=True,
+                    list_only=list_only,
                 )
-        else:
-            with RunLock(config.state_path.parent):
-                cleanup_stale_owned_temp(config.temp_root)
-                with StateStore(config.state_path) as state:
-                    if config.direct_http is None:
-                        raise ConfigError("direct_http settings are missing")
-                    source = DirectHttpSource(config.direct_http, config.timeout_seconds, config.max_attempts)
-                    summary = reconcile_listed_inventory(
-                        config=config,
-                        source=source,
-                        state=state,
-                        logger=logger,
-                        run_id=run_id,
-                        list_only=False,
-                    )
     except AppError as exc:
         log_terminal_failure(logger, exc)
         support_ref = support_ref_for(exc)

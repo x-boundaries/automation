@@ -52,7 +52,7 @@ function lookup(outputs) {
   return (name) => ({ first: () => ({ json: outputs[name] && outputs[name][0] && outputs[name][0].json }) });
 }
 function execute(code, items, helpers, outputs) {
-  const wrapped = new Function('$input', '$', 'return (async function(){\n' + code + '\n})()');
+  const wrapped = new Function('$input', '$', 'return (async function(){\n' + code + '\n}).call(this)');
   return wrapped.call({ helpers: helpers || {} }, { all: () => items }, lookup(outputs || {}));
 }
 function expression(value, item, outputs) {
@@ -350,7 +350,11 @@ class InvoiceDeliveryExportShape(unittest.TestCase):
         merge = self.by_name["Merge Request And PDF Hash"]["parameters"]
         self.assertEqual(("combine", "combineByPosition"), (merge["mode"], merge["combineBy"]))
         self.assertIn(
-            ("Validate Invoice Request", 0, "Merge Request And PDF Hash", 0),
+            ("Validate Invoice Request", 0, "Request Is Valid", 0),
+            self.edges(),
+        )
+        self.assertIn(
+            ("Request Is Valid", 0, "Merge Request And PDF Hash", 0),
             self.edges(),
         )
         self.assertIn(
@@ -393,7 +397,7 @@ class InvoiceDeliveryExportShape(unittest.TestCase):
         boundary = self.by_name["Boundary"]["parameters"]["content"].lower()
         self.assertIn("not atomic", boundary)
         self.assertIn("local sqlite", boundary)
-        self.assertIn("never resends", boundary)
+        self.assertIn("never resent", boundary)
 
     def test_every_fallible_node_routes_its_error_output_to_bounded_response(self) -> None:
         edges = self.edges()
@@ -578,4 +582,3 @@ class InvoiceDeliveryCodeExecution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

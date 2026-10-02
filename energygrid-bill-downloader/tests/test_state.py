@@ -278,7 +278,7 @@ class V2StateTests(unittest.TestCase):
 
     def test_apply_preserves_v1_rows_and_makes_imported_invoice_unclassified(self) -> None:
         from energygrid_bill_downloader.state import StateV2Store, migrate_state_database
-        from fixtures.synthetic_http_source import test_stream_entries
+        from fixtures.synthetic_dual_stream import test_stream_entries
         from energygrid_bill_downloader.invoice import Stream
 
         create_state_fixture(self.path)
@@ -307,7 +307,7 @@ class V2StateTests(unittest.TestCase):
 
     def test_write_once_watermark_cannot_regress_or_be_cleared(self) -> None:
         from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_http_source import candidate, create_v2_database
+        from fixtures.synthetic_dual_stream import candidate, create_v2_database
         from energygrid_bill_downloader.invoice import Stream
 
         create_v2_database(self.path)

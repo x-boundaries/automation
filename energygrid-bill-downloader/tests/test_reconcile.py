@@ -693,7 +693,7 @@ class DualStreamReconcileTests(unittest.TestCase):
     def setUp(self) -> None:
         from energygrid_bill_downloader.config import DeliverySettings, DriveSettings, DualRuntimeConfig
         from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_http_source import create_v2_database, test_stream_entries
+        from fixtures.synthetic_dual_stream import create_v2_database, test_stream_entries
 
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -728,7 +728,7 @@ class DualStreamReconcileTests(unittest.TestCase):
     def adapters(self, *, tie_eb: bool = False, eb_candidates=None):
         from energygrid_bill_downloader.invoice import Stream
         from fixtures.synthetic_delivery import synthetic_pdf
-        from fixtures.synthetic_http_source import SyntheticAdapter, candidate, snapshot
+        from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, snapshot
 
         eb = tuple(eb_candidates) if eb_candidates is not None else (
             candidate(Stream.EB_BILL, name="eb-old.pdf", invoice_date="2026-09-01"),

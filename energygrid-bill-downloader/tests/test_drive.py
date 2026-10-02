@@ -11,7 +11,7 @@ from energygrid_bill_downloader.publication import FileInfo, validate_pdf
 from energygrid_bill_downloader.state import StateV2Store
 from energygrid_bill_downloader.drive import DriveStager
 from fixtures.synthetic_delivery import synthetic_pdf
-from fixtures.synthetic_http_source import SYNTHETIC_EVIDENCE, SYNTHETIC_NAMESPACE, candidate, create_v2_database
+from fixtures.synthetic_dual_stream import SYNTHETIC_EVIDENCE, SYNTHETIC_NAMESPACE, candidate, create_v2_database
 
 
 class DriveStagerTests(unittest.TestCase):

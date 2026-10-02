@@ -20,7 +20,7 @@ from energygrid_bill_downloader.invoice import Stream
 from energygrid_bill_downloader.publication import validate_pdf
 from energygrid_bill_downloader.state import StateV2Store
 from fixtures.synthetic_delivery import synthetic_pdf
-from fixtures.synthetic_http_source import candidate, create_v2_database
+from fixtures.synthetic_dual_stream import candidate, create_v2_database
 
 
 RUN1 = "00000000-0000-0000-0000-000000000001"

@@ -6,7 +6,7 @@ from typing import Any, Protocol
 import re
 import uuid
 
-from .config import MAX_INVENTORY_CEILING, RuntimeConfig
+from .config import MAX_INVENTORY_CEILING, RuntimeConfig, is_within
 from .errors import (
     ACTION_REQUIRED,
     ALREADY_PRESENT,
@@ -92,7 +92,7 @@ class RunSummary:
                     "delivered_count": self.delivered_count,
                     "handled_count": self.handled_count,
                     "uncertain_count": self.uncertain_count,
-                    "streams": self.stream_results,
+                    "stream_results": self.stream_results,
                 }
             )
         return document
@@ -712,6 +712,7 @@ def reconcile_dual_stream(
         if stream_name not in prepared_snapshots:
             continue
         snapshot = prepared_snapshots[stream_name]
+        adapter = adapters[stream_name]
         stream_state = state.stream(stream_name)
         if not snapshot.candidates:
             if stream_state is not None and stream_state["watermark_day"] is not None:

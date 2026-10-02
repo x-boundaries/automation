@@ -118,7 +118,6 @@ class CliTests(unittest.TestCase):
             self.assertEqual({"legacy_rows": 0, "status": "PLAN_READY"}, json.loads(stdout.getvalue()))
             self.assertEqual(before, _cli_tree_snapshot(root))
             self.assertFalse(list(root.glob("*.bak")))
-
             malformed_config = root / "array-config.json"
             malformed_config.write_text("[]", encoding="utf-8")
             rejected = io.StringIO()
@@ -130,6 +129,33 @@ class CliTests(unittest.TestCase):
                     ]),
                 )
             self.assertEqual("CONFIG_OR_DEPENDENCY", json.loads(rejected.getvalue())["error_class"])
+
+    def test_legacy_run_is_refused_before_runtime_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = json.loads(
+                (Path(__file__).parents[1] / "config" / "energygrid.direct_http.example.json").read_text(encoding="utf-8")
+            )
+            raw.update(
+                archive_root=str(root / "archive"),
+                state_path=str(root / "state" / "state.sqlite3"),
+                temp_root=str(root / "temp"),
+                log_root=str(root / "logs"),
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            before = _cli_tree_snapshot(root)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), \
+                    mock.patch.object(cli, "run_direct_http") as run_direct_http:
+                exit_code = main(["run", "--config", str(config_path)])
+            self.assertEqual(64, exit_code)
+            self.assertEqual(
+                {"error_class": "LEGACY_RUN_DISABLED", "status": "ACTION_REQUIRED", "support_ref": "EG_LEGACY_RUN_DISABLED"},
+                json.loads(stdout.getvalue()),
+            )
+            run_direct_http.assert_not_called()
+            self.assertEqual(before, _cli_tree_snapshot(root))
 
     def test_only_locked_commands_and_overrides_are_exposed(self) -> None:
         args = build_parser().parse_args(
@@ -212,7 +238,7 @@ class CliTests(unittest.TestCase):
             job_lines, "- name: EnergyGrid n8n invoice delivery focused offline test", 6
         )
         self.assertIn(
-            'run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v',
+            '        run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v',
             invoice_delivery_step,
         )
 
@@ -499,38 +525,29 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
     )
 
     def write_config(self, root: Path) -> Path:
-        """Write a synthetic config whose private roots are all inside `root`."""
-        (root / "archive").mkdir()
-        config_path = root / "config.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    # Never contacted: every case replaces the portal class.
-                    "portal_url": "http://127.0.0.1:1/synthetic",
-                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
-                    "archive_root": str(root / "archive"),
-                    "state_path": str(root / "state" / "state.sqlite3"),
-                    "temp_root": str(root / "temp"),
-                    "log_root": str(root / "logs"),
-                    "timeout_seconds": 5,
-                    "max_attempts": 2,
-                    "inventory_safety_ceiling": 50,
-                }
-            ),
-            encoding="utf-8",
-        )
-        return config_path
+        """Use the public v2 command boundary with only a synthetic worker seam."""
+        return _dual_cli_fixture(root)[0]
 
     def run_cli(self, root: Path, portal_cls, command: str = "run") -> tuple[int, str]:
         config_path = self.write_config(root)
-        original = cli.PlaywrightPortal
-        cli.PlaywrightPortal = portal_cls
+        run_id = "00000000-0000-0000-0000-000000000123"
+
+        def synthetic_run(config, logger, supplied_run_id, *, list_only):
+            self.assertEqual(run_id, supplied_run_id)
+            self.assertFalse(list_only)
+            logger.event("login_start")
+            with portal_cls(config) as portal:
+                portal.login()
+            logger.event("login_complete")
+            logger.event("run_complete", status=NO_NEW_BILLS)
+            print(json.dumps(cli.RunSummary(run_id, NO_NEW_BILLS, 0).as_dict(), sort_keys=True))
+            return 0
+
         buffer = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buffer):
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": run_id}), \
+                mock.patch.object(cli, "run_dual_stream", side_effect=synthetic_run), \
+                contextlib.redirect_stdout(buffer):
                 exit_code = cli.main([command, "--config", str(config_path)])
-        finally:
-            cli.PlaywrightPortal = original
         return exit_code, buffer.getvalue()
 
     @staticmethod
@@ -1092,6 +1109,7 @@ class LoginDiagnosticCliTests(unittest.TestCase):
                 "login-diagnostic",
                 "navigation-diagnostic",
                 "download-preflight-diagnostic",
+                "migrate-state",
             ],
         )
 

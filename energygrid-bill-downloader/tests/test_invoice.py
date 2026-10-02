@@ -7,7 +7,7 @@ from energygrid_bill_downloader.errors import SourceContractError
 from energygrid_bill_downloader.http_source import ListedBill
 from energygrid_bill_downloader.invoice import Candidate, DATE_PROFILE_ISO_V1, DirectHttpAdapter, InventorySnapshot, Stream, parse_invoice_date
 from energygrid_bill_downloader.publication import filename_key
-from fixtures.synthetic_http_source import SYNTHETIC_EVIDENCE, SYNTHETIC_NAMESPACE, candidate
+from fixtures.synthetic_dual_stream import SYNTHETIC_EVIDENCE, SYNTHETIC_NAMESPACE, candidate
 
 
 class InvoiceIdentityTests(unittest.TestCase):
