@@ -6,9 +6,11 @@ context. It inventories the complete available bill list, validates PDFs, and
 publishes each new bill exactly once to a private archive.
 
 This project is intentionally self-contained under this directory. It does not
-add n8n, email parsing, recurring LLM use, AutoCount integration, or a live API
-client. The browser is used only through the selectors in
-`energygrid_bill_downloader/portal.py`; all tests use the local synthetic portal.
+add AutoCount integration or recurring LLM use. The legacy browser source uses
+the selectors in `energygrid_bill_downloader/portal.py`; all tests use local
+synthetic sources. The dual-stream v2 repository path includes a bounded direct
+HTTP adapter and optional loopback email delivery, but requires no runtime n8n
+dependency; its inactive workflow export lives at the repository root.
 
 ## Direct-HTTP MVP daily path (DL-XB-199 G3-101)
 
@@ -26,6 +28,36 @@ reopened for scoped discovery. Details, the fail-closed reference table, the
 single-run lock and the alert contract are in `docs/runbook.md`.
 
 The browser source below remains the legacy default when `source` is absent.
+
+## Dual-stream repository path (EnergyGrid G3 #226/#228)
+
+The v2 `dual_stream` configuration separates `EB_BILL` and `TENANT_BILL`. For
+each admitted stream, the runner requires a complete inventory, selects one
+unique latest bill date, and never backfills an older candidate. It writes the
+canonical PDF below `EB Bill/` or `Tenant Bill/`, then stages the exact bytes
+under the corresponding local Drive-for-desktop mirror path. `DRIVE_STAGED` is
+the completion boundary; this implementation does not inspect remote Drive
+cloud state.
+
+Tenant Bill production admission remains `UNBOUND` pending accepted #227
+evidence. No endpoint, discriminator, or date format is inferred. The committed
+`config/energygrid.dual_stream.example.json` is an inert shape with both streams
+unbound and all private paths as examples.
+
+Email dispatch is backed by SQLite. The runner durably creates `PENDING_SEND`
+and atomically writes a one-time dispatch marker before its single webhook
+request. A crash, timeout, invalid response, or lost result becomes
+`DELIVERY_OUTCOME_UNCERTAIN`; ordinary runs never resend that invoice. The n8n
+Data Table is secondary evidence and does not provide transactional uniqueness
+or send permission. See the [EnergyGrid runbook](docs/runbook.md) and the
+[inactive invoice-delivery workflow notes](../n8n-workflows/README.md).
+
+`migrate-state` plans are read-only unless `--apply` is explicitly supplied.
+Any migration of a real private database and any classification of historical
+PDFs require a separate reviewed handoff; repository tests use synthetic data
+only. The 08:00 +08:00 Scheduler XML remains disabled. Repository changes do
+not register a task, contact Energy@Grid, stage real files, import a workflow,
+or send email.
 
 ## Install and configure
 

@@ -213,6 +213,22 @@ class SupervisorStaticContractTests(unittest.TestCase):
         self.assertIn("Command = 'run'", self.source)
         self.assertIn("ValidateRange(1, 3600)", parameter_block)
 
+    def test_shared_run_id_is_validated_recorded_and_forwarded_to_the_launcher(self):
+        parameter_block = self.source[self.source.index("param("): self.source.index(")\n\nSet-StrictMode")]
+        self.assertIn("[string]$RunId", parameter_block)
+        validation = self.source[
+            self.source.index("function Set-EgInputContract"):
+            self.source.index("function Test-EgShellContract")
+        ]
+        self.assertIn("$RunId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'", validation)
+        self.assertIn('"RunId = $(ConvertTo-EgSafePowerShellLiteral -Value $RunId)"', self.source)
+        self.assertIn("run_id = $RunId", self.source)
+        main_flow = self.source[self.source.index("try {\n    Test-EgShellContract"):]
+        self.assertLess(
+            main_flow.index("Set-EgInputContract"),
+            main_flow.index("$creation = [EnergyGridOneShotSupervisorNative]::CreateContainedProcess("),
+        )
+
     def test_shell_and_input_rejections_are_before_creation(self):
         creation_call = self.source.rindex("CreateContainedProcess(")
         self.assertLess(self.source.index("Test-EgShellContract"), creation_call)

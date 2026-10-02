@@ -83,6 +83,17 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - Committing this file performs no live n8n action. Import, credential binding, activation and execution each require separate explicit current-turn approval.
 - Focused offline coverage: [energygrid-bill-downloader/tests/test_alert_ingress_workflow.py](../energygrid-bill-downloader/tests/test_alert_ingress_workflow.py).
 
+### energygrid_invoice_delivery.workflow.json
+
+- Purpose: inactive multipart webhook design for one EnergyGrid invoice email. It validates the exact `energygrid.invoice_delivery.v1` metadata object and one PDF binary, hashes the PDF bytes, checks the secondary delivery ledger, sends at most once, records a bounded outcome, and responds to the caller.
+- Architecture: authenticated POST webhook -> strict request validation -> Crypto SHA-256 -> Data Table readback -> pending row -> one Send Email node -> delivered ledger update and readback verification -> bounded webhook response. Validation and node errors use closed 422/503 JSON results.
+- Privacy: only `metadata` and the `pdf` multipart field are accepted. Success, error, and manual execution payloads are not saved. The workflow stores no caller-selected sender or recipient, and the PDF is never copied into a durable execution record.
+- Status: source-controlled, inactive, MCP-disabled, with placeholder webhook path and Data Table ID and no credential, webhook ID, sender, recipient, or instance binding. A local import copy may be considered only under separate authority; keep the webhook loopback-only and bind approved Header Auth and SMTP credentials locally.
+- Delivery authority: SQLite in the Windows runner is the primary no-resend authority. The Data Table is secondary evidence; its Get and Insert are not atomic and do not require global concurrency one. `Send Email` has automatic retry disabled. A send error attempts to record `DELIVERY_OUTCOME_UNCERTAIN`; a later request with an existing uncertain row is never sent again.
+- Runbook: [Energy@Grid runbook](../energygrid-bill-downloader/docs/runbook.md) (Dual-stream v2 repository contract).
+- Committing this file performs no n8n import, activation, execution, SMTP send, or Drive operation. The workflow is evidence, not proof of deployment or execution.
+- Focused offline coverage: [tests/test_energygrid_invoice_delivery_workflow.py](../tests/test_energygrid_invoice_delivery_workflow.py).
+
 ## Directory Rules
 
 - Do not rename existing workflow files during unrelated work. Existing filenames are canonical and are referenced by tests, README links, and runbooks.

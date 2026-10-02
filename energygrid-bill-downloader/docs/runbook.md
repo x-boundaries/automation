@@ -1,11 +1,11 @@
 # Energy@Grid bill downloader runbook
 
-This project is a deterministic, local Windows utility. It is designed to log in
-once per run, inventory the one settled EB Bill results table, download every
-listed bill, reconcile the downloads against a private archive and SQLite
-manifest, and exit with a truthful status. It does not
-use n8n, email parsing, recurring LLM calls, AutoCount, or a live API in its
-normal path.
+This project is a deterministic, local Windows utility. Its legacy browser path
+inventories the settled EB Bill results table; its direct-HTTP path uses a
+bounded configured source. The repository-only dual-stream v2 successor adds
+separate EB Bill and Tenant Bill seams, local Drive staging, and a one-shot
+loopback email handoff. Tenant Bill remains unbound pending accepted #227
+evidence. The project does not use recurring LLM calls or AutoCount.
 
 ## Repository and private runtime boundary
 
@@ -19,6 +19,51 @@ rejects arbitrary in-checkout archive/runtime paths and overlapping paths.
 The eventual archive target is an owner-controlled path such as
 `C:\XB\_MandarinGallery\Utilities\EnergyGrid`. The example config is a shape
 only; it is not a live configuration and contains no credential values.
+
+## Dual-stream v2 repository contract (G3 #226/#228)
+
+`config/energygrid.dual_stream.example.json` is the closed v2 shape. Its paths
+are examples, both source streams are `UNBOUND`, Drive is unbound, and its
+loopback delivery path is a placeholder. Copying or editing the example does
+not bind a source, Drive folder, webhook, or credential.
+
+For every production-bound stream, a run must finish both stream inventory
+attempts before any acquisition, archive, Drive, or email effect. Each complete
+inventory must have one unique candidate on its maximum admitted ISO date; older
+candidates are not backfilled. Archive names are deterministic:
+`EB Bill/YYYY-MM-DD.pdf` and `Tenant Bill/YYYY-MM-DD.pdf`. The Tenant Bill
+adapter stays `UNBOUND` until Web accepts a #227 terminal contract. Synthetic
+same-family HTTP, distinct HTTP, and browser seams do not change production
+admission.
+
+The local Drive-for-desktop stage copies and verifies exact PDF bytes at the
+canonical stream path. `DRIVE_STAGED` is the MVP sink result. It proves the
+local mirrored copy and hash, not remote cloud confirmation.
+
+Email uses an opaque delivery ID saved in SQLite. Before the only webhook POST,
+SQLite stores `PENDING_SEND` and atomically sets a write-once dispatch marker.
+After that marker, timeout, process failure, lost or malformed response, and
+ambiguous acceptance become `DELIVERY_OUTCOME_UNCERTAIN`; ordinary Scheduler
+runs never send again. `DELIVERED` also never sends again. The n8n Data Table is
+secondary evidence; its Get and Insert are not atomic and do not authorise sends.
+The inactive export accepts exactly one `metadata` text field and one validated
+PDF field, stores no success/error execution payload, sends once with retry
+disabled, records a bounded outcome, then responds.
+
+The repository migration code and fixtures cover additive SQLite v2 migration
+without reading or changing private live state. `migrate-state` defaults to a
+read-only plan. The `--apply` option writes a local state database and is not
+part of this repository-only handoff. The four historical PDFs remain
+unclassified until a separate authority supplies private evidence; tests use
+synthetic fixtures only. The Scheduler template stays disabled at 08:00
+`+08:00`; no task is registered here.
+
+The shared lower-case UUID RunId flows from the one-shot supervisor through the
+launcher and Python metadata to the delivery webhook. The inactive workflow
+contains no live webhook path, Header Auth binding, sender, recipient, SMTP
+credential, Data Table ID, or instance ID. Import, credential binding,
+activation, source contact, private-state migration, Drive staging, and email
+remain separate actions requiring their own authority.
 
 ## Runtime prerequisites
 
@@ -447,13 +492,15 @@ must check it after any change to the host.
 
 ### Launcher preconditions that still apply
 
-The launcher's position 10 is source-aware: with `"source": "direct_http"` it requires
-`direct_http` (with non-blank `list_url`, `fetch_url`, `tenant_id`) plus the four path
-keys, and not `portal_url` or `account_identity`. An absent `source` keeps the historical
-browser key set; any other value fails. The launcher still requires the private browser
-cache (position 13) and the DPAPI credential (positions 19-21) and injects that credential
-into the child, although the direct-HTTP source uses neither. Removing those gates changes
-the launcher security design and is left for an explicit Owner/Web decision.
+The launcher's position 10 is source-aware. `direct_http` requires its block and the four
+path keys; `dual_stream` requires schema `energygrid.runtime.v2` and the top-level
+`streams`, `drive`, and `delivery` blocks. The application owns nested config validation.
+An absent `source` keeps the historical browser key set; any other value fails. The
+launcher still requires the private browser cache (position 13) and the DPAPI credential
+(positions 19-21), and injects the four process-scoped variables including the shared
+RunId. The direct-HTTP and dual-stream application adapters do not read the browser
+credential, but removing the launcher's established gates requires a separate Owner/Web
+decision.
 
 ### Known MVP limitations (accepted or pending decision)
 

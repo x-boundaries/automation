@@ -29,9 +29,108 @@ from energygrid_bill_downloader.errors import (
     LayoutChangedError,
     LoginError,
 )
+from energygrid_bill_downloader.state import StateStore, migrate_state_database
+
+
+def _dual_cli_fixture(root: Path, *, initialize_v2: bool = True) -> tuple[Path, Path, Path]:
+    example = Path(__file__).parents[1] / "config" / "energygrid.dual_stream.example.json"
+    raw = json.loads(example.read_text(encoding="utf-8"))
+    archive = root / "archive"
+    archive.mkdir()
+    state_path = root / "state" / "bills.sqlite3"
+    temp_root = root / "temp"
+    log_root = root / "logs"
+    raw.update(
+        archive_root=str(archive),
+        state_path=str(state_path),
+        temp_root=str(temp_root),
+        log_root=str(log_root),
+    )
+    config_path = root / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    if initialize_v2:
+        migrate_state_database(state_path, apply=True)
+    return config_path, state_path, root
+
+
+def _cli_tree_snapshot(root: Path) -> dict[str, tuple[bool, int, bytes | None]]:
+    if not root.exists():
+        return {}
+    paths = [root, *sorted(root.rglob("*"))]
+    return {
+        path.relative_to(root).as_posix() or ".": (
+            path.is_dir(), path.stat().st_mtime_ns, None if path.is_dir() else path.read_bytes()
+        )
+        for path in paths
+    }
 
 
 class CliTests(unittest.TestCase):
+    def test_run_id_is_shared_only_as_a_lowercase_uuid(self) -> None:
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-0000-0000-000000000123"}):
+            self.assertEqual("00000000-0000-0000-0000-000000000123", cli.resolve_run_id())
+        for value in ("", "00000000-0000-0000-0000-00000000012A", "not-a-uuid"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": value}):
+                with self.assertRaises(ConfigError):
+                    cli.resolve_run_id()
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": ""}):
+            del os.environ["ENERGYGRID_RUN_ID"]
+            generated = cli.resolve_run_id()
+        self.assertRegex(generated, r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+    def test_v2_list_is_read_only_and_reports_the_unbound_shared_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path, _state_path, _ = _dual_cli_fixture(root)
+            before = _cli_tree_snapshot(root)
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-0000-0000-000000000123"}), \
+                    contextlib.redirect_stdout(stdout):
+                exit_code = main(["list", "--config", str(config_path)])
+            self.assertEqual(20, exit_code)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual("ACTION_REQUIRED", result["status"])
+            self.assertEqual(
+                ["SHARED_SINK_UNBOUND", "SHARED_SINK_UNBOUND"],
+                [item["status"] for item in result["stream_results"]],
+            )
+            self.assertEqual(before, _cli_tree_snapshot(root))
+
+    def test_migration_plan_is_read_only_and_non_object_config_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path, state_path, _ = _dual_cli_fixture(root, initialize_v2=False)
+            with StateStore(state_path):
+                pass
+            mapping_path = root / "mapping.json"
+            mapping_path.write_text(
+                json.dumps({"schema": "energygrid.state_migration_mapping.v2", "entries": []}),
+                encoding="utf-8",
+            )
+            before = _cli_tree_snapshot(root)
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-0000-0000-000000000123"}), \
+                    contextlib.redirect_stdout(stdout):
+                exit_code = main([
+                    "migrate-state", "--config", str(config_path), "--mapping", str(mapping_path),
+                ])
+            self.assertEqual(0, exit_code)
+            self.assertEqual({"legacy_rows": 0, "status": "PLAN_READY"}, json.loads(stdout.getvalue()))
+            self.assertEqual(before, _cli_tree_snapshot(root))
+            self.assertFalse(list(root.glob("*.bak")))
+
+            malformed_config = root / "array-config.json"
+            malformed_config.write_text("[]", encoding="utf-8")
+            rejected = io.StringIO()
+            with contextlib.redirect_stdout(rejected):
+                self.assertEqual(
+                    64,
+                    main([
+                        "migrate-state", "--config", str(malformed_config), "--mapping", str(mapping_path),
+                    ]),
+                )
+            self.assertEqual("CONFIG_OR_DEPENDENCY", json.loads(rejected.getvalue())["error_class"])
+
     def test_only_locked_commands_and_overrides_are_exposed(self) -> None:
         args = build_parser().parse_args(
             [
@@ -101,10 +200,20 @@ class CliTests(unittest.TestCase):
                 '      - "n8n-workflows/energygrid_download_error_handler.workflow.json"',
                 '      - "n8n-workflows/energygrid_alert_ingress.workflow.json"',
                 '      - "tests/test_energygrid_n8n_error_handler.py"',
+                "      # Invoice delivery (#226/#228): inactive sanitized export and focused offline test.",
+                '      - "n8n-workflows/energygrid_invoice_delivery.workflow.json"',
+                '      - "tests/test_energygrid_invoice_delivery_workflow.py"',
                 '      - "n8n-workflows/README.md"',
                 '      - "README.md"',
                 '      - ".gitignore"',
             ],
+        )
+        invoice_delivery_step = block_for(
+            job_lines, "- name: EnergyGrid n8n invoice delivery focused offline test", 6
+        )
+        self.assertIn(
+            'run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v',
+            invoice_delivery_step,
         )
 
         scope_guard = block_for(lines, "foreach ($file in $files) {", 12)
@@ -118,6 +227,8 @@ class CliTests(unittest.TestCase):
                 "$file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and",
                 "$file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and",
                 "$file -ne 'tests/test_energygrid_n8n_error_handler.py' -and",
+                "$file -ne 'n8n-workflows/energygrid_invoice_delivery.workflow.json' -and",
+                "$file -ne 'tests/test_energygrid_invoice_delivery_workflow.py' -and",
                 "$file -ne 'n8n-workflows/README.md' -and",
                 "$file -ne 'README.md' -and",
                 "$file -ne '.gitignore') {",
@@ -141,12 +252,13 @@ class CliTests(unittest.TestCase):
                 "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or",
                 "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or",
                 "$_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or",
-                "$_ -eq 'tests/test_energygrid_n8n_error_handler.py'",
+                "$_ -eq 'tests/test_energygrid_n8n_error_handler.py' -or",
+                "$_ -eq 'n8n-workflows/energygrid_invoice_delivery.workflow.json' -or",
+                "$_ -eq 'tests/test_energygrid_invoice_delivery_workflow.py'",
             ],
         )
-        # The n8n error handler export and its focused test are EnergyGrid-owned, so either
-        # one alone arms the guard. `n8n-workflows/README.md` is a shared companion: it
-        # triggers the workflow and is permitted, but it never confers ownership.
+        # The EnergyGrid n8n exports and focused tests are owned paths. The workflow
+        # directory README is a shared companion: permitted, but never an ownership signal.
         self.assertNotIn("README.md", ownership_text)
         self.assertNotIn(".gitignore", ownership_text)
         self.assertIn("if ($owned.Count -eq 0) {", workflow)
@@ -304,6 +416,23 @@ class CliTests(unittest.TestCase):
             "scripts/member_create_uat_approval.py",
         ])
         self.assertNotEqual(result.returncode, 0, "an out-of-scope path must fail closed")
+        self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    def test_n8n_invoice_delivery_change_with_test_and_directory_readme_is_accepted(self) -> None:
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_invoice_delivery.workflow.json",
+            "tests/test_energygrid_invoice_delivery_workflow.py",
+            "n8n-workflows/README.md",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    def test_n8n_invoice_delivery_change_with_an_unrelated_path_still_fails(self) -> None:
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_invoice_delivery.workflow.json",
+            "scripts/member_create_uat_approval.py",
+        ])
+        self.assertNotEqual(result.returncode, 0)
         self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
 
     def test_n8n_directory_readme_alone_does_not_confer_energygrid_ownership(self) -> None:

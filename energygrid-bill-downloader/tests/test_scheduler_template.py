@@ -37,6 +37,17 @@ class SchedulerTemplateContract(unittest.TestCase):
     def test_template_is_inert(self) -> None:
         self.assertEqual("false", self.value("t:Settings/t:Enabled"))
 
+    def test_one_daily_calendar_trigger_has_fixed_singapore_time_and_date_placeholder(self) -> None:
+        triggers = self.root.findall("t:Triggers/t:CalendarTrigger", NS)
+        self.assertEqual(1, len(triggers))
+        boundary = self.value("t:Triggers/t:CalendarTrigger/t:StartBoundary")
+        self.assertEqual("REPLACE_WITH_START_DATET08:00:00+08:00", boundary)
+        self.assertEqual(
+            "2026-10-03T08:00:00+08:00",
+            boundary.replace("REPLACE_WITH_START_DATE", "2026-10-03"),
+        )
+        self.assertEqual("1", self.value("t:Triggers/t:CalendarTrigger/t:ScheduleByDay/t:DaysInterval"))
+
     def test_non_elevated_run_principal(self) -> None:
         self.assertEqual("LeastPrivilege", self.value("t:Principals/t:Principal/t:RunLevel"))
         self.assertEqual("Password", self.value("t:Principals/t:Principal/t:LogonType"))

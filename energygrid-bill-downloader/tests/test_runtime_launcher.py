@@ -823,6 +823,47 @@ switch ($Op) {
             viabilitySupportRef = $viability.SupportRef
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'runidinject' {
+        # Exercise process-only restoration with the same helper called by launcher.ps1.
+        # The identifier is a fixed synthetic UUID and is the only value written by the stub.
+        $name = 'ENERGYGRID_RUN_ID'
+        if ($Value2 -ne '') {
+            Set-EgProcessEnvironmentVariable -Name $name -Value $Value2
+        }
+        else {
+            Set-EgProcessEnvironmentVariable -Name $name -Value $null
+        }
+        $beforeValue = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+        $before = [ordered]@{
+            present = (Test-ProbeVariablePresent -Name $name)
+            value   = ([string]$beforeValue)
+        }
+        $outPath = Join-Path $Dir 'runid_observed.json'
+        $variables = [ordered]@{}
+        $variables[$name] = '00000000-0000-0000-0000-000000000001'
+        $stubArguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $Path3, '-OutPath', $outPath)
+        $injected = Invoke-EgWithInjectedProcessEnvironment -Variables $variables -Body {
+            $started = Start-Process -FilePath $Path2 -ArgumentList $stubArguments `
+                -NoNewWindow -Wait -PassThru
+            $started.ExitCode
+        }
+        $afterValue = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+        $childObserved = ''
+        if (Test-Path -LiteralPath $outPath -PathType Leaf) {
+            $childObserved = [System.IO.File]::ReadAllText($outPath)
+        }
+        [ordered]@{
+            before            = $before
+            afterPresent      = (Test-ProbeVariablePresent -Name $name)
+            afterValue        = ([string]$afterValue)
+            childStubRan      = (Test-Path -LiteralPath $outPath -PathType Leaf)
+            childExit         = $injected.BodyResult
+            restorePass       = $injected.Restore.Pass
+            restoreSupportRef = $injected.Restore.SupportRef
+            childObserved     = $childObserved
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     'credinject' {
         # The full injection sequence: snapshot, set at PROCESS SCOPE ONLY, run a child
         # stub, then restore exactly on the finally-equivalent path. -Path is the credential
@@ -4042,6 +4083,7 @@ function Get-ProcessVariable([string]$Name) {
 $username = Get-ProcessVariable 'ENERGYGRID_USERNAME'
 $password = Get-ProcessVariable 'ENERGYGRID_PASSWORD'
 $cache = Get-ProcessVariable 'PLAYWRIGHT_BROWSERS_PATH'
+$runId = Get-ProcessVariable 'ENERGYGRID_RUN_ID'
 
 # PRESENCE and non-emptiness only for the credential variables. Their VALUES are never
 # written to disk, emitted, measured, or hashed by this stub. The browser-cache value is a
@@ -4052,6 +4094,7 @@ $observed = [ordered]@{
     usernameNonEmpty  = (-not [string]::IsNullOrEmpty($username))
     passwordNonEmpty  = (-not [string]::IsNullOrEmpty($password))
     browserCacheValue = ([string]$cache)
+    runIdValue        = ([string]$runId)
     workingDirectory  = (Get-Location).Path
 }
 
@@ -6617,13 +6660,14 @@ ORDERED_PREFLIGHT_CHECK_NAMES = (
     "launcher_root_write_trustees_authorised",
     "launcher_files_not_reparse_points",
     "launcher_files_not_unexpectedly_readonly",
+    "run_id_valid",
     "credential_import_ok",
     "username_nonempty",
     "password_nonempty",
 )
 
-NON_SECRET_CHECK_NAMES = ORDERED_PREFLIGHT_CHECK_NAMES[:18]
-CREDENTIAL_CHECK_NAMES = ORDERED_PREFLIGHT_CHECK_NAMES[18:]
+NON_SECRET_CHECK_NAMES = ORDERED_PREFLIGHT_CHECK_NAMES[:19]
+CREDENTIAL_CHECK_NAMES = ORDERED_PREFLIGHT_CHECK_NAMES[19:]
 
 REQUIRED_CONFIG_KEYS = (
     "portal_url",
@@ -6785,7 +6829,7 @@ class LauncherPreflightContract(TierABase):
     """Task 16, steps 8 to 14: design sections 5.1, 5.2, 5.3, and 11.3."""
 
     def test_the_preflight_check_order_matches_the_committed_contract(self):
-        """The emitted checks map carries the twenty-one stable names in exact order."""
+        """The emitted checks map carries the twenty-two stable names in exact order."""
         with TemporaryScratch() as tmp:
             environment = LauncherEnvironment(tmp, ANY_PS).build()
             completed = environment.run()
@@ -6815,7 +6859,7 @@ class LauncherPreflightContract(TierABase):
                 )
 
     def test_a_failing_non_secret_preflight_causes_zero_credential_import_attempt(self):
-        """EGRT-T48: the credential artefact is never opened when an earlier check fails.
+        """EGRT-T48: the credential artefact is never opened when a non-secret check fails.
 
         The artefact path is pointed at a file that does not exist, so any attempt to open
         it would be visible as a credential support reference. Each case below fails a
@@ -7052,6 +7096,31 @@ class LauncherPreflightContract(TierABase):
                 with TemporaryScratch() as tmp:
                     environment = LauncherEnvironment(tmp, ANY_PS).build(
                         config_overrides=overrides, omit_config_keys=omitted
+                    )
+                    observed = launcher_validation(environment.run())
+                self.assertEqual("FAIL", observed["checks"]["config_required_keys_present"])
+                self.assertEqual("EG_LAUNCHER_CONFIG_KEY_MISSING", observed["support_ref"])
+
+    def test_a_dual_stream_v2_config_satisfies_position_ten_without_browser_keys(self):
+        example = PROJECT_ROOT / "config" / "energygrid.dual_stream.example.json"
+        dual = json.loads(example.read_text(encoding="utf-8"))
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build(
+                config_overrides=dual, omit_config_keys=("portal_url", "account_identity")
+            )
+            observed = launcher_validation(environment.run())
+        self.assertEqual("PASS", observed["checks"]["config_parses_json"])
+        self.assertEqual("PASS", observed["checks"]["config_required_keys_present"])
+
+        wrong_schema = dict(dual, schema="energygrid.runtime.v1")
+        missing_delivery = dict(dual)
+        missing_delivery.pop("delivery")
+        for overrides in (wrong_schema, missing_delivery):
+            with self.subTest(schema=overrides.get("schema"), has_delivery="delivery" in overrides):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build(
+                        config_overrides=overrides,
+                        omit_config_keys=("portal_url", "account_identity"),
                     )
                     observed = launcher_validation(environment.run())
                 self.assertEqual("FAIL", observed["checks"]["config_required_keys_present"])
@@ -7330,6 +7399,72 @@ class LauncherStaticGuards(TierCBase):
             "[Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch",
             self.launcher,
         )
+
+    def test_run_id_is_a_non_secret_preflight_check_before_credential_import(self):
+        check = self.launcher.index("Set-EgCheckOutcome -Name 'run_id_valid'")
+        credential = self.launcher.index("Import-EgLauncherCredential")
+        self.assertLess(check, credential)
+        self.assertIn("$script:EgRunIdPattern = '\\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'", self.launcher)
+        self.assertIn("$runIdValid = [string]::IsNullOrEmpty($RunId) -or ($RunId -cmatch $script:EgRunIdPattern)", self.launcher)
+
+    def test_run_id_is_process_only_and_does_not_change_the_child_vector(self):
+        self.assertIn("$injected['ENERGYGRID_RUN_ID'] = $RunId", self.launcher)
+        self.assertIn("Invoke-EgWithInjectedProcessEnvironment -Variables $injected", self.launcher)
+        self.assertIn("Exactly four process-scope variables", self.launcher)
+        generated = self.launcher.index("$RunId = [guid]::NewGuid().ToString('D').ToLowerInvariant()")
+        validation_exit = self.launcher.index("Exit-EgLauncher -ExitCode 0")
+        self.assertGreater(generated, validation_exit, "ValidateOnly must not generate a RunId")
+        self.assertEqual(2, self.launcher.count("$childArguments"))
+
+    def test_validate_only_reports_absent_and_explicit_valid_run_ids_without_generation(self):
+        values = (None, "00000000-0000-0000-0000-000000000001")
+        for value in values:
+            with self.subTest(run_id=value):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build()
+                    extra = () if value is None else ("-RunId", value)
+                    observed = launcher_validation(environment.run(*extra))
+                self.assertEqual("PASS", observed["checks"]["run_id_valid"])
+                self.assertEqual(list(ORDERED_PREFLIGHT_CHECK_NAMES), list(observed["checks"]))
+
+    def test_invalid_explicit_run_id_fails_before_credential_import(self):
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            observed = launcher_validation(environment.run("-RunId", "not-a-run-id"))
+        self.assertEqual("FAIL", observed["checks"]["run_id_valid"])
+        for name in CREDENTIAL_CHECK_NAMES:
+            self.assertEqual("FAIL", observed["checks"][name])
+
+    def test_shared_run_id_is_visible_only_during_child_execution_and_restored(self):
+        if ANY_PS is None:
+            self.skipTest("a PowerShell runtime is required")
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            observed = probe_json(ANY_PS, "runidinject", tmp, dir=work, path2=ANY_PS, path3=stub)
+        self.assertTrue(observed["childStubRan"])
+        self.assertEqual(0, observed["childExit"])
+        self.assertEqual("00000000-0000-0000-0000-000000000001", json.loads(observed["childObserved"])["runIdValue"])
+        self.assertFalse(observed["before"]["present"])
+        self.assertFalse(observed["afterPresent"], "an absent prior value must be removed")
+        self.assertTrue(observed["restorePass"], observed["restoreSupportRef"])
+
+    def test_shared_run_id_prior_process_value_is_restored_exactly(self):
+        if ANY_PS is None:
+            self.skipTest("a PowerShell runtime is required")
+        prior = "00000000-0000-0000-0000-000000000002"
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            observed = probe_json(
+                ANY_PS, "runidinject", tmp, dir=work, path2=ANY_PS, path3=stub, value2=prior
+            )
+        self.assertEqual(prior, observed["before"]["value"])
+        self.assertTrue(observed["afterPresent"])
+        self.assertEqual(prior, observed["afterValue"])
+        self.assertTrue(observed["restorePass"], observed["restoreSupportRef"])
 
 
 # --------------------------------------------------------------------------------------
@@ -8000,6 +8135,7 @@ LIVE_SUPPORT_REFS = (
     "EG_LAUNCHER_CONFIG_INSIDE_CHECKOUT",
     "EG_LAUNCHER_CONFIG_UNPARSABLE",
     "EG_LAUNCHER_CONFIG_KEY_MISSING",
+    "EG_LAUNCHER_RUN_ID_INVALID",
     "EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED",
     "EG_LAUNCHER_ROOT_INSIDE_CHECKOUT",
     "EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE",
@@ -8015,7 +8151,7 @@ LIVE_SUPPORT_REFS = (
     "EG_LAUNCHER_UNCLASSIFIED",
 )
 
-LIVE_SUPPORT_REF_COUNT = 49
+LIVE_SUPPORT_REF_COUNT = 50
 
 # Design section 17.2 records the first as retired vocabulary that must not be emitted. The
 # second existed only in an earlier revision of the plan, was never implemented and never

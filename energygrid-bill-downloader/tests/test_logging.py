@@ -51,12 +51,12 @@ class LoggingTests(unittest.TestCase):
 
 
 class InvoiceFailureLogFieldTests(unittest.TestCase):
-    """DL-XB-199 G2-083: the exact ten fields and backward-compatible JSONL."""
+    """Bounded legacy enrichment plus the closed dual-stream summary fields."""
 
     def lines(self, logger: SafeLogger) -> list[dict]:
         return [json.loads(line) for line in logger.log_path.read_text(encoding="utf-8").splitlines()]
 
-    def test_the_allowlist_is_exactly_the_existing_seven_plus_three(self) -> None:
+    def test_the_allowlist_is_closed_for_legacy_and_dual_stream_fields(self) -> None:
         self.assertEqual(
             cli.ALLOWED_LOG_FIELDS,
             {
@@ -70,6 +70,13 @@ class InvoiceFailureLogFieldTests(unittest.TestCase):
                 "row_ordinal",
                 "preflight_reason",
                 "preflight_checkpoint",
+                "stream",
+                "archive_reused_count",
+                "archive_staged_count",
+                "drive_staged_count",
+                "delivered_count",
+                "handled_count",
+                "uncertain_count",
             },
         )
 
@@ -164,6 +171,27 @@ class InvoiceFailureLogFieldTests(unittest.TestCase):
         )
         for event in events:
             self.assertTrue(set(event) <= {"run_id", "phase", "status"} | cli.ALLOWED_LOG_FIELDS)
+
+    def test_dual_stream_logs_keep_only_closed_streams_and_bounded_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logger = SafeLogger(Path(directory), "run-4")
+            logger.event(
+                "stream_complete",
+                status="DELIVERED",
+                stream="EB_BILL",
+                inventory_count=1,
+                delivered_count=1,
+                handled_count=1,
+                drive_staged_count=10_001,
+                tenant_id="PRIVATE-TENANT",
+                source_filename="PRIVATE.pdf",
+            )
+            event = self.lines(logger)[0]
+        self.assertEqual("EB_BILL", event["stream"])
+        self.assertEqual(1, event["delivered_count"])
+        self.assertNotIn("drive_staged_count", event)
+        self.assertNotIn("tenant_id", event)
+        self.assertNotIn("source_filename", event)
 
 
 if __name__ == "__main__":

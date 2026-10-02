@@ -238,5 +238,85 @@ class StateTests(unittest.TestCase):
                     self.assertEqual("SEEN", state.get("key").status)
 
 
+class V2StateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / "private-state" / "bills.sqlite3"
+
+    def test_daily_v2_open_refuses_missing_and_v1_without_mutation(self) -> None:
+        from energygrid_bill_downloader.state import StateV2Store
+
+        with self.assertRaises(StateError):
+            with StateV2Store(self.path, read_only=True):
+                self.fail("missing v2 state was accepted")
+        self.assertFalse(self.path.exists())
+        create_state_fixture(self.path)
+        before = state_snapshot(self.root)
+        with self.assertRaises(StateError):
+            with StateV2Store(self.path, read_only=True):
+                self.fail("legacy v1 state was accepted as v2")
+        self.assertEqual(before, state_snapshot(self.root))
+
+    def test_migration_default_returns_plan_without_changing_legacy_state(self) -> None:
+        from energygrid_bill_downloader.state import migrate_state_database
+
+        create_state_fixture(self.path)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("invoice-1.pdf", "invoice-1.pdf", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", None, None, None, "SEEN", None, None, 0, None),
+            )
+        before = state_snapshot(self.root)
+        result = migrate_state_database(self.path)
+        self.assertEqual({"status": "PLAN_READY", "legacy_rows": 1}, result)
+        self.assertEqual(before, state_snapshot(self.root))
+        self.assertFalse(list(self.path.parent.glob("*.bak")))
+
+    def test_apply_preserves_v1_rows_and_makes_imported_invoice_unclassified(self) -> None:
+        from energygrid_bill_downloader.state import StateV2Store, migrate_state_database
+        from fixtures.synthetic_http_source import test_stream_entries
+        from energygrid_bill_downloader.invoice import Stream
+
+        create_state_fixture(self.path)
+        sha = "a" * 64
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("legacy.pdf", "legacy.pdf", "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00", None, 123, sha, "SEEN", None, None, 1, None),
+            )
+        result = migrate_state_database(self.path, apply=True, streams=test_stream_entries(bound=(Stream.EB_BILL,)))
+        self.assertEqual({"status": "MIGRATED", "legacy_rows": 1}, result)
+        backups = list(self.path.parent.glob("bills.sqlite3.v1-*.bak"))
+        self.assertEqual(1, len(backups))
+        with StateV2Store(self.path, read_only=True) as state:
+            row = state.connection.execute(
+                "SELECT classification,legacy_filename_key,legacy_path,archive_state,migration_state,drive_state,byte_size,sha256 FROM energygrid_invoice_v2"
+            ).fetchone()
+            self.assertEqual(("UNCLASSIFIED", "legacy.pdf", "legacy.pdf", "UNVERIFIED", "UNCLASSIFIED", "NOT_STAGED", 123, sha), row)
+            self.assertEqual("UNBOUND", state.stream("TENANT_BILL")["admission"])
+            self.assertIsNone(state.delivery_for_invoice(state.connection.execute("SELECT invoice_id FROM energygrid_invoice_v2").fetchone()[0]))
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual((1,), backup.execute("PRAGMA user_version").fetchone())
+            self.assertEqual(("legacy.pdf", 123, sha), backup.execute("SELECT filename_key,byte_size,sha256 FROM bills").fetchone())
+
+    def test_write_once_watermark_cannot_regress_or_be_cleared(self) -> None:
+        from energygrid_bill_downloader.state import StateV2Store
+        from fixtures.synthetic_http_source import candidate, create_v2_database
+        from energygrid_bill_downloader.invoice import Stream
+
+        create_v2_database(self.path)
+        with StateV2Store(self.path) as state:
+            invoice_id = state.accept_latest(candidate(Stream.EB_BILL), "00000000-0000-0000-0000-000000000001", "2026-10-02T00:00:00+00:00")
+            with self.assertRaises(StateError):
+                with state.transaction() as connection:
+                    connection.execute("UPDATE energygrid_stream_v2 SET watermark_day=NULL WHERE stream='EB_BILL'")
+            with self.assertRaises(StateError):
+                with state.transaction() as connection:
+                    connection.execute("UPDATE energygrid_stream_v2 SET watermark_day=1 WHERE stream='EB_BILL'")
+            self.assertEqual(invoice_id, state.stream("EB_BILL")["watermark_invoice_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

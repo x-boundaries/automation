@@ -50,6 +50,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:EgRunIdPattern = '\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 
 # The ONLY dot-source in this script, and a fixed join of this script's own directory with
 # the fixed library name. The launcher never enumerates the root to locate a library.
@@ -60,9 +61,9 @@ $launcherRoot = $PSScriptRoot
 # --------------------------------------------------------------------------------------
 # Ordered preflight state
 # --------------------------------------------------------------------------------------
-# The twenty-one stable check names, in the exact order design section 5.2 evaluates them.
-# Positions 1 to 18 are the NON-SECRET preflight. Every one of them completes before
-# position 19 is attempted, so credential import is literally the last check and a run that
+# The twenty-two stable check names, in the exact order design section 5.2 evaluates them.
+# Positions 1 to 19 are the NON-SECRET preflight. Every one of them completes before
+# position 20 is attempted, so credential import is literally the last group and a run that
 # will fail for any other reason never opens the credential artefact at all. That ordering
 # is a security property, not a performance preference.
 $script:EgOrderedCheckNames = @(
@@ -84,6 +85,7 @@ $script:EgOrderedCheckNames = @(
     'launcher_root_write_trustees_authorised',
     'launcher_files_not_reparse_points',
     'launcher_files_not_unexpectedly_readonly',
+    'run_id_valid',
     'credential_import_ok',
     'username_nonempty',
     'password_nonempty'
@@ -175,7 +177,11 @@ function Exit-EgPreflightFailure {
     # explicitly among the things it must not create, so validation emits its bounded
     # JSON document and nothing else.
     if (-not $ValidateOnly) {
-        Write-EgLauncherTerminalEvent -LogRoot ([string]$LogRoot) -RunId ([string]$RunId) `
+        $eventRunId = ''
+        if ($null -ne $RunId -and $RunId -cmatch $script:EgRunIdPattern) {
+            $eventRunId = $RunId
+        }
+        Write-EgLauncherTerminalEvent -LogRoot ([string]$LogRoot) -RunId $eventRunId `
             -Phase 'preflight' -Status 'FAILED' -SupportRef $script:EgFirstFailureRef
     }
     Exit-EgLauncher -ExitCode $script:EgLauncherExitCodes['PreflightFailed']
@@ -294,10 +300,15 @@ if (Test-EgPreflightShouldContinue) {
 }
 
 # --------------------------------------------------------------------------------------
-# Positions 19 to 21 - the credential artefact, and only now
+# Position 19 validates the optional shared RunId before any credential import.
+# Positions 20 to 22 - the credential artefact, and only now
 # --------------------------------------------------------------------------------------
 # Reached ONLY when every non-secret position above passed. A run that will fail for any
 # other reason never opens the credential artefact at all.
+
+$runIdValid = [string]::IsNullOrEmpty($RunId) -or ($RunId -cmatch $script:EgRunIdPattern)
+Set-EgCheckOutcome -Name 'run_id_valid' -Pass $runIdValid `
+    -SupportRef 'EG_LAUNCHER_RUN_ID_INVALID'
 
 $credential = $null
 $credentialUsable = $false
@@ -332,6 +343,10 @@ if ($ValidateOnly) {
     Exit-EgLauncher -ExitCode 0
 }
 
+if ([string]::IsNullOrEmpty($RunId)) {
+    $RunId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
+}
+
 if (-not $credentialUsable) {
     Exit-EgPreflightFailure
 }
@@ -339,7 +354,7 @@ if (-not $credentialUsable) {
 # --------------------------------------------------------------------------------------
 # Invocation
 # --------------------------------------------------------------------------------------
-# Exactly three process-scope variables are set immediately before the child starts and
+# Exactly four process-scope variables are set immediately before the child starts and
 # restored on the finally-equivalent path. No other environment change is made.
 
 $plainUsername = $credential.UserName
@@ -359,6 +374,7 @@ $injected = [ordered]@{}
 $injected[$script:EgCredentialVariableNames[0]] = $plainUsername
 $injected[$script:EgCredentialVariableNames[1]] = $plainPassword
 $injected[$script:EgBrowserCacheVariableName] = $BrowserCachePath
+$injected['ENERGYGRID_RUN_ID'] = $RunId
 
 $workingDirectory = Join-Path $CheckoutRoot 'energygrid-bill-downloader'
 $childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $ConfigPath)

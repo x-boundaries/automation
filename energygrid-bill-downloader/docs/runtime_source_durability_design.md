@@ -1,18 +1,22 @@
 # Energy@Grid Runtime Source-Durability Design
 
-Status: design only. This change adds no launcher, no installer, no runtime
-implementation, no test, and no CI change. It records the reviewed contract that a
-later, separately approved implementation change must satisfy.
+Status: original design record. G3 implements the dual-stream repository path and adds
+the shared RunId check and process variable described below; the earlier runtime-source
+durability contract remains in force where this G3 amendment does not explicitly extend it.
 
 Design lock: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY`.
 Accepted amendment: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1`, which narrowly amends
 the invocation contract of sections 5.1 and 5.3 to admit one fixed repository-controlled
 `login-diagnostic` operation, and adds its bounded contract as section 5.4. Every other
 clause of `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY` remains controlling and unchanged:
-the eleven-parameter surface, the twenty-one ordered preflight checks, credential import
-last, the three injected process variables, exact environment restoration, the
+the eleven-parameter surface, credential import last, exact environment restoration, the
 installer/manifest/source-integrity architecture, the exit bands, and Scheduler `run`
 semantics are all untouched by the amendment.
+G3 adds one pre-credential `run_id_valid` check, bringing the ordered check count to 22,
+and injects `ENERGYGRID_RUN_ID` with the three existing process variables. An absent or
+empty RunId passes validation and is generated only after `ValidateOnly`; an explicit
+value must match the lower-case UUID form. Its bounded failure reference is
+`EG_LAUNCHER_RUN_ID_INVALID`, bringing the live runtime vocabulary from 49 to 50.
 Architecture: Option 2, Git canonical for reusable runtime behaviour.
 Authority at authoring time: repository `x-boundaries/automation`, remote `main` at
 `893f319a3e9ccf5055723a201377fe9261cda42a`.
@@ -195,7 +199,7 @@ approved.
 | `-Command` | no | `run` (default), `list`, `login-diagnostic` (section 5.4), or `download-preflight-diagnostic` (section 5.5) |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch, contract in section 8 |
-| `-RunId` | no | Correlation identifier for the terminal event only |
+| `-RunId` | no | Optional exact lower-case UUID shared with the Python child; ordinary execution generates one only after `ValidateOnly` exits. |
 
 `-CredentialPath` and `-BrowserCachePath` locate private host artefacts; they never
 carry a credential value or a committed path. `-ExpectedBranch` is mandatory with an
@@ -291,10 +295,11 @@ script, module, path, portal address, credential value, or arbitrary child argum
 reaches the child.
 
 The environment is not passed through unchanged. Immediately before the child starts,
-the launcher sets exactly three process-scope variables from the values established in
+the launcher sets exactly four process-scope variables from values established in
 preflight: `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` from the imported credential
-(section 9.2), and the Playwright browser-cache variable from `-BrowserCachePath`
-(section 9.3). Each is restored to its exact prior process state in a finally-equivalent
+(section 9.2), the Playwright browser-cache variable from `-BrowserCachePath`
+(section 9.3), and `ENERGYGRID_RUN_ID` from the validated or generated shared run
+identifier. Each is restored to its exact prior process state in a finally-equivalent
 path once the child exits or fails to start. No other environment change is made.
 
 The application returns `0`, `10`, `20`, or `64`. The launcher's own failures therefore

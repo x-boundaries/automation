@@ -4,15 +4,28 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import MAX_INVENTORY_CEILING, SOURCE_DIRECT_HTTP, RuntimeConfig, load_config_file, load_runtime_config
+from .config import (
+    BOUND_ADMISSION,
+    MAX_INVENTORY_CEILING,
+    RUNTIME_V2_SCHEMA,
+    SOURCE_DIRECT_HTTP,
+    DualRuntimeConfig,
+    RuntimeConfig,
+    load_config_file,
+    load_dual_stream_config,
+    load_runtime_config,
+)
 from .errors import ACTION_REQUIRED, SUPPORT_REF_PATTERN, AppError, ConfigError, DependencyError, exit_code_for
 from .http_source import DirectHttpSource
+from .invoice import DirectHttpAdapter, Stream
+from .invoice import DirectHttpAdapter, Stream
 from .notify import build_alert_payload, send_alert
 from .run_lock import RunLock
 from .publication import cleanup_stale_owned_temp
@@ -79,13 +92,13 @@ from .portal import (
     unobserved_navigation_pre_ems,
     unobserved_login_witnesses,
 )
-from .reconcile import RunSummary, reconcile_inventory, reconcile_listed_inventory
-from .state import StateStore
+from .reconcile import RunSummary, reconcile_dual_stream, reconcile_inventory, reconcile_listed_inventory
+from .state import StateStore, StateV2Store, migrate_state_database
 
 
-# The last three are the additive invoice_failure enrichment accepted by
-# DL-XB-199 G2-083. They are never required, so a log written by an earlier
-# build stays valid, and reconcile validates each value before it is logged.
+# Invoice-failure enrichment and dual-stream summary fields are optional, so a log
+# written by an earlier build stays valid. Callers validate safe vocabularies before
+# emission; this boundary also enforces the stream and count bounds.
 ALLOWED_LOG_FIELDS = {
     "inventory_count",
     "downloaded_count",
@@ -97,6 +110,13 @@ ALLOWED_LOG_FIELDS = {
     "row_ordinal",
     "preflight_reason",
     "preflight_checkpoint",
+    "stream",
+    "archive_reused_count",
+    "archive_staged_count",
+    "drive_staged_count",
+    "delivered_count",
+    "handled_count",
+    "uncertain_count",
 }
 
 RUN_FAILED_PHASE = "run_failed"
@@ -385,10 +405,30 @@ class SafeLogger:
             payload["status"] = status
         for key in ALLOWED_LOG_FIELDS:
             if key in fields:
-                payload[key] = fields[key]
+                value = fields[key]
+                if key == "stream" and value not in {"EB_BILL", "TENANT_BILL"}:
+                    continue
+                if key.endswith("_count"):
+                    if type(value) is not int or not 0 <= value <= MAX_INVENTORY_CEILING:
+                        continue
+                if key in {"attempt", "duration_ms", "row_ordinal"}:
+                    if type(value) is not int or value < 0:
+                        continue
+                    if key == "row_ordinal" and value >= MAX_INVENTORY_CEILING:
+                        continue
+                if key == "support_ref" and (type(value) is not str or not re.fullmatch(SUPPORT_REF_PATTERN, value)):
+                    continue
+                payload[key] = value
         payload = {key: redact_sensitive(str(value)) if isinstance(value, str) else value for key, value in payload.items()}
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=True) + "\n")
+
+
+class _ReadOnlyLogger:
+    """Discard events for inventory-only commands without creating log files."""
+
+    def event(self, phase: str, status: str | None = None, **fields: Any) -> None:
+        return None
 
 
 def log_terminal_failure(logger: SafeLogger | None, error: AppError) -> None:
@@ -426,10 +466,8 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
     """
 
     try:
-        with RunLock(config.state_path.parent):
-            if not list_only:
-                cleanup_stale_owned_temp(config.temp_root)
-            with StateStore(config.state_path, read_only=list_only) as state:
+        if list_only:
+            with StateStore(config.state_path, read_only=True) as state:
                 if config.direct_http is None:
                     raise ConfigError("direct_http settings are missing")
                 source = DirectHttpSource(config.direct_http, config.timeout_seconds, config.max_attempts)
@@ -439,8 +477,23 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
                     state=state,
                     logger=logger,
                     run_id=run_id,
-                    list_only=list_only,
+                    list_only=True,
                 )
+        else:
+            with RunLock(config.state_path.parent):
+                cleanup_stale_owned_temp(config.temp_root)
+                with StateStore(config.state_path) as state:
+                    if config.direct_http is None:
+                        raise ConfigError("direct_http settings are missing")
+                    source = DirectHttpSource(config.direct_http, config.timeout_seconds, config.max_attempts)
+                    summary = reconcile_listed_inventory(
+                        config=config,
+                        source=source,
+                        state=state,
+                        logger=logger,
+                        run_id=run_id,
+                        list_only=False,
+                    )
     except AppError as exc:
         log_terminal_failure(logger, exc)
         support_ref = support_ref_for(exc)
@@ -493,6 +546,67 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
             status=summary.status,
             support_ref=summary.failure_support_ref or f"EG_RESULT_{summary.status}",
             exit_code=summary.exit_code,
+            summary=summary,
+        )
+    return summary.exit_code
+
+
+RUN_ID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z", re.ASCII)
+
+
+def resolve_run_id() -> str:
+    supplied = os.environ.get("ENERGYGRID_RUN_ID")
+    if supplied is None:
+        return str(uuid.uuid4())
+    if type(supplied) is not str or not RUN_ID_PATTERN.fullmatch(supplied):
+        raise ConfigError("ENERGYGRID_RUN_ID is invalid")
+    return supplied
+
+
+def run_dual_stream(config: DualRuntimeConfig, logger: SafeLogger, run_id: str, *, list_only: bool) -> int:
+    adapters: dict[str, Any] = {}
+    for stream_name, entry in config.streams.items():
+        if entry.admission != BOUND_ADMISSION:
+            continue
+        if entry.adapter_id != "DIRECT_HTTP_V1" or entry.settings is None or entry.source_namespace is None or entry.evidence_ref is None:
+            raise ConfigError("bound source adapter configuration is incomplete")
+        source = DirectHttpSource(entry.settings, config.timeout_seconds, config.max_attempts)
+        adapters[stream_name] = DirectHttpAdapter(
+            source,
+            stream=Stream(stream_name),
+            source_namespace=entry.source_namespace,
+            evidence_ref=entry.evidence_ref,
+        )
+
+    # Validate the durable schema before creating a lock file or contacting a
+    # source. Then hold one global lock across both streams and all effects.
+    with StateV2Store(config.state_path, read_only=True):
+        pass
+    if list_only:
+        with StateV2Store(config.state_path, read_only=True) as state:
+            summary = reconcile_dual_stream(config, adapters, state, logger, run_id, list_only=True)
+    else:
+        with RunLock(config.state_path.parent):
+            with StateV2Store(config.state_path) as state:
+                summary = reconcile_dual_stream(config, adapters, state, logger, run_id, list_only=False)
+    logger.event(
+        "run_complete", status=summary.status,
+        inventory_count=summary.inventory_count,
+        downloaded_count=summary.downloaded_count,
+        present_count=summary.present_count,
+        failure_count=summary.failure_count,
+        archive_reused_count=summary.archive_reused_count,
+        archive_staged_count=summary.downloaded_count,
+        drive_staged_count=summary.drive_staged_count,
+        delivered_count=summary.delivered_count,
+        handled_count=summary.handled_count,
+        uncertain_count=summary.uncertain_count,
+    )
+    print(json.dumps(summary.as_dict(), sort_keys=True))
+    if summary.exit_code != 0 and not list_only:
+        notify_failure(
+            config, logger, run_id, stage="run", status=summary.status,
+            support_ref="EG_DUAL_STREAM_INCOMPLETE", exit_code=summary.exit_code,
             summary=summary,
         )
     return summary.exit_code
@@ -564,7 +678,49 @@ def build_parser() -> argparse.ArgumentParser:
     # properties of the operation, never arguments.
     preflight_diagnostic = subparsers.add_parser(DOWNLOAD_PREFLIGHT_DIAGNOSTIC_COMMAND)
     preflight_diagnostic.add_argument("--config", required=True, type=Path)
+    migration = subparsers.add_parser("migrate-state")
+    migration.add_argument("--config", required=True, type=Path)
+    migration.add_argument("--mapping", required=True, type=Path)
+    migration.add_argument("--apply", action="store_true")
     return parser
+
+
+def _migration_mapping(path: Path) -> list[dict[str, Any]]:
+    if not path.is_absolute():
+        raise ConfigError("migration mapping path must be absolute")
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ConfigError("migration mapping must be an existing regular file")
+    except OSError as exc:
+        raise ConfigError("migration mapping is unavailable") from exc
+    document = load_config_file(path)
+    if type(document) is not dict or set(document) != {"schema", "entries"}:
+        raise ConfigError("migration mapping is invalid")
+    if document["schema"] != "energygrid.state_migration_mapping.v2" or type(document["entries"]) is not list:
+        raise ConfigError("migration mapping is invalid")
+    return document["entries"]
+
+
+def _run_migration(args) -> int:
+    raw = load_config_file(args.config)
+    if type(raw) is not dict or raw.get("schema") != RUNTIME_V2_SCHEMA:
+        raise ConfigError("migrate-state requires a v2 config")
+    config = load_dual_stream_config(raw)
+    entries = _migration_mapping(args.mapping)
+    run_id = resolve_run_id()
+    if args.apply:
+        with RunLock(config.state_path.parent):
+            result = migrate_state_database(
+                config.state_path, apply=True, streams=config.streams,
+                mapping_entries=entries, migration_run_id=run_id,
+            )
+    else:
+        result = migrate_state_database(
+            config.state_path, apply=False, streams=config.streams,
+            mapping_entries=entries, migration_run_id=run_id,
+        )
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 def login_diagnostic_document(
@@ -1350,8 +1506,21 @@ def main(argv: list[str] | None = None) -> int:
             # Same early-return boundary: no preflight, logger, stale-temp
             # cleanup, StateStore, reconciliation or Download is reachable.
             return run_download_preflight_diagnostic(args.config)
+        if args.command == "migrate-state":
+            return _run_migration(args)
         raw = load_config_file(args.config)
+        if type(raw) is dict and raw.get("schema") == RUNTIME_V2_SCHEMA:
+            if any(getattr(args, name, None) is not None for name in ("archive_root", "state_path", "temp_root", "log_root", "timeout_seconds", "max_attempts")) or getattr(args, "headed", False):
+                raise ConfigError("v2 configuration does not accept runtime overrides")
+            config_v2 = load_dual_stream_config(raw)
+            run_id = resolve_run_id()
+            config_v2.preflight(read_only=args.command == "list")
+            logger = _ReadOnlyLogger() if args.command == "list" else SafeLogger(config_v2.log_root, run_id)
+            return run_dual_stream(config_v2, logger, run_id, list_only=args.command == "list")
         config = load_runtime_config(raw)
+        if args.command == "run":
+            print(json.dumps({"status": ACTION_REQUIRED, "error_class": "LEGACY_RUN_DISABLED", "support_ref": "EG_LEGACY_RUN_DISABLED"}, sort_keys=True))
+            return 64
         config = config.with_overrides(
             {
                 "archive_root": args.archive_root,
@@ -1362,18 +1531,16 @@ def main(argv: list[str] | None = None) -> int:
                 "max_attempts": args.max_attempts,
             }
         )
-        config.preflight(
-            require_archive=True,
-            read_only=config.source == SOURCE_DIRECT_HTTP and args.command == "list",
-        )
-        run_id = str(uuid.uuid4())
-        logger = SafeLogger(config.log_root, run_id)
+        run_id = resolve_run_id()
+        config.preflight(require_archive=True, read_only=args.command == "list")
+        logger = _ReadOnlyLogger() if args.command == "list" else SafeLogger(config.log_root, run_id)
         if config.source == SOURCE_DIRECT_HTTP:
             if args.headed:
                 raise ConfigError("--headed is not valid for the direct_http source")
             return run_direct_http(config, logger, run_id, list_only=args.command == "list")
-        cleanup_stale_owned_temp(config.temp_root)
-        with StateStore(config.state_path) as state:
+        if args.command != "list":
+            cleanup_stale_owned_temp(config.temp_root)
+        with StateStore(config.state_path, read_only=args.command == "list") as state:
             with PlaywrightPortal(config, headed=args.headed) as portal:
                 logger.event("login_start")
                 portal.login()
@@ -1404,7 +1571,11 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     except AppError as exc:
         log_terminal_failure(logger, exc)
-        print(json.dumps({"status": exc.status, "error_class": exc.status}, sort_keys=True))
+        document = {"status": exc.status, "error_class": exc.status}
+        support_ref = getattr(exc, "support_ref", None)
+        if type(support_ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, support_ref):
+            document["support_ref"] = support_ref
+        print(json.dumps(document, sort_keys=True))
         return exc.exit_code or exit_code_for(exc.status)
     except (OSError, ValueError, TypeError):
         print(json.dumps({"status": ACTION_REQUIRED, "error_class": "RUNTIME_FAILURE"}, sort_keys=True))
