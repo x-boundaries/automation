@@ -44,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741",
+    "scripts/install_ac2_member_gateway_worker.ps1": "ac82b1f4e05eac9a6e08a7e124ff9d9b6dab12a0",
     "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
     "scripts/ac2_member_gateway_worker_lib.ps1": "8293559ec6308a8d9afdf73fd4c8b0af322ae382",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
@@ -58,6 +58,9 @@ PROTECTED_WORKER_TREES = {
 }
 
 WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)
+
+CI7_DEFECTIVE_BASELINE_COMMIT = "ef194d43cd5b2a6e56468c3381a1b44bced23d8d"
+CI7_DEFECTIVE_INSTALLER_BLOB = "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741"
 
 ALLOWED_FILES = {
     "docs/autocount2-automation/member_gateway_production_contract.md",
@@ -4053,6 +4056,73 @@ def _installer_function(source: str, name: str) -> str:
     return source[start:] if end < 0 else source[start:end]
 
 
+def _frozen_ci7_context_source() -> tuple[str, str]:
+    revision = f"{CI7_DEFECTIVE_BASELINE_COMMIT}:{INSTALLER_PATH}"
+    blob = _git_output("rev-parse", revision)
+    if blob != CI7_DEFECTIVE_INSTALLER_BLOB:
+        raise AssertionError(f"frozen CI7 installer blob changed: {blob}")
+    completed = subprocess.run(
+        ["git", "show", revision],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return _installer_function(completed.stdout, "Open-XbCi7VerificationContext"), blob
+
+
+class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
+    """Bind the defective control and freeze every adjacent CI7 contract."""
+
+    def test_frozen_control_and_adjacent_ci7_contracts_are_immutable(self) -> None:
+        frozen_context, blob = _frozen_ci7_context_source()
+        self.assertEqual(blob, CI7_DEFECTIVE_INSTALLER_BLOB)
+        baseline_source = subprocess.run(
+            ["git", "show", f"{CI7_DEFECTIVE_BASELINE_COMMIT}:{INSTALLER_PATH}"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        self.assertEqual(frozen_context, _installer_function(baseline_source, "Open-XbCi7VerificationContext"))
+        for right in (
+            "0x00000002", "0x00000004", "0x00000010", "0x00000040",
+            "0x00000100", "0x00010000", "0x00040000", "0x00080000",
+        ):
+            with self.subTest(frozen_denial=right):
+                self.assertIn(right, frozen_context)
+
+        candidate = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        candidate_context = _installer_function(candidate, "Open-XbCi7VerificationContext")
+        self.assertIn(
+            "$directoryMutationDenials = @([uint32]0x00000002, [uint32]0x00000004, [uint32]0x00000010,\n"
+            "            [uint32]0x00000040, [uint32]0x00000100, [uint32]0x00010000, [uint32]0x00040000, [uint32]0x00080000)",
+            candidate_context,
+        )
+        self.assertIn(
+            "$ancestorMutationDenials = @([uint32]0x00000040, [uint32]0x00010000, [uint32]0x00040000, [uint32]0x00080000)",
+            candidate_context,
+        )
+        self.assertIn("if ($directoryKey -ieq $protectedRootKey)", candidate_context)
+
+        for function_name in (
+            "Get-XbNativePathChain",
+            "Invoke-XbNativeAccessCheck",
+            "Invoke-XbCi7HandleAccessCheck",
+            "Add-XbCi7ProtectedLeaf",
+            "Assert-XbCi7DirectoryRights",
+            "Assert-XbCi7PathDeletionComposition",
+            "Confirm-XbCi7VerificationContext",
+        ):
+            with self.subTest(unchanged_function=function_name):
+                self.assertEqual(
+                    _installer_function(candidate, function_name),
+                    _installer_function(baseline_source, function_name),
+                )
+
+
 _LOCAL_TASK_CONTRACT_HARNESS = r'''[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InstallerPath,
@@ -4345,7 +4415,10 @@ Set-Item function:script:Remove-XbWorkerScheduledTask $originalUnregister
 _HOSTED_TASK_BOUNDARY_HARNESS = r'''[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InstallerPath,
-    [Parameter(Mandatory)][string]$ReviewedManifestPath
+    [Parameter(Mandatory)][string]$ReviewedManifestPath,
+    [Parameter(Mandatory)][string]$FrozenContextPath,
+    [Parameter(Mandatory)][string]$FrozenSourceCommit,
+    [Parameter(Mandatory)][string]$FrozenInstallerBlob
 )
 # Disposable GitHub-hosted Windows runner only. Never starts a task; every created object is removed and read back.
 Set-StrictMode -Version Latest
@@ -5086,6 +5159,50 @@ try {
         } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
     }
 
+    function Invoke-XbCi7AccessResultFixture {
+        param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][uint32]$DesiredAccess, [Parameter(Mandatory)]$Token, [Parameter(Mandatory)][scriptblock]$Body)
+        $subject = [XbWorkerProtectedObject]::Open([IO.Path]::GetFullPath($Path), $true, $false)
+        $original = ${function:script:Invoke-XbCi7HandleAccessCheck}
+        $script:XbCi7FixtureOriginalHelper = $original
+        $script:XbCi7FixtureIdentity = [string]$subject.FileIdentity
+        $script:XbCi7FixtureMask = [uint32]$DesiredAccess
+        $script:XbCi7FixtureCalls = 0
+        try {
+            Set-Item function:script:Invoke-XbCi7HandleAccessCheck {
+                param($Object, $Token, [uint32]$DesiredAccess)
+                if ([string]$Object.FileIdentity -ceq [string]$script:XbCi7FixtureIdentity -and
+                    [uint32]$DesiredAccess -eq [uint32]$script:XbCi7FixtureMask) {
+                    $script:XbCi7FixtureCalls++
+                    return [XbWorkerAccessResult]::new($true, [uint32]$DesiredAccess)
+                }
+                return & $script:XbCi7FixtureOriginalHelper -Object $Object -Token $Token -DesiredAccess $DesiredAccess
+            }
+            $fixtureResult = Invoke-XbCi7HandleAccessCheck -Object $subject -Token $Token -DesiredAccess $DesiredAccess
+            $script:XbCi7FixtureCalls = 0
+            $result = $null
+            try {
+                $result = & $Body
+                $outcome = "pass"
+            } catch {
+                $outcome = [string]$_.Exception.Message
+            } finally {
+                if ($null -ne $result -and $null -ne $result.PSObject.Properties["Objects"]) {
+                    Dispose-XbCi7VerificationContext -Context $result
+                }
+            }
+            return [ordered]@{
+                outcome = $outcome
+                fixture_allowed = [bool]$fixtureResult.Allowed
+                fixture_granted_access = [uint32]$fixtureResult.GrantedAccess
+                policy_consulted_fixture = [bool]($script:XbCi7FixtureCalls -gt 0)
+            }
+        } finally {
+            Set-Item function:script:Invoke-XbCi7HandleAccessCheck $original
+            $subject.Dispose()
+            Remove-Variable -Scope Script -Name XbCi7FixtureOriginalHelper, XbCi7FixtureIdentity, XbCi7FixtureMask, XbCi7FixtureCalls -ErrorAction SilentlyContinue
+        }
+    }
+
     function Invoke-XbCi7OwnerProbe {
         param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Management.Automation.PSCredential]$Credential, [Parameter(Mandatory)][string]$WrongOwnerSid)
         $original = Get-Acl -LiteralPath $Path -ErrorAction Stop
@@ -5221,6 +5338,172 @@ try {
                 $ci7.verify_release_sha256 = [string]$verification.release_sha256
                 $ci7.verify_checks = $verification.checks
             } catch { $ci7.verify_outcome = [string]$_.Exception.Message }
+
+            $installChain = [string[]](Get-XbNativePathChain -Path $InstallRoot)
+            if ($installChain.Count -lt 1) { throw "ci7_install_chain_missing" }
+            $driveRoot = [string]$installChain[0]
+            $driveRootObject = [XbWorkerProtectedObject]::Open($driveRoot, $true, $false)
+            try {
+                $driveRootDescriptorBefore = [string]$driveRootObject.SecurityDescriptorSha256
+                $driveRootIdentityBefore = [string]$driveRootObject.FileIdentity
+                $driveRootAddDirectory = Invoke-XbCi7HandleAccessCheck -Object $driveRootObject -Token $nativeToken -DesiredAccess ([uint32]0x00000004)
+                $ci7.drive_root_index0 = [ordered]@{
+                    index = 0
+                    path = $driveRoot
+                    right = "0x00000004"
+                    allowed = [bool]$driveRootAddDirectory.Allowed
+                    granted_access = [uint32]$driveRootAddDirectory.GrantedAccess
+                }
+
+                $frozenContextText = [IO.File]::ReadAllText($FrozenContextPath)
+                if (-not $frozenContextText.StartsWith("function Open-XbCi7VerificationContext {", [StringComparison]::Ordinal)) {
+                    throw "ci7_frozen_context_source_invalid"
+                }
+                $frozenContextOpen = $frozenContextText.IndexOf("{")
+                $frozenContextClose = $frozenContextText.LastIndexOf("}")
+                if ($frozenContextOpen -lt 0 -or $frozenContextClose -le $frozenContextOpen) { throw "ci7_frozen_context_source_invalid" }
+                $frozenContextBody = $frozenContextText.Substring($frozenContextOpen + 1, $frozenContextClose - $frozenContextOpen - 1)
+                $currentContextFunction = ${function:script:Open-XbCi7VerificationContext}
+                $ci7.frozen_control_source_commit = $FrozenSourceCommit
+                $ci7.frozen_control_installer_blob = $FrozenInstallerBlob
+                try {
+                    Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextBody))
+                    $ci7.frozen_defective_context_outcome = Get-XbBoundaryOutcome { Open-XbCi7VerificationContext -Token $nativeToken }
+                } finally { Set-Item function:script:Open-XbCi7VerificationContext $currentContextFunction }
+
+            } finally { $driveRootObject.Dispose() }
+            $driveRootAfter = [XbWorkerProtectedObject]::Open($driveRoot, $true, $false)
+            try {
+                $ci7.drive_root_descriptor_unchanged = ([string]$driveRootAfter.SecurityDescriptorSha256 -ceq $driveRootDescriptorBefore)
+                $ci7.drive_root_identity_unchanged = ([string]$driveRootAfter.FileIdentity -ceq $driveRootIdentityBefore)
+            } finally { $driveRootAfter.Dispose() }
+
+            $scopeOutRights = @(
+                @{ name = "file_add_file"; mask = [uint32]0x00000002 },
+                @{ name = "file_add_subdirectory"; mask = [uint32]0x00000004 },
+                @{ name = "file_write_ea"; mask = [uint32]0x00000010 },
+                @{ name = "file_write_attributes"; mask = [uint32]0x00000100 }
+            )
+            $ancestorDeniedRights = @(
+                @{ name = "delete_child"; mask = [uint32]0x00000040 },
+                @{ name = "delete"; mask = [uint32]0x00010000 },
+                @{ name = "write_dac"; mask = [uint32]0x00040000 },
+                @{ name = "write_owner"; mask = [uint32]0x00080000 }
+            )
+            $protectedDeniedRights = @($scopeOutRights + $ancestorDeniedRights)
+            $configPath = Join-Path $RuntimeRoot "config"
+            $exactProtectedRoots = @($InstallRoot, $configPath)
+            $ci7.exact_root_mutation_matrix = @()
+            foreach ($protectedRoot in $exactProtectedRoots) {
+                foreach ($right in $protectedDeniedRights) {
+                    $probe = Invoke-XbCi7AccessResultFixture -Path $protectedRoot -DesiredAccess $right.mask -Token $nativeToken -Body {
+                        Open-XbCi7VerificationContext -Token $nativeToken
+                    }
+                    $ci7.exact_root_mutation_matrix += [ordered]@{
+                        root = $protectedRoot
+                        right = $right.name
+                        mask = ("0x{0:X8}" -f [uint32]$right.mask)
+                        outcome = [string]$probe.outcome
+                        fixture_allowed = [bool]$probe.fixture_allowed
+                        fixture_granted_access = [uint32]$probe.fixture_granted_access
+                        policy_consulted_fixture = [bool]$probe.policy_consulted_fixture
+                    }
+                }
+            }
+
+            $ancestorPathByKey = @{}
+            foreach ($protectedRoot in $exactProtectedRoots) {
+                $chain = [string[]](Get-XbNativePathChain -Path $protectedRoot)
+                if ($chain.Count -lt 2) { throw "ci7_protected_root_has_no_ancestor" }
+                for ($index = 0; $index -lt ($chain.Count - 1); $index++) {
+                    $ancestorPath = [string]$chain[$index]
+                    $ancestorKey = Get-XbCi7PathKey -Path $ancestorPath
+                    $ancestorPathByKey[$ancestorKey] = $ancestorPath
+                }
+            }
+            $ancestorPaths = @($ancestorPathByKey.Keys | Sort-Object | ForEach-Object { [string]$ancestorPathByKey[$_] })
+            $ci7.ancestor_scoped_out_right_matrix = @()
+            foreach ($ancestorPath in $ancestorPaths) {
+                foreach ($right in $scopeOutRights) {
+                    $probe = Invoke-XbCi7AccessResultFixture -Path $ancestorPath -DesiredAccess $right.mask -Token $nativeToken -Body {
+                        Open-XbCi7VerificationContext -Token $nativeToken
+                    }
+                    $ci7.ancestor_scoped_out_right_matrix += [ordered]@{
+                        ancestor = $ancestorPath
+                        right = $right.name
+                        mask = ("0x{0:X8}" -f [uint32]$right.mask)
+                        outcome = [string]$probe.outcome
+                        fixture_allowed = [bool]$probe.fixture_allowed
+                        fixture_granted_access = [uint32]$probe.fixture_granted_access
+                        policy_consulted_fixture = [bool]$probe.policy_consulted_fixture
+                    }
+                }
+            }
+            $ci7.ancestor_denied_right_matrix = @()
+            foreach ($ancestorPath in $ancestorPaths) {
+                foreach ($right in $ancestorDeniedRights) {
+                    $probe = Invoke-XbCi7AccessResultFixture -Path $ancestorPath -DesiredAccess $right.mask -Token $nativeToken -Body {
+                        Open-XbCi7VerificationContext -Token $nativeToken
+                    }
+                    $ci7.ancestor_denied_right_matrix += [ordered]@{
+                        ancestor = $ancestorPath
+                        right = $right.name
+                        mask = ("0x{0:X8}" -f [uint32]$right.mask)
+                        outcome = [string]$probe.outcome
+                        fixture_allowed = [bool]$probe.fixture_allowed
+                        fixture_granted_access = [uint32]$probe.fixture_granted_access
+                        policy_consulted_fixture = [bool]$probe.policy_consulted_fixture
+                    }
+                }
+            }
+
+            $deletionContext = $null
+            try {
+                $deletionContext = Open-XbCi7VerificationContext -Token $nativeToken
+                $deletionProfiles = @(
+                    $InstallRoot,
+                    (Join-Path $RuntimeRoot "config"),
+                    (Join-Path $RuntimeRoot "secrets"),
+                    (Join-Path $RuntimeRoot "logs"),
+                    (Join-Path $RuntimeRoot "rollback")
+                )
+                $ci7.delete_chain_matrix = @()
+                $ci7.delete_child_parent_edge_matrix = @()
+                foreach ($surfacePath in $deletionProfiles) {
+                    $surfaceKey = Get-XbCi7PathKey -Path $surfacePath
+                    $chain = [string[]]$deletionContext.PathChains[$surfaceKey]
+                    for ($index = $chain.Count - 1; $index -ge 0; $index--) {
+                        $checkedPath = [string]$chain[$index]
+                        $probe = Invoke-XbCi7AccessResultFixture -Path $checkedPath -DesiredAccess ([uint32]0x00010000) -Token $nativeToken -Body {
+                            Assert-XbCi7PathDeletionComposition -Path $surfacePath -Token $nativeToken -Context $deletionContext
+                        }
+                        $ci7.delete_chain_matrix += [ordered]@{
+                            surface = $surfacePath
+                            path = $checkedPath
+                            right = "0x00010000"
+                            outcome = [string]$probe.outcome
+                            fixture_allowed = [bool]$probe.fixture_allowed
+                            fixture_granted_access = [uint32]$probe.fixture_granted_access
+                            policy_consulted_fixture = [bool]$probe.policy_consulted_fixture
+                        }
+                    }
+                    for ($index = $chain.Count - 1; $index -gt 0; $index--) {
+                        $parentPath = [string]$chain[$index - 1]
+                        $probe = Invoke-XbCi7AccessResultFixture -Path $parentPath -DesiredAccess ([uint32]0x00000040) -Token $nativeToken -Body {
+                            Assert-XbCi7PathDeletionComposition -Path $surfacePath -Token $nativeToken -Context $deletionContext
+                        }
+                        $ci7.delete_child_parent_edge_matrix += [ordered]@{
+                            surface = $surfacePath
+                            parent = $parentPath
+                            right = "0x00000040"
+                            outcome = [string]$probe.outcome
+                            fixture_allowed = [bool]$probe.fixture_allowed
+                            fixture_granted_access = [uint32]$probe.fixture_granted_access
+                            policy_consulted_fixture = [bool]$probe.policy_consulted_fixture
+                        }
+                    }
+                }
+            } finally { Dispose-XbCi7VerificationContext -Context $deletionContext }
 
             $reviewedIdentity = Read-XbReviewedPackageIdentity -Path $ReviewedManifestPath -PackageRoot (Split-Path -Parent $InstallerPath)
             $upgrade = $null
@@ -6109,6 +6392,9 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             root = Path(temp_dir)
             manifest = root / "reviewed-package.json"
             manifest.write_text(json.dumps(_reviewed_package_identity(), indent=2) + "\n", encoding="utf-8")
+            frozen_context, frozen_blob = _frozen_ci7_context_source()
+            frozen_context_path = root / "frozen_ci7_context.ps1"
+            frozen_context_path.write_text(frozen_context, encoding="utf-8", newline="\n")
             harness = root / "task_boundary_harness.ps1"
             harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
             completed = subprocess.run(
@@ -6117,6 +6403,9 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
                     "-File", str(harness),
                     "-InstallerPath", str(ROOT / INSTALLER_PATH),
                     "-ReviewedManifestPath", str(manifest),
+                    "-FrozenContextPath", str(frozen_context_path),
+                    "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
+                    "-FrozenInstallerBlob", frozen_blob,
                 ],
                 cwd=ROOT,
                 env=_windows_powershell_module_environment(),
@@ -6377,6 +6666,78 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertRegex(ci7["verify_release_sha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(ci7["verify_checks"])
         self.assertTrue(all(value == "pass" for value in ci7["verify_checks"].values()))
+        self.assertEqual(ci7["frozen_control_source_commit"], CI7_DEFECTIVE_BASELINE_COMMIT)
+        self.assertEqual(ci7["frozen_control_installer_blob"], CI7_DEFECTIVE_INSTALLER_BLOB)
+        self.assertEqual(ci7["drive_root_index0"]["index"], 0)
+        self.assertEqual(ci7["drive_root_index0"]["right"], "0x00000004")
+        self.assertTrue(ci7["drive_root_index0"]["allowed"], ci7["drive_root_index0"])
+        self.assertEqual(ci7["drive_root_index0"]["granted_access"], 0x00000004)
+        self.assertEqual(ci7["frozen_defective_context_outcome"], "effective_rights_exceeded")
+        self.assertTrue(ci7["drive_root_descriptor_unchanged"])
+        self.assertTrue(ci7["drive_root_identity_unchanged"])
+
+        exact_matrix = ci7["exact_root_mutation_matrix"]
+        self.assertEqual(len(exact_matrix), 16)
+        self.assertEqual({probe["right"] for probe in exact_matrix}, {
+            "file_add_file", "file_add_subdirectory", "file_write_ea", "delete_child",
+            "file_write_attributes", "delete", "write_dac", "write_owner",
+        })
+        for probe in exact_matrix:
+            with self.subTest(ci7_exact_root=probe):
+                self.assertEqual(probe["outcome"], "effective_rights_exceeded")
+                self.assertTrue(probe["fixture_allowed"])
+                self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
+                self.assertTrue(probe["policy_consulted_fixture"])
+        for root in {probe["root"] for probe in exact_matrix}:
+            self.assertEqual(sum(probe["root"] == root for probe in exact_matrix), 8)
+
+        scope_out_names = {"file_add_file", "file_add_subdirectory", "file_write_ea", "file_write_attributes"}
+        ancestor_scope_out = ci7["ancestor_scoped_out_right_matrix"]
+        ancestor_paths = {probe["ancestor"] for probe in ancestor_scope_out}
+        self.assertGreater(len(ancestor_paths), 0)
+        self.assertEqual({probe["right"] for probe in ancestor_scope_out}, scope_out_names)
+        self.assertEqual(
+            {(probe["ancestor"], probe["right"]) for probe in ancestor_scope_out},
+            set(product(ancestor_paths, scope_out_names)),
+        )
+        for probe in ancestor_scope_out:
+            with self.subTest(ci7_scoped_out_ancestor=probe):
+                self.assertEqual(probe["outcome"], "pass")
+                self.assertTrue(probe["fixture_allowed"])
+                self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
+                self.assertFalse(probe["policy_consulted_fixture"])
+
+        ancestor_denied = ci7["ancestor_denied_right_matrix"]
+        retained_ancestor_names = {"delete_child", "delete", "write_dac", "write_owner"}
+        self.assertEqual({probe["ancestor"] for probe in ancestor_denied}, ancestor_paths)
+        self.assertEqual({probe["right"] for probe in ancestor_denied}, retained_ancestor_names)
+        self.assertEqual(
+            {(probe["ancestor"], probe["right"]) for probe in ancestor_denied},
+            set(product(ancestor_paths, retained_ancestor_names)),
+        )
+        for probe in ancestor_denied:
+            with self.subTest(ci7_retained_ancestor=probe):
+                self.assertEqual(probe["outcome"], "effective_rights_exceeded")
+                self.assertTrue(probe["fixture_allowed"])
+                self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
+                self.assertTrue(probe["policy_consulted_fixture"])
+
+        self.assertTrue(ci7["delete_chain_matrix"])
+        for probe in ci7["delete_chain_matrix"]:
+            with self.subTest(ci7_delete_chain=probe):
+                self.assertEqual(probe["right"], "0x00010000")
+                self.assertEqual(probe["outcome"], "effective_rights_exceeded")
+                self.assertTrue(probe["fixture_allowed"])
+                self.assertEqual(probe["fixture_granted_access"], 0x00010000)
+                self.assertTrue(probe["policy_consulted_fixture"])
+        self.assertTrue(ci7["delete_child_parent_edge_matrix"])
+        for probe in ci7["delete_child_parent_edge_matrix"]:
+            with self.subTest(ci7_delete_child_edge=probe):
+                self.assertEqual(probe["right"], "0x00000040")
+                self.assertEqual(probe["outcome"], "effective_rights_exceeded")
+                self.assertTrue(probe["fixture_allowed"])
+                self.assertEqual(probe["fixture_granted_access"], 0x00000040)
+                self.assertTrue(probe["policy_consulted_fixture"])
         self.assertEqual(ci7["upgrade_outcome"], "upgraded")
         self.assertEqual(ci7["verify_after_upgrade"], "pass")
         self.assertEqual(ci7["empty_config_verify"], "pass")
@@ -6736,6 +7097,20 @@ class MemberWorkerReleaseIntegrityTests(unittest.TestCase):
         for marker in ('Get-XbCi7DirectoryInventory -Path $InstallRoot', 'Get-XbCi7DirectoryInventory -Path $configRoot', '"installation-manifest.json"', 'foreach ($item in $configInventory.Items)', 'directoryMutationDenials', 'XbWorkerProtectedObject]::Open'):
             with self.subTest(context_marker=marker):
                 self.assertIn(marker, context)
+        self.assertIn("$ancestorMutationDenials", context)
+        self.assertIn("if ($directoryKey -ieq $protectedRootKey)", context)
+        for marker in (
+            "Invoke-XbCi7AccessResultFixture",
+            "$ci7.drive_root_index0",
+            "$ci7.frozen_defective_context_outcome",
+            "$ci7.exact_root_mutation_matrix",
+            "$ci7.ancestor_scoped_out_right_matrix",
+            "$ci7.ancestor_denied_right_matrix",
+            "$ci7.delete_chain_matrix",
+            "$ci7.delete_child_parent_edge_matrix",
+        ):
+            with self.subTest(ci7_policy_fixture=marker):
+                self.assertIn(marker, _HOSTED_TASK_BOUNDARY_HARNESS)
         self.assertNotIn('$configInventory.Names -cnotcontains "worker.config.json"', context)
         effective = _installer_function(source, "Assert-XbCi7DirectoryRights")
         for marker in ("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven", "Assert-XbLogsRootAclShape", "Assert-XbOwnerRightsLogFile", "Assert-XbCi7PathDeletionComposition"):

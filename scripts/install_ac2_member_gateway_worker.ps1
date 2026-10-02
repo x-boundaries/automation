@@ -1587,14 +1587,19 @@ function Open-XbCi7VerificationContext {
             }
         }
 
-        # The install and config ancestors must not grant create, replacement,
-        # deletion, DACL or owner rights to the batch token.
+        # Exact install/config roots deny all eight tested mutation rights.
+        # Proper ancestors deny only deletion, DACL and owner changes.
         $directoryMutationDenials = @([uint32]0x00000002, [uint32]0x00000004, [uint32]0x00000010,
             [uint32]0x00000040, [uint32]0x00000100, [uint32]0x00010000, [uint32]0x00040000, [uint32]0x00080000)
+        $ancestorMutationDenials = @([uint32]0x00000040, [uint32]0x00010000, [uint32]0x00040000, [uint32]0x00080000)
         foreach ($surface in @($InstallRoot, $configRoot)) {
+            $protectedRootKey = Get-XbCi7PathKey -Path $surface
             foreach ($directoryPath in $pathChains[(Get-XbCi7PathKey -Path $surface)]) {
-                $directory = $directories[(Get-XbCi7PathKey -Path $directoryPath)].Object
-                foreach ($right in $directoryMutationDenials) {
+                $directoryKey = Get-XbCi7PathKey -Path $directoryPath
+                $directory = $directories[$directoryKey].Object
+                $mutationDenials = $ancestorMutationDenials
+                if ($directoryKey -ieq $protectedRootKey) { $mutationDenials = $directoryMutationDenials }
+                foreach ($right in $mutationDenials) {
                     if ((Invoke-XbCi7HandleAccessCheck -Object $directory -Token $Token -DesiredAccess $right).Allowed) { throw "effective_rights_exceeded" }
                 }
             }
