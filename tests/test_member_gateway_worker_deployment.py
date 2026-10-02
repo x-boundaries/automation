@@ -5111,7 +5111,12 @@ try {
     }
 
     function Get-XbCi7BaselineTokenMetadata {
-        param([Parameter(Mandatory)]$Token)
+        param(
+            [Parameter(Mandatory)]$Token,
+            [Parameter(Mandatory)][ref]$CaptureStage,
+            [Parameter(Mandatory)][System.Collections.IDictionary]$Evidence
+        )
+        $CaptureStage.Value = "token_handle"
         if ($null -eq ("XbCi7BaselineTokenMetadata" -as [type])) {
             Add-Type -Language CSharp -TypeDefinition @"
 using System;
@@ -5245,7 +5250,7 @@ public static class XbCi7BaselineTokenMetadata
         return name.ToString();
     }
 
-    private static List<Dictionary<string, object>> ReadPrivileges(IntPtr token)
+    public static List<Dictionary<string, object>> ReadPrivileges(IntPtr token)
     {
         uint length;
         IntPtr buffer = ReadInformation(token, TokenPrivileges, out length);
@@ -5261,9 +5266,26 @@ public static class XbCi7BaselineTokenMetadata
             {
                 IntPtr entryAddress = new IntPtr(buffer.ToInt64() + offset + ((long)index * stride));
                 LuidAndAttributes privilege = (LuidAndAttributes)Marshal.PtrToStructure(entryAddress, typeof(LuidAndAttributes));
+                string name = null;
+                int? nameLookupError = null;
+                string nameLookupExceptionType = null;
+                try { name = ReadPrivilegeName(privilege.Luid); }
+                catch (Exception exception)
+                {
+                    nameLookupExceptionType = exception.GetType().FullName;
+                    if (nameLookupExceptionType.Length > 160)
+                        nameLookupExceptionType = nameLookupExceptionType.Substring(0, 160);
+                    Win32Exception win32Exception = exception as Win32Exception;
+                    if (win32Exception != null) nameLookupError = win32Exception.NativeErrorCode;
+                }
                 privileges.Add(new Dictionary<string, object>
                 {
-                    { "name", ReadPrivilegeName(privilege.Luid) },
+                    { "name", name },
+                    { "name_resolution_status", name == null ? "unresolved" : "resolved" },
+                    { "name_lookup_exception_type", nameLookupExceptionType },
+                    { "name_lookup_win32_native_error_code", nameLookupError },
+                    { "luid_low_part", privilege.Luid.LowPart },
+                    { "luid_high_part", privilege.Luid.HighPart },
                     { "attributes", privilege.Attributes },
                     { "attributes_hex", String.Format("0x{0:X8}", privilege.Attributes) },
                     { "enabled", (privilege.Attributes & 0x00000002) != 0 },
@@ -5287,16 +5309,46 @@ public static class XbCi7BaselineTokenMetadata
             { "privileges", ReadPrivileges(token) }
         };
     }
+
+    public static string ReadUser(IntPtr token)
+    {
+        if (token == IntPtr.Zero) throw new InvalidOperationException("baseline_token_metadata_unproven");
+        return ReadUserSid(token);
+    }
+
+    public static List<Dictionary<string, object>> ReadGroups(IntPtr token)
+    {
+        if (token == IntPtr.Zero) throw new InvalidOperationException("baseline_token_metadata_unproven");
+        return ReadSids(token, TokenGroups);
+    }
+
+    public static List<Dictionary<string, object>> ReadRestrictingSids(IntPtr token)
+    {
+        if (token == IntPtr.Zero) throw new InvalidOperationException("baseline_token_metadata_unproven");
+        return ReadSids(token, TokenRestrictedSids);
+    }
 }
 "@ -ErrorAction Stop
         }
+        $CaptureStage.Value = "token_handle"
         $flags = [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::NonPublic
         $tokenField = $Token.GetType().GetField("token", $flags)
         if ($null -eq $tokenField) { throw "baseline_token_metadata_unproven" }
         $tokenHandle = [IntPtr]$tokenField.GetValue($Token)
-        $metadata = [XbCi7BaselineTokenMetadata]::Read($tokenHandle)
-        if ([string]$metadata["user_sid"] -cne [string]$Token.UserSid) { throw "baseline_token_metadata_unproven" }
-        return ,$metadata
+        if ($tokenHandle -eq [IntPtr]::Zero) { throw "baseline_token_metadata_unproven" }
+        $CaptureStage.Value = "token_user"
+        $userSid = [XbCi7BaselineTokenMetadata]::ReadUser($tokenHandle)
+        if ([string]$userSid -cne [string]$Token.UserSid) { throw "baseline_token_metadata_unproven" }
+        $Evidence["token_user_sid"] = [string]$userSid
+        $CaptureStage.Value = "token_groups"
+        $groups = [XbCi7BaselineTokenMetadata]::ReadGroups($tokenHandle)
+        $Evidence["token_group_sids_and_attributes"] = @($groups.ToArray())
+        $CaptureStage.Value = "token_restricted_sids"
+        $restrictedSids = [XbCi7BaselineTokenMetadata]::ReadRestrictingSids($tokenHandle)
+        $Evidence["token_restricting_sids"] = @($restrictedSids.ToArray())
+        $CaptureStage.Value = "token_privileges"
+        $privileges = [XbCi7BaselineTokenMetadata]::ReadPrivileges($tokenHandle)
+        $Evidence["token_privileges"] = @($privileges.ToArray())
     }
 
     function Get-XbCi7BaselinePathClassification {
@@ -5324,9 +5376,8 @@ public static class XbCi7BaselineTokenMetadata
         return "OS ancestor"
     }
 
-    function Add-XbCi7BaselineDenyRecord {
+    function New-XbCi7BaselineAccessObservation {
         param(
-            [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Denials,
             [Parameter(Mandatory)][int]$SequenceIndex,
             [Parameter(Mandatory)][string]$Surface,
             [Parameter(Mandatory)][int]$PathSequenceIndex,
@@ -5335,8 +5386,7 @@ public static class XbCi7BaselineTokenMetadata
             [Parameter(Mandatory)][string]$SymbolicRight,
             [Parameter(Mandatory)]$AccessResult
         )
-        if ($Denials.Count -ge 512) { throw "baseline_diagnostic_trace_limit" }
-        [void]$Denials.Add([ordered]@{
+        return [ordered]@{
             sequence_index = $SequenceIndex
             surface = $Surface
             path_sequence_index = $PathSequenceIndex
@@ -5345,26 +5395,42 @@ public static class XbCi7BaselineTokenMetadata
             symbolic_right = $SymbolicRight
             Allowed = [bool]$AccessResult.Allowed
             GrantedAccess = [uint32]$AccessResult.GrantedAccess
-        })
+        }
+    }
+
+    function Add-XbCi7BaselineDenyRecord {
+        param(
+            [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Denials,
+            [Parameter(Mandatory)][System.Collections.IDictionary]$Observation
+        )
+        if ($Denials.Count -ge 512) { throw "baseline_diagnostic_trace_limit" }
+        [void]$Denials.Add($Observation)
     }
 
     function Get-XbCi7BaselineAccessEvidence {
         param(
             [Parameter(Mandatory)]$Object,
             [Parameter(Mandatory)]$Token,
-            [Parameter(Mandatory)][string]$Surface,
-            [Parameter(Mandatory)][int]$SequenceIndex,
-            [Parameter(Mandatory)][int]$PathSequenceIndex,
-            [Parameter(Mandatory)][string]$Path,
-            [AllowNull()]$Request,
-            [AllowNull()]$AccessResult,
+            [AllowNull()][System.Collections.IDictionary]$Observation,
+            [Parameter(Mandatory)][System.Collections.IDictionary]$Evidence,
+            [Parameter(Mandatory)][ref]$CaptureStage,
             [Parameter(Mandatory)][string]$Condition
         )
+        if ($null -ne $Observation) {
+            foreach ($key in $Observation.Keys) { $Evidence[$key] = $Observation[$key] }
+        }
+        $Evidence["condition"] = $Condition
+        $Evidence["capture_complete"] = $false
+        $CaptureStage.Value = "descriptor"
         $descriptorBytes = $Object.GetSecurityDescriptorBytes()
         try {
             $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($descriptorBytes, 0)
             if ($null -eq $descriptor.Owner -or $null -eq $descriptor.Group) { throw "baseline_descriptor_unproven" }
             if ([string]$descriptor.Owner.Value -cne [string]$Object.OwnerSid) { throw "baseline_descriptor_unproven" }
+            $Evidence["held_object_file_identity"] = [string]$Object.FileIdentity
+            $Evidence["held_object_security_descriptor_sha256"] = [string]$Object.SecurityDescriptorSha256
+            $Evidence["owner_sid"] = [string]$descriptor.Owner.Value
+            $Evidence["primary_group_sid"] = [string]$descriptor.Group.Value
             $dacl = $descriptor.DiscretionaryAcl
             $daclCount = if ($null -eq $dacl) { 0 } else { [int]$dacl.Count }
             $maximumAces = 256
@@ -5400,34 +5466,16 @@ public static class XbCi7BaselineTokenMetadata
                     [void]$orderedAces.Add($aceRecord)
                 }
             }
-            $tokenMetadata = Get-XbCi7BaselineTokenMetadata -Token $Token
-            $result = [ordered]@{
-                surface = $Surface
-                sequence_index = $SequenceIndex
-                path_sequence_index = $PathSequenceIndex
-                exact_path = [IO.Path]::GetFullPath($Path)
-                path_classification = Get-XbCi7BaselinePathClassification -Path $Path
-                condition = $Condition
-                desired_mask = if ($null -eq $Request) { $null } else { "0x{0:X8}" -f [uint32]$Request.Mask }
-                symbolic_right = if ($null -eq $Request) { "OWNER_SID_POLICY" } else { [string]$Request.SymbolicRight }
-                Allowed = if ($null -eq $AccessResult) { $null } else { [bool]$AccessResult.Allowed }
-                GrantedAccess = if ($null -eq $AccessResult) { $null } else { [uint32]$AccessResult.GrantedAccess }
-                granted_access_mask_hex = if ($null -eq $AccessResult) { $null } else { "0x{0:X8}" -f [uint32]$AccessResult.GrantedAccess }
-                held_object_file_identity = [string]$Object.FileIdentity
-                held_object_security_descriptor_sha256 = [string]$Object.SecurityDescriptorSha256
-                owner_sid = [string]$descriptor.Owner.Value
-                primary_group_sid = [string]$descriptor.Group.Value
-                dacl_is_null = ($null -eq $dacl)
-                dacl_ace_count = $daclCount
-                ordered_dacl_aces = @($orderedAces.ToArray())
-                dacl_truncated = ($daclCount -gt $maximumAces)
-                token_user_sid = [string]$tokenMetadata["user_sid"]
-                token_group_sids_and_attributes = @($tokenMetadata["group_sids_and_attributes"])
-                token_restricting_sids = @($tokenMetadata["restricting_sids"])
-                token_privileges = @($tokenMetadata["privileges"])
-                capture_complete = ($daclCount -le $maximumAces)
-            }
-            return $result
+            $Evidence["dacl_is_null"] = ($null -eq $dacl)
+            $Evidence["dacl_ace_count"] = $daclCount
+            $Evidence["ordered_dacl_aces"] = @($orderedAces.ToArray())
+            $Evidence["dacl_truncated"] = ($daclCount -gt $maximumAces)
+            if ($daclCount -gt $maximumAces) { throw "baseline_descriptor_metadata_limit" }
+            Get-XbCi7BaselineTokenMetadata -Token $Token -CaptureStage $CaptureStage -Evidence $Evidence
+            $CaptureStage.Value = "classification"
+            $Evidence["path_classification"] = Get-XbCi7BaselinePathClassification -Path ([string]$Evidence["exact_path"])
+            $Evidence["capture_complete"] = $true
+            return $Evidence
         }
         finally { [Array]::Clear($descriptorBytes, 0, $descriptorBytes.Length) }
     }
@@ -5436,7 +5484,10 @@ public static class XbCi7BaselineTokenMetadata
         param([Parameter(Mandatory)]$Token)
         $denials = New-Object System.Collections.Generic.List[object]
         $sequenceIndex = 0
-        $first = $null
+        $firstAllowObservation = $null
+        $firstExceededCondition = $null
+        $firstEvidence = $null
+        $captureStage = "path_chain"
         $stopReason = "all_baseline_prohibited_access_checks_denied"
         $directoryRequests = @(
             [pscustomobject]@{ Mask = [uint32]0x00000002; SymbolicRight = "FILE_ADD_FILE" }
@@ -5468,6 +5519,7 @@ public static class XbCi7BaselineTokenMetadata
             [pscustomobject]@{ Mask = [uint32]0x00080000; SymbolicRight = "WRITE_OWNER" }
         )
         try {
+            $captureStage = "path_chain"
             $configRoot = Join-Path $RuntimeRoot "config"
             $surfaces = @(
                 [pscustomobject]@{ Name = "install_chain"; Path = [IO.Path]::GetFullPath($InstallRoot) }
@@ -5478,20 +5530,27 @@ public static class XbCi7BaselineTokenMetadata
                 $chain = [string[]]@(Get-XbNativePathChain -Path $surface.Path)
                 for ($pathIndex = 0; $pathIndex -lt $chain.Count; $pathIndex++) {
                     if ($stop) { break }
+                    $captureStage = "path_chain"
                     $directoryPath = [IO.Path]::GetFullPath($chain[$pathIndex])
                     $heldObject = $null
                     try {
+                        $captureStage = "object_open"
                         $heldObject = [XbWorkerProtectedObject]::Open($directoryPath, $true, $false)
                         foreach ($request in $directoryRequests) {
                             $sequenceIndex++
+                            $captureStage = "access_check"
                             $access = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$request.Mask)
+                            $observation = New-XbCi7BaselineAccessObservation -SequenceIndex $sequenceIndex -Surface $surface.Name -PathSequenceIndex $pathIndex -Path $directoryPath -DesiredAccess ([uint32]$request.Mask) -SymbolicRight ([string]$request.SymbolicRight) -AccessResult $access
                             if ($access.Allowed) {
-                                $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $surface.Name -SequenceIndex $sequenceIndex -PathSequenceIndex $pathIndex -Path $directoryPath -Request $request -AccessResult $access -Condition "directory_right_allowed"
+                                $firstAllowObservation = $observation
+                                $firstExceededCondition = [ordered]@{ condition = "directory_right_allowed"; observation = $observation }
+                                $firstEvidence = [ordered]@{}
+                                $null = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Observation $observation -Evidence $firstEvidence -CaptureStage ([ref]$captureStage) -Condition "directory_right_allowed"
                                 $stopReason = "first_baseline_directory_right_allowed"
                                 $stop = $true
                                 break
                             }
-                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $surface.Name -PathSequenceIndex $pathIndex -Path $directoryPath -DesiredAccess ([uint32]$request.Mask) -SymbolicRight $request.SymbolicRight -AccessResult $access
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $observation
                         }
                     }
                     finally { if ($null -ne $heldObject) { $heldObject.Dispose() } }
@@ -5499,7 +5558,8 @@ public static class XbCi7BaselineTokenMetadata
                 if ($stop) { break }
             }
 
-            if ($null -eq $first) {
+            if ($null -eq $firstExceededCondition) {
+                $captureStage = "path_chain"
                 $leafTargets = New-Object System.Collections.Generic.List[object]
                 foreach ($name in $packageFiles) {
                     [void]$leafTargets.Add([pscustomobject]@{
@@ -5528,27 +5588,54 @@ public static class XbCi7BaselineTokenMetadata
                 $trustedOwners = @("S-1-5-18", "S-1-5-32-544")
                 $maximumAllowedRequest = [pscustomobject]@{ Mask = [uint32]0x02000000; SymbolicRight = "MAXIMUM_ALLOWED" }
                 for ($leafIndex = 0; $leafIndex -lt $leafTargets.Count; $leafIndex++) {
-                    if ($null -ne $first) { break }
+                    if ($null -ne $firstExceededCondition) { break }
                     $leaf = $leafTargets[$leafIndex]
                     $heldObject = $null
                     try {
+                        $captureStage = "object_open"
                         $heldObject = [XbWorkerProtectedObject]::Open([string]$leaf.Path, $false, $true)
                         if ([string]$heldObject.OwnerSid -cnotin $trustedOwners) {
                             $sequenceIndex++
-                            $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $leaf.Surface -SequenceIndex $sequenceIndex -PathSequenceIndex $leafIndex -Path $leaf.Path -Request $null -AccessResult $null -Condition "leaf_owner_sid_disallowed"
+                            $firstExceededCondition = [ordered]@{
+                                condition = "leaf_owner_sid_disallowed"
+                                surface = [string]$leaf.Surface
+                                sequence_index = $sequenceIndex
+                                path_sequence_index = $leafIndex
+                                exact_path = [IO.Path]::GetFullPath([string]$leaf.Path)
+                            }
+                            $firstEvidence = [ordered]@{
+                                condition = "leaf_owner_sid_disallowed"
+                                surface = [string]$leaf.Surface
+                                sequence_index = $sequenceIndex
+                                path_sequence_index = $leafIndex
+                                exact_path = [IO.Path]::GetFullPath([string]$leaf.Path)
+                                symbolic_right = "OWNER_SID_POLICY"
+                                Allowed = $null
+                                GrantedAccess = $null
+                            }
+                            $null = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Observation $null -Evidence $firstEvidence -CaptureStage ([ref]$captureStage) -Condition "leaf_owner_sid_disallowed"
                             $stopReason = "first_baseline_leaf_owner_condition"
                             break
                         }
 
                         $sequenceIndex++
+                        $captureStage = "access_check"
                         $maximum = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$maximumAllowedRequest.Mask)
+                        $maximumObservation = New-XbCi7BaselineAccessObservation -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path ([IO.Path]::GetFullPath([string]$leaf.Path)) -DesiredAccess ([uint32]$maximumAllowedRequest.Mask) -SymbolicRight ([string]$maximumAllowedRequest.SymbolicRight) -AccessResult $maximum
                         $outsideMask = [uint32]([uint32]$maximum.GrantedAccess -band ([uint32]::MaxValue -bxor [uint32]$leaf.AllowedMask))
                         if (-not $maximum.Allowed) {
-                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path $leaf.Path -DesiredAccess ([uint32]$maximumAllowedRequest.Mask) -SymbolicRight $maximumAllowedRequest.SymbolicRight -AccessResult $maximum
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $maximumObservation
                         }
                         if ($outsideMask -ne 0) {
-                            $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $leaf.Surface -SequenceIndex $sequenceIndex -PathSequenceIndex $leafIndex -Path $leaf.Path -Request $maximumAllowedRequest -AccessResult $maximum -Condition "maximum_allowed_outside_leaf_allow_mask"
-                            $first.granted_access_outside_allowed_mask = "0x{0:X8}" -f $outsideMask
+                            $firstExceededCondition = [ordered]@{
+                                condition = "maximum_allowed_outside_leaf_allow_mask"
+                                observation = $maximumObservation
+                                granted_access_outside_allowed_mask = "0x{0:X8}" -f $outsideMask
+                            }
+                            if ($maximum.Allowed) { $firstAllowObservation = $maximumObservation }
+                            $firstEvidence = [ordered]@{}
+                            $null = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Observation $maximumObservation -Evidence $firstEvidence -CaptureStage ([ref]$captureStage) -Condition "maximum_allowed_outside_leaf_allow_mask"
+                            $firstEvidence["granted_access_outside_allowed_mask"] = "0x{0:X8}" -f $outsideMask
                             $exceededRights = @(
                                 foreach ($request in $leafExceededRightNames) {
                                     if (($outsideMask -band [uint32]$request.Mask) -ne 0) {
@@ -5556,50 +5643,80 @@ public static class XbCi7BaselineTokenMetadata
                                     }
                                 }
                             )
-                            $first.exceeded_rights = $exceededRights
-                            if ($exceededRights.Count -gt 0) { $first.first_exceeded_right = $exceededRights[0] }
+                            $firstEvidence["exceeded_rights"] = $exceededRights
+                            if ($exceededRights.Count -gt 0) { $firstEvidence["first_exceeded_right"] = $exceededRights[0] }
                             $stopReason = "first_baseline_leaf_maximum_allowed_exceeded"
                             break
                         }
 
                         $sequenceIndex++
+                        $captureStage = "access_check"
                         $required = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$leaf.RequiredMask)
+                        $requiredObservation = New-XbCi7BaselineAccessObservation -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path ([IO.Path]::GetFullPath([string]$leaf.Path)) -DesiredAccess ([uint32]$leaf.RequiredMask) -SymbolicRight "REQUIRED_LEAF_READ_MASK" -AccessResult $required
                         if (-not $required.Allowed) {
-                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path $leaf.Path -DesiredAccess ([uint32]$leaf.RequiredMask) -SymbolicRight "REQUIRED_LEAF_READ_MASK" -AccessResult $required
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $requiredObservation
                             $stopReason = "baseline_leaf_required_access_denied_before_exceeded"
                             break
                         }
 
                         foreach ($request in $leafProhibitedRequests) {
                             $sequenceIndex++
+                            $captureStage = "access_check"
                             $access = Invoke-XbCi7HandleAccessCheck -Object $heldObject -Token $Token -DesiredAccess ([uint32]$request.Mask)
+                            $observation = New-XbCi7BaselineAccessObservation -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path ([IO.Path]::GetFullPath([string]$leaf.Path)) -DesiredAccess ([uint32]$request.Mask) -SymbolicRight ([string]$request.SymbolicRight) -AccessResult $access
                             if ($access.Allowed) {
-                                $first = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Surface $leaf.Surface -SequenceIndex $sequenceIndex -PathSequenceIndex $leafIndex -Path $leaf.Path -Request $request -AccessResult $access -Condition "leaf_prohibited_right_allowed"
+                                $firstAllowObservation = $observation
+                                $firstExceededCondition = [ordered]@{ condition = "leaf_prohibited_right_allowed"; observation = $observation }
+                                $firstEvidence = [ordered]@{}
+                                $null = Get-XbCi7BaselineAccessEvidence -Object $heldObject -Token $Token -Observation $observation -Evidence $firstEvidence -CaptureStage ([ref]$captureStage) -Condition "leaf_prohibited_right_allowed"
                                 $stopReason = "first_baseline_leaf_right_allowed"
                                 break
                             }
-                            Add-XbCi7BaselineDenyRecord -Denials $denials -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path $leaf.Path -DesiredAccess ([uint32]$request.Mask) -SymbolicRight $request.SymbolicRight -AccessResult $access
+                            Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $observation
                         }
                     }
                     finally { if ($null -ne $heldObject) { $heldObject.Dispose() } }
                 }
             }
-            $rightObserved = ($null -ne $first -and $null -ne $first.Allowed -and [bool]$first.Allowed)
+            $rightObserved = ($null -ne $firstAllowObservation)
             return [ordered]@{
-                status = if ($rightObserved) { "first_baseline_right_observed" } else { "no_baseline_right_observed" }
+                status = if ($rightObserved) { "first_baseline_right_observed" } elseif ($null -ne $firstExceededCondition) { "first_baseline_exceeded_condition_observed" } else { "no_baseline_right_observed" }
                 trace_complete = $true
                 stop_reason = $stopReason
-                all_directory_requests_denied = ($null -eq $first -or [string]$first.surface -notin @("install_chain", "config_chain"))
-                first_exceeded = $first
+                all_directory_requests_denied = ($null -eq $firstAllowObservation -or [string]$firstAllowObservation.surface -notin @("install_chain", "config_chain"))
+                first_allow_observation = $firstAllowObservation
+                first_exceeded_condition = $firstExceededCondition
+                first_exceeded = $firstEvidence
                 preceding_denials = @($denials.ToArray())
             }
         }
         catch {
+            $exception = $_.Exception
+            $safeStages = @("path_chain", "object_open", "access_check", "descriptor", "token_handle", "token_user", "token_groups", "token_restricted_sids", "token_privileges", "privilege_name", "classification")
+            $safeStage = if ($captureStage -cin $safeStages) { [string]$captureStage } else { "classification" }
+            $exceptionType = if ($null -eq $exception) { "System.Exception" } else { [string]$exception.GetType().FullName }
+            if ($exceptionType.Length -gt 160) { $exceptionType = $exceptionType.Substring(0, 160) }
+            $nativeErrorCode = $null
+            $nativeProbe = $exception
+            for ($depth = 0; $depth -lt 4 -and $null -ne $nativeProbe; $depth++) {
+                $nativeProperty = $nativeProbe.PSObject.Properties["NativeErrorCode"]
+                if ($null -ne $nativeProperty) {
+                    try { $nativeErrorCode = [int]$nativeProperty.Value } catch { $nativeErrorCode = $null }
+                    break
+                }
+                $nativeProbe = $nativeProbe.InnerException
+            }
             return [ordered]@{
-                status = "baseline_diagnostic_capture_failed"
+                status = if ($null -ne $firstAllowObservation) { "first_baseline_right_observed_metadata_incomplete" } else { "baseline_diagnostic_capture_failed" }
                 trace_complete = $false
                 stop_reason = "bounded_handle_trace_or_metadata_unproven"
                 capture_error = "baseline_diagnostic_capture_failed"
+                capture_stage = $safeStage
+                exception_type = $exceptionType
+                win32_native_error_code = $nativeErrorCode
+                first_allow_observation = $firstAllowObservation
+                first_exceeded_condition = $firstExceededCondition
+                first_exceeded = $firstEvidence
                 preceding_denials = @($denials.ToArray())
             }
         }
@@ -6288,6 +6405,18 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         self.assertIn("token_group_sids_and_attributes", helper)
         self.assertIn("token_restricting_sids", helper)
         self.assertIn("token_privileges", helper)
+        evidence_start = helper.index("function Get-XbCi7BaselineAccessEvidence")
+        evidence_end = helper.index("function Invoke-XbCi7BaselineRightsDiagnostic", evidence_start)
+        evidence_helper = helper[evidence_start:evidence_end]
+        self.assertIn('$Evidence["path_classification"] = Get-XbCi7BaselinePathClassification -Path ([string]$Evidence["exact_path"])', evidence_helper)
+        for partial_field in (
+            'token_user_sid"] =',
+            'token_group_sids_and_attributes"] =',
+            'token_restricting_sids"] =',
+            'token_privileges"] =',
+        ):
+            with self.subTest(partial_field=partial_field):
+                self.assertIn(partial_field, helper)
         self.assertNotIn("Get-Acl", helper)
         self.assertNotIn("GetNetworkCredential", helper)
         self.assertNotIn("PSCredential", helper)
@@ -6322,6 +6451,57 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         ):
             with self.subTest(mask=mask):
                 self.assertIn(mask, helper)
+
+    def test_hosted_ci7_first_allow_is_frozen_before_staged_metadata(self) -> None:
+        harness = _HOSTED_TASK_BOUNDARY_HARNESS
+        diagnostic_start = harness.index("function Invoke-XbCi7BaselineRightsDiagnostic")
+        diagnostic_end = harness.index('\n    Invoke-XbBoundaryCase -Name "install_then_uninstall"', diagnostic_start)
+        diagnostic = harness[diagnostic_start:diagnostic_end]
+        access_check = diagnostic.index("$access = Invoke-XbCi7HandleAccessCheck")
+        observation = diagnostic.index("$observation = New-XbCi7BaselineAccessObservation", access_check)
+        freeze = diagnostic.index("$firstAllowObservation = $observation", observation)
+        enrichment = diagnostic.index("Get-XbCi7BaselineAccessEvidence", freeze)
+        self.assertLess(access_check, observation)
+        self.assertLess(observation, freeze)
+        self.assertLess(freeze, enrichment)
+        self.assertIn("first_allow_observation = $firstAllowObservation", diagnostic)
+        self.assertIn("preceding_denials = @($denials.ToArray())", diagnostic)
+        for safe_field in ("capture_stage", "exception_type", "win32_native_error_code"):
+            with self.subTest(safe_field=safe_field):
+                self.assertIn(safe_field, diagnostic)
+        for stage in (
+            "path_chain",
+            "object_open",
+            "access_check",
+            "descriptor",
+            "token_handle",
+            "token_user",
+            "token_groups",
+            "token_restricted_sids",
+            "token_privileges",
+            "privilege_name",
+            "classification",
+        ):
+            with self.subTest(stage=stage):
+                self.assertIn(f'"{stage}"', diagnostic)
+        for forbidden in ("$_.Exception.Message", "$_.ScriptStackTrace", ".StackTrace"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, diagnostic)
+
+        privilege_reader = harness[
+            harness.index("public static List<Dictionary<string, object>> ReadPrivileges"):
+            harness.index("public static Dictionary<string, object> Read(", harness.index("public static List<Dictionary<string, object>> ReadPrivileges"))
+        ]
+        for field in (
+            '"luid_low_part"',
+            '"luid_high_part"',
+            '"name_resolution_status"',
+            '"name_lookup_exception_type"',
+            '"name_lookup_win32_native_error_code"',
+            'catch (Exception exception)',
+        ):
+            with self.subTest(privilege_field=field):
+                self.assertIn(field, privilege_reader)
 
     def test_synthetic_config_teardown_is_identity_gated_before_uninstall(self) -> None:
         start = _HOSTED_TASK_BOUNDARY_HARNESS.index(
