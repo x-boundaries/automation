@@ -5527,7 +5527,11 @@ public static class XbCi7BaselineTokenMetadata
             )
             $stop = $false
             foreach ($surface in $surfaces) {
-                $chain = [string[]]@(Get-XbNativePathChain -Path $surface.Path)
+                $chain = Get-XbNativePathChain -Path $surface.Path
+                if ($null -eq $chain -or $chain.Count -lt 1) { throw "effective_rights_unproven" }
+                foreach ($element in $chain) {
+                    if ($element -isnot [string] -or [string]::IsNullOrWhiteSpace($element)) { throw "effective_rights_unproven" }
+                }
                 for ($pathIndex = 0; $pathIndex -lt $chain.Count; $pathIndex++) {
                     if ($stop) { break }
                     $captureStage = "path_chain"
@@ -6451,6 +6455,25 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         ):
             with self.subTest(mask=mask):
                 self.assertIn(mask, helper)
+
+    def test_hosted_ci7_path_chain_consumer_is_direct_and_shape_checked(self) -> None:
+        diagnostic = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7BaselineRightsDiagnostic")
+        assignment = "$chain = Get-XbNativePathChain -Path $surface.Path"
+        non_empty_guard = 'if ($null -eq $chain -or $chain.Count -lt 1) { throw "effective_rights_unproven" }'
+        element_loop = "foreach ($element in $chain)"
+        element_guard = 'if ($element -isnot [string] -or [string]::IsNullOrWhiteSpace($element)) { throw "effective_rights_unproven" }'
+        path_loop = "for ($pathIndex = 0; $pathIndex -lt $chain.Count; $pathIndex++) {"
+        self.assertIn(assignment, diagnostic)
+        self.assertNotIn("@(Get-XbNativePathChain", diagnostic)
+        self.assertNotIn("[string[]]@(Get-XbNativePathChain", diagnostic)
+        assignment_index = diagnostic.index(assignment)
+        path_loop_index = diagnostic.index(path_loop, assignment_index)
+        validation = diagnostic[assignment_index:path_loop_index]
+        self.assertIn(non_empty_guard, validation)
+        self.assertIn(element_loop, validation)
+        self.assertIn(element_guard, validation)
+        self.assertLess(validation.index(non_empty_guard), validation.index(element_loop))
+        self.assertIn("$chain[$pathIndex]", diagnostic[path_loop_index:])
 
     def test_hosted_ci7_first_allow_is_frozen_before_staged_metadata(self) -> None:
         harness = _HOSTED_TASK_BOUNDARY_HARNESS
