@@ -502,6 +502,156 @@ function Get-XbReleaseIdentityFromEntries {
     finally { $algorithm.Dispose() }
 }
 
+function ConvertFrom-XbInstalledManifestText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [switch]$AllowPrevious)
+
+    try {
+        $manifest = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+        if ($null -eq $manifest -or $manifest -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "installation_manifest_invalid"
+        }
+
+        $schemaProperties = @($manifest.PSObject.Properties | Where-Object {
+            [string]::Equals([string]$_.Name, "schema_version", [StringComparison]::Ordinal)
+        })
+        if ($schemaProperties.Count -ne 1 -or $schemaProperties[0].Value -isnot [string]) {
+            throw "installation_manifest_invalid"
+        }
+        $schema = [string]$schemaProperties[0].Value
+        if ([string]::Equals($schema, "xb.member.gateway.worker.installation.v2", [StringComparison]::Ordinal)) {
+            $expectedTopLevel = @("schema_version", "reviewed_source", "release_sha256", "install_root", "runtime_root", "package_files", "task", "rollback_owned_roots")
+            $isPrevious = $false
+        }
+        elseif ([string]::Equals($schema, "xb.member.gateway.worker.installation.v1", [StringComparison]::Ordinal) -and $AllowPrevious) {
+            $expectedTopLevel = @("schema_version", "reviewed_source", "install_root", "runtime_root", "package_files", "task", "rollback_owned_roots")
+            $isPrevious = $true
+        }
+        else { throw "installation_manifest_invalid" }
+
+        $assertProperties = {
+            param($Value, [string[]]$Expected, [string]$ErrorId)
+            if ($null -eq $Value -or $Value -isnot [System.Management.Automation.PSCustomObject]) { throw $ErrorId }
+            $actualNames = [string[]]@($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+            $expectedNames = [string[]]@($Expected)
+            [Array]::Sort($actualNames, [StringComparer]::Ordinal)
+            [Array]::Sort($expectedNames, [StringComparer]::Ordinal)
+            if ($actualNames.Length -ne $expectedNames.Length) { throw $ErrorId }
+            for ($index = 0; $index -lt $actualNames.Length; $index++) {
+                if (-not [string]::Equals($actualNames[$index], $expectedNames[$index], [StringComparison]::Ordinal)) { throw $ErrorId }
+            }
+        }
+
+        & $assertProperties $manifest $expectedTopLevel "installation_manifest_invalid"
+        & $assertProperties $manifest.reviewed_source @("commit", "tree") "installation_manifest_invalid"
+        if ($manifest.reviewed_source.commit -isnot [string] -or $manifest.reviewed_source.tree -isnot [string] -or
+            ([string]$manifest.reviewed_source.commit) -cnotmatch '^[0-9a-f]{40}$' -or
+            ([string]$manifest.reviewed_source.tree) -cnotmatch '^[0-9a-f]{40}$') {
+            throw "installation_manifest_invalid"
+        }
+
+        if ($manifest.install_root -isnot [string] -or
+            -not [string]::Equals([string]$manifest.install_root, "C:\Program Files\X-Boundaries\MemberGatewayWorker\", [StringComparison]::Ordinal) -or
+            $manifest.runtime_root -isnot [string] -or
+            -not [string]::Equals([string]$manifest.runtime_root, "C:\ProgramData\X-Boundaries\MemberGatewayWorker\", [StringComparison]::Ordinal)) {
+            throw "installation_manifest_path_invalid"
+        }
+
+        if ($null -eq $manifest.package_files -or $manifest.package_files -isnot [System.Array]) {
+            throw "installation_manifest_membership_invalid"
+        }
+        $expectedPackageNames = [string[]]@($packageFiles)
+        if ($isPrevious) {
+            $expectedPackageNames = [string[]]@($packageFiles | Where-Object { $_ -cne "ac2_member_create_primitive.ps1" })
+        }
+        if ($manifest.package_files.Length -ne $expectedPackageNames.Length) {
+            throw "installation_manifest_membership_invalid"
+        }
+        $seenPackageNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $releaseEntries = [ordered]@{}
+        foreach ($entry in $manifest.package_files) {
+            & $assertProperties $entry @("name", "sha256") "installation_manifest_membership_invalid"
+            if ($entry.name -isnot [string] -or $entry.sha256 -isnot [string]) {
+                throw "installation_manifest_membership_invalid"
+            }
+            $name = [string]$entry.name
+            $digest = [string]$entry.sha256
+            if ([string]::IsNullOrEmpty($name) -or $expectedPackageNames -cnotcontains $name) {
+                throw "installation_manifest_membership_invalid"
+            }
+            if (-not $seenPackageNames.Add($name) -or $digest -cnotmatch '^[0-9a-f]{64}$') {
+                throw "installation_manifest_membership_invalid"
+            }
+            $releaseEntries[$name] = $digest
+        }
+        foreach ($name in $expectedPackageNames) {
+            if (-not $seenPackageNames.Contains($name)) { throw "installation_manifest_membership_invalid" }
+        }
+
+        $expectedTaskProperties = @("path", "name", "enabled", "trigger_count", "action_mode", "production_switches", "multiple_instances", "execution_time_limit", "restart_count", "start_when_available", "executable", "launcher_path", "arguments", "working_directory", "principal_user_id", "principal_logon_type", "principal_run_level")
+        & $assertProperties $manifest.task $expectedTaskProperties "installation_manifest_task_invalid"
+        $task = $manifest.task
+        if ($task.path -isnot [string] -or -not [string]::Equals([string]$task.path, "\X-Boundaries\", [StringComparison]::Ordinal) -or
+            $task.name -isnot [string] -or -not [string]::Equals([string]$task.name, "AC2 Member Gateway Worker", [StringComparison]::Ordinal) -or
+            $task.enabled -isnot [bool] -or $task.enabled -ne $false -or
+            ($task.trigger_count -isnot [int] -and $task.trigger_count -isnot [long]) -or $task.trigger_count -ne 0 -or
+            $task.action_mode -isnot [string] -or -not [string]::Equals([string]$task.action_mode, "DisabledProof", [StringComparison]::Ordinal) -or
+            $null -eq $task.production_switches -or $task.production_switches -isnot [System.Array] -or $task.production_switches.Length -ne 0 -or
+            $task.multiple_instances -isnot [string] -or -not [string]::Equals([string]$task.multiple_instances, "IgnoreNew", [StringComparison]::Ordinal) -or
+            $task.execution_time_limit -isnot [string] -or -not [string]::Equals([string]$task.execution_time_limit, "PT10M", [StringComparison]::Ordinal) -or
+            ($task.restart_count -isnot [int] -and $task.restart_count -isnot [long]) -or $task.restart_count -ne 0 -or
+            $task.start_when_available -isnot [bool] -or $task.start_when_available -ne $false) {
+            throw "installation_manifest_task_invalid"
+        }
+
+        $expectedLauncher = "C:\Program Files\X-Boundaries\MemberGatewayWorker\launch_ac2_member_gateway_worker.ps1"
+        $expectedExecutable = if ($isPrevious) { "powershell.exe" } else { "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" }
+        $expectedArguments = '-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $expectedLauncher
+        if ($task.executable -isnot [string] -or -not [string]::Equals([string]$task.executable, $expectedExecutable, [StringComparison]::Ordinal) -or
+            $task.launcher_path -isnot [string] -or -not [string]::Equals([string]$task.launcher_path, $expectedLauncher, [StringComparison]::Ordinal) -or
+            $task.arguments -isnot [string] -or -not [string]::Equals([string]$task.arguments, $expectedArguments, [StringComparison]::Ordinal) -or
+            $task.working_directory -isnot [string] -or -not [string]::Equals([string]$task.working_directory, "", [StringComparison]::Ordinal) -or
+            $task.principal_user_id -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$task.principal_user_id) -or
+            $task.principal_logon_type -isnot [string] -or -not [string]::Equals([string]$task.principal_logon_type, "Password", [StringComparison]::Ordinal) -or
+            $task.principal_run_level -isnot [string] -or -not [string]::Equals([string]$task.principal_run_level, "Limited", [StringComparison]::Ordinal)) {
+            throw "installation_manifest_task_invalid"
+        }
+
+        $expectedRollbackRoots = [string[]]@("config", "secrets", "logs", "rollback")
+        if ($null -eq $manifest.rollback_owned_roots -or $manifest.rollback_owned_roots -isnot [System.Array] -or
+            $manifest.rollback_owned_roots.Length -ne $expectedRollbackRoots.Length) {
+            throw "installation_runtime_roots_invalid"
+        }
+        $seenRollbackRoots = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($root in $manifest.rollback_owned_roots) {
+            if ($root -isnot [string] -or $expectedRollbackRoots -cnotcontains [string]$root -or -not $seenRollbackRoots.Add([string]$root)) {
+                throw "installation_runtime_roots_invalid"
+            }
+        }
+        foreach ($root in $expectedRollbackRoots) {
+            if (-not $seenRollbackRoots.Contains($root)) { throw "installation_runtime_roots_invalid" }
+        }
+
+        if (-not $isPrevious) {
+            if ($manifest.release_sha256 -isnot [string] -or ([string]$manifest.release_sha256) -cnotmatch '^[0-9a-f]{64}$') {
+                throw "installation_manifest_invalid"
+            }
+            $expectedRelease = Get-XbReleaseIdentityFromEntries -Entries $releaseEntries
+            if (-not [string]::Equals($expectedRelease, [string]$manifest.release_sha256, [StringComparison]::Ordinal)) {
+                throw "release_identity_mismatch"
+            }
+        }
+
+        return $manifest
+    }
+    catch {
+        $reason = [string]$_.Exception.Message
+        if ($reason -in @("installation_manifest_invalid", "installation_manifest_path_invalid", "installation_manifest_membership_invalid", "installation_manifest_task_invalid", "installation_runtime_roots_invalid", "release_identity_mismatch")) {
+            throw $reason
+        }
+        throw "installation_manifest_invalid"
+    }
+}
+
 function Get-XbReleaseIdentityFromRoot {
     param([Parameter(Mandatory)][string]$Root)
     $entries = [ordered]@{}
@@ -1484,7 +1634,7 @@ function Open-XbCi7VerificationContext {
     catch {
         foreach ($object in @($objects.ToArray())[-1..0]) { try { $object.Dispose() } catch { } }
         $reason = [string]$_.Exception.Message
-        if ($reason -in @("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven", "installation_owned_surface_unknown", "installation_manifest_invalid", "installation_manifest_membership_invalid", "installation_manifest_path_invalid")) { throw $reason }
+        if ($reason -in @("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven", "installation_owned_surface_unknown", "installation_manifest_invalid", "installation_manifest_membership_invalid", "installation_manifest_path_invalid", "installation_manifest_task_invalid", "installation_runtime_roots_invalid", "release_identity_mismatch")) { throw $reason }
         throw "effective_rights_unproven"
     }
 }
@@ -1742,7 +1892,8 @@ function Invoke-XbInstallVerifier {
         $reason = [string]$_.Exception.Message
         if ($reason -in @("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven",
                 "installation_owned_surface_unknown", "installation_manifest_invalid", "installation_manifest_membership_invalid",
-                "installation_manifest_path_invalid", "release_identity_mismatch", "release_content_forbidden_file",
+                "installation_manifest_path_invalid", "installation_manifest_task_invalid", "installation_runtime_roots_invalid",
+                "release_identity_mismatch", "release_content_forbidden_file",
                 "release_content_unknown_file", "release_content_file_missing", "release_content_delete_present",
                 "release_content_save_call_sites_invalid", "installation_task_missing")) { throw $reason }
         throw "effective_rights_unproven"
