@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -263,11 +264,12 @@ class V2StateTests(unittest.TestCase):
         from energygrid_bill_downloader.state import migrate_state_database
 
         create_state_fixture(self.path)
-        with sqlite3.connect(self.path) as connection:
-            connection.execute(
-                "INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("invoice-1.pdf", "invoice-1.pdf", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", None, None, None, "SEEN", None, None, 0, None),
-            )
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.execute(
+                    "INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("invoice-1.pdf", "invoice-1.pdf", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", None, None, None, "SEEN", None, None, 0, None),
+                )
         before = state_snapshot(self.root)
         result = migrate_state_database(self.path)
         self.assertEqual({"status": "PLAN_READY", "legacy_rows": 1}, result)
@@ -281,11 +283,12 @@ class V2StateTests(unittest.TestCase):
 
         create_state_fixture(self.path)
         sha = "a" * 64
-        with sqlite3.connect(self.path) as connection:
-            connection.execute(
-                "INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("legacy.pdf", "legacy.pdf", "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00", None, 123, sha, "SEEN", None, None, 1, None),
-            )
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.execute(
+                    "INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("legacy.pdf", "legacy.pdf", "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00", None, 123, sha, "SEEN", None, None, 1, None),
+                )
         result = migrate_state_database(self.path, apply=True, streams=test_stream_entries(bound=(Stream.EB_BILL,)))
         self.assertEqual({"status": "MIGRATED", "legacy_rows": 1}, result)
         backups = list(self.path.parent.glob("bills.sqlite3.v1-*.bak"))
@@ -297,9 +300,10 @@ class V2StateTests(unittest.TestCase):
             self.assertEqual(("UNCLASSIFIED", "legacy.pdf", "legacy.pdf", "UNVERIFIED", "UNCLASSIFIED", "NOT_STAGED", 123, sha), row)
             self.assertEqual("UNBOUND", state.stream("TENANT_BILL")["admission"])
             self.assertIsNone(state.delivery_for_invoice(state.connection.execute("SELECT invoice_id FROM energygrid_invoice_v2").fetchone()[0]))
-        with sqlite3.connect(backups[0]) as backup:
-            self.assertEqual((1,), backup.execute("PRAGMA user_version").fetchone())
-            self.assertEqual(("legacy.pdf", 123, sha), backup.execute("SELECT filename_key,byte_size,sha256 FROM bills").fetchone())
+        with closing(sqlite3.connect(backups[0])) as backup:
+            with backup:
+                self.assertEqual((1,), backup.execute("PRAGMA user_version").fetchone())
+                self.assertEqual(("legacy.pdf", 123, sha), backup.execute("SELECT filename_key,byte_size,sha256 FROM bills").fetchone())
 
     def test_write_once_watermark_cannot_regress_or_be_cleared(self) -> None:
         from energygrid_bill_downloader.state import StateV2Store

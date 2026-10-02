@@ -859,7 +859,7 @@ def migrate_state_database(
                 backup.commit()
             finally:
                 backup.close()
-            with backup_path.open("rb") as handle:
+            with backup_path.open("rb+") as handle:
                 os.fsync(handle.fileno())
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute(f"PRAGMA busy_timeout={V2_BUSY_TIMEOUT_MS}")
