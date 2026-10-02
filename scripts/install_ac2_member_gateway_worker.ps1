@@ -1046,6 +1046,7 @@ public sealed class XbWorkerProtectedObject : IDisposable
     private const uint FileAttributeReparsePoint = 0x00000400;
     private const int ErrorInsufficientBuffer = 122;
     private const uint OwnerSecurityInformation = 0x00000001;
+    private const uint GroupSecurityInformation = 0x00000002;
     private const uint DaclSecurityInformation = 0x00000004;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -1105,6 +1106,11 @@ public sealed class XbWorkerProtectedObject : IDisposable
     public bool IsDirectory { get; private set; }
     public bool IsReparsePoint { get; private set; }
 
+    private static bool HasUsableSecurityDescriptor(uint status, IntPtr owner, IntPtr group, IntPtr descriptor)
+    {
+        return status == 0 && owner != IntPtr.Zero && group != IntPtr.Zero && descriptor != IntPtr.Zero;
+    }
+
     private XbWorkerProtectedObject(IntPtr openedHandle, bool expectDirectory)
     {
         handle = openedHandle;
@@ -1125,10 +1131,15 @@ public sealed class XbWorkerProtectedObject : IDisposable
             IntPtr dacl;
             IntPtr sacl;
             IntPtr descriptor;
-            uint status = GetSecurityInfo(handle, 1, OwnerSecurityInformation | DaclSecurityInformation,
+            uint status = GetSecurityInfo(handle, 1,
+                OwnerSecurityInformation | GroupSecurityInformation | DaclSecurityInformation,
                 out owner, out group, out dacl, out sacl, out descriptor);
-            if (status != 0 || descriptor == IntPtr.Zero || owner == IntPtr.Zero)
-                throw new Win32Exception(status == 0 ? Marshal.GetLastWin32Error() : (int)status);
+            if (!HasUsableSecurityDescriptor(status, owner, group, descriptor))
+            {
+                int componentError = status == 0 ? Marshal.GetLastWin32Error() : (int)status;
+                if (status == 0 && descriptor != IntPtr.Zero) LocalFree(descriptor);
+                throw new Win32Exception(componentError);
+            }
             try
             {
                 IntPtr ownerText;

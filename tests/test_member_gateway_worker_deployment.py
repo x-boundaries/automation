@@ -44,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "e22b4081b65a018ac3eab715f28f6ecdec449dc0",
+    "scripts/install_ac2_member_gateway_worker.ps1": "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741",
     "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
     "scripts/ac2_member_gateway_worker_lib.ps1": "8293559ec6308a8d9afdf73fd4c8b0af322ae382",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
@@ -6773,10 +6773,11 @@ class MemberWorkerReleaseIntegrityTests(unittest.TestCase):
         self.assertNotIn("ac2_member_test_cleanup.ps1", source)
 
 
-# CI7 parent/ancestor delete composition over a real scratch path chain. The
-# caller's token restricted to Everyone (S-1-1-0) is used as a disposable native
-# AccessCheck subject: it needs no privilege or password, and on a standard temp
-# chain it holds neither DELETE nor DELETE_CHILD until the harness grants one.
+# CI7 handle-bound descriptor checks and parent/ancestor delete composition over
+# a real scratch path chain. The caller's token restricted to Everyone (S-1-1-0)
+# is a disposable native AccessCheck subject: it needs no privilege or password,
+# and on a standard temp chain it holds neither DELETE nor DELETE_CHILD until
+# the harness grants one.
 _PATH_CHAIN_HARNESS = r'''[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InstallerPath,
@@ -6789,6 +6790,20 @@ $out = [ordered]@{}
 function Get-XbOutcome {
     param([Parameter(Mandatory)][scriptblock]$Body)
     try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+function Get-XbBytesSha256 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($Bytes)).Replace("-", "").ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+}
+function Invoke-XbHandleAccessProbe {
+    param([Parameter(Mandatory)][byte[]]$Bytes, [Parameter(Mandatory)][uint32]$DesiredAccess)
+    try {
+        return [pscustomobject]@{ completed = $true; result = $token.Check($Bytes, $DesiredAccess) }
+    } catch {
+        return [pscustomobject]@{ completed = $false; result = $null }
+    }
 }
 
 Initialize-XbWorkerNativeAccess
@@ -6958,6 +6973,94 @@ $out.wrapped_first_type = $wrapped[0].GetType().FullName
 $token = [XbTestRestrictedToken]::new()
 try {
     $out.token_restricted = $token.Restricted
+    $componentGuard = [XbWorkerProtectedObject].GetMethod(
+        "HasUsableSecurityDescriptor",
+        ([System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static)
+    )
+    $out.group_completeness_guard_present = ($null -ne $componentGuard)
+    $out.incomplete_group_descriptor_rejected = $false
+    if ($null -ne $componentGuard) {
+        $usableWithoutGroup = [bool]$componentGuard.Invoke(
+            $null,
+            [object[]]@([uint32]0, [IntPtr]::new(1), [IntPtr]::Zero, [IntPtr]::new(2))
+        )
+        $out.incomplete_group_descriptor_rejected = -not $usableWithoutGroup
+    }
+
+    $descriptorDirectory = Join-Path $LeafPath "descriptor-access"
+    $null = New-Item -ItemType Directory -Path $descriptorDirectory -ErrorAction Stop
+    $descriptorFile = Join-Path $descriptorDirectory "access-target.txt"
+    [IO.File]::WriteAllText($descriptorFile, "local-safe-group-sid", [Text.UTF8Encoding]::new($false))
+    $originalDescriptorDirectoryAcl = Get-Acl -LiteralPath $descriptorDirectory
+    $originalDescriptorFileAcl = Get-Acl -LiteralPath $descriptorFile
+    $descriptorDirectoryObject = $null
+    $descriptorFileObject = $null
+    try {
+        $directoryAcl = Get-Acl -LiteralPath $descriptorDirectory
+        $directoryAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $everyoneSid,
+            [Security.AccessControl.FileSystemRights]::ListDirectory,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $descriptorDirectory -AclObject $directoryAcl -ErrorAction Stop
+        $fileAcl = Get-Acl -LiteralPath $descriptorFile
+        $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $everyoneSid,
+            [Security.AccessControl.FileSystemRights]::ReadData,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $descriptorFile -AclObject $fileAcl -ErrorAction Stop
+
+        $descriptorDirectoryObject = [XbWorkerProtectedObject]::Open($descriptorDirectory, $true, $true)
+        $descriptorFileObject = [XbWorkerProtectedObject]::Open($descriptorFile, $false, $true)
+        $directoryBytes = $descriptorDirectoryObject.GetSecurityDescriptorBytes()
+        $fileBytes = $descriptorFileObject.GetSecurityDescriptorBytes()
+        $directorySecurity = [Security.AccessControl.RawSecurityDescriptor]::new($directoryBytes, 0)
+        $fileSecurity = [Security.AccessControl.RawSecurityDescriptor]::new($fileBytes, 0)
+        $out.handle_directory_owner_present = ($null -ne $directorySecurity.Owner)
+        $out.handle_directory_group_present = ($null -ne $directorySecurity.Group)
+        $out.handle_file_owner_present = ($null -ne $fileSecurity.Owner)
+        $out.handle_file_group_present = ($null -ne $fileSecurity.Group)
+        $out.handle_directory_descriptor_matches_hash =
+            ((Get-XbBytesSha256 -Bytes $directoryBytes) -ceq [string]$descriptorDirectoryObject.SecurityDescriptorSha256)
+        $out.handle_file_descriptor_matches_hash =
+            ((Get-XbBytesSha256 -Bytes $fileBytes) -ceq [string]$descriptorFileObject.SecurityDescriptorSha256)
+
+        $directoryAccess = Invoke-XbHandleAccessProbe -Bytes $directoryBytes -DesiredAccess ([uint32]0x00000001)
+        $out.handle_directory_accesscheck_completed = [bool]$directoryAccess.completed
+        $out.handle_directory_list_access_allowed =
+            [bool]$directoryAccess.completed -and
+            $null -ne $directoryAccess.result -and
+            [bool]$directoryAccess.result.Allowed -and
+            (($directoryAccess.result.GrantedAccess -band [uint32]0x00000001) -ne 0)
+        $fileAccess = Invoke-XbHandleAccessProbe -Bytes $fileBytes -DesiredAccess ([uint32]0x00000001)
+        $out.handle_file_read_accesscheck_completed = [bool]$fileAccess.completed
+        $out.handle_file_read_access_allowed =
+            [bool]$fileAccess.completed -and
+            $null -ne $fileAccess.result -and
+            [bool]$fileAccess.result.Allowed -and
+            (($fileAccess.result.GrantedAccess -band [uint32]0x00000001) -ne 0)
+        $fileDelete = Invoke-XbHandleAccessProbe -Bytes $fileBytes -DesiredAccess ([uint32]0x00010000)
+        $out.handle_file_delete_accesscheck_completed = [bool]$fileDelete.completed
+        $out.handle_file_delete_access_denied =
+            [bool]$fileDelete.completed -and $null -ne $fileDelete.result -and -not [bool]$fileDelete.result.Allowed
+        $maximumAccess = Invoke-XbHandleAccessProbe -Bytes $fileBytes -DesiredAccess ([uint32]0x02000000)
+        $out.handle_file_maximum_accesscheck_completed = [bool]$maximumAccess.completed
+        $out.handle_file_maximum_access_usable =
+            [bool]$maximumAccess.completed -and
+            $null -ne $maximumAccess.result -and
+            [bool]$maximumAccess.result.Allowed -and
+            (($maximumAccess.result.GrantedAccess -band [uint32]0x00000001) -ne 0) -and
+            (($maximumAccess.result.GrantedAccess -band [uint32]0x00010000) -eq 0)
+    } finally {
+        if ($null -ne $descriptorFileObject) { $descriptorFileObject.Dispose() }
+        if ($null -ne $descriptorDirectoryObject) { $descriptorDirectoryObject.Dispose() }
+        Set-Acl -LiteralPath $descriptorFile -AclObject $originalDescriptorFileAcl -ErrorAction Stop
+        Set-Acl -LiteralPath $descriptorDirectory -AclObject $originalDescriptorDirectoryAcl -ErrorAction Stop
+        if (Test-Path -LiteralPath $descriptorFile) { Remove-Item -LiteralPath $descriptorFile -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $descriptorDirectory) { Remove-Item -LiteralPath $descriptorDirectory -Force -ErrorAction Stop }
+    }
+
     $out.pass_case = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
     $out.leaf_delete = Invoke-XbGrantProbe -Path $LeafPath -Rights ([Security.AccessControl.FileSystemRights]::Delete) -DesiredAccess ([uint32]0x00010000)
     $out.parent_delete_child = Invoke-XbGrantProbe -Path $parentPath -Rights ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -DesiredAccess ([uint32]0x00000040)
@@ -7589,6 +7692,50 @@ class MemberWorkerPathChainCompositionTests(unittest.TestCase):
         self.assertTrue(self.report["handle_sample_owner_present"])
         self.assertTrue(self.report["handle_replace_blocked"])
         self.assertTrue(self.report["handle_rename_blocked"])
+
+    def test_handle_acquired_file_and_directory_descriptors_include_owner_and_group(self) -> None:
+        for name in (
+            "handle_directory_owner_present",
+            "handle_directory_group_present",
+            "handle_file_owner_present",
+            "handle_file_group_present",
+            "handle_directory_descriptor_matches_hash",
+            "handle_file_descriptor_matches_hash",
+        ):
+            with self.subTest(component=name):
+                self.assertTrue(self.report[name])
+
+    def test_exact_handle_descriptor_bytes_reach_native_accesscheck(self) -> None:
+        for name in (
+            "handle_directory_accesscheck_completed",
+            "handle_file_read_accesscheck_completed",
+            "handle_file_delete_accesscheck_completed",
+            "handle_file_maximum_accesscheck_completed",
+            "handle_directory_list_access_allowed",
+            "handle_file_read_access_allowed",
+            "handle_file_delete_access_denied",
+            "handle_file_maximum_access_usable",
+        ):
+            with self.subTest(access_check=name):
+                self.assertTrue(self.report[name])
+
+    def test_group_incomplete_descriptor_fails_closed_and_component_mask_is_complete(self) -> None:
+        self.assertTrue(self.report["group_completeness_guard_present"])
+        self.assertTrue(self.report["incomplete_group_descriptor_rejected"])
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        native = _installer_function(source, "Initialize-XbWorkerNativeAccess")
+        self.assertIn("GroupSecurityInformation = 0x00000002", native)
+        self.assertIn(
+            "OwnerSecurityInformation | GroupSecurityInformation | DaclSecurityInformation",
+            native,
+        )
+        self.assertIn("HasUsableSecurityDescriptor(status, owner, group, descriptor)", native)
+
+    def test_ci7_required_probe_completion_remains_mandatory(self) -> None:
+        self.assertIn(
+            '$ci7.required_probe_completion.status -cne "complete"',
+            _HOSTED_TASK_BOUNDARY_HARNESS,
+        )
 
     def test_granted_delete_or_delete_child_is_exceeded(self) -> None:
         checks = self._expected_checks()
