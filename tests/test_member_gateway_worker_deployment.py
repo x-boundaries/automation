@@ -5449,7 +5449,9 @@ public static class XbCi7BaselineTokenMetadata
 
     function Add-XbCi7BaselineDenyRecord {
         param(
-            [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Denials,
+            [AllowEmptyCollection()]
+            [Parameter(Mandatory)]
+            [System.Collections.Generic.List[object]]$Denials,
             [Parameter(Mandatory)][System.Collections.IDictionary]$Observation
         )
         if ($Denials.Count -ge 512) { throw "baseline_diagnostic_trace_limit" }
@@ -5621,6 +5623,7 @@ public static class XbCi7BaselineTokenMetadata
                                 $stop = $true
                                 break
                             }
+                            $captureStage = "deny_record_binding"
                             Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $observation
                         }
                     }
@@ -5706,6 +5709,7 @@ public static class XbCi7BaselineTokenMetadata
                         $maximumObservation = New-XbCi7BaselineAccessObservation -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path ([IO.Path]::GetFullPath([string]$leaf.Path)) -DesiredAccess ([uint32]$maximumAllowedRequest.Mask) -SymbolicRight ([string]$maximumAllowedRequest.SymbolicRight) -Allowed $maximumFields.Allowed -GrantedAccess $maximumFields.GrantedAccess -CaptureStage ([ref]$captureStage)
                         $outsideMask = [uint32]([uint32]$maximumFields.GrantedAccess -band ([uint32]::MaxValue -bxor [uint32]$leaf.AllowedMask))
                         if (-not $maximumFields.Allowed) {
+                            $captureStage = "deny_record_binding"
                             Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $maximumObservation
                         }
                         if ($outsideMask -ne 0) {
@@ -5747,6 +5751,7 @@ public static class XbCi7BaselineTokenMetadata
                         $captureStage = "observation_binding"
                         $requiredObservation = New-XbCi7BaselineAccessObservation -SequenceIndex $sequenceIndex -Surface $leaf.Surface -PathSequenceIndex $leafIndex -Path ([IO.Path]::GetFullPath([string]$leaf.Path)) -DesiredAccess ([uint32]$leaf.RequiredMask) -SymbolicRight "REQUIRED_LEAF_READ_MASK" -Allowed $requiredFields.Allowed -GrantedAccess $requiredFields.GrantedAccess -CaptureStage ([ref]$captureStage)
                         if (-not $requiredFields.Allowed) {
+                            $captureStage = "deny_record_binding"
                             Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $requiredObservation
                             $stopReason = "baseline_leaf_required_access_denied_before_exceeded"
                             break
@@ -5776,6 +5781,7 @@ public static class XbCi7BaselineTokenMetadata
                                 $stopReason = "first_baseline_leaf_right_allowed"
                                 break
                             }
+                            $captureStage = "deny_record_binding"
                             Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $observation
                         }
                     }
@@ -5796,7 +5802,7 @@ public static class XbCi7BaselineTokenMetadata
         }
         catch {
             $exception = $_.Exception
-            $safeStages = @("path_chain", "object_open", "access_check_binding", "access_check_call", "observation_binding", "observation_build", "descriptor", "token_handle", "token_user", "token_groups", "token_restricted_sids", "token_privileges", "privilege_name", "classification")
+            $safeStages = @("path_chain", "object_open", "access_check_binding", "access_check_call", "observation_binding", "observation_build", "deny_record_binding", "descriptor", "token_handle", "token_user", "token_groups", "token_restricted_sids", "token_privileges", "privilege_name", "classification")
             $safeStage = if ($captureStage -cin $safeStages) { [string]$captureStage } else { "classification" }
             $exceptionType = if ($null -eq $exception) { "System.Exception" } else { [string]$exception.GetType().FullName }
             if ($exceptionType.Length -gt 160) { $exceptionType = $exceptionType.Substring(0, 160) }
@@ -6595,6 +6601,33 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         ):
             with self.subTest(mask=mask):
                 self.assertIn(mask, helper)
+
+    def test_hosted_ci7_denial_ledger_allows_initial_empty_list_only(self) -> None:
+        # Inspect only the test-only hosted diagnostic harness embedded in this module.
+        denial_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Add-XbCi7BaselineDenyRecord")
+        parameter_block = denial_helper[denial_helper.index("param("):denial_helper.index("if ($Denials.Count")]
+        compact_parameters = " ".join(parameter_block.split())
+        self.assertIn(
+            "[AllowEmptyCollection()] [Parameter(Mandatory)] [System.Collections.Generic.List[object]]$Denials,",
+            compact_parameters,
+        )
+        self.assertNotIn("[AllowNull()]", compact_parameters)
+        self.assertIn('if ($Denials.Count -ge 512) { throw "baseline_diagnostic_trace_limit" }', denial_helper)
+        self.assertIn("[void]$Denials.Add($Observation)", denial_helper)
+
+        diagnostic = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7BaselineRightsDiagnostic")
+        lines = diagnostic.splitlines()
+        call_lines = [
+            index
+            for index, line in enumerate(lines)
+            if line.strip().startswith("Add-XbCi7BaselineDenyRecord -Denials $denials -Observation $")
+        ]
+        self.assertEqual(len(call_lines), 4)
+        for index in call_lines:
+            with self.subTest(denial_call_line=index):
+                self.assertEqual(lines[index - 1].strip(), '$captureStage = "deny_record_binding"')
+        safe_stages = next(line for line in lines if "$safeStages = @(" in line)
+        self.assertIn('"deny_record_binding"', safe_stages)
 
     def test_hosted_ci7_path_chain_consumer_is_direct_and_shape_checked(self) -> None:
         diagnostic = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7BaselineRightsDiagnostic")
