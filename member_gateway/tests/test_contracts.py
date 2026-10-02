@@ -2,8 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from xb_member_gateway.allocation import AllocationError, MemberNoAllocator
-from xb_member_gateway.config import ConfigError, GatewayConfig
+from xb_member_gateway.config import EXECUTION_DEADLINE_SECONDS, LEASE_SECONDS, GatewayConfig
 from xb_member_gateway.models import JobState
 from xb_member_gateway.state_machine import ALLOWED_TRANSITIONS
 
@@ -27,6 +26,11 @@ class ContractSurfaceTests(unittest.TestCase):
             "schemas/member_gateway_source_cursor.v1.schema.json",
             "schemas/member_gateway_operator_status.v1.schema.json",
             "schemas/member_gateway_operator_reconciliation.v1.schema.json",
+            "schemas/member_gateway_worker_claim.v2.schema.json",
+            "schemas/member_gateway_result.v2.schema.json",
+            "schemas/member_gateway_job.v3.schema.json",
+            "schemas/member_gateway_resolution.v1.schema.json",
+            "schemas/member_gateway_operator_status.v2.schema.json",
             "config/member_gateway.production.example.json",
         ):
             value = self.read_json(relative)
@@ -55,6 +59,11 @@ class ContractSurfaceTests(unittest.TestCase):
             "schemas/member_gateway_source_cursor.v1.schema.json",
             "schemas/member_gateway_operator_status.v1.schema.json",
             "schemas/member_gateway_operator_reconciliation.v1.schema.json",
+            "schemas/member_gateway_worker_claim.v2.schema.json",
+            "schemas/member_gateway_result.v2.schema.json",
+            "schemas/member_gateway_job.v3.schema.json",
+            "schemas/member_gateway_resolution.v1.schema.json",
+            "schemas/member_gateway_operator_status.v2.schema.json",
         ):
             assert_closed(self.read_json(relative))
 
@@ -75,37 +84,30 @@ class ContractSurfaceTests(unittest.TestCase):
         config = self.read_json("config/member_gateway.production.example.json")
         self.assertFalse(config["production_activation_enabled"])
         self.assertTrue(config["kill_switch_enabled"])
-        self.assertEqual(config["member_no_max_length"], 20)
-        self.assertEqual(config["schema_version"], "xb.member.gateway.config.v2")
+        self.assertEqual(config["schema_version"], "xb.member.gateway.config.v3")
+        self.assertEqual(config["member_book_mode"], "production")
         self.assertEqual(config["initial_source_window_max"], 1)
         self.assertFalse(config["autocount_adapter_ready"])
         self.assertIsNone(config["source_cutover_watermark"])
         self.assertIsNone(config["source_production_cutover_exact"])
         self.assertEqual(config["source_admission_mode"], "first_member")
-        self.assertIsNone(config["worker_token_sha256"])
-        self.assertIsNone(config["recovery_token_sha256"])
-        self.assertIsNone(config["mailer_token_sha256"])
+        for removed in ("recovery_token_sha256", "recovery_token_env", "heartbeat_seconds", "member_no_max_length"):
+            self.assertNotIn(removed, config)
+        for name in ("source", "operator", "control", "worker", "mailer"):
+            self.assertIsNone(config[f"{name}_token_sha256"])
         self.assertEqual(config["mailer_token_env"], "XB_MEMBER_GATEWAY_MAILER_TOKEN")
         loaded = GatewayConfig.from_mapping(config, require_complete=True)
         self.assertFalse(loaded.gateway_ready)
         self.assertEqual(loaded.initial_window_max, 1)
         self.assertIn("source_cutover_watermark_required", loaded.readiness_reasons())
         self.assertIn("source_production_cutover_exact_required", loaded.readiness_reasons())
-        self.assertIn("recovery_credential_digest_required", loaded.readiness_reasons())
+        self.assertIn("worker_credential_digest_required", loaded.readiness_reasons())
         self.assertIn("mailer_credential_digest_required", loaded.readiness_reasons())
 
-    def test_writer_timing_order_is_strictly_nested(self):
-        base = {
-            "member_no_max_length": 20,
-            "worker_token_sha256": "0" * 64,
-            "recovery_token_sha256": "1" * 64,
-            "production_activation_enabled": True,
-            "kill_switch_enabled": False,
-        }
-        with self.assertRaisesRegex(ConfigError, "heartbeat_must_be_shorter_than_execution_deadline"):
-            GatewayConfig.from_mapping({**base, "heartbeat_seconds": 300, "execution_deadline_seconds": 300})
-        with self.assertRaisesRegex(ConfigError, "execution_deadline_exceeds_lease"):
-            GatewayConfig.from_mapping({**base, "lease_seconds": 300, "execution_deadline_seconds": 300})
+    def test_lease_is_at_least_twice_the_child_deadline(self):
+        # No heartbeat: the 600 s lease covers the 300 s child deadline twice.
+        self.assertEqual((LEASE_SECONDS, EXECUTION_DEADLINE_SECONDS), (600, 300))
+        self.assertGreaterEqual(LEASE_SECONDS, 2 * EXECUTION_DEADLINE_SECONDS)
 
     def test_migration_has_durable_model_and_restrictive_history(self):
         first = (ROOT / "member_gateway/migrations/0001_member_gateway.sql").read_text(
@@ -235,6 +237,8 @@ class ContractSurfaceTests(unittest.TestCase):
             "CREATED_READBACK_MISMATCH",
             "MANUAL_REVIEW",
             "DEAD_LETTER",
+            "LINKED_EXISTING",
+            "RESOLVED",
         }
         self.assertTrue(required.issubset({state.value for state in JobState}))
         self.assertNotIn(JobState.QUEUED, ALLOWED_TRANSITIONS[JobState.WRITING])
@@ -242,22 +246,6 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertNotIn(JobState.WRITING, ALLOWED_TRANSITIONS[JobState.WRITER_TERMINATION_UNCONFIRMED])
         self.assertNotIn(JobState.CREATED_VERIFIED, ALLOWED_TRANSITIONS[JobState.WRITER_TERMINATION_UNCONFIRMED])
         self.assertNotIn(JobState.CONFIRMED_NOT_CREATED, ALLOWED_TRANSITIONS[JobState.WRITER_TERMINATION_UNCONFIRMED])
-
-    def test_allocator_rejects_truncation_and_uses_only_deterministic_suffixes(self):
-        allocator = MemberNoAllocator(12)
-        values = list(allocator.candidates("6581234567"))
-        self.assertEqual(values[0], "6581234567")
-        self.assertEqual(values[1], "6581234567X1")
-        self.assertEqual(values[-1], "6581234567X9")
-        self.assertNotIn("6581234567X10", values)
-        self.assertFalse(allocator.validate_candidate("6581234567", "658123456"))
-        self.assertFalse(allocator.validate_candidate("6581234567", "6581234567-1"))
-        self.assertFalse(allocator.validate_candidate("6581234567", "6581234567X01"))
-
-        production_allocator = MemberNoAllocator(20)
-        self.assertFalse(
-            production_allocator.validate_candidate("1" * 20, "1" * 21)
-        )
 
     def test_schemas_bind_the_opaque_digit_phone_and_total_member_no_length(self):
         phone_pattern = "^[0-9]{6,15}$"
@@ -287,28 +275,6 @@ class ContractSurfaceTests(unittest.TestCase):
                 # is what the allocator and AutoCount actually constrain.
                 self.assertEqual(member_no["maxLength"], 20)
 
-    def test_fifteen_digit_base_keeps_the_full_production_allocation_horizon(self):
-        allocator = MemberNoAllocator(20)
-        base = "1" * 15
-        candidates = allocator.candidates(base)
-        self.assertEqual(next(candidates), base)
-        self.assertEqual(next(candidates), base + "X1")
-        self.assertTrue(allocator.validate_candidate(base, base + "X9999"))
-        self.assertEqual(len(base + "X9999"), 20)
-        # X10000 would be 21 characters, so the length-derived generator stops
-        # exactly at the worker's existing 10,000-probe horizon.
-        self.assertFalse(allocator.validate_candidate(base, base + "X10000"))
-
-    def test_allocator_accepts_the_opaque_range_and_rejects_outside_it(self):
-        allocator = MemberNoAllocator(20)
-        for base in ("1" * 6, "91234567", "6591234567", "1" * 15):
-            with self.subTest(base=base):
-                self.assertEqual(next(allocator.candidates(base)), base)
-        for base in ("1" * 5, "1" * 16, "65912345a7", "+6591234567"):
-            with self.subTest(base=base):
-                with self.assertRaises(AllocationError):
-                    next(allocator.candidates(base))
-
     def test_governed_mapping_surfaces_do_not_bind_unused_udfs(self):
         governed = (
             ROOT / "member_gateway/src/xb_member_gateway/canonical.py",
@@ -320,6 +286,33 @@ class ContractSurfaceTests(unittest.TestCase):
         text = "\n".join(path.read_text(encoding="utf-8") for path in governed)
         self.assertNotIn("UDF_CustId", text)
         self.assertNotIn("UDF_MemberId", text)
+
+
+class DeployPlaceholderTests(unittest.TestCase):
+    """member_gateway/deploy is placeholder-only and never auto-restarts."""
+
+    DEPLOY = ROOT / "member_gateway/deploy"
+
+    def test_compose_has_no_auto_restart_no_host_ports_and_only_placeholders(self):
+        text = (self.DEPLOY / "compose.example.yaml").read_text(encoding="utf-8")
+        text.encode("ascii")
+        code = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+        self.assertEqual(sum(1 for line in code if line.strip().startswith("restart:")), 3)
+        self.assertTrue(all(line.strip() == 'restart: "no"' for line in code if line.strip().startswith("restart:")))
+        self.assertFalse(any(line.strip().startswith("ports:") for line in code))
+        for line in code:
+            if line.strip().startswith("image:"):
+                self.assertIn("REPLACE_WITH_", line)
+        self.assertIn("internal: true", text)
+
+    def test_env_example_names_match_the_config_and_hold_no_values(self):
+        config = json.loads((ROOT / "config/member_gateway.production.example.json").read_text(encoding="utf-8"))
+        expected = {value for key, value in config.items() if key.endswith("_env")}
+        lines = [line for line in (self.DEPLOY / "gateway.env.example").read_text(encoding="utf-8").splitlines() if line and not line.startswith("#")]
+        pairs = dict(line.split("=", 1) for line in lines)
+        self.assertEqual(set(pairs), expected)
+        self.assertTrue(all(value.startswith("REPLACE_WITH_PRIVATE_") for value in pairs.values()))
+        (self.DEPLOY / "BACKUP_RESTORE.md").read_text(encoding="utf-8").encode("ascii")
 
 
 if __name__ == "__main__":

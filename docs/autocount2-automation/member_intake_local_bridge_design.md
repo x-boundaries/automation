@@ -1,5 +1,15 @@
 # Member Intake Local Bridge Design
 
+> **SUPERSEDED / HISTORICAL - not current architecture.**
+> This local bridge design (Google Sheets queue, n8n, protected queue/API and a
+> local lookup/write bridge) was an earlier design and is kept only as history.
+> The current member architecture is Google Form -> n8n -> member gateway +
+> Postgres on SERVER_PC <- AC2 worker pull -> narrow local AutoCount primitive
+> (at most one SaveMember, readback) -> replay-safe welcome outbox. See the
+> canonical [member intake automation blueprint](member_intake_automation_blueprint.md)
+> and [architecture.md](architecture.md). Nothing below is a current
+> requirement.
+
 Status: design only. This PR does not implement a production bridge or write to AutoCount.
 
 ## Purpose

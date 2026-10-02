@@ -1,4 +1,11 @@
-"""Explicit fail-closed job state transitions."""
+"""Explicit fail-closed v2 job state transitions (W-G2-149 section 3).
+
+Only the edges below can be entered. Legacy v1 states (PRECHECKING,
+ALLOCATION_BOUND, WRITE_INTENT_RECORDED, WRITING, READBACK, AMBIGUOUS_LOOKUP,
+WRITE_OUTCOME_UNCERTAIN, WRITER_TERMINATION_UNCONFIRMED,
+CONFIRMED_NOT_CREATED, CREATED_READBACK_MISMATCH, DEAD_LETTER) remain valid
+stored values that can be read, but no edge enters or leaves them.
+"""
 
 from __future__ import annotations
 
@@ -11,30 +18,40 @@ class InvalidTransition(RuntimeError):
     pass
 
 
-ALLOWED_TRANSITIONS = {
+LIVE_STATES = frozenset({JobState.RECEIVED, JobState.VALIDATED, JobState.QUEUED, JobState.LEASED, JobState.RETRY_WAIT})
+V2_TERMINAL_STATES = frozenset({JobState.CREATED_VERIFIED, JobState.LINKED_EXISTING, JobState.REJECTED_VALIDATION, JobState.RESOLVED})
+HUMAN_QUEUE_STATES = frozenset({JobState.MANUAL_REVIEW})
+LEGACY_STATES = frozenset(
+    {
+        JobState.PRECHECKING, JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED, JobState.WRITING,
+        JobState.READBACK, JobState.AMBIGUOUS_LOOKUP, JobState.WRITE_OUTCOME_UNCERTAIN,
+        JobState.WRITER_TERMINATION_UNCONFIRMED, JobState.CONFIRMED_NOT_CREATED,
+        JobState.CREATED_READBACK_MISMATCH, JobState.DEAD_LETTER,
+    }
+)
+
+ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.RECEIVED: frozenset({JobState.VALIDATED, JobState.REJECTED_VALIDATION}),
     JobState.VALIDATED: frozenset({JobState.QUEUED, JobState.REJECTED_VALIDATION}),
-    JobState.QUEUED: frozenset({JobState.LEASED, JobState.RETRY_WAIT, JobState.DEAD_LETTER}),
-    JobState.LEASED: frozenset({JobState.PRECHECKING, JobState.RETRY_WAIT, JobState.DEAD_LETTER}),
-    JobState.PRECHECKING: frozenset({JobState.ALLOCATION_BOUND, JobState.REJECTED_VALIDATION, JobState.RETRY_WAIT, JobState.AMBIGUOUS_LOOKUP, JobState.MANUAL_REVIEW}),
-    JobState.ALLOCATION_BOUND: frozenset({JobState.WRITE_INTENT_RECORDED, JobState.AMBIGUOUS_LOOKUP, JobState.MANUAL_REVIEW, JobState.RETRY_WAIT}),
-    JobState.WRITE_INTENT_RECORDED: frozenset({JobState.WRITING, JobState.WRITE_OUTCOME_UNCERTAIN, JobState.MANUAL_REVIEW, JobState.RETRY_WAIT}),
-    JobState.WRITING: frozenset({JobState.READBACK, JobState.WRITER_TERMINATION_UNCONFIRMED, JobState.WRITE_OUTCOME_UNCERTAIN, JobState.CONFIRMED_NOT_CREATED, JobState.CREATED_READBACK_MISMATCH}),
-    JobState.READBACK: frozenset({JobState.CREATED_VERIFIED, JobState.CREATED_READBACK_MISMATCH, JobState.WRITER_TERMINATION_UNCONFIRMED, JobState.WRITE_OUTCOME_UNCERTAIN, JobState.CONFIRMED_NOT_CREATED}),
-    JobState.RETRY_WAIT: frozenset({JobState.QUEUED, JobState.LEASED, JobState.DEAD_LETTER, JobState.MANUAL_REVIEW}),
-    JobState.AMBIGUOUS_LOOKUP: frozenset({JobState.MANUAL_REVIEW}),
-    JobState.WRITE_OUTCOME_UNCERTAIN: frozenset({JobState.CREATED_VERIFIED, JobState.CONFIRMED_NOT_CREATED, JobState.CREATED_READBACK_MISMATCH, JobState.MANUAL_REVIEW}),
-    JobState.WRITER_TERMINATION_UNCONFIRMED: frozenset({JobState.WRITE_OUTCOME_UNCERTAIN, JobState.MANUAL_REVIEW}),
-    JobState.CONFIRMED_NOT_CREATED: frozenset({JobState.MANUAL_REVIEW}),
-    JobState.CREATED_READBACK_MISMATCH: frozenset({JobState.MANUAL_REVIEW}),
-    JobState.MANUAL_REVIEW: frozenset({JobState.DEAD_LETTER}),
-    JobState.REJECTED_VALIDATION: frozenset({JobState.DEAD_LETTER}),
-    JobState.DEAD_LETTER: frozenset(),
+    JobState.QUEUED: frozenset({JobState.LEASED}),
+    JobState.RETRY_WAIT: frozenset({JobState.LEASED}),
+    JobState.LEASED: frozenset(
+        {
+            JobState.CREATED_VERIFIED, JobState.LINKED_EXISTING, JobState.REJECTED_VALIDATION,
+            JobState.MANUAL_REVIEW, JobState.RETRY_WAIT,
+        }
+    ),
+    JobState.MANUAL_REVIEW: frozenset({JobState.RESOLVED, JobState.QUEUED}),
     JobState.CREATED_VERIFIED: frozenset(),
+    JobState.LINKED_EXISTING: frozenset(),
+    JobState.REJECTED_VALIDATION: frozenset(),
+    JobState.RESOLVED: frozenset(),
+    **{state: frozenset() for state in LEGACY_STATES},
 }
 
-TERMINAL_STATES = frozenset({JobState.CREATED_VERIFIED, JobState.REJECTED_VALIDATION, JobState.CONFIRMED_NOT_CREATED, JobState.CREATED_READBACK_MISMATCH, JobState.MANUAL_REVIEW, JobState.DEAD_LETTER})
-POST_DISPATCH_STATES = frozenset({JobState.WRITING, JobState.READBACK, JobState.CREATED_VERIFIED, JobState.WRITE_OUTCOME_UNCERTAIN, JobState.WRITER_TERMINATION_UNCONFIRMED, JobState.CONFIRMED_NOT_CREATED, JobState.CREATED_READBACK_MISMATCH, JobState.MANUAL_REVIEW, JobState.DEAD_LETTER})
+# A job in one of these states can never be claimed again and holds no lease.
+TERMINAL_STATES = V2_TERMINAL_STATES | HUMAN_QUEUE_STATES | LEGACY_STATES
+CLAIMABLE_STATES = frozenset({JobState.QUEUED, JobState.RETRY_WAIT})
 
 
 def as_state(value: JobState | str) -> JobState:
@@ -44,21 +61,15 @@ def as_state(value: JobState | str) -> JobState:
         raise InvalidTransition("unknown_state") from exc
 
 
-def validate_transition(current: JobState | str, target: JobState | str, *, dispatch_fenced: bool = False) -> None:
+def validate_transition(current: JobState | str, target: JobState | str) -> None:
     current_state, target_state = as_state(current), as_state(target)
-    if dispatch_fenced and target_state not in POST_DISPATCH_STATES:
-        raise InvalidTransition("post_dispatch_state_cannot_requeue")
     if target_state not in ALLOWED_TRANSITIONS.get(current_state, frozenset()):
         raise InvalidTransition(f"transition_not_allowed:{current_state.value}:{target_state.value}")
 
 
-def next_state(current: JobState | str, target: JobState | str, *, dispatch_fenced: bool = False) -> JobState:
-    validate_transition(current, target, dispatch_fenced=dispatch_fenced)
+def next_state(current: JobState | str, target: JobState | str) -> JobState:
+    validate_transition(current, target)
     return as_state(target)
-
-
-def can_auto_retry(state: JobState | str, *, dispatch_fenced: bool) -> bool:
-    return not dispatch_fenced and as_state(state) in {JobState.QUEUED, JobState.LEASED, JobState.PRECHECKING, JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED, JobState.RETRY_WAIT}
 
 
 def transition_values(state: JobState | str) -> Iterable[str]:

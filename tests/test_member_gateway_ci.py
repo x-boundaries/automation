@@ -88,6 +88,22 @@ class MemberGatewayCiTests(unittest.TestCase):
         ):
             self.assertEqual(self.text.count(required_path), 2, required_path)
 
+    def test_member_write_v2_files_are_narrowly_triggered_and_run(self):
+        for required_path in (
+            '"schemas/member_gateway_worker_claim.v2.schema.json"',
+            '"schemas/member_gateway_result.v2.schema.json"',
+            '"schemas/member_gateway_job.v3.schema.json"',
+            '"schemas/member_gateway_resolution.v1.schema.json"',
+            '"scripts/ac2_member_create_primitive.ps1"',
+            '"scripts/ac2_member_test_cleanup.ps1"',
+            '"config/ac2_member_gateway_worker.test_book.example.json"',
+            '"tests/fixtures/ac2_member_primitive/**"',
+            '"tests/test_member_write_v2_cross_contract.py"',
+        ):
+            self.assertEqual(self.text.count(required_path), 2, required_path)
+        for module in ("tests.test_ac2_member_primitive", "tests.test_ac2_member_primitive_cleanup", "tests.test_member_write_v2_cross_contract"):
+            self.assertEqual(len(re.findall(re.escape(module) + r"(?![_A-Za-z0-9])", self.text)), 1, module)
+
     def test_worker_production_example_is_narrowly_triggered(self):
         required_path = '"config/ac2_member_gateway_worker.production.example.json"'
         self.assertEqual(self.text.count(required_path), 2, required_path)

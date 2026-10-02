@@ -1,4 +1,10 @@
-"""Closed, fail-closed configuration for the member gateway."""
+"""Closed, fail-closed v3 configuration for the member gateway.
+
+v3 (W-G2-149 section 2.8) binds exactly five principals: source, operator,
+control, worker and mailer. The removed recovery principal, the heartbeat
+timing and the allocator length are not configurable: any of those keys is a
+configuration error, never an ignored field.
+"""
 
 from __future__ import annotations
 
@@ -8,10 +14,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .identity import BOOK_MODES
+
 
 class ConfigError(ValueError):
     """Configuration cannot safely support the production gateway."""
 
+
+CONFIG_SCHEMA_VERSION = "xb.member.gateway.config.v3"
+PRINCIPAL_NAMES = ("source", "operator", "control", "worker", "mailer")
+LEASE_SECONDS = 600
+EXECUTION_DEADLINE_SECONDS = 300
+WRITE_ATTEMPT_BUDGET = 3
+# Keys of the removed v2 surface. Present in a v3 document they fail closed
+# with a specific code so a stale deployment file cannot silently load.
+REMOVED_CONFIG_KEYS = frozenset(
+    {"recovery_token_sha256", "recovery_token_env", "heartbeat_seconds", "member_no_max_length"}
+)
 
 _HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -49,12 +68,15 @@ def _digest(value: Any, field: str) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class GatewayConfig:
-    schema_version: str = "xb.member.gateway.config.v2"
+    schema_version: str = CONFIG_SCHEMA_VERSION
     environment: str = "production"
     expected_environment: str = "production"
     production_activation_enabled: bool = False
     kill_switch_enabled: bool = True
     autocount_adapter_ready: bool = True
+    # Required, closed: "production" or "test". There is deliberately no
+    # value that means either; None fails validation and readiness.
+    member_book_mode: str | None = None
     allowed_form_aliases: tuple[str, ...] = ("member_registration",)
     allowed_mapping_versions: tuple[str, ...] = ("member-intake.v1",)
     source_form_id: str | None = "synthetic-form"
@@ -67,22 +89,18 @@ class GatewayConfig:
     # deprecated audit-only derivative.
     source_production_cutover_exact: str | None = "1970-01-01T00:00:00Z"
     # Synthetic partial-mapping default only. Production load_config requires
-    # every field, and the committed example and first-member deployment bind
-    # "first_member" explicitly.
+    # every field, and the committed example binds "first_member" explicitly.
     source_admission_mode: str = "continuous"
     initial_source_window_max: int = 1
-    member_no_max_length: int | None = 20
-    lease_seconds: int = 600
-    heartbeat_seconds: int = 120
-    execution_deadline_seconds: int = 300
-    max_attempts: int = 3
+    lease_seconds: int = LEASE_SECONDS
+    execution_deadline_seconds: int = EXECUTION_DEADLINE_SECONDS
+    max_attempts: int = WRITE_ATTEMPT_BUDGET
     worker_concurrency: int = 1
     claim_size: int = 1
     source_token_sha256: str | None = None
     operator_token_sha256: str | None = None
     control_token_sha256: str | None = None
     worker_token_sha256: str | None = None
-    recovery_token_sha256: str | None = None
     mailer_token_sha256: str | None = None
     postgres_dsn_env: str = "XB_MEMBER_GATEWAY_DATABASE_URL"
     bind_address_env: str = "XB_MEMBER_GATEWAY_BIND_ADDRESS"
@@ -92,13 +110,16 @@ class GatewayConfig:
     operator_token_env: str = "XB_MEMBER_GATEWAY_OPERATOR_TOKEN"
     control_token_env: str = "XB_MEMBER_GATEWAY_CONTROL_TOKEN"
     worker_token_env: str = "XB_MEMBER_GATEWAY_WORKER_TOKEN"
-    recovery_token_env: str = "XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
     mailer_token_env: str = "XB_MEMBER_GATEWAY_MAILER_TOKEN"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, require_complete: bool = False) -> "GatewayConfig":
         if not isinstance(value, Mapping):
             raise ConfigError("config_must_be_object")
+        if set(value) & REMOVED_CONFIG_KEYS:
+            if {"recovery_token_sha256", "recovery_token_env"} & set(value):
+                raise ConfigError("recovery_principal_removed")
+            raise ConfigError("removed_config_field_present")
         defaults = cls()
         if set(value) - set(cls.__dataclass_fields__):
             raise ConfigError("unknown_config_fields")
@@ -122,9 +143,6 @@ class GatewayConfig:
         source_form_id = value.get("source_form_id", defaults.source_form_id)
         if source_form_id is not None and (not isinstance(source_form_id, str) or not _ID_RE.fullmatch(source_form_id)):
             raise ConfigError("source_form_id_invalid")
-        max_length = value.get("member_no_max_length", defaults.member_no_max_length)
-        if max_length is not None and (isinstance(max_length, bool) or not isinstance(max_length, int)):
-            raise ConfigError("member_no_max_length_invalid")
         result = cls(
             schema_version=value.get("schema_version", defaults.schema_version),
             environment=value.get("environment", defaults.environment),
@@ -132,15 +150,14 @@ class GatewayConfig:
             production_activation_enabled=_bool(value.get("production_activation_enabled", defaults.production_activation_enabled), "production_activation_enabled"),
             kill_switch_enabled=_bool(value.get("kill_switch_enabled", defaults.kill_switch_enabled), "kill_switch_enabled"),
             autocount_adapter_ready=_bool(value.get("autocount_adapter_ready", defaults.autocount_adapter_ready), "autocount_adapter_ready"),
+            member_book_mode=value.get("member_book_mode", defaults.member_book_mode),
             allowed_form_aliases=tuple(aliases), allowed_mapping_versions=tuple(mappings),
             source_form_id=source_form_id, source_question_ids=tuple(pairs),
             source_cutover_watermark=value.get("source_cutover_watermark", defaults.source_cutover_watermark),
             source_production_cutover_exact=value.get("source_production_cutover_exact", defaults.source_production_cutover_exact),
             source_admission_mode=value.get("source_admission_mode", defaults.source_admission_mode),
             initial_source_window_max=_positive(value.get("initial_source_window_max", defaults.initial_source_window_max), "initial_source_window_max"),
-            member_no_max_length=max_length,
             lease_seconds=_positive(value.get("lease_seconds", defaults.lease_seconds), "lease_seconds"),
-            heartbeat_seconds=_positive(value.get("heartbeat_seconds", defaults.heartbeat_seconds), "heartbeat_seconds"),
             execution_deadline_seconds=_positive(value.get("execution_deadline_seconds", defaults.execution_deadline_seconds), "execution_deadline_seconds"),
             max_attempts=_positive(value.get("max_attempts", defaults.max_attempts), "max_attempts"),
             worker_concurrency=_positive(value.get("worker_concurrency", defaults.worker_concurrency), "worker_concurrency"),
@@ -149,7 +166,6 @@ class GatewayConfig:
             operator_token_sha256=_digest(value.get("operator_token_sha256", defaults.operator_token_sha256), "operator_token_sha256"),
             control_token_sha256=_digest(value.get("control_token_sha256", defaults.control_token_sha256), "control_token_sha256"),
             worker_token_sha256=_digest(value.get("worker_token_sha256", defaults.worker_token_sha256), "worker_token_sha256"),
-            recovery_token_sha256=_digest(value.get("recovery_token_sha256", defaults.recovery_token_sha256), "recovery_token_sha256"),
             mailer_token_sha256=_digest(value.get("mailer_token_sha256", defaults.mailer_token_sha256), "mailer_token_sha256"),
             postgres_dsn_env=_env(value.get("postgres_dsn_env", defaults.postgres_dsn_env), "postgres_dsn_env"),
             bind_address_env=_env(value.get("bind_address_env", defaults.bind_address_env), "bind_address_env"),
@@ -159,7 +175,6 @@ class GatewayConfig:
             operator_token_env=_env(value.get("operator_token_env", defaults.operator_token_env), "operator_token_env"),
             control_token_env=_env(value.get("control_token_env", defaults.control_token_env), "control_token_env"),
             worker_token_env=_env(value.get("worker_token_env", defaults.worker_token_env), "worker_token_env"),
-            recovery_token_env=_env(value.get("recovery_token_env", defaults.recovery_token_env), "recovery_token_env"),
             mailer_token_env=_env(value.get("mailer_token_env", defaults.mailer_token_env), "mailer_token_env"),
         )
         result.validate()
@@ -167,11 +182,11 @@ class GatewayConfig:
 
     @property
     def credential_digests(self) -> tuple[str | None, ...]:
-        return (self.source_token_sha256, self.operator_token_sha256, self.control_token_sha256, self.worker_token_sha256, self.recovery_token_sha256, self.mailer_token_sha256)
+        return (self.source_token_sha256, self.operator_token_sha256, self.control_token_sha256, self.worker_token_sha256, self.mailer_token_sha256)
 
     @property
     def credential_env_names(self) -> tuple[str, ...]:
-        return (self.source_token_env, self.operator_token_env, self.control_token_env, self.worker_token_env, self.recovery_token_env, self.mailer_token_env)
+        return (self.source_token_env, self.operator_token_env, self.control_token_env, self.worker_token_env, self.mailer_token_env)
 
     @property
     def admission_mode(self) -> "SourceAdmissionMode":
@@ -188,23 +203,23 @@ class GatewayConfig:
         return dict(self.source_question_ids)
 
     def validate(self) -> None:
-        if self.schema_version != "xb.member.gateway.config.v2":
+        if self.schema_version != CONFIG_SCHEMA_VERSION:
             raise ConfigError("config_schema_version_invalid")
         if not isinstance(self.environment, str) or not self.environment.strip() or not isinstance(self.expected_environment, str) or not self.expected_environment.strip():
             raise ConfigError("environment_invalid")
-        if self.lease_seconds <= self.heartbeat_seconds:
-            raise ConfigError("heartbeat_must_be_shorter_than_lease")
-        if self.heartbeat_seconds >= self.execution_deadline_seconds:
-            raise ConfigError("heartbeat_must_be_shorter_than_execution_deadline")
-        if self.execution_deadline_seconds >= self.lease_seconds:
-            raise ConfigError("execution_deadline_exceeds_lease")
+        if not isinstance(self.member_book_mode, str) or self.member_book_mode not in BOOK_MODES:
+            raise ConfigError("member_book_mode_invalid")
+        if self.lease_seconds != LEASE_SECONDS:
+            raise ConfigError("lease_seconds_must_be_600")
+        if self.execution_deadline_seconds != EXECUTION_DEADLINE_SECONDS:
+            raise ConfigError("execution_deadline_seconds_must_be_300")
+        if self.max_attempts != WRITE_ATTEMPT_BUDGET:
+            raise ConfigError("max_attempts_must_be_three")
         if self.worker_concurrency != 1 or self.claim_size != 1:
             raise ConfigError("worker_concurrency_must_be_one")
         if self.initial_source_window_max != 1:
             raise ConfigError("initial_source_window_max_must_be_one")
-        if self.member_no_max_length is not None and self.member_no_max_length != 20:
-            raise ConfigError("member_no_max_length_must_be_twenty")
-        if len({name.casefold() for name in self.credential_env_names}) != 6:
+        if len({name.casefold() for name in self.credential_env_names}) != len(PRINCIPAL_NAMES):
             raise ConfigError("credential_environment_bindings_must_differ")
         present = [digest.casefold() for digest in self.credential_digests if digest is not None]
         if len(set(present)) != len(present):
@@ -235,19 +250,8 @@ class GatewayConfig:
         return self.environment == self.expected_environment
 
     @property
-    def member_no_constraint_valid(self) -> bool:
-        return self.member_no_max_length == 20
-
-    @property
     def kill_switch_clear(self) -> bool:
         return not self.kill_switch_enabled
-
-    @property
-    def worker_gateway_ready(self) -> bool:
-        return (
-            self.environment_matches and self.member_no_constraint_valid
-            and self.worker_token_sha256 is not None and self.recovery_token_sha256 is not None
-        )
 
     def readiness_reasons(self) -> tuple[str, ...]:
         reasons: list[str] = []
@@ -257,8 +261,6 @@ class GatewayConfig:
             reasons.append(str(exc))
         if not self.environment_matches:
             reasons.append("environment_mismatch")
-        if not self.member_no_constraint_valid:
-            reasons.append("member_no_max_length_required")
         if not self.autocount_adapter_ready:
             reasons.append("autocount_adapter_not_ready")
         if self.source_form_id is None:
@@ -269,7 +271,7 @@ class GatewayConfig:
             reasons.append("source_cutover_watermark_required")
         if self.source_production_cutover_exact is None:
             reasons.append("source_production_cutover_exact_required")
-        for name, digest in zip(("source", "operator", "control", "worker", "recovery", "mailer"), self.credential_digests):
+        for name, digest in zip(PRINCIPAL_NAMES, self.credential_digests):
             if digest is None:
                 reasons.append(f"{name}_credential_digest_required")
         return tuple(dict.fromkeys(reasons))

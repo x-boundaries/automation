@@ -1,0 +1,13 @@
+{
+  "gateway_base_url": "https://gateway.example.test",
+  "autocount_assembly_path": "C:\\Program Files\\AutoCount\\Bin",
+  "autocount_server_name": null,
+  "autocount_database_name": null,
+  "autocount_user_id": null,
+  "autocount_integration_user_id": null,
+  "autocount_book_mode": "test",
+  "autocount_production_book": null,
+  "autocount_test_book_allowlist": [
+    "REPLACE_WITH_TEST_BOOK_DATABASE_NAME"
+  ]
+}

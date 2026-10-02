@@ -49,7 +49,7 @@ class SourceCursorTests(unittest.TestCase):
         self.repository = repository or InMemoryRepository(source_cutover_watermark=CUTOVER, source_form_id=FORM)
         self.config = GatewayConfig(
             source_cutover_watermark=CUTOVER, source_production_cutover_exact=CUTOVER,
-            source_admission_mode=mode, source_form_id=FORM,
+            source_admission_mode=mode, source_form_id=FORM, member_book_mode="production",
         )
         self.service = GatewayService(self.config, self.repository, adapter_ready=True)
         self.app = GatewayApp(self.service, StaticAuthenticator({"source": principal("configured-source", SOURCE_SCOPES)}))
@@ -326,7 +326,7 @@ class SourceCursorTests(unittest.TestCase):
             self.service.ingest(event("forms-mode-b", "2026-09-15T00:00:02Z"))
 
     def test_epoch_binding_mismatch_and_uninitialized_cutover_fail_closed(self):
-        self.config = GatewayConfig(source_cutover_watermark=CUTOVER, source_production_cutover_exact=CUTOVER, source_admission_mode="first_member", source_form_id="another-form")
+        self.config = GatewayConfig(source_cutover_watermark=CUTOVER, source_production_cutover_exact=CUTOVER, source_admission_mode="first_member", source_form_id="another-form", member_book_mode="production")
         service = GatewayService(self.config, self.repository, adapter_ready=True)
         with self.assertRaisesRegex(SourceConflict, "source_form_binding_mismatch"):
             service.begin_source_epoch(dict(BINDING))

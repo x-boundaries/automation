@@ -1,6 +1,8 @@
-# Official local AutoCount boundary for the production member worker.
-# This file is intentionally inert unless the worker supplies the explicit
+# Official local AutoCount boundary for the member-write v2 primitive.
+# This file is intentionally inert unless the caller supplies the explicit
 # production adapter switch and a separately configured runtime session.
+# It contains the only member write call site of the installable package
+# (Invoke-XbAutoCountSaveMember); it has no row removal, row edit or bulk surface.
 
 Set-StrictMode -Version Latest
 $script:XbAutoCountAssignedFields = @(
@@ -8,6 +10,65 @@ $script:XbAutoCountAssignedFields = @(
     "DOB", "RegisterDate", "ExpiryDate", "OpeningPoints", "IsActive", "Individual"
 )
 $script:XbAutoCountAdapterManagedFields = @("IsActive", "Individual")
+# Columns the fixed parameterless probe read (MemberCommand.LoadBrowseTable)
+# must expose (contract section 2.4); confirmed live by T-2/T-3.
+$script:XbAutoCountProbeColumns = @(
+    "MemberNo", "MobilePhone", "Name", "EmailAddress", "IsActive", "Guid", "CreatedUserID", "CreatedTime"
+)
+# The single named kernel mutex serialising probe -> save -> readback on AC2_VM.
+$script:XbAc2MemberCreateMutexName = "Global\XB-AC2-MemberCreate"
+# Installable release package (release identity input and installer membership).
+$script:XbAc2ReleasePackageFiles = @(
+    "ac2_member_create_primitive.ps1",
+    "ac2_member_gateway_autocount_adapter.ps1",
+    "ac2_member_gateway_worker.ps1",
+    "ac2_member_gateway_worker_lib.ps1",
+    "launch_ac2_member_gateway_worker.ps1",
+    "test_ac2_member_gateway_autocount_dependencies.ps1"
+)
+$script:XbSaveMemberInvocationCount = 0
+
+function Get-XbAc2FileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+}
+
+# Release identity (primitive.release_sha256): the lowercase SHA-256 hex of
+# the ASCII text made of one line "<file name>:<lowercase sha256 of the file
+# bytes>" plus LF per release package file, file names sorted ordinally. The
+# installer records the same value in installation-manifest.json and the CI7
+# verifier recomputes it from the installed bytes.
+function Get-XbAc2ReleaseIdentityFromEntries {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Entries)
+    $names = [string[]]@($Entries.Keys)
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($name in $names) {
+        $digest = [string]$Entries[$name]
+        if ($name -cnotmatch '^[A-Za-z0-9_.-]{1,120}$' -or $digest -cnotmatch '^[0-9a-f]{64}$') { throw "release_identity_entry_invalid" }
+        [void]$builder.Append($name).Append(":").Append($digest).Append("`n")
+    }
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::ASCII.GetBytes($builder.ToString())
+        return ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+    }
+    finally { $algorithm.Dispose() }
+}
+
+function Get-XbAc2ReleaseIdentity {
+    param([Parameter(Mandatory)][string]$PackageRoot)
+    $entries = [ordered]@{}
+    foreach ($name in $script:XbAc2ReleasePackageFiles) {
+        $path = Join-Path $PackageRoot $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "release_identity_file_missing" }
+        $entries[$name] = Get-XbAc2FileSha256 -Path $path
+    }
+    return (Get-XbAc2ReleaseIdentityFromEntries -Entries $entries)
+}
 
 function Get-XbAutoCountRuntimeValue {
     param(
@@ -118,6 +179,8 @@ function Convert-XbAutoCountSessionBinding {
         UserSession = $userSession
         DBSetting = $dbSetting
         MemberCommandFactory = if ($factory -is [scriptblock]) { $factory } else { $null }
+        DatabaseName = [string](Get-XbAutoCountBindingValue -Binding $Binding -Name "DatabaseName")
+        LoginUserId = [string](Get-XbAutoCountBindingValue -Binding $Binding -Name "LoginUserId")
     }
 }
 
@@ -194,11 +257,15 @@ function Initialize-XbAutoCountReviewedSession {
         }
         if (-not $loginOk) { throw "autocount_authentication_failed" }
 
+        # DatabaseName and LoginUserId are the exact values this successful
+        # authentication was bound to (book and integration-user binding).
         [pscustomobject]@{
             UserSession = $session
             DBSetting = $dbSetting
             MemberCommandFactory = $null
             AssemblyResolveHandler = $assemblyResolveHandler
+            DatabaseName = [string]$database
+            LoginUserId = [string]$user
         }
     }
     catch {
@@ -322,7 +389,9 @@ function Convert-XbAutoCountNormalizedValue {
     if ($Value -is [byte] -or $Value -is [int16] -or $Value -is [int32] -or
         $Value -is [int64] -or $Value -is [decimal] -or $Value -is [double] -or
         $Value -is [single]) {
-        return ([System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)).Trim()
+        # Compare numbers by value, not by text: a SQL-backed readback may carry
+        # the column scale ([decimal]0.00), which must equal the assigned 0.
+        return ([decimal]$Value).ToString("0.#############################", [System.Globalization.CultureInfo]::InvariantCulture)
     }
     return ([string]$Value).Trim()
 }
@@ -367,16 +436,36 @@ function Get-XbAutoCountMember {
     return $command.GetMember($MemberNo)
 }
 
-function New-XbAutoCountMember {
+# Fixed, parameterless, read-only probe (contract 2.4): every Member row,
+# active and inactive, projected to the eight probe columns only.
+function Get-XbAutoCountMemberProbeRows {
     param(
         [Parameter(Mandatory)]$Session,
-        [Parameter(Mandatory)][hashtable]$Member,
-        [Parameter(Mandatory)][switch]$EnableProductionAdapter,
         [scriptblock]$MemberCommandFactory
     )
-    Assert-XbAutoCountAdapterEnabled -EnableProductionAdapter:$EnableProductionAdapter
-    if ([string]::IsNullOrWhiteSpace([string]$Member.MemberNo)) { throw "member_no_required" }
+    $command = Get-XbAutoCountMemberCommand -Session $Session -MemberCommandFactory $MemberCommandFactory
+    $table = $command.LoadBrowseTable()
+    if ($null -eq $table -or $table -isnot [System.Data.DataTable]) { throw "probe_table_unavailable" }
+    foreach ($column in $script:XbAutoCountProbeColumns) {
+        if (-not $table.Columns.Contains($column)) { throw "probe_columns_missing" }
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $table.Rows) {
+        $projected = [ordered]@{}
+        foreach ($column in $script:XbAutoCountProbeColumns) {
+            $projected[$column] = Get-XbAutoCountMemberRowValue -Row $row -Field $column
+        }
+        $rows.Add([pscustomobject]$projected)
+    }
+    return ,$rows.ToArray()
+}
 
+# The effective record the adapter writes for a member (adapter mapping).
+# The caller supplies only non-managed fields; IsActive and Individual are
+# adapter-owned effective defaults, not caller inputs.
+function Get-XbAutoCountMemberAssignments {
+    param([Parameter(Mandatory)][hashtable]$Member)
+    if ([string]::IsNullOrWhiteSpace([string]$Member.MemberNo)) { throw "member_no_required" }
     foreach ($field in $Member.Keys) {
         if ($script:XbAutoCountAdapterManagedFields -contains $field) {
             throw "adapter_managed_defaults_are_not_caller_inputs"
@@ -388,15 +477,7 @@ function New-XbAutoCountMember {
             throw "member_field_not_allowed"
         }
     }
-
-    $command = Get-XbAutoCountMemberCommand -Session $Session -MemberCommandFactory $MemberCommandFactory
-    $entity = $command.NewMember($false)
-    if ($null -eq $entity) { throw "autocount_new_member_failed" }
-    $row = Get-XbAutoCountMemberRow -Entity $entity
-    if ($null -eq $row) { throw "autocount_member_row_unavailable" }
-
-    # These values are adapter-owned effective defaults, not source/customer inputs.
-    $assignments = [ordered]@{
+    return [ordered]@{
         MemberNo      = [string]$Member.MemberNo
         MemberType    = "Default"
         Name          = [string]$Member.Name
@@ -415,34 +496,85 @@ function New-XbAutoCountMember {
         IsActive      = "T"
         Individual    = "T"
     }
+}
+
+function Get-XbAutoCountExpectedMemberRecord {
+    param([Parameter(Mandatory)][hashtable]$Member)
+    $assignments = Get-XbAutoCountMemberAssignments -Member $Member
+    $expected = [ordered]@{}
+    foreach ($field in $script:XbAutoCountAssignedFields) {
+        $expected[$field] = Convert-XbAutoCountNormalizedValue -Value $assignments[$field] -Field $field
+    }
+    return $expected
+}
+
+# NewMember(false) plus the adapter field fill. Nothing is written here.
+function New-XbAutoCountMemberEntity {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][hashtable]$Member,
+        [Parameter(Mandatory)][switch]$EnableProductionAdapter,
+        [scriptblock]$MemberCommandFactory
+    )
+    Assert-XbAutoCountAdapterEnabled -EnableProductionAdapter:$EnableProductionAdapter
+    $assignments = Get-XbAutoCountMemberAssignments -Member $Member
+    $command = Get-XbAutoCountMemberCommand -Session $Session -MemberCommandFactory $MemberCommandFactory
+    $entity = $command.NewMember($false)
+    if ($null -eq $entity) { throw "autocount_new_member_failed" }
+    $row = Get-XbAutoCountMemberRow -Entity $entity
+    if ($null -eq $row) { throw "autocount_member_row_unavailable" }
     foreach ($field in $assignments.Keys) {
         Set-XbAutoCountMemberRowValue -Row $row -Field $field -Value $assignments[$field]
     }
-
-    $effectiveExpected = [ordered]@{}
-    foreach ($field in $script:XbAutoCountAssignedFields) {
-        $effectiveExpected[$field] = Convert-XbAutoCountNormalizedValue -Value $assignments[$field] -Field $field
-    }
-
-    $script:XbSaveMemberInvocationCount = 0
-    $script:XbSaveMemberInvocationCount++
-    if ($script:XbSaveMemberInvocationCount -ne 1) {
-        throw "save_member_invocation_count_invalid"
-    }
-    # This is the sole irreversible member write call in the repository.
-    $command.SaveMember($entity)
-
-    $readbackEntity = $command.GetMember([string]$Member.MemberNo)
-    $readbackFound = ($null -ne $readbackEntity)
     [pscustomobject]@{
-        SaveInvocationCount = $script:XbSaveMemberInvocationCount
-        Expected = $effectiveExpected
-        ReadBackFound = $readbackFound
-        ReadBack = if ($readbackFound) {
-            Convert-XbAutoCountMemberRecord -Entity $readbackEntity
-        } else {
-            $null
+        Command = $command
+        Entity = $entity
+        Expected = (Get-XbAutoCountExpectedMemberRecord -Member $Member)
+    }
+}
+
+# The sole irreversible member write call site of the installable package.
+# At most one invocation per process: a second call fails before the write.
+# Returns $true when the call returned normally and $false when it threw. The
+# exception text is never surfaced because it may carry personal data.
+function Invoke-XbAutoCountSaveMember {
+    param(
+        [Parameter(Mandatory)]$Prepared,
+        [Parameter(Mandatory)][switch]$EnableProductionAdapter
+    )
+    Assert-XbAutoCountAdapterEnabled -EnableProductionAdapter:$EnableProductionAdapter
+    if ($script:XbSaveMemberInvocationCount -ne 0) { throw "save_member_invocation_count_invalid" }
+    $script:XbSaveMemberInvocationCount = 1
+    $command = $Prepared.Command
+    $entity = $Prepared.Entity
+    try {
+        $command.SaveMember($entity)
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# Readback audit columns (contract 2.7 step 7). Guid is returned in the
+# lowercase 8-4-4-4-12 form, or "" when absent or unparseable.
+function Get-XbAutoCountMemberAudit {
+    param([AllowNull()][object]$Entity)
+    if ($null -eq $Entity) { return $null }
+    $guidValue = Get-XbAutoCountEntityValue -Entity $Entity -Field "Guid"
+    $guidText = ""
+    if ($null -ne $guidValue -and $guidValue -isnot [System.DBNull]) {
+        [Guid]$parsed = [Guid]::Empty
+        if ([Guid]::TryParse(([string]$guidValue).Trim(), [ref]$parsed) -and $parsed -ne [Guid]::Empty) {
+            $guidText = $parsed.ToString("D").ToLowerInvariant()
         }
+    }
+    $createdUser = Get-XbAutoCountEntityValue -Entity $Entity -Field "CreatedUserID"
+    $createdTime = Get-XbAutoCountEntityValue -Entity $Entity -Field "CreatedTime"
+    [pscustomobject]@{
+        Guid = $guidText
+        CreatedUserID = $(if ($null -eq $createdUser -or $createdUser -is [System.DBNull]) { "" } else { ([string]$createdUser).Trim() })
+        CreatedTime = $(if ($createdTime -is [datetime]) { $createdTime } else { $null })
     }
 }
 

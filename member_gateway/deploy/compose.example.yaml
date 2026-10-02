@@ -1,0 +1,82 @@
+# XB member gateway - placeholder-only compose shape (W-G2-149 section 8).
+#
+# Nothing here is run by the repository, the tests or CI. Every REPLACE_WITH_*
+# value is supplied privately at deployment, outside Git, under a separately
+# approved live step (L7/L10). No credential, book name, host name or address
+# belongs in this file.
+#
+# Posture while production activation is off:
+# - restart: "no" on every service (no auto-restart; start manually).
+# - The database is on an internal network and never publishes a host port.
+# - The gateway binds only its private backend address (bootstrap refuses a
+#   wildcard or public bind) and is reached only through the ingress.
+# - The ingress host port is added only after the Hyper-V Internal endpoint
+#   proof in the production runbook; it stays commented out here.
+
+name: xb-member-gateway
+
+services:
+  gateway-db:
+    image: REPLACE_WITH_POSTGRES_IMAGE@sha256:REPLACE_WITH_POSTGRES_IMAGE_DIGEST
+    restart: "no"
+    networks:
+      - backend
+    environment:
+      POSTGRES_DB: REPLACE_WITH_DATABASE_NAME
+      POSTGRES_USER: REPLACE_WITH_DATABASE_OWNER_ROLE
+      POSTGRES_PASSWORD_FILE: /run/secrets/gateway_db_owner_password
+    secrets:
+      - gateway_db_owner_password
+    volumes:
+      - gateway-db-data:/var/lib/postgresql/data
+    # No "ports:" section: the database is never published to the host.
+
+  gateway:
+    image: REPLACE_WITH_GATEWAY_IMAGE@sha256:REPLACE_WITH_GATEWAY_IMAGE_DIGEST
+    restart: "no"
+    depends_on:
+      - gateway-db
+    command: ["python", "-m", "xb_member_gateway", "--config", "/run/config/gateway.config.json"]
+    read_only: true
+    networks:
+      backend:
+        ipv4_address: REPLACE_WITH_PRIVATE_BACKEND_ADDRESS
+    # Runtime bindings named by the v3 config (see gateway.env.example). The
+    # file lives outside Git; its values are never logged.
+    env_file:
+      - REPLACE_WITH_PRIVATE_GATEWAY_ENV_FILE
+    volumes:
+      - REPLACE_WITH_PRIVATE_GATEWAY_CONFIG_FILE:/run/config/gateway.config.json:ro
+
+  ingress:
+    image: REPLACE_WITH_NGINX_IMAGE@sha256:REPLACE_WITH_NGINX_IMAGE_DIGEST
+    restart: "no"
+    depends_on:
+      - gateway
+    networks:
+      - backend
+      - edge
+    volumes:
+      - REPLACE_WITH_PRIVATE_NGINX_CONF_FILE:/etc/nginx/conf.d/gateway.conf:ro
+      - REPLACE_WITH_PRIVATE_TLS_DIRECTORY:/etc/nginx/tls:ro
+    # Added only after the Hyper-V Internal endpoint proof (runbook step 11):
+    # ports:
+    #   - "REPLACE_WITH_PROVEN_INTERNAL_ENDPOINT:443:443"
+
+networks:
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: REPLACE_WITH_PRIVATE_BACKEND_SUBNET
+  edge:
+    name: REPLACE_WITH_N8N_INGRESS_NETWORK
+    external: true
+
+volumes:
+  gateway-db-data:
+    name: REPLACE_WITH_GATEWAY_DB_VOLUME
+
+secrets:
+  gateway_db_owner_password:
+    file: REPLACE_WITH_PRIVATE_DB_OWNER_PASSWORD_FILE

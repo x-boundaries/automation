@@ -1,209 +1,180 @@
-# AutoCount 2.0 Local Automation Architecture
+# AutoCount 2.0 Automation Architecture
 
-This design assumes AutoCount Accounting 2.0 and Microsoft SQL Server 2019 run on the same existing Windows VM. It optimizes for low/no additional cost, read-only automation first, and a native Windows approach.
+Canonical architecture surface for the AutoCount 2.0 automation work in this
+repository (#155). It records the accepted target architecture for the two
+current lanes and the status of each.
 
-Current near-term scope is narrowed by the
-[inventory intelligence scope](inventory_intelligence_scope.md): manual
-read-only inventory, PO, stock movement, and purchasing analytics foundation
-first. Scheduler, write-back, CoA, GL opening, bank opening, and full accounting
-cutover work remain future/parked unless separately approved.
+```text
+ARCHITECTURE_AUTHORITY=#155 G1-147 (Web acceptance #155:5889718018)
+MEMBER_WRITE_CONTRACT=W-G2-149 (+ Web amendment #155:5890550314)
+REPORTING_CONTRACT=R-G2-148 (+ Web amendments #155:5890302647)
+REPORTING_ARCHITECTURE_STATUS=ACCEPTED
+REPORTING_IMPLEMENTATION_STATUS=QUEUED_NOT_YET_IMPLEMENTED
+MEMBER_WRITE_ARCHITECTURE_STATUS=ACCEPTED
+MEMBER_WRITE_IMPLEMENTATION_STATUS=REPOSITORY_IMPLEMENTATION_PRODUCTION_DARK
+FIRST_PRODUCTION_MEMBER=SEPARATE_W-ACT_GATE (not authorised)
+GENERIC_AUTOCOUNT_API_FACADE=DEFERRED_NOT_CURRENT
+```
 
-## Architecture Goals
+Logical host names only are used here: `AC2_VM` (the Windows VM running
+AutoCount 2.0 and its SQL Server), `SERVER_PC` (the host running n8n and the
+member gateway with its Postgres database), `gateway`, `worker`, `AutoCount`
+and `Drive Desktop` (Google Drive for desktop). Private host, network, book,
+database, credential and discovery details do not belong in this repository.
 
-- Keep AutoCount production tables protected.
-- Avoid direct SQL writes to AutoCount.
-- Run locally on the existing Windows VM.
-- Use Windows Task Scheduler instead of paid orchestration.
-- Load a separate reporting/analytics database on the same SQL Server instance.
-- Feed dashboards and AI summaries only from curated reporting views.
-- Keep n8n optional for later notifications or approvals, not part of the first critical path.
+## Stable boundaries (both lanes)
 
-## Logical Design
+- AutoCount remains the source of truth for accounting, inventory and member
+  records. Nothing in this repository replaces it.
+- No direct SQL writes to AutoCount, ever.
+- Reporting reads go through governed, read-only SQL views. The member lane
+  reads and writes only through the official AutoCount member API, inside one
+  narrow local AutoCount primitive on `AC2_VM`. There is no other write path.
+- Credentials, private configuration and generated outputs stay outside
+  GitHub.
+
+## Reporting lane (accepted, implementation queued)
+
+```text
+REPORTING_ARCHITECTURE_STATUS=ACCEPTED
+REPORTING_IMPLEMENTATION_STATUS=QUEUED_NOT_YET_IMPLEMENTED
+```
+
+The reporting exporter, validator, seal and publisher described below are not
+yet implemented in this repository. The implementation lane (R-G3-150) is
+queued. Until it lands, treat this section as the accepted target, not as a
+description of shipped code.
 
 ```mermaid
 flowchart LR
-    AC[AutoCount Accounting 2.0 desktop] --> ACDB[(AutoCount production SQL DB)]
-    TS[Windows Task Scheduler] --> Runner[Native extractor runner<br/>.NET Framework 4.8]
-    Runner -->|read-only API, report API, or approved SQL views| ACDB
-    Runner -->|write extracted batches| RPT[(Reporting SQL DB)]
-    Runner --> Archive[Secure raw export archive<br/>outside GitHub]
-    Runner --> Logs[Job logs]
-    RPT --> Raw[raw schema]
-    RPT --> Stg[staging schema]
-    RPT --> Mart[mart schema]
-    RPT --> Audit[audit schema]
-    Mart --> Dash[Dashboard layer]
-    Mart --> Pack[Daily summary pack]
-    Pack --> AI[AI daily summary job]
-    Audit --> Dash
-    RPT -. optional later .-> N8N[n8n sidecar]
+    AC[(AutoCount SQL database<br/>on AC2_VM)] --> V[Governed read-only<br/>SQL views]
+    V --> S[Deterministic full<br/>daily snapshot]
+    S --> Val[Blocking validation]
+    Val --> Seal[Manifest-last<br/>local seal]
+    Seal --> Pub[Owner-user Task Scheduler<br/>publisher]
+    Pub --> DD[Drive Desktop<br/>synced folder]
+    DD --> Dash[Dashboard and<br/>downstream reporting]
 ```
 
-## Components
+1. **Governed SQL views** are the admitted read boundary. The export identity
+   has `SELECT` on the approved views only.
+2. **Deterministic full daily snapshot.** Each run exports the complete
+   admitted dataset set; there is no incremental change-capture in V1.
+   Snapshot isolation is preferred. Where it is unavailable, the accepted
+   fallback is a quiet-hour read with blocking cross-table invariants and one
+   bounded retry.
+3. **Blocking validation.** A snapshot that fails validation is never sealed
+   or published.
+4. **Manifest-last local seal.** Files are written first and the manifest is
+   written last, so a partial snapshot can never look complete.
+5. **Owner-user Task Scheduler publisher** copies only sealed snapshots into
+   the **Drive Desktop** synced folder. Publication is idempotent.
+6. **Dashboards and downstream reporting** consume sealed snapshot outputs
+   only, never live AutoCount tables.
 
-### AutoCount VM
+Disclosure limits (R-G2-148 amendments): a random opaque reporting-source ID
+from private configuration identifies the source; any member identity used to
+derive a keyed pseudonym is transient process input only; V1 exports
+counterparty codes and non-personal attributes, not counterparty names.
 
-Use the existing Windows VM as the execution boundary. Running the extractor beside AutoCount avoids firewall, file share, and remote SQL complications during the spike.
+Deferred or excluded:
 
-Required local software:
+- Marketplace settlement / payout economics is deferred to V2.
+- Advanced MDSA (multidimensional sales analysis) is a consumer requirement,
+  not the extraction engine.
+- A freshness monitor is required before unattended reporting is considered
+  operational, but it does not block the first validated snapshot.
 
-- AutoCount Accounting 2.0 client/server components.
-- Microsoft SQL Server 2019.
-- .NET Framework 4.8 runtime.
-- Extractor runtime folder outside the repo, with generated outputs under `C:\XB\autocount_outputs`.
-- Secure stock archive folder outside the repo, for example `C:\XB\autocount_outputs\extract\stock`.
-
-### Native Extractor Runner
-
-Preferred implementation: .NET Framework 4.8 console application.
-
-Responsibilities:
-
-- Open a read-only AutoCount API/session or read approved read-only SQL views.
-- Extract only configured datasets.
-- Write raw batch files and reporting database rows.
-- Record run status, row counts, checksums, warnings, and exceptions.
-- Never write to AutoCount production tables.
-
-First datasets:
-
-- item master and product attributes,
-- stock status/balance/cost by item/location,
-- debtor and creditor master,
-- sales invoice and cash sale listings,
-- purchase order and GRN listings,
-- AR/AP open item summaries,
-- account and GL summary data if approved.
-
-### Windows Task Scheduler
-
-Use Task Scheduler for the first version because it is built into Windows and enough for daily read jobs.
-
-Suggested schedules:
-
-- `02:00` daily extraction after business close.
-- `02:30` validation and mart refresh.
-- `03:00` dashboard snapshot generation.
-- `03:15` AI summary pack generation.
-
-Each task should run under a dedicated Windows service account with minimal local permissions.
-
-### Reporting SQL Database
-
-Create a separate database, for example `XB_AutoCount_Reporting`, on SQL Server 2019. The extractor writes here only. AutoCount writes here never.
-
-Schemas:
-
-- `raw`: append-only ingested rows by source and batch. Keep source field names and raw payload hashes.
-- `stg`: typed, cleaned staging tables with consistent dates, amounts, item codes, account codes, and location codes.
-- `mart`: curated business-facing tables/views for dashboards and AI packs.
-- `audit`: run manifests, row counts, source checksums, data quality checks, exceptions, and approval logs.
-
-Optional later schemas:
-
-- `ref`: internal SKU mappings and approved business mappings.
-- `queue`: future write-back request queue, only after the read side is stable.
-
-### Raw Export Archive
-
-Keep raw CSV/JSON extracts outside GitHub. Each batch should have a deterministic folder:
+## Member-write lane (accepted, implemented in repository, production-dark)
 
 ```text
-C:\XB\autocount_outputs\extract\stock\
-  ac2_stock_2026-06-06\
-    run_manifest.json
-    item_master.csv
-    stock_status.csv
-    sales_invoice_listing.csv
-    ar_open_items.csv
+MEMBER_WRITE_ARCHITECTURE_STATUS=ACCEPTED
+MEMBER_WRITE_IMPLEMENTATION_STATUS=REPOSITORY_IMPLEMENTATION_PRODUCTION_DARK
+FIRST_PRODUCTION_MEMBER=SEPARATE_W-ACT_GATE
 ```
 
-Retention recommendation:
+```mermaid
+flowchart LR
+    GF[Google Form] --> N8N[n8n on SERVER_PC]
+    N8N --> GW[(Member gateway + Postgres<br/>on SERVER_PC)]
+    W[AC2 worker on AC2_VM] -->|outbound pull:<br/>readyz, claim, result| GW
+    W --> P[Narrow local AutoCount<br/>member primitive]
+    P -->|probe, at most one SaveMember,<br/>readback| AC[(AutoCount)]
+    GW --> OB[Replay-safe<br/>welcome outbox]
+    OB --> N8N
+```
 
-- Keep daily raw extracts for 90 days.
-- Keep month-end snapshots for 7 years if finance requests it and storage is approved.
-- Store hashes in `audit.extract_file`.
+- **Google Form and n8n** own intake and orchestration. n8n ingests form
+  responses into the gateway and later sends welcome emails from the outbox.
+- **Gateway and Postgres on `SERVER_PC`** own the durable queue and state:
+  responseId + payload-hash idempotency, the job state machine, a single
+  active lease across all jobs, retry budgets, the kill switch and activation
+  flag, and the welcome-email outbox.
+- **The worker on `AC2_VM` pulls work outbound.** Each cycle makes exactly
+  three gateway calls: readiness, claim, result. Nothing connects inbound to
+  `AC2_VM` or AutoCount.
+- **AutoCount is changed only by the narrow local primitive.** Under a local
+  machine-wide mutex it probes existing members, decides, calls `SaveMember`
+  at most once per invocation, and reads the result back. An uncertain
+  outcome is resolved by running the same job again: the next probe sees
+  what actually happened.
+- **Welcome email** uses a durable, replay-safe outbox. Only a verified new
+  member (`CREATED_VERIFIED`) gets one; a linked, reviewed or rejected job
+  never does, and an email whose delivery is uncertain is never resent.
 
-### Dashboard Layer
+MemberNo and identity rules (XB-MN-1):
 
-Lowest-cost options:
+- The base MemberNo is the submitted phone after the existing ingest clean-up,
+  digits only. There is no country inference and no E.164 conversion. Leading
+  zeroes are kept, and a base starting `000` is an ordinary base.
+- There is no automatic X1/X2/X3 suffix allocation.
+- An obvious existing member - a member already holding the number (or an
+  unambiguous format variant of it) with the same email, or the same name
+  ignoring word order - links to the existing record (`LINKED_EXISTING`);
+  nothing is created and no existing record is updated. An email that only
+  matches a member with a different number does not link; it is recorded as a
+  data-quality flag.
+- A genuine shared number belonging to a different person gets the base plus
+  a bounded name component (ASCII letters from the name, total length at
+  most 20).
+- Inactive, multiple, unknown or conflicting evidence, a name-component
+  collision, or an empty name component goes to `MANUAL_REVIEW`.
 
-1. Power BI Desktop connected to `mart` views. Good first choice if business users already use Power BI locally. Scheduled cloud refresh may require additional licensing.
-2. Static HTML/Markdown dashboard generated by scheduled script. Good for zero license cost and GitHub-style review.
-3. SQL Server Reporting Services only if already licensed/installed.
-4. Metabase or another open-source BI sidecar later if the team is comfortable operating a service.
+Test safety: synthetic test operations require explicit test-book mode, an
+allowlisted test book, synthetic name and email markers, guarded test hooks
+and pre-test absence checks. Synthetic markers are refused in production.
 
-Initial dashboard views:
+Contract and runbooks:
 
-- daily sales by channel/outlet,
-- stock on hand by item/location,
-- low-stock and dead-stock candidates,
-- product master completeness,
-- open AR/AP aging summary,
-- extraction health and data quality warnings.
+- [Member gateway production contract](member_gateway_production_contract.md)
+- [Member gateway production runbook](member_gateway_production_runbook.md)
+- [Member write v2 live runbook](member_write_v2_live_runbook.md)
+- [Member intake automation blueprint](member_intake_automation_blueprint.md)
 
-### AI Daily Summary Layer
+The code is production-dark: the kill switch is on, activation is off, the
+worker task is disabled and n8n workflows are inactive. Every live step, and
+the first production member (W-ACT), needs its own approval.
 
-The AI layer must read a generated summary pack, not unrestricted ERP data. The pack should be a small JSON or Markdown file generated from curated `mart` views.
+## Deferred / not current
 
-Example pack contents:
+- A generic X-Boundaries AutoCount API wrapper, external-agency API product,
+  client administration UI or broad endpoint catalogue is deferred by the
+  Owner and is not a design requirement.
+- AutoCount write-back other than member creation (for example purchasing or
+  accounting postings) is not in scope.
+- CoA, GL opening, bank opening and full accounting cutover remain parked; see
+  the [inventory intelligence scope](inventory_intelligence_scope.md).
 
-- total sales, gross margin if approved, and transaction count,
-- top movers and slow movers,
-- stockouts and low-stock risks,
-- unusual AR/AP changes,
-- failed extraction or data quality checks,
-- links to dashboard tables for human review.
+## Superseded architecture (historical)
 
-Provider choices:
+The earlier design in this file (a .NET Framework extractor loading a
+separate reporting SQL database with raw/staging/mart/audit schemas, feeding
+dashboards and an AI summary pack, with n8n as an optional sidecar) is
+superseded as the target architecture. Existing read-only extraction and
+probe scripts and their runbooks remain as evidence tooling; they are not the
+target pipeline. See the historical [MVP plan](mvp_plan.md).
 
-- Local LLM through Ollama or a similar local runtime if the VM has enough resources.
-- Low-cost hosted API only if secrets can be stored outside the repo and the curated pack is approved for external processing.
-
-AI output should be advisory. It should never post transactions, update master data, or send unrestricted raw rows to a model.
-
-### Optional n8n Sidecar
-
-n8n is optional and should not be introduced unless it clearly saves effort.
-
-Useful later roles:
-
-- send daily summaries to email/chat,
-- route exception approvals,
-- watch for generated summary files,
-- orchestrate human approval for future write-back queues.
-
-Avoid using n8n as the database of record. It should receive manifests, dashboard links, or curated summary packs, not raw ERP data.
-
-## Data Flow
-
-1. Task Scheduler starts the extractor.
-2. Extractor opens a read-only source connection.
-3. Extractor writes raw files outside GitHub.
-4. Extractor loads `raw` tables in the reporting DB.
-5. Stored procedures or extractor steps transform `raw` to `stg`.
-6. Mart refresh creates dashboard-ready views.
-7. Validation checks write to `audit`.
-8. Dashboard refresh reads `mart` and `audit`.
-9. AI job reads a generated summary pack from `mart` views.
-
-## Security Boundary
-
-Use two distinct data access identities:
-
-- AutoCount source read identity: `SELECT` only on approved views, or API user with read-only access where supported.
-- Reporting loader identity: write access to `XB_AutoCount_Reporting` only.
-
-Do not grant the reporting loader account permissions on AutoCount production tables.
-
-## First Technical Spike
-
-Build a tiny extractor proof of life:
-
-- Connect to the account book using a test company or non-production copy if available.
-- Extract one low-risk dataset, such as item master or debtor listing.
-- Write rows to `raw.item_master` and `audit.extract_run`.
-- Generate a single `mart.vw_item_master_quality` view.
-- Produce a one-page dashboard or Markdown summary.
-
-Exit gate: the read-only account cannot insert, update, delete, execute posting routines, or alter AutoCount schema.
+The earlier member designs (Google Sheets queue, local lookup bridge, dry-run
+flow, and the gateway's X1/X2 allocator with dispatch fence and writer
+registration/quarantine) are also superseded; see the
+[member intake automation blueprint](member_intake_automation_blueprint.md).

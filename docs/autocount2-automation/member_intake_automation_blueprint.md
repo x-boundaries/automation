@@ -1,175 +1,131 @@
 # Member Intake Automation Blueprint
 
-Status: discovery and implementation planning only. No production writeback is implemented by this PR.
+Canonical member-intake architecture surface (#155).
+
+```text
+ARCHITECTURE_AUTHORITY=#155 G1-147 (Web acceptance #155:5889718018)
+MEMBER_WRITE_CONTRACT=W-G2-149 (+ Web amendment #155:5890550314)
+MEMBER_WRITE_ARCHITECTURE_STATUS=ACCEPTED
+MEMBER_WRITE_IMPLEMENTATION_STATUS=REPOSITORY_IMPLEMENTATION_PRODUCTION_DARK
+FIRST_PRODUCTION_MEMBER=SEPARATE_W-ACT_GATE (not authorised)
+GENERIC_AUTOCOUNT_API_FACADE=DEFERRED_NOT_CURRENT
+```
+
+The gateway, worker and AutoCount primitive for this flow are implemented in
+this repository and are production-dark: the kill switch is on, activation is
+off, the worker task is disabled and the n8n workflows are inactive. Every live
+step (L1-L13 in the [member write v2 live runbook](member_write_v2_live_runbook.md))
+and the first production member (W-ACT) need their own approval.
 
 ## Target Flow
 
 ```text
-Google Form -> Google Sheets -> n8n validation workflow -> local bridge -> AutoCount 2.0 Member API
-```
-
-The first rollout should stop before live writeback:
-
-```text
-Google Form -> Google Sheets -> n8n draft workflow/design -> dry-run validator -> read-only AC2 member lookup -> manual review
+Google Form
+  -> n8n (SERVER_PC)
+  -> member gateway + Postgres (SERVER_PC): durable queue, state, idempotency, outbox
+  <- AC2 worker (AC2_VM) pulls outbound: readyz, claim, result
+  -> narrow local AutoCount member primitive (AC2_VM)
+  -> probe -> at most one SaveMember -> readback (under a local mutex)
+  -> bounded result back to the gateway
+  -> replay-safe welcome-email outbox (sent by n8n)
 ```
 
 ## System Roles
 
 | Component | Role | Source-of-truth status |
 | --- | --- | --- |
-| Google Form | User-friendly intake surface for new member registration. | Not source of truth |
-| Google Sheets | Intake queue, audit queue, approval queue, and human review surface. | Not source of truth |
-| n8n | Orchestration, validation, approval-state transitions, retry/dead-letter routing. | Not source of truth |
-| Local bridge | Future controlled adapter between n8n and official AutoCount APIs. | Not source of truth |
-| AutoCount 2.0 | Final member record, member number, member type, bonus point membership state. | Source of truth |
+| Google Form | Member registration intake surface. | Not source of truth |
+| n8n (SERVER_PC) | Ingests form responses into the gateway; sends welcome emails from the outbox. | Not source of truth |
+| Member gateway + Postgres (SERVER_PC) | Durable job queue and state machine, responseId + payload-hash idempotency, single active lease, retry budgets, kill switch and activation, manual-review queue, welcome outbox. | Source of truth for job state only |
+| AC2 worker (AC2_VM) | Pulls one job at a time outbound, runs the primitive as a child process with a hard deadline, posts one bounded result. | Not source of truth |
+| AutoCount member primitive (AC2_VM) | The only AutoCount write path: probe existing members, decide, at most one `SaveMember`, readback. | Not source of truth |
+| AutoCount 2.0 | Final member record, member number, member type, bonus point state. | Source of truth |
 
-Current duplicate-check rule: the Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, Birthday Month maps to future `DOB` as `2000-MM-01`, and old POS or side-sheet values are reference-only. The read-only member lookup review does not create/update/delete members.
+There is no Google Sheets queue, no local lookup bridge and no dry-run approval
+sheet in the current production flow. Those were earlier designs (see
+[Superseded designs](#superseded-designs)).
 
-## Why Google Sheet Is Intake/Audit Queue Only
+## MemberNo And Duplicate Rules (XB-MN-1)
 
-Google Sheets is useful for visibility, manual approval, and non-technical operations review, but it must not become a parallel member database. Sheet rows can be edited outside the form, formulas can drift, and access can expand beyond AutoCount administrators.
+- **Base MemberNo** = the submitted phone after the existing ingest clean-up,
+  digits only. No country inference, no E.164 conversion, no prefix added or
+  stripped. Leading zeroes are kept; a base starting `000` is an ordinary base.
+- **No X1/X2/X3 suffix allocation.**
+- **Obvious same member -> `LINKED_EXISTING`.** If an existing member holding
+  the number (or an unambiguous format variant of it) has the same email, or
+  the same name ignoring word order, the job links to that member. Nothing is
+  created and no existing member is updated.
+- **Genuine shared number, different person -> base + bounded name
+  component.** The component is the ASCII letters of the name, upper-cased,
+  trimmed so the MemberNo is at most 20 characters. The gateway computes it
+  once; the primitive only checks its shape.
+- **Ambiguity -> `MANUAL_REVIEW`.** Inactive or multiple matching members, a
+  holder with no name and no email, a format variant belonging to someone else,
+  inconsistent evidence from a prior attempt, an empty name component, or a
+  name-component collision all go to the manual-review queue. An operator can
+  close or requeue a reviewed job.
+- **Field limits** (Name at most 100, Email at most 200 UTF-16 units) are
+  checked at validation; values are rejected, never truncated.
+- Every created member records `MobilePhone` = the base MemberNo.
 
-The sheet should store intake status and sync status only:
+## Write Safety
 
-- one row per submitted registration,
-- validation and approval status,
-- future bridge request/response metadata,
-- redacted failure details,
-- AutoCount member number after successful approved sync.
-
-Do not treat sheet values as authoritative after AutoCount accepts a member. If a conflict exists, AutoCount wins.
-
-## Why AutoCount Remains Source of Truth
-
-AutoCount controls member numbers, member types, Bonus Point module behavior, point balances, and downstream sales/bonus-point usage. The wiki confirms member APIs are part of AutoCount member maintenance and Bonus Point workflows. Creating a side database or direct SQL write path would risk bypassing validation, numbering rules, audit behavior, and module-specific logic.
-
-## Preferred Write Path
-
-Use a local-only bridge unless AOTG member write access is confirmed end-to-end in a sandbox.
-
-Reasons:
-
-- The AutoCount Accounting 2.0 desktop assembly API is confirmed for member create/update examples.
-- The bridge can run near the installed AutoCount client/server and use the same official assemblies as documented.
-- AOTG member endpoints are publicly listed, but X-Boundaries still must confirm subscription, account book activation, API key handling, and tenant-specific permissions.
-- A local bridge can be locked to localhost or a private LAN allowlist and can enforce dry-run mode before any live writeback.
-
-If AOTG is later selected, it must still follow the same approval, idempotency, dry-run, and audit requirements.
+- The primitive holds a machine-wide mutex across probe -> decision -> at most
+  one `SaveMember` -> readback, so creates on `AC2_VM` are strictly one at a
+  time. The gateway additionally allows only one active lease across all jobs.
+- An uncertain outcome (crash after save, lost result, expired lease) is never
+  guessed. The same job is re-run; the next probe under the mutex finds the
+  real state and the job resolves to `CREATED_VERIFIED`, a link, or review.
+- Result posts are compare-and-set on the lease: a stale or different result
+  cannot create a second outcome.
+- An AutoCount member can be credited as created by at most one job, so at most
+  one welcome email is sent per member.
 
 ## Privacy And PDPA Considerations
 
-Member intake contains personal data: name, mobile number (used as the AutoCount member number), email, birthday month, and consent status. Treat every form row as sensitive.
+Member intake contains personal data: name, mobile number (the base of the
+AutoCount MemberNo), email, birthday month, and consent status. Treat every
+form response as sensitive.
 
-Google Form consent controls use these live export values (full contract: [member_form_intake_contract.md](member_form_intake_contract.md)):
+Google Form consent controls use these live export values (form contract:
+[member_form_intake_contract.md](member_form_intake_contract.md); its
+dry-run-validator rules about `MemberNo`/`MobilePhone` are historical, the
+production rules are the XB-MN-1 rules above):
 
-- `PDPA Acknowledged`: checkbox exporting `Yes`, accepted case-insensitively by the dry-run validator. Legacy `I agree` may be accepted only for older exported rows. Any other value, including blank, flags the row `pdpa_blocked` and blocks sync eligibility without invalidating the row.
-- `Marketing Consent`: multiple choice with exact values `Yes` / `No`, accepted case-insensitively. `No` never blocks member registration; missing or unrecognized values make the row invalid.
+- `PDPA Acknowledged`: checkbox exporting `Yes`, accepted case-insensitively.
+  Any other value, including blank, blocks admission.
+- `Marketing Consent`: multiple choice with exact values `Yes` / `No`, accepted
+  case-insensitively. `No` never blocks member registration; missing or
+  unrecognized values reject the response.
 
 Minimum controls:
 
-- Form must require PDPA acknowledgement before sync eligibility.
-- Marketing consent must be explicit `Yes` or `No`; missing consent is not acceptable.
-- n8n and bridge logs must not dump full payloads.
-- Audit logs may store intake ID, hash/idempotency key, field presence, status codes, and redacted errors.
-- Limit Google Sheet access to approved operators.
-- Avoid storing free-text remarks in bridge logs.
-- Do not commit real form rows, sheet IDs, screenshots, n8n credentials, API keys, or bridge runtime outputs.
-- Define retention for rejected/dead-letter rows before production rollout.
+- The gateway stores the canonical payload privately; operator views, logs and
+  audit events carry metadata only (no name, phone, email, MemberNo or member
+  Guid).
+- The primitive's result carries no personal data except the MemberNo.
+- n8n and worker logs must not dump payloads.
+- Do not commit real form responses, form IDs, screenshots, n8n credentials,
+  API keys, book names, host details or runtime outputs.
 
-## Manual Approval Gate
+## Deferred / Not Current
 
-First rollout must require manual approval before any member write:
+- A generic X-Boundaries AutoCount API wrapper or external-agency API product
+  is deferred by the Owner and is not a design requirement.
+- Updating existing members, legacy member import and member merges are
+  separate future projects with their own approval gates.
 
-1. Form submission lands in Google Sheet with `ApprovalStatus = Pending`.
-2. n8n or a local validator computes `ValidationStatus`.
-3. Operator reviews required fields, dry-run match decisions (`EXISTING_MEMBER_REVIEW`, `POSSIBLE_CONFLICT_REVIEW`, `manual_review` member numbers), and consent flags.
-4. `MemberType` is not collected by the form; the operator selects a sandbox-confirmed AutoCount member type at the future write step, which still requires separate business approval.
-5. Operator sets `ApprovalStatus = Approved` only when ready.
-6. Dry-run bridge returns the proposed AutoCount payload.
-7. Live writeback remains disabled until a separate production approval PR/runbook exists.
+## Superseded Designs
 
-## Failure And Dead-Letter Handling
+The following earlier designs are historical and are not the current
+architecture:
 
-Use explicit statuses instead of overwriting rows in place.
-
-Recommended statuses:
-
-- `ValidationStatus`: `Pending`, `Valid`, `Invalid`
-- `ApprovalStatus`: `Pending`, `Approved`, `Rejected`, `NeedsReview`
-- `SyncStatus`: `NotStarted`, `DryRunPassed`, `DryRunFailed`, `Queued`, `Synced`, `Failed`, `DeadLetter`
-
-Dead-letter rows should capture:
-
-- `IntakeID`,
-- failure stage,
-- redacted error code/message,
-- retry count,
-- last attempted timestamp,
-- operator decision,
-- next action.
-
-Do not retry indefinitely. Require operator review after repeated validation/bridge failures.
-
-## Legacy Import Plan For Existing Members Later
-
-Existing member import is a separate project. Do not mix it with first-time intake automation.
-
-Later import should:
-
-- export existing members from AutoCount through official API/reporting/read-only approved surfaces,
-- normalize legacy identifiers, mobile/email duplicates, and consent state,
-- dry-run match against AutoCount by `MemberNo`, mobile, email, and name,
-- produce a manual review workbook without raw secrets or unnecessary PII,
-- use sandbox-only write tests,
-- require a separate approval gate before any production merge/update.
-
-## Current PR Boundary
-
-Included:
-
-- API research and evidence notes.
-- Field mapping plan.
-- Local bridge design.
-- Discovery runbook.
-- Python dry-run validator with synthetic tests.
-- Explicitly gated, sanitized, read-only AC2 `MemberNo` lookup review for future duplicate checking.
-
-Excluded:
-
-- Production AutoCount writeback.
-- Final write automation.
-- Direct SQL writes.
-- n8n production workflow creation.
-- AutoCount DLL dependency in CI.
-- Real customer/member PII, sheet IDs, credentials, API keys, or runtime outputs.
-
-## Future production member-intake workflow boundary
-
-The single-member creation UAT (see
-[Single-member creation UAT runbook](member_create_uat_runbook.md)) is bounded UAT
-scaffolding that proves exactly one real form-derived member can be created and read
-back safely. It is deliberately not the permanent production workflow and must not be
-grown into it by repeated patching.
-
-The permanent production member-intake workflow will be newly designed and built in a
-separate, separately approved effort. It is not implemented or activated by the UAT.
-When built, it must include:
-
-- continuous intake;
-- durable claim / lease handling;
-- idempotency;
-- duplicate mobile-number protection;
-- separate existing-member, manual-review, and create routes;
-- a controlled reviewer approval mechanism;
-- crash recovery;
-- a bounded retry policy;
-- uncertain-write recovery;
-- read-back verification;
-- terminal Sheet states;
-- operational alerting;
-- credential / resource rebinding;
-- no silent update-member path.
-
-Until that workflow exists and is separately reviewed and approved, member creation
-remains a manual, single-member, fail-closed UAT only.
+- Google Form -> Google Sheets -> n8n validation -> local bridge -> AutoCount
+  Member API, with a Sheets approval queue and dry-run validator. See the
+  historical [local bridge design](member_intake_local_bridge_design.md) and the
+  review-only lookup/UAT runbooks.
+- The gateway's earlier X1/X2 MemberNo allocator with probe/recheck, write
+  intent, dispatch fence, writer registration/termination/quarantine, recovery
+  principal and heartbeat. Removed in favour of the primitive + mutex design.
+- The single-member creation UAT ([runbook](member_create_uat_runbook.md))
+  remains bounded UAT scaffolding only; it is not the production workflow.

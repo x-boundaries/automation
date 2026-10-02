@@ -51,37 +51,47 @@ checks, `git diff --check`, and the final secret/PII/scope scan. Use synthetic
 fixtures only. Do not set production credentials or enable the workflow while
 reviewing the branch.
 
-The committed config v2 example must remain activation-disabled,
-kill-switch-on, adapter-not-ready, fixed to `member_no_max_length=20`, and
-without real form/question IDs, cutover watermark, credential digests, database,
-bind, TLS, host, or gateway bindings. Those values make readiness fail closed
-until an owner supplies reviewed deployment configuration outside Git.
+The committed config v3 example (`config/member_gateway.production.example.json`,
+`schema_version` `xb.member.gateway.config.v3`) must remain
+activation-disabled, kill-switch-on, adapter-not-ready, bound to
+`member_book_mode=production`, and without real form/question IDs, cutover
+watermark, credential digests, database, bind, TLS, host, or gateway bindings.
+Those values make readiness fail closed until an owner supplies reviewed
+deployment configuration outside Git. Config v3 has exactly five principals
+(source, operator, control, worker, mailer). The removed keys
+`recovery_token_sha256`, `recovery_token_env`, `heartbeat_seconds` and
+`member_no_max_length` are configuration errors, not ignored fields. The lease
+is fixed at 600 s, the worker child deadline at 300 s, and the write budget at
+3.
 
 Before any listener starts, run only `python -m xb_member_gateway --config
 <reviewed-external-config>`. Bootstrap must read and validate config, resolve
-the named runtime boundaries, validate all six principal separations, build
+the named runtime boundaries, validate all five principal separations, build
 the strict authenticator and repository, and read-only verify migrations
-0001-0005, required control rows, initialized watermark, exact production
+0001-0006, required control rows, initialized watermark, exact production
 cutover and form binding, that every source response has an exact
-`createTime` and a handling receipt, and that no `CREATED_VERIFIED` result lacks
-a welcome outbox row.
+`createTime` and a handling receipt, and that no `CREATED_VERIFIED` in either
+the legacy `results` table or `member_outcomes` lacks a welcome outbox row.
 Any bounded bootstrap error is a stop condition. Do not let bootstrap apply a
 migration, initialize the cursor, repair state, generate a credential, clear
 the kill switch, or activate the gateway.
 
 Dark bring-up is the one composition exemption: `autocount_adapter_ready=false`
-no longer blocks startup composition, provided production activation is false,
+does not block startup composition, provided production activation is false,
 the kill switch is true, and every other admission check passes. Adapter-not-
 ready still reports readiness false, still lists `autocount_adapter_not_ready`,
-and still blocks dispatch, so a composed dark gateway is not an activated one.
-The bind address must be a private IP literal; a wildcard, unspecified,
-malformed, multicast, reserved, or public value is refused with a bounded code
-that does not echo the value, and there is no fallback bind.
+and every claim answers `claimed:false, reason:dispatch_disabled`, so a composed
+dark gateway is not an activated one. The bind address must be a private IP
+literal; a wildcard, unspecified, malformed, multicast, reserved, or public
+value is refused with a bounded code that does not echo the value, and there is
+no fallback bind.
 
 ## Private HTTPS dark bring-up
 
 This sequence prepares the dark gateway. It does not activate the gateway, start
-a worker, or touch AutoCount or member data.
+a worker, or touch AutoCount or member data. The compose placeholders and the
+database backup procedure are in `member_gateway/deploy/` (placeholders only;
+nothing there is run by the repository or CI).
 
 1. Re-verify the repository head and a clean worktree. Confirm the accepted
    PostgreSQL network is still `internal=true`, that no host database port is
@@ -96,7 +106,7 @@ a worker, or touch AutoCount or member data.
    condition. Do not continue to any host binding on a partial proof, and never
    substitute a wildcard, LAN, or public bind.
 4. Build the gateway image and pull the pinned nginx ingress image.
-5. Create the reviewed external deployment state, the six pairwise-distinct
+5. Create the reviewed external deployment state, the five pairwise-distinct
    bearer principals, and the separate reference-HMAC key. Keep every raw value
    outside Git, chat, and logs.
 6. Create the two container networks: the internal backend bridge and the
@@ -122,14 +132,14 @@ network still internal; no LAN or public path to the gateway or the ingress; the
 gateway listening socket equal to its fixed private backend address and never a
 wildcard; private HTTPS only, with trusted certificates from both the n8n and
 AC2 caller classes and no verification disabled anywhere; least-privilege
-database connectivity working over the unchanged DSN; production activation
-false, kill switch true, adapter not ready with readiness false and dispatch
-ineligible; the six bearer principals and the reference-HMAC key separated by
-environment name, configured digest, and resolved value, with the
-reference-HMAC key unable to authenticate HTTP; cursor, watermark, control rows,
-and business state unchanged, with source, jobs, results, allocations, attempts,
-and write intents all zero; no n8n execution or activation; no worker start; and
-no AutoCount, AC2, or member activity.
+database connectivity working over the unchanged DSN; `GET /readyz` showing
+`dispatch_enabled:false` (activation false, kill switch true); a manual idle
+worker cycle answering `claimed:false`; the five bearer principals and the
+reference-HMAC key separated by environment name, configured digest, and
+resolved value, with the reference-HMAC key unable to authenticate HTTP;
+migrations 0001-0006 applied with zero non-terminal jobs; cursor, watermark,
+control rows, and business state unchanged; no n8n execution or activation; no
+worker task enabled; and no AutoCount, AC2, or member activity.
 
 ## Dark rollback boundaries
 
@@ -143,31 +153,62 @@ accepted database, its DSN, the source cursor and watermark, the control rows,
 and the unrelated tunnel stack are never mutated by this bring-up, so none of
 them requires rollback.
 
+## Migration 0006 (member write v2)
+
+`member_gateway/migrations/0006_member_write_v2.sql` is additive: it widens the
+job state check (every old value kept, `LINKED_EXISTING` and `RESOLVED` added),
+adds the XB-MN-1 identity, retry-budget and lease-token columns, creates the
+append-only `member_outcomes` and `job_resolutions` tables with the partial
+unique index `UNIQUE(member_guid) WHERE outcome='CREATED_VERIFIED'`, and
+replaces the body of `require_created_verified_for_welcome()` so an outbox row
+needs `CREATED_VERIFIED` in either `results` or `member_outcomes`. No table,
+column, row, index, trigger or function is dropped; the v1 allocation, fence,
+writer, hold and result tables stay present and read-only until a separately
+approved retirement migration.
+
+Its guard refuses (and the whole transaction rolls back) while any job is in a
+state outside `CREATED_VERIFIED`, `REJECTED_VALIDATION`,
+`CONFIRMED_NOT_CREATED`, `CREATED_READBACK_MISMATCH`, `MANUAL_REVIEW`,
+`DEAD_LETTER`, or while any `writer_execution_holds` row is not `CLEARED`.
+Before applying it, as a separately approved step: take and verify a
+`pg_dump` (see `member_gateway/deploy/BACKUP_RESTORE.md`), confirm zero
+non-terminal jobs and zero uncleared holds, and keep the kill switch on. Once
+recorded, a re-run is a no-op for the guard. Rollback is restoring the
+pre-migration dump and the previous image; there is no down-migration.
+
 ## Pre-activation review
 
 An owner must independently verify the unsupported prerequisites in the
-production contract. In particular, repository evidence of a 20-character
-column is not sufficient evidence of effective account-book behaviour. Confirm
-the official local API surface in the installed licensed environment without
-using direct SQL or a real member write.
+production contract and the live test matrix (T-1 20-character MemberNo, T-2
+`CreatedUserID`, T-6 POS lookup, T-14 `CreatedTime` time zone). Confirm the
+official local API surface in the installed licensed environment without using
+direct SQL or a real member write.
 
 Review the source mapping against the current form contract. Preserve immutable
 `responseId`, authoritative `createTime`, explicit marketing `Yes`/`No`, and
 PDPA acknowledgement. Marketing `No` must remain eligible for membership
-creation.
+creation. The gateway applies the former dispatch predicates at `VALIDATED`:
+a response without PDPA acknowledgement, with unrecognised marketing consent,
+a wrong field set, a non-`member.create` operation, or a non-allowlisted
+source/form/mapping becomes `REJECTED_VALIDATION` with a bounded reason and is
+never queued. The same predicates, plus dispatch enabled, environment match
+and readiness, are rechecked at claim; a stored job failing them is never
+handed to the worker.
 
 Confirm private transport, authentication scopes, database backups, operator
-access, alerting, and manual reconciliation ownership. Bind exactly six
-pairwise-distinct source, operator, control, normal-worker, recovery, and
-mailer bearer principals. The mailer holds only `welcome_email.claim`,
-`welcome_email.send_intent`, and `welcome_email.result`. Keep their environment names, configured digests, and runtime
-values pairwise distinct; do not combine roles. Bind recovery only to
-`worker.writer_termination_recovery`, and never use the reference-HMAC key as a
-bearer.
+access, alerting, and manual-review ownership. Bind exactly five
+pairwise-distinct source, operator, control, worker, and mailer bearer
+principals. The worker holds only `worker.claim` and `worker.result`; the
+control principal holds `control.kill_switch`, `control.activate` and
+`control.resolve`; the mailer holds only `welcome_email.claim`,
+`welcome_email.send_intent`, and `welcome_email.result`. Keep their environment
+names, configured digests, and runtime values pairwise distinct; do not combine
+roles, and never use the reference-HMAC key as a bearer. There is no recovery
+principal.
 
-Apply migrations 0004 and 0005 and initialize the cursor row (watermark,
-immutable `production_cutover_exact`, and private form ID) only in a later
-separately authorised deployment transaction. The configured watermark,
+Apply migrations and initialize the cursor row (watermark, immutable
+`production_cutover_exact`, and private form ID) only in a later separately
+authorised deployment transaction. The configured watermark,
 `source_production_cutover_exact` (the verbatim Google `createTime` form), and
 `source_form_id` must exactly match the persisted values; the cutover never
 advances. Keep `source_admission_mode` at `first_member` until first-member
@@ -178,7 +219,10 @@ stop condition. Restart an epoch only for `token_invalidated` or
 `ambiguous_crashed_attempt`. If readiness reports
 `source_exact_time_backfill_missing` or `created_verified_without_welcome_outbox`,
 stop: exact values are never guessed and historical success is never made
-email-eligible without separate reviewed private no-send work.
+email-eligible without separate reviewed private no-send work. In
+`first_member` mode only a member accepted by the gateway consumes the single
+member admission. A `REJECTED_VALIDATION` response is recorded and receipted
+without consuming that allowance.
 
 Welcome email: bind exactly one authorised SMTP credential for the sending
 identity `noreply@x-boundaries.com` (provider SPF/DKIM as required) and the
@@ -188,124 +232,103 @@ is never resent automatically; resend needs private positive proof that SMTP
 did not accept. Rollback after any attempt re-engages the kill switch and
 disables schedules; it never deletes or rewinds outbox evidence, resends
 uncertain email, or down-migrates PostgreSQL.
-Keep worker concurrency and claim size at one for this initial topology. The repository must enforce
-one active non-expired worker lease across concurrent claim requests. A worker
-run must generate one bounded `ws-` session identifier and send it in
-`X-XB-Worker-Session`; it is an execution identity, not a credential or host
-identity. Do not substitute a username, SID, hostname, or private path.
-Claim transactions hold the existing `kill_switch_enabled` control row lock for
-their full transaction, providing the durable singleton mutex across processes.
 
-Before the irreversible call, refresh the job lease with the current
-`state_version`. The worker keeps one `ws-` session and starts the reviewed
-AutoCount writer in one supervised child process. It renews the lease on the
-configured heartbeat cadence and uses `attempt_started_at` plus the configured
-execution deadline as the hard boundary. A heartbeat failure or deadline causes
-the child to be terminated and its exit to be positively observed before lease
-protection can lapse. Failure to confirm exit is fail closed into durable
-quarantine; it never starts a second writer or retries `SaveMember`.
+## Worker v2 wire contract
 
-The dispatch-fence transaction creates a `PENDING` writer hold before the child
-starts. The child receives no payload while pending, so it cannot create the
-AutoCount session or reach `SaveMember`. The parent records the exact PID and
-process-start timestamp, registers them with the existing fence/attempt/session/
-host/execution bindings, waits for the `REGISTERED` acknowledgement, and only
-then releases stdin. The registered child is the single writer process and may
-not detach or spawn a SaveMember-capable descendant.
+Keep worker concurrency and claim size at one. The worker makes exactly three
+gateway calls per cycle: `GET /readyz`
+(`{ready, reasons[], dispatch_enabled, server_time_utc}`),
+`POST /v2/worker/claim` and `POST /v2/jobs/{job_id}/result`, each with one
+bounded `ws-` session in `X-XB-Worker-Session` (an execution identity, not a
+credential or host identity).
+
+The claim transaction locks both control rows, requires activation on and the
+kill switch off, reaps any expired lease (the job goes to `RETRY_WAIT` as an
+uncertain write attempt, eligible 5 minutes after expiry, or to
+`MANUAL_REVIEW(uncertain_exhausted)` on the third), refuses while any lease is
+active anywhere (`singleton_busy`), and leases the oldest eligible job for
+600 s with a fresh `lease-<32hex>` token. `first_claimed_at` is set once. The
+claim response (`xb.member.gateway.worker_claim.v2`) carries the member record
+computed once at `VALIDATED`, including the immutable XB-MN-1
+`base_member_no` and `name_component`. There is no heartbeat, precheck,
+allocation, write-intent, dispatch fence, writer registration, quarantine or
+recovery route; those v1 routes answer `404 route_not_found`.
+
+A result (`xb.member.gateway.result.v2`) is accepted only while the job is
+`LEASED` with the same active token, session, `attempt_no` and
+`state_version`; the kill switch never blocks it. The identical body again
+returns the stored response; a different body for a recorded lease is
+`409 result_conflict` and is recorded; a body for an expired or replaced lease
+is `409 result_stale` and changes nothing. A lease-matching body that breaks
+the section 4.4 consistency rules sends the job to
+`MANUAL_REVIEW(result_contract_violation)`. `FAILED_BEFORE_WRITE`,
+`NOT_CREATED`, `NOT_CREATED_CONFLICT`, `OUTCOME_UNCERTAIN` and lease expiry
+retry after 5 then 30 minutes within a 3-attempt write budget; `MUTEX_BUSY`
+retries every 5 minutes within its own 12-attempt budget.
+
+`CREATED_VERIFIED` writes one `member_outcomes` row and the welcome outbox row
+in the same transaction. A prior-attempt create whose member Guid is already
+credited to another job is demoted to `LINKED_EXISTING(guid_already_verified)`
+without email; a fresh create hitting a credited Guid is
+`MANUAL_REVIEW(guid_conflict_on_fresh_create)`. MemberNo and Guid are stored
+but never logged, audited, or shown in operator views.
 
 ## Operating sequence after a separately approved activation
 
 The kill switch defaults to ON. To engage it, use the separately scoped
 `POST /v1/control/kill-switch/enable` operation with the `control.kill_switch`
-scope and an empty body. Engagement fails closed for new claims and dispatch.
-Clearing is separate: use `POST /v1/control/kill-switch/disable` only after the
-owner has verified the remaining predicates and is observing the approved
-window.
+scope and an empty body. Engagement blocks new claims; a result for a job
+already in flight is still accepted. Clearing is separate: use
+`POST /v1/control/kill-switch/disable` only after the owner has verified the
+remaining predicates and is observing the approved window.
 
 1. Keep the kill switch engaged until readiness, source mapping, and adapter
    checks are green.
 2. Enable only the approved private source/gateway transport and verify that
    the workflow remains inactive until the explicit activation procedure.
 3. Enable gateway activation through the scoped control endpoint with an
-   external approval reference and a verified effective MemberNo limit.
+   external approval reference (activation also requires a valid
+   `member_book_mode`).
 4. Clear the kill switch only when the owner is observing the first bounded
    synthetic or approved operational window.
-5. Observe job states and safe counts. Never treat a timeout as proof of
-   absence or success.
+5. Observe `GET /v1/operator/status` (`xb.member.gateway.operator_status.v2`:
+   control flags, `dispatch_enabled`, per-state counts and manual-review reason
+   counts) and `GET /v1/jobs/{job_id}` (`xb.member.gateway.job.v3`, operator
+   scope, metadata only). Never treat a timeout as proof of absence or success.
 
-## Uncertain write handling
+## Manual review and resolution
 
-After a dispatch fence, do not replay the job, call SaveMember again, or select
-another suffix. First verify that the writer hold is
-`TERMINATION_CONFIRMED`. A normal child result is posted only after that
-durable confirmation. If confirmation is unavailable, preserve the fence,
-allocation, and write-intent lineage in `WRITER_TERMINATION_UNCONFIRMED` with a
-`QUARANTINED` hold; do not infer safety from elapsed time, a Kill() return,
-watchdog callback, or a restart. A quarantined job cannot be claimed,
-reallocated, written, expired into ordinary uncertainty, or reconciled.
+Every unclear case is settled by running the same job again; the next
+attempt's probe runs under the AC2 mutex and sees the real state. Nothing in
+the gateway retries `SaveMember` itself. A job in `MANUAL_REVIEW` is resolved
+only by the control principal with
+`POST /v2/control/jobs/{job_id}/resolve`
+(`xb.member.gateway.resolution.v1`):
 
-Only the distinct runtime recovery principal, with a fresh host-bound session,
-exact recorded process identity, and positive exit evidence, may resolve the
-termination side of a quarantined fence. The normal worker principal is denied
-this route even if it supplies a newly created worker session. Recovery does not
-retry SaveMember or allocate a new MemberNo. When termination is confirmed but the business outcome is unknown,
-the repository atomically creates exactly one immutable
-`WRITE_OUTCOME_UNCERTAIN` event and current projection, moves the job to that
-existing result state, clears the hold, and releases the stale lease. The
-existing reconciliation path then applies only to that ordinary uncertainty:
-the hold must be cleared, no lease may remain active, and the existing case and
-read-only check evidence must be present. Positive absence does not authorize
-automatic recreation; mismatch or ambiguity remains manual review.
+- `{"action":"CLOSE","resolution_code":"<code>"}` moves it to `RESOLVED`.
+- `{"action":"REQUEUE","resolution_code":"<code>"}` moves it to `QUEUED` with
+  the write budget raised by 3 (capped at 12; a spent capped budget is
+  `409 write_budget_cap_reached`) and the busy counter reset.
+- Optional `member_no` / `member_guid` record what staff found. They are stored
+  only in the append-only `job_resolutions` table and are never echoed.
+
+A resolved or linked job never gets a welcome email. Resolution is allowed only
+from `MANUAL_REVIEW` (`409 resolution_state_invalid` otherwise).
 
 ## Stop and disable
 
 Use the scoped `POST /v1/control/kill-switch/enable` operation on any source,
-mapping, readiness, lease, allocation, adapter, database, or readback anomaly.
-The worker must stop claiming and no new dispatch fence may be recorded while
-the switch is set. Do not delete history or reset a job to make a retry appear
-clean; preserve the source, allocation, intent, fence, result, and
-reconciliation lineage. Only the separately scoped `.../disable` operation may
-clear the switch after controlled review.
+mapping, readiness, lease, adapter, database, or readback anomaly. The worker
+must stop claiming while the switch is set. Do not delete history or reset a
+job to make a retry appear clean; preserve the source, attempt, outcome,
+resolution and outbox lineage. Only the separately scoped `.../disable`
+operation may clear the switch after controlled review.
 
 The repository check is authoritative at the mutation boundary. In memory, the
-kill-switch read and claim/fence mutation share one repository lock. In
-PostgreSQL, the mutation transaction locks the `kill_switch_enabled` control row
-with `FOR UPDATE` before creating a lease or fence; a missing row blocks closed.
-The API readiness check is only defence in depth.
-
-## Recovery boundaries
-
-Before a dispatch fence, lease expiry may move a job through bounded retry or
-dead-letter handling while retaining the durable allocation and intent. After a
-fence, expiry while the writer hold lacks positive termination proof preserves
-quarantine and global exclusion. If termination proof was already durable,
-expiry may atomically settle the existing ordinary
-`WRITE_OUTCOME_UNCERTAIN` event/projection and clear the hold. There is no
-automatic suffix advance or second SaveMember attempt. Manual review is the
-safe terminal path when lookup or readback evidence is not positive and exact.
-
-The candidate `FREE` probe is not the final dispatch evidence. Immediately
-before write intent/fence, the worker rechecks the already bound MemberNo using
-a distinct public-safe probe reference. The repository durably binds that
-marker to the job, attempt, worker session, bound MemberNo, and `FREE` result;
-stale, missing, conflicting, or non-FREE evidence blocks the write boundary.
-Reconciliation is permitted only from exact `WRITE_OUTCOME_UNCERTAIN` after
-the original writer lease has expired and been reclaimed, then an existing case
-and read-only check must be recorded. A `WRITING` job or live writer cannot be
-reconciled.
-
-The published fence ID remains the `fence-...` representation. PostgreSQL's
-existing UUID storage is internal only and is converted at the repository
-boundary; the A1 migration adds the writer hold without changing that public
-representation. The repository rate gate is fail closed and derives eligibility only from the
-current sole active lease/attempt evidence; no new owner-facing numeric rate is
-defined here.
-
-The public job/status contract is versioned as
-schemas/member_gateway_job.v2.schema.json. It exposes only the safe
-writer-termination state and proof-required/hold-active indicators; it does
-not expose PID, process-start timestamp, host identity, nonce, or raw evidence.
-The result-status vocabulary remains the existing v1 vocabulary.
+control read and claim mutation share one repository lock. In PostgreSQL, the
+claim transaction locks the control rows with `FOR UPDATE` before reaping or
+creating a lease; a missing row blocks closed. The API readiness check is only
+defence in depth.
 
 ## Not performed by this run
 

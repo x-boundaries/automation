@@ -1,9 +1,11 @@
 """Immutable ``welcome_v1`` message and the durable welcome-email state machine.
 
 The gateway, never form input or the n8n export, constructs the sender,
-template, subject and body. A welcome email becomes eligible only when an AC2
-member result is durably ``CREATED_VERIFIED``; email failure never touches the
-member job, allocation or AutoCount.
+template, subject and body. A welcome email becomes eligible only when a
+member job is durably ``CREATED_VERIFIED``: the outbox row is inserted in the
+same transaction as the job's ``member_outcomes`` CREATED_VERIFIED row (v2) or,
+historically, its v1 ``results`` row. Linked, reviewed, resolved and demoted
+jobs never get one. Email failure never touches the member job or AutoCount.
 
 Delivery semantics:
 

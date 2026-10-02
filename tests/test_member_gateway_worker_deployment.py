@@ -23,7 +23,7 @@ _MISSING = object()
 
 NODE_COUNTS = (
     -1, 0, 1, 128, 129, 130, 131, 200,
-    285, 286, 287, 4095, 4096, 4097,
+    286, 287, 288, 4095, 4096, 4097,
     2_147_483_647, 2_147_483_648,
 )
 
@@ -44,35 +44,34 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "724fc4439fcd3de1966e82eae5adf6fee112b142",
-    "scripts/ac2_member_gateway_worker.ps1": "27f0a3f8c78ba9b391b1a09ad33fe5805f723cc1",
-    "scripts/ac2_member_gateway_worker_lib.ps1": "332af5a25f2be996694fdb6cef085139192ebf19",
-    "scripts/ac2_member_gateway_autocount_adapter.ps1": "37ea54fea46c57671b02cbc15a138791a2977244",
-    "scripts/launch_ac2_member_gateway_worker.ps1": "a913dffc6191a8f8945b6427652bab963ab34d70",
-    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "2143f59739a413b80e4745bc23053fefade09486",
+    "scripts/install_ac2_member_gateway_worker.ps1": "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741",
+    "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
+    "scripts/ac2_member_gateway_worker_lib.ps1": "8293559ec6308a8d9afdf73fd4c8b0af322ae382",
+    "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
+    "scripts/launch_ac2_member_gateway_worker.ps1": "64174f398cac61cc2a19f35eaf64070a7b10be0d",
+    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "4ac24e79c23a70d20ef78cdff921a230c80cff05",
+    "scripts/ac2_member_create_primitive.ps1": "2043de36df57159b4d362c17c93f5989eba2b190",
 }
 
 PROTECTED_WORKER_TREES = {
-    "member_gateway": "bf4c9693bdd187a5585660b0cc61223511906637",
+    "member_gateway": "08caccf8751ef8851a38fe5ec9066aa4f3043717",
 }
 
 WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)
 
 ALLOWED_FILES = {
-    ".github/workflows/member-gateway-tests.yml",
-    "config/ac2_member_gateway_worker.production.example.json",
-    "config/member_forms_gateway_bounded_import.v2.template.json",
-    "docs/autocount2-automation/member_gateway_production_runbook.md",
-    "n8n-workflows/README.md",
-    "n8n-workflows/scripts/README.md",
-    "n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1",
+    "docs/autocount2-automation/member_gateway_production_contract.md",
+    "docs/autocount2-automation/member_write_v2_live_runbook.md",
+    "scripts/ac2_member_create_primitive.ps1",
     "scripts/install_ac2_member_gateway_worker.ps1",
-    "scripts/launch_ac2_member_gateway_worker.ps1",
-    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1",
+    "tests/fixtures/ac2_member_primitive/cross_contract_cases.v1.fixture",
+    "tests/fixtures/ac2_member_primitive/fake_autocount.ps1",
+    "tests/test_ac2_member_primitive.py",
+    "tests/test_member_gateway_worker_cycle_ps.py",
     "tests/test_member_gateway_worker_deployment.py",
-    "tests/test_member_gateway_bounded_import_security.py",
-    "tests/test_member_gateway_ci.py",
+    "tests/test_member_write_v2_cross_contract.py",
 }
+
 
 
 _CANONICAL_AUTCOUNT_PROBE = r'''[CmdletBinding()]
@@ -117,7 +116,7 @@ foreach ($requirement in $requiredTypes) {
 
 $memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)
 $methodNames = @($memberCommand.GetMethods() | ForEach-Object Name)
-foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
+foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")) {
     if ($methodNames -notcontains $name) { throw "autocount_required_method_missing" }
 }
 
@@ -127,7 +126,7 @@ foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
     process_bitness = 64
     assembly_count = $requiredAssemblies.Count
     required_type_count = $requiredTypes.Count
-    required_method_count = 4
+    required_method_count = 5
 } | ConvertTo-Json -Compress
 '''
 
@@ -165,7 +164,7 @@ $ExpectedNodeCounts = [ordered]@{
     PipelineAst = 33
     ScriptBlockAst = 1
     StatementBlockAst = 16
-    StringConstantExpressionAst = 53
+    StringConstantExpressionAst = 54
     ThrowStatementAst = 6
     TypeConstraintAst = 2
     TypeExpressionAst = 3
@@ -376,7 +375,7 @@ function Test-MemberCommand {
 
 function Test-RequiredMethods {
     param([object[]]$Nodes)
-    $expected = @("Create", "GetMember", "NewMember", "SaveMember")
+    $expected = @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")
     $matches = @()
     foreach ($loop in $Nodes) {
         if ($loop -isnot [System.Management.Automation.Language.ForEachStatementAst]) { continue }
@@ -515,7 +514,7 @@ try {
     }
     $canonicalNodes = @(Get-AstNodes -Root $canonicalAst)
     $counts = Get-AstNodeCounts -Nodes $nodes
-    $globalShapeOk = $nodes.Count -eq 286 -and $canonicalNodes.Count -eq 286
+    $globalShapeOk = $nodes.Count -eq 287 -and $canonicalNodes.Count -eq 287
     if ($globalShapeOk -and $counts.Count -eq $ExpectedNodeCounts.Count) {
         foreach ($name in $ExpectedNodeCounts.Keys) {
             if (-not $counts.ContainsKey($name) -or $counts[$name] -ne $ExpectedNodeCounts[$name]) {
@@ -1185,7 +1184,7 @@ def _validate_native_result(result: dict[str, object]) -> dict[str, object]:
     required_methods_ok = result["required_methods_ok"]
     accepted = result["accepted"]
 
-    if global_shape_ok and (node_count != 286 or not required_methods_ok):
+    if global_shape_ok and (node_count != 287 or not required_methods_ok):
         raise AssertionError("native AST inspector global-shape result is inconsistent")
 
     if reason == "NATIVE_REQUIRED":
@@ -1330,7 +1329,7 @@ def _validate_native_result(result: dict[str, object]) -> dict[str, object]:
             native
             and parse_ok
             and parse_errors == 0
-            and node_count == 286
+            and node_count == 287
             and global_shape_ok
             and assemblies_ok
             and invoicing_ok
@@ -1382,7 +1381,7 @@ def _expected_native_emission_valid(
     native, parse_ok, global_shape, assemblies, invoicing, member_command, required_methods, accepted = (
         boolean_values
     )
-    if global_shape and (node_count != 286 or not required_methods):
+    if global_shape and (node_count != 287 or not required_methods):
         return False
 
     if reason == "NATIVE_REQUIRED":
@@ -1523,7 +1522,7 @@ def _expected_native_emission_valid(
             native
             and parse_ok
             and parse_errors == 0
-            and node_count == 286
+            and node_count == 287
             and global_shape
             and assemblies
             and invoicing
@@ -1872,7 +1871,7 @@ _ASSEMBLY_VALUES = (
     "AutoCount.ImportExport.dll",
     "AutoCount.Tools.dll",
 )
-_METHOD_VALUES = ("Create", "GetMember", "NewMember", "SaveMember")
+_METHOD_VALUES = ("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")
 
 
 def _array_assignment_block(name: str, elements: list[str]) -> str:
@@ -1999,7 +1998,7 @@ def _collection_variants(source: str) -> list[tuple[str, str]]:
         [
             (
                 "method fifth element",
-                _replace_method_condition(source, "@(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"ExtraMember\")"),
+                _replace_method_condition(source, "@(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"LoadBrowseTable\", \"ExtraMember\")"),
             ),
             (
                 "method flattened comma output",
@@ -2021,7 +2020,7 @@ def _collection_variants(source: str) -> list[tuple[str, str]]:
             (
                 "method duplicate loop",
                 source.rstrip()
-                + "\nforeach ($name in @(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\")) {\n}\n",
+                + "\nforeach ($name in @(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"LoadBrowseTable\")) {\n}\n",
             ),
             (
                 "method replacement collection",
@@ -2265,7 +2264,7 @@ class NativeAstTempPathTests(unittest.TestCase):
                 "native51_x64": True,
                 "parse_ok": True,
                 "parse_errors": 0,
-                "node_count": 286,
+                "node_count": 287,
                 "global_shape_ok": True,
                 "assemblies_ok": True,
                 "invoicing_ok": True,
@@ -2488,7 +2487,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
             "native51_x64": True,
             "parse_ok": True,
             "parse_errors": 0,
-            "node_count": 286,
+            "node_count": 287,
             "global_shape_ok": True,
             "assemblies_ok": True,
             "invoicing_ok": True,
@@ -2630,7 +2629,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
                 "trusted global-shape-success assemblies rejection",
                 self._result(
                     "ASSEMBLIES",
-                    node_count=286,
+                    node_count=287,
                     global_shape_ok=True,
                     assemblies_ok=False,
                 ),
@@ -2841,7 +2840,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
 
         add("OK node count zero", "OK", node_count=0)
         add("OK node count above limit", "OK", node_count=4097)
-        add("OK node count not canonical", "OK", node_count=285)
+        add("OK node count not canonical", "OK", node_count=286)
         for field in ("global_shape_ok", "assemblies_ok", "invoicing_ok", "member_command_ok", "required_methods_ok"):
             add(f"OK required flag false: {field}", "OK", **{field: False})
         add("OK accepted false", "OK", accepted=False)
@@ -2909,7 +2908,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
         add("INPUT_LIMIT parse true", "INPUT_LIMIT", parse_ok=True)
         add("INPUT_LIMIT node count nonzero", "INPUT_LIMIT", node_count=1)
 
-        add("global success wrong count", "OK", node_count=287)
+        add("global success wrong count", "OK", node_count=288)
         add("global success required methods false", "OK", required_methods_ok=False)
 
         unknown_field = self._result("OK")
@@ -3019,6 +3018,8 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
         for path, expected in PROTECTED_WORKER_BLOBS.items():
             with self.subTest(path=path):
                 self.assertEqual(self._blob(path), expected)
+        # The gateway tree pin binds the reviewed candidate; it is checked
+        # against the committed HEAD tree.
         for path, expected in PROTECTED_WORKER_TREES.items():
             with self.subTest(path=path):
                 self.assertEqual(self._tree(path), expected)
@@ -3115,8 +3116,8 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             1,
         )
         fifth_single_method = probe.replace(
-            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember"))',
-            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", \'FifthSingleQuoted\'))',
+            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable"))',
+            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable", \'SixthSingleQuoted\'))',
             1,
         )
 
@@ -3133,7 +3134,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             ("sixth non-literal required assembly", sixth_non_literal_assembly),
             ("expandable-string invoicing rebinding", expandable_rebind),
             ("escaped-braced invoicing rebinding", escaped_braced_rebind),
-            ("fifth single-quoted required method", fifth_single_method),
+            ("sixth single-quoted required method", fifth_single_method),
         ):
             with self.subTest(counterexample=name):
                 result = _inspect_autocount_probe(counterexample)
@@ -3436,7 +3437,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
         probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
         variants = _collection_variants(probe)
-        self.assertEqual(len(variants), 92)
+        self.assertEqual(len(variants), 101)  # 92 + 9 derived from the fifth required method literal
         results = _inspect_many([source for _, source in variants])
         for (label, _), result in zip(variants, results):
             with self.subTest(variant=label):
@@ -3460,7 +3461,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
         probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
         variants = _positive_variants(probe)
-        self.assertEqual(len(variants), 15)
+        self.assertEqual(len(variants), 16)  # 15 + 1 single-quoted variant of the fifth method literal
         results = _inspect_many([source for _, source in variants])
         for (label, _), result in zip(variants, results):
             with self.subTest(variant=label):
@@ -3563,7 +3564,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             )
         )
         self.assertTrue(global_shape_success["global_shape_ok"], global_shape_success)
-        self.assertEqual(global_shape_success["node_count"], 286, global_shape_success)
+        self.assertEqual(global_shape_success["node_count"], 287, global_shape_success)
         self.assertFalse(global_shape_success["invoicing_ok"], global_shape_success)
 
     def test_native_inspector_transport_and_schema_contract(self) -> None:
@@ -3619,11 +3620,14 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             (runtime / "secrets").mkdir()
             config = {
                 "gateway_base_url": "https://gateway.example.test",
-                "worker_host_binding": "host-ac2-worker",
                 "autocount_assembly_path": r"C:\\AutoCount",
                 "autocount_server_name": "  server exact  ",
                 "autocount_database_name": "database exact",
                 "autocount_user_id": "user exact",
+                "autocount_integration_user_id": "user exact",
+                "autocount_book_mode": "production",
+                "autocount_production_book": "database exact",
+                "autocount_test_book_allowlist": [],
             }
             (runtime / "config" / "worker.config.json").write_text(json.dumps(config), encoding="utf-8")
             launcher_text = (ROOT / "scripts/launch_ac2_member_gateway_worker.ps1").read_text(encoding="utf-8")
@@ -3643,6 +3647,12 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
     server = $info.EnvironmentVariables['XB_AC2_SERVER_NAME']
     database = $info.EnvironmentVariables['XB_AC2_DATABASE_NAME']
     user = $info.EnvironmentVariables['XB_AC2_USER_ID']
+    integration_user = $info.EnvironmentVariables['XB_AC2_INTEGRATION_USER_ID']
+    production_book = $info.EnvironmentVariables['XB_AC2_PRODUCTION_BOOK']
+    test_allowlist = $info.EnvironmentVariables['XB_AC2_TEST_BOOK_ALLOWLIST']
+    host_binding = $info.EnvironmentVariables.ContainsKey('XB_MEMBER_GATEWAY_WORKER_HOST_BINDING')
+    arguments = $info.Arguments
+    interpreter = $info.FileName
     probe_server = $info.EnvironmentVariables.ContainsKey('AC2_PROBE_SERVER_NAME')
     probe_database = $info.EnvironmentVariables.ContainsKey('AC2_PROBE_DATABASE_NAME')
     probe_user = $info.EnvironmentVariables.ContainsKey('AC2_PROBE_USER_ID')
@@ -3660,6 +3670,7 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
                     "AC2_PROBE_USER_ID": "legacy-user",
                     "AC2_PROBE_PASSWORD": "legacy-password",
                     "XB_AC2_SESSION_FACTORY": "legacy-factory",
+                    "XB_MEMBER_GATEWAY_WORKER_HOST_BINDING": "host-legacy",
                 }
             )
             completed = self._run_powershell_harness(
@@ -3674,6 +3685,12 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             self.assertEqual(observed["server"], "  server exact  ")
             self.assertEqual(observed["database"], "database exact")
             self.assertEqual(observed["user"], "user exact")
+            self.assertEqual(observed["integration_user"], "user exact")
+            self.assertEqual(observed["production_book"], "database exact")
+            self.assertEqual(observed["test_allowlist"], "")
+            self.assertFalse(observed["host_binding"])
+            self.assertEqual(observed["interpreter"], r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            self.assertIn('"-Book" "production" "-EnableProductionWorker" "-EnableProductionAdapter"', observed["arguments"])
             for name in ("probe_server", "probe_database", "probe_user", "probe_password", "session_factory"):
                 self.assertFalse(observed[name], name)
             self.assertEqual(observed["password"], "password")
@@ -3692,7 +3709,8 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             install.mkdir()
             marker = root / "child-started.txt"
             (install / "ac2_member_gateway_worker.ps1").write_text(
-                "param([switch]$EnableProductionWorker, [switch]$EnableProductionAdapter)\n"
+                "param([string]$Book, [switch]$EnableProductionWorker, [switch]$EnableProductionAdapter)\n"
+                "if ($Book -cne 'production') { throw 'synthetic_book_missing' }\n"
                 "$marker = [Environment]::GetEnvironmentVariable('XB_TEST_CHILD_MARKER', 'Process')\n"
                 "if ([string]::IsNullOrWhiteSpace($marker)) { throw 'synthetic_marker_missing' }\n"
                 "[IO.File]::WriteAllText($marker, 'started')\n"
@@ -3701,11 +3719,14 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             )
             base_config = {
                 "gateway_base_url": "https://gateway.example.test",
-                "worker_host_binding": "host-ac2-worker",
                 "autocount_assembly_path": r"C:\\AutoCount",
                 "autocount_server_name": "synthetic-server",
                 "autocount_database_name": "synthetic-database",
                 "autocount_user_id": "synthetic-user",
+                "autocount_integration_user_id": "synthetic-user",
+                "autocount_book_mode": "production",
+                "autocount_production_book": "synthetic-database",
+                "autocount_test_book_allowlist": [],
             }
             (runtime / "config" / "worker.config.json").write_text(
                 json.dumps(base_config), encoding="utf-8"
@@ -3779,8 +3800,15 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             self.assertTrue(marker.exists(), control.stdout + control.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8"), "started")
 
-            for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id"):
-                for value in invalid_values:
+            invalid_cases = [
+                (field, value)
+                for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id", "autocount_integration_user_id", "autocount_production_book", "autocount_book_mode")
+                for value in invalid_values
+            ]
+            invalid_cases += [("autocount_book_mode", "Production"), ("autocount_book_mode", "staging")]
+            invalid_cases += [("autocount_test_book_allowlist", value) for value in (_MISSING, None, "book", [7], [""], ["a;b"])]
+            for field, value in invalid_cases:
+                if True:
                     with self.subTest(field=field, value=value):
                         config = dict(base_config)
                         if value is _MISSING:
@@ -3867,6 +3895,9 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             "autocount_server_name": "launcher_autocount_server_name_invalid",
             "autocount_database_name": "launcher_autocount_database_name_invalid",
             "autocount_user_id": "launcher_autocount_user_id_invalid",
+            "autocount_integration_user_id": "launcher_autocount_integration_user_id_invalid",
+            "autocount_production_book": "launcher_autocount_production_book_invalid",
+            "autocount_book_mode": "launcher_autocount_book_mode_invalid",
         }
         for field, error_id in fields.items():
             with self.subTest(field=field):
@@ -3876,6 +3907,9 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             "XB_AC2_SERVER_NAME",
             "XB_AC2_DATABASE_NAME",
             "XB_AC2_USER_ID",
+            "XB_AC2_INTEGRATION_USER_ID",
+            "XB_AC2_PRODUCTION_BOOK",
+            "XB_AC2_TEST_BOOK_ALLOWLIST",
         ):
             self.assertIn(f'EnvironmentVariables["{environment_name}"]', launcher)
         for environment_name in (
@@ -3884,8 +3918,11 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             "AC2_PROBE_USER_ID",
             "AC2_PROBE_PASSWORD",
             "XB_AC2_SESSION_FACTORY",
+            "XB_MEMBER_GATEWAY_WORKER_HOST_BINDING",
         ):
             self.assertIn(f'EnvironmentVariables.Remove("{environment_name}")', launcher)
+        self.assertNotIn("worker_host_binding", launcher)
+        self.assertNotIn("$PSHOME", launcher.replace("never resolved from PATH or $PSHOME", ""))
         self.assertIn('$value -isnot [string]', launcher)
         self.assertIn('[string]::IsNullOrWhiteSpace($value)', launcher)
         self.assertNotIn('[string]$config.autocount_server_name', launcher)
@@ -3900,17 +3937,29 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
         example = json.loads(
             (ROOT / "config/ac2_member_gateway_worker.production.example.json").read_text(encoding="utf-8")
         )
-        for field in (
+        test_example = json.loads(
+            (ROOT / "config/ac2_member_gateway_worker.test_book.example.json").read_text(encoding="utf-8")
+        )
+        fields = {
             "gateway_base_url",
-            "worker_host_binding",
             "autocount_assembly_path",
             "autocount_server_name",
             "autocount_database_name",
             "autocount_user_id",
-        ):
-            self.assertIn(field, example)
-        for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id"):
-            self.assertIsNone(example[field])
+            "autocount_integration_user_id",
+            "autocount_book_mode",
+            "autocount_production_book",
+            "autocount_test_book_allowlist",
+        }
+        for document, mode in ((example, "production"), (test_example, "test")):
+            self.assertEqual(set(document), fields)
+            self.assertNotIn("worker_host_binding", document)
+            self.assertEqual(document["autocount_book_mode"], mode)
+            for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id", "autocount_integration_user_id", "autocount_production_book"):
+                self.assertIsNone(document[field])
+        self.assertEqual(example["autocount_test_book_allowlist"], [])
+        self.assertEqual(test_example["autocount_test_book_allowlist"], ["REPLACE_WITH_TEST_BOOK_DATABASE_NAME"])
+
 
     def test_worktree_change_allowlist_is_narrow(self) -> None:
         status = subprocess.run(
@@ -3939,7 +3988,9 @@ INSTALLER_PACKAGE_FILES = (
     "ac2_member_gateway_autocount_adapter.ps1",
     "launch_ac2_member_gateway_worker.ps1",
     "test_ac2_member_gateway_autocount_dependencies.ps1",
+    "ac2_member_create_primitive.ps1",
 )
+WINDOWS_POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
 def _hosted_windows_boundary_required(env: dict[str, str] | None = None) -> bool:
@@ -4313,6 +4364,8 @@ $report = [ordered]@{
 $secretValues = New-Object 'System.Collections.Generic.List[string]'
 $trace = New-Object 'System.Collections.Generic.List[string]'
 $state = @{ pristine_proven = $false; user_sid = $null; temp_redirect = $null; stage_before = @(); boundary_folder = $null; boundary_tasks = @(); lsa_loaded = $false }
+$securePassword = $null
+$secureWrong = $null
 
 $lsaSource = @"
 using System;
@@ -4330,6 +4383,7 @@ public static class XbBoundaryLsa
 
     [DllImport("advapi32.dll")] private static extern uint LsaOpenPolicy(IntPtr systemName, ref LsaObjectAttributes objectAttributes, uint desiredAccess, out IntPtr policyHandle);
     [DllImport("advapi32.dll")] private static extern uint LsaEnumerateAccountRights(IntPtr policyHandle, byte[] accountSid, out IntPtr userRights, out uint countOfRights);
+    [DllImport("advapi32.dll")] private static extern uint LsaAddAccountRights(IntPtr policyHandle, byte[] accountSid, ref LsaUnicodeString userRights, uint countOfRights);
     [DllImport("advapi32.dll")] private static extern uint LsaRemoveAccountRights(IntPtr policyHandle, byte[] accountSid, [MarshalAs(UnmanagedType.U1)] bool allRights, IntPtr userRights, uint countOfRights);
     [DllImport("advapi32.dll")] private static extern uint LsaFreeMemory(IntPtr buffer);
     [DllImport("advapi32.dll")] private static extern uint LsaClose(IntPtr policyHandle);
@@ -4383,6 +4437,28 @@ public static class XbBoundaryLsa
         finally { LsaClose(handle); }
     }
 
+    public static void AddAccountRight(string sid, string name)
+    {
+        if (String.IsNullOrWhiteSpace(name)) { throw new InvalidOperationException("lsa_right_name_invalid"); }
+        IntPtr handle = Open();
+        IntPtr buffer = IntPtr.Zero;
+        try
+        {
+            buffer = Marshal.StringToHGlobalUni(name);
+            LsaUnicodeString right = new LsaUnicodeString();
+            right.Length = checked((ushort)(name.Length * 2));
+            right.MaximumLength = checked((ushort)(right.Length + 2));
+            right.Buffer = buffer;
+            uint status = LsaAddAccountRights(handle, SidBytes(sid), ref right, 1);
+            if (status != 0) { throw new InvalidOperationException("lsa_add_right_failed:" + LsaNtStatusToWinError(status)); }
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+            LsaClose(handle);
+        }
+    }
+
     public static void RemoveAllRights(string sid)
     {
         IntPtr handle = Open();
@@ -4424,17 +4500,51 @@ function Get-XbBoundaryOutcome {
 }
 
 function Invoke-XbBoundaryCase {
-    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
-    $record = [ordered]@{ status = "error" }
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Body,
+        [switch]$PreserveIncrementally
+    )
+    $record = [ordered]@{ status = "running" }
+    $report.cases[$Name] = $record
     try {
-        $data = @(& $Body)
-        if ($data.Count -gt 0 -and $data[-1] -is [Collections.IDictionary]) { foreach ($key in @($data[-1].Keys)) { $record[$key] = $data[-1][$key] } }
+        if ($PreserveIncrementally) {
+            $null = & $Body $record
+        } else {
+            $data = @(& $Body)
+            if ($data.Count -gt 0 -and $data[-1] -is [Collections.IDictionary]) { foreach ($key in @($data[-1].Keys)) { $record[$key] = $data[-1][$key] } }
+        }
         $record.status = "completed"
     } catch {
+        $record.status = "error"
         $record.error = [string]$_.Exception.Message
         $record.error_stack = [string]$_.ScriptStackTrace
     }
-    $report.cases[$Name] = $record
+}
+
+function Invoke-XbBoundaryCleanup {
+    param(
+        [Parameter(Mandatory)]$CaseRecord,
+        [Parameter(Mandatory)][scriptblock]$Preflight,
+        [Parameter(Mandatory)][scriptblock]$Body
+    )
+    $CaseRecord.cleanup = [ordered]@{
+        attempted = $false
+        pass = $null
+        error = $null
+        stack = $null
+    }
+    try {
+        $null = & $Preflight $CaseRecord
+        $CaseRecord.cleanup.attempted = $true
+        $null = & $Body
+        $CaseRecord.cleanup.pass = $true
+    } catch {
+        if ($CaseRecord.cleanup.attempted) { $CaseRecord.cleanup.pass = $false }
+        $CaseRecord.cleanup.error = [string]$_.Exception.Message
+        $CaseRecord.cleanup.stack = [string]$_.ScriptStackTrace
+        throw
+    }
 }
 
 function Get-XbStageNames {
@@ -4509,6 +4619,186 @@ function Get-XbProductionReadback {
         program_files_parent_present = (Test-Path -LiteralPath $programFilesParent)
         program_data_parent_present = (Test-Path -LiteralPath $programDataParent)
         new_stage_count = @($stageNow | Where-Object { $state.stage_before -notcontains $_ }).Count
+    }
+}
+
+function Get-XbBoundaryComTaskFolderReadback {
+    $requestedFolderPath = ConvertTo-XbComFolderPath -Path $taskPath
+    $service = Connect-XbTaskService
+    $observation = [ordered]@{ requested_folder_path = $requestedFolderPath }
+    try { $folder = $service.GetFolder($requestedFolderPath) }
+    catch {
+        if ((Get-XbBoundaryHResult $_) -eq -2147024894) {
+            $observation.folder_present = $false
+            $observation.task_present = $false
+            return $observation
+        }
+        throw "task_folder_presence_unproven"
+    }
+    $observation.folder_present = $true
+    $observation.returned_folder_path = [string]$folder.Path
+    if ($observation.returned_folder_path -cne $requestedFolderPath) { throw "task_folder_identity_invalid" }
+    $registered = $null
+    try { $registered = $folder.GetTask($taskName) }
+    catch {
+        if ((Get-XbBoundaryHResult $_) -eq -2147024894) {
+            $observation.task_present = $false
+        } else {
+            throw "task_presence_unproven"
+        }
+    }
+    if ($null -ne $registered) {
+        $observation.task_present = $true
+        $observation.task_path = [string]$registered.Path
+        if ($observation.task_path -cne ($taskPath + $taskName)) { throw "task_identity_invalid" }
+    }
+    $observation.task_count = [int]$folder.GetTasks(1).Count
+    $observation.child_folder_count = [int]$folder.GetFolders(0).Count
+    return $observation
+}
+
+function Set-XbBoundaryTaskPresenceReadback {
+    param(
+        [Parameter(Mandatory)]$CaseRecord,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $observation = [ordered]@{
+        effective_task_path = [string]$taskPath
+        effective_task_name = [string]$taskName
+    }
+    $CaseRecord[$Name] = $observation
+    $observation.cim_task_present = ($null -ne (Get-XbWorkerTaskIfPresent))
+    $observation.com = Get-XbBoundaryComTaskFolderReadback
+}
+
+function Get-XbSyntheticConfigSnapshot {
+    param([Parameter(Mandatory)][string]$Path)
+    Initialize-XbWorkerNativeAccess
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $pathChain = Get-XbNativePathChain -Path $fullPath
+    for ($index = 0; $index -lt $pathChain.Count; $index++) {
+        $chainItem = Get-Item -LiteralPath $pathChain[$index] -Force -ErrorAction Stop
+        $isLeaf = ($index -eq ($pathChain.Count - 1))
+        if (($chainItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            ($isLeaf -and [bool]$chainItem.PSIsContainer) -or
+            (-not $isLeaf -and -not [bool]$chainItem.PSIsContainer)) {
+            throw "effective_rights_unproven"
+        }
+    }
+    $protected = $null
+    try {
+        $protected = [XbWorkerProtectedObject]::Open($fullPath, $false, $true)
+        if ($protected.IsDirectory -or $protected.IsReparsePoint) { throw "effective_rights_unproven" }
+        $snapshot = $protected.ReadSnapshot()
+        return [ordered]@{
+            file_identity = [string]$protected.FileIdentity
+            text = [string]$snapshot.Text
+            path_chain_parent_count = [int]($pathChain.Count - 1)
+            path_chain_ordinary_non_reparse = $true
+        }
+    } finally { if ($null -ne $protected) { $protected.Dispose() } }
+}
+
+function Get-XbRuntimeDirectoryEvidence {
+    $expectedDirectories = @("config", "logs", "rollback", "secrets")
+    $rootItem = Get-Item -LiteralPath $RuntimeRoot -Force -ErrorAction Stop
+    $rootIsDirectory = [bool]$rootItem.PSIsContainer
+    $rootReparsePoint = (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+    $evidence = [ordered]@{
+        runtime_root_path = [IO.Path]::GetFullPath($RuntimeRoot)
+        root_is_directory = $rootIsDirectory
+        root_reparse_point = [bool]$rootReparsePoint
+    }
+    if (-not $rootIsDirectory -or $rootReparsePoint) {
+        $evidence.prerequisite_satisfied = $false
+        return $evidence
+    }
+
+    $rootEntries = @(Get-ChildItem -LiteralPath $RuntimeRoot -Force -ErrorAction Stop)
+    $directories = @($rootEntries | Where-Object { $_.PSIsContainer })
+    $files = @($rootEntries | Where-Object { -not $_.PSIsContainer })
+    $directoryNames = @($directories | ForEach-Object Name | Sort-Object)
+    $fileNames = @($files | ForEach-Object Name | Sort-Object)
+    $directoryContents = [ordered]@{}
+    $emptyExpectedDirectories = $true
+    foreach ($name in $expectedDirectories) {
+        $matches = @($directories | Where-Object { [string]$_.Name -ceq $name })
+        if ($matches.Count -ne 1) {
+            $directoryContents[$name] = [ordered]@{
+                present = ($matches.Count -gt 0)
+                match_count = $matches.Count
+            }
+            $emptyExpectedDirectories = $false
+            continue
+        }
+        $directory = $matches[0]
+        $reparsePoint = (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($reparsePoint) {
+            $directoryContents[$name] = [ordered]@{
+                present = $true
+                reparse_point = $true
+            }
+            $emptyExpectedDirectories = $false
+            continue
+        }
+        $entries = @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)
+        $entryNames = @($entries | ForEach-Object Name | Sort-Object)
+        $directoryContents[$name] = [ordered]@{
+            present = $true
+            reparse_point = $false
+            entry_count = $entries.Count
+            entry_names = $entryNames
+        }
+        if ($entries.Count -ne 0) { $emptyExpectedDirectories = $false }
+    }
+    $directorySetMatches = (@(Compare-Object -ReferenceObject $directoryNames -DifferenceObject $expectedDirectories -CaseSensitive).Count -eq 0)
+    $evidence.root_directory_count = $directories.Count
+    $evidence.root_file_count = $files.Count
+    $evidence.root_directory_names = $directoryNames
+    $evidence.root_file_names = $fileNames
+    $evidence.directory_contents = $directoryContents
+    $evidence.prerequisite_satisfied = [bool]($directorySetMatches -and $files.Count -eq 0 -and $emptyExpectedDirectories)
+    return $evidence
+}
+
+function Get-XbRetainedParentEvidence {
+    $parents = [ordered]@{}
+    $safeToRemove = $true
+    foreach ($spec in @(
+        @("program_files_parent", $programFilesParent),
+        @("program_data_parent", $programDataParent)
+    )) {
+        $name = [string]$spec[0]
+        $path = [string]$spec[1]
+        $item = $null
+        try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] {
+            $parents[$name] = [ordered]@{ present = $false }
+            continue
+        } catch {
+            throw "container_not_owned_empty"
+        }
+        $isDirectory = [bool]$item.PSIsContainer
+        $reparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $parentEvidence = [ordered]@{
+            present = $true
+            is_directory = $isDirectory
+            reparse_point = [bool]$reparsePoint
+        }
+        if (-not $isDirectory -or $reparsePoint) {
+            $parents[$name] = $parentEvidence
+            $safeToRemove = $false
+            continue
+        }
+        $children = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)
+        $parentEvidence.child_count = $children.Count
+        $parentEvidence.child_names = @($children | ForEach-Object Name | Sort-Object)
+        $parents[$name] = $parentEvidence
+        if ($children.Count -ne 0) { $safeToRemove = $false }
+    }
+    return [ordered]@{
+        safe_to_remove = [bool]$safeToRemove
+        parents = $parents
     }
 }
 
@@ -4592,7 +4882,13 @@ try {
     $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
     $wrongCredential = New-Object Management.Automation.PSCredential($workerAccount, $secureWrong)
     $script:WorkerAccount = $workerAccount
+    if ($null -ne [XbBoundaryLsa]::GetRights($state.user_sid)) { throw "boundary_user_right_preimage_not_clean" }
+    [XbBoundaryLsa]::AddAccountRight($state.user_sid, "SeBatchLogonRight")
+    $workerRights = @([XbBoundaryLsa]::GetRights($state.user_sid))
+    if ($workerRights.Count -ne 1 -or $workerRights[0] -cne "SeBatchLogonRight") { throw "boundary_batch_logon_right_not_assigned" }
+    $report.account.batch_logon_right_assigned = $true
     $report.environment.worker_account = $workerAccount
+    $report.environment.worker_sid = $state.user_sid
     try {
         $report.environment.administrators_member = (@(Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop | Where-Object { $_.SID.Value -eq $state.user_sid }).Count -ne 0)
     } catch {
@@ -4609,7 +4905,7 @@ try {
     $fakeLauncher = "C:\xb-boundary-launcher-$boundaryHex\launch_ac2_member_gateway_worker.ps1"
 
     Invoke-XbBoundaryCase "in_memory_null_trigger_pin" {
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
+        $action = New-ScheduledTaskAction -Execute $script:XbWindowsPowerShellPath -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $workerAccount -LogonType Password -RunLevel Limited
         $memory = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
@@ -4642,7 +4938,7 @@ try {
     Invoke-XbBoundaryCase "one_trigger_control" {
         $script:taskPath = $state.boundary_folder
         $script:taskName = $controlName
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
+        $action = New-ScheduledTaskAction -Execute $script:XbWindowsPowerShellPath -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $workerAccount -LogonType Password -RunLevel Limited
         $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::new(2099, 1, 1, 0, 0, 0))
@@ -4777,37 +5073,541 @@ try {
         }
     }
 
-    Invoke-XbBoundaryCase "install_then_uninstall" {
+    function Invoke-XbCi7AclProbe {
+        param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Security.AccessControl.FileSystemAccessRule]$Rule, [Parameter(Mandatory)]$Token, [Parameter(Mandatory)][uint32]$DesiredAccess, [Parameter(Mandatory)][Management.Automation.PSCredential]$Credential)
+        $original = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        try {
+            $changed = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $changed.AddAccessRule($Rule)
+            Set-Acl -LiteralPath $Path -AclObject $changed -ErrorAction Stop
+            $granted = Test-XbNativeAccessAllowed -Path $Path -Token $Token -DesiredAccess $DesiredAccess
+            $outcome = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $Credential }
+            return [ordered]@{ requested_operation_granted = [bool]$granted; effective_rights = $outcome }
+        } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
+    }
+
+    function Invoke-XbCi7OwnerProbe {
+        param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Management.Automation.PSCredential]$Credential, [Parameter(Mandatory)][string]$WrongOwnerSid)
+        $original = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        try {
+            $changed = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $changed.SetOwner([Security.Principal.SecurityIdentifier]::new($WrongOwnerSid))
+            Set-Acl -LiteralPath $Path -AclObject $changed -ErrorAction Stop
+            return (Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $Credential })
+        } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
+    }
+
+    function Invoke-XbCi7DenyProbe {
+        param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Security.AccessControl.FileSystemAccessRule]$Rule, [Parameter(Mandatory)]$Token, [Parameter(Mandatory)][uint32]$DesiredAccess, [Parameter(Mandatory)][Management.Automation.PSCredential]$Credential)
+        $original = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        try {
+            $changed = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $changed.AddAccessRule($Rule)
+            Set-Acl -LiteralPath $Path -AclObject $changed -ErrorAction Stop
+            $denied = -not (Test-XbNativeAccessAllowed -Path $Path -Token $Token -DesiredAccess $DesiredAccess)
+            $outcome = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $Credential }
+            return [ordered]@{ requested_operation_denied = [bool]$denied; effective_rights = $outcome }
+        } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
+    }
+
+    Invoke-XbBoundaryCase -Name "install_then_uninstall" -PreserveIncrementally -Body {
+        param($case)
+        $ci7 = [ordered]@{
+            fatal = $null
+            required_probe_completion = [ordered]@{ status = "in_progress" }
+        }
+        $case.ci7 = $ci7
+        $case.synthetic_config_snapshot = [ordered]@{}
         Set-XbProductionTaskIdentity
         $script:TaskCredential = $credential
         $trace.Clear()
-        $installOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
-        $installed = Get-XbProductionReadback
-        $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) }
-        $ownership = Get-XbBoundaryOutcome { Assert-XbUninstallOwnership }
-        $evidence = Get-XbTaskEvidence
+        $case.install_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $case.installed = Get-XbProductionReadback
+        Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "install_task_presence"
+        $case.contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) }
+        $case.ownership = Get-XbBoundaryOutcome { Assert-XbUninstallOwnership }
+        $case.evidence = Get-XbTaskEvidence
         $manifest = Get-Content -Raw -LiteralPath (Join-Path $InstallRoot "installation-manifest.json") | ConvertFrom-Json
-        $accountInstalled = Get-XbAccountObservation
-        $script:Operation = "Uninstall"
-        $uninstallOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
-        $uninstalled = Get-XbProductionReadback
-        $accountUninstalled = Get-XbAccountObservation
-        $rollbackTrace = @($trace)
-        Clear-XbRetainedProductionContainers
-        return [ordered]@{
-            install_outcome = $installOutcome
-            installed = $installed
-            contract = $contract
-            ownership = $ownership
-            evidence = $evidence
-            manifest_trigger_count = [int]$manifest.task.trigger_count
-            account_installed = $accountInstalled
-            uninstall_outcome = $uninstallOutcome
-            uninstalled = $uninstalled
-            account_uninstalled = $accountUninstalled
-            rollback_trace = $rollbackTrace
-            post_cleanup = (Get-XbProductionReadback)
+        $case.manifest_trigger_count = [int]$manifest.task.trigger_count
+        $configFile = Join-Path (Join-Path $RuntimeRoot "config") "worker.config.json"
+        [IO.File]::WriteAllText($configFile, "{}", [Text.UTF8Encoding]::new($false))
+        Set-XbWorkerTrustedOwner -Path $configFile -OwnerSid "S-1-5-18"
+        $nativeTypeBeforeSnapshot = "XbWorkerProtectedObject" -as [type]
+        $case.synthetic_config_snapshot.native_type_absent_before_first_use = ($null -eq $nativeTypeBeforeSnapshot)
+        if ($null -ne $nativeTypeBeforeSnapshot) { throw "synthetic_config_native_type_preloaded" }
+        $syntheticConfigSnapshot = Get-XbSyntheticConfigSnapshot -Path $configFile
+        $case.synthetic_config_snapshot.native_type_initialized = ($null -ne ("XbWorkerProtectedObject" -as [type]))
+        if ($syntheticConfigSnapshot.text -cne "{}") { throw "synthetic_config_fixture_content_unexpected" }
+        $configBytes = [IO.File]::ReadAllBytes($configFile)
+        $case.synthetic_config_snapshot.fixture_bytes_hex = [BitConverter]::ToString($configBytes).Replace("-", "").ToLowerInvariant()
+        if ($configBytes.Length -ne 2 -or $configBytes[0] -ne 0x7b -or $configBytes[1] -ne 0x7d) {
+            throw "synthetic_config_fixture_bytes_unexpected"
         }
+        $syntheticConfigIdentity = [string]$syntheticConfigSnapshot.file_identity
+        $snapshotProbePath = Join-Path (Split-Path -Parent $configFile) ".snapshot-probe.json"
+        $snapshotProbeBackupPath = $snapshotProbePath + ".original"
+        if ((Test-Path -LiteralPath $snapshotProbePath) -or (Test-Path -LiteralPath $snapshotProbeBackupPath)) {
+            throw "synthetic_config_snapshot_probe_preimage_exists"
+        }
+        try {
+            [IO.File]::WriteAllText($snapshotProbePath, '{"wrong":true}', [Text.UTF8Encoding]::new($false))
+            Set-XbWorkerTrustedOwner -Path $snapshotProbePath -OwnerSid "S-1-5-18"
+            $wrongContentSnapshot = Get-XbSyntheticConfigSnapshot -Path $snapshotProbePath
+            $case.synthetic_config_snapshot.wrong_content_exact = [string]::Equals([string]$wrongContentSnapshot.text, '{"wrong":true}', [StringComparison]::Ordinal)
+            if (-not $case.synthetic_config_snapshot.wrong_content_exact) { throw "synthetic_config_wrong_content_not_exact" }
+            $wrongContentIdentity = [string]$wrongContentSnapshot.file_identity
+            Move-Item -LiteralPath $snapshotProbePath -Destination $snapshotProbeBackupPath -ErrorAction Stop
+            [IO.File]::WriteAllText($snapshotProbePath, "{}", [Text.UTF8Encoding]::new($false))
+            Set-XbWorkerTrustedOwner -Path $snapshotProbePath -OwnerSid "S-1-5-18"
+            $replacementSnapshot = Get-XbSyntheticConfigSnapshot -Path $snapshotProbePath
+            $case.synthetic_config_snapshot.replacement_identity_changed = ([string]$replacementSnapshot.file_identity -cne $wrongContentIdentity)
+            if (-not $case.synthetic_config_snapshot.replacement_identity_changed) { throw "synthetic_config_replacement_identity_not_changed" }
+        } finally {
+            if (Test-Path -LiteralPath $snapshotProbePath) { Remove-Item -LiteralPath $snapshotProbePath -Force -ErrorAction Stop }
+            if (Test-Path -LiteralPath $snapshotProbeBackupPath) { Remove-Item -LiteralPath $snapshotProbeBackupPath -Force -ErrorAction Stop }
+        }
+        $case.account_installed = Get-XbAccountObservation
+        $nativeToken = $null
+        $logPath = $null
+        $junctionPath = $null
+        try {
+            $logsPath = Join-Path $RuntimeRoot "logs"
+            $runtimeRootAcl = Get-Acl -LiteralPath $RuntimeRoot
+            $logsRootAcl = Get-Acl -LiteralPath $logsPath
+            $workerSid = Get-XbAccountSid -Account $WorkerAccount
+            $workerSidIdentity = [Security.Principal.SecurityIdentifier]::new($workerSid)
+            $ci7.root_owner_sid = $logsRootAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+            $ci7.root_owner_accepted = ($ci7.root_owner_sid -in @("S-1-5-18", "S-1-5-32-544"))
+            $ci7.root_dacl_protected = [bool]$logsRootAcl.AreAccessRulesProtected
+            $ci7.root_acl_shape = Get-XbBoundaryOutcome { Assert-XbLogsRootAclShape -Path $logsPath -WorkerSid $workerSid }
+            $nativeToken = New-XbWorkerBatchToken -Credential $credential
+            $ci7.token_user_sid = [string]$nativeToken.UserSid
+            $ci7.token_type = [int]$nativeToken.TokenType
+            $ci7.token_impersonation_level = [int]$nativeToken.ImpersonationLevel
+            $rootMaximum = Invoke-XbNativeAccessCheck -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x02000000)
+            $ci7.logs_root_granted_mask = "0x{0:X8}" -f [uint32]$rootMaximum.GrantedAccess
+            $ci7.root_write_dac = Test-XbNativeAccessAllowed -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x00040000)
+            $ci7.root_write_owner = Test-XbNativeAccessAllowed -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x00080000)
+            $ci7.root_delete = Test-XbNativeAccessAllowed -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x00010000)
+            $ci7.runtime_root_delete_child = Test-XbNativeAccessAllowed -Path $RuntimeRoot -Token $nativeToken -DesiredAccess ([uint32]0x00000040)
+            $ci7.parent_delete_composition = Get-XbBoundaryOutcome { Assert-XbPathNotDeleteable -Path $logsPath -Token $nativeToken }
+
+            $logPath = Join-Path $logsPath ("launcher-ci7-{0}.jsonl" -f (New-XbBoundaryHex 8))
+            $nativeToken.Impersonate()
+            try {
+                Set-Content -LiteralPath $logPath -Value "ci7-create" -NoNewline
+                Add-Content -LiteralPath $logPath -Value "|ci7-append" -NoNewline
+                $ci7.ps51_enumerated = (@(Get-ChildItem -LiteralPath $logsPath -File -Force | ForEach-Object FullName) -contains $logPath)
+                $ci7.ps51_content = [IO.File]::ReadAllText($logPath)
+            } finally { [XbWorkerBatchToken]::Revert() }
+            $childAcl = Get-Acl -LiteralPath $logPath
+            $ci7.child_owner_sid = $childAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+            $ci7.child_owner_is_worker = ($ci7.child_owner_sid -ceq $workerSid)
+            $ci7.child_owner_rights_shape = Get-XbBoundaryOutcome { Assert-XbOwnerRightsLogFile -Path $logPath -WorkerSid $workerSid }
+            $ownerRules = @($childAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -ceq "S-1-3-4" })
+            $ci7.child_owner_rights_ace_count = $ownerRules.Count
+            $ci7.child_owner_rights_ace_mask = if ($ownerRules.Count -eq 1) { "0x{0:X8}" -f [int]$ownerRules[0].FileSystemRights } else { $null }
+            $childMaximum = Invoke-XbNativeAccessCheck -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x02000000)
+            $ci7.child_granted_mask = "0x{0:X8}" -f [uint32]$childMaximum.GrantedAccess
+            $ci7.child_write_dac = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00040000)
+            $ci7.child_write_owner = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00080000)
+            $ci7.child_delete = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00010000)
+
+            $verification = $null
+            try {
+                $verification = Invoke-XbInstallVerifier -TaskCredential $credential
+                $ci7.verify_outcome = "pass"
+                $ci7.verify_status = [string]$verification.status
+                $ci7.verify_release_sha256 = [string]$verification.release_sha256
+                $ci7.verify_checks = $verification.checks
+            } catch { $ci7.verify_outcome = [string]$_.Exception.Message }
+
+            $reviewedIdentity = Read-XbReviewedPackageIdentity -Path $ReviewedManifestPath -PackageRoot (Split-Path -Parent $InstallerPath)
+            $upgrade = $null
+            try {
+                $upgrade = Invoke-XbWorkerUpgrade -SourceRoot (Split-Path -Parent $InstallerPath) -ReviewedIdentity $reviewedIdentity
+                $ci7.upgrade_outcome = [string]$upgrade.status
+            } catch { $ci7.upgrade_outcome = [string]$_.Exception.Message }
+            if ($null -ne $upgrade -and -not [string]::IsNullOrWhiteSpace([string]$upgrade.snapshot)) {
+                $upgradeSnapshot = Join-Path (Join-Path $RuntimeRoot "rollback") ([string]$upgrade.snapshot)
+                if (Test-Path -LiteralPath $upgradeSnapshot) { Remove-Item -LiteralPath $upgradeSnapshot -Recurse -Force -ErrorAction Stop }
+            }
+            $ci7.verify_after_upgrade = Get-XbBoundaryOutcome { Invoke-XbInstallVerifier -TaskCredential $credential }
+            $configContent = [IO.File]::ReadAllText($configFile)
+            Remove-Item -LiteralPath $configFile -Force -ErrorAction Stop
+            $ci7.empty_config_verify = Get-XbBoundaryOutcome { Invoke-XbInstallVerifier -TaskCredential $credential }
+            [IO.File]::WriteAllText($configFile, $configContent, [Text.UTF8Encoding]::new($false))
+            Set-XbWorkerTrustedOwner -Path $configFile -OwnerSid "S-1-5-18"
+            $syntheticConfigSnapshot = Get-XbSyntheticConfigSnapshot -Path $configFile
+            if ($syntheticConfigSnapshot.text -cne "{}") { throw "synthetic_config_fixture_content_unexpected" }
+            $syntheticConfigIdentity = [string]$syntheticConfigSnapshot.file_identity
+            $ci7.package_owner_sids = @($packageFiles + "installation-manifest.json" | ForEach-Object { (Get-Acl -LiteralPath (Join-Path $InstallRoot $_)).GetOwner([Security.Principal.SecurityIdentifier]).Value })
+            $ci7.config_owner_sid = (Get-Acl -LiteralPath $configFile).GetOwner([Security.Principal.SecurityIdentifier]).Value
+
+            $ci7.missing_credential = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights }
+            $mismatchedCredential = New-Object Management.Automation.PSCredential("xb-ci7-other", $securePassword)
+            $ci7.mismatched_credential = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $mismatchedCredential }
+            $ci7.invalid_password = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $wrongCredential }
+            $unsupportedAccount = $WorkerAccount + "@invalid.example"
+            $unsupportedCredential = New-Object Management.Automation.PSCredential($unsupportedAccount, $securePassword)
+            $originalWorkerAccount = $script:WorkerAccount
+            try {
+                $script:WorkerAccount = $unsupportedAccount
+                $ci7.unsupported_account_profile = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $unsupportedCredential }
+            } finally { $script:WorkerAccount = $originalWorkerAccount }
+
+            $originalAccessCheck = ${function:Invoke-XbNativeAccessCheck}
+            Set-Item function:script:Invoke-XbNativeAccessCheck { param([string]$Path, $Token, [uint32]$DesiredAccess) throw "forced_native_access_failure" }
+            try { $ci7.native_access_failure = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential } }
+            finally { Set-Item function:script:Invoke-XbNativeAccessCheck $originalAccessCheck }
+
+            $originalHandleAccessCheck = ${function:Invoke-XbCi7HandleAccessCheck}
+            Set-Item function:script:Invoke-XbCi7HandleAccessCheck { param($Object, $Token, [uint32]$DesiredAccess) throw "forced_handle_access_failure" }
+            try { $ci7.handle_native_access_failure = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential } }
+            finally { Set-Item function:script:Invoke-XbCi7HandleAccessCheck $originalHandleAccessCheck }
+
+            $configPath = Join-Path $RuntimeRoot "config"
+            $denyRead = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ReadData, [Security.AccessControl.AccessControlType]::Deny)
+            $originalConfigAcl = Get-Acl -LiteralPath $configPath
+            try {
+                $deniedConfigAcl = Get-Acl -LiteralPath $configPath
+                $deniedConfigAcl.AddAccessRule($denyRead)
+                Set-Acl -LiteralPath $configPath -AclObject $deniedConfigAcl -ErrorAction Stop
+                $ci7.required_operation_denied = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally { Set-Acl -LiteralPath $configPath -AclObject $originalConfigAcl -ErrorAction Stop }
+
+            $ci7.prohibited_write_dac_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
+            $ci7.prohibited_write_owner_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
+            $ci7.prohibited_delete_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00010000) -Credential $credential
+            $ci7.prohibited_delete_child_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+            $ci7.child_write_dac_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
+            $ci7.child_write_owner_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
+            $ci7.parent_delete_child_allow = Invoke-XbCi7AclProbe -Path $RuntimeRoot -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+
+            $installRootPath = $InstallRoot
+            $manifestPath = Join-Path $InstallRoot "installation-manifest.json"
+            $packagePath = Join-Path $InstallRoot "ac2_member_gateway_worker.ps1"
+            $leafTargets = @()
+            foreach ($name in $packageFiles) { $leafTargets += @{ Class = "package"; Name = $name; Path = (Join-Path $InstallRoot $name) } }
+            $leafTargets += @{ Class = "manifest"; Name = "installation-manifest.json"; Path = $manifestPath }
+            $leafTargets += @{ Class = "config"; Name = "worker.config.json"; Path = $configFile }
+            $ci7.positive_leaf_access_matrix = @()
+            $ci7.positive_leaf_denial_matrix = @()
+            foreach ($target in $leafTargets) {
+                $requiredMask = if ($target.Class -eq "package") { [uint32]0x001200A9 } else { [uint32]0x00120089 }
+                $ci7.positive_leaf_access_matrix += [ordered]@{ class = $target.Class; leaf = $target.Name; required_mask = ("0x{0:X8}" -f $requiredMask); granted = [bool](Test-XbNativeAccessAllowed -Path $target.Path -Token $nativeToken -DesiredAccess $requiredMask) }
+                foreach ($right in @(
+                    @{ Name = "write_data"; Mask = [uint32]0x00000002 },
+                    @{ Name = "append_data"; Mask = [uint32]0x00000004 },
+                    @{ Name = "write_ea"; Mask = [uint32]0x00000010 },
+                    @{ Name = "write_attributes"; Mask = [uint32]0x00000100 },
+                    @{ Name = "delete"; Mask = [uint32]0x00010000 },
+                    @{ Name = "write_dac"; Mask = [uint32]0x00040000 },
+                    @{ Name = "write_owner"; Mask = [uint32]0x00080000 }
+                )) {
+                    $ci7.positive_leaf_denial_matrix += [ordered]@{ class = $target.Class; leaf = $target.Name; right = $right.Name; granted = [bool](Test-XbNativeAccessAllowed -Path $target.Path -Token $nativeToken -DesiredAccess $right.Mask) }
+                }
+            }
+            $leafRights = @(
+                @{ Name = "write_data"; Mask = [uint32]0x00000002; Rights = [Security.AccessControl.FileSystemRights]::WriteData }
+                @{ Name = "append_data"; Mask = [uint32]0x00000004; Rights = [Security.AccessControl.FileSystemRights]::AppendData }
+                @{ Name = "write_ea"; Mask = [uint32]0x00000010; Rights = [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes }
+                @{ Name = "write_attributes"; Mask = [uint32]0x00000100; Rights = [Security.AccessControl.FileSystemRights]::WriteAttributes }
+                @{ Name = "delete"; Mask = [uint32]0x00010000; Rights = [Security.AccessControl.FileSystemRights]::Delete }
+                @{ Name = "write_dac"; Mask = [uint32]0x00040000; Rights = [Security.AccessControl.FileSystemRights]::ChangePermissions }
+                @{ Name = "write_owner"; Mask = [uint32]0x00080000; Rights = [Security.AccessControl.FileSystemRights]::TakeOwnership }
+            )
+            $ci7.leaf_denial_matrix = @()
+            foreach ($target in $leafTargets) {
+                foreach ($right in $leafRights) {
+                    $probe = Invoke-XbCi7AclProbe -Path $target.Path -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, $right.Rights, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess $right.Mask -Credential $credential
+                    $ci7.leaf_denial_matrix += [ordered]@{ class = $target.Class; leaf = $target.Name; right = $right.Name; requested_operation_granted = [bool]$probe.requested_operation_granted; effective_rights = [string]$probe.effective_rights }
+                }
+            }
+
+            $requiredAccessMatrix = @()
+            foreach ($target in $leafTargets) {
+                $requiredRights = if ($target.Class -eq "package") {
+                    @(@{ Name = "read"; Mask = [uint32]0x00000001; Right = [Security.AccessControl.FileSystemRights]::ReadData },
+                      @{ Name = "execute"; Mask = [uint32]0x00000020; Right = [Security.AccessControl.FileSystemRights]::ExecuteFile })
+                } else { @(@{ Name = "read"; Mask = [uint32]0x00000001; Right = [Security.AccessControl.FileSystemRights]::ReadData }) }
+                foreach ($requiredRight in $requiredRights) {
+                    $probe = Invoke-XbCi7DenyProbe -Path $target.Path -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, $requiredRight.Right, [Security.AccessControl.AccessControlType]::Deny)) -Token $nativeToken -DesiredAccess $requiredRight.Mask -Credential $credential
+                    $requiredAccessMatrix += [ordered]@{ class = $target.Class; leaf = $target.Name; right = $requiredRight.Name; requested_operation_denied = [bool]$probe.requested_operation_denied; effective_rights = [string]$probe.effective_rights }
+                }
+            }
+            $ci7.required_access_matrix = $requiredAccessMatrix
+
+            $ownerTargets = @()
+            foreach ($name in $packageFiles) { $ownerTargets += [ordered]@{ class = "package"; path = (Join-Path $InstallRoot $name) } }
+            $ownerTargets += [ordered]@{ class = "manifest"; path = $manifestPath }
+            $ownerTargets += [ordered]@{ class = "config"; path = $configFile }
+            $ci7.owner_denial_matrix = @()
+            $ownerSids = @(
+                @{ kind = "worker"; sid = $workerSid }
+                @{ kind = "arbitrary_admin"; sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+            )
+            foreach ($owner in $ownerSids) {
+                if ([string]$owner.sid -in @("S-1-5-18", "S-1-5-32-544", $workerSid)) {
+                    if ([string]$owner.kind -eq "arbitrary_admin") { throw "ci7_untrusted_owner_fixture_unavailable" }
+                }
+            }
+            foreach ($target in $ownerTargets) {
+                foreach ($owner in $ownerSids) {
+                    $ci7.owner_denial_matrix += [ordered]@{ class = $target.class; leaf = (Split-Path -Leaf $target.path); owner_kind = $owner.kind; outcome = (Invoke-XbCi7OwnerProbe -Path $target.path -Credential $credential -WrongOwnerSid ([string]$owner.sid)) }
+                }
+            }
+
+            $configParentOriginal = Get-Acl -LiteralPath $configPath -ErrorAction Stop
+            $configLeafOriginal = Get-Acl -LiteralPath $configFile -ErrorAction Stop
+            try {
+                $parentWithDeleteChild = Get-Acl -LiteralPath $configPath -ErrorAction Stop
+                $parentWithDeleteChild.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow))
+                Set-Acl -LiteralPath $configPath -AclObject $parentWithDeleteChild -ErrorAction Stop
+                $childWithDeleteDeny = Get-Acl -LiteralPath $configFile -ErrorAction Stop
+                $childWithDeleteDeny.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Deny))
+                Set-Acl -LiteralPath $configFile -AclObject $childWithDeleteDeny -ErrorAction Stop
+                $ci7.config_parent_delete_child_granted = Test-XbNativeAccessAllowed -Path $configPath -Token $nativeToken -DesiredAccess ([uint32]0x00000040)
+                $ci7.config_child_delete_denied = -not (Test-XbNativeAccessAllowed -Path $configFile -Token $nativeToken -DesiredAccess ([uint32]0x00010000))
+                $ci7.config_parent_delete_child_composition = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally {
+                Set-Acl -LiteralPath $configFile -AclObject $configLeafOriginal -ErrorAction Stop
+                Set-Acl -LiteralPath $configPath -AclObject $configParentOriginal -ErrorAction Stop
+            }
+
+            $packageDeleteCompositionLeaf = [string]$packageFiles[0]
+            $packageDeleteCompositionPath = Join-Path $InstallRoot $packageDeleteCompositionLeaf
+            $packageDeleteCompositionParentOriginal = Get-Acl -LiteralPath $installRootPath -ErrorAction Stop
+            $packageDeleteCompositionLeafOriginal = Get-Acl -LiteralPath $packageDeleteCompositionPath -ErrorAction Stop
+            try {
+                $packageParentWithDeleteChild = Get-Acl -LiteralPath $installRootPath -ErrorAction Stop
+                $packageParentWithDeleteChild.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow))
+                Set-Acl -LiteralPath $installRootPath -AclObject $packageParentWithDeleteChild -ErrorAction Stop
+                $packageLeafWithDeleteDeny = Get-Acl -LiteralPath $packageDeleteCompositionPath -ErrorAction Stop
+                $packageLeafWithDeleteDeny.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Deny))
+                Set-Acl -LiteralPath $packageDeleteCompositionPath -AclObject $packageLeafWithDeleteDeny -ErrorAction Stop
+                $ci7.package_parent_delete_child_leaf = $packageDeleteCompositionLeaf
+                $ci7.package_parent_delete_child_granted = Test-XbNativeAccessAllowed -Path $installRootPath -Token $nativeToken -DesiredAccess ([uint32]0x00000040)
+                $ci7.package_child_delete_denied = -not (Test-XbNativeAccessAllowed -Path $packageDeleteCompositionPath -Token $nativeToken -DesiredAccess ([uint32]0x00010000))
+                $ci7.package_parent_delete_child_composition = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally {
+                Set-Acl -LiteralPath $packageDeleteCompositionPath -AclObject $packageDeleteCompositionLeafOriginal -ErrorAction Stop
+                Set-Acl -LiteralPath $installRootPath -AclObject $packageDeleteCompositionParentOriginal -ErrorAction Stop
+            }
+
+            $usersSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-545")
+            $configParentOriginal = Get-Acl -LiteralPath $configPath -ErrorAction Stop
+            try {
+                $withInheritedGroupGrant = Get-Acl -LiteralPath $configPath -ErrorAction Stop
+                $withInheritedGroupGrant.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($usersSid, [Security.AccessControl.FileSystemRights]::WriteData, [Security.AccessControl.InheritanceFlags]::ObjectInherit, [Security.AccessControl.PropagationFlags]::InheritOnly, [Security.AccessControl.AccessControlType]::Allow))
+                Set-Acl -LiteralPath $configPath -AclObject $withInheritedGroupGrant -ErrorAction Stop
+                $childAclWithInheritedGroupGrant = Get-Acl -LiteralPath $configFile -ErrorAction Stop
+                $inheritedRules = @($childAclWithInheritedGroupGrant.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -ceq $usersSid.Value -and $_.IsInherited -and ([int]$_.FileSystemRights -band 0x00000002) -ne 0 })
+                $ci7.inherited_group_write_granted = Test-XbNativeAccessAllowed -Path $configFile -Token $nativeToken -DesiredAccess ([uint32]0x00000002)
+                $ci7.inherited_group_write_ace_count = $inheritedRules.Count
+                $ci7.inherited_group_write_rejected = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally { Set-Acl -LiteralPath $configPath -AclObject $configParentOriginal -ErrorAction Stop }
+
+            $ci7.readonly_explicit_control = Invoke-XbCi7AclProbe -Path $configFile -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::Read, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00120089) -Credential $credential
+            $configInheritedRules = @((Get-Acl -LiteralPath $configFile -ErrorAction Stop).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -ceq $workerSid -and $_.IsInherited -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow })
+            $ci7.inherited_readonly_control = [ordered]@{ inherited_worker_read_allow_count = $configInheritedRules.Count; verifier = Get-XbBoundaryOutcome { Invoke-XbInstallVerifier -TaskCredential $credential } }
+
+            $unexpectedConfigDirectory = Join-Path $configPath ".ci7-unsupported-dir"
+            try {
+                New-Item -ItemType Directory -Path $unexpectedConfigDirectory -ErrorAction Stop | Out-Null
+                $ci7.config_subdirectory_rejected = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally {
+                if (Test-Path -LiteralPath $unexpectedConfigDirectory) { Remove-Item -LiteralPath $unexpectedConfigDirectory -Force -ErrorAction Stop }
+            }
+
+            $context = $null
+            try {
+                $context = Open-XbCi7VerificationContext -Token $nativeToken
+                $firstProtectedLeaf = @($context.Leaves.Values)[0]
+                $firstProtectedLeaf.FileIdentity = "00000000:0000000000000000"
+                $ci7.conflicting_handle_identity = Get-XbBoundaryOutcome { Confirm-XbCi7VerificationContext -Context $context -Token $nativeToken }
+            } finally { Dispose-XbCi7VerificationContext -Context $context }
+            $hiddenConfigPath = Join-Path (Join-Path $RuntimeRoot "config") ".ci7-hidden-probe"
+            try {
+                Set-Content -LiteralPath $hiddenConfigPath -Value "hidden" -Encoding UTF8
+                [IO.File]::SetAttributes($hiddenConfigPath, [IO.FileAttributes]::Hidden)
+                Set-XbWorkerTrustedOwner -Path $hiddenConfigPath -OwnerSid "S-1-5-18"
+                $hiddenAcl = Get-Acl -LiteralPath $hiddenConfigPath
+                $hiddenAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::WriteData, [Security.AccessControl.AccessControlType]::Allow))
+                Set-Acl -LiteralPath $hiddenConfigPath -AclObject $hiddenAcl -ErrorAction Stop
+                $ci7.hidden_config_write_granted = Test-XbNativeAccessAllowed -Path $hiddenConfigPath -Token $nativeToken -DesiredAccess ([uint32]0x00000002)
+                $ci7.hidden_config_write_rejected = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally { Remove-Item -LiteralPath $hiddenConfigPath -Force -ErrorAction SilentlyContinue }
+
+            $configAddFileRule = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::CreateFiles, [Security.AccessControl.AccessControlType]::Allow)
+            $configAddDirectoryRule = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::CreateDirectories, [Security.AccessControl.AccessControlType]::Allow)
+            $installAddFileRule = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::CreateFiles, [Security.AccessControl.AccessControlType]::Allow)
+            $installAddDirectoryRule = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::CreateDirectories, [Security.AccessControl.AccessControlType]::Allow)
+            $ci7.config_create_file = Invoke-XbCi7AclProbe -Path $configPath -Rule $configAddFileRule -Token $nativeToken -DesiredAccess ([uint32]0x00000002) -Credential $credential
+            $ci7.config_create_directory = Invoke-XbCi7AclProbe -Path $configPath -Rule $configAddDirectoryRule -Token $nativeToken -DesiredAccess ([uint32]0x00000004) -Credential $credential
+            $ci7.install_create_file = Invoke-XbCi7AclProbe -Path $installRootPath -Rule $installAddFileRule -Token $nativeToken -DesiredAccess ([uint32]0x00000002) -Credential $credential
+            $ci7.install_create_directory = Invoke-XbCi7AclProbe -Path $installRootPath -Rule $installAddDirectoryRule -Token $nativeToken -DesiredAccess ([uint32]0x00000004) -Credential $credential
+            $ci7.install_parent_delete_child_allow = Invoke-XbCi7AclProbe -Path $installRootPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+
+            $ci7.held_leaf_matrix = @()
+            foreach ($target in $leafTargets) {
+                $backupBytes = [IO.File]::ReadAllBytes($target.Path)
+                $backupAlgorithm = [Security.Cryptography.SHA256]::Create()
+                try { $backupHash = ([BitConverter]::ToString($backupAlgorithm.ComputeHash($backupBytes))).Replace("-", "").ToLowerInvariant() }
+                finally { $backupAlgorithm.Dispose() }
+                $renamedPath = $target.Path + ".ci7-rename-" + (New-XbBoundaryHex 4)
+                $heldObject = $null
+                $renameBlocked = $false
+                $replaceBlocked = $false
+                $identityBefore = $null
+                $identityAfter = $null
+                try {
+                    $heldObject = [XbWorkerProtectedObject]::Open($target.Path, $false, $true)
+                    $identityBefore = [string]$heldObject.FileIdentity
+                    try { Move-Item -LiteralPath $target.Path -Destination $renamedPath -ErrorAction Stop; $renameBlocked = $false }
+                    catch { $renameBlocked = $true }
+                    if (Test-Path -LiteralPath $renamedPath) { Move-Item -LiteralPath $renamedPath -Destination $target.Path -Force -ErrorAction Stop }
+                    try { Set-Content -LiteralPath $target.Path -Value "replacement-probe" -ErrorAction Stop; $replaceBlocked = $false }
+                    catch { $replaceBlocked = $true }
+                    $identityAfter = [string]$heldObject.FileIdentity
+                } finally {
+                    if ($null -ne $heldObject) { $heldObject.Dispose() }
+                    if (Test-Path -LiteralPath $renamedPath) { Move-Item -LiteralPath $renamedPath -Destination $target.Path -Force -ErrorAction Stop }
+                    if (Test-Path -LiteralPath $target.Path) {
+                        if ((Get-XbFileSha256 -Path $target.Path) -cne $backupHash) {
+                            [IO.File]::WriteAllBytes($target.Path, $backupBytes)
+                        }
+                    } else { [IO.File]::WriteAllBytes($target.Path, $backupBytes) }
+                }
+                $ci7.held_leaf_matrix += [ordered]@{ class = $target.Class; leaf = $target.Name; rename_blocked = $renameBlocked; replace_blocked = $replaceBlocked; identity_before = $identityBefore; identity_after = $identityAfter }
+            }
+
+            $configBackupPath = Join-Path (Split-Path -Parent $configPath) "config-ci7-original"
+            Move-Item -LiteralPath $configPath -Destination $configBackupPath -ErrorAction Stop
+            & cmd.exe /c mklink /J "$configPath" "$configBackupPath" | Out-Null
+            if ($LASTEXITCODE -ne 0) { Move-Item -LiteralPath $configBackupPath -Destination $configPath -ErrorAction Stop; throw "ci7_reparse_ancestor_fixture_create_failed" }
+            $ci7.reparse_snapshot_ancestor_rejected = Get-XbBoundaryOutcome { Get-XbSyntheticConfigSnapshot -Path (Join-Path $configPath "worker.config.json") }
+            try { $ci7.reparse_ancestor_rejected = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential } }
+            finally {
+                & cmd.exe /c rmdir "$configPath" | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "ci7_reparse_ancestor_fixture_cleanup_failed" }
+                Move-Item -LiteralPath $configBackupPath -Destination $configPath -ErrorAction Stop
+            }
+
+            $reparseTarget = Join-Path $configPath ".ci7-leaf-target"
+            Move-Item -LiteralPath $configFile -Destination $reparseTarget -ErrorAction Stop
+            & cmd.exe /c mklink "$configFile" "$reparseTarget" | Out-Null
+            if ($LASTEXITCODE -ne 0) { Move-Item -LiteralPath $reparseTarget -Destination $configFile -ErrorAction Stop; throw "ci7_reparse_leaf_fixture_create_failed" }
+            $ci7.reparse_snapshot_leaf_rejected = Get-XbBoundaryOutcome { Get-XbSyntheticConfigSnapshot -Path $configFile }
+            try { $ci7.reparse_leaf_rejected = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential } }
+            finally {
+                if (Test-Path -LiteralPath $configFile) { Remove-Item -LiteralPath $configFile -Force -ErrorAction Stop }
+                Move-Item -LiteralPath $reparseTarget -Destination $configFile -ErrorAction Stop
+            }
+
+            $junctionPath = Join-Path ([IO.Path]::GetTempPath()) ("xb-ci7-junction-{0}" -f (New-XbBoundaryHex 8))
+            & cmd.exe /c mklink /J "$junctionPath" "$logsPath" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "ci7_reparse_fixture_create_failed" }
+            $ci7.reparse_fail_closed = Get-XbBoundaryOutcome { Assert-XbOwnerRightsLogFile -Path (Join-Path $junctionPath (Split-Path -Leaf $logPath)) -WorkerSid $workerSid }
+            & cmd.exe /c rmdir "$junctionPath" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "ci7_reparse_fixture_cleanup_failed" }
+            $ci7.reparse_fixture_absent = (-not (Test-Path -LiteralPath $junctionPath))
+            $ci7.unsupported_unc_fail_closed = Get-XbBoundaryOutcome { Get-XbNativePathChain -Path "\\invalid-host\share" }
+
+            $nativeToken.Impersonate()
+            try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop }
+            finally { [XbWorkerBatchToken]::Revert() }
+            $ci7.retention_delete = (-not (Test-Path -LiteralPath $logPath))
+            $ci7.required_probe_completion.status = "complete"
+            $ci7.required_probe_completion.completed_through = "retention_delete"
+        } catch {
+            $ci7.required_probe_completion.status = "incomplete"
+            $ci7.fatal = [string]$_.Exception.Message
+            $ci7.fatal_stack = [string]$_.ScriptStackTrace
+        } finally {
+            if ($null -ne $nativeToken) {
+                try { $nativeToken.Dispose() } catch { }
+            }
+            if ($null -ne $junctionPath -and (Test-Path -LiteralPath $junctionPath)) {
+                try { & cmd.exe /c rmdir "$junctionPath" | Out-Null } catch { }
+            }
+            if ($null -ne $logPath -and (Test-Path -LiteralPath $logPath)) {
+                try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop } catch { $ci7.cleanup_error = [string]$_.Exception.Message }
+            }
+        }
+        $case.synthetic_config_teardown = [ordered]@{}
+        $configTeardown = $case.synthetic_config_teardown
+        $expectedConfigFile = [IO.Path]::GetFullPath((Join-Path (Join-Path $RuntimeRoot "config") "worker.config.json"))
+        $configTeardown.path = [IO.Path]::GetFullPath($configFile)
+        $configTeardown.path_matches_expected = ($configTeardown.path -ceq $expectedConfigFile)
+        $configItem = $null
+        try { $configItem = Get-Item -LiteralPath $configFile -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { $configItem = $null }
+        catch { throw "synthetic_config_presence_unproven" }
+        $configTeardown.present_before = ($null -ne $configItem)
+        $configTeardown.runtime_before = Get-XbRuntimeDirectoryEvidence
+        if ($null -eq $configItem) { throw "synthetic_config_fixture_missing" }
+
+        $configIsLeaf = -not [bool]$configItem.PSIsContainer
+        $configReparsePoint = (($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $runtimeRootItem = Get-Item -LiteralPath $RuntimeRoot -Force -ErrorAction Stop
+        $configDirectory = Get-Item -LiteralPath (Join-Path $RuntimeRoot "config") -Force -ErrorAction Stop
+        $runtimeRootReparsePoint = (($runtimeRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $configDirectoryReparsePoint = (($configDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $configTeardown.file_is_leaf = [bool]$configIsLeaf
+        $configTeardown.file_reparse_point = [bool]$configReparsePoint
+        $configTeardown.runtime_root_reparse_point = [bool]$runtimeRootReparsePoint
+        $configTeardown.config_directory_reparse_point = [bool]$configDirectoryReparsePoint
+        $configTeardown.ordinary_non_reparse = [bool]($configIsLeaf -and -not $configReparsePoint -and -not $runtimeRootReparsePoint -and -not $configDirectoryReparsePoint)
+        if (-not $configTeardown.path_matches_expected -or -not $configTeardown.ordinary_non_reparse) {
+            throw "synthetic_config_identity_unproven"
+        }
+
+        $currentConfigSnapshot = Get-XbSyntheticConfigSnapshot -Path $configFile
+        $configTeardown.parent_chain_component_count = [int]$currentConfigSnapshot.path_chain_parent_count
+        $configTeardown.parent_chain_ordinary_non_reparse = [bool]$currentConfigSnapshot.path_chain_ordinary_non_reparse
+        $configTeardown.expected_file_identity = [string]$syntheticConfigIdentity
+        $configTeardown.observed_file_identity = [string]$currentConfigSnapshot.file_identity
+        $configTeardown.identity_matches_created_file = ($currentConfigSnapshot.file_identity -ceq $syntheticConfigIdentity)
+        $configTeardown.content_matches_expected = ($currentConfigSnapshot.text -ceq "{}")
+        if (-not $configTeardown.identity_matches_created_file -or -not $configTeardown.content_matches_expected) {
+            throw "synthetic_config_identity_or_content_unproven"
+        }
+        if (-not $configTeardown.parent_chain_ordinary_non_reparse -or $configTeardown.parent_chain_component_count -lt 1) {
+            throw "synthetic_config_identity_unproven"
+        }
+
+        $configTeardown.removal_attempted = $true
+        Remove-Item -LiteralPath $configFile -Force -ErrorAction Stop
+        $configTeardown.present_after = Test-Path -LiteralPath $configFile
+        $configTeardown.removal_pass = (-not $configTeardown.present_after)
+        if (-not $configTeardown.removal_pass) { throw "synthetic_config_fixture_teardown_failed" }
+        $configTeardown.runtime_after = Get-XbRuntimeDirectoryEvidence
+        if (-not $configTeardown.runtime_after.prerequisite_satisfied) {
+            throw "runtime_uninstall_prerequisite_unproven"
+        }
+        if ($null -ne $ci7.fatal) { throw "ci7_fatal" }
+        if ($ci7.required_probe_completion.status -cne "complete") { throw "ci7_required_probes_incomplete" }
+        if ($ci7.Contains("cleanup_error")) { throw "ci7_fixture_cleanup_failed" }
+
+        $script:Operation = "Uninstall"
+        $case.uninstall_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $case.uninstalled = Get-XbProductionReadback
+        Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "uninstall_task_presence"
+        $case.account_uninstalled = Get-XbAccountObservation
+        $case.rollback_trace = @($trace)
+        Invoke-XbBoundaryCleanup -CaseRecord $case -Preflight {
+            param($case)
+            $case.production_folder_before_retained_cleanup = Get-XbBoundaryComTaskFolderReadback
+            $case.retained_parent_state_before_cleanup = Get-XbRetainedParentEvidence
+            if (-not $case.retained_parent_state_before_cleanup.safe_to_remove) {
+                throw "container_not_owned_empty"
+            }
+        } -Body {
+            Clear-XbRetainedProductionContainers
+        }
+        $case.post_cleanup = Get-XbProductionReadback
+        Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "post_cleanup_task_presence"
     }
 } catch {
     $report.fatal = [string]$_.Exception.Message
@@ -4863,6 +5663,8 @@ try {
         try { Remove-Item -LiteralPath $state.temp_redirect -Recurse -Force; $cleanup.temp_redirect_absent = (-not (Test-Path -LiteralPath $state.temp_redirect)) }
         catch { $cleanup.temp_redirect_error = [string]$_.Exception.Message }
     }
+    if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { $cleanup.secure_password_disposed = $false } }
+    if ($null -ne $secureWrong) { try { $secureWrong.Dispose() } catch { $cleanup.secure_wrong_disposed = $false } }
     $report.cleanup = $cleanup
 }
 
@@ -4957,6 +5759,81 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, _HOSTED_TASK_BOUNDARY_HARNESS)
                 self.assertNotIn(forbidden, self.source)
+
+
+    def test_hosted_case_record_and_cleanup_errors_are_preserved(self) -> None:
+        case_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCase")
+        self.assertLess(
+            case_helper.index("$report.cases[$Name] = $record"),
+            case_helper.index("$null = & $Body $record"),
+        )
+        self.assertIn("if ($PreserveIncrementally)", case_helper)
+        self.assertIn('$record.status = "error"', case_helper)
+        cleanup_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCleanup")
+        for field in ("attempted", "pass", "error", "stack"):
+            with self.subTest(cleanup_field=field):
+                self.assertIn(f"cleanup.{field}", cleanup_helper)
+        self.assertIn("throw", cleanup_helper)
+
+    def test_synthetic_config_teardown_is_identity_gated_before_uninstall(self) -> None:
+        start = _HOSTED_TASK_BOUNDARY_HARNESS.index(
+            'Invoke-XbBoundaryCase -Name "install_then_uninstall"'
+        )
+        end = _HOSTED_TASK_BOUNDARY_HARNESS.index(
+            '\n} catch {\n    $report.fatal',
+            start,
+        )
+        case_source = _HOSTED_TASK_BOUNDARY_HARNESS[start:end]
+        for marker in (
+            "identity_matches_created_file",
+            "content_matches_expected",
+            "[IO.FileAttributes]::ReparsePoint",
+            "runtime_after.prerequisite_satisfied",
+            "required_probe_completion.status",
+            "parent_chain_ordinary_non_reparse",
+            "parent_chain_component_count",
+            "reparse_snapshot_ancestor_rejected",
+            "reparse_snapshot_leaf_rejected",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, case_source)
+        self.assertIn('[IO.File]::WriteAllText($configFile, "{}", [Text.UTF8Encoding]::new($false))', case_source)
+        self.assertLess(case_source.index("$case.ci7 = $ci7"), case_source.index("Set-XbProductionTaskIdentity"))
+        self.assertLess(case_source.index("native_type_absent_before_first_use"), case_source.index("Get-XbSyntheticConfigSnapshot -Path $configFile"))
+        self.assertIn("replacement_identity_changed", case_source)
+        self.assertIn("wrong_content_exact", case_source)
+        teardown_start = case_source.index("$case.synthetic_config_teardown")
+        uninstall_start = case_source.index('$script:Operation = "Uninstall"')
+        teardown = case_source[teardown_start:uninstall_start]
+        self.assertEqual(teardown.count("Remove-Item -LiteralPath $configFile"), 1)
+        self.assertNotIn("-Recurse", teardown)
+        for prerequisite in (
+            "if (-not $configTeardown.runtime_after.prerequisite_satisfied)",
+            "if ($null -ne $ci7.fatal)",
+            "if ($ci7.required_probe_completion.status -cne \"complete\")",
+            "if ($ci7.Contains(\"cleanup_error\"))",
+        ):
+            with self.subTest(prerequisite=prerequisite):
+                self.assertLess(case_source.index(prerequisite), uninstall_start)
+        self.assertLess(
+            case_source.index("$configTeardown.removal_attempted = $true"),
+            uninstall_start,
+        )
+        self.assertEqual(case_source.count('$script:Operation = "Uninstall"'), 1)
+        self.assertEqual(
+            case_source.count("Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }"),
+            2,
+        )
+
+    def test_synthetic_config_snapshot_initializes_before_open_and_uses_one_held_object(self) -> None:
+        snapshot = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Get-XbSyntheticConfigSnapshot")
+        self.assertLess(snapshot.index("Initialize-XbWorkerNativeAccess"), snapshot.index("Get-XbNativePathChain"))
+        self.assertLess(snapshot.index("Get-XbNativePathChain"), snapshot.index("[XbWorkerProtectedObject]::Open($fullPath, $false, $true)"))
+        self.assertLess(snapshot.index("[XbWorkerProtectedObject]::Open($fullPath, $false, $true)"), snapshot.index("$protected.ReadSnapshot()"))
+        self.assertIn("$protected.FileIdentity", snapshot)
+        self.assertIn("$protected.Dispose()", snapshot)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", snapshot)
+        self.assertNotIn("Add-XbCi7ProtectedLeaf", snapshot)
 
 
 class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
@@ -5125,6 +6002,97 @@ class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
         )
 
 
+class MemberWorkerBoundaryCaseRecordRegressionTests(unittest.TestCase):
+    """Bounded PowerShell regression for evidence retention when retained cleanup throws."""
+
+    def test_cleanup_exception_preserves_evidence_and_fails_the_case(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for case-record regression")
+
+        case_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCase")
+        cleanup_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCleanup")
+        harness_source = "\n".join(
+            (
+                "$ErrorActionPreference = \"Stop\"",
+                "$report = [ordered]@{ cases = [ordered]@{} }",
+                case_helper,
+                cleanup_helper,
+                r"""
+$body = {
+    param($case)
+    $case.install_outcome = "pass"
+    $case.installed = [ordered]@{ task_present = $true }
+    $case.ci7 = [ordered]@{
+        fatal = $null
+        required_probe_completion = [ordered]@{ status = "complete" }
+    }
+    Invoke-XbBoundaryCleanup -CaseRecord $case -Preflight {
+        param($case)
+        $case.production_folder_before_retained_cleanup = [ordered]@{
+            task_count = 0
+            child_folder_count = 0
+        }
+    } -Body {
+        throw "forced_cleanup_exception"
+    }
+}
+Invoke-XbBoundaryCase -Name "cleanup_exception" -PreserveIncrementally -Body $body
+$case = $report.cases["cleanup_exception"]
+if ($case.status -cne "error" -or $case.error -cne "forced_cleanup_exception" -or
+    $case.install_outcome -cne "pass" -or $case.installed.task_present -ne $true -or
+    $null -ne $case.ci7.fatal -or
+    $case.ci7.required_probe_completion.status -cne "complete" -or
+    $case.production_folder_before_retained_cleanup.task_count -ne 0 -or
+    $case.cleanup.attempted -ne $true -or $case.cleanup.pass -ne $false -or
+    $case.cleanup.error -cne "forced_cleanup_exception" -or
+    [string]::IsNullOrWhiteSpace([string]$case.cleanup.stack) -or
+    [string]::IsNullOrWhiteSpace([string]$case.error_stack)) {
+    throw "boundary_case_cleanup_regression_failed"
+}
+[Console]::Out.WriteLine(($case | ConvertTo-Json -Depth 8 -Compress))
+""",
+            )
+        )
+        with tempfile.TemporaryDirectory(prefix="xb-boundary-case-record-") as temp_dir:
+            harness = Path(temp_dir) / "case_record_regression.ps1"
+            harness.write_text(harness_source, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        case = json.loads(completed.stdout)
+        self.assertEqual(case["status"], "error")
+        self.assertEqual(case["error"], "forced_cleanup_exception")
+        self.assertTrue(case["error_stack"])
+        self.assertEqual(case["install_outcome"], "pass")
+        self.assertEqual(case["installed"], {"task_present": True})
+        self.assertEqual(case["ci7"]["fatal"], None)
+        self.assertEqual(case["ci7"]["required_probe_completion"]["status"], "complete")
+        self.assertEqual(
+            case["production_folder_before_retained_cleanup"],
+            {"task_count": 0, "child_folder_count": 0},
+        )
+        self.assertEqual(
+            {key: value for key, value in case["cleanup"].items() if key != "stack"},
+            {
+                "attempted": True,
+                "pass": False,
+                "error": "forced_cleanup_exception",
+            },
+        )
+        self.assertTrue(case["cleanup"]["stack"])
+
+
 class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
     """Real Schedule.Service/ScheduledTasks boundary on disposable GitHub-hosted Windows only."""
 
@@ -5200,8 +6168,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["cim_action_count"], 1)
         self.assertEqual(evidence["com_action_count"], 1)
         self.assertEqual(evidence["com_action_type"], 0)
-        self.assertEqual(evidence["action_execute"], "powershell.exe")
-        self.assertEqual(evidence["com_action_path"], "powershell.exe")
+        self.assertEqual(evidence["action_execute"], WINDOWS_POWERSHELL)
+        self.assertEqual(evidence["com_action_path"], WINDOWS_POWERSHELL)
         self.assertEqual(evidence["com_action_arguments"], evidence["action_arguments"])
         self.assertRegex(str(evidence["action_arguments"]), r"-Mode DisabledProof$")
         self.assertNotRegex(str(evidence["action_arguments"]), r"EnableProduction")
@@ -5339,7 +6307,16 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self._assert_pristine(case["post_cleanup"])
 
     def test_install_then_uninstall(self) -> None:
+        self.assertTrue(self.report["account"]["batch_logon_right_assigned"])
         case = self._case("install_then_uninstall")
+        install_presence = case["install_task_presence"]
+        self.assertEqual(install_presence["effective_task_path"], "\\X-Boundaries\\")
+        self.assertEqual(install_presence["effective_task_name"], "AC2 Member Gateway Worker")
+        self.assertTrue(install_presence["cim_task_present"])
+        self.assertTrue(install_presence["com"]["folder_present"])
+        self.assertTrue(install_presence["com"]["task_present"])
+        self.assertEqual(install_presence["com"]["task_count"], 1)
+        self.assertEqual(install_presence["com"]["child_folder_count"], 0)
         self.assertEqual(case["install_outcome"], "pass")
         self.assertEqual(
             case["installed"],
@@ -5356,10 +6333,160 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(case["contract"], "pass")
         self.assertEqual(case["ownership"], "pass")
         self.assertEqual(case["manifest_trigger_count"], 0)
+        snapshot = case["synthetic_config_snapshot"]
+        self.assertTrue(snapshot["native_type_absent_before_first_use"], snapshot)
+        self.assertTrue(snapshot["native_type_initialized"], snapshot)
+        self.assertEqual(snapshot["fixture_bytes_hex"], "7b7d")
+        self.assertTrue(snapshot["wrong_content_exact"], snapshot)
+        self.assertTrue(snapshot["replacement_identity_changed"], snapshot)
         self._assert_zero_triggers(case["evidence"])
         self._assert_exact_disabled_proof(case["evidence"], self.report["environment"]["worker_account"])
         self._assert_never_run(case["evidence"])
         self._assert_no_worker_session(case["account_installed"])
+        ci7 = case["ci7"]
+        self.assertIsNone(ci7["fatal"], ci7)
+        self.assertEqual(
+            ci7["required_probe_completion"],
+            {"status": "complete", "completed_through": "retention_delete"},
+        )
+        self.assertTrue(ci7["root_owner_accepted"], ci7)
+        self.assertIn(ci7["root_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
+        self.assertTrue(ci7["root_dacl_protected"])
+        self.assertEqual(ci7["root_acl_shape"], "pass")
+        self.assertEqual(ci7["token_user_sid"], self.report["environment"]["worker_sid"])
+        self.assertEqual(ci7["token_type"], 2)
+        self.assertEqual(ci7["token_impersonation_level"], 2)
+        self.assertEqual(ci7["logs_root_granted_mask"], "0x001200AB")
+        self.assertFalse(ci7["root_write_dac"])
+        self.assertFalse(ci7["root_write_owner"])
+        self.assertFalse(ci7["root_delete"])
+        self.assertFalse(ci7["runtime_root_delete_child"])
+        self.assertEqual(ci7["parent_delete_composition"], "pass")
+        self.assertTrue(ci7["ps51_enumerated"])
+        self.assertEqual(ci7["ps51_content"], "ci7-create|ci7-append")
+        self.assertTrue(ci7["child_owner_is_worker"])
+        self.assertEqual(ci7["child_owner_rights_shape"], "pass")
+        self.assertEqual(ci7["child_owner_rights_ace_count"], 1)
+        self.assertEqual(ci7["child_owner_rights_ace_mask"], "0x001301BF")
+        self.assertEqual(ci7["child_granted_mask"], "0x001301BF")
+        self.assertFalse(ci7["child_write_dac"])
+        self.assertFalse(ci7["child_write_owner"])
+        self.assertTrue(ci7["child_delete"])
+        self.assertEqual(ci7["verify_outcome"], "pass")
+        self.assertEqual(ci7["verify_status"], "install_verified")
+        self.assertRegex(ci7["verify_release_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(ci7["verify_checks"])
+        self.assertTrue(all(value == "pass" for value in ci7["verify_checks"].values()))
+        self.assertEqual(ci7["upgrade_outcome"], "upgraded")
+        self.assertEqual(ci7["verify_after_upgrade"], "pass")
+        self.assertEqual(ci7["empty_config_verify"], "pass")
+        self.assertEqual(len(ci7["package_owner_sids"]), 7)
+        self.assertTrue(all(owner == "S-1-5-18" for owner in ci7["package_owner_sids"]))
+        self.assertIn(ci7["config_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
+        for key in ("missing_credential", "mismatched_credential", "invalid_password", "unsupported_account_profile", "native_access_failure", "handle_native_access_failure", "reparse_fail_closed", "reparse_ancestor_rejected", "reparse_leaf_rejected", "reparse_snapshot_ancestor_rejected", "reparse_snapshot_leaf_rejected", "config_subdirectory_rejected", "conflicting_handle_identity", "unsupported_unc_fail_closed"):
+            with self.subTest(ci7=key):
+                self.assertEqual(ci7[key], "effective_rights_unproven")
+        self.assertEqual(ci7["required_operation_denied"], "effective_rights_missing")
+        for key in ("prohibited_write_dac_allow", "prohibited_write_owner_allow", "prohibited_delete_allow", "prohibited_delete_child_allow", "child_write_dac_allow", "child_write_owner_allow", "parent_delete_child_allow"):
+            with self.subTest(ci7=key):
+                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
+        self.assertEqual(len(ci7["positive_leaf_access_matrix"]), 8)
+        self.assertTrue(all(probe["granted"] for probe in ci7["positive_leaf_access_matrix"]))
+        self.assertEqual(len(ci7["positive_leaf_denial_matrix"]), 56)
+        self.assertTrue(all(not probe["granted"] for probe in ci7["positive_leaf_denial_matrix"]))
+        self.assertEqual({probe["leaf"] for probe in ci7["positive_leaf_access_matrix"] if probe["class"] == "package"}, set(INSTALLER_PACKAGE_FILES))
+        self.assertEqual(len(ci7["leaf_denial_matrix"]), 56)
+        for probe in ci7["leaf_denial_matrix"]:
+            with self.subTest(ci7_leaf=probe):
+                self.assertTrue(probe["requested_operation_granted"], probe)
+                self.assertEqual(probe["effective_rights"], "effective_rights_exceeded")
+        self.assertEqual(len(ci7["required_access_matrix"]), 14)
+        for probe in ci7["required_access_matrix"]:
+            with self.subTest(ci7_required_access=probe):
+                self.assertTrue(probe["requested_operation_denied"], probe)
+                self.assertEqual(probe["effective_rights"], "effective_rights_missing")
+        self.assertEqual(len(ci7["owner_denial_matrix"]), 16)
+        for probe in ci7["owner_denial_matrix"]:
+            with self.subTest(ci7_owner=probe):
+                self.assertEqual(probe["outcome"], "effective_rights_exceeded")
+        self.assertEqual({probe["owner_kind"] for probe in ci7["owner_denial_matrix"]}, {"worker", "arbitrary_admin"})
+        self.assertTrue(ci7["hidden_config_write_granted"])
+        self.assertEqual(ci7["hidden_config_write_rejected"], "effective_rights_exceeded")
+        self.assertTrue(ci7["config_parent_delete_child_granted"])
+        self.assertTrue(ci7["config_child_delete_denied"])
+        self.assertEqual(ci7["config_parent_delete_child_composition"], "effective_rights_exceeded")
+        self.assertIn(ci7["package_parent_delete_child_leaf"], INSTALLER_PACKAGE_FILES)
+        self.assertTrue(ci7["package_parent_delete_child_granted"])
+        self.assertTrue(ci7["package_child_delete_denied"])
+        self.assertEqual(ci7["package_parent_delete_child_composition"], "effective_rights_exceeded")
+        self.assertTrue(ci7["inherited_group_write_granted"])
+        self.assertGreater(ci7["inherited_group_write_ace_count"], 0)
+        self.assertEqual(ci7["inherited_group_write_rejected"], "effective_rights_exceeded")
+        self.assertTrue(ci7["readonly_explicit_control"]["requested_operation_granted"])
+        self.assertEqual(ci7["readonly_explicit_control"]["effective_rights"], "pass")
+        self.assertGreater(ci7["inherited_readonly_control"]["inherited_worker_read_allow_count"], 0)
+        self.assertEqual(ci7["inherited_readonly_control"]["verifier"], "pass")
+        for key in ("config_create_file", "config_create_directory", "install_create_file", "install_create_directory"):
+            with self.subTest(ci7=key):
+                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
+        self.assertEqual(len(ci7["held_leaf_matrix"]), 8)
+        for probe in ci7["held_leaf_matrix"]:
+            with self.subTest(ci7_held_leaf=probe):
+                self.assertTrue(probe["rename_blocked"], probe)
+                self.assertTrue(probe["replace_blocked"], probe)
+                self.assertRegex(probe["identity_before"], r"^[0-9a-f]{8}:[0-9a-f]{16}$")
+                self.assertEqual(probe["identity_after"], probe["identity_before"])
+        self.assertTrue(ci7["install_parent_delete_child_allow"]["requested_operation_granted"])
+        self.assertEqual(ci7["install_parent_delete_child_allow"]["effective_rights"], "effective_rights_exceeded")
+        self.assertEqual(ci7["config_subdirectory_rejected"], "effective_rights_unproven")
+        self.assertEqual(ci7["conflicting_handle_identity"], "effective_rights_unproven")
+        self.assertTrue(ci7["reparse_fixture_absent"])
+        self.assertTrue(ci7["retention_delete"])
+        self.assertNotIn("cleanup_error", ci7)
+        teardown = case["synthetic_config_teardown"]
+        self.assertTrue(teardown["present_before"])
+        self.assertTrue(teardown["path_matches_expected"])
+        self.assertTrue(teardown["file_is_leaf"])
+        self.assertFalse(teardown["file_reparse_point"])
+        self.assertFalse(teardown["runtime_root_reparse_point"])
+        self.assertFalse(teardown["config_directory_reparse_point"])
+        self.assertTrue(teardown["ordinary_non_reparse"])
+        self.assertTrue(teardown["parent_chain_ordinary_non_reparse"])
+        self.assertGreater(teardown["parent_chain_component_count"], 0)
+        self.assertTrue(teardown["identity_matches_created_file"])
+        self.assertEqual(teardown["expected_file_identity"], teardown["observed_file_identity"])
+        self.assertTrue(teardown["content_matches_expected"])
+        self.assertTrue(teardown["removal_attempted"])
+        self.assertTrue(teardown["removal_pass"])
+        self.assertFalse(teardown["present_after"])
+        self.assertEqual(teardown["runtime_before"]["root_directory_count"], 4)
+        self.assertEqual(teardown["runtime_before"]["root_file_count"], 0)
+        self.assertEqual(teardown["runtime_before"]["root_directory_names"], ["config", "logs", "rollback", "secrets"])
+        self.assertEqual(
+            teardown["runtime_before"]["directory_contents"]["config"]["entry_names"],
+            ["worker.config.json"],
+        )
+        self.assertFalse(teardown["runtime_before"]["prerequisite_satisfied"])
+        self.assertTrue(teardown["runtime_after"]["prerequisite_satisfied"])
+        self.assertTrue(all(
+            directory["entry_count"] == 0
+            for directory in teardown["runtime_after"]["directory_contents"].values()
+        ))
+
+        uninstall_presence = case["uninstall_task_presence"]
+        self.assertEqual(uninstall_presence["effective_task_path"], "\\X-Boundaries\\")
+        self.assertEqual(uninstall_presence["effective_task_name"], "AC2 Member Gateway Worker")
+        self.assertFalse(uninstall_presence["cim_task_present"])
+        self.assertTrue(uninstall_presence["com"]["folder_present"])
+        self.assertFalse(uninstall_presence["com"]["task_present"])
+        self.assertEqual(
+            uninstall_presence["com"]["returned_folder_path"],
+            uninstall_presence["com"]["requested_folder_path"],
+        )
+        self.assertEqual(uninstall_presence["com"]["task_count"], 0)
+        self.assertEqual(uninstall_presence["com"]["child_folder_count"], 0)
         self.assertEqual(case["uninstall_outcome"], "pass")
         self.assertEqual(
             case["uninstalled"],
@@ -5375,6 +6502,14 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         )
         self._assert_no_worker_session(case["account_uninstalled"])
         self.assertEqual(case["rollback_trace"], [])
+        self.assertEqual(case["production_folder_before_retained_cleanup"]["task_count"], 0)
+        self.assertEqual(case["production_folder_before_retained_cleanup"]["child_folder_count"], 0)
+        self.assertTrue(case["retained_parent_state_before_cleanup"]["safe_to_remove"])
+        self.assertEqual(case["cleanup"], {"attempted": True, "pass": True, "error": None, "stack": None})
+        post_cleanup_presence = case["post_cleanup_task_presence"]
+        self.assertFalse(post_cleanup_presence["cim_task_present"])
+        self.assertFalse(post_cleanup_presence["com"]["folder_present"])
+        self.assertFalse(post_cleanup_presence["com"]["task_present"])
         self._assert_pristine(case["post_cleanup"])
 
     def test_disposable_state_cleanup_readback(self) -> None:
@@ -5392,6 +6527,1238 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         if self.report["environment"].get("temp_redirected"):
             expected["temp_redirect_absent"] = True
         self.assertEqual(cleanup, expected)
+
+
+
+_RELEASE_INTEGRITY_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$AdapterPath,
+    [Parameter(Mandatory)][string]$ScriptsRoot,
+    [Parameter(Mandatory)][string]$WorkRoot
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. $InstallerPath -LibraryOnly
+$installerPackage = @($packageFiles)
+. $AdapterPath
+$out = [ordered]@{}
+function Get-XbOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+$out.installer_package = @($installerPackage | Sort-Object)
+$out.adapter_package = @($script:XbAc2ReleasePackageFiles | Sort-Object)
+$out.installer_release = Get-XbReleaseIdentityFromRoot -Root $ScriptsRoot
+$out.adapter_release = Get-XbAc2ReleaseIdentity -PackageRoot $ScriptsRoot
+
+function New-XbPackageCopy {
+    param([string]$Name)
+    $root = Join-Path $WorkRoot $Name
+    New-Item -ItemType Directory -Path $root | Out-Null
+    foreach ($file in $installerPackage) { Copy-Item -LiteralPath (Join-Path $ScriptsRoot $file) -Destination (Join-Path $root $file) }
+    return $root
+}
+$clean = New-XbPackageCopy "clean"
+$out.ci4_clean = Get-XbOutcome { Assert-XbReleaseContent -Root $clean }
+$second = New-XbPackageCopy "second-save"
+Add-Content -LiteralPath (Join-Path $second "ac2_member_gateway_worker_lib.ps1") -Value '# $x.SaveMember($y)'
+$out.ci4_second_save_site = Get-XbOutcome { Assert-XbReleaseContent -Root $second }
+$twoInAdapter = New-XbPackageCopy "two-in-adapter"
+Add-Content -LiteralPath (Join-Path $twoInAdapter "ac2_member_gateway_autocount_adapter.ps1") -Value '# $command.SaveMember($entity)'
+$out.ci4_two_sites_in_adapter = Get-XbOutcome { Assert-XbReleaseContent -Root $twoInAdapter }
+$delete = New-XbPackageCopy "delete"
+Add-Content -LiteralPath (Join-Path $delete "ac2_member_create_primitive.ps1") -Value '# DeleteMember'
+$out.ci4_delete_present = Get-XbOutcome { Assert-XbReleaseContent -Root $delete }
+$cleanupFile = New-XbPackageCopy "cleanup-file"
+Copy-Item -LiteralPath (Join-Path $ScriptsRoot "ac2_member_test_cleanup.ps1") -Destination (Join-Path $cleanupFile "ac2_member_test_cleanup.ps1")
+$out.ci4_cleanup_script_present = Get-XbOutcome { Assert-XbReleaseContent -Root $cleanupFile }
+$uat = New-XbPackageCopy "uat-file"
+Set-Content -LiteralPath (Join-Path $uat "ac2_member_create_uat_runner.ps1") -Value "#"
+$out.ci4_uat_script_present = Get-XbOutcome { Assert-XbReleaseContent -Root $uat }
+$missing = New-XbPackageCopy "missing"
+Remove-Item -LiteralPath (Join-Path $missing "ac2_member_create_primitive.ps1")
+$out.ci4_missing_file = Get-XbOutcome { Assert-XbReleaseContent -Root $missing }
+
+$identity = [pscustomobject]@{
+    source = [pscustomobject]@{ commit = ("a" * 40); tree = ("b" * 40) }
+    package_files = @($installerPackage | ForEach-Object { [pscustomobject]@{ name = $_; sha256 = (Get-XbFileSha256 (Join-Path $ScriptsRoot $_)); git_blob = ("c" * 40) } })
+}
+$manifest = New-XbWorkerInstallationManifest -PackageRoot $ScriptsRoot -ReviewedIdentity $identity -WorkerAccount "XBHOST\xbworker"
+$out.manifest_schema = $manifest.schema_version
+$out.manifest_release = $manifest.release_sha256
+$out.manifest_keys = @($manifest.Keys)
+$out.manifest_executable = $manifest.task.executable
+$out.manifest_arguments = $manifest.task.arguments
+
+$secure = [Security.SecureString]::new()
+"synthetic".ToCharArray() | ForEach-Object { $secure.AppendChar($_) }
+$securePath = Join-Path $WorkRoot "secure.clixml"
+$secure | Export-Clixml -LiteralPath $securePath
+$plainPath = Join-Path $WorkRoot "plain.clixml"
+"synthetic" | Export-Clixml -LiteralPath $plainPath
+$garbagePath = Join-Path $WorkRoot "garbage.clixml"
+Set-Content -LiteralPath $garbagePath -Value "<not xml"
+$out.ci6_secure_artifact = (Test-XbSecureStringArtifact -Path $securePath)
+$out.ci6_plain_artifact = (Test-XbSecureStringArtifact -Path $plainPath)
+$out.ci6_garbage_artifact = (Test-XbSecureStringArtifact -Path $garbagePath)
+
+$script:RuntimeRoot = Join-Path $WorkRoot "runtime"
+foreach ($child in @("config", "secrets", "logs", "rollback")) { New-Item -ItemType Directory -Path (Join-Path $RuntimeRoot $child) -Force | Out-Null }
+$out.ci6_inherited_acl = Get-XbOutcome { Assert-XbRuntimeCustody }
+
+$script:WorkerAccount = "XBHOST\bworker"
+$ci7Password = [Security.SecureString]::new()
+$ci7Password.AppendChar('x')
+$ci7Credential = New-Object Management.Automation.PSCredential($script:WorkerAccount, $ci7Password)
+$ci7WrongName = New-Object Management.Automation.PSCredential("XBHOST\other", $ci7Password)
+$out.ci7_missing_credential = Get-XbOutcome { Assert-XbWorkerEffectiveRights }
+$out.ci7_mismatched_credential = Get-XbOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $ci7WrongName }
+$originalTokenFactory = ${function:New-XbWorkerBatchToken}
+Set-Item function:script:New-XbWorkerBatchToken { param([Management.Automation.PSCredential]$Credential) throw "forced_native_token_failure" }
+try { $out.ci7_native_token_failure = Get-XbOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $ci7Credential } }
+finally { Set-Item function:script:New-XbWorkerBatchToken $originalTokenFactory }
+Add-Type -TypeDefinition 'public sealed class XbWorkerBatchToken { public static void Touch() { } }'
+$out.ci7_preloaded_native_type = Get-XbOutcome { Initialize-XbWorkerNativeAccess }
+$ci7Password.Dispose()
+[Console]::Out.Write(($out | ConvertTo-Json -Depth 8 -Compress))
+'''
+
+
+class MemberWorkerReleaseIntegrityTests(unittest.TestCase):
+    """CI1-CI7 release integrity (installer binding of the W-G2-149 checks) without admin or task registration."""
+
+    report: dict[str, object]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for installer behavior validation")
+        with tempfile.TemporaryDirectory(prefix="xb-release-integrity-") as temp_dir:
+            harness = Path(temp_dir) / "release_integrity_harness.ps1"
+            harness.write_text(_RELEASE_INTEGRITY_HARNESS, encoding="utf-8", newline="\n")
+            work_root = Path(temp_dir) / "work"
+            work_root.mkdir()
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                    "-AdapterPath", str(ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1"),
+                    "-ScriptsRoot", str(ROOT / "scripts"),
+                    "-WorkRoot", str(work_root),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        cls.report = json.loads(completed.stdout)
+
+    def test_package_membership_and_release_identity_agree(self) -> None:
+        self.assertEqual(self.report["installer_package"], sorted(INSTALLER_PACKAGE_FILES))
+        self.assertEqual(self.report["adapter_package"], sorted(INSTALLER_PACKAGE_FILES))
+        lines = "".join(
+            f"{name}:{hashlib.sha256((ROOT / 'scripts' / name).read_bytes()).hexdigest()}\n"
+            for name in sorted(INSTALLER_PACKAGE_FILES)
+        )
+        expected = hashlib.sha256(lines.encode("ascii")).hexdigest()
+        self.assertEqual(self.report["installer_release"], expected)
+        self.assertEqual(self.report["adapter_release"], expected)
+        self.assertEqual(self.report["manifest_release"], expected)
+
+    def test_ci4_release_content(self) -> None:
+        self.assertEqual(self.report["ci4_clean"], "pass")
+        self.assertEqual(self.report["ci4_second_save_site"], "release_content_save_call_sites_invalid")
+        self.assertEqual(self.report["ci4_two_sites_in_adapter"], "release_content_save_call_sites_invalid")
+        self.assertEqual(self.report["ci4_delete_present"], "release_content_delete_present")
+        self.assertEqual(self.report["ci4_cleanup_script_present"], "release_content_forbidden_file")
+        self.assertEqual(self.report["ci4_uat_script_present"], "release_content_forbidden_file")
+        self.assertEqual(self.report["ci4_missing_file"], "release_content_file_missing")
+
+    def test_installation_manifest_v2_records_release_and_absolute_interpreter(self) -> None:
+        self.assertEqual(self.report["manifest_schema"], "xb.member.gateway.worker.installation.v2")
+        self.assertEqual(
+            self.report["manifest_keys"],
+            ["schema_version", "reviewed_source", "release_sha256", "install_root", "runtime_root", "package_files", "task", "rollback_owned_roots"],
+        )
+        self.assertEqual(self.report["manifest_executable"], WINDOWS_POWERSHELL)
+        self.assertRegex(self.report["manifest_arguments"], r"-Mode DisabledProof$")
+        self.assertNotRegex(self.report["manifest_arguments"], r"EnableProduction")
+
+    def test_ci6_custody_and_ci7_fail_closed_wrappers(self) -> None:
+        self.assertTrue(self.report["ci6_secure_artifact"])
+        self.assertFalse(self.report["ci6_plain_artifact"])
+        self.assertFalse(self.report["ci6_garbage_artifact"])
+        self.assertEqual(self.report["ci6_inherited_acl"], "runtime_custody_acl_invalid")
+        self.assertEqual(self.report["ci7_missing_credential"], "effective_rights_unproven")
+        self.assertEqual(self.report["ci7_mismatched_credential"], "effective_rights_unproven")
+        self.assertEqual(self.report["ci7_native_token_failure"], "effective_rights_unproven")
+        self.assertEqual(self.report["ci7_preloaded_native_type"], "effective_rights_unproven")
+
+    def test_ci7_uses_native_token_accesscheck_and_preserves_ci6_oracle(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        self.assertNotIn("Test-XbRightsWithin", source)
+        ci6 = _installer_function(source, "Assert-XbRuntimeCustody")
+        self.assertIn("Get-XbGrantedRights", ci6)
+        token = _installer_function(source, "Initialize-XbWorkerNativeAccess")
+        for required in ("LogonUserW", "LOGON32_LOGON_BATCH", "DuplicateTokenEx", "SecurityImpersonation", "TokenImpersonation", "AccessCheck", "CreateFileW", "GetSecurityInfo", "FileShareRead", "FileFlagOpenReparsePoint", "SecureStringToGlobalAllocUnicode", "ZeroFreeGlobalAllocUnicode"):
+            with self.subTest(required=required):
+                self.assertIn(required, token)
+        access = _installer_function(source, "Invoke-XbNativeAccessCheck")
+        self.assertIn("GetSecurityDescriptorBinaryForm", access)
+        self.assertIn("$Token.Check($securityDescriptor, $DesiredAccess)", access)
+        for marker in (
+            "$packageDeleteCompositionLeaf = [string]$packageFiles[0]",
+            "$packageParentWithDeleteChild.AddAccessRule(",
+            "$packageLeafWithDeleteDeny.AddAccessRule(",
+            '$ci7.package_parent_delete_child_granted = Test-XbNativeAccessAllowed -Path $installRootPath -Token $nativeToken',
+            '$ci7.package_child_delete_denied = -not (Test-XbNativeAccessAllowed -Path $packageDeleteCompositionPath -Token $nativeToken',
+            '$ci7.package_parent_delete_child_composition = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }',
+            'Set-Acl -LiteralPath $packageDeleteCompositionPath -AclObject $packageDeleteCompositionLeafOriginal -ErrorAction Stop',
+            'Set-Acl -LiteralPath $installRootPath -AclObject $packageDeleteCompositionParentOriginal -ErrorAction Stop',
+        ):
+            with self.subTest(package_composition=marker):
+                self.assertIn(marker, _HOSTED_TASK_BOUNDARY_HARNESS)
+        leaf = _installer_function(source, "Add-XbCi7ProtectedLeaf")
+        for marker in ("$AllowedMask", "$RequiredMask", "effective_rights_missing", "0x00000002", "0x00000004", "0x00000010", "0x00000100", "0x00010000", "0x00040000", "0x00080000", "OwnerSid", "ReadSnapshot"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, leaf)
+        self.assertNotIn("Get-Acl", leaf)
+        handle_check = _installer_function(source, "Invoke-XbCi7HandleAccessCheck")
+        self.assertIn("$Object.Check($Token, $DesiredAccess)", handle_check)
+        self.assertIn('throw "effective_rights_unproven"', handle_check)
+        context = _installer_function(source, "Open-XbCi7VerificationContext")
+        for marker in ('Get-XbCi7DirectoryInventory -Path $InstallRoot', 'Get-XbCi7DirectoryInventory -Path $configRoot', '"installation-manifest.json"', 'foreach ($item in $configInventory.Items)', 'directoryMutationDenials', 'XbWorkerProtectedObject]::Open'):
+            with self.subTest(context_marker=marker):
+                self.assertIn(marker, context)
+        self.assertNotIn('$configInventory.Names -cnotcontains "worker.config.json"', context)
+        effective = _installer_function(source, "Assert-XbCi7DirectoryRights")
+        for marker in ("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven", "Assert-XbLogsRootAclShape", "Assert-XbOwnerRightsLogFile", "Assert-XbCi7PathDeletionComposition"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, effective)
+        for marker in ("0x001200A9", "0x00120089"):
+            with self.subTest(allowed_directory_mask=marker):
+                self.assertIn(marker, effective)
+        self.assertIn("0x001200A9", context)
+        self.assertIn("0x00120089", context)
+        verifier = _installer_function(source, "Invoke-XbInstallVerifier")
+        self.assertLess(verifier.index("Open-XbCi7VerificationContext"), verifier.index("Get-XbWorkerTaskIfPresent"))
+        self.assertLess(verifier.index("Assert-XbCi7DirectoryRights"), verifier.index("Assert-XbWorkerTaskContract"))
+        self.assertLess(verifier.index("Assert-XbRuntimeCustody"), verifier.index("Confirm-XbCi7VerificationContext"))
+        self.assertIn("0x001301BF", source)
+        self.assertIn("0x001200AB", source)
+
+    def test_installer_binds_ci1_to_ci7_and_upgrade_contract(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        for label in ("[CI1]", "[CI2]", "[CI3]", "[CI4]", "[CI5]", "[CI6]", "[CI7]"):
+            self.assertIn(label, source)
+        self.assertIn('[ValidateSet("Install", "Upgrade", "Verify", "Uninstall", "ValidateOnly")]', source)
+        upgrade = _installer_function(source, "Invoke-XbWorkerUpgrade")
+        self.assertLess(upgrade.index("Assert-XbStagedPackageIdentity"), upgrade.index("Remove-Item -LiteralPath (Join-Path $InstallRoot $name)"))
+        self.assertLess(upgrade.index("Assert-XbReleaseContent -Root $stageRoot"), upgrade.index("Remove-Item -LiteralPath (Join-Path $InstallRoot $name)"))
+        self.assertIn("Register-XbWorkerScheduledTask", upgrade)
+        self.assertIn("Set-XbWorkerInstalledPackageOwners", upgrade)
+        for protected in ('"config"', '"secrets"', '"logs"'):
+            self.assertNotIn(f"Remove-Item -LiteralPath (Join-Path $RuntimeRoot {protected})", upgrade)
+        verifier = _installer_function(source, "Invoke-XbInstallVerifier")
+        for step in ("Assert-XbWorkerInstallLayout", "Get-XbReleaseIdentityFromEntries", "Assert-XbReleaseContentText", "Assert-XbCi7DirectoryRights", "Assert-XbWorkerTaskContract", "Assert-XbRuntimeCustody", "Confirm-XbCi7VerificationContext"):
+            self.assertIn(step, verifier)
+        install = _installer_function(source, "Invoke-XbWorkerInstaller")
+        self.assertIn("Set-XbWorkerInstalledPackageOwners", install)
+        self.assertNotIn("ac2_member_test_cleanup.ps1", source)
+
+
+# CI7 handle-bound descriptor checks and parent/ancestor delete composition over
+# a real scratch path chain. The caller's token restricted to Everyone (S-1-1-0)
+# is a disposable native AccessCheck subject: it needs no privilege or password,
+# and on a standard temp chain it holds neither DELETE nor DELETE_CHILD until
+# the harness grants one.
+_PATH_CHAIN_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$LeafPath
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. $InstallerPath -LibraryOnly
+$out = [ordered]@{}
+function Get-XbOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+function Get-XbBytesSha256 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($Bytes)).Replace("-", "").ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+}
+function Invoke-XbHandleAccessProbe {
+    param([Parameter(Mandatory)][byte[]]$Bytes, [Parameter(Mandatory)][uint32]$DesiredAccess)
+    try {
+        return [pscustomobject]@{ completed = $true; result = $token.Check($Bytes, $DesiredAccess) }
+    } catch {
+        return [pscustomobject]@{ completed = $false; result = $null }
+    }
+}
+
+Initialize-XbWorkerNativeAccess
+$samplePath = Join-Path $LeafPath "handle-bound-sample.txt"
+[IO.File]::WriteAllText($samplePath, "local-safe-f2", [Text.UTF8Encoding]::new($false))
+$heldSample = [XbWorkerProtectedObject]::Open($samplePath, $false, $true)
+try {
+    $sampleSnapshot = $heldSample.ReadSnapshot()
+    $out.handle_sample_text = [string]$sampleSnapshot.Text
+    $out.handle_sample_sha256 = [string]$sampleSnapshot.Sha256
+    $out.handle_sample_identity = [string]$heldSample.FileIdentity
+    $out.handle_sample_owner_present = (-not [string]::IsNullOrWhiteSpace([string]$heldSample.OwnerSid))
+    try { Set-Content -LiteralPath $samplePath -Value "replace-probe" -ErrorAction Stop; $out.handle_replace_blocked = $false }
+    catch { $out.handle_replace_blocked = $true }
+    try { Move-Item -LiteralPath $samplePath -Destination ($samplePath + ".renamed") -ErrorAction Stop; $out.handle_rename_blocked = $false }
+    catch { $out.handle_rename_blocked = $true }
+} finally {
+    $heldSample.Dispose()
+    if (Test-Path -LiteralPath $samplePath) { Remove-Item -LiteralPath $samplePath -Force -ErrorAction Stop }
+    if (Test-Path -LiteralPath ($samplePath + ".renamed")) { Remove-Item -LiteralPath ($samplePath + ".renamed") -Force -ErrorAction Stop }
+}
+
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public sealed class XbTestAccessResult
+{
+    public bool Allowed { get; private set; }
+    public uint GrantedAccess { get; private set; }
+    public XbTestAccessResult(bool allowed, uint granted) { Allowed = allowed; GrantedAccess = granted; }
+}
+
+public sealed class XbTestRestrictedToken : IDisposable
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GenericMapping { public uint GenericRead, GenericWrite, GenericExecute, GenericAll; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr memory);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSidToSid(string stringSid, out IntPtr sid);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateRestrictedToken(IntPtr existing, uint flags, uint disableCount, IntPtr sidsToDisable,
+        uint deleteCount, IntPtr privilegesToDelete, uint restrictCount, [In] SidAndAttributes[] sidsToRestrict, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(IntPtr source, uint access, IntPtr attributes, int level, int type, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsTokenRestricted(IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AccessCheck(IntPtr securityDescriptor, IntPtr clientToken, uint desiredAccess,
+        ref GenericMapping genericMapping, IntPtr privilegeSet, ref uint privilegeSetLength,
+        out uint grantedAccess, [MarshalAs(UnmanagedType.Bool)] out bool accessAllowed);
+
+    private IntPtr token;
+    public bool Restricted { get; private set; }
+
+    // Current process token restricted to Everyone: effective access is the intersection
+    // of the normal check and an Everyone-only check, at the caller's integrity level.
+    public XbTestRestrictedToken()
+    {
+        IntPtr process = IntPtr.Zero, everyone = IntPtr.Zero, restricted = IntPtr.Zero;
+        try
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), 0x000A, out process)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!ConvertStringSidToSid("S-1-1-0", out everyone)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            SidAndAttributes[] restrict = new SidAndAttributes[1];
+            restrict[0].Sid = everyone;
+            if (!CreateRestrictedToken(process, 0, 0, IntPtr.Zero, 0, IntPtr.Zero, 1, restrict, out restricted))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!DuplicateTokenEx(restricted, 0x0008, IntPtr.Zero, 2, 2, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            Restricted = IsTokenRestricted(token);
+        }
+        finally
+        {
+            if (restricted != IntPtr.Zero) CloseHandle(restricted);
+            if (everyone != IntPtr.Zero) LocalFree(everyone);
+            if (process != IntPtr.Zero) CloseHandle(process);
+        }
+    }
+
+    // Same AccessCheck call shape as the installer's XbWorkerBatchToken.Check.
+    public XbTestAccessResult Check(byte[] securityDescriptorBytes, uint desiredAccess)
+    {
+        if (token == IntPtr.Zero || securityDescriptorBytes == null || securityDescriptorBytes.Length < 20)
+            throw new InvalidOperationException("access_check_input_unproven");
+        IntPtr securityDescriptor = Marshal.AllocHGlobal(securityDescriptorBytes.Length);
+        IntPtr privilegeSet = Marshal.AllocHGlobal(256);
+        try
+        {
+            Marshal.Copy(securityDescriptorBytes, 0, securityDescriptor, securityDescriptorBytes.Length);
+            GenericMapping mapping = new GenericMapping();
+            mapping.GenericRead = 0x00120089;
+            mapping.GenericWrite = 0x00120116;
+            mapping.GenericExecute = 0x001200A0;
+            mapping.GenericAll = 0x001F01FF;
+            uint privilegeSetLength = 256;
+            uint granted;
+            bool allowed;
+            if (!AccessCheck(securityDescriptor, token, desiredAccess, ref mapping, privilegeSet, ref privilegeSetLength, out granted, out allowed))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return new XbTestAccessResult(allowed, granted);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(privilegeSet);
+            Marshal.FreeHGlobal(securityDescriptor);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (token == IntPtr.Zero) return;
+        CloseHandle(token);
+        token = IntPtr.Zero;
+    }
+}
+"@
+
+# Record every native check Assert-XbPathNotDeleteable reaches, then delegate to the real one.
+$script:nativeChecks = New-Object System.Collections.Generic.List[string]
+$originalAccessCheck = ${function:Invoke-XbNativeAccessCheck}
+Set-Item function:script:Invoke-XbNativeAccessCheck {
+    param([string]$Path, $Token, [uint32]$DesiredAccess)
+    $script:nativeChecks.Add(("{0}|0x{1:X8}" -f $Path, $DesiredAccess))
+    & $originalAccessCheck -Path $Path -Token $Token -DesiredAccess $DesiredAccess
+}
+function Get-XbRecordedOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    $script:nativeChecks.Clear()
+    $outcome = Get-XbOutcome $Body
+    return [ordered]@{ outcome = $outcome; checks = @($script:nativeChecks) }
+}
+
+$parentPath = Split-Path -Parent $LeafPath
+$ancestorPath = Split-Path -Parent $parentPath
+$everyoneSid = [Security.Principal.SecurityIdentifier]::new("S-1-1-0")
+function Invoke-XbGrantProbe {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Security.AccessControl.FileSystemRights]$Rights, [Parameter(Mandatory)][uint32]$DesiredAccess)
+    $original = Get-Acl -LiteralPath $Path
+    try {
+        $changed = Get-Acl -LiteralPath $Path
+        $changed.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyoneSid, $Rights, [Security.AccessControl.AccessControlType]::Allow))
+        Set-Acl -LiteralPath $Path -AclObject $changed
+        $granted = Test-XbNativeAccessAllowed -Path $Path -Token $token -DesiredAccess $DesiredAccess
+        $result = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+        $result.requested_operation_granted = [bool]$granted
+        return $result
+    } finally { Set-Acl -LiteralPath $Path -AclObject $original }
+}
+
+$direct = Get-XbNativePathChain -Path $LeafPath
+$out.direct_chain = @($direct | ForEach-Object { [string]$_ })
+$out.direct_count = $direct.Count
+$out.direct_element_types = @($direct | ForEach-Object { $_.GetType().FullName } | Sort-Object -Unique)
+$wrapped = @(Get-XbNativePathChain -Path $LeafPath)
+$out.wrapped_count = $wrapped.Count
+$out.wrapped_first_type = $wrapped[0].GetType().FullName
+
+$token = [XbTestRestrictedToken]::new()
+try {
+    $out.token_restricted = $token.Restricted
+    $componentGuard = [XbWorkerProtectedObject].GetMethod(
+        "HasUsableSecurityDescriptor",
+        ([System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static)
+    )
+    $out.group_completeness_guard_present = ($null -ne $componentGuard)
+    $out.incomplete_group_descriptor_rejected = $false
+    if ($null -ne $componentGuard) {
+        $usableWithoutGroup = [bool]$componentGuard.Invoke(
+            $null,
+            [object[]]@([uint32]0, [IntPtr]::new(1), [IntPtr]::Zero, [IntPtr]::new(2))
+        )
+        $out.incomplete_group_descriptor_rejected = -not $usableWithoutGroup
+    }
+
+    $descriptorDirectory = Join-Path $LeafPath "descriptor-access"
+    $null = New-Item -ItemType Directory -Path $descriptorDirectory -ErrorAction Stop
+    $descriptorFile = Join-Path $descriptorDirectory "access-target.txt"
+    [IO.File]::WriteAllText($descriptorFile, "local-safe-group-sid", [Text.UTF8Encoding]::new($false))
+    $originalDescriptorDirectoryAcl = Get-Acl -LiteralPath $descriptorDirectory
+    $originalDescriptorFileAcl = Get-Acl -LiteralPath $descriptorFile
+    $descriptorDirectoryObject = $null
+    $descriptorFileObject = $null
+    try {
+        $directoryAcl = Get-Acl -LiteralPath $descriptorDirectory
+        $directoryAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $everyoneSid,
+            [Security.AccessControl.FileSystemRights]::ListDirectory,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $descriptorDirectory -AclObject $directoryAcl -ErrorAction Stop
+        $fileAcl = Get-Acl -LiteralPath $descriptorFile
+        $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $everyoneSid,
+            [Security.AccessControl.FileSystemRights]::ReadData,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+        Set-Acl -LiteralPath $descriptorFile -AclObject $fileAcl -ErrorAction Stop
+
+        $descriptorDirectoryObject = [XbWorkerProtectedObject]::Open($descriptorDirectory, $true, $true)
+        $descriptorFileObject = [XbWorkerProtectedObject]::Open($descriptorFile, $false, $true)
+        $directoryBytes = $descriptorDirectoryObject.GetSecurityDescriptorBytes()
+        $fileBytes = $descriptorFileObject.GetSecurityDescriptorBytes()
+        $directorySecurity = [Security.AccessControl.RawSecurityDescriptor]::new($directoryBytes, 0)
+        $fileSecurity = [Security.AccessControl.RawSecurityDescriptor]::new($fileBytes, 0)
+        $out.handle_directory_owner_present = ($null -ne $directorySecurity.Owner)
+        $out.handle_directory_group_present = ($null -ne $directorySecurity.Group)
+        $out.handle_file_owner_present = ($null -ne $fileSecurity.Owner)
+        $out.handle_file_group_present = ($null -ne $fileSecurity.Group)
+        $out.handle_directory_descriptor_matches_hash =
+            ((Get-XbBytesSha256 -Bytes $directoryBytes) -ceq [string]$descriptorDirectoryObject.SecurityDescriptorSha256)
+        $out.handle_file_descriptor_matches_hash =
+            ((Get-XbBytesSha256 -Bytes $fileBytes) -ceq [string]$descriptorFileObject.SecurityDescriptorSha256)
+
+        $directoryAccess = Invoke-XbHandleAccessProbe -Bytes $directoryBytes -DesiredAccess ([uint32]0x00000001)
+        $out.handle_directory_accesscheck_completed = [bool]$directoryAccess.completed
+        $out.handle_directory_list_access_allowed =
+            [bool]$directoryAccess.completed -and
+            $null -ne $directoryAccess.result -and
+            [bool]$directoryAccess.result.Allowed -and
+            (($directoryAccess.result.GrantedAccess -band [uint32]0x00000001) -ne 0)
+        $fileAccess = Invoke-XbHandleAccessProbe -Bytes $fileBytes -DesiredAccess ([uint32]0x00000001)
+        $out.handle_file_read_accesscheck_completed = [bool]$fileAccess.completed
+        $out.handle_file_read_access_allowed =
+            [bool]$fileAccess.completed -and
+            $null -ne $fileAccess.result -and
+            [bool]$fileAccess.result.Allowed -and
+            (($fileAccess.result.GrantedAccess -band [uint32]0x00000001) -ne 0)
+        $fileDelete = Invoke-XbHandleAccessProbe -Bytes $fileBytes -DesiredAccess ([uint32]0x00010000)
+        $out.handle_file_delete_accesscheck_completed = [bool]$fileDelete.completed
+        $out.handle_file_delete_access_denied =
+            [bool]$fileDelete.completed -and $null -ne $fileDelete.result -and -not [bool]$fileDelete.result.Allowed
+        $maximumAccess = Invoke-XbHandleAccessProbe -Bytes $fileBytes -DesiredAccess ([uint32]0x02000000)
+        $out.handle_file_maximum_accesscheck_completed = [bool]$maximumAccess.completed
+        $out.handle_file_maximum_access_usable =
+            [bool]$maximumAccess.completed -and
+            $null -ne $maximumAccess.result -and
+            [bool]$maximumAccess.result.Allowed -and
+            (($maximumAccess.result.GrantedAccess -band [uint32]0x00000001) -ne 0) -and
+            (($maximumAccess.result.GrantedAccess -band [uint32]0x00010000) -eq 0)
+    } finally {
+        if ($null -ne $descriptorFileObject) { $descriptorFileObject.Dispose() }
+        if ($null -ne $descriptorDirectoryObject) { $descriptorDirectoryObject.Dispose() }
+        Set-Acl -LiteralPath $descriptorFile -AclObject $originalDescriptorFileAcl -ErrorAction Stop
+        Set-Acl -LiteralPath $descriptorDirectory -AclObject $originalDescriptorDirectoryAcl -ErrorAction Stop
+        if (Test-Path -LiteralPath $descriptorFile) { Remove-Item -LiteralPath $descriptorFile -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $descriptorDirectory) { Remove-Item -LiteralPath $descriptorDirectory -Force -ErrorAction Stop }
+    }
+
+    $out.pass_case = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+    $out.leaf_delete = Invoke-XbGrantProbe -Path $LeafPath -Rights ([Security.AccessControl.FileSystemRights]::Delete) -DesiredAccess ([uint32]0x00010000)
+    $out.parent_delete_child = Invoke-XbGrantProbe -Path $parentPath -Rights ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -DesiredAccess ([uint32]0x00000040)
+    $out.ancestor_delete = Invoke-XbGrantProbe -Path $ancestorPath -Rights ([Security.AccessControl.FileSystemRights]::Delete) -DesiredAccess ([uint32]0x00010000)
+    $out.restored_pass = (Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }).outcome
+
+    $throwingToken = [pscustomobject]@{}
+    $throwingToken | Add-Member -MemberType ScriptMethod -Name Check -Value { param($Descriptor, $Access) throw "forced_native_check_failure" }
+    $out.forced_native_failure = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $throwingToken }
+    $out.missing_path = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path (Join-Path $LeafPath "absent") -Token $token }
+
+    $originalChain = ${function:Get-XbNativePathChain}
+    try {
+        Set-Item function:script:Get-XbNativePathChain { param([string]$Path) return ,@(,@("C:\", "C:\Windows")) }
+        $out.nested_chain_guard = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+        Set-Item function:script:Get-XbNativePathChain { param([string]$Path) return ,@("C:\", "") }
+        $out.empty_element_guard = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+    } finally { Set-Item function:script:Get-XbNativePathChain $originalChain }
+} finally { $token.Dispose() }
+$out.disposed_token = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+[Console]::Out.Write(($out | ConvertTo-Json -Depth 8 -Compress))
+'''
+
+
+class MemberWorkerInstalledManifestParserTests(unittest.TestCase):
+    """Pure installed-manifest parsing and exact v1/v2 contract regression matrix."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            if _hosted_windows_boundary_required():
+                raise AssertionError("native Windows PowerShell is required on the hosted runner")
+            raise unittest.SkipTest("Windows PowerShell is required for manifest parser behavior validation")
+        script = r'''[CmdletBinding()]
+param([Parameter(Mandatory)][string]$InstallerPath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. $InstallerPath -LibraryOnly
+
+$out = [ordered]@{
+    parser_available = ($null -ne (Get-Command -Name ConvertFrom-XbInstalledManifestText -CommandType Function -ErrorAction SilentlyContinue))
+    native_type_absent_before = ($null -eq ("XbWorkerProtectedObject" -as [type]))
+    cases = [ordered]@{}
+}
+
+function New-XbTestManifest {
+    param([switch]$Previous)
+    $names = [string[]]@(
+        "ac2_member_gateway_worker.ps1",
+        "ac2_member_gateway_worker_lib.ps1",
+        "ac2_member_gateway_autocount_adapter.ps1",
+        "launch_ac2_member_gateway_worker.ps1",
+        "test_ac2_member_gateway_autocount_dependencies.ps1",
+        "ac2_member_create_primitive.ps1"
+    )
+    if ($Previous) { $names = [string[]]@($names | Where-Object { $_ -cne "ac2_member_create_primitive.ps1" }) }
+    $entries = @(
+        foreach ($name in $names) { [ordered]@{ name = $name; sha256 = ("a" * 64) } }
+    )
+    $releaseEntries = [ordered]@{}
+    foreach ($entry in $entries) { $releaseEntries[[string]$entry.name] = [string]$entry.sha256 }
+    $launcher = "C:\Program Files\X-Boundaries\MemberGatewayWorker\launch_ac2_member_gateway_worker.ps1"
+    $task = [ordered]@{
+        path = "\X-Boundaries\"
+        name = "AC2 Member Gateway Worker"
+        enabled = $false
+        trigger_count = 0
+        action_mode = "DisabledProof"
+        production_switches = @()
+        multiple_instances = "IgnoreNew"
+        execution_time_limit = "PT10M"
+        restart_count = 0
+        start_when_available = $false
+        executable = if ($Previous) { "powershell.exe" } else { "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" }
+        launcher_path = $launcher
+        arguments = ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $launcher)
+        working_directory = ""
+        principal_user_id = "xb-test-worker"
+        principal_logon_type = "Password"
+        principal_run_level = "Limited"
+    }
+    if ($Previous) {
+        return [ordered]@{
+            schema_version = "xb.member.gateway.worker.installation.v1"
+            reviewed_source = [ordered]@{ commit = ("a" * 40); tree = ("b" * 40) }
+            install_root = "C:\Program Files\X-Boundaries\MemberGatewayWorker\"
+            runtime_root = "C:\ProgramData\X-Boundaries\MemberGatewayWorker\"
+            package_files = $entries
+            task = $task
+            rollback_owned_roots = @("config", "secrets", "logs", "rollback")
+        }
+    }
+    return [ordered]@{
+        schema_version = "xb.member.gateway.worker.installation.v2"
+        reviewed_source = [ordered]@{ commit = ("a" * 40); tree = ("b" * 40) }
+        release_sha256 = Get-XbReleaseIdentityFromEntries -Entries $releaseEntries
+        install_root = "C:\Program Files\X-Boundaries\MemberGatewayWorker\"
+        runtime_root = "C:\ProgramData\X-Boundaries\MemberGatewayWorker\"
+        package_files = $entries
+        task = $task
+        rollback_owned_roots = @("config", "secrets", "logs", "rollback")
+    }
+}
+
+function Copy-XbTestValue {
+    param($Value)
+    return (ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $Value -Depth 30 -Compress) -ErrorAction Stop)
+}
+
+function Get-XbManifestOutcome {
+    param([AllowEmptyString()][string]$Text, [switch]$AllowPrevious)
+    try {
+        $null = ConvertFrom-XbInstalledManifestText -Text $Text -AllowPrevious:$AllowPrevious
+        return "pass"
+    } catch { return [string]$_.Exception.Message }
+}
+
+function Add-XbJsonCase {
+    param([string]$Name, [AllowEmptyString()][string]$Text, [switch]$AllowPrevious)
+    $out.cases[$Name] = Get-XbManifestOutcome -Text $Text -AllowPrevious:$AllowPrevious
+}
+
+function Add-XbObjectCase {
+    param([string]$Name, $Value, [switch]$AllowPrevious)
+    Add-XbJsonCase -Name $Name -Text (ConvertTo-Json -InputObject $Value -Depth 30 -Compress) -AllowPrevious:$AllowPrevious
+}
+
+$valid = New-XbTestManifest
+$previous = New-XbTestManifest -Previous
+Add-XbObjectCase "valid_v2" $valid
+Add-XbObjectCase "v1_with_previous" $previous -AllowPrevious
+Add-XbObjectCase "v1_default" $previous
+Add-XbJsonCase "empty_text" ""
+Add-XbJsonCase "malformed_json" "{"
+Add-XbJsonCase "null_root" "null"
+Add-XbJsonCase "scalar_root" "7"
+Add-XbJsonCase "array_root" "[]"
+
+$reviewed = [pscustomobject]@{
+    source = [pscustomobject]@{ commit = ("c" * 40); tree = ("d" * 40) }
+    package_files = @(
+        foreach ($name in @(
+            "ac2_member_gateway_worker.ps1",
+            "ac2_member_gateway_worker_lib.ps1",
+            "ac2_member_gateway_autocount_adapter.ps1",
+            "launch_ac2_member_gateway_worker.ps1",
+            "test_ac2_member_gateway_autocount_dependencies.ps1",
+            "ac2_member_create_primitive.ps1"
+        )) { [pscustomobject]@{ name = $name; sha256 = ("e" * 64) } }
+    )
+}
+$produced = New-XbWorkerInstallationManifest -PackageRoot "unused" -ReviewedIdentity $reviewed -WorkerAccount "xb-test-worker"
+Add-XbJsonCase "producer_round_trip" (ConvertTo-Json -InputObject $produced -Depth 30 -Compress)
+$out.producer_release_sha256 = [string]$produced.release_sha256
+
+$bad = Copy-XbTestValue $valid
+$null = $bad.PSObject.Properties.Remove("runtime_root")
+Add-XbObjectCase "top_missing" $bad
+$bad = Copy-XbTestValue $valid
+Add-Member -InputObject $bad -NotePropertyName "ignored" -NotePropertyValue $true
+Add-XbObjectCase "top_extra" $bad
+$bad = Copy-XbTestValue $valid
+$schemaValue = [string]$bad.schema_version
+$null = $bad.PSObject.Properties.Remove("schema_version")
+Add-Member -InputObject $bad -NotePropertyName "Schema_version" -NotePropertyValue $schemaValue
+Add-XbObjectCase "top_case_changed" $bad
+$bad = Copy-XbTestValue $valid
+$bad.schema_version = "xb.member.gateway.worker.installation.v9"
+Add-XbObjectCase "schema_unsupported" $bad
+$bad = Copy-XbTestValue $valid
+$bad.schema_version = 2
+Add-XbObjectCase "schema_wrong_type" $bad
+$bad = Copy-XbTestValue $valid
+$null = $bad.PSObject.Properties.Remove("release_sha256")
+Add-XbObjectCase "v2_release_missing" $bad
+$bad = Copy-XbTestValue $previous
+Add-Member -InputObject $bad -NotePropertyName "release_sha256" -NotePropertyValue ("a" * 64)
+Add-XbObjectCase "v1_release_extra" $bad -AllowPrevious
+
+$bad = Copy-XbTestValue $valid
+$bad.reviewed_source = "source"
+Add-XbObjectCase "source_wrong_type" $bad
+$bad = Copy-XbTestValue $valid
+$null = $bad.reviewed_source.PSObject.Properties.Remove("tree")
+Add-XbObjectCase "source_missing" $bad
+$bad = Copy-XbTestValue $valid
+Add-Member -InputObject $bad.reviewed_source -NotePropertyName "extra" -NotePropertyValue 1
+Add-XbObjectCase "source_extra" $bad
+$bad = Copy-XbTestValue $valid
+$treeValue = [string]$bad.reviewed_source.tree
+$null = $bad.reviewed_source.PSObject.Properties.Remove("tree")
+Add-Member -InputObject $bad.reviewed_source -NotePropertyName "Tree" -NotePropertyValue $treeValue
+Add-XbObjectCase "source_case_changed" $bad
+foreach ($sourceCase in @(
+    @{ name = "commit_upper"; field = "commit"; value = ("A" * 40) },
+    @{ name = "commit_length"; field = "commit"; value = ("a" * 39) },
+    @{ name = "commit_nonhex"; field = "commit"; value = (("a" * 39) + "g") },
+    @{ name = "commit_wrong_type"; field = "commit"; value = 7 },
+    @{ name = "tree_upper"; field = "tree"; value = ("B" * 40) },
+    @{ name = "tree_length"; field = "tree"; value = ("b" * 41) },
+    @{ name = "tree_nonhex"; field = "tree"; value = (("b" * 39) + "g") },
+    @{ name = "tree_wrong_type"; field = "tree"; value = $true }
+)) {
+    $bad = Copy-XbTestValue $valid
+    $bad.reviewed_source.PSObject.Properties[[string]$sourceCase.field].Value = $sourceCase.value
+    Add-XbObjectCase ("source_" + [string]$sourceCase.name) $bad
+}
+
+$rootVariants = @(
+    @{ name = "case"; value = "C:\Program Files\x-Boundaries\MemberGatewayWorker\" },
+    @{ name = "drive"; value = "D:\Program Files\X-Boundaries\MemberGatewayWorker\" },
+    @{ name = "relative"; value = "MemberGatewayWorker\" },
+    @{ name = "traversal"; value = "C:\Program Files\X-Boundaries\MemberGatewayWorker\..\MemberGatewayWorker\" },
+    @{ name = "unc"; value = "\\server\share\MemberGatewayWorker\" },
+    @{ name = "device"; value = "\\?\C:\Program Files\X-Boundaries\MemberGatewayWorker\" },
+    @{ name = "stream"; value = "C:\Program Files\X-Boundaries\MemberGatewayWorker:stream\" },
+    @{ name = "missing_trailing"; value = "C:\Program Files\X-Boundaries\MemberGatewayWorker" }
+)
+foreach ($rootProperty in @("install_root", "runtime_root")) {
+    foreach ($variant in $rootVariants) {
+        $bad = Copy-XbTestValue $valid
+        $bad.PSObject.Properties[$rootProperty].Value = [string]$variant.value
+        Add-XbObjectCase ("root_" + $rootProperty + "_" + [string]$variant.name) $bad
+    }
+    $bad = Copy-XbTestValue $valid
+    $bad.PSObject.Properties[$rootProperty].Value = 7
+    Add-XbObjectCase ("root_" + $rootProperty + "_wrong_type") $bad
+}
+
+$bad = Copy-XbTestValue $valid
+$bad.package_files = $null
+Add-XbObjectCase "package_null" $bad
+$bad = Copy-XbTestValue $valid
+$bad.package_files = "files"
+Add-XbObjectCase "package_wrong_type" $bad
+$bad = Copy-XbTestValue $valid
+$bad.package_files = @($bad.package_files[1..($bad.package_files.Length - 1)])
+Add-XbObjectCase "package_missing" $bad
+$bad = Copy-XbTestValue $valid
+$bad.package_files[$bad.package_files.Length - 1].name = [string]$bad.package_files[0].name
+Add-XbObjectCase "package_duplicate" $bad
+$bad = Copy-XbTestValue $valid
+$bad.package_files[0].name = "unknown.ps1"
+Add-XbObjectCase "package_unknown" $bad
+$bad = Copy-XbTestValue $valid
+$bad.package_files[0].name = "..\worker.ps1"
+Add-XbObjectCase "package_invalid_filename" $bad
+$bad = Copy-XbTestValue $valid
+$bad.package_files[0].name = 7
+Add-XbObjectCase "package_name_wrong_type" $bad
+$bad = Copy-XbTestValue $valid
+$null = $bad.package_files[0].PSObject.Properties.Remove("sha256")
+Add-XbObjectCase "package_entry_missing" $bad
+$bad = Copy-XbTestValue $valid
+Add-Member -InputObject $bad.package_files[0] -NotePropertyName "extra" -NotePropertyValue 1
+Add-XbObjectCase "package_entry_extra" $bad
+$bad = Copy-XbTestValue $valid
+$digestValue = [string]$bad.package_files[0].sha256
+$null = $bad.package_files[0].PSObject.Properties.Remove("sha256")
+Add-Member -InputObject $bad.package_files[0] -NotePropertyName "SHA256" -NotePropertyValue $digestValue
+Add-XbObjectCase "package_entry_case_changed" $bad
+foreach ($hashCase in @(
+    @{ name = "null"; value = $null },
+    @{ name = "wrong_type"; value = 7 },
+    @{ name = "short"; value = ("a" * 63) },
+    @{ name = "uppercase"; value = ("A" * 64) },
+    @{ name = "nonhex"; value = (("a" * 63) + "g") }
+)) {
+    $bad = Copy-XbTestValue $valid
+    $bad.package_files[0].sha256 = $hashCase.value
+    Add-XbObjectCase ("package_hash_" + [string]$hashCase.name) $bad
+}
+$bad = Copy-XbTestValue $previous
+$bad.package_files = @($bad.package_files) + @([ordered]@{ name = "ac2_member_create_primitive.ps1"; sha256 = ("a" * 64) })
+Add-XbObjectCase "v1_six_file_package" $bad -AllowPrevious
+$bad = Copy-XbTestValue $valid
+$bad.package_files = @($bad.package_files[0..4])
+Add-XbObjectCase "v2_five_file_package" $bad
+
+foreach ($releaseCase in @(
+    @{ name = "null"; value = $null },
+    @{ name = "wrong_type"; value = 7 },
+    @{ name = "short"; value = ("a" * 63) },
+    @{ name = "uppercase"; value = ("A" * 64) },
+    @{ name = "nonhex"; value = (("a" * 63) + "g") }
+)) {
+    $bad = Copy-XbTestValue $valid
+    $bad.release_sha256 = $releaseCase.value
+    Add-XbObjectCase ("release_format_" + [string]$releaseCase.name) $bad
+}
+$bad = Copy-XbTestValue $valid
+$bad.release_sha256 = ("b" * 64)
+Add-XbObjectCase "release_mismatch" $bad
+
+$bad = Copy-XbTestValue $valid
+$bad.task = $null
+Add-XbObjectCase "task_null" $bad
+$bad = Copy-XbTestValue $valid
+$bad.task = @()
+Add-XbObjectCase "task_array" $bad
+$bad = Copy-XbTestValue $valid
+$null = $bad.task.PSObject.Properties.Remove("action_mode")
+Add-XbObjectCase "task_missing" $bad
+$bad = Copy-XbTestValue $valid
+Add-Member -InputObject $bad.task -NotePropertyName "extra" -NotePropertyValue 1
+Add-XbObjectCase "task_extra" $bad
+$bad = Copy-XbTestValue $valid
+$actionValue = [string]$bad.task.action_mode
+$null = $bad.task.PSObject.Properties.Remove("action_mode")
+Add-Member -InputObject $bad.task -NotePropertyName "Action_mode" -NotePropertyValue $actionValue
+Add-XbObjectCase "task_case_changed" $bad
+foreach ($taskCase in @(
+    @{ name = "path"; value = "\X-Boundaries" },
+    @{ name = "name"; value = "Other Task" },
+    @{ name = "enabled"; value = $true },
+    @{ name = "trigger_count"; value = 1 },
+    @{ name = "action_mode"; value = "Production" },
+    @{ name = "production_switches"; value = @("EnableProduction") },
+    @{ name = "multiple_instances"; value = "Parallel" },
+    @{ name = "execution_time_limit"; value = "PT11M" },
+    @{ name = "restart_count"; value = 1 },
+    @{ name = "start_when_available"; value = $true },
+    @{ name = "executable"; value = "powershell.exe" },
+    @{ name = "launcher_path"; value = "C:\other\launch.ps1" },
+    @{ name = "arguments"; value = "-File other.ps1" },
+    @{ name = "working_directory"; value = "C:\work" },
+    @{ name = "principal_user_id"; value = " " },
+    @{ name = "principal_logon_type"; value = "Interactive" },
+    @{ name = "principal_run_level"; value = "Highest" }
+)) {
+    $bad = Copy-XbTestValue $valid
+    $bad.task.PSObject.Properties[[string]$taskCase.name].Value = $taskCase.value
+    Add-XbObjectCase ("task_value_" + [string]$taskCase.name) $bad
+}
+foreach ($taskType in @(
+    @{ name = "path"; value = 7 },
+    @{ name = "name"; value = $true },
+    @{ name = "enabled"; value = "false" },
+    @{ name = "trigger_count"; value = "0" },
+    @{ name = "action_mode"; value = 7 },
+    @{ name = "production_switches"; value = "none" },
+    @{ name = "multiple_instances"; value = 7 },
+    @{ name = "execution_time_limit"; value = 10.0 },
+    @{ name = "restart_count"; value = $false },
+    @{ name = "start_when_available"; value = 0 },
+    @{ name = "executable"; value = 7 },
+    @{ name = "launcher_path"; value = $false },
+    @{ name = "arguments"; value = 7 },
+    @{ name = "working_directory"; value = $null },
+    @{ name = "principal_user_id"; value = $null },
+    @{ name = "principal_logon_type"; value = 7 },
+    @{ name = "principal_run_level"; value = @() }
+)) {
+    $bad = Copy-XbTestValue $valid
+    $bad.task.PSObject.Properties[[string]$taskType.name].Value = $taskType.value
+    Add-XbObjectCase ("task_type_" + [string]$taskType.name) $bad
+}
+$validJson = ConvertTo-Json -InputObject $valid -Depth 30 -Compress
+Add-XbJsonCase "task_type_trigger_count_decimal" $validJson.Replace('"trigger_count":0,', '"trigger_count":0.0,')
+Add-XbJsonCase "task_type_restart_count_decimal" $validJson.Replace('"restart_count":0,', '"restart_count":0.0,')
+$bad = Copy-XbTestValue $previous
+$bad.task.executable = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+Add-XbObjectCase "v1_task_executable_mismatch" $bad -AllowPrevious
+
+$bad = Copy-XbTestValue $valid
+$bad.rollback_owned_roots = @("config", "secrets", "logs")
+Add-XbObjectCase "roots_missing" $bad
+$bad = Copy-XbTestValue $valid
+$bad.rollback_owned_roots[3] = "config"
+Add-XbObjectCase "roots_duplicate" $bad
+$bad = Copy-XbTestValue $valid
+$bad.rollback_owned_roots[3] = "other"
+Add-XbObjectCase "roots_unknown" $bad
+$bad = Copy-XbTestValue $valid
+$bad.rollback_owned_roots = "config,secrets,logs,rollback"
+Add-XbObjectCase "roots_wrong_type" $bad
+$bad = Copy-XbTestValue $valid
+$bad.rollback_owned_roots[0] = 7
+Add-XbObjectCase "roots_entry_wrong_type" $bad
+$bad = Copy-XbTestValue $valid
+$bad.rollback_owned_roots[0] = "Config"
+Add-XbObjectCase "roots_case_changed" $bad
+
+$out.native_type_absent_after = ($null -eq ("XbWorkerProtectedObject" -as [type]))
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject $out -Depth 30 -Compress))
+'''
+        with tempfile.TemporaryDirectory(prefix="xb-installed-manifest-") as temp_dir:
+            harness = Path(temp_dir) / "manifest_parser_harness.ps1"
+            harness.write_text(script, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [
+                    pwsh,
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    str(harness),
+                    "-InstallerPath",
+                    str(ROOT / INSTALLER_PATH),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        cls.report = json.loads(completed.stdout)
+
+    def assert_outcomes(self, names: tuple[str, ...], expected: str) -> None:
+        for name in names:
+            with self.subTest(case=name):
+                self.assertEqual(self.report["cases"][name], expected)
+
+    def test_library_only_parser_is_available_before_native_initialization(self) -> None:
+        self.assertTrue(self.report["parser_available"])
+        self.assertTrue(self.report["native_type_absent_before"])
+        self.assertTrue(self.report["native_type_absent_after"])
+        self.assertEqual(self.report["cases"]["valid_v2"], "pass")
+
+    def test_v2_producer_round_trip_and_v1_upgrade_only_compatibility(self) -> None:
+        self.assertEqual(self.report["cases"]["producer_round_trip"], "pass")
+        self.assertRegex(self.report["producer_release_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(self.report["cases"]["v1_with_previous"], "pass")
+        self.assertEqual(self.report["cases"]["v1_default"], "installation_manifest_invalid")
+        self.assertEqual(self.report["cases"]["v1_task_executable_mismatch"], "installation_manifest_task_invalid")
+        self.assertEqual(self.report["cases"]["v1_six_file_package"], "installation_manifest_membership_invalid")
+        self.assertEqual(self.report["cases"]["v2_five_file_package"], "installation_manifest_membership_invalid")
+
+    def test_json_schema_source_and_release_format_errors_are_bounded(self) -> None:
+        invalid = (
+            "empty_text", "malformed_json", "null_root", "scalar_root", "array_root",
+            "top_missing", "top_extra", "top_case_changed", "schema_unsupported", "schema_wrong_type",
+            "v2_release_missing", "v1_release_extra", "source_wrong_type", "source_missing",
+            "source_extra", "source_case_changed", "source_commit_upper", "source_commit_length",
+            "source_commit_nonhex", "source_commit_wrong_type", "source_tree_upper", "source_tree_length",
+            "source_tree_nonhex", "source_tree_wrong_type",
+            "release_format_null", "release_format_wrong_type", "release_format_short",
+            "release_format_uppercase", "release_format_nonhex",
+        )
+        self.assert_outcomes(invalid, "installation_manifest_invalid")
+        self.assertEqual(self.report["cases"]["release_mismatch"], "release_identity_mismatch")
+
+    def test_fixed_roots_require_exact_literal_strings(self) -> None:
+        names = tuple(
+            f"root_{root}_{variant}"
+            for root in ("install_root", "runtime_root")
+            for variant in ("case", "drive", "relative", "traversal", "unc", "device", "stream", "missing_trailing", "wrong_type")
+        )
+        self.assert_outcomes(names, "installation_manifest_path_invalid")
+
+    def test_package_shape_membership_and_hash_matrix(self) -> None:
+        names = (
+            "package_null", "package_wrong_type", "package_missing", "package_duplicate", "package_unknown",
+            "package_invalid_filename", "package_name_wrong_type", "package_entry_missing", "package_entry_extra",
+            "package_entry_case_changed", "package_hash_null", "package_hash_wrong_type", "package_hash_short",
+            "package_hash_uppercase", "package_hash_nonhex",
+        )
+        self.assert_outcomes(names, "installation_manifest_membership_invalid")
+
+    def test_every_task_value_and_json_type_is_validated(self) -> None:
+        fields = (
+            "path", "name", "enabled", "trigger_count", "action_mode", "production_switches",
+            "multiple_instances", "execution_time_limit", "restart_count", "start_when_available",
+            "executable", "launcher_path", "arguments", "working_directory", "principal_user_id",
+            "principal_logon_type", "principal_run_level",
+        )
+        names = ("task_null", "task_array", "task_missing", "task_extra", "task_case_changed", "v1_task_executable_mismatch")
+        names += tuple(f"task_value_{field}" for field in fields)
+        names += tuple(f"task_type_{field}" for field in fields)
+        names += ("task_type_trigger_count_decimal", "task_type_restart_count_decimal")
+        self.assert_outcomes(names, "installation_manifest_task_invalid")
+
+    def test_rollback_roots_are_exact_and_unique(self) -> None:
+        self.assert_outcomes(
+            ("roots_missing", "roots_duplicate", "roots_unknown", "roots_wrong_type", "roots_entry_wrong_type", "roots_case_changed"),
+            "installation_runtime_roots_invalid",
+        )
+
+    def test_parser_consumers_and_ci7_error_boundaries_remain_canonical(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        parser = _installer_function(source, "ConvertFrom-XbInstalledManifestText")
+        self.assertIn("ConvertFrom-Json -InputObject $Text -ErrorAction Stop", parser)
+        self.assertIn("[StringComparison]::Ordinal", parser)
+        for forbidden in ("Get-Content", "Set-Content", "Remove-Item", "git", "TaskService", "New-XbWorkerBatchToken", "Initialize-XbWorkerNativeAccess", "PSCredential", "XbWorkerProtectedObject"):
+            with self.subTest(parser_forbidden=forbidden):
+                self.assertNotIn(forbidden, parser)
+        reader = _installer_function(source, "Read-XbInstalledManifest")
+        self.assertIn("-AllowPrevious:$AllowPrevious", reader)
+        context = _installer_function(source, "Open-XbCi7VerificationContext")
+        self.assertIn('ConvertFrom-XbInstalledManifestText -Text ([string]$manifestRecord.Text)', context)
+        self.assertNotIn("Get-Content", context)
+        uninstall = _installer_function(source, "Assert-XbUninstallOwnership")
+        self.assertIn("Read-XbInstalledManifest", uninstall)
+        installer = _installer_function(source, "Invoke-XbWorkerInstaller")
+        self.assertLess(installer.index("$null = Assert-XbUninstallOwnership"), installer.index("Remove-XbWorkerOwnedState -TaskMayExist"))
+        for function_name in ("Open-XbCi7VerificationContext", "Invoke-XbInstallVerifier"):
+            function = _installer_function(source, function_name)
+            for error_id in (
+                "installation_manifest_invalid",
+                "installation_manifest_path_invalid",
+                "installation_manifest_membership_invalid",
+                "installation_manifest_task_invalid",
+                "installation_runtime_roots_invalid",
+                "release_identity_mismatch",
+            ):
+                with self.subTest(function=function_name, error=error_id):
+                    self.assertIn(error_id, function)
+
+
+class MemberWorkerPathChainCompositionTests(unittest.TestCase):
+    """CI7 parent/ancestor delete composition consumes individual chain paths and reaches native AccessCheck."""
+
+    report: dict[str, object]
+    leaf: PureWindowsPath
+    _scratch_dir = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for path-chain composition validation")
+        cls._scratch_dir = tempfile.TemporaryDirectory(prefix="xb-path-chain-")
+        try:
+            temp_dir = Path(cls._scratch_dir.name)
+            harness = temp_dir / "path_chain_harness.ps1"
+            harness.write_text(_PATH_CHAIN_HARNESS, encoding="utf-8", newline="\n")
+            leaf = temp_dir / "chain" / "parent" / "leaf"
+            leaf.mkdir(parents=True)
+            cls.leaf = PureWindowsPath(str(leaf))
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                    "-LeafPath", str(leaf),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if completed.returncode != 0:
+                raise AssertionError(completed.stdout + completed.stderr)
+            cls.report = json.loads(completed.stdout)
+        except BaseException:
+            cls._scratch_dir.cleanup()
+            cls._scratch_dir = None
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._scratch_dir is not None:
+            cls._scratch_dir.cleanup()
+            cls._scratch_dir = None
+
+    def _expected_chain(self) -> list[str]:
+        chain = [self.leaf.anchor]
+        for part in self.leaf.parts[1:]:
+            chain.append(str(PureWindowsPath(chain[-1], part)))
+        return chain
+
+    def _expected_checks(self) -> list[tuple[str, str]]:
+        chain = self._expected_chain()
+        checks: list[tuple[str, str]] = []
+        for index in range(len(chain) - 1, -1, -1):
+            checks.append((chain[index], "0x00010000"))
+            if index > 0:
+                checks.append((chain[index - 1], "0x00000040"))
+        return checks
+
+    def _assert_same_path_objects(self, actual: object, expected: list[str]) -> None:
+        self.assertIsInstance(actual, list)
+        self.assertEqual(len(actual), len(expected))
+        for index, (actual_path, expected_path) in enumerate(zip(actual, expected)):
+            self.assertIs(type(actual_path), str, f"path at chain position {index} is not an individual string")
+            try:
+                same_object = os.path.samefile(actual_path, expected_path)
+            except OSError as exc:
+                self.fail(f"could not resolve filesystem identity at chain position {index}: {type(exc).__name__}")
+            self.assertTrue(same_object, f"path at chain position {index} resolves to a different filesystem object")
+
+    def _assert_checks_match(self, actual: object, expected: list[tuple[str, str]]) -> None:
+        self.assertIsInstance(actual, list)
+        self.assertEqual(len(actual), len(expected))
+        for index, (actual_check, (expected_path, expected_mask)) in enumerate(zip(actual, expected)):
+            self.assertIs(type(actual_check), str, f"probe at position {index} is not an individual string")
+            path_and_mask = actual_check.rsplit("|", 1)
+            if len(path_and_mask) != 2:
+                self.fail(f"probe at position {index} does not contain a path and access mask")
+            actual_path, actual_mask = path_and_mask
+            self.assertEqual(actual_mask, expected_mask, f"access mask differs at probe position {index}")
+            self._assert_same_path_objects([actual_path], [expected_path])
+
+    def test_direct_assignment_yields_ordered_individual_string_paths(self) -> None:
+        expected = self._expected_chain()
+        self._assert_same_path_objects(self.report["direct_chain"], expected)
+        self.assertEqual(self.report["direct_count"], len(expected))
+        self.assertEqual(self.report["direct_element_types"], ["System.String"])
+
+    def test_outer_array_wrapper_would_nest_the_chain(self) -> None:
+        # Pins the Windows PowerShell 5.1 semantics behind the corrected defect.
+        self.assertEqual(self.report["wrapped_count"], 1)
+        self.assertEqual(self.report["wrapped_first_type"], "System.Object[]")
+
+    def test_consumer_uses_direct_assignment_and_producer_shape_is_preserved(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        consumer = _installer_function(source, "Assert-XbPathNotDeleteable")
+        self.assertNotIn("@(Get-XbNativePathChain", consumer)
+        self.assertIn("$chain = Get-XbNativePathChain -Path $Path", consumer)
+        self.assertIn("return ,$chain", _installer_function(source, "Get-XbNativePathChain"))
+
+    def test_safe_chain_passes_after_every_per_element_native_check(self) -> None:
+        self.assertTrue(self.report["token_restricted"])
+        self.assertEqual(set(self.report["pass_case"]), {"outcome", "checks"})
+        self.assertEqual(self.report["pass_case"]["outcome"], "pass")
+        self._assert_checks_match(self.report["pass_case"]["checks"], self._expected_checks())
+        self.assertEqual(self.report["restored_pass"], "pass")
+
+    def test_protected_handle_reads_bytes_and_blocks_replace_or_rename(self) -> None:
+        self.assertEqual(self.report["handle_sample_text"], "local-safe-f2")
+        self.assertEqual(self.report["handle_sample_sha256"], hashlib.sha256(b"local-safe-f2").hexdigest())
+        self.assertRegex(self.report["handle_sample_identity"], r"^[0-9a-f]{8}:[0-9a-f]{16}$")
+        self.assertTrue(self.report["handle_sample_owner_present"])
+        self.assertTrue(self.report["handle_replace_blocked"])
+        self.assertTrue(self.report["handle_rename_blocked"])
+
+    def test_handle_acquired_file_and_directory_descriptors_include_owner_and_group(self) -> None:
+        for name in (
+            "handle_directory_owner_present",
+            "handle_directory_group_present",
+            "handle_file_owner_present",
+            "handle_file_group_present",
+            "handle_directory_descriptor_matches_hash",
+            "handle_file_descriptor_matches_hash",
+        ):
+            with self.subTest(component=name):
+                self.assertTrue(self.report[name])
+
+    def test_exact_handle_descriptor_bytes_reach_native_accesscheck(self) -> None:
+        for name in (
+            "handle_directory_accesscheck_completed",
+            "handle_file_read_accesscheck_completed",
+            "handle_file_delete_accesscheck_completed",
+            "handle_file_maximum_accesscheck_completed",
+            "handle_directory_list_access_allowed",
+            "handle_file_read_access_allowed",
+            "handle_file_delete_access_denied",
+            "handle_file_maximum_access_usable",
+        ):
+            with self.subTest(access_check=name):
+                self.assertTrue(self.report[name])
+
+    def test_group_incomplete_descriptor_fails_closed_and_component_mask_is_complete(self) -> None:
+        self.assertTrue(self.report["group_completeness_guard_present"])
+        self.assertTrue(self.report["incomplete_group_descriptor_rejected"])
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        native = _installer_function(source, "Initialize-XbWorkerNativeAccess")
+        self.assertIn("GroupSecurityInformation = 0x00000002", native)
+        self.assertIn(
+            "OwnerSecurityInformation | GroupSecurityInformation | DaclSecurityInformation",
+            native,
+        )
+        self.assertIn("HasUsableSecurityDescriptor(status, owner, group, descriptor)", native)
+
+    def test_ci7_required_probe_completion_remains_mandatory(self) -> None:
+        self.assertIn(
+            '$ci7.required_probe_completion.status -cne "complete"',
+            _HOSTED_TASK_BOUNDARY_HARNESS,
+        )
+
+    def test_granted_delete_or_delete_child_is_exceeded(self) -> None:
+        checks = self._expected_checks()
+        cases = {
+            "leaf_delete": checks[:1],
+            "parent_delete_child": checks[:2],
+            "ancestor_delete": checks[:5],
+        }
+        for key, reached in cases.items():
+            with self.subTest(case=key):
+                case = self.report[key]
+                self.assertTrue(case["requested_operation_granted"], case)
+                self.assertEqual(case["outcome"], "effective_rights_exceeded")
+                self._assert_checks_match(case["checks"], reached)
+
+    def test_native_and_shape_failures_stay_unproven(self) -> None:
+        for key in ("forced_native_failure", "disposed_token"):
+            with self.subTest(case=key):
+                self.assertEqual(self.report[key]["outcome"], "effective_rights_unproven")
+                self._assert_checks_match(self.report[key]["checks"], self._expected_checks()[:1])
+        for key in ("missing_path", "nested_chain_guard", "empty_element_guard"):
+            with self.subTest(case=key):
+                self.assertEqual(self.report[key], {"outcome": "effective_rights_unproven", "checks": []})
 
 
 if __name__ == "__main__":

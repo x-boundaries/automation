@@ -12,19 +12,19 @@ from datetime import datetime, timedelta, timezone
 
 from xb_member_gateway.api import GatewayApp, GatewayService
 from xb_member_gateway.auth import (
-    CONTROL_SCOPES, MAILER_SCOPES, OPERATOR_SCOPES, RECOVERY_SCOPES, SOURCE_SCOPES, WORKER_SCOPES,
-    StaticAuthenticator, principal,
+    CONTROL_SCOPES, MAILER_SCOPES, OPERATOR_SCOPES, SOURCE_SCOPES, WORKER_SCOPES, StaticAuthenticator, principal,
 )
 from xb_member_gateway.canonical import build_source_event
-from xb_member_gateway.config import GatewayConfig
 from xb_member_gateway.models import JobState, WelcomeEmailState
 from xb_member_gateway.notifications import WELCOME_V1, build_welcome_message, welcome_message_hash
-from xb_member_gateway.repository import InMemoryRepository, PostgresRepository, ResultConflict
+from xb_member_gateway.repository import InMemoryRepository, RepositoryError
 
 try:
     from .test_postgres_cursor import CUTOVER, FORM, RealPostgresTestCase
+    from .v2_support import guid, make_config, outcome_body
 except ImportError:  # discovered as a top-level module
     from test_postgres_cursor import CUTOVER, FORM, RealPostgresTestCase
+    from v2_support import guid, make_config, outcome_body
 
 
 NOW = datetime(2026, 9, 20, 1, 0, tzinfo=timezone.utc)
@@ -33,63 +33,39 @@ RECIPIENT = "welcome-synthetic@example.test"
 TOKENS = {
     "source": ("configured-source", SOURCE_SCOPES), "operator": ("configured-operator", OPERATOR_SCOPES),
     "control": ("configured-control", CONTROL_SCOPES), "worker": ("configured-worker", WORKER_SCOPES),
-    "recovery": ("configured-recovery", RECOVERY_SCOPES), "mailer": ("configured-mailer", MAILER_SCOPES),
+    "mailer": ("configured-mailer", MAILER_SCOPES),
 }
 
 
 def config(**changes):
-    values = {
-        "member_no_max_length": 20, "worker_token_sha256": "0" * 64, "recovery_token_sha256": "1" * 64,
-        "production_activation_enabled": True, "kill_switch_enabled": False,
-        "source_cutover_watermark": CUTOVER, "source_production_cutover_exact": CUTOVER,
-        "source_form_id": FORM, "source_admission_mode": "continuous",
-    }
-    values.update(changes)
-    return GatewayConfig.from_mapping(values)
+    return make_config(**changes)
 
 
 def source_event(response_id, email=RECIPIENT, phone="81234567"):
     return build_source_event(
-        response_id=response_id, request_id=f"welcome-request-{response_id}", create_time="2026-09-19T08:30:00.123456789Z",
+        response_id=response_id, request_id=f"welcome-request-{len(response_id)}-{sum(map(ord, response_id))}", create_time="2026-09-19T08:30:00.123456789Z",
         form_alias="member_registration", mapping_version="member-intake.v1",
         payload={"name": "Welcome Synthetic", "phone": phone, "email": email, "birthday_month": "March", "marketing_consent": "No", "pdpa_acknowledged": True},
     )
 
 
 class MemberFlow:
-    """Drives one member through the real worker contract to a result."""
+    """Drives one member through the real v2 worker contract to a result."""
 
     def __init__(self, service, repository):
         self.service = service
         self.repository = repository
+        self.count = 0
 
-    def to_result(self, response_id, status="CREATED_VERIFIED", *, phone="81234567", email=RECIPIENT):
+    def to_result(self, response_id, outcome="CREATED_VERIFIED", *, phone="81234567", email=RECIPIENT):
         service = self.service
+        self.count += 1
         service.ingest(source_event(response_id, email=email, phone=phone))
-        job = service.claim(SESSION)["job"]
-        job_id = job["job_id"]
-        service.precheck(job_id, SESSION)
-        candidate = service.allocation_candidate(job_id, SESSION)["candidate"]
-        service.allocation_probe(job_id, SESSION, {"candidate": candidate, "status": "FREE", "probe_reference": f"probe-{response_id}"})
-        service.allocation_recheck(job_id, SESSION, {"status": "FREE", "probe_reference": f"recheck-{response_id}"})
-        record = self.repository.get_job(job_id)
-        service.write_intent(job_id, SESSION, {"operation": "member.create", "member_no": record.allocation_member_no, "payload_hash": record.payload_hash}, principal_valid=True)
-        fence = service.dispatch_fence(job_id, SESSION, {"operation": "member.create", "member_no": record.allocation_member_no}, principal_valid=True)
-        writer = dict(
-            fence_id=fence["dispatch_fence_id"], attempt=1, worker_session=SESSION, host_binding=f"host-{SESSION}",
-            execution_id=fence["execution_id"], pid=4321, process_start_time="2026-09-20T01:00:01Z", now=service.clock,
-        )
-        self.repository.register_writer_execution(job_id, **writer)
-        self.repository.confirm_writer_termination(job_id, **writer, evidence_type="process_exit", evidence_reference=f"exit-{response_id}", exit_code=0)
-        positive = status == "CREATED_VERIFIED"
-        body = {
-            "schema_version": "xb.member.gateway.result.v1", "job_id": job_id, "operation": "member.create",
-            "dispatch_fence_id": fence["dispatch_fence_id"], "status": status, "member_no": record.allocation_member_no,
-            "save_invocation_count": 1, "readback_found": positive or status == "CREATED_READBACK_MISMATCH",
-            "readback_match": positive, "error_code": None if positive else "synthetic_non_positive",
-        }
-        acknowledged = service.acknowledge_result(job_id, SESSION, body)
-        return job_id, body, acknowledged
+        claim = service.claim(SESSION)
+        changes = {"member_guid": guid(self.count)} if outcome in {"CREATED_VERIFIED", "LINKED_EXISTING", "CREATED_READBACK_MISMATCH"} else {}
+        body = outcome_body(claim, outcome, **changes)
+        response = service.submit_result(claim["job_id"], SESSION, body)
+        return claim["job_id"], body, response
 
 
 class WelcomeOutboxTests(unittest.TestCase):
@@ -132,29 +108,32 @@ class WelcomeOutboxTests(unittest.TestCase):
             self.assertNotIn(private, json.dumps({key: value for key, value in envelope.items() if key != "message"}))
 
     def test_non_positive_member_outcomes_never_create_an_outbox(self):
-        for index, status in enumerate(("WRITE_OUTCOME_UNCERTAIN", "CONFIRMED_NOT_CREATED", "CREATED_READBACK_MISMATCH")):
+        for index, status in enumerate(("OUTCOME_UNCERTAIN", "NOT_CREATED", "CREATED_READBACK_MISMATCH", "LINKED_EXISTING", "MANUAL_REVIEW", "REJECTED_VALIDATION", "FAILED_BEFORE_WRITE", "MUTEX_BUSY")):
             with self.subTest(status=status):
                 job_id, _, _ = self.flow.to_result(f"welcome-negative-{index}", status, phone=f"8200000{index}")
                 self.assertIsNone(self.repository.welcome_outbox_for_job(job_id))
         self.assertEqual(self.repository.welcome_outboxes(), ())
 
-    def test_exact_match_reconciliation_creates_the_outbox_atomically(self):
-        job_id, body, _ = self.flow.to_result("welcome-reconcile", "WRITE_OUTCOME_UNCERTAIN")
+    def test_prior_attempt_after_uncertainty_creates_the_outbox_once(self):
+        job_id, _, _ = self.flow.to_result("welcome-prior", "OUTCOME_UNCERTAIN")
         self.assertIsNone(self.repository.welcome_outbox_for_job(job_id))
-        reconciled = self.service.reconcile(job_id, {"member_no": body["member_no"], "lookup_status": "exact_match", "readback_found": True, "readback_match": True, "error_code": None})
-        self.assertEqual(reconciled["state"], "CREATED_VERIFIED")
+        self.service.clock = NOW + timedelta(minutes=5)
+        claim = self.service.claim(SESSION)
+        self.assertEqual((claim["job_id"], claim["attempt_no"]), (job_id, 2))
+        response = self.service.submit_result(job_id, SESSION, outcome_body(claim, "CREATED_VERIFIED_PRIOR_ATTEMPT", member_guid=guid(99)))
+        self.assertEqual(response["state"], "CREATED_VERIFIED")
         self.assertIsNotNone(self.repository.welcome_outbox_for_job(job_id))
+        self.assertEqual(len(self.repository.welcome_outboxes()), 1)
 
-    def test_duplicate_positive_ack_verifies_and_never_backfills(self):
+    def test_duplicate_positive_result_replays_and_never_backfills(self):
         job_id, body, _ = self.flow.to_result("welcome-duplicate")
-        again = self.service.acknowledge_result(job_id, SESSION, body)
-        self.assertTrue(again["duplicate"])
+        again = self.service.submit_result(job_id, SESSION, body)
+        self.assertTrue(again["replayed"])
         self.assertEqual(len(self.repository.welcome_outboxes()), 1)
         with self.repository._lock:
             outbox_id = self.repository._outbox_by_job.pop(job_id)
             self.repository._outbox.pop(outbox_id)
-        with self.assertRaisesRegex(ResultConflict, "welcome_outbox_identity_missing"):
-            self.service.acknowledge_result(job_id, SESSION, body)
+        self.assertTrue(self.service.submit_result(job_id, SESSION, body)["replayed"])
         self.assertEqual(self.repository.welcome_outboxes(), ())
 
     # --- state machine -------------------------------------------------------
@@ -253,15 +232,15 @@ class WelcomeOutboxTests(unittest.TestCase):
         response = self.post("mailer", "/v1/welcome-emails/claim")
         self.assertEqual((response.status, response.body["error_code"]), (409, "welcome_email_message_identity_mismatch"))
 
-    def test_email_failure_never_touches_the_member_job_or_allocation(self):
+    def test_email_failure_never_touches_the_member_job_or_outcome(self):
         job_id, _, _ = self.flow.to_result("welcome-isolation")
         before = self.repository.get_job(job_id)
-        allocation = self.repository.get_allocation(job_id)
+        outcome = self.repository.member_outcome(job_id)
         job = self.claim()["job"]
         self.service.welcome_result(job["outbox_id"], {"schema_version": "xb.member.welcome_email.result.v1", "lease_id": job["lease_id"], "state_version": job["state_version"], "outcome": "failed_before_send_intent", "error_code": "smtp_unreachable"})
         after = self.repository.get_job(job_id)
-        self.assertEqual((after.state, after.state_version, after.save_invocation_count), (JobState.CREATED_VERIFIED, before.state_version, 1))
-        self.assertEqual(self.repository.get_allocation(job_id), allocation)
+        self.assertEqual((after.state, after.state_version), (JobState.CREATED_VERIFIED, before.state_version))
+        self.assertEqual(self.repository.member_outcome(job_id), outcome)
         self.assertEqual(len(self.repository.all_jobs()), 1)
         # Replaying the same Forms response returns the same job and outbox.
         self.assertTrue(self.service.ingest(source_event("welcome-isolation"))["replayed"])
@@ -282,12 +261,8 @@ class WelcomeOutboxTests(unittest.TestCase):
             ("POST", "/v1/source-events"), ("POST", "/v1/source-rejections"), ("GET", "/v1/source/cursor?form_alias=member_registration&mapping_version=member-intake.v1"),
             ("POST", "/v1/source/epochs/begin"), ("POST", "/v1/source/epochs/epoch-" + "0" * 32 + "/restart"),
             ("POST", "/v1/source/epochs/epoch-" + "0" * 32 + "/pages/open"), ("POST", "/v1/source/pages/page-" + "0" * 32 + "/commit"),
-            ("POST", "/v1/worker/claim"), ("POST", f"/v1/jobs/{job_id}/precheck"), ("POST", f"/v1/jobs/{job_id}/lease"),
-            ("POST", f"/v1/jobs/{job_id}/allocation/candidate"), ("POST", f"/v1/jobs/{job_id}/allocation"),
-            ("POST", f"/v1/jobs/{job_id}/write-intent"), ("POST", f"/v1/jobs/{job_id}/dispatch-fence"),
-            ("POST", f"/v1/jobs/{job_id}/writer/register"), ("POST", f"/v1/jobs/{job_id}/writer/termination"),
-            ("POST", f"/v1/jobs/{job_id}/writer/quarantine"), ("POST", f"/v1/jobs/{job_id}/writer/recover"),
-            ("POST", f"/v1/jobs/{job_id}/result"), ("POST", f"/v1/jobs/{job_id}/reconcile"), ("GET", f"/v1/jobs/{job_id}"),
+            ("POST", "/v2/worker/claim"), ("POST", f"/v2/jobs/{job_id}/result"), ("POST", f"/v2/control/jobs/{job_id}/resolve"),
+            ("GET", f"/v1/jobs/{job_id}"), ("GET", f"/v1/jobs/{job_id}/status"),
             ("GET", "/v1/operator/status"), ("GET", f"/v1/operator/reconciliation/{job_id}"),
             ("POST", "/v1/control/kill-switch/disable"), ("POST", "/v1/control/kill-switch/enable"), ("POST", "/v1/control/activation"),
         ]
@@ -299,7 +274,7 @@ class WelcomeOutboxTests(unittest.TestCase):
 
     def test_no_other_principal_can_reach_the_welcome_routes(self):
         routes = ("/v1/welcome-emails/claim", "/v1/welcome-emails/welcome-" + "0" * 32 + "/send-intent", "/v1/welcome-emails/welcome-" + "0" * 32 + "/result")
-        for token in ("source", "operator", "control", "worker", "recovery"):
+        for token in ("source", "operator", "control", "worker"):
             for route in routes:
                 with self.subTest(token=token, route=route):
                     response = self.post(token, route)
@@ -308,8 +283,8 @@ class WelcomeOutboxTests(unittest.TestCase):
 
 
 class RealPostgresWelcomeTests(RealPostgresTestCase):
-    """Real psycopg production path: the F1 results insert and the atomic
-    welcome_v1 outbox must both execute against PostgreSQL."""
+    """Real psycopg production path: member_outcomes and the atomic welcome_v1
+    outbox must both execute against PostgreSQL."""
 
     def make_service(self):
         self.seed_cursor()
@@ -318,14 +293,14 @@ class RealPostgresWelcomeTests(RealPostgresTestCase):
         self.service = GatewayService(config(), self.repository, adapter_ready=True, clock=NOW)
         return MemberFlow(self.service, self.repository)
 
-    def test_first_positive_result_inserts_result_and_outbox_then_mails_once(self):
+    def test_first_positive_result_inserts_outcome_and_outbox_then_mails_once(self):
         flow = self.make_service()
-        job_id, body, acknowledged = flow.to_result("real-welcome-positive")
-        self.assertEqual((acknowledged["state"], acknowledged["duplicate"]), ("CREATED_VERIFIED", False))
-        self.assertEqual(self.sql("SELECT status,save_invocation_count FROM xb_member_gateway.results WHERE job_id=%s", (job_id,)), [("CREATED_VERIFIED", 1)])
+        job_id, body, response = flow.to_result("real-welcome-positive")
+        self.assertEqual((response["state"], response["replayed"]), ("CREATED_VERIFIED", False))
+        self.assertEqual(self.sql("SELECT outcome,rule,attempt_number FROM xb_member_gateway.member_outcomes WHERE job_id=%s", (job_id,)), [("CREATED_VERIFIED", "R1", 1)])
         rows = self.sql("SELECT template_id,recipient,message_hash,state FROM xb_member_gateway.welcome_email_outbox WHERE job_id=%s", (job_id,))
         self.assertEqual(rows, [("welcome_v1", RECIPIENT, welcome_message_hash(build_welcome_message(RECIPIENT)), "PENDING")])
-        self.assertTrue(self.service.acknowledge_result(job_id, SESSION, body)["duplicate"])
+        self.assertTrue(self.service.submit_result(job_id, SESSION, body)["replayed"])
         self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.welcome_email_outbox"), [(1,)])
         self.service.clock = NOW + timedelta(minutes=2)
         job = self.service.claim_welcome_email({})["job"]
@@ -341,11 +316,13 @@ class RealPostgresWelcomeTests(RealPostgresTestCase):
         with self.assertRaisesRegex(Exception, "welcome_email_outbox_delete_forbidden"):
             self.sql("DELETE FROM xb_member_gateway.welcome_email_outbox")
 
-    def test_uncertain_result_has_no_outbox_and_exact_reconciliation_creates_it(self):
+    def test_uncertain_result_has_no_outbox_and_prior_attempt_creates_it(self):
         flow = self.make_service()
-        job_id, body, _ = flow.to_result("real-welcome-reconcile", "WRITE_OUTCOME_UNCERTAIN")
+        job_id, _, _ = flow.to_result("real-welcome-prior", "OUTCOME_UNCERTAIN")
         self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.welcome_email_outbox"), [(0,)])
-        self.service.reconcile(job_id, {"member_no": body["member_no"], "lookup_status": "exact_match", "readback_found": True, "readback_match": True, "error_code": None})
+        self.service.clock = NOW + timedelta(minutes=5)
+        claim = self.service.claim(SESSION)
+        self.service.submit_result(job_id, SESSION, outcome_body(claim, "CREATED_VERIFIED_PRIOR_ATTEMPT", member_guid=guid(42)))
         self.assertEqual(self.sql("SELECT state FROM xb_member_gateway.welcome_email_outbox WHERE job_id=%s", (job_id,)), [("PENDING",)])
 
     def test_post_intent_crash_is_uncertain_in_postgres(self):
@@ -358,22 +335,25 @@ class RealPostgresWelcomeTests(RealPostgresTestCase):
         self.assertFalse(self.service.claim_welcome_email({})["claimed"])
         self.assertEqual(self.sql("SELECT state,last_error_code FROM xb_member_gateway.welcome_email_outbox"), [("DELIVERY_OUTCOME_UNCERTAIN", "send_intent_lease_expired")])
 
-    def test_readiness_blocks_created_verified_without_outbox_and_insert_requires_result(self):
-        from xb_member_gateway.repository import RepositoryError
+    def test_readiness_blocks_created_verified_without_outbox_and_insert_requires_outcome(self):
         flow = self.make_service()
-        job_id, _, _ = flow.to_result("real-welcome-readiness", "CONFIRMED_NOT_CREATED")
+        job_id, _, _ = flow.to_result("real-welcome-readiness", "NOT_CREATED")
+        insert_outbox = (
+            "INSERT INTO xb_member_gateway.welcome_email_outbox(outbox_id,job_id,response_id,source_response_ref,template_id,recipient,message_hash,state,state_version,attempt,max_attempts,created_at,updated_at) SELECT 'welcome-" + "1" * 32 + "',job_id,response_id,'hmac-v1:" + "0" * 64 + "','welcome_v1','x@example.test','sha256:" + "0" * 64 + "','PENDING',0,0,3,now(),now() FROM xb_member_gateway.jobs WHERE job_id=%s"
+        )
         with self.assertRaisesRegex(Exception, "welcome_email_requires_created_verified"):
-            self.sql(
-                "INSERT INTO xb_member_gateway.welcome_email_outbox(outbox_id,job_id,response_id,source_response_ref,template_id,recipient,message_hash,state,state_version,attempt,max_attempts,created_at,updated_at) SELECT 'welcome-" + "1" * 32 + "',job_id,response_id,'hmac-v1:" + "0" * 64 + "','welcome_v1','x@example.test','sha256:" + "0" * 64 + "','PENDING',0,0,3,now(),now() FROM xb_member_gateway.jobs WHERE job_id=%s",
-                (job_id,),
-            )
-        self.sql("ALTER TABLE xb_member_gateway.results DISABLE TRIGGER USER")
-        self.sql("UPDATE xb_member_gateway.results SET status='CREATED_VERIFIED' WHERE job_id=%s", (job_id,))
-        self.sql("ALTER TABLE xb_member_gateway.results ENABLE TRIGGER USER")
+            self.sql(insert_outbox, (job_id,))
+        self.sql(
+            "INSERT INTO xb_member_gateway.member_outcomes(job_id,outcome,rule,member_no,member_guid,attempt_number,result_hash,recorded_at) VALUES(%s,'CREATED_VERIFIED','R1','81234567',%s,1,%s,now())",
+            (job_id, guid(77), "sha256:" + "0" * 64),
+        )
         self.sql("UPDATE xb_member_gateway.control_flags SET enabled=(flag_name='kill_switch_enabled')")
-        cfg = GatewayConfig(source_cutover_watermark=CUTOVER, source_production_cutover_exact=CUTOVER, source_form_id=FORM)
+        cfg = config(production_activation_enabled=False, kill_switch_enabled=True)
         with self.assertRaisesRegex(RepositoryError, "created_verified_without_welcome_outbox"):
             self.repository.verify_bootstrap_readiness(cfg)
+        # The replaced trigger accepts CREATED_VERIFIED from member_outcomes.
+        self.sql(insert_outbox, (job_id,))
+        self.repository.verify_bootstrap_readiness(cfg)
 
 
 if __name__ == "__main__":

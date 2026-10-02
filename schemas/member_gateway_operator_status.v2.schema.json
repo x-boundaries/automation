@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_operator_status.v2.schema.json",
+  "title": "XB member gateway operator status v2",
+  "description": "GET /v1/operator/status (operator.status.read). Counts and closed reason codes only; no MemberNo, Guid or customer data. The v1 writer-hold fields are gone with the writer lifecycle (W-G2-149 section 11).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "activation_enabled",
+    "kill_switch_enabled",
+    "dispatch_enabled",
+    "migrations_ready",
+    "source_cursor_ready",
+    "active_lease_count",
+    "job_state_counts",
+    "legacy_state_count",
+    "manual_review_reason_counts",
+    "dq_flag_counts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "xb.member.gateway.operator_status.v2"
+    },
+    "activation_enabled": {
+      "type": "boolean"
+    },
+    "kill_switch_enabled": {
+      "type": "boolean"
+    },
+    "dispatch_enabled": {
+      "type": "boolean"
+    },
+    "migrations_ready": {
+      "type": "boolean"
+    },
+    "source_cursor_ready": {
+      "type": "boolean"
+    },
+    "active_lease_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "job_state_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "RECEIVED",
+        "VALIDATED",
+        "QUEUED",
+        "LEASED",
+        "RETRY_WAIT",
+        "CREATED_VERIFIED",
+        "LINKED_EXISTING",
+        "REJECTED_VALIDATION",
+        "MANUAL_REVIEW",
+        "RESOLVED"
+      ],
+      "properties": {
+        "RECEIVED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "VALIDATED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "QUEUED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "LEASED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "RETRY_WAIT": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "CREATED_VERIFIED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "LINKED_EXISTING": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "REJECTED_VALIDATION": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "MANUAL_REVIEW": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "RESOLVED": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "legacy_state_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "manual_review_reason_counts": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9_.:-]{1,80}$"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "dq_flag_counts": {
+      "description": "Counts of closed data-quality flags, one per flag per accepted result (so per job attempt, not per job; a retried job can add more than one). Codes only (W-G2-149 sections 2.6, 2.7 step 8).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "email_seen_on_other_member": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "malformed_member_no_excluded": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "post_save_same_person_other_row": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

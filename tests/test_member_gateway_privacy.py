@@ -13,6 +13,11 @@ IMPLEMENTATION_FILES = (
     ROOT / "scripts/ac2_member_gateway_worker.ps1",
     ROOT / "scripts/ac2_member_gateway_worker_lib.ps1",
     ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1",
+    ROOT / "scripts/ac2_member_create_primitive.ps1",
+    ROOT / "scripts/ac2_member_test_cleanup.ps1",
+    ROOT / "member_gateway/migrations/0006_member_write_v2.sql",
+    ROOT / "config/ac2_member_gateway_worker.production.example.json",
+    ROOT / "config/ac2_member_gateway_worker.test_book.example.json",
     ROOT / "n8n-workflows/member_forms_gateway_ingest.workflow.json",
     ROOT / "n8n-workflows/member_welcome_email_outbox.workflow.json",
     ROOT / "config/member_gateway.production.example.json",
@@ -44,8 +49,11 @@ class MemberGatewayPrivacyTests(unittest.TestCase):
             payload=payload,
         )
         repository = InMemoryRepository()
+        from xb_member_gateway.admission import AdmissionPolicy
+
         outcome = repository.ingest_source_event(
             __import__("xb_member_gateway.canonical", fromlist=["canonicalize_source_event"]).canonicalize_source_event(event),
+            policy=AdmissionPolicy("production", ("member_registration",), ("member-intake.v1",)),
             now=datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc),
         )
         safe = outcome.job.safe_dict()
@@ -55,6 +63,10 @@ class MemberGatewayPrivacyTests(unittest.TestCase):
             "email",
             "DOB",
             "MemberNo",
+            "member_no",
+            "member_guid",
+            "base_member_no",
+            "name_component",
             "response_id",
             "member_payload",
         }

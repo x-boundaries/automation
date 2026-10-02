@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_worker_claim.v2.schema.json",
+  "title": "XB member gateway worker claim v2 (W-G2-149 section 2.8)",
+  "description": "Response of POST /v2/worker/claim. The request object is the member record the gateway derived once at VALIDATED (build_member_record); the primitive chooses MemberNo in {base_member_no, base_member_no + name_component} and always writes MobilePhone = base_member_no.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "claimed", "reason", "server_time_utc"],
+      "properties": {
+        "schema_version": {"const": "xb.member.gateway.worker_claim.v2"},
+        "claimed": {"const": false},
+        "reason": {"type": "string", "enum": ["dispatch_disabled", "no_eligible_job", "singleton_busy"]},
+        "server_time_utc": {"type": "string", "format": "date-time"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "claimed", "job_id", "attempt_no", "lease_id", "state_version", "lease_expires_at", "first_claimed_at", "server_time_utc", "request"],
+      "properties": {
+        "schema_version": {"const": "xb.member.gateway.worker_claim.v2"},
+        "claimed": {"const": true},
+        "job_id": {"type": "string", "pattern": "^job-[A-Za-z0-9]{16,64}$"},
+        "attempt_no": {"type": "integer", "minimum": 1},
+        "lease_id": {"type": "string", "pattern": "^lease-[0-9a-f]{32}$"},
+        "state_version": {"type": "integer", "minimum": 0},
+        "lease_expires_at": {"type": "string", "format": "date-time"},
+        "first_claimed_at": {"type": "string", "format": "date-time"},
+        "server_time_utc": {"type": "string", "format": "date-time"},
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rule", "base_member_no", "name_component", "phone", "name", "email", "MemberType", "DOB", "RegisterDate", "ExpiryDate", "OpeningPoints", "IsActive", "Individual"],
+          "properties": {
+            "rule": {"const": "XB-MN-1"},
+            "base_member_no": {"type": "string", "pattern": "^[0-9]{6,15}$"},
+            "name_component": {"type": "string", "pattern": "^[A-Z]{0,14}$"},
+            "phone": {"type": "string", "minLength": 1, "maxLength": 64},
+            "name": {"type": "string", "minLength": 1, "maxLength": 200},
+            "email": {"type": "string", "minLength": 1, "maxLength": 254},
+            "MemberType": {"const": "Default"},
+            "DOB": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "RegisterDate": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "ExpiryDate": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "OpeningPoints": {"const": 0},
+            "IsActive": {"type": "boolean"},
+            "Individual": {"type": "boolean"}
+          }
+        }
+      }
+    }
+  ]
+}

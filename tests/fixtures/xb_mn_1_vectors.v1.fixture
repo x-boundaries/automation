@@ -1,0 +1,444 @@
+{
+ "schema_version": "xb.member.gateway.test_vectors.xb_mn_1.v1",
+ "description": "Synthetic XB-MN-1 vectors (W-G2-149 sections 2.1-2.3, amendment #155:5890550314) and the ingest byte-identity corpus generated with main@488884d canonical.py. No real person, phone or email.",
+ "base_vectors": [
+  {
+   "id": "U-MN-01-sg-8-digit",
+   "phone_input": "91234567",
+   "base": "91234567"
+  },
+  {
+   "id": "U-MN-02-65-plus-8",
+   "phone_input": "6591234567",
+   "base": "6591234567"
+  },
+  {
+   "id": "U-MN-03-plus-65-spaces",
+   "phone_input": "+65 9123 4567",
+   "base": "6591234567"
+  },
+  {
+   "id": "U-MN-04-0065-prefix",
+   "phone_input": "0065 9123 4567",
+   "base": "006591234567"
+  },
+  {
+   "id": "U-MN-05-foreign-uk",
+   "phone_input": "+44 20 7946 0958",
+   "base": "442079460958"
+  },
+  {
+   "id": "U-MN-06-foreign-punct",
+   "phone_input": "1-212-555-0100",
+   "base": "12125550100"
+  },
+  {
+   "id": "U-MN-07-leading-zero",
+   "phone_input": "(0812) 345.678",
+   "base": "0812345678"
+  },
+  {
+   "id": "U-MN-08-six-digits",
+   "phone_input": "123456",
+   "base": "123456"
+  },
+  {
+   "id": "U-MN-09-fifteen-digits",
+   "phone_input": "123456789012345",
+   "base": "123456789012345"
+  },
+  {
+   "id": "U-MN-10-production-base-000",
+   "phone_input": "000 1234 5678",
+   "base": "00012345678"
+  },
+  {
+   "id": "U-MN-11-sixteen-digits",
+   "phone_input": "1234567890123456",
+   "ingest_rejection": "phone_shape_invalid"
+  },
+  {
+   "id": "U-MN-12-five-digits",
+   "phone_input": "12345",
+   "ingest_rejection": "phone_shape_invalid"
+  },
+  {
+   "id": "U-MN-13-full-width-digits",
+   "phone_input": "\uff19\uff11\uff12\uff13\uff14\uff15\uff16\uff17",
+   "ingest_rejection": "phone_contains_letters_or_unsupported_characters"
+  },
+  {
+   "id": "U-MN-14-letters",
+   "phone_input": "9123abcd",
+   "ingest_rejection": "phone_contains_letters_or_unsupported_characters"
+  },
+  {
+   "id": "U-MN-15-inner-tab",
+   "phone_input": "9123\t4567",
+   "ingest_rejection": "phone_contains_letters_or_unsupported_characters"
+  },
+  {
+   "id": "U-MN-16-plus-not-leading",
+   "phone_input": "(+65) 9123-4567",
+   "ingest_rejection": "phone_shape_invalid"
+  },
+  {
+   "id": "U-MN-17-arabic-indic-digits",
+   "phone_input": "\u0669\u0661\u0662\u0663\u0664\u0665\u0666\u0667",
+   "ingest_rejection": "phone_contains_letters_or_unsupported_characters"
+  }
+ ],
+ "direct_base_vectors": [
+  {
+   "id": "U-MN-18-defensive-16",
+   "phone": "1234567890123456",
+   "identity_rejection": "phone_digits_out_of_range"
+  },
+  {
+   "id": "U-MN-19-defensive-5",
+   "phone": "12345",
+   "identity_rejection": "phone_digits_out_of_range"
+  },
+  {
+   "id": "U-MN-20-defensive-non-string",
+   "phone": null,
+   "identity_rejection": "phone_digits_out_of_range"
+  }
+ ],
+ "name_vectors": [
+  {
+   "id": "U-NC-01-ascii",
+   "name": "Tan Ah Kow",
+   "base": "91234567",
+   "component": "TANAHKOW"
+  },
+  {
+   "id": "U-NC-02-accents",
+   "name": "Jos\u00e9 M\u00fcller",
+   "base": "6591234567",
+   "component": "JOSEMULLER"
+  },
+  {
+   "id": "U-NC-03-sharp-s-dropped",
+   "name": "Stra\u00dfe",
+   "base": "91234567",
+   "component": "STRAE"
+  },
+  {
+   "id": "U-NC-04-ligature-fi",
+   "name": "\ufb01ona",
+   "base": "91234567",
+   "component": "FIONA"
+  },
+  {
+   "id": "U-NC-05-han-empty",
+   "name": "\u9648\u5927\u6587",
+   "base": "91234567",
+   "component": ""
+  },
+  {
+   "id": "U-NC-06-devanagari-empty",
+   "name": "\u0928\u092e\u0938\u094d\u0924\u0947",
+   "base": "91234567",
+   "component": ""
+  },
+  {
+   "id": "U-NC-07-ring-and-slashed-o",
+   "name": "\u00c5lesund \u00d8ystein",
+   "base": "91234567",
+   "component": "ALESUNDYSTEI"
+  },
+  {
+   "id": "U-NC-08-room-5",
+   "name": "Alexandra",
+   "base": "123456789012345",
+   "component": "ALEXA"
+  },
+  {
+   "id": "U-NC-09-room-14",
+   "name": "Christopher Columbus",
+   "base": "123456",
+   "component": "CHRISTOPHERCOL"
+  },
+  {
+   "id": "U-NC-10-digits-dropped",
+   "name": "Agent 007",
+   "base": "91234567",
+   "component": "AGENT"
+  },
+  {
+   "id": "U-NC-11-full-width-latin",
+   "name": "\uff21\uff22\uff23",
+   "base": "91234567",
+   "component": "ABC"
+  },
+  {
+   "id": "U-NC-12-ae-oe-dropped",
+   "name": "\u00e6sir \u0152uvre",
+   "base": "91234567",
+   "component": "SIRUVRE"
+  },
+  {
+   "id": "U-NC-13-supplementary-plane-dropped",
+   "name": "\ud83d\ude00 Smile",
+   "base": "91234567",
+   "component": "SMILE"
+  },
+  {
+   "id": "U-NC-14-vietnamese",
+   "name": "Nguy\u1ec5n V\u0103n An",
+   "base": "84912345678",
+   "component": "NGUYENVAN"
+  },
+  {
+   "id": "U-NC-15-punctuation",
+   "name": "Mary-Jane O\u2019Neil",
+   "base": "91234567",
+   "component": "MARYJANEONEI"
+  }
+ ],
+ "limit_vectors": [
+  {
+   "id": "U-LIM-01-name-100",
+   "name": {
+    "repeat": "a",
+    "count": 100
+   },
+   "email": "ok@example.test",
+   "mode": "production",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-02-name-101",
+   "name": {
+    "repeat": "a",
+    "count": 101
+   },
+   "email": "ok@example.test",
+   "mode": "production",
+   "rejection": "name_exceeds_autocount_limit"
+  },
+  {
+   "id": "U-LIM-03-name-50-emoji-is-100-units",
+   "name": {
+    "repeat": "\ud83d\ude00",
+    "count": 50
+   },
+   "email": "ok@example.test",
+   "mode": "production",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-04-name-50-emoji-plus-1-is-101-units",
+   "name": {
+    "repeat": "\ud83d\ude00",
+    "count": 50,
+    "suffix": "a"
+   },
+   "email": "ok@example.test",
+   "mode": "production",
+   "rejection": "name_exceeds_autocount_limit"
+  },
+  {
+   "id": "U-LIM-05-email-200",
+   "name": "Ok Name",
+   "email": {
+    "repeat": "a",
+    "count": 187,
+    "suffix": "@example.test"
+   },
+   "mode": "production",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-06-email-201",
+   "name": "Ok Name",
+   "email": {
+    "repeat": "a",
+    "count": 188,
+    "suffix": "@example.test"
+   },
+   "mode": "production",
+   "rejection": "email_exceeds_autocount_limit"
+  },
+  {
+   "id": "U-LIM-07-email-emoji-199-units",
+   "name": "Ok Name",
+   "email": {
+    "repeat": "\ud83d\ude00",
+    "count": 93,
+    "suffix": "@example.test"
+   },
+   "mode": "production",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-08-email-emoji-201-units",
+   "name": "Ok Name",
+   "email": {
+    "repeat": "\ud83d\ude00",
+    "count": 94,
+    "suffix": "@example.test"
+   },
+   "mode": "production",
+   "rejection": "email_exceeds_autocount_limit"
+  },
+  {
+   "id": "U-LIM-09-prod-synthetic-name",
+   "name": "ZZTEST Alice",
+   "email": "alice@example.test",
+   "mode": "production",
+   "rejection": "synthetic_in_production"
+  },
+  {
+   "id": "U-LIM-10-prod-synthetic-email-case",
+   "name": "Alice",
+   "email": "alice@EXAMPLE.Invalid",
+   "mode": "production",
+   "rejection": "synthetic_in_production"
+  },
+  {
+   "id": "U-LIM-11-prod-no-space-not-synthetic",
+   "name": "ZZTESTAlice",
+   "email": "alice@example.test",
+   "mode": "production",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-12-prod-base-000-not-synthetic",
+   "name": "Alice",
+   "email": "alice@example.test",
+   "mode": "production",
+   "phone": "00012345678",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-13-test-fully-synthetic",
+   "name": "ZZTEST Alice",
+   "email": "alice@example.invalid",
+   "mode": "test",
+   "rejection": null
+  },
+  {
+   "id": "U-LIM-14-test-name-only",
+   "name": "ZZTEST Alice",
+   "email": "alice@example.test",
+   "mode": "test",
+   "rejection": "test_book_requires_synthetic"
+  },
+  {
+   "id": "U-LIM-15-test-email-only",
+   "name": "Alice",
+   "email": "alice@example.invalid",
+   "mode": "test",
+   "rejection": "test_book_requires_synthetic"
+  },
+  {
+   "id": "U-LIM-16-test-non-synthetic",
+   "name": "Alice",
+   "email": "alice@example.test",
+   "mode": "test",
+   "rejection": "test_book_requires_synthetic"
+  },
+  {
+   "id": "U-LIM-17-lowercase-prefix-not-synthetic",
+   "name": "zztest Alice",
+   "email": "alice@example.test",
+   "mode": "production",
+   "rejection": null
+  }
+ ],
+ "ingest_corpus": [
+  {
+   "id": "ing-01",
+   "payload": {
+    "name": "  Tan   Ah Kow ",
+    "phone": "+65 9123 4567",
+    "email": " Tan.AhKow@Example.TEST ",
+    "birthday_month": " march ",
+    "marketing_consent": "YES",
+    "pdpa_acknowledged": true
+   },
+   "canonical_json": "{\"birthday_month\":\"March\",\"email\":\"tan.ahkow@example.test\",\"marketing_consent\":\"Yes\",\"name\":\"Tan Ah Kow\",\"pdpa_acknowledged\":true,\"phone\":\"6591234567\"}",
+   "payload_hash": "sha256:c03cf1311fe8c7e0b72e6c59ec63d29ffb7c4dd79d0a382f54c33400d5238ff9"
+  },
+  {
+   "id": "ing-02",
+   "payload": {
+    "name": "Jos\u00e9 M\u00fcller",
+    "phone": "0065-9123-4567",
+    "email": "jose@example.test",
+    "birthday_month": "December",
+    "marketing_consent": "no",
+    "pdpa_acknowledged": "I agree"
+   },
+   "canonical_json": "{\"birthday_month\":\"December\",\"email\":\"jose@example.test\",\"marketing_consent\":\"No\",\"name\":\"Jos\u00e9 M\u00fcller\",\"pdpa_acknowledged\":true,\"phone\":\"006591234567\"}",
+   "payload_hash": "sha256:cd273f0b0a1a51759c9d54c13bbcc048a6e5c877ee4a249d65c266400fea74a8"
+  },
+  {
+   "id": "ing-03",
+   "payload": {
+    "name": "\u9648\u5927\u6587",
+    "phone": "(0812) 345.678",
+    "email": "chan@example.test",
+    "birthday_month": "January",
+    "marketing_consent": "No",
+    "pdpa_acknowledged": "yes"
+   },
+   "canonical_json": "{\"birthday_month\":\"January\",\"email\":\"chan@example.test\",\"marketing_consent\":\"No\",\"name\":\"\u9648\u5927\u6587\",\"pdpa_acknowledged\":true,\"phone\":\"0812345678\"}",
+   "payload_hash": "sha256:50f8439cca8e33fe19f3b968b5063dd63ec94f6b1d5e3670c5abeb9a8717a00e"
+  },
+  {
+   "id": "ing-04",
+   "payload": {
+    "name": "Stra\u00dfe \ufb01ona",
+    "phone": "123456",
+    "email": "s@example.test",
+    "birthday_month": "July",
+    "marketing_consent": "Yes",
+    "pdpa_acknowledged": false
+   },
+   "canonical_json": "{\"birthday_month\":\"July\",\"email\":\"s@example.test\",\"marketing_consent\":\"Yes\",\"name\":\"Stra\u00dfe \ufb01ona\",\"pdpa_acknowledged\":false,\"phone\":\"123456\"}",
+   "payload_hash": "sha256:6ea3343b71bb9cece3e29fb9b9dc858f4e369c37715ef149e003f2e940b2ab27"
+  },
+  {
+   "id": "ing-05",
+   "payload": {
+    "name": "Line\r\nBreak",
+    "phone": "000 1234 5678",
+    "email": "l@example.test",
+    "birthday_month": "May",
+    "marketing_consent": "No",
+    "pdpa_acknowledged": true
+   },
+   "canonical_json": "{\"birthday_month\":\"May\",\"email\":\"l@example.test\",\"marketing_consent\":\"No\",\"name\":\"Line Break\",\"pdpa_acknowledged\":true,\"phone\":\"00012345678\"}",
+   "payload_hash": "sha256:5059fdf081a1b791dad7c684846c451bfef0679ae5fee52cfef0255ece1f9d39"
+  },
+  {
+   "id": "ing-06",
+   "payload": {
+    "name": "\ud83d\ude00 Smile",
+    "phone": "+442079460958",
+    "email": "e@example.test",
+    "birthday_month": "February",
+    "marketing_consent": "No",
+    "pdpa_acknowledged": true
+   },
+   "canonical_json": "{\"birthday_month\":\"February\",\"email\":\"e@example.test\",\"marketing_consent\":\"No\",\"name\":\"\ud83d\ude00 Smile\",\"pdpa_acknowledged\":true,\"phone\":\"442079460958\"}",
+   "payload_hash": "sha256:07b1ccd120f1e647801678457b7287b1bf910003bcddbfaee88aca3c7f1a1932"
+  },
+  {
+   "id": "ing-07",
+   "payload": {
+    "name": "Long Fifteen",
+    "phone": "123456789012345",
+    "email": "f@example.test",
+    "birthday_month": "October",
+    "marketing_consent": "Yes",
+    "pdpa_acknowledged": true
+   },
+   "canonical_json": "{\"birthday_month\":\"October\",\"email\":\"f@example.test\",\"marketing_consent\":\"Yes\",\"name\":\"Long Fifteen\",\"pdpa_acknowledged\":true,\"phone\":\"123456789012345\"}",
+   "payload_hash": "sha256:1572ac36b5af65aaaef2953d5c27712ca3f54dad426dd88bed045ad876833d04"
+  }
+ ]
+}

@@ -9,6 +9,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Absolute interpreter path; never resolved from PATH or $PSHOME.
+$script:XbWindowsPowerShellPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 function ConvertTo-XbLauncherArgument {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -71,10 +73,29 @@ function Get-XbRequiredProductionConfigString {
     return $value
 }
 
+function Get-XbProductionConfigBookMode {
+    param($Config)
+    $value = Get-XbRequiredProductionConfigString -Config $Config -PropertyName "autocount_book_mode" -ErrorId "launcher_autocount_book_mode_invalid"
+    if ($value -cne "production" -and $value -cne "test") { throw "launcher_autocount_book_mode_invalid" }
+    return $value
+}
+
+function Get-XbProductionConfigAllowlist {
+    param($Config, [Parameter(Mandatory)][string]$BookMode)
+    $property = $Config.PSObject.Properties["autocount_test_book_allowlist"]
+    if ($null -eq $property -or $null -eq $property.Value -or $property.Value -isnot [array]) { throw "launcher_autocount_test_book_allowlist_invalid" }
+    $entries = @($property.Value)
+    foreach ($entry in $entries) {
+        if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry) -or $entry.Contains(";")) { throw "launcher_autocount_test_book_allowlist_invalid" }
+    }
+    if ($BookMode -ceq "test" -and $entries.Count -eq 0) { throw "launcher_autocount_test_book_allowlist_invalid" }
+    return [string]::Join(";", [string[]]$entries)
+}
+
 function New-XbWorkerProcessStartInfo {
     param([string]$WorkerScript, [string]$LauncherMode, [string]$RuntimeRootPath)
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = Join-Path $PSHOME "powershell.exe"
+    $startInfo.FileName = $script:XbWindowsPowerShellPath
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
@@ -88,6 +109,10 @@ function New-XbWorkerProcessStartInfo {
         $autocountServerName = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_server_name" -ErrorId "launcher_autocount_server_name_invalid"
         $autocountDatabaseName = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_database_name" -ErrorId "launcher_autocount_database_name_invalid"
         $autocountUserId = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_user_id" -ErrorId "launcher_autocount_user_id_invalid"
+        $integrationUserId = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_integration_user_id" -ErrorId "launcher_autocount_integration_user_id_invalid"
+        $productionBook = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_production_book" -ErrorId "launcher_autocount_production_book_invalid"
+        $bookMode = Get-XbProductionConfigBookMode -Config $config
+        $testBookAllowlist = Get-XbProductionConfigAllowlist -Config $config -BookMode $bookMode
         $workerToken = Read-XbCurrentUserSecretArtifact -Path (Join-Path $RuntimeRootPath "secrets\worker-token.clixml")
         $ac2Password = Read-XbCurrentUserSecretArtifact -Path (Join-Path $RuntimeRootPath "secrets\autocount-password.clixml")
         if ([string]::IsNullOrWhiteSpace($workerToken) -or [string]::IsNullOrWhiteSpace($ac2Password)) { throw "launcher_secret_invalid" }
@@ -95,17 +120,20 @@ function New-XbWorkerProcessStartInfo {
         $startInfo.EnvironmentVariables["XB_AC2_PASSWORD"] = $ac2Password
         $startInfo.EnvironmentVariables["XB_AC2_PASSWORD_ENV_VAR"] = "XB_AC2_PASSWORD"
         $startInfo.EnvironmentVariables["XB_MEMBER_GATEWAY_URL"] = [string]$config.gateway_base_url
-        $startInfo.EnvironmentVariables["XB_MEMBER_GATEWAY_WORKER_HOST_BINDING"] = [string]$config.worker_host_binding
         $startInfo.EnvironmentVariables["XB_AC2_ASSEMBLY_PATH"] = [string]$config.autocount_assembly_path
         $startInfo.EnvironmentVariables["XB_AC2_SERVER_NAME"] = $autocountServerName
         $startInfo.EnvironmentVariables["XB_AC2_DATABASE_NAME"] = $autocountDatabaseName
         $startInfo.EnvironmentVariables["XB_AC2_USER_ID"] = $autocountUserId
+        $startInfo.EnvironmentVariables["XB_AC2_INTEGRATION_USER_ID"] = $integrationUserId
+        $startInfo.EnvironmentVariables["XB_AC2_PRODUCTION_BOOK"] = $productionBook
+        $startInfo.EnvironmentVariables["XB_AC2_TEST_BOOK_ALLOWLIST"] = $testBookAllowlist
         [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_SERVER_NAME")
         [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_DATABASE_NAME")
         [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_USER_ID")
         [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_PASSWORD")
         [void]$startInfo.EnvironmentVariables.Remove("XB_AC2_SESSION_FACTORY")
-        $arguments += @("-EnableProductionWorker", "-EnableProductionAdapter")
+        [void]$startInfo.EnvironmentVariables.Remove("XB_MEMBER_GATEWAY_WORKER_HOST_BINDING")
+        $arguments += @("-Book", $bookMode, "-EnableProductionWorker", "-EnableProductionAdapter")
         $workerToken = $null
         $ac2Password = $null
     }
@@ -149,7 +177,7 @@ try {
     if ($exitCode -ne 0) { throw "worker_nonzero_exit" }
     $result = $stdout | ConvertFrom-Json -ErrorAction Stop
     if ($Mode -eq "DisabledProof") {
-        if ($exitCode -ne 0 -or [string]$result.status -cne "disabled" -or [int]$result.writes -ne 0 -or [bool]$result.dispatch_fence) {
+        if ($exitCode -ne 0 -or [string]$result.status -cne "disabled" -or [int]$result.writes -ne 0) {
             throw "disabled_proof_result_invalid"
         }
         $terminalStatus = "disabled_proof_pass"

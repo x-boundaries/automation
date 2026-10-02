@@ -16,6 +16,20 @@ on:
       - "schemas/member_gateway_welcome_email_result.v1.schema.json"
       - "schemas/member_gateway_operator_status.v1.schema.json"
       - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
+      - "schemas/member_gateway_worker_claim.v2.schema.json"
+      - "schemas/member_gateway_result.v2.schema.json"
+      - "schemas/member_gateway_job.v3.schema.json"
+      - "schemas/member_gateway_resolution.v1.schema.json"
+      - "schemas/member_gateway_operator_status.v2.schema.json"
+      - "config/ac2_member_gateway_worker.test_book.example.json"
+      - "scripts/ac2_member_create_primitive.ps1"
+      - "scripts/ac2_member_test_cleanup.ps1"
+      - "tests/test_ac2_member_primitive.py"
+      - "tests/test_ac2_member_primitive_cleanup.py"
+      - "tests/test_member_write_v2_cross_contract.py"
+      - "tests/fixtures/ac2_member_primitive/**"
+      - "tests/fixtures/xb_mn_1_vectors.v1.fixture"
+      - "docs/autocount2-automation/member_write_v2_live_runbook.md"
       - "config/ac2_member_gateway_worker.production.example.json"
       - "config/member_gateway.production.example.json"
       - "config/member_forms_gateway_bounded_import.v2.template.json"
@@ -66,6 +80,20 @@ on:
       - "schemas/member_gateway_welcome_email_result.v1.schema.json"
       - "schemas/member_gateway_operator_status.v1.schema.json"
       - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
+      - "schemas/member_gateway_worker_claim.v2.schema.json"
+      - "schemas/member_gateway_result.v2.schema.json"
+      - "schemas/member_gateway_job.v3.schema.json"
+      - "schemas/member_gateway_resolution.v1.schema.json"
+      - "schemas/member_gateway_operator_status.v2.schema.json"
+      - "config/ac2_member_gateway_worker.test_book.example.json"
+      - "scripts/ac2_member_create_primitive.ps1"
+      - "scripts/ac2_member_test_cleanup.ps1"
+      - "tests/test_ac2_member_primitive.py"
+      - "tests/test_ac2_member_primitive_cleanup.py"
+      - "tests/test_member_write_v2_cross_contract.py"
+      - "tests/fixtures/ac2_member_primitive/**"
+      - "tests/fixtures/xb_mn_1_vectors.v1.fixture"
+      - "docs/autocount2-automation/member_write_v2_live_runbook.md"
       - "config/ac2_member_gateway_worker.production.example.json"
       - "config/member_gateway.production.example.json"
       - "config/member_forms_gateway_bounded_import.v2.template.json"
@@ -134,7 +162,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_write_v2_cross_contract -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD
@@ -163,7 +191,9 @@ jobs:
           python -m unittest tests.test_member_gateway_worker_static
           tests.test_member_gateway_worker_deployment
           tests.test_member_gateway_adapter_ps
-          tests.test_member_gateway_worker_cycle_ps -v
+          tests.test_member_gateway_worker_cycle_ps
+          tests.test_ac2_member_primitive
+          tests.test_ac2_member_primitive_cleanup -v
 
   bounded-import-security:
     runs-on: windows-latest

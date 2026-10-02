@@ -1,5 +1,18 @@
 # AutoCount 2.0 Inventory Intelligence Scope
 
+```text
+ARCHITECTURE_AUTHORITY=#155 G1-147 (Web acceptance #155:5889718018); R-G2-148 (#155:5890302647)
+REPORTING_ARCHITECTURE_STATUS=ACCEPTED
+REPORTING_IMPLEMENTATION_STATUS=QUEUED_NOT_YET_IMPLEMENTED
+```
+
+The accepted reporting architecture is recorded in
+[architecture.md](architecture.md): AutoCount -> governed SQL views ->
+deterministic full daily snapshot -> blocking validation -> manifest-last local
+seal -> Owner-user Task Scheduler publisher -> Drive Desktop synced folder ->
+dashboard/downstream reporting. Its implementation lane (R-G3-150) is queued
+and has not landed; nothing below describes shipped reporting code.
+
 ## Current Objective
 
 The current objective is to build a read-only AutoCount 2.0 inventory, purchase
@@ -25,7 +38,7 @@ back to AutoCount or replacing AutoCount as the accounting system.
 - GRN / goods receiving surfaces.
 - Stock transfer / location movement surfaces.
 - Supplier context for purchasing analytics.
-- Dashboard-ready staging and warehouse design.
+- Dashboard-ready fact/dimension design over sealed daily snapshots.
 - Safe local snapshot/export runbooks.
 
 ## Out Of Current Scope / Parked
@@ -47,32 +60,41 @@ not required for the stock movement analytics MVP.
 | Analytics need | Business question answered | Current extraction status | Known/current surface | Gap / next action | Priority |
 | --- | --- | --- | --- | --- | --- |
 | Item master | Which SKUs exist, how are they named, and which products are active enough for dashboards and purchase planning? | Stock smoke extraction already exists for stock master style data; final production mapping still needs reconciliation. | Stock smoke workflow; item/product candidates from probe and phase 1 mapping. | Confirm item master, item UOM, barcode, category, brand, active/inactive, non-stock/service, and variant semantics against AutoCount UI/report paths. | High |
-| Stock balance by location | What is on hand by item and location, and where are low-stock or negative-stock risks? | Stock smoke extraction already exists for stock balance style data; location meaning still needs reconciliation. | Stock smoke workflow; balance/status candidates from phase 1 mapping. | Reconcile stock balance by item/location and confirm where stock locations live. `Branch`/`vBranch` had 0 rows, so location master remains unclear and may live elsewhere. | High |
+| Stock balance by location | What is on hand by item and location, and where are low-stock or negative-stock risks? | Stock smoke extraction already exists for stock balance style data; location meaning still needs reconciliation. | Stock smoke workflow; balance/status candidates from phase 1 mapping. | Reconcile stock balance by item/location and confirm where stock locations live. The location master is not yet confirmed and may live outside `Branch`/`vBranch`. | High |
 | Stock movement history | Why did stock move, what document caused it, and which items are fast, slow, or irregular movers? | Stock smoke extraction already exists for movement style data; document type semantics are not final. | Stock smoke workflow; movement/stock card candidates from phase 1 mapping. | Confirm signs, posting/cancelled behavior, document type codes, date-window rules, and drill-through consistency against AutoCount reports. | High |
 | PO / outstanding PO | What has been ordered, what is still outstanding, and what stock-in-transit signal can support purchasing decisions? | Selected-surface snapshot extraction already exists for PO headers and lines. | `dbo.PO`, `dbo.PODTL`, `dbo.vPurchaseOrder`. | Reconcile outstanding quantity/status semantics and connect PO lines to item, supplier, and receiving status. | High |
 | GRN / receiving | What was received, when, from whom, and against which PO? | Needs discovery/confirmation. | No confirmed production extraction surface yet. | Discover and reconcile GRN / goods receiving header and detail surfaces; confirm relationship to PO and stock movement rows. | High |
 | Stock transfer / inter-location movement | Which transfers moved stock between locations and what remains in transit? | Needs discovery/confirmation. | Stock document/transfer candidates only; no confirmed final surface. | Discover and reconcile stock transfer header/detail or stock document surfaces, including from-location/to-location semantics. | High |
 | Supplier context | Which suppliers support each item, how concentrated is supply, and what context supports reorder decisions? | Selected-surface snapshot extraction already exists for supplier master context. | `dbo.Creditor`, `dbo.vCreditor`; PO supplier fields. | Connect supplier master to PO lines and item/vendor relationships; look for supplier lead-time signal if available. | Medium |
 | Debtor/customer context | Which customer context may explain demand patterns without expanding into full sales migration? | Selected-surface snapshot extraction already exists for debtor master context. | `dbo.Debtor`, `dbo.vDebtor`. | Keep as supporting context only unless sales-demand analytics later need confirmed sales/AR surfaces. | Low |
-| AR/AP invoice context | Are invoice headers useful as optional context for open-item or purchasing cash-flow awareness? | Selected-surface snapshot extraction already exists for AR/AP invoice headers, currently with 0 rows in the latest safe summary; detail extraction remains disabled by default. | `dbo.ARInvoice`, `dbo.APInvoice`; `dbo.ARInvoiceDTL` and `dbo.APInvoiceDTL` remain disabled. | Keep detail surfaces disabled unless a later reviewed scope needs them; do not treat AR/AP as required for inventory analytics MVP. | Low |
+| AR/AP invoice context | Are invoice headers useful as optional context for open-item or purchasing cash-flow awareness? | Selected-surface snapshot extraction already exists for AR/AP invoice headers; detail extraction remains disabled by default. | `dbo.ARInvoice`, `dbo.APInvoice`; `dbo.ARInvoiceDTL` and `dbo.APInvoiceDTL` remain disabled. | Keep detail surfaces disabled unless a later reviewed scope needs them; do not treat AR/AP as required for inventory analytics MVP. | Low |
 | CoA/GL/bank accounting context | Is accounting cutover or finance migration ready? | Parked. Not needed for stock movement analytics MVP. | `coa_account_master` unresolved; `GLDTL` disabled by default for raw extraction; bank surfaces not selected. | Do not add CoA extraction, GL opening, bank opening, or accounting cutover work to this MVP. Revisit only under a separate finance-owned scope. | Parked |
 | Payment method context | Which payment setup context exists for later purchasing or AP interpretation? | Selected-surface snapshot extraction already exists. | `dbo.PaymentMethod`. | Keep as reference context; not a blocker for inventory dashboards. | Low |
 
-## Proposed Analytics Architecture
+## Analytics Architecture (accepted; implementation queued)
 
-### Stage 1: Read-Only Extraction And Local Snapshot
+### Stage 1: Governed Views And Sealed Daily Snapshot
 
-Continue using manual, read-only extraction and metadata discovery. Generated
-outputs stay under the approved local output root, outside GitHub. Raw CSVs,
-local `.local` configs, screenshots, credentials, and raw ERP rows are not
-committed.
+Reads go through governed, read-only SQL views on the AutoCount database. A
+deterministic full daily snapshot of the admitted views is validated
+(blocking), sealed locally with the manifest written last, and only then
+published by an Owner-user Task Scheduler task into the Drive Desktop synced
+folder. Status: accepted, queued (R-G3-150), not yet implemented.
 
-### Stage 2: Dashboard-Ready Warehouse/Staging Tables
+The existing manual, read-only extraction and metadata-discovery scripts remain
+evidence tools for choosing and reconciling surfaces. Their outputs stay under
+the approved local output root, outside GitHub. Raw CSVs, local `.local`
+configs, screenshots, credentials and raw ERP rows are not committed.
 
-Design a separate reporting/staging layer for curated inventory facts and
-dimensions, such as item, item UOM, location, stock balance, movement, PO,
-receiving, transfer, and supplier context. The staging/warehouse layer is for
-dashboards and analytics only; it must not write to AutoCount production tables.
+### Stage 2: Dashboard-Ready Facts And Dimensions From Sealed Snapshots
+
+Dashboards and downstream analytics consume the sealed snapshot outputs only,
+through a fact/dimension model (item, item UOM, location, stock balance,
+movement, PO, receiving, transfer, supplier context). There is no separate
+reporting SQL database or raw/staging/mart warehouse in the target
+architecture; that earlier design is superseded (see the historical
+[MVP plan](mvp_plan.md)). Marketplace settlement / payout economics is deferred
+to V2. Advanced MDSA is a consumer requirement, not the extraction engine.
 
 ### Stage 3: Purchasing Recommendation Logic
 
@@ -88,10 +110,11 @@ export/import handoff artifacts. It should not directly post to AC2.
 
 ### Stage 5: Controlled AC2 Write/API Integration Only If Later Approved
 
-Direct AC2 writes, official API writes, plug-in execution, or import automation
-are parked until separately approved after the read-only foundation is stable,
-reconciled, and audited. Direct SQL writes to AutoCount production tables remain
-out of scope.
+Inventory/purchasing writes, official API writes, plug-in execution, or import
+automation are parked until separately approved. Direct SQL writes to
+AutoCount production tables remain out of scope. (Member creation has its own
+separately governed lane; see [architecture.md](architecture.md).) A generic
+AutoCount API facade is deferred and not a current direction.
 
 ## Next Extractor Target Shortlist
 
@@ -110,7 +133,8 @@ extraction profile.
 ## Operating Guardrails
 
 - No SQL write-back.
-- No scheduler/automation runs until separately approved.
+- No scheduler/automation runs until separately approved (the accepted
+  Task Scheduler publisher is queued, not yet implemented or enabled).
 - No new production extraction run from this documentation change.
 - No generated outputs or `.local` config committed.
 - No credentials, connection strings, screenshots, raw CSVs, or raw ERP rows
