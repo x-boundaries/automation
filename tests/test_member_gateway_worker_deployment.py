@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -4545,6 +4546,151 @@ public static class XbBoundaryLsa
 }
 "@
 
+$lockOwnerSource = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class XbRestartManagerProcess
+{
+    public int ProcessId { get; set; }
+    public long StartTimeFileTimeUtc { get; set; }
+}
+
+public static class XbLockOwnerProbe
+{
+    private const uint DeleteAccess = 0x00010000;
+    private const uint OpenExisting = 3;
+    private const uint FileAttributeNormal = 0x00000080;
+    private const int ErrorMoreData = 234;
+    private const uint MaximumOwnerCount = 32;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RmFileTime
+    {
+        public uint LowDateTime;
+        public uint HighDateTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RmUniqueProcess
+    {
+        public int ProcessId;
+        public RmFileTime ProcessStartTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct RmProcessInfo
+    {
+        public RmUniqueProcess Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ApplicationName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string ServiceShortName;
+        public uint ApplicationType;
+        public uint ApplicationStatus;
+        public uint SessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint sessionHandle, uint sessionFlags, StringBuilder sessionKey);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(
+        uint sessionHandle,
+        uint fileCount,
+        [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr)] string[] fileNames,
+        uint applicationCount,
+        IntPtr applications,
+        uint serviceCount,
+        IntPtr services);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmGetList(
+        uint sessionHandle,
+        out uint processInfoNeeded,
+        ref uint processInfoCount,
+        [Out] RmProcessInfo[] affectedApplications,
+        out uint rebootReasons);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmEndSession(uint sessionHandle);
+
+    public static bool ProbeDeleteAccess(string path, out bool completed)
+    {
+        completed = false;
+        using (SafeFileHandle handle = CreateFile(
+            path, DeleteAccess, 0, IntPtr.Zero, OpenExisting, FileAttributeNormal, IntPtr.Zero))
+        {
+            completed = true;
+            return handle != null && !handle.IsInvalid;
+        }
+    }
+
+    public static XbRestartManagerProcess[] GetOwners(string path, out bool completed)
+    {
+        completed = false;
+        uint sessionHandle;
+        StringBuilder sessionKey = new StringBuilder(33);
+        int status = RmStartSession(out sessionHandle, 0, sessionKey);
+        if (status != 0) { return new XbRestartManagerProcess[0]; }
+        try
+        {
+            status = RmRegisterResources(sessionHandle, 1, new string[] { path }, 0, IntPtr.Zero, 0, IntPtr.Zero);
+            if (status != 0) { return new XbRestartManagerProcess[0]; }
+
+            uint needed;
+            uint count = 0;
+            uint rebootReasons;
+            status = RmGetList(sessionHandle, out needed, ref count, null, out rebootReasons);
+            if (status == 0)
+            {
+                completed = needed == 0 && count == 0;
+                return new XbRestartManagerProcess[0];
+            }
+            if (status != ErrorMoreData || needed == 0 || needed > MaximumOwnerCount)
+            {
+                return new XbRestartManagerProcess[0];
+            }
+
+            RmProcessInfo[] affected = new RmProcessInfo[needed];
+            count = needed;
+            status = RmGetList(sessionHandle, out needed, ref count, affected, out rebootReasons);
+            if (status != 0 || count > affected.Length || count > MaximumOwnerCount)
+            {
+                return new XbRestartManagerProcess[0];
+            }
+
+            List<XbRestartManagerProcess> owners = new List<XbRestartManagerProcess>();
+            for (int index = 0; index < count; index++)
+            {
+                RmUniqueProcess process = affected[index].Process;
+                long startTime = ((long)process.ProcessStartTime.HighDateTime << 32) |
+                    (long)process.ProcessStartTime.LowDateTime;
+                owners.Add(new XbRestartManagerProcess
+                {
+                    ProcessId = process.ProcessId,
+                    StartTimeFileTimeUtc = startTime
+                });
+            }
+            owners.Sort((left, right) => left.ProcessId.CompareTo(right.ProcessId));
+            completed = true;
+            return owners.ToArray();
+        }
+        finally
+        {
+            RmEndSession(sessionHandle);
+        }
+    }
+}
+"@
+
 function New-XbBoundaryHex {
     param([Parameter(Mandatory)][int]$Bytes)
     $buffer = New-Object byte[] $Bytes
@@ -4636,6 +4782,110 @@ function Get-XbAccountObservation {
         user_profile_count = @(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $state.user_sid)).Count
         worker_process_count = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { [string]$_.UserName -ieq $qualifiedAccount }).Count
     }
+}
+
+function Get-XbPrimitiveLockOwnerDiagnostic {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$WorkerAccount,
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][string]$TaskName,
+        [int[]]$TestCreatedChildProcessIds = @()
+    )
+    $diagnostic = [ordered]@{
+        harness_pid = [int]$PID
+        primitive_filename = "ac2_member_create_primitive.ps1"
+        delete_access_probe_completed = $false
+        delete_access_probe_succeeded = $false
+        owner_enumeration_completed = $false
+        owner_process_mapping_completed = $false
+        lock_owner_count = $null
+        lock_owners = @()
+        scheduled_task_state_observed = $false
+        scheduled_task_running = $null
+        worker_account_process_count_observed = $false
+        worker_account_process_count = $null
+        classification = "LOCK_OWNER_UNPROVEN"
+    }
+
+    try {
+        $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
+        $diagnostic.scheduled_task_running = ([string]$task.State -ceq "Running")
+        $diagnostic.scheduled_task_state_observed = $true
+    } catch { }
+
+    $workerProcessIds = @{}
+    try {
+        $workerProcesses = @(Get-Process -IncludeUserName -ErrorAction Stop | Where-Object {
+            [string]$_.UserName -ieq $WorkerAccount
+        })
+        $diagnostic.worker_account_process_count = [int]$workerProcesses.Count
+        $diagnostic.worker_account_process_count_observed = $true
+        foreach ($process in $workerProcesses) { $workerProcessIds[[int]$process.Id] = $true }
+    } catch { }
+
+    try {
+        $restartManagerCompleted = $false
+        $restartManagerOwners = [XbLockOwnerProbe]::GetOwners($Path, [ref]$restartManagerCompleted)
+        if ($restartManagerCompleted) {
+            $diagnostic.owner_enumeration_completed = $true
+            $diagnostic.lock_owner_count = [int]@($restartManagerOwners).Count
+            $owners = New-Object 'System.Collections.Generic.List[object]'
+            $mappingCompleted = $true
+            foreach ($owner in @($restartManagerOwners)) {
+                $ownerPid = [int]$owner.ProcessId
+                $process = Get-Process -Id $ownerPid -ErrorAction Stop
+                $processStartTime = ([datetime]$process.StartTime).ToUniversalTime().ToFileTimeUtc()
+                if ([long]$processStartTime -ne [long]$owner.StartTimeFileTimeUtc) {
+                    $mappingCompleted = $false
+                    break
+                }
+                $classification = $null
+                if ($ownerPid -eq $PID) {
+                    $classification = "current_harness_powershell"
+                } elseif ($TestCreatedChildProcessIds -contains $ownerPid) {
+                    $classification = "test_created_child"
+                } elseif (-not $diagnostic.worker_account_process_count_observed) {
+                    $mappingCompleted = $false
+                    break
+                } elseif ($workerProcessIds.ContainsKey($ownerPid)) {
+                    $classification = "synthetic_worker_account"
+                } else {
+                    $classification = "external_system_process"
+                }
+                $processBasename = [string]$process.ProcessName
+                if ($processBasename -notmatch '^[A-Za-z0-9_.-]{1,64}$') {
+                    $mappingCompleted = $false
+                    break
+                }
+                $owners.Add([ordered]@{
+                    pid = $ownerPid
+                    process_basename = $processBasename
+                    classification = $classification
+                })
+            }
+            if ($mappingCompleted -and $owners.Count -eq $diagnostic.lock_owner_count) {
+                $diagnostic.owner_process_mapping_completed = $true
+                $diagnostic.lock_owners = @($owners.ToArray())
+                $ownerClasses = @($diagnostic.lock_owners | ForEach-Object { $_.classification })
+                if ($ownerClasses -contains "current_harness_powershell") {
+                    $diagnostic.classification = "HARNESS_SELF_LOCK_PROVEN"
+                } elseif ($ownerClasses -contains "test_created_child") {
+                    $diagnostic.classification = "HARNESS_CHILD_LOCK_PROVEN"
+                } elseif ($ownerClasses.Count -gt 0) {
+                    $diagnostic.classification = "HOSTED_ENVIRONMENT_LOCK_OWNER_PROVEN"
+                }
+            }
+        }
+    } catch { }
+
+    try {
+        $probeCompleted = $false
+        $diagnostic.delete_access_probe_succeeded = [bool][XbLockOwnerProbe]::ProbeDeleteAccess($Path, [ref]$probeCompleted)
+        $diagnostic.delete_access_probe_completed = [bool]$probeCompleted
+    } catch { }
+
+    return $diagnostic
 }
 
 function Get-XbTaskEvidence {
@@ -4909,6 +5159,7 @@ try {
     $report.environment.schedule_service = [bool]$probeService.Connected
     if (-not $report.environment.schedule_service) { throw "boundary_requires_schedule_service" }
     Add-Type -TypeDefinition $lsaSource -Language CSharp
+    Add-Type -TypeDefinition $lockOwnerSource -Language CSharp
     $state.lsa_loaded = $true
 
     . $InstallerPath -LibraryOnly
@@ -5873,6 +6124,11 @@ try {
         if ($ci7.required_probe_completion.status -cne "complete") { throw "ci7_required_probes_incomplete" }
         if ($ci7.Contains("cleanup_error")) { throw "ci7_fixture_cleanup_failed" }
 
+        $case.primitive_lock_diagnostic = Get-XbPrimitiveLockOwnerDiagnostic `
+            -Path (Join-Path $InstallRoot "ac2_member_create_primitive.ps1") `
+            -WorkerAccount $qualifiedAccount `
+            -TaskPath $taskPath `
+            -TaskName $taskName
         $script:Operation = "Uninstall"
         $case.uninstall_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
         $case.uninstalled = Get-XbProductionReadback
@@ -6117,6 +6373,61 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         self.assertIn("$protected.Dispose()", snapshot)
         self.assertIn("[IO.FileAttributes]::ReparsePoint", snapshot)
         self.assertNotIn("Add-XbCi7ProtectedLeaf", snapshot)
+
+    def test_primitive_lock_owner_diagnostic_is_bounded_and_precedes_uninstall(self) -> None:
+        diagnostic = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Get-XbPrimitiveLockOwnerDiagnostic")
+        case_start = _HOSTED_TASK_BOUNDARY_HARNESS.index(
+            'Invoke-XbBoundaryCase -Name "install_then_uninstall"'
+        )
+        case_source = _HOSTED_TASK_BOUNDARY_HARNESS[case_start:]
+        diagnostic_call = case_source.index("$case.primitive_lock_diagnostic = Get-XbPrimitiveLockOwnerDiagnostic")
+        self.assertLess(diagnostic_call, case_source.index('$script:Operation = "Uninstall"'))
+        self.assertEqual(case_source.count("$case.primitive_lock_diagnostic = Get-XbPrimitiveLockOwnerDiagnostic"), 1)
+        self.assertEqual(case_source.count("Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }"), 2)
+        self.assertIn('primitive_filename = "ac2_member_create_primitive.ps1"', diagnostic)
+        for field in (
+            "harness_pid",
+            "delete_access_probe_succeeded",
+            "lock_owner_count",
+            "process_basename",
+            "scheduled_task_running",
+            "worker_account_process_count",
+        ):
+            with self.subTest(diagnostic_field=field):
+                self.assertIn(field, diagnostic)
+        for owner_class in (
+            "current_harness_powershell",
+            "test_created_child",
+            "synthetic_worker_account",
+            "external_system_process",
+        ):
+            with self.subTest(owner_class=owner_class):
+                self.assertIn(owner_class, diagnostic)
+        for result in (
+            "HARNESS_SELF_LOCK_PROVEN",
+            "HARNESS_CHILD_LOCK_PROVEN",
+            "HOSTED_ENVIRONMENT_LOCK_OWNER_PROVEN",
+            "LOCK_OWNER_UNPROVEN",
+        ):
+            with self.subTest(result=result):
+                self.assertIn(result, diagnostic)
+        native_start = _HOSTED_TASK_BOUNDARY_HARNESS.index('$lockOwnerSource = @"')
+        native_end = _HOSTED_TASK_BOUNDARY_HARNESS.index('\n"@', native_start) + len('\n"@')
+        native_probe = _HOSTED_TASK_BOUNDARY_HARNESS[native_start:native_end]
+        self.assertIn("RmStartSession", native_probe)
+        self.assertIn("RmRegisterResources", native_probe)
+        self.assertIn("RmGetList", native_probe)
+        self.assertIn("CreateFileW", native_probe)
+        for forbidden in ("Start-Sleep", "Stop-Process", "RmShutdown", "NtSetInformationFile"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, native_probe)
+        self.assertLess(diagnostic.index("Get-ScheduledTask"), diagnostic.index("ProbeDeleteAccess"))
+        self.assertLess(diagnostic.index("GetOwners"), diagnostic.index("ProbeDeleteAccess"))
+        self.assertLess(diagnostic.index("ProbeDeleteAccess"), diagnostic.index("return $diagnostic"))
+        python_source = Path(__file__).read_text(encoding="utf-8")
+        unsafe_log_expression = "print(" + "json.dumps(report"
+        self.assertNotIn(unsafe_log_expression, python_source)
+        self.assertIn('"primitive_filename": "ac2_member_create_primitive.ps1"', python_source)
 
 
 class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
@@ -6397,34 +6708,118 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             frozen_context_path.write_text(frozen_context, encoding="utf-8", newline="\n")
             harness = root / "task_boundary_harness.ps1"
             harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
-            completed = subprocess.run(
-                [
-                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
-                    "-File", str(harness),
-                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
-                    "-ReviewedManifestPath", str(manifest),
-                    "-FrozenContextPath", str(frozen_context_path),
-                    "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
-                    "-FrozenInstallerBlob", frozen_blob,
-                ],
-                cwd=ROOT,
-                env=_windows_powershell_module_environment(),
-                capture_output=True,
-                text=True,
-                timeout=1500,
-            )
+            try:
+                completed = subprocess.run(
+                    [
+                        pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                        "-File", str(harness),
+                        "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                        "-ReviewedManifestPath", str(manifest),
+                        "-FrozenContextPath", str(frozen_context_path),
+                        "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
+                        "-FrozenInstallerBlob", frozen_blob,
+                    ],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=1500,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise AssertionError("hosted boundary harness did not return") from None
         report = _boundary_report(completed.stdout)
         if report is None:
-            raise AssertionError(
-                "hosted boundary harness produced no report\n" + completed.stdout[-4000:] + completed.stderr[-4000:]
-            )
+            raise AssertionError("hosted boundary harness produced no parseable report")
+        case = report.get("cases", {}).get("install_then_uninstall", {})
+        raw_diagnostic = case.get("primitive_lock_diagnostic", {}) if isinstance(case, dict) else {}
+        if not isinstance(raw_diagnostic, dict):
+            raw_diagnostic = {}
+        allowed_owner_classes = {
+            "current_harness_powershell",
+            "test_created_child",
+            "synthetic_worker_account",
+            "external_system_process",
+        }
+        safe_owners = []
+        raw_owners = raw_diagnostic.get("lock_owners", []) if isinstance(raw_diagnostic, dict) else []
+        if isinstance(raw_owners, list):
+            for owner in raw_owners[:32]:
+                if not isinstance(owner, dict):
+                    continue
+                pid = owner.get("pid")
+                process_basename = owner.get("process_basename")
+                owner_class = owner.get("classification")
+                if (
+                    type(pid) is int and pid > 0
+                    and isinstance(process_basename, str)
+                    and 1 <= len(process_basename) <= 64
+                    and all(character.isalnum() or character in "._-" for character in process_basename)
+                    and owner_class in allowed_owner_classes
+                ):
+                    safe_owners.append({
+                        "pid": pid,
+                        "process_basename": process_basename,
+                        "classification": owner_class,
+                    })
+        classification = raw_diagnostic.get("classification") if isinstance(raw_diagnostic, dict) else None
+        if classification not in {
+            "HARNESS_SELF_LOCK_PROVEN",
+            "HARNESS_CHILD_LOCK_PROVEN",
+            "HOSTED_ENVIRONMENT_LOCK_OWNER_PROVEN",
+            "LOCK_OWNER_UNPROVEN",
+        }:
+            classification = "LOCK_OWNER_UNPROVEN"
+        uninstall_outcome = case.get("uninstall_outcome") if isinstance(case, dict) else None
+        uninstall_readback = case.get("uninstalled", {}) if isinstance(case, dict) else {}
+        pristine_keys = (
+            "task_present",
+            "scheduler_folder_present",
+            "install_root_present",
+            "runtime_root_present",
+            "program_files_parent_present",
+            "program_data_parent_present",
+        )
+        uninstall_readback_pristine = None
+        if isinstance(uninstall_readback, dict) and all(type(uninstall_readback.get(key)) is bool for key in pristine_keys):
+            uninstall_readback_pristine = not any(uninstall_readback[key] for key in pristine_keys) and uninstall_readback.get("new_stage_count") == 0
+        ci7 = case.get("ci7", {}) if isinstance(case, dict) else {}
+        required_probes = ci7.get("required_probe_completion", {}) if isinstance(ci7, dict) else {}
+        report_secret_state = report.get("secret_exposure")
+        if report_secret_state not in {"none", "detected", "unchecked"}:
+            report_secret_state = "unchecked"
+        safe_summary = {
+            "primitive_lock_diagnostic": {
+                "harness_pid": raw_diagnostic.get("harness_pid") if type(raw_diagnostic.get("harness_pid")) is int else None,
+                "primitive_filename": "ac2_member_create_primitive.ps1",
+                "delete_access_probe_completed": raw_diagnostic.get("delete_access_probe_completed") if type(raw_diagnostic.get("delete_access_probe_completed")) is bool else None,
+                "delete_access_probe_succeeded": raw_diagnostic.get("delete_access_probe_succeeded") if type(raw_diagnostic.get("delete_access_probe_succeeded")) is bool else None,
+                "owner_enumeration_completed": raw_diagnostic.get("owner_enumeration_completed") if type(raw_diagnostic.get("owner_enumeration_completed")) is bool else None,
+                "owner_process_mapping_completed": raw_diagnostic.get("owner_process_mapping_completed") if type(raw_diagnostic.get("owner_process_mapping_completed")) is bool else None,
+                "lock_owner_count": raw_diagnostic.get("lock_owner_count") if type(raw_diagnostic.get("lock_owner_count")) is int else None,
+                "lock_owners": safe_owners,
+                "scheduled_task_state_observed": raw_diagnostic.get("scheduled_task_state_observed") if type(raw_diagnostic.get("scheduled_task_state_observed")) is bool else None,
+                "scheduled_task_running": raw_diagnostic.get("scheduled_task_running") if type(raw_diagnostic.get("scheduled_task_running")) is bool else None,
+                "worker_account_process_count_observed": raw_diagnostic.get("worker_account_process_count_observed") if type(raw_diagnostic.get("worker_account_process_count_observed")) is bool else None,
+                "worker_account_process_count": raw_diagnostic.get("worker_account_process_count") if type(raw_diagnostic.get("worker_account_process_count")) is int else None,
+                "classification": classification,
+            },
+            "case_status": case.get("status") if isinstance(case, dict) and case.get("status") in {"running", "completed", "error"} else "missing",
+            "uninstall_result": "pass" if uninstall_outcome == "pass" else ("not_recorded" if uninstall_outcome is None else "failed"),
+            "uninstall_readback_pristine": uninstall_readback_pristine,
+            "cleanup_result": case.get("cleanup", {}).get("pass") if isinstance(case, dict) and isinstance(case.get("cleanup"), dict) and type(case["cleanup"].get("pass")) is bool else None,
+            "ci7_required_probe_completion": required_probes.get("status") if isinstance(required_probes, dict) and required_probes.get("status") in {"complete", "incomplete"} else "unavailable",
+            "ci7_completed_through": required_probes.get("completed_through") if isinstance(required_probes, dict) and required_probes.get("completed_through") == "retention_delete" else None,
+            "ci7_verify_outcome": "pass" if isinstance(ci7, dict) and ci7.get("verify_outcome") == "pass" else ("failed" if isinstance(ci7, dict) and "verify_outcome" in ci7 else "unavailable"),
+            "ci7_verify_status": ci7.get("verify_status") if isinstance(ci7, dict) and ci7.get("verify_status") in {"install_verified", "failed"} else "unavailable",
+            "secret_exposure": report_secret_state,
+        }
         print(TASK_BOUNDARY_MARKER, flush=True)
-        print(json.dumps(report, sort_keys=True), flush=True)
+        print(json.dumps(safe_summary, sort_keys=True), flush=True)
         cls.report = report
 
     def _case(self, name: str) -> dict[str, object]:
         case = self.report["cases"][name]
-        self.assertEqual(case["status"], "completed", case)
+        self.assertEqual(case["status"], "completed", "hosted boundary case did not complete")
         return case
 
     def _assert_pristine(self, readback: dict[str, object]) -> None:
@@ -6446,8 +6841,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["com_last_task_result"], SCHED_S_TASK_HAS_NOT_RUN)
         self.assertEqual(evidence["missed_runs"], 0)
         self.assertEqual(evidence["com_missed_runs"], 0)
-        self.assertTrue(evidence["last_run_time"] is None or str(evidence["last_run_time"]).startswith("1999-11-30"), evidence)
-        self.assertLess(str(evidence["com_last_run_time"]), "2000", evidence)
+        self.assertTrue(evidence["last_run_time"] is None or str(evidence["last_run_time"]).startswith("1999-11-30"), "task has not been run")
+        self.assertLess(str(evidence["com_last_run_time"]), "2000", "task has not been run")
 
     def _assert_exact_disabled_proof(self, evidence: dict[str, object], worker_account: str) -> None:
         self.assertEqual(evidence["cim_state"], "Disabled")
@@ -6457,12 +6852,12 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["cim_action_count"], 1)
         self.assertEqual(evidence["com_action_count"], 1)
         self.assertEqual(evidence["com_action_type"], 0)
-        self.assertEqual(evidence["action_execute"], WINDOWS_POWERSHELL)
-        self.assertEqual(evidence["com_action_path"], WINDOWS_POWERSHELL)
-        self.assertEqual(evidence["com_action_arguments"], evidence["action_arguments"])
-        self.assertRegex(str(evidence["action_arguments"]), r"-Mode DisabledProof$")
-        self.assertNotRegex(str(evidence["action_arguments"]), r"EnableProduction")
-        self.assertEqual(evidence["principal_user_id"], worker_account)
+        self.assertTrue(evidence["action_execute"] == WINDOWS_POWERSHELL, "task interpreter matches")
+        self.assertTrue(evidence["com_action_path"] == WINDOWS_POWERSHELL, "task interpreter matches")
+        self.assertTrue(evidence["com_action_arguments"] == evidence["action_arguments"], "task arguments match")
+        self.assertTrue(bool(re.search(r"-Mode DisabledProof$", str(evidence["action_arguments"]))), "disabled proof mode")
+        self.assertFalse(bool(re.search(r"EnableProduction", str(evidence["action_arguments"]))), "production mode absent")
+        self.assertTrue(evidence["principal_user_id"] == worker_account, "task principal matches synthetic worker")
         self.assertEqual(evidence["principal_logon_type"], "Password")
         self.assertEqual(evidence["principal_run_level"], "Limited")
         self.assertEqual(evidence["multiple_instances"], "IgnoreNew")
@@ -6478,12 +6873,61 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["xml_trigger_count"], 0)
 
     def _assert_no_worker_session(self, observation: dict[str, object]) -> None:
-        self.assertFalse(observation["profile_list_present"], observation)
-        self.assertEqual(observation["user_profile_count"], 0, observation)
-        self.assertEqual(observation["worker_process_count"], 0, observation)
+        self.assertFalse(observation["profile_list_present"], "worker profile absent")
+        self.assertEqual(observation["user_profile_count"], 0, "worker profile absent")
+        self.assertEqual(observation["worker_process_count"], 0, "worker process absent")
+
+    def _assert_bounded_lock_diagnostic(self, diagnostic: dict[str, object]) -> None:
+        self.assertIsInstance(diagnostic, dict, "primitive lock diagnostic recorded")
+        self.assertTrue(type(diagnostic.get("harness_pid")) is int and diagnostic["harness_pid"] > 0, "harness PID recorded")
+        self.assertEqual(diagnostic.get("primitive_filename"), "ac2_member_create_primitive.ps1")
+        for key in ("delete_access_probe_completed", "delete_access_probe_succeeded", "owner_enumeration_completed", "owner_process_mapping_completed"):
+            self.assertTrue(type(diagnostic.get(key)) is bool, "lock diagnostic probe state recorded")
+        self.assertIn(
+            diagnostic.get("classification"),
+            {
+                "HARNESS_SELF_LOCK_PROVEN",
+                "HARNESS_CHILD_LOCK_PROVEN",
+                "HOSTED_ENVIRONMENT_LOCK_OWNER_PROVEN",
+                "LOCK_OWNER_UNPROVEN",
+            },
+        )
+        owner_count = diagnostic.get("lock_owner_count")
+        self.assertTrue(owner_count is None or type(owner_count) is int, "bounded lock owner count")
+        owners = diagnostic.get("lock_owners")
+        self.assertIsInstance(owners, list, "bounded lock owner records")
+        if diagnostic["owner_enumeration_completed"]:
+            self.assertTrue(type(owner_count) is int, "Restart Manager owner count recorded")
+        if diagnostic["owner_process_mapping_completed"]:
+            self.assertEqual(len(owners), owner_count, "owner PID mapping completed")
+        else:
+            self.assertEqual(owners, [], "incomplete owner mapping omitted")
+            self.assertEqual(diagnostic["classification"], "LOCK_OWNER_UNPROVEN")
+        owner_classes = {
+            "current_harness_powershell",
+            "test_created_child",
+            "synthetic_worker_account",
+            "external_system_process",
+        }
+        for owner in owners:
+            self.assertTrue(type(owner.get("pid")) is int and owner["pid"] > 0, "lock owner PID recorded")
+            self.assertTrue(
+                isinstance(owner.get("process_basename"), str)
+                and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", owner["process_basename"]),
+                "lock owner basename is bounded",
+            )
+            self.assertIn(owner.get("classification"), owner_classes)
+        self.assertTrue(type(diagnostic.get("scheduled_task_state_observed")) is bool, "scheduled task state evidence")
+        self.assertTrue(
+            diagnostic.get("scheduled_task_running") is None or type(diagnostic.get("scheduled_task_running")) is bool,
+            "scheduled task running state bounded",
+        )
+        self.assertTrue(type(diagnostic.get("worker_account_process_count_observed")) is bool, "worker process evidence")
+        worker_count = diagnostic.get("worker_account_process_count")
+        self.assertTrue(worker_count is None or type(worker_count) is int, "worker process count bounded")
 
     def test_native_boundary_environment(self) -> None:
-        self.assertIsNone(self.report["fatal"], self.report)
+        self.assertIsNone(self.report["fatal"], "hosted boundary harness completed")
         environment = self.report["environment"]
         self.assertTrue(str(environment["ps_version"]).startswith("5.1."))
         self.assertEqual(environment["ps_edition"], "Desktop")
@@ -6496,7 +6940,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(environment["administrators_member"])
         # Installer/task identity must bind to the bare local account, as production does.
-        self.assertRegex(str(environment["worker_account"]), r"^xbt[0-9a-f]{12}$")
+        self.assertTrue(bool(re.fullmatch(r"xbt[0-9a-f]{12}", str(environment["worker_account"]))), "synthetic worker account shape")
 
     def test_no_secret_exposure(self) -> None:
         self.assertEqual(self.report["secret_exposure"], "none")
@@ -6542,20 +6986,20 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
     def test_registration_failure_rollback_treats_absent_task_as_restored(self) -> None:
         case = self._case("registration_failure_parent_absent")
         self.assertNotEqual(case["install_outcome"], "pass")
-        self.assertFalse(str(case["install_outcome"]).startswith("install_rollback_failed"), case)
+        self.assertFalse(str(case["install_outcome"]).startswith("install_rollback_failed"), "rollback completed without secondary failure")
         self.assertIn("task_step:absent", case["rollback_trace"])
         self._assert_pristine(case["readback"])
         self.assertEqual(case["historical_unconditional_unregister"], "task_unregister_failed")
 
     def test_post_registration_rollback_removes_task_and_parents(self) -> None:
         case = self._case("forced_post_registration_parent_absent")
-        self.assertEqual(case["install_outcome"], "forced_post_registration_failure")
+        self.assertTrue(case["install_outcome"] == "forced_post_registration_failure", "forced registration failure observed")
         self.assertEqual(case["rollback_trace"], ["task_step:present", "folder_step:present"])
         self._assert_pristine(case["readback"])
 
     def test_preexisting_parents_and_sentinels_are_preserved(self) -> None:
         case = self._case("preexisting_parents_sentinel")
-        self.assertEqual(case["install_outcome"], "forced_post_registration_failure")
+        self.assertTrue(case["install_outcome"] == "forced_post_registration_failure", "forced registration failure observed")
         self.assertEqual(case["rollback_trace"], ["task_step:present"])
         self.assertEqual(
             case["readback"],
@@ -6578,7 +7022,10 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
 
     def test_unexpected_attempt_container_content_holds(self) -> None:
         case = self._case("unexpected_container_content_hold")
-        self.assertEqual(case["install_outcome"], "install_rollback_failed: container_not_owned_empty")
+        self.assertTrue(
+            case["install_outcome"] == "install_rollback_failed: container_not_owned_empty",
+            "unexpected container content held",
+        )
         self.assertEqual(case["rollback_trace"], ["folder_step:absent"])
         self.assertTrue(case["unexpected_preserved"])
         self.assertEqual(
@@ -6598,15 +7045,16 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
     def test_install_then_uninstall(self) -> None:
         self.assertTrue(self.report["account"]["batch_logon_right_assigned"])
         case = self._case("install_then_uninstall")
+        self._assert_bounded_lock_diagnostic(case.get("primitive_lock_diagnostic"))
         install_presence = case["install_task_presence"]
-        self.assertEqual(install_presence["effective_task_path"], "\\X-Boundaries\\")
-        self.assertEqual(install_presence["effective_task_name"], "AC2 Member Gateway Worker")
+        self.assertTrue(install_presence["effective_task_path"] == "\\X-Boundaries\\", "production task path")
+        self.assertTrue(install_presence["effective_task_name"] == "AC2 Member Gateway Worker", "production task name")
         self.assertTrue(install_presence["cim_task_present"])
         self.assertTrue(install_presence["com"]["folder_present"])
         self.assertTrue(install_presence["com"]["task_present"])
         self.assertEqual(install_presence["com"]["task_count"], 1)
         self.assertEqual(install_presence["com"]["child_folder_count"], 0)
-        self.assertEqual(case["install_outcome"], "pass")
+        self.assertTrue(case["install_outcome"] == "pass", "hosted install passed")
         self.assertEqual(
             case["installed"],
             {
@@ -6623,26 +7071,26 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(case["ownership"], "pass")
         self.assertEqual(case["manifest_trigger_count"], 0)
         snapshot = case["synthetic_config_snapshot"]
-        self.assertTrue(snapshot["native_type_absent_before_first_use"], snapshot)
-        self.assertTrue(snapshot["native_type_initialized"], snapshot)
+        self.assertTrue(snapshot["native_type_absent_before_first_use"], "native type lifecycle")
+        self.assertTrue(snapshot["native_type_initialized"], "native type lifecycle")
         self.assertEqual(snapshot["fixture_bytes_hex"], "7b7d")
-        self.assertTrue(snapshot["wrong_content_exact"], snapshot)
-        self.assertTrue(snapshot["replacement_identity_changed"], snapshot)
+        self.assertTrue(snapshot["wrong_content_exact"], "synthetic content control")
+        self.assertTrue(snapshot["replacement_identity_changed"], "synthetic identity control")
         self._assert_zero_triggers(case["evidence"])
         self._assert_exact_disabled_proof(case["evidence"], self.report["environment"]["worker_account"])
         self._assert_never_run(case["evidence"])
         self._assert_no_worker_session(case["account_installed"])
         ci7 = case["ci7"]
-        self.assertIsNone(ci7["fatal"], ci7)
+        self.assertIsNone(ci7["fatal"], "CI7 matrix completed")
         self.assertEqual(
             ci7["required_probe_completion"],
             {"status": "complete", "completed_through": "retention_delete"},
         )
-        self.assertTrue(ci7["root_owner_accepted"], ci7)
-        self.assertIn(ci7["root_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
+        self.assertTrue(ci7["root_owner_accepted"], "protected root owner accepted")
+        self.assertTrue(ci7["root_owner_sid"] in {"S-1-5-18", "S-1-5-32-544"}, "protected root owner type")
         self.assertTrue(ci7["root_dacl_protected"])
         self.assertEqual(ci7["root_acl_shape"], "pass")
-        self.assertEqual(ci7["token_user_sid"], self.report["environment"]["worker_sid"])
+        self.assertTrue(ci7["token_user_sid"] == self.report["environment"]["worker_sid"], "native token identity matched")
         self.assertEqual(ci7["token_type"], 2)
         self.assertEqual(ci7["token_impersonation_level"], 2)
         self.assertEqual(ci7["logs_root_granted_mask"], "0x001200AB")
@@ -6670,7 +7118,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(ci7["frozen_control_installer_blob"], CI7_DEFECTIVE_INSTALLER_BLOB)
         self.assertEqual(ci7["drive_root_index0"]["index"], 0)
         self.assertEqual(ci7["drive_root_index0"]["right"], "0x00000004")
-        self.assertTrue(ci7["drive_root_index0"]["allowed"], ci7["drive_root_index0"])
+        self.assertTrue(ci7["drive_root_index0"]["allowed"], "frozen drive-root control reproduced")
         self.assertEqual(ci7["drive_root_index0"]["granted_access"], 0x00000004)
         self.assertEqual(ci7["frozen_defective_context_outcome"], "effective_rights_exceeded")
         self.assertTrue(ci7["drive_root_descriptor_unchanged"])
@@ -6683,7 +7131,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             "file_write_attributes", "delete", "write_dac", "write_owner",
         })
         for probe in exact_matrix:
-            with self.subTest(ci7_exact_root=probe):
+            with self.subTest(ci7_exact_root_index=exact_matrix.index(probe)):
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
@@ -6696,12 +7144,13 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         ancestor_paths = {probe["ancestor"] for probe in ancestor_scope_out}
         self.assertGreater(len(ancestor_paths), 0)
         self.assertEqual({probe["right"] for probe in ancestor_scope_out}, scope_out_names)
-        self.assertEqual(
-            {(probe["ancestor"], probe["right"]) for probe in ancestor_scope_out},
-            set(product(ancestor_paths, scope_out_names)),
+        self.assertTrue(
+            {(probe["ancestor"], probe["right"]) for probe in ancestor_scope_out}
+            == set(product(ancestor_paths, scope_out_names)),
+            "ancestor scoped-out-right matrix is complete",
         )
         for probe in ancestor_scope_out:
-            with self.subTest(ci7_scoped_out_ancestor=probe):
+            with self.subTest(ci7_scoped_out_ancestor_index=ancestor_scope_out.index(probe)):
                 self.assertEqual(probe["outcome"], "pass")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
@@ -6709,14 +7158,15 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
 
         ancestor_denied = ci7["ancestor_denied_right_matrix"]
         retained_ancestor_names = {"delete_child", "delete", "write_dac", "write_owner"}
-        self.assertEqual({probe["ancestor"] for probe in ancestor_denied}, ancestor_paths)
+        self.assertTrue({probe["ancestor"] for probe in ancestor_denied} == ancestor_paths, "ancestor structural-right matrix covers each parent")
         self.assertEqual({probe["right"] for probe in ancestor_denied}, retained_ancestor_names)
-        self.assertEqual(
-            {(probe["ancestor"], probe["right"]) for probe in ancestor_denied},
-            set(product(ancestor_paths, retained_ancestor_names)),
+        self.assertTrue(
+            {(probe["ancestor"], probe["right"]) for probe in ancestor_denied}
+            == set(product(ancestor_paths, retained_ancestor_names)),
+            "ancestor structural-right matrix is complete",
         )
         for probe in ancestor_denied:
-            with self.subTest(ci7_retained_ancestor=probe):
+            with self.subTest(ci7_retained_ancestor_index=ancestor_denied.index(probe)):
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
@@ -6724,7 +7174,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
 
         self.assertTrue(ci7["delete_chain_matrix"])
         for probe in ci7["delete_chain_matrix"]:
-            with self.subTest(ci7_delete_chain=probe):
+            with self.subTest(ci7_delete_chain_index=ci7["delete_chain_matrix"].index(probe)):
                 self.assertEqual(probe["right"], "0x00010000")
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
@@ -6732,7 +7182,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
                 self.assertTrue(probe["policy_consulted_fixture"])
         self.assertTrue(ci7["delete_child_parent_edge_matrix"])
         for probe in ci7["delete_child_parent_edge_matrix"]:
-            with self.subTest(ci7_delete_child_edge=probe):
+            with self.subTest(ci7_delete_child_edge_index=ci7["delete_child_parent_edge_matrix"].index(probe)):
                 self.assertEqual(probe["right"], "0x00000040")
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
@@ -6742,15 +7192,15 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(ci7["verify_after_upgrade"], "pass")
         self.assertEqual(ci7["empty_config_verify"], "pass")
         self.assertEqual(len(ci7["package_owner_sids"]), 7)
-        self.assertTrue(all(owner == "S-1-5-18" for owner in ci7["package_owner_sids"]))
-        self.assertIn(ci7["config_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
+        self.assertTrue(all(owner == "S-1-5-18" for owner in ci7["package_owner_sids"]), "package owner type")
+        self.assertTrue(ci7["config_owner_sid"] in {"S-1-5-18", "S-1-5-32-544"}, "config owner type")
         for key in ("missing_credential", "mismatched_credential", "invalid_password", "unsupported_account_profile", "native_access_failure", "handle_native_access_failure", "reparse_fail_closed", "reparse_ancestor_rejected", "reparse_leaf_rejected", "reparse_snapshot_ancestor_rejected", "reparse_snapshot_leaf_rejected", "config_subdirectory_rejected", "conflicting_handle_identity", "unsupported_unc_fail_closed"):
             with self.subTest(ci7=key):
                 self.assertEqual(ci7[key], "effective_rights_unproven")
         self.assertEqual(ci7["required_operation_denied"], "effective_rights_missing")
         for key in ("prohibited_write_dac_allow", "prohibited_write_owner_allow", "prohibited_delete_allow", "prohibited_delete_child_allow", "child_write_dac_allow", "child_write_owner_allow", "parent_delete_child_allow"):
             with self.subTest(ci7=key):
-                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertTrue(ci7[key]["requested_operation_granted"], "requested operation granted")
                 self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(len(ci7["positive_leaf_access_matrix"]), 8)
         self.assertTrue(all(probe["granted"] for probe in ci7["positive_leaf_access_matrix"]))
@@ -6759,17 +7209,17 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual({probe["leaf"] for probe in ci7["positive_leaf_access_matrix"] if probe["class"] == "package"}, set(INSTALLER_PACKAGE_FILES))
         self.assertEqual(len(ci7["leaf_denial_matrix"]), 56)
         for probe in ci7["leaf_denial_matrix"]:
-            with self.subTest(ci7_leaf=probe):
-                self.assertTrue(probe["requested_operation_granted"], probe)
+            with self.subTest(ci7_leaf_index=ci7["leaf_denial_matrix"].index(probe)):
+                self.assertTrue(probe["requested_operation_granted"], "leaf denial control grant observed")
                 self.assertEqual(probe["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(len(ci7["required_access_matrix"]), 14)
         for probe in ci7["required_access_matrix"]:
-            with self.subTest(ci7_required_access=probe):
-                self.assertTrue(probe["requested_operation_denied"], probe)
+            with self.subTest(ci7_required_access_index=ci7["required_access_matrix"].index(probe)):
+                self.assertTrue(probe["requested_operation_denied"], "required access negative control")
                 self.assertEqual(probe["effective_rights"], "effective_rights_missing")
         self.assertEqual(len(ci7["owner_denial_matrix"]), 16)
         for probe in ci7["owner_denial_matrix"]:
-            with self.subTest(ci7_owner=probe):
+            with self.subTest(ci7_owner_index=ci7["owner_denial_matrix"].index(probe)):
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
         self.assertEqual({probe["owner_kind"] for probe in ci7["owner_denial_matrix"]}, {"worker", "arbitrary_admin"})
         self.assertTrue(ci7["hidden_config_write_granted"])
@@ -6790,15 +7240,15 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(ci7["inherited_readonly_control"]["verifier"], "pass")
         for key in ("config_create_file", "config_create_directory", "install_create_file", "install_create_directory"):
             with self.subTest(ci7=key):
-                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertTrue(ci7[key]["requested_operation_granted"], "requested operation granted")
                 self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(len(ci7["held_leaf_matrix"]), 8)
         for probe in ci7["held_leaf_matrix"]:
-            with self.subTest(ci7_held_leaf=probe):
-                self.assertTrue(probe["rename_blocked"], probe)
-                self.assertTrue(probe["replace_blocked"], probe)
+            with self.subTest(ci7_held_leaf_index=ci7["held_leaf_matrix"].index(probe)):
+                self.assertTrue(probe["rename_blocked"], "held leaf rename blocked")
+                self.assertTrue(probe["replace_blocked"], "held leaf replacement blocked")
                 self.assertRegex(probe["identity_before"], r"^[0-9a-f]{8}:[0-9a-f]{16}$")
-                self.assertEqual(probe["identity_after"], probe["identity_before"])
+                self.assertTrue(probe["identity_after"] == probe["identity_before"], "held leaf identity unchanged")
         self.assertTrue(ci7["install_parent_delete_child_allow"]["requested_operation_granted"])
         self.assertEqual(ci7["install_parent_delete_child_allow"]["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(ci7["config_subdirectory_rejected"], "effective_rights_unproven")
