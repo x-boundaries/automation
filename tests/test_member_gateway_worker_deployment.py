@@ -4318,7 +4318,13 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
         positions = [child.index(f'$setupStage = "{stage}"') for stage in stages]
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("TOKEN_OPEN", child)
-        self.assertIn("[Management.Automation.PSCredential]::new($workerAccount, $securePassword)", child)
+        credential_stage_start = child.index('$setupStage = "CREDENTIAL_OBJECT"')
+        credential_stage_end = child.index('$setupStage = "ACCOUNT_SID_RESOLVE"', credential_stage_start)
+        credential_stage = child[credential_stage_start:credential_stage_end]
+        # The pre-split child at 7c440bd used this constructor under TOKEN_OPEN.
+        previous_child_assignment = "$credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)"
+        self.assertIn(previous_child_assignment, credential_stage)
+        self.assertNotIn("[Management.Automation.PSCredential]::new(", credential_stage)
         self.assertIn("Get-XbAccountSid -Account $workerAccount", child)
         self.assertIn(
             "[XbWorkerBatchToken]::OpenBatch($userName, $domain, $securePassword, $workerSid)",
@@ -5181,7 +5187,7 @@ try {
     $setupStage = "CREDENTIAL_RESTORE"
     $securePassword = ConvertTo-SecureString -String $encryptedPassword -ErrorAction Stop
     $setupStage = "CREDENTIAL_OBJECT"
-    $credential = [Management.Automation.PSCredential]::new($workerAccount, $securePassword)
+    $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
     $encryptedPassword = $null
     $Fixture.encrypted_password = $null
 
