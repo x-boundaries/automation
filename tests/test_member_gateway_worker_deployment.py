@@ -4056,12 +4056,28 @@ _CI7_CHILD_SETUP_STAGES = (
     "SOURCE_LOAD",
     "NATIVE_INIT",
     "CREDENTIAL_RESTORE",
-    "TOKEN_OPEN",
+    "CREDENTIAL_OBJECT",
+    "ACCOUNT_SID_RESOLVE",
+    "NATIVE_BATCH_OPEN",
+    "PRODUCT_TOKEN_HELPER",
     "PATH_CHAIN",
     "DRIVE_PROBE",
     "FROZEN_CONTROL",
     "RESULT_EMIT",
     "CLEANUP",
+)
+_CI7_NATIVE_REASONS = (
+    "NONE",
+    "LOGON_FAILURE",
+    "LOGON_TYPE_NOT_GRANTED",
+    "ACCOUNT_RESTRICTION",
+    "PASSWORD_EXPIRED",
+    "ACCOUNT_DISABLED",
+    "TOKEN_INFORMATION_UNPROVEN",
+    "TOKEN_PROFILE_UNPROVEN",
+    "TOKEN_USER_UNPROVEN",
+    "TOKEN_USER_MISMATCH",
+    "NATIVE_OTHER",
 )
 _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS = (15, 15, 15, 15, 3, 15, 15, 15)
 _CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS = 120
@@ -4128,6 +4144,8 @@ def _public_safe_hosted_failure_summary(report: object) -> str:
     )
     add_count(ci7, "frozen_control_child_exit_status", "child_exit_status", 255)
     add_enum(ci7, "frozen_control_child_setup_stage", "child_setup_stage", set(_CI7_CHILD_SETUP_STAGES))
+    add_enum(ci7, "frozen_control_child_native_reason", "native_reason", set(_CI7_NATIVE_REASONS))
+    add_bool(ci7, "parent_product_token_baseline", "parent_product_token_baseline")
     add_bool(ci7, "frozen_control_child_terminated", "process_terminated")
     add_bool(ci7, "frozen_control_child_stderr_present", "stderr_present")
     add_enum(ci7, "frozen_control_child_residue", "residue", {"none", "present", "unproven"})
@@ -4185,7 +4203,9 @@ class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
                         "fatal": private_values[7],
                         "frozen_control_child_status": "structured_failure",
                         "frozen_control_child_exit_status": 1,
-                        "frozen_control_child_setup_stage": "TOKEN_OPEN",
+                        "parent_product_token_baseline": True,
+                        "frozen_control_child_setup_stage": "NATIVE_BATCH_OPEN",
+                        "frozen_control_child_native_reason": "LOGON_TYPE_NOT_GRANTED",
                         "frozen_control_child_terminated": True,
                         "frozen_control_child_stderr_present": True,
                         "frozen_control_child_residue": "none",
@@ -4215,7 +4235,9 @@ class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
             "case_status=error",
             "frozen_child_status=structured_failure",
             "child_exit_status=1",
-            "child_setup_stage=TOKEN_OPEN",
+            "child_setup_stage=NATIVE_BATCH_OPEN",
+            "native_reason=LOGON_TYPE_NOT_GRANTED",
+            "parent_product_token_baseline=true",
             "process_terminated=true",
             "stderr_present=true",
             "residue=none",
@@ -4225,6 +4247,11 @@ class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
         ):
             if required not in summary:
                 raise AssertionError("public-safe hosted diagnostic omitted a bounded status field")
+        report["cases"]["install_then_uninstall"]["ci7"]["frozen_control_child_native_reason"] = private_values[7]
+        unmapped_summary = _public_safe_hosted_failure_summary(report)
+        if private_values[7] in unmapped_summary or "native_reason=" in unmapped_summary:
+            raise AssertionError("public-safe hosted diagnostic emitted an unmapped native reason")
+        report["cases"]["install_then_uninstall"]["ci7"]["frozen_control_child_native_reason"] = "LOGON_TYPE_NOT_GRANTED"
         if len(summary) > 1024:
             raise AssertionError("public-safe hosted diagnostic exceeded its output bound")
         diagnostic_case = MemberWorkerHostedTaskBoundaryTests("test_no_secret_exposure")
@@ -4278,6 +4305,55 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
         self.assertNotIn("Exception.Message", setup_failure_catch)
         self.assertNotIn("Exception.ToString", setup_failure_catch)
         self.assertNotIn("Write-Error", setup_failure_catch)
+
+    def test_token_substages_split_credential_resolution_and_native_open(self) -> None:
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        stages = (
+            "CREDENTIAL_OBJECT",
+            "ACCOUNT_SID_RESOLVE",
+            "NATIVE_BATCH_OPEN",
+            "PRODUCT_TOKEN_HELPER",
+            "PATH_CHAIN",
+        )
+        positions = [child.index(f'$setupStage = "{stage}"') for stage in stages]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("TOKEN_OPEN", child)
+        self.assertIn("[Management.Automation.PSCredential]::new($workerAccount, $securePassword)", child)
+        self.assertIn("Get-XbAccountSid -Account $workerAccount", child)
+        self.assertIn(
+            "[XbWorkerBatchToken]::OpenBatch($userName, $domain, $securePassword, $workerSid)",
+            child,
+        )
+        self.assertIn("$nativeProbeToken.Dispose()", child)
+        self.assertLess(child.index("$nativeProbeToken.Dispose()"), child.index('$setupStage = "PRODUCT_TOKEN_HELPER"'))
+        self.assertIn(
+            '$setupStage = "PRODUCT_TOKEN_HELPER"\n    $nativeToken = New-XbWorkerBatchToken -Credential $credential',
+            child,
+        )
+        mapper_start = child.index("# CI7_NATIVE_REASON_MAPPER_BEGIN")
+        mapper_end = child.index("# CI7_NATIVE_REASON_MAPPER_END", mapper_start)
+        mapper = child[mapper_start:mapper_end]
+        self.assertIn("NativeErrorCode", mapper)
+        self.assertIn("InnerException", mapper)
+        self.assertNotIn("ToString()", mapper)
+        self.assertNotIn("Write-Error", mapper)
+        self.assertNotIn("Write-Output", mapper)
+        for reason in _CI7_NATIVE_REASONS:
+            if reason != "NONE":
+                self.assertIn(f'return "{reason}"', mapper)
+
+        installer = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        helper = _installer_function(installer, "New-XbWorkerBatchToken").casefold()
+        child_folded = child.casefold()
+        for fragment in (
+            r"lastindexof('\')",
+            'if ($domain -ceq ".") { $domain = [environment]::machinename }',
+            'if ([string]$workeraccount -match \'@\') { throw "effective_rights_unproven" }',
+            "$domain = [environment]::machinename",
+        ):
+            with self.subTest(account_derivation=fragment):
+                self.assertIn(fragment, helper)
+                self.assertIn(fragment, child_folded)
 
     def test_child_runner_retains_distinct_bounded_result_statuses(self) -> None:
         runner = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild")
@@ -4446,6 +4522,70 @@ class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, "PowerShell child or hosted source did not parse")
         self.assertEqual(completed.stdout.strip(), "parse_pass")
 
+    def test_native_reason_mapping_uses_fixed_win32_codes_and_identifiers(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("native Windows PowerShell 5.1 is required for native reason mapping")
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        mapper_start = child.index("# CI7_NATIVE_REASON_MAPPER_BEGIN")
+        mapper_end = child.index("# CI7_NATIVE_REASON_MAPPER_END", mapper_start)
+        mapper = child[mapper_start:mapper_end]
+        script = (
+            '$ErrorActionPreference = "Stop"\n'
+            + mapper
+            + r'''
+$cases = @(
+    [pscustomobject]@{ expected = "LOGON_FAILURE"; exception = [System.ComponentModel.Win32Exception]::new(1326) },
+    [pscustomobject]@{ expected = "LOGON_TYPE_NOT_GRANTED"; exception = [System.Exception]::new("private-wrapper", [System.ComponentModel.Win32Exception]::new(1385)) },
+    [pscustomobject]@{ expected = "ACCOUNT_RESTRICTION"; exception = [System.ComponentModel.Win32Exception]::new(1327) },
+    [pscustomobject]@{ expected = "ACCOUNT_RESTRICTION"; exception = [System.ComponentModel.Win32Exception]::new(1328) },
+    [pscustomobject]@{ expected = "ACCOUNT_RESTRICTION"; exception = [System.ComponentModel.Win32Exception]::new(1329) },
+    [pscustomobject]@{ expected = "PASSWORD_EXPIRED"; exception = [System.ComponentModel.Win32Exception]::new(1330) },
+    [pscustomobject]@{ expected = "ACCOUNT_DISABLED"; exception = [System.ComponentModel.Win32Exception]::new(1331) },
+    [pscustomobject]@{ expected = "TOKEN_INFORMATION_UNPROVEN"; exception = [System.InvalidOperationException]::new("token_information_unproven") },
+    [pscustomobject]@{ expected = "TOKEN_PROFILE_UNPROVEN"; exception = [System.InvalidOperationException]::new("token_profile_unproven") },
+    [pscustomobject]@{ expected = "TOKEN_USER_UNPROVEN"; exception = [System.InvalidOperationException]::new("token_user_unproven") },
+    [pscustomobject]@{ expected = "TOKEN_USER_MISMATCH"; exception = [System.InvalidOperationException]::new("token_user_mismatch") },
+    [pscustomobject]@{ expected = "NATIVE_OTHER"; exception = [System.ComponentModel.Win32Exception]::new(987654) },
+    [pscustomobject]@{ expected = "NATIVE_OTHER"; exception = [System.InvalidOperationException]::new("private-exception-text-sentinel") }
+)
+$actual = @()
+foreach ($case in $cases) {
+    $reason = Get-XbCi7NativeReason -Exception $case.exception
+    if ($reason -cne $case.expected) { throw "native_reason_mapping_mismatch" }
+    $actual += [string]$reason
+}
+[Console]::Out.WriteLine(($actual | ConvertTo-Json -Compress))
+'''
+        )
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-native-reason-") as temp_dir:
+            temporary_root = Path(temp_dir)
+            _assert_temp_outside_checkout(ROOT, temporary_root)
+            script_path = temporary_root / "native_reason_mapping.ps1"
+            script_path.write_text(script, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertFalse(temporary_root.exists(), "native reason mapper left temporary state")
+        if completed.returncode != 0:
+            raise AssertionError("native reason mapping harness failed; output withheld")
+        try:
+            actual = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise AssertionError("native reason mapping harness emitted an invalid summary; output withheld") from None
+        expected = [
+            "LOGON_FAILURE", "LOGON_TYPE_NOT_GRANTED", "ACCOUNT_RESTRICTION", "ACCOUNT_RESTRICTION",
+            "ACCOUNT_RESTRICTION", "PASSWORD_EXPIRED", "ACCOUNT_DISABLED", "TOKEN_INFORMATION_UNPROVEN",
+            "TOKEN_PROFILE_UNPROVEN", "TOKEN_USER_UNPROVEN", "TOKEN_USER_MISMATCH", "NATIVE_OTHER", "NATIVE_OTHER",
+        ]
+        self.assertEqual(actual, expected, "native reason mapping did not remain closed and bounded")
+        self.assertNotIn("private-exception-text-sentinel", completed.stdout)
+
     def test_child_lifecycle_outer_budget_exceeds_bounded_inner_budget(self) -> None:
         self.assertGreater(
             _CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS,
@@ -4463,6 +4603,7 @@ class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
             "fixture_status": "completed",
             "outcome": "effective_rights_exceeded",
             "setup_stage": "RESULT_EMIT",
+            "native_reason": "NONE",
             "source_commit": CI7_DEFECTIVE_BASELINE_COMMIT,
             "source_blob": CI7_DEFECTIVE_INSTALLER_BLOB,
             "drive_root_index": 0,
@@ -4475,6 +4616,7 @@ class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
             "fixture_status": "failed",
             "outcome": "fixture_setup_failed",
             "setup_stage": "NATIVE_INIT",
+            "native_reason": None,
             "drive_root_index": -1,
             "drive_root_right": "",
             "drive_root_allowed": False,
@@ -4494,6 +4636,14 @@ $structuredFailureScript = @'
 [Console]::Error.WriteLine('private-stderr-sentinel')
 exit 1
 '@
+$unknownNativeReasonScript = @'
+[Console]::Out.WriteLine('__UNKNOWN_NATIVE_REASON_RESULT__')
+exit 1
+'@
+$malformedNativeReasonScript = @'
+[Console]::Out.WriteLine('__MALFORMED_NATIVE_REASON_RESULT__')
+exit 1
+'@
 $root = Split-Path -Parent $PSCommandPath
 $valid = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $validScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
 $validAssertion = $false
@@ -4508,6 +4658,8 @@ $wrongOutcomeRejected = $false
 try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $wrongOutcome -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
 catch { $wrongOutcomeRejected = ($_.Exception.Message -ceq "frozen_control_child_outcome_mismatch") }
 $structuredFailure = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $structuredFailureScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$unknownNativeReason = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $unknownNativeReasonScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$malformedNativeReason = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $malformedNativeReasonScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
 $structuredFailureRejected = $false
 try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $structuredFailure -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
 catch { $structuredFailureRejected = ($_.Exception.Message -ceq "frozen_control_child_setup_failed") }
@@ -4515,6 +4667,8 @@ $stderrSuccessScript = $validScript + "`n[Console]::Error.WriteLine('private-std
 $stderrSuccess = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $stderrSuccessScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
 $launchFailed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'unused' -Fixture @{} -TimeoutMilliseconds 0
 $structuredFailureJson = ConvertTo-Json -InputObject $structuredFailure -Depth 8 -Compress
+$unknownNativeReasonJson = ConvertTo-Json -InputObject $unknownNativeReason -Depth 8 -Compress
+$malformedNativeReasonJson = ConvertTo-Json -InputObject $malformedNativeReason -Depth 8 -Compress
 $summary = [ordered]@{
     valid = ($valid.status -ceq "completed" -and $valid.process_terminated -and $valid.residue -ceq "none" -and $validAssertion)
     malformed = ($malformed.status -ceq "malformed_output" -and $malformed.process_terminated -and $malformed.residue -ceq "none")
@@ -4527,6 +4681,9 @@ $summary = [ordered]@{
     structured_failure_stderr_present = [bool]$structuredFailure.stderr_present
     structured_failure_raw_withheld = (-not $structuredFailureJson.Contains("private-stderr-sentinel"))
     structured_failure_validator_rejected = $structuredFailureRejected
+    unknown_native_reason_rejected = ($unknownNativeReason.status -ceq "malformed_output" -and $null -eq $unknownNativeReason.child_result)
+    malformed_native_reason_rejected = ($malformedNativeReason.status -ceq "malformed_output" -and $null -eq $malformedNativeReason.child_result)
+    native_reason_raw_withheld = (-not $unknownNativeReasonJson.Contains("private-native-reason-sentinel") -and -not $malformedNativeReasonJson.Contains("1326"))
     stderr_success_rejected = ($stderrSuccess.status -ceq "malformed_output" -and $stderrSuccess.stderr_present -and $stderrSuccess.process_terminated -and $stderrSuccess.residue -ceq "none")
     launch_failed = ($launchFailed.status -ceq "launch_failed" -and $launchFailed.failure_stage -ceq "input" -and -not $launchFailed.process_terminated -and $launchFailed.residue -ceq "none")
     wrong_outcome_rejected = $wrongOutcomeRejected
@@ -4547,7 +4704,7 @@ $summary = [ordered]@{
         )
         if (
             _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS != expected_timeout_schedule
-            or script.count("__LONG_CHILD_TIMEOUT_MS__") != 7
+            or script.count("__LONG_CHILD_TIMEOUT_MS__") != 9
             or script.count("__SHORT_CHILD_TIMEOUT_MS__") != 1
         ):
             raise AssertionError("child lifecycle timeout schedule no longer matches its bounded budget")
@@ -4556,6 +4713,24 @@ $summary = [ordered]@{
             .replace("__RESULT_VALIDATOR__", validator)
             .replace("__VALID_RESULT__", json.dumps(valid_result, separators=(",", ":")))
             .replace("__STRUCTURED_FAILURE_RESULT__", json.dumps(structured_failure_result, separators=(",", ":")))
+            .replace(
+                "__UNKNOWN_NATIVE_REASON_RESULT__",
+                json.dumps(
+                    {
+                        **structured_failure_result,
+                        "setup_stage": "NATIVE_BATCH_OPEN",
+                        "native_reason": "private-native-reason-sentinel",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+            .replace(
+                "__MALFORMED_NATIVE_REASON_RESULT__",
+                json.dumps(
+                    {**structured_failure_result, "setup_stage": "NATIVE_BATCH_OPEN", "native_reason": 1326},
+                    separators=(",", ":"),
+                ),
+            )
             .replace("__LONG_CHILD_TIMEOUT_MS__", str(long_timeout_seconds * 1000))
             .replace("__SHORT_CHILD_TIMEOUT_MS__", str(short_timeout_seconds * 1000))
         )
@@ -4586,7 +4761,9 @@ $summary = [ordered]@{
         expected_summary_keys = {
             "valid", "malformed", "abnormal", "oversized", "timeout", "structured_failure",
             "structured_failure_stage", "structured_failure_stage_closed", "structured_failure_stderr_present",
-            "structured_failure_raw_withheld", "structured_failure_validator_rejected", "stderr_success_rejected",
+            "structured_failure_raw_withheld", "structured_failure_validator_rejected",
+            "unknown_native_reason_rejected", "malformed_native_reason_rejected", "native_reason_raw_withheld",
+            "stderr_success_rejected",
             "launch_failed", "wrong_outcome_rejected",
         }
         boolean_summary_keys = expected_summary_keys - {"structured_failure_stage"}
@@ -4607,6 +4784,9 @@ $summary = [ordered]@{
         self.assertEqual(result.get("structured_failure_stderr_present"), True, "structured child stderr presence was not reported")
         self.assertEqual(result.get("structured_failure_raw_withheld"), True, "structured child failure retained raw stderr")
         self.assertEqual(result.get("structured_failure_validator_rejected"), True, "structured setup failure was accepted as success")
+        self.assertEqual(result.get("unknown_native_reason_rejected"), True, "unknown native reason was not rejected")
+        self.assertEqual(result.get("malformed_native_reason_rejected"), True, "malformed native reason was not rejected")
+        self.assertEqual(result.get("native_reason_raw_withheld"), True, "untrusted native reason output was retained")
         self.assertEqual(result.get("stderr_success_rejected"), True, "successful child with stderr was accepted")
         self.assertEqual(result.get("wrong_outcome_rejected"), True, "unexpected fixture outcome was accepted")
 
@@ -4930,11 +5110,41 @@ Set-Item function:script:Remove-XbWorkerScheduledTask $originalUnregister
 _FROZEN_CI7_CHILD_SCRIPT = r'''param([Parameter(Mandatory)]$Fixture)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# CI7_NATIVE_REASON_MAPPER_BEGIN
+function Get-XbCi7NativeReason {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+    $current = $Exception
+    for ($depth = 0; $null -ne $current -and $depth -lt 8; $depth++) {
+        if ($current -is [System.ComponentModel.Win32Exception]) {
+            switch ([int]$current.NativeErrorCode) {
+                1326 { return "LOGON_FAILURE" }
+                1385 { return "LOGON_TYPE_NOT_GRANTED" }
+                1327 { return "ACCOUNT_RESTRICTION" }
+                1328 { return "ACCOUNT_RESTRICTION" }
+                1329 { return "ACCOUNT_RESTRICTION" }
+                1330 { return "PASSWORD_EXPIRED" }
+                1331 { return "ACCOUNT_DISABLED" }
+            }
+        }
+        if ($current -is [System.InvalidOperationException]) {
+            switch -CaseSensitive ([string]$current.Message) {
+                "token_information_unproven" { return "TOKEN_INFORMATION_UNPROVEN" }
+                "token_profile_unproven" { return "TOKEN_PROFILE_UNPROVEN" }
+                "token_user_unproven" { return "TOKEN_USER_UNPROVEN" }
+                "token_user_mismatch" { return "TOKEN_USER_MISMATCH" }
+            }
+        }
+        $current = $current.InnerException
+    }
+    return "NATIVE_OTHER"
+}
+# CI7_NATIVE_REASON_MAPPER_END
 $childResult = [ordered]@{
     schema_version = "xb.member.worker.ci7.frozen-control.v1"
     fixture_status = "failed"
     outcome = "fixture_setup_failed"
     setup_stage = "INPUT"
+    native_reason = $null
     source_commit = ""
     source_blob = ""
     drive_root_index = -1
@@ -4944,6 +5154,7 @@ $childResult = [ordered]@{
 }
 $securePassword = $null
 $nativeToken = $null
+$nativeProbeToken = $null
 $context = $null
 $setupStage = "INPUT"
 try {
@@ -4969,10 +5180,53 @@ try {
     Initialize-XbWorkerNativeAccess
     $setupStage = "CREDENTIAL_RESTORE"
     $securePassword = ConvertTo-SecureString -String $encryptedPassword -ErrorAction Stop
-    $setupStage = "TOKEN_OPEN"
-    $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
+    $setupStage = "CREDENTIAL_OBJECT"
+    $credential = [Management.Automation.PSCredential]::new($workerAccount, $securePassword)
     $encryptedPassword = $null
     $Fixture.encrypted_password = $null
+
+    $setupStage = "ACCOUNT_SID_RESOLVE"
+    $workerSid = Get-XbAccountSid -Account $workerAccount
+
+    $setupStage = "NATIVE_BATCH_OPEN"
+    try {
+        $separator = ([string]$workerAccount).LastIndexOf('\')
+        if ($separator -ge 0) {
+            $domain = ([string]$workerAccount).Substring(0, $separator)
+            $userName = ([string]$workerAccount).Substring($separator + 1)
+            if ($domain -ceq ".") { $domain = [Environment]::MachineName }
+        }
+        else {
+            if ([string]$workerAccount -match '@') { throw "effective_rights_unproven" }
+            $domain = [Environment]::MachineName
+            $userName = [string]$workerAccount
+        }
+        if ([string]::IsNullOrWhiteSpace($userName) -or [string]::IsNullOrWhiteSpace($domain)) {
+            throw "effective_rights_unproven"
+        }
+        $nativeProbeToken = [XbWorkerBatchToken]::OpenBatch($userName, $domain, $securePassword, $workerSid)
+        if ($null -eq $nativeProbeToken) { throw "token_open_result_unproven" }
+        $childResult.native_reason = "NONE"
+    } catch {
+        try { $childResult.native_reason = Get-XbCi7NativeReason -Exception $_.Exception }
+        catch { $childResult.native_reason = "NATIVE_OTHER" }
+        throw "fixture_native_batch_open_failed"
+    } finally {
+        if ($null -ne $nativeProbeToken) {
+            try {
+                $nativeProbeToken.Dispose()
+                $nativeProbeToken = $null
+            } catch {
+                $childResult.native_reason = "NATIVE_OTHER"
+                throw "fixture_native_probe_dispose_failed"
+            }
+        }
+    }
+    $workerSid = $null
+    $domain = $null
+    $userName = $null
+
+    $setupStage = "PRODUCT_TOKEN_HELPER"
     $nativeToken = New-XbWorkerBatchToken -Credential $credential
 
     $setupStage = "PATH_CHAIN"
@@ -5027,6 +5281,7 @@ try {
         try { Dispose-XbCi7VerificationContext -Context $context } catch { $cleanupFailed = $true }
     }
     if ($null -ne $nativeToken) { try { $nativeToken.Dispose() } catch { $cleanupFailed = $true } }
+    if ($null -ne $nativeProbeToken) { try { $nativeProbeToken.Dispose() } catch { $cleanupFailed = $true } }
     if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { $cleanupFailed = $true } }
     $credential = $null
     $Fixture = $null
@@ -5385,14 +5640,34 @@ public sealed class XbCi7BoundedTextCapture
                         $actualFields = @($child.PSObject.Properties | ForEach-Object Name | Sort-Object)
                         $expectedFields = @(
                             "drive_root_allowed", "drive_root_granted_access", "drive_root_index",
-                            "drive_root_right", "fixture_status", "outcome", "schema_version",
+                            "drive_root_right", "fixture_status", "native_reason", "outcome", "schema_version",
                             "setup_stage", "source_blob", "source_commit"
                         )
+                        $nativeReasonValues = @(
+                            "NONE", "LOGON_FAILURE", "LOGON_TYPE_NOT_GRANTED", "ACCOUNT_RESTRICTION",
+                            "PASSWORD_EXPIRED", "ACCOUNT_DISABLED", "TOKEN_INFORMATION_UNPROVEN",
+                            "TOKEN_PROFILE_UNPROVEN", "TOKEN_USER_UNPROVEN", "TOKEN_USER_MISMATCH", "NATIVE_OTHER"
+                        )
+                        $nativeReasonValid = $null -eq $child.native_reason -or (
+                            $child.native_reason -is [string] -and $nativeReasonValues -ccontains $child.native_reason
+                        )
+                        if ($child.setup_stage -ceq "NATIVE_BATCH_OPEN") {
+                            $nativeReasonStageValid = $nativeReasonValid -and
+                                $child.native_reason -is [string] -and $child.native_reason -cne "NONE"
+                        } elseif ($child.setup_stage -cin @(
+                            "PRODUCT_TOKEN_HELPER", "PATH_CHAIN", "DRIVE_PROBE", "FROZEN_CONTROL", "RESULT_EMIT", "CLEANUP"
+                        )) {
+                            $nativeReasonStageValid = $child.native_reason -ceq "NONE"
+                        } else {
+                            $nativeReasonStageValid = $null -eq $child.native_reason
+                        }
                         if (($actualFields -join "|") -cne ($expectedFields -join "|") -or
+                            -not $nativeReasonValid -or -not $nativeReasonStageValid -or
                             $child.schema_version -cne "xb.member.worker.ci7.frozen-control.v1" -or
                             $child.fixture_status -cnotin @("completed", "failed") -or
                             $child.setup_stage -cnotin @(
-                                "INPUT", "SOURCE_LOAD", "NATIVE_INIT", "CREDENTIAL_RESTORE", "TOKEN_OPEN",
+                                "INPUT", "SOURCE_LOAD", "NATIVE_INIT", "CREDENTIAL_RESTORE",
+                                "CREDENTIAL_OBJECT", "ACCOUNT_SID_RESOLVE", "NATIVE_BATCH_OPEN", "PRODUCT_TOKEN_HELPER",
                                 "PATH_CHAIN", "DRIVE_PROBE", "FROZEN_CONTROL", "RESULT_EMIT", "CLEANUP"
                             ) -or
                             $child.outcome -cnotin @(
@@ -5421,6 +5696,7 @@ public sealed class XbCi7BoundedTextCapture
                                 fixture_status = [string]$child.fixture_status
                                 outcome = [string]$child.outcome
                                 setup_stage = [string]$child.setup_stage
+                                native_reason = $child.native_reason
                                 source_commit = [string]$child.source_commit
                                 source_blob = [string]$child.source_blob
                                 drive_root_index = [int]$child.drive_root_index
@@ -5437,6 +5713,7 @@ public sealed class XbCi7BoundedTextCapture
                                 fixture_status = [string]$child.fixture_status
                                 outcome = [string]$child.outcome
                                 setup_stage = [string]$child.setup_stage
+                                native_reason = $child.native_reason
                                 source_commit = [string]$child.source_commit
                                 source_blob = [string]$child.source_blob
                                 drive_root_index = [int]$child.drive_root_index
@@ -6325,7 +6602,9 @@ public static class XbCi7FailureCleanupProbe
             $ci7.root_owner_accepted = ($ci7.root_owner_sid -in @("S-1-5-18", "S-1-5-32-544"))
             $ci7.root_dacl_protected = [bool]$logsRootAcl.AreAccessRulesProtected
             $ci7.root_acl_shape = Get-XbBoundaryOutcome { Assert-XbLogsRootAclShape -Path $logsPath -WorkerSid $workerSid }
+            $ci7.parent_product_token_baseline = $false
             $nativeToken = New-XbWorkerBatchToken -Credential $credential
+            $ci7.parent_product_token_baseline = $true
             $ci7.token_user_sid = [string]$nativeToken.UserSid
             $ci7.token_type = [int]$nativeToken.TokenType
             $ci7.token_impersonation_level = [int]$nativeToken.ImpersonationLevel
@@ -6418,11 +6697,13 @@ public static class XbCi7FailureCleanupProbe
                 $ci7.frozen_control_child_residue = [string]$frozenChildRun.residue
                 $ci7.frozen_control_child_stderr_present = [bool]$frozenChildRun.stderr_present
                 $ci7.frozen_control_child_setup_stage = $null
+                $ci7.frozen_control_child_native_reason = $null
                 $ci7.frozen_control_parent_function_replaced = -not [object]::ReferenceEquals(
                     $candidateContextBefore, ${function:script:Open-XbCi7VerificationContext}
                 )
                 if ($null -ne $frozenChildRun.child_result) {
                     $ci7.frozen_control_child_setup_stage = [string]$frozenChildRun.child_result.setup_stage
+                    $ci7.frozen_control_child_native_reason = $frozenChildRun.child_result.native_reason
                     $ci7.frozen_defective_context_outcome = [string]$frozenChildRun.child_result.outcome
                     $ci7.frozen_control_child_source_commit = [string]$frozenChildRun.child_result.source_commit
                     $ci7.frozen_control_child_installer_blob = [string]$frozenChildRun.child_result.source_blob
