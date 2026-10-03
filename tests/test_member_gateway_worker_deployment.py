@@ -44,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "ac82b1f4e05eac9a6e08a7e124ff9d9b6dab12a0",
+    "scripts/install_ac2_member_gateway_worker.ps1": "de99933e6dbc91e084d9576130a068f9348dcdef",
     "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
     "scripts/ac2_member_gateway_worker_lib.ps1": "8293559ec6308a8d9afdf73fd4c8b0af322ae382",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
@@ -4122,6 +4122,35 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
                     _installer_function(baseline_source, function_name),
                 )
 
+    def test_context_construction_failure_disposes_every_object_in_reverse_order(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        context = _installer_function(source, "Open-XbCi7VerificationContext")
+        self.assertNotIn("[-1..0]", context)
+        self.assertIn("$items = @($objects.ToArray())", context)
+        self.assertIn("for ($index = $items.Count - 1; $index -ge 0; $index--)", context)
+        self.assertEqual(context.count("$items[$index].Dispose()"), 1)
+        self.assertIn("try { $items[$index].Dispose() } catch { }", context)
+        self.assertIn("$reason = [string]$_.Exception.Message", context)
+        self.assertIn('if ($reason -in @("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven"', context)
+
+        harness = _HOSTED_TASK_BOUNDARY_HARNESS
+        denial = harness.index('$ci7.required_operation_denied = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }')
+        owner_probe = harness.index('$ci7.failure_cleanup_lock_owner_count = [int][XbCi7FailureCleanupProbe]::GetOwnerCount', denial)
+        delete_probe = harness.index('$ci7.failure_cleanup_exclusive_delete_succeeded = [bool][XbCi7FailureCleanupProbe]::ProbeExclusiveDelete', owner_probe)
+        self.assertLess(denial, owner_probe)
+        self.assertLess(owner_probe, delete_probe)
+        for marker in (
+            '$script:failureCleanupPrimitiveLeafOpened = $false',
+            '$script:failureCleanupPrimitiveLeafOpened = $true',
+            '$record = & $script:failureCleanupOriginalAddProtectedLeaf @PSBoundParameters',
+            '$ci7.failure_cleanup_primitive_leaf_opened = [bool]$script:failureCleanupPrimitiveLeafOpened',
+            '$ci7.failure_cleanup_owner_enumeration_completed = [bool]$ownerEnumerationCompleted',
+            '$ci7.failure_cleanup_current_harness_owner = [bool]$currentHarnessOwnsPrimitive',
+            '$ci7.failure_cleanup_exclusive_delete_completed = [bool]$exclusiveDeleteCompleted',
+        ):
+            with self.subTest(boundary_regression=marker):
+                self.assertIn(marker, harness)
+
 
 _LOCAL_TASK_CONTRACT_HARNESS = r'''[CmdletBinding()]
 param(
@@ -4912,6 +4941,101 @@ try {
     $state.lsa_loaded = $true
 
     . $InstallerPath -LibraryOnly
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public static class XbCi7FailureCleanupProbe
+{
+    private const int ErrorMoreData = 234;
+    private const uint MaximumOwnerCount = 32;
+    private const uint DeleteAccess = 0x00010000;
+    private const uint OpenExisting = 3;
+    private const uint FileAttributeNormal = 0x00000080;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RmFileTime { public uint LowDateTime; public uint HighDateTime; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RmUniqueProcess { public int ProcessId; public RmFileTime ProcessStartTime; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct RmProcessInfo
+    {
+        public RmUniqueProcess Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ApplicationName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string ServiceShortName;
+        public uint ApplicationType;
+        public uint ApplicationStatus;
+        public uint SessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint sessionHandle, uint sessionFlags, StringBuilder sessionKey);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(
+        uint sessionHandle, uint fileCount,
+        [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr)] string[] fileNames,
+        uint applicationCount, IntPtr applications, uint serviceCount, IntPtr services);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmGetList(
+        uint sessionHandle, out uint processInfoNeeded, ref uint processInfoCount,
+        [In, Out, MarshalAs(UnmanagedType.LPArray)] RmProcessInfo[] affectedApplications,
+        out uint rebootReasons);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmEndSession(uint sessionHandle);
+
+    public static int GetOwnerCount(string path, int currentProcessId, out bool completed, out bool currentProcessOwns)
+    {
+        completed = false;
+        currentProcessOwns = false;
+        uint sessionHandle;
+        StringBuilder sessionKey = new StringBuilder(33);
+        if (RmStartSession(out sessionHandle, 0, sessionKey) != 0) return 0;
+        try
+        {
+            if (RmRegisterResources(sessionHandle, 1, new string[] { path }, 0, IntPtr.Zero, 0, IntPtr.Zero) != 0) return 0;
+            uint needed;
+            uint count = 0;
+            uint rebootReasons;
+            int status = RmGetList(sessionHandle, out needed, ref count, null, out rebootReasons);
+            if (status == 0)
+            {
+                completed = true;
+                return 0;
+            }
+            if (status != ErrorMoreData || needed > MaximumOwnerCount) return 0;
+            RmProcessInfo[] processes = new RmProcessInfo[(int)needed];
+            count = needed;
+            status = RmGetList(sessionHandle, out needed, ref count, processes, out rebootReasons);
+            if (status != 0 || count > MaximumOwnerCount) return 0;
+            for (int index = 0; index < (int)count; index++)
+            {
+                if (processes[index].Process.ProcessId == currentProcessId) currentProcessOwns = true;
+            }
+            completed = true;
+            return (int)count;
+        }
+        finally { RmEndSession(sessionHandle); }
+    }
+
+    public static bool ProbeExclusiveDelete(string path, out bool completed)
+    {
+        completed = false;
+        using (SafeFileHandle handle = CreateFile(
+            path, DeleteAccess, 0, IntPtr.Zero, OpenExisting, FileAttributeNormal, IntPtr.Zero))
+        {
+            completed = true;
+            return handle != null && !handle.IsInvalid;
+        }
+    }
+}
+'@ -Language CSharp
     $productionTaskPath = $taskPath
     $productionTaskName = $taskName
     $programFilesParent = Split-Path -Parent $InstallRoot
@@ -5552,12 +5676,41 @@ try {
             $configPath = Join-Path $RuntimeRoot "config"
             $denyRead = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ReadData, [Security.AccessControl.AccessControlType]::Deny)
             $originalConfigAcl = Get-Acl -LiteralPath $configPath
+            $primitivePath = Join-Path $InstallRoot "ac2_member_create_primitive.ps1"
+            $script:failureCleanupPrimitiveLeafOpened = $false
+            $originalAddProtectedLeaf = ${function:Add-XbCi7ProtectedLeaf}
+            $script:failureCleanupOriginalAddProtectedLeaf = $originalAddProtectedLeaf
             try {
+                Set-Item function:script:Add-XbCi7ProtectedLeaf {
+                    param([string]$Path, [uint32]$AllowedMask, [uint32]$RequiredMask, $Token, [System.Collections.Generic.List[object]]$Objects)
+                    $record = & $script:failureCleanupOriginalAddProtectedLeaf @PSBoundParameters
+                    if ([IO.Path]::GetFileName($Path) -ceq "ac2_member_create_primitive.ps1") { $script:failureCleanupPrimitiveLeafOpened = $true }
+                    return $record
+                }
                 $deniedConfigAcl = Get-Acl -LiteralPath $configPath
                 $deniedConfigAcl.AddAccessRule($denyRead)
                 Set-Acl -LiteralPath $configPath -AclObject $deniedConfigAcl -ErrorAction Stop
                 $ci7.required_operation_denied = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
-            } finally { Set-Acl -LiteralPath $configPath -AclObject $originalConfigAcl -ErrorAction Stop }
+                Set-Item function:script:Add-XbCi7ProtectedLeaf $originalAddProtectedLeaf
+                $ci7.failure_cleanup_primitive_leaf_opened = [bool]$script:failureCleanupPrimitiveLeafOpened
+                $ownerEnumerationCompleted = $false
+                $currentHarnessOwnsPrimitive = $false
+                $ci7.failure_cleanup_lock_owner_count = [int][XbCi7FailureCleanupProbe]::GetOwnerCount($primitivePath, [int]$PID, [ref]$ownerEnumerationCompleted, [ref]$currentHarnessOwnsPrimitive)
+                $ci7.failure_cleanup_owner_enumeration_completed = [bool]$ownerEnumerationCompleted
+                $ci7.failure_cleanup_current_harness_owner = [bool]$currentHarnessOwnsPrimitive
+                $exclusiveDeleteCompleted = $false
+                $ci7.failure_cleanup_exclusive_delete_succeeded = [bool][XbCi7FailureCleanupProbe]::ProbeExclusiveDelete($primitivePath, [ref]$exclusiveDeleteCompleted)
+                $ci7.failure_cleanup_exclusive_delete_completed = [bool]$exclusiveDeleteCompleted
+            } finally {
+                try { Set-Item function:script:Add-XbCi7ProtectedLeaf $originalAddProtectedLeaf }
+                finally {
+                    try { Set-Acl -LiteralPath $configPath -AclObject $originalConfigAcl -ErrorAction Stop }
+                    finally {
+                        Remove-Variable -Name failureCleanupPrimitiveLeafOpened -Scope Script -ErrorAction SilentlyContinue
+                        Remove-Variable -Name failureCleanupOriginalAddProtectedLeaf -Scope Script -ErrorAction SilentlyContinue
+                    }
+                }
+            }
 
             $ci7.prohibited_write_dac_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
             $ci7.prohibited_write_owner_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
@@ -6594,6 +6747,16 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             },
         )
         self._assert_pristine(case["post_cleanup"])
+
+    def test_required_operation_failure_releases_primitive_package_handle(self) -> None:
+        ci7 = self._case("install_then_uninstall")["ci7"]
+        self.assertEqual(ci7["required_operation_denied"], "effective_rights_missing")
+        self.assertTrue(ci7["failure_cleanup_primitive_leaf_opened"])
+        self.assertTrue(ci7["failure_cleanup_owner_enumeration_completed"])
+        self.assertEqual(ci7["failure_cleanup_lock_owner_count"], 0)
+        self.assertFalse(ci7["failure_cleanup_current_harness_owner"])
+        self.assertTrue(ci7["failure_cleanup_exclusive_delete_completed"])
+        self.assertTrue(ci7["failure_cleanup_exclusive_delete_succeeded"])
 
     def test_install_then_uninstall(self) -> None:
         self.assertTrue(self.report["account"]["batch_logon_right_assigned"])

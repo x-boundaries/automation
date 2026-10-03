@@ -1648,8 +1648,11 @@ function Open-XbCi7VerificationContext {
         }
     }
     catch {
-        foreach ($object in @($objects.ToArray())[-1..0]) { try { $object.Dispose() } catch { } }
         $reason = [string]$_.Exception.Message
+        $items = @($objects.ToArray())
+        for ($index = $items.Count - 1; $index -ge 0; $index--) {
+            try { $items[$index].Dispose() } catch { }
+        }
         if ($reason -in @("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven", "installation_owned_surface_unknown", "installation_manifest_invalid", "installation_manifest_membership_invalid", "installation_manifest_path_invalid", "installation_manifest_task_invalid", "installation_runtime_roots_invalid", "release_identity_mismatch")) { throw $reason }
         throw "effective_rights_unproven"
     }
