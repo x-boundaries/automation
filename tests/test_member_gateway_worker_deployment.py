@@ -4800,6 +4800,7 @@ function Get-XbPrimitiveLockOwnerDiagnostic {
         owner_enumeration_completed = $false
         owner_process_mapping_completed = $false
         lock_owner_count = $null
+        current_harness_owns_primitive = $false
         lock_owners = @()
         scheduled_task_state_observed = $false
         scheduled_task_running = $null
@@ -4834,6 +4835,7 @@ function Get-XbPrimitiveLockOwnerDiagnostic {
             $mappingCompleted = $true
             foreach ($owner in @($restartManagerOwners)) {
                 $ownerPid = [int]$owner.ProcessId
+                if ($ownerPid -eq $PID) { $diagnostic.current_harness_owns_primitive = $true }
                 $process = Get-Process -Id $ownerPid -ErrorAction Stop
                 $processStartTime = ([datetime]$process.StartTime).ToUniversalTime().ToFileTimeUtc()
                 if ([long]$processStartTime -ne [long]$owner.StartTimeFileTimeUtc) {
@@ -4886,6 +4888,38 @@ function Get-XbPrimitiveLockOwnerDiagnostic {
     } catch { }
 
     return $diagnostic
+}
+
+function ConvertTo-XbPrimitiveLockCheckpoint {
+    param(
+        [Parameter(Mandatory)][ValidateSet("CP1", "CP2", "CP3", "CP4", "CP5", "CP6", "CP7", "CP8", "CP9", "CP10")][string]$Checkpoint,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Diagnostic
+    )
+    $ownerCount = $Diagnostic.lock_owner_count
+    return [ordered]@{
+        checkpoint = $Checkpoint
+        owner_enumeration_completed = [bool]$Diagnostic.owner_enumeration_completed
+        lock_owner_count = $(if ($null -eq $ownerCount) { $null } else { [int]$ownerCount })
+        current_harness_owns_primitive = [bool]$Diagnostic.current_harness_owns_primitive
+        delete_access_probe_completed = [bool]$Diagnostic.delete_access_probe_completed
+        delete_access_probe_succeeded = [bool]$Diagnostic.delete_access_probe_succeeded
+    }
+}
+
+function Get-XbPrimitiveLockCheckpoint {
+    param(
+        [Parameter(Mandatory)][ValidateSet("CP1", "CP2", "CP3", "CP4", "CP5", "CP6", "CP7", "CP8", "CP9", "CP10")][string]$Checkpoint,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$WorkerAccount,
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][string]$TaskName
+    )
+    $diagnostic = Get-XbPrimitiveLockOwnerDiagnostic `
+        -Path $Path `
+        -WorkerAccount $WorkerAccount `
+        -TaskPath $TaskPath `
+        -TaskName $TaskName
+    return ConvertTo-XbPrimitiveLockCheckpoint -Checkpoint $Checkpoint -Diagnostic $diagnostic
 }
 
 function Get-XbTaskEvidence {
@@ -5483,13 +5517,22 @@ try {
         $ci7 = [ordered]@{
             fatal = $null
             required_probe_completion = [ordered]@{ status = "in_progress" }
+            lock_checkpoints = @()
         }
         $case.ci7 = $ci7
+        $lockCheckpointParameters = @{
+            Path = (Join-Path $InstallRoot "ac2_member_create_primitive.ps1")
+            WorkerAccount = $qualifiedAccount
+            TaskPath = $taskPath
+            TaskName = $taskName
+        }
         $case.synthetic_config_snapshot = [ordered]@{}
         Set-XbProductionTaskIdentity
         $script:TaskCredential = $credential
         $trace.Clear()
         $case.install_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $lockCheckpointParameters.Checkpoint = "CP1"
+        $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
         $case.installed = Get-XbProductionReadback
         Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "install_task_presence"
         $case.contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) }
@@ -5589,6 +5632,8 @@ try {
                 $ci7.verify_release_sha256 = [string]$verification.release_sha256
                 $ci7.verify_checks = $verification.checks
             } catch { $ci7.verify_outcome = [string]$_.Exception.Message }
+            $lockCheckpointParameters.Checkpoint = "CP2"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
 
             $installChain = [string[]](Get-XbNativePathChain -Path $InstallRoot)
             if ($installChain.Count -lt 1) { throw "ci7_install_chain_missing" }
@@ -5628,6 +5673,8 @@ try {
                 $ci7.drive_root_descriptor_unchanged = ([string]$driveRootAfter.SecurityDescriptorSha256 -ceq $driveRootDescriptorBefore)
                 $ci7.drive_root_identity_unchanged = ([string]$driveRootAfter.FileIdentity -ceq $driveRootIdentityBefore)
             } finally { $driveRootAfter.Dispose() }
+            $lockCheckpointParameters.Checkpoint = "CP3"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
 
             $scopeOutRights = @(
                 @{ name = "file_add_file"; mask = [uint32]0x00000002 },
@@ -5661,6 +5708,8 @@ try {
                     }
                 }
             }
+            $lockCheckpointParameters.Checkpoint = "CP4"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
 
             $ancestorPathByKey = @{}
             foreach ($protectedRoot in $exactProtectedRoots) {
@@ -5707,6 +5756,8 @@ try {
                     }
                 }
             }
+            $lockCheckpointParameters.Checkpoint = "CP5"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
 
             $deletionContext = $null
             try {
@@ -5755,6 +5806,8 @@ try {
                     }
                 }
             } finally { Dispose-XbCi7VerificationContext -Context $deletionContext }
+            $lockCheckpointParameters.Checkpoint = "CP6"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
 
             $reviewedIdentity = Read-XbReviewedPackageIdentity -Path $ReviewedManifestPath -PackageRoot (Split-Path -Parent $InstallerPath)
             $upgrade = $null
@@ -5767,6 +5820,8 @@ try {
                 if (Test-Path -LiteralPath $upgradeSnapshot) { Remove-Item -LiteralPath $upgradeSnapshot -Recurse -Force -ErrorAction Stop }
             }
             $ci7.verify_after_upgrade = Get-XbBoundaryOutcome { Invoke-XbInstallVerifier -TaskCredential $credential }
+            $lockCheckpointParameters.Checkpoint = "CP7"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
             $configContent = [IO.File]::ReadAllText($configFile)
             Remove-Item -LiteralPath $configFile -Force -ErrorAction Stop
             $ci7.empty_config_verify = Get-XbBoundaryOutcome { Invoke-XbInstallVerifier -TaskCredential $credential }
@@ -6015,6 +6070,8 @@ try {
                 }
                 $ci7.held_leaf_matrix += [ordered]@{ class = $target.Class; leaf = $target.Name; rename_blocked = $renameBlocked; replace_blocked = $replaceBlocked; identity_before = $identityBefore; identity_after = $identityAfter }
             }
+            $lockCheckpointParameters.Checkpoint = "CP8"
+            $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
 
             $configBackupPath = Join-Path (Split-Path -Parent $configPath) "config-ci7-original"
             Move-Item -LiteralPath $configPath -Destination $configBackupPath -ErrorAction Stop
@@ -6069,6 +6126,8 @@ try {
                 try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop } catch { $ci7.cleanup_error = [string]$_.Exception.Message }
             }
         }
+        $lockCheckpointParameters.Checkpoint = "CP9"
+        $ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters
         $case.synthetic_config_teardown = [ordered]@{}
         $configTeardown = $case.synthetic_config_teardown
         $expectedConfigFile = [IO.Path]::GetFullPath((Join-Path (Join-Path $RuntimeRoot "config") "worker.config.json"))
@@ -6129,6 +6188,7 @@ try {
             -WorkerAccount $qualifiedAccount `
             -TaskPath $taskPath `
             -TaskName $taskName
+        $ci7.lock_checkpoints += ConvertTo-XbPrimitiveLockCheckpoint -Checkpoint "CP10" -Diagnostic $case.primitive_lock_diagnostic
         $script:Operation = "Uninstall"
         $case.uninstall_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
         $case.uninstalled = Get-XbProductionReadback
@@ -6424,10 +6484,50 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         self.assertLess(diagnostic.index("Get-ScheduledTask"), diagnostic.index("ProbeDeleteAccess"))
         self.assertLess(diagnostic.index("GetOwners"), diagnostic.index("ProbeDeleteAccess"))
         self.assertLess(diagnostic.index("ProbeDeleteAccess"), diagnostic.index("return $diagnostic"))
+        checkpoint_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Get-XbPrimitiveLockCheckpoint")
+        checkpoint_converter = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "ConvertTo-XbPrimitiveLockCheckpoint")
+        self.assertLess(checkpoint_helper.index("Get-XbPrimitiveLockOwnerDiagnostic"), checkpoint_helper.index("ConvertTo-XbPrimitiveLockCheckpoint"))
+        for checkpoint_field in (
+            "checkpoint",
+            "owner_enumeration_completed",
+            "lock_owner_count",
+            "current_harness_owns_primitive",
+            "delete_access_probe_completed",
+            "delete_access_probe_succeeded",
+        ):
+            with self.subTest(checkpoint_field=checkpoint_field):
+                self.assertIn(checkpoint_field, checkpoint_converter)
+        self.assertIn("$diagnostic.current_harness_owns_primitive = $true", diagnostic)
+        self.assertEqual(case_source.count("$ci7.lock_checkpoints += Get-XbPrimitiveLockCheckpoint @lockCheckpointParameters"), 9)
+        checkpoint_positions = {
+            checkpoint: case_source.index(f'$lockCheckpointParameters.Checkpoint = "{checkpoint}"')
+            for checkpoint in (f"CP{index}" for index in range(1, 10))
+        }
+        self.assertEqual(list(checkpoint_positions), [f"CP{index}" for index in range(1, 10)])
+        for previous, following in zip(list(checkpoint_positions.values()), list(checkpoint_positions.values())[1:]):
+            self.assertLess(previous, following)
+        self.assertLess(case_source.index("$case.install_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }"), checkpoint_positions["CP1"])
+        self.assertLess(checkpoint_positions["CP1"], case_source.index("$case.installed = Get-XbProductionReadback"))
+        self.assertLess(checkpoint_positions["CP2"], case_source.index("$installChain = [string[]](Get-XbNativePathChain -Path $InstallRoot)"))
+        self.assertLess(case_source.index("$driveRootAfter.Dispose()"), checkpoint_positions["CP3"])
+        self.assertLess(case_source.index("$ci7.exact_root_mutation_matrix +="), checkpoint_positions["CP4"])
+        self.assertLess(checkpoint_positions["CP4"], case_source.index("$ancestorPathByKey = @{}"))
+        self.assertLess(case_source.index("$ci7.ancestor_denied_right_matrix +="), checkpoint_positions["CP5"])
+        self.assertLess(checkpoint_positions["CP5"], case_source.index("$deletionContext = $null"))
+        self.assertLess(case_source.index("Dispose-XbCi7VerificationContext -Context $deletionContext"), checkpoint_positions["CP6"])
+        self.assertLess(case_source.index("$ci7.verify_after_upgrade = Get-XbBoundaryOutcome"), checkpoint_positions["CP7"])
+        self.assertLess(case_source.index("$ci7.held_leaf_matrix +="), checkpoint_positions["CP8"])
+        self.assertLess(checkpoint_positions["CP8"], case_source.index("$configBackupPath = Join-Path"))
+        self.assertLess(case_source.index("$nativeToken.Dispose()"), checkpoint_positions["CP9"])
+        self.assertLess(checkpoint_positions["CP9"], case_source.index("$case.synthetic_config_teardown ="))
+        checkpoint_10 = case_source.index('$ci7.lock_checkpoints += ConvertTo-XbPrimitiveLockCheckpoint -Checkpoint "CP10"')
+        self.assertLess(diagnostic_call, checkpoint_10)
+        self.assertLess(checkpoint_10, case_source.index('$script:Operation = "Uninstall"'))
         python_source = Path(__file__).read_text(encoding="utf-8")
         unsafe_log_expression = "print(" + "json.dumps(report"
         self.assertNotIn(unsafe_log_expression, python_source)
         self.assertIn('"primitive_filename": "ac2_member_create_primitive.ps1"', python_source)
+        self.assertIn('"ci7_lock_checkpoints": safe_checkpoints', python_source)
 
 
 class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
@@ -6784,6 +6884,25 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             uninstall_readback_pristine = not any(uninstall_readback[key] for key in pristine_keys) and uninstall_readback.get("new_stage_count") == 0
         ci7 = case.get("ci7", {}) if isinstance(case, dict) else {}
         required_probes = ci7.get("required_probe_completion", {}) if isinstance(ci7, dict) else {}
+        raw_checkpoints = ci7.get("lock_checkpoints", []) if isinstance(ci7, dict) else []
+        safe_checkpoints = []
+        allowed_checkpoint_ids = {f"CP{index}" for index in range(1, 11)}
+        if isinstance(raw_checkpoints, list):
+            for checkpoint in raw_checkpoints[:10]:
+                if not isinstance(checkpoint, dict):
+                    continue
+                checkpoint_id = checkpoint.get("checkpoint")
+                if checkpoint_id not in allowed_checkpoint_ids:
+                    continue
+                owner_count = checkpoint.get("lock_owner_count")
+                safe_checkpoints.append({
+                    "checkpoint": checkpoint_id,
+                    "owner_enumeration_completed": checkpoint.get("owner_enumeration_completed") if type(checkpoint.get("owner_enumeration_completed")) is bool else None,
+                    "lock_owner_count": owner_count if type(owner_count) is int and 0 <= owner_count <= 32 else None,
+                    "current_harness_owns_primitive": checkpoint.get("current_harness_owns_primitive") if type(checkpoint.get("current_harness_owns_primitive")) is bool else None,
+                    "delete_access_probe_completed": checkpoint.get("delete_access_probe_completed") if type(checkpoint.get("delete_access_probe_completed")) is bool else None,
+                    "delete_access_probe_succeeded": checkpoint.get("delete_access_probe_succeeded") if type(checkpoint.get("delete_access_probe_succeeded")) is bool else None,
+                })
         report_secret_state = report.get("secret_exposure")
         if report_secret_state not in {"none", "detected", "unchecked"}:
             report_secret_state = "unchecked"
@@ -6809,6 +6928,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             "cleanup_result": case.get("cleanup", {}).get("pass") if isinstance(case, dict) and isinstance(case.get("cleanup"), dict) and type(case["cleanup"].get("pass")) is bool else None,
             "ci7_required_probe_completion": required_probes.get("status") if isinstance(required_probes, dict) and required_probes.get("status") in {"complete", "incomplete"} else "unavailable",
             "ci7_completed_through": required_probes.get("completed_through") if isinstance(required_probes, dict) and required_probes.get("completed_through") == "retention_delete" else None,
+            "ci7_lock_checkpoints": safe_checkpoints,
             "ci7_verify_outcome": "pass" if isinstance(ci7, dict) and ci7.get("verify_outcome") == "pass" else ("failed" if isinstance(ci7, dict) and "verify_outcome" in ci7 else "unavailable"),
             "ci7_verify_status": ci7.get("verify_status") if isinstance(ci7, dict) and ci7.get("verify_status") in {"install_verified", "failed"} else "unavailable",
             "secret_exposure": report_secret_state,
@@ -6925,6 +7045,31 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertTrue(type(diagnostic.get("worker_account_process_count_observed")) is bool, "worker process evidence")
         worker_count = diagnostic.get("worker_account_process_count")
         self.assertTrue(worker_count is None or type(worker_count) is int, "worker process count bounded")
+
+    def _assert_bounded_lock_checkpoints(self, checkpoints: object) -> None:
+        self.assertIsInstance(checkpoints, list, "CI7 lock checkpoint sequence recorded")
+        expected_ids = [f"CP{index}" for index in range(1, 11)]
+        self.assertEqual([checkpoint.get("checkpoint") for checkpoint in checkpoints], expected_ids)
+        allowed_fields = {
+            "checkpoint",
+            "owner_enumeration_completed",
+            "lock_owner_count",
+            "current_harness_owns_primitive",
+            "delete_access_probe_completed",
+            "delete_access_probe_succeeded",
+        }
+        for checkpoint in checkpoints:
+            with self.subTest(checkpoint=checkpoint.get("checkpoint")):
+                self.assertEqual(set(checkpoint), allowed_fields, "checkpoint contains only bounded fields")
+                for field in (
+                    "owner_enumeration_completed",
+                    "current_harness_owns_primitive",
+                    "delete_access_probe_completed",
+                    "delete_access_probe_succeeded",
+                ):
+                    self.assertTrue(type(checkpoint.get(field)) is bool, "checkpoint boolean is bounded")
+                owner_count = checkpoint.get("lock_owner_count")
+                self.assertTrue(owner_count is None or (type(owner_count) is int and 0 <= owner_count <= 32))
 
     def test_native_boundary_environment(self) -> None:
         self.assertIsNone(self.report["fatal"], "hosted boundary harness completed")
@@ -7046,6 +7191,14 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertTrue(self.report["account"]["batch_logon_right_assigned"])
         case = self._case("install_then_uninstall")
         self._assert_bounded_lock_diagnostic(case.get("primitive_lock_diagnostic"))
+        self._assert_bounded_lock_checkpoints(case.get("ci7", {}).get("lock_checkpoints"))
+        cp10 = case["ci7"]["lock_checkpoints"][9]
+        final_diagnostic = case["primitive_lock_diagnostic"]
+        self.assertEqual(cp10["owner_enumeration_completed"], final_diagnostic["owner_enumeration_completed"])
+        self.assertEqual(cp10["lock_owner_count"], final_diagnostic["lock_owner_count"])
+        self.assertEqual(cp10["current_harness_owns_primitive"], final_diagnostic["current_harness_owns_primitive"])
+        self.assertEqual(cp10["delete_access_probe_completed"], final_diagnostic["delete_access_probe_completed"])
+        self.assertEqual(cp10["delete_access_probe_succeeded"], final_diagnostic["delete_access_probe_succeeded"])
         install_presence = case["install_task_presence"]
         self.assertTrue(install_presence["effective_task_path"] == "\\X-Boundaries\\", "production task path")
         self.assertTrue(install_presence["effective_task_name"] == "AC2 Member Gateway Worker", "production task name")
