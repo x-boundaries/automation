@@ -4051,6 +4051,194 @@ def _boundary_report(stdout: str) -> dict[str, object] | None:
     return json.loads(lines[0][len(TASK_BOUNDARY_RESULT_PREFIX):])
 
 
+_CI7_CHILD_SETUP_STAGES = (
+    "INPUT",
+    "SOURCE_LOAD",
+    "NATIVE_INIT",
+    "CREDENTIAL_RESTORE",
+    "TOKEN_OPEN",
+    "PATH_CHAIN",
+    "DRIVE_PROBE",
+    "FROZEN_CONTROL",
+    "RESULT_EMIT",
+    "CLEANUP",
+)
+_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS = (15, 15, 15, 15, 3, 15, 15, 15)
+_CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS = 120
+_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS = 240
+
+
+def _public_safe_hosted_failure_summary(report: object) -> str:
+    """Render a compact diagnostic using only fixed enums, booleans, and bounded counts."""
+    if not isinstance(report, dict):
+        return "hosted boundary assertion failed; diagnostics unavailable"
+
+    parts: list[str] = []
+
+    def add_enum(source: object, key: str, label: str, allowed: set[str]) -> None:
+        if not isinstance(source, dict):
+            return
+        value = source.get(key)
+        if isinstance(value, str) and value in allowed:
+            parts.append(f"{label}={value}")
+
+    def add_bool(source: object, key: str, label: str) -> None:
+        if not isinstance(source, dict):
+            return
+        value = source.get(key)
+        if type(value) is bool:
+            parts.append(f"{label}={'true' if value else 'false'}")
+
+    def add_count(source: object, key: str, label: str, maximum: int = 1024) -> None:
+        if not isinstance(source, dict):
+            return
+        value = source.get(key)
+        if type(value) is int and 0 <= value <= maximum:
+            parts.append(f"{label}={value}")
+
+    safe_codes = {
+        "ci7_fatal",
+        "ci7_required_probes_incomplete",
+        "ci7_fixture_cleanup_failed",
+        "frozen_control_child_setup_failed",
+        "frozen_control_child_structured_failure",
+    }
+    fatal = report.get("fatal")
+    cases = report.get("cases")
+    case = cases.get("install_then_uninstall") if isinstance(cases, dict) else None
+    add_enum(case, "status", "case_status", {"completed", "error", "failed"})
+    ci7 = case.get("ci7") if isinstance(case, dict) else None
+    ci7_fatal = ci7.get("fatal") if isinstance(ci7, dict) else None
+    fatal_value = fatal if fatal is not None else ci7_fatal
+    if fatal_value is None:
+        parts.append("fatal_code=none")
+    elif isinstance(fatal_value, str) and fatal_value in safe_codes:
+        parts.append(f"fatal_code={fatal_value}")
+    else:
+        parts.append("fatal_code=unclassified")
+
+    add_enum(
+        ci7,
+        "frozen_control_child_status",
+        "frozen_child_status",
+        {
+            "completed", "structured_failure", "abnormal_exit", "malformed_output",
+            "timeout", "termination_unproven", "launch_failed",
+        },
+    )
+    add_count(ci7, "frozen_control_child_exit_status", "child_exit_status", 255)
+    add_enum(ci7, "frozen_control_child_setup_stage", "child_setup_stage", set(_CI7_CHILD_SETUP_STAGES))
+    add_bool(ci7, "frozen_control_child_terminated", "process_terminated")
+    add_bool(ci7, "frozen_control_child_stderr_present", "stderr_present")
+    add_enum(ci7, "frozen_control_child_residue", "residue", {"none", "present", "unproven"})
+    add_bool(ci7, "frozen_control_parent_function_replaced", "parent_function_replaced")
+    add_enum(
+        ci7,
+        "frozen_defective_context_outcome",
+        "frozen_control_outcome",
+        {
+            "effective_rights_exceeded", "effective_rights_missing", "effective_rights_unproven",
+            "installation_owned_surface_unknown", "installation_manifest_invalid",
+            "installation_manifest_membership_invalid", "installation_manifest_path_invalid",
+            "installation_manifest_task_invalid", "installation_runtime_roots_invalid",
+            "release_identity_mismatch", "unexpected_success", "unexpected_error",
+            "fixture_setup_failed",
+        },
+    )
+    completion = ci7.get("required_probe_completion") if isinstance(ci7, dict) else None
+    add_enum(completion, "status", "required_probe_status", {"complete", "incomplete", "in_progress"})
+    add_enum(completion, "completed_through", "required_probe_through", {"retention_delete"})
+    add_bool(report.get("cleanup"), "pass", "cleanup_pass")
+    for key, label in (
+        ("failure_cleanup_primitive_leaf_opened", "cleanup_primitive_opened"),
+        ("failure_cleanup_owner_enumeration_completed", "cleanup_owner_enumeration"),
+        ("failure_cleanup_exclusive_delete_completed", "cleanup_delete_completed"),
+        ("failure_cleanup_exclusive_delete_succeeded", "cleanup_delete_succeeded"),
+    ):
+        add_bool(ci7, key, label)
+    add_count(ci7, "failure_cleanup_lock_owner_count", "cleanup_lock_owner_count", 64)
+
+    if not parts:
+        return "hosted boundary assertion failed; diagnostics unavailable"
+    return "hosted boundary assertion failed; " + "; ".join(parts[:16])
+
+
+class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
+    def test_failure_summary_uses_only_bounded_public_fields(self) -> None:
+        private_values = (
+            r"C:\Users\private-user\AppData\Local\worker-runtime\task.xml",
+            "xbt-account-secret",
+            "S-1-5-21-111111111-222222222-333333333-4444",
+            "abcd1234:0123456789abcdef",
+            "-TaskName private-task -Argument private-runtime-value",
+            "worker-credential-secret",
+            "encrypted-password-secret",
+            "private exception details",
+        )
+        report = {
+            "fatal": private_values[0],
+            "cleanup": {"pass": False, "absolute_path": private_values[0]},
+            "cases": {
+                "install_then_uninstall": {
+                    "status": "error",
+                    "ci7": {
+                        "fatal": private_values[7],
+                        "frozen_control_child_status": "structured_failure",
+                        "frozen_control_child_exit_status": 1,
+                        "frozen_control_child_setup_stage": "TOKEN_OPEN",
+                        "frozen_control_child_terminated": True,
+                        "frozen_control_child_stderr_present": True,
+                        "frozen_control_child_residue": "none",
+                        "frozen_control_parent_function_replaced": False,
+                        "frozen_defective_context_outcome": "fixture_setup_failed",
+                        "required_probe_completion": {
+                            "status": "incomplete",
+                            "completed_through": "retention_delete",
+                        },
+                        "failure_cleanup_lock_owner_count": 0,
+                        "worker_account": private_values[1],
+                        "worker_sid": private_values[2],
+                        "file_identity": private_values[3],
+                        "task_arguments": private_values[4],
+                        "credential": private_values[5],
+                        "encrypted_password": private_values[6],
+                    },
+                },
+            },
+        }
+        summary = _public_safe_hosted_failure_summary(report)
+        if any(value in summary for value in private_values):
+            raise AssertionError("public-safe hosted diagnostic emitted private fixture data")
+        if any(key in summary for key in ("worker_account", "worker_sid", "file_identity", "task_arguments", "credential")):
+            raise AssertionError("public-safe hosted diagnostic emitted a private field name")
+        for required in (
+            "case_status=error",
+            "frozen_child_status=structured_failure",
+            "child_exit_status=1",
+            "child_setup_stage=TOKEN_OPEN",
+            "process_terminated=true",
+            "stderr_present=true",
+            "residue=none",
+            "parent_function_replaced=false",
+            "required_probe_status=incomplete",
+            "cleanup_pass=false",
+        ):
+            if required not in summary:
+                raise AssertionError("public-safe hosted diagnostic omitted a bounded status field")
+        if len(summary) > 1024:
+            raise AssertionError("public-safe hosted diagnostic exceeded its output bound")
+        diagnostic_case = MemberWorkerHostedTaskBoundaryTests("test_no_secret_exposure")
+        diagnostic_case.report = report
+        try:
+            diagnostic_case.assertEqual(report, {})
+        except AssertionError as error:
+            assertion_message = str(error)
+        else:
+            raise AssertionError("hosted report assertion unexpectedly passed")
+        if any(value in assertion_message for value in private_values):
+            raise AssertionError("hosted assertion message emitted private report data")
+
+
 def _installer_function(source: str, name: str) -> str:
     start = source.index(f"function {name} {{")
     end = source.find("\nfunction ", start + 1)
@@ -4075,6 +4263,38 @@ def _frozen_ci7_context_source() -> tuple[str, str]:
 
 class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
     """Bind the defective control and freeze every adjacent CI7 contract."""
+
+    def test_frozen_child_setup_failure_emits_only_closed_stage_diagnostics(self) -> None:
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        for stage in _CI7_CHILD_SETUP_STAGES:
+            with self.subTest(stage=stage):
+                self.assertIn(f'"{stage}"', child)
+        catch_start = child.index('$childResult.fixture_status = "completed"\n} catch {')
+        catch_end = child.index("} finally {", catch_start)
+        setup_failure_catch = child[catch_start:catch_end]
+        self.assertIn('$childResult.fixture_status = "failed"', setup_failure_catch)
+        self.assertIn('$childResult.outcome = "fixture_setup_failed"', setup_failure_catch)
+        self.assertIn("$childResult.setup_stage = $setupStage", setup_failure_catch)
+        self.assertNotIn("Exception.Message", setup_failure_catch)
+        self.assertNotIn("Exception.ToString", setup_failure_catch)
+        self.assertNotIn("Write-Error", setup_failure_catch)
+
+    def test_child_runner_retains_distinct_bounded_result_statuses(self) -> None:
+        runner = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild")
+        for status in (
+            "completed",
+            "structured_failure",
+            "abnormal_exit",
+            "malformed_output",
+            "timeout",
+            "termination_unproven",
+            "launch_failed",
+        ):
+            with self.subTest(status=status):
+                self.assertIn(f'"{status}"', runner)
+        self.assertIn("$result.stderr_present = [bool]($stderr.Length -gt 0)", runner)
+        self.assertNotIn("$result.stderr_text", runner)
+        self.assertNotIn("$result.raw_stderr", runner)
 
     def test_frozen_control_and_adjacent_ci7_contracts_are_immutable(self) -> None:
         self.assertEqual(CI7_DEFECTIVE_BASELINE_COMMIT, "ef194d43cd5b2a6e56468c3381a1b44bced23d8d")
@@ -4226,6 +4446,13 @@ class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, "PowerShell child or hosted source did not parse")
         self.assertEqual(completed.stdout.strip(), "parse_pass")
 
+    def test_child_lifecycle_outer_budget_exceeds_bounded_inner_budget(self) -> None:
+        self.assertGreater(
+            _CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS,
+            sum(_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS)
+            + _CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS,
+        )
+
     def test_child_process_runner_fails_closed_and_proves_timeout_termination(self) -> None:
         pwsh = _resolve_native_powershell()
         if not pwsh:
@@ -4235,12 +4462,23 @@ class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
             "schema_version": "xb.member.worker.ci7.frozen-control.v1",
             "fixture_status": "completed",
             "outcome": "effective_rights_exceeded",
+            "setup_stage": "RESULT_EMIT",
             "source_commit": CI7_DEFECTIVE_BASELINE_COMMIT,
             "source_blob": CI7_DEFECTIVE_INSTALLER_BLOB,
             "drive_root_index": 0,
             "drive_root_right": "0x00000004",
             "drive_root_allowed": True,
             "drive_root_granted_access": 4,
+        }
+        structured_failure_result = {
+            **valid_result,
+            "fixture_status": "failed",
+            "outcome": "fixture_setup_failed",
+            "setup_stage": "NATIVE_INIT",
+            "drive_root_index": -1,
+            "drive_root_right": "",
+            "drive_root_allowed": False,
+            "drive_root_granted_access": 0,
         }
         helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild")
         validator = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Assert-XbCi7FrozenControlChildResult")
@@ -4251,37 +4489,75 @@ __RESULT_VALIDATOR__
 $validScript = @'
 [Console]::Out.WriteLine('__VALID_RESULT__')
 '@
+$structuredFailureScript = @'
+[Console]::Out.WriteLine('__STRUCTURED_FAILURE_RESULT__')
+[Console]::Error.WriteLine('private-stderr-sentinel')
+exit 1
+'@
 $root = Split-Path -Parent $PSCommandPath
-$valid = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $validScript -Fixture @{} -TimeoutMilliseconds 15000
+$valid = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $validScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
 $validAssertion = $false
 try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $valid -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741"; $validAssertion = $true } catch { }
-$malformed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine("malformed")' -Fixture @{} -TimeoutMilliseconds 15000
-$abnormal = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText ($validScript + "`nexit 17") -Fixture @{} -TimeoutMilliseconds 15000
-$oversized = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine(("x" * 5000))' -Fixture @{} -TimeoutMilliseconds 15000
-$timeout = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'Start-Sleep -Seconds 30' -Fixture @{} -TimeoutMilliseconds 3000
+$malformed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine("malformed")' -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$abnormal = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'exit 17' -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$oversized = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine(("x" * 5000))' -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$timeout = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'Start-Sleep -Seconds 30' -Fixture @{} -TimeoutMilliseconds __SHORT_CHILD_TIMEOUT_MS__
 $wrongOutcomeScript = $validScript.Replace("effective_rights_exceeded", "effective_rights_missing")
-$wrongOutcome = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $wrongOutcomeScript -Fixture @{} -TimeoutMilliseconds 15000
+$wrongOutcome = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $wrongOutcomeScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
 $wrongOutcomeRejected = $false
 try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $wrongOutcome -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
 catch { $wrongOutcomeRejected = ($_.Exception.Message -ceq "frozen_control_child_outcome_mismatch") }
+$structuredFailure = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $structuredFailureScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$structuredFailureRejected = $false
+try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $structuredFailure -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
+catch { $structuredFailureRejected = ($_.Exception.Message -ceq "frozen_control_child_setup_failed") }
+$stderrSuccessScript = $validScript + "`n[Console]::Error.WriteLine('private-stderr-sentinel')"
+$stderrSuccess = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $stderrSuccessScript -Fixture @{} -TimeoutMilliseconds __LONG_CHILD_TIMEOUT_MS__
+$launchFailed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'unused' -Fixture @{} -TimeoutMilliseconds 0
+$structuredFailureJson = ConvertTo-Json -InputObject $structuredFailure -Depth 8 -Compress
 $summary = [ordered]@{
     valid = ($valid.status -ceq "completed" -and $valid.process_terminated -and $valid.residue -ceq "none" -and $validAssertion)
-    valid_status = [string]$valid.status
-    valid_exit_status = $valid.exit_status
-    valid_child_result_present = ($null -ne $valid.child_result)
-    valid_failure_stage = $valid.failure_stage
     malformed = ($malformed.status -ceq "malformed_output" -and $malformed.process_terminated -and $malformed.residue -ceq "none")
     abnormal = ($abnormal.status -ceq "abnormal_exit" -and $abnormal.process_terminated -and $abnormal.residue -ceq "none")
     oversized = ($oversized.status -ceq "malformed_output" -and $oversized.process_terminated -and $oversized.residue -ceq "none")
     timeout = ($timeout.status -ceq "timeout" -and $timeout.process_terminated -and $timeout.residue -ceq "none")
+    structured_failure = ($structuredFailure.status -ceq "structured_failure" -and $structuredFailure.exit_status -eq 1 -and $structuredFailure.process_terminated -and $structuredFailure.residue -ceq "none")
+    structured_failure_stage = [string]$structuredFailure.child_result.setup_stage
+    structured_failure_stage_closed = ($structuredFailure.child_result.setup_stage -ceq "NATIVE_INIT")
+    structured_failure_stderr_present = [bool]$structuredFailure.stderr_present
+    structured_failure_raw_withheld = (-not $structuredFailureJson.Contains("private-stderr-sentinel"))
+    structured_failure_validator_rejected = $structuredFailureRejected
+    stderr_success_rejected = ($stderrSuccess.status -ceq "malformed_output" -and $stderrSuccess.stderr_present -and $stderrSuccess.process_terminated -and $stderrSuccess.residue -ceq "none")
+    launch_failed = ($launchFailed.status -ceq "launch_failed" -and $launchFailed.failure_stage -ceq "input" -and -not $launchFailed.process_terminated -and $launchFailed.residue -ceq "none")
     wrong_outcome_rejected = $wrongOutcomeRejected
 }
 [Console]::Out.WriteLine(($summary | ConvertTo-Json -Compress))
 '''
+        long_timeout_seconds = _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS[0]
+        short_timeout_seconds = _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS[4]
+        expected_timeout_schedule = (
+            long_timeout_seconds,
+            long_timeout_seconds,
+            long_timeout_seconds,
+            long_timeout_seconds,
+            short_timeout_seconds,
+            long_timeout_seconds,
+            long_timeout_seconds,
+            long_timeout_seconds,
+        )
+        if (
+            _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS != expected_timeout_schedule
+            or script.count("__LONG_CHILD_TIMEOUT_MS__") != 7
+            or script.count("__SHORT_CHILD_TIMEOUT_MS__") != 1
+        ):
+            raise AssertionError("child lifecycle timeout schedule no longer matches its bounded budget")
         script = (
             script.replace("__RUNNER_HELPER__", helper)
             .replace("__RESULT_VALIDATOR__", validator)
             .replace("__VALID_RESULT__", json.dumps(valid_result, separators=(",", ":")))
+            .replace("__STRUCTURED_FAILURE_RESULT__", json.dumps(structured_failure_result, separators=(",", ":")))
+            .replace("__LONG_CHILD_TIMEOUT_MS__", str(long_timeout_seconds * 1000))
+            .replace("__SHORT_CHILD_TIMEOUT_MS__", str(short_timeout_seconds * 1000))
         )
 
         with tempfile.TemporaryDirectory(prefix="xb-ci7-child-lifecycle-") as temp_dir:
@@ -4289,28 +4565,49 @@ $summary = [ordered]@{
             _assert_temp_outside_checkout(ROOT, temporary_root)
             harness_path = temporary_root / "child_lifecycle.ps1"
             harness_path.write_text(script, encoding="utf-8", newline="\n")
-            completed = subprocess.run(
-                [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness_path)],
-                cwd=ROOT,
-                env=_windows_powershell_module_environment(),
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
+            try:
+                completed = subprocess.run(
+                    [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness_path)],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                raise AssertionError("child lifecycle regression harness exceeded its bounded run; output withheld") from None
         self.assertFalse(temporary_root.exists(), "child lifecycle test left temporary state")
-        diagnostic = (completed.stdout + completed.stderr).replace(str(ROOT), "<repository>").replace(str(harness_path), "<harness>").replace(temp_dir, "<temporary>")
-        diagnostic = re.sub(r"(?i)[A-Z]:\\Users\\[^\\\s]+", "<user>", diagnostic)
-        self.assertEqual(completed.returncode, 0, "child lifecycle regression harness failed: " + diagnostic[-2000:])
-        result = json.loads(completed.stdout)
-        self.assertEqual(
-            result.get("valid"), True,
-            "valid child did not pass bounded result validation: "
-            + json.dumps({key: result.get(key) for key in ("valid_status", "valid_exit_status", "valid_child_result_present", "valid_failure_stage")}, sort_keys=True),
-        )
+        if completed.returncode != 0:
+            raise AssertionError("child lifecycle regression harness failed; output withheld")
+        try:
+            result = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise AssertionError("child lifecycle regression harness emitted an invalid summary; output withheld") from None
+        expected_summary_keys = {
+            "valid", "malformed", "abnormal", "oversized", "timeout", "structured_failure",
+            "structured_failure_stage", "structured_failure_stage_closed", "structured_failure_stderr_present",
+            "structured_failure_raw_withheld", "structured_failure_validator_rejected", "stderr_success_rejected",
+            "launch_failed", "wrong_outcome_rejected",
+        }
+        boolean_summary_keys = expected_summary_keys - {"structured_failure_stage"}
+        if (
+            not isinstance(result, dict)
+            or set(result) != expected_summary_keys
+            or any(type(result[key]) is not bool for key in boolean_summary_keys)
+            or result["structured_failure_stage"] not in _CI7_CHILD_SETUP_STAGES
+        ):
+            raise AssertionError("child lifecycle regression harness emitted an unsafe summary; output withheld")
+        self.assertEqual(result.get("valid"), True, "valid child did not pass bounded result validation")
         self.assertEqual(result.get("malformed"), True, "malformed child output did not fail closed")
         self.assertEqual(result.get("abnormal"), True, "abnormal child exit did not fail closed")
         self.assertEqual(result.get("oversized"), True, "oversized child output was not bounded and rejected")
         self.assertEqual(result.get("timeout"), True, "timeout did not prove child termination")
+        self.assertEqual(result.get("structured_failure"), True, "structured child setup failure was not classified distinctly")
+        self.assertEqual(result.get("structured_failure_stage_closed"), True, "structured child failure stage was not closed")
+        self.assertEqual(result.get("structured_failure_stderr_present"), True, "structured child stderr presence was not reported")
+        self.assertEqual(result.get("structured_failure_raw_withheld"), True, "structured child failure retained raw stderr")
+        self.assertEqual(result.get("structured_failure_validator_rejected"), True, "structured setup failure was accepted as success")
+        self.assertEqual(result.get("stderr_success_rejected"), True, "successful child with stderr was accepted")
         self.assertEqual(result.get("wrong_outcome_rejected"), True, "unexpected fixture outcome was accepted")
 
     def test_process_arguments_environment_and_output_are_secret_safe(self) -> None:
@@ -4637,8 +4934,9 @@ $childResult = [ordered]@{
     schema_version = "xb.member.worker.ci7.frozen-control.v1"
     fixture_status = "failed"
     outcome = "fixture_setup_failed"
-    source_commit = [string]$Fixture.source_commit
-    source_blob = [string]$Fixture.source_blob
+    setup_stage = "INPUT"
+    source_commit = ""
+    source_blob = ""
     drive_root_index = -1
     drive_root_right = ""
     drive_root_allowed = $false
@@ -4647,7 +4945,10 @@ $childResult = [ordered]@{
 $securePassword = $null
 $nativeToken = $null
 $context = $null
+$setupStage = "INPUT"
 try {
+    $childResult.source_commit = [string]$Fixture.source_commit
+    $childResult.source_blob = [string]$Fixture.source_blob
     $installerPath = [string]$Fixture.installer_path
     $workerAccount = [string]$Fixture.worker_account
     $encryptedPassword = [string]$Fixture.encrypted_password
@@ -4661,19 +4962,25 @@ try {
         throw "fixture_input_invalid"
     }
 
+    $setupStage = "SOURCE_LOAD"
     . $installerPath -LibraryOnly
     $script:WorkerAccount = $workerAccount
+    $setupStage = "NATIVE_INIT"
     Initialize-XbWorkerNativeAccess
+    $setupStage = "CREDENTIAL_RESTORE"
     $securePassword = ConvertTo-SecureString -String $encryptedPassword -ErrorAction Stop
+    $setupStage = "TOKEN_OPEN"
     $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
     $encryptedPassword = $null
     $Fixture.encrypted_password = $null
     $nativeToken = New-XbWorkerBatchToken -Credential $credential
 
+    $setupStage = "PATH_CHAIN"
     $installChain = [string[]](Get-XbNativePathChain -Path $InstallRoot)
     if ($installChain.Count -lt 1) { throw "fixture_drive_root_unproven" }
     $driveRoot = [string]$installChain[0]
     if ($driveRoot -notmatch '^[A-Za-z]:\\$') { throw "fixture_drive_root_unproven" }
+    $setupStage = "DRIVE_PROBE"
     $driveRootObject = [XbWorkerProtectedObject]::Open($driveRoot, $true, $false)
     try {
         $driveRootResult = Invoke-XbCi7HandleAccessCheck -Object $driveRootObject -Token $nativeToken -DesiredAccess ([uint32]0x00000004)
@@ -4686,6 +4993,7 @@ try {
         throw "fixture_drive_root_counterexample_unproven"
     }
 
+    $setupStage = "FROZEN_CONTROL"
     Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextText))
     try {
         $context = Open-XbCi7VerificationContext -Token $nativeToken
@@ -4702,6 +5010,7 @@ try {
         $childResult.outcome = if ($safeOutcomes -ccontains $reason) { $reason } else { "unexpected_error" }
     }
     if ($null -ne $context) {
+        $setupStage = "CLEANUP"
         Dispose-XbCi7VerificationContext -Context $context
         $context = $null
     }
@@ -4709,15 +5018,25 @@ try {
 } catch {
     $childResult.fixture_status = "failed"
     $childResult.outcome = "fixture_setup_failed"
+    $childResult.setup_stage = $setupStage
 } finally {
+    $cleanupFailed = $false
+    $setupSucceeded = $childResult.fixture_status -ceq "completed"
+    if ($setupSucceeded) { $setupStage = "CLEANUP" }
     if ($null -ne $context) {
-        try { Dispose-XbCi7VerificationContext -Context $context } catch { }
+        try { Dispose-XbCi7VerificationContext -Context $context } catch { $cleanupFailed = $true }
     }
-    if ($null -ne $nativeToken) { try { $nativeToken.Dispose() } catch { } }
-    if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { } }
+    if ($null -ne $nativeToken) { try { $nativeToken.Dispose() } catch { $cleanupFailed = $true } }
+    if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { $cleanupFailed = $true } }
     $credential = $null
     $Fixture = $null
+    if ($cleanupFailed -and $setupSucceeded) {
+        $childResult.fixture_status = "failed"
+        $childResult.outcome = "fixture_setup_failed"
+        $childResult.setup_stage = "CLEANUP"
+    }
 }
+if ($childResult.fixture_status -ceq "completed") { $childResult.setup_stage = "RESULT_EMIT" }
 [Console]::Out.WriteLine(($childResult | ConvertTo-Json -Depth 4 -Compress))
 if ($childResult.fixture_status -cne "completed") { exit 1 }
 exit 0
@@ -4945,6 +5264,7 @@ public sealed class XbCi7BoundedTextCapture
         residue = "unproven"
         child_result = $null
         failure_stage = $null
+        stderr_present = $false
     }
     $process = $null
     $processStarted = $false
@@ -5047,15 +5367,17 @@ public sealed class XbCi7BoundedTextCapture
             $stderrCapture.Wait()
             $stdout = [string]$stdoutCapture.Text
             $stderr = [string]$stderrCapture.Text
+            $result.stderr_present = [bool]($stderr.Length -gt 0)
             if ($timeoutOccurred) {
                 $result.status = "timeout"
             } elseif ($stdoutCapture.Overflow -or $stderrCapture.Overflow -or
-                $stdoutCapture.ReadFailed -or $stderrCapture.ReadFailed -or
-                -not [string]::IsNullOrWhiteSpace($stderr)) {
+                $stdoutCapture.ReadFailed -or $stderrCapture.ReadFailed) {
                 $result.status = "malformed_output"
             } else {
                 $jsonLine = $stdout.TrimEnd("`r", "`n")
-                if ([string]::IsNullOrWhiteSpace($jsonLine) -or $jsonLine.Contains("`r") -or $jsonLine.Contains("`n")) {
+                if ([string]::IsNullOrWhiteSpace($jsonLine)) {
+                    $result.status = if ($result.exit_status -ne 0) { "abnormal_exit" } else { "malformed_output" }
+                } elseif ($jsonLine.Contains("`r") -or $jsonLine.Contains("`n")) {
                     $result.status = "malformed_output"
                 } else {
                     try {
@@ -5064,11 +5386,15 @@ public sealed class XbCi7BoundedTextCapture
                         $expectedFields = @(
                             "drive_root_allowed", "drive_root_granted_access", "drive_root_index",
                             "drive_root_right", "fixture_status", "outcome", "schema_version",
-                            "source_blob", "source_commit"
+                            "setup_stage", "source_blob", "source_commit"
                         )
                         if (($actualFields -join "|") -cne ($expectedFields -join "|") -or
                             $child.schema_version -cne "xb.member.worker.ci7.frozen-control.v1" -or
                             $child.fixture_status -cnotin @("completed", "failed") -or
+                            $child.setup_stage -cnotin @(
+                                "INPUT", "SOURCE_LOAD", "NATIVE_INIT", "CREDENTIAL_RESTORE", "TOKEN_OPEN",
+                                "PATH_CHAIN", "DRIVE_PROBE", "FROZEN_CONTROL", "RESULT_EMIT", "CLEANUP"
+                            ) -or
                             $child.outcome -cnotin @(
                                 "effective_rights_exceeded", "effective_rights_missing", "effective_rights_unproven",
                                 "installation_owned_surface_unknown", "installation_manifest_invalid",
@@ -5078,17 +5404,23 @@ public sealed class XbCi7BoundedTextCapture
                             ) -or
                             [string]$child.source_commit -notmatch '^[0-9a-f]{40}$' -or
                             [string]$child.source_blob -notmatch '^[0-9a-f]{40}$' -or
-                            [int]$child.drive_root_index -ne 0 -or
-                            [string]$child.drive_root_right -cne "0x00000004" -or
+                            $child.drive_root_index -isnot [int] -or
+                            $child.drive_root_right -isnot [string] -or
                             $child.drive_root_allowed -isnot [bool] -or
-                            $child.drive_root_granted_access -isnot [int] -or
-                            [int]$child.drive_root_granted_access -ne 4) {
+                            $child.drive_root_granted_access -isnot [int]) {
                             $result.status = "malformed_output"
-                        } else {
+                        } elseif ($child.fixture_status -ceq "completed" -and
+                            $child.outcome -cne "fixture_setup_failed" -and
+                            $result.exit_status -eq 0 -and
+                            $child.drive_root_index -eq 0 -and
+                            $child.drive_root_right -ceq "0x00000004" -and
+                            $child.drive_root_allowed -and
+                            $child.drive_root_granted_access -eq 4) {
                             $result.child_result = [ordered]@{
                                 schema_version = [string]$child.schema_version
                                 fixture_status = [string]$child.fixture_status
                                 outcome = [string]$child.outcome
+                                setup_stage = [string]$child.setup_stage
                                 source_commit = [string]$child.source_commit
                                 source_blob = [string]$child.source_blob
                                 drive_root_index = [int]$child.drive_root_index
@@ -5096,7 +5428,25 @@ public sealed class XbCi7BoundedTextCapture
                                 drive_root_allowed = [bool]$child.drive_root_allowed
                                 drive_root_granted_access = [uint32]$child.drive_root_granted_access
                             }
-                            $result.status = if ($result.exit_status -eq 0) { "completed" } else { "abnormal_exit" }
+                            $result.status = if ($result.stderr_present) { "malformed_output" } else { "completed" }
+                        } elseif ($child.fixture_status -ceq "failed" -and
+                            $child.outcome -ceq "fixture_setup_failed" -and
+                            $result.exit_status -ne 0) {
+                            $result.child_result = [ordered]@{
+                                schema_version = [string]$child.schema_version
+                                fixture_status = [string]$child.fixture_status
+                                outcome = [string]$child.outcome
+                                setup_stage = [string]$child.setup_stage
+                                source_commit = [string]$child.source_commit
+                                source_blob = [string]$child.source_blob
+                                drive_root_index = [int]$child.drive_root_index
+                                drive_root_right = [string]$child.drive_root_right
+                                drive_root_allowed = [bool]$child.drive_root_allowed
+                                drive_root_granted_access = [uint32]$child.drive_root_granted_access
+                            }
+                            $result.status = "structured_failure"
+                        } else {
+                            $result.status = "malformed_output"
                         }
                     } catch { $result.status = "malformed_output" }
                 }
@@ -5138,6 +5488,7 @@ function Assert-XbCi7FrozenControlChildResult {
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)][string]$SourceBlob
     )
+    if ($RunResult.status -ceq "structured_failure") { throw "frozen_control_child_setup_failed" }
     if ($RunResult.status -cne "completed") { throw ("frozen_control_child_" + [string]$RunResult.status) }
     if (-not [bool]$RunResult.process_terminated) { throw "frozen_control_child_termination_unproven" }
     if ([string]$RunResult.residue -cne "none") { throw "frozen_control_child_residue_unproven" }
@@ -6065,10 +6416,13 @@ public static class XbCi7FailureCleanupProbe
                 $ci7.frozen_control_child_exit_status = $frozenChildRun.exit_status
                 $ci7.frozen_control_child_terminated = [bool]$frozenChildRun.process_terminated
                 $ci7.frozen_control_child_residue = [string]$frozenChildRun.residue
+                $ci7.frozen_control_child_stderr_present = [bool]$frozenChildRun.stderr_present
+                $ci7.frozen_control_child_setup_stage = $null
                 $ci7.frozen_control_parent_function_replaced = -not [object]::ReferenceEquals(
                     $candidateContextBefore, ${function:script:Open-XbCi7VerificationContext}
                 )
                 if ($null -ne $frozenChildRun.child_result) {
+                    $ci7.frozen_control_child_setup_stage = [string]$frozenChildRun.child_result.setup_stage
                     $ci7.frozen_defective_context_outcome = [string]$frozenChildRun.child_result.outcome
                     $ci7.frozen_control_child_source_commit = [string]$frozenChildRun.child_result.source_commit
                     $ci7.frozen_control_child_installer_blob = [string]$frozenChildRun.child_result.source_blob
@@ -7122,6 +7476,53 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
 
     report: dict[str, object]
 
+    def _safe_failure(self) -> None:
+        self.fail(_public_safe_hosted_failure_summary(getattr(self, "report", None)))
+
+    def assertEqual(self, first: object, second: object, msg: object = None) -> None:
+        if first != second:
+            self._safe_failure()
+
+    def assertNotEqual(self, first: object, second: object, msg: object = None) -> None:
+        if first == second:
+            self._safe_failure()
+
+    def assertTrue(self, expr: object, msg: object = None) -> None:
+        if not expr:
+            self._safe_failure()
+
+    def assertFalse(self, expr: object, msg: object = None) -> None:
+        if expr:
+            self._safe_failure()
+
+    def assertIn(self, member: object, container: object, msg: object = None) -> None:
+        if member not in container:
+            self._safe_failure()
+
+    def assertNotIn(self, member: object, container: object, msg: object = None) -> None:
+        if member in container:
+            self._safe_failure()
+
+    def assertIsNone(self, obj: object, msg: object = None) -> None:
+        if obj is not None:
+            self._safe_failure()
+
+    def assertGreater(self, first: object, second: object, msg: object = None) -> None:
+        if not first > second:
+            self._safe_failure()
+
+    def assertLess(self, first: object, second: object, msg: object = None) -> None:
+        if not first < second:
+            self._safe_failure()
+
+    def assertRegex(self, text: str, expected_regex: str | re.Pattern[str], msg: object = None) -> None:
+        if re.search(expected_regex, text) is None:
+            self._safe_failure()
+
+    def assertNotRegex(self, text: str, unexpected_regex: str | re.Pattern[str], msg: object = None) -> None:
+        if re.search(unexpected_regex, text) is not None:
+            self._safe_failure()
+
     @classmethod
     def setUpClass(cls) -> None:
         if not _hosted_windows_boundary_required():
@@ -7142,26 +7543,32 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
                 raise AssertionError("hosted fixture source readback failed")
             harness = root / "task_boundary_harness.ps1"
             harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
-            completed = subprocess.run(
-                [
-                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
-                    "-File", str(harness),
-                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
-                    "-ReviewedManifestPath", str(manifest),
-                    "-FrozenContextPath", str(frozen_context_path),
-                    "-FrozenChildScriptPath", str(frozen_child_path),
-                    "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
-                    "-FrozenInstallerBlob", frozen_blob,
-                ],
-                cwd=ROOT,
-                env=_windows_powershell_module_environment(),
-                capture_output=True,
-                text=True,
-                timeout=1500,
-            )
+            try:
+                completed = subprocess.run(
+                    [
+                        pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                        "-File", str(harness),
+                        "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                        "-ReviewedManifestPath", str(manifest),
+                        "-FrozenContextPath", str(frozen_context_path),
+                        "-FrozenChildScriptPath", str(frozen_child_path),
+                        "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
+                        "-FrozenInstallerBlob", frozen_blob,
+                    ],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=1500,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                raise AssertionError("hosted boundary harness did not complete within its bounded runtime") from None
         if root.exists():
             raise AssertionError("hosted fixture temporary residue present")
-        report = _boundary_report(completed.stdout)
+        try:
+            report = _boundary_report(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise AssertionError("hosted boundary harness emitted an invalid bounded report") from None
         if report is None:
             raise AssertionError("hosted boundary harness produced no bounded report")
         if completed.returncode != 0 and report.get("fatal") is None:
@@ -7171,7 +7578,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
 
     def _case(self, name: str) -> dict[str, object]:
         case = self.report["cases"][name]
-        self.assertEqual(case["status"], "completed", case)
+        self.assertEqual(case["status"], "completed")
         return case
 
     def _assert_pristine(self, readback: dict[str, object]) -> None:
@@ -7193,8 +7600,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["com_last_task_result"], SCHED_S_TASK_HAS_NOT_RUN)
         self.assertEqual(evidence["missed_runs"], 0)
         self.assertEqual(evidence["com_missed_runs"], 0)
-        self.assertTrue(evidence["last_run_time"] is None or str(evidence["last_run_time"]).startswith("1999-11-30"), evidence)
-        self.assertLess(str(evidence["com_last_run_time"]), "2000", evidence)
+        self.assertTrue(evidence["last_run_time"] is None or str(evidence["last_run_time"]).startswith("1999-11-30"))
+        self.assertLess(str(evidence["com_last_run_time"]), "2000")
 
     def _assert_exact_disabled_proof(self, evidence: dict[str, object], worker_account: str) -> None:
         self.assertEqual(evidence["cim_state"], "Disabled")
@@ -7225,12 +7632,12 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["xml_trigger_count"], 0)
 
     def _assert_no_worker_session(self, observation: dict[str, object]) -> None:
-        self.assertFalse(observation["profile_list_present"], observation)
-        self.assertEqual(observation["user_profile_count"], 0, observation)
-        self.assertEqual(observation["worker_process_count"], 0, observation)
+        self.assertFalse(observation["profile_list_present"])
+        self.assertEqual(observation["user_profile_count"], 0)
+        self.assertEqual(observation["worker_process_count"], 0)
 
     def test_native_boundary_environment(self) -> None:
-        self.assertIsNone(self.report["fatal"], self.report)
+        self.assertIsNone(self.report["fatal"])
         environment = self.report["environment"]
         self.assertTrue(str(environment["ps_version"]).startswith("5.1."))
         self.assertEqual(environment["ps_edition"], "Desktop")
@@ -7289,7 +7696,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
     def test_registration_failure_rollback_treats_absent_task_as_restored(self) -> None:
         case = self._case("registration_failure_parent_absent")
         self.assertNotEqual(case["install_outcome"], "pass")
-        self.assertFalse(str(case["install_outcome"]).startswith("install_rollback_failed"), case)
+        self.assertFalse(str(case["install_outcome"]).startswith("install_rollback_failed"))
         self.assertIn("task_step:absent", case["rollback_trace"])
         self._assert_pristine(case["readback"])
         self.assertEqual(case["historical_unconditional_unregister"], "task_unregister_failed")
@@ -7380,22 +7787,22 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(case["ownership"], "pass")
         self.assertEqual(case["manifest_trigger_count"], 0)
         snapshot = case["synthetic_config_snapshot"]
-        self.assertTrue(snapshot["native_type_absent_before_first_use"], snapshot)
-        self.assertTrue(snapshot["native_type_initialized"], snapshot)
+        self.assertTrue(snapshot["native_type_absent_before_first_use"])
+        self.assertTrue(snapshot["native_type_initialized"])
         self.assertEqual(snapshot["fixture_bytes_hex"], "7b7d")
-        self.assertTrue(snapshot["wrong_content_exact"], snapshot)
-        self.assertTrue(snapshot["replacement_identity_changed"], snapshot)
+        self.assertTrue(snapshot["wrong_content_exact"])
+        self.assertTrue(snapshot["replacement_identity_changed"])
         self._assert_zero_triggers(case["evidence"])
         self._assert_exact_disabled_proof(case["evidence"], self.report["environment"]["worker_account"])
         self._assert_never_run(case["evidence"])
         self._assert_no_worker_session(case["account_installed"])
         ci7 = case["ci7"]
-        self.assertIsNone(ci7["fatal"], ci7)
+        self.assertIsNone(ci7["fatal"])
         self.assertEqual(
             ci7["required_probe_completion"],
             {"status": "complete", "completed_through": "retention_delete"},
         )
-        self.assertTrue(ci7["root_owner_accepted"], ci7)
+        self.assertTrue(ci7["root_owner_accepted"])
         self.assertIn(ci7["root_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
         self.assertTrue(ci7["root_dacl_protected"])
         self.assertEqual(ci7["root_acl_shape"], "pass")
@@ -7427,7 +7834,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(ci7["frozen_control_installer_blob"], CI7_DEFECTIVE_INSTALLER_BLOB)
         self.assertEqual(ci7["drive_root_index0"]["index"], 0)
         self.assertEqual(ci7["drive_root_index0"]["right"], "0x00000004")
-        self.assertTrue(ci7["drive_root_index0"]["allowed"], ci7["drive_root_index0"])
+        self.assertTrue(ci7["drive_root_index0"]["allowed"])
         self.assertEqual(ci7["drive_root_index0"]["granted_access"], 0x00000004)
         self.assertEqual(ci7["frozen_defective_context_outcome"], "effective_rights_exceeded")
         self.assertTrue(ci7["drive_root_descriptor_unchanged"])
@@ -7439,8 +7846,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             "file_add_file", "file_add_subdirectory", "file_write_ea", "delete_child",
             "file_write_attributes", "delete", "write_dac", "write_owner",
         })
-        for probe in exact_matrix:
-            with self.subTest(ci7_exact_root=probe):
+        for probe_index, probe in enumerate(exact_matrix):
+            with self.subTest(ci7_exact_root=probe_index):
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
@@ -7457,8 +7864,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             {(probe["ancestor"], probe["right"]) for probe in ancestor_scope_out},
             set(product(ancestor_paths, scope_out_names)),
         )
-        for probe in ancestor_scope_out:
-            with self.subTest(ci7_scoped_out_ancestor=probe):
+        for probe_index, probe in enumerate(ancestor_scope_out):
+            with self.subTest(ci7_scoped_out_ancestor=probe_index):
                 self.assertEqual(probe["outcome"], "pass")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
@@ -7472,24 +7879,24 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             {(probe["ancestor"], probe["right"]) for probe in ancestor_denied},
             set(product(ancestor_paths, retained_ancestor_names)),
         )
-        for probe in ancestor_denied:
-            with self.subTest(ci7_retained_ancestor=probe):
+        for probe_index, probe in enumerate(ancestor_denied):
+            with self.subTest(ci7_retained_ancestor=probe_index):
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], int(probe["mask"], 16))
                 self.assertTrue(probe["policy_consulted_fixture"])
 
         self.assertTrue(ci7["delete_chain_matrix"])
-        for probe in ci7["delete_chain_matrix"]:
-            with self.subTest(ci7_delete_chain=probe):
+        for probe_index, probe in enumerate(ci7["delete_chain_matrix"]):
+            with self.subTest(ci7_delete_chain=probe_index):
                 self.assertEqual(probe["right"], "0x00010000")
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
                 self.assertEqual(probe["fixture_granted_access"], 0x00010000)
                 self.assertTrue(probe["policy_consulted_fixture"])
         self.assertTrue(ci7["delete_child_parent_edge_matrix"])
-        for probe in ci7["delete_child_parent_edge_matrix"]:
-            with self.subTest(ci7_delete_child_edge=probe):
+        for probe_index, probe in enumerate(ci7["delete_child_parent_edge_matrix"]):
+            with self.subTest(ci7_delete_child_edge=probe_index):
                 self.assertEqual(probe["right"], "0x00000040")
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
                 self.assertTrue(probe["fixture_allowed"])
@@ -7507,7 +7914,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(ci7["required_operation_denied"], "effective_rights_missing")
         for key in ("prohibited_write_dac_allow", "prohibited_write_owner_allow", "prohibited_delete_allow", "prohibited_delete_child_allow", "child_write_dac_allow", "child_write_owner_allow", "parent_delete_child_allow"):
             with self.subTest(ci7=key):
-                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertTrue(ci7[key]["requested_operation_granted"])
                 self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(len(ci7["positive_leaf_access_matrix"]), 8)
         self.assertTrue(all(probe["granted"] for probe in ci7["positive_leaf_access_matrix"]))
@@ -7515,18 +7922,18 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertTrue(all(not probe["granted"] for probe in ci7["positive_leaf_denial_matrix"]))
         self.assertEqual({probe["leaf"] for probe in ci7["positive_leaf_access_matrix"] if probe["class"] == "package"}, set(INSTALLER_PACKAGE_FILES))
         self.assertEqual(len(ci7["leaf_denial_matrix"]), 56)
-        for probe in ci7["leaf_denial_matrix"]:
-            with self.subTest(ci7_leaf=probe):
-                self.assertTrue(probe["requested_operation_granted"], probe)
+        for probe_index, probe in enumerate(ci7["leaf_denial_matrix"]):
+            with self.subTest(ci7_leaf=probe_index):
+                self.assertTrue(probe["requested_operation_granted"])
                 self.assertEqual(probe["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(len(ci7["required_access_matrix"]), 14)
-        for probe in ci7["required_access_matrix"]:
-            with self.subTest(ci7_required_access=probe):
-                self.assertTrue(probe["requested_operation_denied"], probe)
+        for probe_index, probe in enumerate(ci7["required_access_matrix"]):
+            with self.subTest(ci7_required_access=probe_index):
+                self.assertTrue(probe["requested_operation_denied"])
                 self.assertEqual(probe["effective_rights"], "effective_rights_missing")
         self.assertEqual(len(ci7["owner_denial_matrix"]), 16)
-        for probe in ci7["owner_denial_matrix"]:
-            with self.subTest(ci7_owner=probe):
+        for probe_index, probe in enumerate(ci7["owner_denial_matrix"]):
+            with self.subTest(ci7_owner=probe_index):
                 self.assertEqual(probe["outcome"], "effective_rights_exceeded")
         self.assertEqual({probe["owner_kind"] for probe in ci7["owner_denial_matrix"]}, {"worker", "arbitrary_admin"})
         self.assertTrue(ci7["hidden_config_write_granted"])
@@ -7547,13 +7954,13 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(ci7["inherited_readonly_control"]["verifier"], "pass")
         for key in ("config_create_file", "config_create_directory", "install_create_file", "install_create_directory"):
             with self.subTest(ci7=key):
-                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertTrue(ci7[key]["requested_operation_granted"])
                 self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
         self.assertEqual(len(ci7["held_leaf_matrix"]), 8)
-        for probe in ci7["held_leaf_matrix"]:
-            with self.subTest(ci7_held_leaf=probe):
-                self.assertTrue(probe["rename_blocked"], probe)
-                self.assertTrue(probe["replace_blocked"], probe)
+        for probe_index, probe in enumerate(ci7["held_leaf_matrix"]):
+            with self.subTest(ci7_held_leaf=probe_index):
+                self.assertTrue(probe["rename_blocked"])
+                self.assertTrue(probe["replace_blocked"])
                 self.assertRegex(probe["identity_before"], r"^[0-9a-f]{8}:[0-9a-f]{16}$")
                 self.assertEqual(probe["identity_after"], probe["identity_before"])
         self.assertTrue(ci7["install_parent_delete_child_allow"]["requested_operation_granted"])
