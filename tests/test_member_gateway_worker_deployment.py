@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -4076,6 +4077,8 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
     """Bind the defective control and freeze every adjacent CI7 contract."""
 
     def test_frozen_control_and_adjacent_ci7_contracts_are_immutable(self) -> None:
+        self.assertEqual(CI7_DEFECTIVE_BASELINE_COMMIT, "ef194d43cd5b2a6e56468c3381a1b44bced23d8d")
+        self.assertEqual(CI7_DEFECTIVE_INSTALLER_BLOB, "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741")
         frozen_context, blob = _frozen_ci7_context_source()
         self.assertEqual(blob, CI7_DEFECTIVE_INSTALLER_BLOB)
         baseline_source = subprocess.run(
@@ -4150,6 +4153,192 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
         ):
             with self.subTest(boundary_regression=marker):
                 self.assertIn(marker, harness)
+
+
+class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
+    """Keep the defective immutable control inside a bounded disposable child."""
+
+    def test_parent_preservation_child_boundary_and_matrix_order_are_pinned(self) -> None:
+        harness = _HOSTED_TASK_BOUNDARY_HARNESS
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        self.assertNotIn("Set-Item function:script:Open-XbCi7VerificationContext", harness)
+        self.assertEqual(child.count("Set-Item function:script:Open-XbCi7VerificationContext"), 1)
+        self.assertIn("[object]::ReferenceEquals", harness)
+        self.assertIn("frozen_control_parent_function_replaced", harness)
+        self.assertEqual(harness.count("$frozenChildRun = Invoke-XbCi7FrozenControlChild"), 1)
+        for marker in (
+            "$ci7.exact_root_mutation_matrix = @()",
+            "$ci7.ancestor_scoped_out_right_matrix = @()",
+            "$ci7.ancestor_denied_right_matrix = @()",
+            "$ci7.delete_chain_matrix = @()",
+            "$ci7.upgrade_outcome",
+            "$ci7.held_leaf_matrix = @()",
+            "$ci7.reparse_fixture_absent",
+            "$case.uninstall_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }",
+        ):
+            with self.subTest(later_probe=marker):
+                self.assertLess(
+                    harness.index("$frozenChildRun = Invoke-XbCi7FrozenControlChild"),
+                    harness.index(marker),
+                )
+        self.assertIn("-RunResult $frozenChildRun", harness)
+        self.assertIn('throw "frozen_control_child_outcome_mismatch"', harness)
+        self.assertIn("Open-XbCi7VerificationContext -Token $nativeToken", harness)
+        self.assertIn("Invoke-XbCi7HandleAccessCheck", child)
+        self.assertIn('drive_root_right = "0x00000004"', child)
+        self.assertIn("drive_root_granted_access = [uint32]$driveRootResult.GrantedAccess", child)
+        self.assertIn("Set-Item function:script:Open-XbCi7VerificationContext", child)
+        self.assertNotIn("Invoke-XbWorkerUpgrade", child)
+        self.assertNotIn("Invoke-XbWorkerInstaller", child)
+
+    def test_hosted_and_frozen_child_powerShell_sources_parse(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("native Windows PowerShell 5.1 is required for source parsing")
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-source-parse-") as temp_dir:
+            temporary_root = Path(temp_dir)
+            _assert_temp_outside_checkout(ROOT, temporary_root)
+            child_path = temporary_root / "frozen_control_child.ps1"
+            hosted_path = temporary_root / "hosted_boundary_harness.ps1"
+            parser_path = temporary_root / "parse_sources.ps1"
+            child_path.write_text(_FROZEN_CI7_CHILD_SCRIPT, encoding="utf-8", newline="\n")
+            hosted_path.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
+            parser_path.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                "foreach ($path in $args) {\n"
+                "    $tokens = $null; $errors = $null\n"
+                "    $null = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)\n"
+                "    if ($errors.Count -ne 0) { exit 11 }\n"
+                "}\n"
+                "[Console]::Out.WriteLine('parse_pass')\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            completed = subprocess.run(
+                [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(parser_path), str(child_path), str(hosted_path)],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertFalse(temporary_root.exists(), "PowerShell source parser left temporary state")
+        self.assertEqual(completed.returncode, 0, "PowerShell child or hosted source did not parse")
+        self.assertEqual(completed.stdout.strip(), "parse_pass")
+
+    def test_child_process_runner_fails_closed_and_proves_timeout_termination(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("native Windows PowerShell 5.1 is required for process lifecycle checks")
+
+        valid_result = {
+            "schema_version": "xb.member.worker.ci7.frozen-control.v1",
+            "fixture_status": "completed",
+            "outcome": "effective_rights_exceeded",
+            "source_commit": CI7_DEFECTIVE_BASELINE_COMMIT,
+            "source_blob": CI7_DEFECTIVE_INSTALLER_BLOB,
+            "drive_root_index": 0,
+            "drive_root_right": "0x00000004",
+            "drive_root_allowed": True,
+            "drive_root_granted_access": 4,
+        }
+        helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild")
+        validator = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Assert-XbCi7FrozenControlChildResult")
+        script = r'''Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+__RUNNER_HELPER__
+__RESULT_VALIDATOR__
+$validScript = @'
+[Console]::Out.WriteLine('__VALID_RESULT__')
+'@
+$root = Split-Path -Parent $PSCommandPath
+$valid = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $validScript -Fixture @{} -TimeoutMilliseconds 15000
+$validAssertion = $false
+try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $valid -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741"; $validAssertion = $true } catch { }
+$malformed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine("malformed")' -Fixture @{} -TimeoutMilliseconds 15000
+$abnormal = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText ($validScript + "`nexit 17") -Fixture @{} -TimeoutMilliseconds 15000
+$oversized = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine(("x" * 5000))' -Fixture @{} -TimeoutMilliseconds 15000
+$timeout = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'Start-Sleep -Seconds 30' -Fixture @{} -TimeoutMilliseconds 3000
+$wrongOutcomeScript = $validScript.Replace("effective_rights_exceeded", "effective_rights_missing")
+$wrongOutcome = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $wrongOutcomeScript -Fixture @{} -TimeoutMilliseconds 15000
+$wrongOutcomeRejected = $false
+try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $wrongOutcome -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
+catch { $wrongOutcomeRejected = ($_.Exception.Message -ceq "frozen_control_child_outcome_mismatch") }
+$summary = [ordered]@{
+    valid = ($valid.status -ceq "completed" -and $valid.process_terminated -and $valid.residue -ceq "none" -and $validAssertion)
+    valid_status = [string]$valid.status
+    valid_exit_status = $valid.exit_status
+    valid_child_result_present = ($null -ne $valid.child_result)
+    valid_failure_stage = $valid.failure_stage
+    malformed = ($malformed.status -ceq "malformed_output" -and $malformed.process_terminated -and $malformed.residue -ceq "none")
+    abnormal = ($abnormal.status -ceq "abnormal_exit" -and $abnormal.process_terminated -and $abnormal.residue -ceq "none")
+    oversized = ($oversized.status -ceq "malformed_output" -and $oversized.process_terminated -and $oversized.residue -ceq "none")
+    timeout = ($timeout.status -ceq "timeout" -and $timeout.process_terminated -and $timeout.residue -ceq "none")
+    wrong_outcome_rejected = $wrongOutcomeRejected
+}
+[Console]::Out.WriteLine(($summary | ConvertTo-Json -Compress))
+'''
+        script = (
+            script.replace("__RUNNER_HELPER__", helper)
+            .replace("__RESULT_VALIDATOR__", validator)
+            .replace("__VALID_RESULT__", json.dumps(valid_result, separators=(",", ":")))
+        )
+
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-child-lifecycle-") as temp_dir:
+            temporary_root = Path(temp_dir)
+            _assert_temp_outside_checkout(ROOT, temporary_root)
+            harness_path = temporary_root / "child_lifecycle.ps1"
+            harness_path.write_text(script, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness_path)],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        self.assertFalse(temporary_root.exists(), "child lifecycle test left temporary state")
+        diagnostic = (completed.stdout + completed.stderr).replace(str(ROOT), "<repository>").replace(str(harness_path), "<harness>").replace(temp_dir, "<temporary>")
+        diagnostic = re.sub(r"(?i)[A-Z]:\\Users\\[^\\\s]+", "<user>", diagnostic)
+        self.assertEqual(completed.returncode, 0, "child lifecycle regression harness failed: " + diagnostic[-2000:])
+        result = json.loads(completed.stdout)
+        self.assertEqual(
+            result.get("valid"), True,
+            "valid child did not pass bounded result validation: "
+            + json.dumps({key: result.get(key) for key in ("valid_status", "valid_exit_status", "valid_child_result_present", "valid_failure_stage")}, sort_keys=True),
+        )
+        self.assertEqual(result.get("malformed"), True, "malformed child output did not fail closed")
+        self.assertEqual(result.get("abnormal"), True, "abnormal child exit did not fail closed")
+        self.assertEqual(result.get("oversized"), True, "oversized child output was not bounded and rejected")
+        self.assertEqual(result.get("timeout"), True, "timeout did not prove child termination")
+        self.assertEqual(result.get("wrong_outcome_rejected"), True, "unexpected fixture outcome was accepted")
+
+    def test_process_arguments_environment_and_output_are_secret_safe(self) -> None:
+        harness = _HOSTED_TASK_BOUNDARY_HARNESS
+        runner = _installer_function(harness, "Invoke-XbCi7FrozenControlChild")
+        argument_line = next(line for line in runner.splitlines() if "$startInfo.Arguments =" in line)
+        self.assertIn("$bootstrap", argument_line)
+        for forbidden in ("Credential", "UserName", "Password", "WorkerAccount", "source_commit", "installer_path"):
+            with self.subTest(process_argument=forbidden):
+                self.assertNotIn(forbidden, argument_line)
+        self.assertIn("$startInfo.RedirectStandardInput = $true", runner)
+        self.assertIn("$process.StandardInput.BaseStream", runner)
+        self.assertIn("$inputStream.Write($wireBytes", runner)
+        self.assertIn("$environment.Clear()", runner)
+        self.assertEqual(
+            re.findall(r'\$environment\["([A-Za-z]+)"\]', runner),
+            ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP"],
+        )
+        self.assertIn("XbCi7BoundedTextCapture", runner)
+        self.assertIn("$stdoutCapture.Overflow", runner)
+        self.assertIn("$stderrCapture.Overflow", runner)
+        self.assertNotIn("ReadToEndAsync", runner)
+        self.assertNotIn("$process.StartInfo.ToString()", runner)
+        self.assertIn("ConvertFrom-SecureString -SecureString $credential.Password", harness)
+        self.assertIn("ConvertTo-SecureString -String $encryptedPassword", _FROZEN_CI7_CHILD_SCRIPT)
+        source = Path(__file__).read_text(encoding="utf-8")
+        hosted_class = source[source.index("\nclass MemberWorkerHostedTaskBoundaryTests("):]
+        self.assertNotIn("print(json.dumps(report", hosted_class)
 
 
 _LOCAL_TASK_CONTRACT_HARNESS = r'''[CmdletBinding()]
@@ -4441,11 +4630,106 @@ Set-Item function:script:Remove-XbWorkerScheduledTask $originalUnregister
 '''
 
 
+_FROZEN_CI7_CHILD_SCRIPT = r'''param([Parameter(Mandatory)]$Fixture)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$childResult = [ordered]@{
+    schema_version = "xb.member.worker.ci7.frozen-control.v1"
+    fixture_status = "failed"
+    outcome = "fixture_setup_failed"
+    source_commit = [string]$Fixture.source_commit
+    source_blob = [string]$Fixture.source_blob
+    drive_root_index = -1
+    drive_root_right = ""
+    drive_root_allowed = $false
+    drive_root_granted_access = 0
+}
+$securePassword = $null
+$nativeToken = $null
+$context = $null
+try {
+    $installerPath = [string]$Fixture.installer_path
+    $workerAccount = [string]$Fixture.worker_account
+    $encryptedPassword = [string]$Fixture.encrypted_password
+    $frozenContextText = [string]$Fixture.frozen_context_source
+    if ($Fixture.source_commit -cne "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -or
+        $Fixture.source_blob -cne "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" -or
+        $frozenContextText -notmatch '^function Open-XbCi7VerificationContext \{(?s).+\}\s*$' -or
+        [string]::IsNullOrWhiteSpace($installerPath) -or
+        [string]::IsNullOrWhiteSpace($workerAccount) -or
+        [string]::IsNullOrWhiteSpace($encryptedPassword)) {
+        throw "fixture_input_invalid"
+    }
+
+    . $installerPath -LibraryOnly
+    $script:WorkerAccount = $workerAccount
+    Initialize-XbWorkerNativeAccess
+    $securePassword = ConvertTo-SecureString -String $encryptedPassword -ErrorAction Stop
+    $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
+    $encryptedPassword = $null
+    $Fixture.encrypted_password = $null
+    $nativeToken = New-XbWorkerBatchToken -Credential $credential
+
+    $installChain = [string[]](Get-XbNativePathChain -Path $InstallRoot)
+    if ($installChain.Count -lt 1) { throw "fixture_drive_root_unproven" }
+    $driveRoot = [string]$installChain[0]
+    if ($driveRoot -notmatch '^[A-Za-z]:\\$') { throw "fixture_drive_root_unproven" }
+    $driveRootObject = [XbWorkerProtectedObject]::Open($driveRoot, $true, $false)
+    try {
+        $driveRootResult = Invoke-XbCi7HandleAccessCheck -Object $driveRootObject -Token $nativeToken -DesiredAccess ([uint32]0x00000004)
+        $childResult.drive_root_index = 0
+        $childResult.drive_root_right = "0x00000004"
+        $childResult.drive_root_allowed = [bool]$driveRootResult.Allowed
+        $childResult.drive_root_granted_access = [uint32]$driveRootResult.GrantedAccess
+    } finally { $driveRootObject.Dispose() }
+    if (-not $childResult.drive_root_allowed -or $childResult.drive_root_granted_access -ne [uint32]0x00000004) {
+        throw "fixture_drive_root_counterexample_unproven"
+    }
+
+    Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextText))
+    try {
+        $context = Open-XbCi7VerificationContext -Token $nativeToken
+        $childResult.outcome = "unexpected_success"
+    } catch {
+        $safeOutcomes = @(
+            "effective_rights_exceeded", "effective_rights_missing", "effective_rights_unproven",
+            "installation_owned_surface_unknown", "installation_manifest_invalid",
+            "installation_manifest_membership_invalid", "installation_manifest_path_invalid",
+            "installation_manifest_task_invalid", "installation_runtime_roots_invalid",
+            "release_identity_mismatch"
+        )
+        $reason = [string]$_.Exception.Message
+        $childResult.outcome = if ($safeOutcomes -ccontains $reason) { $reason } else { "unexpected_error" }
+    }
+    if ($null -ne $context) {
+        Dispose-XbCi7VerificationContext -Context $context
+        $context = $null
+    }
+    $childResult.fixture_status = "completed"
+} catch {
+    $childResult.fixture_status = "failed"
+    $childResult.outcome = "fixture_setup_failed"
+} finally {
+    if ($null -ne $context) {
+        try { Dispose-XbCi7VerificationContext -Context $context } catch { }
+    }
+    if ($null -ne $nativeToken) { try { $nativeToken.Dispose() } catch { } }
+    if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { } }
+    $credential = $null
+    $Fixture = $null
+}
+[Console]::Out.WriteLine(($childResult | ConvertTo-Json -Depth 4 -Compress))
+if ($childResult.fixture_status -cne "completed") { exit 1 }
+exit 0
+'''
+
+
 _HOSTED_TASK_BOUNDARY_HARNESS = r'''[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InstallerPath,
     [Parameter(Mandatory)][string]$ReviewedManifestPath,
     [Parameter(Mandatory)][string]$FrozenContextPath,
+    [Parameter(Mandatory)][string]$FrozenChildScriptPath,
     [Parameter(Mandatory)][string]$FrozenSourceCommit,
     [Parameter(Mandatory)][string]$FrozenInstallerBlob
 )
@@ -4599,6 +4883,275 @@ function Get-XbBoundaryHResult {
 function Get-XbBoundaryOutcome {
     param([Parameter(Mandatory)][scriptblock]$Body)
     try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+
+function Invoke-XbCi7FrozenControlChild {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$ScriptText,
+        [Parameter(Mandatory)]$Fixture,
+        [int]$TimeoutMilliseconds = 60000
+    )
+    if ($null -eq ("XbCi7BoundedTextCapture" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class XbCi7BoundedTextCapture
+{
+    private readonly StringBuilder text = new StringBuilder();
+    private readonly int limit;
+    private readonly Task readerTask;
+    private volatile bool overflow;
+    private Exception readError;
+
+    public XbCi7BoundedTextCapture(StreamReader reader, int maximumCharacters)
+    {
+        if (reader == null) throw new ArgumentNullException("reader");
+        if (maximumCharacters < 1) throw new ArgumentOutOfRangeException("maximumCharacters");
+        limit = maximumCharacters;
+        readerTask = Task.Factory.StartNew(() => {
+            char[] buffer = new char[1024];
+            try {
+                int count;
+                while ((count = reader.Read(buffer, 0, buffer.Length)) != 0) {
+                    lock (text) {
+                        int remaining = limit - text.Length;
+                        int keep = Math.Max(0, Math.Min(count, remaining));
+                        if (keep > 0) text.Append(buffer, 0, keep);
+                        if (keep < count) overflow = true;
+                    }
+                }
+            } catch (Exception error) {
+                readError = error;
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
+
+    public bool Overflow { get { return overflow; } }
+    public bool ReadFailed { get { return readError != null; } }
+    public string Text { get { lock (text) return text.ToString(); } }
+    public void Wait() { readerTask.Wait(); }
+}
+'@ -ErrorAction Stop | Out-Null
+    }
+    $result = [ordered]@{
+        status = "launch_failed"
+        exit_status = $null
+        process_terminated = $false
+        residue = "unproven"
+        child_result = $null
+        failure_stage = $null
+    }
+    $process = $null
+    $processStarted = $false
+    $childTempPath = $null
+    $childTempCreated = $false
+    $timeoutOccurred = $false
+    $failureStage = "input"
+    try {
+        if ($TimeoutMilliseconds -lt 1 -or $TimeoutMilliseconds -gt 120000 -or
+            [string]::IsNullOrWhiteSpace($ScriptText)) { throw "fixture_input_invalid" }
+        $failureStage = "temporary_state"
+        $repositoryRootFull = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\') + '\'
+        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        $childTempPath = Join-Path $tempRoot ("xb-ci7-frozen-control-" + [Guid]::NewGuid().ToString("N"))
+        $childTempFull = [IO.Path]::GetFullPath($childTempPath).TrimEnd('\') + '\'
+        if ($childTempFull.StartsWith($repositoryRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "fixture_temp_inside_repository"
+        }
+        New-Item -ItemType Directory -Path $childTempPath -ErrorAction Stop | Out-Null
+        $childTempCreated = $true
+        if (@(Get-ChildItem -LiteralPath $childTempPath -Force -ErrorAction Stop).Count -ne 0) {
+            throw "fixture_temp_preimage_invalid"
+        }
+
+        $failureStage = "stdin_payload"
+        $payload = [ordered]@{ script = $ScriptText; fixture = $Fixture } | ConvertTo-Json -Depth 8 -Compress
+        if ([string]::IsNullOrEmpty($payload) -or $payload.Length -gt 262144) { throw "fixture_input_invalid" }
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $utf8Bytes = $utf8.GetBytes($payload)
+        $wireText = [Convert]::ToBase64String($utf8Bytes)
+        $wireBytes = [Text.Encoding]::ASCII.GetBytes($wireText + "`n")
+
+        $failureStage = "process_setup"
+        $bootstrap = '$wire=[Console]::In.ReadToEnd();$json=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($wire.Trim()));$packet=ConvertFrom-Json -InputObject $json -ErrorAction Stop;& ([ScriptBlock]::Create([string]$packet.script)) $packet.fixture'
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $failureStage = "process_executable"
+        $startInfo.FileName = Join-Path $PSHOME "powershell.exe"
+        $failureStage = "process_arguments"
+        $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + $bootstrap + '"'
+        $failureStage = "process_working_directory"
+        $startInfo.WorkingDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+        $failureStage = "process_redirects"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $failureStage = "process_environment_clear"
+        $environment = $startInfo.EnvironmentVariables
+        $environment.Clear()
+        $failureStage = "process_environment_systemroot"
+        $systemRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+        if ([string]::IsNullOrWhiteSpace($systemRoot)) { throw "fixture_process_environment_invalid" }
+        $failureStage = "process_environment_assign"
+        $environment["SystemRoot"] = $systemRoot
+        $environment["WINDIR"] = $systemRoot
+        $environment["PATH"] = Join-Path $systemRoot "System32"
+        $environment["TEMP"] = $childTempPath
+        $environment["TMP"] = $childTempPath
+
+        $process = New-Object System.Diagnostics.Process
+        $failureStage = "process_info_assign"
+        $process.StartInfo = $startInfo
+        $failureStage = "process_encoding"
+        $originalInputEncoding = [Console]::InputEncoding
+        $bomlessInputEncoding = New-Object System.Text.UTF8Encoding($false, $true)
+        try {
+            [Console]::InputEncoding = $bomlessInputEncoding
+            if ([Console]::InputEncoding.GetPreamble().Length -ne 0) { throw "fixture_stdin_encoding_invalid" }
+            $failureStage = "process_start"
+            $processStarted = $process.Start()
+        } finally {
+            [Console]::InputEncoding = $originalInputEncoding
+        }
+        if (-not $processStarted) { throw "fixture_child_start_failed" }
+
+        $stdoutCapture = [XbCi7BoundedTextCapture]::new($process.StandardOutput, 4096)
+        $stderrCapture = [XbCi7BoundedTextCapture]::new($process.StandardError, 4096)
+        $failureStage = "stdin_write"
+        $inputStream = $process.StandardInput.BaseStream
+        $inputStream.Write($wireBytes, 0, $wireBytes.Length)
+        $inputStream.Flush()
+        $process.StandardInput.Close()
+
+        $failureStage = "wait"
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $timeoutOccurred = $true
+            try { $process.Kill() } catch { }
+            $result.process_terminated = [bool]($process.WaitForExit(10000) -and $process.HasExited)
+        } else {
+            $failureStage = "result_capture"
+            $process.WaitForExit()
+            $result.process_terminated = [bool]$process.HasExited
+        }
+        if (-not $result.process_terminated) {
+            $result.status = "termination_unproven"
+        } else {
+            $result.exit_status = [int]$process.ExitCode
+            $stdoutCapture.Wait()
+            $stderrCapture.Wait()
+            $stdout = [string]$stdoutCapture.Text
+            $stderr = [string]$stderrCapture.Text
+            if ($timeoutOccurred) {
+                $result.status = "timeout"
+            } elseif ($stdoutCapture.Overflow -or $stderrCapture.Overflow -or
+                $stdoutCapture.ReadFailed -or $stderrCapture.ReadFailed -or
+                -not [string]::IsNullOrWhiteSpace($stderr)) {
+                $result.status = "malformed_output"
+            } else {
+                $jsonLine = $stdout.TrimEnd("`r", "`n")
+                if ([string]::IsNullOrWhiteSpace($jsonLine) -or $jsonLine.Contains("`r") -or $jsonLine.Contains("`n")) {
+                    $result.status = "malformed_output"
+                } else {
+                    try {
+                        $child = ConvertFrom-Json -InputObject $jsonLine -ErrorAction Stop
+                        $actualFields = @($child.PSObject.Properties | ForEach-Object Name | Sort-Object)
+                        $expectedFields = @(
+                            "drive_root_allowed", "drive_root_granted_access", "drive_root_index",
+                            "drive_root_right", "fixture_status", "outcome", "schema_version",
+                            "source_blob", "source_commit"
+                        )
+                        if (($actualFields -join "|") -cne ($expectedFields -join "|") -or
+                            $child.schema_version -cne "xb.member.worker.ci7.frozen-control.v1" -or
+                            $child.fixture_status -cnotin @("completed", "failed") -or
+                            $child.outcome -cnotin @(
+                                "effective_rights_exceeded", "effective_rights_missing", "effective_rights_unproven",
+                                "installation_owned_surface_unknown", "installation_manifest_invalid",
+                                "installation_manifest_membership_invalid", "installation_manifest_path_invalid",
+                                "installation_manifest_task_invalid", "installation_runtime_roots_invalid",
+                                "release_identity_mismatch", "unexpected_success", "unexpected_error", "fixture_setup_failed"
+                            ) -or
+                            [string]$child.source_commit -notmatch '^[0-9a-f]{40}$' -or
+                            [string]$child.source_blob -notmatch '^[0-9a-f]{40}$' -or
+                            [int]$child.drive_root_index -ne 0 -or
+                            [string]$child.drive_root_right -cne "0x00000004" -or
+                            $child.drive_root_allowed -isnot [bool] -or
+                            $child.drive_root_granted_access -isnot [int] -or
+                            [int]$child.drive_root_granted_access -ne 4) {
+                            $result.status = "malformed_output"
+                        } else {
+                            $result.child_result = [ordered]@{
+                                schema_version = [string]$child.schema_version
+                                fixture_status = [string]$child.fixture_status
+                                outcome = [string]$child.outcome
+                                source_commit = [string]$child.source_commit
+                                source_blob = [string]$child.source_blob
+                                drive_root_index = [int]$child.drive_root_index
+                                drive_root_right = [string]$child.drive_root_right
+                                drive_root_allowed = [bool]$child.drive_root_allowed
+                                drive_root_granted_access = [uint32]$child.drive_root_granted_access
+                            }
+                            $result.status = if ($result.exit_status -eq 0) { "completed" } else { "abnormal_exit" }
+                        }
+                    } catch { $result.status = "malformed_output" }
+                }
+            }
+        }
+    } catch {
+        $result.status = "launch_failed"
+        $result.failure_stage = $failureStage
+    } finally {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) {
+                    try { $process.Kill() } catch { }
+                    $result.process_terminated = [bool]($process.WaitForExit(10000) -and $process.HasExited)
+                }
+            } catch { $result.process_terminated = $false }
+            try { $process.Dispose() } catch { }
+        }
+        if ($childTempCreated -and $null -ne $childTempPath -and
+            (-not $processStarted -or $result.process_terminated)) {
+            try {
+                if (Test-Path -LiteralPath $childTempPath) {
+                    Remove-Item -LiteralPath $childTempPath -Recurse -Force -ErrorAction Stop
+                }
+                $result.residue = if (Test-Path -LiteralPath $childTempPath) { "present" } else { "none" }
+            } catch { $result.residue = "unproven" }
+        } elseif ($childTempCreated -and $processStarted -and -not $result.process_terminated) {
+            $result.residue = "unproven"
+        } elseif (-not $childTempCreated) {
+            $result.residue = "none"
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Assert-XbCi7FrozenControlChildResult {
+    param(
+        [Parameter(Mandatory)]$RunResult,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$SourceBlob
+    )
+    if ($RunResult.status -cne "completed") { throw ("frozen_control_child_" + [string]$RunResult.status) }
+    if (-not [bool]$RunResult.process_terminated) { throw "frozen_control_child_termination_unproven" }
+    if ([string]$RunResult.residue -cne "none") { throw "frozen_control_child_residue_unproven" }
+    $child = $RunResult.child_result
+    if ($null -eq $child -or $child.fixture_status -cne "completed") { throw "frozen_control_child_result_missing" }
+    if ($child.source_commit -cne $SourceCommit -or $child.source_blob -cne $SourceBlob) {
+        throw "frozen_control_child_source_binding_invalid"
+    }
+    if ($child.drive_root_index -ne 0 -or $child.drive_root_right -cne "0x00000004" -or
+        -not [bool]$child.drive_root_allowed -or $child.drive_root_granted_access -ne [uint32]0x00000004) {
+        throw "frozen_control_child_counterexample_unproven"
+    }
+    if ($child.outcome -cne "effective_rights_exceeded") { throw "frozen_control_child_outcome_mismatch" }
+    return $true
 }
 
 function Invoke-XbBoundaryCase {
@@ -5483,17 +6036,52 @@ public static class XbCi7FailureCleanupProbe
                 if (-not $frozenContextText.StartsWith("function Open-XbCi7VerificationContext {", [StringComparison]::Ordinal)) {
                     throw "ci7_frozen_context_source_invalid"
                 }
-                $frozenContextOpen = $frozenContextText.IndexOf("{")
-                $frozenContextClose = $frozenContextText.LastIndexOf("}")
-                if ($frozenContextOpen -lt 0 -or $frozenContextClose -le $frozenContextOpen) { throw "ci7_frozen_context_source_invalid" }
-                $frozenContextBody = $frozenContextText.Substring($frozenContextOpen + 1, $frozenContextClose - $frozenContextOpen - 1)
-                $currentContextFunction = ${function:script:Open-XbCi7VerificationContext}
                 $ci7.frozen_control_source_commit = $FrozenSourceCommit
                 $ci7.frozen_control_installer_blob = $FrozenInstallerBlob
+                $frozenChildScriptText = [IO.File]::ReadAllText($FrozenChildScriptPath)
+                if ([string]::IsNullOrWhiteSpace($frozenChildScriptText) -or $frozenChildScriptText.Length -gt 32768) {
+                    throw "ci7_frozen_child_script_invalid"
+                }
+                $candidateContextBefore = ${function:script:Open-XbCi7VerificationContext}
+                $encryptedPassword = ConvertFrom-SecureString -SecureString $credential.Password
+                $childFixture = [ordered]@{
+                    installer_path = $InstallerPath
+                    worker_account = [string]$credential.UserName
+                    encrypted_password = $encryptedPassword
+                    frozen_context_source = $frozenContextText
+                    source_commit = $FrozenSourceCommit
+                    source_blob = $FrozenInstallerBlob
+                }
                 try {
-                    Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextBody))
-                    $ci7.frozen_defective_context_outcome = Get-XbBoundaryOutcome { Open-XbCi7VerificationContext -Token $nativeToken }
-                } finally { Set-Item function:script:Open-XbCi7VerificationContext $currentContextFunction }
+                    $frozenChildRun = Invoke-XbCi7FrozenControlChild `
+                        -RepositoryRoot (Split-Path -Parent (Split-Path -Parent $InstallerPath)) `
+                        -ScriptText $frozenChildScriptText `
+                        -Fixture $childFixture
+                } finally {
+                    $childFixture.encrypted_password = $null
+                    $encryptedPassword = $null
+                }
+                $ci7.frozen_control_child_status = [string]$frozenChildRun.status
+                $ci7.frozen_control_child_exit_status = $frozenChildRun.exit_status
+                $ci7.frozen_control_child_terminated = [bool]$frozenChildRun.process_terminated
+                $ci7.frozen_control_child_residue = [string]$frozenChildRun.residue
+                $ci7.frozen_control_parent_function_replaced = -not [object]::ReferenceEquals(
+                    $candidateContextBefore, ${function:script:Open-XbCi7VerificationContext}
+                )
+                if ($null -ne $frozenChildRun.child_result) {
+                    $ci7.frozen_defective_context_outcome = [string]$frozenChildRun.child_result.outcome
+                    $ci7.frozen_control_child_source_commit = [string]$frozenChildRun.child_result.source_commit
+                    $ci7.frozen_control_child_installer_blob = [string]$frozenChildRun.child_result.source_blob
+                    $ci7.frozen_control_child_drive_root_index = [int]$frozenChildRun.child_result.drive_root_index
+                    $ci7.frozen_control_child_drive_root_right = [string]$frozenChildRun.child_result.drive_root_right
+                    $ci7.frozen_control_child_drive_root_allowed = [bool]$frozenChildRun.child_result.drive_root_allowed
+                    $ci7.frozen_control_child_drive_root_granted_access = [uint32]$frozenChildRun.child_result.drive_root_granted_access
+                }
+                if ($ci7.frozen_control_parent_function_replaced) { throw "ci7_parent_context_function_replaced" }
+                $null = Assert-XbCi7FrozenControlChildResult `
+                    -RunResult $frozenChildRun `
+                    -SourceCommit $FrozenSourceCommit `
+                    -SourceBlob $FrozenInstallerBlob
 
             } finally { $driveRootObject.Dispose() }
             $driveRootAfter = [XbWorkerProtectedObject]::Open($driveRoot, $true, $false)
@@ -6548,6 +7136,10 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             frozen_context, frozen_blob = _frozen_ci7_context_source()
             frozen_context_path = root / "frozen_ci7_context.ps1"
             frozen_context_path.write_text(frozen_context, encoding="utf-8", newline="\n")
+            frozen_child_path = root / "frozen_control_child.ps1"
+            frozen_child_path.write_text(_FROZEN_CI7_CHILD_SCRIPT, encoding="utf-8", newline="\n")
+            if frozen_context_path.read_text(encoding="utf-8") != frozen_context or frozen_child_path.read_text(encoding="utf-8") != _FROZEN_CI7_CHILD_SCRIPT:
+                raise AssertionError("hosted fixture source readback failed")
             harness = root / "task_boundary_harness.ps1"
             harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
             completed = subprocess.run(
@@ -6557,6 +7149,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
                     "-InstallerPath", str(ROOT / INSTALLER_PATH),
                     "-ReviewedManifestPath", str(manifest),
                     "-FrozenContextPath", str(frozen_context_path),
+                    "-FrozenChildScriptPath", str(frozen_child_path),
                     "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
                     "-FrozenInstallerBlob", frozen_blob,
                 ],
@@ -6566,13 +7159,14 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
                 text=True,
                 timeout=1500,
             )
+        if root.exists():
+            raise AssertionError("hosted fixture temporary residue present")
         report = _boundary_report(completed.stdout)
         if report is None:
-            raise AssertionError(
-                "hosted boundary harness produced no report\n" + completed.stdout[-4000:] + completed.stderr[-4000:]
-            )
+            raise AssertionError("hosted boundary harness produced no bounded report")
+        if completed.returncode != 0 and report.get("fatal") is None:
+            raise AssertionError("hosted boundary harness exited abnormally")
         print(TASK_BOUNDARY_MARKER, flush=True)
-        print(json.dumps(report, sort_keys=True), flush=True)
         cls.report = report
 
     def _case(self, name: str) -> dict[str, object]:
