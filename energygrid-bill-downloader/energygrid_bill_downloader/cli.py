@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
 import os
 import re
@@ -1527,19 +1528,22 @@ def main(argv: list[str] | None = None) -> int:
             return run_direct_http(config, logger, run_id, list_only=args.command == "list")
         if args.command != "list":
             cleanup_stale_owned_temp(config.temp_root)
-        with StateStore(config.state_path, read_only=args.command == "list") as state:
-            with PlaywrightPortal(config, headed=args.headed) as portal:
-                logger.event("login_start")
-                portal.login()
-                logger.event("login_complete")
-                summary = reconcile_inventory(
-                    config=config,
-                    portal=portal,
-                    state=state,
-                    logger=logger,
-                    run_id=run_id,
-                    list_only=args.command == "list",
-                )
+        with ExitStack() as stack:
+            state = StateStore(config.state_path, read_only=args.command == "list")
+            if args.command != "list":
+                state = stack.enter_context(state)
+            portal = stack.enter_context(PlaywrightPortal(config, headed=args.headed))
+            logger.event("login_start")
+            portal.login()
+            logger.event("login_complete")
+            summary = reconcile_inventory(
+                config=config,
+                portal=portal,
+                state=state,
+                logger=logger,
+                run_id=run_id,
+                list_only=args.command == "list",
+            )
         logger.event(
             "run_complete",
             status=summary.status,

@@ -29,6 +29,7 @@ from energygrid_bill_downloader.errors import (
     LayoutChangedError,
     LoginError,
 )
+from energygrid_bill_downloader.publication import FileInfo
 from energygrid_bill_downloader.state import StateStore, migrate_state_database
 
 
@@ -131,31 +132,89 @@ class CliTests(unittest.TestCase):
             self.assertEqual("CONFIG_OR_DEPENDENCY", json.loads(rejected.getvalue())["error_class"])
 
     def test_legacy_run_is_refused_before_runtime_side_effects(self) -> None:
+        examples = Path(__file__).parents[1] / "config"
+        effects = (
+            "SafeLogger",
+            "_ReadOnlyLogger",
+            "StateStore",
+            "StateV2Store",
+            "RunLock",
+            "cleanup_stale_owned_temp",
+            "PlaywrightPortal",
+            "DirectHttpSource",
+            "run_direct_http",
+            "reconcile_inventory",
+            "reconcile_listed_inventory",
+            "reconcile_dual_stream",
+            "notify_failure",
+            "send_alert",
+            "migrate_state_database",
+        )
+        archived_bytes = b"%PDF-1.4\nhistorical invoice\n%%EOF\n"
+
+        for source, example_name in (
+            ("browser", "energygrid.example.json"),
+            ("direct_http", "energygrid.direct_http.example.json"),
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                raw = json.loads((examples / example_name).read_text(encoding="utf-8"))
+                archive_root = root / "archive"
+                archive_root.mkdir()
+                (archive_root / "historical.pdf").write_bytes(archived_bytes)
+                state_path = root / "state" / "state.sqlite3"
+                raw.update(
+                    archive_root=str(archive_root),
+                    state_path=str(state_path),
+                    temp_root=str(root / "temp"),
+                    log_root=str(root / "logs"),
+                )
+                config_path = root / "config.json"
+                config_path.write_text(json.dumps(raw), encoding="utf-8")
+                with StateStore(state_path) as state:
+                    state.record_archived(
+                        "historical.pdf",
+                        "historical.pdf",
+                        FileInfo(len(archived_bytes), "a" * 64),
+                        now="2026-10-03T00:00:00+00:00",
+                    )
+
+                before = _cli_tree_snapshot(root)
+                with contextlib.ExitStack() as stack:
+                    boundaries = {
+                        name: stack.enter_context(mock.patch.object(cli, name))
+                        for name in effects
+                    }
+                    for _attempt in range(2):
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            exit_code = main(["run", "--config", str(config_path)])
+                        self.assertEqual(64, exit_code)
+                        self.assertEqual(
+                            {
+                                "error_class": "LEGACY_RUN_DISABLED",
+                                "status": "ACTION_REQUIRED",
+                                "support_ref": "EG_LEGACY_RUN_DISABLED",
+                            },
+                            json.loads(stdout.getvalue()),
+                        )
+                    for boundary in boundaries.values():
+                        boundary.assert_not_called()
+                self.assertEqual(before, _cli_tree_snapshot(root))
+
+    def test_legacy_run_invalid_configuration_keeps_its_bounded_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            raw = json.loads(
-                (Path(__file__).parents[1] / "config" / "energygrid.direct_http.example.json").read_text(encoding="utf-8")
-            )
-            raw.update(
-                archive_root=str(root / "archive"),
-                state_path=str(root / "state" / "state.sqlite3"),
-                temp_root=str(root / "temp"),
-                log_root=str(root / "logs"),
-            )
-            config_path = root / "config.json"
-            config_path.write_text(json.dumps(raw), encoding="utf-8")
-            before = _cli_tree_snapshot(root)
+            config_path = root / "invalid.json"
+            config_path.write_text("{}", encoding="utf-8")
             stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout), \
-                    mock.patch.object(cli, "run_direct_http") as run_direct_http:
+            with contextlib.redirect_stdout(stdout):
                 exit_code = main(["run", "--config", str(config_path)])
             self.assertEqual(64, exit_code)
             self.assertEqual(
-                {"error_class": "LEGACY_RUN_DISABLED", "status": "ACTION_REQUIRED", "support_ref": "EG_LEGACY_RUN_DISABLED"},
+                {"status": ACTION_REQUIRED, "error_class": "CONFIG_OR_DEPENDENCY"},
                 json.loads(stdout.getvalue()),
             )
-            run_direct_http.assert_not_called()
-            self.assertEqual(before, _cli_tree_snapshot(root))
 
     def test_only_locked_commands_and_overrides_are_exposed(self) -> None:
         args = build_parser().parse_args(
