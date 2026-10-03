@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
@@ -68,7 +69,8 @@ def validate_filename(filename: str, archive_root: Path) -> Path:
 
 def validate_pdf(path: Path) -> FileInfo:
     try:
-        if not path.is_file():
+        ensure_no_reparse_components(path)
+        if not stat.S_ISREG(path.lstat().st_mode):
             raise InvalidPdfError("download is not a regular file")
         byte_size = path.stat().st_size
         if byte_size <= 0:
@@ -111,11 +113,14 @@ def ensure_same_volume(source: Path, destination: Path) -> None:
 
 
 def publish_no_replace(source: Path, destination: Path) -> None:
+    ensure_no_reparse_components(source)
+    ensure_no_reparse_components(destination)
     if destination.exists():
         raise ArchiveConflictError("archive destination already exists")
-    if not source.is_file():
+    if not stat.S_ISREG(source.lstat().st_mode):
         raise StateError("owned publication source is missing")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    ensure_no_reparse_components(destination.parent)
     ensure_same_volume(source, destination)
     if os.name != "nt":
         raise ConfigError("v1 publication requires Windows MoveFileExW")
@@ -130,6 +135,27 @@ def publish_no_replace(source: Path, destination: Path) -> None:
             raise ArchiveConflictError("archive destination appeared during publication")
         error_code = ctypes.get_last_error()
         raise StateError(f"no-replace publication failed with Windows error {error_code}")
+
+
+def ensure_no_reparse_components(path: Path) -> None:
+    """Reject symlinks/junctions in every existing component of a private path."""
+    lexical = Path(os.path.abspath(path))
+    parts = lexical.parts
+    if not parts:
+        return
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise StateError("publication path component could not be inspected") from exc
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if stat.S_ISLNK(metadata.st_mode) or attributes & reparse_flag:
+            raise ConfigError("reparse points are forbidden in publication paths")
 
 
 def create_run_directory(temp_root: Path, run_id: str) -> Path:

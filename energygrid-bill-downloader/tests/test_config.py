@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from energygrid_bill_downloader.config import is_within, load_runtime_config
+from energygrid_bill_downloader.config import is_within, load_runtime_config, load_dual_stream_config, load_config_file
 from energygrid_bill_downloader.errors import ConfigError
 
 
@@ -160,6 +160,89 @@ class ConfigTests(unittest.TestCase):
         raw = json.loads(example.read_text(encoding="utf-8"))
         self.assertEqual(raw["account_identity"], "REPLACE_WITH_PRIVATE_ACCOUNT_IDENTITY")
         self.assertNotIn("C&W", raw["account_identity"])
+
+
+class DualStreamConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def raw(self) -> dict[str, object]:
+        unbound = {
+            "admission": "UNBOUND", "source_namespace": None, "adapter_id": None,
+            "date_profile": None, "evidence_ref": None, "settings": None,
+        }
+        return {
+            "schema": "energygrid.runtime.v2",
+            "source": "dual_stream",
+            "archive_root": str(self.root / "archive"),
+            "state_path": str(self.root / "state" / "state.sqlite3"),
+            "temp_root": str(self.root / "temp"),
+            "log_root": str(self.root / "logs"),
+            "streams": {"EB_BILL": dict(unbound), "TENANT_BILL": dict(unbound)},
+            "drive": {"mode": "unbound", "root": None, "binding_id": None},
+            "delivery": {
+                "url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_PRIVATE_PATH",
+                "auth_header_name": "X-EnergyGrid-Delivery",
+                "auth_token_env": "ENERGYGRID_DELIVERY_TOKEN",
+                "max_pdf_bytes": 15_000_000,
+                "timeout_seconds": 30,
+            },
+        }
+
+    def test_example_is_deliberately_unbound_and_schema_complete(self) -> None:
+        path = Path(__file__).parents[1] / "config" / "energygrid.dual_stream.example.json"
+        raw = load_config_file(path)
+        config = load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        self.assertEqual("UNBOUND", config.streams["TENANT_BILL"].admission)
+        self.assertEqual("unbound", config.drive.mode)
+        self.assertEqual(15_000_000, config.delivery.max_pdf_bytes)
+
+    def test_exact_shape_rejects_unknown_keys_and_duplicate_json_fields(self) -> None:
+        raw = self.raw()
+        raw["unexpected"] = True
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        path = self.root / "duplicate.json"
+        path.write_text('{"schema":"energygrid.runtime.v2","schema":"energygrid.runtime.v2"}', encoding="utf-8")
+        with self.assertRaises(ConfigError):
+            load_config_file(path)
+
+    def test_tenant_stream_cannot_be_production_bound_without_accepted_evidence(self) -> None:
+        raw = self.raw()
+        raw["streams"]["TENANT_BILL"] = {
+            "admission": "BOUND", "source_namespace": "SYNTHETIC_TENANT",
+            "adapter_id": "DIRECT_HTTP_V1", "date_profile": "INVOICE_DATE_ISO_V1",
+            "evidence_ref": "EG_SYNTHETIC_SOURCE", "settings": {
+                "list_url": "https://example.invalid/list",
+                "fetch_url": "https://example.invalid/fetch",
+                "tenant_id": "SYNTHETIC-TENANT",
+            },
+        }
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+
+    def test_drive_binding_requires_separate_external_root_and_evidence_id(self) -> None:
+        raw = self.raw()
+        raw["drive"] = {
+            "mode": "local_stage", "root": str(self.root / "drive"), "binding_id": "SYNTHETIC_DRIVE",
+        }
+        config = load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        self.assertEqual("local_stage", config.drive.mode)
+        raw["drive"]["root"] = raw["archive_root"]
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+
+    def test_delivery_endpoint_rejects_remote_plain_http_and_invalid_size(self) -> None:
+        raw = self.raw()
+        raw["delivery"]["url"] = "http://example.invalid/webhook"
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        raw = self.raw()
+        raw["delivery"]["max_pdf_bytes"] = True
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root)
 
 if __name__ == "__main__":
     unittest.main()

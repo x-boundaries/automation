@@ -140,6 +140,7 @@ $script:EgLauncherSupportRefs = @(
     'EG_LAUNCHER_CONFIG_INSIDE_CHECKOUT',
     'EG_LAUNCHER_CONFIG_UNPARSABLE',
     'EG_LAUNCHER_CONFIG_KEY_MISSING',
+    'EG_LAUNCHER_RUN_ID_INVALID',
     'EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED',
     'EG_LAUNCHER_ROOT_INSIDE_CHECKOUT',
     'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE',
@@ -1877,14 +1878,19 @@ $script:EgRequiredConfigKeys = @(
     'portal_url', 'account_identity', 'archive_root', 'state_path', 'temp_root', 'log_root'
 )
 
-# DL-XB-199 G3-101. The application selects its source with an explicit `source` key. When
-# it is `direct_http`, the browser-only `portal_url` and `account_identity` are not used and
-# the `direct_http` object with exactly these non-blank members is required instead. An
-# absent `source` keeps the historical browser key set unchanged; any other value fails.
+# Source-aware config admission. Legacy direct_http keeps its established required-key
+# shape. The v2 dual_stream shape has its own schema marker and closed top-level blocks;
+# Python remains the authority for all nested values and path policy. An absent `source`
+# keeps the historical browser key set unchanged; any other value fails.
 $script:EgDirectHttpSource = 'direct_http'
 $script:EgBrowserSource = 'browser'
+$script:EgDualStreamSource = 'dual_stream'
+$script:EgDualStreamSchema = 'energygrid.runtime.v2'
 $script:EgDirectHttpRequiredConfigKeys = @(
     'direct_http', 'archive_root', 'state_path', 'temp_root', 'log_root'
+)
+$script:EgDualStreamRequiredConfigKeys = @(
+    'schema', 'archive_root', 'state_path', 'temp_root', 'log_root', 'streams', 'drive', 'delivery'
 )
 $script:EgDirectHttpRequiredMembers = @('list_url', 'fetch_url', 'tenant_id')
 
@@ -2002,14 +2008,35 @@ function Test-EgLauncherConfigContract {
     }
     $requiredKeys = $script:EgRequiredConfigKeys
     $directHttp = $false
+    $dualStream = $false
     if ($propertyNames -ccontains 'source') {
         $source = $parsed.source
         if (($source -is [string]) -and ($source -ceq $script:EgDirectHttpSource)) {
             $directHttp = $true
             $requiredKeys = $script:EgDirectHttpRequiredConfigKeys
         }
+        elseif (($source -is [string]) -and ($source -ceq $script:EgDualStreamSource)) {
+            $dualStream = $true
+            $requiredKeys = $script:EgDualStreamRequiredConfigKeys
+            if (($propertyNames -cnotcontains 'schema') -or
+                ($parsed.schema -cne $script:EgDualStreamSchema)) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
+        }
         elseif (-not (($source -is [string]) -and ($source -ceq $script:EgBrowserSource))) {
             return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+    }
+    if ($dualStream) {
+        foreach ($member in @('streams', 'drive', 'delivery')) {
+            if ($propertyNames -cnotcontains $member) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
+            $block = $parsed.$member
+            if (($null -eq $block) -or
+                ($block -isnot [System.Management.Automation.PSCustomObject])) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
         }
     }
     if ($directHttp) {

@@ -145,6 +145,23 @@ class Deployment:
         self.config_path.write_text(json.dumps(raw), encoding="utf-8")
 
     def run(self, command: str = "run") -> tuple[int, dict]:
+        # Preserve coverage of the direct-HTTP worker after the public legacy
+        # `run` command is closed by the v2 admission contract. `list` remains
+        # a public read-only CLI operation.
+        if command != "run":
+            return self.run_cli(command)
+        config = cli.load_runtime_config(self.raw)
+        config.preflight(require_archive=True)
+        run_id = cli.resolve_run_id()
+        logger = cli.SafeLogger(config.log_root, run_id)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.run_direct_http(config, logger, run_id, list_only=False)
+        lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
+        self.last_stdout = stdout.getvalue()
+        return code, json.loads(lines[-1])
+
+    def run_cli(self, command: str = "run") -> tuple[int, dict]:
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = cli.main([command, "--config", str(self.config_path)])
@@ -1876,6 +1893,23 @@ class DirectHttpConfiguration(unittest.TestCase):
 
 
 class NoBrowserOnTheDirectPath(DirectHttpCase):
+    def test_legacy_run_cli_is_closed_before_contact_or_runtime_effects(self) -> None:
+        deployment = self.deployment()
+        before = state_snapshot(deployment.tmp)
+        code, document = deployment.run_cli("run")
+        self.assertEqual(64, code)
+        self.assertEqual(
+            {"status": "ACTION_REQUIRED", "error_class": "LEGACY_RUN_DISABLED", "support_ref": "EG_LEGACY_RUN_DISABLED"},
+            document,
+        )
+        self.assertEqual(before, state_snapshot(deployment.tmp))
+        self.assertEqual([], self.service_state.list_requests)
+        self.assertEqual([], self.service_state.fetch_requests)
+        self.assertEqual([], self.service_state.other_requests)
+        self.assertFalse(deployment.state_path.exists())
+        self.assertFalse(deployment.temp_root.exists())
+        self.assertFalse(deployment.log_root.exists())
+
     def test_direct_http_run_never_constructs_the_browser_portal(self) -> None:
         with mock.patch.object(cli, "PlaywrightPortal", side_effect=AssertionError("browser reached")):
             deployment = self.deployment()

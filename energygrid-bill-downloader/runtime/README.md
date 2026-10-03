@@ -72,7 +72,7 @@ own directory.
 | `-Command` | no | `run` (default), `list`, `login-diagnostic`, or `download-preflight-diagnostic` |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch; see below |
-| `-RunId` | no | Correlation identifier for the terminal event only |
+| `-RunId` | no | Shared lower-case UUID run identifier. A valid explicit value reaches Python in process scope; an ordinary run without one generates it after `ValidateOnly` exits. It is restored with the other injected process variables. |
 
 `-Command` is a closed allowlist of four fixed operation names and is the only thing that
 varies in the invocation. The child is always started as
@@ -80,6 +80,13 @@ varies in the invocation. The child is always started as
 arguments, in that order, for every admitted command. Nothing is appended conditionally, and
 no caller-supplied script, module, path, portal address, credential value, or arbitrary
 child argument can reach it.
+
+Position 10 admits the legacy browser and direct-HTTP config contracts plus the
+v2 `dual_stream` contract. The latter requires the exact
+`energygrid.runtime.v2` schema marker and the top-level `streams`, `drive`, and
+`delivery` objects. The launcher does not validate nested source bindings,
+dates, or path policy; Python owns those checks. Private configuration remains
+outside the checkout.
 
 `login-diagnostic` runs the bounded login diagnostic: the canonical login sequence up to and
 including exactly one real Login submit, then a bounded read-only observation of fixed

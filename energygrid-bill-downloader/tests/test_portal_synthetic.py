@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -27,7 +28,8 @@ from energygrid_bill_downloader.errors import (
     LoginError,
 )
 from energygrid_bill_downloader.portal import PlaywrightPortal
-from energygrid_bill_downloader.publication import validate_pdf
+from energygrid_bill_downloader.publication import FileInfo, validate_pdf
+from energygrid_bill_downloader.state import StateStore
 from tests.fixtures.synthetic_portal import SyntheticBill, SyntheticPortalServer, synthetic_pdf, write_config
 
 try:
@@ -41,6 +43,24 @@ def runtime_credentials() -> dict[str, str]:
         "ENERGYGRID_USERNAME": "synthetic-" + uuid.uuid4().hex,
         "ENERGYGRID_PASSWORD": "synthetic-" + uuid.uuid4().hex,
     }
+
+
+def filesystem_snapshot(root: Path) -> dict[str, tuple[bool, int, bytes | None]]:
+    if not root.exists():
+        return {}
+    paths = [root, *sorted(root.rglob("*"))]
+    return {
+        path.relative_to(root).as_posix() or ".": (
+            path.is_dir(), path.stat().st_mtime_ns, None if path.is_dir() else path.read_bytes()
+        )
+        for path in paths
+    }
+
+
+def read_v1_state_rows(path: Path) -> tuple[tuple, ...]:
+    uri = path.resolve().as_uri() + "?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True)) as connection:
+        return tuple(connection.execute("SELECT * FROM bills ORDER BY filename_key").fetchall())
 
 
 @contextlib.contextmanager
@@ -624,11 +644,14 @@ class SyntheticPortalTests(unittest.TestCase):
                     with self.assertRaises(InvalidPdfError):
                         validate_pdf(target)
 
-    def cli_run(self, server: SyntheticPortalServer, root: Path, command: str = "run") -> tuple[int, dict]:
+    def cli_config(self, server: SyntheticPortalServer, root: Path) -> Path:
         config_path = root / "config.json"
         if not config_path.exists():
             (root / "archive").mkdir()
             write_config(config_path, server, root)
+        return config_path
+
+    def cli_command(self, config_path: Path, command: str) -> tuple[int, dict]:
         old, _values = self.with_credentials()
         stdout = io.StringIO()
         try:
@@ -638,76 +661,208 @@ class SyntheticPortalTests(unittest.TestCase):
             self.restore_credentials(old)
         return result, json.loads(stdout.getvalue().strip().splitlines()[-1])
 
-    def state_records(self, root: Path) -> dict:
-        from energygrid_bill_downloader.state import StateStore
+    def cli_run(self, server: SyntheticPortalServer, root: Path, command: str = "run") -> tuple[int, dict]:
+        return self.cli_command(self.cli_config(server, root), command)
 
-        with StateStore(root / "state" / "state.sqlite3") as state:
-            return {record.filename_key: record for record in state.records()}
+    def assert_legacy_run_refused(self, config_path: Path) -> None:
+        effect_names = (
+            "SafeLogger",
+            "_ReadOnlyLogger",
+            "StateStore",
+            "StateV2Store",
+            "RunLock",
+            "cleanup_stale_owned_temp",
+            "PlaywrightPortal",
+            "DirectHttpSource",
+            "run_direct_http",
+            "reconcile_inventory",
+            "reconcile_listed_inventory",
+            "reconcile_dual_stream",
+            "notify_failure",
+            "send_alert",
+            "migrate_state_database",
+        )
+        old, _values = self.with_credentials()
+        try:
+            with contextlib.ExitStack() as stack:
+                boundaries = {
+                    name: stack.enter_context(mock.patch.object(cli, name))
+                    for name in effect_names
+                }
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    result = main(["run", "--config", str(config_path)])
+                self.assertEqual(64, result)
+                self.assertEqual(
+                    {
+                        "error_class": "LEGACY_RUN_DISABLED",
+                        "status": ACTION_REQUIRED,
+                        "support_ref": "EG_LEGACY_RUN_DISABLED",
+                    },
+                    json.loads(stdout.getvalue()),
+                )
+                for boundary in boundaries.values():
+                    boundary.assert_not_called()
+        finally:
+            self.restore_credentials(old)
 
-    def test_cli_run_downloads_every_row_and_a_rerun_publishes_nothing(self) -> None:
-        bills = [
-            SyntheticBill("2026-05-09_account_ref.pdf", payload=synthetic_pdf(b"run-a")),
-            SyntheticBill("2026-05-10_account_ref.pdf", payload=synthetic_pdf(b"run-b")),
-        ]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
-            root = Path(directory)
-            first, first_summary = self.cli_run(server, root)
-            self.assertEqual(first, 0)
-            self.assertEqual(first_summary["status"], "DOWNLOADED")
-            self.assertEqual(first_summary["downloaded_count"], 2)
-            before = self.state_records(root)
-            stats = {bill.filename: (root / "archive" / bill.filename).stat().st_mtime_ns for bill in bills}
+    def cli_list_without_state_access(self, config_path: Path) -> tuple[int, dict]:
+        state_path = Path(json.loads(config_path.read_text(encoding="utf-8"))["state_path"]).resolve()
+        old, _values = self.with_credentials()
+        stdout = io.StringIO()
+        try:
+            with contextlib.ExitStack() as stack:
+                store_factory = stack.enter_context(mock.patch.object(cli, "StateStore", wraps=StateStore))
+                state_enter = stack.enter_context(mock.patch.object(
+                    StateStore, "__enter__", autospec=True,
+                    side_effect=AssertionError("browser LIST entered StateStore"),
+                ))
+                state_open = stack.enter_context(mock.patch.object(
+                    StateStore, "_open_read_only", autospec=True,
+                    side_effect=AssertionError("browser LIST opened state"),
+                ))
+                state_initialize = stack.enter_context(mock.patch.object(
+                    StateStore, "_initialize", autospec=True,
+                    side_effect=AssertionError("browser LIST initialized state"),
+                ))
+                state_sql = stack.enter_context(mock.patch.object(
+                    StateStore, "_execute", autospec=True,
+                    side_effect=AssertionError("browser LIST queried state"),
+                ))
+                sqlite_connect = stack.enter_context(mock.patch(
+                    "energygrid_bill_downloader.state.sqlite3.connect",
+                    side_effect=AssertionError("browser LIST opened SQLite"),
+                ))
+                cleanup = stack.enter_context(mock.patch.object(cli, "cleanup_stale_owned_temp"))
+                writable_logger = stack.enter_context(mock.patch.object(cli, "SafeLogger"))
+                notification = stack.enter_context(mock.patch.object(cli, "notify_failure"))
+                direct_source = stack.enter_context(mock.patch.object(cli, "DirectHttpSource"))
+                direct_dispatch = stack.enter_context(mock.patch.object(cli, "run_direct_http"))
+                with contextlib.redirect_stdout(stdout):
+                    result = main(["list", "--config", str(config_path)])
+                store_factory.assert_called_once_with(state_path, read_only=True)
+                for boundary in (
+                    state_enter, state_open, state_initialize, state_sql, sqlite_connect,
+                    cleanup, writable_logger, notification, direct_source, direct_dispatch,
+                ):
+                    boundary.assert_not_called()
+        finally:
+            self.restore_credentials(old)
+        return result, json.loads(stdout.getvalue().strip().splitlines()[-1])
 
-            second, second_summary = self.cli_run(server, root)
-            self.assertEqual(second, 0)
-            self.assertEqual(second_summary["status"], "ALREADY_PRESENT")
-            self.assertEqual(second_summary["present_count"], 2)
-            self.assertEqual(second_summary["downloaded_count"], 0)
-            self.assertEqual(server.download_counts, {bill.filename: 2 for bill in bills})
-            after = self.state_records(root)
-            self.assertEqual(set(after), set(before))
-            for key, record in after.items():
-                for name in ("status", "sha256", "byte_size", "archived_at_utc", "completion_source"):
-                    self.assertEqual(getattr(record, name), getattr(before[key], name))
-            for bill in bills:
-                self.assertEqual((root / "archive" / bill.filename).stat().st_mtime_ns, stats[bill.filename])
-            self.assertEqual(list((root / "temp").glob("run-*")), [])
-            self.assert_no_business_detour(server)
+    def cli_list_with_state_spies(self, config_path: Path) -> tuple[int, dict]:
+        return self.cli_list_without_state_access(config_path)
 
-    def test_cli_list_downloads_nothing_and_writes_no_state(self) -> None:
+    def add_read_only_sentinels(self, root: Path) -> None:
+        (root / "archive" / "preserve.bin").write_bytes(b"archive evidence")
+        temp_run = root / "temp" / "run-preserve"
+        temp_run.mkdir(parents=True)
+        (temp_run / "sentinel.txt").write_bytes(b"temp evidence")
+        log_root = root / "logs"
+        log_root.mkdir()
+        (log_root / "business.jsonl").write_bytes(b"log evidence\n")
+
+    def test_cli_run_refuses_two_row_duplicate_and_header_only_surfaces(self) -> None:
+        cases = (
+            ("two-rows", [SyntheticBill("2026-05-09_a.pdf"), SyntheticBill("2026-05-10_b.pdf")]),
+            ("duplicate-name", [SyntheticBill("Invoice.pdf"), SyntheticBill("invoice.PDF")]),
+            ("header-only", []),
+        )
+        for label, bills in cases:
+            with self.subTest(surface=label), tempfile.TemporaryDirectory() as directory, \
+                    SyntheticPortalServer(bills) as server:
+                root = Path(directory)
+                config_path = self.cli_config(server, root)
+                before = filesystem_snapshot(root)
+                self.assert_legacy_run_refused(config_path)
+                self.assertEqual(before, filesystem_snapshot(root))
+                self.assertEqual(0, server.search_count)
+                self.assertEqual(0, server.download_clicks)
+                self.assertEqual(0, server.activation_count)
+                self.assertEqual(0, server.ems_actuation_count)
+                self.assert_no_business_detour(server)
+
+    def test_cli_list_is_inventory_only_with_missing_or_populated_v1_state(self) -> None:
         bills = [SyntheticBill("2026-05-11_list.pdf"), SyntheticBill("2026-05-12_list.pdf")]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
-            root = Path(directory)
-            result, summary = self.cli_run(server, root, command="list")
-            self.assertEqual(result, 20)
-            self.assertEqual(summary["status"], ACTION_REQUIRED)
-            self.assertEqual(summary["inventory_count"], 2)
-            self.assertEqual(summary["present_count"], 0)
-            self.assertEqual(server.download_clicks, 0)
-            self.assertEqual(server.search_count, 1)
-            self.assertEqual(self.state_records(root), {})
+        historical_pdf = b"%PDF-1.4\nhistorical invoice\n%%EOF\n"
+        for state_case in ("missing-parent", "missing-database", "populated-v1"):
+            with self.subTest(state=state_case), tempfile.TemporaryDirectory() as directory, \
+                    SyntheticPortalServer(bills) as server:
+                root = Path(directory)
+                config_path = self.cli_config(server, root)
+                state_path = root / "state" / "state.sqlite3"
+                self.add_read_only_sentinels(root)
+                if state_case == "missing-database":
+                    state_path.parent.mkdir()
+                elif state_case == "populated-v1":
+                    (root / "archive" / "historical.pdf").write_bytes(historical_pdf)
+                    with StateStore(state_path) as state:
+                        state.record_archived(
+                            "historical.pdf",
+                            "historical.pdf",
+                            FileInfo(len(historical_pdf), "b" * 64),
+                            now="2026-10-03T00:00:00+00:00",
+                        )
 
-    def test_cli_duplicate_normalized_filenames_publish_nothing(self) -> None:
-        bills = [SyntheticBill("Invoice.pdf"), SyntheticBill("invoice.PDF")]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
-            root = Path(directory)
-            result, summary = self.cli_run(server, root)
-            self.assertEqual(result, 20)
-            self.assertEqual(summary["status"], PORTAL_LAYOUT_CHANGED)
-            self.assertEqual(list((root / "archive").iterdir()), [])
-            self.assertEqual(self.state_records(root), {})
-            self.assertEqual(list((root / "temp").glob("run-*")), [])
+                before = filesystem_snapshot(root)
+                if state_case == "populated-v1":
+                    state_bytes = state_path.read_bytes()
+                    state_stat = (state_path.stat().st_size, state_path.stat().st_mtime_ns)
+                    state_rows = read_v1_state_rows(state_path)
 
-    def test_cli_header_only_surface_fails_closed_with_its_reference(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([]) as server:
-            root = Path(directory)
-            with fast_portal_recovery():
-                result, summary = self.cli_run(server, root)
-            self.assertEqual(result, 20)
-            self.assertEqual(summary["status"], PORTAL_LAYOUT_CHANGED)
-            log_text = "".join(path.read_text(encoding="utf-8") for path in (root / "logs").glob("*.jsonl"))
-            self.assertIn("EG_NAV_RESULTS_HEADER_ONLY", log_text)
-            self.assertNotIn("SYNTHETIC-INTENDED-ACCOUNT", log_text)
+                result, summary = self.cli_list_with_state_spies(config_path)
+                self.assertEqual(20, result)
+                self.assertEqual(ACTION_REQUIRED, summary["status"])
+                self.assertEqual(2, summary["inventory_count"])
+                self.assertEqual(0, summary["downloaded_count"])
+                self.assertEqual(0, summary["present_count"])
+                self.assertEqual(0, summary["failure_count"])
+                self.assertEqual([], summary["failure_classes"])
+                self.assertEqual(1, server.search_count)
+                self.assertEqual(0, server.download_clicks)
+                self.assertEqual([], server.download_order)
+                self.assert_no_business_detour(server)
+                self.assertEqual(before, filesystem_snapshot(root))
+                self.assertTrue((root / "temp" / "run-preserve" / "sentinel.txt").is_file())
+                self.assertEqual(b"log evidence\n", (root / "logs" / "business.jsonl").read_bytes())
+                if state_case == "missing-parent":
+                    self.assertFalse(state_path.parent.exists())
+                    self.assertFalse(state_path.exists())
+                elif state_case == "missing-database":
+                    self.assertTrue(state_path.parent.is_dir())
+                    self.assertFalse(state_path.exists())
+                else:
+                    self.assertEqual(state_bytes, state_path.read_bytes())
+                    self.assertEqual(state_stat, (state_path.stat().st_size, state_path.stat().st_mtime_ns))
+                    self.assertEqual(state_rows, read_v1_state_rows(state_path))
+
+    def test_cli_list_preserves_login_and_header_only_layout_failures(self) -> None:
+        cases = (
+            ("login", [SyntheticBill("2026-05-13_login.pdf")], {"login_success": False}),
+            ("header-only", [], {}),
+        )
+        for label, bills, server_options in cases:
+            with self.subTest(failure=label), tempfile.TemporaryDirectory() as directory, \
+                    SyntheticPortalServer(bills, **server_options) as server:
+                root = Path(directory)
+                config_path = self.cli_config(server, root)
+                self.add_read_only_sentinels(root)
+                before = filesystem_snapshot(root)
+                if label == "header-only":
+                    with fast_portal_recovery():
+                        result, document = self.cli_list_with_state_spies(config_path)
+                    self.assertEqual(PORTAL_LAYOUT_CHANGED, document["status"])
+                    self.assertEqual(PORTAL_LAYOUT_CHANGED, document["error_class"])
+                    self.assertEqual(1, server.search_count, "LIST reached the header-only inventory")
+                else:
+                    result, document = self.cli_list_with_state_spies(config_path)
+                    self.assertEqual("LOGIN_FAILED", document["status"])
+                    self.assertEqual("LOGIN_FAILED", document["error_class"])
+                    self.assertEqual(0, server.search_count, "login failure stopped before inventory")
+                self.assertEqual(20, result)
+                self.assertEqual(before, filesystem_snapshot(root))
+                self.assertEqual(0, server.download_clicks)
+                self.assert_no_business_detour(server)
 
     def test_the_login_diagnostic_never_actuates_ems(self) -> None:
         """The diagnostic observes a landing; it never enters the application."""

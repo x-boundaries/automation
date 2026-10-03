@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Energy@Grid daily bill run - INERT Task Scheduler template (DL-XB-199 G3-101).
+  Energy@Grid daily bill run - INERT Task Scheduler template (integrated G3).
 
   This file registers nothing. It is a reviewed shape for a later, separately
   Owner-approved registration on the production host. Every REPLACE_WITH_*
@@ -8,6 +8,8 @@
   never committed. The template ships Enabled=false.
 
   Contract (asserted by tests/test_scheduler_template.py):
+  - one daily CalendarTrigger at 08:00 +08:00; replace only REPLACE_WITH_START_DATE
+    with the approved YYYY-MM-DD start date in a private local copy;
   - the action is the absolute Windows PowerShell 5.1 path invoking the
     installed launcher with -File (never Python, never the mutable checkout);
   - -File, not -Command: -File returns the script's own exit code, while a
@@ -27,7 +29,7 @@
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
-      <StartBoundary>REPLACE_WITH_START_BOUNDARY</StartBoundary>
+      <StartBoundary>REPLACE_WITH_START_DATET08:00:00+08:00</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>

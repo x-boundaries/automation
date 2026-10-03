@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,10 @@ MIN_ATTEMPTS = 1
 MAX_ATTEMPTS = 3
 MIN_INVENTORY_CEILING = 1
 MAX_INVENTORY_CEILING = 100_000
+RUNTIME_V2_SCHEMA = "energygrid.runtime.v2"
+DUAL_SOURCE = "dual_stream"
+BOUND_ADMISSION = "BOUND"
+UNBOUND_ADMISSION = "UNBOUND"
 
 # DL-XB-199 G3-101. `browser` is the legacy Playwright source; `direct_http` is
 # the MVP daily source. The choice is explicit private configuration, never a
@@ -121,6 +127,116 @@ class AlertSettings:
             raw["auth_header_name"] = self.auth_header_name
             raw["auth_token_env"] = self.auth_token_env
         return raw
+
+
+@dataclass(frozen=True)
+class DualStreamEntry:
+    admission: str
+    source_namespace: str | None = field(default=None, repr=False)
+    adapter_id: str | None = None
+    date_profile: str | None = None
+    evidence_ref: str | None = None
+    settings: DirectHttpSettings | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class DriveSettings:
+    mode: str
+    root: Path | None = field(default=None, repr=False)
+    binding_id: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class DeliverySettings:
+    url: str = field(repr=False)
+    auth_header_name: str = field(repr=False)
+    auth_token_env: str = field(repr=False)
+    max_pdf_bytes: int
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class DualRuntimeConfig:
+    """Strict v2 configuration; all path and source bindings are private."""
+
+    archive_root: Path = field(repr=False)
+    state_path: Path = field(repr=False)
+    temp_root: Path = field(repr=False)
+    log_root: Path = field(repr=False)
+    streams: dict[str, DualStreamEntry] = field(repr=False)
+    drive: DriveSettings = field(repr=False)
+    delivery: DeliverySettings = field(repr=False)
+    inventory_safety_ceiling: int = 1000
+    max_attempts: int = 2
+    timeout_seconds: int = 30
+    alert: AlertSettings | None = field(default=None, repr=False)
+    checkout_root: Path | None = field(default=None, repr=False)
+
+    def preflight(self, *, read_only: bool = False) -> None:
+        if not self.archive_root.exists() or not self.archive_root.is_dir():
+            raise ConfigError("archive_root must already exist as a directory")
+        if self.state_path.exists() and self.state_path.is_dir():
+            raise ConfigError("state_path must be a file path")
+        for directory in (self.state_path.parent, self.temp_root, self.log_root):
+            if directory.exists() and not directory.is_dir():
+                raise ConfigError("runtime directory path must be a directory")
+        if self.drive.mode == "local_stage":
+            assert self.drive.root is not None
+            if not self.drive.root.exists() or not self.drive.root.is_dir():
+                raise ConfigError("drive root must already exist as a directory")
+        if read_only:
+            return
+        # The v2 state file itself is never created by a daily run. These
+        # runtime directories contain only bounded diagnostics and owned temps.
+        for directory in (self.temp_root, self.log_root):
+            directory.mkdir(parents=True, exist_ok=True)
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _exact_keys(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != keys:
+        raise ConfigError(f"{label} has an invalid shape")
+    return value
+
+
+def _strict_text(value: Any, label: str, *, max_length: int = 512) -> str:
+    if type(value) is not str or not value or value != value.strip() or len(value) > max_length:
+        raise ConfigError(f"{label} is invalid")
+    if not value.isprintable():
+        raise ConfigError(f"{label} is invalid")
+    return value
+
+
+def _strict_positive_int(value: Any, minimum: int, maximum: int, label: str) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ConfigError(f"{label} is outside its allowed bounds")
+    return value
+
+
+def _reject_reparse_components(path: Path) -> None:
+    lexical = Path(os.path.abspath(path))
+    parts = lexical.parts
+    if not parts:
+        return
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ConfigError("configured path component could not be inspected") from exc
+        if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            raise ConfigError("configured path contains a reparse point")
 
 
 def _validate_endpoint(value: Any, label: str) -> str:
@@ -245,11 +361,140 @@ class RuntimeConfig:
 
 def load_config_file(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=_strict_object)
     except FileNotFoundError as exc:
         raise ConfigError("config file was not found") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         raise ConfigError("config file is unreadable or invalid JSON") from exc
+
+
+def load_dual_stream_config(raw: dict[str, Any], checkout_root: Path | None = None) -> DualRuntimeConfig:
+    """Load the closed v2 shape without coercion or permissive extra keys."""
+
+    allowed = {
+        "schema", "source", "archive_root", "state_path", "temp_root", "log_root",
+        "inventory_safety_ceiling", "timeout_seconds", "max_attempts", "streams",
+        "drive", "delivery", "alert",
+    }
+    if type(raw) is not dict or set(raw) - allowed:
+        raise ConfigError("v2 config has an invalid shape")
+    if raw.get("schema") != RUNTIME_V2_SCHEMA or raw.get("source") != DUAL_SOURCE:
+        raise ConfigError("v2 config schema or source is unsupported")
+
+    roots: dict[str, Path] = {}
+    required_paths = ("archive_root", "state_path", "temp_root", "log_root")
+    for key in required_paths:
+        value = raw.get(key)
+        if type(value) is not str or not value:
+            raise ConfigError(f"{key} must be a non-empty absolute path")
+        path = Path(value)
+        _reject_reparse_components(path)
+        roots[key] = require_archive_location(path, checkout_root) if key == "archive_root" else require_external(path, checkout_root, key)
+
+    private_roots = [roots[name] for name in ("archive_root", "state_path", "temp_root", "log_root")]
+
+    streams_raw = _exact_keys(raw.get("streams"), {"EB_BILL", "TENANT_BILL"}, "streams")
+    streams: dict[str, DualStreamEntry] = {}
+    for name in ("EB_BILL", "TENANT_BILL"):
+        item = _exact_keys(
+            streams_raw[name],
+            {"admission", "source_namespace", "adapter_id", "date_profile", "evidence_ref", "settings"},
+            f"streams.{name}",
+        )
+        admission = item["admission"]
+        if admission == UNBOUND_ADMISSION:
+            if any(item[key] is not None for key in ("source_namespace", "adapter_id", "date_profile", "evidence_ref", "settings")):
+                raise ConfigError(f"streams.{name} unbound fields must be null")
+            streams[name] = DualStreamEntry(admission=UNBOUND_ADMISSION)
+            continue
+        if admission != BOUND_ADMISSION:
+            raise ConfigError(f"streams.{name}.admission is unsupported")
+        namespace = _strict_text(item["source_namespace"], f"streams.{name}.source_namespace")
+        if any(ord(ch) < 32 for ch in namespace):
+            raise ConfigError(f"streams.{name}.source_namespace is invalid")
+        adapter_id = item["adapter_id"]
+        date_profile = item["date_profile"]
+        evidence_ref = item["evidence_ref"]
+        if adapter_id != "DIRECT_HTTP_V1" or date_profile != "INVOICE_DATE_ISO_V1":
+            raise ConfigError(f"streams.{name} binding is not an admitted source/date profile")
+        if name == "TENANT_BILL":
+            # No accepted #227 terminal contract is present in this repository
+            # task. Synthetic adapters remain injectable in tests only.
+            raise ConfigError("Tenant Bill production admission requires accepted source evidence")
+        if type(evidence_ref) is not str or not re.fullmatch(r"EG_[A-Z0-9_]{1,60}\Z", evidence_ref, re.ASCII):
+            raise ConfigError(f"streams.{name}.evidence_ref is invalid")
+        settings_raw = _exact_keys(item["settings"], {"list_url", "fetch_url", "tenant_id"}, f"streams.{name}.settings")
+        settings = _validate_direct_http(settings_raw)
+        streams[name] = DualStreamEntry(
+            admission=BOUND_ADMISSION,
+            source_namespace=namespace,
+            adapter_id=adapter_id,
+            date_profile=date_profile,
+            evidence_ref=evidence_ref,
+            settings=settings,
+        )
+
+    drive_raw = _exact_keys(raw.get("drive"), {"mode", "root", "binding_id"}, "drive")
+    drive_mode = drive_raw["mode"]
+    if drive_mode == "unbound":
+        if drive_raw["root"] is not None or drive_raw["binding_id"] is not None:
+            raise ConfigError("unbound Drive fields must be null")
+        drive = DriveSettings(mode="unbound")
+    elif drive_mode == "local_stage":
+        root_value = _strict_text(drive_raw["root"], "drive.root", max_length=1024)
+        binding_id = _strict_text(drive_raw["binding_id"], "drive.binding_id", max_length=128)
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}\Z", binding_id, re.ASCII):
+            raise ConfigError("drive.binding_id is invalid")
+        _reject_reparse_components(Path(root_value))
+        drive_root = require_external(Path(root_value), checkout_root, "drive.root")
+        private_roots.append(drive_root)
+        drive = DriveSettings(mode="local_stage", root=drive_root, binding_id=binding_id)
+    else:
+        raise ConfigError("drive.mode is unsupported")
+
+    for index, first in enumerate(private_roots):
+        for second in private_roots[index + 1:]:
+            if is_within(first, second) or is_within(second, first):
+                raise ConfigError("archive, Drive and runtime paths must be separate")
+
+    delivery_raw = _exact_keys(
+        raw.get("delivery"),
+        {"url", "auth_header_name", "auth_token_env", "max_pdf_bytes", "timeout_seconds"},
+        "delivery",
+    )
+    url = _validate_endpoint(delivery_raw["url"], "delivery.url")
+    parsed_url = urlparse(url)
+    if parsed_url.query or (parsed_url.scheme == "http" and parsed_url.hostname not in LOOPBACK_HOSTS):
+        raise ConfigError("delivery.url must be loopback HTTP or query-free HTTPS")
+    header = delivery_raw["auth_header_name"]
+    env_name = delivery_raw["auth_token_env"]
+    if type(header) is not str or not re.fullmatch(HEADER_NAME_RE, header, re.ASCII):
+        raise ConfigError("delivery.auth_header_name is invalid")
+    if type(env_name) is not str or not re.fullmatch(ENV_NAME_RE, env_name, re.ASCII):
+        raise ConfigError("delivery.auth_token_env is invalid")
+    delivery = DeliverySettings(
+        url=url,
+        auth_header_name=header,
+        auth_token_env=env_name,
+        max_pdf_bytes=_strict_positive_int(delivery_raw["max_pdf_bytes"], 1, 33_554_432, "delivery.max_pdf_bytes"),
+        timeout_seconds=_strict_positive_int(delivery_raw["timeout_seconds"], 1, MAX_TIMEOUT_SECONDS, "delivery.timeout_seconds"),
+    )
+
+    alert = _validate_alert(raw["alert"]) if raw.get("alert") is not None else None
+    return DualRuntimeConfig(
+        archive_root=roots["archive_root"],
+        state_path=roots["state_path"],
+        temp_root=roots["temp_root"],
+        log_root=roots["log_root"],
+        streams=streams,
+        drive=drive,
+        delivery=delivery,
+        inventory_safety_ceiling=_strict_positive_int(raw.get("inventory_safety_ceiling", 1000), 1, MAX_INVENTORY_CEILING, "inventory_safety_ceiling"),
+        max_attempts=_strict_positive_int(raw.get("max_attempts", 2), MIN_ATTEMPTS, MAX_ATTEMPTS, "max_attempts"),
+        timeout_seconds=_strict_positive_int(raw.get("timeout_seconds", 30), MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, "timeout_seconds"),
+        alert=alert,
+        checkout_root=resolved(checkout_root) if checkout_root is not None else find_checkout_root(),
+    )
 
 
 def load_runtime_config(raw: dict[str, Any], checkout_root: Path | None = None) -> RuntimeConfig:
