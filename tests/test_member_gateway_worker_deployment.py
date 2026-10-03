@@ -4056,7 +4056,8 @@ _CI7_CHILD_SETUP_STAGES = (
     "SOURCE_LOAD",
     "NATIVE_INIT",
     "CREDENTIAL_RESTORE",
-    "CREDENTIAL_OBJECT",
+    "CREDENTIAL_OBJECT_CREATE",
+    "CREDENTIAL_TRANSPORT_CLEAR",
     "ACCOUNT_SID_RESOLVE",
     "NATIVE_BATCH_OPEN",
     "PRODUCT_TOKEN_HELPER",
@@ -4145,6 +4146,15 @@ def _public_safe_hosted_failure_summary(report: object) -> str:
     add_count(ci7, "frozen_control_child_exit_status", "child_exit_status", 255)
     add_enum(ci7, "frozen_control_child_setup_stage", "child_setup_stage", set(_CI7_CHILD_SETUP_STAGES))
     add_enum(ci7, "frozen_control_child_native_reason", "native_reason", set(_CI7_NATIVE_REASONS))
+    add_enum(
+        ci7,
+        "frozen_control_child_credential_constructor_control",
+        "CREDENTIAL_CONSTRUCTOR_CONTROL",
+        {"PASS", "FAIL", "NOT_REACHED"},
+    )
+    add_bool(ci7, "frozen_control_child_worker_account_shape_valid", "WORKER_ACCOUNT_SHAPE_VALID")
+    add_bool(ci7, "frozen_control_child_restored_securestring_type_valid", "RESTORED_SECURESTRING_TYPE_VALID")
+    add_bool(ci7, "frozen_control_child_restored_securestring_nonempty", "RESTORED_SECURESTRING_NONEMPTY")
     add_bool(ci7, "parent_product_token_baseline", "parent_product_token_baseline")
     add_bool(ci7, "frozen_control_child_terminated", "process_terminated")
     add_bool(ci7, "frozen_control_child_stderr_present", "stderr_present")
@@ -4178,7 +4188,7 @@ def _public_safe_hosted_failure_summary(report: object) -> str:
 
     if not parts:
         return "hosted boundary assertion failed; diagnostics unavailable"
-    return "hosted boundary assertion failed; " + "; ".join(parts[:16])
+    return "hosted boundary assertion failed; " + "; ".join(parts[:20])
 
 
 class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
@@ -4206,6 +4216,10 @@ class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
                         "parent_product_token_baseline": True,
                         "frozen_control_child_setup_stage": "NATIVE_BATCH_OPEN",
                         "frozen_control_child_native_reason": "LOGON_TYPE_NOT_GRANTED",
+                        "frozen_control_child_credential_constructor_control": "PASS",
+                        "frozen_control_child_worker_account_shape_valid": True,
+                        "frozen_control_child_restored_securestring_type_valid": True,
+                        "frozen_control_child_restored_securestring_nonempty": True,
                         "frozen_control_child_terminated": True,
                         "frozen_control_child_stderr_present": True,
                         "frozen_control_child_residue": "none",
@@ -4237,6 +4251,10 @@ class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
             "child_exit_status=1",
             "child_setup_stage=NATIVE_BATCH_OPEN",
             "native_reason=LOGON_TYPE_NOT_GRANTED",
+            "CREDENTIAL_CONSTRUCTOR_CONTROL=PASS",
+            "WORKER_ACCOUNT_SHAPE_VALID=true",
+            "RESTORED_SECURESTRING_TYPE_VALID=true",
+            "RESTORED_SECURESTRING_NONEMPTY=true",
             "parent_product_token_baseline=true",
             "process_terminated=true",
             "stderr_present=true",
@@ -4252,6 +4270,11 @@ class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
         if private_values[7] in unmapped_summary or "native_reason=" in unmapped_summary:
             raise AssertionError("public-safe hosted diagnostic emitted an unmapped native reason")
         report["cases"]["install_then_uninstall"]["ci7"]["frozen_control_child_native_reason"] = "LOGON_TYPE_NOT_GRANTED"
+        report["cases"]["install_then_uninstall"]["ci7"]["frozen_control_child_credential_constructor_control"] = private_values[7]
+        report["cases"]["install_then_uninstall"]["ci7"]["frozen_control_child_worker_account_shape_valid"] = private_values[1]
+        malformed_control_summary = _public_safe_hosted_failure_summary(report)
+        if "CREDENTIAL_CONSTRUCTOR_CONTROL=" in malformed_control_summary or "WORKER_ACCOUNT_SHAPE_VALID=" in malformed_control_summary:
+            raise AssertionError("public-safe hosted diagnostic emitted malformed credential input data")
         if len(summary) > 1024:
             raise AssertionError("public-safe hosted diagnostic exceeded its output bound")
         diagnostic_case = MemberWorkerHostedTaskBoundaryTests("test_no_secret_exposure")
@@ -4309,7 +4332,8 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
     def test_token_substages_split_credential_resolution_and_native_open(self) -> None:
         child = _FROZEN_CI7_CHILD_SCRIPT
         stages = (
-            "CREDENTIAL_OBJECT",
+            "CREDENTIAL_OBJECT_CREATE",
+            "CREDENTIAL_TRANSPORT_CLEAR",
             "ACCOUNT_SID_RESOLVE",
             "NATIVE_BATCH_OPEN",
             "PRODUCT_TOKEN_HELPER",
@@ -4318,13 +4342,22 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
         positions = [child.index(f'$setupStage = "{stage}"') for stage in stages]
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("TOKEN_OPEN", child)
-        credential_stage_start = child.index('$setupStage = "CREDENTIAL_OBJECT"')
+        self.assertNotIn('$setupStage = "CREDENTIAL_OBJECT"', child)
+        credential_stage_start = child.index('$setupStage = "CREDENTIAL_OBJECT_CREATE"')
+        transport_clear_start = child.index('$setupStage = "CREDENTIAL_TRANSPORT_CLEAR"', credential_stage_start)
         credential_stage_end = child.index('$setupStage = "ACCOUNT_SID_RESOLVE"', credential_stage_start)
-        credential_stage = child[credential_stage_start:credential_stage_end]
+        credential_create_stage = child[credential_stage_start:transport_clear_start]
+        credential_clear_stage = child[transport_clear_start:credential_stage_end]
         # The pre-split child at 7c440bd used this constructor under TOKEN_OPEN.
         previous_child_assignment = "$credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)"
-        self.assertIn(previous_child_assignment, credential_stage)
-        self.assertNotIn("[Management.Automation.PSCredential]::new(", credential_stage)
+        self.assertIn(previous_child_assignment, credential_create_stage)
+        self.assertNotIn("[Management.Automation.PSCredential]::new(", credential_create_stage)
+        self.assertIn("$encryptedPassword = $null", credential_clear_stage)
+        self.assertIn("$Fixture.encrypted_password = $null", credential_clear_stage)
+        self.assertLess(
+            credential_create_stage.index(previous_child_assignment),
+            child.index('$setupStage = "CREDENTIAL_TRANSPORT_CLEAR"'),
+        )
         self.assertIn("Get-XbAccountSid -Account $workerAccount", child)
         self.assertIn(
             "[XbWorkerBatchToken]::OpenBatch($userName, $domain, $securePassword, $workerSid)",
@@ -4361,6 +4394,29 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
                 self.assertIn(fragment, helper)
                 self.assertIn(fragment, child_folded)
 
+    def test_credential_constructor_control_and_input_shape_are_bounded(self) -> None:
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        create_start = child.index('$setupStage = "CREDENTIAL_OBJECT_CREATE"')
+        control_start = child.index("# CI7_CREDENTIAL_CONSTRUCTOR_CONTROL_BEGIN", create_start)
+        control_end = child.index("# CI7_CREDENTIAL_CONSTRUCTOR_CONTROL_END", control_start)
+        shape_start = child.index("# CI7_CREDENTIAL_INPUT_SHAPE_BEGIN", create_start)
+        shape_end = child.index("# CI7_CREDENTIAL_INPUT_SHAPE_END", shape_start)
+        control = child[control_start:control_end]
+        shape = child[shape_start:shape_end]
+
+        self.assertIn("New-Object System.Security.SecureString", control)
+        self.assertIn('New-Object Management.Automation.PSCredential("xbt000000000000", $constructorControlSecurePassword)', control)
+        self.assertIn('$childResult.credential_constructor_control = "PASS"', control)
+        self.assertIn('$childResult.credential_constructor_control = "FAIL"', control)
+        self.assertNotIn("New-XbWorkerBatchToken", control)
+        self.assertNotIn("[XbWorkerBatchToken]::OpenBatch", control)
+        self.assertIn("^xbt[0-9a-f]{12}$", shape)
+        self.assertIn("$workerAccount -cmatch", shape)
+        self.assertIn("$securePassword -is [System.Security.SecureString]", shape)
+        self.assertIn("$securePassword.Length -gt 0", shape)
+        self.assertNotIn("[Console]", shape)
+        self.assertNotIn("ConvertTo-Json", shape)
+
     def test_child_runner_retains_distinct_bounded_result_statuses(self) -> None:
         runner = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild")
         for status in (
@@ -4377,6 +4433,11 @@ class MemberWorkerCi7MutationPolicySourceTests(unittest.TestCase):
         self.assertIn("$result.stderr_present = [bool]($stderr.Length -gt 0)", runner)
         self.assertNotIn("$result.stderr_text", runner)
         self.assertNotIn("$result.raw_stderr", runner)
+        self.assertIn('"CREDENTIAL_OBJECT_CREATE", "CREDENTIAL_TRANSPORT_CLEAR"', runner)
+        self.assertIn('$child.credential_constructor_control -cin @("PASS", "FAIL", "NOT_REACHED")', runner)
+        self.assertIn("$child.worker_account_shape_valid -is [bool]", runner)
+        self.assertIn("$child.restored_securestring_type_valid -is [bool]", runner)
+        self.assertIn("$child.restored_securestring_nonempty -is [bool]", runner)
 
     def test_frozen_control_and_adjacent_ci7_contracts_are_immutable(self) -> None:
         self.assertEqual(CI7_DEFECTIVE_BASELINE_COMMIT, "ef194d43cd5b2a6e56468c3381a1b44bced23d8d")
@@ -4528,6 +4589,107 @@ class MemberWorkerCi7FrozenControlIsolationTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, "PowerShell child or hosted source did not parse")
         self.assertEqual(completed.stdout.strip(), "parse_pass")
 
+    def _run_credential_diagnostic_snippet(self, script: str, prefix: str, failure_message: str) -> str:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("native Windows PowerShell 5.1 is required for credential diagnostics")
+        with tempfile.TemporaryDirectory(prefix=prefix) as temp_dir:
+            temporary_root = Path(temp_dir)
+            _assert_temp_outside_checkout(ROOT, temporary_root)
+            script_path = temporary_root / "credential_diagnostic.ps1"
+            script_path.write_text(script, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertFalse(temporary_root.exists(), "credential diagnostic left temporary state")
+        if completed.returncode != 0:
+            raise AssertionError(f"{failure_message}; output withheld")
+        return completed.stdout.strip()
+
+    def test_synthetic_credential_constructor_control_passes_without_emitting_identity(self) -> None:
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        start = child.index("# CI7_CREDENTIAL_CONSTRUCTOR_CONTROL_BEGIN")
+        start = child.index("\n", start) + 1
+        end = child.index("# CI7_CREDENTIAL_CONSTRUCTOR_CONTROL_END", start)
+        control = child[start:end]
+        script = (
+            '$ErrorActionPreference = "Stop"\n'
+            '$childResult = [ordered]@{ credential_constructor_control = "NOT_REACHED" }\n'
+            + control
+            + '\n[Console]::Out.WriteLine("CREDENTIAL_CONSTRUCTOR_CONTROL=" + $childResult.credential_constructor_control)\n'
+        )
+        output = self._run_credential_diagnostic_snippet(
+            script,
+            "xb-ci7-constructor-control-",
+            "synthetic credential constructor control failed",
+        )
+        self.assertEqual(output, "CREDENTIAL_CONSTRUCTOR_CONTROL=PASS")
+
+    def test_credential_input_shape_checks_return_only_boolean_diagnostics(self) -> None:
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        start = child.index("# CI7_CREDENTIAL_INPUT_SHAPE_BEGIN")
+        start = child.index("\n", start) + 1
+        end = child.index("# CI7_CREDENTIAL_INPUT_SHAPE_END", start)
+        shape = child[start:end]
+        script = (
+            '$ErrorActionPreference = "Stop"\n'
+            'function Get-CredentialShape([string]$workerAccount, $securePassword) {\n'
+            '    $childResult = [ordered]@{ worker_account_shape_valid = $null; restored_securestring_type_valid = $null; restored_securestring_nonempty = $null }\n'
+            + shape
+            + '    return [pscustomobject]$childResult\n}\n'
+            '$nonempty = New-Object System.Security.SecureString\n'
+            "$nonempty.AppendChar('x')\n"
+            '$nonempty.MakeReadOnly()\n'
+            '$empty = New-Object System.Security.SecureString\n'
+            '$empty.MakeReadOnly()\n'
+            '$summary = [ordered]@{\n'
+            "    valid = Get-CredentialShape -workerAccount 'xbt0123456789ab' -securePassword $nonempty\n"
+            "    invalid_account = Get-CredentialShape -workerAccount 'xbt-invalid' -securePassword $nonempty\n"
+            "    empty = Get-CredentialShape -workerAccount 'xbt0123456789ab' -securePassword $empty\n"
+            "    wrong_type = Get-CredentialShape -workerAccount 'xbt0123456789ab' -securePassword 'synthetic'\n"
+            '}\n'
+            'try { [Console]::Out.WriteLine(($summary | ConvertTo-Json -Depth 4 -Compress)) }\n'
+            'finally { $nonempty.Dispose(); $empty.Dispose() }\n'
+        )
+        output = self._run_credential_diagnostic_snippet(
+            script,
+            "xb-ci7-credential-shape-",
+            "credential input-shape diagnostic failed",
+        )
+        try:
+            actual = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            raise AssertionError("credential input-shape diagnostic emitted an invalid summary; output withheld") from None
+        expected = {
+            "valid": {
+                "worker_account_shape_valid": True,
+                "restored_securestring_type_valid": True,
+                "restored_securestring_nonempty": True,
+            },
+            "invalid_account": {
+                "worker_account_shape_valid": False,
+                "restored_securestring_type_valid": True,
+                "restored_securestring_nonempty": True,
+            },
+            "empty": {
+                "worker_account_shape_valid": True,
+                "restored_securestring_type_valid": True,
+                "restored_securestring_nonempty": False,
+            },
+            "wrong_type": {
+                "worker_account_shape_valid": True,
+                "restored_securestring_type_valid": False,
+                "restored_securestring_nonempty": False,
+            },
+        }
+        self.assertEqual(actual, expected)
+        self.assertTrue(all(type(value) is bool for case in actual.values() for value in case.values()))
+
     def test_native_reason_mapping_uses_fixed_win32_codes_and_identifiers(self) -> None:
         pwsh = _resolve_native_powershell()
         if not pwsh:
@@ -4610,6 +4772,10 @@ foreach ($case in $cases) {
             "outcome": "effective_rights_exceeded",
             "setup_stage": "RESULT_EMIT",
             "native_reason": "NONE",
+            "credential_constructor_control": "PASS",
+            "worker_account_shape_valid": True,
+            "restored_securestring_type_valid": True,
+            "restored_securestring_nonempty": True,
             "source_commit": CI7_DEFECTIVE_BASELINE_COMMIT,
             "source_blob": CI7_DEFECTIVE_INSTALLER_BLOB,
             "drive_root_index": 0,
@@ -4623,6 +4789,10 @@ foreach ($case in $cases) {
             "outcome": "fixture_setup_failed",
             "setup_stage": "NATIVE_INIT",
             "native_reason": None,
+            "credential_constructor_control": "NOT_REACHED",
+            "worker_account_shape_valid": None,
+            "restored_securestring_type_valid": None,
+            "restored_securestring_nonempty": None,
             "drive_root_index": -1,
             "drive_root_right": "",
             "drive_root_allowed": False,
@@ -5151,6 +5321,10 @@ $childResult = [ordered]@{
     outcome = "fixture_setup_failed"
     setup_stage = "INPUT"
     native_reason = $null
+    credential_constructor_control = "NOT_REACHED"
+    worker_account_shape_valid = $null
+    restored_securestring_type_valid = $null
+    restored_securestring_nonempty = $null
     source_commit = ""
     source_blob = ""
     drive_root_index = -1
@@ -5186,8 +5360,43 @@ try {
     Initialize-XbWorkerNativeAccess
     $setupStage = "CREDENTIAL_RESTORE"
     $securePassword = ConvertTo-SecureString -String $encryptedPassword -ErrorAction Stop
-    $setupStage = "CREDENTIAL_OBJECT"
+    $setupStage = "CREDENTIAL_OBJECT_CREATE"
+    # CI7_CREDENTIAL_INPUT_SHAPE_BEGIN
+    $childResult.worker_account_shape_valid = [bool]($workerAccount -cmatch '^xbt[0-9a-f]{12}$')
+    $childResult.restored_securestring_type_valid = [bool]($securePassword -is [System.Security.SecureString])
+    $childResult.restored_securestring_nonempty = $false
+    if ($childResult.restored_securestring_type_valid) {
+        $childResult.restored_securestring_nonempty = [bool]($securePassword.Length -gt 0)
+    }
+    # CI7_CREDENTIAL_INPUT_SHAPE_END
+
+    # CI7_CREDENTIAL_CONSTRUCTOR_CONTROL_BEGIN
+    $constructorControlSecurePassword = $null
+    $constructorControlCredential = $null
+    try {
+        $constructorControlSecurePassword = New-Object System.Security.SecureString
+        $constructorControlSecurePassword.AppendChar('x')
+        $constructorControlSecurePassword.MakeReadOnly()
+        $constructorControlCredential = New-Object Management.Automation.PSCredential("xbt000000000000", $constructorControlSecurePassword)
+        $childResult.credential_constructor_control = "PASS"
+    } catch {
+        $childResult.credential_constructor_control = "FAIL"
+        throw "fixture_credential_constructor_control_failed"
+    } finally {
+        $constructorControlCredential = $null
+        if ($null -ne $constructorControlSecurePassword) {
+            try { $constructorControlSecurePassword.Dispose() }
+            catch {
+                $childResult.credential_constructor_control = "FAIL"
+                throw "fixture_credential_constructor_control_cleanup_failed"
+            }
+            $constructorControlSecurePassword = $null
+        }
+    }
+    # CI7_CREDENTIAL_CONSTRUCTOR_CONTROL_END
+
     $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
+    $setupStage = "CREDENTIAL_TRANSPORT_CLEAR"
     $encryptedPassword = $null
     $Fixture.encrypted_password = $null
 
@@ -5645,9 +5854,10 @@ public sealed class XbCi7BoundedTextCapture
                         $child = ConvertFrom-Json -InputObject $jsonLine -ErrorAction Stop
                         $actualFields = @($child.PSObject.Properties | ForEach-Object Name | Sort-Object)
                         $expectedFields = @(
-                            "drive_root_allowed", "drive_root_granted_access", "drive_root_index",
-                            "drive_root_right", "fixture_status", "native_reason", "outcome", "schema_version",
-                            "setup_stage", "source_blob", "source_commit"
+                            "credential_constructor_control", "drive_root_allowed", "drive_root_granted_access",
+                            "drive_root_index", "drive_root_right", "fixture_status", "native_reason", "outcome",
+                            "restored_securestring_nonempty", "restored_securestring_type_valid", "schema_version",
+                            "setup_stage", "source_blob", "source_commit", "worker_account_shape_valid"
                         )
                         $nativeReasonValues = @(
                             "NONE", "LOGON_FAILURE", "LOGON_TYPE_NOT_GRANTED", "ACCOUNT_RESTRICTION",
@@ -5667,13 +5877,24 @@ public sealed class XbCi7BoundedTextCapture
                         } else {
                             $nativeReasonStageValid = $null -eq $child.native_reason
                         }
+                        $credentialConstructorControlValid = $child.credential_constructor_control -is [string] -and
+                            $child.credential_constructor_control -cin @("PASS", "FAIL", "NOT_REACHED")
+                        $workerAccountShapeValidType = $null -eq $child.worker_account_shape_valid -or
+                            $child.worker_account_shape_valid -is [bool]
+                        $restoredSecureStringTypeValidType = $null -eq $child.restored_securestring_type_valid -or
+                            $child.restored_securestring_type_valid -is [bool]
+                        $restoredSecureStringNonemptyType = $null -eq $child.restored_securestring_nonempty -or
+                            $child.restored_securestring_nonempty -is [bool]
                         if (($actualFields -join "|") -cne ($expectedFields -join "|") -or
                             -not $nativeReasonValid -or -not $nativeReasonStageValid -or
+                            -not $credentialConstructorControlValid -or -not $workerAccountShapeValidType -or
+                            -not $restoredSecureStringTypeValidType -or -not $restoredSecureStringNonemptyType -or
                             $child.schema_version -cne "xb.member.worker.ci7.frozen-control.v1" -or
                             $child.fixture_status -cnotin @("completed", "failed") -or
                             $child.setup_stage -cnotin @(
                                 "INPUT", "SOURCE_LOAD", "NATIVE_INIT", "CREDENTIAL_RESTORE",
-                                "CREDENTIAL_OBJECT", "ACCOUNT_SID_RESOLVE", "NATIVE_BATCH_OPEN", "PRODUCT_TOKEN_HELPER",
+                                "CREDENTIAL_OBJECT_CREATE", "CREDENTIAL_TRANSPORT_CLEAR", "ACCOUNT_SID_RESOLVE",
+                                "NATIVE_BATCH_OPEN", "PRODUCT_TOKEN_HELPER",
                                 "PATH_CHAIN", "DRIVE_PROBE", "FROZEN_CONTROL", "RESULT_EMIT", "CLEANUP"
                             ) -or
                             $child.outcome -cnotin @(
@@ -5703,6 +5924,10 @@ public sealed class XbCi7BoundedTextCapture
                                 outcome = [string]$child.outcome
                                 setup_stage = [string]$child.setup_stage
                                 native_reason = $child.native_reason
+                                credential_constructor_control = [string]$child.credential_constructor_control
+                                worker_account_shape_valid = $child.worker_account_shape_valid
+                                restored_securestring_type_valid = $child.restored_securestring_type_valid
+                                restored_securestring_nonempty = $child.restored_securestring_nonempty
                                 source_commit = [string]$child.source_commit
                                 source_blob = [string]$child.source_blob
                                 drive_root_index = [int]$child.drive_root_index
@@ -5720,6 +5945,10 @@ public sealed class XbCi7BoundedTextCapture
                                 outcome = [string]$child.outcome
                                 setup_stage = [string]$child.setup_stage
                                 native_reason = $child.native_reason
+                                credential_constructor_control = [string]$child.credential_constructor_control
+                                worker_account_shape_valid = $child.worker_account_shape_valid
+                                restored_securestring_type_valid = $child.restored_securestring_type_valid
+                                restored_securestring_nonempty = $child.restored_securestring_nonempty
                                 source_commit = [string]$child.source_commit
                                 source_blob = [string]$child.source_blob
                                 drive_root_index = [int]$child.drive_root_index
@@ -6704,12 +6933,20 @@ public static class XbCi7FailureCleanupProbe
                 $ci7.frozen_control_child_stderr_present = [bool]$frozenChildRun.stderr_present
                 $ci7.frozen_control_child_setup_stage = $null
                 $ci7.frozen_control_child_native_reason = $null
+                $ci7.frozen_control_child_credential_constructor_control = "NOT_REACHED"
+                $ci7.frozen_control_child_worker_account_shape_valid = $null
+                $ci7.frozen_control_child_restored_securestring_type_valid = $null
+                $ci7.frozen_control_child_restored_securestring_nonempty = $null
                 $ci7.frozen_control_parent_function_replaced = -not [object]::ReferenceEquals(
                     $candidateContextBefore, ${function:script:Open-XbCi7VerificationContext}
                 )
                 if ($null -ne $frozenChildRun.child_result) {
                     $ci7.frozen_control_child_setup_stage = [string]$frozenChildRun.child_result.setup_stage
                     $ci7.frozen_control_child_native_reason = $frozenChildRun.child_result.native_reason
+                    $ci7.frozen_control_child_credential_constructor_control = [string]$frozenChildRun.child_result.credential_constructor_control
+                    $ci7.frozen_control_child_worker_account_shape_valid = $frozenChildRun.child_result.worker_account_shape_valid
+                    $ci7.frozen_control_child_restored_securestring_type_valid = $frozenChildRun.child_result.restored_securestring_type_valid
+                    $ci7.frozen_control_child_restored_securestring_nonempty = $frozenChildRun.child_result.restored_securestring_nonempty
                     $ci7.frozen_defective_context_outcome = [string]$frozenChildRun.child_result.outcome
                     $ci7.frozen_control_child_source_commit = [string]$frozenChildRun.child_result.source_commit
                     $ci7.frozen_control_child_installer_blob = [string]$frozenChildRun.child_result.source_blob
