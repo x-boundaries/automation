@@ -109,7 +109,17 @@ class DeliveryClient:
         self._post_once = post_once or _post_once
         self._environ = os.environ if environ is None else environ
 
-    def deliver(self, state: StateV2Store, invoice: dict, archive_path: Path, run_id: str) -> DeliveryOutcome:
+    def deliver(self, state: StateV2Store, invoice: dict, archive_path: Path, run_id: str, *, logger=None) -> DeliveryOutcome:
+        def emit(phase: str, status: str, support_ref: str | None = None) -> None:
+            try:
+                if logger is not None:
+                    fields = {"stream": invoice.get("stream")}
+                    if support_ref is not None:
+                        fields["support_ref"] = support_ref
+                    logger.event(phase, status=status, **fields)
+            except Exception:
+                return None
+
         if type(run_id) is not str or not RUN_ID_RE.fullmatch(run_id):
             raise StateError("delivery run identity is invalid")
         info = validate_pdf(archive_path)
@@ -137,31 +147,44 @@ class DeliveryClient:
             invoice_id=invoice["invoice_id"], metadata=metadata, run_id=run_id,
             timestamp=_utc_now(), delivery_id=delivery_id,
         )
+        emit("delivery_intent", "CREATED" if _created else "REUSED")
         if intent["state"] == "DELIVERED":
+            emit("delivery_no_send", "ALREADY_DELIVERED", intent.get("support_ref") or "EG_MAIL_ALREADY_DELIVERED")
             return DeliveryOutcome("DELIVERED", intent["delivery_id"], intent["support_ref"] or "EG_MAIL_ALREADY_DELIVERED", False)
         if intent["state"] in {"DELIVERY_OUTCOME_UNCERTAIN", "REQUEST_REJECTED"}:
+            emit("delivery_no_send", intent["state"], intent.get("support_ref") or "EG_MAIL_TERMINAL")
             return DeliveryOutcome(intent["state"], intent["delivery_id"], intent["support_ref"] or "EG_MAIL_TERMINAL", False)
         if intent["dispatch_started_at_utc"] is not None:
             state.recover_uncertain_deliveries(run_id, _utc_now())
+            emit("delivery_no_send", "DELIVERY_OUTCOME_UNCERTAIN", "EG_MAIL_RECOVERY_UNCERTAIN")
             return DeliveryOutcome("DELIVERY_OUTCOME_UNCERTAIN", delivery_id, "EG_MAIL_RECOVERY_UNCERTAIN", False)
 
         # Prepare the exact bytes and retrieve authentication before consuming
         # the one-time dispatch permission.
-        body, content_type = build_multipart(metadata, pdf_bytes, self._settings.max_pdf_bytes)
+        try:
+            body, content_type = build_multipart(metadata, pdf_bytes, self._settings.max_pdf_bytes)
+        except Exception:
+            emit("delivery_no_send", "PREPARATION_FAILED", "EG_MAIL_REQUEST_INVALID")
+            raise
         token = self._environ.get(self._settings.auth_token_env)
         if type(token) is not str or not token:
+            emit("delivery_no_send", "AUTH_UNAVAILABLE", "EG_MAIL_AUTH_UNAVAILABLE")
             raise StateError("delivery authentication is unavailable")
         header_name = self._settings.auth_header_name
         if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header_name, re.ASCII) or "\r" in token or "\n" in token:
+            emit("delivery_no_send", "AUTH_INVALID", "EG_MAIL_AUTH_INVALID")
             raise StateError("delivery authentication is invalid")
 
         if not state.claim_delivery_dispatch(delivery_id, run_id, _utc_now()):
             after = state.delivery(delivery_id)
             if after and after["dispatch_started_at_utc"] is not None:
                 state.recover_uncertain_deliveries(run_id, _utc_now())
+                emit("delivery_no_send", "DELIVERY_OUTCOME_UNCERTAIN", "EG_MAIL_DISPATCH_CLAIMED")
                 return DeliveryOutcome("DELIVERY_OUTCOME_UNCERTAIN", delivery_id, "EG_MAIL_DISPATCH_CLAIMED", False)
+            emit("delivery_no_send", "REQUEST_REJECTED", "EG_MAIL_DISPATCH_NOT_CLAIMED")
             return DeliveryOutcome("REQUEST_REJECTED", delivery_id, "EG_MAIL_DISPATCH_NOT_CLAIMED", False)
 
+        emit("dispatch_start", "COMMITTED")
         try:
             status, response_body = self._post_once(
                 self._settings.url,
@@ -186,7 +209,9 @@ class DeliveryClient:
         except Exception:
             recorded = False
         if not recorded:
+            emit("delivery_outcome", "DELIVERY_OUTCOME_UNCERTAIN", "EG_MAIL_OUTCOME_NOT_DURABLE")
             return DeliveryOutcome("DELIVERY_OUTCOME_UNCERTAIN", delivery_id, "EG_MAIL_OUTCOME_NOT_DURABLE", True)
+        emit("delivery_outcome", outcome, support_ref)
         return DeliveryOutcome(outcome, delivery_id, support_ref, True)
 
 

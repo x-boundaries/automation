@@ -193,6 +193,44 @@ class InvoiceFailureLogFieldTests(unittest.TestCase):
         self.assertNotIn("tenant_id", event)
         self.assertNotIn("source_filename", event)
 
+    def test_stage_event_family_uses_only_safe_fields(self) -> None:
+        phases = (
+            "inventory_started", "inventory_result", "latest_selection", "selection_committed",
+            "fetch_decision", "fetch_started", "fetch_completed", "archive_started", "archive_result",
+            "drive_started", "drive_result", "delivery_intent", "dispatch_start", "delivery_no_send",
+            "delivery_outcome", "stream_complete",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            logger = SafeLogger(Path(directory), "run-stage-family")
+            for phase in phases:
+                logger.event(
+                    phase,
+                    status="OBSERVED",
+                    stream="EB_BILL",
+                    inventory_count=2,
+                    support_ref="EG_STAGE_TEST",
+                    source_namespace="PRIVATE-NAMESPACE-CANARY",
+                    source_key="PRIVATE-SOURCE-KEY-CANARY",
+                    filename="PRIVATE-SOURCE-FILENAME-CANARY.pdf",
+                    path="C:/PRIVATE/PATH-CANARY",
+                    url="https://private.invalid/URL-CANARY",
+                    recipient="PRIVATE-RECIPIENT-CANARY",
+                    delivery_id="PRIVATE-DELIVERY-ID-CANARY",
+                    operation_id="PRIVATE-OPERATION-ID-CANARY",
+                    pdf_content="PRIVATE-PDF-CANARY",
+                )
+            rendered = logger.log_path.read_text(encoding="utf-8")
+            events = self.lines(logger)
+        self.assertEqual(list(phases), [event["phase"] for event in events])
+        self.assertTrue(all(event["stream"] == "EB_BILL" and event["support_ref"] == "EG_STAGE_TEST" for event in events))
+        self.assertTrue(all(set(event) <= {"run_id", "phase", "status"} | cli.ALLOWED_LOG_FIELDS for event in events))
+        for private in (
+            "PRIVATE-NAMESPACE-CANARY", "PRIVATE-SOURCE-KEY-CANARY", "PRIVATE-SOURCE-FILENAME-CANARY",
+            "PRIVATE/PATH-CANARY", "URL-CANARY", "PRIVATE-RECIPIENT-CANARY",
+            "PRIVATE-DELIVERY-ID-CANARY", "PRIVATE-OPERATION-ID-CANARY", "PRIVATE-PDF-CANARY",
+        ):
+            self.assertNotIn(private, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

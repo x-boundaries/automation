@@ -62,6 +62,49 @@ function expression(value, item, outputs) {
 function mappedValues(values, item, outputs) {
   return Object.fromEntries(Object.entries(values).map(([key, value]) => [key, expression(value, item, outputs)]));
 }
+function hasEdge(sourceName, outputIndex, targetName, inputIndex) {
+  const branches = wf.connections[sourceName] && wf.connections[sourceName].main;
+  return Boolean(branches && branches[outputIndex] && branches[outputIndex].some(
+    (edge) => edge.node === targetName && edge.index === inputIndex,
+  ));
+}
+function mergeInputs(nodeName, outputs) {
+  const node = byName[nodeName];
+  if (!node || node.type !== 'n8n-nodes-base.merge' || node.typeVersion !== 3) {
+    throw new Error('merge node shape is unsupported');
+  }
+  const count = node.parameters.numberInputs || 2;
+  const inputs = Array.from({ length: count }, () => []);
+  for (const [sourceName, connection] of Object.entries(wf.connections)) {
+    for (const [outputIndex, links] of (connection.main || []).entries()) {
+      for (const link of links) {
+        if (link.node !== nodeName) continue;
+        if (!Number.isInteger(link.index) || link.index < 0 || link.index >= count) {
+          throw new Error('merge connection input index is invalid');
+        }
+        inputs[link.index].push(...(outputs[sourceName] || []));
+      }
+    }
+  }
+  return { node, inputs };
+}
+function executeMerge(nodeName, outputs) {
+  const { node, inputs } = mergeInputs(nodeName, outputs);
+  const mode = node.parameters.mode;
+  if (mode === 'append') return inputs.flat();
+  if (mode !== 'combine' || node.parameters.combineBy !== 'combineByPosition') {
+    throw new Error('merge mode is unsupported');
+  }
+  const length = Math.min(...inputs.map((items) => items.length));
+  const merged = [];
+  for (let index = 0; index < length; index++) {
+    const items = inputs.map((rows) => rows[index]);
+    const json = Object.assign({}, ...items.map((item) => item && item.json || {}));
+    const binary = Object.assign({}, ...items.map((item) => item && item.binary || {}));
+    merged.push({ json, ...(Object.keys(binary).length ? { binary } : {}) });
+  }
+  return merged;
+}
 function renderTemplate(value, item, outputs) {
   if (typeof value !== 'string') return value;
   return value.replace(/\{\{\s*([\s\S]*?)\s*\}\}/g, (_match, source) =>
@@ -101,9 +144,11 @@ async function runFlow(sample, options) {
   outputs['Validate Invoice Request'] = validation;
   const requestItem = validation[0];
   if (!requestItem || !requestItem.json || requestItem.json.valid !== true) {
+    outputs['Request Is Valid'] = validation;
     return { response: respond('Respond With Request Rejected', requestItem, outputs), rows, messages };
   }
 
+  outputs['Request Is Valid'] = [requestItem];
   const cryptoParameters = byName['Hash PDF SHA256'].parameters;
   const bytes = Buffer.from(sample.pdfBase64, 'base64');
   const hash = crypto.createHash(cryptoParameters.type.toLowerCase()).update(bytes).digest(cryptoParameters.encoding);
@@ -112,18 +157,30 @@ async function runFlow(sample, options) {
     binary: requestItem.binary,
   };
   outputs['Hash PDF SHA256'] = [hashed];
-  const base = { json: { ...requestItem.json, ...hashed.json }, binary: requestItem.binary };
-  outputs['Merge Request And PDF Hash'] = [base];
+  const baseItems = executeMerge('Merge Request And PDF Hash', outputs);
+  if (baseItems.length !== 1 || !baseItems[0].binary || !baseItems[0].binary.pdf) {
+    throw new Error('request/hash merge did not preserve one PDF item');
+  }
+  const base = baseItems[0];
+  outputs['Merge Request And PDF Hash'] = baseItems;
 
   const getNode = byName['Get Existing Delivery'];
   const getFilter = getNode.parameters.filters.conditions[0];
   const deliveryId = expression(getFilter.keyValue, base, outputs);
   const matches = rows.filter((row) => row[getFilter.keyName] === deliveryId).slice(0, getNode.parameters.limit);
-  outputs['Get Existing Delivery'] = matches.map((row) => ({ json: { ...row } }));
-  const mergedStored = matches.length
-    ? matches.map((row) => ({ json: { ...base.json, ...row }, binary: base.binary }))
-    : [{ json: { ...base.json }, binary: base.binary }];
+  outputs['Get Existing Delivery'] = Array.isArray(options.existingItems)
+    ? options.existingItems.map((item) => ({ ...item, json: item && item.json ? { ...item.json } : item && item.json }))
+    : (matches.length
+      ? matches.map((row) => ({ json: { ...row } }))
+      : (getNode.alwaysOutputData ? [{ json: {} }] : []));
+  const mergedStored = executeMerge('Merge Request And Stored State', outputs);
   outputs['Merge Request And Stored State'] = mergedStored;
+  const mergeTrace = mergedStored.map((item) => ({
+    hasRequest: Boolean(item && item.json && item.json.request),
+    delivery_id: (item && item.json && item.json.delivery_id) ||
+      (item && item.json && item.json.request && item.json.request.delivery_id) || null,
+    state: (item && item.json && item.json.state) || null,
+  }));
 
   const decisions = await execute(byName['Decide Delivery'].parameters.jsCode, mergedStored, {}, outputs);
   outputs['Decide Delivery'] = decisions;
@@ -134,16 +191,19 @@ async function runFlow(sample, options) {
     outputs,
   );
   if (!shouldSend) {
-    return { response: respond('Respond With Delivery Result', decision, outputs), rows, messages };
+    return { response: respond('Respond With Delivery Result', decision, outputs), rows, messages, mergeTrace };
   }
 
+  outputs['New Delivery Is Required'] = [decision];
   const insertNode = byName['Insert Pending Delivery'];
   const inserted = mappedValues(insertNode.parameters.columns.value, decision, outputs);
   inserted.id = rows.length + 1;
   rows.push(inserted);
   outputs['Insert Pending Delivery'] = [{ json: { ...inserted } }];
-  const pending = { json: { ...decision.json, ...inserted }, binary: decision.binary };
-  outputs['Merge Pending Intent And Invoice'] = [pending];
+  const pendingItems = executeMerge('Merge Pending Intent And Invoice', outputs);
+  if (pendingItems.length !== 1) throw new Error('pending intent merge did not produce one item');
+  const pending = pendingItems[0];
+  outputs['Merge Pending Intent And Invoice'] = pendingItems;
 
   const emailNode = byName['Send Invoice Email'];
   const attachmentName = emailNode.parameters.options.fileAttachments;
@@ -164,23 +224,28 @@ async function runFlow(sample, options) {
     const filter = uncertainNode.parameters.filters.conditions[0];
     const keyValue = expression(filter.keyValue, pending, outputs);
     updateRows(rows, { keyName: filter.keyName, keyValue }, mappedValues(uncertainNode.parameters.columns.value, pending, outputs));
-    return { response: respond('Respond With Email Uncertain', pending, outputs), rows, messages };
+    return { response: respond('Respond With Email Uncertain', pending, outputs), rows, messages, mergeTrace };
   }
 
   const acceptedNode = byName['Mark Delivery Accepted'];
   const acceptedFilter = acceptedNode.parameters.filters.conditions[0];
   const acceptedId = expression(acceptedFilter.keyValue, pending, outputs);
+  outputs['Send Invoice Email'] = [{ json: { email_accepted: true } }];
+  const successfulItems = executeMerge('Merge Successful Email And Intent', outputs);
+  if (successfulItems.length !== 1) throw new Error('successful email merge did not produce one item');
+  const successful = successfulItems[0];
+  outputs['Merge Successful Email And Intent'] = successfulItems;
   outputs['Mark Delivery Accepted'] = options.dropAcceptedUpdate
     ? [{}]
     : updateRows(
       rows,
       { keyName: acceptedFilter.keyName, keyValue: acceptedId },
-      mappedValues(acceptedNode.parameters.columns.value, pending, outputs),
+      mappedValues(acceptedNode.parameters.columns.value, successful, outputs),
     );
 
   const readbackNode = byName['Read Back Delivery Outcome'];
   const readbackFilter = readbackNode.parameters.filters.conditions[0];
-  const readbackId = expression(readbackFilter.keyValue, pending, outputs);
+  const readbackId = expression(readbackFilter.keyValue, successful, outputs);
   const readback = rows.filter((row) => row[readbackFilter.keyName] === readbackId)
     .slice(0, readbackNode.parameters.limit);
   outputs['Read Back Delivery Outcome'] = readback.length
@@ -192,7 +257,7 @@ async function runFlow(sample, options) {
     {},
     outputs,
   );
-  return { response: respond('Respond With Delivery Result', verified[0], outputs), rows, messages };
+  return { response: respond('Respond With Delivery Result', verified[0], outputs), rows, messages, mergeTrace };
 }
 (async () => {
   const validated = [];
@@ -213,14 +278,6 @@ async function runFlow(sample, options) {
       validated.push({ ok: false, error: String(error && error.message || error) });
     }
   }
-  const decisions = [];
-  for (const items of cases.decisions) {
-    try {
-      decisions.push({ ok: true, output: await execute(byName['Decide Delivery'].parameters.jsCode, items, {}, {}) });
-    } catch (error) {
-      decisions.push({ ok: false, error: String(error && error.message || error) });
-    }
-  }
   const flows = [];
   for (const flowCase of cases.flows || []) {
     try {
@@ -229,7 +286,7 @@ async function runFlow(sample, options) {
       flows.push({ ok: false, error: String(error && error.message || error) });
     }
   }
-  process.stdout.write(JSON.stringify({ validated, decisions, flows }));
+  process.stdout.write(JSON.stringify({ validated, flows }));
 })().catch((error) => {
   process.stderr.write(String(error && error.message || error));
   process.exitCode = 1;
@@ -264,7 +321,7 @@ def validation_sample(
     }
 
 
-def run_harness(cases: dict) -> dict:
+def run_harness(cases: dict, *, workflow_path: Path = WORKFLOW) -> dict:
     node = shutil.which("node")
     if node is None:
         raise unittest.SkipTest("a Node runtime is required to execute the committed Code nodes")
@@ -274,7 +331,7 @@ def run_harness(cases: dict) -> dict:
         harness_path = Path(temporary) / "harness.js"
         harness_path.write_text(HARNESS, encoding="utf-8")
         completed = subprocess.run(
-            [node, str(harness_path), str(WORKFLOW), str(cases_path)],
+            [node, str(harness_path), str(workflow_path), str(cases_path)],
             capture_output=True,
             text=True,
             timeout=60,
@@ -361,6 +418,14 @@ class InvoiceDeliveryExportShape(unittest.TestCase):
             ("Hash PDF SHA256", 0, "Merge Request And PDF Hash", 1),
             self.edges(),
         )
+        stored = self.by_name["Merge Request And Stored State"]
+        self.assertEqual(("append", 2, 3), (
+            stored["parameters"]["mode"],
+            stored["parameters"]["numberInputs"],
+            stored["typeVersion"],
+        ))
+        self.assertIn(("Merge Request And PDF Hash", 0, "Merge Request And Stored State", 0), self.edges())
+        self.assertIn(("Get Existing Delivery", 0, "Merge Request And Stored State", 1), self.edges())
 
     def test_secondary_ledger_dedup_and_one_nonretrying_email_node(self) -> None:
         email_nodes = [node for node in self.nodes if node["type"] == "n8n-nodes-base.emailSend"]
@@ -470,43 +535,116 @@ class InvoiceDeliveryCodeExecution(unittest.TestCase):
         for answer in result[1:3]:
             self.assertEqual("EG_MAIL_REQUEST_SHAPE", answer["output"][0]["json"]["response"]["support_ref"])
 
-    def test_delivery_decision_never_resends_existing_or_uncertain_rows(self) -> None:
-        base = {
-            "request": BASE_METADATA,
-            "data": PDF_SHA256,
-            "pdf_sha256": PDF_SHA256,
-            "should_send": True,
-        }
+    def test_workflow_graph_preserves_bounded_ledger_multiplicity(self) -> None:
+        sample = validation_sample(json.dumps(BASE_METADATA))
+
+        def ledger_row(state: str, **overrides: object) -> dict:
+            return {
+                "id": 7,
+                "delivery_id": DELIVERY_ID,
+                "run_id": RUN_ID,
+                "stream": "EB_BILL",
+                "bill_date": "2026-10-02",
+                "attachment_name": "2026-10-02.pdf",
+                "pdf_sha256": PDF_SHA256,
+                "pdf_byte_size": len(PDF_BYTES),
+                "state": state,
+                "support_ref": "EG_MAIL_ACCEPTED",
+                **overrides,
+            }
+
+        delivered = ledger_row("DELIVERED")
+        conflicting = ledger_row("PENDING_SEND", pdf_sha256="0" * 64)
+        pending = ledger_row("PENDING_SEND")
+        rejected = ledger_row("REQUEST_REJECTED")
+        malformed = {"id": 7, "delivery_id": DELIVERY_ID, "state": "DELIVERED"}
+        triple = {**delivered, "id": 8}
+        mixed_empty_and_row = [{"json": {}}, {"json": delivered}]
+        malformed_empty_sentinel = [{"json": {}, "binary": {"pdf": {"fileName": "private.pdf"}}}]
+        cases = [
+            {"sample": sample, "options": {"rows": [delivered]}},
+            {"sample": sample, "options": {"rows": [conflicting]}},
+            {"sample": sample, "options": {"rows": [pending]}},
+            {"sample": sample, "options": {"rows": [rejected]}},
+            {"sample": sample, "options": {"rows": [malformed]}},
+            {"sample": sample, "options": {"rows": [delivered, delivered]}},
+            {"sample": sample, "options": {"rows": [delivered, conflicting]}},
+            {"sample": sample, "options": {"rows": [conflicting, delivered]}},
+            {"sample": sample, "options": {"rows": [delivered, delivered, triple]}},
+            {"sample": sample, "options": {"existingItems": mixed_empty_and_row}},
+            {"sample": sample, "options": {"existingItems": malformed_empty_sentinel}},
+        ]
+        results = run_harness({"validation": [], "flows": cases})["flows"]
+        self.assertTrue(all(flow["ok"] for flow in results), results)
+
+        already = results[0]
+        self.assertEqual((200, "ALREADY_DELIVERED", True), (
+            already["response"]["status"],
+            already["response"]["body"]["outcome"],
+            already["response"]["body"]["duplicate"],
+        ))
+        self.assertEqual([], already["messages"])
+        self.assertEqual([{"hasRequest": True, "delivery_id": DELIVERY_ID, "state": None},
+                          {"hasRequest": False, "delivery_id": DELIVERY_ID, "state": "DELIVERED"}],
+                         already["mergeTrace"])
+
+        self.assertEqual(409, results[1]["response"]["status"])
+        self.assertEqual(503, results[2]["response"]["status"])
+        self.assertEqual(422, results[3]["response"]["status"])
+        self.assertEqual(503, results[4]["response"]["status"])
+        for flow, originals in zip(results[5:], ([delivered, delivered], [delivered, conflicting], [conflicting, delivered])):
+            with self.subTest(mergeTrace=flow["mergeTrace"]):
+                self.assertEqual((503, "EG_MAIL_TABLE_RESULT_AMBIGUOUS"), (
+                    flow["response"]["status"], flow["response"]["body"]["support_ref"],
+                ))
+                self.assertEqual([], flow["messages"])
+                self.assertEqual(originals, flow["rows"])
+                self.assertEqual(3, len(flow["mergeTrace"]))
+
+        three_matches = results[8]
+        self.assertEqual((503, "EG_MAIL_TABLE_RESULT_AMBIGUOUS"), (
+            three_matches["response"]["status"], three_matches["response"]["body"]["support_ref"],
+        ))
+        self.assertEqual(3, len(three_matches["mergeTrace"]))  # one request plus the configured two-row lookup limit
+        self.assertEqual([], three_matches["messages"])
+        for flow in results[9:]:
+            with self.subTest(mergeTrace=flow.get("mergeTrace")):
+                self.assertEqual((503, "EG_MAIL_TABLE_RESULT_AMBIGUOUS") if flow is results[9] else (503, "EG_MAIL_TABLE_ROW_INVALID"), (
+                    flow["response"]["status"], flow["response"]["body"]["support_ref"],
+                ))
+                self.assertEqual([], flow["messages"])
+                self.assertEqual([], flow["rows"])
+
+    def test_positional_counterfactual_drops_second_bounded_ledger_row(self) -> None:
+        sample = validation_sample(json.dumps(BASE_METADATA))
         delivered = {
-            **base, "id": 7, "delivery_id": DELIVERY_ID, "run_id": RUN_ID,
+            "id": 7, "delivery_id": DELIVERY_ID, "run_id": RUN_ID,
             "stream": "EB_BILL", "bill_date": "2026-10-02",
             "attachment_name": "2026-10-02.pdf", "pdf_sha256": PDF_SHA256,
             "pdf_byte_size": len(PDF_BYTES), "state": "DELIVERED", "support_ref": "EG_MAIL_ACCEPTED",
         }
-        pending = {**delivered, "state": "PENDING_SEND", "support_ref": "EG_MAIL_PENDING"}
-        conflict = {**delivered, "pdf_sha256": "0" * 64}
-        result = run_harness({
-            "validation": [],
-            "decisions": [
-                [{"json": base, "binary": {"pdf": {"fileName": "2026-10-02.pdf"}}}],
-                [{"json": delivered}],
-                [{"json": pending}],
-                [{"json": conflict}],
-                [{"json": {**base, "data": "0" * 64}}],
-                [{"json": base}, {"json": base}],
-            ],
-        })["decisions"]
-        self.assertTrue(result[0]["output"][0]["json"]["should_send"])
-        self.assertEqual(("ALREADY_DELIVERED", True, 200), (
-            result[1]["output"][0]["json"]["response"]["outcome"],
-            result[1]["output"][0]["json"]["response"]["duplicate"],
-            result[1]["output"][0]["json"]["response_code"],
-        ))
-        self.assertEqual("DELIVERY_OUTCOME_UNCERTAIN", result[2]["output"][0]["json"]["response"]["outcome"])
-        self.assertFalse(result[2]["output"][0]["json"]["should_send"])
-        self.assertEqual(409, result[3]["output"][0]["json"]["response_code"])
-        self.assertEqual(422, result[4]["output"][0]["json"]["response_code"])
-        self.assertEqual(503, result[5]["output"][0]["json"]["response_code"])
+        conflict = {**delivered, "id": 8, "state": "PENDING_SEND", "pdf_sha256": "0" * 64}
+        case = {"validation": [], "flows": [{"sample": sample, "options": {"rows": [delivered, conflict]}}]}
+        corrected = run_harness(case)["flows"][0]
+        self.assertTrue(corrected["ok"], corrected)
+        self.assertEqual(3, len(corrected["mergeTrace"]))
+        self.assertEqual(503, corrected["response"]["status"])
+        self.assertEqual([], corrected["messages"])
+
+        counterfactual = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        merge = next(node for node in counterfactual["nodes"] if node["name"] == "Merge Request And Stored State")
+        merge["parameters"] = {"mode": "combine", "combineBy": "combineByPosition", "options": {}}
+        with tempfile.TemporaryDirectory() as temporary:
+            old_path = Path(temporary) / "positional.workflow.json"
+            old_path.write_text(json.dumps(counterfactual), encoding="utf-8")
+            old = run_harness(case, workflow_path=old_path)["flows"][0]
+        self.assertTrue(old["ok"], old)
+        self.assertEqual(1, len(old["mergeTrace"]))
+        self.assertTrue(old["mergeTrace"][0]["hasRequest"])
+        self.assertEqual("DELIVERED", old["mergeTrace"][0]["state"])
+        self.assertNotIn(conflict["pdf_sha256"], str(old["mergeTrace"]))
+        self.assertEqual(503, old["response"]["status"])
+        self.assertEqual([], old["messages"])
 
     def test_mocked_ledger_and_smtp_flow_persists_readback_and_never_resends(self) -> None:
         sample = validation_sample(json.dumps(BASE_METADATA))

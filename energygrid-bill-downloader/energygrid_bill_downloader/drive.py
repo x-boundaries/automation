@@ -6,9 +6,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .errors import ArchiveConflictError, ConfigError, StateError
+from .errors import ArchiveConflictError, ConfigError, InvalidPdfError, StateError
 from .publication import FileInfo, ensure_no_reparse_components, is_within, resolved, validate_pdf
-from .state import StateV2Store
+from .state import StateV2Store, StreamStateConflictError
 
 
 class DriveStager:
@@ -21,7 +21,7 @@ class DriveStager:
         self._drive_root = resolved(drive_root)
         self._binding_id = binding_id
 
-    def stage(self, state: StateV2Store, invoice: dict, archive_path: Path, run_id: str) -> FileInfo:
+    def stage(self, state: StateV2Store, invoice: dict, archive_path: Path, run_id: str, *, logger=None) -> FileInfo:
         relpath = invoice.get("archive_relpath")
         if type(relpath) is not str or relpath not in {
             f"EB Bill/{invoice.get('canonical_filename')}",
@@ -33,87 +33,156 @@ class DriveStager:
         ensure_no_reparse_components(self._archive_root_input)
         ensure_no_reparse_components(self._drive_root_input)
         ensure_no_reparse_components(source_input)
-        ensure_no_reparse_components(target_input)
+        try:
+            ensure_no_reparse_components(target_input)
+        except ConfigError:
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_DESTINATION_CONFLICT") from None
         source = resolved(source_input)
         target = resolved(target_input)
         if not is_within(source, self._archive_root) or not is_within(target, self._drive_root):
             raise ConfigError("Drive staging path escaped its approved root")
         info = validate_pdf(source)
 
-        if invoice.get("drive_state") == "DRIVE_STAGED":
-            if (
-                invoice.get("drive_binding_id") != self._binding_id
-                or invoice.get("drive_relpath") != relpath
-                or invoice.get("drive_size") != info.byte_size
-                or invoice.get("drive_sha256") != info.sha256
-            ):
-                raise ArchiveConflictError("Drive stage ownership differs from current invoice")
-            if validate_pdf(target) != info:
-                raise ArchiveConflictError("Drive staged bytes changed")
-            return info
+        if invoice.get("archive_state") != "COMMITTED" or invoice.get("byte_size") != info.byte_size or invoice.get("sha256") != info.sha256:
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_ARCHIVE_FACTS_CONFLICT")
+        already_staged = invoice.get("drive_state") == "DRIVE_STAGED"
+        if already_staged and (
+            invoice.get("drive_binding_id") != self._binding_id
+            or invoice.get("drive_relpath") != relpath
+            or invoice.get("drive_size") != info.byte_size
+            or invoice.get("drive_sha256") != info.sha256
+        ):
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_STAGE_FACTS_CONFLICT")
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        ensure_no_reparse_components(target.parent)
-        existing_operation = state.file_operation(
+        def emit(phase: str, status: str) -> None:
+            try:
+                if logger is not None:
+                    logger.event(phase, status=status, stream=invoice["stream"])
+            except Exception:
+                return None
+
+        emit("drive_started", "STARTED")
+        active = state.active_file_operation_conflicts(invoice["invoice_id"], {"DRIVE_STAGE"}, relpath)
+        if len(active) > 1 or any(
+            operation["invoice_id"] != invoice["invoice_id"]
+            or operation["binding_id"] != self._binding_id or operation["target_relpath"] != relpath
+            for operation in active
+        ):
+            for operation in active:
+                if operation["state"] == "PREPARED":
+                    state.hold_file_operation(operation["operation_id"], "EG_DRIVE_OPERATION_AUTHORITY_CONFLICT")
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_OPERATION_AUTHORITY_CONFLICT")
+        if active and active[0]["state"] == "HOLD":
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_RECOVERY_HOLD")
+
+        history = state.file_operation_history(
             invoice["invoice_id"], "DRIVE_STAGE", self._binding_id, relpath
         )
-        if existing_operation is None and (target.exists() or target.is_symlink()):
-            raise ArchiveConflictError("Drive destination is not owned by a stage journal")
-        if existing_operation is not None and (
-            existing_operation["expected_size"] != info.byte_size
-            or existing_operation["expected_sha256"] != info.sha256
+        if any(
+            operation["expected_size"] != info.byte_size
+            or operation["expected_sha256"] != info.sha256
+            or operation["source_role"] != "ARCHIVE_COMMITTED"
+            for operation in history
         ):
-            raise ArchiveConflictError("Drive stage journal facts conflict with invoice")
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_HISTORY_CONFLICT")
+
+        target_present = target.exists() or target.is_symlink()
+        if active:
+            operation = active[0]
+            temp_path = Path(operation["private_path_ref"])
+            expected_temp_name = f".{target.name}.{operation['operation_id']}.tmp"
+            if (
+                operation["expected_size"] != info.byte_size
+                or operation["expected_sha256"] != info.sha256
+                or operation["source_role"] != "ARCHIVE_COMMITTED"
+                or temp_path.parent != target.parent or temp_path.name != expected_temp_name
+            ):
+                state.hold_file_operation(operation["operation_id"], "EG_DRIVE_RECOVERY_CONFLICT")
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_RECOVERY_CONFLICT")
+            try:
+                ensure_no_reparse_components(temp_path)
+                ensure_no_reparse_components(target)
+                temp_present = temp_path.exists() or temp_path.is_symlink()
+                target_present = target.exists() or target.is_symlink()
+                if temp_present == target_present:
+                    raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_RECOVERY_AMBIGUOUS")
+                if temp_present:
+                    if validate_pdf(temp_path) != info:
+                        raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_RECOVERY_CONFLICT")
+                    _publish_link_no_replace(temp_path, target)
+                if validate_pdf(target) != info:
+                    raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_RECOVERY_CONFLICT")
+            except StreamStateConflictError as error:
+                state.hold_file_operation(operation["operation_id"], error.support_ref)
+                raise
+            except (OSError, ArchiveConflictError, InvalidPdfError, ConfigError, StateError):
+                try:
+                    state.hold_file_operation(operation["operation_id"], "EG_DRIVE_RECOVERY_HOLD")
+                except Exception:
+                    raise
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_RECOVERY_HOLD") from None
+            state.complete_file_operation(operation["operation_id"], _utc_now(), evidence_ref="EG_DRIVE_STAGE_HASH_VERIFIED")
+            if not already_staged:
+                self._record_stage(state, invoice["invoice_id"], relpath, info)
+            emit("drive_result", "REPAIRED" if already_staged else "STAGED")
+            return info
+
+        if target_present:
+            try:
+                ensure_no_reparse_components(target)
+                target_info = validate_pdf(target)
+            except (OSError, ArchiveConflictError, InvalidPdfError, ConfigError, StateError):
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_DESTINATION_CONFLICT") from None
+            if target_info != info:
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_DESTINATION_CONFLICT")
+            if already_staged:
+                emit("drive_result", "ALREADY_STAGED")
+                return info
+            if not history:
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_UNOWNED_DESTINATION")
+            state.update_invoice_file_state(
+                invoice["invoice_id"], drive_state="DRIVE_STAGED", drive_binding_id=self._binding_id,
+                drive_relpath=relpath, drive_size=info.byte_size, drive_sha256=info.sha256,
+                drive_staged_at_utc=_utc_now(),
+            )
+            emit("drive_result", "RECOVERED")
+            return info
+
+        if target.is_symlink():
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_DESTINATION_CONFLICT")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        ensure_no_reparse_components(target.parent)
         operation_id = str(uuid.uuid4())
         temp_path = target.with_name(f".{target.name}.{operation_id}.tmp")
         operation = state.start_file_operation(
-            operation_id=operation_id,
-            invoice_id=invoice["invoice_id"],
-            kind="DRIVE_STAGE",
-            private_path_ref=str(temp_path),
-            target_relpath=relpath,
-            binding_id=self._binding_id,
-            info=info,
-            source_role="ARCHIVE_COMMITTED",
-            run_id=run_id,
-            timestamp=_utc_now(),
+            operation_id=operation_id, invoice_id=invoice["invoice_id"], kind="DRIVE_STAGE",
+            private_path_ref=str(temp_path), target_relpath=relpath, binding_id=self._binding_id,
+            info=info, source_role="ARCHIVE_COMMITTED", run_id=run_id, timestamp=_utc_now(),
         )
-        if operation["state"] == "HOLD":
-            raise ArchiveConflictError("Drive stage has an unresolved operation")
-        temp_path = Path(operation["private_path_ref"])
-
+        if operation["state"] != "PREPARED" or Path(operation["private_path_ref"]) != temp_path:
+            if operation["state"] == "PREPARED":
+                state.hold_file_operation(operation["operation_id"], "EG_DRIVE_OPERATION_CONFLICT")
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_OPERATION_CONFLICT")
         try:
-            if operation["state"] == "COMMITTED":
-                if not target.is_file() or validate_pdf(target) != info:
-                    raise ArchiveConflictError("committed Drive stage does not match")
-                self._record_stage(state, invoice["invoice_id"], relpath, info)
-                return info
-            if operation["state"] != "PREPARED":
-                raise ArchiveConflictError("Drive stage has an unresolved operation")
-            if target.exists():
-                # A prepared journal owns this target, so exact bytes are
-                # recoverable; an unjournaled equal file is never adopted.
-                if validate_pdf(target) != info:
-                    raise ArchiveConflictError("Drive destination conflicts with invoice")
-            else:
-                if temp_path.exists():
-                    if validate_pdf(temp_path) != info:
-                        raise ArchiveConflictError("prepared Drive copy does not match")
-                else:
-                    _copy_exclusive(source, temp_path, info)
-                ensure_no_reparse_components(temp_path)
-                _publish_link_no_replace(temp_path, target)
-                if validate_pdf(target) != info:
-                    raise ArchiveConflictError("Drive destination verification failed")
-            state.complete_file_operation(operation["operation_id"], _utc_now(), evidence_ref="EG_DRIVE_STAGE_HASH_VERIFIED")
-            self._record_stage(state, invoice["invoice_id"], relpath, info)
-            return info
-        except Exception:
+            _copy_exclusive(source, temp_path, info)
+            ensure_no_reparse_components(temp_path)
+            _publish_link_no_replace(temp_path, target)
+            if validate_pdf(target) != info:
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_STAGE_RECOVERY_HOLD")
+        except StreamStateConflictError as error:
+            state.hold_file_operation(operation["operation_id"], error.support_ref)
+            raise
+        except (OSError, ArchiveConflictError, InvalidPdfError, ConfigError, StateError):
             try:
                 state.hold_file_operation(operation["operation_id"], "EG_DRIVE_STAGE_RECOVERY_HOLD")
             except Exception:
-                pass
-            raise
+                raise
+            raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_STAGE_RECOVERY_HOLD") from None
+        state.complete_file_operation(operation["operation_id"], _utc_now(), evidence_ref="EG_DRIVE_STAGE_HASH_VERIFIED")
+        if not already_staged:
+            self._record_stage(state, invoice["invoice_id"], relpath, info)
+        emit("drive_result", "REPAIRED" if already_staged else "STAGED")
+        return info
 
     def _record_stage(self, state: StateV2Store, invoice_id: str, relpath: str, info: FileInfo) -> None:
         state.update_invoice_file_state(
