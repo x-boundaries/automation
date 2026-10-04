@@ -213,7 +213,8 @@ function New-EgCaseConfig {
     }
     foreach ($key in $Values.Keys) { $document[$key] = $Values[$key] }
     $path = Join-Path $RootPath ($Name + '.json')
-    [IO.File]::WriteAllText($path, ($document | ConvertTo-Json -Depth 8 -Compress), [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText(
+        $path, ($document | ConvertTo-Json -Depth 8 -Compress), (New-Object System.Text.UTF8Encoding($false)))
     return $path
 }
 
@@ -741,7 +742,7 @@ function New-TestChild {
     }
     $configPath = Join-Path $RootPath ([guid]::NewGuid().ToString('N') + '.json')
     [IO.File]::WriteAllText(
-        $configPath, ($document | ConvertTo-Json -Depth 8 -Compress), [Text.Encoding]::UTF8)
+        $configPath, ($document | ConvertTo-Json -Depth 8 -Compress), (New-Object System.Text.UTF8Encoding($false)))
     $items = @($script:EgPythonExeNormal, '-B', '-m', 'energygrid_bill_downloader',
         'run', '--config', $configPath)
     $line = ConvertTo-EgNativeCommandLine -Argument $items

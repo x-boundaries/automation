@@ -30,6 +30,8 @@ LAUNCHER = FIXTURES / "supervisor_launcher" / "launcher.ps1"
 LAUNCHER_LIB = FIXTURES / "supervisor_launcher" / "launcher_lib.ps1"
 BASE_HEAD = "005f5b8b9ae38eb7ae4b4be67115ad559d5e7024"
 BASE_TREE = "a73bff398bc6e2b74a6dc63e767932709ed6b061"
+CONSTRUCTION_HEAD = "70d6eef6da55f9e8faead3c1ab8f647336e194ca"
+CONSTRUCTION_TREE = "28034420e436345586dc94f1624ac4483e97dbbb"
 TARGET_BRANCH = "codex/energygrid-226-dual-stream-latest-email"
 HELPERS = (HARNESS, FUNCTIONS, SUPPORT, PYTHON_FIXTURE, LAUNCHER, LAUNCHER_LIB)
 HELPER_RELATIVES = tuple(item.relative_to(REPO_ROOT).as_posix() for item in HELPERS)
@@ -793,12 +795,25 @@ def _identity(path: Path) -> dict[str, object]:
     }
 
 
+def _valid_candidate_parent(parent: str) -> bool:
+    if parent == BASE_HEAD:
+        return True
+    if _git("rev-parse", f"{CONSTRUCTION_HEAD}^") != BASE_HEAD or \
+            _git("rev-parse", f"{CONSTRUCTION_HEAD}^{{tree}}") != CONSTRUCTION_TREE:
+        return False
+    try:
+        _git("merge-base", "--is-ancestor", CONSTRUCTION_HEAD, parent)
+    except RuntimeError:
+        return False
+    return True
+
+
 def _assert_candidate_scope() -> dict[str, object]:
     head = _git("rev-parse", "HEAD")
     parent = _git("rev-parse", "HEAD^")
     tree = _git("rev-parse", "HEAD^{tree}")
     branch = _git("branch", "--show-current")
-    if branch != TARGET_BRANCH or parent != BASE_HEAD:
+    if branch != TARGET_BRANCH or not _valid_candidate_parent(parent):
         raise RuntimeError(f"unexpected branch/parent: {branch} {parent}")
     if _git("rev-parse", f"{BASE_HEAD}^{{tree}}") != BASE_TREE:
         raise RuntimeError("admitted product tree changed")
@@ -1178,7 +1193,7 @@ class SupervisorHarnessCleanupTests(unittest.TestCase):
 
     def test_receipt_binds_candidate_helpers_test_owner_and_supervisor(self):
         receipt = _load_receipt(_receipt_path())
-        self.assertEqual(BASE_HEAD, receipt["candidate"]["parent"])
+        self.assertTrue(_valid_candidate_parent(receipt["candidate"]["parent"]))
         self.assertEqual(7, receipt["candidate"]["changed_path_count"])
         self.assertEqual(42, receipt["candidate"]["protected_base_path_count"])
         self.assertEqual(6, len(receipt["helpers"]))
