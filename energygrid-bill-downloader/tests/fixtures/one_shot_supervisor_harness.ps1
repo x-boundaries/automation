@@ -2362,6 +2362,49 @@ function Invoke-EgObserverCases {
         New-EgObserverState
         [void](Wait-EgObserverFile -Path $runtime.ReadyPath -ProcessHandle $runtime.Launcher.ProcessHandle)
         $observed = Invoke-EgObserverFunction -Name 'base' -Runtime $runtime -StartTicks $runtime.StartTicks
+        if (-not $observed -or $script:EgState.observer_failed) {
+            $diagnostic = 'observed=' + [string]$observed +
+                ';observer_failed=' + [string]$script:EgState.observer_failed
+            $diagnosticIds = [EnergyGridOneShotSupervisorNative]::GetProcessIds($runtime.JobHandle)
+            if ($diagnosticIds.Succeeded) {
+                foreach ($diagnosticPid in $diagnosticIds.ProcessIds) {
+                    if ([uint32]$diagnosticPid -eq [uint32]$runtime.Launcher.ProcessId) { continue }
+                    $diagnosticCandidate = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess(
+                        [uint32]$diagnosticPid)
+                    if (-not $diagnosticCandidate.Succeeded) {
+                        $diagnostic += ';candidate_open=FAIL'
+                        continue
+                    }
+                    try {
+                        $diagnosticLive = [EnergyGridOneShotSupervisorNative]::GetProcessLive(
+                            $diagnosticCandidate.Handle)
+                        $diagnosticMembership = [EnergyGridOneShotSupervisorNative]::CheckMembership(
+                            $diagnosticCandidate.Handle, $runtime.JobHandle)
+                        $diagnosticImage = [EnergyGridOneShotSupervisorNative]::GetImage(
+                            $diagnosticCandidate.Handle)
+                        $diagnosticMetadata = [EnergyGridOneShotSupervisorNative]::QueryProcessMetadata(
+                            [uint32]$diagnosticPid, $script:EgObserverMetadataTimeoutMilliseconds)
+                        $diagnostic += ';live=' + [string]($diagnosticLive.Succeeded -and $diagnosticLive.Live) +
+                            ';member=' + [string]($diagnosticMembership.Succeeded -and
+                                $diagnosticMembership.IsMember) +
+                            ';image_match=' + [string]($diagnosticImage.Succeeded -and
+                                [System.StringComparer]::OrdinalIgnoreCase.Equals(
+                                    [System.IO.Path]::GetFullPath($diagnosticImage.ImagePath),
+                                    [System.IO.Path]::GetFullPath($script:EgPythonExeNormal))) +
+                            ';metadata=' + [string]$diagnosticMetadata.Succeeded +
+                            ';parent_match=' + [string]($diagnosticMetadata.Succeeded -and
+                                [uint32]$diagnosticMetadata.ParentProcessId -eq
+                                    [uint32]$runtime.Launcher.ProcessId) +
+                            ';command_match=' + [string]($diagnosticMetadata.Succeeded -and
+                                $diagnosticMetadata.CommandLine -ceq (Get-EgCanonicalApplicationCommandLine))
+                    }
+                    catch { $diagnostic += ';candidate_probe=ERROR' }
+                    finally { Close-EgHandle -Handle $diagnosticCandidate.Handle }
+                }
+            }
+            else { $diagnostic += ';job_enumeration=FAIL' }
+            Write-Output ('observer_p1_diagnostic=' + $diagnostic)
+        }
         Assert-EgObserver ($observed -and -not $script:EgState.observer_failed) 'P1_not_proven'
         $accounting = Close-EgObserverRuntime -Runtime $runtime
         $script:EgState.application_child_observed = $observed
