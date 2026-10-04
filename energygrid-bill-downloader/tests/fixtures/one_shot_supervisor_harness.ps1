@@ -633,7 +633,7 @@ try {
     $canaryJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
     [EnergyGridOneShotSupervisorNative]::ConfigureJob($canaryJob)
     $canaryPath = Join-Path $RootPath 'unrelated-canary.bin'
-    
+
     $canaryStream = New-Object System.IO.FileStream(
         $canaryPath, [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite,
         [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
