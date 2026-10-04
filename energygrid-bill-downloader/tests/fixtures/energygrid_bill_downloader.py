@@ -111,6 +111,9 @@ def _run(config_path: str, mode: str) -> int:
     child_count = config.get("descendant_count", 0)
     if isinstance(child_count, bool) or not isinstance(child_count, int) or not 0 <= child_count <= 40:
         raise ValueError("descendant count is outside its bound")
+    detached_descendants = config.get("detached_descendants", False)
+    if not isinstance(detached_descendants, bool):
+        raise ValueError("detached descendant flag is invalid")
     children: list[subprocess.Popen[bytes]] = []
     try:
         marker_value = json.dumps(
@@ -134,23 +137,25 @@ def _run(config_path: str, mode: str) -> int:
                 time.sleep(0.02)
             if not Path(release_path).is_file():
                 raise TimeoutError("release marker timed out")
-        child_wait = _bounded_delay(config.get("child_wait_seconds"), 60.0)
-        for child in children:
-            child.wait(timeout=child_wait + 5.0)
-            if child.returncode != 0:
-                raise RuntimeError("descendant process failed")
+        if not detached_descendants:
+            child_wait = _bounded_delay(config.get("child_wait_seconds"), 60.0)
+            for child in children:
+                child.wait(timeout=child_wait + 5.0)
+                if child.returncode != 0:
+                    raise RuntimeError("descendant process failed")
         return 0
     finally:
-        for child in children:
-            if child.poll() is None:
-                child.terminate()
-        for child in children:
-            if child.poll() is None:
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait(timeout=5)
+        if not detached_descendants:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+            for child in children:
+                if child.poll() is None:
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=5)
 
 
 def _tree_child(config_path: str) -> int:

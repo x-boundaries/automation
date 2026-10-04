@@ -733,6 +733,7 @@ function New-TestChild {
             $document.run_delay_seconds = 0.15
             $document.descendant_count = 1
             $document.child_wait_seconds = 60
+            $document.detached_descendants = $true
         }
         'wait-release' {
             if ([string]::IsNullOrWhiteSpace($ReleasePath)) { throw 'release_path_missing' }
@@ -2343,10 +2344,10 @@ function Finish-EgObserverCase {
 }
 
 function Invoke-EgObserverCases {
-    Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
-        -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     . $LauncherLibraryPath
     . $FunctionsPath
+    Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
+        -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     $script:EgPythonExeNormal = [IO.Path]::GetFullPath($PythonExe)
     $script:TimeoutSeconds = 120
     $script:EgObserverMetadataTimeoutMilliseconds = 1000
@@ -2797,6 +2798,7 @@ function Invoke-EgDirectSupervisor {
 }
 
 function Invoke-EgEndToEndCases {
+    . $LauncherLibraryPath
     Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
         -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     $script:EgPythonExeNormal = [IO.Path]::GetFullPath($PythonExe)
@@ -2848,6 +2850,7 @@ function Write-EgOwnerReady {
 
 function Invoke-EgCrashOwner {
     Assert-EgHarness (-not [string]::IsNullOrWhiteSpace($ReadyPath)) 'crash_owner_ready_path_required'
+    . $LauncherLibraryPath
     Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
         -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     $script:EgPythonExeNormal = [IO.Path]::GetFullPath($PythonExe)
