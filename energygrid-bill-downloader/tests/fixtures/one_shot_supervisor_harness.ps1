@@ -2355,13 +2355,23 @@ function Invoke-EgObserverCases {
     $script:EgObserverProcessGoneErrorCode = 87
     $script:EgObserverN7ProviderCalls = 0
 
-    $values = @{ run_delay_seconds = 30 }
+    $values = @{
+        run_delay_seconds = 30
+        release_path = (Join-Path $RootPath 'P1-release-after-observation.marker')
+    }
     $runtime = Start-EgObserverRuntime -Name 'P1' -Mode 'positive' -Values $values
     try {
         $script:EgConfigPathNormal = $runtime.ConfigPath
         New-EgObserverState
         [void](Wait-EgObserverFile -Path $runtime.ReadyPath -ProcessHandle $runtime.Launcher.ProcessHandle)
-        $observed = Invoke-EgObserverFunction -Name 'base' -Runtime $runtime -StartTicks $runtime.StartTicks
+        $positiveObserverDeadline = [System.Diagnostics.Stopwatch]::GetTimestamp() +
+            ([int64]5 * [int64][System.Diagnostics.Stopwatch]::Frequency)
+        $observed = $false
+        do {
+            $observed = Invoke-EgObserverFunction -Name 'base' -Runtime $runtime -StartTicks $runtime.StartTicks
+            if ($observed -or $script:EgState.observer_failed) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([System.Diagnostics.Stopwatch]::GetTimestamp() -lt $positiveObserverDeadline)
         if (-not $observed -or $script:EgState.observer_failed) {
             $diagnostic = 'observed=' + [string]$observed +
                 ';observer_failed=' + [string]$script:EgState.observer_failed
