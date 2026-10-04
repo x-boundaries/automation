@@ -4050,6 +4050,237 @@ def _boundary_report(stdout: str) -> dict[str, object] | None:
     return json.loads(lines[0][len(TASK_BOUNDARY_RESULT_PREFIX):])
 
 
+_CI7_CHILD_SETUP_STAGES = (
+    "INPUT",
+    "SOURCE_LOAD",
+    "ACCOUNT_PRESERVATION",
+    "NATIVE_INIT",
+    "CREDENTIAL_RESTORE",
+    "CREDENTIAL_OBJECT_CREATE",
+    "PRODUCT_TOKEN_OPEN",
+    "FROZEN_CONTROL",
+    "RESULT_EMIT",
+    "CLEANUP",
+)
+_CI7_CHILD_STATUSES = (
+    "completed",
+    "structured_failure",
+    "abnormal_exit",
+    "malformed_output",
+    "timeout",
+    "termination_unproven",
+    "launch_failed",
+)
+_CI7_FROZEN_OUTCOMES = (
+    "effective_rights_exceeded",
+    "effective_rights_missing",
+    "effective_rights_unproven",
+    "installation_owned_surface_unknown",
+    "installation_manifest_invalid",
+    "installation_manifest_membership_invalid",
+    "installation_manifest_path_invalid",
+    "installation_manifest_task_invalid",
+    "installation_runtime_roots_invalid",
+    "release_identity_mismatch",
+    "unexpected_success",
+    "unexpected_error",
+    "fixture_setup_failed",
+)
+_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS = (15, 15, 15, 15, 3, 15, 15, 15)
+_CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS = 120
+_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS = 240
+
+
+def _public_safe_hosted_failure_summary(
+    report: object,
+    prefix: str = "hosted boundary assertion failed",
+) -> str:
+    """Render failure evidence using only fixed enums, booleans and bounded counts."""
+    if not isinstance(report, dict):
+        return f"{prefix}; diagnostics unavailable"
+
+    parts: list[str] = []
+
+    def add_enum(source: object, key: str, label: str, allowed: set[str]) -> None:
+        if not isinstance(source, dict):
+            return
+        value = source.get(key)
+        if isinstance(value, str) and value in allowed:
+            parts.append(f"{label}={value}")
+
+    def add_bool(source: object, key: str, label: str) -> None:
+        if not isinstance(source, dict):
+            return
+        value = source.get(key)
+        if type(value) is bool:
+            parts.append(f"{label}={'true' if value else 'false'}")
+
+    def add_count(source: object, key: str, label: str, maximum: int = 255) -> None:
+        if not isinstance(source, dict):
+            return
+        value = source.get(key)
+        if type(value) is int and 0 <= value <= maximum:
+            parts.append(f"{label}={value}")
+
+    safe_fatal_codes = {
+        "ci7_fatal",
+        "ci7_required_probes_incomplete",
+        "ci7_fixture_cleanup_failed",
+        "frozen_control_child_setup_failed",
+        "frozen_control_child_structured_failure",
+        "frozen_control_child_source_binding_invalid",
+        "frozen_control_child_outcome_mismatch",
+    }
+    case = report.get("cases", {}).get("install_then_uninstall") if isinstance(report.get("cases"), dict) else None
+    ci7 = case.get("ci7") if isinstance(case, dict) else None
+    add_enum(case, "status", "case_status", {"completed", "error", "failed"})
+
+    fatal = report.get("fatal")
+    ci7_fatal = ci7.get("fatal") if isinstance(ci7, dict) else None
+    fatal_code = fatal if fatal is not None else ci7_fatal
+    if fatal_code is None:
+        parts.append("fatal_code=none")
+    elif isinstance(fatal_code, str) and fatal_code in safe_fatal_codes:
+        parts.append(f"fatal_code={fatal_code}")
+    else:
+        parts.append("fatal_code=unclassified")
+
+    add_enum(ci7, "frozen_control_child_status", "frozen_child_status", set(_CI7_CHILD_STATUSES))
+    add_count(ci7, "frozen_control_child_exit_status", "child_exit_status")
+    add_enum(ci7, "frozen_control_child_setup_stage", "child_setup_stage", set(_CI7_CHILD_SETUP_STAGES))
+    add_bool(ci7, "fixture_account_preserved", "fixture_account_preserved")
+    add_bool(ci7, "credential_username_matches_fixture", "credential_username_matches_fixture")
+    add_enum(ci7, "product_token_open", "product_token_open", {"PASS", "FAIL", "NOT_REACHED"})
+    add_bool(ci7, "frozen_control_source_binding", "frozen_source_binding")
+    add_bool(ci7, "frozen_control_child_process_distinct", "child_process_distinct")
+    add_bool(ci7, "frozen_control_parent_function_replaced", "parent_function_replaced")
+    add_enum(ci7, "frozen_defective_context_outcome", "frozen_control_outcome", set(_CI7_FROZEN_OUTCOMES))
+    add_bool(ci7, "frozen_control_child_terminated", "process_terminated")
+    add_enum(ci7, "frozen_control_child_residue", "residue", {"none", "present", "unproven"})
+    add_bool(ci7, "frozen_control_child_stderr_present", "stderr_present")
+
+    completion = ci7.get("required_probe_completion") if isinstance(ci7, dict) else None
+    add_enum(completion, "status", "required_probe_status", {"complete", "incomplete", "in_progress"})
+    add_enum(completion, "completed_through", "required_probe_through", {"retention_delete"})
+    if isinstance(case, dict):
+        parts.append(f"uninstall={'PASS' if case.get('uninstall_outcome') == 'pass' else 'FAIL'}")
+
+    cleanup = report.get("cleanup")
+    required_cleanup = (
+        "production_folder_absent",
+        "program_files_parent_absent",
+        "program_data_parent_absent",
+        "stage_residue_absent",
+        "lsa_account_object_absent",
+        "profile_absent",
+        "user_absent",
+    )
+    if isinstance(cleanup, dict) and all(type(cleanup.get(key)) is bool for key in required_cleanup):
+        cleanup_pass = all(cleanup[key] for key in required_cleanup)
+        parts.append(f"disposable_cleanup_readback={'PASS' if cleanup_pass else 'FAIL'}")
+
+    secret_exposure = report.get("secret_exposure")
+    if secret_exposure == "none":
+        parts.append("credential_secret_exposure=none")
+    elif secret_exposure == "detected":
+        parts.append("credential_secret_exposure=confirmed")
+    else:
+        parts.append("credential_secret_exposure=possible")
+    parts.append("failure_output_privacy=PASS")
+    parts.append("private_evidence_exposure=none")
+
+    if not parts:
+        return f"{prefix}; diagnostics unavailable"
+    return f"{prefix}; " + "; ".join(parts[:24])
+
+
+class MemberWorkerHostedFailureSummaryTests(unittest.TestCase):
+    def test_failure_summary_uses_only_bounded_public_fields(self) -> None:
+        private_values = (
+            r"C:\Users\private-user\AppData\Local\worker-runtime\task.xml",
+            "xbt-private-account-sentinel",
+            "S-1-5-21-111111111-222222222-333333333-4444",
+            "private-task-arguments-sentinel",
+            "private-password-sentinel",
+            "private-encrypted-password-sentinel",
+            "private-exception-text-sentinel",
+        )
+        report = {
+            "fatal": private_values[0],
+            "secret_exposure": "none",
+            "cleanup": {"pass": False, "absolute_path": private_values[0]},
+            "cases": {
+                "install_then_uninstall": {
+                    "status": "error",
+                    "uninstall_outcome": private_values[6],
+                    "ci7": {
+                        "fatal": private_values[6],
+                        "frozen_control_child_status": "structured_failure",
+                        "frozen_control_child_exit_status": 1,
+                        "frozen_control_child_setup_stage": "PRODUCT_TOKEN_OPEN",
+                        "fixture_account_preserved": True,
+                        "credential_username_matches_fixture": True,
+                        "product_token_open": "FAIL",
+                        "frozen_control_source_binding": True,
+                        "frozen_control_child_process_distinct": True,
+                        "frozen_control_parent_function_replaced": False,
+                        "frozen_defective_context_outcome": "fixture_setup_failed",
+                        "frozen_control_child_terminated": True,
+                        "frozen_control_child_residue": "none",
+                        "frozen_control_child_stderr_present": True,
+                        "worker_account": private_values[1],
+                        "worker_sid": private_values[2],
+                        "task_arguments": private_values[3],
+                        "credential": private_values[4],
+                        "encrypted_password": private_values[5],
+                        "required_probe_completion": {"status": "incomplete", "completed_through": "retention_delete"},
+                    },
+                },
+            },
+        }
+        summary = _public_safe_hosted_failure_summary(report)
+        if any(value in summary for value in private_values):
+            raise AssertionError("public-safe hosted diagnostic emitted private fixture data")
+        if any(key in summary for key in ("worker_account=", "worker_sid=", "task_arguments=", "credential=", "encrypted_password=")):
+            raise AssertionError("public-safe hosted diagnostic emitted a private field name")
+        for required in (
+            "case_status=error",
+            "frozen_child_status=structured_failure",
+            "child_exit_status=1",
+            "child_setup_stage=PRODUCT_TOKEN_OPEN",
+            "fixture_account_preserved=true",
+            "credential_username_matches_fixture=true",
+            "product_token_open=FAIL",
+            "frozen_source_binding=true",
+            "child_process_distinct=true",
+            "parent_function_replaced=false",
+            "frozen_control_outcome=fixture_setup_failed",
+            "process_terminated=true",
+            "residue=none",
+            "stderr_present=true",
+            "required_probe_status=incomplete",
+            "uninstall=FAIL",
+            "credential_secret_exposure=none",
+            "failure_output_privacy=PASS",
+            "private_evidence_exposure=none",
+        ):
+            if required not in summary:
+                raise AssertionError("public-safe hosted diagnostic omitted a bounded status field")
+        if len(summary) > 1024:
+            raise AssertionError("public-safe hosted diagnostic exceeded its output bound")
+
+        diagnostic_case = MemberWorkerHostedTaskBoundaryTests("test_no_secret_exposure")
+        diagnostic_case.report = report
+        try:
+            diagnostic_case.assertEqual(private_values[1], private_values[2])
+        except AssertionError as error:
+            assertion_message = str(error)
+        else:
+            raise AssertionError("hosted report assertion unexpectedly passed")
+        if any(value in assertion_message for value in private_values):
+            raise AssertionError("hosted assertion message emitted private report data")
+
+
 def _installer_function(source: str, name: str) -> str:
     start = source.index(f"function {name} {{")
     end = source.find("\nfunction ", start + 1)
@@ -4441,11 +4672,144 @@ Set-Item function:script:Remove-XbWorkerScheduledTask $originalUnregister
 '''
 
 
+_FROZEN_CI7_CHILD_SCRIPT = r'''param([Parameter(Mandatory)]$Fixture)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$childResult = [ordered]@{
+    schema_version = "xb.member.worker.ci7.frozen-control.v1"
+    fixture_status = "failed"
+    outcome = "fixture_setup_failed"
+    setup_stage = "INPUT"
+    source_commit = ""
+    source_blob = ""
+    fixture_account_preserved = $null
+    credential_username_matches_fixture = $null
+    product_token_open = "NOT_REACHED"
+    product_token_identity_matches_fixture = $null
+}
+$setupStage = "INPUT"
+$securePassword = $null
+$credential = $null
+$nativeToken = $null
+$context = $null
+try {
+    $childResult.source_commit = [string]$Fixture.source_commit
+    $childResult.source_blob = [string]$Fixture.source_blob
+    $installerPath = [string]$Fixture.installer_path
+    # CI7_FIXTURE_ACCOUNT_PRESERVATION_BEGIN
+    $fixtureWorkerAccount = [string]$Fixture.worker_account
+    # CI7_FIXTURE_ACCOUNT_PRESERVATION_END
+    $encryptedPassword = [string]$Fixture.encrypted_password
+    $frozenContextText = [string]$Fixture.frozen_context_source
+    if ($Fixture.source_commit -cne "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -or
+        $Fixture.source_blob -cne "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" -or
+        $frozenContextText -notmatch '^function Open-XbCi7VerificationContext \{(?s).+\}\s*$' -or
+        $frozenContextText.Length -gt 32768 -or
+        [string]::IsNullOrWhiteSpace($installerPath) -or
+        $fixtureWorkerAccount -cnotmatch '^xbt[0-9a-f]{12}$' -or
+        [string]::IsNullOrWhiteSpace($encryptedPassword)) {
+        throw "fixture_input_invalid"
+    }
+
+    $setupStage = "SOURCE_LOAD"
+    . $installerPath -LibraryOnly -WorkerAccount $fixtureWorkerAccount
+    $setupStage = "ACCOUNT_PRESERVATION"
+    $workerAccount = $fixtureWorkerAccount
+    $script:WorkerAccount = $fixtureWorkerAccount
+    $childResult.fixture_account_preserved = [bool](
+        $workerAccount -ceq $fixtureWorkerAccount -and $script:WorkerAccount -ceq $fixtureWorkerAccount
+    )
+    if (-not $childResult.fixture_account_preserved) { throw "fixture_account_not_preserved" }
+
+    $setupStage = "NATIVE_INIT"
+    Initialize-XbWorkerNativeAccess
+    $setupStage = "CREDENTIAL_RESTORE"
+    $securePassword = ConvertTo-SecureString -String $encryptedPassword -ErrorAction Stop
+    $setupStage = "CREDENTIAL_OBJECT_CREATE"
+    $credential = New-Object Management.Automation.PSCredential($fixtureWorkerAccount, $securePassword)
+    $childResult.credential_username_matches_fixture = [bool]($credential.UserName -ceq $fixtureWorkerAccount)
+    if (-not $childResult.credential_username_matches_fixture) { throw "fixture_credential_identity_mismatch" }
+    $encryptedPassword = $null
+    $Fixture.encrypted_password = $null
+
+    $setupStage = "PRODUCT_TOKEN_OPEN"
+    try {
+        $nativeToken = New-XbWorkerBatchToken -Credential $credential
+        if ($null -eq $nativeToken) { throw "fixture_product_token_unproven" }
+        $fixtureSid = Get-XbAccountSid -Account $fixtureWorkerAccount
+        $childResult.product_token_identity_matches_fixture = [bool]($nativeToken.UserSid -ceq $fixtureSid)
+        $fixtureSid = $null
+        if (-not $childResult.product_token_identity_matches_fixture) { throw "fixture_product_token_identity_mismatch" }
+        $childResult.product_token_open = "PASS"
+    } catch {
+        $childResult.product_token_open = "FAIL"
+        throw "fixture_product_token_open_failed"
+    }
+
+    $setupStage = "FROZEN_CONTROL"
+    $frozenOpen = $frozenContextText.IndexOf("{")
+    $frozenClose = $frozenContextText.LastIndexOf("}")
+    if ($frozenOpen -lt 0 -or $frozenClose -le $frozenOpen) { throw "fixture_frozen_source_invalid" }
+    $frozenContextBody = $frozenContextText.Substring($frozenOpen + 1, $frozenClose - $frozenOpen - 1)
+    Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextBody))
+    try {
+        $context = Open-XbCi7VerificationContext -Token $nativeToken
+        $childResult.outcome = "unexpected_success"
+    } catch {
+        $safeOutcomes = @(
+            "effective_rights_exceeded", "effective_rights_missing", "effective_rights_unproven",
+            "installation_owned_surface_unknown", "installation_manifest_invalid",
+            "installation_manifest_membership_invalid", "installation_manifest_path_invalid",
+            "installation_manifest_task_invalid", "installation_runtime_roots_invalid",
+            "release_identity_mismatch"
+        )
+        $reason = [string]$_.Exception.Message
+        $childResult.outcome = if ($safeOutcomes -ccontains $reason) { $reason } else { "unexpected_error" }
+    }
+    if ($null -ne $context) {
+        Dispose-XbCi7VerificationContext -Context $context
+        $context = $null
+    }
+    $childResult.fixture_status = "completed"
+    $setupStage = "RESULT_EMIT"
+} catch {
+    $childResult.fixture_status = "failed"
+    $childResult.outcome = "fixture_setup_failed"
+    $childResult.setup_stage = $setupStage
+} finally {
+    $cleanupFailed = $false
+    $setupSucceeded = $childResult.fixture_status -ceq "completed"
+    if ($setupSucceeded) { $setupStage = "CLEANUP" }
+    if ($null -ne $context) {
+        try { Dispose-XbCi7VerificationContext -Context $context } catch { $cleanupFailed = $true }
+    }
+    if ($null -ne $nativeToken) { try { $nativeToken.Dispose() } catch { $cleanupFailed = $true } }
+    if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { $cleanupFailed = $true } }
+    $credential = $null
+    $Fixture = $null
+    $fixtureWorkerAccount = $null
+    $workerAccount = $null
+    $script:WorkerAccount = $null
+    $encryptedPassword = $null
+    if ($cleanupFailed -and $setupSucceeded) {
+        $childResult.fixture_status = "failed"
+        $childResult.outcome = "fixture_setup_failed"
+        $childResult.setup_stage = "CLEANUP"
+    }
+}
+if ($childResult.fixture_status -ceq "completed") { $childResult.setup_stage = "RESULT_EMIT" }
+[Console]::Out.WriteLine(($childResult | ConvertTo-Json -Depth 4 -Compress))
+if ($childResult.fixture_status -cne "completed") { exit 1 }
+exit 0
+'''
+
+
 _HOSTED_TASK_BOUNDARY_HARNESS = r'''[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InstallerPath,
     [Parameter(Mandatory)][string]$ReviewedManifestPath,
     [Parameter(Mandatory)][string]$FrozenContextPath,
+    [Parameter(Mandatory)][string]$FrozenChildScriptPath,
     [Parameter(Mandatory)][string]$FrozenSourceCommit,
     [Parameter(Mandatory)][string]$FrozenInstallerBlob
 )
@@ -4599,6 +4963,298 @@ function Get-XbBoundaryHResult {
 function Get-XbBoundaryOutcome {
     param([Parameter(Mandatory)][scriptblock]$Body)
     try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+
+function Invoke-XbCi7FrozenControlChild {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$ScriptText,
+        [Parameter(Mandatory)]$Fixture,
+        [int]$TimeoutMilliseconds = 15000
+    )
+    if ($null -eq ("XbCi7BoundedTextCapture" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class XbCi7BoundedTextCapture
+{
+    private readonly StringBuilder text = new StringBuilder();
+    private readonly int limit;
+    private readonly Task readerTask;
+    private volatile bool overflow;
+    private volatile bool readFailed;
+
+    public XbCi7BoundedTextCapture(StreamReader reader, int maximumCharacters)
+    {
+        if (reader == null) throw new ArgumentNullException("reader");
+        if (maximumCharacters < 1) throw new ArgumentOutOfRangeException("maximumCharacters");
+        limit = maximumCharacters;
+        readerTask = Task.Factory.StartNew(() => {
+            char[] buffer = new char[1024];
+            try {
+                int count;
+                while ((count = reader.Read(buffer, 0, buffer.Length)) != 0) {
+                    lock (text) {
+                        int remaining = limit - text.Length;
+                        int keep = Math.Max(0, Math.Min(count, remaining));
+                        if (keep > 0) text.Append(buffer, 0, keep);
+                        if (keep < count) overflow = true;
+                    }
+                }
+            } catch { readFailed = true; }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
+
+    public bool Overflow { get { return overflow; } }
+    public bool ReadFailed { get { return readFailed; } }
+    public string Text { get { lock (text) return text.ToString(); } }
+    public void Wait() { readerTask.Wait(); }
+}
+'@ -ErrorAction Stop | Out-Null
+    }
+
+    $result = [ordered]@{
+        status = "launch_failed"
+        exit_status = $null
+        process_distinct = $false
+        process_terminated = $false
+        residue = "unproven"
+        child_result = $null
+        stderr_present = $false
+    }
+    $process = $null
+    $processStarted = $false
+    $childTempPath = $null
+    $childTempCreated = $false
+    $timeoutOccurred = $false
+    try {
+        if ($TimeoutMilliseconds -lt 1 -or $TimeoutMilliseconds -gt 120000 -or
+            [string]::IsNullOrWhiteSpace($ScriptText) -or $ScriptText.Length -gt 32768) {
+            throw "fixture_input_invalid"
+        }
+        $repositoryRootFull = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\') + '\'
+        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        $childTempPath = Join-Path $tempRoot ("xb-ci7-frozen-control-" + [Guid]::NewGuid().ToString("N"))
+        $childTempFull = [IO.Path]::GetFullPath($childTempPath).TrimEnd('\') + '\'
+        if ($childTempFull.StartsWith($repositoryRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "fixture_temp_inside_repository"
+        }
+        New-Item -ItemType Directory -Path $childTempPath -ErrorAction Stop | Out-Null
+        $childTempCreated = $true
+        if (@(Get-ChildItem -LiteralPath $childTempPath -Force -ErrorAction Stop).Count -ne 0) {
+            throw "fixture_temp_preimage_invalid"
+        }
+
+        $payload = [ordered]@{ script = $ScriptText; fixture = $Fixture } | ConvertTo-Json -Depth 8 -Compress
+        if ([string]::IsNullOrEmpty($payload) -or $payload.Length -gt 262144) { throw "fixture_input_invalid" }
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $wireText = [Convert]::ToBase64String($utf8.GetBytes($payload))
+        $wireBytes = [Text.Encoding]::ASCII.GetBytes($wireText + "`n")
+
+        $bootstrap = '$wire=[Console]::In.ReadToEnd();$json=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($wire.Trim()));$packet=ConvertFrom-Json -InputObject $json -ErrorAction Stop;& ([ScriptBlock]::Create([string]$packet.script)) $packet.fixture'
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = Join-Path $PSHOME "powershell.exe"
+        $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + $bootstrap + '"'
+        $systemRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+        if ([string]::IsNullOrWhiteSpace($systemRoot)) { throw "fixture_process_environment_invalid" }
+        $startInfo.WorkingDirectory = $systemRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $environment = $startInfo.EnvironmentVariables
+        $environment.Clear()
+        $environment["SystemRoot"] = $systemRoot
+        $environment["WINDIR"] = $systemRoot
+        $environment["PATH"] = Join-Path $systemRoot "System32"
+        $environment["TEMP"] = $childTempPath
+        $environment["TMP"] = $childTempPath
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        $originalInputEncoding = [Console]::InputEncoding
+        try {
+            [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false, $true)
+            if ([Console]::InputEncoding.GetPreamble().Length -ne 0) { throw "fixture_stdin_encoding_invalid" }
+            $processStarted = $process.Start()
+        } finally {
+            [Console]::InputEncoding = $originalInputEncoding
+        }
+        if (-not $processStarted) { throw "fixture_child_start_failed" }
+        $result.process_distinct = [bool]($process.Id -ne $PID)
+        $stdoutCapture = [XbCi7BoundedTextCapture]::new($process.StandardOutput, 4096)
+        $stderrCapture = [XbCi7BoundedTextCapture]::new($process.StandardError, 4096)
+        $inputStream = $process.StandardInput.BaseStream
+        $inputStream.Write($wireBytes, 0, $wireBytes.Length)
+        $inputStream.Flush()
+        $process.StandardInput.Close()
+
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $timeoutOccurred = $true
+            try { $process.Kill() } catch { }
+            $result.process_terminated = [bool]($process.WaitForExit(10000) -and $process.HasExited)
+        } else {
+            $process.WaitForExit()
+            $result.process_terminated = [bool]$process.HasExited
+        }
+        if (-not $result.process_terminated) {
+            $result.status = "termination_unproven"
+        } else {
+            $result.exit_status = [int]$process.ExitCode
+            $stdoutCapture.Wait()
+            $stderrCapture.Wait()
+            $stdout = [string]$stdoutCapture.Text
+            $stderr = [string]$stderrCapture.Text
+            $result.stderr_present = [bool]($stderr.Length -gt 0)
+            if ($timeoutOccurred) {
+                $result.status = "timeout"
+            } elseif ($stdoutCapture.Overflow -or $stderrCapture.Overflow -or
+                $stdoutCapture.ReadFailed -or $stderrCapture.ReadFailed) {
+                $result.status = "malformed_output"
+            } else {
+                $jsonLine = $stdout.TrimEnd("`r", "`n")
+                if ([string]::IsNullOrWhiteSpace($jsonLine)) {
+                    $result.status = if ($result.exit_status -ne 0) { "abnormal_exit" } else { "malformed_output" }
+                } elseif ($jsonLine.Contains("`r") -or $jsonLine.Contains("`n")) {
+                    $result.status = "malformed_output"
+                } else {
+                    try {
+                        $child = ConvertFrom-Json -InputObject $jsonLine -ErrorAction Stop
+                        $actualFields = @($child.PSObject.Properties | ForEach-Object Name | Sort-Object)
+                        $expectedFields = @(
+                            "credential_username_matches_fixture", "fixture_account_preserved", "fixture_status",
+                            "outcome", "product_token_identity_matches_fixture", "product_token_open",
+                            "schema_version", "setup_stage", "source_blob", "source_commit"
+                        )
+                        $booleansValid = @(
+                            ($null -eq $child.fixture_account_preserved -or $child.fixture_account_preserved -is [bool]),
+                            ($null -eq $child.credential_username_matches_fixture -or $child.credential_username_matches_fixture -is [bool]),
+                            ($null -eq $child.product_token_identity_matches_fixture -or $child.product_token_identity_matches_fixture -is [bool])
+                        ) -notcontains $false
+                        $shapeValid = ($actualFields -join "|") -ceq ($expectedFields -join "|") -and
+                            $child.schema_version -ceq "xb.member.worker.ci7.frozen-control.v1" -and
+                            $child.fixture_status -cin @("completed", "failed") -and
+                            $child.setup_stage -cin @(
+                                "INPUT", "SOURCE_LOAD", "ACCOUNT_PRESERVATION", "NATIVE_INIT", "CREDENTIAL_RESTORE",
+                                "CREDENTIAL_OBJECT_CREATE", "PRODUCT_TOKEN_OPEN", "FROZEN_CONTROL", "RESULT_EMIT", "CLEANUP"
+                            ) -and
+                            $child.outcome -cin @(
+                                "effective_rights_exceeded", "effective_rights_missing", "effective_rights_unproven",
+                                "installation_owned_surface_unknown", "installation_manifest_invalid",
+                                "installation_manifest_membership_invalid", "installation_manifest_path_invalid",
+                                "installation_manifest_task_invalid", "installation_runtime_roots_invalid",
+                                "release_identity_mismatch", "unexpected_success", "unexpected_error", "fixture_setup_failed"
+                            ) -and
+                            $child.product_token_open -cin @("PASS", "FAIL", "NOT_REACHED") -and
+                            [string]$child.source_commit -match '^[0-9a-f]{40}$' -and
+                            [string]$child.source_blob -match '^[0-9a-f]{40}$' -and
+                            $booleansValid
+                        if (-not $shapeValid) {
+                            $result.status = "malformed_output"
+                        } elseif ($child.fixture_status -ceq "completed" -and
+                            $child.outcome -cne "fixture_setup_failed" -and
+                            $child.setup_stage -ceq "RESULT_EMIT" -and
+                            $child.fixture_account_preserved -is [bool] -and $child.fixture_account_preserved -and
+                            $child.credential_username_matches_fixture -is [bool] -and $child.credential_username_matches_fixture -and
+                            $child.product_token_open -ceq "PASS" -and
+                            $child.product_token_identity_matches_fixture -is [bool] -and $child.product_token_identity_matches_fixture -and
+                            $result.exit_status -eq 0) {
+                            $result.child_result = [ordered]@{
+                                fixture_status = [string]$child.fixture_status
+                                outcome = [string]$child.outcome
+                                setup_stage = [string]$child.setup_stage
+                                source_commit = [string]$child.source_commit
+                                source_blob = [string]$child.source_blob
+                                fixture_account_preserved = [bool]$child.fixture_account_preserved
+                                credential_username_matches_fixture = [bool]$child.credential_username_matches_fixture
+                                product_token_open = [string]$child.product_token_open
+                                product_token_identity_matches_fixture = [bool]$child.product_token_identity_matches_fixture
+                            }
+                            $result.status = if ($result.stderr_present) { "malformed_output" } else { "completed" }
+                        } elseif ($child.fixture_status -ceq "failed" -and
+                            $child.outcome -ceq "fixture_setup_failed" -and
+                            $child.product_token_open -cin @("FAIL", "NOT_REACHED") -and
+                            $result.exit_status -ne 0) {
+                            $result.child_result = [ordered]@{
+                                fixture_status = [string]$child.fixture_status
+                                outcome = [string]$child.outcome
+                                setup_stage = [string]$child.setup_stage
+                                source_commit = [string]$child.source_commit
+                                source_blob = [string]$child.source_blob
+                                fixture_account_preserved = $child.fixture_account_preserved
+                                credential_username_matches_fixture = $child.credential_username_matches_fixture
+                                product_token_open = [string]$child.product_token_open
+                                product_token_identity_matches_fixture = $child.product_token_identity_matches_fixture
+                            }
+                            $result.status = "structured_failure"
+                        } else {
+                            $result.status = "malformed_output"
+                        }
+                    } catch { $result.status = "malformed_output" }
+                }
+            }
+        }
+    } catch {
+        $result.status = "launch_failed"
+    } finally {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) {
+                    try { $process.Kill() } catch { }
+                    $result.process_terminated = [bool]($process.WaitForExit(10000) -and $process.HasExited)
+                }
+            } catch { $result.process_terminated = $false }
+            try { $process.Dispose() } catch { }
+        }
+        if ($childTempCreated -and $null -ne $childTempPath -and
+            (-not $processStarted -or $result.process_terminated)) {
+            try {
+                if (Test-Path -LiteralPath $childTempPath) {
+                    Remove-Item -LiteralPath $childTempPath -Recurse -Force -ErrorAction Stop
+                }
+                $result.residue = if (Test-Path -LiteralPath $childTempPath) { "present" } else { "none" }
+            } catch { $result.residue = "unproven" }
+        } elseif ($childTempCreated -and $processStarted -and -not $result.process_terminated) {
+            $result.residue = "unproven"
+        } elseif (-not $childTempCreated) {
+            $result.residue = "none"
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Assert-XbCi7FrozenControlChildResult {
+    param(
+        [Parameter(Mandatory)]$RunResult,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$SourceBlob
+    )
+    if ($RunResult.status -ceq "structured_failure") { throw "frozen_control_child_setup_failed" }
+    if ($RunResult.status -cnotin @("completed", "structured_failure", "abnormal_exit", "malformed_output", "timeout", "termination_unproven", "launch_failed")) {
+        throw "frozen_control_child_status_invalid"
+    }
+    if ($RunResult.status -cne "completed") { throw ("frozen_control_child_" + [string]$RunResult.status) }
+    if (-not [bool]$RunResult.process_distinct) { throw "frozen_control_child_process_not_isolated" }
+    if (-not [bool]$RunResult.process_terminated) { throw "frozen_control_child_termination_unproven" }
+    if ([string]$RunResult.residue -cne "none") { throw "frozen_control_child_residue_unproven" }
+    $child = $RunResult.child_result
+    if ($null -eq $child -or $child.fixture_status -cne "completed") { throw "frozen_control_child_result_missing" }
+    if ($child.source_commit -cne $SourceCommit -or $child.source_blob -cne $SourceBlob) {
+        throw "frozen_control_child_source_binding_invalid"
+    }
+    if (-not $child.fixture_account_preserved -or -not $child.credential_username_matches_fixture) {
+        throw "frozen_control_child_identity_invalid"
+    }
+    if ($child.product_token_open -cne "PASS" -or -not $child.product_token_identity_matches_fixture) {
+        throw "frozen_control_child_product_token_invalid"
+    }
+    if ($child.outcome -cne "effective_rights_exceeded") { throw "frozen_control_child_outcome_mismatch" }
+    return $true
 }
 
 function Invoke-XbBoundaryCase {
@@ -5479,21 +6135,66 @@ public static class XbCi7FailureCleanupProbe
                     granted_access = [uint32]$driveRootAddDirectory.GrantedAccess
                 }
 
-                $frozenContextText = [IO.File]::ReadAllText($FrozenContextPath)
-                if (-not $frozenContextText.StartsWith("function Open-XbCi7VerificationContext {", [StringComparison]::Ordinal)) {
-                    throw "ci7_frozen_context_source_invalid"
-                }
-                $frozenContextOpen = $frozenContextText.IndexOf("{")
-                $frozenContextClose = $frozenContextText.LastIndexOf("}")
-                if ($frozenContextOpen -lt 0 -or $frozenContextClose -le $frozenContextOpen) { throw "ci7_frozen_context_source_invalid" }
-                $frozenContextBody = $frozenContextText.Substring($frozenContextOpen + 1, $frozenContextClose - $frozenContextOpen - 1)
-                $currentContextFunction = ${function:script:Open-XbCi7VerificationContext}
                 $ci7.frozen_control_source_commit = $FrozenSourceCommit
                 $ci7.frozen_control_installer_blob = $FrozenInstallerBlob
+                $frozenContextText = [IO.File]::ReadAllText($FrozenContextPath)
+                $frozenChildScriptText = [IO.File]::ReadAllText($FrozenChildScriptPath)
+                if (-not $frozenContextText.StartsWith("function Open-XbCi7VerificationContext {", [StringComparison]::Ordinal) -or
+                    $frozenContextText.Length -gt 32768 -or [string]::IsNullOrWhiteSpace($frozenChildScriptText) -or
+                    $frozenChildScriptText.Length -gt 32768) {
+                    throw "ci7_frozen_control_source_invalid"
+                }
+                $candidateContextBefore = ${function:script:Open-XbCi7VerificationContext}
+                $encryptedPassword = ConvertFrom-SecureString -SecureString $credential.Password
+                $childFixture = [ordered]@{
+                    installer_path = $InstallerPath
+                    worker_account = [string]$credential.UserName
+                    encrypted_password = $encryptedPassword
+                    frozen_context_source = $frozenContextText
+                    source_commit = $FrozenSourceCommit
+                    source_blob = $FrozenInstallerBlob
+                }
                 try {
-                    Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextBody))
-                    $ci7.frozen_defective_context_outcome = Get-XbBoundaryOutcome { Open-XbCi7VerificationContext -Token $nativeToken }
-                } finally { Set-Item function:script:Open-XbCi7VerificationContext $currentContextFunction }
+                    $frozenChildRun = Invoke-XbCi7FrozenControlChild `
+                        -RepositoryRoot (Split-Path -Parent (Split-Path -Parent $InstallerPath)) `
+                        -ScriptText $frozenChildScriptText `
+                        -Fixture $childFixture
+                } finally {
+                    $childFixture.encrypted_password = $null
+                    $encryptedPassword = $null
+                }
+                $ci7.frozen_control_child_status = [string]$frozenChildRun.status
+                $ci7.frozen_control_child_exit_status = $frozenChildRun.exit_status
+                $ci7.frozen_control_child_process_distinct = [bool]$frozenChildRun.process_distinct
+                $ci7.frozen_control_child_terminated = [bool]$frozenChildRun.process_terminated
+                $ci7.frozen_control_child_residue = [string]$frozenChildRun.residue
+                $ci7.frozen_control_child_stderr_present = [bool]$frozenChildRun.stderr_present
+                $ci7.frozen_control_child_setup_stage = $null
+                $ci7.fixture_account_preserved = $null
+                $ci7.credential_username_matches_fixture = $null
+                $ci7.product_token_open = "NOT_REACHED"
+                $ci7.frozen_control_source_binding = $false
+                $ci7.frozen_control_parent_function_replaced = -not [object]::ReferenceEquals(
+                    $candidateContextBefore, ${function:script:Open-XbCi7VerificationContext}
+                )
+                if ($null -ne $frozenChildRun.child_result) {
+                    $childResult = $frozenChildRun.child_result
+                    $ci7.frozen_control_child_setup_stage = [string]$childResult.setup_stage
+                    $ci7.fixture_account_preserved = $childResult.fixture_account_preserved
+                    $ci7.credential_username_matches_fixture = $childResult.credential_username_matches_fixture
+                    $ci7.product_token_open = [string]$childResult.product_token_open
+                    $ci7.product_token_identity_matches_fixture = $childResult.product_token_identity_matches_fixture
+                    $ci7.frozen_control_source_binding = [bool](
+                        $childResult.source_commit -ceq $FrozenSourceCommit -and
+                        $childResult.source_blob -ceq $FrozenInstallerBlob
+                    )
+                    $ci7.frozen_defective_context_outcome = [string]$childResult.outcome
+                }
+                if ($ci7.frozen_control_parent_function_replaced) { throw "ci7_parent_context_function_replaced" }
+                $null = Assert-XbCi7FrozenControlChildResult `
+                    -RunResult $frozenChildRun `
+                    -SourceCommit $FrozenSourceCommit `
+                    -SourceBlob $FrozenInstallerBlob
 
             } finally { $driveRootObject.Dispose() }
             $driveRootAfter = [XbWorkerProtectedObject]::Open($driveRoot, $true, $false)
@@ -6115,6 +6816,331 @@ exit 0
 '''
 
 
+class MemberWorkerCi7HarnessClosureTests(unittest.TestCase):
+    """Bounded tests for child identity preservation and frozen-control lifecycle."""
+
+    def test_dot_source_collision_is_reproduced_and_account_is_preserved(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for dot-source parameter binding")
+        script = r'''[CmdletBinding()]
+param([Parameter(Mandatory)][string]$InstallerPath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$fixtureWorkerAccount = "xbt0123456789ab"
+$workerAccount = $fixtureWorkerAccount
+. $InstallerPath -LibraryOnly
+$unpreservedDotSourceLostAccount = [bool]($workerAccount -cne $fixtureWorkerAccount)
+
+. $InstallerPath -LibraryOnly -WorkerAccount $fixtureWorkerAccount
+$workerAccount = $fixtureWorkerAccount
+$script:WorkerAccount = $fixtureWorkerAccount
+$script:ExpectedWorkerAccount = $fixtureWorkerAccount
+Set-Item function:script:Get-XbAccountSid {
+    param([Parameter(Mandatory)][string]$Account)
+    if ($Account -cne $script:ExpectedWorkerAccount) { throw "fixture_account_mismatch" }
+    return "S-1-5-18"
+}
+Set-Item function:script:Initialize-XbWorkerNativeAccess { }
+if ($null -ne ("XbWorkerBatchToken" -as [type])) { throw "unexpected_native_type_preimage" }
+Add-Type -TypeDefinition @'
+using System.Security;
+public sealed class XbWorkerBatchToken
+{
+    public static string LastUserName;
+    public static string LastDomain;
+    public static int OpenCount;
+    public static XbWorkerBatchToken OpenBatch(string userName, string domain, SecureString password, string sid)
+    {
+        LastUserName = userName;
+        LastDomain = domain;
+        OpenCount++;
+        return new XbWorkerBatchToken();
+    }
+}
+'@ -ErrorAction Stop | Out-Null
+$securePassword = New-Object System.Security.SecureString
+$securePassword.AppendChar('x')
+$securePassword.MakeReadOnly()
+$credential = $null
+$productToken = $null
+try {
+    $accountPreserved = [bool]($workerAccount -ceq $fixtureWorkerAccount -and $script:WorkerAccount -ceq $fixtureWorkerAccount)
+    $credential = New-Object Management.Automation.PSCredential($fixtureWorkerAccount, $securePassword)
+    $credentialMatchesFixture = [bool]($credential.UserName -ceq $fixtureWorkerAccount)
+    $productToken = New-XbWorkerBatchToken -Credential $credential
+    $productHelperReceivedFixture = [bool](
+        $null -ne $productToken -and [XbWorkerBatchToken]::OpenCount -eq 1 -and
+        [XbWorkerBatchToken]::LastUserName -ceq $fixtureWorkerAccount -and
+        [XbWorkerBatchToken]::LastDomain -ceq [Environment]::MachineName
+    )
+    $summary = [ordered]@{
+        unpreserved_dot_source_lost_account = $unpreservedDotSourceLostAccount
+        fixture_account_preserved = $accountPreserved
+        credential_username_matches_fixture = $credentialMatchesFixture
+        product_helper_received_fixture = $productHelperReceivedFixture
+        product_token_open = ($null -ne $productToken)
+    }
+    [Console]::Out.WriteLine(($summary | ConvertTo-Json -Compress))
+} finally {
+    $credential = $null
+    if ($null -ne $securePassword) { $securePassword.Dispose() }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-account-preservation-") as temp_dir:
+            harness = Path(temp_dir) / "account_preservation.ps1"
+            harness.write_text(script, encoding="utf-8", newline="\n")
+            try:
+                completed = subprocess.run(
+                    [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness), "-InstallerPath", str(ROOT / INSTALLER_PATH)],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise AssertionError("account-preservation regression exceeded its bound; output withheld") from None
+        if completed.returncode != 0:
+            raise AssertionError("account-preservation regression failed; output withheld")
+        try:
+            actual = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise AssertionError("account-preservation regression emitted an invalid summary; output withheld") from None
+        expected = {
+            "unpreserved_dot_source_lost_account": True,
+            "fixture_account_preserved": True,
+            "credential_username_matches_fixture": True,
+            "product_helper_received_fixture": True,
+            "product_token_open": True,
+        }
+        if actual != expected or any(type(value) is not bool for value in actual.values()):
+            raise AssertionError("account-preservation regression emitted an unexpected bounded result")
+
+    def test_frozen_control_binding_and_child_order_are_pinned(self) -> None:
+        child = _FROZEN_CI7_CHILD_SCRIPT
+        harness = _HOSTED_TASK_BOUNDARY_HARNESS
+        capture = child.index("$fixtureWorkerAccount = [string]$Fixture.worker_account")
+        source_load = child.index(". $installerPath -LibraryOnly -WorkerAccount $fixtureWorkerAccount")
+        account_rebind = child.index("$workerAccount = $fixtureWorkerAccount", source_load)
+        script_rebind = child.index("$script:WorkerAccount = $fixtureWorkerAccount", account_rebind)
+        credential = child.index("New-Object Management.Automation.PSCredential($fixtureWorkerAccount, $securePassword)")
+        token_open = child.index("New-XbWorkerBatchToken -Credential $credential")
+        frozen_control = child.index("Set-Item function:script:Open-XbCi7VerificationContext")
+        self.assertLess(capture, source_load, "collision-free fixture capture must precede dot-source")
+        self.assertLess(source_load, account_rebind, "account variables must be rebound after dot-source")
+        self.assertLess(account_rebind, script_rebind, "script account must be rebound after dot-source")
+        self.assertLess(script_rebind, credential, "credential must use the preserved fixture account")
+        self.assertLess(credential, token_open, "credential identity must be checked before product token open")
+        self.assertLess(token_open, frozen_control, "product token must open before frozen-control execution")
+        self.assertNotIn("Set-Item function:script:Open-XbCi7VerificationContext", harness)
+        self.assertIn("process_distinct", harness)
+        self.assertIn("process_terminated", harness)
+        self.assertIn('residue = "none"', harness)
+        child_call = harness.index("$frozenChildRun = Invoke-XbCi7FrozenControlChild")
+        product_matrix = harness.index("$ci7.exact_root_mutation_matrix = @()")
+        self.assertLess(child_call, product_matrix)
+        for marker in (
+            "$ci7.ancestor_scoped_out_right_matrix = @()",
+            "$ci7.ancestor_denied_right_matrix = @()",
+            "$ci7.delete_chain_matrix = @()",
+            "$ci7.delete_child_parent_edge_matrix = @()",
+            "$ci7.required_probe_completion",
+            "$ci7.failure_cleanup_exclusive_delete_succeeded",
+        ):
+            with self.subTest(matrix_contract=marker.split(".")[-1]):
+                self.assertIn(marker, harness)
+        source = Path(__file__).read_text(encoding="utf-8")
+        hosted_class = source.split("\nclass MemberWorkerHostedTaskBoundaryTests", 1)[1]
+        hosted_case = hosted_class.split("    def test_install_then_uninstall(self) -> None:", 1)[1].split("\n    def ", 1)[0]
+        for field in (
+            "frozen_control_source_binding", "fixture_account_preserved", "credential_username_matches_fixture",
+            "product_token_open", "product_token_identity_matches_fixture", "frozen_control_child_status",
+            "frozen_control_child_exit_status", "frozen_control_child_process_distinct",
+            "frozen_control_child_terminated", "frozen_control_child_residue",
+            "frozen_control_child_stderr_present", "frozen_control_parent_function_replaced",
+        ):
+            with self.subTest(hosted_child_evidence=field):
+                self.assertIn(f'ci7["{field}"]', hosted_case)
+
+    def test_child_lifecycle_outer_budget_exceeds_bounded_inner_budget(self) -> None:
+        self.assertGreater(
+            _CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS,
+            sum(_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS) + _CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS,
+        )
+
+    def test_frozen_child_and_hosted_harness_powerShell_sources_parse(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for parser validation")
+        parser_script = r'''param(
+    [Parameter(Mandatory)][string]$ChildScriptPath,
+    [Parameter(Mandatory)][string]$HarnessScriptPath
+)
+$sourcePaths = @($ChildScriptPath, $HarnessScriptPath)
+foreach ($sourcePath in $sourcePaths) {
+    $tokens = $null
+    $parseErrors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText([string]$sourcePath), [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -ne 0) { exit 17 }
+}
+[Console]::Out.WriteLine("PASS")
+'''
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-parse-") as temp_dir:
+            root = Path(temp_dir)
+            parser_path = root / "parse_sources.ps1"
+            child_path = root / "frozen_child.ps1"
+            harness_path = root / "hosted_harness.ps1"
+            parser_path.write_text(parser_script, encoding="utf-8", newline="\n")
+            child_path.write_text(_FROZEN_CI7_CHILD_SCRIPT, encoding="utf-8", newline="\n")
+            harness_path.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
+            try:
+                completed = subprocess.run(
+                    [
+                        pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                        "-File", str(parser_path), "-ChildScriptPath", str(child_path),
+                        "-HarnessScriptPath", str(harness_path),
+                    ],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise AssertionError("PowerShell source parsing exceeded its bound; output withheld") from None
+        if completed.returncode != 0 or completed.stdout.strip() != "PASS":
+            raise AssertionError("PowerShell source parsing failed; output withheld")
+
+    def test_child_process_runner_fails_closed_and_proves_timeout_termination(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for child process lifecycle checks")
+
+        valid_result = {
+            "schema_version": "xb.member.worker.ci7.frozen-control.v1",
+            "fixture_status": "completed",
+            "outcome": "effective_rights_exceeded",
+            "setup_stage": "RESULT_EMIT",
+            "source_commit": CI7_DEFECTIVE_BASELINE_COMMIT,
+            "source_blob": CI7_DEFECTIVE_INSTALLER_BLOB,
+            "fixture_account_preserved": True,
+            "credential_username_matches_fixture": True,
+            "product_token_open": "PASS",
+            "product_token_identity_matches_fixture": True,
+        }
+        structured_failure_result = {
+            **valid_result,
+            "fixture_status": "failed",
+            "outcome": "fixture_setup_failed",
+            "setup_stage": "PRODUCT_TOKEN_OPEN",
+            "fixture_account_preserved": True,
+            "credential_username_matches_fixture": True,
+            "product_token_open": "FAIL",
+            "product_token_identity_matches_fixture": None,
+        }
+        helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild")
+        validator = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Assert-XbCi7FrozenControlChildResult")
+        lifecycle_script = r'''Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+__RUNNER_HELPER__
+__RESULT_VALIDATOR__
+$validScript = @'
+[Console]::Out.WriteLine('__VALID_RESULT__')
+'@
+$failureScript = @'
+[Console]::Out.WriteLine('__FAILURE_RESULT__')
+[Console]::Error.WriteLine('private-stderr-sentinel')
+exit 1
+'@
+$wrongOutcomeScript = $validScript.Replace("effective_rights_exceeded", "effective_rights_missing")
+$root = Split-Path -Parent $PSCommandPath
+$valid = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $validScript -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$malformed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine("malformed")' -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$abnormal = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'exit 17' -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$oversized = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText '[Console]::Out.WriteLine(("x" * 5000))' -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$timeout = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'Start-Sleep -Seconds 30' -Fixture @{} -TimeoutMilliseconds __SHORT_TIMEOUT__
+$wrongOutcome = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $wrongOutcomeScript -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$failure = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $failureScript -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$stderrSuccessScript = $validScript + "`n[Console]::Error.WriteLine('private-stderr-sentinel')"
+$stderrSuccess = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText $stderrSuccessScript -Fixture @{} -TimeoutMilliseconds __LONG_TIMEOUT__
+$launchFailed = Invoke-XbCi7FrozenControlChild -RepositoryRoot $root -ScriptText 'unused' -Fixture @{} -TimeoutMilliseconds 0
+$validAccepted = $false
+try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $valid -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741"; $validAccepted = $true } catch { }
+$wrongOutcomeRejected = $false
+try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $wrongOutcome -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
+catch { $wrongOutcomeRejected = ($_.Exception.Message -ceq "frozen_control_child_outcome_mismatch") }
+$failureRejected = $false
+try { $null = Assert-XbCi7FrozenControlChildResult -RunResult $failure -SourceCommit "ef194d43cd5b2a6e56468c3381a1b44bced23d8d" -SourceBlob "aa6d4f3172bbc82c69f1c4904f6e4bbf50da3741" }
+catch { $failureRejected = ($_.Exception.Message -ceq "frozen_control_child_setup_failed") }
+$failureResultText = ConvertTo-Json -InputObject $failure -Depth 6 -Compress
+$summary = [ordered]@{
+    valid = ($valid.status -ceq "completed" -and $valid.process_distinct -and $valid.process_terminated -and $valid.residue -ceq "none" -and $validAccepted)
+    malformed = ($malformed.status -ceq "malformed_output" -and $malformed.process_terminated -and $malformed.residue -ceq "none")
+    abnormal = ($abnormal.status -ceq "abnormal_exit" -and $abnormal.process_terminated -and $abnormal.residue -ceq "none")
+    oversized = ($oversized.status -ceq "malformed_output" -and $oversized.process_terminated -and $oversized.residue -ceq "none")
+    timeout = ($timeout.status -ceq "timeout" -and $timeout.process_distinct -and $timeout.process_terminated -and $timeout.residue -ceq "none")
+    structured_failure = ($failure.status -ceq "structured_failure" -and $failure.exit_status -eq 1 -and $failure.process_terminated -and $failure.residue -ceq "none" -and $failureRejected)
+    structured_failure_stage = [string]$failure.child_result.setup_stage
+    structured_failure_stderr_present = [bool]$failure.stderr_present
+    structured_failure_raw_withheld = (-not $failureResultText.Contains("private-stderr-sentinel"))
+    stderr_success_rejected = ($stderrSuccess.status -ceq "malformed_output" -and $stderrSuccess.stderr_present -and $stderrSuccess.process_terminated -and $stderrSuccess.residue -ceq "none")
+    launch_failed = ($launchFailed.status -ceq "launch_failed" -and -not $launchFailed.process_terminated -and $launchFailed.residue -ceq "none")
+    wrong_outcome_rejected = $wrongOutcomeRejected
+}
+[Console]::Out.WriteLine(($summary | ConvertTo-Json -Compress))
+'''
+        long_timeout_seconds = _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS[0]
+        short_timeout_seconds = _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS[4]
+        if lifecycle_script.count("__LONG_TIMEOUT__") != 7 or lifecycle_script.count("__SHORT_TIMEOUT__") != 1:
+            raise AssertionError("child lifecycle timeout schedule changed; output withheld")
+        lifecycle_script = (
+            lifecycle_script.replace("__RUNNER_HELPER__", helper)
+            .replace("__RESULT_VALIDATOR__", validator)
+            .replace("__VALID_RESULT__", json.dumps(valid_result, separators=(",", ":")))
+            .replace("__FAILURE_RESULT__", json.dumps(structured_failure_result, separators=(",", ":")))
+            .replace("__LONG_TIMEOUT__", str(long_timeout_seconds * 1000))
+            .replace("__SHORT_TIMEOUT__", str(short_timeout_seconds * 1000))
+        )
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-child-lifecycle-") as temp_dir:
+            temp_root = Path(temp_dir)
+            _assert_temp_outside_checkout(ROOT, temp_root)
+            lifecycle_path = temp_root / "child_lifecycle.ps1"
+            lifecycle_path.write_text(lifecycle_script, encoding="utf-8", newline="\n")
+            try:
+                completed = subprocess.run(
+                    [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(lifecycle_path)],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise AssertionError("child lifecycle regression exceeded its outer bound; output withheld") from None
+        if completed.returncode != 0:
+            raise AssertionError("child lifecycle regression failed; output withheld")
+        try:
+            result = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise AssertionError("child lifecycle regression emitted an invalid summary; output withheld") from None
+        expected_keys = {
+            "valid", "malformed", "abnormal", "oversized", "timeout", "structured_failure",
+            "structured_failure_stage", "structured_failure_stderr_present", "structured_failure_raw_withheld",
+            "stderr_success_rejected", "launch_failed", "wrong_outcome_rejected",
+        }
+        boolean_keys = expected_keys - {"structured_failure_stage"}
+        if (
+            not isinstance(result, dict)
+            or set(result) != expected_keys
+            or any(type(result[key]) is not bool for key in boolean_keys)
+            or result["structured_failure_stage"] not in _CI7_CHILD_SETUP_STAGES
+        ):
+            raise AssertionError("child lifecycle regression emitted an unsafe summary; output withheld")
+        if not all(result[key] for key in boolean_keys) or result["structured_failure_stage"] != "PRODUCT_TOKEN_OPEN":
+            raise AssertionError("child lifecycle regression did not prove each bounded outcome; output withheld")
+
+
 class MemberWorkerTaskContractSourceTests(unittest.TestCase):
     """Deterministic source pins for the G3-133 Scheduler oracle and rollback correction."""
 
@@ -6541,39 +7567,55 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         pwsh = _resolve_native_powershell()
         if not pwsh:
             raise AssertionError("hosted boundary requires native Windows PowerShell 5.1")
-        with tempfile.TemporaryDirectory(prefix="xb-task-boundary-") as temp_dir:
-            root = Path(temp_dir)
-            manifest = root / "reviewed-package.json"
-            manifest.write_text(json.dumps(_reviewed_package_identity(), indent=2) + "\n", encoding="utf-8")
-            frozen_context, frozen_blob = _frozen_ci7_context_source()
-            frozen_context_path = root / "frozen_ci7_context.ps1"
-            frozen_context_path.write_text(frozen_context, encoding="utf-8", newline="\n")
-            harness = root / "task_boundary_harness.ps1"
-            harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
-            completed = subprocess.run(
-                [
-                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
-                    "-File", str(harness),
-                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
-                    "-ReviewedManifestPath", str(manifest),
-                    "-FrozenContextPath", str(frozen_context_path),
-                    "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
-                    "-FrozenInstallerBlob", frozen_blob,
-                ],
-                cwd=ROOT,
-                env=_windows_powershell_module_environment(),
-                capture_output=True,
-                text=True,
-                timeout=1500,
-            )
-        report = _boundary_report(completed.stdout)
+        try:
+            with tempfile.TemporaryDirectory(prefix="xb-task-boundary-") as temp_dir:
+                root = Path(temp_dir)
+                manifest = root / "reviewed-package.json"
+                manifest.write_text(json.dumps(_reviewed_package_identity(), indent=2) + "\n", encoding="utf-8")
+                frozen_context, frozen_blob = _frozen_ci7_context_source()
+                frozen_context_path = root / "frozen_ci7_context.ps1"
+                frozen_context_path.write_text(frozen_context, encoding="utf-8", newline="\n")
+                frozen_child_script_path = root / "frozen_ci7_child.ps1"
+                frozen_child_script_path.write_text(_FROZEN_CI7_CHILD_SCRIPT, encoding="utf-8", newline="\n")
+                harness = root / "task_boundary_harness.ps1"
+                harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
+                completed = subprocess.run(
+                    [
+                        pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                        "-File", str(harness),
+                        "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                        "-ReviewedManifestPath", str(manifest),
+                        "-FrozenContextPath", str(frozen_context_path),
+                        "-FrozenChildScriptPath", str(frozen_child_script_path),
+                        "-FrozenSourceCommit", CI7_DEFECTIVE_BASELINE_COMMIT,
+                        "-FrozenInstallerBlob", frozen_blob,
+                    ],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=1500,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            raise AssertionError("hosted boundary harness exceeded its bounded execution; output withheld") from None
+        try:
+            report = _boundary_report(completed.stdout)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raise AssertionError("hosted boundary harness emitted an invalid report; output withheld") from None
         if report is None:
-            raise AssertionError(
-                "hosted boundary harness produced no report\n" + completed.stdout[-4000:] + completed.stderr[-4000:]
-            )
-        print(TASK_BOUNDARY_MARKER, flush=True)
-        print(json.dumps(report, sort_keys=True), flush=True)
+            raise AssertionError("hosted boundary harness produced no report; output withheld")
         cls.report = report
+        print(TASK_BOUNDARY_MARKER, flush=True)
+        print(_public_safe_hosted_failure_summary(report, "HOSTED_BOUNDARY_SAFE_EVIDENCE"), flush=True)
+
+    def _formatMessage(self, msg: str | None, standardMsg: str) -> str:
+        return _public_safe_hosted_failure_summary(getattr(self, "report", None))
+
+    def fail(self, msg: str | None = None) -> None:
+        raise self.failureException(_public_safe_hosted_failure_summary(getattr(self, "report", None)))
+
+    def subTest(self, msg: str | None = None, **params: object):
+        return super().subTest(msg="hosted boundary assertion")
 
     def _case(self, name: str) -> dict[str, object]:
         case = self.report["cases"][name]
@@ -6831,6 +7873,18 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertTrue(all(value == "pass" for value in ci7["verify_checks"].values()))
         self.assertEqual(ci7["frozen_control_source_commit"], CI7_DEFECTIVE_BASELINE_COMMIT)
         self.assertEqual(ci7["frozen_control_installer_blob"], CI7_DEFECTIVE_INSTALLER_BLOB)
+        self.assertTrue(ci7["frozen_control_source_binding"])
+        self.assertTrue(ci7["fixture_account_preserved"])
+        self.assertTrue(ci7["credential_username_matches_fixture"])
+        self.assertEqual(ci7["product_token_open"], "PASS")
+        self.assertTrue(ci7["product_token_identity_matches_fixture"])
+        self.assertEqual(ci7["frozen_control_child_status"], "completed")
+        self.assertEqual(ci7["frozen_control_child_exit_status"], 0)
+        self.assertTrue(ci7["frozen_control_child_process_distinct"])
+        self.assertTrue(ci7["frozen_control_child_terminated"])
+        self.assertEqual(ci7["frozen_control_child_residue"], "none")
+        self.assertFalse(ci7["frozen_control_child_stderr_present"])
+        self.assertFalse(ci7["frozen_control_parent_function_replaced"])
         self.assertEqual(ci7["drive_root_index0"]["index"], 0)
         self.assertEqual(ci7["drive_root_index0"]["right"], "0x00000004")
         self.assertTrue(ci7["drive_root_index0"]["allowed"], ci7["drive_root_index0"])
