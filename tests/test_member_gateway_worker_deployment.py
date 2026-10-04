@@ -4713,6 +4713,9 @@ try {
 
     $setupStage = "SOURCE_LOAD"
     . $installerPath -LibraryOnly -WorkerAccount $fixtureWorkerAccount
+    $candidateContextBefore = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -eq $candidateContextBefore) { throw "fixture_candidate_context_not_local" }
+    $candidateContextBodyBefore = [string]$candidateContextBefore.ScriptBlock.ToString()
     $setupStage = "ACCOUNT_PRESERVATION"
     $workerAccount = $fixtureWorkerAccount
     $script:WorkerAccount = $fixtureWorkerAccount
@@ -4751,7 +4754,18 @@ try {
     $frozenClose = $frozenContextText.LastIndexOf("}")
     if ($frozenOpen -lt 0 -or $frozenClose -le $frozenOpen) { throw "fixture_frozen_source_invalid" }
     $frozenContextBody = $frozenContextText.Substring($frozenOpen + 1, $frozenClose - $frozenOpen - 1)
-    Set-Item function:script:Open-XbCi7VerificationContext ([scriptblock]::Create($frozenContextBody))
+    $frozenContextScriptBlock = [scriptblock]::Create($frozenContextBody)
+    Set-Item function:local:Open-XbCi7VerificationContext `
+        $frozenContextScriptBlock
+    $localFrozenContext = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction SilentlyContinue
+    $resolvedFrozenContext = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction Stop
+    $frozenFunctionBody = [string]$frozenContextScriptBlock.ToString()
+    if ($null -eq $localFrozenContext -or
+        $candidateContextBodyBefore -ceq $frozenFunctionBody -or
+        [string]$localFrozenContext.ScriptBlock.ToString() -cne $frozenFunctionBody -or
+        [string]$resolvedFrozenContext.ScriptBlock.ToString() -cne $frozenFunctionBody) {
+        throw "fixture_frozen_context_local_binding_invalid"
+    }
     try {
         $context = Open-XbCi7VerificationContext -Token $nativeToken
         $childResult.outcome = "unexpected_success"
@@ -6917,23 +6931,138 @@ try {
         if actual != expected or any(type(value) is not bool for value in actual.values()):
             raise AssertionError("account-preservation regression emitted an unexpected bounded result")
 
+    def test_frozen_child_local_scope_replacement_uses_real_functions(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for function scope resolution")
+        frozen_context, frozen_blob = _frozen_ci7_context_source()
+        self.assertEqual(frozen_blob, CI7_DEFECTIVE_INSTALLER_BLOB)
+        candidate_source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        candidate_context = _installer_function(candidate_source, "Open-XbCi7VerificationContext")
+        self.assertNotEqual(candidate_context, frozen_context)
+        script = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$FrozenContextPath
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$frozenContextText = [IO.File]::ReadAllText($FrozenContextPath)
+$frozenOpen = $frozenContextText.IndexOf("{")
+$frozenClose = $frozenContextText.LastIndexOf("}")
+if ($frozenOpen -lt 0 -or $frozenClose -le $frozenOpen) { throw "fixture_frozen_source_invalid" }
+$frozenContextBody = $frozenContextText.Substring($frozenOpen + 1, $frozenClose - $frozenOpen - 1)
+$frozenContextScriptBlock = [scriptblock]::Create($frozenContextBody)
+$scopeProbe = {
+    param([string]$InstallerPath, [string]$FrozenContextScriptBlockText)
+    $fixtureWorkerAccount = "xbt0123456789ab"
+    . $InstallerPath -LibraryOnly -WorkerAccount $fixtureWorkerAccount
+    $candidateContextBefore = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -eq $candidateContextBefore) { throw "fixture_candidate_context_not_local" }
+    $candidateContextBodyBefore = [string]$candidateContextBefore.ScriptBlock.ToString()
+    $frozenContextScriptBlock = [scriptblock]::Create($FrozenContextScriptBlockText)
+    $frozenFunctionBody = [string]$frozenContextScriptBlock.ToString()
+    $scriptContextBefore = Get-Item function:script:Open-XbCi7VerificationContext -ErrorAction SilentlyContinue
+    $scriptScopeReplacementKeptCandidate = $false
+    try {
+        Set-Item function:script:Open-XbCi7VerificationContext $frozenContextScriptBlock
+        $scriptResolvedContext = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction Stop
+        $scriptResolvedBody = [string]$scriptResolvedContext.ScriptBlock.ToString()
+        $scriptScopeReplacementKeptCandidate = [bool](
+            $scriptResolvedBody -ceq $candidateContextBodyBefore -and
+            $scriptResolvedBody -cne $frozenFunctionBody
+        )
+    } finally {
+        if ($null -ne $scriptContextBefore) {
+            Set-Item function:script:Open-XbCi7VerificationContext $scriptContextBefore.ScriptBlock
+        } else {
+            Remove-Item function:script:Open-XbCi7VerificationContext -ErrorAction SilentlyContinue
+        }
+    }
+    Set-Item function:local:Open-XbCi7VerificationContext $frozenContextScriptBlock
+    $localFrozenContext = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction Stop
+    $resolvedFrozenContext = Get-Command -Name Open-XbCi7VerificationContext -CommandType Function -ErrorAction Stop
+    $localFrozenBody = [string]$localFrozenContext.ScriptBlock.ToString()
+    $resolvedFrozenBody = [string]$resolvedFrozenContext.ScriptBlock.ToString()
+    $summary = [ordered]@{
+        candidate_context_exists_in_local = ($null -ne $candidateContextBefore)
+        candidate_differs_from_frozen = ($candidateContextBodyBefore -cne $frozenFunctionBody)
+        script_scope_replacement_kept_candidate = $scriptScopeReplacementKeptCandidate
+        local_replacement_installed = ($localFrozenBody -ceq $frozenFunctionBody)
+        invocation_resolves_to_frozen = ($resolvedFrozenBody -ceq $frozenFunctionBody)
+        frozen_function_body_matches_source = ($localFrozenBody -ceq [string]$frozenContextScriptBlock.ToString())
+    }
+    $summary
+}
+$summary = & $scopeProbe $InstallerPath $frozenContextBody
+[Console]::Out.WriteLine(($summary | ConvertTo-Json -Compress))
+'''
+        with tempfile.TemporaryDirectory(prefix="xb-ci7-scope-binding-") as temp_dir:
+            root = Path(temp_dir)
+            harness_path = root / "scope_binding.ps1"
+            frozen_context_path = root / "frozen_context.ps1"
+            harness_path.write_text(script, encoding="utf-8", newline="\n")
+            frozen_context_path.write_text(frozen_context, encoding="utf-8", newline="\n")
+            try:
+                completed = subprocess.run(
+                    [
+                        pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                        "-File", str(harness_path), "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                        "-FrozenContextPath", str(frozen_context_path),
+                    ],
+                    cwd=ROOT,
+                    env=_windows_powershell_module_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise AssertionError("frozen function scope regression exceeded its bound; output withheld") from None
+        if completed.returncode != 0:
+            raise AssertionError("frozen function scope regression failed; output withheld")
+        try:
+            actual = json.loads(completed.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            raise AssertionError("frozen function scope regression emitted an invalid summary; output withheld") from None
+        expected = {
+            "candidate_context_exists_in_local": True,
+            "candidate_differs_from_frozen": True,
+            "script_scope_replacement_kept_candidate": True,
+            "local_replacement_installed": True,
+            "invocation_resolves_to_frozen": True,
+            "frozen_function_body_matches_source": True,
+        }
+        if actual != expected or any(type(value) is not bool for value in actual.values()):
+            raise AssertionError("frozen function scope regression emitted an unexpected bounded result")
+
     def test_frozen_control_binding_and_child_order_are_pinned(self) -> None:
         child = _FROZEN_CI7_CHILD_SCRIPT
         harness = _HOSTED_TASK_BOUNDARY_HARNESS
         capture = child.index("$fixtureWorkerAccount = [string]$Fixture.worker_account")
         source_load = child.index(". $installerPath -LibraryOnly -WorkerAccount $fixtureWorkerAccount")
+        local_candidate = child.index("Get-Command -Name Open-XbCi7VerificationContext -CommandType Function", source_load)
         account_rebind = child.index("$workerAccount = $fixtureWorkerAccount", source_load)
         script_rebind = child.index("$script:WorkerAccount = $fixtureWorkerAccount", account_rebind)
         credential = child.index("New-Object Management.Automation.PSCredential($fixtureWorkerAccount, $securePassword)")
         token_open = child.index("New-XbWorkerBatchToken -Credential $credential")
-        frozen_control = child.index("Set-Item function:script:Open-XbCi7VerificationContext")
+        frozen_control = child.index("Set-Item function:local:Open-XbCi7VerificationContext")
+        resolved_frozen = child.index("Get-Command -Name Open-XbCi7VerificationContext -CommandType Function", frozen_control)
+        frozen_invocation = child.index("Open-XbCi7VerificationContext -Token $nativeToken", resolved_frozen)
         self.assertLess(capture, source_load, "collision-free fixture capture must precede dot-source")
+        self.assertLess(source_load, local_candidate, "current function must be captured from the child's local scope")
+        self.assertLess(local_candidate, account_rebind, "candidate scope proof must follow dot-source")
         self.assertLess(source_load, account_rebind, "account variables must be rebound after dot-source")
         self.assertLess(account_rebind, script_rebind, "script account must be rebound after dot-source")
         self.assertLess(script_rebind, credential, "credential must use the preserved fixture account")
         self.assertLess(credential, token_open, "credential identity must be checked before product token open")
         self.assertLess(token_open, frozen_control, "product token must open before frozen-control execution")
+        self.assertLess(frozen_control, resolved_frozen, "local frozen binding must be resolved before invocation")
+        self.assertLess(resolved_frozen, frozen_invocation, "the frozen function must be the function invoked")
+        self.assertNotIn("Set-Item function:script:Open-XbCi7VerificationContext", child)
         self.assertNotIn("Set-Item function:script:Open-XbCi7VerificationContext", harness)
+        self.assertIn("$candidateContextBodyBefore -ceq $frozenFunctionBody", child)
+        self.assertIn("$localFrozenContext.ScriptBlock.ToString() -cne $frozenFunctionBody", child)
+        self.assertIn("$resolvedFrozenContext.ScriptBlock.ToString() -cne $frozenFunctionBody", child)
         self.assertIn("process_distinct", harness)
         self.assertIn("process_terminated", harness)
         self.assertIn('residue = "none"', harness)
