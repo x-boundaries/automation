@@ -119,6 +119,10 @@ def _run(config_path: str, mode: str) -> int:
             separators=(",", ":"),
         )
         _write_marker(config.get("ready_path"), marker_value)
+        sys.stdout.write("fixture_stdout=ready\n")
+        sys.stdout.flush()
+        sys.stderr.write("fixture_stderr=ready\n")
+        sys.stderr.flush()
         for _ in range(child_count):
             child = _module_child("tree-child", config_path)
             children.append(child)
