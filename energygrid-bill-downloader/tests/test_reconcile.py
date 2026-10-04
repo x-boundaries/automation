@@ -10,7 +10,7 @@ import uuid
 from energygrid_bill_downloader import portal as portal_module
 from energygrid_bill_downloader import reconcile as reconcile_module
 from energygrid_bill_downloader import state as state_module
-from energygrid_bill_downloader.config import RuntimeConfig
+from energygrid_bill_downloader.config import RuntimeConfig, is_within
 from energygrid_bill_downloader.errors import (
     ACTION_REQUIRED,
     ARCHIVE_CONFLICT,
@@ -1268,13 +1268,28 @@ class DualStreamReconcileTests(unittest.TestCase):
                             ))
                         elif case.startswith("fetch_validation_"):
                             original = reconcile_module.validate_pdf
+
+                            matched_temp_paths: list[Path] = []
+                            initial_validation_paths: list[Path] = []
+
+                            def matches_temp_path(args, _kwargs):
+                                path = Path(args[0])
+                                matched = is_within(path, temp_root)
+                                if matched:
+                                    matched_temp_paths.append(path)
+                                return matched
+
+                            def record_initial_validation(*args, **kwargs):
+                                initial_validation_paths.append(Path(args[0]))
+                                return original(*args, **kwargs)
+
                             stack.enter_context(mock.patch.object(
                                 reconcile_module,
                                 "validate_pdf",
                                 new=stop_once(
-                                    original,
+                                    record_initial_validation,
                                     after=case.endswith("after"),
-                                    matches=lambda args, _kwargs: Path(args[0]).is_relative_to(temp_root),
+                                    matches=matches_temp_path,
                                 ),
                             ))
                         elif case.startswith("archive_prepare_"):
@@ -1342,6 +1357,13 @@ class DualStreamReconcileTests(unittest.TestCase):
                 eb_events = [event for event in logger.events if event[2].get("stream") == "EB_BILL"]
                 self.assertTrue(eb_events)
                 self.assertEqual(expected_last, eb_events[-1][:2])
+                if case.startswith("fetch_validation_"):
+                    self.assertEqual(1, len(matched_temp_paths))
+                    self.assertTrue(is_within(matched_temp_paths[0], temp_root))
+                    self.assertEqual(1 if case.endswith("after") else 0, len(initial_validation_paths))
+                    self.assertTrue(all(is_within(path, temp_root) for path in initial_validation_paths))
+                    if case.endswith("after"):
+                        self.assertEqual(matched_temp_paths, initial_validation_paths)
                 if case in {"selection_after", "archive_commit_after", "drive_commit_after", "drive_stage_after"}:
                     from energygrid_bill_downloader.state import migrate_state_database
                     self.assertEqual(
@@ -1350,14 +1372,27 @@ class DualStreamReconcileTests(unittest.TestCase):
                     )
 
                 restart_logger = RecordingLogger()
+                restart_validation_paths: list[Path] = []
+                original_restart_validator = reconcile_module.validate_pdf
+
+                def record_restart_validation(*args, **kwargs):
+                    restart_validation_paths.append(Path(args[0]))
+                    return original_restart_validator(*args, **kwargs)
+
+                restart_validation_context = (
+                    mock.patch.object(reconcile_module, "validate_pdf", new=record_restart_validation)
+                    if case.startswith("fetch_validation_")
+                    else contextlib.nullcontext()
+                )
                 with mock.patch(
                     "energygrid_bill_downloader.delivery.DeliveryClient",
                     return_value=self.fake_delivery(calls),
                 ):
                     with StateV2Store(state_path) as state:
-                        restarted = reconcile_dual_stream(
-                            self.config, adapters, state, restart_logger, str(uuid.uuid4()),
-                        )
+                        with restart_validation_context:
+                            restarted = reconcile_dual_stream(
+                                self.config, adapters, state, restart_logger, str(uuid.uuid4()),
+                            )
                         invoice = state.resolve_latest_candidate(adapters["EB_BILL"]._inventory.candidates[-1])
                         self.assertIsNotNone(invoice)
                         archive_history = state.file_operation_history(
@@ -1369,6 +1404,14 @@ class DualStreamReconcileTests(unittest.TestCase):
                         drive_history.extend(state.active_file_operations(invoice["invoice_id"], {"DRIVE_STAGE"}))
                         delivery_row = state.delivery_for_invoice(invoice["invoice_id"])
 
+                if case.startswith("fetch_validation_"):
+                    archive_validation_paths = [path for path in restart_validation_paths if is_within(path, archive)]
+                    self.assertTrue(archive_validation_paths)
+                    self.assertEqual(
+                        [False] * len(archive_validation_paths),
+                        [matches_temp_path((path,), {}) for path in archive_validation_paths],
+                    )
+                    self.assertEqual(1, len(matched_temp_paths))
                 self.assertEqual(1, len(archive_history))
                 self.assertEqual("COMMITTED", archive_history[0]["state"])
                 self.assertEqual(2 if case in {
