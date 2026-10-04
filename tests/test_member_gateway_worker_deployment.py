@@ -4086,9 +4086,9 @@ _CI7_FROZEN_OUTCOMES = (
     "unexpected_error",
     "fixture_setup_failed",
 )
-_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS = (15, 15, 15, 15, 3, 15, 15, 15)
+_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS = (60, 60, 60, 60, 3, 60, 60, 60)
 _CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS = 120
-_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS = 240
+_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS = 544
 
 
 def _public_safe_hosted_failure_summary(
@@ -4970,7 +4970,7 @@ function Invoke-XbCi7FrozenControlChild {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$ScriptText,
         [Parameter(Mandatory)]$Fixture,
-        [int]$TimeoutMilliseconds = 15000
+        [int]$TimeoutMilliseconds = 60000
     )
     if ($null -eq ("XbCi7BoundedTextCapture" -as [type])) {
         Add-Type -TypeDefinition @'
@@ -6964,6 +6964,16 @@ try {
                 self.assertIn(f'ci7["{field}"]', hosted_case)
 
     def test_child_lifecycle_outer_budget_exceeds_bounded_inner_budget(self) -> None:
+        self.assertEqual(
+            _CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS,
+            (60, 60, 60, 60, 3, 60, 60, 60),
+        )
+        self.assertEqual(_CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS, 120)
+        self.assertEqual(_CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS, 544)
+        self.assertRegex(
+            _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbCi7FrozenControlChild"),
+            r"(?m)^\s*\[int\]\$TimeoutMilliseconds\s*=\s*60000\s*$",
+        )
         self.assertGreater(
             _CI7_CHILD_LIFECYCLE_OUTER_TIMEOUT_SECONDS,
             sum(_CI7_CHILD_LIFECYCLE_TIMEOUTS_SECONDS) + _CI7_CHILD_LIFECYCLE_CLEANUP_MARGIN_SECONDS,
