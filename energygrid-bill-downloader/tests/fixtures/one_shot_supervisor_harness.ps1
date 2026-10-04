@@ -2346,6 +2346,7 @@ function Finish-EgObserverCase {
 function Invoke-EgObserverCases {
     . $LauncherLibraryPath
     . $FunctionsPath
+    $RootPath = $DataRoot
     Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
         -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     $script:EgPythonExeNormal = [IO.Path]::GetFullPath($PythonExe)
@@ -2799,6 +2800,7 @@ function Invoke-EgDirectSupervisor {
 
 function Invoke-EgEndToEndCases {
     . $LauncherLibraryPath
+    $RootPath = $DataRoot
     Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
         -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     $script:EgPythonExeNormal = [IO.Path]::GetFullPath($PythonExe)
@@ -2851,6 +2853,7 @@ function Write-EgOwnerReady {
 function Invoke-EgCrashOwner {
     Assert-EgHarness (-not [string]::IsNullOrWhiteSpace($ReadyPath)) 'crash_owner_ready_path_required'
     . $LauncherLibraryPath
+    $RootPath = $DataRoot
     Set-EgFixturePythonEnvironment -ModulePath $PythonModulePath `
         -ExpectedSha256 (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash
     $script:EgPythonExeNormal = [IO.Path]::GetFullPath($PythonExe)
