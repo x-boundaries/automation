@@ -1286,7 +1286,7 @@ class SupervisorHarnessSourceTests(unittest.TestCase):
             "Wait-EgReap", "Wait-EgDescendantGrace", "Get-EgStartVerdict", "Get-EgExitCode",
         }
         self.assertEqual(expected, set(evidence["definitions"]))
-        self.assertEqual(5, len(evidence["variants"]))
+        self.assertEqual(6, len(evidence["variants"]))
         _assert_source_binding()
 
 
