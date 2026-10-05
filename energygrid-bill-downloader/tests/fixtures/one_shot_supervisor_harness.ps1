@@ -161,13 +161,35 @@ function Export-EgSourceEvidence {
         'Test-EgN5ApplicationChild',
         'Test-EgN7ApplicationChild',
         'Test-EgN10ApplicationChild',
-        'Test-EgN11ApplicationChild'
+        'Test-EgN11ApplicationChild',
+        'Test-EgN13ApplicationChild'
     )
     $variants = @{}
     foreach ($name in $variantNames) {
         $variants[$name] = (Get-EgFunction -Ast $fixtureAst -Name $name).Extent.Text
     }
-    [ordered]@{ definitions = $definitions; assignments = $assignments; variants = $variants } |
+    $outcomeVariants = @{}
+    $outcomeVariants['Write-EgOutcomeWithTimeoutControl'] =
+        (Get-EgFunction -Ast $fixtureAst -Name 'Write-EgOutcomeWithTimeoutControl').Extent.Text
+    $nativeAssignment = Get-EgAssignment -Ast $productionAst -Left '$script:EgNativeSource'
+    $nativeSource = $nativeAssignment.Right.Expression.Value
+    $nativeMethodStart = $nativeSource.IndexOf(
+        'public static ProcessMetadataResult QueryProcessMetadata(', [StringComparison]::Ordinal)
+    $nativeMethodEnd = $nativeSource.IndexOf(
+        'public static bool VerifyX64StructureSizes()', $nativeMethodStart, [StringComparison]::Ordinal)
+    Assert-EgHarness ($nativeMethodStart -ge 0 -and $nativeMethodEnd -gt $nativeMethodStart) `
+        'n7_production_native_method_missing'
+    $nativeMethodLineStart = $nativeSource.LastIndexOf("`n", $nativeMethodStart)
+    if ($nativeMethodLineStart -lt 0) { $nativeMethodLineStart = 0 } else { $nativeMethodLineStart++ }
+    $nativeMethod = $nativeSource.Substring(
+        $nativeMethodLineStart, $nativeMethodEnd - $nativeMethodLineStart).Trim()
+    [ordered]@{
+        definitions = $definitions
+        assignments = $assignments
+        variants = $variants
+        outcome_variants = $outcomeVariants
+        n7_native_method = $nativeMethod
+    } |
         ConvertTo-Json -Depth 8 -Compress
 }
 
@@ -1532,24 +1554,23 @@ Remove-Item -LiteralPath $ordinaryOutcomeRoot -Recurse -Force
 Assert-Native (-not (Test-Path -LiteralPath $ordinaryOutcomeRoot)) 'ordinary_outcome_cleanup_failed'
 
 Write-Output 'function_case=timed_out_outcome_defensive_exact_caller'
-$syntheticTimedOutDurability = [pscustomobject]@{ Succeeded = $true; TimedOut = $true; ErrorCode = 0 }
-$branchStart = $outcomeFunction.IndexOf('if ($durability.TimedOut -or -not $durability.Succeeded) {')
-Assert-Native ($branchStart -ge 0) 'outcome_timeout_branch_missing'
-$branchDepth = 0
-$branchEnd = -1
-for ($branchIndex = $branchStart; $branchIndex -lt $outcomeFunction.Length; $branchIndex++) {
-    if ($outcomeFunction[$branchIndex] -eq '{') { $branchDepth++ }
-    elseif ($outcomeFunction[$branchIndex] -eq '}') {
-        $branchDepth--
-        if ($branchDepth -eq 0) { $branchEnd = $branchIndex + 1; break }
-    }
-}
-Assert-Native ($branchEnd -gt $branchStart) 'outcome_timeout_branch_unbalanced'
-$exactOutcomeTimeoutBranch = $outcomeFunction.Substring($branchStart, $branchEnd - $branchStart)
-$script:DefensiveRejected = $false
-$script:DefensiveSupportRef = $null
-Assert-Native ($outcomeFunction.Contains("Stop-EgSupervisor -SupportRef 'EG_SUPERVISOR_OUTCOME_FLUSH_FAILED'")) 'defensive_timeout_caller_missing'
-Write-Output 'defensive_timeout_caller=PASS'
+$timeoutOutcomeRoot = Join-Path $RootPath 'defensive-timeout-outcome'
+[IO.Directory]::CreateDirectory($timeoutOutcomeRoot) | Out-Null
+$RunId = 'EG-OUTCOME-TIMEOUT-0001'
+$script:EgEvidenceRootNormal = $timeoutOutcomeRoot
+$script:EgExpectedOutcomePath = Join-Path $timeoutOutcomeRoot ($RunId + '.outcome.json')
+$script:EgState = New-State
+$script:EgState.creation_attempted = $true
+Write-EgOutcomeWithTimeoutControl -StartVerdict 'STARTED_PROVEN'
+Assert-Native $script:EgState.outcome_write_attempted 'defensive_outcome_write_not_attempted'
+Assert-Native $script:EgState.evidence_integrity_failure 'defensive_outcome_timeout_not_rejected'
+Assert-Native (-not $script:EgState.outcome_committed) 'defensive_outcome_timeout_committed'
+Assert-Native ($script:EgState.support_ref -ceq 'EG_SUPERVISOR_OUTCOME_FLUSH_FAILED') `
+    'defensive_outcome_timeout_support_ref_invalid'
+Assert-Native (Test-Path -LiteralPath $script:EgExpectedOutcomePath) `
+    'defensive_outcome_timeout_file_not_created'
+Remove-Item -LiteralPath $timeoutOutcomeRoot -Recurse -Force
+Write-Output 'defensive_timeout_caller=PASS support_ref=EG_SUPERVISOR_OUTCOME_FLUSH_FAILED'
 
 Write-Output 'function_case=descendant_grace_stale_zero_global_deadline'
 $staleZeroDeadlineJob = [IntPtr]::Zero
@@ -2069,8 +2090,13 @@ function New-EgObserverConfig {
         module_sha256 = (Get-FileHash -LiteralPath $PythonModulePath -Algorithm SHA256).Hash.ToLowerInvariant()
         mode = $Mode
     }
-    foreach ($key in $Values.Keys) { $document[$key] = $Values[$key] }
     $path = Join-Path $RootPath ($Name + '-' + [guid]::NewGuid().ToString('N') + '.json')
+    foreach ($key in $Values.Keys) { $document[$key] = $Values[$key] }
+    if ($Mode -ceq 'wrong-image') {
+        $canonicalExecutable = [string]$Values.canonical_command_line_executable
+        Assert-EgObserver (-not [string]::IsNullOrWhiteSpace($canonicalExecutable)) `
+            'wrong_image_canonical_executable_missing'
+    }
     [IO.File]::WriteAllText(
         $path, ($document | ConvertTo-Json -Depth 8 -Compress), (New-Object System.Text.UTF8Encoding($false)))
     return $path
@@ -2325,6 +2351,11 @@ function Invoke-EgObserverFunction {
                 -LauncherHandle $Runtime.Launcher.ProcessHandle -LauncherPid $Runtime.Launcher.ProcessId `
                 -StartTicks $StartTicks)
         }
+        'N13' {
+            return [bool](Test-EgN13ApplicationChild -JobHandle $Runtime.JobHandle `
+                -LauncherHandle $Runtime.Launcher.ProcessHandle -LauncherPid $Runtime.Launcher.ProcessId `
+                -StartTicks $StartTicks)
+        }
         default { throw ('EG_HARNESS:observer_function_invalid:' + $Name) }
     }
 }
@@ -2457,7 +2488,7 @@ function Invoke-EgObserverCases {
     $negativeCases = @(
         @{ Name = 'N1_wrong_parent'; Mode = 'wrongparent'; Function = 'base'; Values = @{ wrong_parent_delay_seconds = 30; run_delay_seconds = 30 } },
         @{ Name = 'N2_wrong_command_line'; Mode = 'wrongcmd'; Function = 'base'; Values = @{ list_delay_seconds = 30 } },
-        @{ Name = 'N3_wrong_image_exact_command_line'; Mode = 'positive'; Function = 'base'; Python = $PythonwExe; Values = @{ run_delay_seconds = 30 } },
+        @{ Name = 'N3_wrong_image_exact_command_line'; Mode = 'wrong-image'; Function = 'base'; Python = $PythonwExe; Values = @{ run_delay_seconds = 30; canonical_command_line_executable = $script:EgPythonExeNormal } },
         @{ Name = 'N5_gone_pid_87_then_positive'; Mode = 'positive'; Function = 'N5'; Values = @{ run_delay_seconds = 30 } },
         @{ Name = 'N6_provider_busy'; Mode = 'positive'; Function = 'N7'; Values = @{ run_delay_seconds = 30 } },
         @{ Name = 'N7_provider_timeout'; Mode = 'positive'; Function = 'N7'; Values = @{ run_delay_seconds = 30 } },
@@ -2535,9 +2566,6 @@ function Invoke-EgObserverCases {
             if ($case.Name -ceq 'N3_wrong_image_exact_command_line') {
                 $proof = Get-Content -LiteralPath $runtime.ReadyPath -Raw | ConvertFrom-Json
                 $identity = Get-EgObserverProcessEvidence -ProcessId ([uint32]$proof.pid)
-                $alternateCommand = ConvertTo-EgNativeCommandLine -Argument @(
-                    [IO.Path]::GetFullPath($PythonwExe), '-m', 'energygrid_bill_downloader', 'run', '--config',
-                    $runtime.ConfigPath)
                 $alternateImage = $null
                 if ($identity.Image.Succeeded) { $alternateImage = [IO.Path]::GetFullPath($identity.Image.ImagePath) }
                 Assert-EgObserver ($identity.Live.Live -and $identity.Image.Succeeded -and
@@ -2547,8 +2575,8 @@ function Invoke-EgObserverCases {
                         [StringComparison]::OrdinalIgnoreCase)) 'N3_alternate_image_control'
                 Assert-EgObserver ($identity.Metadata.Succeeded -and
                     [uint32]$identity.Metadata.ParentProcessId -eq $runtime.Launcher.ProcessId -and
-                    $identity.Metadata.CommandLine -ceq $alternateCommand -and
-                    $identity.Metadata.CommandLine -cne (Get-EgCanonicalApplicationCommandLine)) 'N3_command_parent_control'
+                    $identity.Metadata.CommandLine -ceq (Get-EgCanonicalApplicationCommandLine)) `
+                    'N3_exact_command_parent_control'
             }
             if ($case.Name -ceq 'N14_deadline_guard') {
                 $oldStart = [int64]([System.Diagnostics.Stopwatch]::GetTimestamp() -
@@ -2584,6 +2612,10 @@ function Invoke-EgObserverCases {
                 $entered = [EnergyGridOneShotSupervisorN7ProviderControl]::WaitUntilEntered(3000)
                 $incomplete = -not [EnergyGridOneShotSupervisorN7ProviderControl]::IsCompleted()
                 Assert-EgObserver ($entered -and $incomplete -and $script:EgN7LastMetadata.TimedOut) 'N7_timeout_producer_invalid'
+                Assert-EgObserver ([EnergyGridOneShotSupervisorN7ProviderControl]::GetCallCount() -eq 1 -and
+                    [EnergyGridOneShotSupervisorN7ProviderControl]::GetTimeoutMilliseconds() -eq 1000 -and
+                    [EnergyGridOneShotSupervisorN7ProviderControl]::GetProcessId() -eq [uint32]$proof.pid) `
+                    'N7_worker_contract_invalid'
                 Write-Output ('observer_n7_injection=PASS calls=' + [EnergyGridOneShotSupervisorN7ProviderControl]::GetCallCount() + `
                     ' target_pid=' + [EnergyGridOneShotSupervisorN7ProviderControl]::GetProcessId())
                 Write-Output ('native_timeout_producer=PASS substitutions=1 provider_calls=' + `
@@ -2624,13 +2656,25 @@ function Invoke-EgObserverCases {
         finally {
             [EnergyGridOneShotSupervisorN7ProviderControl]::Release()
             $providerRan = ([EnergyGridOneShotSupervisorN7ProviderControl]::GetCallCount() -gt 0)
+            $naturalIdle = $false
+            $workerReleased = $true
             if ($providerRan) {
-                Assert-EgObserver ([EnergyGridOneShotSupervisorN7ProviderControl]::WaitUntilCompleted(5000)) 'N7_worker_release_timeout'
+                $workerReleased = [EnergyGridOneShotSupervisorN7ProviderControl]::WaitUntilCompleted(5000)
+                if ($workerReleased) {
+                    $idleDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                    do {
+                        $naturalIdle = -not [EnergyGridOneShotSupervisorN7ProviderControl]::IsBusy()
+                        if (-not $naturalIdle) { Start-Sleep -Milliseconds 10 }
+                    } while (-not $naturalIdle -and [DateTime]::UtcNow -lt $idleDeadline)
+                }
             }
-            [EnergyGridOneShotSupervisorN7ProviderControl]::Reset()
-            Assert-EgObserver (-not [EnergyGridOneShotSupervisorN7ProviderControl]::IsBusy()) 'N7_busy_state_not_clean'
-            if ($providerRan) { Write-Output 'observer_n7_idle_after_release=PASS' }
+            if ($workerReleased) { [EnergyGridOneShotSupervisorN7ProviderControl]::Reset() }
             if ($Runtime.JobHandle -ne [IntPtr]::Zero) { [void](Close-EgObserverRuntime -Runtime $Runtime) }
+            if ($providerRan) {
+                Assert-EgObserver $workerReleased 'N7_worker_release_timeout'
+                Assert-EgObserver $naturalIdle 'N7_busy_state_not_clean'
+                Write-Output 'observer_n7_idle_after_release=PASS'
+            }
         }
     }
 
@@ -2715,41 +2759,58 @@ function Invoke-EgObserverCases {
     }
     finally { if ($Runtime.JobHandle -ne [IntPtr]::Zero) { [void](Close-EgObserverRuntime -Runtime $Runtime) } }
 
-    $runtime = Start-EgObserverRuntime -Name 'N13' -Mode 'idle' -Values @{}
-    $short = $null
+    $releasePath = Join-Path $RootPath 'N13-release-owned-child.marker'
+    $runtime = Start-EgObserverRuntime -Name 'N13' -Mode 'positive' -Values @{
+        run_delay_seconds = 0; release_path = $releasePath
+    }
+    $childHandle = [IntPtr]::Zero
     try {
-        $config = New-EgObserverConfig -Name 'N13-exited' -Mode 'list' -Values @{
-            list_delay_seconds = 0.15; ready_path = (Join-Path $RootPath 'N13-exited-ready.json')
-        }
-        $short = Start-EgFixturePython -Operation 'list' -PythonExe $script:EgPythonExeNormal -ConfigPath $config
-        $proof = Wait-EgObserverFile -Path (Join-Path $RootPath 'N13-exited-ready.json') -TimeoutMilliseconds 15000
-        Assert-EgObserver ($short.WaitForExit(15000)) 'N13_child_did_not_exit'
-        $short.Dispose()
-        $short = $null
-        $queryDeadline = [DateTime]::UtcNow.AddSeconds(10)
-        $rowFound = $true
-        while ([DateTime]::UtcNow -lt $queryDeadline) {
-            $searcher = New-Object System.Management.ManagementObjectSearcher(
-                'root\cimv2', ('SELECT ProcessId FROM Win32_Process WHERE ProcessId = ' + [uint32]$proof.pid))
-            try { $rows = $searcher.Get(); try { $rowFound = ($rows.Count -gt 0) } finally { $rows.Dispose() } }
-            finally { $searcher.Dispose() }
-            if (-not $rowFound) { break }
-            Start-Sleep -Milliseconds 100
-        }
-        Assert-EgObserver (-not $rowFound) 'N13_WMI_row_persisted_after_exit'
+        $script:EgConfigPathNormal = $runtime.ConfigPath
+        $proof = Wait-EgObserverFile -Path $runtime.ReadyPath `
+            -ProcessHandle $runtime.Launcher.ProcessHandle
+        $script:EgN13ProcessId = [uint32]$proof.pid
+        $opened = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess($script:EgN13ProcessId)
+        Assert-EgObserver ($opened.Succeeded -and $opened.Handle -ne [IntPtr]::Zero) `
+            'N13_owned_child_handle_missing'
+        $childHandle = $opened.Handle
+        $membership = [EnergyGridOneShotSupervisorNative]::CheckMembership($childHandle, $runtime.JobHandle)
+        Assert-EgObserver ($membership.Succeeded -and $membership.IsMember) `
+            'N13_child_not_in_launcher_job'
+        $image = [EnergyGridOneShotSupervisorNative]::GetImage($childHandle)
+        $beforeExit = [EnergyGridOneShotSupervisorNative]::QueryProcessMetadata(
+            $script:EgN13ProcessId, 1000)
+        Assert-EgObserver ($image.Succeeded -and [string]::Equals(
+            [IO.Path]::GetFullPath($image.ImagePath), $script:EgPythonExeNormal,
+            [StringComparison]::OrdinalIgnoreCase)) 'N13_live_child_image_invalid'
+        Assert-EgObserver ($beforeExit.Succeeded -and
+            [uint32]$beforeExit.ParentProcessId -eq $runtime.Launcher.ProcessId -and
+            $beforeExit.CommandLine -ceq (Get-EgCanonicalApplicationCommandLine)) `
+            'N13_live_child_identity_invalid'
+        $script:EgN13ChildHandle = $childHandle
+        $script:EgN13ReleasePath = $releasePath
+        $script:EgN13Metadata = $null
         $script:EgConfigPathNormal = $runtime.ConfigPath
         New-EgObserverState
-        $observed = Test-EgApplicationChild -JobHandle $runtime.JobHandle `
-            -LauncherHandle $runtime.Launcher.ProcessHandle -LauncherPid $runtime.Launcher.ProcessId `
+        $observed = Invoke-EgObserverFunction -Name 'N13' -Runtime $runtime `
             -StartTicks $runtime.StartTicks
-        Assert-EgObserver (-not $observed -and -not $script:EgState.observer_failed) 'N13_exited_child_ambiguous'
+        Assert-EgObserver (-not $observed -and -not $script:EgState.observer_failed) `
+            'N13_exited_child_ambiguous'
+        Assert-EgObserver ($null -ne $script:EgN13Metadata -and
+            -not $script:EgN13Metadata.Succeeded -and -not $script:EgN13Metadata.TimedOut -and
+            -not $script:EgN13Metadata.ProviderFailed) 'N13_production_wmi_no_row_not_observed'
+        $exited = [EnergyGridOneShotSupervisorNative]::GetProcessLive($childHandle)
+        Assert-EgObserver ($exited.Succeeded -and -not $exited.Live) 'N13_held_handle_did_not_prove_exit'
         Finish-EgObserverCase -Name 'N13_real_no_row_after_exit' -Observed $observed -Runtime $runtime
     }
     finally {
-        if ($null -ne $short) {
-            if (-not $short.HasExited) { $short.Kill(); [void]$short.WaitForExit(5000) }
-            $short.Dispose()
+        if (-not [string]::IsNullOrWhiteSpace($releasePath)) {
+            [IO.File]::WriteAllText($releasePath, 'release')
         }
+        if ($childHandle -ne [IntPtr]::Zero) { Close-EgObserverHandle -Handle $childHandle }
+        $script:EgN13ChildHandle = [IntPtr]::Zero
+        $script:EgN13ProcessId = [uint32]0
+        $script:EgN13ReleasePath = $null
+        $script:EgN13Metadata = $null
         if ($Runtime.JobHandle -ne [IntPtr]::Zero) { [void](Close-EgObserverRuntime -Runtime $Runtime) }
     }
     Write-Output 'observer_leftover_processes=0'

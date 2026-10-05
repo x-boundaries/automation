@@ -521,38 +521,28 @@ public static class EnergyGridOneShotSupervisorN7ProviderControl
         Interlocked.Exchange(ref lateSuccess, enabled ? 1 : 0);
     }
 
+    // N7_SOURCE_BOUND_METHOD_BEGIN
     public static EgN7ProcessMetadataResult QueryProcessMetadata(uint processId, int timeoutMilliseconds)
     {
         EgN7ProcessMetadataResult result = new EgN7ProcessMetadataResult();
-        lastProcessId = processId;
-        Interlocked.Exchange(ref lastTimeoutMilliseconds, timeoutMilliseconds);
-        if (timeoutMilliseconds <= 0 || Interlocked.CompareExchange(ref observerBusy, 1, 0) != 0)
+        if (Interlocked.CompareExchange(ref observerBusy, 1, 0) != 0)
         {
             result.ProviderFailed = true;
             return result;
         }
-        Exception workerFailure = null;
         Thread queryThread = new Thread(delegate()
         {
             try
             {
-                Interlocked.Increment(ref providerCalls);
-                ProviderEntered.Set();
-                ProviderRelease.WaitOne();
-                if (Interlocked.CompareExchange(ref lateSuccess, 0, 0) != 0)
-                {
-                    result.ParentProcessId = 1;
-                    result.CommandLine = "late-provider-success";
-                    result.Succeeded = true;
-                }
+                EnergyGridOneShotSupervisorN7ProviderControl.QueryProvider(
+                    processId, timeoutMilliseconds, result);
             }
-            catch (Exception ex)
+            catch
             {
-                workerFailure = ex;
+                result.ProviderFailed = true;
             }
             finally
             {
-                ProviderCompleted.Set();
                 Interlocked.Exchange(ref observerBusy, 0);
             }
         });
@@ -562,11 +552,31 @@ public static class EnergyGridOneShotSupervisorN7ProviderControl
         {
             result.TimedOut = true;
         }
-        else if (workerFailure != null)
-        {
-            result.ProviderFailed = true;
-        }
         return result;
+    }
+    // N7_SOURCE_BOUND_METHOD_END
+
+    private static void QueryProvider(uint processId, int timeoutMilliseconds,
+        EgN7ProcessMetadataResult result)
+    {
+        lastProcessId = processId;
+        Interlocked.Exchange(ref lastTimeoutMilliseconds, timeoutMilliseconds);
+        Interlocked.Increment(ref providerCalls);
+        ProviderEntered.Set();
+        try
+        {
+            ProviderRelease.WaitOne();
+            if (Interlocked.CompareExchange(ref lateSuccess, 0, 0) != 0)
+            {
+                result.ParentProcessId = 1;
+                result.CommandLine = "late-provider-success";
+                result.Succeeded = true;
+            }
+        }
+        finally
+        {
+            ProviderCompleted.Set();
+        }
     }
 
     public static bool WaitUntilEntered(int milliseconds) { return ProviderEntered.WaitOne(milliseconds); }
@@ -607,5 +617,92 @@ public static class EnergyGridHandleCanaryIdentity
         result.VolumeSerialNumber = information.VolumeSerialNumber;
         result.FileIndex = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
         return result;
+    }
+}
+
+public static class EnergyGridWrongImageProcessControl
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct StartupInfo
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+        ExactSpelling = true)]
+    private static extern bool CreateProcessW(
+        string applicationName, StringBuilder commandLine, IntPtr processAttributes,
+        IntPtr threadAttributes, bool inheritHandles, uint creationFlags,
+        IntPtr environment, string currentDirectory, ref StartupInfo startupInfo,
+        out ProcessInformation processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static uint Start(string applicationName, string rawCommandLine,
+        string currentDirectory)
+    {
+        if (String.IsNullOrWhiteSpace(applicationName) ||
+            String.IsNullOrWhiteSpace(rawCommandLine) ||
+            String.IsNullOrWhiteSpace(currentDirectory))
+        {
+            throw new ArgumentException("explicit process identity is required");
+        }
+        StartupInfo startup = new StartupInfo();
+        startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+        ProcessInformation processInformation;
+        bool created = CreateProcessW(applicationName, new StringBuilder(rawCommandLine),
+            IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero,
+            currentDirectory, ref startup, out processInformation);
+        if (!created)
+        {
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+        uint processId = processInformation.dwProcessId;
+        try
+        {
+            if (!CloseHandle(processInformation.hThread))
+            {
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            }
+            processInformation.hThread = IntPtr.Zero;
+            if (!CloseHandle(processInformation.hProcess))
+            {
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            }
+            processInformation.hProcess = IntPtr.Zero;
+            return processId;
+        }
+        finally
+        {
+            if (processInformation.hThread != IntPtr.Zero) { CloseHandle(processInformation.hThread); }
+            if (processInformation.hProcess != IntPtr.Zero) { CloseHandle(processInformation.hProcess); }
+        }
     }
 }

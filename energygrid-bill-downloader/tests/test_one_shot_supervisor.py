@@ -11,7 +11,9 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+import textwrap
+from datetime import datetime, timedelta, timezone
+import uuid
 import time
 import unittest
 
@@ -776,6 +778,69 @@ def _receipt_path() -> Path:
     return path
 
 
+CUSTODY_RECEIPT_MAX_AGE = timedelta(hours=12)
+CUSTODY_RECEIPT_NAME = re.compile(
+    r"^eg212-custody-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.json$"
+)
+
+
+def _custody_run_id(path: Path) -> str:
+    match = CUSTODY_RECEIPT_NAME.fullmatch(path.name)
+    if match is None:
+        raise RuntimeError("invalid custody receipt run identity")
+    return match.group(1).lower()
+
+
+def _assert_current_receipt_path(path: Path) -> None:
+    if path.resolve() != _receipt_path().resolve():
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: receipt path differs from this run")
+
+
+def _parse_receipt_time(value: object, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: missing " + field)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: invalid " + field) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: timezone missing from " + field)
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_receipt_freshness(receipt: dict[str, object], path: Path) -> None:
+    if receipt.get("run_id") != _custody_run_id(path):
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: run identity mismatch")
+    now = datetime.now(timezone.utc)
+    created = _parse_receipt_time(receipt.get("created_utc"), "created_utc")
+    if created > now + timedelta(minutes=1) or now - created > CUSTODY_RECEIPT_MAX_AGE:
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: creation time outside the active run window")
+    observation = receipt.get("endpoint_observation")
+    if not isinstance(observation, dict):
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: endpoint observation missing")
+    started = _parse_receipt_time(observation.get("started_utc"), "endpoint started_utc")
+    if started < created or started > now + timedelta(minutes=1):
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: endpoint observation chronology invalid")
+    checked_value = observation.get("checked_utc")
+    if checked_value is not None:
+        checked = _parse_receipt_time(checked_value, "endpoint checked_utc")
+        if checked < started or checked > now + timedelta(minutes=1) or \
+                now - checked > CUSTODY_RECEIPT_MAX_AGE:
+            raise RuntimeError("STALE_CUSTODY_RECEIPT: endpoint observation is stale")
+    history = receipt.get("phase_history")
+    if not isinstance(history, list):
+        raise RuntimeError("STALE_CUSTODY_RECEIPT: phase history missing")
+    previous = created
+    for entry in history:
+        if not isinstance(entry, dict):
+            raise RuntimeError("STALE_CUSTODY_RECEIPT: invalid phase history")
+        checked = _parse_receipt_time(entry.get("checked_utc"), "phase checked_utc")
+        if checked < previous or checked > now + timedelta(minutes=1):
+            raise RuntimeError("STALE_CUSTODY_RECEIPT: phase chronology invalid")
+        previous = checked
+
+
 def _git(*arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments], cwd=REPO_ROOT, capture_output=True, text=True, check=False
@@ -837,17 +902,19 @@ def _assert_candidate_scope() -> dict[str, object]:
     }
 
 
-def _fresh_receipt() -> dict[str, object]:
+def _fresh_receipt(receipt_path: Path) -> dict[str, object]:
     candidate = _assert_candidate_scope()
+    created = datetime.now(timezone.utc)
     return {
         "schema": "energygrid.supervisor-harness-custody.v1",
-        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": _custody_run_id(receipt_path),
+        "created_utc": created.isoformat(),
         "candidate": candidate,
         "helpers": [_identity(item) for item in HELPERS],
         "test_identity": _identity(Path(__file__).resolve()),
         "supervisor_identity": _identity(SUPERVISOR),
         "endpoint_observation": {
-            "started_utc": datetime.now(timezone.utc).isoformat(),
+            "started_utc": created.isoformat(),
             "protection_enabled": "UNKNOWN",
             "coverage": "UNKNOWN",
             "detection_events": "UNKNOWN",
@@ -864,6 +931,7 @@ def _load_receipt(path: Path) -> dict[str, object]:
     if not isinstance(receipt, dict) or receipt.get("schema") != \
             "energygrid.supervisor-harness-custody.v1":
         raise RuntimeError("invalid custody receipt")
+    _validate_receipt_freshness(receipt, path)
     return receipt
 
 
@@ -934,6 +1002,7 @@ def _record_endpoint_evidence(args: argparse.Namespace) -> None:
     path = Path(args.receipt).expanduser()
     if not path.is_absolute():
         raise RuntimeError("custody receipt must be absolute")
+    _assert_current_receipt_path(path)
     receipt = _load_receipt(path)
     if args.enabled not in {"YES", "NO"} or args.coverage not in {"PASS", "FAIL", "UNKNOWN"}:
         raise RuntimeError("invalid endpoint status")
@@ -975,8 +1044,9 @@ def _custody_cli() -> int:
     receipt_path = Path(args.receipt).expanduser()
     if not receipt_path.is_absolute():
         raise RuntimeError("custody receipt must be absolute")
+    _assert_current_receipt_path(receipt_path)
     if args.harness_custody == "freeze":
-        receipt = _fresh_receipt()
+        receipt = _fresh_receipt(receipt_path)
         descriptor = os.open(
             receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
         )
@@ -1087,6 +1157,10 @@ def _assert_source_binding() -> None:
             "Get-EgN11ProcessMetadata -ProcessId ([uint32]$candidatePid) -TimeoutMilliseconds $script:EgObserverMetadataTimeoutMilliseconds",
             "[EnergyGridOneShotSupervisorNative]::QueryProcessMetadata(\n                [uint32]$candidatePid, $script:EgObserverMetadataTimeoutMilliseconds)",
         ),
+        "Test-EgN13ApplicationChild": (
+            "Get-EgN13ProcessMetadata -ProcessId ([uint32]$candidatePid) -TimeoutMilliseconds $script:EgObserverMetadataTimeoutMilliseconds",
+            "[EnergyGridOneShotSupervisorNative]::QueryProcessMetadata(\n                [uint32]$candidatePid, $script:EgObserverMetadataTimeoutMilliseconds)",
+        ),
     }
     if set(evidence["variants"]) != set(substitutions):
         raise AssertionError("observer source variant manifest mismatch")
@@ -1098,6 +1172,51 @@ def _assert_source_binding() -> None:
         normalized = renamed.replace(callsite, production_call, 1)
         if normalized != production_observer:
             raise AssertionError("observer source variant differs beyond its one callsite: " + name)
+
+    outcome_variants = evidence["outcome_variants"]
+    if set(outcome_variants) != {"Write-EgOutcomeWithTimeoutControl"}:
+        raise AssertionError("outcome source variant manifest mismatch")
+    production_outcome = evidence["definitions"]["Write-EgOutcome"]["production"]
+    production_outcome = production_outcome.replace("\r\n", "\n").replace("\r", "\n")
+    outcome_variant = outcome_variants["Write-EgOutcomeWithTimeoutControl"]
+    outcome_variant = outcome_variant.replace("\r\n", "\n").replace("\r", "\n")
+    outcome_call = (
+        "$durability = [EnergyGridOneShotSupervisorNative]::WriteFlushBounded(\n"
+        "                $stream, $bytes, 5000)"
+    )
+    timeout_call = "$durability = Get-EgOutcomeTimedOutFlushResult"
+    renamed_outcome = outcome_variant.replace(
+        "function Write-EgOutcomeWithTimeoutControl {", "function Write-EgOutcome {", 1
+    )
+    if renamed_outcome == outcome_variant or outcome_variant.count(timeout_call) != 1:
+        raise AssertionError("outcome source variant substitution mismatch")
+    normalized_outcome = renamed_outcome.replace(timeout_call, outcome_call, 1)
+    if normalized_outcome != production_outcome:
+        raise AssertionError("outcome source variant differs beyond its flush result control")
+
+    production_n7 = "    " + evidence["n7_native_method"].strip()
+    production_n7 = production_n7.replace("\r\n", "\n").replace("\r", "\n")
+    provider_start = production_n7.find("                string query = ")
+    try_close = production_n7.find("\n            }\n            catch", provider_start)
+    if provider_start < 0 or try_close < provider_start:
+        raise AssertionError("production N7 provider operation missing")
+    provider_operation = production_n7[provider_start:try_close]
+    fixture_provider_call = (
+        "                EnergyGridOneShotSupervisorN7ProviderControl.QueryProvider(\n"
+        "                    processId, timeoutMilliseconds, result);"
+    )
+    expected_n7 = production_n7.replace(provider_operation, fixture_provider_call, 1)
+    expected_n7 = expected_n7.replace("ProcessMetadataResult", "EgN7ProcessMetadataResult")
+    support_source = SUPPORT.read_text(encoding="utf-8").replace("\r\n", "\n")
+    begin_marker = "// N7_SOURCE_BOUND_METHOD_BEGIN"
+    end_marker = "// N7_SOURCE_BOUND_METHOD_END"
+    if support_source.count(begin_marker) != 1 or support_source.count(end_marker) != 1:
+        raise AssertionError("N7 source-bound method markers are invalid")
+    fixture_n7 = support_source.split(begin_marker, 1)[1].split(end_marker, 1)[0]
+    expected_n7 = textwrap.dedent(expected_n7).strip()
+    fixture_n7 = textwrap.dedent(fixture_n7).strip()
+    if fixture_n7 != expected_n7:
+        raise AssertionError("N7 worker differs beyond the one provider-control operation")
 
 
 def _run_driver(phase: str, data_root: Path, timeout: int) -> str:
@@ -1200,6 +1319,43 @@ class SupervisorHarnessCleanupTests(unittest.TestCase):
         self.assertEqual(42, receipt["candidate"]["protected_base_path_count"])
         self.assertEqual(6, len(receipt["helpers"]))
         self.assertEqual("ENDPOINT_EVIDENCE_UNAVAILABLE", _endpoint_state(receipt))
+
+    def test_stale_custody_receipt_is_rejected_even_with_green_endpoint_fields(self):
+        with tempfile.TemporaryDirectory(prefix="eg_stale_custody_") as directory:
+            receipt_path = Path(directory) / (
+                "eg212-custody-" + str(uuid.uuid4()) + ".json"
+            )
+            receipt = _fresh_receipt(receipt_path)
+            receipt["endpoint_observation"].update({
+                "checked_utc": datetime.now(timezone.utc).isoformat(),
+                "protection_enabled": "YES",
+                "coverage": "PASS",
+                "detection_events": "NONE",
+                "status": "ENDPOINT_ACCEPTANCE_PASS",
+            })
+            replay_path = Path(directory) / (
+                "eg212-custody-" + str(uuid.uuid4()) + ".json"
+            )
+            replay_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "STALE_CUSTODY_RECEIPT"):
+                _load_receipt(replay_path)
+            stale_time = datetime.now(timezone.utc) - CUSTODY_RECEIPT_MAX_AGE - timedelta(seconds=1)
+            receipt["created_utc"] = stale_time.isoformat()
+            receipt["endpoint_observation"].update({
+                "started_utc": stale_time.isoformat(),
+                "checked_utc": (stale_time + timedelta(seconds=1)).isoformat(),
+                "protection_enabled": "YES",
+                "coverage": "PASS",
+                "detection_events": "NONE",
+                "status": "ENDPOINT_ACCEPTANCE_PASS",
+            })
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "STALE_CUSTODY_RECEIPT"):
+                _load_receipt(receipt_path)
 
 
 class SupervisorNativeAssuranceTests(unittest.TestCase):

@@ -109,7 +109,7 @@ function Invoke-EgFixtureApplication {
     param(
         [Parameter(Mandatory = $true)][string]$PythonExe,
         [Parameter(Mandatory = $true)][string]$ConfigPath,
-        [Parameter(Mandatory = $true)][ValidateSet('positive', 'noise', 'wrongcmd', 'early',
+        [Parameter(Mandatory = $true)][ValidateSet('positive', 'noise', 'wrongcmd', 'wrong-image', 'early',
             'wrongparent', 'launcher-exit', 'quick-exit', 'deadchild', 'idle')][string]$Mode
     )
 
@@ -150,7 +150,24 @@ function Invoke-EgFixtureApplication {
         if ($Mode -ceq 'wrongcmd') { $operation = 'list' }
         if ($Mode -ceq 'deadchild') { $operation = 'list' }
         if ($Mode -ceq 'wrongparent') { $operation = 'wrong-parent-child' }
-        $application = Start-EgFixturePython -Operation $operation -PythonExe $PythonExe -ConfigPath $ConfigPath
+        if ($Mode -ceq 'wrong-image') {
+            $wrongImageConfig = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($ConfigPath))
+            $canonicalExecutable = [string]$wrongImageConfig.canonical_command_line_executable
+            if ([string]::IsNullOrWhiteSpace($canonicalExecutable)) {
+                throw 'EG_FIXTURE_WRONG_IMAGE_CANONICAL_EXECUTABLE_MISSING'
+            }
+            $canonicalCommandLine = ConvertTo-EgFixtureArguments -Items @(
+                [System.IO.Path]::GetFullPath($canonicalExecutable), '-m',
+                'energygrid_bill_downloader', 'run', '--config', $ConfigPath)
+            $processId = [EnergyGridWrongImageProcessControl]::Start(
+                [System.IO.Path]::GetFullPath($PythonExe),
+                $canonicalCommandLine,
+                [System.IO.Path]::GetFullPath((Get-Location).Path))
+            $application = [System.Diagnostics.Process]::GetProcessById([int]$processId)
+        }
+        else {
+            $application = Start-EgFixturePython -Operation $operation -PythonExe $PythonExe -ConfigPath $ConfigPath
+        }
         $owned.Add($application)
         if ($Mode -ceq 'deadchild') {
             if (-not $application.WaitForExit(15000)) { throw 'EG_FIXTURE_DEAD_CHILD_TIMEOUT' }
