@@ -2038,6 +2038,7 @@ function New-EgObserverState {
         evidence_integrity_failure = $false
         containment_failure = $false
         observer_failed = $false
+        creation_attempted = $true
         creation_succeeded = $true
         baseline_total_processes = [uint64]1
         baseline_active_processes = [uint64]1
