@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import time
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -37,6 +38,27 @@ CONSTRUCTION_TREE = "28034420e436345586dc94f1624ac4483e97dbbb"
 TARGET_BRANCH = "codex/energygrid-226-dual-stream-latest-email"
 HELPERS = (HARNESS, FUNCTIONS, SUPPORT, PYTHON_FIXTURE, LAUNCHER, LAUNCHER_LIB)
 HELPER_RELATIVES = tuple(item.relative_to(REPO_ROOT).as_posix() for item in HELPERS)
+SATURATION_EXPECTED_BYTES = 1048576
+
+
+def _saturation_result_passes(
+    stdout_bytes: int,
+    stderr_bytes: int,
+    stdout_drain_complete: bool,
+    stderr_drain_complete: bool,
+    child_terminal: bool,
+    exit_code_read: bool,
+    exit_code: int,
+) -> bool:
+    return (
+        stdout_bytes == SATURATION_EXPECTED_BYTES
+        and stderr_bytes == SATURATION_EXPECTED_BYTES
+        and stdout_drain_complete
+        and stderr_drain_complete
+        and child_terminal
+        and exit_code_read
+        and exit_code == 0
+    )
 
 
 def native_powershell():
@@ -939,6 +961,11 @@ def _endpoint_state(receipt: dict[str, object]) -> str:
     observation = receipt.get("endpoint_observation")
     if not isinstance(observation, dict):
         return "ENDPOINT_EVIDENCE_UNAVAILABLE"
+    quarantine_paths = observation.get("quarantined_paths", [])
+    if not isinstance(quarantine_paths, list) or quarantine_paths:
+        return "ENDPOINT_ACCEPTANCE_FAIL"
+    if observation.get("status") == "ENDPOINT_ACCEPTANCE_FAIL":
+        return "ENDPOINT_ACCEPTANCE_FAIL"
     if observation.get("detection_events") == "ATTRIBUTABLE":
         return "ENDPOINT_ACCEPTANCE_FAIL"
     if observation.get("protection_enabled") == "YES" and \
@@ -954,6 +981,9 @@ def _custody_check(path: Path, phase: str = "check") -> dict[str, object]:
     current = _assert_candidate_scope()
     if any(recorded.get(key) != current[key] for key in ("head", "tree", "parent")):
         raise RuntimeError("candidate identity changed after freeze")
+    endpoint = _endpoint_state(receipt)
+    if endpoint == "ENDPOINT_ACCEPTANCE_FAIL":
+        raise RuntimeError(endpoint)
     expected = {item["path"]: item for item in receipt["helpers"]}
     missing: list[str] = []
     changed: list[str] = []
@@ -987,9 +1017,6 @@ def _custody_check(path: Path, phase: str = "check") -> dict[str, object]:
         raise RuntimeError(classification + ": " + ", ".join(missing))
     if changed:
         raise RuntimeError("HELPER_IDENTITY_CHANGED: " + ", ".join(changed))
-    endpoint = _endpoint_state(receipt)
-    if endpoint == "ENDPOINT_ACCEPTANCE_FAIL":
-        raise RuntimeError(endpoint)
     receipt["phase_history"].append({
         "phase": phase,
         "checked_utc": datetime.now(timezone.utc).isoformat(),
@@ -1011,22 +1038,31 @@ def _record_endpoint_evidence(args: argparse.Namespace) -> None:
     note = args.note.strip()
     if not note or len(note) > 500:
         raise RuntimeError("safe endpoint observation note is required")
-    receipt["endpoint_observation"] = {
-        "started_utc": receipt["endpoint_observation"]["started_utc"],
+    previous = receipt.get("endpoint_observation")
+    if not isinstance(previous, dict):
+        raise RuntimeError("invalid endpoint observation")
+    previous_quarantine_paths = previous.get("quarantined_paths", [])
+    if not isinstance(previous_quarantine_paths, list) or any(
+            not isinstance(item, str) or not item for item in previous_quarantine_paths):
+        raise RuntimeError("invalid endpoint quarantine evidence")
+    quarantine_paths = list(dict.fromkeys([
+        *previous_quarantine_paths,
+        *([args.quarantined_path] if args.quarantined_path else []),
+    ]))
+    detections = args.detections
+    if previous.get("detection_events") == "ATTRIBUTABLE":
+        detections = "ATTRIBUTABLE"
+    observation: dict[str, object] = {
+        "started_utc": previous["started_utc"],
         "checked_utc": datetime.now(timezone.utc).isoformat(),
         "protection_enabled": args.enabled,
         "coverage": args.coverage,
-        "detection_events": args.detections,
-        "quarantined_paths": [args.quarantined_path] if args.quarantined_path else [],
-        "status": _endpoint_state({
-            "endpoint_observation": {
-                "protection_enabled": args.enabled,
-                "coverage": args.coverage,
-                "detection_events": args.detections,
-            }
-        }),
+        "detection_events": detections,
+        "quarantined_paths": quarantine_paths,
         "safe_observation_note": note,
     }
+    observation["status"] = _endpoint_state({"endpoint_observation": observation})
+    receipt["endpoint_observation"] = observation
     path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -1290,6 +1326,190 @@ class SupervisorHarnessSourceTests(unittest.TestCase):
         _assert_source_binding()
 
 
+class SupervisorCustodyRegressionTests(unittest.TestCase):
+    def _candidate_scope(self):
+        return {
+            "head": _git("rev-parse", "HEAD"),
+            "tree": _git("rev-parse", "HEAD^{tree}"),
+            "parent": _git("rev-parse", "HEAD^"),
+            "branch": TARGET_BRANCH,
+            "changed_paths": sorted([
+                "energygrid-bill-downloader/tests/test_one_shot_supervisor.py",
+                *HELPER_RELATIVES,
+            ]),
+            "changed_path_count": 7,
+            "protected_base_path_count": 42,
+        }
+
+    def _receipt(self, path: Path, observation: dict[str, object] | None = None):
+        with mock.patch(
+                __name__ + "._assert_candidate_scope",
+                return_value=self._candidate_scope()):
+            receipt = _fresh_receipt(path)
+        if observation:
+            receipt["endpoint_observation"].update(observation)
+        path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return receipt
+
+    def _record(self, path: Path, *, detections="NONE", quarantined_path=None):
+        args = argparse.Namespace(
+            receipt=str(path), enabled="YES", coverage="PASS", detections=detections,
+            quarantined_path=quarantined_path, note="Owner observed endpoint state",
+        )
+        with mock.patch.dict(os.environ, {"EG_SUPERVISOR_CUSTODY_RECEIPT": str(path)}):
+            _record_endpoint_evidence(args)
+
+    def test_f1_endpoint_state_regressions_r1_r4_r5_r7(self):
+        with tempfile.TemporaryDirectory(prefix="eg_f1_state_") as directory:
+            receipt_path = Path(directory) / (
+                "eg212-custody-" + str(uuid.uuid4()) + ".json"
+            )
+            receipt = self._receipt(receipt_path)
+            clean_observation = receipt["endpoint_observation"]
+            clean_observation.update({
+                "checked_utc": datetime.now(timezone.utc).isoformat(),
+                "protection_enabled": "YES", "coverage": "PASS",
+                "detection_events": "NONE", "quarantined_paths": [],
+                "status": "ENDPOINT_ACCEPTANCE_PASS",
+            })
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            self.assertEqual("ENDPOINT_ACCEPTANCE_PASS", _endpoint_state(receipt))
+            for helper in HELPERS:
+                self.assertTrue(helper.is_file())
+                recorded = next(item for item in receipt["helpers"]
+                                if item["path"] == helper.relative_to(REPO_ROOT).as_posix())
+                self.assertEqual(recorded, _identity(helper))
+            with mock.patch(
+                    __name__ + "._assert_candidate_scope",
+                    return_value=self._candidate_scope()):
+                self.assertEqual("ENDPOINT_ACCEPTANCE_PASS",
+                                 _custody_check(receipt_path)["endpoint_state"])
+
+            for label, update in (
+                ("F1-R1", {"quarantined_paths": [HELPER_RELATIVES[0]]}),
+                ("F1-R4", {"detection_events": "ATTRIBUTABLE"}),
+                ("F1-R7", {
+                    "quarantined_paths": [HELPER_RELATIVES[0]],
+                    "status": "ENDPOINT_ACCEPTANCE_PASS",
+                }),
+            ):
+                with self.subTest(label=label):
+                    candidate = json.loads(json.dumps(receipt))
+                    candidate["endpoint_observation"].update(update)
+                    self.assertEqual("ENDPOINT_ACCEPTANCE_FAIL", _endpoint_state(candidate))
+                    receipt_path.write_text(
+                        json.dumps(candidate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                    with mock.patch(
+                            __name__ + "._assert_candidate_scope",
+                            return_value=self._candidate_scope()):
+                        with self.assertRaisesRegex(RuntimeError, "ENDPOINT_ACCEPTANCE_FAIL"):
+                            _custody_check(receipt_path)
+
+    def test_f1_quarantine_and_detection_history_cannot_be_cleared_r3_r6(self):
+        with tempfile.TemporaryDirectory(prefix="eg_f1_history_") as directory:
+            receipt_path = Path(directory) / (
+                "eg212-custody-" + str(uuid.uuid4()) + ".json"
+            )
+            self._receipt(receipt_path)
+            self._record(receipt_path, quarantined_path=HELPER_RELATIVES[0])
+            self._record(receipt_path)
+            recorded = _load_receipt(receipt_path)
+            self.assertEqual([HELPER_RELATIVES[0]],
+                             recorded["endpoint_observation"]["quarantined_paths"])
+            self.assertEqual("ENDPOINT_ACCEPTANCE_FAIL",
+                             recorded["endpoint_observation"]["status"])
+            self.assertEqual("ENDPOINT_ACCEPTANCE_FAIL", _endpoint_state(recorded))
+            self.assertTrue(HELPERS[0].is_file())
+            recorded_helper = next(
+                item for item in recorded["helpers"]
+                if item["path"] == HELPER_RELATIVES[0]
+            )
+            self.assertEqual(recorded_helper, _identity(HELPERS[0]))
+            with mock.patch(
+                    __name__ + "._assert_candidate_scope",
+                    return_value=self._candidate_scope()):
+                with self.assertRaisesRegex(RuntimeError, "ENDPOINT_ACCEPTANCE_FAIL"):
+                    _custody_check(receipt_path)
+
+            detection_path = Path(directory) / (
+                "eg212-custody-" + str(uuid.uuid4()) + ".json"
+            )
+            self._receipt(detection_path)
+            self._record(detection_path, detections="ATTRIBUTABLE")
+            self._record(detection_path, detections="NONE")
+            detected = _load_receipt(detection_path)
+            self.assertEqual("ATTRIBUTABLE",
+                             detected["endpoint_observation"]["detection_events"])
+            self.assertEqual("ENDPOINT_ACCEPTANCE_FAIL", _endpoint_state(detected))
+
+    def test_f1_quarantine_rejection_is_independent_of_helper_presence_r2(self):
+        with tempfile.TemporaryDirectory(prefix="eg_f1_missing_") as directory:
+            receipt_path = Path(directory) / (
+                "eg212-custody-" + str(uuid.uuid4()) + ".json"
+            )
+            receipt = self._receipt(receipt_path, {
+                "protection_enabled": "YES", "coverage": "PASS",
+                "detection_events": "NONE",
+                "quarantined_paths": [HELPER_RELATIVES[0]],
+                "status": "ENDPOINT_ACCEPTANCE_PASS",
+            })
+            self.assertEqual("ENDPOINT_ACCEPTANCE_FAIL", _endpoint_state(receipt))
+            missing_helper = Path(directory) / "helper-that-is-not-present.ps1"
+            with mock.patch(__name__ + "._assert_candidate_scope",
+                            return_value=self._candidate_scope()):
+                with mock.patch(__name__ + ".HELPERS", (missing_helper,)):
+                    with self.assertRaisesRegex(RuntimeError, "ENDPOINT_ACCEPTANCE_FAIL"):
+                        _custody_check(receipt_path)
+
+
+class SupervisorSaturationRegressionTests(unittest.TestCase):
+    def test_f2_exact_byte_child_and_drain_regressions_r1_to_r8(self):
+        import ast
+
+        fixture_tree = ast.parse(PYTHON_FIXTURE.read_text(encoding="utf-8-sig"))
+        saturate = next(node for node in fixture_tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "_saturate")
+        byte_counts = [
+            node.value for node in saturate.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "byte_count"
+                    for target in node.targets)
+        ]
+        self.assertEqual(1, len(byte_counts))
+        byte_count = byte_counts[0]
+        self.assertEqual("1024 * 1024", ast.unparse(byte_count))
+        self.assertEqual(SATURATION_EXPECTED_BYTES, 1024 * 1024)
+
+        valid = {
+            "stdout_bytes": SATURATION_EXPECTED_BYTES,
+            "stderr_bytes": SATURATION_EXPECTED_BYTES,
+            "stdout_drain_complete": True,
+            "stderr_drain_complete": True,
+            "child_terminal": True,
+            "exit_code_read": True,
+            "exit_code": 0,
+        }
+        cases = (
+            ("F2-R1", {}, True),
+            ("F2-R2", {"stdout_bytes": 1048575}, False),
+            ("F2-R3", {"stderr_bytes": 1048575}, False),
+            ("F2-R4", {"stdout_bytes": 1048577}, False),
+            ("F2-R5", {"stderr_bytes": 1048577}, False),
+            ("F2-R6", {"stdout_bytes": 2097152, "stderr_bytes": 2097152}, False),
+            ("F2-R7", {"exit_code": 1}, False),
+            ("F2-R8-stdout", {"stdout_drain_complete": False}, False),
+            ("F2-R8-stderr", {"stderr_drain_complete": False}, False),
+            ("child-not-terminal", {"child_terminal": False}, False),
+            ("exit-code-unread", {"exit_code_read": False}, False),
+        )
+        for label, update, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(expected, _saturation_result_passes(**(valid | update)))
+
+
 class SupervisorHarnessParseCompileTests(unittest.TestCase):
     def test_committed_helpers_and_exact_production_native_source_parse_and_compile(self):
         if os.name != "nt":
@@ -1382,8 +1602,15 @@ class SupervisorNativeAssuranceTests(unittest.TestCase):
             if line.startswith("native_saturation_") and "=" in line:
                 name, value = line.split("=", 1)
                 metrics[name] = value
-        self.assertGreaterEqual(int(metrics["native_saturation_stdout_bytes"]), 1048576)
-        self.assertGreaterEqual(int(metrics["native_saturation_stderr_bytes"]), 1048576)
+        self.assertTrue(_saturation_result_passes(
+            stdout_bytes=int(metrics["native_saturation_stdout_bytes"]),
+            stderr_bytes=int(metrics["native_saturation_stderr_bytes"]),
+            stdout_drain_complete=metrics["native_saturation_stdout_drained"] == "True",
+            stderr_drain_complete=metrics["native_saturation_stderr_drained"] == "True",
+            child_terminal=metrics["native_saturation_child_terminal"] == "True",
+            exit_code_read=metrics["native_saturation_exit_read"] == "True",
+            exit_code=int(metrics["native_saturation_exit_code"]),
+        ))
         self.assertIn("native_saturation_drains=True", output)
         self.assertIn("native_saturation_active_processes=0", output)
         self.assertIn("native_assurance_cases=15", output)

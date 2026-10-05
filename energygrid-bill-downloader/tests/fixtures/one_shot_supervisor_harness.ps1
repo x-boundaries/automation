@@ -597,17 +597,29 @@ Write-Output 'native_case=stdout_stderr_saturation_without_deadlock'
     Assert-Native ($saturationResume.Attempted -and $saturationResume.Accepted) 'saturation_resume_failed'
     $saturationWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
         $saturationProcess.ProcessHandle, 15000)
-    Assert-Native ($saturationWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) 'saturation_pipe_deadlock'
+    $saturationTerminal = $saturationWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0
+    Assert-Native $saturationTerminal 'saturation_pipe_deadlock'
+    $saturationExit = [EnergyGridOneShotSupervisorNative]::GetProcessLive(
+        $saturationProcess.ProcessHandle)
+    Assert-Native ($saturationExit.Succeeded -and -not $saturationExit.Live -and
+        $saturationExit.ExitCode -eq 0) 'saturation_child_exit_invalid'
     $saturationFinal = Wait-JobZero -JobHandle $saturationJob
     [void]$saturationProcess.StdoutDrain.Join(10000)
     [void]$saturationProcess.StderrDrain.Join(10000)
     Assert-Native ($saturationProcess.StdoutDrain.Completed -and $saturationProcess.StderrDrain.Completed) 'saturation_drains_incomplete'
-    Assert-Native ($saturationProcess.StdoutDrain.Bytes -ge 1048576 -and $saturationProcess.StderrDrain.Bytes -ge 1048576) 'saturation_byte_counts_incomplete'
+    $expectedSaturationBytes = [uint64]1048576
+    Assert-Native ($saturationProcess.StdoutDrain.Bytes -eq $expectedSaturationBytes) 'saturation_stdout_byte_count_mismatch'
+    Assert-Native ($saturationProcess.StderrDrain.Bytes -eq $expectedSaturationBytes) 'saturation_stderr_byte_count_mismatch'
     Assert-Native ($saturationFinal.ActiveProcesses -eq 0) 'saturation_active_processes_nonzero'
     Write-Output 'native_saturation_writers=CONCURRENT'
     Write-Output ('native_saturation_stdout_bytes=' + [string]$saturationProcess.StdoutDrain.Bytes)
     Write-Output ('native_saturation_stderr_bytes=' + [string]$saturationProcess.StderrDrain.Bytes)
     Write-Output ('native_saturation_drains=' + [string]($saturationProcess.StdoutDrain.Completed -and $saturationProcess.StderrDrain.Completed))
+    Write-Output ('native_saturation_stdout_drained=' + [string]$saturationProcess.StdoutDrain.Completed)
+    Write-Output ('native_saturation_stderr_drained=' + [string]$saturationProcess.StderrDrain.Completed)
+    Write-Output ('native_saturation_child_terminal=' + [string]$saturationTerminal)
+    Write-Output ('native_saturation_exit_read=' + [string]$saturationExit.Succeeded)
+    Write-Output ('native_saturation_exit_code=' + [string]$saturationExit.ExitCode)
     Write-Output ('native_saturation_active_processes=' + [string]$saturationFinal.ActiveProcesses)
 }
 finally {
