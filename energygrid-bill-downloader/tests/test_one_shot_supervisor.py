@@ -5,6 +5,7 @@ import hashlib
 import ctypes
 import ctypes.wintypes as wintypes
 import argparse
+import atexit
 import os
 from pathlib import Path
 import re
@@ -790,13 +791,154 @@ import sys
 from datetime import datetime, timezone
 
 
+LOCAL_ENDPOINT_MODE = "LOCAL_ENDPOINT"
+HOSTED_EXACT_HEAD_MODE = "HOSTED_EXACT_HEAD"
+GITHUB_REPOSITORY = "x-boundaries/automation"
+GITHUB_WORKFLOW = "energygrid-bill-downloader-tests"
+GITHUB_JOB = "synthetic-windows"
+_HOSTED_RECEIPT_PATH: Path | None = None
+_HOSTED_RECEIPT_BINDING: dict[str, object] | None = None
+
+
+def _full_sha(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _execution_context(environment=None, *, actual_head: str | None = None) -> dict[str, object]:
+    env = os.environ if environment is None else environment
+    if "EG_SUPERVISOR_CUSTODY_RECEIPT" in env:
+        value = env.get("EG_SUPERVISOR_CUSTODY_RECEIPT", "")
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("EG_SUPERVISOR_CUSTODY_RECEIPT is required")
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise RuntimeError("custody receipt must be an absolute path")
+        return {"mode": LOCAL_ENDPOINT_MODE, "receipt_path": str(path.resolve())}
+
+    required = (
+        "GITHUB_ACTIONS", "GITHUB_REPOSITORY", "GITHUB_WORKFLOW", "GITHUB_JOB",
+        "GITHUB_WORKSPACE", "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA",
+        "GITHUB_REF", "GITHUB_SERVER_URL", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+        "RUNNER_OS", "RUNNER_ENVIRONMENT", "RUNNER_TEMP",
+    )
+    if any(not isinstance(env.get(key), str) or not env.get(key, "").strip()
+           for key in required):
+        raise RuntimeError("no valid local receipt or complete GitHub Actions context")
+    if env["GITHUB_ACTIONS"].lower() != "true" or \
+            env["GITHUB_REPOSITORY"] != GITHUB_REPOSITORY or \
+            env["GITHUB_WORKFLOW"] != GITHUB_WORKFLOW or \
+            env["GITHUB_JOB"] != GITHUB_JOB or env["GITHUB_SERVER_URL"] != "https://github.com" or \
+            env["RUNNER_OS"].lower() != "windows" or \
+            env["RUNNER_ENVIRONMENT"] != "github-hosted":
+        raise RuntimeError("GitHub Actions context does not match the EnergyGrid hosted job")
+    if not env["GITHUB_RUN_ID"].isdigit() or not env["GITHUB_RUN_ATTEMPT"].isdigit() or \
+            int(env["GITHUB_RUN_ID"]) <= 0 or int(env["GITHUB_RUN_ATTEMPT"]) <= 0:
+        raise RuntimeError("invalid GitHub Actions run identity")
+    if not _full_sha(env["GITHUB_SHA"]):
+        raise RuntimeError("invalid GitHub Actions SHA")
+
+    workspace = Path(env["GITHUB_WORKSPACE"]).expanduser()
+    runner_temp = Path(env["RUNNER_TEMP"]).expanduser()
+    event_path = Path(env["GITHUB_EVENT_PATH"]).expanduser()
+    if not workspace.is_absolute() or os.path.normcase(str(workspace.resolve())) != \
+            os.path.normcase(str(REPO_ROOT.resolve())):
+        raise RuntimeError("GitHub workspace does not identify this repository checkout")
+    if not runner_temp.is_absolute() or not runner_temp.is_dir() or \
+            not event_path.is_absolute() or not event_path.is_file() or \
+            not _path_is_within(event_path, runner_temp):
+        raise RuntimeError("GitHub event payload is not under the runner temporary directory")
+    try:
+        with event_path.open("r", encoding="utf-8") as stream:
+            event = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("GitHub event payload is unavailable or invalid") from error
+    if not isinstance(event, dict):
+        raise RuntimeError("GitHub event payload is invalid")
+    repository = event.get("repository")
+    if not isinstance(repository, dict) or repository.get("full_name") != GITHUB_REPOSITORY:
+        raise RuntimeError("GitHub event repository does not match this repository")
+
+    event_name = env["GITHUB_EVENT_NAME"]
+    ref = env["GITHUB_REF"]
+    if event_name == "pull_request":
+        pull_request = event.get("pull_request")
+        if not isinstance(pull_request, dict):
+            raise RuntimeError("pull request event payload is missing")
+        head = pull_request.get("head")
+        base = pull_request.get("base")
+        head_repo = head.get("repo") if isinstance(head, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        number = pull_request.get("number", event.get("number"))
+        expected_head = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(number, int) or number <= 0 or not isinstance(head, dict) or \
+                not isinstance(base, dict) or not isinstance(head_repo, dict) or \
+                not isinstance(base_repo, dict) or head_repo.get("full_name") != GITHUB_REPOSITORY or \
+                base_repo.get("full_name") != GITHUB_REPOSITORY or \
+                head.get("ref") != TARGET_BRANCH or base.get("ref") != "main" or \
+                not _full_sha(expected_head) or ref != f"refs/pull/{number}/merge":
+            raise RuntimeError("pull request event binding is incomplete or inconsistent")
+        expected_head = expected_head.lower()
+    elif event_name == "workflow_dispatch":
+        event_ref = event.get("ref")
+        if ref != f"refs/heads/{TARGET_BRANCH}" or event_ref not in {
+                TARGET_BRANCH, f"refs/heads/{TARGET_BRANCH}"}:
+            raise RuntimeError("workflow dispatch ref does not identify the candidate branch")
+        expected_head = env["GITHUB_SHA"].lower()
+    else:
+        raise RuntimeError("unsupported GitHub Actions event for exact-head custody")
+
+    head = actual_head if actual_head is not None else _git("rev-parse", "HEAD")
+    if not _full_sha(head) or head.lower() != expected_head:
+        raise RuntimeError("actual HEAD does not match the trusted GitHub event SHA")
+    return {
+        "mode": HOSTED_EXACT_HEAD_MODE,
+        "event_name": event_name,
+        "repository": GITHUB_REPOSITORY,
+        "expected_head": expected_head,
+        "ref": ref,
+        "run_id": env["GITHUB_RUN_ID"],
+        "run_attempt": env["GITHUB_RUN_ATTEMPT"],
+        "runner_temp": str(runner_temp.resolve()),
+    }
+
+
+def _receipt_context_binding(context: dict[str, object]) -> dict[str, object]:
+    mode = context.get("mode")
+    if mode == LOCAL_ENDPOINT_MODE:
+        return {"mode": LOCAL_ENDPOINT_MODE}
+    if mode != HOSTED_EXACT_HEAD_MODE:
+        raise RuntimeError("invalid custody execution context")
+    return {key: context.get(key) for key in (
+        "mode", "event_name", "repository", "expected_head", "ref", "run_id", "run_attempt",
+        "runner_temp",
+    )}
+
+
 def _receipt_path() -> Path:
-    value = os.environ.get("EG_SUPERVISOR_CUSTODY_RECEIPT", "")
-    if not value:
-        raise RuntimeError("EG_SUPERVISOR_CUSTODY_RECEIPT is required")
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        raise RuntimeError("custody receipt must be an absolute path")
+    global _HOSTED_RECEIPT_PATH, _HOSTED_RECEIPT_BINDING
+    context = _execution_context()
+    if context["mode"] == LOCAL_ENDPOINT_MODE:
+        return Path(str(context["receipt_path"]))
+    binding = _receipt_context_binding(context)
+    if _HOSTED_RECEIPT_PATH is not None:
+        if binding != _HOSTED_RECEIPT_BINDING:
+            raise RuntimeError("hosted custody context changed during this process")
+        return _HOSTED_RECEIPT_PATH
+    path = _create_hosted_receipt(context)
+    _HOSTED_RECEIPT_PATH = path
+    _HOSTED_RECEIPT_BINDING = binding
+    atexit.register(_cleanup_hosted_receipt, path, Path(str(context["runner_temp"])))
+    print("HOSTED_CONTEXT=HOSTED_EXACT_HEAD")
+    print("HOSTED_RECEIPT=EPHEMERAL_TEST_OWNED")
+    print("HOSTED_ENDPOINT_STATE=ENDPOINT_EVIDENCE_UNAVAILABLE")
     return path
 
 
@@ -895,13 +1037,24 @@ def _valid_candidate_parent(parent: str) -> bool:
     return True
 
 
-def _assert_candidate_scope() -> dict[str, object]:
+def _assert_candidate_scope(context: dict[str, object] | None = None) -> dict[str, object]:
+    context = _execution_context() if context is None else context
     head = _git("rev-parse", "HEAD")
     parent = _git("rev-parse", "HEAD^")
     tree = _git("rev-parse", "HEAD^{tree}")
     branch = _git("branch", "--show-current")
-    if branch != TARGET_BRANCH or not _valid_candidate_parent(parent):
-        raise RuntimeError(f"unexpected branch/parent: {branch} {parent}")
+    mode = context.get("mode")
+    if mode == LOCAL_ENDPOINT_MODE:
+        if branch != TARGET_BRANCH:
+            raise RuntimeError(f"unexpected local candidate branch: {branch}")
+    elif mode == HOSTED_EXACT_HEAD_MODE:
+        expected_head = context.get("expected_head")
+        if not _full_sha(expected_head) or head.lower() != str(expected_head).lower():
+            raise RuntimeError("hosted checkout does not match the exact event head")
+    else:
+        raise RuntimeError("invalid candidate execution context")
+    if not _valid_candidate_parent(parent):
+        raise RuntimeError(f"unexpected candidate parent/lineage: {parent}")
     if _git("rev-parse", f"{BASE_HEAD}^{{tree}}") != BASE_TREE:
         raise RuntimeError("admitted product tree changed")
     entries = _git("diff", "--name-status", BASE_HEAD, head).splitlines()
@@ -916,6 +1069,7 @@ def _assert_candidate_scope() -> dict[str, object]:
         "tree": tree,
         "parent": parent,
         "branch": branch,
+        "execution_context": _receipt_context_binding(context),
         "changed_paths": sorted(
             ["energygrid-bill-downloader/tests/test_one_shot_supervisor.py", *HELPER_RELATIVES]
         ),
@@ -924,13 +1078,17 @@ def _assert_candidate_scope() -> dict[str, object]:
     }
 
 
-def _fresh_receipt(receipt_path: Path) -> dict[str, object]:
-    candidate = _assert_candidate_scope()
+def _fresh_receipt(
+    receipt_path: Path, context: dict[str, object] | None = None
+) -> dict[str, object]:
+    context = _execution_context() if context is None else context
+    candidate = _assert_candidate_scope(context)
     created = datetime.now(timezone.utc)
     return {
         "schema": "energygrid.supervisor-harness-custody.v1",
         "run_id": _custody_run_id(receipt_path),
         "created_utc": created.isoformat(),
+        "execution_context": _receipt_context_binding(context),
         "candidate": candidate,
         "helpers": [_identity(item) for item in HELPERS],
         "test_identity": _identity(Path(__file__).resolve()),
@@ -945,6 +1103,40 @@ def _fresh_receipt(receipt_path: Path) -> dict[str, object]:
         "phase_history": [],
         "cleanup": "PENDING",
     }
+
+
+def _create_hosted_receipt(context: dict[str, object]) -> Path:
+    if context.get("mode") != HOSTED_EXACT_HEAD_MODE:
+        raise RuntimeError("hosted receipt creation requires HOSTED_EXACT_HEAD context")
+    runner_temp = Path(str(context.get("runner_temp", ""))).resolve()
+    if not runner_temp.is_dir():
+        raise RuntimeError("GitHub runner temporary directory is unavailable")
+    receipt_path = runner_temp / f"eg212-custody-{uuid.uuid4()}.json"
+    receipt = _fresh_receipt(receipt_path, context)
+    descriptor = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(receipt, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+    except BaseException:
+        try:
+            receipt_path.unlink()
+        except OSError:
+            pass
+        raise
+    return receipt_path.resolve()
+
+
+def _cleanup_hosted_receipt(receipt_path: Path, runner_temp: Path) -> None:
+    try:
+        if receipt_path.is_file() and _path_is_within(receipt_path, runner_temp) and \
+                receipt_path.resolve().parent == runner_temp.resolve() and \
+                CUSTODY_RECEIPT_NAME.fullmatch(receipt_path.name):
+            receipt = _load_receipt(receipt_path)
+            if receipt.get("execution_context", {}).get("mode") == HOSTED_EXACT_HEAD_MODE:
+                receipt_path.unlink()
+    except (OSError, RuntimeError, AttributeError, TypeError, json.JSONDecodeError):
+        return
 
 
 def _load_receipt(path: Path) -> dict[str, object]:
@@ -968,6 +1160,9 @@ def _endpoint_state(receipt: dict[str, object]) -> str:
         return "ENDPOINT_ACCEPTANCE_FAIL"
     if observation.get("detection_events") == "ATTRIBUTABLE":
         return "ENDPOINT_ACCEPTANCE_FAIL"
+    context = receipt.get("execution_context")
+    if not isinstance(context, dict) or context.get("mode") != LOCAL_ENDPOINT_MODE:
+        return "ENDPOINT_EVIDENCE_UNAVAILABLE"
     if observation.get("protection_enabled") == "YES" and \
             observation.get("coverage") == "PASS" and \
             observation.get("detection_events") == "NONE":
@@ -976,10 +1171,15 @@ def _endpoint_state(receipt: dict[str, object]) -> str:
 
 
 def _custody_check(path: Path, phase: str = "check") -> dict[str, object]:
+    context = _execution_context()
+    _assert_current_receipt_path(path)
     receipt = _load_receipt(path)
+    if receipt.get("execution_context") != _receipt_context_binding(context):
+        raise RuntimeError("custody receipt execution context changed")
     recorded = receipt["candidate"]
-    current = _assert_candidate_scope()
-    if any(recorded.get(key) != current[key] for key in ("head", "tree", "parent")):
+    current = _assert_candidate_scope(context)
+    if any(recorded.get(key) != current[key]
+           for key in ("head", "tree", "parent", "execution_context")):
         raise RuntimeError("candidate identity changed after freeze")
     endpoint = _endpoint_state(receipt)
     if endpoint == "ENDPOINT_ACCEPTANCE_FAIL":
@@ -1026,11 +1226,16 @@ def _custody_check(path: Path, phase: str = "check") -> dict[str, object]:
     path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"receipt": receipt, "endpoint_state": endpoint}
 def _record_endpoint_evidence(args: argparse.Namespace) -> None:
+    context = _execution_context()
+    if context.get("mode") != LOCAL_ENDPOINT_MODE:
+        raise RuntimeError("endpoint evidence can only be recorded in LOCAL_ENDPOINT mode")
     path = Path(args.receipt).expanduser()
     if not path.is_absolute():
         raise RuntimeError("custody receipt must be absolute")
     _assert_current_receipt_path(path)
     receipt = _load_receipt(path)
+    if receipt.get("execution_context") != _receipt_context_binding(context):
+        raise RuntimeError("custody receipt execution context changed")
     if args.enabled not in {"YES", "NO"} or args.coverage not in {"PASS", "FAIL", "UNKNOWN"}:
         raise RuntimeError("invalid endpoint status")
     if args.detections not in {"NONE", "ATTRIBUTABLE", "UNKNOWN"}:
@@ -1326,26 +1531,309 @@ class SupervisorHarnessSourceTests(unittest.TestCase):
         _assert_source_binding()
 
 
-class SupervisorCustodyRegressionTests(unittest.TestCase):
-    def _candidate_scope(self):
+def _synthetic_candidate_scope() -> dict[str, object]:
+    return {
+        "head": _git("rev-parse", "HEAD"),
+        "tree": _git("rev-parse", "HEAD^{tree}"),
+        "parent": _git("rev-parse", "HEAD^"),
+        "branch": TARGET_BRANCH,
+        "execution_context": {"mode": LOCAL_ENDPOINT_MODE},
+        "changed_paths": sorted([
+            "energygrid-bill-downloader/tests/test_one_shot_supervisor.py",
+            *HELPER_RELATIVES,
+        ]),
+        "changed_path_count": 7,
+        "protected_base_path_count": 42,
+    }
+
+
+class HostedCustodyContextRegressionTests(unittest.TestCase):
+    def _hosted_environment(
+        self,
+        runner_temp: Path,
+        *,
+        event_name: str,
+        expected_head: str,
+        github_sha: str | None = None,
+    ) -> dict[str, str]:
+        event_path = runner_temp / "event.json"
+        if event_name == "pull_request":
+            event = {
+                "number": 229,
+                "repository": {"full_name": GITHUB_REPOSITORY},
+                "pull_request": {
+                    "number": 229,
+                    "head": {
+                        "sha": expected_head,
+                        "ref": TARGET_BRANCH,
+                        "repo": {"full_name": GITHUB_REPOSITORY},
+                    },
+                    "base": {
+                        "ref": "main",
+                        "repo": {"full_name": GITHUB_REPOSITORY},
+                    },
+                },
+            }
+            ref = "refs/pull/229/merge"
+        else:
+            event = {
+                "ref": TARGET_BRANCH,
+                "repository": {"full_name": GITHUB_REPOSITORY},
+            }
+            ref = f"refs/heads/{TARGET_BRANCH}"
+        event_path.write_text(json.dumps(event), encoding="utf-8")
         return {
-            "head": _git("rev-parse", "HEAD"),
-            "tree": _git("rev-parse", "HEAD^{tree}"),
-            "parent": _git("rev-parse", "HEAD^"),
-            "branch": TARGET_BRANCH,
-            "changed_paths": sorted([
-                "energygrid-bill-downloader/tests/test_one_shot_supervisor.py",
-                *HELPER_RELATIVES,
-            ]),
-            "changed_path_count": 7,
-            "protected_base_path_count": 42,
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REPOSITORY": GITHUB_REPOSITORY,
+            "GITHUB_WORKFLOW": GITHUB_WORKFLOW,
+            "GITHUB_JOB": GITHUB_JOB,
+            "GITHUB_WORKSPACE": str(REPO_ROOT),
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_EVENT_NAME": event_name,
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_SHA": github_sha or expected_head,
+            "GITHUB_REF": ref,
+            "GITHUB_RUN_ID": "37303332493",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "RUNNER_OS": "Windows",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_TEMP": str(runner_temp),
         }
 
+    def _hosted_context(
+        self, runner_temp: Path, *, event_name: str = "pull_request",
+        expected_head: str | None = None, github_sha: str | None = None,
+        actual_head: str | None = None,
+    ) -> dict[str, object]:
+        actual_head = actual_head or _git("rev-parse", "HEAD")
+        environment = self._hosted_environment(
+            runner_temp, event_name=event_name,
+            expected_head=expected_head or actual_head, github_sha=github_sha,
+        )
+        return _execution_context(environment, actual_head=actual_head)
+
+    def _hosted_receipt(self, runner_temp: Path):
+        context = self._hosted_context(runner_temp)
+        return context, _create_hosted_receipt(context)
+
+    def _assert_identity_drift(self, receipt_path: Path, context, changed_path: Path) -> None:
+        original_identity = _identity
+        candidate_scope = _synthetic_candidate_scope()
+        candidate_scope["execution_context"] = _receipt_context_binding(context)
+
+        def changed_identity(path: Path) -> dict[str, object]:
+            result = original_identity(path)
+            if path.resolve() == changed_path.resolve():
+                result = result | {"sha256": "0" * 64}
+            return result
+
+        with mock.patch(__name__ + "._execution_context", return_value=context), \
+                mock.patch(__name__ + "._receipt_path", return_value=receipt_path), \
+                mock.patch(__name__ + "._assert_candidate_scope",
+                           return_value=candidate_scope), \
+                mock.patch(__name__ + "._identity", side_effect=changed_identity):
+            with self.assertRaisesRegex(RuntimeError, "HELPER_IDENTITY_CHANGED"):
+                _custody_check(receipt_path)
+
+    def test_h1_missing_local_receipt_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "no valid local receipt"):
+            _execution_context({})
+        with self.assertRaisesRegex(RuntimeError, "EG_SUPERVISOR_CUSTODY_RECEIPT is required"):
+            _execution_context({"EG_SUPERVISOR_CUSTODY_RECEIPT": ""})
+
+    def test_h2_local_mode_rejects_wrong_named_branch(self):
+        context = {"mode": LOCAL_ENDPOINT_MODE, "receipt_path": "C:/temp/receipt.json"}
+        original_git = _git
+
+        def wrong_branch(*arguments: str) -> str:
+            if arguments == ("branch", "--show-current"):
+                return "codex/wrong-branch"
+            return original_git(*arguments)
+
+        with mock.patch(__name__ + "._git", side_effect=wrong_branch):
+            with self.assertRaisesRegex(RuntimeError, "unexpected local candidate branch"):
+                _assert_candidate_scope(context)
+
+    def test_h3_pull_request_exact_head_accepts_detached_checkout(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h3_hosted_") as directory:
+            context = self._hosted_context(Path(directory))
+            original_git = _git
+
+            def detached(*arguments: str) -> str:
+                if arguments == ("branch", "--show-current"):
+                    return ""
+                return original_git(*arguments)
+
+            with mock.patch(__name__ + "._git", side_effect=detached):
+                candidate = _assert_candidate_scope(context)
+            self.assertEqual(HOSTED_EXACT_HEAD_MODE, candidate["execution_context"]["mode"])
+            self.assertEqual(_git("rev-parse", "HEAD"), candidate["head"])
+
+    def test_h4_workflow_dispatch_uses_trusted_github_sha(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h4_hosted_") as directory:
+            head = _git("rev-parse", "HEAD")
+            context = self._hosted_context(
+                Path(directory), event_name="workflow_dispatch", github_sha=head,
+            )
+            original_git = _git
+
+            def detached(*arguments: str) -> str:
+                if arguments == ("branch", "--show-current"):
+                    return ""
+                return original_git(*arguments)
+
+            with mock.patch(__name__ + "._git", side_effect=detached):
+                candidate = _assert_candidate_scope(context)
+            self.assertEqual(head, context["expected_head"])
+            self.assertEqual(head, candidate["head"])
+
+    def test_h5_pull_request_expected_sha_mismatch_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h5_hosted_") as directory:
+            environment = self._hosted_environment(
+                Path(directory), event_name="pull_request", expected_head="f" * 40,
+                github_sha="e" * 40,
+            )
+            with self.assertRaisesRegex(RuntimeError, "actual HEAD does not match"):
+                _execution_context(environment, actual_head=_git("rev-parse", "HEAD"))
+        with tempfile.TemporaryDirectory(prefix="eg_h5_dispatch_") as directory:
+            environment = self._hosted_environment(
+                Path(directory), event_name="workflow_dispatch", expected_head="f" * 40,
+                github_sha="e" * 40,
+            )
+            with self.assertRaisesRegex(RuntimeError, "actual HEAD does not match"):
+                _execution_context(environment, actual_head=_git("rev-parse", "HEAD"))
+
+    def test_h6_partial_or_fake_github_environment_fails(self):
+        partial = {
+            "GITHUB_ACTIONS": "true", "RUNNER_OS": "Windows",
+            "GITHUB_SHA": _git("rev-parse", "HEAD"),
+        }
+        with self.assertRaisesRegex(RuntimeError, "complete GitHub Actions context"):
+            _execution_context(partial)
+
+    def test_h7_hosted_receipt_is_ephemeral_and_endpoint_unavailable(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h7_hosted_") as directory:
+            context, receipt_path = self._hosted_receipt(Path(directory))
+            receipt = _load_receipt(receipt_path)
+            self.assertTrue(_path_is_within(receipt_path, Path(directory)))
+            self.assertEqual(
+                _receipt_context_binding(context), receipt["execution_context"],
+            )
+            self.assertEqual(
+                "ENDPOINT_EVIDENCE_UNAVAILABLE",
+                receipt["endpoint_observation"]["status"],
+            )
+            self.assertEqual("ENDPOINT_EVIDENCE_UNAVAILABLE", _endpoint_state(receipt))
+
+    def test_h8_hosted_endpoint_evidence_cannot_be_recorded_or_passed(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h8_hosted_") as directory:
+            context, receipt_path = self._hosted_receipt(Path(directory))
+            receipt = _load_receipt(receipt_path)
+            receipt["endpoint_observation"].update({
+                "checked_utc": datetime.now(timezone.utc).isoformat(),
+                "protection_enabled": "YES", "coverage": "PASS",
+                "detection_events": "NONE", "quarantined_paths": [],
+                "status": "ENDPOINT_ACCEPTANCE_PASS",
+            })
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            self.assertEqual("ENDPOINT_EVIDENCE_UNAVAILABLE", _endpoint_state(receipt))
+            quarantined = json.loads(json.dumps(receipt))
+            quarantined["endpoint_observation"]["quarantined_paths"] = [HELPER_RELATIVES[0]]
+            self.assertEqual("ENDPOINT_ACCEPTANCE_FAIL", _endpoint_state(quarantined))
+            before = receipt_path.read_bytes()
+            args = argparse.Namespace(
+                receipt=str(receipt_path), enabled="YES", coverage="PASS",
+                detections="NONE", quarantined_path=None, note="forbidden hosted write",
+            )
+            with mock.patch(__name__ + "._execution_context", return_value=context), \
+                    mock.patch(__name__ + "._receipt_path", return_value=receipt_path):
+                with self.assertRaisesRegex(RuntimeError, "only be recorded in LOCAL_ENDPOINT"):
+                    _record_endpoint_evidence(args)
+            self.assertEqual(before, receipt_path.read_bytes())
+
+    def test_h9_hosted_helper_identity_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h9_hosted_") as directory:
+            context, receipt_path = self._hosted_receipt(Path(directory))
+            self._assert_identity_drift(receipt_path, context, HELPERS[0])
+
+    def test_h10_hosted_test_identity_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h10_hosted_") as directory:
+            context, receipt_path = self._hosted_receipt(Path(directory))
+            self._assert_identity_drift(receipt_path, context, Path(__file__).resolve())
+
+    def test_h11_hosted_supervisor_identity_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h11_hosted_") as directory:
+            context, receipt_path = self._hosted_receipt(Path(directory))
+            self._assert_identity_drift(receipt_path, context, SUPERVISOR)
+
+    def test_h12_hosted_parent_lineage_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h12_hosted_") as directory:
+            context = self._hosted_context(Path(directory))
+            with mock.patch(__name__ + "._valid_candidate_parent", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "candidate parent/lineage"):
+                    _assert_candidate_scope(context)
+
+    def test_h13_hosted_base_tree_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h13_hosted_") as directory:
+            context = self._hosted_context(Path(directory))
+            original_git = _git
+
+            def changed_base_tree(*arguments: str) -> str:
+                if arguments == ("rev-parse", f"{BASE_HEAD}^{{tree}}"):
+                    return "0" * 40
+                return original_git(*arguments)
+
+            with mock.patch(__name__ + "._git", side_effect=changed_base_tree):
+                with self.assertRaisesRegex(RuntimeError, "admitted product tree changed"):
+                    _assert_candidate_scope(context)
+
+    def test_h14_hosted_seven_path_scope_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h14_hosted_") as directory:
+            context = self._hosted_context(Path(directory))
+            head = _git("rev-parse", "HEAD")
+            original_git = _git
+
+            def changed_scope(*arguments: str) -> str:
+                if arguments == ("diff", "--name-status", BASE_HEAD, head):
+                    return "M\tREADME.md"
+                return original_git(*arguments)
+
+            with mock.patch(__name__ + "._git", side_effect=changed_scope):
+                with self.assertRaisesRegex(RuntimeError, "exact seven-path envelope"):
+                    _assert_candidate_scope(context)
+
+    def test_h15_local_named_branch_positive_control_remains_valid(self):
+        with tempfile.TemporaryDirectory(prefix="eg_h15_local_") as directory:
+            context = {
+                "mode": LOCAL_ENDPOINT_MODE,
+                "receipt_path": str(Path(directory) / f"eg212-custody-{uuid.uuid4()}.json"),
+            }
+            original_git = _git
+
+            def named_branch(*arguments: str) -> str:
+                if arguments == ("branch", "--show-current"):
+                    return TARGET_BRANCH
+                return original_git(*arguments)
+
+            with mock.patch(__name__ + "._git", side_effect=named_branch):
+                candidate = _assert_candidate_scope(context)
+            self.assertEqual(TARGET_BRANCH, candidate["branch"])
+            self.assertEqual(7, candidate["changed_path_count"])
+            self.assertEqual(42, candidate["protected_base_path_count"])
+
+
+class SupervisorCustodyRegressionTests(unittest.TestCase):
+    def _candidate_scope(self):
+        return _synthetic_candidate_scope()
+
     def _receipt(self, path: Path, observation: dict[str, object] | None = None):
+        context = {"mode": LOCAL_ENDPOINT_MODE, "receipt_path": str(path.resolve())}
         with mock.patch(
                 __name__ + "._assert_candidate_scope",
                 return_value=self._candidate_scope()):
-            receipt = _fresh_receipt(path)
+            receipt = _fresh_receipt(path, context)
         if observation:
             receipt["endpoint_observation"].update(observation)
         path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1358,6 +1846,10 @@ class SupervisorCustodyRegressionTests(unittest.TestCase):
         )
         with mock.patch.dict(os.environ, {"EG_SUPERVISOR_CUSTODY_RECEIPT": str(path)}):
             _record_endpoint_evidence(args)
+
+    def _check(self, path: Path):
+        with mock.patch.dict(os.environ, {"EG_SUPERVISOR_CUSTODY_RECEIPT": str(path)}):
+            return _custody_check(path)
 
     def test_f1_endpoint_state_regressions_r1_r4_r5_r7(self):
         with tempfile.TemporaryDirectory(prefix="eg_f1_state_") as directory:
@@ -1385,7 +1877,7 @@ class SupervisorCustodyRegressionTests(unittest.TestCase):
                     __name__ + "._assert_candidate_scope",
                     return_value=self._candidate_scope()):
                 self.assertEqual("ENDPOINT_ACCEPTANCE_PASS",
-                                 _custody_check(receipt_path)["endpoint_state"])
+                                 self._check(receipt_path)["endpoint_state"])
 
             for label, update in (
                 ("F1-R1", {"quarantined_paths": [HELPER_RELATIVES[0]]}),
@@ -1406,7 +1898,7 @@ class SupervisorCustodyRegressionTests(unittest.TestCase):
                             __name__ + "._assert_candidate_scope",
                             return_value=self._candidate_scope()):
                         with self.assertRaisesRegex(RuntimeError, "ENDPOINT_ACCEPTANCE_FAIL"):
-                            _custody_check(receipt_path)
+                            self._check(receipt_path)
 
     def test_f1_quarantine_and_detection_history_cannot_be_cleared_r3_r6(self):
         with tempfile.TemporaryDirectory(prefix="eg_f1_history_") as directory:
@@ -1432,7 +1924,7 @@ class SupervisorCustodyRegressionTests(unittest.TestCase):
                     __name__ + "._assert_candidate_scope",
                     return_value=self._candidate_scope()):
                 with self.assertRaisesRegex(RuntimeError, "ENDPOINT_ACCEPTANCE_FAIL"):
-                    _custody_check(receipt_path)
+                    self._check(receipt_path)
 
             detection_path = Path(directory) / (
                 "eg212-custody-" + str(uuid.uuid4()) + ".json"
@@ -1462,7 +1954,7 @@ class SupervisorCustodyRegressionTests(unittest.TestCase):
                             return_value=self._candidate_scope()):
                 with mock.patch(__name__ + ".HELPERS", (missing_helper,)):
                     with self.assertRaisesRegex(RuntimeError, "ENDPOINT_ACCEPTANCE_FAIL"):
-                        _custody_check(receipt_path)
+                        self._check(receipt_path)
 
 
 class SupervisorSaturationRegressionTests(unittest.TestCase):
@@ -1545,7 +2037,13 @@ class SupervisorHarnessCleanupTests(unittest.TestCase):
             receipt_path = Path(directory) / (
                 "eg212-custody-" + str(uuid.uuid4()) + ".json"
             )
-            receipt = _fresh_receipt(receipt_path)
+            with mock.patch(
+                    __name__ + "._assert_candidate_scope",
+                    return_value=_synthetic_candidate_scope()):
+                receipt = _fresh_receipt(receipt_path, {
+                    "mode": LOCAL_ENDPOINT_MODE,
+                    "receipt_path": str(receipt_path.resolve()),
+                })
             receipt["endpoint_observation"].update({
                 "checked_utc": datetime.now(timezone.utc).isoformat(),
                 "protection_enabled": "YES",
