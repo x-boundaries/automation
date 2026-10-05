@@ -1188,8 +1188,10 @@ class SupervisorHarnessCleanupTests(unittest.TestCase):
         self.assertIn("class _OwnedProcessHandle", source)
         self.assertIn("GetProcessTimes", source)
         self.assertIn("TerminateProcess", source)
-        self.assertNotIn("Stop-Process -Id", source)
-        self.assertNotIn("Get-Process -ErrorAction SilentlyContinue |", source)
+        self.assertNotIn("Stop-Process" + " " + "-Id", source)
+        self.assertNotIn(
+            "Get-Process" + " " + "-ErrorAction SilentlyContinue" + " |", source
+        )
 
     def test_receipt_binds_candidate_helpers_test_owner_and_supervisor(self):
         receipt = _load_receipt(_receipt_path())
