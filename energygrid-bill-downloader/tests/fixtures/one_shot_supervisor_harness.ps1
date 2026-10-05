@@ -171,6 +171,12 @@ function Export-EgSourceEvidence {
     $outcomeVariants = @{}
     $outcomeVariants['Write-EgOutcomeWithTimeoutControl'] =
         (Get-EgFunction -Ast $fixtureAst -Name 'Write-EgOutcomeWithTimeoutControl').Extent.Text
+    $n10Controls = @{
+        'Open-EgN10QueryProcess' =
+            (Get-EgFunction -Ast $fixtureAst -Name 'Open-EgN10QueryProcess').Extent.Text
+        'Get-EgN10ProcessIds' =
+            (Get-EgFunction -Ast (Get-EgAst -Path $PSCommandPath) -Name 'Get-EgN10ProcessIds').Extent.Text
+    }
     $nativeAssignment = Get-EgAssignment -Ast $productionAst -Left '$script:EgNativeSource'
     $nativeSource = $nativeAssignment.Right.Expression.Value
     $nativeMethodStart = $nativeSource.IndexOf(
@@ -188,6 +194,7 @@ function Export-EgSourceEvidence {
         assignments = $assignments
         variants = $variants
         outcome_variants = $outcomeVariants
+        n10_controls = $n10Controls
         n7_native_method = $nativeMethod
     } |
         ConvertTo-Json -Depth 8 -Compress
@@ -2306,7 +2313,7 @@ function Get-EgN5ProcessIds {
 
 function Get-EgN10ProcessIds {
     param([IntPtr]$JobHandle)
-    return Add-EgObserverInjectedPid -JobHandle $JobHandle -ProcessId ([uint32]4)
+    return Add-EgObserverInjectedPid -JobHandle $JobHandle -ProcessId ([uint32]4294967291)
 }
 
 function Get-EgN11ProcessMetadata {
@@ -2656,10 +2663,6 @@ function Invoke-EgObserverCases {
             if ($case.Name -ceq 'N11_no_row_candidate_live') {
                 Assert-EgObserver ($script:EgState.observer_failed -and -not $observed) 'N11_live_no_row_not_fail_closed'
             }
-            if ($case.Name -ceq 'N10_open_error_non_87') {
-                $open = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]4)
-                Assert-EgObserver (-not $open.Succeeded -and $open.ErrorCode -ne 87) 'N10_expected_non87_open_error_missing'
-            }
             if ($case.Name -ceq 'N14_deadline_guard') {
                 Write-Output 'observer_deadline_guard_metadata_calls=0'
             }
@@ -2762,11 +2765,31 @@ function Invoke-EgObserverCases {
     $runtime = Start-EgObserverRuntime -Name 'N10' -Mode 'idle' -Values @{}
     try {
         $script:EgConfigPathNormal = $runtime.ConfigPath
+        $nativeOpen = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess($runtime.Launcher.ProcessId)
+        $delegatedOpen = Open-EgN10QueryProcess -ProcessId $runtime.Launcher.ProcessId
+        try {
+            Assert-EgObserver ($nativeOpen.Succeeded -and $delegatedOpen.Succeeded -and
+                $nativeOpen.ErrorCode -eq $delegatedOpen.ErrorCode -and
+                $delegatedOpen.Handle -ne [IntPtr]::Zero) 'N10_non_sentinel_native_delegation_failed'
+            $delegatedLive = [EnergyGridOneShotSupervisorNative]::GetProcessLive($delegatedOpen.Handle)
+            Assert-EgObserver ($delegatedLive.Succeeded -and $delegatedLive.Live) 'N10_delegated_native_handle_not_live'
+        }
+        finally {
+            Close-EgObserverHandle -Handle $nativeOpen.Handle
+            Close-EgObserverHandle -Handle $delegatedOpen.Handle
+        }
+        Write-Output 'observer_n10_non_sentinel_native=PASS'
+        $script:EgN10InjectedOpenResult = $null
         New-EgObserverState
         $observed = Invoke-EgObserverFunction -Name 'N10' -Runtime $runtime -StartTicks $runtime.StartTicks
+        $open = $script:EgN10InjectedOpenResult
+        Assert-EgObserver ($null -ne $open -and -not $open.Succeeded -and
+            $open.ErrorCode -eq 5 -and $open.ErrorCode -ne 87 -and
+            $open.Handle -eq [IntPtr]::Zero) 'N10_injected_non87_open_error_missing'
+        Write-Output ('observer_n10_injected_open=PASS sentinel=4294967291 succeeded=' +
+            [string]$open.Succeeded + ' error_code=' + [string]$open.ErrorCode +
+            ' non87=' + [string]($open.ErrorCode -ne 87))
         Assert-EgObserver (-not $observed -and $script:EgState.observer_failed) 'N10_non87_not_fail_closed'
-        $open = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]4)
-        Assert-EgObserver (-not $open.Succeeded -and $open.ErrorCode -ne 87) 'N10_expected_non87_open_error_missing'
         Finish-EgObserverCase -Name 'N10_open_error_non_87' -Observed $observed -Runtime $runtime
     }
     finally { if ($Runtime.JobHandle -ne [IntPtr]::Zero) { [void](Close-EgObserverRuntime -Runtime $Runtime) } }

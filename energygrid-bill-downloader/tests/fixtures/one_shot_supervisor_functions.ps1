@@ -932,6 +932,19 @@ function Test-EgN5ApplicationChild {
     return $false
 }
 
+function Open-EgN10QueryProcess {
+    param([uint32]$ProcessId)
+    if ($ProcessId -eq [uint32]4294967291) {
+        $script:EgN10InjectedOpenResult = [pscustomobject]@{
+            Succeeded = $false
+            ErrorCode = 5
+            Handle = [IntPtr]::Zero
+        }
+        return $script:EgN10InjectedOpenResult
+    }
+    return [EnergyGridOneShotSupervisorNative]::OpenQueryProcess($ProcessId)
+}
+
 function Test-EgN10ApplicationChild {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$JobHandle,
@@ -953,7 +966,7 @@ function Test-EgN10ApplicationChild {
     foreach ($candidatePid in $pidResult.ProcessIds) {
         if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $observerDeadline) { break }
         if ([uint32]$candidatePid -eq $LauncherPid) { continue }
-        $candidate = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]$candidatePid)
+        $candidate = Open-EgN10QueryProcess -ProcessId ([uint32]$candidatePid)
         if (-not $candidate.Succeeded) {
             # A listed descendant that has already exited and been released is absent, not
             # unprovable. Every other open failure remains an observer failure.

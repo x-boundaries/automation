@@ -1411,8 +1411,42 @@ def _assert_source_binding() -> None:
         if renamed == variant or variant.count(callsite) != 1:
             raise AssertionError("observer variant substitution count mismatch: " + name)
         normalized = renamed.replace(callsite, production_call, 1)
+        if name == "Test-EgN10ApplicationChild":
+            open_call = "Open-EgN10QueryProcess -ProcessId ([uint32]$candidatePid)"
+            if variant.count(open_call) != 1:
+                raise AssertionError("N10 open substitution count mismatch")
+            normalized = normalized.replace(
+                open_call,
+                "[EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]$candidatePid)",
+                1,
+            )
         if normalized != production_observer:
-            raise AssertionError("observer source variant differs beyond its one callsite: " + name)
+            raise AssertionError("observer source variant differs beyond its authorized callsites: " + name)
+
+    n10_controls = {
+        "Open-EgN10QueryProcess": """function Open-EgN10QueryProcess {
+    param([uint32]$ProcessId)
+    if ($ProcessId -eq [uint32]4294967291) {
+        $script:EgN10InjectedOpenResult = [pscustomobject]@{
+            Succeeded = $false
+            ErrorCode = 5
+            Handle = [IntPtr]::Zero
+        }
+        return $script:EgN10InjectedOpenResult
+    }
+    return [EnergyGridOneShotSupervisorNative]::OpenQueryProcess($ProcessId)
+}""",
+        "Get-EgN10ProcessIds": """function Get-EgN10ProcessIds {
+    param([IntPtr]$JobHandle)
+    return Add-EgObserverInjectedPid -JobHandle $JobHandle -ProcessId ([uint32]4294967291)
+}""",
+    }
+    if set(evidence["n10_controls"]) != set(n10_controls):
+        raise AssertionError("N10 source control manifest mismatch")
+    for name, expected_control in n10_controls.items():
+        actual_control = evidence["n10_controls"][name].replace("\r\n", "\n").replace("\r", "\n")
+        if actual_control != expected_control:
+            raise AssertionError("N10 deterministic source control mismatch: " + name)
 
     outcome_variants = evidence["outcome_variants"]
     if set(outcome_variants) != {"Write-EgOutcomeWithTimeoutControl"}:
@@ -1545,6 +1579,68 @@ def _synthetic_candidate_scope() -> dict[str, object]:
         "changed_path_count": 7,
         "protected_base_path_count": 42,
     }
+
+
+class N10SourceBindingRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.evidence = _source_evidence()
+
+    def _assert_rejected(self, evidence, message):
+        with mock.patch(__name__ + "._source_evidence", return_value=evidence):
+            with self.assertRaisesRegex(AssertionError, message):
+                _assert_source_binding()
+
+    def test_n10_error_and_native_delegation_cannot_drift(self):
+        for original, replacement in (
+            ("ErrorCode = 5", "ErrorCode = 87"),
+            ("OpenQueryProcess($ProcessId)", "OpenQueryProcess([uint32]0)"),
+        ):
+            with self.subTest(replacement=replacement):
+                evidence = json.loads(json.dumps(self.evidence))
+                control = evidence["n10_controls"]["Open-EgN10QueryProcess"]
+                self.assertEqual(1, control.count(original))
+                evidence["n10_controls"]["Open-EgN10QueryProcess"] = control.replace(
+                    original, replacement, 1,
+                )
+                self._assert_rejected(evidence, "N10 deterministic source control mismatch")
+
+    def test_n10_sentinel_cannot_be_replaced_with_pid4(self):
+        for name in self.evidence["n10_controls"]:
+            with self.subTest(control=name):
+                evidence = json.loads(json.dumps(self.evidence))
+                control = evidence["n10_controls"][name]
+                self.assertEqual(1, control.count("[uint32]4294967291"))
+                evidence["n10_controls"][name] = control.replace(
+                    "[uint32]4294967291", "[uint32]4", 1,
+                )
+                self._assert_rejected(evidence, "N10 deterministic source control mismatch")
+
+    def test_n10_open_seam_and_other_observer_branches_are_bound(self):
+        for original, replacement, message in (
+            ("Open-EgN10QueryProcess -ProcessId ([uint32]$candidatePid)",
+             "[EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]$candidatePid)",
+             "N10 open substitution count mismatch"),
+            ("$script:EgState.observer_failed = $true",
+             "$script:EgState.observer_failed = $false",
+             "observer source variant differs beyond its authorized callsites"),
+        ):
+            with self.subTest(replacement=replacement):
+                evidence = json.loads(json.dumps(self.evidence))
+                evidence["variants"]["Test-EgN10ApplicationChild"] = evidence["variants"][
+                    "Test-EgN10ApplicationChild"
+                ].replace(original, replacement, 1)
+                self._assert_rejected(evidence, message)
+
+    def test_n10_control_manifest_cannot_omit_or_add_a_seam(self):
+        for extra in (False, True):
+            with self.subTest(extra=extra):
+                evidence = json.loads(json.dumps(self.evidence))
+                if extra:
+                    evidence["n10_controls"]["Unapproved-Control"] = ""
+                else:
+                    del evidence["n10_controls"]["Open-EgN10QueryProcess"]
+                self._assert_rejected(evidence, "N10 source control manifest mismatch")
 
 
 class HostedCustodyContextRegressionTests(unittest.TestCase):
@@ -2339,7 +2435,7 @@ class SupervisorRealObserverTests(unittest.TestCase):
             "N7_provider_timeout observed=False observer_failed=True verdict=AMBIGUOUS",
             "N8_launcher_dead observed=False observer_failed=False",
             "N9_child_dead observed=False observer_failed=False",
-            "N10_open_error_non_87 observed=False observer_failed=True",
+            "N10_open_error_non_87 observed=False observer_failed=True verdict=AMBIGUOUS",
             "N11_no_row_candidate_live observed=False observer_failed=True",
             "N12_late_success_after_timeout observed=False observer_failed=True",
             "N13_real_no_row_after_exit observed=False observer_failed=False",
@@ -2356,6 +2452,11 @@ class SupervisorRealObserverTests(unittest.TestCase):
         self.assertIn("observer_n7_injection=PASS calls=1 target_pid=", output)
         self.assertIn("observer_n7_idle_after_release=PASS", output)
         self.assertIn("observer_deadline_guard_metadata_calls=0", output)
+        self.assertIn("observer_n10_non_sentinel_native=PASS", output)
+        self.assertIn(
+            "observer_n10_injected_open=PASS sentinel=4294967291 succeeded=False "
+            "error_code=5 non87=True", output,
+        )
         self.assertIn("observer_leftover_processes=0", output)
         self.assertIn("real_observer_matrix=PASS cases=17 budget_ms=1000", output)
 
