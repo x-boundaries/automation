@@ -73,16 +73,31 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
-def _module_child(operation: str, config_path: str) -> subprocess.Popen[bytes]:
+def _module_child(
+    operation: str, config_path: str, *, canonical_command_line: bool = False
+) -> subprocess.Popen[bytes]:
+    arguments = [
+        sys.executable,
+        "-m",
+        "energygrid_bill_downloader",
+        operation,
+        "--config",
+        config_path,
+    ]
+    if canonical_command_line and os.name == "nt":
+        if any('"' in argument for argument in arguments):
+            raise ValueError("canonical fixture arguments cannot contain quotes")
+        return subprocess.Popen(
+            " ".join(f'"{argument}"' for argument in arguments),
+            executable=sys.executable,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            env=_child_environment(),
+        )
     return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "energygrid_bill_downloader",
-            operation,
-            "--config",
-            config_path,
-        ],
+        arguments,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -176,7 +191,7 @@ def _noise_child(config_path: str) -> int:
 
 def _wrong_parent_child(config_path: str) -> int:
     config = _read_config(config_path)
-    child = _module_child("run", config_path)
+    child = _module_child("run", config_path, canonical_command_line=True)
     try:
         time.sleep(_bounded_delay(config.get("wrong_parent_delay_seconds"), 30.0))
         if child.poll() is None:
