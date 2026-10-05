@@ -3059,6 +3059,7 @@ switch ($Phase) {
     }
     'EndToEnd' {
         Assert-EgReceiptHelpers -Path $ReceiptPath
+        . $FunctionsPath
         Invoke-EgEndToEndCases
     }
     'CrashOwner' {
