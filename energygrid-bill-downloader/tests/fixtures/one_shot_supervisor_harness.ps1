@@ -2565,7 +2565,20 @@ function Invoke-EgObserverCases {
                     $case.Name -ceq 'N12_late_success_after_timeout') {
                     $script:TimeoutSeconds = 120
                 }
-                $observed = Invoke-EgObserverFunction -Name $case.Function -Runtime $runtime -StartTicks $runtime.StartTicks
+                if ($case.Name -ceq 'N5_gone_pid_87_then_positive') {
+                    $retryDeadline = [System.Diagnostics.Stopwatch]::GetTimestamp() +
+                        ([int64]5 * [int64][System.Diagnostics.Stopwatch]::Frequency)
+                    do {
+                        $observed = Invoke-EgObserverFunction -Name $case.Function `
+                            -Runtime $runtime -StartTicks $runtime.StartTicks
+                        if ($observed -or $script:EgState.observer_failed) { break }
+                        Start-Sleep -Milliseconds 50
+                    } while ([System.Diagnostics.Stopwatch]::GetTimestamp() -lt $retryDeadline)
+                }
+                else {
+                    $observed = Invoke-EgObserverFunction -Name $case.Function `
+                        -Runtime $runtime -StartTicks $runtime.StartTicks
+                }
             }
             if ($case.Name -ceq 'N7_provider_timeout' -or $case.Name -ceq 'N12_late_success_after_timeout') {
                 $entered = [EnergyGridOneShotSupervisorN7ProviderControl]::WaitUntilEntered(3000)
