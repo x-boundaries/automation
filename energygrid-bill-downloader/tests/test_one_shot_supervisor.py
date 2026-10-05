@@ -1484,10 +1484,16 @@ class SupervisorRealObserverTests(unittest.TestCase):
             "E2_noise exit=0 verdict=STARTED_PROVEN observed=True launcher_exit=0 reap=True",
             "E3_wrong_command_line exit=4 verdict=AMBIGUOUS observed=False launcher_exit=0 reap=True",
             "E4_launcher_exit_70_no_child exit=4 verdict=AMBIGUOUS observed=False launcher_exit=70 "
-            "reap=True total_processes=2",
+            "reap=True",
         )
         for case in cases:
             self.assertIn("e2e_case=" + case, output)
+        e4_line = next(line for line in output.splitlines()
+                       if line.startswith("e2e_case=E4_launcher_exit_70_no_child "))
+        process_count = e4_line.rsplit("total_processes=", 1)
+        self.assertEqual(2, len(process_count))
+        # E4 must exceed the launcher-only NOT_STARTED_PROVEN accounting predicate.
+        self.assertGreaterEqual(int(process_count[1].split()[0]), 2)
         self.assertEqual(4, output.count("integrity=True leftover=0"))
         self.assertIn("e2e_supervisor=PASS cases=4", output)
 
