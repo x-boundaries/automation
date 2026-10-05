@@ -108,7 +108,10 @@ def _module_child(
 
 def _write_marker(path_value: object, value: str) -> None:
     if isinstance(path_value, str) and path_value:
-        Path(path_value).write_text(value, encoding="ascii")
+        destination = Path(path_value)
+        temporary = destination.with_name(destination.name + f".{os.getpid()}.tmp")
+        temporary.write_text(value, encoding="ascii")
+        os.replace(temporary, destination)
 
 
 def _run(config_path: str, mode: str) -> int:
