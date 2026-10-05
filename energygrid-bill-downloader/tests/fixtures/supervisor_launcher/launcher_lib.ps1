@@ -132,8 +132,11 @@ function Invoke-EgFixtureApplication {
                 $owned.Add($noise)
             }
             $noiseConfig = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($ConfigPath))
-            if (-not [string]::IsNullOrWhiteSpace([string]$noiseConfig.noise_started_path)) {
-                [System.IO.File]::WriteAllText([string]$noiseConfig.noise_started_path, '{"status":"started"}')
+            $noiseStartedPathProperty = $noiseConfig.PSObject.Properties['noise_started_path']
+            if ($null -ne $noiseStartedPathProperty -and
+                -not [string]::IsNullOrWhiteSpace([string]$noiseStartedPathProperty.Value)) {
+                [System.IO.File]::WriteAllText(
+                    [string]$noiseStartedPathProperty.Value, '{"status":"started"}')
             }
             foreach ($noise in $owned) {
                 if (-not $noise.WaitForExit(30000)) { throw 'EG_FIXTURE_NOISE_CHILD_TIMEOUT' }
