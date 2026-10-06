@@ -4,6 +4,32 @@ This repository contains AutoCount 2 automation work: local extraction scripts, 
 
 Task tracking, pending-work dashboards, completed-task logs, and personal planning notes are intentionally kept outside this repo.
 
+
+## XB Automation Operating Model
+
+Automation XB defaults to a **Google Workspace-first, Claude Code-first** operating model.
+
+- **Google Workspace is the corporate working surface.** Prefer approved Google Drive / Google Workspace connectors for corporate documents, operational files, shared working data, and business context that already live there. Do not duplicate those materials into Git merely to make them available to an agent.
+- **Claude Code is the preferred executor.** Prefer approved plugins/connectors, then supported APIs, then browser/UI interaction only when required. Production-facing work should not be forced into manual Owner clicks when the current child authority permits Claude to perform the exact operation safely.
+- **Authority remains operation-scoped.** This preference does not grant blanket production mutation, credentials, deployment, customer/accounting writes, destructive operations, merge, or finality.
+- **Runtime hosts stay thin.** Production hosts and VMs are execution targets, not default development workstations. Repository development, broad diagnostics, n8n workflow work, Toolkit work, and agent-skill work normally belong on the laptop, server PC, or controller environment.
+- **Do not install Toolkit or general-purpose agent skills on runtime VMs by default.** Add runtime-side tooling only when the active delivery contract proves it is genuinely required there and Owner/Web explicitly approves it.
+- **Use deterministic runtime seams.** AutoCount remains behind its reviewed local official-API worker/adapter; Claude may supervise an already-authorised closed command envelope without turning the VM into a development environment.
+- **Sensitive operational detail stays private.** Public Git/GitHub surfaces contain sanitised policy, architecture, identities/digests, and secret names only. Durable sensitive operational mappings use the existing private `x-boundaries/TRANSPORT-automation` custody workflow.
+- **Never put secrets into repo `.env` files.** Use approved connector credential stores, Windows/private-host environment bindings, or other authorised private configuration outside Git.
+
+Preferred topology:
+
+```text
+Google Workspace / SaaS source
+    -> approved connector or supported API
+    -> Claude Code / controller
+    -> reviewed deterministic automation
+    -> thin production runtime
+```
+
+This is the default direction for new Automation XB work unless a child-specific contract records a concrete reason to deviate.
+
 The isolated Energy@Grid utility surface is documented in [energygrid-bill-downloader/](energygrid-bill-downloader/README.md) and does not change the AutoCount integration surfaces above.
 
 ## Current Automation Surfaces
