@@ -12,7 +12,7 @@ cutover work remain future/parked unless separately approved.
 
 The Automation XB default operating model is **Google Workspace-first and Claude Code-first**.
 
-- Corporate working documents and operational files should stay in Google Workspace and be accessed through approved connectors where practical.
+- Corporate working documents and operational files should stay in Google Workspace and be accessed through approved connectors where practical. Prefer connector-native access over installing local Drive/sync clients unless a concrete runtime contract requires a local filesystem surface.
 - Claude Code/controller work normally runs from the laptop, server PC, or controller environment.
 - The AutoCount VM is a **thin production execution target**, not a default development workstation.
 - Do not install Toolkit or general-purpose agent skills on the AutoCount VM merely to support architecture, n8n, repository, or controller work. Those tasks should execute off-VM unless a current delivery contract proves a runtime-local dependency is unavoidable and Owner/Web explicitly approves the install.
