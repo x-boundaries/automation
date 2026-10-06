@@ -8,6 +8,21 @@ read-only inventory, PO, stock movement, and purchasing analytics foundation
 first. Scheduler, write-back, CoA, GL opening, bank opening, and full accounting
 cutover work remain future/parked unless separately approved.
 
+## Interim delivery-first controller procedure — 6 October 2026
+
+This repository remains governed by its own accepted architecture and live child contracts while consuming the canonical Toolkit Controller. The merged delivery-first Controller change is applied at safe reconciliation boundaries as an **interim manual Web procedure**; it is not a claim that host/runtime interception has been mechanised.
+
+For current Automation XB work:
+
+- preserve active workers, accepted contracts, evidence, correction budgets, and child ownership;
+- move the next complete usable milestone through the smallest authorised end-to-end path;
+- require a concrete milestone consequence before adding a new prerequisite, investigation, or hardening step;
+- keep optional improvements in their existing future owner rather than delaying a safe accepted release;
+- retain all real safety, privacy, data-integrity, migration, independent-assurance, UAT, and finality requirements;
+- do not wait on unfinished Toolkit mechanism work when the current XB child has no genuine local dependency on it.
+
+The programme parent #117 is the live source for current milestone priority and child sequencing. At adoption, the next complete usable milestone is the EnergyGrid daily latest-invoice workflow; AutoCount member M1 remains an authorised parallel lane and is not restarted or demoted.
+
 ## Operating Model Boundary
 
 The Automation XB default operating model is **Google Workspace-first and Claude Code-first**.
