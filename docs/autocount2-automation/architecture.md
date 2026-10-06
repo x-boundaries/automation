@@ -8,6 +8,20 @@ read-only inventory, PO, stock movement, and purchasing analytics foundation
 first. Scheduler, write-back, CoA, GL opening, bank opening, and full accounting
 cutover work remain future/parked unless separately approved.
 
+## Operating Model Boundary
+
+The Automation XB default operating model is **Google Workspace-first and Claude Code-first**.
+
+- Corporate working documents and operational files should stay in Google Workspace and be accessed through approved connectors where practical.
+- Claude Code/controller work normally runs from the laptop, server PC, or controller environment.
+- The AutoCount VM is a **thin production execution target**, not a default development workstation.
+- Do not install Toolkit or general-purpose agent skills on the AutoCount VM merely to support architecture, n8n, repository, or controller work. Those tasks should execute off-VM unless a current delivery contract proves a runtime-local dependency is unavoidable and Owner/Web explicitly approves the install.
+- The VM should contain only AutoCount, required runtime dependencies, private production configuration, and reviewed deterministic worker/adapter components needed for the admitted production path.
+- A separately authorised Claude supervisor may coordinate an already-reviewed deterministic worker command without gaining unrestricted AutoCount, shell, repository, or development authority.
+- Public repository documentation records sanitised architecture only. Sensitive operational bindings use the private TRANSPORT custody workflow rather than Git.
+
+This boundary supersedes older wording that implied broad development work should run locally on the VM. The VM remains local to AutoCount for the calls that must execute beside AutoCount, while development and orchestration stay off-VM.
+
 ## Architecture Goals
 
 - Keep AutoCount production tables protected.
