@@ -5,6 +5,21 @@ This repository contains AutoCount 2 automation work: local extraction scripts, 
 Task tracking, pending-work dashboards, completed-task logs, and personal planning notes are intentionally kept outside this repo.
 
 
+## Interim delivery-first controller procedure — 6 October 2026
+
+Automation XB continues to consume the canonical Toolkit Controller; it does **not** maintain a repository-local Controller copy. At the next safe reconciliation boundary, Web applies the merged Toolkit delivery-first procedure manually while preserving XB-owned architecture, accepted contracts, safety/assurance floors, consumed attempts, and active-worker boundaries.
+
+For the current milestone:
+
+- advance the smallest authorised action that moves the accepted usable workflow end to end;
+- classify newly surfaced work as **required for this milestone**, **immediate post-delivery**, or **later hardening** under its existing owner;
+- do not restart or widen a healthy or ambiguously active worker merely because Controller law changed;
+- hold only for a concrete local safety, authority, evidence, dependency, or code blocker;
+- preserve required independent assurance, controlled UAT, release acceptance, and finality;
+- treat this as interim controller procedure, **not** automatic runtime interception or enforcement.
+
+The live milestone/child mapping and next action are projected on programme parent #117 and the owning child CURRENT records.
+
 ## XB Automation Operating Model
 
 Automation XB defaults to a **Google Workspace-first, Claude Code-first** operating model.
