@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from contextlib import closing
+import hashlib
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 
 from energygrid_bill_downloader.errors import StateError
 from energygrid_bill_downloader.publication import FileInfo
@@ -772,6 +774,310 @@ class V2StateTests(unittest.TestCase):
         with self.assertRaises(StateError):
             with StateV2Store(self.path):
                 self.fail("private delivery support reference was accepted")
+
+
+class StateV3MigrationTests(unittest.TestCase):
+    """#226 G3 schema v3: v1->v3 and v2->v3 plan/apply, frozen historical
+    DRIVE_STAGED facts, and the Drive receipt triggers."""
+
+    RUN = "00000000-0000-4000-8000-0000000000d1"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def v1_database(self, name: str = "eb-latest.pdf", invoice_date: str = "2026-10-01") -> tuple[Path, bytes]:
+        from fixtures.synthetic_delivery import synthetic_pdf
+
+        path = self.root / "v1" / "state.sqlite3"
+        path.parent.mkdir()
+        payload = synthetic_pdf(name.encode())
+        digest = hashlib.sha256(payload).hexdigest()
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                "CREATE TABLE bills (filename_key TEXT PRIMARY KEY,portal_filename TEXT NOT NULL,first_seen_at_utc TEXT NOT NULL,last_seen_at_utc TEXT NOT NULL,archived_at_utc TEXT,byte_size INTEGER,sha256 TEXT,status TEXT NOT NULL,last_error_class TEXT,last_error_at_utc TEXT,attempt_count INTEGER NOT NULL DEFAULT 0,completion_source TEXT)"
+            )
+            connection.execute("PRAGMA user_version=1")
+            connection.execute("INSERT INTO bills VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                               (name, name, "t", "t", "t", len(payload), digest, "ARCHIVED", None, None, 1, "downloaded"))
+            connection.commit()
+        return path, payload
+
+    def mapping(self, name: str = "eb-latest.pdf", invoice_date: str = "2026-10-01") -> list[dict]:
+        from fixtures.synthetic_dual_stream import test_stream_entries
+
+        entry = test_stream_entries()["EB_BILL"]
+        return [{"legacy_filename_key": name, "stream": "EB_BILL", "source_namespace": entry.source_namespace,
+                 "source_filename": name, "raw_date": invoice_date, "date_profile": entry.date_profile,
+                 "evidence_ref": entry.evidence_ref}]
+
+    def test_v1_to_v3_plan_is_read_only_and_apply_backs_up_classifies_and_validates(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store, migrate_state_database_v3
+        from fixtures.synthetic_dual_stream import test_stream_entries
+
+        path, _payload = self.v1_database()
+        before = path.read_bytes()
+        plan = migrate_state_database_v3(path, streams=test_stream_entries(), mapping_entries=self.mapping())
+        self.assertEqual({"status": "PLAN_READY_V3", "legacy_rows": 1}, plan)
+        self.assertEqual(before, path.read_bytes())
+        result = migrate_state_database_v3(path, apply=True, streams=test_stream_entries(), mapping_entries=self.mapping(),
+                                           migration_run_id=self.RUN)
+        self.assertEqual({"status": "MIGRATED_V3", "legacy_rows": 1}, result)
+        backups = list(path.parent.glob("state.sqlite3.v1-*.bak"))
+        self.assertEqual(1, len(backups))
+        with closing(sqlite3.connect(backups[0])) as backup:
+            self.assertEqual(1, backup.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(["eb-latest.pdf"], [row[0] for row in backup.execute("SELECT filename_key FROM bills")])
+        with StateV3Store(path, read_only=True) as state:
+            self.assertEqual("RESUMABLE_V3", state.validation_status)
+            self.assertEqual(3, state._conn().execute("PRAGMA user_version").fetchone()[0])
+            invoice = state.invoice(state.stream("EB_BILL")["watermark_invoice_id"])
+            self.assertEqual(("CLASSIFIED", "NOT_STAGED"), (invoice["classification"], invoice["drive_state"]))
+            self.assertEqual([], state.drive_operations_for_invoice(invoice["invoice_id"]))
+        self.assertEqual({"status": "RESUMABLE_V3", "legacy_rows": 0}, migrate_state_database_v3(path, apply=True))
+
+    def test_failed_v3_inspection_rolls_back_every_change(self) -> None:
+        from energygrid_bill_downloader import state as state_module
+        from fixtures.synthetic_dual_stream import test_stream_entries
+
+        path, _payload = self.v1_database()
+        before = path.read_bytes()
+        with mock.patch.object(state_module, "_inspect_v3_database", return_value="INCOMPATIBLE_V3"):
+            with self.assertRaises(StateError):
+                state_module.migrate_state_database_v3(path, apply=True, streams=test_stream_entries(),
+                                                       mapping_entries=self.mapping(), migration_run_id=self.RUN)
+        self.assertEqual(before, path.read_bytes())
+
+    def staged_v2_database(self, *, drive_stage_open: bool = False) -> tuple[Path, str]:
+        """A v2 database whose latest invoice is historically DRIVE_STAGED and DELIVERED."""
+        from fixtures.synthetic_delivery import synthetic_pdf
+        from fixtures.synthetic_dual_stream import candidate, create_v2_database
+        from energygrid_bill_downloader.invoice import Stream
+        from energygrid_bill_downloader.publication import FileInfo
+        from energygrid_bill_downloader.state import StateV2Store
+
+        path = self.root / "v2" / "state.sqlite3"
+        path.parent.mkdir()
+        create_v2_database(path)
+        payload = synthetic_pdf(b"historical staged")
+        info = FileInfo(len(payload), hashlib.sha256(payload).hexdigest())
+        with StateV2Store(path) as state:
+            invoice_id = state.accept_latest(candidate(Stream.EB_BILL, name="eb-latest.pdf"), self.RUN, "t")
+            invoice = state.invoice(invoice_id)
+            op = state.start_file_operation(operation_id=str(uuid.uuid4()), invoice_id=invoice_id, kind="ARCHIVE_PUBLISH",
+                                            private_path_ref="x", target_relpath=invoice["archive_relpath"], binding_id=None,
+                                            info=info, source_role="SOURCE_ACQUISITION", run_id=self.RUN, timestamp="t")
+            state.complete_file_operation(op["operation_id"], "t", evidence_ref="EG_ARCHIVE_HASH_VERIFIED")
+            state.update_invoice_file_state(invoice_id, archive_state="COMMITTED", byte_size=info.byte_size, sha256=info.sha256, archived_at_utc="t")
+            stage = state.start_file_operation(operation_id=str(uuid.uuid4()), invoice_id=invoice_id, kind="DRIVE_STAGE",
+                                               private_path_ref="y", target_relpath=invoice["archive_relpath"], binding_id="LEGACY_BINDING",
+                                               info=info, source_role="ARCHIVE_COMMITTED", run_id=self.RUN, timestamp="t")
+            if drive_stage_open:
+                return path, invoice_id
+            state.complete_file_operation(stage["operation_id"], "t", evidence_ref="EG_DRIVE_STAGE_HASH_VERIFIED")
+            state.update_invoice_file_state(invoice_id, drive_state="DRIVE_STAGED", drive_binding_id="LEGACY_BINDING",
+                                            drive_relpath=invoice["archive_relpath"], drive_size=info.byte_size,
+                                            drive_sha256=info.sha256, drive_staged_at_utc="t")
+            metadata = {"schema": "energygrid.invoice_delivery.v1", "stream": "EB_BILL", "bill_date": invoice["bill_date"],
+                        "attachment_name": invoice["canonical_filename"], "pdf_byte_size": info.byte_size, "pdf_sha256": info.sha256}
+            delivery_id = "egmail-v1-" + "1" * 32
+            state.prepare_delivery(invoice_id=invoice_id, metadata=metadata, run_id=self.RUN, timestamp="t", delivery_id=delivery_id)
+            state.claim_delivery_dispatch(delivery_id, self.RUN, "t")
+            state.record_delivery_outcome(delivery_id, self.RUN, "t", state="DELIVERED", evidence="VALIDATED_N8N_RESULT",
+                                          support_ref="EG_MAIL_ACCEPTED", accepted_at_utc="t")
+        return path, invoice_id
+
+    def test_v2_to_v3_preserves_and_freezes_historical_drive_staged_without_fabricating_a_receipt(self) -> None:
+        from energygrid_bill_downloader.state import StateV2Store, StateV3Store, migrate_state_database_v3
+
+        path, invoice_id = self.staged_v2_database()
+        before = path.read_bytes()
+        self.assertEqual({"status": "PLAN_UPGRADE_V3", "legacy_rows": 0}, migrate_state_database_v3(path))
+        self.assertEqual(before, path.read_bytes())
+        self.assertEqual({"status": "UPGRADED_V3", "legacy_rows": 0}, migrate_state_database_v3(path, apply=True))
+        self.assertEqual(1, len(list(path.parent.glob("state.sqlite3.v2-*.bak"))))
+        with self.assertRaises(StateError):
+            with StateV2Store(path):
+                pass
+        with StateV3Store(path) as state:
+            invoice = state.invoice(invoice_id)
+            self.assertEqual(("DRIVE_STAGED", "LEGACY_BINDING"), (invoice["drive_state"], invoice["drive_binding_id"]))
+            self.assertEqual([], state.drive_operations_for_invoice(invoice_id), "no fabricated v3 receipt")
+            self.assertEqual("DELIVERED", state.delivery_for_invoice(invoice_id)["state"], "delivered stays delivered")
+            connection = state._conn()
+            for statement in (
+                "UPDATE energygrid_invoice_v2 SET drive_state='NOT_STAGED' WHERE invoice_id=?",
+                "UPDATE energygrid_invoice_v2 SET drive_binding_id='OTHER' WHERE invoice_id=?",
+            ):
+                with self.subTest(statement=statement), self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(statement, (invoice_id,))
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute(
+                    "INSERT INTO energygrid_file_operation_v2 (operation_id,invoice_id,kind,state,private_path_ref,target_relpath,binding_id,expected_size,expected_sha256,source_role,run_id,prepared_at_utc) "
+                    "VALUES ('x',?,'DRIVE_STAGE','PREPARED','p','EB Bill/2026-10-01.pdf','B',1,?,'ARCHIVE_COMMITTED',?,'t')",
+                    (invoice_id, "0" * 64, self.RUN),
+                )
+
+    def test_open_drive_stage_operation_holds_v3_migration_without_change(self) -> None:
+        from energygrid_bill_downloader.state import StreamStateConflictError, migrate_state_database_v3
+
+        path, _ = self.staged_v2_database(drive_stage_open=True)
+        before = path.read_bytes()
+        self.assertEqual({"status": "HOLD", "support_ref": "EG_V3_MIGRATION_DRIVE_STAGE_OPEN", "legacy_rows": 0},
+                         migrate_state_database_v3(path))
+        with self.assertRaises(StreamStateConflictError):
+            migrate_state_database_v3(path, apply=True)
+        self.assertEqual(before, path.read_bytes())
+        self.assertFalse(list(path.parent.glob("*.bak")))
+
+    def test_fresh_v3_and_daily_open_never_create_or_migrate(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store, migrate_state_database_v3
+
+        missing = self.root / "fresh" / "state.sqlite3"
+        with self.assertRaises(StateError):
+            with StateV3Store(missing):
+                pass
+        self.assertFalse(missing.exists())
+        self.assertEqual({"status": "PLAN_CREATE_V3", "legacy_rows": 0}, migrate_state_database_v3(missing))
+        self.assertEqual({"status": "CREATED_V3", "legacy_rows": 0}, migrate_state_database_v3(missing, apply=True))
+        self.assertEqual({"status": "ALREADY_V3", "legacy_rows": 0}, migrate_state_database_v3(missing, apply=True))
+        v1, _ = self.v1_database()
+        with self.assertRaises(StateError):
+            with StateV3Store(v1):
+                pass
+
+    def test_drift_from_the_reference_v3_schema_is_not_opened(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store, migrate_state_database_v3
+
+        path = self.root / "drift" / "state.sqlite3"
+        migrate_state_database_v3(path, apply=True)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("DROP TRIGGER energygrid_delivery_invoice_guard_v3")
+            connection.commit()
+        with self.assertRaises(StateError):
+            with StateV3Store(path):
+                pass
+
+
+class StateV3TriggerTests(unittest.TestCase):
+    RUN = "00000000-0000-4000-8000-0000000000e1"
+
+    def setUp(self) -> None:
+        from fixtures.synthetic_dual_stream import bind_synthetic_drive, create_v3_database
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "state.sqlite3"
+        create_v3_database(self.path)
+        bind_synthetic_drive(self.path)
+
+    def committed_latest(self, state, name="eb-latest.pdf", invoice_date="2026-10-01") -> dict:
+        from energygrid_bill_downloader.invoice import Stream
+        from energygrid_bill_downloader.publication import FileInfo
+        from fixtures.synthetic_dual_stream import candidate
+
+        info = FileInfo(1234, hashlib.sha256(name.encode()).hexdigest())
+        invoice_id = state.accept_latest(candidate(Stream.EB_BILL, name=name, invoice_date=invoice_date), self.RUN, "t")
+        invoice = state.invoice(invoice_id)
+        op = state.start_file_operation(operation_id=str(uuid.uuid4()), invoice_id=invoice_id, kind="ARCHIVE_PUBLISH",
+                                        private_path_ref="x", target_relpath=invoice["archive_relpath"], binding_id=None,
+                                        info=info, source_role="SOURCE_ACQUISITION", run_id=self.RUN, timestamp="t")
+        state.complete_file_operation(op["operation_id"], "t", evidence_ref="EG_ARCHIVE_HASH_VERIFIED")
+        state.update_invoice_file_state(invoice_id, archive_state="COMMITTED", byte_size=info.byte_size, sha256=info.sha256, archived_at_utc="t")
+        return state.invoice(invoice_id)
+
+    def intent(self, state, invoice) -> dict:
+        row, created = state.create_drive_intent(invoice=invoice, binding=state.active_binding("EB_BILL"), local_md5="a" * 32,
+                                                 operation_id=str(uuid.uuid4()), run_id=self.RUN, timestamp="t")
+        self.assertTrue(created)
+        return row
+
+    def test_intent_only_for_the_current_latest_and_the_active_binding(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        with StateV3Store(self.path) as state:
+            older = self.committed_latest(state)
+            self.committed_latest(state, name="eb-newer.pdf", invoice_date="2026-10-05")
+            with self.assertRaises(StateError):
+                self.intent(state, older)
+            binding = dict(state.active_binding("EB_BILL"), folder_id="synthOtherFolder00001")
+            with self.assertRaises(StateError):
+                state.create_drive_intent(invoice=state.invoice(state.stream("EB_BILL")["watermark_invoice_id"]), binding=binding,
+                                          local_md5="a" * 32, operation_id=str(uuid.uuid4()), run_id=self.RUN, timestamp="t")
+
+    def test_identity_app_properties_and_terminal_states_are_frozen_and_rows_retained(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        with StateV3Store(self.path) as state:
+            row = self.intent(state, self.committed_latest(state))
+            connection = state._conn()
+            for statement, parameters in (
+                ("UPDATE energygrid_drive_operation_v3 SET local_sha256=? WHERE operation_id=?", ("0" * 64, row["operation_id"])),
+                ("UPDATE energygrid_drive_operation_v3 SET app_properties_json=? WHERE operation_id=?", ("{}", row["operation_id"])),
+                ("UPDATE energygrid_drive_operation_v3 SET upload_attempt_count=1, reserved_remote_file_id='synthBypass000000001', "
+                 "reserved_run_id='r', reserved_at_utc='t' WHERE operation_id=?", (row["operation_id"],)),
+                ("UPDATE energygrid_drive_operation_v3 SET state='DRIVE_VERIFIED' WHERE operation_id=?", (row["operation_id"],)),
+            ):
+                with self.subTest(statement=statement[:60]), self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(statement, parameters)
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute("DELETE FROM energygrid_drive_operation_v3")
+            with self.assertRaises(sqlite3.DatabaseError):
+                connection.execute("DELETE FROM energygrid_drive_binding_v3")
+            state.finish_drive_operation(row["operation_id"], run_id=self.RUN, timestamp="t", new_state="DRIVE_CONFLICT",
+                                         support_ref="EG_DRIVE_NAME_OCCUPIED")
+            with self.assertRaises(StateError):
+                state.finish_drive_operation(row["operation_id"], run_id=self.RUN, timestamp="t", new_state="HOLD",
+                                             support_ref="EG_DRIVE_HOLD")
+
+    def test_verified_requires_dispatch_reserved_id_and_matching_receipt(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        receipt = {"remote_file_id": "synthReservedFile00001", "remote_parent_id": "synthEbBillFolder00001",
+                   "remote_name_observed": "2026-10-01.pdf", "remote_mime_type": "application/pdf", "remote_size": 1234,
+                   "remote_sha256": None, "remote_md5": "a" * 32, "accepted_app_properties_json": None,
+                   "verification_method": "MD5_SIZE", "receipt_sha256": "b" * 64}
+        with StateV3Store(self.path) as state:
+            row = self.intent(state, self.committed_latest(state))
+            receipt["remote_sha256"] = None
+            receipt["accepted_app_properties_json"] = row["app_properties_json"]
+            # No reservation and no dispatch: VERIFIED is impossible.
+            with self.assertRaises(StateError):
+                state.finish_drive_operation(row["operation_id"], run_id=self.RUN, timestamp="t", new_state="DRIVE_VERIFIED", receipt=receipt)
+            state.reserve_drive_file_id(row["operation_id"], "synthReservedFile00001", self.RUN, "t")
+            state.begin_drive_dispatch(row["operation_id"], self.RUN, "t")
+            # Open dispatch marker: still impossible.
+            with self.assertRaises(StateError):
+                state.finish_drive_operation(row["operation_id"], run_id=self.RUN, timestamp="t", new_state="DRIVE_VERIFIED", receipt=receipt)
+            for key, value in (("remote_file_id", "synthDifferentFile001"), ("remote_size", 1233), ("remote_md5", "c" * 32),
+                               ("remote_parent_id", "synthOtherFolder00001")):
+                with self.subTest(key=key), self.assertRaises(StateError):
+                    state.finish_drive_operation(row["operation_id"], run_id=self.RUN, timestamp="t", new_state="DRIVE_VERIFIED",
+                                                 receipt={**receipt, key: value}, dispatch_outcome="VALID_RESULT")
+            verified = state.finish_drive_operation(row["operation_id"], run_id=self.RUN, timestamp="t", new_state="DRIVE_VERIFIED",
+                                                    receipt=receipt, dispatch_outcome="VALID_RESULT")
+            self.assertEqual(verified["reserved_remote_file_id"], verified["remote_file_id"])
+            with self.assertRaises(sqlite3.DatabaseError):
+                state._conn().execute("UPDATE energygrid_drive_operation_v3 SET verified_at_utc='x' WHERE operation_id=?", (row["operation_id"],))
+            # The binding cannot be retired while... VERIFIED is final, retirement is allowed now.
+            state.retire_binding(state.active_binding("EB_BILL")["binding_id"], "t")
+
+    def test_binding_cannot_retire_with_open_operation_and_run_rows_are_insert_only(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        with StateV3Store(self.path) as state:
+            self.intent(state, self.committed_latest(state))
+            with self.assertRaises(StateError):
+                state.retire_binding(state.active_binding("EB_BILL")["binding_id"], "t")
+            state.insert_run_record(run_id=self.RUN, started_at_utc="t", acquire_state="COMPLETED", acquire_exit_code=0,
+                                    acquire_support_ref=None, streams={"EB_BILL": ("READY", None)}, timestamp="t")
+            with self.assertRaises(StateError):
+                state.insert_run_record(run_id=self.RUN, started_at_utc="t", acquire_state="COMPLETED", acquire_exit_code=0,
+                                        acquire_support_ref=None, streams={}, timestamp="t")
+            for statement in ("UPDATE energygrid_run_v3 SET acquire_state='FAILED'", "DELETE FROM energygrid_run_v3"):
+                with self.subTest(statement=statement), self.assertRaises(sqlite3.DatabaseError):
+                    state._conn().execute(statement)
 
 
 if __name__ == "__main__":

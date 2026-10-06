@@ -412,6 +412,12 @@ V2_SCHEMA_SQL = (
 class StateV2Store:
     """Existing v2 state only. Opening a daily run never creates or migrates it."""
 
+    _accepted_statuses = frozenset({"COMPLETE_V2", "RESUMABLE_V2"})
+
+    @staticmethod
+    def _inspect(connection: sqlite3.Connection) -> str:
+        return _inspect_v2_database(connection)
+
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = path
         self.read_only = read_only
@@ -441,8 +447,8 @@ class StateV2Store:
                 raise StateError("v2 SQLite durability settings are unavailable")
             if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
                 raise StateError("v2 SQLite foreign keys are unavailable")
-            self.validation_status = _inspect_v2_database(conn)
-            if self.validation_status not in {"COMPLETE_V2", "RESUMABLE_V2"}:
+            self.validation_status = self._inspect(conn)
+            if self.validation_status not in self._accepted_statuses:
                 raise StateError("v2 state database is not a complete supported schema")
             return self
         except (OSError, sqlite3.Error, StateError) as exc:
@@ -1476,3 +1482,795 @@ def _apply_migration_mapping(connection: sqlite3.Connection, entries: list[dict]
             "UPDATE energygrid_stream_v2 SET watermark_day=?,watermark_invoice_id=?,watermark_run_id=?,watermark_at_utc=? WHERE stream=?",
             (maximum, latest[0][0], run_id, utc_now(), name),
         )
+
+
+# ---------------------------------------------------------------------------
+# Schema v3 (#226 G3): n8n Google Drive receipt model with a pre-generated
+# Drive file ID as the upload idempotency primitive. v3 is additive over v2.
+# Historical v2 DRIVE_STAGED facts are retained and frozen; no v3 receipt is
+# ever fabricated for them. Daily commands only open an existing v3 database.
+# ---------------------------------------------------------------------------
+
+V3_SCHEMA_VERSION = 3
+DRIVE_MAX_BYTES = 15_000_000
+DRIVE_STATES = (
+    "DRIVE_UPLOAD_INTENT", "DRIVE_UPLOAD_UNCERTAIN", "DRIVE_VERIFIED", "DRIVE_CONFLICT", "HOLD",
+)
+DRIVE_VERIFICATION_UNAVAILABLE = "EG_DRIVE_VERIFICATION_UNAVAILABLE"
+STREAM_ACQUIRE_RESULTS = (
+    "READY", "EMPTY", "UNBOUND", "HOLD", "SOURCE_FAILURE", "SOURCE_FAILURE_RETRYABLE", "NOT_REACHED",
+)
+DRIVE_ID_RE = re.compile(r"[A-Za-z0-9_-]{10,128}\Z", re.ASCII)
+ACCOUNT_REF_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z", re.ASCII)
+OPERATION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z", re.ASCII)
+_SUPPORT_REF_RE = re.compile(r"EG_[A-Z0-9_]{1,60}\Z", re.ASCII)
+_HEX64 = "length({0})=64 AND {0} NOT GLOB '*[^0-9a-f]*'"
+_DRIVE_ID = "length({0}) BETWEEN 10 AND 128 AND {0} NOT GLOB '*[^A-Za-z0-9_-]*'"
+_UUID = "length({0})=36 AND {0} NOT GLOB '*[^0-9a-f-]*'"
+_STREAM_FOLDER = "(CASE {0} WHEN 'EB_BILL' THEN 'EB Bill/' ELSE 'Tenant Bill/' END)"
+# The exact seven-key private appProperties map, canonical JSON with sorted
+# keys and compact separators. SQLite rebuilds it from the frozen identity
+# columns so no other map can ever be stored for an operation.
+_APP_PROPERTIES_SQL = (
+    "'{{\"egApp\":\"xb-energygrid\",\"egBnd\":\"'||{p}binding_id||'\",\"egInv\":\"'||{p}invoice_id||"
+    "'\",\"egOp\":\"'||{p}operation_id||'\",\"egSchema\":\"eg-drive-v3\",\"egSha\":\"'||{p}local_sha256||"
+    "'\",\"egStream\":\"'||{p}stream||'\"}}'"
+)
+
+V3_DROPPED_V2_OBJECTS = ("energygrid_delivery_invoice_guard_v1",)
+
+V3_SCHEMA_SQL = (
+    "CREATE TABLE energygrid_drive_binding_v3 ("
+    "binding_id TEXT PRIMARY KEY CHECK(length(binding_id)=38 AND substr(binding_id,1,6)='egdb3-' AND substr(binding_id,7) NOT GLOB '*[^0-9a-f]*'),"
+    "stream TEXT NOT NULL CHECK(stream IN ('EB_BILL','TENANT_BILL')),"
+    "account_ref TEXT NOT NULL CHECK(length(account_ref) BETWEEN 1 AND 128 AND account_ref NOT GLOB '*[^A-Za-z0-9_-]*'),"
+    f"root_folder_id TEXT NOT NULL CHECK({_DRIVE_ID.format('root_folder_id')}),"
+    f"folder_id TEXT NOT NULL UNIQUE CHECK({_DRIVE_ID.format('folder_id')} AND folder_id!=root_folder_id),"
+    "logical_path TEXT NOT NULL CHECK(logical_path=(CASE stream WHEN 'EB_BILL' THEN 'Automation/_MandarinGallery/Utilities/EnergyGrid/EB Bill' ELSE 'Automation/_MandarinGallery/Utilities/EnergyGrid/Tenant Bill' END)),"
+    f"chain_sha256 TEXT NOT NULL CHECK({_HEX64.format('chain_sha256')}),"
+    "state TEXT NOT NULL CHECK(state IN ('ACTIVE','RETIRED')),"
+    f"bound_run_id TEXT NOT NULL CHECK({_UUID.format('bound_run_id')}), bound_at_utc TEXT NOT NULL, retired_at_utc TEXT,"
+    "CHECK((state='ACTIVE' AND retired_at_utc IS NULL) OR (state='RETIRED' AND retired_at_utc IS NOT NULL))"
+    ") STRICT",
+    "CREATE UNIQUE INDEX energygrid_drive_binding_active_v3 ON energygrid_drive_binding_v3(stream) WHERE state='ACTIVE'",
+    "CREATE TABLE energygrid_drive_operation_v3 ("
+    f"operation_id TEXT PRIMARY KEY CHECK({_UUID.format('operation_id')} AND substr(operation_id,15,1)='4'),"
+    "invoice_id TEXT NOT NULL REFERENCES energygrid_invoice_v2(invoice_id),"
+    "binding_id TEXT NOT NULL REFERENCES energygrid_drive_binding_v3(binding_id),"
+    "stream TEXT NOT NULL CHECK(stream IN ('EB_BILL','TENANT_BILL')),"
+    f"folder_id TEXT NOT NULL CHECK({_DRIVE_ID.format('folder_id')}),"
+    f"logical_relpath TEXT NOT NULL CHECK(logical_relpath={_STREAM_FOLDER.format('stream')}||remote_name),"
+    "remote_name TEXT NOT NULL CHECK(length(remote_name)=14 AND remote_name GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].pdf'),"
+    f"local_byte_size INTEGER NOT NULL CHECK(typeof(local_byte_size)='integer' AND local_byte_size BETWEEN 1 AND {DRIVE_MAX_BYTES}),"
+    f"local_sha256 TEXT NOT NULL CHECK({_HEX64.format('local_sha256')}),"
+    "local_md5 TEXT NOT NULL CHECK(length(local_md5)=32 AND local_md5 NOT GLOB '*[^0-9a-f]*'),"
+    f"app_properties_json TEXT NOT NULL CHECK(app_properties_json={_APP_PROPERTIES_SQL.format(p='')}),"
+    f"reserved_remote_file_id TEXT UNIQUE CHECK(reserved_remote_file_id IS NULL OR ({_DRIVE_ID.format('reserved_remote_file_id')})),"
+    "reserved_run_id TEXT, reserved_at_utc TEXT,"
+    "state TEXT NOT NULL CHECK(state IN ('DRIVE_UPLOAD_INTENT','DRIVE_UPLOAD_UNCERTAIN','DRIVE_VERIFIED','DRIVE_CONFLICT','HOLD')),"
+    "upload_attempt_count INTEGER NOT NULL CHECK(typeof(upload_attempt_count)='integer' AND upload_attempt_count BETWEEN 0 AND 2),"
+    "intent_run_id TEXT NOT NULL, intent_at_utc TEXT NOT NULL,"
+    "retry_authorised_run_id TEXT, retry_authorised_at_utc TEXT,"
+    "last_reconcile_run_id TEXT, last_reconcile_at_utc TEXT,"
+    "last_reconcile_result TEXT CHECK(last_reconcile_result IS NULL OR last_reconcile_result IN ('FOUND_EXACT','NOT_FOUND','CHECKSUM_UNAVAILABLE','CONFLICT','UNAVAILABLE','DESTINATION_CHANGED')),"
+    "remote_file_id TEXT UNIQUE, remote_parent_id TEXT, remote_name_observed TEXT, remote_mime_type TEXT,"
+    "remote_size INTEGER, remote_sha256 TEXT, remote_md5 TEXT, accepted_app_properties_json TEXT,"
+    "verification_method TEXT CHECK(verification_method IS NULL OR verification_method IN ('SHA256','MD5_SIZE')),"
+    "receipt_sha256 TEXT, verified_run_id TEXT, verified_at_utc TEXT,"
+    "uncertain_at_utc TEXT, conflict_at_utc TEXT, hold_at_utc TEXT,"
+    "support_ref TEXT CHECK(support_ref IS NULL OR (length(support_ref) BETWEEN 4 AND 63 AND substr(support_ref,1,3)='EG_' AND substr(support_ref,4) NOT GLOB '*[^A-Z0-9_]*')),"
+    "UNIQUE(invoice_id,binding_id), UNIQUE(binding_id,remote_name),"
+    "CHECK((reserved_remote_file_id IS NULL AND reserved_run_id IS NULL AND reserved_at_utc IS NULL) OR (reserved_remote_file_id IS NOT NULL AND reserved_run_id IS NOT NULL AND reserved_at_utc IS NOT NULL)),"
+    "CHECK(upload_attempt_count=0 OR reserved_remote_file_id IS NOT NULL),"
+    "CHECK((retry_authorised_run_id IS NULL)=(retry_authorised_at_utc IS NULL)),"
+    "CHECK(retry_authorised_run_id IS NULL OR upload_attempt_count>=1),"
+    "CHECK(state!='DRIVE_VERIFIED' OR ("
+    "upload_attempt_count>=1 AND remote_file_id IS NOT NULL AND remote_file_id=reserved_remote_file_id"
+    " AND remote_parent_id=folder_id AND remote_name_observed=remote_name AND remote_mime_type='application/pdf'"
+    " AND typeof(remote_size)='integer' AND remote_size=local_byte_size AND accepted_app_properties_json=app_properties_json"
+    " AND (remote_sha256 IS NULL OR remote_sha256=local_sha256) AND (remote_md5 IS NULL OR remote_md5=local_md5)"
+    " AND ((verification_method='SHA256' AND remote_sha256=local_sha256) OR (verification_method='MD5_SIZE' AND remote_sha256 IS NULL AND remote_md5=local_md5))"
+    f" AND {_HEX64.format('receipt_sha256')} AND verified_run_id IS NOT NULL AND verified_at_utc IS NOT NULL)),"
+    "CHECK(state='DRIVE_VERIFIED' OR (remote_file_id IS NULL AND remote_parent_id IS NULL AND remote_name_observed IS NULL AND remote_mime_type IS NULL AND remote_size IS NULL AND remote_sha256 IS NULL AND remote_md5 IS NULL AND accepted_app_properties_json IS NULL AND verification_method IS NULL AND receipt_sha256 IS NULL AND verified_run_id IS NULL AND verified_at_utc IS NULL)),"
+    "CHECK(state!='DRIVE_UPLOAD_UNCERTAIN' OR uncertain_at_utc IS NOT NULL),"
+    "CHECK(state!='DRIVE_CONFLICT' OR (conflict_at_utc IS NOT NULL AND support_ref IS NOT NULL)),"
+    "CHECK(state!='HOLD' OR (hold_at_utc IS NOT NULL AND support_ref IS NOT NULL))"
+    ") STRICT",
+    "CREATE TABLE energygrid_drive_dispatch_v3 ("
+    "operation_id TEXT NOT NULL REFERENCES energygrid_drive_operation_v3(operation_id),"
+    "attempt_no INTEGER NOT NULL CHECK(typeof(attempt_no)='integer' AND attempt_no IN (1,2)),"
+    f"reserved_remote_file_id TEXT NOT NULL CHECK({_DRIVE_ID.format('reserved_remote_file_id')}),"
+    "dispatch_run_id TEXT NOT NULL, dispatched_at_utc TEXT NOT NULL,"
+    "outcome TEXT CHECK(outcome IS NULL OR outcome IN ('VALID_RESULT','NO_VALID_RESULT','RECOVERED_MARKER')),"
+    "outcome_at_utc TEXT, support_ref TEXT,"
+    "PRIMARY KEY(operation_id,attempt_no),"
+    "CHECK((outcome IS NULL AND outcome_at_utc IS NULL AND support_ref IS NULL) OR (outcome IS NOT NULL AND outcome_at_utc IS NOT NULL AND support_ref IS NOT NULL))"
+    ") STRICT",
+    "CREATE TABLE energygrid_run_v3 ("
+    f"run_id TEXT PRIMARY KEY CHECK({_UUID.format('run_id')}),"
+    "started_at_utc TEXT NOT NULL,"
+    "acquire_state TEXT NOT NULL CHECK(acquire_state IN ('COMPLETED','FAILED')),"
+    "acquire_at_utc TEXT NOT NULL,"
+    "acquire_exit_code INTEGER NOT NULL CHECK(typeof(acquire_exit_code)='integer' AND acquire_exit_code BETWEEN 0 AND 255),"
+    "acquire_support_ref TEXT,"
+    "eb_bill_acquire TEXT NOT NULL CHECK(eb_bill_acquire IN ('READY','EMPTY','UNBOUND','HOLD','SOURCE_FAILURE','SOURCE_FAILURE_RETRYABLE','NOT_REACHED')),"
+    "tenant_bill_acquire TEXT NOT NULL CHECK(tenant_bill_acquire IN ('READY','EMPTY','UNBOUND','HOLD','SOURCE_FAILURE','SOURCE_FAILURE_RETRYABLE','NOT_REACHED')),"
+    "eb_bill_support_ref TEXT, tenant_bill_support_ref TEXT,"
+    "CHECK((acquire_state='COMPLETED')=(acquire_exit_code=0))"
+    ") STRICT",
+    # Binding rows: insert ACTIVE only; the only change ever allowed is
+    # ACTIVE -> RETIRED with no open Drive operation under that binding.
+    "CREATE TRIGGER energygrid_drive_binding_insert_guard_v3 BEFORE INSERT ON energygrid_drive_binding_v3 WHEN NEW.state!='ACTIVE' BEGIN SELECT RAISE(ABORT,'Drive binding must be inserted active'); END",
+    "CREATE TRIGGER energygrid_drive_binding_freeze_v3 BEFORE UPDATE ON energygrid_drive_binding_v3 WHEN NOT (OLD.state='ACTIVE' AND NEW.state='RETIRED' AND NEW.retired_at_utc IS NOT NULL"
+    " AND NEW.binding_id=OLD.binding_id AND NEW.stream=OLD.stream AND NEW.account_ref=OLD.account_ref AND NEW.root_folder_id=OLD.root_folder_id"
+    " AND NEW.folder_id=OLD.folder_id AND NEW.logical_path=OLD.logical_path AND NEW.chain_sha256=OLD.chain_sha256"
+    " AND NEW.bound_run_id=OLD.bound_run_id AND NEW.bound_at_utc=OLD.bound_at_utc)"
+    " OR EXISTS (SELECT 1 FROM energygrid_drive_operation_v3 o WHERE o.binding_id=OLD.binding_id AND o.state IN ('DRIVE_UPLOAD_INTENT','DRIVE_UPLOAD_UNCERTAIN'))"
+    " BEGIN SELECT RAISE(ABORT,'Drive binding is frozen'); END",
+    "CREATE TRIGGER energygrid_drive_binding_no_delete_v3 BEFORE DELETE ON energygrid_drive_binding_v3 BEGIN SELECT RAISE(ABORT,'Drive binding rows are retained'); END",
+    # Operation intent: only for the stream's current latest, committed archive
+    # facts and the ACTIVE binding of the same stream and folder.
+    "CREATE TRIGGER energygrid_drive_operation_insert_guard_v3 BEFORE INSERT ON energygrid_drive_operation_v3 WHEN"
+    " NEW.state!='DRIVE_UPLOAD_INTENT' OR NEW.upload_attempt_count!=0 OR NEW.reserved_remote_file_id IS NOT NULL"
+    " OR NEW.retry_authorised_run_id IS NOT NULL OR NEW.last_reconcile_run_id IS NOT NULL OR NEW.support_ref IS NOT NULL"
+    " OR NEW.uncertain_at_utc IS NOT NULL OR NEW.conflict_at_utc IS NOT NULL OR NEW.hold_at_utc IS NOT NULL"
+    " OR NOT EXISTS (SELECT 1 FROM energygrid_invoice_v2 i JOIN energygrid_stream_v2 s ON s.stream=i.stream AND s.watermark_invoice_id=i.invoice_id"
+    " WHERE i.invoice_id=NEW.invoice_id AND i.classification='CLASSIFIED' AND i.stream=NEW.stream AND i.archive_state='COMMITTED'"
+    " AND i.byte_size=NEW.local_byte_size AND i.sha256=NEW.local_sha256 AND i.archive_relpath=NEW.logical_relpath AND i.canonical_filename=NEW.remote_name)"
+    " OR NOT EXISTS (SELECT 1 FROM energygrid_drive_binding_v3 b WHERE b.binding_id=NEW.binding_id AND b.state='ACTIVE' AND b.stream=NEW.stream AND b.folder_id=NEW.folder_id)"
+    " BEGIN SELECT RAISE(ABORT,'Drive intent facts mismatch'); END",
+    "CREATE TRIGGER energygrid_drive_operation_identity_freeze_v3 BEFORE UPDATE ON energygrid_drive_operation_v3 WHEN"
+    " NEW.operation_id IS NOT OLD.operation_id OR NEW.invoice_id IS NOT OLD.invoice_id OR NEW.binding_id IS NOT OLD.binding_id"
+    " OR NEW.stream IS NOT OLD.stream OR NEW.folder_id IS NOT OLD.folder_id OR NEW.logical_relpath IS NOT OLD.logical_relpath"
+    " OR NEW.remote_name IS NOT OLD.remote_name OR NEW.local_byte_size IS NOT OLD.local_byte_size OR NEW.local_sha256 IS NOT OLD.local_sha256"
+    " OR NEW.local_md5 IS NOT OLD.local_md5 OR NEW.app_properties_json IS NOT OLD.app_properties_json"
+    " OR NEW.intent_run_id IS NOT OLD.intent_run_id OR NEW.intent_at_utc IS NOT OLD.intent_at_utc"
+    " BEGIN SELECT RAISE(ABORT,'Drive operation identity is frozen'); END",
+    # Amendment A: the pre-generated Drive file ID is written once, only
+    # before any dispatch, and can never be replaced afterwards.
+    "CREATE TRIGGER energygrid_drive_operation_reservation_once_v3 BEFORE UPDATE ON energygrid_drive_operation_v3 WHEN"
+    " (OLD.reserved_remote_file_id IS NOT NULL AND (NEW.reserved_remote_file_id IS NOT OLD.reserved_remote_file_id OR NEW.reserved_run_id IS NOT OLD.reserved_run_id OR NEW.reserved_at_utc IS NOT OLD.reserved_at_utc))"
+    " OR (OLD.reserved_remote_file_id IS NULL AND NEW.reserved_remote_file_id IS NOT NULL AND (OLD.state!='DRIVE_UPLOAD_INTENT' OR NEW.state!='DRIVE_UPLOAD_INTENT' OR OLD.upload_attempt_count!=0 OR NEW.upload_attempt_count!=0"
+    " OR EXISTS (SELECT 1 FROM energygrid_drive_dispatch_v3 d WHERE d.operation_id=OLD.operation_id)))"
+    " OR (OLD.reserved_remote_file_id IS NULL AND NEW.reserved_remote_file_id IS NULL AND (NEW.reserved_run_id IS NOT NULL OR NEW.reserved_at_utc IS NOT NULL))"
+    " BEGIN SELECT RAISE(ABORT,'reserved Drive file ID is frozen'); END",
+    "CREATE TRIGGER energygrid_drive_operation_attempt_guard_v3 BEFORE UPDATE OF upload_attempt_count ON energygrid_drive_operation_v3 WHEN"
+    " NEW.upload_attempt_count IS NOT OLD.upload_attempt_count AND (NEW.upload_attempt_count!=OLD.upload_attempt_count+1"
+    " OR OLD.state!='DRIVE_UPLOAD_INTENT' OR NEW.state!='DRIVE_UPLOAD_INTENT'"
+    " OR NOT EXISTS (SELECT 1 FROM energygrid_drive_dispatch_v3 d WHERE d.operation_id=OLD.operation_id AND d.attempt_no=NEW.upload_attempt_count AND d.reserved_remote_file_id=OLD.reserved_remote_file_id))"
+    " BEGIN SELECT RAISE(ABORT,'Drive attempt count requires a dispatch marker'); END",
+    "CREATE TRIGGER energygrid_drive_operation_terminal_freeze_v3 BEFORE UPDATE ON energygrid_drive_operation_v3 WHEN"
+    " OLD.state IN ('DRIVE_VERIFIED','DRIVE_CONFLICT') OR (OLD.state='HOLD' AND OLD.support_ref!='EG_DRIVE_VERIFICATION_UNAVAILABLE')"
+    " BEGIN SELECT RAISE(ABORT,'terminal Drive operation is frozen'); END",
+    "CREATE TRIGGER energygrid_drive_operation_state_guard_v3 BEFORE UPDATE OF state ON energygrid_drive_operation_v3 WHEN NEW.state IS NOT OLD.state AND NOT ("
+    "(OLD.state='DRIVE_UPLOAD_INTENT' AND NEW.state IN ('DRIVE_VERIFIED','DRIVE_UPLOAD_UNCERTAIN','DRIVE_CONFLICT','HOLD'))"
+    " OR (OLD.state='DRIVE_UPLOAD_UNCERTAIN' AND NEW.state IN ('DRIVE_VERIFIED','DRIVE_CONFLICT','HOLD'))"
+    " OR (OLD.state='DRIVE_UPLOAD_UNCERTAIN' AND NEW.state='DRIVE_UPLOAD_INTENT' AND OLD.upload_attempt_count=1 AND NEW.upload_attempt_count=1"
+    "  AND OLD.retry_authorised_run_id IS NULL AND NEW.retry_authorised_run_id IS NOT NULL AND NEW.retry_authorised_run_id=NEW.last_reconcile_run_id"
+    "  AND NEW.last_reconcile_result='NOT_FOUND'"
+    "  AND NOT EXISTS (SELECT 1 FROM energygrid_drive_dispatch_v3 d WHERE d.operation_id=OLD.operation_id AND (d.outcome IS NULL OR d.dispatch_run_id=NEW.retry_authorised_run_id)))"
+    " OR (OLD.state='HOLD' AND OLD.support_ref='EG_DRIVE_VERIFICATION_UNAVAILABLE' AND NEW.state='DRIVE_VERIFIED')"
+    ") BEGIN SELECT RAISE(ABORT,'Drive state transition is not allowed'); END",
+    "CREATE TRIGGER energygrid_drive_operation_retry_once_v3 BEFORE UPDATE OF retry_authorised_run_id,retry_authorised_at_utc ON energygrid_drive_operation_v3 WHEN"
+    " (OLD.retry_authorised_run_id IS NOT NULL AND (NEW.retry_authorised_run_id IS NOT OLD.retry_authorised_run_id OR NEW.retry_authorised_at_utc IS NOT OLD.retry_authorised_at_utc))"
+    " OR (OLD.retry_authorised_run_id IS NULL AND NEW.retry_authorised_run_id IS NOT NULL AND NOT (OLD.state='DRIVE_UPLOAD_UNCERTAIN' AND NEW.state='DRIVE_UPLOAD_INTENT'))"
+    " BEGIN SELECT RAISE(ABORT,'Drive retry authority is write-once'); END",
+    "CREATE TRIGGER energygrid_drive_operation_verified_binding_v3 BEFORE UPDATE OF state ON energygrid_drive_operation_v3 WHEN NEW.state='DRIVE_VERIFIED' AND OLD.state!='DRIVE_VERIFIED'"
+    " AND (NOT EXISTS (SELECT 1 FROM energygrid_drive_binding_v3 b WHERE b.binding_id=NEW.binding_id AND b.state='ACTIVE' AND b.folder_id=NEW.folder_id)"
+    " OR EXISTS (SELECT 1 FROM energygrid_drive_dispatch_v3 d WHERE d.operation_id=NEW.operation_id AND (d.outcome IS NULL OR d.reserved_remote_file_id IS NOT NEW.reserved_remote_file_id))"
+    " OR NOT EXISTS (SELECT 1 FROM energygrid_invoice_v2 i WHERE i.invoice_id=NEW.invoice_id AND i.archive_state='COMMITTED' AND i.byte_size=NEW.local_byte_size AND i.sha256=NEW.local_sha256))"
+    " BEGIN SELECT RAISE(ABORT,'Drive verification lacks current authority'); END",
+    "CREATE TRIGGER energygrid_drive_operation_no_delete_v3 BEFORE DELETE ON energygrid_drive_operation_v3 BEGIN SELECT RAISE(ABORT,'Drive operation rows are retained'); END",
+    # Dispatch markers: one per attempt, carrying the frozen reserved ID.
+    "CREATE TRIGGER energygrid_drive_dispatch_insert_guard_v3 BEFORE INSERT ON energygrid_drive_dispatch_v3 WHEN"
+    " NEW.outcome IS NOT NULL OR NOT EXISTS (SELECT 1 FROM energygrid_drive_operation_v3 o WHERE o.operation_id=NEW.operation_id"
+    " AND o.state='DRIVE_UPLOAD_INTENT' AND o.reserved_remote_file_id IS NOT NULL AND o.reserved_remote_file_id=NEW.reserved_remote_file_id"
+    " AND NEW.attempt_no=o.upload_attempt_count+1 AND (NEW.attempt_no=1 OR (o.retry_authorised_run_id IS NOT NULL"
+    " AND o.last_reconcile_run_id=NEW.dispatch_run_id AND o.last_reconcile_result='NOT_FOUND')))"
+    " OR EXISTS (SELECT 1 FROM energygrid_drive_dispatch_v3 d WHERE d.operation_id=NEW.operation_id AND (d.outcome IS NULL OR d.dispatch_run_id=NEW.dispatch_run_id))"
+    " BEGIN SELECT RAISE(ABORT,'Drive dispatch is not authorised'); END",
+    "CREATE TRIGGER energygrid_drive_dispatch_once_v3 BEFORE UPDATE ON energygrid_drive_dispatch_v3 WHEN OLD.outcome IS NOT NULL"
+    " OR NEW.operation_id IS NOT OLD.operation_id OR NEW.attempt_no IS NOT OLD.attempt_no OR NEW.reserved_remote_file_id IS NOT OLD.reserved_remote_file_id"
+    " OR NEW.dispatch_run_id IS NOT OLD.dispatch_run_id OR NEW.dispatched_at_utc IS NOT OLD.dispatched_at_utc"
+    " BEGIN SELECT RAISE(ABORT,'Drive dispatch marker is write-once'); END",
+    "CREATE TRIGGER energygrid_drive_dispatch_no_delete_v3 BEFORE DELETE ON energygrid_drive_dispatch_v3 BEGIN SELECT RAISE(ABORT,'Drive dispatch rows are retained'); END",
+    "CREATE TRIGGER energygrid_run_no_update_v3 BEFORE UPDATE ON energygrid_run_v3 BEGIN SELECT RAISE(ABORT,'run rows are insert-only'); END",
+    "CREATE TRIGGER energygrid_run_no_delete_v3 BEFORE DELETE ON energygrid_run_v3 BEGIN SELECT RAISE(ABORT,'run rows are retained'); END",
+    # Historical v2 Drive facts: preserved and frozen, never newly produced.
+    "CREATE TRIGGER energygrid_invoice_drive_legacy_freeze_v3 BEFORE UPDATE ON energygrid_invoice_v2 WHEN"
+    " NEW.drive_state IS NOT OLD.drive_state OR NEW.drive_binding_id IS NOT OLD.drive_binding_id OR NEW.drive_relpath IS NOT OLD.drive_relpath"
+    " OR NEW.drive_size IS NOT OLD.drive_size OR NEW.drive_sha256 IS NOT OLD.drive_sha256 OR NEW.drive_staged_at_utc IS NOT OLD.drive_staged_at_utc"
+    " BEGIN SELECT RAISE(ABORT,'historical Drive stage facts are frozen'); END",
+    "CREATE TRIGGER energygrid_invoice_drive_legacy_insert_guard_v3 BEFORE INSERT ON energygrid_invoice_v2 WHEN"
+    " NEW.drive_state!='NOT_STAGED' OR NEW.drive_binding_id IS NOT NULL OR NEW.drive_relpath IS NOT NULL OR NEW.drive_size IS NOT NULL"
+    " OR NEW.drive_sha256 IS NOT NULL OR NEW.drive_staged_at_utc IS NOT NULL"
+    " BEGIN SELECT RAISE(ABORT,'filesystem Drive staging is retired'); END",
+    "CREATE TRIGGER energygrid_file_operation_drive_stage_retired_v3 BEFORE INSERT ON energygrid_file_operation_v2 WHEN NEW.kind='DRIVE_STAGE'"
+    " BEGIN SELECT RAISE(ABORT,'filesystem Drive staging is retired'); END",
+    # Drive-before-email: an email intent requires a DRIVE_VERIFIED receipt for
+    # the same invoice bytes under the binding that is ACTIVE now.
+    "CREATE TRIGGER energygrid_delivery_invoice_guard_v3 BEFORE INSERT ON energygrid_delivery_v1 WHEN"
+    " NOT EXISTS (SELECT 1 FROM energygrid_invoice_v2 i WHERE i.invoice_id=NEW.invoice_id AND i.classification='CLASSIFIED' AND i.stream=NEW.stream"
+    " AND i.bill_date=NEW.bill_date AND i.canonical_filename=NEW.attachment_name AND i.archive_state='COMMITTED' AND i.byte_size=NEW.byte_size AND i.sha256=NEW.sha256)"
+    " OR NOT EXISTS (SELECT 1 FROM energygrid_drive_operation_v3 o JOIN energygrid_drive_binding_v3 b ON b.binding_id=o.binding_id"
+    " WHERE o.invoice_id=NEW.invoice_id AND o.state='DRIVE_VERIFIED' AND o.local_sha256=NEW.sha256 AND o.local_byte_size=NEW.byte_size"
+    " AND o.remote_file_id=o.reserved_remote_file_id AND b.state='ACTIVE' AND b.stream=NEW.stream)"
+    " BEGIN SELECT RAISE(ABORT,'delivery requires a verified Drive receipt'); END",
+)
+
+V3_TABLES = (
+    "energygrid_drive_binding_v3", "energygrid_drive_operation_v3",
+    "energygrid_drive_dispatch_v3", "energygrid_run_v3",
+)
+
+
+def drive_binding_id(stream: str, account_ref: str, root_folder_id: str, folder_id: str) -> str:
+    """The deterministic binding identity from the accepted G2 contract."""
+    import hashlib
+
+    material = f"energygrid.drive_binding.v3\n{stream}\n{account_ref}\n{root_folder_id}\n{folder_id}"
+    return "egdb3-" + hashlib.sha256(material.encode("ascii")).hexdigest()[:32]
+
+
+def drive_app_properties(*, binding_id: str, invoice_id: str, operation_id: str, local_sha256: str, stream: str) -> dict[str, str]:
+    """The exact seven private appProperties keys; every value is ASCII."""
+    return {
+        "egApp": "xb-energygrid",
+        "egBnd": binding_id,
+        "egInv": invoice_id,
+        "egOp": operation_id,
+        "egSchema": "eg-drive-v3",
+        "egSha": local_sha256,
+        "egStream": stream,
+    }
+
+
+def canonical_json(value: dict) -> str:
+    import json
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _reference_v3_manifest() -> dict[tuple[str, str], str | None]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(_LEGACY_BILLS_SCHEMA_SQL)
+        for statement in V2_SCHEMA_SQL:
+            connection.execute(statement)
+        _apply_v3_schema(connection)
+        return _schema_manifest(connection)
+    finally:
+        connection.close()
+
+
+def _apply_v3_schema(connection: sqlite3.Connection) -> None:
+    for name in V3_DROPPED_V2_OBJECTS:
+        connection.execute(f"DROP TRIGGER {name}")
+    for statement in V3_SCHEMA_SQL:
+        connection.execute(statement)
+
+
+def _inspect_v3_database(connection: sqlite3.Connection) -> str:
+    """Return a closed v3 schema/data status without repairing anything."""
+    try:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != V3_SCHEMA_VERSION:
+            return "INCOMPATIBLE_V3"
+        if connection.execute("PRAGMA journal_mode").fetchone()[0].lower() != "delete":
+            return "INCOMPATIBLE_V3"
+        if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
+            return "INCOMPATIBLE_V3"
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            return "INCOMPATIBLE_V3"
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            return "CORRUPT_OR_UNREADABLE_V3"
+        actual = _schema_manifest(connection)
+        expected = _reference_v3_manifest()
+        if actual != expected:
+            return "INCOMPLETE_V3" if set(expected) - set(actual) else "INCOMPATIBLE_V3"
+        if list(connection.execute("PRAGMA foreign_key_check")):
+            return "INCOMPATIBLE_V3"
+        if not _v2_semantic_data_is_valid(connection) or not _v3_semantic_data_is_valid(connection):
+            return "INCOMPATIBLE_V3"
+        return "RESUMABLE_V3" if _v3_has_resumable_work(connection) else "COMPLETE_V3"
+    except sqlite3.Error:
+        return "CORRUPT_OR_UNREADABLE_V3"
+
+
+def _v3_semantic_data_is_valid(connection: sqlite3.Connection) -> bool:
+    bindings = {
+        row[0]: _named_row(connection, "energygrid_drive_binding_v3", row)
+        for row in connection.execute("SELECT * FROM energygrid_drive_binding_v3")
+    }
+    for binding in bindings.values():
+        if binding["binding_id"] != drive_binding_id(
+            binding["stream"], binding["account_ref"], binding["root_folder_id"], binding["folder_id"]
+        ):
+            return False
+    invoices = {
+        row[0]: _named_row(connection, "energygrid_invoice_v2", row)
+        for row in connection.execute("SELECT * FROM energygrid_invoice_v2")
+    }
+    dispatches: dict[str, list[dict]] = {}
+    for row in connection.execute("SELECT * FROM energygrid_drive_dispatch_v3 ORDER BY operation_id,attempt_no"):
+        item = _named_row(connection, "energygrid_drive_dispatch_v3", row)
+        dispatches.setdefault(item["operation_id"], []).append(item)
+    operation_ids: set[str] = set()
+    for row in connection.execute("SELECT * FROM energygrid_drive_operation_v3"):
+        operation = _named_row(connection, "energygrid_drive_operation_v3", row)
+        operation_ids.add(operation["operation_id"])
+        invoice = invoices.get(operation["invoice_id"])
+        binding = bindings.get(operation["binding_id"])
+        if invoice is None or binding is None or invoice["classification"] != "CLASSIFIED":
+            return False
+        if (
+            binding["stream"] != operation["stream"] or binding["folder_id"] != operation["folder_id"]
+            or invoice["stream"] != operation["stream"] or invoice["archive_relpath"] != operation["logical_relpath"]
+            or invoice["canonical_filename"] != operation["remote_name"]
+            or invoice["byte_size"] != operation["local_byte_size"] or invoice["sha256"] != operation["local_sha256"]
+        ):
+            return False
+        attempts = dispatches.get(operation["operation_id"], [])
+        if [item["attempt_no"] for item in attempts] != list(range(1, len(attempts) + 1)):
+            return False
+        if len(attempts) != operation["upload_attempt_count"]:
+            return False
+        if any(item["reserved_remote_file_id"] != operation["reserved_remote_file_id"] for item in attempts):
+            return False
+        if sum(1 for item in attempts if item["outcome"] is None) > 1:
+            return False
+        if operation["support_ref"] is not None and _SUPPORT_REF_RE.fullmatch(operation["support_ref"]) is None:
+            return False
+        if operation["state"] == "DRIVE_VERIFIED" and any(item["outcome"] is None for item in attempts):
+            return False
+    if set(dispatches) - operation_ids:
+        return False
+    for attempts in dispatches.values():
+        for item in attempts:
+            if item["support_ref"] is not None and _SUPPORT_REF_RE.fullmatch(item["support_ref"]) is None:
+                return False
+    return True
+
+
+def _v3_has_resumable_work(connection: sqlite3.Connection) -> bool:
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM energygrid_invoice_v2 WHERE classification='UNCLASSIFIED' "
+            "OR archive_state IN ('PREPARED','CONFLICT','UNVERIFIED') "
+            "OR migration_state IN ('UNCLASSIFIED','MOVE_PLANNED','HOLD') LIMIT 1"
+        ).fetchone()
+        or connection.execute("SELECT 1 FROM energygrid_stream_v2 WHERE admission='HOLD' LIMIT 1").fetchone()
+        or connection.execute(
+            "SELECT 1 FROM energygrid_file_operation_v2 WHERE kind!='DRIVE_STAGE' AND state IN ('PREPARED','HOLD') LIMIT 1"
+        ).fetchone()
+        or connection.execute(
+            "SELECT 1 FROM energygrid_drive_operation_v3 WHERE state!='DRIVE_VERIFIED' LIMIT 1"
+        ).fetchone()
+        or connection.execute(
+            "SELECT 1 FROM energygrid_stream_v2 AS stream "
+            "LEFT JOIN energygrid_drive_operation_v3 AS operation ON operation.invoice_id=stream.watermark_invoice_id AND operation.state='DRIVE_VERIFIED' "
+            "LEFT JOIN energygrid_delivery_v1 AS delivery ON delivery.invoice_id=stream.watermark_invoice_id "
+            "WHERE stream.watermark_invoice_id IS NOT NULL AND (operation.operation_id IS NULL "
+            "OR delivery.delivery_id IS NULL OR delivery.state!='DELIVERED') LIMIT 1"
+        ).fetchone()
+        or connection.execute("SELECT 1 FROM energygrid_delivery_v1 WHERE state!='DELIVERED' LIMIT 1").fetchone()
+    )
+
+
+class StateV3Store(StateV2Store):
+    """Existing v3 state only. Daily commands never create or migrate it."""
+
+    _accepted_statuses = frozenset({"COMPLETE_V3", "RESUMABLE_V3"})
+
+    @staticmethod
+    def _inspect(connection: sqlite3.Connection) -> str:
+        return _inspect_v3_database(connection)
+
+    # -- reads ------------------------------------------------------------
+    def _rows(self, table: str, sql: str, parameters: tuple = ()) -> list[dict]:
+        connection = self._conn()
+        return [_named_row(connection, table, row) for row in connection.execute(sql, parameters).fetchall()]
+
+    def active_binding(self, stream: str) -> dict | None:
+        rows = self._rows(
+            "energygrid_drive_binding_v3",
+            "SELECT * FROM energygrid_drive_binding_v3 WHERE stream=? AND state='ACTIVE'", (stream,),
+        )
+        return rows[0] if rows else None
+
+    def binding(self, binding_id: str) -> dict | None:
+        rows = self._rows(
+            "energygrid_drive_binding_v3", "SELECT * FROM energygrid_drive_binding_v3 WHERE binding_id=?", (binding_id,),
+        )
+        return rows[0] if rows else None
+
+    def drive_operation(self, operation_id: str) -> dict | None:
+        rows = self._rows(
+            "energygrid_drive_operation_v3", "SELECT * FROM energygrid_drive_operation_v3 WHERE operation_id=?", (operation_id,),
+        )
+        return rows[0] if rows else None
+
+    def drive_operation_for(self, invoice_id: str, binding_id: str) -> dict | None:
+        rows = self._rows(
+            "energygrid_drive_operation_v3",
+            "SELECT * FROM energygrid_drive_operation_v3 WHERE invoice_id=? AND binding_id=?", (invoice_id, binding_id),
+        )
+        return rows[0] if rows else None
+
+    def drive_operations_for_invoice(self, invoice_id: str) -> list[dict]:
+        return self._rows(
+            "energygrid_drive_operation_v3",
+            "SELECT * FROM energygrid_drive_operation_v3 WHERE invoice_id=? ORDER BY intent_at_utc,operation_id", (invoice_id,),
+        )
+
+    def drive_dispatches(self, operation_id: str) -> list[dict]:
+        return self._rows(
+            "energygrid_drive_dispatch_v3",
+            "SELECT * FROM energygrid_drive_dispatch_v3 WHERE operation_id=? ORDER BY attempt_no", (operation_id,),
+        )
+
+    def open_drive_dispatch(self, operation_id: str) -> dict | None:
+        rows = [item for item in self.drive_dispatches(operation_id) if item["outcome"] is None]
+        return rows[0] if rows else None
+
+    def run_record(self, run_id: str) -> dict | None:
+        rows = self._rows("energygrid_run_v3", "SELECT * FROM energygrid_run_v3 WHERE run_id=?", (run_id,))
+        return rows[0] if rows else None
+
+    def has_open_archive_operation(self, invoice_id: str) -> bool:
+        row = self._conn().execute(
+            "SELECT 1 FROM energygrid_file_operation_v2 WHERE invoice_id=? AND kind IN ('ARCHIVE_PUBLISH','LEGACY_MOVE') "
+            "AND state IN ('PREPARED','HOLD') LIMIT 1",
+            (invoice_id,),
+        ).fetchone()
+        return row is not None
+
+    # -- writes -----------------------------------------------------------
+    def insert_run_record(self, *, run_id: str, started_at_utc: str, acquire_state: str, acquire_exit_code: int,
+                          acquire_support_ref: str | None, streams: dict[str, tuple[str, str | None]], timestamp: str) -> None:
+        if not _valid_run_id(run_id) or acquire_state not in {"COMPLETED", "FAILED"}:
+            raise StateError("run record is invalid")
+        eb = streams.get("EB_BILL", ("NOT_REACHED", None))
+        tenant = streams.get("TENANT_BILL", ("NOT_REACHED", None))
+        for result, ref in (eb, tenant):
+            if result not in STREAM_ACQUIRE_RESULTS or (ref is not None and _SUPPORT_REF_RE.fullmatch(ref) is None):
+                raise StateError("run record is invalid")
+        if acquire_support_ref is not None and _SUPPORT_REF_RE.fullmatch(acquire_support_ref) is None:
+            raise StateError("run record is invalid")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO energygrid_run_v3 (run_id,started_at_utc,acquire_state,acquire_at_utc,acquire_exit_code,acquire_support_ref,"
+                "eb_bill_acquire,tenant_bill_acquire,eb_bill_support_ref,tenant_bill_support_ref) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (run_id, started_at_utc, acquire_state, timestamp, acquire_exit_code, acquire_support_ref,
+                 eb[0], tenant[0], eb[1], tenant[1]),
+            )
+
+    def insert_binding(self, *, stream: str, account_ref: str, root_folder_id: str, folder_id: str,
+                       chain_sha256: str, run_id: str, timestamp: str) -> dict:
+        if stream not in V2_STREAMS or not ACCOUNT_REF_RE.fullmatch(account_ref or "") or not _valid_run_id(run_id):
+            raise StateError("Drive binding is invalid")
+        if not DRIVE_ID_RE.fullmatch(root_folder_id or "") or not DRIVE_ID_RE.fullmatch(folder_id or ""):
+            raise StateError("Drive binding is invalid")
+        binding_id = drive_binding_id(stream, account_ref, root_folder_id, folder_id)
+        label = "EB Bill" if stream == "EB_BILL" else "Tenant Bill"
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO energygrid_drive_binding_v3 (binding_id,stream,account_ref,root_folder_id,folder_id,logical_path,"
+                "chain_sha256,state,bound_run_id,bound_at_utc) VALUES (?,?,?,?,?,?,?,'ACTIVE',?,?)",
+                (binding_id, stream, account_ref, root_folder_id, folder_id,
+                 f"Automation/_MandarinGallery/Utilities/EnergyGrid/{label}", chain_sha256, run_id, timestamp),
+            )
+        row = self.binding(binding_id)
+        if row is None:
+            raise StateError("Drive binding could not be read back")
+        return row
+
+    def retire_binding(self, binding_id: str, timestamp: str) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE energygrid_drive_binding_v3 SET state='RETIRED',retired_at_utc=? WHERE binding_id=? AND state='ACTIVE'",
+                (timestamp, binding_id),
+            )
+            if cursor.rowcount != 1:
+                raise StateError("Drive binding could not be retired")
+
+    def create_drive_intent(self, *, invoice: dict, binding: dict, local_md5: str, operation_id: str,
+                            run_id: str, timestamp: str) -> tuple[dict, bool]:
+        """Insert the frozen INTENT for (invoice, binding), or return the identical existing row."""
+        if not _valid_run_id(run_id) or not OPERATION_ID_RE.fullmatch(operation_id):
+            raise StateError("Drive intent identity is invalid")
+        existing = self.drive_operation_for(invoice["invoice_id"], binding["binding_id"])
+        if existing is not None:
+            if (
+                existing["local_sha256"] != invoice["sha256"] or existing["local_byte_size"] != invoice["byte_size"]
+                or existing["local_md5"] != local_md5 or existing["folder_id"] != binding["folder_id"]
+            ):
+                raise StreamStateConflictError(invoice["stream"], "EG_DRIVE_INTENT_FACTS_CONFLICT")
+            return existing, False
+        properties = canonical_json(drive_app_properties(
+            binding_id=binding["binding_id"], invoice_id=invoice["invoice_id"], operation_id=operation_id,
+            local_sha256=invoice["sha256"], stream=invoice["stream"],
+        ))
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO energygrid_drive_operation_v3 (operation_id,invoice_id,binding_id,stream,folder_id,logical_relpath,remote_name,"
+                "local_byte_size,local_sha256,local_md5,app_properties_json,state,upload_attempt_count,intent_run_id,intent_at_utc) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,'DRIVE_UPLOAD_INTENT',0,?,?)",
+                (operation_id, invoice["invoice_id"], binding["binding_id"], invoice["stream"], binding["folder_id"],
+                 invoice["archive_relpath"], invoice["canonical_filename"], invoice["byte_size"], invoice["sha256"],
+                 local_md5, properties, run_id, timestamp),
+            )
+        row = self.drive_operation(operation_id)
+        if row is None:
+            raise StateError("Drive intent could not be read back")
+        return row, True
+
+    def reserve_drive_file_id(self, operation_id: str, file_id: str, run_id: str, timestamp: str) -> bool:
+        """Persist the one pre-generated Drive file ID; false when one is already frozen."""
+        if type(file_id) is not str or not DRIVE_ID_RE.fullmatch(file_id) or not _valid_run_id(run_id):
+            raise StateError("reserved Drive file ID is invalid")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE energygrid_drive_operation_v3 SET reserved_remote_file_id=?,reserved_run_id=?,reserved_at_utc=? "
+                "WHERE operation_id=? AND reserved_remote_file_id IS NULL AND state='DRIVE_UPLOAD_INTENT' AND upload_attempt_count=0",
+                (file_id, run_id, timestamp, operation_id),
+            )
+            return cursor.rowcount == 1
+
+    def begin_drive_dispatch(self, operation_id: str, run_id: str, timestamp: str) -> int:
+        """Commit the write-once dispatch marker and attempt count; return the attempt number."""
+        if not _valid_run_id(run_id):
+            raise StateError("Drive dispatch identity is invalid")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT upload_attempt_count,reserved_remote_file_id FROM energygrid_drive_operation_v3 WHERE operation_id=? AND state='DRIVE_UPLOAD_INTENT'",
+                (operation_id,),
+            ).fetchone()
+            if row is None or row[1] is None:
+                raise StateError("Drive dispatch is not authorised")
+            attempt = int(row[0]) + 1
+            connection.execute(
+                "INSERT INTO energygrid_drive_dispatch_v3 (operation_id,attempt_no,reserved_remote_file_id,dispatch_run_id,dispatched_at_utc) VALUES (?,?,?,?,?)",
+                (operation_id, attempt, row[1], run_id, timestamp),
+            )
+            connection.execute(
+                "UPDATE energygrid_drive_operation_v3 SET upload_attempt_count=? WHERE operation_id=?",
+                (attempt, operation_id),
+            )
+        return attempt
+
+    def finish_drive_operation(
+        self,
+        operation_id: str,
+        *,
+        run_id: str,
+        timestamp: str,
+        new_state: str | None,
+        support_ref: str | None = None,
+        dispatch_outcome: str | None = None,
+        dispatch_support_ref: str | None = None,
+        reconcile_result: str | None = None,
+        receipt: dict | None = None,
+        authorise_retry: bool = False,
+    ) -> dict:
+        """Close any open dispatch marker and apply one state change in one transaction."""
+        if not _valid_run_id(run_id):
+            raise StateError("Drive result identity is invalid")
+        for ref in (support_ref, dispatch_support_ref):
+            if ref is not None and _SUPPORT_REF_RE.fullmatch(ref) is None:
+                raise StateError("Drive support reference is invalid")
+        receipt_columns = {
+            "remote_file_id", "remote_parent_id", "remote_name_observed", "remote_mime_type", "remote_size",
+            "remote_sha256", "remote_md5", "accepted_app_properties_json", "verification_method", "receipt_sha256",
+        }
+        with self.transaction() as connection:
+            if dispatch_outcome is not None:
+                cursor = connection.execute(
+                    "UPDATE energygrid_drive_dispatch_v3 SET outcome=?,outcome_at_utc=?,support_ref=? WHERE operation_id=? AND outcome IS NULL",
+                    (dispatch_outcome, timestamp, dispatch_support_ref or support_ref or "EG_DRIVE_DISPATCH_CLOSED", operation_id),
+                )
+                if cursor.rowcount != 1:
+                    raise StateError("Drive dispatch marker is unavailable")
+            fields: dict = {}
+            if reconcile_result is not None:
+                fields.update(last_reconcile_run_id=run_id, last_reconcile_at_utc=timestamp, last_reconcile_result=reconcile_result)
+            if new_state == "DRIVE_VERIFIED":
+                if type(receipt) is not dict or set(receipt) != receipt_columns:
+                    raise StateError("Drive receipt is invalid")
+                fields.update(receipt)
+                fields.update(state="DRIVE_VERIFIED", verified_run_id=run_id, verified_at_utc=timestamp)
+            elif new_state == "DRIVE_UPLOAD_UNCERTAIN":
+                fields.update(state=new_state, uncertain_at_utc=timestamp, support_ref=support_ref)
+            elif new_state == "DRIVE_CONFLICT":
+                fields.update(state=new_state, conflict_at_utc=timestamp, support_ref=support_ref)
+            elif new_state == "HOLD":
+                fields.update(state=new_state, hold_at_utc=timestamp, support_ref=support_ref)
+            elif new_state == "DRIVE_UPLOAD_INTENT":
+                if not authorise_retry:
+                    raise StateError("Drive retry requires core authority")
+                fields.update(state=new_state, retry_authorised_run_id=run_id, retry_authorised_at_utc=timestamp)
+            elif new_state is not None:
+                raise StateError("Drive state is invalid")
+            if fields:
+                assignments = ",".join(f"{name}=?" for name in fields)
+                cursor = connection.execute(
+                    f"UPDATE energygrid_drive_operation_v3 SET {assignments} WHERE operation_id=?",
+                    (*fields.values(), operation_id),
+                )
+                if cursor.rowcount != 1:
+                    raise StateError("Drive operation is unavailable")
+        row = self.drive_operation(operation_id)
+        if row is None:
+            raise StateError("Drive operation could not be read back")
+        return row
+
+
+def _check_migration_path(path: Path) -> bool:
+    if not path.is_absolute():
+        raise StateError("migration database path must be absolute")
+    exists = path.exists()
+    if exists and not stat.S_ISREG(path.lstat().st_mode):
+        raise StateError("migration database must be a regular file")
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            path.with_name(path.name + suffix).lstat()
+        except FileNotFoundError:
+            continue
+        raise StateError("migration database has an operational sidecar")
+    return exists
+
+
+def _v1_rows(connection: sqlite3.Connection) -> list[tuple]:
+    names = {row[0] for row in connection.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    if names != {"bills"}:
+        raise StateError("migration source schema is unsupported")
+    columns = {row[1]: row[2].upper() for row in connection.execute("PRAGMA table_xinfo(bills)")}
+    expected_types = {name: ("INTEGER" if name in {"byte_size", "attempt_count"} else "TEXT") for name in REQUIRED_COLUMNS}
+    if columns != expected_types:
+        raise StateError("migration source schema is unsupported")
+    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise StateError("migration source integrity check failed")
+    return connection.execute(
+        "SELECT filename_key,portal_filename,first_seen_at_utc,last_seen_at_utc,archived_at_utc,byte_size,sha256,status,last_error_class,last_error_at_utc,attempt_count,completion_source FROM bills ORDER BY filename_key"
+    ).fetchall()
+
+
+def _upgrade_v2_connection_to_v3(connection: sqlite3.Connection) -> None:
+    """Inside an open transaction: refuse an open DRIVE_STAGE, then add v3."""
+    if connection.execute(
+        "SELECT 1 FROM energygrid_file_operation_v2 WHERE kind='DRIVE_STAGE' AND state='PREPARED' LIMIT 1"
+    ).fetchone():
+        raise StreamStateConflictError("EB_BILL", "EG_V3_MIGRATION_DRIVE_STAGE_OPEN")
+    _apply_v3_schema(connection)
+    connection.execute(f"PRAGMA user_version={V3_SCHEMA_VERSION}")
+    if _inspect_v3_database(connection) not in {"COMPLETE_V3", "RESUMABLE_V3"}:
+        raise StateError("v3 migration schema or ownership validation failed")
+
+
+def migrate_state_database_v3(
+    path: Path,
+    *,
+    apply: bool = False,
+    streams: dict | None = None,
+    mapping_entries: list[dict] | None = None,
+    migration_run_id: str | None = None,
+) -> dict[str, int | str]:
+    """Bounded v1/v2 -> v3 migration. A default call only returns a read-only plan.
+
+    Every apply writes an exclusive-create backup first, then performs the whole
+    change and the v3 inspection in one transaction; any failure rolls back.
+    Historical DRIVE_STAGED facts are preserved and frozen, never converted.
+    """
+    exists = _check_migration_path(path)
+    mapping_entries = mapping_entries or []
+    _validate_migration_mapping(mapping_entries, streams or {})
+    migration_run_id = migration_run_id or "00000000-0000-0000-0000-000000000000"
+    if not _valid_run_id(migration_run_id):
+        raise StateError("migration run identity is invalid")
+    if not exists:
+        if not apply:
+            return {"status": "PLAN_CREATE_V3", "legacy_rows": 0}
+        if mapping_entries:
+            raise StateError("fresh v3 state cannot classify legacy mappings")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute(f"PRAGMA busy_timeout={V2_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(_LEGACY_BILLS_SCHEMA_SQL)
+                _create_v2_schema(connection, streams)
+                connection.execute(f"PRAGMA user_version={V2_SCHEMA_VERSION}")
+                _upgrade_v2_connection_to_v3(connection)
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return {"status": "CREATED_V3", "legacy_rows": 0}
+        finally:
+            connection.close()
+
+    uri = path.resolve().as_uri() + ("?mode=rw" if apply else "?mode=ro")
+    try:
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    except sqlite3.Error:
+        raise StateError("migration database could not be opened") from None
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={V2_BUSY_TIMEOUT_MS}")
+        connection.execute("PRAGMA synchronous=FULL")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version == V3_SCHEMA_VERSION:
+            if mapping_entries:
+                raise StateError("existing v3 state cannot accept a legacy mapping")
+            status = _inspect_v3_database(connection)
+            if status == "COMPLETE_V3":
+                return {"status": "ALREADY_V3", "legacy_rows": 0}
+            if status == "RESUMABLE_V3":
+                return {"status": "RESUMABLE_V3", "legacy_rows": 0}
+            raise StateError("existing v3 database is incomplete or incompatible")
+        if version == 1:
+            rows = _v1_rows(connection)
+            if not apply:
+                return {"status": "PLAN_READY_V3", "legacy_rows": len(rows)}
+            _backup_state_database(connection, path, "v1")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                _create_v2_schema(connection, streams)
+                for row in rows:
+                    connection.execute(
+                        "INSERT INTO energygrid_invoice_v2 (invoice_id,legacy_filename_key,classification,legacy_path,archive_state,byte_size,sha256,migration_state,drive_state,created_at_utc,created_run_id) VALUES (?,?,'UNCLASSIFIED',?,'UNVERIFIED',?,?,'UNCLASSIFIED','NOT_STAGED',?,'00000000-0000-0000-0000-000000000000')",
+                        (_stable_invoice_id("legacy", "LEGACY", row[0]), row[0], row[1], row[5], row[6], row[2]),
+                    )
+                _apply_migration_mapping(connection, mapping_entries, streams or {}, migration_run_id)
+                connection.execute(f"PRAGMA user_version={V2_SCHEMA_VERSION}")
+                if _inspect_v2_database(connection) not in {"COMPLETE_V2", "RESUMABLE_V2"}:
+                    raise StateError("migration schema or ownership validation failed")
+                _upgrade_v2_connection_to_v3(connection)
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return {"status": "MIGRATED_V3", "legacy_rows": len(rows)}
+        if version == V2_SCHEMA_VERSION:
+            if mapping_entries:
+                raise StateError("existing v2 state cannot accept a legacy mapping")
+            status = _inspect_v2_database(connection)
+            if status not in {"COMPLETE_V2", "RESUMABLE_V2", "RECOGNIZED_PREDECESSOR"}:
+                raise StateError("existing v2 database is incomplete or incompatible")
+            if connection.execute(
+                "SELECT 1 FROM energygrid_file_operation_v2 WHERE kind='DRIVE_STAGE' AND state='PREPARED' LIMIT 1"
+            ).fetchone():
+                if not apply:
+                    return {"status": "HOLD", "support_ref": "EG_V3_MIGRATION_DRIVE_STAGE_OPEN", "legacy_rows": 0}
+                raise StreamStateConflictError("EB_BILL", "EG_V3_MIGRATION_DRIVE_STAGE_OPEN")
+            if not apply:
+                return {"status": "PLAN_UPGRADE_V3", "legacy_rows": 0}
+            _backup_state_database(connection, path, "v2")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if status == "RECOGNIZED_PREDECESSOR":
+                    connection.execute("DROP TRIGGER energygrid_invoice_archive_commit_guard_v2")
+                    connection.execute(next(
+                        statement for statement in V2_SCHEMA_SQL
+                        if statement.startswith("CREATE TRIGGER energygrid_invoice_archive_commit_guard_v2")
+                    ))
+                    if _inspect_v2_database(connection) not in {"COMPLETE_V2", "RESUMABLE_V2"}:
+                        raise StateError("bounded v2 predecessor upgrade did not validate")
+                _upgrade_v2_connection_to_v3(connection)
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return {"status": "UPGRADED_V3", "legacy_rows": 0}
+        raise StateError("migration source schema is unsupported")
+    except sqlite3.Error:
+        raise StateError("migration database could not be inspected or updated") from None
+    finally:
+        connection.close()

@@ -79,6 +79,9 @@ class RunSummary:
     handled_count: int = 0
     uncertain_count: int = 0
     stream_results: list[dict[str, Any]] = field(default_factory=list)
+    # v3 acquire only: the per-stream retryability of a source failure. Never
+    # serialised; the core records it in the insert-only run row.
+    stream_exit_codes: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         document = self._base_dict()
@@ -643,6 +646,7 @@ DUAL_STAGE_EVENT_STATUSES = {
         "LATEST_INVOICE_MISSING", "LATEST_AMBIGUOUS", "ARCHIVE_PATH_INVALID",
         "LATEST_IDENTITY_CONFLICT", "SOURCE_REGRESSION", "ARCHIVE_RECOVERY_HOLD",
         "ARCHIVE_FAILURE", "DRIVE_FAILURE", "REQUEST_REJECTED", "DELIVERY_FAILURE",
+        "ARCHIVE_READY",
     }),
 }
 DUAL_STAGE_LOG_FIELDS = frozenset({
@@ -660,37 +664,28 @@ def reconcile_dual_stream(
     *,
     list_only: bool = False,
 ) -> RunSummary:
-    """Select at most one latest candidate per independently bound stream."""
+    """v3 `acquire`: select at most one latest invoice per independently bound
+    stream and make its canonical local archive available.
+
+    Google Drive upload and email delivery are deliberately absent here. They
+    are separate deterministic core commands (#226 G3) gated by durable state,
+    so this step never touches the Drive or email boundaries.
+    """
     from .config import BOUND_ADMISSION, UNBOUND_ADMISSION
-    from .delivery import DeliveryClient
-    from .drive import DriveStager
     from .invoice import InventorySnapshot, Stream
     from .publication import ensure_no_reparse_components, ensure_same_volume
-    from .state import StateV2Store, StreamStateConflictError
+    from .state import StateV3Store, StreamStateConflictError
 
-    if not isinstance(state, StateV2Store):
-        raise StateError("dual-stream execution requires the v2 state store")
+    if not isinstance(state, StateV3Store):
+        raise StateError("dual-stream acquisition requires the v3 state store")
     logger = _install_observational_logger(logger)
     summary = RunSummary(run_id=run_id, status=ACTION_REQUIRED, exit_code=20)
     details: dict[str, dict[str, Any]] = {}
     failures: list[int] = []
-    if config.drive.mode != "local_stage" or config.drive.root is None or not config.drive.binding_id:
-        for stream_name in DUAL_STREAMS:
-            details[stream_name] = _dual_detail(stream_name, "SHARED_SINK_UNBOUND", "EG_DRIVE_BINDING_UNBOUND")
-        summary.stream_results = [details[name] for name in DUAL_STREAMS]
-        summary.failure_count = len(DUAL_STREAMS)
-        summary.failures = [ACTION_REQUIRED]
-        summary.status = ACTION_REQUIRED
-        summary.exit_code = 20
-        for detail in summary.stream_results:
-            _emit_stream_complete(logger, detail)
-        return summary
+    drive = None
 
-    drive = DriveStager(config.archive_root, config.drive.root, config.drive.binding_id)
-    delivery = DeliveryClient(config.delivery)
     # Validate the shared roots before any adapter is contacted.
     ensure_no_reparse_components(config.archive_root)
-    ensure_no_reparse_components(config.drive.root)
     ensure_no_reparse_components(config.temp_root)
     ensure_same_volume(config.temp_root, config.archive_root / "_volume_probe_")
 
@@ -743,6 +738,7 @@ def reconcile_dual_stream(
         except AppError as exc:
             _dual_hold(detail, "SOURCE_FAILURE", _dual_support_ref(exc, "EG_SOURCE_INVENTORY_FAILED"))
             failures.append(exc.exit_code or 20)
+            summary.stream_exit_codes[stream_name] = exc.exit_code or 20
             _safe_log(logger, "inventory_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
             _emit_stream_complete(logger, detail)
             continue
@@ -902,79 +898,9 @@ def reconcile_dual_stream(
             _emit_stream_complete(logger, detail)
             continue
         _safe_log(logger, "archive_result", status="COMMITTED", stream=stream_name, archive_reused_count=detail["archive_reused_count"], archive_staged_count=detail["archive_staged_count"])
-
-        try:
-            invoice = state.invoice(invoice_id)
-            if invoice is None:
-                raise StateError("invoice state is unavailable")
-            was_staged = invoice["drive_state"] == "DRIVE_STAGED"
-            drive_target = config.drive.root / invoice["archive_relpath"]
-            target_was_present = drive_target.exists() and not drive_target.is_symlink()
-            drive.stage(state, invoice, archive_path, run_id, logger=logger)
-            if not was_staged or not target_was_present:
-                detail["drive_staged_count"] = 1
-                summary.drive_staged_count += 1
-        except StreamStateConflictError as exc:
-            _dual_hold(detail, "DRIVE_FAILURE", exc.support_ref)
-            failures.append(20)
-            _safe_log(logger, "drive_result", status="HOLD", stream=stream_name, support_ref=detail["support_ref"])
-            _emit_stream_complete(logger, detail)
-            continue
-        except AppError as exc:
-            if isinstance(exc, (StateError, ConfigError)):
-                raise
-            _dual_hold(detail, "DRIVE_FAILURE", _dual_support_ref(exc, "EG_DRIVE_STAGE_FAILURE"))
-            failures.append(exc.exit_code or 20)
-            _safe_log(logger, "drive_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
-            _emit_stream_complete(logger, detail)
-            continue
-        except Exception:
-            _dual_hold(detail, "DRIVE_FAILURE", "EG_DRIVE_STAGE_FAILURE")
-            failures.append(20)
-            _safe_log(logger, "drive_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
-            _emit_stream_complete(logger, detail)
-            continue
-
-        try:
-            invoice = state.invoice(invoice_id)
-            if invoice is None:
-                raise StateError("invoice state is unavailable")
-            mail = delivery.deliver(state, invoice, archive_path, run_id, logger=logger)
-            detail["delivery_outcome"] = mail.state
-            detail["support_ref"] = mail.support_ref
-            if mail.state == "DELIVERED":
-                detail["status"] = "DELIVERED"
-                detail["delivered_count"] = 1
-                detail["handled_count"] = 1
-                summary.delivered_count += 1
-                summary.handled_count += 1
-            elif mail.state == "DELIVERY_OUTCOME_UNCERTAIN":
-                detail["status"] = "DELIVERY_OUTCOME_UNCERTAIN"
-                detail["uncertain_count"] = 1
-                summary.uncertain_count += 1
-                failures.append(20)
-            else:
-                _dual_hold(detail, "REQUEST_REJECTED", mail.support_ref)
-                failures.append(20)
-                _emit_stream_complete(logger, detail)
-                continue
-        except StreamStateConflictError as exc:
-            _dual_hold(detail, "DELIVERY_FAILURE", exc.support_ref)
-            failures.append(20)
-            _emit_stream_complete(logger, detail)
-            continue
-        except AppError as exc:
-            if isinstance(exc, StateError):
-                raise
-            _dual_hold(detail, "DELIVERY_FAILURE", _dual_support_ref(exc, "EG_DELIVERY_PREPARATION_FAILED"))
-            failures.append(exc.exit_code or 20)
-            _emit_stream_complete(logger, detail)
-            continue
-        except Exception:
-            _dual_hold(detail, "DELIVERY_FAILURE", "EG_DELIVERY_PREPARATION_FAILED")
-            failures.append(20)
-            _emit_stream_complete(logger, detail)
-            continue
+        # The canonical archive is committed and re-verified. Drive and email
+        # are the core's later, separately gated `drive-*` and `deliver` steps.
+        detail["status"] = "ARCHIVE_READY"
         _emit_stream_complete(logger, detail)
 
     summary.stream_results = [details[name] for name in DUAL_STREAMS]
@@ -1379,7 +1305,10 @@ def _recover_archive_operation(state, invoice: dict, destination: Path, operatio
 
 
 def _is_fully_handled(config, state, drive, invoice: dict | None) -> bool:
-    if invoice is None or invoice.get("classification") != "CLASSIFIED" or state.has_open_file_operation(invoice["invoice_id"]):
+    """v3: latest + committed archive + DRIVE_VERIFIED under the ACTIVE
+    configured binding + DELIVERED email with matching facts. No local Drive
+    file is consulted; `drive` is unused and kept for call-site stability."""
+    if invoice is None or invoice.get("classification") != "CLASSIFIED" or state.has_open_archive_operation(invoice["invoice_id"]):
         return False
     watermark = state.stream(invoice["stream"])
     if (
@@ -1388,13 +1317,18 @@ def _is_fully_handled(config, state, drive, invoice: dict | None) -> bool:
         or watermark.get("watermark_invoice_id") != invoice.get("invoice_id")
     ):
         return False
-    if invoice.get("archive_state") != "COMMITTED" or invoice.get("drive_state") != "DRIVE_STAGED":
+    if invoice.get("archive_state") != "COMMITTED":
         return False
+    binding = state.active_binding(invoice["stream"])
+    configured = getattr(config.drive, "bindings", {}).get(invoice["stream"]) if hasattr(config.drive, "bindings") else None
+    if binding is None or configured is None or configured.binding_id != binding["binding_id"]:
+        return False
+    operation = state.drive_operation_for(invoice["invoice_id"], binding["binding_id"])
     if (
-        invoice.get("drive_binding_id") != config.drive.binding_id
-        or invoice.get("drive_relpath") != invoice.get("archive_relpath")
-        or invoice.get("drive_size") != invoice.get("byte_size")
-        or invoice.get("drive_sha256") != invoice.get("sha256")
+        operation is None or operation.get("state") != "DRIVE_VERIFIED"
+        or operation.get("remote_file_id") != operation.get("reserved_remote_file_id")
+        or operation.get("local_byte_size") != invoice.get("byte_size")
+        or operation.get("local_sha256") != invoice.get("sha256")
     ):
         return False
     delivery_row = state.delivery_for_invoice(invoice["invoice_id"])
@@ -1405,11 +1339,6 @@ def _is_fully_handled(config, state, drive, invoice: dict | None) -> bool:
         ensure_no_reparse_components(archive_path)
         archive_info = validate_pdf(archive_path)
         if archive_info.byte_size != invoice["byte_size"] or archive_info.sha256 != invoice["sha256"]:
-            return False
-        drive_path = config.drive.root / invoice["archive_relpath"]
-        ensure_no_reparse_components(drive_path)
-        drive_info = validate_pdf(drive_path)
-        if drive_info != archive_info:
             return False
     except (OSError, AppError):
         return False

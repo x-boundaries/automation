@@ -1,5 +1,5 @@
 {
-  "schema": "energygrid.runtime.v2",
+  "schema": "energygrid.runtime.v3",
   "source": "dual_stream",
   "archive_root": "C:\\EnergyGrid\\archive",
   "state_path": "C:\\EnergyGrid\\state\\bills.sqlite3",
@@ -27,9 +27,14 @@
     }
   },
   "drive": {
-    "mode": "unbound",
-    "root": null,
-    "binding_id": null
+    "webhook_url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_DRIVE_WEBHOOK_PATH",
+    "auth_header_name": "X-EnergyGrid-Drive",
+    "auth_token_env": "ENERGYGRID_DRIVE_TOKEN",
+    "timeout_seconds": 180,
+    "bindings": {
+      "EB_BILL": null,
+      "TENANT_BILL": null
+    }
   },
   "delivery": {
     "url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_PRIVATE_PATH",

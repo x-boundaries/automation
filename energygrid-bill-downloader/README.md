@@ -29,20 +29,27 @@ single-run lock and the alert contract are in `docs/runbook.md`.
 
 The browser source below remains the legacy default when `source` is absent.
 
-## Dual-stream repository path (EnergyGrid G3 #226/#228)
+## Dual-stream v3 path (EnergyGrid #226 G3)
 
-The v2 `dual_stream` configuration separates `EB_BILL` and `TENANT_BILL`. For
-each admitted stream, the runner requires a complete inventory, selects one
-unique latest bill date, and never backfills an older candidate. It writes the
-canonical PDF below `EB Bill/` or `Tenant Bill/`, then stages the exact bytes
-under the corresponding local Drive-for-desktop mirror path. `DRIVE_STAGED` is
-the completion boundary; this implementation does not inspect remote Drive
-cloud state.
+The `energygrid.runtime.v3` configuration separates `EB_BILL` and `TENANT_BILL`.
+Daily work is a planned sequence of deterministic core commands sequenced by
+the bounded Claude supervisor: `acquire` (complete inventory, one unique latest
+per stream, canonical PDF below `EB Bill/` or `Tenant Bill/`, never a backfill),
+`drive-intent`, `drive-upload` / `drive-reconcile` (exact bytes to Google Drive
+through the inactive n8n "EnergyGrid - Drive Upload" workflow using one
+pre-generated Drive file ID per operation) and `deliver` (email only after
+`DRIVE_VERIFIED`). `DRIVE_VERIFIED` requires the reserved file ID, folder,
+canonical name, MIME type, the exact seven appProperties, size and a SHA-256 or
+MD5+size checksum read back from Google; size alone or an HTTP 200 never counts.
+Google Drive for desktop and filesystem `DRIVE_STAGED` are retired; historical
+`DRIVE_STAGED` rows are preserved and frozen. The combined v2 `run`/`list` is
+retired. See [the v3 contract](docs/v3_claude_n8n_drive_contract.md).
 
 Tenant Bill production admission remains `UNBOUND` pending accepted #227
 evidence. No endpoint, discriminator, or date format is inferred. The committed
-`config/energygrid.dual_stream.example.json` is an inert shape with both streams
-unbound and all private paths as examples.
+`config/energygrid.dual_stream.example.json` is an inert v3 shape with both
+streams and both Drive folder bindings unbound and all private paths as
+examples.
 
 Email dispatch is backed by SQLite. The runner durably creates `PENDING_SEND`
 and atomically writes a one-time dispatch marker before its single webhook
@@ -53,6 +60,7 @@ or send permission. See the [EnergyGrid runbook](docs/runbook.md) and the
 [inactive invoice-delivery workflow notes](../n8n-workflows/README.md).
 
 `migrate-state` plans are read-only unless `--apply` is explicitly supplied.
+With a v3 config it migrates v1 or v2 state to v3 in one backed-up transaction.
 Any migration of a real private database and any classification of historical
 PDFs require a separate reviewed handoff; repository tests use synthetic data
 only. The 08:00 +08:00 Scheduler XML remains disabled. Repository changes do

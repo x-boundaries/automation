@@ -16,6 +16,7 @@ from .config import (
     BOUND_ADMISSION,
     MAX_INVENTORY_CEILING,
     RUNTIME_V2_SCHEMA,
+    RUNTIME_V3_SCHEMA,
     SOURCE_DIRECT_HTTP,
     DualRuntimeConfig,
     RuntimeConfig,
@@ -25,7 +26,6 @@ from .config import (
 )
 from .errors import ACTION_REQUIRED, SUPPORT_REF_PATTERN, AppError, ConfigError, DependencyError, exit_code_for
 from .http_source import DirectHttpSource
-from .invoice import DirectHttpAdapter, Stream
 from .invoice import DirectHttpAdapter, Stream
 from .notify import build_alert_payload, send_alert
 from .run_lock import RunLock
@@ -94,7 +94,7 @@ from .portal import (
     unobserved_login_witnesses,
 )
 from .reconcile import RunSummary, reconcile_dual_stream, reconcile_inventory, reconcile_listed_inventory
-from .state import StateStore, StateV2Store, migrate_state_database
+from .state import StateStore, StateV2Store, StateV3Store, migrate_state_database, migrate_state_database_v3
 
 
 # Invoice-failure enrichment and dual-stream summary fields are optional, so a log
@@ -551,7 +551,7 @@ def resolve_run_id() -> str:
     return supplied
 
 
-def run_dual_stream(config: DualRuntimeConfig, logger: SafeLogger, run_id: str, *, list_only: bool) -> int:
+def build_dual_adapters(config: DualRuntimeConfig) -> dict[str, Any]:
     adapters: dict[str, Any] = {}
     for stream_name, entry in config.streams.items():
         if entry.admission != BOUND_ADMISSION:
@@ -565,39 +565,17 @@ def run_dual_stream(config: DualRuntimeConfig, logger: SafeLogger, run_id: str, 
             source_namespace=entry.source_namespace,
             evidence_ref=entry.evidence_ref,
         )
+    return adapters
 
-    # Validate the durable schema before creating a lock file or contacting a
-    # source. Then hold one global lock across both streams and all effects.
-    with StateV2Store(config.state_path, read_only=True):
-        pass
-    if list_only:
-        with StateV2Store(config.state_path, read_only=True) as state:
-            summary = reconcile_dual_stream(config, adapters, state, logger, run_id, list_only=True)
-    else:
-        with RunLock(config.state_path.parent):
-            with StateV2Store(config.state_path) as state:
-                summary = reconcile_dual_stream(config, adapters, state, logger, run_id, list_only=False)
-    logger.event(
-        "run_complete", status=summary.status,
-        inventory_count=summary.inventory_count,
-        downloaded_count=summary.downloaded_count,
-        present_count=summary.present_count,
-        failure_count=summary.failure_count,
-        archive_reused_count=summary.archive_reused_count,
-        archive_staged_count=summary.downloaded_count,
-        drive_staged_count=summary.drive_staged_count,
-        delivered_count=summary.delivered_count,
-        handled_count=summary.handled_count,
-        uncertain_count=summary.uncertain_count,
-    )
-    print(json.dumps(summary.as_dict(), sort_keys=True))
-    if summary.exit_code != 0 and not list_only:
-        notify_failure(
-            config, logger, run_id, stage="run", status=summary.status,
-            support_ref="EG_DUAL_STREAM_INCOMPLETE", exit_code=summary.exit_code,
-            summary=summary,
-        )
-    return summary.exit_code
+
+def run_dual_stream(config: DualRuntimeConfig, logger: SafeLogger, run_id: str, *, list_only: bool) -> int:
+    """#226 G3: the combined dual-stream `run`/`list` (archive + filesystem
+    Drive mirror + email in one process) is retired. Daily work is the planned
+    sequence of deterministic core commands driven by the Claude supervisor.
+    Nothing is contacted, locked or written here."""
+    print(json.dumps({"status": ACTION_REQUIRED, "error_class": "DUAL_RUN_RETIRED",
+                      "support_ref": "EG_DUAL_RUN_RETIRED_USE_CORE"}, sort_keys=True))
+    return 64
 
 
 def notify_failure(
@@ -670,7 +648,130 @@ def build_parser() -> argparse.ArgumentParser:
     migration.add_argument("--config", required=True, type=Path)
     migration.add_argument("--mapping", required=True, type=Path)
     migration.add_argument("--apply", action="store_true")
+    # #226 G3 deterministic core commands. The caller supplies only the command
+    # and, for stream commands, one of two fixed stream names - never an ID,
+    # date, path or amount. The core decides whether the command is planned.
+    for command in ("plan", "status", "acquire"):
+        core = subparsers.add_parser(command)
+        core.add_argument("--config", required=True, type=Path)
+    for command in ("drive-intent", "drive-upload", "drive-reconcile", "deliver"):
+        core = subparsers.add_parser(command)
+        core.add_argument("--config", required=True, type=Path)
+        core.add_argument("--stream", required=True, choices=("EB_BILL", "TENANT_BILL"))
+    # Operator only (never on the Claude allowlist): bind private Drive folder IDs.
+    binding = subparsers.add_parser("drive-bind")
+    binding.add_argument("--config", required=True, type=Path)
+    binding.add_argument("--apply", action="store_true")
+    binding.add_argument("--rebind", action="store_true")
     return parser
+
+
+CORE_COMMANDS = ("plan", "status", "acquire", "drive-intent", "drive-upload", "drive-reconcile", "deliver")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _load_v3_config(path: Path) -> DualRuntimeConfig:
+    raw = load_config_file(path)
+    if type(raw) is not dict or raw.get("schema") != RUNTIME_V3_SCHEMA:
+        raise ConfigError("this command requires an energygrid.runtime.v3 config")
+    return load_dual_stream_config(raw)
+
+
+def run_core_command(args) -> int:
+    """One deterministic core command; one line of strict JSON on stdout."""
+    from .delivery import DeliveryClient
+    from .drive import DriveClient
+    from .orchestration import CoreContext, RESULT_SCHEMA, run_command
+
+    stream = getattr(args, "stream", None)
+    try:
+        config = _load_v3_config(args.config)
+        run_id = resolve_run_id()
+        read_only = args.command in {"plan", "status"}
+        config.preflight(read_only=read_only)
+        logger = _ReadOnlyLogger() if read_only else SafeLogger(config.log_root, run_id)
+        core = CoreContext(
+            config, run_id=run_id, logger=logger,
+            adapters_factory=lambda: build_dual_adapters(config),
+            drive_client=DriveClient(config.drive), delivery_client=DeliveryClient(config.delivery),
+        )
+        document, exit_code = run_command(args.command, stream, core)
+    except ConfigError:
+        document, exit_code = {
+            "schema": RESULT_SCHEMA, "command": args.command, "stream": stream, "outcome": "REFUSED",
+            "support_ref": "EG_CORE_CONFIG_INVALID", "mutated": False,
+        }, 64
+    except AppError as exc:
+        ref = getattr(exc, "support_ref", None)
+        document, exit_code = {
+            "schema": RESULT_SCHEMA, "command": args.command, "stream": stream, "outcome": "FAILED",
+            "support_ref": ref if type(ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, ref) else "EG_CORE_FAILURE",
+            "mutated": None,
+        }, (exc.exit_code if exc.exit_code in {10, 20} else 20)
+    print(json.dumps(document, sort_keys=True, separators=(",", ":")))
+    return exit_code
+
+
+def _run_drive_bind(args) -> int:
+    """Operator-only: verify configured Drive folder IDs read-only through the
+    n8n RESOLVE_DESTINATION mode, then insert ACTIVE bindings only if identical."""
+    import hashlib
+
+    from .drive import DriveClient, destination_request
+    from .orchestration import STREAMS
+
+    config = _load_v3_config(args.config)
+    run_id = resolve_run_id()
+    client = DriveClient(config.drive)
+    results: dict[str, str] = {}
+    exit_code = 0
+    with RunLock(config.state_path.parent):
+        with StateV3Store(config.state_path) as state:
+            for stream in STREAMS:
+                configured = config.drive.bindings.get(stream)
+                active = state.active_binding(stream)
+                if configured is None:
+                    results[stream] = "UNBOUND" if active is None else "HOLD_CONFIG_MISSING"
+                    exit_code = exit_code if active is None else 20
+                    continue
+                if active is not None and active["binding_id"] == configured.binding_id:
+                    results[stream] = "BOUND_UNCHANGED"
+                    continue
+                if active is not None and not args.rebind:
+                    results[stream] = "HOLD_BINDING_MISMATCH"
+                    exit_code = 20
+                    continue
+                if not args.apply:
+                    results[stream] = "PLAN_REBIND" if active is not None else "PLAN_BIND"
+                    continue
+                metadata = destination_request(stream, configured)
+                result = client.send(client.prepare(metadata, None), metadata)
+                if (
+                    result is None or result["outcome"] != "DESTINATION_RESOLVED" or result["folder_check"] != "PASS"
+                    or result["account_ref"] != configured.account_ref
+                ):
+                    results[stream] = "HOLD_DESTINATION_UNVERIFIED"
+                    exit_code = 20
+                    continue
+                if active is not None:
+                    state.retire_binding(active["binding_id"], _utc_timestamp())
+                label = "EB Bill" if stream == "EB_BILL" else "Tenant Bill"
+                chain = hashlib.sha256(
+                    "\n".join((
+                        "energygrid.drive_chain.v3", configured.account_ref, configured.root_folder_id,
+                        configured.folder_id, f"Automation/_MandarinGallery/Utilities/EnergyGrid/{label}",
+                    )).encode("ascii")
+                ).hexdigest()
+                state.insert_binding(
+                    stream=stream, account_ref=configured.account_ref, root_folder_id=configured.root_folder_id,
+                    folder_id=configured.folder_id, chain_sha256=chain, run_id=run_id, timestamp=_utc_timestamp(),
+                )
+                results[stream] = "BOUND"
+    print(json.dumps({"schema": "energygrid.drive_bind.v3", "streams": results}, sort_keys=True))
+    return exit_code
 
 
 def _migration_mapping(path: Path) -> list[dict[str, Any]]:
@@ -691,19 +792,22 @@ def _migration_mapping(path: Path) -> list[dict[str, Any]]:
 
 def _run_migration(args) -> int:
     raw = load_config_file(args.config)
-    if type(raw) is not dict or raw.get("schema") != RUNTIME_V2_SCHEMA:
-        raise ConfigError("migrate-state requires a v2 config")
+    if type(raw) is not dict or raw.get("schema") not in {RUNTIME_V2_SCHEMA, RUNTIME_V3_SCHEMA}:
+        raise ConfigError("migrate-state requires a v2 or v3 config")
     config = load_dual_stream_config(raw)
     entries = _migration_mapping(args.mapping)
     run_id = resolve_run_id()
+    # A v3 config migrates v1 or v2 state to v3 (#226 G3); a v2 config keeps
+    # the earlier bounded v1 -> v2 behaviour for historical evidence only.
+    migrate = migrate_state_database_v3 if raw.get("schema") == RUNTIME_V3_SCHEMA else migrate_state_database
     if args.apply:
         with RunLock(config.state_path.parent):
-            result = migrate_state_database(
+            result = migrate(
                 config.state_path, apply=True, streams=config.streams,
                 mapping_entries=entries, migration_run_id=run_id,
             )
     else:
-        result = migrate_state_database(
+        result = migrate(
             config.state_path, apply=False, streams=config.streams,
             mapping_entries=entries, migration_run_id=run_id,
         )
@@ -1496,8 +1600,12 @@ def main(argv: list[str] | None = None) -> int:
             return run_download_preflight_diagnostic(args.config)
         if args.command == "migrate-state":
             return _run_migration(args)
+        if args.command in CORE_COMMANDS:
+            return run_core_command(args)
+        if args.command == "drive-bind":
+            return _run_drive_bind(args)
         raw = load_config_file(args.config)
-        if type(raw) is dict and raw.get("schema") == RUNTIME_V2_SCHEMA:
+        if type(raw) is dict and raw.get("schema") in {RUNTIME_V2_SCHEMA, RUNTIME_V3_SCHEMA}:
             if any(getattr(args, name, None) is not None for name in ("archive_root", "state_path", "temp_root", "log_root", "timeout_seconds", "max_attempts")) or getattr(args, "headed", False):
                 raise ConfigError("v2 configuration does not accept runtime overrides")
             config_v2 = load_dual_stream_config(raw)

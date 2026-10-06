@@ -17,8 +17,12 @@
 # operation only; it is not a mode any caller can select, and 'run' and 'list' are
 # unaffected. The fixed 'download-preflight-diagnostic' operation is always headless and
 # never dispatches a Download (DL-XB-199 G2-083).
-# -Command is a closed allowlist of four fixed operation names, and the child argument
-# vector stays a fixed five elements with nothing appended conditionally. Two
+# -Command is a closed allowlist of eleven fixed operation names: the four earlier names
+# plus the seven #226 G3 deterministic core commands (plan, status, acquire, drive-intent,
+# drive-upload, drive-reconcile, deliver). -Stream is a closed allowlist of NONE, EB_BILL
+# and TENANT_BILL. The child argument vector is the fixed five elements followed by a
+# fixed stream suffix looked up from a closed table keyed by -Stream (empty for NONE), so
+# no caller-supplied text ever reaches the child. Two
 # parameters are mandatory specifically so that omitting an argument can never silently
 # disable a security expectation: -ExpectedBranch takes the literal ANY_BRANCH sentinel
 # rather than being optional, and -AuthorisedLauncherRootWriteSid is the only route by
@@ -42,7 +46,8 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$BrowserCachePath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid,
-    [ValidateSet('run', 'list', 'login-diagnostic', 'download-preflight-diagnostic')][string]$Command = 'run',
+    [ValidateSet('run', 'list', 'login-diagnostic', 'download-preflight-diagnostic', 'plan', 'status', 'acquire', 'drive-intent', 'drive-upload', 'drive-reconcile', 'deliver')][string]$Command = 'run',
+    [ValidateSet('NONE', 'EB_BILL', 'TENANT_BILL')][string]$Stream = 'NONE',
     [string]$LogRoot,
     [switch]$ValidateOnly,
     [string]$RunId
@@ -377,7 +382,14 @@ $injected[$script:EgBrowserCacheVariableName] = $BrowserCachePath
 $injected['ENERGYGRID_RUN_ID'] = $RunId
 
 $workingDirectory = Join-Path $CheckoutRoot 'energygrid-bill-downloader'
-$childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $ConfigPath)
+# The stream suffix is a constant from this closed table, never the caller's text. The
+# Python CLI separately refuses a suffix on a command that takes no stream.
+$script:EgStreamArguments = @{
+    'NONE'        = @()
+    'EB_BILL'     = @('--stream', 'EB_BILL')
+    'TENANT_BILL' = @('--stream', 'TENANT_BILL')
+}
+$childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $ConfigPath) + @($script:EgStreamArguments[$Stream])
 
 $childExitCode = $script:EgLauncherExitCodes['PreflightFailed']
 $restoreResult = $null

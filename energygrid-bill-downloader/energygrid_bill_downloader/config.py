@@ -19,6 +19,8 @@ MAX_ATTEMPTS = 3
 MIN_INVENTORY_CEILING = 1
 MAX_INVENTORY_CEILING = 100_000
 RUNTIME_V2_SCHEMA = "energygrid.runtime.v2"
+RUNTIME_V3_SCHEMA = "energygrid.runtime.v3"
+DRIVE_V3_MODE = "n8n_drive_v3"
 DUAL_SOURCE = "dual_stream"
 BOUND_ADMISSION = "BOUND"
 UNBOUND_ADMISSION = "UNBOUND"
@@ -147,6 +149,30 @@ class DriveSettings:
 
 
 @dataclass(frozen=True)
+class DriveBinding:
+    """Private Drive destination identity for one stream: folder IDs only."""
+
+    binding_id: str = field(repr=False)
+    account_ref: str = field(repr=False)
+    root_folder_id: str = field(repr=False)
+    folder_id: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class DriveV3Settings:
+    """Loopback n8n Drive boundary (#226 G3). No Google credential lives here."""
+
+    mode: str
+    url: str = field(repr=False)
+    auth_header_name: str = field(repr=False)
+    auth_token_env: str = field(repr=False)
+    timeout_seconds: int
+    bindings: dict[str, DriveBinding | None] = field(repr=False)
+    root: None = None
+    binding_id: None = None
+
+
+@dataclass(frozen=True)
 class DeliverySettings:
     url: str = field(repr=False)
     auth_header_name: str = field(repr=False)
@@ -164,13 +190,14 @@ class DualRuntimeConfig:
     temp_root: Path = field(repr=False)
     log_root: Path = field(repr=False)
     streams: dict[str, DualStreamEntry] = field(repr=False)
-    drive: DriveSettings = field(repr=False)
+    drive: DriveSettings | DriveV3Settings = field(repr=False)
     delivery: DeliverySettings = field(repr=False)
     inventory_safety_ceiling: int = 1000
     max_attempts: int = 2
     timeout_seconds: int = 30
     alert: AlertSettings | None = field(default=None, repr=False)
     checkout_root: Path | None = field(default=None, repr=False)
+    schema: str = RUNTIME_V2_SCHEMA
 
     def preflight(self, *, read_only: bool = False) -> None:
         if not self.archive_root.exists() or not self.archive_root.is_dir():
@@ -378,7 +405,8 @@ def load_dual_stream_config(raw: dict[str, Any], checkout_root: Path | None = No
     }
     if type(raw) is not dict or set(raw) - allowed:
         raise ConfigError("v2 config has an invalid shape")
-    if raw.get("schema") != RUNTIME_V2_SCHEMA or raw.get("source") != DUAL_SOURCE:
+    schema = raw.get("schema")
+    if schema not in {RUNTIME_V2_SCHEMA, RUNTIME_V3_SCHEMA} or raw.get("source") != DUAL_SOURCE:
         raise ConfigError("v2 config schema or source is unsupported")
 
     roots: dict[str, Path] = {}
@@ -434,9 +462,15 @@ def load_dual_stream_config(raw: dict[str, Any], checkout_root: Path | None = No
             settings=settings,
         )
 
-    drive_raw = _exact_keys(raw.get("drive"), {"mode", "root", "binding_id"}, "drive")
+    if schema == RUNTIME_V3_SCHEMA:
+        drive_raw = {"mode": "v3"}
+        drive = _validate_drive_v3(raw.get("drive"))
+    else:
+        drive_raw = _exact_keys(raw.get("drive"), {"mode", "root", "binding_id"}, "drive")
     drive_mode = drive_raw["mode"]
-    if drive_mode == "unbound":
+    if drive_mode == "v3":
+        pass
+    elif drive_mode == "unbound":
         if drive_raw["root"] is not None or drive_raw["binding_id"] is not None:
             raise ConfigError("unbound Drive fields must be null")
         drive = DriveSettings(mode="unbound")
@@ -494,6 +528,61 @@ def load_dual_stream_config(raw: dict[str, Any], checkout_root: Path | None = No
         timeout_seconds=_strict_positive_int(raw.get("timeout_seconds", 30), MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, "timeout_seconds"),
         alert=alert,
         checkout_root=resolved(checkout_root) if checkout_root is not None else find_checkout_root(),
+        schema=schema,
+    )
+
+
+DRIVE_V3_KEYS = {"webhook_url", "auth_header_name", "auth_token_env", "timeout_seconds", "bindings"}
+DRIVE_BINDING_KEYS = {"binding_id", "account_ref", "root_folder_id", "folder_id"}
+DRIVE_ID_PATTERN = r"[A-Za-z0-9_-]{10,128}\Z"
+
+
+def _validate_drive_v3(value: Any) -> DriveV3Settings:
+    """Closed v3 Drive block: one loopback n8n webhook plus per-stream folder IDs."""
+    from .state import drive_binding_id
+
+    raw = _exact_keys(value, DRIVE_V3_KEYS, "drive")
+    url = _validate_endpoint(raw["webhook_url"], "drive.webhook_url")
+    parsed = urlparse(url)
+    if parsed.scheme != "http" or parsed.hostname not in LOOPBACK_HOSTS or parsed.query:
+        raise ConfigError("drive.webhook_url must be a query-free loopback HTTP URL")
+    header = raw["auth_header_name"]
+    env_name = raw["auth_token_env"]
+    if type(header) is not str or not re.fullmatch(HEADER_NAME_RE, header, re.ASCII):
+        raise ConfigError("drive.auth_header_name is invalid")
+    if type(env_name) is not str or not re.fullmatch(ENV_NAME_RE, env_name, re.ASCII):
+        raise ConfigError("drive.auth_token_env is invalid")
+    timeout = _strict_positive_int(raw["timeout_seconds"], 1, MAX_TIMEOUT_SECONDS, "drive.timeout_seconds")
+    bindings_raw = _exact_keys(raw["bindings"], {"EB_BILL", "TENANT_BILL"}, "drive.bindings")
+    bindings: dict[str, DriveBinding | None] = {}
+    folders: set[str] = set()
+    for name in ("EB_BILL", "TENANT_BILL"):
+        item = bindings_raw[name]
+        if item is None:
+            bindings[name] = None
+            continue
+        entry = _exact_keys(item, DRIVE_BINDING_KEYS, f"drive.bindings.{name}")
+        for key in DRIVE_BINDING_KEYS:
+            if type(entry[key]) is not str:
+                raise ConfigError(f"drive.bindings.{name}.{key} is invalid")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}\Z", entry["account_ref"], re.ASCII):
+            raise ConfigError(f"drive.bindings.{name}.account_ref is invalid")
+        for key in ("root_folder_id", "folder_id"):
+            if not re.fullmatch(DRIVE_ID_PATTERN, entry[key], re.ASCII):
+                raise ConfigError(f"drive.bindings.{name}.{key} is invalid")
+        if entry["folder_id"] == entry["root_folder_id"] or entry["folder_id"] in folders:
+            raise ConfigError("drive.bindings folder identities must be distinct")
+        folders.add(entry["folder_id"])
+        expected = drive_binding_id(name, entry["account_ref"], entry["root_folder_id"], entry["folder_id"])
+        if entry["binding_id"] != expected:
+            raise ConfigError(f"drive.bindings.{name}.binding_id does not match its folder identity")
+        bindings[name] = DriveBinding(
+            binding_id=entry["binding_id"], account_ref=entry["account_ref"],
+            root_folder_id=entry["root_folder_id"], folder_id=entry["folder_id"],
+        )
+    return DriveV3Settings(
+        mode=DRIVE_V3_MODE, url=url, auth_header_name=header, auth_token_env=env_name,
+        timeout_seconds=timeout, bindings=bindings,
     )
 
 

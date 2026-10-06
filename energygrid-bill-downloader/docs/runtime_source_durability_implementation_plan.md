@@ -4,6 +4,14 @@ Status: original implementation plan with the G3 RunId amendment implemented in 
 launcher source and its synthetic contract tests. Remaining original plan material is
 historical design context unless the G3 amendment below explicitly updates it.
 
+#226 G3 amendment (v3): the Scheduled Task now runs the bounded Claude supervisor
+(`runtime/claude_supervisor.ps1`), which reaches this launcher only through `egcore.cmd`
+and the eleven-command core allowlist. The launcher gains seven core `-Command` names and
+a closed `-Stream` parameter (`NONE`, `EB_BILL`, `TENANT_BILL`) mapped through a fixed
+table; its preflight, credential handling and environment restoration are unchanged. The
+filesystem Drive stage is retired. Controlling contract:
+[v3_claude_n8n_drive_contract.md](v3_claude_n8n_drive_contract.md).
+
 Design lock: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY`.
 Controlling specification: `energygrid-bill-downloader/docs/runtime_source_durability_design.md`.
 Current canonical authority for this plan: `main` at

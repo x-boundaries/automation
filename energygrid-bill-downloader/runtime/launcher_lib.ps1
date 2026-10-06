@@ -1885,7 +1885,7 @@ $script:EgRequiredConfigKeys = @(
 $script:EgDirectHttpSource = 'direct_http'
 $script:EgBrowserSource = 'browser'
 $script:EgDualStreamSource = 'dual_stream'
-$script:EgDualStreamSchema = 'energygrid.runtime.v2'
+$script:EgDualStreamSchemas = @('energygrid.runtime.v2', 'energygrid.runtime.v3')
 $script:EgDirectHttpRequiredConfigKeys = @(
     'direct_http', 'archive_root', 'state_path', 'temp_root', 'log_root'
 )
@@ -2019,7 +2019,7 @@ function Test-EgLauncherConfigContract {
             $dualStream = $true
             $requiredKeys = $script:EgDualStreamRequiredConfigKeys
             if (($propertyNames -cnotcontains 'schema') -or
-                ($parsed.schema -cne $script:EgDualStreamSchema)) {
+                ($script:EgDualStreamSchemas -cnotcontains [string]$parsed.schema)) {
                 return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
             }
         }

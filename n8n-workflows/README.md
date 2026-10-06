@@ -91,8 +91,24 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - Status: source-controlled, inactive, MCP-disabled, with placeholder webhook path and Data Table ID and no credential, webhook ID, sender, recipient, or instance binding. A local import copy may be considered only under separate authority; keep the webhook loopback-only and bind approved Header Auth and SMTP credentials locally.
 - Delivery authority: SQLite in the Windows runner is the primary no-resend authority. The Data Table is secondary evidence; its Get and Insert are not atomic and do not require global concurrency one. `Send Email` has automatic retry disabled. A send error attempts to record `DELIVERY_OUTCOME_UNCERTAIN`; a later request with an existing uncertain row is never sent again.
 - Runbook: [Energy@Grid runbook](../energygrid-bill-downloader/docs/runbook.md) (Dual-stream v2 repository contract).
+- #226 G3: unchanged. The core calls it only after `DRIVE_VERIFIED`; it has no Drive path.
 - Committing this file performs no n8n import, activation, execution, SMTP send, or Drive operation. The workflow is evidence, not proof of deployment or execution.
 - Focused offline coverage: [tests/test_energygrid_invoice_delivery_workflow.py](../tests/test_energygrid_invoice_delivery_workflow.py).
+
+### energygrid_drive_upload.workflow.json
+
+- Purpose: inactive loopback boundary that puts one exact EnergyGrid PDF into the bound Google Drive folder and reads it back (#226 G3). Modes: `RESERVE_ID` (`files.generateIds`, creates nothing), `RECONCILE` (read-only), `UPLOAD_IF_ABSENT`, `RESOLVE_DESTINATION` (read-only, operator `drive-bind`).
+- Architecture: Header Auth webhook -> strict `energygrid.drive_request.v3` validation -> SHA-256 and MD5 of the PDF -> destination folder check -> reserved-ID lookup, identity search and canonical-name search -> classify -> (only when the reserved ID is absent and both complete searches are empty) one resumable create carrying the pre-generated ID -> one PUT of the bytes -> read-back and both searches again -> bounded `energygrid.drive_result.v3` response. A 409 on create is read back, never re-minted.
+- Credential: every Google call is an HTTP Request node declaring the predefined credential type `googleDriveOAuth2Api`; private setup binds it with `customScopes=true` and exactly `https://www.googleapis.com/auth/drive`. No credential ID, token, webhook ID or folder ID is committed.
+- Status: source-controlled, inactive, MCP-disabled, no saved executions, `retryOnFail=false` everywhere, placeholder webhook path. The reconcile branch cannot reach any create node; the workflow has no SMTP node. The core alone decides success from the raw read-back.
+- Contract: [v3_claude_n8n_drive_contract.md](../energygrid-bill-downloader/docs/v3_claude_n8n_drive_contract.md).
+- Focused offline coverage: [tests/test_energygrid_drive_upload_workflow.py](../tests/test_energygrid_drive_upload_workflow.py).
+
+### energygrid_drive_destination_setup.workflow.json
+
+- Purpose: manual, inactive, one-time destination setup (#226 G3). Resolves `My Drive/Automation/_MandarinGallery/Utilities/EnergyGrid` one level at a time without creating chain levels, then finds or creates exactly once the `EB Bill` and `Tenant Bill` child folders and reports their folder IDs for the private v3 config.
+- Status: Manual Trigger only, inactive, MCP-disabled, no saved executions, `googleDriveOAuth2Api` predefined credential type with no binding, no delete. Never called by Claude, the core or another workflow.
+- Focused offline coverage: [tests/test_energygrid_drive_destination_setup_workflow.py](../tests/test_energygrid_drive_destination_setup_workflow.py).
 
 ## Directory Rules
 

@@ -53,19 +53,34 @@ class SchedulerTemplateContract(unittest.TestCase):
         self.assertEqual("Password", self.value("t:Principals/t:Principal/t:LogonType"))
         self.assertTrue(self.value("t:Principals/t:Principal/t:UserId").startswith("REPLACE_WITH_"))
 
-    def test_action_is_the_absolute_powershell_launcher_invocation(self) -> None:
+    def test_action_is_the_absolute_powershell_supervisor_invocation(self) -> None:
+        """#226 G3: the task runs the bounded Claude supervisor, never the launcher."""
         execs = self.root.findall("t:Actions/t:Exec", NS)
         self.assertEqual(1, len(execs), "exactly one action")
         self.assertEqual(POWERSHELL, self.value("t:Actions/t:Exec/t:Command"))
         arguments = self.value("t:Actions/t:Exec/t:Arguments")
-        self.assertIn('-File "REPLACE_WITH_LAUNCHER_ROOT\\launcher.ps1"', arguments)
-        self.assertNotIn("-Command \"", arguments)
-        self.assertNotRegex(arguments, r"(?i)python(?!_314_executable_path|exe)", "Python is never scheduled directly")
-        self.assertNotIn("energygrid_bill_downloader", arguments)
-        self.assertIn("-Command run", arguments)
-        self.assertIn("-AuthorisedLauncherRootWriteSid REPLACE_WITH_COMMA_SEPARATED_AUTHORISED_SIDS", arguments)
-        self.assertNotIn("-ValidateOnly", arguments)
+        self.assertEqual(
+            '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "REPLACE_WITH_RUNTIME_ROOT\\claude_supervisor.ps1" '
+            '-SettingsPath "REPLACE_WITH_PRIVATE_SUPERVISOR_SETTINGS_JSON"',
+            arguments,
+        )
+        for forbidden in ("launcher.ps1", "-Command", "python", "energygrid_bill_downloader", "claude.exe", "-ValidateOnly", "token"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden.lower(), arguments.lower())
         self.assertIsNone(self.root.find("t:Actions/t:Exec/t:WorkingDirectory", NS))
+
+    def test_thirty_minute_ceiling_and_never_local_system(self) -> None:
+        self.assertEqual("PT30M", self.value("t:Settings/t:ExecutionTimeLimit"))
+        user = self.value("t:Principals/t:Principal/t:UserId")
+        self.assertNotIn(user.upper(), {"SYSTEM", "LOCALSYSTEM", "NT AUTHORITY\\SYSTEM", "S-1-5-18"})
+        self.assertNotIn("HighestAvailable", self.text)
+        self.assertNotIn("S4U", self.text)
+
+    def test_register_example_is_inert_and_names_the_supervisor(self) -> None:
+        example = (TEMPLATE.parent / "register_task.example.ps1").read_text(encoding="utf-8")
+        self.assertIn("claude_supervisor.ps1", example)
+        code = [line for line in example.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual([], code, "the register example contains comments only")
 
     def test_no_private_value_is_committed(self) -> None:
         self.assertIsNone(re.search(r"S-1-(?:\d+-)+\d+", self.text))

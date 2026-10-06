@@ -16,12 +16,11 @@ from energygrid_bill_downloader.delivery import (
     build_multipart,
 )
 from energygrid_bill_downloader.errors import StateError
-from energygrid_bill_downloader.drive import DriveStager
 from energygrid_bill_downloader.invoice import Stream
 from energygrid_bill_downloader.publication import validate_pdf
-from energygrid_bill_downloader.state import StateV2Store
+from energygrid_bill_downloader.state import StateV3Store
 from fixtures.synthetic_delivery import synthetic_pdf
-from fixtures.synthetic_dual_stream import candidate, create_v2_database
+from fixtures.synthetic_dual_stream import candidate, create_v3_database, seed_verified_drive
 
 
 RUN1 = "00000000-0000-0000-0000-000000000001"
@@ -47,7 +46,7 @@ class DeliveryClientTests(unittest.TestCase):
         self.drive_root.mkdir()
         self.state_path = self.root / "state" / "state.sqlite3"
         self.state_path.parent.mkdir()
-        create_v2_database(self.state_path)
+        create_v3_database(self.state_path)
         self.payload = synthetic_pdf(b"delivery-test")
         self.archive_path = self.archive / "EB Bill" / "2026-10-01.pdf"
         self.archive_path.parent.mkdir()
@@ -61,7 +60,7 @@ class DeliveryClientTests(unittest.TestCase):
             timeout_seconds=5,
         )
 
-    def seed_handled_archive(self, state: StateV2Store) -> dict:
+    def seed_handled_archive(self, state: StateV3Store) -> dict:
         item = candidate(Stream.EB_BILL, name="eb-source-1.pdf", invoice_date="2026-10-01")
         invoice_id = state.accept_latest(item, RUN1, "2026-10-02T00:00:00+00:00")
         invoice = state.invoice(invoice_id)
@@ -77,7 +76,9 @@ class DeliveryClientTests(unittest.TestCase):
             sha256=self.info.sha256, archived_at_utc="2026-10-02T00:00:01+00:00",
         )
         invoice = state.invoice(invoice_id)
-        DriveStager(self.archive, self.drive_root, "SYNTHETIC_DRIVE_BINDING").stage(state, invoice, self.archive_path, RUN1)
+        import hashlib
+
+        seed_verified_drive(state, {**invoice, "_md5": hashlib.md5(self.payload).hexdigest()})
         return state.invoice(invoice_id)
 
     def result(self, delivery_id: str, *, outcome: str = "DELIVERED", duplicate: bool = False) -> bytes:
@@ -100,7 +101,7 @@ class DeliveryClientTests(unittest.TestCase):
             delivery_id = __import__("re").search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
             return 200, self.result(delivery_id)
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             client = DeliveryClient(self.settings, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
             first = client.deliver(state, invoice, self.archive_path, RUN1)
@@ -125,7 +126,7 @@ class DeliveryClientTests(unittest.TestCase):
             delivery_id = __import__("re").search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
             return 200, self.result(delivery_id)
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             with self.assertRaises(StateError):
                 DeliveryClient(self.settings, post_once=post_once, environ={}).deliver(state, invoice, self.archive_path, RUN1)
@@ -143,7 +144,7 @@ class DeliveryClientTests(unittest.TestCase):
             calls += 1
             raise TimeoutError("synthetic transport uncertainty")
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             client = DeliveryClient(self.settings, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
             first = client.deliver(state, invoice, self.archive_path, RUN1)
@@ -166,7 +167,7 @@ class DeliveryClientTests(unittest.TestCase):
             delivery_id = __import__("re").search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
             return 200, self.result(delivery_id)
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             state_ref.update(state=state, invoice=invoice)
             client = DeliveryClient(self.settings, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
@@ -188,7 +189,7 @@ class DeliveryClientTests(unittest.TestCase):
             posts.append("POST")
             raise AssertionError("a rejected dispatch marker reached POST")
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             client = DeliveryClient(self.settings, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
             with mock.patch.object(state, "claim_delivery_dispatch", return_value=False):
@@ -210,7 +211,7 @@ class DeliveryClientTests(unittest.TestCase):
             delivery_id = __import__("re").search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
             return 200, self.result(delivery_id)
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             client = DeliveryClient(self.settings, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
             with mock.patch.object(state, "record_delivery_outcome", side_effect=StateError("synthetic outcome persistence failure")):
@@ -246,7 +247,7 @@ class DeliveryClientTests(unittest.TestCase):
                 self.archive_path.parent.mkdir(parents=True)
                 self.drive_root.mkdir(parents=True)
                 self.state_path.parent.mkdir(parents=True)
-                create_v2_database(self.state_path)
+                create_v3_database(self.state_path)
                 self.archive_path.write_bytes(self.payload)
                 self.info = validate_pdf(self.archive_path)
                 posts: list[str] = []
@@ -268,7 +269,7 @@ class DeliveryClientTests(unittest.TestCase):
                         raise KeyboardInterrupt(f"synthetic interruption at {case}")
                     return call
 
-                with StateV2Store(self.state_path) as state:
+                with StateV3Store(self.state_path) as state:
                     invoice = self.seed_handled_archive(state)
                     client = DeliveryClient(
                         self.settings, post_once=post_once,
@@ -299,7 +300,7 @@ class DeliveryClientTests(unittest.TestCase):
                     self.assertEqual("dispatch_start", logger.events[-1][0])
 
                 restart_logger = RecordingStageLogger()
-                with StateV2Store(self.state_path) as state:
+                with StateV3Store(self.state_path) as state:
                     invoice = state.invoice(invoice["invoice_id"])
                     replay = DeliveryClient(
                         self.settings, post_once=post_once,
@@ -322,14 +323,14 @@ class DeliveryClientTests(unittest.TestCase):
                 self.archive, self.drive_root, self.state_path, self.archive_path, self.info = original_paths
 
     def test_observer_failure_at_each_delivery_stage_preserves_effects_and_replay(self) -> None:
-        from fixtures.synthetic_dual_stream import create_v2_database
+        from fixtures.synthetic_dual_stream import create_v3_database
 
         for phase_to_fail in ("delivery_intent", "dispatch_start", "delivery_outcome", "delivery_no_send"):
             with self.subTest(phase=phase_to_fail):
                 phase_root = self.root / f"observer-{phase_to_fail}"
                 database = phase_root / "state.sqlite3"
                 database.parent.mkdir(parents=True)
-                create_v2_database(database)
+                create_v3_database(database)
                 original_paths = (self.archive, self.drive_root, self.archive_path)
                 self.archive = phase_root / "archive"
                 self.drive_root = phase_root / "drive"
@@ -350,7 +351,7 @@ class DeliveryClientTests(unittest.TestCase):
                     delivery_id = __import__("re").search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
                     return 200, self.result(delivery_id)
 
-                with StateV2Store(database) as state:
+                with StateV3Store(database) as state:
                     invoice = self.seed_handled_archive(state)
                     client = DeliveryClient(
                         self.settings, post_once=post_once,
@@ -378,7 +379,7 @@ class DeliveryClientTests(unittest.TestCase):
             delivery_id = __import__("re").search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
             return 200, self.result(delivery_id)
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             invoice = self.seed_handled_archive(state)
             client = DeliveryClient(self.settings, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
             first = client.deliver(state, invoice, self.archive_path, RUN1, logger=BrokenLogger())

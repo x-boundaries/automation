@@ -4,6 +4,14 @@ Status: original design record. G3 implements the dual-stream repository path an
 the shared RunId check and process variable described below; the earlier runtime-source
 durability contract remains in force where this G3 amendment does not explicitly extend it.
 
+#226 G3 amendment (v3): the Scheduled Task now runs the bounded Claude supervisor
+(`runtime/claude_supervisor.ps1`), which reaches this launcher only through `egcore.cmd`
+and the eleven-command core allowlist. The launcher gains seven core `-Command` names and
+a closed `-Stream` parameter (`NONE`, `EB_BILL`, `TENANT_BILL`) mapped through a fixed
+table; its preflight, credential handling and environment restoration are unchanged. The
+filesystem Drive stage is retired. Controlling contract:
+[v3_claude_n8n_drive_contract.md](v3_claude_n8n_drive_contract.md).
+
 Design lock: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY`.
 Accepted amendment: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1`, which narrowly amends
 the invocation contract of sections 5.1 and 5.3 to admit one fixed repository-controlled

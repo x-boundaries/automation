@@ -7244,7 +7244,7 @@ class LauncherStaticGuards(TierCBase):
                 )
 
     def test_the_launcher_parameter_surface_is_exactly_the_design_contract(self):
-        """Design section 5.1: eleven parameters and no more."""
+        """Design section 5.1 plus #226 G3: twelve parameters and no more."""
         block = self.launcher[self.launcher.index("param("):self.launcher.index(")\n\nSet-StrictMode")]
         declared = re.findall(r"\$(\w+)\s*(?:=|,|\n|\))", block)
         names = []
@@ -7255,7 +7255,7 @@ class LauncherStaticGuards(TierCBase):
             [
                 "ConfigPath", "PythonExe", "CheckoutRoot", "CredentialPath",
                 "BrowserCachePath", "ExpectedBranch", "AuthorisedLauncherRootWriteSid",
-                "Command", "LogRoot", "ValidateOnly", "RunId",
+                "Command", "Stream", "LogRoot", "ValidateOnly", "RunId",
             ],
             names,
         )
@@ -7277,11 +7277,12 @@ class LauncherStaticGuards(TierCBase):
     # no headed switch, and no way for a caller to reach the child with anything
     # of their own. These guards are what stop that from drifting.
 
-    def test_the_command_allowlist_is_exactly_the_four_admitted_operations(self):
+    def test_the_command_allowlist_is_exactly_the_admitted_operations(self):
         """A closed ValidateSet, read from the committed script rather than assumed.
 
-        DL-XB-199 G2-083 / G3-084 admits `download-preflight-diagnostic` as the
-        fourth fixed name; nothing else changes and the default stays `run`.
+        DL-XB-199 G2-083 / G3-084 admitted `download-preflight-diagnostic` as the
+        fourth fixed name; #226 G3 admits the seven deterministic core commands.
+        The default stays `run`, and -Stream is its own closed allowlist.
         """
         match = re.search(
             r"\[ValidateSet\(([^)]*)\)\]\[string\]\$Command", self.launcher
@@ -7289,9 +7290,16 @@ class LauncherStaticGuards(TierCBase):
         self.assertIsNotNone(match, "-Command must carry a ValidateSet")
         admitted = re.findall(r"'([^']*)'", match.group(1))
         self.assertEqual(
-            ["run", "list", "login-diagnostic", "download-preflight-diagnostic"], admitted
+            [
+                "run", "list", "login-diagnostic", "download-preflight-diagnostic",
+                "plan", "status", "acquire", "drive-intent", "drive-upload", "drive-reconcile", "deliver",
+            ],
+            admitted,
         )
         self.assertIn("$Command = 'run'", self.launcher, "the default stays `run`")
+        stream = re.search(r"\[ValidateSet\(([^)]*)\)\]\[string\]\$Stream = 'NONE'", self.launcher)
+        self.assertIsNotNone(stream, "-Stream must carry a closed ValidateSet defaulting to NONE")
+        self.assertEqual(["NONE", "EB_BILL", "TENANT_BILL"], re.findall(r"'([^']*)'", stream.group(1)))
 
     def test_the_preflight_command_adds_no_parameter_branch_or_child_argument(self):
         """The new name is only an allowlist entry: no per-command code path."""
@@ -7318,10 +7326,10 @@ class LauncherStaticGuards(TierCBase):
             [
                 "ConfigPath", "PythonExe", "CheckoutRoot", "CredentialPath",
                 "BrowserCachePath", "ExpectedBranch", "AuthorisedLauncherRootWriteSid",
-                "Command", "LogRoot", "ValidateOnly", "RunId",
+                "Command", "Stream", "LogRoot", "ValidateOnly", "RunId",
             ],
-            re.findall(r"\$([A-Za-z]+)(?: = 'run')?,?\s*$", param_block, re.M),
-            "the parameter surface is unchanged",
+            re.findall(r"\$([A-Za-z]+)(?: = '(?:run|NONE)')?,?\s*$", param_block, re.M),
+            "the parameter surface is exactly the reviewed contract",
         )
 
     def test_the_launcher_states_the_preflight_command_is_headless_and_no_download(self):
@@ -7330,7 +7338,7 @@ class LauncherStaticGuards(TierCBase):
             "download-preflight-diagnostic",
             "always headless",
             "never dispatches a download",
-            "closed allowlist of four fixed operation names",
+            "closed allowlist of eleven fixed operation names",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase.lower(), prose)
@@ -7343,15 +7351,21 @@ class LauncherStaticGuards(TierCBase):
                 self.assertNotIn("download-preflight-diagnostic", text)
 
     def test_the_child_argument_vector_is_fixed_and_never_extended(self):
-        """Five elements, one assignment, and no conditional append anywhere."""
+        """Five fixed elements plus a closed-table stream suffix, one assignment, no append."""
         assignments = re.findall(r"^\s*\$childArguments\s*=.*$", self.launcher, re.M)
         self.assertEqual(
             [
                 "$childArguments = @('-m', 'energygrid_bill_downloader', "
-                "$Command, '--config', $ConfigPath)"
+                "$Command, '--config', $ConfigPath) + @($script:EgStreamArguments[$Stream])"
             ],
             [line.strip() for line in assignments],
-            "the child argument vector is one fixed five-element assignment",
+            "the child argument vector is one fixed assignment with a closed-table suffix",
+        )
+        table = self.launcher[self.launcher.index("$script:EgStreamArguments = @{"):]
+        table = table[:table.index("}") + 1]
+        self.assertEqual(
+            ["'NONE'        = @()", "'EB_BILL'     = @('--stream', 'EB_BILL')", "'TENANT_BILL' = @('--stream', 'TENANT_BILL')"],
+            [line.strip() for line in table.splitlines()[1:-1]],
         )
         for forbidden in ("$childArguments +=", "$childArguments +", "$childArguments.Add"):
             with self.subTest(forbidden=forbidden):
@@ -8675,10 +8689,12 @@ class RuntimeDocumentation(TierCBase):
         self.assertNotIn("<PYTHON_3_12_EXE>", text)
         self.assertEqual(1, text.count("<PYTHON_3_14_EXE>"))
 
-    def test_the_scheduler_example_names_the_launcher_as_the_scheduled_shape(self):
-        """The launcher is the only thing the Scheduled Task will ever invoke."""
-        text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8")
-        self.assertIn("runtime/launcher.ps1", text.replace("\\", "/"))
+    def test_the_scheduler_example_names_the_supervisor_as_the_scheduled_shape(self):
+        """#226 G3: the Scheduled Task invokes only the bounded Claude supervisor, which
+        reaches the launcher solely through the core command allowlist."""
+        text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8").replace("\\", "/")
+        self.assertIn("REPLACE_WITH_RUNTIME_ROOT/claude_supervisor.ps1", text)
+        self.assertIn("runtime/launcher.ps1 only through the eleven-command core allowlist", text)
 
     def test_the_scheduler_example_remains_inert(self):
         """It registers, starts, alters, and removes nothing, and still parses cleanly."""
@@ -8801,14 +8817,15 @@ class RuntimeDocumentation(TierCBase):
         """The directory-level contract states the admitted commands and their bounds."""
         text = RUNTIME_README.read_text(encoding="utf-8")
         self.assertIn(
-            "`run` (default), `list`, `login-diagnostic`, or `download-preflight-diagnostic`", text
+            "`run` (default), `list`, `login-diagnostic`, `download-preflight-diagnostic`, or one of "
+            "the seven #226 G3 core commands", text
         )
         prose = normalised_prose(text)
         for phrase in (
             "no generic headed switch",
             "implicit and non-overridable",
-            "exactly five",
-            "nothing is appended conditionally",
+            "the same fixed five elements",
+            "followed by a stream suffix looked up from a closed table",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase.lower(), prose)
@@ -8816,7 +8833,7 @@ class RuntimeDocumentation(TierCBase):
     def test_the_runtime_readme_documents_the_preflight_command_and_stale_install(self):
         prose = normalised_prose(RUNTIME_README.read_text(encoding="utf-8"))
         for phrase in (
-            "closed allowlist of four fixed operation names",
+            "closed allowlist of eleven fixed operation names",
             "fixed headless no-download pre-dispatch diagnostic",
             "never clicks download",
             "energygrid.download_preflight_diagnostic.v1",

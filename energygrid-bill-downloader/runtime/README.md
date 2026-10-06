@@ -69,21 +69,29 @@ own directory.
 | `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache |
 | `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH` |
 | `-AuthorisedLauncherRootWriteSid` | yes | One or more exact security identifier strings naming the exhaustive set of trustees permitted to hold write-capable access on the launcher root |
-| `-Command` | no | `run` (default), `list`, `login-diagnostic`, or `download-preflight-diagnostic` |
+| `-Command` | no | `run` (default), `list`, `login-diagnostic`, `download-preflight-diagnostic`, or one of the seven #226 G3 core commands `plan`, `status`, `acquire`, `drive-intent`, `drive-upload`, `drive-reconcile`, `deliver` |
+| `-Stream` | no | `NONE` (default), `EB_BILL`, or `TENANT_BILL`; only the core stream commands use it |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch; see below |
 | `-RunId` | no | Shared lower-case UUID run identifier. A valid explicit value reaches Python in process scope; an ordinary run without one generates it after `ValidateOnly` exits. It is restored with the other injected process variables. |
 
-`-Command` is a closed allowlist of four fixed operation names and is the only thing that
-varies in the invocation. The child is always started as
-`<PythonExe> -m energygrid_bill_downloader <Command> --config <ConfigPath>` -- exactly five
-arguments, in that order, for every admitted command. Nothing is appended conditionally, and
-no caller-supplied script, module, path, portal address, credential value, or arbitrary
-child argument can reach it.
+`-Command` is a closed allowlist of eleven fixed operation names and `-Stream` a closed
+allowlist of three. The child is always started as
+`<PythonExe> -m energygrid_bill_downloader <Command> --config <ConfigPath>` -- the same fixed
+five elements -- followed by a stream suffix looked up from a closed table: nothing for
+`NONE`, or exactly `--stream EB_BILL` / `--stream TENANT_BILL`. No caller-supplied script,
+module, path, portal address, credential value, or arbitrary child argument can reach it;
+the Python CLI separately refuses a stream suffix on a command that takes none.
+
+#226 G3: the Scheduled Task no longer invokes this launcher. It runs the bounded Claude
+supervisor (`claude_supervisor.ps1`), which reaches this launcher only through `egcore.cmd`
+and the exact eleven-command core allowlist, with `CLAUDE_CODE_OAUTH_TOKEN` and every
+`ANTHROPIC_*` variable removed from the core's environment. See
+[the v3 contract](../docs/v3_claude_n8n_drive_contract.md).
 
 Position 10 admits the legacy browser and direct-HTTP config contracts plus the
-v2 `dual_stream` contract. The latter requires the exact
-`energygrid.runtime.v2` schema marker and the top-level `streams`, `drive`, and
+`dual_stream` contract. The latter requires the exact `energygrid.runtime.v2` or
+`energygrid.runtime.v3` schema marker and the top-level `streams`, `drive`, and
 `delivery` objects. The launcher does not validate nested source bindings,
 dates, or path policy; Python owns those checks. Private configuration remains
 outside the checkout.

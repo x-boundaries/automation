@@ -692,9 +692,9 @@ class InvoiceFailureEnrichmentTests(unittest.TestCase):
 
 class DualStreamReconcileTests(unittest.TestCase):
     def setUp(self) -> None:
-        from energygrid_bill_downloader.config import DeliverySettings, DriveSettings, DualRuntimeConfig
-        from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_dual_stream import create_v2_database, test_stream_entries
+        from energygrid_bill_downloader.config import RUNTIME_V3_SCHEMA, DeliverySettings, DualRuntimeConfig
+        from energygrid_bill_downloader.state import StateV3Store
+        from fixtures.synthetic_dual_stream import bind_synthetic_drive, create_v3_database, synthetic_drive_settings, test_stream_entries
 
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -708,14 +708,16 @@ class DualStreamReconcileTests(unittest.TestCase):
         self.state_path = self.root / "state" / "state.sqlite3"
         self.state_path.parent.mkdir()
         self.streams = test_stream_entries()
-        create_v2_database(self.state_path)
+        create_v3_database(self.state_path)
+        bind_synthetic_drive(self.state_path)
         self.config = DualRuntimeConfig(
             archive_root=self.archive,
             state_path=self.state_path,
             temp_root=self.temp_root,
             log_root=self.log_root,
             streams=self.streams,
-            drive=DriveSettings(mode="local_stage", root=self.drive_root, binding_id="SYNTHETIC_DRIVE_BINDING"),
+            drive=synthetic_drive_settings(),
+            schema=RUNTIME_V3_SCHEMA,
             delivery=DeliverySettings(
                 url="http://127.0.0.1:5678/webhook/SYNTHETIC",
                 auth_header_name="X-Synthetic-Delivery",
@@ -749,6 +751,32 @@ class DualStreamReconcileTests(unittest.TestCase):
             "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, eb), payloads),
             "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, tenant), payloads),
         }
+
+    def finish_drive_and_email(self, state_path=None) -> list[str]:
+        """Complete Drive (verified receipt) and email for every committed latest,
+        through the real v3 state API, as the core's later commands would."""
+        import hashlib
+        from energygrid_bill_downloader.state import StateV3Store
+        from fixtures.synthetic_dual_stream import FakeDelivery, bind_synthetic_drive, seed_verified_drive
+
+        delivery = FakeDelivery()
+        with StateV3Store(state_path or self.config.state_path) as state:
+            for stream_name in ("EB_BILL", "TENANT_BILL"):
+                row = state.stream(stream_name)
+                if row is None or row["watermark_invoice_id"] is None:
+                    continue
+                invoice = state.invoice(row["watermark_invoice_id"])
+                if invoice["archive_state"] != "COMMITTED":
+                    continue
+                if state.active_binding(stream_name) is None:
+                    state.insert_binding(stream=stream_name, account_ref="01234567890123456789", root_folder_id="synthRootFolder000001",
+                                         folder_id={"EB_BILL": "synthEbBillFolder00001", "TENANT_BILL": "synthTenantFolder00001"}[stream_name],
+                                         chain_sha256="0" * 64, run_id=str(uuid.uuid4()), timestamp="2026-10-06T00:00:00+00:00")
+                path = self.config.archive_root / invoice["archive_relpath"]
+                if not any(op["state"] == "DRIVE_VERIFIED" for op in state.drive_operations_for_invoice(invoice["invoice_id"])):
+                    seed_verified_drive(state, {**invoice, "_md5": hashlib.md5(path.read_bytes()).hexdigest()})
+                delivery.deliver(state, state.invoice(invoice["invoice_id"]), path, str(uuid.uuid4()))
+        return delivery.sent
 
     def fake_delivery(self, calls: list[str]):
         from energygrid_bill_downloader.delivery import DELIVERY_SCHEMA, DeliveryOutcome
@@ -792,7 +820,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         import sqlite3
         from dataclasses import replace
         from energygrid_bill_downloader.invoice import Stream
-        from energygrid_bill_downloader.state import StateV2Store, migrate_state_database
+        from energygrid_bill_downloader.state import StateV3Store, migrate_state_database_v3
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import candidate
 
@@ -826,48 +854,46 @@ class DualStreamReconcileTests(unittest.TestCase):
             "raw_date": invoice_date, "date_profile": entry.date_profile,
             "evidence_ref": entry.evidence_ref,
         }]
-        self.assertEqual("MIGRATED", migrate_state_database(
+        self.assertEqual("MIGRATED_V3", migrate_state_database_v3(
             legacy_path, apply=True, streams=self.streams, mapping_entries=mapping,
         )["status"])
+        from fixtures.synthetic_dual_stream import bind_synthetic_drive
+
+        bind_synthetic_drive(legacy_path)
         old_archive = self.archive / name
         old_archive.write_bytes(payload)
         self.config = replace(self.config, state_path=legacy_path)
-        with StateV2Store(legacy_path, read_only=True) as state:
+        with StateV3Store(legacy_path, read_only=True) as state:
             retained = state.resolve_latest_candidate(item)
             self.assertIsNotNone(retained)
             retained_id = retained["invoice_id"]
         return item, old_archive, payload, info, retained_id
 
-    def seed_migrated_delivered_latest(self, *, label: str, invoice_date: str = "2026-10-01"):
-        from energygrid_bill_downloader.drive import DriveStager
-        from energygrid_bill_downloader.state import StateV2Store
+    def test_migrated_archived_latest_reuses_archive_then_replays_as_handled_without_effects(self) -> None:
+        """v3 successor of the retired filesystem-Drive repair tests: a migrated
+        archived latest is reused with zero FETCH, Drive/email complete through
+        the core, and a replay is fully handled with zero fetch and zero resend."""
+        from energygrid_bill_downloader.invoice import Stream
+        from energygrid_bill_downloader.reconcile import reconcile_dual_stream
+        from energygrid_bill_downloader.state import StateV3Store
+        from fixtures.synthetic_dual_stream import SyntheticAdapter, snapshot
 
-        item, old_archive, payload, info, invoice_id = self.seed_migrated_archived_latest(
-            label=label, invoice_date=invoice_date,
-        )
-        calls: list[str] = []
-        with StateV2Store(self.config.state_path) as state:
-            invoice = state.invoice(invoice_id)
-            recovered, action = reconcile_module._ensure_archive_available(
-                self.config, state, invoice, item, object(), str(uuid.uuid4()), RecordingLogger(),
-            )
-            self.assertEqual((info, "REUSED"), (recovered, action))
-            invoice = state.invoice(invoice_id)
-            DriveStager(self.archive, self.drive_root, self.config.drive.binding_id).stage(
-                state, invoice, self.archive / invoice["archive_relpath"], str(uuid.uuid4()),
-            )
-            invoice = state.invoice(invoice_id)
-            outcome = self.fake_delivery(calls).deliver(
-                state, invoice, self.archive / invoice["archive_relpath"], str(uuid.uuid4()),
-            )
-            self.assertEqual("DELIVERED", outcome.state)
-            delivery = state.delivery(outcome.delivery_id)
-            invoice = state.invoice(invoice_id)
-            drive_history = state.file_operation_history(
-                invoice_id, "DRIVE_STAGE", self.config.drive.binding_id, invoice["archive_relpath"],
-            )
-        self.assertEqual(["EB_BILL"], calls)
-        return item, old_archive, payload, info, invoice_id, delivery, drive_history, invoice["archive_relpath"]
+        item, _old_archive, payload, info, retained_id = self.seed_migrated_archived_latest(label="v3-replay")
+        adapters = {
+            "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, (item,)), {item.source_filename: payload}),
+            "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, ())),
+        }
+        with StateV3Store(self.config.state_path) as state:
+            first = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
+        self.assertEqual("ARCHIVE_READY", first.stream_results[0]["status"])
+        self.assertEqual([], adapters["EB_BILL"].acquire_calls)
+        self.assertEqual(["EB_BILL"], self.finish_drive_and_email())
+        with StateV3Store(self.config.state_path) as state:
+            second = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
+            self.assertEqual(1, len(state.drive_operations_for_invoice(retained_id)))
+        self.assertEqual("ALREADY_HANDLED", second.stream_results[0]["status"])
+        self.assertEqual([], adapters["EB_BILL"].acquire_calls)
+        self.assertEqual(info, validate_pdf(self.archive / "EB Bill" / "2026-10-01.pdf"))
 
     def register_unresolved_legacy_row(self, state, item, *, legacy_key: str | None = None) -> None:
         invoice_id = str(uuid.uuid4())
@@ -887,7 +913,7 @@ class DualStreamReconcileTests(unittest.TestCase):
     def test_migrated_historical_date_drift_holds_before_any_shortcut_or_mutation(self) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, snapshot
 
         item, old_archive, payload, _info, retained_id = self.seed_migrated_archived_latest()
@@ -903,7 +929,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                 raise AssertionError("identity drift reached email")
 
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=MustNotSend()):
-            with StateV2Store(self.config.state_path) as state:
+            with StateV3Store(self.config.state_path) as state:
                 invoice_before = state.invoice(retained_id)
                 stream_before = state.stream(Stream.EB_BILL.value)
                 summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
@@ -921,271 +947,13 @@ class DualStreamReconcileTests(unittest.TestCase):
         self.assertFalse((self.archive / "EB Bill" / "2026-10-01.pdf").exists())
         self.assertFalse(any(self.drive_root.rglob("*.pdf")))
 
-    def test_migrated_delivered_archive_repairs_drive_once_and_replays_without_effects(self) -> None:
-        import json
-        import re
-        from energygrid_bill_downloader.cli import SafeLogger
-        from energygrid_bill_downloader.delivery import DELIVERY_RESULT_SCHEMA, DeliveryClient
-        from energygrid_bill_downloader.invoice import Stream
-        from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_dual_stream import SyntheticAdapter, snapshot
-
-        item, old_archive, payload, info, retained_id = self.seed_migrated_archived_latest()
-        posts: list[str] = []
-
-        def post_once(url, authorization, body, timeout, *, content_type):
-            posts.append("POST")
-            delivery_id = re.search(rb'"delivery_id":"(egmail-v1-[0-9a-f]{32})"', body).group(1).decode()
-            response = json.dumps({
-                "schema": DELIVERY_RESULT_SCHEMA, "delivery_id": delivery_id,
-                "outcome": "DELIVERED", "duplicate": False, "support_ref": "EG_SYNTHETIC_ACCEPTED",
-            }, separators=(",", ":")).encode()
-            return 200, response
-
-        client = DeliveryClient(
-            self.config.delivery, post_once=post_once,
-            environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"},
-        )
-        adapters = {
-            "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, (item,))),
-            "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, ())),
-        }
-        recovery_run_id = str(uuid.uuid4())
-        recovery_logger = SafeLogger(self.log_root / "recovery", recovery_run_id)
-        with StateV2Store(self.config.state_path) as state:
-            with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=client):
-                recovery = reconcile_dual_stream(
-                    self.config, adapters, state, recovery_logger, recovery_run_id,
-                )
-            invoice = state.invoice(retained_id)
-            self.assertIsNotNone(invoice)
-            assert invoice is not None
-            self.assertEqual((info.byte_size, info.sha256), (invoice["byte_size"], invoice["sha256"]))
-            delivered_row = state.delivery_for_invoice(retained_id)
-            self.assertIsNotNone(delivered_row)
-            assert delivered_row is not None
-            delivery_id = delivered_row["delivery_id"]
-            prior_drive = state.file_operation_history(
-                retained_id, "DRIVE_STAGE", self.config.drive.binding_id, invoice["archive_relpath"],
-            )
-            self.assertEqual(1, len(prior_drive))
-
-        self.assertEqual(0, recovery.fetch_count)
-        self.assertEqual(1, recovery.archive_reused_count)
-        self.assertEqual(1, recovery.drive_staged_count)
-        self.assertEqual(1, recovery.delivered_count)
-        self.assertEqual([], adapters["EB_BILL"].acquire_calls)
-        self.assertEqual([], adapters["TENANT_BILL"].acquire_calls)
-        self.assertEqual(["POST"], posts)
-        recovery_events = [json.loads(line) for line in recovery_logger.log_path.read_text(encoding="utf-8").splitlines()]
-        eb_recovery_events = [event for event in recovery_events if event.get("stream") == "EB_BILL"]
-        self.assertEqual(recovery_run_id, eb_recovery_events[0]["run_id"])
-        self.assertEqual([
-            "inventory_started", "inventory_result", "latest_selection", "selection_committed",
-            "fetch_decision", "archive_started", "archive_result", "drive_started", "drive_result",
-            "delivery_intent", "dispatch_start", "delivery_outcome", "stream_complete",
-        ], [event["phase"] for event in eb_recovery_events])
-        self.assertEqual(["RECOVER"], [event["status"] for event in eb_recovery_events if event["phase"] == "fetch_decision"])
-        self.assertEqual(["LEGACY_MOVE"], [event["status"] for event in eb_recovery_events if event["phase"] == "archive_started"])
-
-        drive_target = self.drive_root / "EB Bill" / "2026-10-01.pdf"
-        self.assertEqual(payload, (self.archive / "EB Bill" / "2026-10-01.pdf").read_bytes())
-        self.assertFalse(old_archive.exists())
-        drive_target.unlink()
-        repair_run_id = str(uuid.uuid4())
-        repair_logger = SafeLogger(self.log_root / "repair", repair_run_id)
-        with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=client):
-            with StateV2Store(self.config.state_path) as state:
-                repair = reconcile_dual_stream(self.config, adapters, state, repair_logger, repair_run_id)
-                repaired_invoice = state.invoice(retained_id)
-                repaired_delivery = state.delivery(delivery_id)
-                repaired_history = state.file_operation_history(
-                    retained_id, "DRIVE_STAGE", self.config.drive.binding_id, repaired_invoice["archive_relpath"],
-                )
-        self.assertEqual(0, repair.fetch_count)
-        self.assertEqual(1, repair.archive_reused_count)
-        self.assertEqual(1, repair.drive_staged_count)
-        self.assertEqual(1, repair.delivered_count)
-        self.assertEqual([], adapters["EB_BILL"].acquire_calls)
-        self.assertEqual([], adapters["TENANT_BILL"].acquire_calls)
-        self.assertEqual(["POST"], posts)
-        self.assertEqual(delivered_row, repaired_delivery)
-        self.assertEqual(2, len(repaired_history))
-        retained_history = next(row for row in repaired_history if row["operation_id"] == prior_drive[0]["operation_id"])
-        repair_history = [row for row in repaired_history if row["operation_id"] != prior_drive[0]["operation_id"]]
-        self.assertEqual(prior_drive[0], retained_history)
-        self.assertEqual((1, "COMMITTED"), (len(repair_history), repair_history[0]["state"]))
-        self.assertEqual(payload, drive_target.read_bytes())
-        repair_events = [json.loads(line) for line in repair_logger.log_path.read_text(encoding="utf-8").splitlines()]
-        self.assertTrue(all(event["run_id"] == repair_run_id for event in repair_events))
-        eb_repair_events = [event for event in repair_events if event.get("stream") == "EB_BILL"]
-        self.assertEqual([
-            "inventory_started", "inventory_result", "latest_selection", "selection_committed",
-            "fetch_decision", "archive_started", "archive_result", "drive_started", "drive_result",
-            "delivery_intent", "delivery_no_send", "stream_complete",
-        ], [event["phase"] for event in eb_repair_events])
-        self.assertEqual(["REUSE"], [event["status"] for event in repair_events if event["phase"] == "fetch_decision"])
-        self.assertEqual(["REPAIRED"], [event["status"] for event in repair_events if event["phase"] == "drive_result"])
-        self.assertEqual(["ALREADY_DELIVERED"], [event["status"] for event in repair_events if event["phase"] == "delivery_no_send"])
-
-        repeat_run_id = str(uuid.uuid4())
-        repeat_logger = SafeLogger(self.log_root / "repeat", repeat_run_id)
-        with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=client):
-            with StateV2Store(self.config.state_path) as state:
-                repeat = reconcile_dual_stream(self.config, adapters, state, repeat_logger, repeat_run_id)
-                self.assertEqual(retained_id, state.stream(Stream.EB_BILL.value)["watermark_invoice_id"])
-                self.assertEqual(delivery_id, state.delivery_for_invoice(retained_id)["delivery_id"])
-                self.assertEqual(2, len(state.file_operation_history(
-                    retained_id, "DRIVE_STAGE", self.config.drive.binding_id, "EB Bill/2026-10-01.pdf",
-                )))
-        repeat_events = [json.loads(line) for line in repeat_logger.log_path.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(2, repeat.handled_count)  # the second stream has an empty, complete snapshot
-        self.assertEqual(0, repeat.fetch_count)
-        self.assertTrue(all(event["run_id"] == repeat_run_id for event in repeat_events))
-        eb_repeat_events = [event for event in repeat_events if event.get("stream") == "EB_BILL"]
-        self.assertEqual([
-            "inventory_started", "inventory_result", "latest_selection",
-            "fetch_decision", "delivery_no_send", "stream_complete",
-        ], [event["phase"] for event in eb_repeat_events])
-        self.assertEqual(["NO_FETCH"], [event["status"] for event in repeat_events if event["phase"] == "fetch_decision"])
-        self.assertEqual(["ALREADY_DELIVERED"], [event["status"] for event in repeat_events if event["phase"] == "delivery_no_send"])
-        self.assertEqual(["POST"], posts)
-
-    def test_migrated_delivered_repair_holds_on_archive_or_drive_authority_drift(self) -> None:
-        from dataclasses import replace
-        from energygrid_bill_downloader.invoice import Stream
-        from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_dual_stream import SyntheticAdapter, snapshot
-
-        original_drive = self.config.drive
-        for day, case in enumerate(("missing_archive", "conflicting_archive", "changed_binding"), start=1):
-            with self.subTest(case=case):
-                self.config = replace(self.config, drive=original_drive)
-
-                invoice_date = f"2026-10-0{day}"
-                item, _old_archive, payload, _info, invoice_id, delivered_row, drive_history, relpath = (
-                    self.seed_migrated_delivered_latest(label=f"repair-hold-{case}", invoice_date=invoice_date)
-                )
-                archive_target = self.archive / relpath
-                drive_target = self.drive_root / relpath
-                if case == "missing_archive":
-                    archive_target.unlink()
-                elif case == "conflicting_archive":
-                    archive_target.write_bytes(b"corrupt canonical archive")
-                else:
-                    drive_target.unlink()
-                    self.config = replace(
-                        self.config,
-                        drive=replace(original_drive, binding_id="CHANGED_SYNTHETIC_BINDING"),
-                    )
-
-                adapters = {
-                    "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, (item,)), {item.source_filename: payload}),
-                    "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, ())),
-                }
-                email_calls: list[str] = []
-
-                class MustNotSend:
-                    def deliver(inner_self, *args, **kwargs):
-                        email_calls.append("called")
-                        raise AssertionError("authority drift reached email")
-
-                run_id = str(uuid.uuid4())
-                with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=MustNotSend()):
-                    with StateV2Store(self.config.state_path) as state:
-                        summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), run_id)
-                        invoice_after = state.invoice(invoice_id)
-                        delivery_after = state.delivery(delivered_row["delivery_id"])
-                        history_after = state.file_operation_history(
-                            invoice_id, "DRIVE_STAGE", original_drive.binding_id, relpath,
-                        )
-
-                expected_status = "DRIVE_FAILURE" if case == "changed_binding" else "ARCHIVE_RECOVERY_HOLD"
-                self.assertEqual(expected_status, summary.stream_results[0]["status"])
-                self.assertEqual(0, summary.fetch_count)
-                self.assertEqual([], adapters["EB_BILL"].acquire_calls)
-                self.assertEqual([], adapters["TENANT_BILL"].acquire_calls)
-                self.assertEqual([], email_calls)
-                self.assertEqual(delivered_row, delivery_after)
-                self.assertEqual(drive_history, history_after)
-                self.assertEqual("COMMITTED", invoice_after["archive_state"])
-                if case == "missing_archive":
-                    self.assertFalse(archive_target.exists())
-                elif case == "conflicting_archive":
-                    self.assertEqual(b"corrupt canonical archive", archive_target.read_bytes())
-                else:
-                    self.assertFalse(drive_target.exists())
-                self.config = replace(self.config, drive=original_drive)
-
-    def test_delivered_replay_holds_on_drive_target_junction_without_fetch_or_send(self) -> None:
-        import os
-        import subprocess
-        from energygrid_bill_downloader.invoice import Stream
-        from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_dual_stream import SyntheticAdapter, snapshot
-
-        item, _old_archive, _payload, _info, invoice_id, delivery_row, drive_history, relpath = (
-            self.seed_migrated_delivered_latest(label="delivered-drive-junction")
-        )
-        real_drive_dir = self.root / "drive-target-data"
-        drive_parent = self.drive_root / "EB Bill"
-        drive_parent.rename(real_drive_dir)
-        environment = os.environ.copy()
-        environment["CODEX_TEST_JUNCTION_PATH"] = str(drive_parent)
-        environment["CODEX_TEST_JUNCTION_TARGET"] = str(real_drive_dir)
-        created = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-             "New-Item -ItemType Junction -Path $env:CODEX_TEST_JUNCTION_PATH -Target $env:CODEX_TEST_JUNCTION_TARGET -ErrorAction Stop | Out-Null"],
-            capture_output=True, text=True, env=environment, check=False,
-        )
-        if created.returncode != 0:
-            self.skipTest("directory junctions are unavailable in this Windows test environment")
-
-        adapters = {
-            "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, (item,))),
-            "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, ())),
-        }
-        email_calls: list[str] = []
-
-        class MustNotSend:
-            def deliver(inner_self, *args, **kwargs):
-                email_calls.append("called")
-                raise AssertionError("delivered replay reached email through a Drive junction")
-
-        with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=MustNotSend()):
-            with StateV2Store(self.config.state_path) as state:
-                summary = reconcile_dual_stream(
-                    self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()),
-                )
-                invoice_after = state.invoice(invoice_id)
-                delivery_after = state.delivery(delivery_row["delivery_id"])
-                history_after = state.file_operation_history(
-                    invoice_id, "DRIVE_STAGE", self.config.drive.binding_id, relpath,
-                )
-
-        self.assertEqual("DRIVE_FAILURE", summary.stream_results[0]["status"])
-        self.assertEqual(0, summary.fetch_count)
-        self.assertEqual([], adapters["EB_BILL"].acquire_calls)
-        self.assertEqual([], adapters["TENANT_BILL"].acquire_calls)
-        self.assertEqual([], email_calls)
-        self.assertEqual(delivery_row, delivery_after)
-        self.assertEqual(drive_history, history_after)
-        self.assertEqual("COMMITTED", invoice_after["archive_state"])
-        self.assertEqual("DRIVE_STAGED", invoice_after["drive_state"])
-        self.assertTrue((real_drive_dir / Path(relpath).name).is_file())
-
     def test_lifecycle_interruption_restart_matrix_preserves_last_stage_evidence(self) -> None:
         from contextlib import ExitStack
         from dataclasses import replace
-        from energygrid_bill_downloader.drive import DriveStager
-        from energygrid_bill_downloader import drive as drive_module
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_dual_stream import SyntheticAdapter, create_v2_database, snapshot
+        from energygrid_bill_downloader.state import StateV3Store
+        from fixtures.synthetic_dual_stream import SyntheticAdapter, bind_synthetic_drive, create_v3_database, snapshot
 
         cases = (
             ("selection_before", ("latest_selection", "SELECTED")),
@@ -1198,13 +966,10 @@ class DualStreamReconcileTests(unittest.TestCase):
             ("archive_publish_after", ("fetch_completed", "SUCCESS")),
             ("archive_commit_before", ("fetch_completed", "SUCCESS")),
             ("archive_commit_after", ("fetch_completed", "SUCCESS")),
-            ("drive_copy_before", ("drive_started", "STARTED")),
-            ("drive_copy_after", ("drive_started", "STARTED")),
-            ("drive_commit_after", ("drive_started", "STARTED")),
-            ("drive_stage_before", ("archive_result", "COMMITTED")),
-            ("drive_stage_after", ("drive_result", "STAGED")),
-            ("terminal_observation_before", ("drive_result", "STAGED")),
-            ("terminal_observation_after", ("stream_complete", "DELIVERED")),
+            # v3 acquire ends at the committed archive; Drive and email are the
+            # core's later commands (covered in test_orchestration).
+            ("terminal_observation_before", ("archive_result", "COMMITTED")),
+            ("terminal_observation_after", ("stream_complete", "ARCHIVE_READY")),
         )
         original_config = self.config
 
@@ -1226,21 +991,19 @@ class DualStreamReconcileTests(unittest.TestCase):
             with self.subTest(boundary=case):
                 phase_root = self.root / f"r20-{case}"
                 archive = phase_root / "archive"
-                drive_root = phase_root / "drive"
                 temp_root = phase_root / "temp"
                 log_root = phase_root / "logs"
                 state_path = phase_root / "state" / "state.sqlite3"
                 archive.mkdir(parents=True)
-                drive_root.mkdir()
                 state_path.parent.mkdir()
-                create_v2_database(state_path)
+                create_v3_database(state_path)
+                bind_synthetic_drive(state_path)
                 self.config = replace(
                     original_config,
                     archive_root=archive,
                     state_path=state_path,
                     temp_root=temp_root,
                     log_root=log_root,
-                    drive=replace(original_config.drive, root=drive_root),
                 )
                 self.config.preflight()
                 adapters = self.adapters()
@@ -1259,7 +1022,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                 if case.startswith("terminal_observation_"):
                     logger = InterruptAtTerminal()
 
-                with StateV2Store(state_path) as state:
+                with StateV3Store(state_path) as state:
                     with ExitStack() as stack:
                         if case.startswith("selection_"):
                             stack.enter_context(mock.patch.object(
@@ -1316,37 +1079,6 @@ class DualStreamReconcileTests(unittest.TestCase):
                                 "complete_file_operation",
                                 new=stop_once(state.complete_file_operation, after=case.endswith("after")),
                             ))
-                        elif case == "drive_commit_after":
-                            stack.enter_context(mock.patch.object(
-                                state,
-                                "update_invoice_file_state",
-                                new=stop_once(
-                                    state.update_invoice_file_state,
-                                    after=False,
-                                    matches=lambda _args, kwargs: kwargs.get("drive_state") == "DRIVE_STAGED",
-                                ),
-                            ))
-                        elif case.startswith("drive_copy_"):
-                            stack.enter_context(mock.patch.object(
-                                drive_module,
-                                "_copy_exclusive",
-                                new=stop_once(drive_module._copy_exclusive, after=case.endswith("after")),
-                            ))
-                        elif case.startswith("drive_stage_"):
-                            original = DriveStager.stage
-                            triggered = False
-
-                            def stage_and_interrupt(stager, *args, **kwargs):
-                                nonlocal triggered
-                                if not triggered:
-                                    triggered = True
-                                    if case.endswith("after"):
-                                        original(stager, *args, **kwargs)
-                                    raise KeyboardInterrupt("synthetic Drive stage interruption")
-                                return original(stager, *args, **kwargs)
-
-                            stack.enter_context(mock.patch.object(DriveStager, "stage", new=stage_and_interrupt))
-
                         stack.enter_context(mock.patch(
                             "energygrid_bill_downloader.delivery.DeliveryClient",
                             return_value=self.fake_delivery(calls),
@@ -1364,11 +1096,11 @@ class DualStreamReconcileTests(unittest.TestCase):
                     self.assertTrue(all(is_within(path, temp_root) for path in initial_validation_paths))
                     if case.endswith("after"):
                         self.assertEqual(matched_temp_paths, initial_validation_paths)
-                if case in {"selection_after", "archive_commit_after", "drive_commit_after", "drive_stage_after"}:
-                    from energygrid_bill_downloader.state import migrate_state_database
+                if case in {"selection_after", "archive_commit_after"}:
+                    from energygrid_bill_downloader.state import migrate_state_database_v3
                     self.assertEqual(
-                        {"status": "RESUMABLE_V2", "legacy_rows": 0},
-                        migrate_state_database(state_path, apply=True),
+                        {"status": "RESUMABLE_V3", "legacy_rows": 0},
+                        migrate_state_database_v3(state_path, apply=True),
                     )
 
                 restart_logger = RecordingLogger()
@@ -1388,7 +1120,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                     "energygrid_bill_downloader.delivery.DeliveryClient",
                     return_value=self.fake_delivery(calls),
                 ):
-                    with StateV2Store(state_path) as state:
+                    with StateV3Store(state_path) as state:
                         with restart_validation_context:
                             restarted = reconcile_dual_stream(
                                 self.config, adapters, state, restart_logger, str(uuid.uuid4()),
@@ -1398,10 +1130,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                         archive_history = state.file_operation_history(
                             invoice["invoice_id"], "ARCHIVE_PUBLISH", None, invoice["archive_relpath"],
                         )
-                        drive_history = state.file_operation_history(
-                            invoice["invoice_id"], "DRIVE_STAGE", self.config.drive.binding_id, invoice["archive_relpath"],
-                        )
-                        drive_history.extend(state.active_file_operations(invoice["invoice_id"], {"DRIVE_STAGE"}))
+                        drive_operations = state.drive_operations_for_invoice(invoice["invoice_id"])
                         delivery_row = state.delivery_for_invoice(invoice["invoice_id"])
 
                 if case.startswith("fetch_validation_"):
@@ -1417,27 +1146,22 @@ class DualStreamReconcileTests(unittest.TestCase):
                 self.assertEqual(2 if case in {
                     "fetch_validation_before", "fetch_validation_after", "archive_prepare_before",
                 } else 1, len(adapters["EB_BILL"].acquire_calls))
-                if case == "drive_copy_before":
-                    self.assertEqual("DRIVE_FAILURE", restarted.stream_results[0]["status"])
-                    self.assertEqual((1, "HOLD"), (len(drive_history), drive_history[0]["state"]))
-                    self.assertIsNone(delivery_row)
-                    self.assertEqual([], calls)
-                else:
-                    expected_status = "ALREADY_HANDLED" if case.startswith("terminal_observation_") else "DELIVERED"
-                    self.assertEqual(expected_status, restarted.stream_results[0]["status"])
-                    self.assertEqual((1, "COMMITTED"), (len(drive_history), drive_history[0]["state"]))
-                    self.assertEqual("DELIVERED", delivery_row["state"])
-                    self.assertEqual(["EB_BILL"], calls)
+                # Restart reaches the committed archive exactly once; acquire
+                # never creates a Drive intent or an email intent.
+                self.assertEqual("ARCHIVE_READY", restarted.stream_results[0]["status"])
+                self.assertEqual([], drive_operations)
+                self.assertIsNone(delivery_row)
+                self.assertEqual([], calls)
                 self.config = original_config
 
     def test_archive_recovery_hold_is_stream_local_while_peer_completes(self) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         from fixtures.synthetic_delivery import synthetic_pdf
         adapters = self.adapters()
         eb_item = adapters["EB_BILL"]._inventory.candidates[-1]
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             eb_invoice_id = state.accept_latest(eb_item, str(uuid.uuid4()), "2026-10-02T00:00:00+00:00")
             eb_invoice = state.invoice(eb_invoice_id)
             source_dir = self.temp_root / "archive-recovery-both"
@@ -1465,14 +1189,15 @@ class DualStreamReconcileTests(unittest.TestCase):
             self.assertEqual(operation["operation_id"], state.active_file_operations(eb_invoice_id, {"ARCHIVE_PUBLISH"})[0]["operation_id"])
             tenant_invoice = state.resolve_latest_candidate(adapters["TENANT_BILL"]._inventory.candidates[-1])
             self.assertIsNotNone(tenant_invoice)
-            self.assertEqual("DELIVERED", state.delivery_for_invoice(tenant_invoice["invoice_id"])["state"])
+            self.assertEqual("COMMITTED", tenant_invoice["archive_state"])
+            self.assertIsNone(state.delivery_for_invoice(tenant_invoice["invoice_id"]))
 
         self.assertEqual("ARCHIVE_RECOVERY_HOLD", summary.stream_results[0]["status"])
-        self.assertEqual("DELIVERED", summary.stream_results[1]["status"])
+        self.assertEqual("ARCHIVE_READY", summary.stream_results[1]["status"])
         self.assertEqual(1, summary.fetch_count)
         self.assertEqual([], adapters["EB_BILL"].acquire_calls)
         self.assertEqual(["tenant-latest.pdf"], adapters["TENANT_BILL"].acquire_calls)
-        self.assertEqual(["TENANT_BILL"], delivery_calls)
+        self.assertEqual([], delivery_calls)
         self.assertEqual(source_payload, source.read_bytes())
         self.assertNotEqual(source_payload, target.read_bytes())
         eb_events = [event for event in logger.events if event[2].get("stream") == "EB_BILL"]
@@ -1482,11 +1207,11 @@ class DualStreamReconcileTests(unittest.TestCase):
 
     def test_shared_state_authority_error_aborts_before_other_stream_effects(self) -> None:
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
 
         adapters = self.adapters()
         fetches_before = {name: list(adapter.acquire_calls) for name, adapter in adapters.items()}
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             with mock.patch.object(state, "accept_latest", side_effect=StateError("synthetic shared DB authority failure")):
                 with self.assertRaises(StateError):
                     reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
@@ -1499,22 +1224,22 @@ class DualStreamReconcileTests(unittest.TestCase):
 
     def test_latest_only_per_stream_and_fully_handled_rerun_has_no_effects(self) -> None:
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
 
         adapters = self.adapters()
         first_calls: list[str] = []
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery(first_calls)):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 first = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
         self.assertEqual(2, first.downloaded_count)
-        self.assertEqual(2, first.delivered_count)
-        self.assertEqual(["EB_BILL", "TENANT_BILL"], first_calls)
+        self.assertEqual(0, first.delivered_count, "acquire never emails")
+        self.assertEqual([], first_calls)
+        self.assertEqual(["ARCHIVE_READY", "ARCHIVE_READY"], [row["status"] for row in first.stream_results])
         self.assertEqual(["eb-latest.pdf"], adapters["EB_BILL"].acquire_calls)
         self.assertEqual(["tenant-latest.pdf"], adapters["TENANT_BILL"].acquire_calls)
         archive_paths = sorted(path.relative_to(self.archive).as_posix() for path in self.archive.rglob("*.pdf"))
-        drive_paths = sorted(path.relative_to(self.drive_root).as_posix() for path in self.drive_root.rglob("*.pdf"))
         self.assertEqual(["EB Bill/2026-10-01.pdf", "Tenant Bill/2026-10-02.pdf"], archive_paths)
-        self.assertEqual(archive_paths, drive_paths)
+        self.assertEqual(["EB_BILL", "TENANT_BILL"], self.finish_drive_and_email())
 
         second_calls: list[str] = []
         class MustNotSend:
@@ -1524,7 +1249,7 @@ class DualStreamReconcileTests(unittest.TestCase):
 
         adapters = self.adapters()
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=MustNotSend()):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 second = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
         self.assertEqual(2, second.handled_count)
         self.assertEqual(2, second.archive_reused_count)
@@ -1535,7 +1260,7 @@ class DualStreamReconcileTests(unittest.TestCase):
     def test_both_stream_snapshots_finish_before_any_acquisition_or_delivery(self) -> None:
         from energygrid_bill_downloader.errors import SourceContractError
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
 
         adapters = self.adapters()
         events: list[str] = []
@@ -1570,36 +1295,36 @@ class DualStreamReconcileTests(unittest.TestCase):
                 return self.fake_delivery([]).deliver(state, invoice, archive_path, run_id)
 
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=RecordingDelivery()):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
 
         self.assertEqual(["inventory:EB_BILL", "inventory:TENANT_BILL"], events[:2])
         self.assertGreater(events.index("acquire:EB_BILL"), events.index("inventory:TENANT_BILL"))
-        self.assertEqual(["EB_BILL"], delivered)
-        self.assertEqual("DELIVERED", summary.stream_results[0]["status"])
+        self.assertEqual([], delivered, "acquire never emails")
+        self.assertEqual("ARCHIVE_READY", summary.stream_results[0]["status"])
         self.assertEqual("SOURCE_FAILURE", summary.stream_results[1]["status"])
 
     def test_tied_latest_holds_only_that_stream_and_other_stream_continues(self) -> None:
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
 
         adapters = self.adapters(tie_eb=True)
         calls: list[str] = []
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery(calls)):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
         self.assertEqual("LATEST_AMBIGUOUS", summary.stream_results[0]["status"])
-        self.assertEqual("DELIVERED", summary.stream_results[1]["status"])
+        self.assertEqual("ARCHIVE_READY", summary.stream_results[1]["status"])
         self.assertEqual([], adapters["EB_BILL"].acquire_calls)
         self.assertEqual(["tenant-latest.pdf"], adapters["TENANT_BILL"].acquire_calls)
-        self.assertEqual(["TENANT_BILL"], calls)
+        self.assertEqual([], calls)
 
     def test_unresolved_legacy_identity_blocks_duplicate_fetch_only_in_its_stream(self) -> None:
         from dataclasses import replace
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
-        from fixtures.synthetic_dual_stream import candidate, create_v2_database
+        from energygrid_bill_downloader.state import StateV3Store
+        from fixtures.synthetic_dual_stream import candidate, create_v3_database
 
         original_config = self.config
         cases = (
@@ -1614,7 +1339,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                 state_path = case_root / "state.sqlite3"
                 archive.mkdir(parents=True)
                 drive_root.mkdir()
-                create_v2_database(state_path)
+                create_v3_database(state_path)
                 self.config = replace(
                     original_config,
                     archive_root=archive,
@@ -1627,7 +1352,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                 latest = candidate(Stream.EB_BILL, name=source_filename, invoice_date="2026-10-01")
                 adapters = self.adapters(eb_candidates=(latest,))
                 calls: list[str] = []
-                with StateV2Store(state_path) as state:
+                with StateV3Store(state_path) as state:
                     self.register_unresolved_legacy_row(state, latest, legacy_key=legacy_key)
                     with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery(calls)):
                         summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
@@ -1637,15 +1362,15 @@ class DualStreamReconcileTests(unittest.TestCase):
                         "SELECT COUNT(*) FROM energygrid_invoice_v2 WHERE classification='CLASSIFIED' AND source_invoice_key=?",
                         (latest.source_invoice_key,),
                     ).fetchone()[0])
-                    self.assertEqual("DELIVERED", summary.stream_results[1]["status"])
+                    self.assertEqual("ARCHIVE_READY", summary.stream_results[1]["status"])
                     listed = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()), list_only=True)
                     self.assertEqual("LATEST_IDENTITY_CONFLICT", listed.stream_results[0]["status"])
                     self.assertEqual(0, listed.stream_results[0]["handled_count"])
-                    self.assertEqual(1, listed.stream_results[1]["handled_count"])
+                    self.assertEqual(0, listed.stream_results[1]["handled_count"], "archived but Drive/email not yet done")
                     self.assertEqual(0, listed.fetch_count)
                 self.assertEqual([], adapters["EB_BILL"].acquire_calls)
                 self.assertEqual(["tenant-latest.pdf"], adapters["TENANT_BILL"].acquire_calls)
-                self.assertEqual(["TENANT_BILL"], calls)
+                self.assertEqual([], calls)
                 self.assertFalse((archive / "EB Bill" / "2026-10-01.pdf").exists())
                 self.assertEqual(ACTION_REQUIRED, summary.status)
                 self.assertEqual(20, summary.exit_code)
@@ -1654,16 +1379,17 @@ class DualStreamReconcileTests(unittest.TestCase):
     def run_chronology_drift_case(self, drift_stream: str) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, snapshot
 
         initial = self.adapters()
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery([])):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 first = reconcile_dual_stream(self.config, initial, state, RecordingLogger(), str(uuid.uuid4()))
                 self.assertEqual(0, first.exit_code)
                 old_drift_watermark = state.stream(drift_stream)["watermark_day"]
+        self.finish_drive_and_email()
 
         if drift_stream == "EB_BILL":
             drift = candidate(Stream.EB_BILL, name="eb-latest.pdf", invoice_date="2026-10-03")
@@ -1683,21 +1409,21 @@ class DualStreamReconcileTests(unittest.TestCase):
         }
         calls: list[str] = []
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery(calls)):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 result = reconcile_dual_stream(self.config, new_adapters, state, RecordingLogger(), str(uuid.uuid4()))
                 drift_detail = next(item for item in result.stream_results if item["stream"] == drift_stream)
                 peer_detail = next(item for item in result.stream_results if item["stream"] == peer_stream_enum.value)
                 self.assertEqual("LATEST_IDENTITY_CONFLICT", drift_detail["status"])
                 self.assertEqual("EG_LATEST_IDENTITY_FACTS_CHANGED", drift_detail["support_ref"])
-                self.assertEqual("DELIVERED", peer_detail["status"])
+                self.assertEqual("ARCHIVE_READY", peer_detail["status"])
                 self.assertEqual(peer.day_ordinal, state.stream(peer_stream_enum.value)["watermark_day"])
                 self.assertEqual(old_drift_watermark, state.stream(drift_stream)["watermark_day"])
         self.assertEqual([], new_adapters[drift_stream].acquire_calls)
         self.assertEqual([peer.source_filename], new_adapters[peer_stream_enum.value].acquire_calls)
-        self.assertEqual([peer_stream_enum.value], calls)
+        self.assertEqual([], calls)
         self.assertEqual(ACTION_REQUIRED, result.status)
         self.assertEqual(20, result.exit_code)
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             listed = reconcile_dual_stream(self.config, new_adapters, state, RecordingLogger(), str(uuid.uuid4()), list_only=True)
             drift_listed = next(row for row in listed.stream_results if row["stream"] == drift_stream)
             self.assertEqual("LATEST_IDENTITY_CONFLICT", drift_listed["status"])
@@ -1715,16 +1441,17 @@ class DualStreamReconcileTests(unittest.TestCase):
     def run_evidence_binding_drift_case(self, drift_stream: str) -> None:
         from energygrid_bill_downloader.invoice import DATE_PROFILE_ISO_V1, Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import SyntheticAdapter, SYNTHETIC_NAMESPACE, candidate, snapshot
 
         initial = self.adapters()
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery([])):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 self.assertEqual(0, reconcile_dual_stream(
                     self.config, initial, state, RecordingLogger(), str(uuid.uuid4()),
                 ).exit_code)
+        self.finish_drive_and_email()
 
         if drift_stream == "EB_BILL":
             stream = Stream.EB_BILL
@@ -1750,17 +1477,17 @@ class DualStreamReconcileTests(unittest.TestCase):
         }
         calls: list[str] = []
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery(calls)):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 result = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
                 drift_detail = next(row for row in result.stream_results if row["stream"] == drift_stream)
                 peer_detail = next(row for row in result.stream_results if row["stream"] == peer_stream.value)
                 self.assertEqual(("LATEST_IDENTITY_CONFLICT", "EG_LATEST_IDENTITY_FACTS_CHANGED"), (
                     drift_detail["status"], drift_detail["support_ref"],
                 ))
-                self.assertEqual("DELIVERED", peer_detail["status"])
+                self.assertEqual("ARCHIVE_READY", peer_detail["status"])
         self.assertEqual([], adapters[drift_stream].acquire_calls)
         self.assertEqual([peer_name], adapters[peer_stream.value].acquire_calls)
-        self.assertEqual([peer_stream.value], calls)
+        self.assertEqual([], calls)
         self.assertEqual(ACTION_REQUIRED, result.status)
         self.assertEqual(20, result.exit_code)
 
@@ -1773,16 +1500,17 @@ class DualStreamReconcileTests(unittest.TestCase):
     def test_dual_summary_mixes_handled_and_new_delivery_with_exact_counts(self) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, snapshot
 
         first_adapters = self.adapters()
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery([])):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 self.assertEqual(0, reconcile_dual_stream(
                     self.config, first_adapters, state, RecordingLogger(), str(uuid.uuid4()),
                 ).exit_code)
+        self.finish_drive_and_email()
         handled = candidate(Stream.EB_BILL, name="eb-latest.pdf", invoice_date="2026-10-01")
         new = candidate(Stream.TENANT_BILL, name="tenant-next.pdf", invoice_date="2026-10-04")
         adapters = {
@@ -1791,22 +1519,22 @@ class DualStreamReconcileTests(unittest.TestCase):
         }
         calls: list[str] = []
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=self.fake_delivery(calls)):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()))
         self.assertEqual((0, "DOWNLOADED"), (summary.exit_code, summary.status))
-        self.assertEqual((1, 1, 2, 2), (
+        self.assertEqual((1, 1, 1, 1), (
             summary.fetch_count, summary.downloaded_count, summary.delivered_count, summary.handled_count,
         ))
-        self.assertEqual(["ALREADY_HANDLED", "DELIVERED"], [row["status"] for row in summary.stream_results])
+        self.assertEqual(["ALREADY_HANDLED", "ARCHIVE_READY"], [row["status"] for row in summary.stream_results])
         self.assertEqual([], adapters["EB_BILL"].acquire_calls)
         self.assertEqual([new.source_filename], adapters["TENANT_BILL"].acquire_calls)
-        self.assertEqual(["TENANT_BILL"], calls)
+        self.assertEqual([], calls)
 
     def test_dual_summary_reports_both_holds_and_mixed_retryability(self) -> None:
         from energygrid_bill_downloader.errors import DownloadError, SourceContractError, SourceTransportError
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, snapshot
 
         eb_candidates = (
@@ -1821,7 +1549,7 @@ class DualStreamReconcileTests(unittest.TestCase):
             "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, eb_candidates)),
             "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, tenant_candidates)),
         }
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             tied = reconcile_dual_stream(self.config, both_held, state, RecordingLogger(), str(uuid.uuid4()))
         self.assertEqual(["LATEST_AMBIGUOUS", "LATEST_AMBIGUOUS"], [row["status"] for row in tied.stream_results])
         self.assertEqual(20, tied.exit_code)
@@ -1830,7 +1558,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         failed = self.adapters()
         failed["EB_BILL"].inventory = lambda _ceiling: (_ for _ in ()).throw(SourceTransportError("synthetic retryable"))
         failed["TENANT_BILL"].inventory = lambda _ceiling: (_ for _ in ()).throw(SourceContractError("EG_SYNTHETIC_CONTRACT_FAILURE"))
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             mixed = reconcile_dual_stream(self.config, failed, state, RecordingLogger(), str(uuid.uuid4()))
         self.assertEqual(["SOURCE_FAILURE", "SOURCE_FAILURE"], [row["status"] for row in mixed.stream_results])
         self.assertEqual(20, mixed.exit_code)
@@ -1840,7 +1568,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         import sqlite3
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import _ensure_archive_available
-        from energygrid_bill_downloader.state import StateV2Store, StreamStateConflictError
+        from energygrid_bill_downloader.state import StateV3Store, StreamStateConflictError
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import candidate
 
@@ -1848,7 +1576,7 @@ class DualStreamReconcileTests(unittest.TestCase):
             "source_only", "target_only", "both", "both_different_bytes", "neither", "wrong_source_bytes", "wrong_target_bytes",
             "wrong_target_path", "wrong_binding", "wrong_role", "wrong_hash", "wrong_size", "wrong_source_root",
         )
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             for day, label in enumerate(cases, start=1):
                 date = f"2026-11-{day:02d}"
                 item = candidate(Stream.EB_BILL, name=f"archive-{label}.pdf", invoice_date=date)
@@ -1928,11 +1656,11 @@ class DualStreamReconcileTests(unittest.TestCase):
     def test_archive_equal_bytes_without_ownership_and_cross_invoice_owner_hold(self) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import _ensure_archive_available
-        from energygrid_bill_downloader.state import StateV2Store, StreamStateConflictError
+        from energygrid_bill_downloader.state import StateV3Store, StreamStateConflictError
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import candidate
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             unowned = candidate(Stream.EB_BILL, name="unowned-equal.pdf", invoice_date="2026-12-20")
             unowned_id = state.accept_latest(unowned, "00000000-0000-0000-0000-000000000001", "2026-12-20T00:00:00+00:00")
             unowned_invoice = state.invoice(unowned_id)
@@ -1970,7 +1698,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         from dataclasses import replace
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store, migrate_state_database
+        from energygrid_bill_downloader.state import StateV3Store, migrate_state_database_v3
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import SyntheticAdapter, snapshot, test_stream_entries
 
@@ -1991,7 +1719,7 @@ class DualStreamReconcileTests(unittest.TestCase):
             )
             connection.commit()
         streams = test_stream_entries()
-        migrate_state_database(
+        migrate_state_database_v3(
             legacy_path, apply=True, streams=streams, mapping_entries=[{
                 "legacy_filename_key": legacy_name, "stream": Stream.EB_BILL.value,
                 "source_namespace": streams[Stream.EB_BILL.value].source_namespace,
@@ -2000,13 +1728,16 @@ class DualStreamReconcileTests(unittest.TestCase):
                 "evidence_ref": streams[Stream.EB_BILL.value].evidence_ref,
             }],
         )
+        from fixtures.synthetic_dual_stream import bind_synthetic_drive
+
+        bind_synthetic_drive(legacy_path)
         old_archive = self.archive / legacy_name
         old_archive.write_bytes(payload)
         self.config = replace(self.config, state_path=legacy_path)
         adapters = self.adapters()
         adapters["TENANT_BILL"] = SyntheticAdapter(snapshot(Stream.TENANT_BILL, ()))
         calls: list[str] = []
-        with StateV2Store(legacy_path) as state:
+        with StateV3Store(legacy_path) as state:
             retained = state.resolve_latest_candidate(adapters["EB_BILL"]._inventory.candidates[-1])
             self.assertIsNotNone(retained)
             retained_id = retained["invoice_id"]
@@ -2020,12 +1751,12 @@ class DualStreamReconcileTests(unittest.TestCase):
         self.assertFalse(old_archive.exists())
         self.assertEqual(payload, (self.archive / "EB Bill" / "2026-10-01.pdf").read_bytes())
         self.assertEqual(0, summary.fetch_count)
-        self.assertEqual(["EB_BILL"], calls)
+        self.assertEqual([], calls)
 
     def test_legacy_move_authority_matrix_requires_exact_source_owner_and_binding(self) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.reconcile import _ensure_archive_available
-        from energygrid_bill_downloader.state import StateV2Store, StreamStateConflictError
+        from energygrid_bill_downloader.state import StateV3Store, StreamStateConflictError
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import candidate
 
@@ -2042,7 +1773,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                 )
                 target = self.archive / "EB Bill" / f"{date}.pdf"
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with StateV2Store(self.config.state_path) as state:
+                with StateV3Store(self.config.state_path) as state:
                     invoice = state.invoice(invoice_id)
                     operation_owner = invoice_id
                     operation_target = invoice["archive_relpath"]
@@ -2118,7 +1849,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         item, old_source, payload, _info, invoice_id = self.seed_migrated_archived_latest(
             name="legacy-unowned-equal.pdf", label="unowned-equal", verified_archive=False,
         )
-        with StateV2Store(self.config.state_path) as state:
+        with StateV3Store(self.config.state_path) as state:
             invoice = state.invoice(invoice_id)
             target = self.archive / invoice["archive_relpath"]
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2136,7 +1867,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         from energygrid_bill_downloader.invoice import Stream
         from energygrid_bill_downloader.errors import ConfigError
         from energygrid_bill_downloader.reconcile import _canonical_path, _ensure_archive_available
-        from energygrid_bill_downloader.state import StateV2Store, StreamStateConflictError
+        from energygrid_bill_downloader.state import StateV3Store, StreamStateConflictError
         from fixtures.synthetic_delivery import synthetic_pdf
         from fixtures.synthetic_dual_stream import candidate
 
@@ -2167,7 +1898,7 @@ class DualStreamReconcileTests(unittest.TestCase):
                     fetch_calls.append(selected.source_filename)
                     raise AssertionError("fetch called before archive destination reparse check")
 
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 invoice_id = state.accept_latest(
                     item, "00000000-0000-0000-0000-000000000001", "2026-11-24T00:00:00+00:00",
                 )
@@ -2197,7 +1928,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         finally:
             destination_parent.rmdir()
 
-        with StateV2Store(self.state_path) as state:
+        with StateV3Store(self.state_path) as state:
             item = candidate(Stream.EB_BILL, name="archive-reparse.pdf", invoice_date="2026-11-25")
             invoice_id = state.accept_latest(item, "00000000-0000-0000-0000-000000000001", "2026-11-25T00:00:00+00:00")
             invoice = state.invoice(invoice_id)
@@ -2232,7 +1963,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         (real_legacy_dir / "payload.pdf").write_bytes(payload)
         old_source.unlink()
         make_junction(old_source, real_legacy_dir)
-        with StateV2Store(self.config.state_path) as state:
+        with StateV3Store(self.config.state_path) as state:
             invoice = state.invoice(invoice_id)
             operation = state.start_file_operation(
                 operation_id=str(uuid.uuid4()), invoice_id=invoice_id, kind="LEGACY_MOVE",
@@ -2253,7 +1984,7 @@ class DualStreamReconcileTests(unittest.TestCase):
         import re
         from energygrid_bill_downloader.cli import SafeLogger
         from energygrid_bill_downloader.delivery import DELIVERY_RESULT_SCHEMA, DeliveryClient
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
 
         adapters = self.adapters()
         run_id = str(uuid.uuid4())
@@ -2273,7 +2004,7 @@ class DualStreamReconcileTests(unittest.TestCase):
             environ={"ENERGYGRID_DELIVERY_TOKEN": "PRIVATE-TOKEN-CANARY"},
         )
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=client):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 summary = reconcile_module.reconcile_dual_stream(self.config, adapters, state, logger, run_id)
         events = [json.loads(line) for line in logger.log_path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual("DOWNLOADED", summary.status)
@@ -2285,8 +2016,7 @@ class DualStreamReconcileTests(unittest.TestCase):
             self.assertEqual([
                 "inventory_started", "inventory_result", "latest_selection", "selection_committed",
                 "fetch_decision", "archive_started", "fetch_started", "fetch_completed",
-                "archive_result", "drive_started", "drive_result", "delivery_intent",
-                "dispatch_start", "delivery_outcome", "stream_complete",
+                "archive_result", "stream_complete",
             ], phases)
         rendered = logger.log_path.read_text(encoding="utf-8")
         for private in (
@@ -2297,7 +2027,7 @@ class DualStreamReconcileTests(unittest.TestCase):
 
     def test_logger_callback_failure_preserves_reconciliation_effects(self) -> None:
         from energygrid_bill_downloader.delivery import DELIVERY_RESULT_SCHEMA, DeliveryClient
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
         import json
         import re
 
@@ -2319,12 +2049,13 @@ class DualStreamReconcileTests(unittest.TestCase):
 
         client = DeliveryClient(self.config.delivery, post_once=post_once, environ={"ENERGYGRID_DELIVERY_TOKEN": "SYNTHETIC_TOKEN"})
         with mock.patch("energygrid_bill_downloader.delivery.DeliveryClient", return_value=client):
-            with StateV2Store(self.state_path) as state:
+            with StateV3Store(self.state_path) as state:
                 summary = reconcile_module.reconcile_dual_stream(self.config, adapters, state, BrokenLogger(), str(uuid.uuid4()))
-                self.assertEqual(2, state.connection.execute("SELECT COUNT(*) FROM energygrid_delivery_v1 WHERE state='DELIVERED'").fetchone()[0])
+                self.assertEqual(0, state.connection.execute("SELECT COUNT(*) FROM energygrid_delivery_v1").fetchone()[0])
+                self.assertEqual(2, state.connection.execute("SELECT COUNT(*) FROM energygrid_invoice_v2 WHERE archive_state='COMMITTED'").fetchone()[0])
         self.assertEqual("DOWNLOADED", summary.status)
         self.assertEqual(0, summary.exit_code)
-        self.assertEqual(2, len(posts))
+        self.assertEqual(0, len(posts))
         self.assertEqual(["eb-latest.pdf"], adapters["EB_BILL"].acquire_calls)
         self.assertEqual(["tenant-latest.pdf"], adapters["TENANT_BILL"].acquire_calls)
 
@@ -2347,12 +2078,12 @@ class DualStreamReconcileTests(unittest.TestCase):
 
     def test_list_only_reads_snapshot_without_lock_state_or_file_writes(self) -> None:
         from energygrid_bill_downloader.reconcile import reconcile_dual_stream
-        from energygrid_bill_downloader.state import StateV2Store
+        from energygrid_bill_downloader.state import StateV3Store
 
         adapters = self.adapters()
         before_db = self.state_path.stat().st_mtime_ns
         before_files = sorted(path.relative_to(self.root).as_posix() for path in self.root.rglob("*"))
-        with StateV2Store(self.state_path, read_only=True) as state:
+        with StateV3Store(self.state_path, read_only=True) as state:
             summary = reconcile_dual_stream(self.config, adapters, state, RecordingLogger(), str(uuid.uuid4()), list_only=True)
         after_files = sorted(path.relative_to(self.root).as_posix() for path in self.root.rglob("*"))
         self.assertEqual(before_files, after_files)
