@@ -397,7 +397,9 @@ function Invoke-XbMemberGatewayWorkerCycle {
         [string]$WorkerSession,
         [string]$WorkerHostBinding,
         [scriptblock]$GatewayRequest,
-        [scriptblock]$WriterProcessFactory
+        [scriptblock]$WriterProcessFactory,
+        [scriptblock]$NextMemberNo,
+        [scriptblock]$LegacyPrecheck
     )
     if (-not $EnableProductionWorker) {
         return [pscustomobject]@{ status = "disabled"; writes = 0; dispatch_fence = $false }
@@ -433,7 +435,24 @@ function Invoke-XbMemberGatewayWorkerCycle {
 
     $job = $claim.job
     $jobId = [string]$job.job_id
+    $isShopify = ($null -ne $job.PSObject.Properties["source_system"] -and [string]$job.source_system -ceq "shopify")
     & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/precheck" -f $jobId) "POST" @{} $WorkerSession | Out-Null
+    if ($isShopify) {
+        # Shopify M1: conservative legacy duplicate precheck before any
+        # allocation. Only booleans are reported; protected values stay in
+        # this process's memory.
+        if ($null -eq $NextMemberNo -or $null -eq $LegacyPrecheck) { throw "shopify_worker_seams_required" }
+        $legacy = & $LegacyPrecheck $job.create_payload
+        $precheck = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/shopify/legacy-precheck" -f $jobId) "POST" @{
+            outcome = [string]$legacy.outcome
+            phone_member_no_hit = [bool]$legacy.phone_member_no_hit
+            mobile_phone_hit = [bool]$legacy.mobile_phone_hit
+            email_hit = [bool]$legacy.email_hit
+        } $WorkerSession
+        if ([string]$precheck.state -eq "MANUAL_REVIEW") {
+            return [pscustomobject]@{ status = "MANUAL_REVIEW"; writes = 0; dispatch_fence = $false }
+        }
+    }
     $candidateResponse = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/allocation/candidate" -f $jobId) "POST" @{} $WorkerSession
     $allocation = $null
     for ($index = 0; $index -lt 10000; $index++) {
@@ -441,7 +460,9 @@ function Invoke-XbMemberGatewayWorkerCycle {
             $allocation = $candidateResponse
             break
         }
-        $candidate = [string]$candidateResponse.candidate
+        # Shopify candidates come only from the official AC2 generator; the
+        # gateway bounds pre-fence reallocation and never advances on ambiguity.
+        $candidate = if ($isShopify) { [string](& $NextMemberNo) } else { [string]$candidateResponse.candidate }
         $probe = & $ProbeMember $candidate
         $probeStatus = [string]$probe.status
         $probeBody = @{
@@ -550,4 +571,55 @@ function Invoke-XbMemberGatewayWorkerCycle {
         }
         catch { throw "writer_termination_unconfirmed" }
     }
+}
+
+function Invoke-XbMemberGatewayShopifyReconcileCycle {
+    # Deterministic read-only reconciliation of one uncertain Shopify write,
+    # using only the already bound MemberNo. Never calls SaveMember and never
+    # selects another MemberNo. Emits status codes only.
+    param(
+        [Parameter(Mandatory)][string]$GatewayBaseUrl,
+        [Parameter(Mandatory)][switch]$EnableProductionWorker,
+        [Parameter(Mandatory)][scriptblock]$ReconcileMember,
+        [string]$WorkerSession,
+        [scriptblock]$GatewayRequest
+    )
+    if (-not $EnableProductionWorker) {
+        return [pscustomobject]@{ status = "disabled"; writes = 0 }
+    }
+    if ($null -eq $GatewayRequest) {
+        $GatewayRequest = {
+            param($base, $path, $method, $body, $session, $timeout)
+            $requestTimeout = if ($null -eq $timeout) { 30 } else { [int]$timeout }
+            Invoke-XbMemberGatewayRequest -GatewayBaseUrl $base -Path $path -Method $method -Body $body -WorkerSession $session -TimeoutSec $requestTimeout
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($WorkerSession)) { $WorkerSession = New-XbMemberGatewayWorkerSession }
+    elseif ($WorkerSession -cnotmatch '^ws-[0-9a-f]{32}$') { throw "worker_session_invalid" }
+    $ready = & $GatewayRequest $GatewayBaseUrl "/readyz" "GET" $null $WorkerSession
+    if ($ready.ready -ne $true) { throw "gateway_not_ready" }
+    $claim = & $GatewayRequest $GatewayBaseUrl "/v1/worker/reconcile/claim" "POST" @{} $WorkerSession
+    if ($claim.claimed -ne $true) { return [pscustomobject]@{ status = "idle"; writes = 0 } }
+    $target = $claim.job
+    $jobId = [string]$target.job_id
+    $memberNo = [string]$target.member_no
+    try {
+        $check = & $ReconcileMember $memberNo $target.create_payload
+        $found = [bool]$check.found
+        $match = [bool]$check.match
+        if (-not $found) { $lookup = "absent"; $errorCode = "confirmed_absent_manual_followup" }
+        elseif ($match) { $lookup = "exact_match"; $errorCode = $null }
+        else { $lookup = "mismatch"; $errorCode = "readback_mismatch_manual_review" }
+    }
+    catch {
+        $found = $false; $match = $false; $lookup = "ambiguous"; $errorCode = "reconciliation_lookup_uncertain"
+    }
+    & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/reconcile" -f $jobId) "POST" @{
+        member_no = $memberNo
+        lookup_status = $lookup
+        readback_found = $found
+        readback_match = $match
+        error_code = $errorCode
+    } $WorkerSession | Out-Null
+    return [pscustomobject]@{ status = $lookup; writes = 0 }
 }

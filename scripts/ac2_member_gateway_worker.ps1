@@ -6,6 +6,7 @@ param(
     [switch]$EnableProductionWorker,
     [switch]$EnableProductionAdapter,
     [switch]$ChildExternalWrite,
+    [switch]$ReconcileOnce,
     [string]$WriteDeadlineUtc,
     [scriptblock]$SessionFactory,
     [scriptblock]$MemberCommandFactory
@@ -23,6 +24,29 @@ function Invoke-XbMemberGatewayCreateMember {
         [Parameter(Mandatory)][switch]$EnableProductionAdapter,
         [scriptblock]$MemberCommandFactory
     )
+    if ($null -ne $Job.PSObject.Properties["source_system"] -and [string]$Job.source_system -ceq "shopify") {
+        # Shopify M1: caller fields only; exact Shopify dates; no DOB; absent
+        # contact fields stay NULL. Values exist only in this process.
+        $payload = $Job.create_payload
+        $member = @{
+            MemberNo = [string]$Allocation.member_no
+            Name = [string]$payload.name
+            RegisterDate = [string]$payload.register_date
+            ExpiryDate = [string]$payload.expiry_date
+        }
+        if ($null -ne $payload.mobile_phone) { $member.MobilePhone = $payload.mobile_phone }
+        if ($null -ne $payload.email_address) { $member.EmailAddress = $payload.email_address }
+        $outcome = New-XbAutoCountMember -Session $Session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -MemberCommandFactory $MemberCommandFactory -FieldProfile "shopify_m1"
+        $check = Compare-XbAutoCountMemberReadBack -Expected $outcome.Expected -Actual $outcome.ReadBack -FieldProfile "shopify_m1"
+        return [pscustomobject]@{
+            save_invocation_count = $outcome.SaveInvocationCount
+            readback_found = [bool]$check.Found
+            readback_match = [bool]$check.Match
+            status = if (-not $check.Found) { "WRITE_OUTCOME_UNCERTAIN" } elseif ($check.Match) { "CREATED_VERIFIED" } else { "CREATED_READBACK_MISMATCH" }
+            error_code = if ($check.Found -and $check.Match) { $null } elseif (-not $check.Found) { "readback_absent" } else { "readback_mismatch" }
+            mismatches = $check.Mismatches
+        }
+    }
     $submitted = [DateTimeOffset]::Parse([string]$Job.member_payload.create_time)
     $singapore = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId($submitted, "Singapore Standard Time")
     $registerDate = $singapore.Date
@@ -91,9 +115,31 @@ if (-not $EnableProductionWorker) {
 if ([string]::IsNullOrWhiteSpace($GatewayBaseUrl)) { throw "gateway_url_missing" }
 
 $session = New-XbAutoCountSession -EnableProductionAdapter:$EnableProductionAdapter -SessionFactory $SessionFactory
+if ($ReconcileOnce) {
+    $reconcileMember = {
+        param([string]$MemberNo, $CreatePayload)
+        $expected = New-XbAutoCountShopifyExpectedRecord -MemberNo $MemberNo -CreatePayload $CreatePayload
+        $actual = Get-XbAutoCountMember -Session $session -MemberNo $MemberNo -MemberCommandFactory $MemberCommandFactory
+        $check = Compare-XbAutoCountMemberReadBack -Expected $expected -Actual $actual -FieldProfile "shopify_m1"
+        [pscustomobject]@{ found = [bool]$check.Found; match = [bool]$check.Match }
+    }
+    $reconciled = Invoke-XbMemberGatewayShopifyReconcileCycle -GatewayBaseUrl $GatewayBaseUrl -EnableProductionWorker:$EnableProductionWorker -ReconcileMember $reconcileMember
+    $reconciled | ConvertTo-Json -Compress
+    exit 0
+}
+$nextMemberNo = {
+    Get-XbAutoCountNextMemberNo -Session $session -MemberCommandFactory $MemberCommandFactory
+}
+$legacyPrecheck = {
+    param($CreatePayload)
+    Test-XbAutoCountLegacyMemberCandidate -Session $session -MobilePhone $CreatePayload.mobile_phone -EmailAddress $CreatePayload.email_address -MemberCommandFactory $MemberCommandFactory
+}
 $probe = {
     param([string]$Candidate)
-    $member = Get-XbAutoCountMember -Session $session -MemberNo $Candidate -MemberCommandFactory $MemberCommandFactory
+    try {
+        $member = Get-XbAutoCountMember -Session $session -MemberNo $Candidate -MemberCommandFactory $MemberCommandFactory
+    }
+    catch { throw "member_no_probe_failed" }
     if ($null -eq $member) {
         [pscustomobject]@{ status = "FREE" }
     } else {
@@ -111,5 +157,5 @@ $writerProcessFactory = {
     Start-XbMemberGatewayChildWriter -ScriptPath $writerScriptPath -Arguments @("-ChildExternalWrite", "-EnableProductionAdapter", "-WriteDeadlineUtc", $StopAt.ToString("o"))
 }.GetNewClosure()
 
-$result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl $GatewayBaseUrl -WorkerId $WorkerId -WorkerHostBinding $WorkerHostBinding -EnableProductionWorker:$EnableProductionWorker -EnableProductionAdapter:$EnableProductionAdapter -ProbeMember $probe -CreateMember $create -WriterProcessFactory $writerProcessFactory
+$result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl $GatewayBaseUrl -WorkerId $WorkerId -WorkerHostBinding $WorkerHostBinding -EnableProductionWorker:$EnableProductionWorker -EnableProductionAdapter:$EnableProductionAdapter -ProbeMember $probe -CreateMember $create -WriterProcessFactory $writerProcessFactory -NextMemberNo $nextMemberNo -LegacyPrecheck $legacyPrecheck
 $result | ConvertTo-Json -Compress

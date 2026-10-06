@@ -307,6 +307,43 @@ writer-termination state and proof-required/hold-active indicators; it does
 not expose PID, process-start timestamp, host identity, nonce, or raw evidence.
 The result-status vocabulary remains the existing v1 vocabulary.
 
+## Shopify M1 receiver and admission (repository-only)
+
+Prerequisites for any separately approved Shopify M1 bring-up (none is
+performed or authorised by the repository change):
+
+1. Apply migration `0006_shopify_member_m1.sql` after `0001`-`0005`
+   (forward-only; existing Forms rows become `source_system='google_forms'`).
+2. Provide `config/member_shopify_m1.production.example.json` values through a
+   reviewed external copy: `shopify_enabled`, the exact `shop_domain`, and the
+   bound `api_version`. Secrets are environment bindings only:
+   `XB_SHOPIFY_WEBHOOK_SECRET` (app client secret), `XB_SHOPIFY_ADMIN_TOKEN`
+   (`read_customers` only), `XB_MEMBER_GATEWAY_PROTECTED_PAYLOAD_KEY`
+   (base64url 32 random bytes; distinct from every other credential) and the
+   receiver private bind address/port.
+3. Prove encryption in transit and the database/backup encryption boundary for
+   `shopify_protected_payloads` before activation.
+4. With admission disabled, run
+   `python -m xb_member_gateway.shopify_receiver capture-baseline --config <gw> --shopify-config <shopify>`
+   in a quiet window. It prints only the baseline id, member count, digest and
+   state. Record them as evidence.
+5. Enable admission only with an approval reference:
+   `POST /v1/control/shopify-admission/enable` with `baseline_id` and
+   `approval_reference` (control principal). Disable with
+   `POST /v1/control/shopify-admission/disable`.
+6. Start the gateway with `--shopify-config` so the worker can claim Shopify
+   jobs; start the dedicated receiver with
+   `python -m xb_member_gateway.shopify_receiver serve ...`. The public edge must
+   forward only `POST /v1/shopify/webhooks/customers` to the private receiver.
+7. Watch `GET /v1/operator/shopify-status` (counts and codes only). Manual
+   review re-reads Shopify under explicit authority; no protected copy is kept
+   for convenience.
+
+The AC2 VM stays a thin runtime: it receives only the AutoCount create fields,
+the bound MemberNo and non-PII references. Do not install Toolkit or agent
+skills there. Run uncertain-write reconciliation with the worker's
+`-ReconcileOnce` switch; it never calls SaveMember or selects a new MemberNo.
+
 ## Not performed by this run
 
 No live Google Forms/Sheets, n8n instance, PostgreSQL server, AutoCount account

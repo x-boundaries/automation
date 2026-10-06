@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_job.v3.schema.json",
+  "title": "XB member gateway Shopify M1 job v3",
+  "description": "Source-aware job projection for Shopify M1. Never carries the Shopify Customer GID or a member_payload; create_payload appears only in the worker claim envelope (decrypted in memory) and is never persisted on the job.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "request_id",
+    "source_response_ref",
+    "payload_hash",
+    "operation",
+    "source_system",
+    "form_alias",
+    "mapping_version",
+    "state",
+    "state_version",
+    "attempt",
+    "max_attempts",
+    "writer_termination_state",
+    "writer_termination_hold_active",
+    "writer_termination_proof_required"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "xb.member.gateway.job.v3"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^job-[0-9a-f]{32}$"
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^job-[0-9a-f]{32}$"
+    },
+    "source_response_ref": {
+      "type": "string",
+      "pattern": "^hmac-v1:[0-9a-f]{64}$"
+    },
+    "payload_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "operation": {
+      "const": "member.create"
+    },
+    "source_system": {
+      "const": "shopify"
+    },
+    "form_alias": {
+      "const": "shopify_customer"
+    },
+    "mapping_version": {
+      "const": "shopify-member-m1.v1"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "RECEIVED",
+        "VALIDATED",
+        "QUEUED",
+        "LEASED",
+        "PRECHECKING",
+        "ALLOCATION_BOUND",
+        "WRITE_INTENT_RECORDED",
+        "WRITING",
+        "READBACK",
+        "CREATED_VERIFIED",
+        "REJECTED_VALIDATION",
+        "RETRY_WAIT",
+        "AMBIGUOUS_LOOKUP",
+        "WRITE_OUTCOME_UNCERTAIN",
+        "WRITER_TERMINATION_UNCONFIRMED",
+        "CONFIRMED_NOT_CREATED",
+        "CREATED_READBACK_MISMATCH",
+        "MANUAL_REVIEW",
+        "DEAD_LETTER"
+      ]
+    },
+    "state_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_attempts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attempt_started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "next_attempt_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "lease_expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "has_allocation": {
+      "type": "boolean"
+    },
+    "has_write_intent": {
+      "type": "boolean"
+    },
+    "has_dispatch_fence": {
+      "type": "boolean"
+    },
+    "result_status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "CREATED_VERIFIED",
+        "WRITE_OUTCOME_UNCERTAIN",
+        "CONFIRMED_NOT_CREATED",
+        "CREATED_READBACK_MISMATCH",
+        null
+      ]
+    },
+    "last_error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "writer_termination_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "PENDING",
+        "REGISTERED",
+        "TERMINATION_CONFIRMED",
+        "QUARANTINED",
+        "CLEARED",
+        null
+      ]
+    },
+    "writer_termination_hold_active": {
+      "type": "boolean"
+    },
+    "writer_termination_proof_required": {
+      "type": "boolean"
+    },
+    "create_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "mobile_phone",
+        "email_address",
+        "register_date",
+        "expiry_date"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "mobile_phone": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9]{6,15}$"
+        },
+        "email_address": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "email",
+          "maxLength": 254
+        },
+        "register_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "expiry_date": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member_no"
+      ],
+      "properties": {
+        "member_no": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,19}$"
+        }
+      }
+    }
+  }
+}

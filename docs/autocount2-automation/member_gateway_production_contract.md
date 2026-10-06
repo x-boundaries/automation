@@ -510,6 +510,96 @@ response IDs and message payloads stay private. Public-safe evidence is limited
 to outbox/job IDs, the HMAC source reference, hashes, state, version, attempt,
 template and bounded error codes.
 
+## Shopify-authoritative M1 create (#155 G3)
+
+Shopify is the authoritative member profile system. Milestone 1 is
+`NEW_CANONICAL_MEMBER_MG_CREATE_ONLY` in scope: a new, post-cutover customer
+classified `member-mg` is created once in AutoCount. Legacy/`XB Member`
+conversion, profile update sync, anti-entropy writeback and welcome/expiry
+communications are outside M1.
+
+```text
+Shopify HTTPS webhook -> dedicated shopify-webhook-receiver (direct HMAC)
+  -> durable gateway (PostgreSQL) -> asynchronous authoritative Shopify re-read
+  -> Shopify M1 job -> one outbound-only AC2 worker -> official MemberCommand
+```
+
+n8n is not part of the Shopify protected-customer ingress.
+
+### Receiver
+
+`xb_member_gateway.shopify_receiver` is a separate process with exactly one
+application route, `POST /v1/shopify/webhooks/customers` (plus `GET /livez`).
+It reads the exact raw bytes (bounded at 256 KiB, `Content-Length` only),
+verifies `X-Shopify-Hmac-Sha256` in constant time with the app client secret
+before parsing anything, and only then allowlists topic
+(`customers/create`, `customers/update`, `customer.tags_added`), shop domain and
+API version. It persists only bounded delivery metadata and the Customer GID in
+`shopify_webhook_receipts` (append-only, deduplicated on
+`X-Shopify-Webhook-Id`; a conflicting replay fails closed with 409). No raw
+body, body digest or profile value is stored or logged. It binds a private IP
+literal only; the public hostname/TLS/tunnel is a separate deployment binding.
+
+### Cutover baseline and admission
+
+`capture-baseline` scans every customer by cursor until `hasNextPage=false`
+(not a search query), keeps exact `member-mg` GIDs only and fails closed on any
+read error, malformed page, missing/repeated cursor, duplicate GID or page
+overrun. The sealed baseline stores GIDs only with a count and a sorted-GID
+SHA-256 digest; the database recomputes both at seal time and rejects any
+capture that is not sealed in its own transaction. Admission is disabled until
+`POST /v1/control/shopify-admission/enable` binds the sealed baseline after an
+independent application-side recompute; the binding is immutable.
+
+The admission processor re-reads each pending GID with read-only Admin GraphQL
+(`read_customers` only) and decides:
+
+| Authoritative read | Outcome |
+|---|---|
+| no `member-mg` / customer absent | `NOT_ELIGIBLE` (re-evaluated on a later webhook) |
+| GID in sealed baseline | `EXCLUDED_BASELINE` (`MANUAL_REVIEW` if a `customers/create` arrived during capture) |
+| `member-legacy` or `XB Member` tag | `MANUAL_REVIEW` |
+| customer created before the cutover | `MANUAL_REVIEW` (an update never invents a signup) |
+| Name or membership dates absent | bounded wait, then `MANUAL_REVIEW` |
+| malformed date/phone/email, expiry before start | `MANUAL_REVIEW` |
+| otherwise | `ADMITTED` exactly once (GID -> job unique) |
+
+### Protected transient payload
+
+The only protected values are the AutoCount create fields (Name, optional
+MobilePhone, optional EmailAddress, RegisterDate, ExpiryDate). They exist at
+rest only as an `xbpp1` AES-256-GCM envelope (PyCA `cryptography`) bound by
+associated data to the envelope version, key id and job id, in
+`shopify_protected_payloads`. The key is the runtime binding named by
+`protected_payload_key_env` (base64url of 32 random bytes) and must not alias
+any other credential. Shopify jobs carry `{}` as `canonical_payload` and no
+`response_id` (database-enforced). The envelope is immutable and may be deleted
+only when the job is terminal, no writer may still be live and no uncertain
+write remains; a commit-time trigger then scrubs it and records a PII-free
+`shopify_payload_scrubs` row. Readiness fails closed while any terminal resolved
+job still holds a payload.
+
+### Worker, MemberNo and AutoCount field floor
+
+The worker claim decrypts the payload in memory for the worker channel only.
+The worker reports a boolean-only legacy precheck (exact normalised phone
+against legacy MemberNo and MobilePhone, exact normalised email; name is never
+match authority); any hit or lookup failure is `MANUAL_REVIEW`. MemberNo comes
+only from `MemberCommand.GetNextMemberNo()`; a positively occupied candidate is
+re-generated up to `max_member_no_candidates` before the fence, a repeated or
+ambiguous candidate never advances, and after the fence no other MemberNo is
+ever selected. The adapter `shopify_m1` profile accepts only MemberNo, Name,
+RegisterDate, ExpiryDate, optional MobilePhone/EmailAddress; it owns
+`MemberType=Default`, `OpeningPoints=0`, `IsActive=T`, `Individual=T`; never
+assigns DOB; writes absent contact fields as DBNull (empty strings are
+rejected and never equal NULL on readback); calls `SaveMember` exactly once
+and requires exact null-aware readback. Protected values reach the child
+writer only on stdin and never appear in arguments, stdout/stderr, logs, the
+cycle status or operator projections. Uncertain writes are reconciled
+read-only with the same bound MemberNo (`-ReconcileOnce`).
+
+Shopify jobs never create or require the Forms `welcome_v1` outbox.
+
 ## Unsupported production prerequisites
 
 Before any separately controlled activation, an owner must positively verify:

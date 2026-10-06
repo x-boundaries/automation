@@ -27,9 +27,10 @@ from .canonical import (
     canonicalize_source_rejection,
     validate_google_create_time_exact,
 )
-from .config import GatewayConfig
+from .config import GatewayConfig, ShopifyM1Config
 from .eligibility import EligibilityContext, evaluate_eligibility
 from .models import JobState, ProbeStatus, ResultStatus, source_cursor_v2
+from .protected_payload import ProtectedPayloadCipher, ProtectedPayloadError
 from .notifications import (
     WELCOME_JOB_SCHEMA_VERSION,
     WelcomeEmailError,
@@ -72,6 +73,23 @@ _APPROVAL_RE = re.compile(r"^[A-Za-z0-9._:/#-]{1,160}$")
 _EXECUTION_ID_RE = re.compile(r"^exec-[A-Za-z0-9]{16,80}$")
 _EVIDENCE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _PROCESS_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$")
+# AutoCount MemberCommand.GetNextMemberNo() output: opaque, bounded, never
+# phone-derived. Total length is still capped by member_no_max_length (20).
+_SHOPIFY_MEMBER_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,19}$")
+_BASELINE_ID_RE = re.compile(r"^baseline-[0-9a-f]{32}$")
+SHOPIFY_RECONCILE_CLAIM_SCHEMA = "xb.member.gateway.shopify_reconcile_claim.v1"
+
+
+@dataclass(frozen=True)
+class ShopifyRuntime:
+    """Shopify M1 gateway binding: closed config + in-memory AEAD cipher."""
+
+    config: ShopifyM1Config
+    cipher: ProtectedPayloadCipher
+
+    @property
+    def enabled(self) -> bool:
+        return self.config.shopify_enabled
 
 
 def _safe_code(value: Any, default: str = "request_rejected") -> str:
@@ -120,11 +138,22 @@ class GatewayService:
         *,
         adapter_ready: bool | None = None,
         clock=None,
+        shopify: ShopifyRuntime | None = None,
     ):
         self.config = config
         self.repository = repository
         self.adapter_ready = config.autocount_adapter_ready if adapter_ready is None else adapter_ready
         self.clock = clock
+        self.shopify = shopify
+
+    @property
+    def shopify_enabled(self) -> bool:
+        return self.shopify is not None and self.shopify.enabled
+
+    def _require_shopify(self) -> ShopifyRuntime:
+        if not self.shopify_enabled:
+            raise ApiError(409, "shopify_disabled")
+        return self.shopify  # type: ignore[return-value]
 
     def _runtime_config(self) -> GatewayConfig:
         control = self.repository.get_control()
@@ -142,6 +171,12 @@ class GatewayService:
         reasons = list(config.readiness_reasons())
         if not self.adapter_ready:
             reasons.append("autocount_adapter_not_ready")
+        if self.shopify_enabled:
+            reasons.extend(self.shopify.config.readiness_reasons())  # type: ignore[union-attr]
+            # A terminally resolved Shopify job must never still hold
+            # protected values; fail closed until the scrub is proven.
+            if self.repository.protected_payload_leftover_count() != 0:
+                reasons.append("terminal_job_protected_payload_present")
         return {
             "status": "ready" if not reasons else "not_ready",
             "ready": not reasons,
@@ -184,10 +219,28 @@ class GatewayService:
         config = self._runtime_config()
         if config.kill_switch_enabled:
             raise ApiError(423, "kill_switch_enabled")
-        job = self.repository.claim_job(worker_id, lease_seconds=config.lease_seconds, now=self.clock)
+        sources = ("google_forms", "shopify") if self.shopify_enabled else ("google_forms",)
+        job = self.repository.claim_job(worker_id, lease_seconds=config.lease_seconds, now=self.clock, source_systems=sources)
         if job is None:
             return {"schema_version": "xb.member.gateway.job.v2", "claimed": False, "job": None}
-        return {"schema_version": "xb.member.gateway.job.v2", "claimed": True, "job": job.worker_dict()}
+        value = job.worker_dict()
+        if job.is_shopify:
+            # Decrypted only in this request's memory for the worker channel.
+            value["create_payload"] = self._decrypt_for_worker(job, worker_id)
+        return {"schema_version": "xb.member.gateway.job.v2", "claimed": True, "job": value}
+
+    def _decrypt_for_worker(self, job: Any, worker_id: str) -> dict[str, Any]:
+        runtime = self._require_shopify()
+        try:
+            envelope = self.repository.get_shopify_protected_payload(job.job_id)
+            if envelope is None:
+                raise ProtectedPayloadError("protected_payload_missing")
+            return runtime.cipher.decrypt(job.job_id, envelope)
+        except ProtectedPayloadError as exc:
+            # Integrity/key failure is never retried with guessed data: the
+            # pre-fence job is dead-lettered and Shopify stays authoritative.
+            self.repository.mark_state(job.job_id, JobState.DEAD_LETTER, worker_id=worker_id, require_lease=True, error_code=exc.code, now=self.clock)
+            raise ApiError(409, exc.code) from exc
 
     def precheck(self, job_id: str, worker_id: str) -> dict[str, Any]:
         job = self.repository.begin_prechecking(job_id, worker_id, now=self.clock)
@@ -225,6 +278,14 @@ class GatewayService:
     def _validate_candidate(self, job: Any, candidate: Any) -> str:
         if not isinstance(candidate, str) or not candidate:
             raise ApiError(400, "allocation_candidate_invalid")
+        if job.is_shopify:
+            self._require_shopify()
+            config = self._runtime_config()
+            if not config.member_no_constraint_valid:
+                raise ApiError(409, "member_no_max_length_required")
+            if not _SHOPIFY_MEMBER_NO_RE.fullmatch(candidate) or len(candidate) > (config.member_no_max_length or 0):
+                raise ApiError(400, "allocation_candidate_invalid")
+            return candidate
         allocator, base = self._allocation_context(job)
         if not allocator.validate_candidate(base, candidate):
             raise ApiError(400, "allocation_candidate_invalid")
@@ -238,6 +299,8 @@ class GatewayService:
         allocation = self.repository.get_allocation(job_id)
         if allocation is not None:
             return {"job_id": job_id, "bound": True, "member_no": allocation.member_no}
+        if job.is_shopify:
+            return self._shopify_allocation_candidate(job)
         allocator, base = self._allocation_context(job)
         if job.state != JobState.PRECHECKING:
             raise ApiError(409, "allocation_candidate_state_invalid")
@@ -259,6 +322,8 @@ class GatewayService:
             status = ProbeStatus(body["status"])
         except (ValueError, TypeError) as exc:
             raise ApiError(400, "allocation_probe_status_invalid") from exc
+        if job.is_shopify:
+            return self._shopify_allocation_probe(job, worker_id, candidate, status, probe_reference)
         self.repository.record_probe(job_id, candidate, status, probe_reference, worker_id, now=self.clock)
         if status == ProbeStatus.FREE:
             try:
@@ -282,6 +347,99 @@ class GatewayService:
             now=self.clock,
         )
         raise ApiError(409, "allocation_probe_not_positive_free")
+
+    def _shopify_review(self, job_id: str, worker_id: str, code: str) -> None:
+        """Shopify allocation ambiguity never advances: AMBIGUOUS_LOOKUP then
+        MANUAL_REVIEW (terminal, pre-fence, so the payload is scrubbed)."""
+
+        self.repository.mark_state(job_id, JobState.AMBIGUOUS_LOOKUP, worker_id=worker_id, require_lease=True, error_code=code, now=self.clock)
+        self.repository.mark_state(job_id, JobState.MANUAL_REVIEW, error_code=code, now=self.clock)
+
+    def _shopify_allocation_candidate(self, job: Any) -> dict[str, Any]:
+        runtime = self._require_shopify()
+        if job.state != JobState.PRECHECKING:
+            raise ApiError(409, "allocation_candidate_state_invalid")
+        if not self.repository.shopify_precheck_clear(job.job_id):
+            raise ApiError(409, "shopify_legacy_precheck_required")
+        occupied = sum(1 for probe in self.repository.get_probes(job.job_id) if probe.status == ProbeStatus.OCCUPIED)
+        remaining = runtime.config.max_member_no_candidates - occupied
+        if remaining <= 0:
+            raise ApiError(409, "member_no_exhausted")
+        # The worker obtains the candidate from the official generator on
+        # the AC2 host; the gateway never derives MemberNo from the phone.
+        return {"job_id": job.job_id, "bound": False, "generator": "member_command_get_next_member_no", "candidates_remaining": remaining}
+
+    def _shopify_allocation_probe(self, job: Any, worker_id: str, candidate: str, status: ProbeStatus, probe_reference: str) -> dict[str, Any]:
+        runtime = self._require_shopify()
+        if not self.repository.shopify_precheck_clear(job.job_id):
+            raise ApiError(409, "shopify_legacy_precheck_required")
+        prior = self.repository.get_probes(job.job_id)
+        if any(item.candidate == candidate and item.status == ProbeStatus.OCCUPIED for item in prior):
+            self._shopify_review(job.job_id, worker_id, "member_no_generator_not_advancing")
+            raise ApiError(409, "member_no_generator_not_advancing")
+        self.repository.record_probe(job.job_id, candidate, status, probe_reference, worker_id, now=self.clock)
+        if status == ProbeStatus.FREE:
+            try:
+                allocation = self.repository.bind_allocation(job.job_id, candidate, probe_reference, worker_id, now=self.clock)
+            except AllocationConflict as exc:
+                if str(exc) == "member_no_allocation_race":
+                    return self.allocation_candidate(job.job_id, worker_id)
+                raise
+            return {"job_id": job.job_id, "state": JobState.ALLOCATION_BOUND.value, "bound": True, "member_no": allocation.member_no}
+        if status == ProbeStatus.OCCUPIED:
+            occupied = sum(1 for item in self.repository.get_probes(job.job_id) if item.status == ProbeStatus.OCCUPIED)
+            if occupied >= runtime.config.max_member_no_candidates:
+                self._shopify_review(job.job_id, worker_id, "member_no_reallocation_exhausted")
+                raise ApiError(409, "member_no_exhausted")
+            return self.allocation_candidate(job.job_id, worker_id)
+        self._shopify_review(job.job_id, worker_id, "allocation_probe_not_conclusive")
+        raise ApiError(409, "allocation_probe_not_positive_free")
+
+    def shopify_legacy_precheck(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_shopify()
+        _exact_fields(body, {"outcome", "phone_member_no_hit", "mobile_phone_hit", "email_hit"})
+        job = self.repository.record_shopify_legacy_precheck(
+            job_id, worker_id, outcome=body["outcome"], phone_member_no_hit=body["phone_member_no_hit"],
+            mobile_phone_hit=body["mobile_phone_hit"], email_hit=body["email_hit"], now=self.clock,
+        )
+        return {"job_id": job.job_id, "state": job.state.value, "state_version": job.state_version}
+
+    def claim_shopify_reconciliation(self) -> dict[str, Any]:
+        runtime = self._require_shopify()
+        job = self.repository.claim_shopify_reconciliation(now=self.clock)
+        if job is None:
+            return {"schema_version": SHOPIFY_RECONCILE_CLAIM_SCHEMA, "claimed": False, "job": None}
+        fence = self.repository.get_dispatch_fence(job.job_id)
+        allocation = self.repository.get_allocation(job.job_id)
+        envelope = self.repository.get_shopify_protected_payload(job.job_id)
+        if fence is None or allocation is None or envelope is None or fence.member_no != allocation.member_no:
+            raise ApiError(409, "reconciliation_member_binding_invalid")
+        try:
+            payload = runtime.cipher.decrypt(job.job_id, envelope)
+        except ProtectedPayloadError as exc:
+            raise ApiError(409, exc.code) from exc
+        return {
+            "schema_version": SHOPIFY_RECONCILE_CLAIM_SCHEMA, "claimed": True,
+            "job": {"job_id": job.job_id, "source_system": job.source_system, "dispatch_fence_id": fence.fence_id, "member_no": fence.member_no, "create_payload": payload},
+        }
+
+    def shopify_operator_status(self) -> dict[str, Any]:
+        self._require_shopify()
+        return self.repository.shopify_operator_status()
+
+    def enable_shopify_admission(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self._require_shopify()
+        _exact_fields(body, {"baseline_id", "approval_reference"})
+        if not isinstance(body["baseline_id"], str) or not _BASELINE_ID_RE.fullmatch(body["baseline_id"]):
+            raise ApiError(422, "shopify_baseline_id_invalid")
+        if not isinstance(body["approval_reference"], str) or not _APPROVAL_RE.fullmatch(body["approval_reference"]):
+            raise ApiError(422, "activation_reference_required")
+        self.repository.enable_shopify_admission(body["baseline_id"], body["approval_reference"], now=self.clock)
+        return {"status": "shopify_admission_enabled", "admission_enabled": True}
+
+    def disable_shopify_admission(self) -> dict[str, Any]:
+        self.repository.disable_shopify_admission(now=self.clock)
+        return {"status": "shopify_admission_disabled", "admission_enabled": False}
 
     def allocation_recheck(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         _exact_fields(body, {"status", "probe_reference"})
@@ -326,8 +484,16 @@ class GatewayService:
             fresh_recheck = self.repository.get_fresh_recheck(job_id, worker_id, now=self.clock) is not None
         except (LeaseConflict, RepositoryError):
             fresh_recheck = None
+        shopify_context: dict[str, Any] = {}
+        if job.is_shopify:
+            shopify_context = {
+                "shopify_enabled": self.shopify_enabled,
+                "shopify_payload_present": self.repository.shopify_payload_present(job_id),
+                "shopify_precheck_clear": self.repository.shopify_precheck_clear(job_id),
+            }
         return evaluate_eligibility(
             EligibilityContext(
+                **shopify_context,
                 config=config,
                 job=job,
                 allocation=allocation,
@@ -819,6 +985,24 @@ class GatewayApp:
             if method == "POST" and route == "/v1/worker/claim":
                 self._principal(headers, "worker.claim")
                 return ApiResponse(200, self.service.claim(self._worker_session(headers)))
+            if method == "POST" and route == "/v1/worker/reconcile/claim":
+                self._principal(headers, "worker.reconcile")
+                return ApiResponse(200, self.service.claim_shopify_reconciliation())
+            if method == "GET" and route == "/v1/operator/shopify-status":
+                self._principal(headers, "operator.status.read")
+                return ApiResponse(200, self.service.shopify_operator_status())
+            if method == "POST" and route == "/v1/control/shopify-admission/enable":
+                self._principal(headers, "control.activate")
+                return ApiResponse(200, self.service.enable_shopify_admission(value))
+            if method == "POST" and route == "/v1/control/shopify-admission/disable":
+                self._principal(headers, "control.kill_switch")
+                if value:
+                    _exact_fields(value, set())
+                return ApiResponse(200, self.service.disable_shopify_admission())
+            match = re.fullmatch(r"/v1/jobs/([^/]+)/shopify/legacy-precheck", route)
+            if method == "POST" and match:
+                self._principal(headers, "worker.claim")
+                return ApiResponse(200, self.service.shopify_legacy_precheck(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/precheck", route)
             if method == "POST" and match:
                 self._principal(headers, "worker.claim")

@@ -9,6 +9,17 @@ WORKFLOW = ROOT / ".github/workflows/member-gateway-tests.yml"
 
 class MemberGatewayCiTests(unittest.TestCase):
     TZDATA_COMMAND = "python -m pip install --quiet tzdata"
+    # The only other permitted install: the exact-pinned PyCA AEAD used by the
+    # Shopify M1 protected payload, in the gateway-tests job only.
+    CRYPTO_COMMAND = 'python -m pip install --quiet "cryptography==46.0.7"'
+
+    def _assert_exact_crypto_allowance(self, text):
+        job = text.split("  gateway-tests:", 1)[1].split("\n  powershell-static:", 1)[0]
+        line = "        run: " + self.CRYPTO_COMMAND
+        self.assertEqual(text.count(self.CRYPTO_COMMAND), 1)
+        self.assertEqual(job.count(line), 1)
+        self.assertLess(job.index("      - uses: actions/setup-python@v5"), job.index(line))
+        self.assertLess(job.index(line), job.index("python -m unittest discover -s member_gateway/tests"))
 
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding="utf-8")
@@ -23,6 +34,8 @@ class MemberGatewayCiTests(unittest.TestCase):
         self.assertLess(setup_index, install_index)
         self.assertLess(install_index, suite_index)
         remaining = text.replace("        run: " + self.TZDATA_COMMAND, "", 1)
+        self._assert_exact_crypto_allowance(text)
+        remaining = remaining.replace("        run: " + self.CRYPTO_COMMAND, "", 1)
         self.assertIsNone(re.search(r"\bpip\s+install\b", remaining, re.IGNORECASE))
 
     def test_workflow_has_narrow_triggers_and_read_only_permissions(self):
@@ -91,6 +104,16 @@ class MemberGatewayCiTests(unittest.TestCase):
     def test_worker_production_example_is_narrowly_triggered(self):
         required_path = '"config/ac2_member_gateway_worker.production.example.json"'
         self.assertEqual(self.text.count(required_path), 2, required_path)
+
+    def test_crypto_allowance_is_exact_pinned_and_gateway_job_only(self):
+        self._assert_exact_crypto_allowance(self.text)
+        for mutated in (
+            self.text.replace("cryptography==46.0.7", "cryptography", 1),
+            self.text.replace("cryptography==46.0.7", "cryptography==46.0.7 requests", 1),
+            self.text.replace("  full-offline-regression:\n", "  another-job:\n    steps:\n      - run: " + self.CRYPTO_COMMAND + "\n\n  full-offline-regression:\n", 1),
+        ):
+            with self.assertRaises(AssertionError):
+                self._assert_exact_tzdata_allowance(mutated)
 
     def test_tzdata_allowance_rejects_appended_package(self):
         mutated = self.text.replace(self.TZDATA_COMMAND, self.TZDATA_COMMAND + " requests", 1)

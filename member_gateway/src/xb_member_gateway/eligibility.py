@@ -8,11 +8,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import GatewayConfig
-from .models import AllocationRecord, JobRecord, JobState
+from .models import SHOPIFY_FORM_ALIAS, SHOPIFY_MAPPING_VERSION, AllocationRecord, JobRecord, JobState
 
 
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_REF_RE = re.compile(r"^hmac-v1:[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,10 @@ class EligibilityContext:
     rate_allowed: bool | None = None
     source_conflict: bool | None = False
     now: datetime | None = None
+    # Shopify M1 only; unknown is a block like every other predicate.
+    shopify_enabled: bool | None = None
+    shopify_payload_present: bool | None = None
+    shopify_precheck_clear: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,18 +89,35 @@ def evaluate_eligibility(context: EligibilityContext) -> EligibilityDecision:
         "name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged"
     }
     payload_shape_valid = set(payload).issubset(required | {"create_time"}) and required.issubset(payload)
+    if job.source_system == "shopify":
+        # Protected values are never on the job; their presence is proven by
+        # the encrypted transient row and the PII-free legacy precheck.
+        source_predicates: dict[str, bool | None] = {
+            "source_system_allowlisted": context.shopify_enabled,
+            "source_form_allowlisted": job.form_alias == SHOPIFY_FORM_ALIAS,
+            "source_mapping_version_allowlisted": job.mapping_version == SHOPIFY_MAPPING_VERSION,
+            "response_identity_valid": job.response_id is None and isinstance(job.source_response_ref, str) and bool(_REF_RE.fullmatch(job.source_response_ref)),
+            "payload_hash_valid": isinstance(job.payload_hash, str) and bool(_HASH_RE.fullmatch(job.payload_hash)),
+            "job_record_pii_free": payload == {},
+            "shopify_protected_payload_present": context.shopify_payload_present,
+            "shopify_legacy_precheck_clear": context.shopify_precheck_clear,
+        }
+    else:
+        source_predicates = {
+            "source_system_allowlisted": job.source_system == "google_forms",
+            "source_form_allowlisted": job.form_alias in config.allowed_form_aliases,
+            "source_mapping_version_allowlisted": job.mapping_version in config.allowed_mapping_versions,
+            "response_identity_valid": isinstance(job.response_id, str) and bool(_ID_RE.fullmatch(job.response_id)),
+            "payload_hash_valid": isinstance(job.payload_hash, str) and bool(_HASH_RE.fullmatch(job.payload_hash)),
+            "pdpa_acknowledged": payload.get("pdpa_acknowledged") is True,
+            "marketing_consent_recognized": payload.get("marketing_consent") in {"Yes", "No"},
+            "required_source_fields_valid": payload_shape_valid,
+        }
     predicates: dict[str, bool | None] = {
         "production_activation_enabled": config.production_activation_enabled,
         "kill_switch_clear": config.kill_switch_clear,
         "correct_configured_environment": config.environment_matches,
-        "source_system_allowlisted": job.source_system == "google_forms",
-        "source_form_allowlisted": job.form_alias in config.allowed_form_aliases,
-        "source_mapping_version_allowlisted": job.mapping_version in config.allowed_mapping_versions,
-        "response_identity_valid": isinstance(job.response_id, str) and bool(_ID_RE.fullmatch(job.response_id)),
-        "payload_hash_valid": isinstance(job.payload_hash, str) and bool(_HASH_RE.fullmatch(job.payload_hash)),
-        "pdpa_acknowledged": payload.get("pdpa_acknowledged") is True,
-        "marketing_consent_recognized": payload.get("marketing_consent") in {"Yes", "No"},
-        "required_source_fields_valid": payload_shape_valid,
+        **source_predicates,
         "no_unknown_mapping_or_source_conflict": context.source_conflict is False,
         "operation_exact": job.operation == "member.create",
         "eligible_state": job.state in {JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED},

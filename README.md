@@ -54,6 +54,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `config/autocount_stock_extract.example.json`
 - `config/autocount_stock_extract.from_probe.example.json`
 - `config/member_gateway.production.example.json` (closed `xb.member.gateway.config.v2` example; MemberNo is fixed at 20, activation is disabled, the kill switch is on, the adapter is not ready, and all real source, database, network, watermark, and credential bindings remain external)
+- `config/member_shopify_m1.production.example.json` (closed `xb.member.shopify_m1.config.v1` example for the Shopify-authoritative M1 receiver/admission; Shopify disabled, no shop identity, secrets are environment-variable names only)
 
 Copy example files to local ignored config paths before use. Do not commit credentials, connection strings, production exports, or real operational data.
 
