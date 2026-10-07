@@ -8,6 +8,35 @@ read-only inventory, PO, stock movement, and purchasing analytics foundation
 first. Scheduler, write-back, CoA, GL opening, bank opening, and full accounting
 cutover work remain future/parked unless separately approved.
 
+## Interim delivery-first controller procedure — 6 October 2026
+
+This repository remains governed by its own accepted architecture and live child contracts while consuming the canonical Toolkit Controller. The merged delivery-first Controller change is applied at safe reconciliation boundaries as an **interim manual Web procedure**; it is not a claim that host/runtime interception has been mechanised.
+
+For current Automation XB work:
+
+- preserve active workers, accepted contracts, evidence, correction budgets, and child ownership;
+- move the next complete usable milestone through the smallest authorised end-to-end path;
+- require a concrete milestone consequence before adding a new prerequisite, investigation, or hardening step;
+- keep optional improvements in their existing future owner rather than delaying a safe accepted release;
+- retain all real safety, privacy, data-integrity, migration, independent-assurance, UAT, and finality requirements;
+- do not wait on unfinished Toolkit mechanism work when the current XB child has no genuine local dependency on it.
+
+The programme parent #117 is the live source for current milestone priority and child sequencing. At adoption, the next complete usable milestone is the EnergyGrid daily latest-invoice workflow; AutoCount member M1 remains an authorised parallel lane and is not restarted or demoted.
+
+## Operating Model Boundary
+
+The Automation XB default operating model is **Google Workspace-first and Claude Code-first**.
+
+- Corporate working documents and operational files should stay in Google Workspace and be accessed through approved connectors where practical. Prefer connector-native access over installing local Drive/sync clients unless a concrete runtime contract requires a local filesystem surface.
+- Claude Code/controller work normally runs from the laptop, server PC, or controller environment.
+- The AutoCount VM is a **thin production execution target**, not a default development workstation.
+- Do not install Toolkit or general-purpose agent skills on the AutoCount VM merely to support architecture, n8n, repository, or controller work. Those tasks should execute off-VM unless a current delivery contract proves a runtime-local dependency is unavoidable and Owner/Web explicitly approves the install.
+- The VM should contain only AutoCount, required runtime dependencies, private production configuration, and reviewed deterministic worker/adapter components needed for the admitted production path.
+- A separately authorised Claude supervisor may coordinate an already-reviewed deterministic worker command without gaining unrestricted AutoCount, shell, repository, or development authority.
+- Public repository documentation records sanitised architecture only. Sensitive operational bindings use the private TRANSPORT custody workflow rather than Git.
+
+This boundary supersedes older wording that implied broad development work should run locally on the VM. The VM remains local to AutoCount for the calls that must execute beside AutoCount, while development and orchestration stay off-VM.
+
 ## Architecture Goals
 
 - Keep AutoCount production tables protected.
