@@ -355,13 +355,45 @@ class GatewayService:
         self.repository.mark_state(job_id, JobState.AMBIGUOUS_LOOKUP, worker_id=worker_id, require_lease=True, error_code=code, now=self.clock)
         self.repository.mark_state(job_id, JobState.MANUAL_REVIEW, error_code=code, now=self.clock)
 
+    def _shopify_occupied_candidates(self, job: Any) -> set[str]:
+        """Candidates positively established as occupied for this job.
+
+        Either AutoCount reported the candidate OCCUPIED, or the worker saw it
+        FREE but it is durably bound to another gateway job (the
+        ``member_no_allocation_race`` collision). Both consume the same
+        bounded pre-fence budget, so ``GetNextMemberNo()`` re-offering a
+        gateway-held MemberNo can never cycle indefinitely.
+        """
+
+        occupied: set[str] = set()
+        for probe in self.repository.get_probes(job.job_id):
+            if probe.status == ProbeStatus.OCCUPIED:
+                occupied.add(probe.candidate)
+            elif probe.status == ProbeStatus.FREE:
+                owner = self.repository.member_no_owner(probe.candidate)
+                if owner is not None and owner != job.job_id:
+                    occupied.add(probe.candidate)
+        return occupied
+
+    def _shopify_after_occupied(self, job: Any, worker_id: str, *, gateway_bound: bool) -> dict[str, Any]:
+        runtime = self._require_shopify()
+        if len(self._shopify_occupied_candidates(job)) >= runtime.config.max_member_no_candidates:
+            self._shopify_review(job.job_id, worker_id, "member_no_reallocation_exhausted")
+            raise ApiError(409, "member_no_exhausted")
+        response = self.allocation_candidate(job.job_id, worker_id)
+        if gateway_bound:
+            # Tells the worker its own FREE probe was superseded by a durable
+            # gateway binding, so it may request the next generated candidate.
+            response["gateway_bound_collision"] = True
+        return response
+
     def _shopify_allocation_candidate(self, job: Any) -> dict[str, Any]:
         runtime = self._require_shopify()
         if job.state != JobState.PRECHECKING:
             raise ApiError(409, "allocation_candidate_state_invalid")
         if not self.repository.shopify_precheck_clear(job.job_id):
             raise ApiError(409, "shopify_legacy_precheck_required")
-        occupied = sum(1 for probe in self.repository.get_probes(job.job_id) if probe.status == ProbeStatus.OCCUPIED)
+        occupied = len(self._shopify_occupied_candidates(job))
         remaining = runtime.config.max_member_no_candidates - occupied
         if remaining <= 0:
             raise ApiError(409, "member_no_exhausted")
@@ -370,11 +402,12 @@ class GatewayService:
         return {"job_id": job.job_id, "bound": False, "generator": "member_command_get_next_member_no", "candidates_remaining": remaining}
 
     def _shopify_allocation_probe(self, job: Any, worker_id: str, candidate: str, status: ProbeStatus, probe_reference: str) -> dict[str, Any]:
-        runtime = self._require_shopify()
+        self._require_shopify()
         if not self.repository.shopify_precheck_clear(job.job_id):
             raise ApiError(409, "shopify_legacy_precheck_required")
-        prior = self.repository.get_probes(job.job_id)
-        if any(item.candidate == candidate and item.status == ProbeStatus.OCCUPIED for item in prior):
+        if candidate in self._shopify_occupied_candidates(job):
+            # A repeated occupied (AutoCount or gateway-held) candidate means
+            # the generator is not advancing: never re-probe, never advance.
             self._shopify_review(job.job_id, worker_id, "member_no_generator_not_advancing")
             raise ApiError(409, "member_no_generator_not_advancing")
         self.repository.record_probe(job.job_id, candidate, status, probe_reference, worker_id, now=self.clock)
@@ -383,15 +416,13 @@ class GatewayService:
                 allocation = self.repository.bind_allocation(job.job_id, candidate, probe_reference, worker_id, now=self.clock)
             except AllocationConflict as exc:
                 if str(exc) == "member_no_allocation_race":
-                    return self.allocation_candidate(job.job_id, worker_id)
+                    # Positively established: another gateway job durably
+                    # holds this MemberNo. Same bounded budget as OCCUPIED.
+                    return self._shopify_after_occupied(job, worker_id, gateway_bound=True)
                 raise
             return {"job_id": job.job_id, "state": JobState.ALLOCATION_BOUND.value, "bound": True, "member_no": allocation.member_no}
         if status == ProbeStatus.OCCUPIED:
-            occupied = sum(1 for item in self.repository.get_probes(job.job_id) if item.status == ProbeStatus.OCCUPIED)
-            if occupied >= runtime.config.max_member_no_candidates:
-                self._shopify_review(job.job_id, worker_id, "member_no_reallocation_exhausted")
-                raise ApiError(409, "member_no_exhausted")
-            return self.allocation_candidate(job.job_id, worker_id)
+            return self._shopify_after_occupied(job, worker_id, gateway_bound=False)
         self._shopify_review(job.job_id, worker_id, "allocation_probe_not_conclusive")
         raise ApiError(409, "allocation_probe_not_positive_free")
 

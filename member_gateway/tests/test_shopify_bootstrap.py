@@ -3,10 +3,12 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from xb_member_gateway.bootstrap import BootstrapError, compose_gateway
 from xb_member_gateway.config import ConfigError, ShopifyM1Config, load_shopify_config
+from xb_member_gateway.models import ShopifyAdmissionState, ShopifyWebhookReceipt
 from xb_member_gateway.repository import InMemoryRepository
 from xb_member_gateway.shopify_receiver import capture_baseline, compose_receiver
 
@@ -41,8 +43,8 @@ class MemoryRepositoryFactory:
 class FakeClient:
     def __init__(self, config, token):
         self.token_present = bool(token)
-        self.pages = [{"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [{"id": BASELINE_GID, "tags": ["member-mg"]}]},
-                      {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": NEW_GID, "tags": []}]}]
+        self.pages = [{"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [{"id": BASELINE_GID, "createdAt": "2020-01-01T00:00:00Z", "tags": ["member-mg"]}]},
+                      {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": NEW_GID, "createdAt": "2099-01-01T00:00:00Z", "tags": ["member-mg"]}]}]
 
     def baseline_page(self, after):
         return self.pages.pop(0)
@@ -119,10 +121,19 @@ class CompositionTests(unittest.TestCase):
         factory = MemoryRepositoryFactory()
         composition = compose_receiver(self.write("gw.json", config_value()), self.write("shop.json", shopify_value()), environment=self.receiver_env(), repository_factory=factory, client_factory=FakeClient)
         self.assertEqual((composition.bind_address, composition.bind_port), ("10.0.0.5", 8444))
+        # No HMAC-verified receipt before C yet: capture refuses and reads nothing.
+        with self.assertRaises(BootstrapError) as raised:
+            capture_baseline(composition)
+        self.assertEqual(raised.exception.code, "shopify_receiver_not_verified_before_cutover")
+        self.assertEqual(len(composition.client.pages), 2)
+        proof = ShopifyWebhookReceipt("wh-00000000-0900", "customers/update", SHOP, "2026-10", "evt-0900", None, "gid://shopify/Customer/9000000900")
+        factory.repository.record_shopify_webhook(proof, now=datetime(2026, 1, 1, tzinfo=timezone.utc))
         sealed = capture_baseline(composition)
-        self.assertEqual((sealed["member_count"], sealed["state"]), (1, "SEALED"))
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"], sealed["state"]), (1, 1, "SEALED"))
         self.assertTrue(factory.repository.verify_shopify_baseline(sealed["baseline_id"]))
-        self.assertEqual(set(sealed), {"baseline_id", "member_count", "member_digest", "state"})
+        self.assertEqual(set(sealed), {"baseline_id", "member_count", "member_digest", "state", "transition_pending_count"})
+        self.assertEqual(factory.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.PENDING)
+        self.assertEqual(factory.repository.get_shopify_baseline().capture_started_at[-1], "Z")
 
     def test_receiver_rejects_public_bind_shared_secrets_and_disabled_config(self):
         gw = self.write("gw.json", config_value())

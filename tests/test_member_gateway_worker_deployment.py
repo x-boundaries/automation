@@ -46,14 +46,14 @@ BOOLEAN_ORDER = (
 PROTECTED_WORKER_BLOBS = {
     "scripts/install_ac2_member_gateway_worker.ps1": "724fc4439fcd3de1966e82eae5adf6fee112b142",
     "scripts/ac2_member_gateway_worker.ps1": "5ef41368dffae4eecadf56a1de1606508f8eadb5",
-    "scripts/ac2_member_gateway_worker_lib.ps1": "53285c110dff1084d9b8c39ba6db0511c894cf00",
+    "scripts/ac2_member_gateway_worker_lib.ps1": "4d2140d944d0e5c4384bc8b35a748f5bf53ecb20",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "f2fdbd56f23bf92b0ba9b0b4d7fde93d4b98e08e",
     "scripts/launch_ac2_member_gateway_worker.ps1": "a913dffc6191a8f8945b6427652bab963ab34d70",
     "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "2143f59739a413b80e4745bc23053fefade09486",
 }
 
 PROTECTED_WORKER_TREES = {
-    "member_gateway": "451e275d55865aff3d9ef9a9ec1c44db194d5413",
+    "member_gateway": "98e21d946b63d5507429a384b725b305b49d2c0a",
 }
 
 WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)

@@ -542,14 +542,29 @@ literal only; the public hostname/TLS/tunnel is a separate deployment binding.
 
 ### Cutover baseline and admission
 
-`capture-baseline` scans every customer by cursor until `hasNextPage=false`
-(not a search query), keeps exact `member-mg` GIDs only and fails closed on any
-read error, malformed page, missing/repeated cursor, duplicate GID or page
-overrun. The sealed baseline stores GIDs only with a count and a sorted-GID
-SHA-256 digest; the database recomputes both at seal time and rejects any
-capture that is not sealed in its own transaction. Admission is disabled until
-`POST /v1/control/shopify-admission/enable` binds the sealed baseline after an
-independent application-side recompute; the binding is immutable.
+The cutover `C` is the sealed baseline's `capture_started_at`: read from the
+gateway PostgreSQL clock (the clock of `shopify_webhook_receipts.received_at`),
+UTC, floored to a whole second, fixed before page 1. Earlier aborted or
+unsealed captures define nothing. Shopify `Customer.createdAt` (read-only,
+`read_customers`) is the only temporal classifier: historical iff
+`createdAt < C`, post-cutover iff `createdAt >= C` (equality is post-cutover).
+Webhook arrival time and page position never classify.
+
+`capture-baseline` refuses to start unless admission is disabled and an
+HMAC-verified receipt for the exact bound shop and API version was received
+strictly before `C` (also enforced by the baseline INSERT trigger). It scans
+every customer by cursor until `hasNextPage=false` (not a search query),
+requests `createdAt` for every node and fails closed on any read error,
+malformed page, missing/repeated cursor, duplicate GID, page overrun or a
+missing/malformed/offset-less `createdAt`. Historical `member-mg` GIDs form the
+baseline; scanned `member-mg` GIDs with `createdAt >= C` become GID-only
+`PENDING` admissions (an existing admission row stays authoritative). The
+historical rows, the transition rows and the seal commit in one transaction;
+the sealed baseline stores GIDs only with a count and a sorted-GID SHA-256
+digest that the database recomputes. `createdAt` is never stored. Admission is
+disabled until `POST /v1/control/shopify-admission/enable` binds the sealed
+baseline after an independent application-side recompute; the binding is
+immutable.
 
 The admission processor re-reads each pending GID with read-only Admin GraphQL
 (`read_customers` only) and decides:
@@ -557,9 +572,9 @@ The admission processor re-reads each pending GID with read-only Admin GraphQL
 | Authoritative read | Outcome |
 |---|---|
 | no `member-mg` / customer absent | `NOT_ELIGIBLE` (re-evaluated on a later webhook) |
-| GID in sealed baseline | `EXCLUDED_BASELINE` (`MANUAL_REVIEW` if a `customers/create` arrived during capture) |
+| GID in sealed baseline | `EXCLUDED_BASELINE` (`MANUAL_REVIEW` `baseline_created_at_conflict` if the re-read reports `createdAt >= C`) |
 | `member-legacy` or `XB Member` tag | `MANUAL_REVIEW` |
-| customer created before the cutover | `MANUAL_REVIEW` (an update never invents a signup) |
+| `createdAt < C` and not in baseline | `MANUAL_REVIEW` (an update or later tag never invents a signup) |
 | Name or membership dates absent | bounded wait, then `MANUAL_REVIEW` |
 | malformed date/phone/email, expiry before start | `MANUAL_REVIEW` |
 | otherwise | `ADMITTED` exactly once (GID -> job unique) |
@@ -588,7 +603,11 @@ match authority); any hit or lookup failure is `MANUAL_REVIEW`. MemberNo comes
 only from `MemberCommand.GetNextMemberNo()`; a positively occupied candidate is
 re-generated up to `max_member_no_candidates` before the fence, a repeated or
 ambiguous candidate never advances, and after the fence no other MemberNo is
-ever selected. The adapter `shopify_m1` profile accepts only MemberNo, Name,
+ever selected. A candidate the worker probed FREE that another gateway job
+already durably holds (`member_no_allocation_race`) is positively occupied: it
+consumes the same `max_member_no_candidates` budget, the worker is told
+`gateway_bound_collision` and may request the next generated candidate, and a
+repeat of it is `member_no_generator_not_advancing` review. The adapter `shopify_m1` profile accepts only MemberNo, Name,
 RegisterDate, ExpiryDate, optional MobilePhone/EmailAddress; it owns
 `MemberType=Default`, `OpeningPoints=0`, `IsActive=T`, `Individual=T`; never
 assigns DOB; writes absent contact fields as DBNull (empty strings are

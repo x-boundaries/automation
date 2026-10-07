@@ -3,11 +3,18 @@
 Shopify is authoritative; webhook bodies are never trusted. Every decision is
 taken from a fresh read-only Admin GraphQL read (``read_customers`` only).
 
+Cutover (#155 targeted G2 re-entry): ``C`` is the sealed baseline's
+``capture_started_at``, read from the gateway PostgreSQL clock (UTC, whole
+second) before page 1. Shopify ``Customer.createdAt`` is the only temporal
+classifier: historical iff ``createdAt < C``; post-cutover iff
+``createdAt >= C``. Webhook arrival time and page position never classify.
+
 Admission law (M1 = new canonical ``member-mg`` create only):
 
 * no ``member-mg`` tag                         -> NOT_ELIGIBLE (re-evaluable)
-* GID in the sealed cutover baseline          -> EXCLUDED_BASELINE
-  (MANUAL_REVIEW if a ``customers/create`` receipt arrived during capture)
+* GID in the sealed historical baseline       -> EXCLUDED_BASELINE
+  (MANUAL_REVIEW ``baseline_created_at_conflict`` if a re-read reports
+  ``createdAt >= C``; never ADMIT)
 * ``member-legacy`` / ``XB Member`` present    -> MANUAL_REVIEW
 * customer created before the cutover          -> MANUAL_REVIEW (an update on
   a pre-existing GID never invents a new signup)
@@ -42,6 +49,9 @@ REVIEW_TAGS = ("member-legacy", "XB Member")
 BASELINE_PAGE_SIZE = 250
 BASELINE_MAX_PAGES = 4000
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# RFC 3339 date-time with an explicit ``Z`` or numeric offset; no naive,
+# date-only or basic-format value is ever trusted as a creation instant.
+_RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$")
 
 CUSTOMER_QUERY = """query XbShopifyMemberRead($id: ID!) {
   customer(id: $id) {
@@ -60,7 +70,7 @@ CUSTOMER_QUERY = """query XbShopifyMemberRead($id: ID!) {
 BASELINE_QUERY = """query XbShopifyBaselinePage($first: Int!, $after: String) {
   customers(first: $first, after: $after, sortKey: ID) {
     pageInfo { hasNextPage endCursor }
-    nodes { id tags }
+    nodes { id createdAt tags }
   }
 }"""
 
@@ -164,19 +174,41 @@ def _has_tag(tags: Any, wanted: str) -> bool:
     return isinstance(tags, list) and any(isinstance(tag, str) and tag.strip().casefold() == wanted.casefold() for tag in tags)
 
 
-def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, Any]], *, max_pages: int = BASELINE_MAX_PAGES) -> tuple[str, ...]:
+def parse_created_at(value: Any) -> datetime | None:
+    """Strict RFC 3339 instant in UTC, or ``None`` when absent/malformed/naive."""
+
+    if not isinstance(value, str) or not _RFC3339_RE.fullmatch(value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, Any]], *, cutover_at: datetime, max_pages: int = BASELINE_MAX_PAGES) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Exhaustive cursor scan of every customer until ``hasNextPage`` is false.
 
     The scan reads all customers (not a search query, whose index may lag) and
-    keeps exact ``member-mg`` GIDs only. Any malformed page, missing/repeated
-    cursor, duplicate GID, read error or page-limit overrun fails closed and
-    yields nothing, so a partial capture can never be sealed.
+    partitions exact ``member-mg`` GIDs by Shopify ``createdAt`` against the
+    fixed cutover ``C``: ``(historical, transition)`` where historical is
+    ``createdAt < C`` and transition is ``createdAt >= C`` (equality is
+    post-cutover). Any malformed page, missing/repeated cursor, duplicate GID,
+    missing/malformed/offset-less ``createdAt``, read error or page-limit
+    overrun fails closed and yields nothing, so a partial capture can never be
+    sealed. ``createdAt`` is used only here and is never returned or stored.
     """
 
+    if not isinstance(cutover_at, datetime) or cutover_at.tzinfo is None:
+        raise BaselineCaptureError("baseline_cutover_invalid")
+    cutover = cutover_at.astimezone(timezone.utc)
     after: str | None = None
     seen_cursors: set[str] = set()
     seen_ids: set[str] = set()
-    members: list[str] = []
+    historical: list[str] = []
+    transition: list[str] = []
     for _ in range(max_pages):
         try:
             page = page_reader(after)
@@ -199,10 +231,13 @@ def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, 
             if gid in seen_ids:
                 raise BaselineCaptureError("baseline_duplicate_gid")
             seen_ids.add(gid)
+            created_at = parse_created_at(node.get("createdAt"))
+            if created_at is None:
+                raise BaselineCaptureError("baseline_created_at_invalid")
             if _has_tag(tags, MEMBER_TAG):
-                members.append(gid)
+                (historical if created_at < cutover else transition).append(gid)
         if not has_next:
-            return tuple(sorted(members))
+            return tuple(sorted(historical)), tuple(sorted(transition))
         cursor = info.get("endCursor")
         if not isinstance(cursor, str) or not cursor or len(cursor) > 1024:
             raise BaselineCaptureError("baseline_cursor_missing")
@@ -240,19 +275,7 @@ def _metafield_date(field: Any) -> tuple[str | None, str | None]:
     return value, None
 
 
-def _parse_created_at(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
-
-
-def evaluate_profile(customer: Mapping[str, Any] | None, *, in_baseline: bool, created_during_capture: bool, cutover_at: datetime, profile_complete_required: bool) -> AdmissionDecision:
+def evaluate_profile(customer: Mapping[str, Any] | None, *, in_baseline: bool, cutover_at: datetime, profile_complete_required: bool) -> AdmissionDecision:
     """Pure decision over one authoritative read. ``profile_complete_required``
     is true once the bounded wait budget is exhausted."""
 
@@ -261,13 +284,15 @@ def evaluate_profile(customer: Mapping[str, Any] | None, *, in_baseline: bool, c
     tags = customer.get("tags")
     if not _has_tag(tags, MEMBER_TAG):
         return AdmissionDecision("NOT_ELIGIBLE", "not_member_mg")
+    created_at = parse_created_at(customer.get("createdAt"))
     if in_baseline:
-        if created_during_capture:
-            return AdmissionDecision("MANUAL_REVIEW", "baseline_member_created_during_capture")
+        # Sealed membership is immutable; createdAt is read-only in Shopify.
+        # A contradiction is surfaced for review and never admitted.
+        if created_at is not None and created_at >= cutover_at:
+            return AdmissionDecision("MANUAL_REVIEW", "baseline_created_at_conflict")
         return AdmissionDecision("EXCLUDED_BASELINE")
     if any(_has_tag(tags, tag) for tag in REVIEW_TAGS):
         return AdmissionDecision("MANUAL_REVIEW", "legacy_tag_present")
-    created_at = _parse_created_at(customer.get("createdAt"))
     if created_at is None:
         return AdmissionDecision("MANUAL_REVIEW", "created_at_malformed")
     if created_at < cutover_at:
@@ -349,7 +374,6 @@ class ShopifyAdmissionProcessor:
                 decision = evaluate_profile(
                     customer,
                     in_baseline=self.repository.shopify_baseline_contains(baseline, gid),
-                    created_during_capture=self.repository.shopify_created_signal_during_capture(baseline, gid),
                     cutover_at=cutover_at,
                     profile_complete_required=admission.check_count + 1 >= self.config.profile_wait_max_checks,
                 )

@@ -28,6 +28,9 @@ API_VERSION = "2026-10"
 BASELINE_GID = "gid://shopify/Customer/9000000001"
 NEW_GID = "gid://shopify/Customer/9000000101"
 SECOND_GID = "gid://shopify/Customer/9000000102"
+# Receiver-before-C proof: an HMAC-verified delivery for a non-member GID.
+PROOF_GID = "gid://shopify/Customer/9000000900"
+PROOF_WEBHOOK_ID = "wh-00000000-0900"
 SYNTHETIC_NAME = ("Synthetic", "Shopify Alpha")
 SYNTHETIC_PHONE = "+1 555-010-0101"
 SYNTHETIC_PHONE_DIGITS = "15550100101"
@@ -122,7 +125,7 @@ def signed_headers(secret, raw, *, topic="customers/create", webhook_id="wh-0000
 class ShopifyHarness:
     """Wires receiver -> admission -> gateway API over one repository."""
 
-    def __init__(self, repository, *, config=None, gw_config=None, reader=None, baseline=(BASELINE_GID,), enable=True, clock=NOW):
+    def __init__(self, repository, *, config=None, gw_config=None, reader=None, baseline=(BASELINE_GID,), transition=(), enable=True, clock=NOW, receiver_proof=True):
         self.repository = repository
         self.config = config or shopify_config()
         self.secret = runtime_secret()
@@ -143,9 +146,23 @@ class ShopifyHarness:
         self.headers = {"Authorization": "Bearer synthetic-worker-token", "X-XB-Worker-Session": "ws-" + "a" * 32}
         self.baseline = None
         if baseline is not None:
-            self.baseline = repository.store_shopify_baseline(list(baseline), shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER, now=CUTOVER + timedelta(minutes=1))
+            if receiver_proof:
+                self.deliver_receiver_proof()
+            self.baseline = repository.store_shopify_baseline(list(baseline), transition_gids=list(transition), shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER, now=CUTOVER + timedelta(minutes=1))
             if enable:
                 repository.enable_shopify_admission(self.baseline.baseline_id, "synthetic-approval-155-g3")
+
+    def deliver_receiver_proof(self, at=CUTOVER - timedelta(minutes=10), webhook_id=PROOF_WEBHOOK_ID):
+        """Records one HMAC-verified delivery for this harness's exact shop and
+        API version binding, received at ``at`` (before the cutover by default)."""
+        saved = self.receiver.clock
+        self.receiver.clock = at
+        try:
+            response = self.deliver(PROOF_GID, topic="customers/update", webhook_id=webhook_id, shop=self.config.shop_domain, version=self.config.api_version)
+        finally:
+            self.receiver.clock = saved
+        assert response.status == 200, response.body
+        return response
 
     def set_clock(self, value):
         self.clock = value

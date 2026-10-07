@@ -627,7 +627,7 @@ SHOPIFY_ADMISSION_TERMINAL = frozenset(
 SHOPIFY_REVIEW_CODES = frozenset({
     "legacy_tag_present",
     "preexisting_customer_not_new_signup",
-    "baseline_member_created_during_capture",
+    "baseline_created_at_conflict",
     "name_missing",
     "membership_dates_missing",
     "membership_date_malformed",

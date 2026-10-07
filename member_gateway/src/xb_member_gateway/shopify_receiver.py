@@ -6,7 +6,7 @@ is a separately approved deployment binding that forwards exactly one route.
 
 ``... capture-baseline ...`` performs the exhaustive ``member-mg`` cutover
 capture while admission is disabled and prints only the PII-free seal
-(baseline id, member count, digest).
+(baseline id, historical member count, digest, transition PENDING count).
 
 Secrets (webhook secret, Admin token, protected-payload key, DSN, reference
 key) are read from the runtime environment only and never echoed.
@@ -102,23 +102,36 @@ def compose_receiver(
 
 
 def capture_baseline(composition: ReceiverComposition, *, now: Callable[[], datetime] | None = None) -> dict[str, Any]:
-    """Admission must be disabled; nothing is persisted unless fully sealed."""
+    """Cutover capture (#155 targeted G2): admission disabled; the receiver must
+    already have recorded an HMAC-verified delivery for the exact bound shop and
+    API version before ``C``; ``C`` is fixed from the gateway database clock
+    before page 1; nothing is persisted unless the historical baseline, the
+    transition PENDING rows and the seal commit together."""
 
     clock = now or (lambda: datetime.now(timezone.utc))
-    if composition.repository.shopify_admission_gate() is not None:
+    repository = composition.repository
+    shop_domain, api_version = composition.shopify_config.shop_domain, composition.shopify_config.api_version
+    if repository.shopify_admission_gate() is not None:
         raise BootstrapError("shopify_admission_must_be_disabled_for_capture")
-    started = clock()
+    cutover_at = repository.shopify_cutover_now()
+    if not repository.shopify_receiver_verified_before(shop_domain, api_version, cutover_at):
+        raise BootstrapError("shopify_receiver_not_verified_before_cutover")
     try:
-        gids = capture_member_mg_baseline(composition.client.baseline_page)
+        historical, transition = capture_member_mg_baseline(composition.client.baseline_page, cutover_at=cutover_at)
     except BaselineCaptureError as exc:
         raise BootstrapError(exc.code.split(":", 1)[0]) from None
-    baseline = composition.repository.store_shopify_baseline(
-        gids, shop_domain=composition.shopify_config.shop_domain, api_version=composition.shopify_config.api_version,
-        capture_started_at=started, now=clock(),
+    baseline = repository.store_shopify_baseline(
+        historical, transition_gids=transition, shop_domain=shop_domain, api_version=api_version,
+        capture_started_at=cutover_at, now=clock(),
     )
-    if not composition.repository.verify_shopify_baseline(baseline.baseline_id):
+    if not repository.verify_shopify_baseline(baseline.baseline_id):
         raise BootstrapError("shopify_baseline_readback_failed")
-    return {"baseline_id": baseline.baseline_id, "member_count": baseline.member_count, "member_digest": baseline.member_digest, "state": baseline.state}
+    if any(repository.get_shopify_admission(gid) is None for gid in transition):
+        raise BootstrapError("shopify_transition_readback_failed")
+    return {
+        "baseline_id": baseline.baseline_id, "member_count": baseline.member_count, "member_digest": baseline.member_digest,
+        "state": baseline.state, "transition_pending_count": len(transition),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:

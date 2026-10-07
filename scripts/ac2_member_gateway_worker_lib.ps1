@@ -475,7 +475,12 @@ function Invoke-XbMemberGatewayWorkerCycle {
             $allocation = $candidateResponse
             break
         }
-        if ($probeStatus -ne "OCCUPIED") { throw "allocation_probe_not_positive_free" }
+        # A FREE probe stays unbound only when the gateway positively proves
+        # the MemberNo is durably held by another job; that collision consumes
+        # the gateway's bounded pre-fence budget like OCCUPIED. Anything else
+        # unbound after FREE fails closed.
+        $gatewayBound = ($isShopify -and $null -ne $candidateResponse.PSObject.Properties["gateway_bound_collision"] -and $candidateResponse.gateway_bound_collision -eq $true)
+        if ($probeStatus -ne "OCCUPIED" -and -not $gatewayBound) { throw "allocation_probe_not_positive_free" }
     }
     if ($null -eq $allocation) { throw "member_no_allocation_exhausted" }
 

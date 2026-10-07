@@ -264,6 +264,25 @@ def validate_baseline_members(gids: Any) -> tuple[tuple[str, ...], int, str]:
     return members, len(members), shopify_baseline_digest(members)
 
 
+def validate_cutover_partition(historical: Any, transition: Any, cutover_at: Any) -> tuple[tuple[str, ...], int, str, tuple[str, ...], datetime]:
+    """Historical baseline + transition GIDs for one whole-second UTC cutover.
+
+    The two sets come from one ``createdAt`` partition and must be disjoint;
+    a GID can never be both historical and admissible.
+    """
+
+    members, count, digest = validate_baseline_members(historical)
+    if not isinstance(transition, (list, tuple)) or any(not isinstance(gid, str) or not _SHOPIFY_GID_RE.fullmatch(gid) for gid in transition):
+        raise SourceConflict("shopify_transition_members_invalid")
+    if len(set(transition)) != len(transition):
+        raise SourceConflict("shopify_transition_duplicate_gid")
+    if set(transition) & set(members):
+        raise SourceConflict("shopify_baseline_transition_overlap")
+    if not isinstance(cutover_at, datetime) or cutover_at.tzinfo is None or cutover_at.microsecond != 0:
+        raise SourceConflict("shopify_cutover_not_whole_second")
+    return members, count, digest, tuple(sorted(transition)), cutover_at.astimezone(timezone.utc)
+
+
 def validate_approval_reference(value: Any) -> str:
     if not isinstance(value, str) or not _APPROVAL_REFERENCE_RE.fullmatch(value):
         raise SourceConflict("shopify_admission_approval_reference_required")
@@ -1116,6 +1135,11 @@ class InMemoryRepository:
             self._job(job_id)
             return self._copy(self._allocations.get(job_id))
 
+    def member_no_owner(self, member_no: str) -> str | None:
+        """Job id durably bound to ``member_no`` (bindings are write-once)."""
+        with self._lock:
+            return self._allocations_by_member.get(member_no)
+
     def get_fresh_recheck(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> AllocationRecheck | None:
         current = utc_now(now)
         with self._lock:
@@ -1908,20 +1932,48 @@ class InMemoryRepository:
         with self._lock:
             return self._copy(self._shopify_admissions.get(gid))
 
-    def store_shopify_baseline(self, gids: tuple[str, ...] | list[str], *, shop_domain: str, api_version: str, capture_started_at: datetime, now: datetime | None = None) -> ShopifyBaseline:
-        members, count, digest = validate_baseline_members(gids)
-        current = utc_now(now)
+    def shopify_cutover_now(self, *, now: datetime | None = None) -> datetime:
+        """Cutover ``C``: the repository clock, UTC, floored to a whole second."""
+        return utc_now(now).replace(microsecond=0)
+
+    def _receiver_verified_before(self, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        return any(
+            receipt.shop_domain == shop_domain and receipt.api_version == api_version and parse_timestamp(received) < cutover_at
+            for receipt, received in self._shopify_receipts.values()
+        )
+
+    def shopify_receiver_verified_before(self, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        """True only if an HMAC-verified receipt for this exact binding was
+        recorded strictly before ``C`` (receipts exist only after HMAC)."""
+        with self._lock:
+            return self._receiver_verified_before(shop_domain, api_version, utc_now(cutover_at))
+
+    def store_shopify_baseline(self, gids: tuple[str, ...] | list[str], *, transition_gids: tuple[str, ...] | list[str] = (), shop_domain: str, api_version: str, capture_started_at: datetime, now: datetime | None = None) -> ShopifyBaseline:
+        """Atomically seal the historical baseline and make every scanned
+        post-cutover GID a durable GID-only PENDING admission (existing rows
+        stay authoritative). Nothing is kept if any check fails."""
+
+        members, count, digest, transition, cutover_at = validate_cutover_partition(gids, transition_gids, capture_started_at)
+        sealed_at = max(utc_now(now), cutover_at)
         with self._lock:
             if self._shopify_control["enabled"] or any(item.state == "SEALED" for item in self._shopify_baselines.values()):
                 raise SourceConflict("shopify_baseline_already_sealed")
+            if not self._receiver_verified_before(shop_domain, api_version, cutover_at):
+                raise SourceConflict("shopify_receiver_not_verified_before_cutover")
             baseline_id = f"baseline-{uuid.uuid4().hex}"
             # Independent recompute over the stored rows before sealing.
             stored = frozenset(members)
             if (len(stored), shopify_baseline_digest(sorted(stored))) != (count, digest):
                 raise SourceConflict("shopify_baseline_seal_mismatch")
-            baseline = ShopifyBaseline(baseline_id, "SEALED", shop_domain, api_version, timestamp(utc_now(capture_started_at)), timestamp(current), count, digest)
+            baseline = ShopifyBaseline(baseline_id, "SEALED", shop_domain, api_version, timestamp(cutover_at), timestamp(sealed_at), count, digest)
             self._shopify_baselines[baseline_id] = baseline
             self._shopify_baseline_members[baseline_id] = stored
+            for gid in transition:
+                if gid not in self._shopify_admissions:
+                    self._shopify_admissions[gid] = ShopifyAdmission(
+                        gid, hmac_reference(gid, self._reference_key), ShopifyAdmissionState.PENDING, None, 0,
+                        timestamp(sealed_at), None, 0, None, timestamp(sealed_at),
+                    )
             self._audit("shopify_baseline_sealed", count=count)
             return self._copy(baseline)
 
@@ -1972,17 +2024,6 @@ class InMemoryRepository:
     def shopify_baseline_contains(self, baseline_id: str, gid: str) -> bool:
         with self._lock:
             return gid in self._shopify_baseline_members.get(baseline_id, frozenset())
-
-    def shopify_created_signal_during_capture(self, baseline_id: str, gid: str) -> bool:
-        with self._lock:
-            baseline = self._shopify_baselines.get(baseline_id)
-            if baseline is None:
-                return False
-            started = parse_timestamp(baseline.capture_started_at)
-            return any(
-                receipt.customer_gid == gid and receipt.topic == "customers/create" and parse_timestamp(received) >= started
-                for receipt, received in self._shopify_receipts.values()
-            )
 
     def _shopify_pending(self, gid: str, expected_state_version: int) -> ShopifyAdmission:
         admission = self._shopify_admissions.get(gid)
@@ -3251,6 +3292,13 @@ class PostgresRepository:
                 row = cursor.fetchone()
                 return None if row is None else AllocationRecord(job_id,row[0],row[1],row[2],self._dt(row[3]) or "")
 
+    def member_no_owner(self, member_no: str) -> str | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT job_id FROM xb_member_gateway.member_allocations WHERE member_no=%s", (member_no,))
+                row = cursor.fetchone()
+                return None if row is None else str(row[0])
+
     def bind_allocation(self, job_id: str, member_no: str, probe_reference: str, worker_id: str, *, now: datetime | None = None) -> AllocationRecord:
         current = utc_now(now)
         with self._transaction() as connection:
@@ -3858,10 +3906,38 @@ class PostgresRepository:
             return None
         return baseline
 
-    def store_shopify_baseline(self, gids: tuple[str, ...] | list[str], *, shop_domain: str, api_version: str, capture_started_at: datetime, now: datetime | None = None) -> ShopifyBaseline:
-        members, count, digest = validate_baseline_members(gids)
-        current = utc_now(now)
-        started = utc_now(capture_started_at)
+    def shopify_cutover_now(self) -> datetime:
+        """Cutover ``C`` from the gateway PostgreSQL clock (the same clock as
+        ``shopify_webhook_receipts.received_at``), UTC, whole second."""
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT date_trunc('second', clock_timestamp())")
+                value = cursor.fetchone()[0]
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise RepositoryError("shopify_cutover_clock_invalid")
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _receiver_verified_before_cursor(cursor: Any, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        cursor.execute(
+            "SELECT 1 FROM xb_member_gateway.shopify_webhook_receipts WHERE shop_domain=%s AND api_version=%s AND received_at<%s LIMIT 1",
+            (shop_domain, api_version, cutover_at),
+        )
+        return cursor.fetchone() is not None
+
+    def shopify_receiver_verified_before(self, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._receiver_verified_before_cursor(cursor, shop_domain, api_version, utc_now(cutover_at))
+
+    def store_shopify_baseline(self, gids: tuple[str, ...] | list[str], *, transition_gids: tuple[str, ...] | list[str] = (), shop_domain: str, api_version: str, capture_started_at: datetime, now: datetime | None = None) -> ShopifyBaseline:
+        """One transaction: historical members, transition PENDING rows and the
+        SEALED state commit together (0006 also re-checks the receiver proof,
+        whole-second ``C`` and the recount/digest)."""
+
+        members, count, digest, transition, started = validate_cutover_partition(gids, transition_gids, capture_started_at)
+        current = max(utc_now(now), started)
+        reference_key = self._reference_key_bytes()
         baseline_id = f"baseline-{uuid.uuid4().hex}"
         with self._transaction() as connection:
             with connection.cursor() as cursor:
@@ -3872,6 +3948,8 @@ class PostgresRepository:
                 cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_cutover_baselines WHERE state='SEALED' LIMIT 1")
                 if cursor.fetchone() is not None:
                     raise SourceConflict("shopify_baseline_already_sealed")
+                if not self._receiver_verified_before_cursor(cursor, shop_domain, api_version, started):
+                    raise SourceConflict("shopify_receiver_not_verified_before_cutover")
                 cursor.execute(
                     "INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,member_count,member_digest) "
                     "VALUES(%s,'CAPTURING',%s,%s,%s,%s,%s)",
@@ -3879,6 +3957,13 @@ class PostgresRepository:
                 )
                 for gid in members:
                     cursor.execute("INSERT INTO xb_member_gateway.shopify_baseline_members(baseline_id,customer_gid) VALUES(%s,%s)", (baseline_id, gid))
+                for gid in transition:
+                    # GID-only; an existing admission row stays authoritative.
+                    cursor.execute(
+                        "INSERT INTO xb_member_gateway.shopify_member_admissions(customer_gid,gid_ref,state,next_check_at,created_at,updated_at) "
+                        "VALUES(%s,%s,'PENDING',%s,%s,%s) ON CONFLICT (customer_gid) DO NOTHING",
+                        (gid, hmac_reference(gid, reference_key), current, current, current),
+                    )
                 cursor.execute("UPDATE xb_member_gateway.shopify_cutover_baselines SET state='SEALED',sealed_at=%s WHERE baseline_id=%s AND state='CAPTURING'", (current, baseline_id))
                 if cursor.rowcount != 1:
                     raise SourceConflict("shopify_baseline_seal_mismatch")
@@ -3956,16 +4041,6 @@ class PostgresRepository:
         with self._transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_baseline_members WHERE baseline_id=%s AND customer_gid=%s", (baseline_id, gid))
-                return cursor.fetchone() is not None
-
-    def shopify_created_signal_during_capture(self, baseline_id: str, gid: str) -> bool:
-        with self._transaction() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT 1 FROM xb_member_gateway.shopify_webhook_receipts r JOIN xb_member_gateway.shopify_cutover_baselines b "
-                    "ON b.baseline_id=%s WHERE r.customer_gid=%s AND r.topic='customers/create' AND r.received_at>=b.capture_started_at LIMIT 1",
-                    (baseline_id, gid),
-                )
                 return cursor.fetchone() is not None
 
     def _shopify_pending_cursor(self, cursor: Any, gid: str, expected_state_version: int) -> ShopifyAdmission:

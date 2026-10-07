@@ -147,7 +147,7 @@ CYCLE_PROBE = r"""
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Lib,
-    [Parameter(Mandatory)][ValidateSet("create", "review", "reconcile")][string]$Op,
+    [Parameter(Mandatory)][ValidateSet("create", "review", "reconcile", "collision", "unmarked")][string]$Op,
     [string]$Lookup = "exact",
     [switch]$ChildWriter
 )
@@ -173,6 +173,8 @@ $gateway = {
     if ($Path -like "*/shopify/legacy-precheck") { return [pscustomobject]@{ state = $(if ($Body.outcome -eq "NO_CANDIDATE") { "PRECHECKING" } else { "MANUAL_REVIEW" }) } }
     if ($Path -like "*/allocation/candidate") { return [pscustomobject]@{ bound = $false; generator = "member_command_get_next_member_no" } }
     if ($Path -like "*/allocation/probe") {
+        if ($Body.status -eq "FREE" -and $Body.candidate -eq "M000201" -and $Op -eq "collision") { return [pscustomobject]@{ bound = $false; generator = "member_command_get_next_member_no"; candidates_remaining = 2; gateway_bound_collision = $true } }
+        if ($Body.status -eq "FREE" -and $Body.candidate -eq "M000201" -and $Op -eq "unmarked") { return [pscustomobject]@{ bound = $false; generator = "member_command_get_next_member_no"; candidates_remaining = 2 } }
         if ($Body.status -eq "FREE") { return [pscustomobject]@{ bound = $true; member_no = $Body.candidate } }
         return [pscustomobject]@{ bound = $false; generator = "member_command_get_next_member_no" }
     }
@@ -187,7 +189,7 @@ $gateway = {
     if ($Path -like "*/reconcile") { $s.result = $Body; return [pscustomobject]@{ state = "X" } }
     return [pscustomobject]@{}
 }.GetNewClosure()
-$probe = { param([string]$Candidate) if ($Candidate -eq "M000201") { [pscustomobject]@{ status = "OCCUPIED" } } else { [pscustomobject]@{ status = "FREE" } } }
+$probe = { param([string]$Candidate) if ($Candidate -eq "M000201" -and $Op -eq "create") { [pscustomobject]@{ status = "OCCUPIED" } } else { [pscustomobject]@{ status = "FREE" } } }.GetNewClosure()
 $next = { $value = $state.next[$state.next_index]; $state.next_index++; return $value }.GetNewClosure()
 $legacyOutcome = if ($Op -eq "review") { "CANDIDATE_FOUND" } else { "NO_CANDIDATE" }
 $legacy = { param($Payload) [pscustomobject]@{ outcome = $legacyOutcome; phone_member_no_hit = ($legacyOutcome -eq "CANDIDATE_FOUND"); mobile_phone_hit = $false; email_hit = $false } }.GetNewClosure()
@@ -205,7 +207,12 @@ if ($Op -eq "reconcile") {
     }.GetNewClosure()
     $cycle = Invoke-XbMemberGatewayShopifyReconcileCycle -GatewayBaseUrl "https://gateway.example.test" -EnableProductionWorker -ReconcileMember $reconcile -GatewayRequest $gateway
 } else {
-    $cycle = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.example.test" -WorkerId "synthetic" -WorkerHostBinding "host-test" -EnableProductionWorker -EnableProductionAdapter -ProbeMember $probe -CreateMember { throw "inline_writer_not_allowed" } -GatewayRequest $gateway -WriterProcessFactory $factory -NextMemberNo $next -LegacyPrecheck $legacy
+    try {
+        $cycle = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.example.test" -WorkerId "synthetic" -WorkerHostBinding "host-test" -EnableProductionWorker -EnableProductionAdapter -ProbeMember $probe -CreateMember { throw "inline_writer_not_allowed" } -GatewayRequest $gateway -WriterProcessFactory $factory -NextMemberNo $next -LegacyPrecheck $legacy
+    } catch {
+        if ($Op -ne "unmarked") { throw }
+        $cycle = [pscustomobject]@{ error = $_.Exception.Message }
+    }
 }
 [pscustomobject]@{
     cycle = ($cycle | ConvertTo-Json -Compress)
@@ -301,6 +308,22 @@ class ShopifyPowerShellTests(unittest.TestCase):
         self.assert_private(result["cycle"])
         self.assert_private(proc.stdout)
         self.assert_private(proc.stderr)
+
+    def test_gateway_bound_collision_on_free_probe_requests_next_generated_candidate(self):
+        proc, result = self.cycle("collision")
+        cycle = json.loads(result["cycle"])
+        self.assertEqual((cycle["status"], cycle["writes"]), ("CREATED_VERIFIED", 1))
+        self.assertEqual(result["generator_calls"], 2)
+        self.assertEqual(json.loads(result["result"])["member_no"], "M000202")
+        self.assertEqual(result["paths"].split(",").count("/v1/jobs/job-1/allocation/probe"), 2)
+        self.assert_private(result["bodies"] + result["cycle"] + proc.stdout + proc.stderr)
+
+    def test_unbound_free_probe_without_gateway_collision_fails_closed(self):
+        _, result = self.cycle("unmarked")
+        self.assertEqual(json.loads(result["cycle"]), {"error": "allocation_probe_not_positive_free"})
+        self.assertEqual(result["generator_calls"], 1)
+        self.assertNotIn("dispatch-fence", result["paths"])
+        self.assertIsNone(result["result"])
 
     def test_shopify_precheck_review_stops_before_allocation(self):
         _, result = self.cycle("review")

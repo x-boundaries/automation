@@ -323,19 +323,27 @@ performed or authorised by the repository change):
    receiver private bind address/port.
 3. Prove encryption in transit and the database/backup encryption boundary for
    `shopify_protected_payloads` before activation.
-4. With admission disabled, run
-   `python -m xb_member_gateway.shopify_receiver capture-baseline --config <gw> --shopify-config <shopify>`
-   in a quiet window. It prints only the baseline id, member count, digest and
-   state. Record them as evidence.
-5. Enable admission only with an approval reference:
+4. Receiver before cutover: start the dedicated receiver with
+   `python -m xb_member_gateway.shopify_receiver serve ...` (the public edge
+   forwards only `POST /v1/shopify/webhooks/customers` to it), activate the app
+   subscription for the bound API version, and confirm at least one
+   HMAC-verified delivery for the exact shop and API version is recorded.
+   Admission stays disabled, so deliveries only queue GID-only `PENDING` rows.
+5. Then run
+   `python -m xb_member_gateway.shopify_receiver capture-baseline --config <gw> --shopify-config <shopify>`.
+   It fixes `C` from the database clock, refuses to run without the step-4
+   receipt, and prints only the baseline id, historical member count, digest,
+   state and `transition_pending_count`. Record them as evidence. A failed
+   capture leaves nothing; rerun from scratch (a fresh `C`).
+6. Enable admission only with an approval reference:
    `POST /v1/control/shopify-admission/enable` with `baseline_id` and
    `approval_reference` (control principal). Disable with
-   `POST /v1/control/shopify-admission/disable`.
-6. Start the gateway with `--shopify-config` so the worker can claim Shopify
-   jobs; start the dedicated receiver with
-   `python -m xb_member_gateway.shopify_receiver serve ...`. The public edge must
-   forward only `POST /v1/shopify/webhooks/customers` to the private receiver.
-7. Watch `GET /v1/operator/shopify-status` (counts and codes only). Manual
+   `POST /v1/control/shopify-admission/disable`. Disable admission before any
+   bulk `member-mg` import or merge: Shopify would report those customers as
+   created after `C`.
+7. Start the gateway with `--shopify-config` so the worker can claim Shopify
+   jobs.
+8. Watch `GET /v1/operator/shopify-status` (counts and codes only). Manual
    review re-reads Shopify under explicit authority; no protected copy is kept
    for convenience.
 

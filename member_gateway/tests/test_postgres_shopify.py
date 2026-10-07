@@ -7,19 +7,22 @@ Runs only against a disposable loopback database named by
 import json
 import unittest
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest import mock
 
 from xb_member_gateway.config import GatewayConfig
 from xb_member_gateway.models import JobState, ShopifyAdmissionState
 from xb_member_gateway.repository import PostgresRepository, RepositoryError, SourceConflict
 from xb_member_gateway.shopify_admission import baseline_digest
+from xb_member_gateway.shopify_receiver import capture_baseline
 
 try:
     from .test_postgres_cursor import CUTOVER as FORMS_CUTOVER, FORM, MIGRATIONS, RealPostgresTestCase, psycopg, source_event
-    from ._shopify_support import BASELINE_GID, CUTOVER, NEW_GID, NOW, SECOND_GID, SHOP, ShopifyHarness, customer
+    from ._shopify_support import API_VERSION, BASELINE_GID, CUTOVER, NEW_GID, NOW, PROOF_GID, SECOND_GID, SHOP, ShopifyHarness, customer
 except ImportError:  # discovered as a top-level module
     from test_postgres_cursor import CUTOVER as FORMS_CUTOVER, FORM, MIGRATIONS, RealPostgresTestCase, psycopg, source_event  # type: ignore
-    from _shopify_support import BASELINE_GID, CUTOVER, NEW_GID, NOW, SECOND_GID, SHOP, ShopifyHarness, customer  # type: ignore
+    from _shopify_support import API_VERSION, BASELINE_GID, CUTOVER, NEW_GID, NOW, PROOF_GID, SECOND_GID, SHOP, ShopifyHarness, customer  # type: ignore
 
 HASH = "sha256:" + "b" * 64
 PII = ("Synthetic", "Shopify Alpha", "example.test", "15550100101", "555-010")
@@ -44,7 +47,7 @@ class RealPostgresShopifyTests(RealPostgresTestCase):
             self.sql("INSERT INTO xb_member_gateway.jobs(job_id,response_id,operation,payload_hash,canonical_payload,state,max_attempts,source_system) VALUES('job-x',NULL,'member.create',%s,'{\"name\":\"x\"}'::jsonb,'QUEUED',3,'shopify')", (HASH,))
         with self.assertRaises(psycopg.errors.CheckViolation):
             self.sql("INSERT INTO xb_member_gateway.jobs(job_id,response_id,operation,payload_hash,canonical_payload,state,max_attempts,source_system) VALUES('job-y',NULL,'member.create',%s,'{}'::jsonb,'QUEUED',3,'google_forms')", (HASH,))
-        harness = self.harness()
+        harness = self.harness(baseline=None)  # receipt behaviour is baseline-independent
         self.assertEqual(harness.deliver().status, 200)
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_webhook_receipts_append_only"):
             self.sql("DELETE FROM xb_member_gateway.shopify_webhook_receipts")
@@ -56,12 +59,26 @@ class RealPostgresShopifyTests(RealPostgresTestCase):
 
     def test_baseline_seal_is_recomputed_by_database_and_partial_capture_cannot_commit(self):
         baseline_id = "baseline-" + uuid.uuid4().hex
+        insert = "INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,member_count,member_digest) VALUES(%s,'CAPTURING',%s,%s,{c},0,%s)"
+        whole = "date_trunc('second', now())"
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_baseline_must_start_capturing"):
             self.sql("INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,sealed_at,member_count,member_digest) VALUES(%s,'SEALED',%s,'2026-10',now(),now(),0,%s)", (baseline_id, SHOP, baseline_digest([])))
+        # Receiver-before-C is enforced by the database itself.
+        with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_receiver_not_verified_before_cutover"):
+            self.sql(insert.format(c=whole), (baseline_id, SHOP, API_VERSION, baseline_digest([])))
+        self.harness(baseline=None).deliver_receiver_proof()
+        with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_receiver_not_verified_before_cutover"):
+            self.sql(insert.format(c="%s"), (baseline_id, SHOP, API_VERSION, CUTOVER - timedelta(minutes=10), baseline_digest([])))
+        with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_receiver_not_verified_before_cutover"):
+            self.sql(insert.format(c=whole), (baseline_id, SHOP, "2026-07", baseline_digest([])))
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.sql(insert.format(c="%s"), (baseline_id, SHOP, API_VERSION, CUTOVER + timedelta(microseconds=250000), baseline_digest([])))
+        with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_cutover_in_future"):
+            self.sql(insert.format(c="date_trunc('second', now()) + interval '1 hour'"), (baseline_id, SHOP, API_VERSION, baseline_digest([])))
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_baseline_partial_capture"):
-            self.sql("INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,member_count,member_digest) VALUES(%s,'CAPTURING',%s,'2026-10',now(),0,%s)", (baseline_id, SHOP, baseline_digest([])))
+            self.sql(insert.format(c=whole), (baseline_id, SHOP, API_VERSION, baseline_digest([])))
         with psycopg.connect(self.dsn) as connection:
-            connection.execute("INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,member_count,member_digest) VALUES(%s,'CAPTURING',%s,'2026-10',now(),1,%s)", (baseline_id, SHOP, baseline_digest([NEW_GID])))
+            connection.execute("INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,member_count,member_digest) VALUES(%s,'CAPTURING',%s,'2026-10',date_trunc('second', now()),1,%s)", (baseline_id, SHOP, baseline_digest([NEW_GID])))
             connection.execute("INSERT INTO xb_member_gateway.shopify_baseline_members VALUES(%s,%s)", (baseline_id, BASELINE_GID))
             with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_baseline_seal_mismatch"):
                 connection.execute("UPDATE xb_member_gateway.shopify_cutover_baselines SET state='SEALED',sealed_at=now() WHERE baseline_id=%s", (baseline_id,))
@@ -77,6 +94,95 @@ class RealPostgresShopifyTests(RealPostgresTestCase):
             self.sql("DELETE FROM xb_member_gateway.shopify_baseline_members")
         with self.assertRaisesRegex(SourceConflict, "shopify_baseline_already_sealed"):
             self.repository.store_shopify_baseline([], shop_domain=SHOP, api_version="2026-10", capture_started_at=CUTOVER)
+
+    def test_cutover_is_the_database_clock_whole_second_utc(self):
+        cutover = self.repository.shopify_cutover_now()
+        database_now = self.sql("SELECT now()")[0][0]
+        self.assertEqual((cutover.microsecond, cutover.utcoffset()), (0, timedelta(0)))
+        self.assertLessEqual(abs((database_now - cutover).total_seconds()), 5)
+        self.assertFalse(self.repository.shopify_receiver_verified_before(SHOP, API_VERSION, cutover))
+        self.harness(baseline=None).deliver_receiver_proof()
+        self.assertTrue(self.repository.shopify_receiver_verified_before(SHOP, API_VERSION, cutover))
+        self.assertFalse(self.repository.shopify_receiver_verified_before(SHOP, API_VERSION, CUTOVER - timedelta(minutes=10)))
+        self.assertFalse(self.repository.shopify_receiver_verified_before(SHOP, "2026-07", cutover))
+
+    def test_atomic_seal_writes_historical_and_gid_only_transition_rows(self):
+        harness = self.harness(baseline=None)
+        harness.deliver_receiver_proof()
+        harness.deliver(SECOND_GID, webhook_id="wh-00000000-0610")
+        existing = self.repository.get_shopify_admission(SECOND_GID)
+        with self.assertRaisesRegex(SourceConflict, "shopify_receiver_not_verified_before_cutover"):
+            self.repository.store_shopify_baseline([BASELINE_GID], transition_gids=[NEW_GID], shop_domain=SHOP, api_version="2026-07", capture_started_at=CUTOVER, now=NOW)
+        sealed = self.repository.store_shopify_baseline([BASELINE_GID], transition_gids=[NEW_GID, SECOND_GID], shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER, now=NOW)
+        self.assertEqual(self.sql("SELECT customer_gid FROM xb_member_gateway.shopify_baseline_members"), [(BASELINE_GID,)])
+        self.assertEqual(self.sql("SELECT state,capture_started_at FROM xb_member_gateway.shopify_cutover_baselines"), [("SEALED", CUTOVER)])
+        rows = dict(self.sql("SELECT customer_gid,state FROM xb_member_gateway.shopify_member_admissions"))
+        self.assertEqual(rows, {PROOF_GID: "PENDING", SECOND_GID: "PENDING", NEW_GID: "PENDING"})
+        self.assertEqual(self.repository.get_shopify_admission(SECOND_GID), existing)  # existing row authoritative
+        transition = self.repository.get_shopify_admission(NEW_GID)
+        self.assertEqual((transition.state_version, transition.job_id, transition.reason_code), (0, None, None))
+        self.assertTrue(transition.gid_ref.startswith("hmac-v1:"))
+        self.assertTrue(self.repository.verify_shopify_baseline(sealed.baseline_id))
+        dump = self.full_dump()
+        for value in PII:
+            self.assertNotIn(value, dump)
+        self.assertNotIn("createdAt", dump)
+
+    def test_failure_inside_seal_transaction_leaves_no_partial_state(self):
+        self.harness(baseline=None).deliver_receiver_proof()
+        with mock.patch.object(PostgresRepository, "_verify_baseline_cursor", return_value=None):
+            with self.assertRaisesRegex(SourceConflict, "shopify_baseline_seal_mismatch"):
+                self.repository.store_shopify_baseline([BASELINE_GID], transition_gids=[NEW_GID], shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER, now=NOW)
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.shopify_cutover_baselines"), [(0,)])
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.shopify_baseline_members"), [(0,)])
+        self.assertEqual(self.sql("SELECT customer_gid FROM xb_member_gateway.shopify_member_admissions"), [(PROOF_GID,)])
+        self.assertIsNone(self.repository.get_shopify_baseline())
+
+    def test_capture_end_to_end_on_database_clock(self):
+        harness = self.harness(baseline=None)
+        harness.deliver_receiver_proof()
+        pages = [
+            {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [{"id": BASELINE_GID, "createdAt": "2020-01-01T00:00:00Z", "tags": ["member-mg"]}]},
+            {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": NEW_GID, "createdAt": "2099-01-01T00:00:00+08:00", "tags": ["member-mg"]}]},
+        ]
+        composition = SimpleNamespace(repository=self.repository, client=SimpleNamespace(baseline_page=lambda after: pages.pop(0)), shopify_config=SimpleNamespace(shop_domain=SHOP, api_version=API_VERSION))
+        sealed = capture_baseline(composition)
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"]), (1, 1))
+        cutover = self.sql("SELECT capture_started_at FROM xb_member_gateway.shopify_cutover_baselines")[0][0]
+        self.assertEqual(cutover.microsecond, 0)
+        self.repository.enable_shopify_admission(sealed["baseline_id"], "synthetic-approval-a2")
+        current = datetime.now(timezone.utc) + timedelta(minutes=1)
+        harness.clock = current
+        harness.reader.customers[NEW_GID] = customer(NEW_GID, created_at=datetime(2099, 1, 1, tzinfo=timezone.utc))
+        harness.reader.customers[BASELINE_GID] = customer(BASELINE_GID, created_at=datetime(2099, 1, 1, tzinfo=timezone.utc))
+        harness.receiver.clock = current
+        harness.deliver(BASELINE_GID, topic="customers/update", webhook_id="wh-00000000-0620")
+        harness.processor.run_once()
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.ADMITTED)
+        conflict = self.repository.get_shopify_admission(BASELINE_GID)
+        self.assertEqual((conflict.state, conflict.reason_code), (ShopifyAdmissionState.MANUAL_REVIEW, "baseline_created_at_conflict"))
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.jobs WHERE source_system='shopify'"), [(1,)])
+
+    def test_gateway_held_member_no_collision_is_bounded_in_database(self):
+        harness = self.harness()
+        harness.admit()
+        job, held = harness.claim_through_allocation(member_no="M000701")
+        fence, writer = harness.dispatch(job, held)
+        harness.confirm(job, writer)
+        harness.result(job, fence, held, "CREATED_VERIFIED", found=True, match=True)
+        self.assertEqual(self.repository.member_no_owner(held), job["job_id"])
+        self.assertIsNone(self.repository.member_no_owner("M000799"))
+        harness.admit(SECOND_GID, profile=customer(SECOND_GID), webhook_id="wh-00000000-0702")
+        second = harness.call("POST", "/v1/worker/claim", {}).body["job"]
+        harness.call("POST", f"/v1/jobs/{second['job_id']}/precheck", {})
+        harness.call("POST", f"/v1/jobs/{second['job_id']}/shopify/legacy-precheck", {"outcome": "NO_CANDIDATE", "phone_member_no_hit": False, "mobile_phone_hit": False, "email_hit": False})
+        collision = harness.call("POST", f"/v1/jobs/{second['job_id']}/allocation/probe", {"candidate": held, "status": "FREE", "probe_reference": "probe-pg-1"})
+        self.assertEqual((collision.status, collision.body["gateway_bound_collision"], collision.body["candidates_remaining"]), (200, True, 2))
+        repeated = harness.call("POST", f"/v1/jobs/{second['job_id']}/allocation/probe", {"candidate": held, "status": "FREE", "probe_reference": "probe-pg-2"})
+        self.assertEqual((repeated.status, repeated.body["error_code"]), (409, "member_no_generator_not_advancing"))
+        self.assertEqual(self.repository.get_job(second["job_id"]).state, JobState.MANUAL_REVIEW)
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.member_allocations WHERE job_id=%s", (second["job_id"],)), [(0,)])
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.shopify_protected_payloads WHERE job_id=%s", (second["job_id"],)), [(0,)])
 
     def test_admission_cannot_enable_or_admit_without_verified_baseline(self):
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "shopify_admission_requires_sealed_baseline|violates foreign key|check"):

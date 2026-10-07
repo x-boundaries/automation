@@ -3,8 +3,10 @@
 import json
 import unittest
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest import mock
 
+from xb_member_gateway.bootstrap import BootstrapError
 from xb_member_gateway.models import JobState, ShopifyAdmissionState
 from xb_member_gateway.protected_payload import ProtectedPayloadCipher, ProtectedPayloadError, decode_key, envelope_digest
 from xb_member_gateway.reconciliation import reconcile_uncertain_write
@@ -18,17 +20,18 @@ from xb_member_gateway.shopify_admission import (
     capture_member_mg_baseline,
     evaluate_profile,
 )
+from xb_member_gateway.shopify_receiver import capture_baseline
 from xb_member_gateway.shopify_webhook import WEBHOOK_ROUTE, verify_shopify_hmac
 
 try:
     from ._shopify_support import (
-        BASELINE_GID, CUTOVER, NEW_GID, NOW, SECOND_GID, SHOP, SYNTHETIC_EMAIL, SYNTHETIC_EMAIL_NORMALIZED,
+        API_VERSION, BASELINE_GID, CUTOVER, NEW_GID, NOW, PROOF_GID, SECOND_GID, SHOP, SYNTHETIC_EMAIL, SYNTHETIC_EMAIL_NORMALIZED,
         SYNTHETIC_PHONE, SYNTHETIC_PHONE_DIGITS, FakeReader, ShopifyHarness, customer, runtime_key, shopify_config,
         signed_headers, webhook_body,
     )
 except ImportError:  # discovered as a top-level module
     from _shopify_support import (  # type: ignore
-        BASELINE_GID, CUTOVER, NEW_GID, NOW, SECOND_GID, SHOP, SYNTHETIC_EMAIL, SYNTHETIC_EMAIL_NORMALIZED,
+        API_VERSION, BASELINE_GID, CUTOVER, NEW_GID, NOW, PROOF_GID, SECOND_GID, SHOP, SYNTHETIC_EMAIL, SYNTHETIC_EMAIL_NORMALIZED,
         SYNTHETIC_PHONE, SYNTHETIC_PHONE_DIGITS, FakeReader, ShopifyHarness, customer, runtime_key, shopify_config,
         signed_headers, webhook_body,
     )
@@ -57,7 +60,8 @@ def assert_no_pii(test, value):
 class WebhookReceiverTests(unittest.TestCase):
     def setUp(self):
         self.repository = RecordingRepository()
-        self.harness = ShopifyHarness(self.repository)
+        # Receiver behaviour is independent of the cutover baseline.
+        self.harness = ShopifyHarness(self.repository, baseline=None)
 
     def test_valid_hmac_accepted_and_only_metadata_and_gid_persisted(self):
         response = self.harness.deliver()
@@ -157,46 +161,82 @@ class BaselineTests(unittest.TestCase):
     def page(nodes, has_next, cursor=None):
         return {"pageInfo": {"hasNextPage": has_next, "endCursor": cursor}, "nodes": nodes}
 
+    @staticmethod
+    def node(gid, tags=("member-mg",), created_at=CUTOVER - timedelta(days=30)):
+        value = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, "isoformat") else created_at
+        return {"id": gid, "createdAt": value, "tags": list(tags)}
+
+    def capture(self, reader, **kwargs):
+        return capture_member_mg_baseline(reader, cutover_at=CUTOVER, **kwargs)
+
     def test_zero_one_and_multi_page_exhaustive_capture(self):
         reader, _ = self.pages(self.page([], False))
-        self.assertEqual(capture_member_mg_baseline(reader), ())
-        reader, _ = self.pages(self.page([{"id": BASELINE_GID, "tags": ["member-mg"]}, {"id": NEW_GID, "tags": ["vip"]}], False))
-        self.assertEqual(capture_member_mg_baseline(reader), (BASELINE_GID,))
+        self.assertEqual(self.capture(reader), ((), ()))
+        reader, _ = self.pages(self.page([self.node(BASELINE_GID), self.node(NEW_GID, tags=["vip"])], False))
+        self.assertEqual(self.capture(reader), ((BASELINE_GID,), ()))
         reader, state = self.pages(
-            self.page([{"id": SECOND_GID, "tags": ["Member-MG"]}], True, "c1"),
-            self.page([{"id": NEW_GID, "tags": []}], True, "c2"),
-            self.page([{"id": BASELINE_GID, "tags": ["member-mg", "x"]}], False),
+            self.page([self.node(SECOND_GID, tags=["Member-MG"])], True, "c1"),
+            self.page([self.node(NEW_GID, tags=[])], True, "c2"),
+            self.page([self.node(BASELINE_GID, tags=["member-mg", "x"])], False),
         )
-        self.assertEqual(capture_member_mg_baseline(reader), (BASELINE_GID, SECOND_GID))
+        self.assertEqual(self.capture(reader), ((BASELINE_GID, SECOND_GID), ()))
         self.assertEqual(state["afters"], [None, "c1", "c2"])
+
+    def test_created_at_partitions_historical_and_transition_with_equality_post_cutover(self):
+        reader, _ = self.pages(
+            self.page([self.node(BASELINE_GID, created_at=CUTOVER - timedelta(seconds=1)), self.node(SECOND_GID, created_at=CUTOVER)], True, "c1"),
+            self.page([self.node(NEW_GID, created_at=CUTOVER + timedelta(seconds=5)), self.node("gid://shopify/Customer/9000000103", tags=[], created_at=CUTOVER + timedelta(seconds=6))], False),
+        )
+        self.assertEqual(self.capture(reader), ((BASELINE_GID,), (NEW_GID, SECOND_GID)))
+        # Offsets are honoured: 19:00:00+08:00 == 11:00:00Z == CUTOVER (post-cutover).
+        reader, _ = self.pages(self.page([
+            self.node(NEW_GID, created_at="2026-10-06T19:00:00+08:00"),
+            self.node(BASELINE_GID, created_at="2026-10-06T18:59:59.999999+08:00"),
+        ], False))
+        self.assertEqual(self.capture(reader), ((BASELINE_GID,), (NEW_GID,)))
+
+    def test_missing_malformed_or_offset_less_created_at_fails_capture(self):
+        for value in (None, "", "2026-10-06T11:00:00", "2026-10-06", "yesterday", "20261006T110000Z",
+                      "2026-10-06 11:00:00Z", "2026-10-06T11:00:00.1234567Z", 1759748400):
+            node = {"id": NEW_GID, "tags": ["vip"]}
+            if value is not None:
+                node["createdAt"] = value
+            reader, _ = self.pages(self.page([self.node(BASELINE_GID), node], False))
+            with self.assertRaises(BaselineCaptureError) as raised:
+                self.capture(reader)
+            self.assertEqual(raised.exception.code, "baseline_created_at_invalid", value)
+        with self.assertRaises(BaselineCaptureError) as raised:
+            capture_member_mg_baseline(self.pages(self.page([], False))[0], cutover_at=CUTOVER.replace(tzinfo=None))
+        self.assertEqual(raised.exception.code, "baseline_cutover_invalid")
 
     def test_fail_closed_on_missing_cursor_duplicates_errors_and_malformed_pages(self):
         cases = (
             ((self.page([], True, None),), "baseline_cursor_missing"),
             ((self.page([], True, "c1"), self.page([], True, "c1")), "baseline_cursor_repeated"),
-            ((self.page([{"id": NEW_GID, "tags": []}], True, "c1"), self.page([{"id": NEW_GID, "tags": []}], False)), "baseline_duplicate_gid"),
+            ((self.page([self.node(NEW_GID, tags=[])], True, "c1"), self.page([self.node(NEW_GID, tags=[])], False)), "baseline_duplicate_gid"),
             (({"pageInfo": {"hasNextPage": "no"}, "nodes": []},), "baseline_page_info_invalid"),
             (({"nodes": []},), "baseline_page_invalid"),
-            ((self.page([{"id": "gid://shopify/Order/1", "tags": []}], False),), "baseline_node_invalid"),
+            ((self.page([self.node("gid://shopify/Order/1", tags=[])], False),), "baseline_node_invalid"),
         )
         for pages, code in cases:
             reader, _ = self.pages(*pages)
             with self.assertRaises(BaselineCaptureError) as raised:
-                capture_member_mg_baseline(reader)
+                self.capture(reader)
             self.assertEqual(raised.exception.code, code)
 
         def failing(after):
             raise ShopifyReadError("shopify_graphql_error")
 
         with self.assertRaises(BaselineCaptureError) as raised:
-            capture_member_mg_baseline(failing)
+            self.capture(failing)
         self.assertEqual(raised.exception.code, "baseline_read_failed:shopify_graphql_error")
         reader, _ = self.pages(*[self.page([], True, f"c{i}") for i in range(3)])
         with self.assertRaises(BaselineCaptureError):
-            capture_member_mg_baseline(reader, max_pages=3)
+            self.capture(reader, max_pages=3)
 
     def test_seal_count_digest_readback_and_admission_gate(self):
         repository = InMemoryRepository()
+        ShopifyHarness(repository, baseline=None).deliver_receiver_proof()
         sealed = repository.store_shopify_baseline([SECOND_GID, BASELINE_GID], shop_domain=SHOP, api_version="2026-10", capture_started_at=CUTOVER, now=NOW)
         self.assertEqual((sealed.member_count, sealed.member_digest), (2, baseline_digest([BASELINE_GID, SECOND_GID])))
         self.assertTrue(repository.verify_shopify_baseline(sealed.baseline_id))
@@ -205,6 +245,8 @@ class BaselineTests(unittest.TestCase):
             repository.store_shopify_baseline([], shop_domain=SHOP, api_version="2026-10", capture_started_at=CUTOVER)
         with self.assertRaisesRegex(SourceConflict, "shopify_baseline_duplicate_gid"):
             InMemoryRepository().store_shopify_baseline([NEW_GID, NEW_GID], shop_domain=SHOP, api_version="2026-10", capture_started_at=CUTOVER)
+        with self.assertRaisesRegex(SourceConflict, "shopify_receiver_not_verified_before_cutover"):
+            InMemoryRepository().store_shopify_baseline([NEW_GID], shop_domain=SHOP, api_version="2026-10", capture_started_at=CUTOVER)
         # Tampered rows can never enable admission.
         repository._shopify_baseline_members[sealed.baseline_id] = frozenset({BASELINE_GID})
         with self.assertRaisesRegex(SourceConflict, "shopify_admission_baseline_verification_failed"):
@@ -248,14 +290,18 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual((preexisting.state, preexisting.reason_code), (ShopifyAdmissionState.MANUAL_REVIEW, "preexisting_customer_not_new_signup"))
         self.assertFalse(any(item.is_shopify for item in self.repository.all_jobs()))
 
-    def test_xb_member_tag_and_baseline_created_during_capture_reviewed(self):
+    def test_xb_member_tag_and_baseline_created_at_conflict_reviewed_never_admitted(self):
         self.harness.reader.customers[NEW_GID] = customer(NEW_GID, tags=("member-mg", "XB Member"))
         self.harness.deliver(NEW_GID, webhook_id="wh-00000000-0030")
-        self.harness.reader.customers[BASELINE_GID] = customer(BASELINE_GID)
-        self.harness.deliver(BASELINE_GID, webhook_id="wh-00000000-0031")
+        # A sealed historical GID whose authoritative re-read reports
+        # createdAt >= C is a conflict, whatever topic or timing delivered it.
+        self.harness.reader.customers[BASELINE_GID] = customer(BASELINE_GID, created_at=CUTOVER)
+        self.harness.deliver(BASELINE_GID, topic="customers/update", webhook_id="wh-00000000-0031")
         self.harness.processor.run_once()
         self.assertEqual(self.repository.get_shopify_admission(NEW_GID).reason_code, "legacy_tag_present")
-        self.assertEqual(self.repository.get_shopify_admission(BASELINE_GID).reason_code, "baseline_member_created_during_capture")
+        conflict = self.repository.get_shopify_admission(BASELINE_GID)
+        self.assertEqual((conflict.state, conflict.reason_code), (ShopifyAdmissionState.MANUAL_REVIEW, "baseline_created_at_conflict"))
+        self.assertFalse(any(item.is_shopify for item in self.repository.all_jobs()))
 
     def test_non_member_not_admitted_and_becomes_re_evaluable(self):
         self.harness.reader.customers[NEW_GID] = customer(NEW_GID, tags=())
@@ -281,7 +327,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual((admission.state, admission.reason_code), (ShopifyAdmissionState.MANUAL_REVIEW, "membership_dates_missing"))
 
     def test_profile_decisions_for_name_dates_contacts(self):
-        base = dict(in_baseline=False, created_during_capture=False, cutover_at=CUTOVER, profile_complete_required=True)
+        base = dict(in_baseline=False, cutover_at=CUTOVER, profile_complete_required=True)
         cases = (
             (customer(first=None, last="  "), "MANUAL_REVIEW", "name_missing"),
             (customer(start="2026-13-01"), "MANUAL_REVIEW", "membership_date_malformed"),
@@ -290,6 +336,8 @@ class AdmissionTests(unittest.TestCase):
             (customer(phone="call me"), "MANUAL_REVIEW", "phone_malformed"),
             (customer(email="not-an-email"), "MANUAL_REVIEW", "email_malformed"),
             (dict(customer(), createdAt="yesterday"), "MANUAL_REVIEW", "created_at_malformed"),
+            (dict(customer(), createdAt="2026-10-06T11:30:00"), "MANUAL_REVIEW", "created_at_malformed"),
+            (customer(created_at=CUTOVER - timedelta(seconds=1)), "MANUAL_REVIEW", "preexisting_customer_not_new_signup"),
             (None, "NOT_ELIGIBLE", "customer_not_found"),
         )
         for profile, outcome, code in cases:
@@ -297,6 +345,12 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual((decision.outcome, decision.code), (outcome, code))
         waiting = evaluate_profile(customer(first=None, last=None), **dict(base, profile_complete_required=False))
         self.assertEqual((waiting.outcome, waiting.code), ("WAIT", "name_missing"))
+        self.assertEqual(evaluate_profile(customer(created_at=CUTOVER), **base).outcome, "ADMIT")
+        historical = dict(base, in_baseline=True)
+        self.assertEqual(evaluate_profile(customer(created_at=CUTOVER - timedelta(days=1)), **historical).outcome, "EXCLUDED_BASELINE")
+        self.assertEqual(evaluate_profile(dict(customer(), createdAt=None), **historical).outcome, "EXCLUDED_BASELINE")
+        conflict = evaluate_profile(customer(created_at=CUTOVER), **historical)
+        self.assertEqual((conflict.outcome, conflict.code), ("MANUAL_REVIEW", "baseline_created_at_conflict"))
         admitted = evaluate_profile(customer(phone=None, email=None), **base)
         self.assertEqual(admitted.create_payload, {"email_address": None, "expiry_date": "2028-10-05", "mobile_phone": None, "name": "Synthetic Shopify Alpha", "register_date": "2026-10-06"})
         exact = evaluate_profile(customer(), **base).create_payload
@@ -323,7 +377,8 @@ class AdmissionTests(unittest.TestCase):
     def test_read_errors_retry_or_review_without_admitting(self):
         self.harness.reader.error = ShopifyReadError("shopify_graphql_throttled", retryable=True)
         self.harness.deliver()
-        self.assertEqual(self.harness.processor.run_once()["deferred"], 1)
+        # The harness receiver-proof GID is pending too and is deferred alike.
+        self.assertEqual(self.harness.processor.run_once()["deferred"], 2)
         self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.PENDING)
         self.harness.reader.error = ShopifyReadError("shopify_graphql_error")
         self.harness.processor.clock = lambda: NOW + timedelta(hours=1)
@@ -606,6 +661,62 @@ class AllocationAndPrecheckTests(unittest.TestCase):
             self.repository.bind_allocation(job["job_id"], "M000999", "probe-late", "ws-" + "a" * 32, now=NOW)
         self.assertEqual(self.repository.get_allocation(job["job_id"]).member_no, member_no)
 
+    # -- M1: gateway-bound MemberNo collision (settled G3 defect) ---------
+
+    def _held_member_no_and_second_job(self, member_no="M000601"):
+        """Job A fully creates ``member_no``; job B is claimed and prechecked."""
+        job, bound = self.harness.claim_through_allocation(member_no=member_no)
+        self.harness.admit(SECOND_GID, profile=customer(SECOND_GID), webhook_id="wh-00000000-0602")
+        fence, writer = self.harness.dispatch(job, bound)
+        self.harness.confirm(job, writer)
+        self.harness.result(job, fence, bound, "CREATED_VERIFIED", found=True, match=True)
+        second = self.claim()
+        self.precheck(second)
+        return bound, second
+
+    def probe(self, job, member_no, status, reference):
+        return self.harness.call("POST", f"/v1/jobs/{job['job_id']}/allocation/probe", {"candidate": member_no, "status": status, "probe_reference": reference})
+
+    def test_repeated_gateway_held_collision_terminates_within_bound(self):
+        held, second = self._held_member_no_and_second_job()
+        first = self.probe(second, held, "FREE", "probe-gw-1")
+        self.assertEqual(first.status, 200, first.body)
+        self.assertEqual((first.body["bound"], first.body["gateway_bound_collision"], first.body["candidates_remaining"]), (False, True, 2))
+        # GetNextMemberNo() re-offers the same gateway-held MemberNo: before
+        # the correction this returned 200/unbound forever (PRECHECKING loop).
+        repeated = self.probe(second, held, "FREE", "probe-gw-2")
+        self.assertEqual((repeated.status, repeated.body["error_code"]), (409, "member_no_generator_not_advancing"))
+        job = self.repository.get_job(second["job_id"])
+        self.assertEqual((job.state, job.last_error_code), (JobState.MANUAL_REVIEW, "member_no_generator_not_advancing"))
+        self.assertIsNone(self.repository.get_allocation(second["job_id"]))
+        self.assertIsNone(self.repository.get_dispatch_fence(second["job_id"]))
+        self.assertFalse(self.repository.shopify_payload_present(second["job_id"]))
+        after = self.probe(second, "M000699", "FREE", "probe-gw-3")
+        self.assertEqual(after.status, 409)
+        self.assertIsNone(self.repository.get_allocation(second["job_id"]))
+
+    def test_gateway_held_collision_consumes_the_accepted_occupied_bound(self):
+        held, second = self._held_member_no_and_second_job()
+        self.assertEqual(self.probe(second, "M000602", "OCCUPIED", "probe-occ-a").body["candidates_remaining"], 2)
+        self.assertEqual(self.probe(second, "M000603", "OCCUPIED", "probe-occ-b").body["candidates_remaining"], 1)
+        exhausted = self.probe(second, held, "FREE", "probe-gw-x")
+        self.assertEqual((exhausted.status, exhausted.body["error_code"]), (409, "member_no_exhausted"))
+        job = self.repository.get_job(second["job_id"])
+        self.assertEqual((job.state, job.last_error_code), (JobState.MANUAL_REVIEW, "member_no_reallocation_exhausted"))
+        self.assertIsNone(self.repository.get_allocation(second["job_id"]))
+        self.assertFalse(self.repository.shopify_payload_present(second["job_id"]))
+
+    def test_occupied_and_gateway_held_candidates_then_free_candidate_binds(self):
+        held, second = self._held_member_no_and_second_job()
+        collision = self.probe(second, held, "FREE", "probe-gw-p")
+        self.assertEqual((collision.body["gateway_bound_collision"], collision.body["candidates_remaining"]), (True, 2))
+        self.assertEqual(self.probe(second, "M000612", "OCCUPIED", "probe-occ-p").body["candidates_remaining"], 1)
+        bound = self.probe(second, "M000613", "FREE", "probe-free-p")
+        self.assertEqual((bound.status, bound.body["bound"], bound.body["member_no"]), (200, True, "M000613"))
+        self.assertEqual(self.repository.get_allocation(second["job_id"]).member_no, "M000613")
+        self.assertEqual(self.repository.member_no_owner(held), self.repository.get_shopify_admission(NEW_GID).job_id)
+        self.assertEqual(self.repository.member_no_owner("M000613"), second["job_id"])
+
     def test_dispatch_requires_precheck_for_current_attempt(self):
         job, member_no = self.harness.claim_through_allocation()
         self.repository._shopify_prechecks.clear()
@@ -624,6 +735,180 @@ class AllocationAndPrecheckTests(unittest.TestCase):
         self.assertNotIn("M000101", rendered)
         self.assertEqual(status.body["admission_counts"]["ADMITTED"], 1)
         self.assertTrue(status.body["baseline_verified"])
+
+
+class CutoverTests(unittest.TestCase):
+    """#155 targeted G2 cutover contract through the real capture entry point."""
+
+    TAGGED_LATER = "gid://shopify/Customer/9000000104"
+
+    def setUp(self):
+        self.repository = InMemoryRepository()
+        self.harness = ShopifyHarness(self.repository, baseline=None)
+        self.cutover = CUTOVER
+        self.repository.shopify_cutover_now = lambda: self.cutover
+        self.pages = []
+
+    def node(self, gid, created_at, tags=("member-mg",)):
+        value = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, "isoformat") else created_at
+        return {"id": gid, "createdAt": value, "tags": list(tags)}
+
+    def set_pages(self, *pages):
+        self.pages = [{"pageInfo": {"hasNextPage": index < len(pages) - 1, "endCursor": f"c{index + 1}" if index < len(pages) - 1 else None}, "nodes": list(nodes)} for index, nodes in enumerate(pages)]
+
+    def baseline_page(self, after):
+        if isinstance(self.pages, Exception):
+            raise self.pages
+        return self.pages.pop(0)
+
+    def capture(self):
+        composition = SimpleNamespace(
+            repository=self.repository, client=SimpleNamespace(baseline_page=self.baseline_page),
+            shopify_config=SimpleNamespace(shop_domain=SHOP, api_version=API_VERSION),
+        )
+        return capture_baseline(composition, now=lambda: self.cutover + timedelta(minutes=1))
+
+    def enable(self, sealed):
+        self.repository.enable_shopify_admission(sealed["baseline_id"], "synthetic-approval-155-g3-a2")
+
+    def shopify_jobs(self):
+        return [item for item in self.repository.all_jobs() if item.is_shopify]
+
+    def test_post_cutover_last_page_gid_without_create_receipt_is_pending_then_admitted_once(self):
+        self.harness.deliver_receiver_proof()
+        self.set_pages(
+            [self.node(BASELINE_GID, CUTOVER - timedelta(days=400))],
+            [self.node(NEW_GID, CUTOVER + timedelta(seconds=5))],
+        )
+        sealed = self.capture()
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"], sealed["state"]), (1, 1, "SEALED"))
+        self.assertFalse(self.repository.shopify_baseline_contains(sealed["baseline_id"], NEW_GID))
+        self.assertTrue(self.repository.shopify_baseline_contains(sealed["baseline_id"], BASELINE_GID))
+        pending = self.repository.get_shopify_admission(NEW_GID)
+        self.assertEqual((pending.state, pending.job_id, pending.reason_code), (ShopifyAdmissionState.PENDING, None, None))
+        self.assertFalse(any(receipt.customer_gid == NEW_GID for receipt, _ in self.repository._shopify_receipts.values()))
+        self.assertEqual(self.harness.processor.run_once()["processed"], 0)  # admission still disabled
+        self.enable(sealed)
+        self.harness.reader.customers[NEW_GID] = customer(NEW_GID, created_at=CUTOVER + timedelta(seconds=5))
+        self.harness.reader.customers[BASELINE_GID] = customer(BASELINE_GID, created_at=CUTOVER - timedelta(days=400))
+        self.harness.deliver(BASELINE_GID, topic="customers/update", webhook_id="wh-00000000-1001")
+        counts = self.harness.processor.run_once()
+        self.assertEqual(counts["admitted"], 1)
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.ADMITTED)
+        self.assertEqual(self.repository.get_shopify_admission(BASELINE_GID).state, ShopifyAdmissionState.EXCLUDED_BASELINE)
+        self.harness.deliver(NEW_GID, webhook_id="wh-00000000-1002")
+        self.harness.processor.run_once()
+        self.assertEqual(len(self.shopify_jobs()), 1)
+        assert_no_pii(self, self.repository.snapshot_state())
+
+    def test_created_at_equal_to_cutover_is_post_cutover(self):
+        self.harness.deliver_receiver_proof()
+        self.set_pages([self.node(NEW_GID, CUTOVER), self.node(BASELINE_GID, CUTOVER - timedelta(seconds=1))])
+        sealed = self.capture()
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"]), (1, 1))
+        self.assertFalse(self.repository.shopify_baseline_contains(sealed["baseline_id"], NEW_GID))
+        self.enable(sealed)
+        self.harness.reader.customers[NEW_GID] = customer(NEW_GID, created_at=CUTOVER)
+        self.harness.processor.run_once()
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.ADMITTED)
+
+    def test_missing_or_late_or_wrong_binding_receiver_proof_rejects_capture_and_seals_nothing(self):
+        def attempt():
+            self.set_pages([self.node(BASELINE_GID, CUTOVER - timedelta(days=1))])
+            with self.assertRaises(BootstrapError) as raised:
+                self.capture()
+            self.assertEqual(raised.exception.code, "shopify_receiver_not_verified_before_cutover")
+            self.assertIsNone(self.repository.get_shopify_baseline())
+            self.assertEqual(len(self.pages), 1, "no page may be read without receiver proof")
+
+        attempt()
+        self.harness.deliver_receiver_proof(at=CUTOVER)  # received_at == C is not before C
+        attempt()
+        other = ShopifyHarness(self.repository, baseline=None, config=shopify_config(api_version="2026-07"))
+        other.deliver_receiver_proof(at=CUTOVER - timedelta(minutes=5), webhook_id="wh-00000000-0901")  # wrong API version binding
+        attempt()
+        self.assertIsNone(self.repository.get_shopify_admission(BASELINE_GID))
+
+    def test_malformed_or_naive_created_at_rejects_capture(self):
+        self.harness.deliver_receiver_proof()
+        for value in ("2026-10-06T11:00:05", "2026-10-06", "not-a-time", None):
+            node = self.node(NEW_GID, value) if value is not None else {"id": NEW_GID, "tags": ["member-mg"]}
+            self.set_pages([self.node(BASELINE_GID, CUTOVER - timedelta(days=1))], [node])
+            with self.assertRaises(BootstrapError) as raised:
+                self.capture()
+            self.assertEqual(raised.exception.code, "baseline_created_at_invalid")
+            self.assertIsNone(self.repository.get_shopify_baseline())
+            self.assertIsNone(self.repository.get_shopify_admission(NEW_GID))
+
+    def test_pre_cutover_gid_tagged_only_after_scan_is_conservative_manual_review(self):
+        self.harness.deliver_receiver_proof()
+        self.set_pages([self.node(BASELINE_GID, CUTOVER - timedelta(days=9)), self.node(self.TAGGED_LATER, CUTOVER - timedelta(days=3), tags=())])
+        sealed = self.capture()
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"]), (1, 0))
+        self.enable(sealed)
+        self.harness.reader.customers[self.TAGGED_LATER] = customer(self.TAGGED_LATER, created_at=CUTOVER - timedelta(days=3))
+        self.harness.deliver(self.TAGGED_LATER, topic="customer.tags_added", webhook_id="wh-00000000-1101")
+        self.harness.processor.run_once()
+        review = self.repository.get_shopify_admission(self.TAGGED_LATER)
+        self.assertEqual((review.state, review.reason_code), (ShopifyAdmissionState.MANUAL_REVIEW, "preexisting_customer_not_new_signup"))
+        self.assertEqual(self.shopify_jobs(), [])
+
+    def test_webhook_and_scan_for_same_post_cutover_gid_admit_one_job(self):
+        self.harness.deliver_receiver_proof()
+        self.harness.deliver(NEW_GID, webhook_id="wh-00000000-1201")
+        before = self.repository.get_shopify_admission(NEW_GID)
+        self.set_pages([self.node(NEW_GID, CUTOVER + timedelta(seconds=30))])
+        sealed = self.capture()
+        self.assertEqual(sealed["transition_pending_count"], 1)
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID), before)  # existing row authoritative
+        self.enable(sealed)
+        self.harness.reader.customers[NEW_GID] = customer(NEW_GID, created_at=CUTOVER + timedelta(seconds=30))
+        self.harness.deliver(NEW_GID, topic="customers/update", webhook_id="wh-00000000-1202")
+        self.harness.processor.run_once()
+        self.harness.deliver(NEW_GID, topic="customer.tags_added", webhook_id="wh-00000000-1203")
+        self.harness.processor.run_once()
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.ADMITTED)
+        self.assertEqual(len(self.shopify_jobs()), 1)
+
+    def test_seal_failure_leaves_no_historical_or_transition_state(self):
+        self.harness.deliver_receiver_proof()
+        for historical, transition, code in (
+            ([BASELINE_GID], [BASELINE_GID], "shopify_baseline_transition_overlap"),
+            ([BASELINE_GID], [NEW_GID, NEW_GID], "shopify_transition_duplicate_gid"),
+            ([BASELINE_GID], ["gid://shopify/Order/1"], "shopify_transition_members_invalid"),
+        ):
+            with self.assertRaisesRegex(SourceConflict, code):
+                self.repository.store_shopify_baseline(historical, transition_gids=transition, shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER, now=NOW)
+        with self.assertRaisesRegex(SourceConflict, "shopify_cutover_not_whole_second"):
+            self.repository.store_shopify_baseline([BASELINE_GID], transition_gids=[NEW_GID], shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER + timedelta(microseconds=1), now=NOW)
+        # The seal recompute disagrees with the validated digest (second call only).
+        real = baseline_digest([BASELINE_GID])
+        with mock.patch("xb_member_gateway.repository.shopify_baseline_digest", side_effect=[real, "sha256:" + "0" * 64]):
+            with self.assertRaisesRegex(SourceConflict, "shopify_baseline_seal_mismatch"):
+                self.repository.store_shopify_baseline([BASELINE_GID], transition_gids=[NEW_GID], shop_domain=SHOP, api_version=API_VERSION, capture_started_at=CUTOVER, now=NOW)
+        self.assertIsNone(self.repository.get_shopify_baseline())
+        self.assertEqual(self.repository._shopify_baseline_members, {})
+        self.assertIsNone(self.repository.get_shopify_admission(NEW_GID))
+
+    def test_crash_before_seal_leaves_no_cutover_and_restart_gets_fresh_cutover(self):
+        self.harness.deliver_receiver_proof()
+        between = "gid://shopify/Customer/9000000105"
+        self.pages = ShopifyReadError("shopify_transport_failed", retryable=True)
+        with self.assertRaises(BootstrapError):
+            self.capture()
+        self.assertIsNone(self.repository.get_shopify_baseline())
+        self.assertIsNone(self.repository.shopify_admission_gate())
+        # Restart from scratch: a fresh C2 > C1; a member created between the
+        # two attempts is historical under the sealed C2.
+        self.cutover = CUTOVER + timedelta(minutes=30)
+        self.set_pages([self.node(between, CUTOVER + timedelta(minutes=10)), self.node(NEW_GID, self.cutover + timedelta(seconds=1))])
+        sealed = self.capture()
+        baseline = self.repository.get_shopify_baseline()
+        self.assertEqual(baseline.capture_started_at, (CUTOVER + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"))
+        self.assertTrue(self.repository.shopify_baseline_contains(sealed["baseline_id"], between))
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.PENDING)
+        self.enable(sealed)
+        self.assertEqual(self.repository.shopify_admission_gate()[1], CUTOVER + timedelta(minutes=30))
 
 
 class FormsIsolationTests(unittest.TestCase):
