@@ -333,8 +333,17 @@ performed or authorised by the repository change):
    `python -m xb_member_gateway.shopify_receiver capture-baseline --config <gw> --shopify-config <shopify>`.
    It fixes `C` from the database clock, refuses to run without the step-4
    receipt, and prints only the baseline id, historical member count, digest,
-   state and `transition_pending_count`. Record them as evidence. A failed
-   capture leaves nothing; rerun from scratch (a fresh `C`).
+   state and `transition_pending_count`. Record them as evidence. Shopify
+   throttling (`THROTTLED`, HTTP 429), HTTP 500/502/503/504 and transport
+   failures are retried on the same page within fixed bounds (6 attempts per
+   page, 60 retries, 900 seconds total wait, 60 seconds per wait; a numeric
+   `Retry-After` is honoured, rounded up), so a large store may take several
+   minutes. A failed capture leaves nothing; rerun from scratch (a fresh `C`).
+   `shopify_receiver_failed:baseline_read_retry_exhausted` means the bounds were
+   used up: wait for Shopify to recover, then rerun.
+   `baseline_query_cost_exceeds_bucket` or
+   `baseline_read_retry_after_exceeds_bound` fail at once without waiting:
+   record the code and escalate rather than looping reruns.
 6. Enable admission only with an approval reference:
    `POST /v1/control/shopify-admission/enable` with `baseline_id` and
    `approval_reference` (control principal). Disable with

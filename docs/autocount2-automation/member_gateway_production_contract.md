@@ -554,9 +554,9 @@ Webhook arrival time and page position never classify.
 HMAC-verified receipt for the exact bound shop and API version was received
 strictly before `C` (also enforced by the baseline INSERT trigger). It scans
 every customer by cursor until `hasNextPage=false` (not a search query),
-requests `createdAt` for every node and fails closed on any read error,
-malformed page, missing/repeated cursor, duplicate GID, page overrun or a
-missing/malformed/offset-less `createdAt`. Historical `member-mg` GIDs form the
+requests `createdAt` for every node and fails closed on any non-retryable read
+error, malformed page, missing/repeated cursor, duplicate GID, page overrun or
+a missing/malformed/offset-less `createdAt`. Historical `member-mg` GIDs form the
 baseline; scanned `member-mg` GIDs with `createdAt >= C` become GID-only
 `PENDING` admissions (an existing admission row stays authoritative). The
 historical rows, the transition rows and the seal commit in one transaction;
@@ -565,6 +565,35 @@ digest that the database recomputes. `createdAt` is never stored. Admission is
 disabled until `POST /v1/control/shopify-admission/enable` binds the sealed
 baseline after an independent application-side recompute; the binding is
 immutable.
+
+Baseline transient-read recovery (#155 Web-directed continuation). Only
+retryable reads are retried: GraphQL `THROTTLED` (`shopify_graphql_throttled`),
+HTTP 429/500/502/503/504 (`shopify_http_error`, retryable) and transport
+failure (`shopify_transport_failed`). Every other GraphQL, HTTP, response,
+page, cursor, node, identity or `createdAt` failure stays an immediate
+fail-closed capture failure with no sleep. A retry repeats the exact same
+cursor and request; a page contributes data only after it is structurally
+accepted whole, so a failed attempt contributes nothing, and `C` is read once
+before page 1 and never recomputed. Bounds: 6 attempts per page, 60 retries per
+capture, 900 seconds total sleep, 60 seconds per sleep, minimum 1 second, no
+jitter; every budget is checked before sleeping. The wait is:
+
+| Signal | Wait |
+|---|---|
+| `THROTTLED` with valid `extensions.cost` `requestedQueryCost` > `throttleStatus.maximumAvailable` | immediate `baseline_query_cost_exceeds_bucket` |
+| HTTP 429/503 with a numeric `Retry-After` (integer or decimal, e.g. `2.0`) | that value rounded up to whole seconds (minimum 1); above 60 -> immediate `baseline_read_retry_after_exceeds_bound` |
+| `THROTTLED` with complete valid `requestedQueryCost`/`currentlyAvailable`/`restoreRate` (> 0)/`maximumAvailable` | `ceil((requested - currentlyAvailable) / restoreRate)`, bounded to 1..60 (1 if already available) |
+| anything else retryable, or missing/non-numeric/non-finite/negative metadata | `min(2^(n-1), 60)` for the page's retry `n` |
+
+Exhaustion fails as `baseline_read_retry_exhausted:<client code>` (the CLI
+prints the bounded prefix only). A failed or exhausted capture seals nothing,
+writes no `CAPTURING`, baseline-member or capture-created transition row and
+enables nothing; webhook `PENDING` rows received independently meanwhile stay
+legitimate. A later operator rerun is a fresh capture with a fresh `C`. Retry
+errors carry only the code, the normalised Retry-After seconds and the numeric
+throttle budget: never a token, header dump, body, cursor, GID or provider
+message. The existing receiver-before-`C` check plus the seal-time trigger
+remain the receiver proof; admission-processor retry semantics are unchanged.
 
 The admission processor re-reads each pending GID with read-only Admin GraphQL
 (`read_customers` only) and decides:

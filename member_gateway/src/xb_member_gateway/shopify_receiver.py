@@ -101,12 +101,15 @@ def compose_receiver(
         raise BootstrapError("bootstrap_rejected") from None
 
 
-def capture_baseline(composition: ReceiverComposition, *, now: Callable[[], datetime] | None = None) -> dict[str, Any]:
+def capture_baseline(composition: ReceiverComposition, *, now: Callable[[], datetime] | None = None, sleep: Callable[[int], None] | None = None) -> dict[str, Any]:
     """Cutover capture (#155 targeted G2): admission disabled; the receiver must
     already have recorded an HMAC-verified delivery for the exact bound shop and
     API version before ``C``; ``C`` is fixed from the gateway database clock
-    before page 1; nothing is persisted unless the historical baseline, the
-    transition PENDING rows and the seal commit together."""
+    once before page 1 and is never recomputed by bounded same-cursor read
+    retries (``sleep`` is injectable for tests; production uses
+    ``time.sleep``); nothing is persisted unless the historical baseline, the
+    transition PENDING rows and the seal commit together, so a failed or
+    exhausted capture leaves no seal and no capture-created transition row."""
 
     clock = now or (lambda: datetime.now(timezone.utc))
     repository = composition.repository
@@ -117,7 +120,7 @@ def capture_baseline(composition: ReceiverComposition, *, now: Callable[[], date
     if not repository.shopify_receiver_verified_before(shop_domain, api_version, cutover_at):
         raise BootstrapError("shopify_receiver_not_verified_before_cutover")
     try:
-        historical, transition = capture_member_mg_baseline(composition.client.baseline_page, cutover_at=cutover_at)
+        historical, transition = capture_member_mg_baseline(composition.client.baseline_page, cutover_at=cutover_at, sleep=sleep)
     except BaselineCaptureError as exc:
         raise BootstrapError(exc.code.split(":", 1)[0]) from None
     baseline = repository.store_shopify_baseline(

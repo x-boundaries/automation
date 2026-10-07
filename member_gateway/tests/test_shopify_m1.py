@@ -1,11 +1,16 @@
 """Shopify-authoritative M1 synthetic scenarios (#155 G3). Offline only."""
 
+import contextlib
+import email.message
+import io
 import json
 import unittest
+import urllib.error
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest import mock
 
+from xb_member_gateway import shopify_receiver
 from xb_member_gateway.bootstrap import BootstrapError
 from xb_member_gateway.models import JobState, ShopifyAdmissionState
 from xb_member_gateway.protected_payload import ProtectedPayloadCipher, ProtectedPayloadError, decode_key, envelope_digest
@@ -13,12 +18,18 @@ from xb_member_gateway.reconciliation import reconcile_uncertain_write
 from xb_member_gateway.repository import InMemoryRepository, SourceConflict
 from xb_member_gateway.results import build_shopify_member_record
 from xb_member_gateway.shopify_admission import (
+    BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE,
+    BASELINE_RETRY_MAX_SINGLE_WAIT_SECONDS,
+    BASELINE_RETRY_MAX_TOTAL_RETRIES,
+    BASELINE_RETRY_MAX_TOTAL_WAIT_SECONDS,
     BaselineCaptureError,
     ShopifyAdminClient,
     ShopifyReadError,
+    ShopifyThrottleStatus,
     baseline_digest,
     capture_member_mg_baseline,
     evaluate_profile,
+    parse_retry_after_seconds,
 )
 from xb_member_gateway.shopify_receiver import capture_baseline
 from xb_member_gateway.shopify_webhook import WEBHOOK_ROUTE, verify_shopify_hmac
@@ -166,7 +177,11 @@ class BaselineTests(unittest.TestCase):
         value = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, "isoformat") else created_at
         return {"id": gid, "createdAt": value, "tags": list(tags)}
 
+    def setUp(self):
+        self.sleeps = []
+
     def capture(self, reader, **kwargs):
+        kwargs.setdefault("sleep", self.sleeps.append)
         return capture_member_mg_baseline(reader, cutover_at=CUTOVER, **kwargs)
 
     def test_zero_one_and_multi_page_exhaustive_capture(self):
@@ -181,6 +196,7 @@ class BaselineTests(unittest.TestCase):
         )
         self.assertEqual(self.capture(reader), ((BASELINE_GID, SECOND_GID), ()))
         self.assertEqual(state["afters"], [None, "c1", "c2"])
+        self.assertEqual(self.sleeps, [], "an unthrottled capture never sleeps")
 
     def test_created_at_partitions_historical_and_transition_with_equality_post_cutover(self):
         reader, _ = self.pages(
@@ -233,6 +249,303 @@ class BaselineTests(unittest.TestCase):
         reader, _ = self.pages(*[self.page([], True, f"c{i}") for i in range(3)])
         with self.assertRaises(BaselineCaptureError):
             self.capture(reader, max_pages=3)
+        self.assertEqual(self.sleeps, [], "structural and non-retryable failures never sleep")
+
+
+THROTTLED_BODY = {"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}]}
+
+
+def throttled(requested=None, available=None, restore=None, maximum=None):
+    return ShopifyReadError("shopify_graphql_throttled", retryable=True, throttle=ShopifyThrottleStatus(requested, available, restore, maximum))
+
+
+class BaselineRetryTests(unittest.TestCase):
+    """#155 Web-directed G3: bounded same-cursor baseline read recovery."""
+
+    def setUp(self):
+        self.sleeps = []
+        self.afters = []
+
+    @staticmethod
+    def page(nodes, has_next, cursor=None):
+        return {"pageInfo": {"hasNextPage": has_next, "endCursor": cursor}, "nodes": nodes}
+
+    @staticmethod
+    def node(gid, created_at, tags=("member-mg",)):
+        return {"id": gid, "createdAt": created_at.isoformat().replace("+00:00", "Z"), "tags": list(tags)}
+
+    def clean_pages(self):
+        return [
+            self.page([self.node(BASELINE_GID, CUTOVER - timedelta(days=9)), self.node(SECOND_GID, CUTOVER + timedelta(seconds=1), tags=("vip",))], True, "c1"),
+            self.page([self.node("gid://shopify/Customer/9000000103", CUTOVER - timedelta(days=1)), self.node(NEW_GID, CUTOVER)], True, "c2"),
+            self.page([self.node("gid://shopify/Customer/9000000104", CUTOVER + timedelta(minutes=1))], False),
+        ]
+
+    def scripted(self, *outcomes):
+        """Reader returning/raising each outcome in order and recording ``after``."""
+        queue = list(outcomes)
+
+        def reader(after):
+            self.afters.append(after)
+            item = queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        reader.queue = queue
+        return reader
+
+    def capture(self, reader, **kwargs):
+        return capture_member_mg_baseline(reader, cutover_at=CUTOVER, sleep=self.sleeps.append, **kwargs)
+
+    def assert_fails(self, reader, code, sleeps):
+        with self.assertRaises(BaselineCaptureError) as raised:
+            self.capture(reader)
+        self.assertEqual(raised.exception.code, code)
+        self.assertEqual(self.sleeps, sleeps)
+        return raised.exception
+
+    def urlopen_client(self, *outcomes):
+        """Real urllib transport with only ``urlopen`` scripted; records bodies."""
+        self.bodies = []
+        queue = list(outcomes)
+        for item in queue:
+            if isinstance(item, urllib.error.HTTPError):
+                self.addCleanup(item.close)
+
+        def urlopen(request, timeout):
+            self.bodies.append(request.data)
+            item = queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({"data": {"customers": item}}).encode()
+            return response
+
+        patcher = mock.patch("urllib.request.urlopen", side_effect=urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return ShopifyAdminClient(shopify_config(), "synthetic-admin-token-value")
+
+    @staticmethod
+    def http_error(status, retry_after=None):
+        headers = email.message.Message()
+        if retry_after is not None:
+            headers["Retry-After"] = retry_after
+        return urllib.error.HTTPError("https://synthetic.invalid/", status, "synthetic", headers, None)
+
+    def test_middle_page_throttle_then_success_equals_clean_capture(self):
+        clean = self.capture(self.scripted(*self.clean_pages()))
+        self.assertEqual(self.sleeps, [])
+        self.afters = []
+        first, second, third = self.clean_pages()
+        result = self.capture(self.scripted(first, throttled(), throttled(), second, third))
+        self.assertEqual(result, clean)
+        self.assertEqual(result, ((BASELINE_GID, "gid://shopify/Customer/9000000103"), (NEW_GID, "gid://shopify/Customer/9000000104")))
+        self.assertEqual(self.afters, [None, "c1", "c1", "c1", "c2"], "every retry repeats the exact same cursor")
+        self.assertEqual(self.sleeps, [1, 2])
+
+    def test_persistent_throttle_exhausts_deterministically(self):
+        def run():
+            self.sleeps, self.afters = [], []
+            reader = self.scripted(self.page([], True, "c1"), *[throttled() for _ in range(BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE)], self.page([], False))
+            error = self.assert_fails(reader, "baseline_read_retry_exhausted:shopify_graphql_throttled", [1, 2, 4, 8, 16])
+            self.assertEqual(len(reader.queue), 1, "exactly six attempts of the failing page")
+            return error.code, list(self.sleeps), list(self.afters)
+
+        first = run()
+        self.assertEqual(first, run(), "identical code, sleep sequence and cursors")
+        self.assertEqual(first[2], [None] + ["c1"] * BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE)
+
+    def test_throttle_wait_uses_shopify_budget_metadata_and_bounds(self):
+        cases = (
+            (throttled(1002.0, 102.0, 100.0, 2000.0), 9),   # ceil(900/100)
+            (throttled(1002.0, 101.5, 100.0, 2000.0), 10),  # ceil(900.5/100): never rounded down
+            (throttled(10.0, 50.0, 100.0, 2000.0), 1),      # THROTTLED despite budget: minimum 1
+            (throttled(1000.0, 0.0, 1.0, 2000.0), 60),      # bounded to the single-wait maximum
+            (throttled(1000.0, None, 100.0, 2000.0), 1),    # incomplete -> fallback 2^0
+            (throttled(1000.0, 0.0, 0.0, 2000.0), 1),       # zero restore rate unusable -> fallback
+            (throttled(), 1),
+        )
+        for error, wait in cases:
+            self.sleeps = []
+            self.assertEqual(self.capture(self.scripted(error, self.page([], False))), ((), ()))
+            self.assertEqual(self.sleeps, [wait], error.throttle)
+
+    def test_client_preserves_only_validated_numeric_throttle_metadata(self):
+        def client(body):
+            return ShopifyAdminClient(shopify_config(), "synthetic-admin-token-value", transport=lambda *a: json.dumps(body).encode())
+
+        body = dict(THROTTLED_BODY, extensions={"cost": {"requestedQueryCost": 1002, "actualQueryCost": None, "throttleStatus": {"maximumAvailable": 2000.0, "currentlyAvailable": 102, "restoreRate": 100.0}}})
+        with self.assertRaises(ShopifyReadError) as raised:
+            client(body).baseline_page(None)
+        self.assertEqual(raised.exception.throttle, ShopifyThrottleStatus(1002.0, 102.0, 100.0, 2000.0))
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(self.capture(self.scripted(raised.exception, self.page([], False))), ((), ()))
+        self.assertEqual(self.sleeps, [9])
+        malformed = dict(THROTTLED_BODY, extensions={"cost": {"requestedQueryCost": "1002", "throttleStatus": {"maximumAvailable": float("inf"), "currentlyAvailable": -1, "restoreRate": True}}})
+        with self.assertRaises(ShopifyReadError) as raised:
+            client(malformed).baseline_page(None)
+        self.assertEqual(raised.exception.throttle, ShopifyThrottleStatus(None, None, None, None))
+        self.sleeps = []
+        self.assertEqual(self.capture(self.scripted(raised.exception, self.page([], False))), ((), ()))
+        self.assertEqual(self.sleeps, [1], "malformed metadata uses the deterministic fallback")
+        with self.assertRaises(ShopifyReadError) as raised:
+            client(THROTTLED_BODY).baseline_page(None)
+        self.assertIsNone(raised.exception.throttle)
+        huge = dict(THROTTLED_BODY, extensions={"cost": {"requestedQueryCost": 10 ** 400, "throttleStatus": {"maximumAvailable": 2000, "currentlyAvailable": 0, "restoreRate": 100}}})
+        with self.assertRaises(ShopifyReadError) as raised:
+            client(huge).baseline_page(None)
+        self.assertEqual(raised.exception.throttle, ShopifyThrottleStatus(None, 0.0, 100.0, 2000.0))
+        self.sleeps = []
+        self.assertEqual(self.capture(self.scripted(raised.exception, self.page([], False))), ((), ()))
+        self.assertEqual(self.sleeps, [1], "out-of-range metadata is unusable and uses the fallback")
+
+    def test_impossible_query_cost_fails_immediately_without_sleep(self):
+        self.assert_fails(self.scripted(throttled(2001.0, 2000.0, 100.0, 2000.0)), "baseline_query_cost_exceeds_bucket", [])
+        # Provable from requested/maximum alone, even when the rest is unusable.
+        self.assert_fails(self.scripted(throttled(5000.0, None, None, 1000.0)), "baseline_query_cost_exceeds_bucket", [])
+
+    def test_retry_after_parsing_rounds_up_and_rejects_unusable(self):
+        for value, expected in (("2.0", 2), ("2", 2), ("2.1", 3), (" 3 ", 3), ("0", 1), ("0.25", 1), ("60", 60), ("60.0", 60), ("60.01", 61), ("3600", 3600)):
+            self.assertEqual(parse_retry_after_seconds(value), expected, value)
+        for value in (None, "", "-1", "-0.5", "nan", "NaN", "inf", "Infinity", "1e3", "+2", ".5", "2.", "0x10", "Wed, 21 Oct 2015 07:28:00 GMT", 2, 2.0):
+            self.assertIsNone(parse_retry_after_seconds(value), value)
+
+    def test_http_429_retry_after_decimal_waits_exactly_rounded_up_seconds(self):
+        client = self.urlopen_client(self.http_error(429, "2.0"), self.page([], False))
+        self.assertEqual(self.capture(client.baseline_page), ((), ()))
+        self.assertEqual(self.sleeps, [2])
+        self.sleeps = []
+        client = self.urlopen_client(self.http_error(503, "1.2"), self.http_error(429, "nonsense"), self.page([], False))
+        self.assertEqual(self.capture(client.baseline_page), ((), ()))
+        self.assertEqual(self.sleeps, [2, 2], "503 Retry-After rounded up; an unusable header uses fallback 2^(2-1)")
+
+    def test_retry_after_above_bound_fails_immediately_without_sleep(self):
+        for value in ("61", "60.5", "3600"):
+            self.sleeps = []
+            client = self.urlopen_client(self.http_error(429, value), self.page([], False))
+            self.assert_fails(client.baseline_page, "baseline_read_retry_after_exceeds_bound", [])
+            self.assertEqual(len(self.bodies), 1)
+
+    def test_retryable_5xx_and_transport_then_success(self):
+        client = self.urlopen_client(self.http_error(502), self.http_error(500, "30"), self.http_error(504), self.page([self.node(BASELINE_GID, CUTOVER - timedelta(days=1))], False))
+        self.assertEqual(self.capture(client.baseline_page), ((BASELINE_GID,), ()))
+        self.assertEqual(self.sleeps, [1, 2, 4], "Retry-After is honoured only for 429/503")
+        self.sleeps = []
+        client = self.urlopen_client(urllib.error.URLError("synthetic"), TimeoutError(), self.page([], False))
+        self.assertEqual(self.capture(client.baseline_page), ((), ()))
+        self.assertEqual(self.sleeps, [1, 2])
+
+    def test_non_retryable_failures_are_immediate_without_sleep(self):
+        client = ShopifyAdminClient(shopify_config(), "token", transport=lambda *a: b'{"errors":[{"message":"bad","extensions":{"code":"BAD_REQUEST"}}]}')
+        self.assert_fails(client.baseline_page, "baseline_read_failed:shopify_graphql_error", [])
+        for status in (400, 401, 403, 404, 422):
+            self.assert_fails(self.urlopen_client(self.http_error(status, "1")).baseline_page, "baseline_read_failed:shopify_http_error", [])
+        for error in (ShopifyReadError("shopify_response_invalid"), ShopifyReadError("shopify_customer_identity_mismatch", retryable=True)):
+            self.assert_fails(self.scripted(error), f"baseline_read_failed:{error.code}", [])
+        self.assert_fails(ShopifyAdminClient(shopify_config(), "token", transport=lambda *a: b"not json").baseline_page, "baseline_read_failed:shopify_response_invalid", [])
+        self.assert_fails(ShopifyAdminClient(shopify_config(), "token", transport=lambda *a: b'{"data":{"customers":null}}').baseline_page, "baseline_read_failed:shopify_response_invalid", [])
+
+    def test_every_retry_repeats_the_same_after_and_transport_body(self):
+        bodies = []
+        first, second, third = self.clean_pages()
+        queue = [first, THROTTLED_BODY, THROTTLED_BODY, second, third]
+
+        def transport(url, body, headers, timeout):
+            bodies.append(body)
+            item = queue.pop(0)
+            return json.dumps(item if "errors" in item else {"data": {"customers": item}}).encode()
+
+        client = ShopifyAdminClient(shopify_config(), "synthetic-admin-token-value", transport=transport)
+        self.capture(client.baseline_page)
+        self.assertEqual([json.loads(body)["variables"]["after"] for body in bodies], [None, "c1", "c1", "c1", "c2"])
+        self.assertEqual(bodies[1], bodies[2])
+        self.assertEqual(bodies[2], bodies[3])
+        client = self.urlopen_client(first, self.http_error(429, "1"), self.http_error(502), second, third)
+        self.capture(client.baseline_page)
+        self.assertEqual(self.bodies[1:4], [bodies[1]] * 3, "real transport retries send byte-identical requests")
+
+    def test_malformed_successful_page_is_structural_failure_without_retry(self):
+        for page, code in (({"nodes": []}, "baseline_page_invalid"), (self.page([{"id": NEW_GID, "tags": ["member-mg"]}], False), "baseline_created_at_invalid"), (self.page([], True, None), "baseline_cursor_missing")):
+            self.sleeps = []
+            reader = self.scripted(throttled(), page, self.page([], False))
+            self.assert_fails(reader, code, [1])
+            self.assertEqual(len(reader.queue), 1, "the malformed page is never re-read")
+
+    def test_global_retry_cap_fails_before_exceeding_bound(self):
+        per_page = BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE - 1
+        pages = BASELINE_RETRY_MAX_TOTAL_RETRIES // per_page
+        outcomes = []
+        for index in range(pages):
+            outcomes.extend([throttled()] * per_page)
+            outcomes.append(self.page([], True, f"c{index + 1}"))
+        reader = self.scripted(*outcomes, throttled(), self.page([], False))
+        self.assert_fails(reader, "baseline_read_retry_exhausted:shopify_graphql_throttled", [1, 2, 4, 8, 16] * pages)
+        self.assertEqual(len(self.sleeps), BASELINE_RETRY_MAX_TOTAL_RETRIES)
+        self.assertEqual(len(reader.queue), 1)
+
+    def test_total_wait_budget_fails_before_exceeding_bound(self):
+        slow = throttled(1000.0, 0.0, 1.0, 2000.0)  # 60 seconds per retry
+        per_page = BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE - 1
+        pages = BASELINE_RETRY_MAX_TOTAL_WAIT_SECONDS // (BASELINE_RETRY_MAX_SINGLE_WAIT_SECONDS * per_page)
+        outcomes = []
+        for index in range(pages):
+            outcomes.extend([slow] * per_page)
+            outcomes.append(self.page([], True, f"c{index + 1}"))
+        self.assert_fails(self.scripted(*outcomes, slow), "baseline_read_retry_exhausted:shopify_graphql_throttled", [60] * 15)
+        self.assertEqual(sum(self.sleeps), BASELINE_RETRY_MAX_TOTAL_WAIT_SECONDS)
+        # Exactly the budget is usable: the same waits ending in a final page succeed.
+        self.sleeps = []
+        outcomes[-1] = self.page([], False)
+        self.assertEqual(self.capture(self.scripted(*outcomes)), ((), ()))
+        self.assertEqual(sum(self.sleeps), BASELINE_RETRY_MAX_TOTAL_WAIT_SECONDS)
+
+    def test_retry_errors_carry_no_secret_cursor_gid_or_message(self):
+        token, cursor = "synthetic-admin-token-value", "cursor-SECRET-c1"
+        body = {
+            "errors": [{"message": f"Throttled {NEW_GID} {SYNTHETIC_EMAIL}", "extensions": {"code": "THROTTLED"}}],
+            "extensions": {"cost": {"requestedQueryCost": 10, "throttleStatus": {"maximumAvailable": 2000, "currentlyAvailable": 1, "restoreRate": 100}}},
+        }
+        queue = [self.page([self.node(NEW_GID, CUTOVER)], True, cursor)] + [body] * BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE
+        errors = []
+
+        def transport(url, raw, headers, timeout):
+            item = queue.pop(0)
+            return json.dumps(item if "errors" in item else {"data": {"customers": item}}).encode()
+
+        client = ShopifyAdminClient(shopify_config(), token, transport=transport)
+
+        def reader(after):
+            try:
+                return client.baseline_page(after)
+            except ShopifyReadError as exc:
+                errors.append(exc)
+                raise
+
+        with self.assertRaises(BaselineCaptureError) as raised:
+            self.capture(reader)
+        self.assertEqual(len(errors), BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE)
+        rendered = " ".join([repr(raised.exception), str(raised.exception), raised.exception.code] + [repr(e) + str(e) + repr(e.throttle) for e in errors])
+        for forbidden in (token, cursor, NEW_GID, "Customer/", SYNTHETIC_EMAIL, "Throttled "):
+            self.assertNotIn(forbidden, rendered)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
+
+        def always_throttled(after):
+            raise throttled()
+
+        # Operator surface: the CLI prints only the bounded code; production sleep is time.sleep.
+        repository = InMemoryRepository()
+        ShopifyHarness(repository, baseline=None).deliver_receiver_proof()
+        repository.shopify_cutover_now = lambda: CUTOVER
+        composition = SimpleNamespace(repository=repository, client=SimpleNamespace(baseline_page=always_throttled), shopify_config=SimpleNamespace(shop_domain=SHOP, api_version=API_VERSION))
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with mock.patch.object(shopify_receiver, "compose_receiver", return_value=composition), mock.patch("time.sleep") as fake_sleep, contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+            self.assertEqual(shopify_receiver.main(["capture-baseline", "--config", "gw.json", "--shopify-config", "shop.json"]), 2)
+        self.assertEqual((stderr.getvalue(), stdout.getvalue()), ("shopify_receiver_failed:baseline_read_retry_exhausted\n", ""))
+        self.assertEqual([call.args[0] for call in fake_sleep.call_args_list], [1, 2, 4, 8, 16])
+        self.assertIsNone(repository.get_shopify_baseline())
 
     def test_seal_count_digest_readback_and_admission_gate(self):
         repository = InMemoryRepository()
@@ -748,6 +1061,8 @@ class CutoverTests(unittest.TestCase):
         self.cutover = CUTOVER
         self.repository.shopify_cutover_now = lambda: self.cutover
         self.pages = []
+        self.afters = []
+        self.sleeps = []
 
     def node(self, gid, created_at, tags=("member-mg",)):
         value = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, "isoformat") else created_at
@@ -757,16 +1072,34 @@ class CutoverTests(unittest.TestCase):
         self.pages = [{"pageInfo": {"hasNextPage": index < len(pages) - 1, "endCursor": f"c{index + 1}" if index < len(pages) - 1 else None}, "nodes": list(nodes)} for index, nodes in enumerate(pages)]
 
     def baseline_page(self, after):
+        self.afters.append(after)
         if isinstance(self.pages, Exception):
             raise self.pages
-        return self.pages.pop(0)
+        item = self.pages.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
-    def capture(self):
+    def capture(self, sleep=None):
         composition = SimpleNamespace(
             repository=self.repository, client=SimpleNamespace(baseline_page=self.baseline_page),
             shopify_config=SimpleNamespace(shop_domain=SHOP, api_version=API_VERSION),
         )
-        return capture_baseline(composition, now=lambda: self.cutover + timedelta(minutes=1))
+        return capture_baseline(composition, now=lambda: self.cutover + timedelta(minutes=1), sleep=sleep or self.sleeps.append)
+
+    def count_cutover_reads(self):
+        reads = []
+        clock = self.repository.shopify_cutover_now
+
+        def counted():
+            reads.append(clock())
+            return reads[-1]
+
+        self.repository.shopify_cutover_now = counted
+        return reads
+
+    def admission_rows(self):
+        return {gid: (row.state, row.job_id, row.reason_code) for gid, row in self.repository._shopify_admissions.items()}
 
     def enable(self, sealed):
         self.repository.enable_shopify_admission(sealed["baseline_id"], "synthetic-approval-155-g3-a2")
@@ -894,8 +1227,10 @@ class CutoverTests(unittest.TestCase):
         self.harness.deliver_receiver_proof()
         between = "gid://shopify/Customer/9000000105"
         self.pages = ShopifyReadError("shopify_transport_failed", retryable=True)
-        with self.assertRaises(BootstrapError):
+        with self.assertRaises(BootstrapError) as raised:
             self.capture()
+        self.assertEqual(raised.exception.code, "baseline_read_retry_exhausted")
+        self.assertEqual(self.sleeps, [1, 2, 4, 8, 16])
         self.assertIsNone(self.repository.get_shopify_baseline())
         self.assertIsNone(self.repository.shopify_admission_gate())
         # Restart from scratch: a fresh C2 > C1; a member created between the
@@ -909,6 +1244,65 @@ class CutoverTests(unittest.TestCase):
         self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.PENDING)
         self.enable(sealed)
         self.assertEqual(self.repository.shopify_admission_gate()[1], CUTOVER + timedelta(minutes=30))
+
+    def test_throttled_capture_seals_same_state_as_clean_capture_with_one_cutover(self):
+        pages = ([self.node(BASELINE_GID, CUTOVER - timedelta(days=4))], [self.node(NEW_GID, CUTOVER + timedelta(seconds=5)), self.node(SECOND_GID, CUTOVER - timedelta(days=1))])
+        saved, self.repository = self.repository, InMemoryRepository()
+        ShopifyHarness(self.repository, baseline=None).deliver_receiver_proof()
+        self.repository.shopify_cutover_now = lambda: self.cutover
+        self.set_pages(*pages)
+        clean = self.capture()
+        clean_baseline, clean_rows = self.repository.get_shopify_baseline(), self.admission_rows()
+        self.repository, self.afters = saved, []
+        self.harness.deliver_receiver_proof()
+        reads = self.count_cutover_reads()
+        self.set_pages(*pages)
+        self.pages[1:1] = [ShopifyReadError("shopify_http_error", retryable=True, retry_after_seconds=2), ShopifyReadError("shopify_graphql_throttled", retryable=True)]
+        sealed = self.capture()
+        self.assertEqual(self.afters, [None, "c1", "c1", "c1"])
+        self.assertEqual(self.sleeps, [2, 2])
+        self.assertEqual(reads, [CUTOVER], "C is read exactly once and never recomputed by retries")
+        baseline = self.repository.get_shopify_baseline()
+        self.assertEqual(sealed, dict(clean, baseline_id=sealed["baseline_id"]))
+        self.assertEqual((baseline.member_count, baseline.member_digest, baseline.capture_started_at), (clean_baseline.member_count, clean_baseline.member_digest, clean_baseline.capture_started_at))
+        self.assertEqual(baseline.capture_started_at, CUTOVER.isoformat().replace("+00:00", "Z"))
+        self.assertEqual(self.repository._shopify_baseline_members[baseline.baseline_id], frozenset({BASELINE_GID, SECOND_GID}))
+        self.assertEqual(self.admission_rows(), clean_rows)
+
+    def test_exhausted_capture_has_zero_durable_effect_and_rerun_gets_fresh_cutover(self):
+        self.harness.deliver_receiver_proof()
+        reads = self.count_cutover_reads()
+        during_sleep = []
+
+        def sleep(seconds):
+            # A webhook independently received during a retry wait is a
+            # legitimate PENDING row; a failed capture never rolls it back.
+            during_sleep.append(seconds)
+            if len(during_sleep) == 1:
+                self.assertEqual(self.harness.deliver(SECOND_GID, webhook_id="wh-00000000-1301").status, 200)
+
+        self.set_pages([self.node(BASELINE_GID, CUTOVER - timedelta(days=4))], [self.node(NEW_GID, CUTOVER + timedelta(seconds=5))])
+        self.pages[1:1] = [ShopifyReadError("shopify_graphql_throttled", retryable=True)] * BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE
+        with self.assertRaises(BootstrapError) as raised:
+            self.capture(sleep=sleep)
+        self.assertEqual(raised.exception.code, "baseline_read_retry_exhausted")
+        self.assertEqual(during_sleep, [1, 2, 4, 8, 16])
+        self.assertIsNone(self.repository.get_shopify_baseline())
+        self.assertEqual(self.repository._shopify_baseline_members, {})
+        self.assertIsNone(self.repository.shopify_admission_gate())
+        self.assertEqual(set(self.admission_rows()), {PROOF_GID, SECOND_GID}, "no capture-created baseline or transition row")
+        webhook_row = self.repository.get_shopify_admission(SECOND_GID)
+        self.assertEqual(webhook_row.state, ShopifyAdmissionState.PENDING)
+        # Fresh operator rerun: a fresh C2 is read and the capture seals.
+        self.cutover = CUTOVER + timedelta(minutes=5)
+        self.set_pages([self.node(BASELINE_GID, CUTOVER - timedelta(days=4))], [self.node(NEW_GID, CUTOVER + timedelta(minutes=6)), self.node(SECOND_GID, CUTOVER + timedelta(minutes=7))])
+        sealed = self.capture()
+        self.assertEqual(reads, [CUTOVER, CUTOVER + timedelta(minutes=5)])
+        self.assertEqual(self.repository.get_shopify_baseline().capture_started_at, (CUTOVER + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"))
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"]), (1, 2))
+        self.assertEqual(self.repository.get_shopify_admission(SECOND_GID), webhook_row, "the webhook row survives the seal unchanged")
+        self.assertEqual(self.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.PENDING)
+        assert_no_pii(self, self.repository.snapshot_state())
 
 
 class FormsIsolationTests(unittest.TestCase):

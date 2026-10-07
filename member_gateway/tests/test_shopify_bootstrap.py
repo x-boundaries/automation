@@ -10,6 +10,7 @@ from xb_member_gateway.bootstrap import BootstrapError, compose_gateway
 from xb_member_gateway.config import ConfigError, ShopifyM1Config, load_shopify_config
 from xb_member_gateway.models import ShopifyAdmissionState, ShopifyWebhookReceipt
 from xb_member_gateway.repository import InMemoryRepository
+from xb_member_gateway.shopify_admission import ShopifyAdminClient
 from xb_member_gateway.shopify_receiver import capture_baseline, compose_receiver
 
 try:
@@ -134,6 +135,30 @@ class CompositionTests(unittest.TestCase):
         self.assertEqual(set(sealed), {"baseline_id", "member_count", "member_digest", "state", "transition_pending_count"})
         self.assertEqual(factory.repository.get_shopify_admission(NEW_GID).state, ShopifyAdmissionState.PENDING)
         self.assertEqual(factory.repository.get_shopify_baseline().capture_started_at[-1], "Z")
+
+    def test_composed_admin_client_capture_retries_same_cursor_then_seals(self):
+        pages = FakeClient(None, "x").pages
+        throttled = {"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
+                     "extensions": {"cost": {"requestedQueryCost": 502, "throttleStatus": {"maximumAvailable": 1000.0, "currentlyAvailable": 2.0, "restoreRate": 50.0}}}}
+        responses = [{"data": {"customers": pages[0]}}, throttled, {"data": {"customers": pages[1]}}]
+        bodies, sleeps = [], []
+
+        def transport(url, body, headers, timeout):
+            bodies.append(json.loads(body))
+            return json.dumps(responses.pop(0)).encode()
+
+        factory = MemoryRepositoryFactory()
+        composition = compose_receiver(
+            self.write("gw.json", config_value()), self.write("shop.json", shopify_value()), environment=self.receiver_env(),
+            repository_factory=factory, client_factory=lambda config, token: ShopifyAdminClient(config, token, transport=transport),
+        )
+        proof = ShopifyWebhookReceipt("wh-00000000-0900", "customers/update", SHOP, "2026-10", "evt-0900", None, "gid://shopify/Customer/9000000900")
+        factory.repository.record_shopify_webhook(proof, now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        sealed = capture_baseline(composition, sleep=sleeps.append)
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"], sealed["state"]), (1, 1, "SEALED"))
+        self.assertEqual(sleeps, [10])  # ceil((502 - 2) / 50) from Shopify's own throttleStatus
+        self.assertEqual([body["variables"]["after"] for body in bodies], [None, "c1", "c1"])
+        self.assertEqual(bodies[1], bodies[2])
 
     def test_receiver_rejects_public_bind_shared_secrets_and_disabled_config(self):
         gw = self.write("gw.json", config_value())

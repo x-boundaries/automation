@@ -11,10 +11,11 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
+from xb_member_gateway.bootstrap import BootstrapError
 from xb_member_gateway.config import GatewayConfig
 from xb_member_gateway.models import JobState, ShopifyAdmissionState
 from xb_member_gateway.repository import PostgresRepository, RepositoryError, SourceConflict
-from xb_member_gateway.shopify_admission import baseline_digest
+from xb_member_gateway.shopify_admission import ShopifyReadError, baseline_digest
 from xb_member_gateway.shopify_receiver import capture_baseline
 
 try:
@@ -162,6 +163,63 @@ class RealPostgresShopifyTests(RealPostgresTestCase):
         conflict = self.repository.get_shopify_admission(BASELINE_GID)
         self.assertEqual((conflict.state, conflict.reason_code), (ShopifyAdmissionState.MANUAL_REVIEW, "baseline_created_at_conflict"))
         self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.jobs WHERE source_system='shopify'"), [(1,)])
+
+    def test_exhausted_capture_leaves_zero_durable_effect_and_fresh_cutover_rerun_seals(self):
+        harness = self.harness(baseline=None)
+        harness.deliver_receiver_proof()
+        reads = []
+        clock = self.repository.shopify_cutover_now
+
+        def counted_cutover():
+            reads.append(clock())
+            return reads[-1]
+
+        self.repository.shopify_cutover_now = counted_cutover
+        first_page = {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [{"id": BASELINE_GID, "createdAt": "2020-01-01T00:00:00Z", "tags": ["member-mg"]}]}
+        outcomes = [first_page] + [ShopifyReadError("shopify_graphql_throttled", retryable=True)] * 6
+        afters, sleeps = [], []
+
+        def failing_page(after):
+            afters.append(after)
+            item = outcomes.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:  # an independent webhook arrives during the wait
+                self.assertEqual(harness.deliver(SECOND_GID, webhook_id="wh-00000000-0630").status, 200)
+
+        binding = SimpleNamespace(shop_domain=SHOP, api_version=API_VERSION)
+        with self.assertRaises(BootstrapError) as raised:
+            capture_baseline(SimpleNamespace(repository=self.repository, client=SimpleNamespace(baseline_page=failing_page), shopify_config=binding), sleep=sleep)
+        self.assertEqual(raised.exception.code, "baseline_read_retry_exhausted")
+        self.assertEqual((afters, sleeps), ([None] + ["c1"] * 6, [1, 2, 4, 8, 16]))
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.shopify_cutover_baselines"), [(0,)])
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.shopify_baseline_members"), [(0,)])
+        admissions = "SELECT customer_gid,state,job_id,reason_code,state_version FROM xb_member_gateway.shopify_member_admissions ORDER BY customer_gid"
+        before = self.sql(admissions)
+        self.assertEqual([(row[0], row[1]) for row in before], [(SECOND_GID, "PENDING"), (PROOF_GID, "PENDING")])
+        self.assertIsNone(self.repository.shopify_admission_gate())
+        # Fresh operator rerun on the database clock: a fresh C is read and the capture seals.
+        pages = [first_page, {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+            {"id": NEW_GID, "createdAt": "2099-01-01T00:00:00Z", "tags": ["member-mg"]},
+            {"id": SECOND_GID, "createdAt": "2099-01-01T00:00:00Z", "tags": ["member-mg"]},
+        ]}]
+        sealed = capture_baseline(SimpleNamespace(repository=self.repository, client=SimpleNamespace(baseline_page=lambda after: pages.pop(0)), shopify_config=binding), sleep=sleeps.append)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(self.sql("SELECT capture_started_at FROM xb_member_gateway.shopify_cutover_baselines"), [(reads[1],)])
+        self.assertEqual((sealed["member_count"], sealed["transition_pending_count"], sealed["state"]), (1, 2, "SEALED"))
+        after = self.sql(admissions)
+        self.assertEqual([row for row in after if row[0] == SECOND_GID], [row for row in before if row[0] == SECOND_GID], "the webhook row survives the seal unchanged")
+        self.assertEqual([(row[0], row[1]) for row in after], [(NEW_GID, "PENDING"), (SECOND_GID, "PENDING"), (PROOF_GID, "PENDING")])
+        self.assertTrue(self.repository.verify_shopify_baseline(sealed["baseline_id"]))
+        dump = self.full_dump()
+        for value in PII:
+            self.assertNotIn(value, dump)
+        self.assertNotIn('"c1"', dump, "cursors are never persisted")
 
     def test_gateway_held_member_no_collision_is_bounded_in_database(self):
         harness = self.harness()

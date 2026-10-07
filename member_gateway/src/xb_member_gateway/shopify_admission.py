@@ -24,19 +24,28 @@ Admission law (M1 = new canonical ``member-mg`` create only):
 
 Only GIDs, counts, digests and PII-free codes are ever persisted by this
 module; the create payload leaves it only as an AEAD envelope.
+
+Baseline transient-read recovery (#155 Web-directed G3 continuation): the
+capture retries only retryable reads (GraphQL ``THROTTLED``, HTTP
+429/500/502/503/504, transport failure) of the exact same page/cursor within
+deterministic per-page, global and wait budgets; ``C`` is never recomputed and
+exhaustion fails closed before anything is persisted.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
 
 from .canonical import CanonicalizationError, canonical_phone, normalize_email, normalize_spaces
@@ -48,6 +57,15 @@ MEMBER_TAG = "member-mg"
 REVIEW_TAGS = ("member-legacy", "XB Member")
 BASELINE_PAGE_SIZE = 250
 BASELINE_MAX_PAGES = 4000
+# Bounded same-cursor recovery of retryable baseline page reads.
+BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE = 6
+BASELINE_RETRY_MAX_TOTAL_RETRIES = 60
+BASELINE_RETRY_MAX_TOTAL_WAIT_SECONDS = 900
+BASELINE_RETRY_MAX_SINGLE_WAIT_SECONDS = 60
+BASELINE_RETRY_MIN_WAIT_SECONDS = 1
+BASELINE_RETRYABLE_READ_CODES = frozenset({"shopify_graphql_throttled", "shopify_http_error", "shopify_transport_failed"})
+_RETRY_AFTER_STATUSES = frozenset({429, 503})
+_RETRY_AFTER_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # RFC 3339 date-time with an explicit ``Z`` or numeric offset; no naive,
 # date-only or basic-format value is ever trusted as a creation instant.
@@ -75,11 +93,83 @@ BASELINE_QUERY = """query XbShopifyBaselinePage($first: Int!, $after: String) {
 }"""
 
 
+@dataclass(frozen=True, slots=True)
+class ShopifyThrottleStatus:
+    """Numeric GraphQL cost budget only (``extensions.cost``); each field is
+    ``None`` when absent, non-numeric, non-finite or negative."""
+
+    requested_cost: float | None = None
+    currently_available: float | None = None
+    restore_rate: float | None = None
+    maximum_available: float | None = None
+
+
 class ShopifyReadError(RuntimeError):
-    def __init__(self, code: str, *, retryable: bool = False):
+    """Bounded read failure. Only the code, the retryable flag, a normalised
+    Retry-After (whole seconds) and numeric throttle budget may be carried;
+    no token, header, body, cursor, GID or provider message."""
+
+    def __init__(self, code: str, *, retryable: bool = False, retry_after_seconds: int | None = None, throttle: ShopifyThrottleStatus | None = None):
         self.code = code
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        self.throttle = throttle
         super().__init__(code)
+
+    def __repr__(self) -> str:
+        return f"ShopifyReadError(code={self.code!r}, retryable={self.retryable!r})"
+
+
+def _budget_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an integer beyond float range is unusable metadata
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def parse_throttle_status(response: Mapping[str, Any]) -> ShopifyThrottleStatus | None:
+    """Validated top-level ``extensions.cost`` throttle budget, if present."""
+
+    extensions = response.get("extensions")
+    cost = extensions.get("cost") if isinstance(extensions, Mapping) else None
+    if not isinstance(cost, Mapping):
+        return None
+    status = cost.get("throttleStatus")
+    status = status if isinstance(status, Mapping) else {}
+    return ShopifyThrottleStatus(
+        requested_cost=_budget_number(cost.get("requestedQueryCost")),
+        currently_available=_budget_number(status.get("currentlyAvailable")),
+        restore_rate=_budget_number(status.get("restoreRate")),
+        maximum_available=_budget_number(status.get("maximumAvailable")),
+    )
+
+
+def parse_retry_after_seconds(value: Any) -> int | None:
+    """Shopify ``Retry-After`` is numeric seconds (e.g. ``2.0``): a finite
+    non-negative integer/decimal is rounded UP to whole seconds (minimum 1).
+    Anything else (date, negative, NaN/inf, garbage) is unusable -> ``None``."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not _RETRY_AFTER_RE.fullmatch(text):
+        return None
+    try:
+        seconds = int(Decimal(text).to_integral_value(rounding=ROUND_CEILING))
+    except (InvalidOperation, ValueError):
+        return None
+    return max(seconds, BASELINE_RETRY_MIN_WAIT_SECONDS)
+
+
+def http_read_error(status: int, retry_after: Any = None) -> ShopifyReadError:
+    """Classify an HTTP failure; Retry-After is kept only for 429/503."""
+
+    retryable = status in {429, 500, 502, 503, 504}
+    seconds = parse_retry_after_seconds(retry_after) if status in _RETRY_AFTER_STATUSES else None
+    return ShopifyReadError("shopify_http_error", retryable=retryable, retry_after_seconds=seconds)
 
 
 class BaselineCaptureError(RuntimeError):
@@ -118,7 +208,8 @@ class ShopifyAdminClient:
             with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https URL
                 return response.read(4_194_304)
         except urllib.error.HTTPError as exc:
-            raise ShopifyReadError("shopify_http_error", retryable=exc.code in {429, 500, 502, 503, 504}) from None
+            headers = exc.headers
+            raise http_read_error(exc.code, headers.get("Retry-After") if headers is not None else None) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise ShopifyReadError("shopify_transport_failed", retryable=True) from None
 
@@ -138,7 +229,9 @@ class ShopifyAdminClient:
                 isinstance(item, Mapping) and isinstance(item.get("extensions"), Mapping) and item["extensions"].get("code") == "THROTTLED"
                 for item in errors
             )
-            raise ShopifyReadError("shopify_graphql_throttled" if throttled else "shopify_graphql_error", retryable=throttled)
+            if throttled:
+                raise ShopifyReadError("shopify_graphql_throttled", retryable=True, throttle=parse_throttle_status(value))
+            raise ShopifyReadError("shopify_graphql_error")
         data = value.get("data")
         if not isinstance(data, Mapping):
             raise ShopifyReadError("shopify_response_invalid")
@@ -188,7 +281,33 @@ def parse_created_at(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, Any]], *, cutover_at: datetime, max_pages: int = BASELINE_MAX_PAGES) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def baseline_retry_wait_seconds(error: ShopifyReadError, retry_number: int) -> int:
+    """Deterministic wait (whole seconds, no jitter) before same-cursor retry
+    ``retry_number`` (1-based, per page) of a retryable read.
+
+    Raises ``BaselineCaptureError`` for an impossible query cost or a
+    Retry-After above the single-wait bound; never rounds a provider delay down.
+    """
+
+    throttle = error.throttle
+    if throttle is not None and throttle.requested_cost is not None and throttle.maximum_available is not None and throttle.requested_cost > throttle.maximum_available:
+        raise BaselineCaptureError("baseline_query_cost_exceeds_bucket")
+    if error.retry_after_seconds is not None:
+        if error.retry_after_seconds > BASELINE_RETRY_MAX_SINGLE_WAIT_SECONDS:
+            raise BaselineCaptureError("baseline_read_retry_after_exceeds_bound")
+        return max(error.retry_after_seconds, BASELINE_RETRY_MIN_WAIT_SECONDS)
+    if (
+        error.code == "shopify_graphql_throttled" and throttle is not None
+        and None not in (throttle.requested_cost, throttle.currently_available, throttle.restore_rate, throttle.maximum_available)
+        and throttle.restore_rate > 0
+    ):
+        deficit = throttle.requested_cost - throttle.currently_available
+        wait = math.ceil(deficit / throttle.restore_rate) if deficit > 0 else BASELINE_RETRY_MIN_WAIT_SECONDS
+        return min(max(wait, BASELINE_RETRY_MIN_WAIT_SECONDS), BASELINE_RETRY_MAX_SINGLE_WAIT_SECONDS)
+    return min(2 ** (retry_number - 1), BASELINE_RETRY_MAX_SINGLE_WAIT_SECONDS)
+
+
+def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, Any]], *, cutover_at: datetime, max_pages: int = BASELINE_MAX_PAGES, sleep: Callable[[int], None] | None = None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Exhaustive cursor scan of every customer until ``hasNextPage`` is false.
 
     The scan reads all customers (not a search query, whose index may lag) and
@@ -196,24 +315,49 @@ def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, 
     fixed cutover ``C``: ``(historical, transition)`` where historical is
     ``createdAt < C`` and transition is ``createdAt >= C`` (equality is
     post-cutover). Any malformed page, missing/repeated cursor, duplicate GID,
-    missing/malformed/offset-less ``createdAt``, read error or page-limit
-    overrun fails closed and yields nothing, so a partial capture can never be
-    sealed. ``createdAt`` is used only here and is never returned or stored.
+    missing/malformed/offset-less ``createdAt``, non-retryable read error or
+    page-limit overrun fails closed and yields nothing, so a partial capture
+    can never be sealed. ``createdAt`` is used only here and is never returned
+    or stored.
+
+    A retryable read (``BASELINE_RETRYABLE_READ_CODES``) is retried with the
+    exact same ``after`` within ``BASELINE_RETRY_*`` budgets; every budget is
+    checked before sleeping and exhaustion fails closed with
+    ``baseline_read_retry_exhausted:<client code>``. A page contributes data
+    only after it is accepted whole; ``C`` is never recomputed here.
     """
 
     if not isinstance(cutover_at, datetime) or cutover_at.tzinfo is None:
         raise BaselineCaptureError("baseline_cutover_invalid")
     cutover = cutover_at.astimezone(timezone.utc)
+    pause = sleep or time.sleep
     after: str | None = None
     seen_cursors: set[str] = set()
     seen_ids: set[str] = set()
     historical: list[str] = []
     transition: list[str] = []
+    total_retries = 0
+    total_wait = 0
     for _ in range(max_pages):
-        try:
-            page = page_reader(after)
-        except ShopifyReadError as exc:
-            raise BaselineCaptureError(f"baseline_read_failed:{exc.code}") from None
+        page_attempts = 0
+        while True:
+            page_attempts += 1
+            try:
+                page = page_reader(after)
+                break
+            except ShopifyReadError as exc:
+                if not (exc.retryable and exc.code in BASELINE_RETRYABLE_READ_CODES):
+                    raise BaselineCaptureError(f"baseline_read_failed:{exc.code}") from None
+                wait = baseline_retry_wait_seconds(exc, page_attempts)
+                if (
+                    page_attempts >= BASELINE_RETRY_MAX_ATTEMPTS_PER_PAGE
+                    or total_retries >= BASELINE_RETRY_MAX_TOTAL_RETRIES
+                    or total_wait + wait > BASELINE_RETRY_MAX_TOTAL_WAIT_SECONDS
+                ):
+                    raise BaselineCaptureError(f"baseline_read_retry_exhausted:{exc.code}") from None
+            pause(wait)
+            total_retries += 1
+            total_wait += wait
         if not isinstance(page, Mapping):
             raise BaselineCaptureError("baseline_page_invalid")
         info, nodes = page.get("pageInfo"), page.get("nodes")
@@ -222,27 +366,35 @@ def capture_member_mg_baseline(page_reader: Callable[[str | None], Mapping[str, 
         has_next = info.get("hasNextPage")
         if not isinstance(has_next, bool):
             raise BaselineCaptureError("baseline_page_info_invalid")
+        page_ids: set[str] = set()
+        page_historical: list[str] = []
+        page_transition: list[str] = []
         for node in nodes:
             if not isinstance(node, Mapping):
                 raise BaselineCaptureError("baseline_node_invalid")
             gid, tags = node.get("id"), node.get("tags")
             if not isinstance(gid, str) or not GID_RE.fullmatch(gid) or not isinstance(tags, list):
                 raise BaselineCaptureError("baseline_node_invalid")
-            if gid in seen_ids:
+            if gid in seen_ids or gid in page_ids:
                 raise BaselineCaptureError("baseline_duplicate_gid")
-            seen_ids.add(gid)
+            page_ids.add(gid)
             created_at = parse_created_at(node.get("createdAt"))
             if created_at is None:
                 raise BaselineCaptureError("baseline_created_at_invalid")
             if _has_tag(tags, MEMBER_TAG):
-                (historical if created_at < cutover else transition).append(gid)
+                (page_historical if created_at < cutover else page_transition).append(gid)
+        cursor = info.get("endCursor")
+        if has_next:
+            if not isinstance(cursor, str) or not cursor or len(cursor) > 1024:
+                raise BaselineCaptureError("baseline_cursor_missing")
+            if cursor in seen_cursors or cursor == after:
+                raise BaselineCaptureError("baseline_cursor_repeated")
+        # The page is structurally accepted whole; only now does it contribute.
+        seen_ids.update(page_ids)
+        historical.extend(page_historical)
+        transition.extend(page_transition)
         if not has_next:
             return tuple(sorted(historical)), tuple(sorted(transition))
-        cursor = info.get("endCursor")
-        if not isinstance(cursor, str) or not cursor or len(cursor) > 1024:
-            raise BaselineCaptureError("baseline_cursor_missing")
-        if cursor in seen_cursors or cursor == after:
-            raise BaselineCaptureError("baseline_cursor_repeated")
         seen_cursors.add(cursor)
         after = cursor
     raise BaselineCaptureError("baseline_page_limit_exceeded")
