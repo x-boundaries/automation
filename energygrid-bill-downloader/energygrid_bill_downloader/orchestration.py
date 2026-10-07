@@ -63,9 +63,10 @@ ALLOWED_COMMAND_LINES = (
 )
 BUSINESS_OUTCOMES = ("NO_WORK", "COMPLETED", "HOLD", "SOURCE_FAILURE_RETRYABLE", "SOURCE_FAILURE",
                      "DRIVE_UNCERTAIN", "DRIVE_CONFLICT", "EMAIL_UNCERTAIN", "INCOMPLETE")
-# Most severe first; mirrors the supervisor exit-code severity order.
-OUTCOME_SEVERITY = ("DRIVE_CONFLICT", "EMAIL_UNCERTAIN", "DRIVE_UNCERTAIN", "SOURCE_FAILURE", "HOLD",
-                    "SOURCE_FAILURE_RETRYABLE", "INCOMPLETE", "COMPLETED", "NO_WORK")
+# Most severe first; mirrors the supervisor exit-code severity order
+# 89 > 85 > 86 > 84 > 83 > 81 > 82 > 0, so INCOMPLETE is never hidden by a HOLD.
+OUTCOME_SEVERITY = ("INCOMPLETE", "DRIVE_CONFLICT", "EMAIL_UNCERTAIN", "DRIVE_UNCERTAIN", "SOURCE_FAILURE", "HOLD",
+                    "SOURCE_FAILURE_RETRYABLE", "COMPLETED", "NO_WORK")
 
 
 class CoreRefusal(Exception):
@@ -318,7 +319,9 @@ def compute_status(config, state: StateV3Store, run_id: str) -> dict[str, Any]:
     business = next(item for item in OUTCOME_SEVERITY if item in outcomes)
     terminal = run is not None and all(contexts[stream]["action"] in {"NOTHING_TO_DO", "HOLD"} for stream in STREAMS)
     if not terminal:
-        business = "INCOMPLETE" if business in {"COMPLETED", "NO_WORK"} else business
+        # Any planned step left (including an open Drive or email dispatch) means the
+        # run is unfinished, whatever the other stream holds on.
+        business = "INCOMPLETE"
     return {
         "schema": STATUS_SCHEMA,
         "run": {

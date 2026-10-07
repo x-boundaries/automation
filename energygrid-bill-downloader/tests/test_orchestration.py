@@ -617,5 +617,100 @@ class CommandContractTests(unittest.TestCase):
         self.assertEqual(("INCOMPLETE", False), (status["business_outcome"], status["terminal"]))
 
 
+class StatusPrecedenceTests(unittest.TestCase):
+    """#226 G3 M1: an unfinished run is INCOMPLETE, never the ordinary production
+    HOLD that an unbound Tenant Bill stream produces every day."""
+
+    def production_harness(self) -> CoreHarness:
+        # Production shape: Tenant Bill stays UNBOUND, so it HOLDs on every run.
+        return CoreHarness(self, bound=("EB_BILL",), drive_bound=("EB_BILL",))
+
+    def assert_tenant_unbound_hold(self, status: dict) -> None:
+        tenant = status["streams"]["TENANT_BILL"]
+        self.assertEqual(("HOLD", "HOLD"), (tenant["action"], tenant["outcome"]))
+
+    def test_ordinary_tenant_unbound_daily_hold_remains_hold(self) -> None:
+        harness = self.production_harness()
+        current = run_id()
+        harness.loop(current)
+        status = harness.status(current)
+        self.assert_tenant_unbound_hold(status)
+        self.assertTrue(status["streams"]["EB_BILL"]["fully_handled"])
+        self.assertEqual(("HOLD", True, False),
+                         (status["business_outcome"], status["terminal"], status["uncertainty_outstanding"]))
+
+    def test_unfinished_run_with_tenant_unbound_is_incomplete_not_hold(self) -> None:
+        for command in ("drive-intent", "drive-upload", "deliver"):
+            with self.subTest(stopped_before=command):
+                harness = self.production_harness()
+                current = run_id()
+                harness.drive_until(current, "EB_BILL", command)
+                status = harness.status(current)
+                self.assert_tenant_unbound_hold(status)
+                self.assertEqual("INCOMPLETE", status["streams"]["EB_BILL"]["outcome"])
+                self.assertEqual(("INCOMPLETE", False), (status["business_outcome"], status["terminal"]))
+
+    def test_open_drive_dispatch_with_tenant_unbound_is_incomplete_with_uncertainty(self) -> None:
+        harness = self.production_harness()
+        current = run_id()
+        harness.drive_until(current, "EB_BILL", "drive-upload")
+        operation = harness.operation("EB_BILL")
+        with StateV3Store(harness.state_path) as state:
+            state.reserve_drive_file_id(operation["operation_id"], "synthReservedOpenDispatch", current, "2026-10-06T00:00:00+00:00")
+            state.begin_drive_dispatch(operation["operation_id"], current, "2026-10-06T00:00:01+00:00")
+        status = harness.status(current)
+        self.assert_tenant_unbound_hold(status)
+        self.assertEqual("DRIVE_RECONCILE", status["streams"]["EB_BILL"]["action"])
+        self.assertEqual(("INCOMPLETE", False, True),
+                         (status["business_outcome"], status["terminal"], status["uncertainty_outstanding"]))
+
+    def test_open_email_dispatch_with_tenant_unbound_is_incomplete_with_uncertainty(self) -> None:
+        from energygrid_bill_downloader.delivery import DELIVERY_SCHEMA
+
+        harness = self.production_harness()
+        current = run_id()
+        harness.drive_until(current, "EB_BILL", "deliver")
+        with StateV3Store(harness.state_path) as state:
+            invoice = state.invoice(state.stream("EB_BILL")["watermark_invoice_id"])
+            metadata = {
+                "schema": DELIVERY_SCHEMA, "stream": invoice["stream"], "bill_date": invoice["bill_date"],
+                "attachment_name": invoice["canonical_filename"], "pdf_byte_size": invoice["byte_size"],
+                "pdf_sha256": invoice["sha256"],
+            }
+            delivery_id = "egmail-v1-" + uuid.uuid4().hex
+            state.prepare_delivery(invoice_id=invoice["invoice_id"], metadata=metadata, run_id=current,
+                                   timestamp="2026-10-06T00:00:03+00:00", delivery_id=delivery_id)
+            self.assertTrue(state.claim_delivery_dispatch(delivery_id, current, "2026-10-06T00:00:04+00:00"))
+        status = harness.status(current)
+        self.assert_tenant_unbound_hold(status)
+        self.assertEqual("EMAIL_RECONCILE", status["streams"]["EB_BILL"]["action"])
+        self.assertEqual(("INCOMPLETE", False, True),
+                         (status["business_outcome"], status["terminal"], status["uncertainty_outstanding"]))
+        self.assertEqual([], harness.delivery.sent)
+
+    def test_terminal_success_remains_success(self) -> None:
+        harness = CoreHarness(self)
+        current = run_id()
+        harness.loop(current)
+        status = harness.status(current)
+        self.assertEqual(("COMPLETED", True, False),
+                         (status["business_outcome"], status["terminal"], status["uncertainty_outstanding"]))
+
+    def test_outcome_precedence_mirrors_supervisor_severity_and_incomplete_outranks_hold(self) -> None:
+        import re
+
+        from energygrid_bill_downloader.orchestration import BUSINESS_OUTCOMES, OUTCOME_SEVERITY
+
+        self.assertEqual(sorted(BUSINESS_OUTCOMES), sorted(OUTCOME_SEVERITY))
+        self.assertLess(OUTCOME_SEVERITY.index("INCOMPLETE"), OUTCOME_SEVERITY.index("HOLD"))
+        supervisor = (Path(__file__).resolve().parents[1] / "runtime" / "claude_supervisor.ps1").read_text(encoding="utf-8")
+        severity = [int(item) for item in re.search(r"\$script:EgSeverity = @\(([^)]*)\)", supervisor).group(1).split(",")]
+        mapping_block = re.search(r"\$script:EgOutcomeExit = @\{(.*?)\n\}", supervisor, re.S).group(1)
+        mapping = {name: int(code) for name, code in re.findall(r"'([A-Z_]+)' = (\d+)", mapping_block)}
+        self.assertEqual(sorted(BUSINESS_OUTCOMES), sorted(mapping))
+        ranks = [severity.index(mapping[outcome]) for outcome in OUTCOME_SEVERITY]
+        self.assertEqual(sorted(ranks), ranks, "core precedence must follow the supervisor exit-code severity")
+
+
 if __name__ == "__main__":
     unittest.main()

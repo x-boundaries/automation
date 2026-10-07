@@ -280,8 +280,11 @@ function Test-EgStatusDocument {
 function Get-EgStatusExitCode {
     param($Status)
     if (-not (Test-EgStatusDocument -Status $Status)) { return $script:EgExit.StatusInvalid }
+    # A non-terminal status is incomplete whatever its business outcome says, so an
+    # unfinished run can never collapse onto the ordinary HOLD code.
+    if (-not $Status.terminal) { return $script:EgExit.StatusInvalid }
     $code = [int]$script:EgOutcomeExit[[string]$Status.business_outcome]
-    if ($code -eq 0 -and (-not $Status.terminal -or $Status.uncertainty_outstanding)) { return $script:EgExit.StatusInvalid }
+    if ($code -eq 0 -and $Status.uncertainty_outstanding) { return $script:EgExit.StatusInvalid }
     return $code
 }
 

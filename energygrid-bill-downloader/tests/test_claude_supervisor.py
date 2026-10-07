@@ -290,7 +290,11 @@ class SupervisorRunTests(SupervisorHarness):
             ("HOLD", True, False): 81, ("SOURCE_FAILURE_RETRYABLE", True, False): 82, ("SOURCE_FAILURE", True, False): 83,
             ("DRIVE_UNCERTAIN", True, True): 84, ("DRIVE_CONFLICT", True, False): 85, ("EMAIL_UNCERTAIN", True, True): 86,
             ("INCOMPLETE", False, False): 89, ("COMPLETED", False, False): 89, ("NO_WORK", True, True): 89,
-            ("NO_WORK", True, False): 0,
+            ("NO_WORK", True, False): 0, ("COMPLETED", True, False): 0,
+            # M1: a non-terminal status is incomplete (89) even when its outcome claims an
+            # ordinary HOLD or a lower-severity business code.
+            ("HOLD", False, False): 89, ("HOLD", False, True): 89, ("DRIVE_CONFLICT", False, False): 89,
+            ("SOURCE_FAILURE_RETRYABLE", False, False): 89,
         }
         for (outcome, terminal, uncertainty), expected in cases.items():
             with self.subTest(outcome=outcome, terminal=terminal):

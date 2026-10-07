@@ -39,6 +39,15 @@ CONSTRUCTION_TREE = "28034420e436345586dc94f1624ac4483e97dbbb"
 TARGET_BRANCH = "codex/energygrid-226-dual-stream-latest-email"
 HELPERS = (HARNESS, FUNCTIONS, SUPPORT, PYTHON_FIXTURE, LAUNCHER, LAUNCHER_LIB)
 HELPER_RELATIVES = tuple(item.relative_to(REPO_ROOT).as_posix() for item in HELPERS)
+# The accepted AV successor (#212/#226). It alone carries the historical exact
+# seven-path envelope against BASE_HEAD; a later product successor (#226 G3) is
+# admitted only as its descendant with the AV-harness boundary byte-unchanged.
+AV_SUCCESSOR_HEAD = "528f0f73f0824f3630644f1bb15a0efde13a6030"
+AV_SUCCESSOR_TREE = "df2a6833e113aeb0f252c549565fd68bdef05d50"
+AV_ENVELOPE_PATH_COUNT = 7
+AV_PROTECTED_BASE_PATH_COUNT = 42
+SUPERVISOR_RELATIVE = "scripts/energygrid_one_shot_supervisor.ps1"
+AV_PROTECTED_RELATIVES = (*HELPER_RELATIVES, SUPERVISOR_RELATIVE)
 SATURATION_EXPECTED_BYTES = 1048576
 
 
@@ -1057,11 +1066,23 @@ def _assert_candidate_scope(context: dict[str, object] | None = None) -> dict[st
         raise RuntimeError(f"unexpected candidate parent/lineage: {parent}")
     if _git("rev-parse", f"{BASE_HEAD}^{{tree}}") != BASE_TREE:
         raise RuntimeError("admitted product tree changed")
-    entries = _git("diff", "--name-status", BASE_HEAD, head).splitlines()
+    # The historical envelope is proven on the accepted AV successor itself.
+    if _git("rev-parse", f"{AV_SUCCESSOR_HEAD}^{{tree}}") != AV_SUCCESSOR_TREE:
+        raise RuntimeError("accepted AV successor tree changed")
+    if not _is_ancestor(BASE_HEAD, AV_SUCCESSOR_HEAD):
+        raise RuntimeError("accepted AV successor is not anchored to the admitted product base")
+    entries = _git("diff", "--name-status", BASE_HEAD, AV_SUCCESSOR_HEAD).splitlines()
     expected = {"M\tenergygrid-bill-downloader/tests/test_one_shot_supervisor.py"}
     expected.update(f"A\t{relative}" for relative in HELPER_RELATIVES)
-    if set(entries) != expected or len(entries) != 7:
-        raise RuntimeError("candidate diff is outside the exact seven-path envelope")
+    if set(entries) != expected or len(entries) != AV_ENVELOPE_PATH_COUNT:
+        raise RuntimeError("accepted AV successor is outside the exact seven-path envelope")
+    # The candidate is the AV successor or a descendant of it, and nothing inside
+    # the AV-harness boundary (six helpers + production supervisor) has moved.
+    if head != AV_SUCCESSOR_HEAD and not _is_ancestor(AV_SUCCESSOR_HEAD, head):
+        raise RuntimeError("candidate is not a descendant of the accepted AV successor")
+    drift = _git("diff", "--name-status", AV_SUCCESSOR_HEAD, head, "--", *AV_PROTECTED_RELATIVES)
+    if drift:
+        raise RuntimeError("protected AV-harness boundary drifted: " + " ".join(drift.split()))
     if _git("status", "--porcelain=v1") or _git("ls-files", "--others", "--exclude-standard"):
         raise RuntimeError("candidate worktree is not clean")
     return {
@@ -1070,12 +1091,23 @@ def _assert_candidate_scope(context: dict[str, object] | None = None) -> dict[st
         "parent": parent,
         "branch": branch,
         "execution_context": _receipt_context_binding(context),
-        "changed_paths": sorted(
+        "av_successor_head": AV_SUCCESSOR_HEAD,
+        "lineage": "AV_SUCCESSOR" if head == AV_SUCCESSOR_HEAD else "AV_SUCCESSOR_DESCENDANT",
+        "av_envelope_paths": sorted(
             ["energygrid-bill-downloader/tests/test_one_shot_supervisor.py", *HELPER_RELATIVES]
         ),
-        "changed_path_count": 7,
-        "protected_base_path_count": 42,
+        "av_envelope_path_count": AV_ENVELOPE_PATH_COUNT,
+        "protected_base_path_count": AV_PROTECTED_BASE_PATH_COUNT,
+        "av_protected_paths_unchanged": sorted(AV_PROTECTED_RELATIVES),
     }
+
+
+def _is_ancestor(ancestor: str, descendant: str) -> bool:
+    try:
+        _git("merge-base", "--is-ancestor", ancestor, descendant)
+    except RuntimeError:
+        return False
+    return True
 
 
 def _fresh_receipt(
@@ -1298,8 +1330,9 @@ def _custody_cli() -> int:
         print("candidate=" + receipt["candidate"]["head"])
         print("tree=" + receipt["candidate"]["tree"])
         print("parent=" + receipt["candidate"]["parent"])
-        print("changed_paths=7")
-        print("protected_base_paths=42")
+        print("lineage=" + receipt["candidate"]["lineage"])
+        print("av_envelope_paths=" + str(receipt["candidate"]["av_envelope_path_count"]))
+        print("protected_base_paths=" + str(receipt["candidate"]["protected_base_path_count"]))
         print("endpoint_observation=ENDPOINT_EVIDENCE_UNAVAILABLE")
         return 0
     if args.harness_custody == "record-endpoint":
@@ -1572,12 +1605,15 @@ def _synthetic_candidate_scope() -> dict[str, object]:
         "parent": _git("rev-parse", "HEAD^"),
         "branch": TARGET_BRANCH,
         "execution_context": {"mode": LOCAL_ENDPOINT_MODE},
-        "changed_paths": sorted([
+        "av_successor_head": AV_SUCCESSOR_HEAD,
+        "lineage": "AV_SUCCESSOR_DESCENDANT",
+        "av_envelope_paths": sorted([
             "energygrid-bill-downloader/tests/test_one_shot_supervisor.py",
             *HELPER_RELATIVES,
         ]),
-        "changed_path_count": 7,
+        "av_envelope_path_count": 7,
         "protected_base_path_count": 42,
+        "av_protected_paths_unchanged": sorted(AV_PROTECTED_RELATIVES),
     }
 
 
@@ -1888,17 +1924,19 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
     def test_h14_hosted_seven_path_scope_drift_fails(self):
         with tempfile.TemporaryDirectory(prefix="eg_h14_hosted_") as directory:
             context = self._hosted_context(Path(directory))
-            head = _git("rev-parse", "HEAD")
             original_git = _git
+            for drifted in ("M\tREADME.md", "\n".join(
+                    ["M\tenergygrid-bill-downloader/tests/test_one_shot_supervisor.py",
+                     *(f"A\t{relative}" for relative in HELPER_RELATIVES), "M\tREADME.md"])):
+                def changed_scope(*arguments: str, drifted=drifted) -> str:
+                    if arguments == ("diff", "--name-status", BASE_HEAD, AV_SUCCESSOR_HEAD):
+                        return drifted
+                    return original_git(*arguments)
 
-            def changed_scope(*arguments: str) -> str:
-                if arguments == ("diff", "--name-status", BASE_HEAD, head):
-                    return "M\tREADME.md"
-                return original_git(*arguments)
-
-            with mock.patch(__name__ + "._git", side_effect=changed_scope):
-                with self.assertRaisesRegex(RuntimeError, "exact seven-path envelope"):
-                    _assert_candidate_scope(context)
+                with self.subTest(drifted=drifted.count("\n") + 1):
+                    with mock.patch(__name__ + "._git", side_effect=changed_scope):
+                        with self.assertRaisesRegex(RuntimeError, "exact seven-path envelope"):
+                            _assert_candidate_scope(context)
 
     def test_h15_local_named_branch_positive_control_remains_valid(self):
         with tempfile.TemporaryDirectory(prefix="eg_h15_local_") as directory:
@@ -1916,8 +1954,128 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
             with mock.patch(__name__ + "._git", side_effect=named_branch):
                 candidate = _assert_candidate_scope(context)
             self.assertEqual(TARGET_BRANCH, candidate["branch"])
-            self.assertEqual(7, candidate["changed_path_count"])
+            self.assertEqual(AV_SUCCESSOR_HEAD, candidate["av_successor_head"])
+            self.assertEqual(7, candidate["av_envelope_path_count"])
             self.assertEqual(42, candidate["protected_base_path_count"])
+
+    def _as_commit(self, commit: str, *, branch: str = TARGET_BRANCH):
+        """A `_git` double that presents `commit` as the checked-out HEAD."""
+        original_git = _git
+        parent = original_git("rev-parse", f"{commit}^")
+        tree = original_git("rev-parse", f"{commit}^{{tree}}")
+
+        def as_commit(*arguments: str) -> str:
+            if arguments == ("rev-parse", "HEAD"):
+                return commit
+            if arguments == ("rev-parse", "HEAD^"):
+                return parent
+            if arguments == ("rev-parse", "HEAD^{tree}"):
+                return tree
+            if arguments == ("branch", "--show-current"):
+                return branch
+            return original_git(*arguments)
+
+        return as_commit
+
+    def _local_context(self, directory: str) -> dict[str, object]:
+        return {
+            "mode": LOCAL_ENDPOINT_MODE,
+            "receipt_path": str(Path(directory) / f"eg212-custody-{uuid.uuid4()}.json"),
+        }
+
+    def test_h16_accepted_av_successor_itself_proves_the_seven_path_envelope(self):
+        entries = _git("diff", "--name-status", BASE_HEAD, AV_SUCCESSOR_HEAD).splitlines()
+        self.assertEqual(7, len(entries))
+        self.assertEqual(
+            {"M\tenergygrid-bill-downloader/tests/test_one_shot_supervisor.py",
+             *(f"A\t{relative}" for relative in HELPER_RELATIVES)},
+            set(entries),
+        )
+        self.assertEqual(AV_SUCCESSOR_TREE, _git("rev-parse", f"{AV_SUCCESSOR_HEAD}^{{tree}}"))
+        with tempfile.TemporaryDirectory(prefix="eg_h16_local_") as directory:
+            with mock.patch(__name__ + "._git", side_effect=self._as_commit(AV_SUCCESSOR_HEAD)):
+                candidate = _assert_candidate_scope(self._local_context(directory))
+        self.assertEqual(("AV_SUCCESSOR", AV_SUCCESSOR_HEAD, 7),
+                         (candidate["lineage"], candidate["head"], candidate["av_envelope_path_count"]))
+
+    def test_h17_descendant_with_admitted_v3_paths_passes_av_custody_scope(self):
+        head = _git("rev-parse", "HEAD")
+        self.assertNotEqual(AV_SUCCESSOR_HEAD, head)
+        later = set(_git("diff", "--name-only", AV_SUCCESSOR_HEAD, head).splitlines())
+        self.assertIn("energygrid-bill-downloader/energygrid_bill_downloader/orchestration.py", later)
+        self.assertFalse(later & set(AV_PROTECTED_RELATIVES))
+        with tempfile.TemporaryDirectory(prefix="eg_h17_local_") as directory:
+            with mock.patch(__name__ + "._git", side_effect=self._as_commit(head)):
+                candidate = _assert_candidate_scope(self._local_context(directory))
+        self.assertEqual(("AV_SUCCESSOR_DESCENDANT", head), (candidate["lineage"], candidate["head"]))
+        self.assertEqual(sorted(AV_PROTECTED_RELATIVES), candidate["av_protected_paths_unchanged"])
+
+    def test_h18_protected_helper_or_production_supervisor_drift_fails(self):
+        self.assertEqual(7, len(AV_PROTECTED_RELATIVES))
+        self.assertIn(SUPERVISOR_RELATIVE, AV_PROTECTED_RELATIVES)
+        self.assertEqual(SUPERVISOR, REPO_ROOT / SUPERVISOR_RELATIVE)
+        head = _git("rev-parse", "HEAD")
+        for relative in AV_PROTECTED_RELATIVES:
+            base = self._as_commit(head)
+
+            def drifted(*arguments: str, relative=relative) -> str:
+                if arguments == ("diff", "--name-status", AV_SUCCESSOR_HEAD, head, "--",
+                                 *AV_PROTECTED_RELATIVES):
+                    return "M\t" + relative
+                return base(*arguments)
+
+            with self.subTest(path=relative), \
+                    tempfile.TemporaryDirectory(prefix="eg_h18_local_") as directory:
+                with mock.patch(__name__ + "._git", side_effect=drifted):
+                    with self.assertRaisesRegex(RuntimeError, "protected AV-harness boundary drifted"):
+                        _assert_candidate_scope(self._local_context(directory))
+
+    def test_h19_wrong_ancestry_fails(self):
+        head = _git("rev-parse", "HEAD")
+        cases = (
+            (("merge-base", "--is-ancestor", AV_SUCCESSOR_HEAD, head),
+             "not a descendant of the accepted AV successor"),
+            (("merge-base", "--is-ancestor", BASE_HEAD, AV_SUCCESSOR_HEAD),
+             "not anchored to the admitted product base"),
+            (("rev-parse", f"{AV_SUCCESSOR_HEAD}^{{tree}}"), "accepted AV successor tree changed"),
+        )
+        for broken, message in cases:
+            base = self._as_commit(head)
+
+            def wrong(*arguments: str, broken=broken) -> str:
+                if arguments == broken:
+                    if arguments[0] == "merge-base":
+                        raise RuntimeError("git failed: " + " ".join(arguments))
+                    return "0" * 40
+                return base(*arguments)
+
+            with self.subTest(message=message), \
+                    tempfile.TemporaryDirectory(prefix="eg_h19_local_") as directory:
+                with mock.patch(__name__ + "._git", side_effect=wrong):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        _assert_candidate_scope(self._local_context(directory))
+        # A sibling of the AV successor (shares the construction lineage but does not
+        # contain the accepted successor) is not admitted either.
+        sibling = _git("rev-parse", f"{AV_SUCCESSOR_HEAD}^")
+        with tempfile.TemporaryDirectory(prefix="eg_h19_sibling_") as directory:
+            with mock.patch(__name__ + "._git", side_effect=self._as_commit(sibling)):
+                with self.assertRaisesRegex(RuntimeError, "not a descendant of the accepted AV successor"):
+                    _assert_candidate_scope(self._local_context(directory))
+
+    def test_h20_wrong_hosted_head_and_local_wrong_branch_fail_scope(self):
+        hosted = {
+            "mode": HOSTED_EXACT_HEAD_MODE, "event_name": "pull_request",
+            "repository": GITHUB_REPOSITORY, "expected_head": "f" * 40,
+            "ref": "refs/pull/229/merge", "run_id": "1", "run_attempt": "1",
+            "runner_temp": str(REPO_ROOT),
+        }
+        with self.assertRaisesRegex(RuntimeError, "hosted checkout does not match the exact event head"):
+            _assert_candidate_scope(hosted)
+        with tempfile.TemporaryDirectory(prefix="eg_h20_local_") as directory:
+            wrong = self._as_commit(_git("rev-parse", "HEAD"), branch="codex/other-branch")
+            with mock.patch(__name__ + "._git", side_effect=wrong):
+                with self.assertRaisesRegex(RuntimeError, "unexpected local candidate branch"):
+                    _assert_candidate_scope(self._local_context(directory))
 
 
 class SupervisorCustodyRegressionTests(unittest.TestCase):
@@ -2123,7 +2281,8 @@ class SupervisorHarnessCleanupTests(unittest.TestCase):
     def test_receipt_binds_candidate_helpers_test_owner_and_supervisor(self):
         receipt = _load_receipt(_receipt_path())
         self.assertTrue(_valid_candidate_parent(receipt["candidate"]["parent"]))
-        self.assertEqual(7, receipt["candidate"]["changed_path_count"])
+        self.assertEqual(AV_SUCCESSOR_HEAD, receipt["candidate"]["av_successor_head"])
+        self.assertEqual(7, receipt["candidate"]["av_envelope_path_count"])
         self.assertEqual(42, receipt["candidate"]["protected_base_path_count"])
         self.assertEqual(6, len(receipt["helpers"]))
         self.assertEqual("ENDPOINT_EVIDENCE_UNAVAILABLE", _endpoint_state(receipt))
