@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from energygrid_bill_downloader.orchestration import ALLOWED_COMMAND_LINES
 
@@ -28,6 +29,52 @@ CLAUDE_DIR = RUNTIME / "claude"
 POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
 WINDOWS = sys.platform == "win32" and POWERSHELL.exists()
 VERSION = "9.9.9 (Claude Code)"
+SYNTHETIC_TOKEN = "synthetic-setup-token"
+
+# The synthetic DPAPI token fixture. The SecureString is built from .NET directly
+# and serialised with Export-Clixml (a core cmdlet), so the fixture never loads
+# Microsoft.PowerShell.Security: a pwsh parent (the GitHub-hosted default shell)
+# puts its own Security module first on PSModulePath, and Windows PowerShell 5.1
+# then cannot load ConvertTo-SecureString. The file is still a real CurrentUser
+# DPAPI CLIXML SecureString, read by the unchanged production Import-Clixml path.
+TOKEN_FIXTURE_SCRIPT = (
+    "$secure = New-Object System.Security.SecureString; "
+    "foreach ($character in $env:EG_SYNTHETIC_TOKEN_VALUE.ToCharArray()) { $secure.AppendChar($character) }; "
+    "$secure.MakeReadOnly(); Export-Clixml -InputObject $secure -LiteralPath $env:EG_SYNTHETIC_TOKEN_PATH"
+)
+
+
+def windows_powershell_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Pin Windows PowerShell 5.1 module resolution to its own system module roots,
+    as a Task Scheduler start of powershell.exe has it, so an inherited pwsh
+    PSModulePath cannot shadow 5.1 modules (same rule as the #220 harness)."""
+    source = os.environ if base is None else base
+    env = {key: value for key, value in source.items() if key.casefold() != "psmodulepath"}
+    system_root = env.get("SystemRoot") or env.get("WINDIR") or r"C:\Windows"
+    program_files = env.get("ProgramFiles") or r"C:\Program Files"
+    env["PSModulePath"] = os.pathsep.join((
+        str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"),
+        str(Path(program_files) / "WindowsPowerShell" / "Modules"),
+    ))
+    return env
+
+
+def run_windows_powershell(script: str, *, env: dict[str, str] | None = None, timeout: int = 60,
+                           check: bool = True) -> subprocess.CompletedProcess:
+    completed = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", script],
+                               capture_output=True, text=True, timeout=timeout,
+                               env=windows_powershell_environment() if env is None else env)
+    if check and completed.returncode != 0:
+        raise AssertionError("synthetic Windows PowerShell fixture failed: " + completed.stderr.strip()[:800])
+    return completed
+
+
+def write_synthetic_token(path: Path, value: str = SYNTHETIC_TOKEN, *, env: dict[str, str] | None = None) -> None:
+    """Write a synthetic CurrentUser DPAPI CLIXML SecureString (never a real token)."""
+    environment = windows_powershell_environment() if env is None else dict(env)
+    environment["EG_SYNTHETIC_TOKEN_VALUE"] = value
+    environment["EG_SYNTHETIC_TOKEN_PATH"] = str(path)
+    run_windows_powershell(TOKEN_FIXTURE_SCRIPT, env=environment)
 
 FAKE_CLAUDE_SOURCE = r"""
 using System;
@@ -126,7 +173,7 @@ def setUpModule() -> None:
         f"Add-Type -TypeDefinition ([IO.File]::ReadAllText('{source}')) -OutputAssembly '{exe}' "
         "-OutputType ConsoleApplication -ReferencedAssemblies System.dll"
     )
-    subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, timeout=120)
+    run_windows_powershell(script, timeout=120)
     _FAKE_EXE = exe
 
 
@@ -163,9 +210,7 @@ class SupervisorHarness(unittest.TestCase):
         (self.launcher_dir / "installation_manifest.json").write_text('{"synthetic":true}', encoding="ascii")
         self.responses({"default": {"exit": 0, "stdout": status_document()}})
         self.token = root / "token.clixml"
-        subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command",
-                        f"ConvertTo-SecureString 'synthetic-setup-token' -AsPlainText -Force | Export-Clixml -LiteralPath '{self.token}'"],
-                       check=True, capture_output=True, timeout=60)
+        write_synthetic_token(self.token)
         self.receipts = root / "receipts"
         self.settings_path = root / "supervisor.settings.json"
         self.settings = self.default_settings()
@@ -225,7 +270,7 @@ class SupervisorHarness(unittest.TestCase):
         (self.launcher_dir / "responses.json").write_text(json.dumps(mapping), encoding="utf-8")
 
     def run_supervisor(self) -> int:
-        environment = dict(os.environ)
+        environment = windows_powershell_environment()
         environment["FAKE_CLAUDE_DIR"] = str(self.claude_dir)
         environment["ANTHROPIC_API_KEY"] = "synthetic-anthropic-canary"
         completed = subprocess.run(
@@ -421,7 +466,7 @@ class SupervisorRunTests(SupervisorHarness):
 class EgcoreDispatchTests(SupervisorHarness):
     def dispatch(self, argument_text: str, *, run_id: str | None = "00000000-0000-4000-8000-0000000000aa",
                  settings: bool = True) -> subprocess.CompletedProcess:
-        environment = dict(os.environ)
+        environment = windows_powershell_environment()
         environment["CLAUDE_CODE_OAUTH_TOKEN"] = "synthetic-setup-token"
         environment["ANTHROPIC_API_KEY"] = "synthetic-anthropic-canary"
         environment.pop("ENERGYGRID_RUN_ID", None)
@@ -457,7 +502,135 @@ class EgcoreDispatchTests(SupervisorHarness):
         self.assertEqual([], self.calls())
 
 
+PRODUCTION_TOKEN_LINES = (
+    "if (-not (Test-Path -LiteralPath $settings.token_path -PathType Leaf)) { throw 'EG_SUPERVISOR_TOKEN_UNAVAILABLE' }",
+    "$secure = Import-Clixml -LiteralPath $settings.token_path",
+    "if ($secure -isnot [System.Security.SecureString] -or $secure.Length -eq 0) { throw 'EG_SUPERVISOR_TOKEN_UNAVAILABLE' }",
+)
+# Shape of the pwsh 7 Security module that a hosted pwsh parent puts first on
+# PSModulePath: a manifest exporting the cmdlets whose root module cannot load.
+SHADOW_SECURITY_MANIFEST = """@{
+    GUID = 'a94c8c7e-9810-47c0-b8af-65089c13a35a'
+    ModuleVersion = '7.0.0.0'
+    RootModule = 'Microsoft.PowerShell.Security.psm1'
+    CmdletsToExport = @('ConvertTo-SecureString', 'ConvertFrom-SecureString', 'Get-Acl', 'Set-Acl')
+    FunctionsToExport = @()
+}
+"""
+
+
+@unittest.skipUnless(WINDOWS, "the token fixture is a Windows DPAPI CLIXML SecureString")
+class TokenFixturePortabilityTests(SupervisorHarness):
+    """#226 G3 hosted reclosure: the synthetic token fixture works under a hosted
+    pwsh-parent module path, and the production token path still accepts only a
+    non-empty DPAPI CLIXML SecureString."""
+
+    def shadowed_environment(self) -> dict[str, str]:
+        module = Path(self.temp.name) / "pwsh-modules" / "Microsoft.PowerShell.Security"
+        module.mkdir(parents=True, exist_ok=True)
+        (module / "Microsoft.PowerShell.Security.psm1").write_text("throw 'synthetic pwsh module shadow'\n", encoding="ascii")
+        (module / "Microsoft.PowerShell.Security.psd1").write_text(SHADOW_SECURITY_MANIFEST, encoding="ascii")
+        env = {key: value for key, value in os.environ.items() if key.casefold() != "psmodulepath"}
+        env["PSModulePath"] = os.pathsep.join((str(module.parent), windows_powershell_environment()["PSModulePath"]))
+        return env
+
+    def test_fixture_and_production_read_survive_a_hosted_pwsh_module_path(self) -> None:
+        shadowed = self.shadowed_environment()
+        # Control: the shadow reproduces the hosted failure class of the old fixture.
+        legacy = run_windows_powershell("ConvertTo-SecureString 'x' -AsPlainText -Force | Out-Null", env=shadowed, check=False)
+        self.assertNotEqual(0, legacy.returncode)
+        self.assertIn("could not be loaded", legacy.stderr)
+        # The fixture script itself runs under the shadowed path, without pinning.
+        token = Path(self.temp.name) / "shadowed-token.clixml"
+        write_synthetic_token(token, env=shadowed)
+        text = token.read_text(encoding="utf-16")  # Export-Clixml writes UTF-16 LE with a BOM
+        self.assertIn("<SS>", text)
+        self.assertNotIn(SYNTHETIC_TOKEN, text, "DPAPI-protected, not plaintext")
+        # The exact production token lines read it back under the same shadowed path.
+        supervisor = SUPERVISOR.read_text(encoding="utf-8")
+        for line in PRODUCTION_TOKEN_LINES:
+            self.assertEqual(1, supervisor.count(line))
+        environment = dict(shadowed)
+        environment["EG_SYNTHETIC_TOKEN_PATH"] = str(token)
+        environment["EG_SYNTHETIC_TOKEN_VALUE"] = SYNTHETIC_TOKEN
+        script = "\n".join((
+            "$ErrorActionPreference = 'Stop'",
+            "$settings = [pscustomobject]@{ token_path = $env:EG_SYNTHETIC_TOKEN_PATH }",
+            *PRODUCTION_TOKEN_LINES,
+            "$pointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)",
+            "try { $match = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) -ceq $env:EG_SYNTHETIC_TOKEN_VALUE }",
+            "finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }",
+            "if (-not $match) { exit 3 }",
+        ))
+        self.assertEqual(0, run_windows_powershell(script, env=environment, check=False).returncode)
+
+    def test_full_supervisor_run_with_an_inherited_hosted_module_path(self) -> None:
+        shadowed = self.shadowed_environment()
+        with mock.patch.dict(os.environ, {"PSModulePath": shadowed["PSModulePath"]}):
+            self.setUp()
+            self.assertEqual(0, self.run_supervisor())
+        self.assertEqual([SYNTHETIC_TOKEN], self.record()["TOKEN"])
+        self.assertEqual(["status", "status"], [call["command"] for call in self.calls()])
+
+    def test_absent_or_invalid_token_material_is_88_before_claude(self) -> None:
+        def write(script: str):
+            def mutate():
+                environment = windows_powershell_environment()
+                environment["EG_SYNTHETIC_TOKEN_PATH"] = str(self.token)
+                environment["EG_SYNTHETIC_TOKEN_VALUE"] = SYNTHETIC_TOKEN
+                self.token.unlink()
+                run_windows_powershell(script, env=environment)
+            return mutate
+
+        def plaintext_file():
+            self.token.write_text(SYNTHETIC_TOKEN, encoding="ascii")
+
+        def empty_file():
+            self.token.write_bytes(b"")
+
+        def not_clixml():
+            self.token.write_text("<token>" + SYNTHETIC_TOKEN + "</token>", encoding="utf-8")
+
+        cases = {
+            "missing": lambda: self.token.unlink(),
+            "plaintext file": plaintext_file,
+            "empty file": empty_file,
+            "not clixml": not_clixml,
+            "clixml plain string": write("Export-Clixml -InputObject $env:EG_SYNTHETIC_TOKEN_VALUE -LiteralPath $env:EG_SYNTHETIC_TOKEN_PATH"),
+            "clixml empty securestring": write(
+                "$secure = New-Object System.Security.SecureString; $secure.MakeReadOnly(); "
+                "Export-Clixml -InputObject $secure -LiteralPath $env:EG_SYNTHETIC_TOKEN_PATH"),
+        }
+        for name, mutate in cases.items():
+            for plaintext_in_environment in (False, True):
+                with self.subTest(case=name, plaintext_in_environment=plaintext_in_environment):
+                    self.setUp()
+                    mutate()
+                    if plaintext_in_environment:
+                        # A plaintext token already in the environment is never a fallback.
+                        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": SYNTHETIC_TOKEN}):
+                            code = self.run_supervisor()
+                    else:
+                        code = self.run_supervisor()
+                    self.assertEqual(88, code)
+                    self.assertEqual({}, self.record(), "Claude never started")
+                    self.assertEqual([], self.calls(), "zero core calls")
+
+
 class EnvelopeStaticTests(unittest.TestCase):
+    def test_production_token_path_is_dpapi_clixml_only_with_no_hosted_branch(self) -> None:
+        supervisor = SUPERVISOR.read_text(encoding="utf-8")
+        for line in PRODUCTION_TOKEN_LINES:
+            self.assertEqual(1, supervisor.count(line))
+        self.assertEqual(2, supervisor.count("$settings.token_path"), "token material is read only through Import-Clixml")
+        for forbidden in ("ConvertTo-SecureString", "AsPlainText", "GITHUB_", "RUNNER_", "PSModulePath", "synthetic"):
+            self.assertNotIn(forbidden, supervisor)
+        # The harness fixture writes a DPAPI SecureString, never plaintext token material.
+        self.assertNotIn("ConvertTo-SecureString", TOKEN_FIXTURE_SCRIPT)
+        self.assertNotIn("AsPlainText", TOKEN_FIXTURE_SCRIPT)
+        self.assertIn("System.Security.SecureString", TOKEN_FIXTURE_SCRIPT)
+        self.assertIn("Export-Clixml -InputObject $secure", TOKEN_FIXTURE_SCRIPT)
+
     def test_single_source_allowlist_matches_settings_prompt_and_supervisor(self) -> None:
         settings = json.loads((CLAUDE_DIR / "claude.settings.json").read_text(encoding="utf-8"))
         self.assertEqual([f"Bash({line})" for line in ALLOWED_COMMAND_LINES], settings["permissions"]["allow"])
@@ -517,8 +690,7 @@ class EnvelopeStaticTests(unittest.TestCase):
             "$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile("
             f"'{SUPERVISOR}',[ref]$null,[ref]$e); $e.Count"
         )
-        completed = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", script],
-                                   capture_output=True, text=True, timeout=60)
+        completed = run_windows_powershell(script, check=False)
         self.assertEqual("0", completed.stdout.strip())
 
 
