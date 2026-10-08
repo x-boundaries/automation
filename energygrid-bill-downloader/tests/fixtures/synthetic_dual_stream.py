@@ -161,7 +161,11 @@ class FakeDriveService:
     relevant Google Drive semantics: generateIds, create-with-ID (a second
     create with the same ID answers 409), files.get, and the two searches.
 
-    Faults are explicit switches so each regression names its failure."""
+    Faults are explicit switches so each regression names its failure. A
+    boolean switch applies to every request; `stream_faults` scopes the same
+    named switches (plus `no_checksum`) to one stream, and `stream_mutations`
+    scopes a post-create mutation, so one stream can fail while the other is
+    healthy (#226 G2 fairness reclosure)."""
 
     def __init__(self) -> None:
         self.files: dict[str, dict] = {}
@@ -181,18 +185,25 @@ class FakeDriveService:
         self.mutate_after_create = None
         self.n8n_outcome_override = None
         self.stale_lookup_once = False
+        self.stream_faults: dict[str, set[str]] = {}
+        self.stream_mutations: dict[str, Any] = {}
+        self.requests: list[tuple[str, str | None]] = []
         self._counter = 0
+
+    def _fault(self, name: str, stream: str | None) -> bool:
+        return bool(getattr(self, name, False)) or name in self.stream_faults.get(stream, set())
 
     def _new_id(self) -> str:
         self._counter += 1
         return f"synthDriveFile{self._counter:010d}"
 
     def _resource(self, item: dict) -> dict:
+        hidden = self._fault("no_checksum", (item["appProperties"] or {}).get("egStream"))
         return {
             "id": item["id"], "name": item["name"], "mimeType": item["mimeType"], "parents": list(item["parents"]),
             "size": str(len(item["bytes"])),
-            "md5Checksum": item["md5"] if self.report_md5 else None,
-            "sha256Checksum": item["sha256"] if self.report_sha256 else None,
+            "md5Checksum": item["md5"] if self.report_md5 and not hidden else None,
+            "sha256Checksum": item["sha256"] if self.report_sha256 and not hidden else None,
             "appProperties": dict(item["appProperties"]), "trashed": item["trashed"],
         }
 
@@ -216,6 +227,8 @@ class FakeDriveService:
                       app_properties=metadata["app_properties"])
         if self.mutate_after_create:
             self.mutate_after_create(self.files[actual])
+        if metadata["stream"] in self.stream_mutations:
+            self.stream_mutations[metadata["stream"]](self.files[actual])
         return "CREATED"
 
     def _candidates(self, metadata: dict) -> tuple[str, list[dict]]:
@@ -236,7 +249,9 @@ class FakeDriveService:
 
     def respond(self, metadata: dict, pdf: bytes | None) -> tuple[int, dict]:
         mode = metadata["mode"]
+        stream = metadata.get("stream")
         self.calls.append(mode)
+        self.requests.append((mode, stream))
         base = {
             "schema": "energygrid.drive_result.v3", "mode": mode, "operation_id": metadata["operation_id"],
             "generated_id": None, "folder_check": self.folder_state, "reserved_lookup": "NOT_REQUESTED",
@@ -260,13 +275,13 @@ class FakeDriveService:
             self.stale_lookup_once = False
             lookup, candidates = "NOT_FOUND", []
         if mode == "UPLOAD_IF_ABSENT" and lookup == "NOT_FOUND" and not candidates:
-            if self.fail_create_before_google:
+            if self._fault("fail_create_before_google", stream):
                 return 503, {**base, "reserved_lookup": lookup, "search_complete": True, "upload_result": "FAILED",
                              "outcome": "DRIVE_UNAVAILABLE", "support_ref": "EG_DRIVE_CREATE_FAILED"}
             # Create with the reserved ID; Google answers 409 when it exists.
             upload_result = self._create(metadata["reserved_file_id"], metadata, pdf)
             lookup, candidates = self._candidates(metadata)
-        complete = not self.incomplete_search
+        complete = not self._fault("incomplete_search", stream)
         result = {**base, "reserved_lookup": lookup, "search_complete": complete, "upload_result": upload_result,
                   "candidates": candidates}
         if not complete:
@@ -301,21 +316,28 @@ class FakeDriveService:
         metadata, pdf = parse_multipart(body, content_type)
         status, document = self.respond(metadata, pdf)
         mode = metadata["mode"]
-        if mode == "RESERVE_ID" and self.drop_reservation_response:
+        stream = metadata.get("stream")
+        if mode == "RESERVE_ID" and self._fault("drop_reservation_response", stream):
             raise TimeoutError("synthetic lost reservation response")
-        if mode == "UPLOAD_IF_ABSENT" and self.lose_response_after_create:
+        if mode == "UPLOAD_IF_ABSENT" and self._fault("lose_response_after_create", stream):
             raise TimeoutError("synthetic lost upload response")
-        if mode == "RECONCILE" and self.drop_reconcile_response:
+        if mode == "RECONCILE" and self._fault("drop_reconcile_response", stream):
             raise TimeoutError("synthetic lost reconcile response")
         return status, json.dumps(document).encode("utf-8")
 
 
 class FakeDelivery:
-    """Synthetic email leg using the real durable intent/marker/outcome writes."""
+    """Synthetic email leg using the real durable intent/marker/outcome writes.
+
+    `outcomes` overrides the outcome for one stream; a stream in
+    `preparation_failure_streams` fails like the real client's missing webhook
+    authentication: the intent is durable, then StateError before any marker."""
 
     def __init__(self, outcome: str = "DELIVERED") -> None:
         self.sent: list[str] = []
         self.outcome = outcome
+        self.outcomes: dict[str, str] = {}
+        self.preparation_failure_streams: set[str] = set()
 
     def deliver(self, state, invoice, archive_path, run_id, *, logger=None):
         import uuid as _uuid
@@ -337,14 +359,19 @@ class FakeDelivery:
         if row["dispatch_started_at_utc"] is not None:
             state.recover_uncertain_deliveries(run_id, "2026-10-06T00:00:04+00:00")
             return DeliveryOutcome("DELIVERY_OUTCOME_UNCERTAIN", delivery_id, "EG_MAIL_RECOVERY_UNCERTAIN", False)
+        if invoice["stream"] in self.preparation_failure_streams:
+            from energygrid_bill_downloader.errors import StateError
+
+            raise StateError("synthetic delivery authentication is unavailable")
         if not state.claim_delivery_dispatch(delivery_id, run_id, "2026-10-06T00:00:04+00:00"):
             raise AssertionError("synthetic dispatch marker was not acquired")
         self.sent.append(invoice["stream"])
-        accepted = "2026-10-06T00:00:05+00:00" if self.outcome == "DELIVERED" else None
-        state.record_delivery_outcome(delivery_id, run_id, "2026-10-06T00:00:05+00:00", state=self.outcome,
+        outcome = self.outcomes.get(invoice["stream"], self.outcome)
+        accepted = "2026-10-06T00:00:05+00:00" if outcome == "DELIVERED" else None
+        state.record_delivery_outcome(delivery_id, run_id, "2026-10-06T00:00:05+00:00", state=outcome,
                                       evidence="VALIDATED_N8N_RESULT", support_ref="EG_SYNTHETIC_MAIL",
                                       accepted_at_utc=accepted)
-        return DeliveryOutcome(self.outcome, delivery_id, "EG_SYNTHETIC_MAIL", True)
+        return DeliveryOutcome(outcome, delivery_id, "EG_SYNTHETIC_MAIL", True)
 
 
 def seed_verified_drive(state, invoice: dict, *, run_id: str = "00000000-0000-4000-8000-0000000000c1") -> dict:

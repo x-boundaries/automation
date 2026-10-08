@@ -684,7 +684,7 @@ def run_core_command(args) -> int:
     """One deterministic core command; one line of strict JSON on stdout."""
     from .delivery import DeliveryClient
     from .drive import DriveClient
-    from .orchestration import CoreContext, RESULT_SCHEMA, run_command
+    from .orchestration import CoreContext, fallback_result, run_command
 
     stream = getattr(args, "stream", None)
     try:
@@ -699,18 +699,10 @@ def run_core_command(args) -> int:
             drive_client=DriveClient(config.drive), delivery_client=DeliveryClient(config.delivery),
         )
         document, exit_code = run_command(args.command, stream, core)
-    except ConfigError:
-        document, exit_code = {
-            "schema": RESULT_SCHEMA, "command": args.command, "stream": stream, "outcome": "REFUSED",
-            "support_ref": "EG_CORE_CONFIG_INVALID", "mutated": False,
-        }, 64
     except AppError as exc:
-        ref = getattr(exc, "support_ref", None)
-        document, exit_code = {
-            "schema": RESULT_SCHEMA, "command": args.command, "stream": stream, "outcome": "FAILED",
-            "support_ref": ref if type(ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, ref) else "EG_CORE_FAILURE",
-            "mutated": None,
-        }, (exc.exit_code if exc.exit_code in {10, 20} else 20)
+        # ConfigError -> REFUSED/64; any other escaped AppError -> FAILED/10|20.
+        # Both carry disposition RUN_STOP, built by the same helper the tests use.
+        document, exit_code = fallback_result(args.command, stream, exc)
     print(json.dumps(document, sort_keys=True, separators=(",", ":")))
     return exit_code
 

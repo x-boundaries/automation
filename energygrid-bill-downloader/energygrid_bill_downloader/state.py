@@ -1500,6 +1500,22 @@ DRIVE_VERIFICATION_UNAVAILABLE = "EG_DRIVE_VERIFICATION_UNAVAILABLE"
 STREAM_ACQUIRE_RESULTS = (
     "READY", "EMPTY", "UNBOUND", "HOLD", "SOURCE_FAILURE", "SOURCE_FAILURE_RETRYABLE", "NOT_REACHED",
 )
+# #226 G2 fairness reclosure: the closed set of (command, outcome, exit code)
+# results that stop one stream for the current run. The run stream stop table
+# accepts exactly these tuples; orchestration classifies with the same set.
+RUN_STREAM_STOP_RESULTS = frozenset({
+    ("drive-intent", "HOLD", 20),
+    ("drive-upload", "HOLD", 20),
+    ("drive-upload", "DRIVE_CONFLICT", 20),
+    ("drive-upload", "DRIVE_UPLOAD_UNCERTAIN", 20),
+    ("drive-upload", "RESERVATION_UNAVAILABLE", 10),
+    ("drive-reconcile", "HOLD", 20),
+    ("drive-reconcile", "DRIVE_CONFLICT", 20),
+    ("drive-reconcile", "DRIVE_UPLOAD_UNCERTAIN", 20),
+    ("deliver", "HOLD", 20),
+    ("deliver", "DELIVERY_OUTCOME_UNCERTAIN", 20),
+    ("deliver", "REQUEST_REJECTED", 20),
+})
 DRIVE_ID_RE = re.compile(r"[A-Za-z0-9_-]{10,128}\Z", re.ASCII)
 ACCOUNT_REF_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z", re.ASCII)
 OPERATION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z", re.ASCII)
@@ -1598,6 +1614,18 @@ V3_SCHEMA_SQL = (
     "eb_bill_support_ref TEXT, tenant_bill_support_ref TEXT,"
     "CHECK((acquire_state='COMPLETED')=(acquire_exit_code=0))"
     ") STRICT",
+    # Per-stream run fairness: one append-only row when a stream is stopped for
+    # one run. Keyed by run, so the next run never sees an earlier stop.
+    "CREATE TABLE energygrid_run_stream_stop_v3 ("
+    "run_id TEXT NOT NULL REFERENCES energygrid_run_v3(run_id),"
+    "stream TEXT NOT NULL CHECK(stream IN ('EB_BILL','TENANT_BILL')),"
+    "command TEXT NOT NULL CHECK(command IN ('drive-intent','drive-upload','drive-reconcile','deliver')),"
+    "outcome TEXT NOT NULL CHECK(outcome IN ('HOLD','DRIVE_CONFLICT','DRIVE_UPLOAD_UNCERTAIN','RESERVATION_UNAVAILABLE','DELIVERY_OUTCOME_UNCERTAIN','REQUEST_REJECTED')),"
+    "exit_code INTEGER NOT NULL CHECK(typeof(exit_code)='integer' AND exit_code IN (10,20)),"
+    "support_ref TEXT CHECK(support_ref IS NULL OR (length(support_ref) BETWEEN 4 AND 63 AND substr(support_ref,1,3)='EG_' AND substr(support_ref,4) NOT GLOB '*[^A-Z0-9_]*')),"
+    "stopped_at_utc TEXT NOT NULL,"
+    "PRIMARY KEY(run_id,stream)"
+    ") STRICT",
     # Binding rows: insert ACTIVE only; the only change ever allowed is
     # ACTIVE -> RETIRED with no open Drive operation under that binding.
     "CREATE TRIGGER energygrid_drive_binding_insert_guard_v3 BEFORE INSERT ON energygrid_drive_binding_v3 WHEN NEW.state!='ACTIVE' BEGIN SELECT RAISE(ABORT,'Drive binding must be inserted active'); END",
@@ -1676,6 +1704,8 @@ V3_SCHEMA_SQL = (
     "CREATE TRIGGER energygrid_drive_dispatch_no_delete_v3 BEFORE DELETE ON energygrid_drive_dispatch_v3 BEGIN SELECT RAISE(ABORT,'Drive dispatch rows are retained'); END",
     "CREATE TRIGGER energygrid_run_no_update_v3 BEFORE UPDATE ON energygrid_run_v3 BEGIN SELECT RAISE(ABORT,'run rows are insert-only'); END",
     "CREATE TRIGGER energygrid_run_no_delete_v3 BEFORE DELETE ON energygrid_run_v3 BEGIN SELECT RAISE(ABORT,'run rows are retained'); END",
+    "CREATE TRIGGER energygrid_run_stream_stop_no_update_v3 BEFORE UPDATE ON energygrid_run_stream_stop_v3 BEGIN SELECT RAISE(ABORT,'run stream stop rows are insert-only'); END",
+    "CREATE TRIGGER energygrid_run_stream_stop_no_delete_v3 BEFORE DELETE ON energygrid_run_stream_stop_v3 BEGIN SELECT RAISE(ABORT,'run stream stop rows are retained'); END",
     # Historical v2 Drive facts: preserved and frozen, never newly produced.
     "CREATE TRIGGER energygrid_invoice_drive_legacy_freeze_v3 BEFORE UPDATE ON energygrid_invoice_v2 WHEN"
     " NEW.drive_state IS NOT OLD.drive_state OR NEW.drive_binding_id IS NOT OLD.drive_binding_id OR NEW.drive_relpath IS NOT OLD.drive_relpath"
@@ -1700,7 +1730,7 @@ V3_SCHEMA_SQL = (
 
 V3_TABLES = (
     "energygrid_drive_binding_v3", "energygrid_drive_operation_v3",
-    "energygrid_drive_dispatch_v3", "energygrid_run_v3",
+    "energygrid_drive_dispatch_v3", "energygrid_run_v3", "energygrid_run_stream_stop_v3",
 )
 
 
@@ -1830,6 +1860,12 @@ def _v3_semantic_data_is_valid(connection: sqlite3.Connection) -> bool:
         for item in attempts:
             if item["support_ref"] is not None and _SUPPORT_REF_RE.fullmatch(item["support_ref"]) is None:
                 return False
+    for row in connection.execute("SELECT * FROM energygrid_run_stream_stop_v3"):
+        stop = _named_row(connection, "energygrid_run_stream_stop_v3", row)
+        if (stop["command"], stop["outcome"], stop["exit_code"]) not in RUN_STREAM_STOP_RESULTS:
+            return False
+        if stop["support_ref"] is not None and _SUPPORT_REF_RE.fullmatch(stop["support_ref"]) is None:
+            return False
     return True
 
 
@@ -1918,6 +1954,13 @@ class StateV3Store(StateV2Store):
         rows = self._rows("energygrid_run_v3", "SELECT * FROM energygrid_run_v3 WHERE run_id=?", (run_id,))
         return rows[0] if rows else None
 
+    def run_stream_stops(self, run_id: str) -> frozenset[str]:
+        """Streams stopped for this run only; earlier runs' rows never apply."""
+        rows = self._conn().execute(
+            "SELECT stream FROM energygrid_run_stream_stop_v3 WHERE run_id=?", (run_id,),
+        ).fetchall()
+        return frozenset(row[0] for row in rows)
+
     def has_open_archive_operation(self, invoice_id: str) -> bool:
         row = self._conn().execute(
             "SELECT 1 FROM energygrid_file_operation_v2 WHERE invoice_id=? AND kind IN ('ARCHIVE_PUBLISH','LEGACY_MOVE') "
@@ -1945,6 +1988,28 @@ class StateV3Store(StateV2Store):
                 (run_id, started_at_utc, acquire_state, timestamp, acquire_exit_code, acquire_support_ref,
                  eb[0], tenant[0], eb[1], tenant[1]),
             )
+
+    def insert_run_stream_stop(self, *, run_id: str, stream: str, command: str, outcome: str, exit_code: int,
+                               support_ref: str | None, timestamp: str) -> None:
+        """Append the one stop row for (run, stream) and read it back exactly."""
+        if (
+            not _valid_run_id(run_id) or stream not in V2_STREAMS or type(exit_code) is not int
+            or (command, outcome, exit_code) not in RUN_STREAM_STOP_RESULTS
+            or (support_ref is not None and _SUPPORT_REF_RE.fullmatch(support_ref) is None)
+        ):
+            raise StateError("run stream stop is invalid")
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO energygrid_run_stream_stop_v3 (run_id,stream,command,outcome,exit_code,support_ref,stopped_at_utc) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (run_id, stream, command, outcome, exit_code, support_ref, timestamp),
+            )
+        row = self._conn().execute(
+            "SELECT command,outcome,exit_code,support_ref FROM energygrid_run_stream_stop_v3 WHERE run_id=? AND stream=?",
+            (run_id, stream),
+        ).fetchone()
+        if row is None or tuple(row) != (command, outcome, exit_code, support_ref):
+            raise StateError("run stream stop could not be read back")
 
     def insert_binding(self, *, stream: str, account_ref: str, root_folder_id: str, folder_id: str,
                        chain_sha256: str, run_id: str, timestamp: str) -> dict:

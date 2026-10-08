@@ -1,5 +1,7 @@
 """#226 G3 deterministic core: plan/command contract, pre-generated Drive file
-ID idempotency, receipt verification, Drive-before-email and no-resend.
+ID idempotency, receipt verification, Drive-before-email and no-resend, and
+(#226 G2 fairness reclosure) per-stream run fairness driven by a harness loop
+that transliterates the committed production prompt steps 3 and 4.
 
 Synthetic only: the fake Drive service models the n8n Drive workflow and the
 relevant Google semantics; nothing contacts Google, n8n, SMTP or EnergyGrid.
@@ -8,18 +10,26 @@ relevant Google semantics; nothing contacts Google, n8n, SMTP or EnergyGrid.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
 import uuid
 from contextlib import closing
 from pathlib import Path
+from typing import Callable
 
 from energygrid_bill_downloader.config import RUNTIME_V3_SCHEMA, DeliverySettings, DualRuntimeConfig
 from energygrid_bill_downloader.drive import DriveClient
-from energygrid_bill_downloader.errors import RunLockedError, StateError
+from energygrid_bill_downloader.errors import AppError, RunLockedError, StateError
 from energygrid_bill_downloader.invoice import Stream
-from energygrid_bill_downloader.orchestration import ALLOWED_COMMAND_LINES, CoreContext, compute_status, run_command
+from energygrid_bill_downloader.orchestration import (
+    ALLOWED_COMMAND_LINES,
+    CoreContext,
+    compute_status,
+    fallback_result,
+    run_command,
+)
 from energygrid_bill_downloader.state import StateV3Store
 
 from fixtures.synthetic_delivery import synthetic_pdf
@@ -45,8 +55,90 @@ class RecordingLogger:
         self.events.append((phase, status, fields))
 
 
+RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
+PROMPT_PATH = RUNTIME / "claude" / "energygrid_orchestrator.prompt.md"
+SUPERVISOR_PATH = RUNTIME / "claude_supervisor.ps1"
+# The committed production prompt's loop rule, verbatim (steps 3 and 4).
+# CoreHarness.loop below is a line-by-line transliteration of exactly this text.
+PROMPT_LOOP_LINES = (
+    "3. Loop, counting every command you run in it:",
+    "   a. Run `egcore.cmd plan`. If it exits with a non-zero code, stop the loop.",
+    "   b. Read the JSON field `next.argv`. If it is null, stop the loop.",
+    "   c. Run exactly the command in `next.argv`.",
+    "   d. If its exit code is 0, 10 or 20 and its one line of JSON has the field",
+    "      `disposition` equal to `CONTINUE` or `STREAM_STOPPED`, go back to step a.",
+    "      The core never plans a stopped stream again in this run.",
+    "   e. Otherwise (`RUN_STOP`, any other value, no such field, other exit code,",
+    "      or output that is not one line of JSON) stop the loop.",
+    "   Never start a command after 15 commands have run in the loop; stop instead.",
+    "4. After the loop, always run `egcore.cmd status` exactly once, even if the",
+    "   loop stopped early.",
+)
+PROMPT_COMMAND_CEILING = 15
+
+
+def _one_json_line(text: str):
+    """Claude's reading of a command's stdout: exactly one line of JSON or nothing."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        return json.loads(lines[0])
+    except ValueError:
+        return None
+
+
+def _supervisor_tables() -> tuple[dict[str, int], int]:
+    supervisor = SUPERVISOR_PATH.read_text(encoding="utf-8")
+    block = re.search(r"\$script:EgOutcomeExit = @\{(.*?)\n\}", supervisor, re.S).group(1)
+    mapping = {name: int(code) for name, code in re.findall(r"'([A-Z_]+)' = (\d+)", block)}
+    invalid = int(re.search(r"StatusInvalid = (\d+)", supervisor).group(1))
+    return mapping, invalid
+
+
+# Lines of the supervisor's Get-EgStatusExitCode that supervisor_status_exit
+# transliterates; a static test pins each one.
+SUPERVISOR_STATUS_LINES = (
+    "if (-not (Test-EgStatusDocument -Status $Status)) { return $script:EgExit.StatusInvalid }",
+    "if (-not $Status.terminal) { return $script:EgExit.StatusInvalid }",
+    "$code = [int]$script:EgOutcomeExit[[string]$Status.business_outcome]",
+    "if ($code -eq 0 -and $Status.uncertainty_outstanding) { return $script:EgExit.StatusInvalid }",
+)
+
+
+def supervisor_status_exit(status: dict | None) -> int:
+    """The supervisor's final status -> exit code mapping (Get-EgStatusExitCode)."""
+    mapping, invalid = _supervisor_tables()
+    if not isinstance(status, dict) or status.get("schema") != "energygrid.core.status.v3":
+        return invalid
+    if type(status.get("terminal")) is not bool or type(status.get("uncertainty_outstanding")) is not bool:
+        return invalid
+    if status.get("business_outcome") not in mapping or not status["terminal"]:
+        return invalid
+    code = mapping[status["business_outcome"]]
+    if code == 0 and status["uncertainty_outstanding"]:
+        return invalid
+    return code
+
+
+class HeldLock:
+    def __init__(self, _path):
+        pass
+
+    def __enter__(self):
+        raise RunLockedError()
+
+    def __exit__(self, *args):
+        return None
+
+
 class CoreHarness:
-    """Simulates the supervisor/Claude loop: plan -> run next argv -> repeat."""
+    """The deterministic core behind the exact production orchestration loop.
+
+    `loop` is the only multi-command driver and transliterates the committed
+    prompt steps 3 and 4; it runs at most once per run ID. `run` goes through
+    the CLI's shared fallback helper, so escaped errors produce the same
+    RUN_STOP documents as production."""
 
     def __init__(self, test: unittest.TestCase, *, bound=("EB_BILL", "TENANT_BILL"), drive_bound=("EB_BILL", "TENANT_BILL")) -> None:
         self.test = test
@@ -76,6 +168,13 @@ class CoreHarness:
         self.adapters = None
         self.outputs: list[str] = []
         self.logger = RecordingLogger()
+        self.looped: dict[str, dict] = {}
+        # Test-only switches: Drive auth per stream, and per exact allowlisted line.
+        self.drive_auth_unavailable: set[str] = set()
+        self.drive_client_missing = False
+        self.locked_lines: set[str] = set()
+        self.output_overrides: dict[str, tuple[str, int]] = {}
+        self.after_line: dict[str, Callable[[], None]] = {}
 
     def new_adapters(self):
         payloads = {item.source_filename: synthetic_pdf(item.source_filename.encode()) for item in (*self.eb, *self.tenant)}
@@ -85,37 +184,85 @@ class CoreHarness:
         }
         return self.adapters
 
-    def core(self, run_id: str) -> CoreContext:
-        return CoreContext(
+    def core(self, run_id: str, stream: str | None = None, command: str | None = None) -> CoreContext:
+        token = {} if stream in self.drive_auth_unavailable else {"ENERGYGRID_DRIVE_TOKEN": "synthetic-drive-token"}
+        core = CoreContext(
             self.config, run_id=run_id, logger=self.logger, adapters_factory=self.new_adapters,
-            drive_client=DriveClient(self.config.drive, post_once=self.drive.post_once,
-                                     environ={"ENERGYGRID_DRIVE_TOKEN": "synthetic-drive-token"}),
+            drive_client=None if self.drive_client_missing else DriveClient(
+                self.config.drive, post_once=self.drive.post_once, environ=token),
             delivery_client=self.delivery,
         )
+        if command is not None and command_line_of(command, stream) in self.locked_lines:
+            core.lock_factory = HeldLock
+        return core
 
     def run(self, command: str, stream: str | None = None, *, run_id: str) -> tuple[dict, int]:
-        document, code = run_command(command, stream, self.core(run_id))
+        try:
+            document, code = run_command(command, stream, self.core(run_id, stream, command))
+        except AppError as error:
+            # Exactly what cli.run_core_command prints for an escaped error.
+            document, code = fallback_result(command, stream, error)
         self.outputs.append(json.dumps(document, sort_keys=True))
         return document, code
 
-    def loop(self, run_id: str, *, limit: int = 30) -> list[tuple[str, int]]:
-        """Follow `plan.next.argv` until the plan is terminal or a command fails."""
-        steps = []
-        for _ in range(limit):
-            plan, code = self.run("plan", run_id=run_id)
-            self.test.assertEqual(0, code)
-            argv = plan["next"]["argv"]
-            if argv is None:
-                return steps
-            self.test.assertIn(argv, ALLOWED_COMMAND_LINES)
-            parts = argv.split()
-            command = parts[1]
-            stream = parts[3] if len(parts) == 4 else None
-            _document, code = self.run(command, stream, run_id=run_id)
-            steps.append((argv, code))
+    def execute(self, line: str, run_id: str) -> tuple[str, int]:
+        """One Bash call as Claude sees it: an allowlisted line -> (stdout, exit code)."""
+        self.test.assertIn(line, ALLOWED_COMMAND_LINES)
+        if line in self.output_overrides:
+            text, code = self.output_overrides.pop(line)
+        else:
+            parts = line.split()
+            document, code = self.run(parts[1], parts[3] if len(parts) == 4 else None, run_id=run_id)
+            text = json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        hook = self.after_line.pop(line, None)
+        if hook is not None:
+            hook()
+        return text, code
+
+    def loop(self, run_id: str, *, ceiling: int = PROMPT_COMMAND_CEILING) -> list[tuple[str, int]]:
+        """Prompt steps 3 and 4, transliterated. Returns the executed next.argv
+        commands with exit codes; `self.looped[run_id]` keeps the full trace."""
+        if run_id in self.looped:
+            raise AssertionError("production runs exactly one loop per run ID")
+        trace: dict = {"commands": [], "steps": [], "dispositions": [], "last_plan_action": None}
+        self.looped[run_id] = trace
+        commands = trace["commands"]
+        while True:
+            # "Never start a command after 15 commands have run in the loop; stop instead."
+            if len(commands) >= ceiling:
+                break
+            # a. Run `egcore.cmd plan`. If it exits with a non-zero code, stop the loop.
+            text, code = self.execute("egcore.cmd plan", run_id)
+            commands.append("egcore.cmd plan")
             if code != 0:
-                return steps
-        raise AssertionError("plan did not converge")
+                break
+            # b. Read the JSON field `next.argv`. If it is null, stop the loop.
+            plan = _one_json_line(text)
+            if not isinstance(plan, dict) or not isinstance(plan.get("next"), dict):
+                break
+            trace["last_plan_action"] = plan["next"].get("action")
+            argv = plan["next"].get("argv")
+            if argv is None:
+                break
+            if len(commands) >= ceiling:
+                break
+            # c. Run exactly the command in `next.argv`.
+            text, code = self.execute(argv, run_id)
+            commands.append(argv)
+            trace["steps"].append((argv, code))
+            result = _one_json_line(text)
+            disposition = result.get("disposition") if isinstance(result, dict) else None
+            trace["dispositions"].append(disposition)
+            # d. Exit 0, 10 or 20 with disposition CONTINUE or STREAM_STOPPED: back to a.
+            if code in {0, 10, 20} and disposition in {"CONTINUE", "STREAM_STOPPED"}:
+                continue
+            # e. Otherwise stop the loop.
+            break
+        # 4. After the loop, always run `egcore.cmd status` exactly once.
+        text, code = self.execute("egcore.cmd status", run_id)
+        trace["status"] = _one_json_line(text) if code == 0 else None
+        trace["supervisor_exit"] = supervisor_status_exit(trace["status"])
+        return list(trace["steps"])
 
     def status(self, run_id: str) -> dict:
         document, code = self.run("status", run_id=run_id)
@@ -151,6 +298,10 @@ class CoreHarness:
 
 def run_id() -> str:
     return str(uuid.uuid4())
+
+
+def command_line_of(command: str, stream: str | None) -> str:
+    return f"egcore.cmd {command}" + (f" --stream {stream}" if stream else "")
 
 
 class CoreHappyPathTests(unittest.TestCase):
@@ -248,7 +399,10 @@ class PregeneratedIdTests(unittest.TestCase):
         self.assertEqual([], harness.dispatches("EB_BILL"))
         self.assertEqual({}, harness.drive.files)
         harness.drive.drop_reservation_response = False
-        self.assertEqual(0, harness.run("drive-upload", "EB_BILL", run_id=current)[1])
+        # #226 G2 R13: RESERVATION_UNAVAILABLE stops EB for this run; the later call is a later run.
+        later = run_id()
+        self.assertEqual(0, harness.run("acquire", run_id=later)[1])
+        self.assertEqual(0, harness.run("drive-upload", "EB_BILL", run_id=later)[1])
         operation = harness.operation("EB_BILL")
         self.assertEqual(harness.drive.generated[1], operation["reserved_remote_file_id"])
         self.assertEqual("DRIVE_VERIFIED", operation["state"])
@@ -304,7 +458,10 @@ class PregeneratedIdTests(unittest.TestCase):
         self.assertEqual("NO_VALID_RESULT", harness.dispatches("EB_BILL")[0]["outcome"])
         self.assertEqual([], harness.delivery.sent, "no email while Drive is uncertain")
         harness.drive.lose_response_after_create = False
-        steps = harness.loop(current)
+        # #226 G2 R13: DRIVE_UPLOAD_UNCERTAIN stops EB for this run; reconcile in a later run.
+        later = run_id()
+        self.assertEqual(0, harness.run("acquire", run_id=later)[1])
+        steps = harness.loop(later)
         self.assertEqual("egcore.cmd drive-reconcile --stream EB_BILL", steps[0][0])
         operation = harness.operation("EB_BILL")
         self.assertEqual("DRIVE_VERIFIED", operation["state"])
@@ -446,11 +603,13 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual((20, "DRIVE_CONFLICT"), (code, document["outcome"]))
 
     def test_no_checksum_holds_never_verifies_and_never_emails_then_later_reconcile_verifies(self) -> None:
-        harness, document, code, current = self.upload(report_sha256=False, report_md5=False)
+        harness, document, code, _current = self.upload(report_sha256=False, report_md5=False)
         self.assertEqual((20, "HOLD", "EG_DRIVE_VERIFICATION_UNAVAILABLE"), (code, document["outcome"], document["support_ref"]))
-        harness.loop(current)
+        # #226 G2 R13: that HOLD stops EB for this run; its same-stream reconcile is a later run.
+        middle = run_id()
+        harness.loop(middle)
         self.assertEqual([], harness.delivery.sent, "size alone never authorises email")
-        self.assertEqual("DRIVE_CONFLICT", harness.status(current)["business_outcome"])
+        self.assertEqual("DRIVE_CONFLICT", harness.status(middle)["business_outcome"])
         harness.drive.report_md5 = True
         later = run_id()
         steps = harness.loop(later)
@@ -557,19 +716,44 @@ class CommandContractTests(unittest.TestCase):
         self.assertEqual(creates, harness.drive.creates, "email uncertainty never re-uploads")
 
     def test_drive_uncertainty_is_independent_of_the_other_stream(self) -> None:
+        """#226 G2 R10 = R1(a): one production loop per run. Run 2's EB reconcile
+        response is lost (stream-local, exit 20, STREAM_STOPPED); the same loop
+        re-plans, delivers Tenant, never retries EB, and stays non-success."""
         harness = CoreHarness(self)
-        current = run_id()
-        harness.drive_until(current, "EB_BILL", "drive-upload")
-        harness.drive.lose_response_after_create = True
-        harness.run("drive-upload", "EB_BILL", run_id=current)
-        harness.drive.lose_response_after_create = False
-        harness.drive.drop_reconcile_response = True
-        # EB's reconcile is unavailable this run; the plan then moves on to Tenant.
-        harness.loop(current)
-        harness.loop(current)
+        tenant = harness.tenant
+        harness.tenant = []
+        first = run_id()
+        harness.drive.stream_faults["EB_BILL"] = {"lose_response_after_create"}
+        self.assertEqual([(ACQ, 0), (INTENT_EB, 0), (UPLOAD_EB, 20)], harness.loop(first))
+        self.assertEqual(["CONTINUE", "CONTINUE", "STREAM_STOPPED"], harness.looped[first]["dispositions"])
         self.assertEqual("DRIVE_UPLOAD_UNCERTAIN", harness.operation("EB_BILL")["state"])
-        self.assertIn("TENANT_BILL", harness.delivery.sent)
-        self.assertNotIn("EB_BILL", harness.delivery.sent)
+
+        harness.tenant = tenant
+        harness.drive.stream_faults["EB_BILL"] = {"drop_reconcile_response"}
+        second = run_id()
+        mark = len(harness.drive.requests)
+        steps = harness.loop(second)
+        trace = harness.looped[second]
+        self.assertEqual([(ACQ, 0), (RECONCILE_EB, 20), (INTENT_TENANT, 0), (UPLOAD_TENANT, 0), (DELIVER_TENANT, 0)], steps)
+        self.assertEqual(["CONTINUE", "STREAM_STOPPED", "CONTINUE", "CONTINUE", "CONTINUE"], trace["dispositions"])
+        # A fresh plan follows the stopped EB command, and the final plan is null.
+        self.assertEqual([PLAN, ACQ, PLAN, RECONCILE_EB, PLAN, INTENT_TENANT, PLAN, UPLOAD_TENANT, PLAN, DELIVER_TENANT, PLAN],
+                         trace["commands"])
+        self.assertEqual("HOLD", trace["last_plan_action"])
+        self.assertEqual([("RECONCILE", "EB_BILL")], [item for item in harness.drive.requests[mark:] if item[1] == "EB_BILL"],
+                         "EB is reconciled once and never uploaded or retried in the run")
+        self.assertEqual(["TENANT_BILL"], harness.delivery.sent)
+        self.assertEqual(2, len(harness.drive.creates), "one EB file from run 1, one Tenant file")
+        self.assertEqual(("DRIVE_UPLOAD_UNCERTAIN", "DRIVE_VERIFIED"),
+                         (harness.operation("EB_BILL")["state"], harness.operation("TENANT_BILL")["state"]))
+        status = trace["status"]
+        self.assertEqual(("DRIVE_UNCERTAIN", True, True),
+                         (status["business_outcome"], status["terminal"], status["uncertainty_outstanding"]))
+        self.assertEqual((True, False), (status["streams"]["EB_BILL"]["stopped_for_run"],
+                                         status["streams"]["TENANT_BILL"]["stopped_for_run"]))
+        self.assertEqual(("COMPLETED", True), (status["streams"]["TENANT_BILL"]["outcome"],
+                                               status["streams"]["TENANT_BILL"]["fully_handled"]))
+        self.assertEqual(84, trace["supervisor_exit"], "attention required, not success")
 
     def test_binding_mismatch_holds_before_any_network(self) -> None:
         harness = CoreHarness(self, drive_bound=("EB_BILL",), bound=("EB_BILL",))
@@ -615,6 +799,513 @@ class CommandContractTests(unittest.TestCase):
         harness = CoreHarness(self)
         status = harness.status(run_id())
         self.assertEqual(("INCOMPLETE", False), (status["business_outcome"], status["terminal"]))
+
+
+PLAN = "egcore.cmd plan"
+ACQ = "egcore.cmd acquire"
+INTENT_EB = "egcore.cmd drive-intent --stream EB_BILL"
+UPLOAD_EB = "egcore.cmd drive-upload --stream EB_BILL"
+RECONCILE_EB = "egcore.cmd drive-reconcile --stream EB_BILL"
+DELIVER_EB = "egcore.cmd deliver --stream EB_BILL"
+INTENT_TENANT = "egcore.cmd drive-intent --stream TENANT_BILL"
+UPLOAD_TENANT = "egcore.cmd drive-upload --stream TENANT_BILL"
+RECONCILE_TENANT = "egcore.cmd drive-reconcile --stream TENANT_BILL"
+DELIVER_TENANT = "egcore.cmd deliver --stream TENANT_BILL"
+STREAM_LINES = {
+    stream: tuple(line for line in ALLOWED_COMMAND_LINES if line.endswith(f"--stream {stream}"))
+    for stream in ("EB_BILL", "TENANT_BILL")
+}
+
+
+def archive_path(harness: CoreHarness, stream: str) -> Path:
+    from energygrid_bill_downloader.reconcile import _canonical_path
+
+    with StateV3Store(harness.state_path, read_only=True) as state:
+        invoice = state.invoice(state.stream(stream)["watermark_invoice_id"])
+    return _canonical_path(harness.config.archive_root, stream, invoice["canonical_filename"])
+
+
+def corrupt_archive(harness: CoreHarness, stream: str) -> Callable[[], None]:
+    """Hook: after acquire, the stream's committed archive bytes change; returns a restorer."""
+    saved: dict[str, bytes] = {}
+
+    def corrupt() -> None:
+        path = archive_path(harness, stream)
+        saved["bytes"] = path.read_bytes()
+        path.write_bytes(saved["bytes"] + b"\n%synthetic tamper\n")
+
+    def restore() -> None:
+        archive_path(harness, stream).write_bytes(saved["bytes"])
+
+    harness.after_line[ACQ] = corrupt
+    return restore
+
+
+def stop_rows(harness: CoreHarness) -> list[tuple]:
+    with closing(sqlite3.connect(harness.state_path)) as connection:
+        return list(connection.execute("SELECT run_id,stream,command,outcome,exit_code FROM energygrid_run_stream_stop_v3 ORDER BY run_id,stream"))
+
+
+def database_dump(harness: CoreHarness) -> str:
+    with closing(sqlite3.connect(harness.state_path)) as connection:
+        return "\n".join(connection.iterdump())
+
+
+class DualStreamFairnessTests(unittest.TestCase):
+    """#226 G2 fairness reclosure (G4-F1): a stream-local stop ends only that
+    stream for the current run; the peer stream progresses in the same single
+    production loop; the stopped stream is never retried in that run; the final
+    supervisor status stays fail-closed; the next run reconsiders the stream."""
+
+    def assert_stream_commands_stop_at_their_stop(self, harness: CoreHarness, run: str) -> None:
+        trace = harness.looped[run]
+        for stream, lines in STREAM_LINES.items():
+            stopped_at = [index for index, ((argv, _code), disposition) in enumerate(zip(trace["steps"], trace["dispositions"]))
+                          if argv in lines and disposition != "CONTINUE"]
+            self.assertLessEqual(len(stopped_at), 1, f"{stream} has at most one non-continuation command")
+            if stopped_at:
+                later = [argv for argv, _code in trace["steps"][stopped_at[0] + 1:] if argv in lines]
+                self.assertEqual([], later, f"no {stream} command follows its stop in the same run")
+
+    # -- R1(b) / R2 / R3 / R4 -------------------------------------------------
+    def test_eb_reconcile_with_drive_auth_unavailable_lets_tenant_complete_and_run_is_incomplete(self) -> None:
+        harness = CoreHarness(self)
+        tenant = harness.tenant
+        harness.tenant = []
+        harness.drive.stream_faults["EB_BILL"] = {"lose_response_after_create"}
+        harness.loop(run_id())
+        harness.drive.stream_faults.clear()
+        harness.tenant = tenant
+        harness.drive_auth_unavailable = {"EB_BILL"}
+        second = run_id()
+        mark = len(harness.drive.requests)
+        steps = harness.loop(second)
+        self.assertEqual([(ACQ, 0), (RECONCILE_EB, 20), (INTENT_TENANT, 0), (UPLOAD_TENANT, 0), (DELIVER_TENANT, 0)], steps)
+        self.assertEqual([], [item for item in harness.drive.requests[mark:] if item[1] == "EB_BILL"], "no EB network")
+        self.assertEqual(["TENANT_BILL"], harness.delivery.sent)
+        status = harness.looped[second]["status"]
+        self.assertEqual("DRIVE_RECONCILE", status["streams"]["EB_BILL"]["action"], "the stopped step is kept")
+        self.assertEqual(("INCOMPLETE", False), (status["business_outcome"], status["terminal"]))
+        self.assertEqual(89, harness.looped[second]["supervisor_exit"])
+
+    def test_symmetry_tenant_drive_failures_let_eb_complete(self) -> None:
+        for fault, expected_exit, expected_outcome in (("drop_reconcile_response", 84, "DRIVE_UNCERTAIN"),
+                                                       ("auth", 89, "INCOMPLETE")):
+            with self.subTest(fault=fault):
+                harness = CoreHarness(self)
+                eb = harness.eb
+                harness.eb = []
+                harness.drive.stream_faults["TENANT_BILL"] = {"lose_response_after_create"}
+                first = run_id()
+                self.assertEqual([(ACQ, 0), (INTENT_TENANT, 0), (UPLOAD_TENANT, 20)], harness.loop(first))
+                harness.eb = eb
+                harness.drive.stream_faults.clear()
+                if fault == "auth":
+                    harness.drive_auth_unavailable = {"TENANT_BILL"}
+                else:
+                    harness.drive.stream_faults["TENANT_BILL"] = {fault}
+                second = run_id()
+                steps = harness.loop(second)
+                self.assertEqual([(ACQ, 0), (INTENT_EB, 0), (UPLOAD_EB, 0), (DELIVER_EB, 0), (RECONCILE_TENANT, 20)], steps)
+                self.assertEqual(["EB_BILL"], harness.delivery.sent)
+                self.assertEqual("HOLD", harness.looped[second]["last_plan_action"])
+                status = harness.looped[second]["status"]
+                self.assertEqual(expected_outcome, status["business_outcome"])
+                self.assertTrue(status["streams"]["TENANT_BILL"]["stopped_for_run"])
+                self.assertEqual(expected_exit, harness.looped[second]["supervisor_exit"])
+
+    def test_archive_failure_at_drive_intent_stops_only_that_stream(self) -> None:
+        for failing, healthy in (("EB_BILL", "TENANT_BILL"), ("TENANT_BILL", "EB_BILL")):
+            with self.subTest(failing=failing):
+                harness = CoreHarness(self)
+                corrupt_archive(harness, failing)
+                current = run_id()
+                steps = harness.loop(current)
+                intent_failing = f"egcore.cmd drive-intent --stream {failing}"
+                self.assertEqual(1, [argv for argv, _code in steps].count(intent_failing))
+                self.assertIn((intent_failing, 20), steps)
+                self.assertEqual([healthy], harness.delivery.sent)
+                self.assert_stream_commands_stop_at_their_stop(harness, current)
+                trace = harness.looped[current]
+                self.assertEqual(("INCOMPLETE", 89), (trace["status"]["business_outcome"], trace["supervisor_exit"]))
+                self.assertEqual("DRIVE_PREPARE", trace["status"]["streams"][failing]["action"])
+                self.assertEqual([(current, failing, "drive-intent", "HOLD", 20)], stop_rows(harness))
+                # R3: a direct command for the stopped stream refuses without mutation or network.
+                before = database_dump(harness)
+                requests, sent = list(harness.drive.requests), list(harness.delivery.sent)
+                for line in STREAM_LINES[failing]:
+                    parts = line.split()
+                    document, code = harness.run(parts[1], parts[3], run_id=current)
+                    self.assertEqual((64, "REFUSED", "EG_CORE_STREAM_STOPPED_FOR_RUN", False, "RUN_STOP"),
+                                     (code, document["outcome"], document["support_ref"], document["mutated"], document["disposition"]))
+                self.assertEqual(before, database_dump(harness))
+                self.assertEqual((requests, sent), (harness.drive.requests, harness.delivery.sent))
+
+    def test_eb_delivery_preparation_failure_is_not_retried_and_tenant_is_delivered(self) -> None:
+        harness = CoreHarness(self)
+        harness.delivery.preparation_failure_streams = {"EB_BILL"}
+        current = run_id()
+        steps = harness.loop(current)
+        self.assertEqual([(ACQ, 0), (INTENT_EB, 0), (UPLOAD_EB, 0), (DELIVER_EB, 20),
+                          (INTENT_TENANT, 0), (UPLOAD_TENANT, 0), (DELIVER_TENANT, 0)], steps)
+        self.assertEqual(["TENANT_BILL"], harness.delivery.sent)
+        with StateV3Store(harness.state_path, read_only=True) as state:
+            delivery = state.delivery_for_invoice(state.stream("EB_BILL")["watermark_invoice_id"])
+        self.assertEqual(("PENDING_SEND", None), (delivery["state"], delivery["dispatch_started_at_utc"]), "no dispatch marker")
+        trace = harness.looped[current]
+        self.assertEqual(("INCOMPLETE", 89), (trace["status"]["business_outcome"], trace["supervisor_exit"]))
+        self.assertEqual([(current, "EB_BILL", "deliver", "HOLD", 20)], stop_rows(harness))
+
+    def test_eb_email_uncertainty_never_resends_and_tenant_is_delivered(self) -> None:
+        harness = CoreHarness(self)
+        harness.delivery.outcomes["EB_BILL"] = "DELIVERY_OUTCOME_UNCERTAIN"
+        current = run_id()
+        steps = harness.loop(current)
+        self.assertIn((DELIVER_EB, 20), steps)
+        self.assertEqual(["EB_BILL", "TENANT_BILL"], harness.delivery.sent)
+        self.assertEqual(("EMAIL_UNCERTAIN", 86), (harness.looped[current]["status"]["business_outcome"],
+                                                   harness.looped[current]["supervisor_exit"]))
+        later = run_id()
+        self.assertEqual([(ACQ, 0)], harness.loop(later))
+        self.assertEqual(["EB_BILL", "TENANT_BILL"], harness.delivery.sent, "no resend in this run or the next")
+        self.assertEqual(("EMAIL_UNCERTAIN", 86), (harness.looped[later]["status"]["business_outcome"],
+                                                   harness.looped[later]["supervisor_exit"]))
+
+    # -- R5 / R6 ----------------------------------------------------------------
+    FAULTS = {
+        # name: (expected stream outcome after the run, expected stop command or None)
+        None: ("COMPLETED", None),
+        "upload_uncertain": ("INCOMPLETE", "drive-upload"),
+        "drive_conflict": ("DRIVE_CONFLICT", "drive-upload"),
+        "reservation_lost": ("INCOMPLETE", "drive-upload"),
+        "archive": ("INCOMPLETE", "drive-intent"),
+        "email_uncertain": ("EMAIL_UNCERTAIN", "deliver"),
+        "email_rejected": ("HOLD", "deliver"),
+    }
+
+    def apply_fault(self, harness: CoreHarness, stream: str, fault: str | None) -> None:
+        if fault == "upload_uncertain":
+            harness.drive.stream_faults.setdefault(stream, set()).add("lose_response_after_create")
+        elif fault == "drive_conflict":
+            harness.drive.stream_mutations[stream] = lambda item: item.update(trashed=True)
+        elif fault == "reservation_lost":
+            harness.drive.stream_faults.setdefault(stream, set()).add("drop_reservation_response")
+        elif fault == "archive":
+            hook = harness.after_line.get(ACQ)
+
+            def corrupt(stream=stream, hook=hook) -> None:
+                if hook is not None:
+                    hook()
+                path = archive_path(harness, stream)
+                path.write_bytes(path.read_bytes() + b"\n%synthetic tamper\n")
+
+            harness.after_line[ACQ] = corrupt
+        elif fault == "email_uncertain":
+            harness.delivery.outcomes[stream] = "DELIVERY_OUTCOME_UNCERTAIN"
+        elif fault == "email_rejected":
+            harness.delivery.outcomes[stream] = "REQUEST_REJECTED"
+
+    def test_both_streams_fail_independently_across_a_fault_matrix(self) -> None:
+        from energygrid_bill_downloader.orchestration import OUTCOME_SEVERITY
+
+        for eb_fault in self.FAULTS:
+            for tenant_fault in self.FAULTS:
+                with self.subTest(eb=eb_fault, tenant=tenant_fault):
+                    harness = CoreHarness(self)
+                    self.apply_fault(harness, "EB_BILL", eb_fault)
+                    self.apply_fault(harness, "TENANT_BILL", tenant_fault)
+                    current = run_id()
+                    harness.loop(current)
+                    trace = harness.looped[current]
+                    self.assertLessEqual(len(trace["commands"]), PROMPT_COMMAND_CEILING)
+                    self.assertEqual(PLAN, trace["commands"][-1], "the loop ends on a null plan")
+                    self.assert_stream_commands_stop_at_their_stop(harness, current)
+                    status = trace["status"]
+                    expected = {"EB_BILL": self.FAULTS[eb_fault][0], "TENANT_BILL": self.FAULTS[tenant_fault][0]}
+                    self.assertEqual(expected, {name: item["outcome"] for name, item in status["streams"].items()})
+                    overall = next(item for item in OUTCOME_SEVERITY if item in expected.values())
+                    self.assertEqual(overall, status["business_outcome"])
+                    rows = {(stream, command) for _run, stream, command, _outcome, _code in stop_rows(harness)}
+                    expected_rows = {(stream, self.FAULTS[fault][1]) for stream, fault in
+                                     (("EB_BILL", eb_fault), ("TENANT_BILL", tenant_fault)) if self.FAULTS[fault][1]}
+                    self.assertEqual(expected_rows, rows)
+                    if eb_fault is None and tenant_fault is None:
+                        self.assertEqual(0, trace["supervisor_exit"])
+                    else:
+                        self.assertNotEqual(0, trace["supervisor_exit"], "never false success")
+
+    def test_one_stream_succeeds_while_the_other_holds(self) -> None:
+        harness = CoreHarness(self)
+        self.apply_fault(harness, "EB_BILL", "drive_conflict")
+        current = run_id()
+        harness.loop(current)
+        trace = harness.looped[current]
+        self.assertEqual(("DRIVE_CONFLICT", True), (trace["status"]["business_outcome"], trace["status"]["terminal"]))
+        self.assertTrue(trace["status"]["streams"]["TENANT_BILL"]["fully_handled"])
+        self.assertEqual(85, trace["supervisor_exit"])
+        # Production shape: Tenant UNBOUND every day.
+        harness = CoreHarness(self, bound=("EB_BILL",), drive_bound=("EB_BILL",))
+        current = run_id()
+        harness.loop(current)
+        self.assertEqual(("HOLD", 81), (harness.looped[current]["status"]["business_outcome"], harness.looped[current]["supervisor_exit"]))
+        harness = CoreHarness(self, bound=("EB_BILL",), drive_bound=("EB_BILL",))
+        harness.drive_auth_unavailable = {"EB_BILL"}
+        current = run_id()
+        self.assertEqual([(ACQ, 0), (INTENT_EB, 0), (UPLOAD_EB, 20)], harness.loop(current))
+        self.assertEqual(("INCOMPLETE", 89), (harness.looped[current]["status"]["business_outcome"], harness.looped[current]["supervisor_exit"]),
+                         "an unbound peer's HOLD never hides the stopped stream's unfinished step")
+
+    # -- R7 -----------------------------------------------------------------------
+    def test_next_run_reconsiders_the_stopped_stream_without_repeating_the_other(self) -> None:
+        harness = CoreHarness(self)
+        tenant = harness.tenant
+        harness.tenant = []
+        harness.drive.stream_faults["EB_BILL"] = {"lose_response_after_create"}
+        harness.loop(run_id())
+        harness.drive.stream_faults.clear()
+        harness.tenant = tenant
+        harness.drive_auth_unavailable = {"EB_BILL"}
+        second = run_id()
+        harness.loop(second)
+        self.assertEqual(89, harness.looped[second]["supervisor_exit"])
+        creates, sent = list(harness.drive.creates), list(harness.delivery.sent)
+        harness.drive_auth_unavailable = set()
+        third = run_id()
+        steps = harness.loop(third)
+        self.assertEqual([(ACQ, 0), (RECONCILE_EB, 0), (DELIVER_EB, 0)], steps)
+        self.assertFalse(any(argv in STREAM_LINES["TENANT_BILL"] for argv, _code in steps), "Tenant gets zero commands")
+        self.assertEqual(creates, harness.drive.creates, "no re-upload")
+        self.assertEqual(sent + ["EB_BILL"], harness.delivery.sent, "Tenant is not re-sent")
+        status = harness.looped[third]["status"]
+        self.assertEqual(("COMPLETED", False), (status["business_outcome"], status["streams"]["EB_BILL"]["stopped_for_run"]))
+        self.assertEqual(0, harness.looped[third]["supervisor_exit"])
+
+    # -- R8 -----------------------------------------------------------------------
+    def assert_global_stop(self, harness: CoreHarness, run: str, last: tuple[str, int], support_ref: str | None = None) -> None:
+        trace = harness.looped[run]
+        self.assertEqual(last, trace["steps"][-1])
+        self.assertNotEqual(PLAN, trace["commands"][-1], "the loop stopped without re-planning")
+        self.assertFalse(any(argv in STREAM_LINES["TENANT_BILL"] for argv in trace["commands"]), "Tenant gets zero commands")
+        self.assertEqual([], harness.delivery.sent)
+        self.assertEqual([], stop_rows(harness), "a global stop writes no stop row")
+        self.assertIsNotNone(trace["status"], "status still runs exactly once")
+        self.assertNotEqual(0, trace["supervisor_exit"])
+        if support_ref is not None:
+            self.assertIn(support_ref, harness.outputs[-2])
+
+    def test_global_failures_stop_the_whole_run(self) -> None:
+        from unittest import mock
+
+        from energygrid_bill_downloader import orchestration
+        from energygrid_bill_downloader.errors import SourceContractError
+
+        with self.subTest(case="drive client missing"):
+            harness = CoreHarness(self)
+            harness.drive_client_missing = True
+            current = run_id()
+            harness.loop(current)
+            self.assert_global_stop(harness, current, (UPLOAD_EB, 64), "EG_CORE_CONFIG_INVALID")
+            self.assertEqual("RUN_STOP", harness.looped[current]["dispositions"][-1])
+        with self.subTest(case="run-lock contention on a stream command"):
+            harness = CoreHarness(self)
+            harness.locked_lines = {INTENT_EB}
+            current = run_id()
+            harness.loop(current)
+            self.assert_global_stop(harness, current, (INTENT_EB, 10), "EG_RUN_ALREADY_ACTIVE")
+        with self.subTest(case="forced StateError"):
+            harness = CoreHarness(self)
+            current = run_id()
+            with mock.patch.object(StateV3Store, "create_drive_intent", side_effect=StateError("forced")):
+                harness.loop(current)
+            self.assert_global_stop(harness, current, (INTENT_EB, 20), "EG_CORE_FAILURE")
+            self.assertIn('"outcome": "FAILED"', harness.outputs[-2])
+        with self.subTest(case="acquire failure"):
+            harness = CoreHarness(self)
+
+            def source_down():
+                raise SourceContractError("EG_SYNTHETIC_SOURCE_DOWN")
+
+            harness.new_adapters = source_down
+            current = run_id()
+            harness.loop(current)
+            self.assert_global_stop(harness, current, (ACQ, 20), "EG_ACQUIRE_FAILED")
+        with self.subTest(case="unknown classifier tuple"):
+            harness = CoreHarness(self)
+            reduced = orchestration.CONTINUE_RESULTS - {("drive-intent", "INTENT_CREATED", 0)}
+            current = run_id()
+            with mock.patch.object(orchestration, "CONTINUE_RESULTS", reduced):
+                harness.loop(current)
+            self.assert_global_stop(harness, current, (INTENT_EB, 20), "EG_CORE_FAILURE")
+        supervisor = SUPERVISOR_PATH.read_text(encoding="utf-8")
+        refusal = re.search(r"\$refusal = '([^']*)'", supervisor).group(1)
+        for name, text, code in (
+            ("supervisor CoreDispatch refusal literal", refusal + "\n", 64),
+            ("JSON without disposition", '{"outcome":"INTENT_CREATED","schema":"energygrid.core.result.v3"}\n', 0),
+            ("not JSON", "The system cannot find the path specified.\n", 0),
+            ("two lines", '{"disposition":"CONTINUE"}\n{"disposition":"CONTINUE"}\n', 0),
+            ("launcher exit", '{"disposition":"CONTINUE"}\n', 71),
+        ):
+            with self.subTest(case=name):
+                harness = CoreHarness(self)
+                harness.output_overrides[INTENT_EB] = (text, code)
+                current = run_id()
+                harness.loop(current)
+                self.assert_global_stop(harness, current, (INTENT_EB, code))
+
+    # -- R9 -----------------------------------------------------------------------
+    def dual_recovery_harness(self) -> CoreHarness:
+        harness = CoreHarness(self)
+        harness.drive.fail_create_before_google = True
+        first = run_id()
+        self.assertEqual([(ACQ, 0), (INTENT_EB, 0), (UPLOAD_EB, 20), (INTENT_TENANT, 0), (UPLOAD_TENANT, 20)],
+                         harness.loop(first), "both streams stop; neither starves the other")
+        harness.drive.fail_create_before_google = False
+        return harness
+
+    def test_worst_case_dual_recovery_uses_exactly_the_ceiling_and_ends_on_a_null_plan(self) -> None:
+        harness = self.dual_recovery_harness()
+        second = run_id()
+        steps = harness.loop(second)
+        trace = harness.looped[second]
+        self.assertEqual([(ACQ, 0), (RECONCILE_EB, 0), (UPLOAD_EB, 0), (DELIVER_EB, 0),
+                          (RECONCILE_TENANT, 0), (UPLOAD_TENANT, 0), (DELIVER_TENANT, 0)], steps)
+        self.assertEqual(PROMPT_COMMAND_CEILING, len(trace["commands"]))
+        self.assertEqual((PLAN, "NOTHING_TO_DO"), (trace["commands"][-1], trace["last_plan_action"]))
+        self.assertEqual(("COMPLETED", 0), (trace["status"]["business_outcome"], trace["supervisor_exit"]))
+
+    def test_a_lower_ceiling_stops_the_loop_status_still_runs_and_the_run_is_incomplete(self) -> None:
+        harness = self.dual_recovery_harness()
+        second = run_id()
+        statuses_before = sum(1 for item in harness.outputs if "energygrid.core.status.v3" in item)
+        harness.loop(second, ceiling=12)
+        trace = harness.looped[second]
+        self.assertEqual(12, len(trace["commands"]))
+        self.assertEqual(UPLOAD_TENANT, trace["commands"][-1])
+        self.assertEqual(statuses_before + 1, sum(1 for item in harness.outputs if "energygrid.core.status.v3" in item))
+        self.assertEqual(("INCOMPLETE", False), (trace["status"]["business_outcome"], trace["status"]["terminal"]))
+        self.assertEqual(89, trace["supervisor_exit"])
+
+    # -- R0 / R11 / R14 -----------------------------------------------------------
+    def test_harness_loop_is_the_committed_prompt_and_runs_once_per_run(self) -> None:
+        prompt = PROMPT_PATH.read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertEqual(1, prompt.count("\n".join(PROMPT_LOOP_LINES) + "\n"))
+        self.assertIn(f"after {PROMPT_COMMAND_CEILING} commands", prompt)
+        self.assertNotIn("If that command exits with a non-zero code, stop the loop.", prompt)
+        supervisor = SUPERVISOR_PATH.read_text(encoding="utf-8")
+        for line in SUPERVISOR_STATUS_LINES:
+            self.assertEqual(1, supervisor.count(line))
+        harness = CoreHarness(self)
+        current = run_id()
+        harness.loop(current)
+        with self.assertRaisesRegex(AssertionError, "exactly one loop per run ID"):
+            harness.loop(current)
+
+    def test_disposition_table_is_closed_and_covers_every_result_site(self) -> None:
+        import ast
+        import inspect
+
+        from energygrid_bill_downloader import orchestration
+        from energygrid_bill_downloader.orchestration import (
+            CONTINUE_RESULTS, DISPOSITIONS, RUN_STOP_ANY_COMMAND, RUN_STOP_RESULTS, STREAM_STOPPED_RESULTS,
+            result_disposition,
+        )
+        from energygrid_bill_downloader.state import V3_SCHEMA_SQL
+
+        self.assertEqual(("CONTINUE", "STREAM_STOPPED", "RUN_STOP"), DISPOSITIONS)
+        self.assertFalse(CONTINUE_RESULTS & STREAM_STOPPED_RESULTS or CONTINUE_RESULTS & RUN_STOP_RESULTS
+                         or STREAM_STOPPED_RESULTS & RUN_STOP_RESULTS)
+        for command, outcome, code in CONTINUE_RESULTS | STREAM_STOPPED_RESULTS | RUN_STOP_RESULTS:
+            self.assertNotIn((outcome, code), RUN_STOP_ANY_COMMAND)
+        # The stop table's CHECK vocabulary is exactly the stream-stop class.
+        ddl = next(item for item in V3_SCHEMA_SQL if item.startswith("CREATE TABLE energygrid_run_stream_stop_v3"))
+        vocab = {name: set(re.findall(r"'([a-zA-Z_-]+)'", re.search(rf"{name} [A-Z ]+CHECK\({name} IN \(([^)]*)\)", ddl).group(1)))
+                 for name in ("command", "outcome")}
+        self.assertEqual({item[0] for item in STREAM_STOPPED_RESULTS}, vocab["command"])
+        self.assertEqual({item[1] for item in STREAM_STOPPED_RESULTS}, vocab["outcome"])
+        self.assertEqual({10, 20}, {item[2] for item in STREAM_STOPPED_RESULTS})
+        with self.assertRaises(StateError):
+            result_disposition("drive-intent", "DRIVE_VERIFIED", 0)
+        with self.assertRaises(StateError):
+            result_disposition("drive-upload", "RESERVATION_UNAVAILABLE", 20)
+
+        # Every _finish/_result call site in the module maps to exactly one class.
+        tree = ast.parse(inspect.getsource(orchestration))
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+        def literal_values(node, function) -> set:
+            if isinstance(node, ast.Constant):
+                return {node.value}
+            if isinstance(node, ast.IfExp):
+                return literal_values(node.body, function) | literal_values(node.orelse, function)
+            if isinstance(node, ast.Name):
+                assigned = [item.value for item in ast.walk(function) if isinstance(item, ast.Assign)
+                            and any(isinstance(target, ast.Name) and target.id == node.id for target in item.targets)]
+                if len(assigned) == 1:
+                    return literal_values(assigned[0], function)
+            raise AssertionError(f"unresolved result field at line {node.lineno}")
+
+        verdict = functions["_apply_verdict"]
+        upload_branch = next(item for item in ast.walk(verdict) if isinstance(item, ast.If)
+                             and ast.unparse(item.test) == "command == 'drive-upload'")
+        upload_lines = range(upload_branch.lineno, upload_branch.end_lineno + 1)
+        delivery_states = {"DELIVERY_OUTCOME_UNCERTAIN", "REQUEST_REJECTED"}  # DeliveryOutcome states other than DELIVERED
+        sites = 0
+        for name, function in functions.items():
+            for call in ast.walk(function):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in {"_finish", "_result"}):
+                    continue
+                if name in {"_finish", "fallback_result"} or (name == "run_command" and call.func.id == "_result"):
+                    continue  # the helper itself / refusal sites, checked below
+                offset = 1 if call.func.id == "_finish" else 0
+                command_node, outcome_node, code_node = call.args[offset], call.args[offset + 2], call.args[offset + 5]
+                if isinstance(command_node, ast.Name) and command_node.id == "command" and name == "_apply_verdict":
+                    commands = ({"drive-upload"} if call.lineno in upload_lines
+                                else {"drive-reconcile"} if call.lineno > upload_branch.end_lineno
+                                else {"drive-upload", "drive-reconcile"})
+                else:
+                    commands = literal_values(command_node, function)
+                if ast.unparse(outcome_node) == "outcome.state":
+                    outcomes = delivery_states
+                else:
+                    outcomes = literal_values(outcome_node, function)
+                codes = literal_values(code_node, function)
+                for command in commands:
+                    for outcome in outcomes:
+                        for code in codes:
+                            sites += 1
+                            with self.subTest(line=call.lineno, command=command, outcome=outcome, code=code):
+                                self.assertIn(result_disposition(command, outcome, code), DISPOSITIONS)
+        self.assertGreaterEqual(sites, 30)
+        # run_command's own refusal/lock documents and the CLI fallback are RUN_STOP.
+        for outcome, code in (("REFUSED", 64), ("RUN_IN_PROGRESS", 10), ("FAILED", 10), ("FAILED", 20)):
+            for command in ("plan", "status", "acquire", "drive-upload", "submit-drive-result"):
+                self.assertEqual("RUN_STOP", result_disposition(command, outcome, code))
+
+    def test_new_fields_carry_only_fixed_words_and_booleans(self) -> None:
+        harness = CoreHarness(self)
+        self.apply_fault(harness, "EB_BILL", "drive_conflict")
+        current = run_id()
+        harness.loop(current)
+        harness.run("deliver", "EB_BILL", run_id=current)
+        result_keys = {"schema", "command", "stream", "outcome", "support_ref", "mutated", "disposition"}
+        for text in harness.outputs:
+            document = json.loads(text)
+            if document["schema"] == "energygrid.core.result.v3":
+                self.assertEqual(result_keys, set(document))
+                self.assertIn(document["disposition"], ("CONTINUE", "STREAM_STOPPED", "RUN_STOP"))
+            else:
+                self.assertNotIn("disposition", document, "plan and status keep their schemas")
+                for item in document["streams"].values():
+                    self.assertIs(type(item["stopped_for_run"]), bool)
+        joined = "\n".join(harness.outputs)
+        forbidden = [*SYNTHETIC_FOLDERS.values(), "synthDriveFile", "2026-", "eb-latest", str(harness.archive),
+                     "synthetic-drive-token", "egdb3-", "egmail-v1-", "SYNTHETIC-ENERGYGRID-NAMESPACE", current]
+        for value in forbidden:
+            with self.subTest(value=value):
+                self.assertNotIn(value, joined)
+        with StateV3Store(harness.state_path, read_only=True) as state:
+            row = state._conn().execute("SELECT * FROM energygrid_run_stream_stop_v3").fetchone()
+        self.assertEqual((current, "EB_BILL", "drive-upload", "DRIVE_CONFLICT", 20, "EG_DRIVE_IDENTITY_TRASHED"), tuple(row[:6]))
 
 
 class StatusPrecedenceTests(unittest.TestCase):

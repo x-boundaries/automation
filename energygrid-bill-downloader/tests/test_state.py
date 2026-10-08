@@ -1080,5 +1080,157 @@ class StateV3TriggerTests(unittest.TestCase):
                     state._conn().execute(statement)
 
 
+class StateV3RunStreamStopTests(StateV3MigrationTests):
+    """#226 G2 fairness reclosure R12: the append-only per-run stream stop table
+    is part of the unreleased v3 contract (user_version stays 3)."""
+
+    STOP_OBJECTS = (
+        ("table", "energygrid_run_stream_stop_v3"),
+        ("trigger", "energygrid_run_stream_stop_no_update_v3"),
+        ("trigger", "energygrid_run_stream_stop_no_delete_v3"),
+    )
+
+    def assert_stop_objects(self, path: Path) -> None:
+        with closing(sqlite3.connect(path)) as connection:
+            present = set(connection.execute("SELECT type,name FROM sqlite_master"))
+            self.assertEqual(3, connection.execute("PRAGMA user_version").fetchone()[0])
+        for item in self.STOP_OBJECTS:
+            self.assertIn(item, present)
+
+    def fresh(self, name: str = "fresh") -> Path:
+        from fixtures.synthetic_dual_stream import create_v3_database
+
+        path = self.root / name / "state.sqlite3"
+        path.parent.mkdir()
+        create_v3_database(path)
+        return path
+
+    def record_run(self, state, run_id: str = StateV3MigrationTests.RUN) -> None:
+        state.insert_run_record(run_id=run_id, started_at_utc="t", acquire_state="COMPLETED", acquire_exit_code=0,
+                                acquire_support_ref=None, streams={"EB_BILL": ("EMPTY", None), "TENANT_BILL": ("EMPTY", None)},
+                                timestamp="t")
+
+    def test_create_and_every_migration_path_carry_the_stop_table(self) -> None:
+        from energygrid_bill_downloader.state import V3_TABLES, migrate_state_database_v3
+        from fixtures.synthetic_dual_stream import test_stream_entries
+
+        self.assertIn("energygrid_run_stream_stop_v3", V3_TABLES)
+        self.assert_stop_objects(self.fresh())
+        v1, _payload = self.v1_database()
+        migrate_state_database_v3(v1, apply=True, streams=test_stream_entries(), mapping_entries=self.mapping(),
+                                  migration_run_id=self.RUN)
+        self.assert_stop_objects(v1)
+        v2, _invoice = self.staged_v2_database()
+        migrate_state_database_v3(v2, apply=True)
+        self.assert_stop_objects(v2)
+
+    def test_pre_fix_v3_shape_without_the_table_is_incomplete_and_refused_without_repair(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store, _inspect_v3_database, migrate_state_database_v3
+
+        path = self.fresh()
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("DROP TABLE energygrid_run_stream_stop_v3")  # also drops its two triggers
+            connection.commit()
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA synchronous=FULL")
+            self.assertEqual("INCOMPLETE_V3", _inspect_v3_database(connection))
+        before = path.read_bytes()
+        for read_only in (True, False):
+            with self.subTest(read_only=read_only), self.assertRaises(StateError):
+                with StateV3Store(path, read_only=read_only):
+                    pass
+        with self.assertRaises(StateError):
+            migrate_state_database_v3(path, apply=True)
+        self.assertEqual(before, path.read_bytes(), "no in-place repair of a pre-fix v3 database")
+
+    def test_insert_reads_back_and_applies_only_to_its_own_run(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        other = "00000000-0000-4000-8000-0000000000d2"
+        with StateV3Store(self.fresh()) as state:
+            self.record_run(state)
+            self.record_run(state, other)
+            self.assertEqual(frozenset(), state.run_stream_stops(self.RUN))
+            state.insert_run_stream_stop(run_id=self.RUN, stream="EB_BILL", command="drive-reconcile",
+                                         outcome="DRIVE_UPLOAD_UNCERTAIN", exit_code=20,
+                                         support_ref="EG_DRIVE_RECONCILE_UNAVAILABLE", timestamp="t")
+            self.assertEqual(frozenset({"EB_BILL"}), state.run_stream_stops(self.RUN))
+            self.assertEqual(frozenset(), state.run_stream_stops(other), "a later run never sees an earlier stop")
+            state.insert_run_stream_stop(run_id=self.RUN, stream="TENANT_BILL", command="drive-upload",
+                                         outcome="RESERVATION_UNAVAILABLE", exit_code=10,
+                                         support_ref=None, timestamp="t")
+            self.assertEqual(frozenset({"EB_BILL", "TENANT_BILL"}), state.run_stream_stops(self.RUN))
+
+    def test_duplicate_update_delete_foreign_key_and_check_refusals(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        valid = {"run_id": self.RUN, "stream": "EB_BILL", "command": "deliver", "outcome": "HOLD", "exit_code": 20,
+                 "support_ref": "EG_DELIVERY_PREPARATION_FAILED", "timestamp": "t"}
+        with StateV3Store(self.fresh()) as state:
+            with self.assertRaises(StateError, msg="foreign key: unknown run"):
+                state.insert_run_stream_stop(**valid)
+            self.record_run(state)
+            state.insert_run_stream_stop(**valid)
+            with self.assertRaises(StateError, msg="one stop row per run and stream"):
+                state.insert_run_stream_stop(**valid)
+            for change in ({"command": "drive-intent", "outcome": "DRIVE_CONFLICT"}, {"exit_code": 10},
+                           {"outcome": "DELIVERED", "exit_code": 0}, {"command": "acquire", "outcome": "ACQUIRE_FAILED"},
+                           {"stream": "OTHER"}, {"run_id": "not-a-run"}, {"support_ref": "private value"},
+                           {"exit_code": True}):
+                with self.subTest(change=change), self.assertRaises(StateError):
+                    state.insert_run_stream_stop(**{**valid, "stream": "TENANT_BILL", **change})
+            connection = state._conn()
+            for statement in ("UPDATE energygrid_run_stream_stop_v3 SET outcome='REQUEST_REJECTED'",
+                              "DELETE FROM energygrid_run_stream_stop_v3"):
+                with self.subTest(statement=statement), self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(statement)
+            insert = ("INSERT INTO energygrid_run_stream_stop_v3 (run_id,stream,command,outcome,exit_code,support_ref,stopped_at_utc) "
+                      "VALUES (?,?,?,?,?,?,'t')")
+            for row in (
+                (self.RUN, "OTHER", "deliver", "HOLD", 20, None),
+                (self.RUN, "TENANT_BILL", "acquire", "HOLD", 20, None),
+                (self.RUN, "TENANT_BILL", "deliver", "DELIVERED", 20, None),
+                (self.RUN, "TENANT_BILL", "deliver", "HOLD", 64, None),
+                (self.RUN, "TENANT_BILL", "deliver", "HOLD", 20.5, None),
+                (self.RUN, "TENANT_BILL", "deliver", "HOLD", 20, "EG_lower"),
+                (self.RUN, "TENANT_BILL", "deliver", "HOLD", 20, "XX_REF"),
+            ):
+                with self.subTest(row=row), self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(insert, row)
+            # Every refusal above was a CHECK/type refusal, not the primary key.
+            self.assertEqual(frozenset({"EB_BILL"}), state.run_stream_stops(self.RUN))
+
+    def test_check_valid_but_unclassified_tuple_is_incompatible(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store, _inspect_v3_database
+
+        path = self.fresh()
+        with StateV3Store(path) as state:
+            self.record_run(state)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            # Passes every CHECK, but drive-intent never stops a stream with DRIVE_CONFLICT.
+            connection.execute("INSERT INTO energygrid_run_stream_stop_v3 VALUES (?,'EB_BILL','drive-intent','DRIVE_CONFLICT',20,NULL,'t')",
+                               (self.RUN,))
+            connection.commit()
+            connection.execute("PRAGMA synchronous=FULL")
+            self.assertEqual("INCOMPATIBLE_V3", _inspect_v3_database(connection))
+        with self.assertRaises(StateError):
+            with StateV3Store(path, read_only=True):
+                pass
+
+    def test_stop_rows_never_mark_the_database_resumable(self) -> None:
+        from energygrid_bill_downloader.state import StateV3Store
+
+        path = self.fresh()
+        with StateV3Store(path) as state:
+            self.assertEqual("COMPLETE_V3", state.validation_status)
+            self.record_run(state)
+            state.insert_run_stream_stop(run_id=self.RUN, stream="EB_BILL", command="drive-upload", outcome="HOLD",
+                                         exit_code=20, support_ref="EG_DRIVE_AUTH_UNAVAILABLE", timestamp="t")
+        with StateV3Store(path, read_only=True) as state:
+            self.assertEqual("COMPLETE_V3", state.validation_status)
+
+
 if __name__ == "__main__":
     unittest.main()

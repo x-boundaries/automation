@@ -18,15 +18,18 @@ Rules:
    - egcore.cmd deliver --stream TENANT_BILL
 2. Never chain, pipe, redirect, prefix a path, add arguments, read or write
    files, inspect the environment, use the network, or use any other tool.
-3. Loop:
-   a. Run `egcore.cmd plan`.
-   b. Read the JSON field `next.argv`.
-   c. If `next.argv` is null, stop the loop.
-   d. Otherwise run exactly the command in `next.argv`.
-   e. If that command exits with a non-zero code, stop the loop.
-   f. Otherwise go back to step a.
-   Stop after at most 15 commands in total.
-4. After the loop, run `egcore.cmd status` once.
+3. Loop, counting every command you run in it:
+   a. Run `egcore.cmd plan`. If it exits with a non-zero code, stop the loop.
+   b. Read the JSON field `next.argv`. If it is null, stop the loop.
+   c. Run exactly the command in `next.argv`.
+   d. If its exit code is 0, 10 or 20 and its one line of JSON has the field
+      `disposition` equal to `CONTINUE` or `STREAM_STOPPED`, go back to step a.
+      The core never plans a stopped stream again in this run.
+   e. Otherwise (`RUN_STOP`, any other value, no such field, other exit code,
+      or output that is not one line of JSON) stop the loop.
+   Never start a command after 15 commands have run in the loop; stop instead.
+4. After the loop, always run `egcore.cmd status` exactly once, even if the
+   loop stopped early.
 5. Do not retry a failed command. Do not decide whether an upload or an email
    happened. Do not interpret business data; the core prints none.
 6. Finish with one line of JSON and nothing else:

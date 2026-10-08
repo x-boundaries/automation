@@ -35,6 +35,7 @@ reference exactly.
 | `energygrid_drive_operation_v3` | One row per invoice per binding: frozen intent, `reserved_remote_file_id`, attempt count (0..2), reconcile evidence and the verified receipt. |
 | `energygrid_drive_dispatch_v3` | One write-once marker per attempt, carrying the reserved ID. |
 | `energygrid_run_v3` | Insert-only run row with per-stream acquire results. |
+| `energygrid_run_stream_stop_v3` | Append-only `(run_id, stream)` row when a stream is stopped for one run (section 6). Added to the unreleased v3 contract without changing `user_version`; a v3 database without it is `INCOMPLETE_V3` and refused, never repaired in place. |
 | `energygrid_delivery_invoice_guard_v3` | Replaces the v1 guard: an email intent needs a `DRIVE_VERIFIED` receipt for the same bytes under the `ACTIVE` binding. |
 | Legacy freeze triggers | Historical `drive_*` columns are frozen; new invoices are `NOT_STAGED`; new `DRIVE_STAGE` operations are refused. |
 
@@ -144,13 +145,60 @@ retryable, 20 HOLD/conflict/uncertainty recorded, 64 refused.
 
 | Command | Effect |
 |---|---|
-| `plan` | Read-only. `next {action, stream, argv}` plus per-stream `action, archive, drive, email, support_ref`. |
-| `status` | Read-only. Per-stream outcome and `fully_handled`; `terminal`, `uncertainty_outstanding`, `business_outcome`. |
+| `plan` | Read-only. `next {action, stream, argv}` plus per-stream `action, archive, drive, email, support_ref, stopped_for_run`. |
+| `status` | Read-only. Per-stream outcome, `fully_handled` and `stopped_for_run`; `terminal`, `uncertainty_outstanding`, `business_outcome`. |
 | `acquire` | Once per run: inventory -> latest -> canonical archive (zero FETCH when already archived). Records the run row. Per-stream holds surface through plan/status; exit 0 once recorded. The only command that contacts EnergyGrid. |
 | `drive-intent --stream S` | Re-checks the archive, computes MD5, inserts the frozen INTENT. No network. |
 | `drive-upload --stream S` | Reserves the file ID if needed, commits the dispatch marker, sends one `UPLOAD_IF_ABSENT`, verifies, records exactly one state change. |
 | `drive-reconcile --stream S` | Recovers an open marker as UNCERTAIN, reads back by reserved ID, verifies or applies the retry rule. At most once per operation per run. |
 | `deliver --stream S` | Only after `DRIVE_VERIFIED` under the ACTIVE binding: the unchanged `DeliveryClient` (one marker, one POST, never resend). |
+
+### Per-stream run fairness (#226 G2 fairness reclosure)
+
+A stream-local failure stops only that stream for the current run; the other
+stream may still reach its own safe boundary in the same run. The core, not
+Claude, classifies every `energygrid.core.result.v3` document (including the
+CLI's refusal and failure fallbacks) by its exact `(command, outcome, exit
+code)` tuple and adds `disposition`. Exit codes alone are ambiguous (20 is a
+stream HOLD and the CLI's global `FAILED`; 10 is `RESERVATION_UNAVAILABLE` and
+`RUN_IN_PROGRESS`). `plan` and `status` are not result documents and carry no
+`disposition`; their per-stream entries gain only `stopped_for_run`.
+
+| Disposition | Exact results |
+|---|---|
+| `CONTINUE` (plan again) | `acquire` `ACQUIRED`/0, `ACQUIRED_WITH_HOLDS`/0; `drive-intent` `INTENT_CREATED`/0, `INTENT_EXISTS`/0; `drive-upload` `DRIVE_VERIFIED`/0; `drive-reconcile` `DRIVE_VERIFIED`/0, `RETRY_READY`/0, `RETRY_AUTHORISED`/0; `deliver` `DELIVERED`/0 |
+| `STREAM_STOPPED` (stop row written, plan again) | `drive-intent` `HOLD`/20; `drive-upload` `HOLD`/20, `DRIVE_CONFLICT`/20, `DRIVE_UPLOAD_UNCERTAIN`/20, `RESERVATION_UNAVAILABLE`/10; `drive-reconcile` `HOLD`/20, `DRIVE_CONFLICT`/20, `DRIVE_UPLOAD_UNCERTAIN`/20; `deliver` `HOLD`/20, `DELIVERY_OUTCOME_UNCERTAIN`/20, `REQUEST_REJECTED`/20 |
+| `RUN_STOP` (end the loop, no row) | any `REFUSED`/64 (including `EG_CORE_STREAM_STOPPED_FOR_RUN`); `RUN_IN_PROGRESS`/10; `acquire` `ACQUIRE_FAILED`/20; CLI `FAILED`/10 or 20 |
+
+Any other tuple is a broken invariant: `StateError`, so the CLI prints `FAILED`
+with `RUN_STOP`. Output with no `disposition` (the supervisor's CoreDispatch
+refusal literal, launcher exits, non-JSON) also ends the loop.
+
+- **Stop row.** For `STREAM_STOPPED` the core inserts one row into
+  `energygrid_run_stream_stop_v3` (primary key `(run_id, stream)`, CHECKed
+  command/outcome/exit vocabulary, no update, no delete) and reads it back under
+  the run lock before printing the result. Semantic validation rejects any row
+  whose tuple is outside the `STREAM_STOPPED` class. Stop rows never make the
+  database resumable.
+- **Planner.** `plan` skips a stream stopped for the current run. If every
+  remaining stream is stopped or HOLD, `next` is `HOLD` with a null `argv`.
+- **Admission.** A command for a stopped stream is refused before any state or
+  network access: exit 64, `EG_CORE_STREAM_STOPPED_FOR_RUN`, `RUN_STOP`.
+- **Status.** Stream actions, outcomes, `terminal`, `business_outcome` and
+  `uncertainty_outstanding` are computed from actual stream state, never from
+  stop rows. A stream stopped while it still has a step keeps that step, so the
+  run is `INCOMPLETE` (supervisor 89); otherwise the most severe stream outcome
+  wins. Success on one stream never softens the other's failure.
+- **Next run.** Stop rows are keyed by run, so the next run reconsiders the
+  stream under its existing reconcile, retry and HOLD rules; completed work
+  plans as `NOTHING_TO_DO` and is never repeated.
+- **Prompt loop rule (steps 3 and 4).** Claude runs `plan`; stops on a non-zero
+  plan exit or a null `next.argv`; runs exactly `next.argv`; re-plans only when
+  that command exits 0, 10 or 20 with `disposition` `CONTINUE` or
+  `STREAM_STOPPED`; otherwise stops. It never starts a command after 15 loop
+  commands (worst case: 1 acquire + 3 + 3 actions + 8 plans = 15) and always
+  runs `status` exactly once afterwards. The prompt byte change means the private
+  `expected_sha256.prompt` must be re-bound at authorised setup.
 
 Operator only (never on the Claude allowlist): `migrate-state`, `drive-bind`.
 `drive-bind` verifies the configured folder IDs read-only through

@@ -133,6 +133,52 @@ class CoreCommandCliTests(unittest.TestCase):
             code, out = self.invoke(["plan", "--config", str(config_path)])
             self.assertEqual((64, "EG_CORE_CONFIG_INVALID"), (code, json.loads(out)["support_ref"]))
 
+    def test_fallback_and_refusal_documents_carry_run_stop(self) -> None:
+        """#226 G2 fairness reclosure R15: every CLI fallback is one RUN_STOP result document."""
+        from energygrid_bill_downloader.errors import DependencyError, SourceTransportError, StateError
+
+        keys = {"schema", "command", "stream", "outcome", "support_ref", "mutated", "disposition"}
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            (Path(temporary) / "v2").mkdir()
+            v2_config, _v2_state, _ = _dual_cli_fixture(Path(temporary) / "v2")
+            code, out = self.invoke(["plan", "--config", str(v2_config)])
+            refused = json.loads(out)
+            self.assertEqual(keys, set(refused))
+            self.assertEqual((64, "REFUSED", "EG_CORE_CONFIG_INVALID", False, "RUN_STOP"),
+                             (code, refused["outcome"], refused["support_ref"], refused["mutated"], refused["disposition"]))
+            code, out = self.invoke(["drive-upload", "--config", str(config_path), "--stream", "EB_BILL"])
+            self.assertEqual((64, "EG_CORE_ACTION_NOT_PLANNED", "RUN_STOP"),
+                             (code, json.loads(out)["support_ref"], json.loads(out)["disposition"]))
+            for error, expected_code in ((StateError("forced"), 20), (SourceTransportError("EG_SYNTHETIC_DOWN"), 10),
+                                         (DependencyError("forced"), 20)):
+                with self.subTest(error=type(error).__name__), \
+                        mock.patch("energygrid_bill_downloader.orchestration.run_command", side_effect=error):
+                    code, out = self.invoke(["deliver", "--config", str(config_path), "--stream", "TENANT_BILL"])
+                    self.assertEqual(1, len(out.strip().splitlines()))
+                    failed = json.loads(out)
+                    self.assertEqual(keys, set(failed))
+                    self.assertEqual((expected_code, "FAILED", None, "RUN_STOP", "TENANT_BILL"),
+                                     (code, failed["outcome"], failed["mutated"], failed["disposition"], failed["stream"]))
+
+    def test_plan_and_status_keep_their_schemas_and_gain_only_stopped_for_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            self.assertEqual(0, self.invoke(["acquire", "--config", str(config_path)])[0])
+            for command, stream_keys in (
+                ("plan", {"action", "archive", "drive", "email", "support_ref", "stopped_for_run"}),
+                ("status", {"latest_present", "action", "archive", "drive", "drive_verification_method", "drive_attempts",
+                            "email", "legacy_local_stage", "support_ref", "outcome", "fully_handled", "stopped_for_run"}),
+            ):
+                with self.subTest(command=command):
+                    code, out = self.invoke([command, "--config", str(config_path)])
+                    document = json.loads(out)
+                    self.assertEqual(0, code)
+                    self.assertNotIn("disposition", document)
+                    for item in document["streams"].values():
+                        self.assertEqual(stream_keys, set(item))
+                        self.assertIs(False, item["stopped_for_run"])
+
     def test_drive_bind_without_apply_is_a_plan_with_no_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config_path, state_path = _v3_cli_fixture(Path(temporary))

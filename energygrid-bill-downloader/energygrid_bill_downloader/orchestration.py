@@ -14,20 +14,34 @@ Claude sequences these commands; it never decides business state. Every command:
 - exits 0 (done or nothing to do), 10 (retryable), 20 (HOLD, conflict or
   uncertainty recorded) or 64 (refused, no mutation).
 
+Every command result document also carries `disposition`, classified by the
+core from the exact (command, outcome, exit code) tuple through one closed
+table: CONTINUE (plan again), STREAM_STOPPED (this stream is stopped for the
+current run; a stop row is written before the result is printed; plan again)
+or RUN_STOP (end the run loop). A stopped stream is never planned again in the
+same run and a direct command for it is refused; the next run ignores the row.
+
 The caller supplies only the command and, where required, the stream.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import AppError, ConfigError, RunLockedError, StateError
+from .errors import SUPPORT_REF_PATTERN, AppError, ConfigError, RunLockedError, StateError
 from .publication import ensure_no_reparse_components, validate_pdf
-from .state import DRIVE_MAX_BYTES, DRIVE_VERIFICATION_UNAVAILABLE, StateV3Store, StreamStateConflictError
+from .state import (
+    DRIVE_MAX_BYTES,
+    DRIVE_VERIFICATION_UNAVAILABLE,
+    RUN_STREAM_STOP_RESULTS,
+    StateV3Store,
+    StreamStateConflictError,
+)
 
 
 CORE_SCHEMA = "energygrid.core.v3"
@@ -67,6 +81,40 @@ BUSINESS_OUTCOMES = ("NO_WORK", "COMPLETED", "HOLD", "SOURCE_FAILURE_RETRYABLE",
 # 89 > 85 > 86 > 84 > 83 > 81 > 82 > 0, so INCOMPLETE is never hidden by a HOLD.
 OUTCOME_SEVERITY = ("INCOMPLETE", "DRIVE_CONFLICT", "EMAIL_UNCERTAIN", "DRIVE_UNCERTAIN", "SOURCE_FAILURE", "HOLD",
                     "SOURCE_FAILURE_RETRYABLE", "COMPLETED", "NO_WORK")
+
+# #226 G2 fairness reclosure: the closed disposition taxonomy. Classification is
+# by the exact (command, outcome, exit code) tuple, never by exit code alone:
+# exit 20 is both a stream HOLD and the CLI's global FAILED, and exit 10 is both
+# RESERVATION_UNAVAILABLE (one stream) and RUN_IN_PROGRESS (global).
+DISPOSITIONS = ("CONTINUE", "STREAM_STOPPED", "RUN_STOP")
+CONTINUE_RESULTS = frozenset({
+    ("acquire", "ACQUIRED", 0),
+    ("acquire", "ACQUIRED_WITH_HOLDS", 0),
+    ("drive-intent", "INTENT_CREATED", 0),
+    ("drive-intent", "INTENT_EXISTS", 0),
+    ("drive-upload", "DRIVE_VERIFIED", 0),
+    ("drive-reconcile", "DRIVE_VERIFIED", 0),
+    ("drive-reconcile", "RETRY_READY", 0),
+    ("drive-reconcile", "RETRY_AUTHORISED", 0),
+    ("deliver", "DELIVERED", 0),
+})
+STREAM_STOPPED_RESULTS = RUN_STREAM_STOP_RESULTS
+RUN_STOP_RESULTS = frozenset({("acquire", "ACQUIRE_FAILED", 20)})
+# For any command: a refusal, run-lock contention, or the CLI's deterministic
+# failure document for an application error that escaped a handler.
+RUN_STOP_ANY_COMMAND = frozenset({("REFUSED", 64), ("RUN_IN_PROGRESS", 10), ("FAILED", 10), ("FAILED", 20)})
+
+
+def result_disposition(command: str | None, outcome: str, exit_code: int) -> str:
+    """Classify one command result; an unknown tuple is a broken invariant."""
+    key = (command, outcome, exit_code)
+    if key in CONTINUE_RESULTS:
+        return "CONTINUE"
+    if key in STREAM_STOPPED_RESULTS:
+        return "STREAM_STOPPED"
+    if key in RUN_STOP_RESULTS or (outcome, exit_code) in RUN_STOP_ANY_COMMAND:
+        return "RUN_STOP"
+    raise StateError("core result is outside the closed disposition table")
 
 
 class CoreRefusal(Exception):
@@ -197,17 +245,20 @@ def _stream_context(config, state: StateV3Store, run: dict | None, run_id: str, 
 def compute_plan(config, state: StateV3Store, run_id: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     run = state.run_record(run_id)
     contexts = {stream: _stream_context(config, state, run, run_id, stream) for stream in STREAMS}
+    # Only this run's stop rows apply. The per-stream contexts (and therefore
+    # status) are computed without them; they only exclude a stream from `next`.
+    stopped = state.run_stream_stops(run_id)
     if run is None:
         next_step = {"action": "ACQUIRE_LATEST", "stream": None, "argv": command_line("acquire", None)}
     else:
         next_step = None
         for stream in STREAMS:
             action = contexts[stream]["action"]
-            if action not in {"NOTHING_TO_DO", "HOLD"}:
+            if stream not in stopped and action not in {"NOTHING_TO_DO", "HOLD"}:
                 next_step = {"action": action, "stream": stream, "argv": command_line(ACTION_COMMAND[action], stream)}
                 break
         if next_step is None:
-            held = any(contexts[stream]["action"] == "HOLD" for stream in STREAMS)
+            held = bool(stopped) or any(contexts[stream]["action"] == "HOLD" for stream in STREAMS)
             next_step = {"action": "HOLD" if held else "NOTHING_TO_DO", "stream": None, "argv": None}
     if next_step["argv"] is not None and next_step["argv"] not in ALLOWED_COMMAND_LINES:
         raise StateError("planned command is outside the reviewed allowlist")
@@ -221,10 +272,13 @@ def compute_plan(config, state: StateV3Store, run_id: str) -> tuple[dict[str, An
                 "drive": contexts[stream]["drive"],
                 "email": contexts[stream]["email"],
                 "support_ref": contexts[stream]["support_ref"],
+                "stopped_for_run": stream in stopped,
             }
             for stream in STREAMS
         },
     }
+    for stream in STREAMS:
+        contexts[stream]["stopped_for_run"] = stream in stopped
     return document, contexts
 
 
@@ -315,6 +369,7 @@ def compute_status(config, state: StateV3Store, run_id: str) -> dict[str, Any]:
             "support_ref": ctx["support_ref"],
             "outcome": outcome,
             "fully_handled": fully,
+            "stopped_for_run": ctx["stopped_for_run"],
         }
     business = next(item for item in OUTCOME_SEVERITY if item in outcomes)
     terminal = run is not None and all(contexts[stream]["action"] in {"NOTHING_TO_DO", "HOLD"} for stream in STREAMS)
@@ -377,11 +432,11 @@ def run_command(command: str, stream: str | None, core: CoreContext) -> tuple[di
     """Execute one core command; return (document, exit code). Never raises for
     expected refusals; unexpected application errors propagate to the CLI."""
     if command not in COMMANDS:
-        return _result(command, stream, "REFUSED", "EG_CORE_COMMAND_UNKNOWN", False), 64
+        return _result(command, stream, "REFUSED", "EG_CORE_COMMAND_UNKNOWN", False, 64), 64
     if (command in STREAM_COMMANDS) != (stream is not None) or (stream is not None and stream not in STREAMS):
-        return _result(command, stream, "REFUSED", "EG_CORE_ARGUMENTS_INVALID", False), 64
+        return _result(command, stream, "REFUSED", "EG_CORE_ARGUMENTS_INVALID", False, 64), 64
     if command_line(command, stream) not in ALLOWED_COMMAND_LINES:
-        return _result(command, stream, "REFUSED", "EG_CORE_ARGUMENTS_INVALID", False), 64
+        return _result(command, stream, "REFUSED", "EG_CORE_ARGUMENTS_INVALID", False, 64), 64
     config = core.config
     try:
         with core.lock_factory(config.state_path.parent):
@@ -398,6 +453,9 @@ def run_command(command: str, stream: str | None, core: CoreContext) -> tuple[di
                         raise CoreRefusal("EG_CORE_ACTION_NOT_PLANNED")
                     return _acquire(core, state)
                 ctx = contexts[stream]
+                if ctx["stopped_for_run"]:
+                    # Even a misbehaving caller cannot retry a stopped stream this run.
+                    raise CoreRefusal("EG_CORE_STREAM_STOPPED_FOR_RUN")
                 if ACTION_COMMAND.get(ctx["action"]) != command:
                     raise CoreRefusal("EG_CORE_ACTION_NOT_PLANNED")
                 handler = {
@@ -406,15 +464,34 @@ def run_command(command: str, stream: str | None, core: CoreContext) -> tuple[di
                     "drive-reconcile": _drive_reconcile,
                     "deliver": _deliver,
                 }[command]
-                return handler(core, state, stream, ctx)
+                document, exit_code = handler(core, state, stream, ctx)
+                if document["disposition"] == "STREAM_STOPPED":
+                    # Durable and read back under the run lock before the result is printed.
+                    state.insert_run_stream_stop(
+                        run_id=core.run_id, stream=stream, command=command, outcome=document["outcome"],
+                        exit_code=exit_code, support_ref=document["support_ref"], timestamp=utc_now(),
+                    )
+                return document, exit_code
     except CoreRefusal as refusal:
         core.log("core_command", "REFUSED", stream=stream, support_ref=refusal.support_ref)
-        return _result(command, stream, "REFUSED", refusal.support_ref, False), 64
+        return _result(command, stream, "REFUSED", refusal.support_ref, False, 64), 64
     except RunLockedError:
-        return _result(command, stream, "RUN_IN_PROGRESS", "EG_RUN_ALREADY_ACTIVE", False), 10
+        return _result(command, stream, "RUN_IN_PROGRESS", "EG_RUN_ALREADY_ACTIVE", False, 10), 10
 
 
-def _result(command: str, stream: str | None, outcome: str, support_ref: str | None, mutated: bool) -> dict[str, Any]:
+def fallback_result(command: str, stream: str | None, error: AppError) -> tuple[dict[str, Any], int]:
+    """The deterministic CLI document for an error that escaped `run_command`
+    (configuration refused, broken invariant, unreadable state): always RUN_STOP."""
+    if isinstance(error, ConfigError):
+        return _result(command, stream, "REFUSED", "EG_CORE_CONFIG_INVALID", False, 64), 64
+    ref = getattr(error, "support_ref", None)
+    exit_code = error.exit_code if error.exit_code in {10, 20} else 20
+    support_ref = ref if type(ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, ref) else "EG_CORE_FAILURE"
+    return _result(command, stream, "FAILED", support_ref, None, exit_code), exit_code
+
+
+def _result(command: str, stream: str | None, outcome: str, support_ref: str | None, mutated: bool | None,
+            exit_code: int) -> dict[str, Any]:
     return {
         "schema": RESULT_SCHEMA,
         "command": command,
@@ -422,13 +499,15 @@ def _result(command: str, stream: str | None, outcome: str, support_ref: str | N
         "outcome": outcome,
         "support_ref": support_ref,
         "mutated": mutated,
+        "disposition": result_disposition(command, outcome, exit_code),
     }
 
 
 def _finish(core: CoreContext, command: str, stream: str | None, outcome: str, support_ref: str | None,
             mutated: bool, exit_code: int) -> tuple[dict[str, Any], int]:
+    document = _result(command, stream, outcome, support_ref, mutated, exit_code)
     core.log("core_command", outcome, stream=stream, support_ref=support_ref)
-    return _result(command, stream, outcome, support_ref, mutated), exit_code
+    return document, exit_code
 
 
 def _acquire(core: CoreContext, state: StateV3Store) -> tuple[dict[str, Any], int]:
