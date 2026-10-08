@@ -1033,17 +1033,14 @@ def _identity(path: Path) -> dict[str, object]:
     }
 
 
-def _valid_candidate_parent(parent: str) -> bool:
-    if parent == BASE_HEAD:
-        return True
+def _valid_candidate_lineage(head: str) -> bool:
+    # Lineage is judged on the candidate HEAD, never on its first parent: a legitimate
+    # merge (canonical main's first parent is the pre-merge docs line) carries the
+    # accepted construction lineage through another parent.
     if _git("rev-parse", f"{CONSTRUCTION_HEAD}^") != BASE_HEAD or \
             _git("rev-parse", f"{CONSTRUCTION_HEAD}^{{tree}}") != CONSTRUCTION_TREE:
         return False
-    try:
-        _git("merge-base", "--is-ancestor", CONSTRUCTION_HEAD, parent)
-    except RuntimeError:
-        return False
-    return True
+    return _is_ancestor(CONSTRUCTION_HEAD, head)
 
 
 def _assert_candidate_scope(context: dict[str, object] | None = None) -> dict[str, object]:
@@ -1062,8 +1059,8 @@ def _assert_candidate_scope(context: dict[str, object] | None = None) -> dict[st
             raise RuntimeError("hosted checkout does not match the exact event head")
     else:
         raise RuntimeError("invalid candidate execution context")
-    if not _valid_candidate_parent(parent):
-        raise RuntimeError(f"unexpected candidate parent/lineage: {parent}")
+    if not _valid_candidate_lineage(head):
+        raise RuntimeError(f"unexpected candidate lineage: {head}")
     if _git("rev-parse", f"{BASE_HEAD}^{{tree}}") != BASE_TREE:
         raise RuntimeError("admitted product tree changed")
     # The historical envelope is proven on the accepted AV successor itself.
@@ -1900,11 +1897,11 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
             context, receipt_path = self._hosted_receipt(Path(directory))
             self._assert_identity_drift(receipt_path, context, SUPERVISOR)
 
-    def test_h12_hosted_parent_lineage_drift_fails(self):
+    def test_h12_hosted_candidate_lineage_drift_fails(self):
         with tempfile.TemporaryDirectory(prefix="eg_h12_hosted_") as directory:
             context = self._hosted_context(Path(directory))
-            with mock.patch(__name__ + "._valid_candidate_parent", return_value=False):
-                with self.assertRaisesRegex(RuntimeError, "candidate parent/lineage"):
+            with mock.patch(__name__ + "._valid_candidate_lineage", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "unexpected candidate lineage"):
                     _assert_candidate_scope(context)
 
     def test_h13_hosted_base_tree_drift_fails(self):
@@ -2076,6 +2073,165 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
             with mock.patch(__name__ + "._git", side_effect=wrong):
                 with self.assertRaisesRegex(RuntimeError, "unexpected local candidate branch"):
                     _assert_candidate_scope(self._local_context(directory))
+
+
+class CandidateLineageTopologyTests(unittest.TestCase):
+    """Custody lineage is proven through the candidate HEAD, never its first parent.
+
+    Each case runs the real `_assert_candidate_scope` over real git objects, and only
+    HEAD itself is substituted, as the hosted and local tests already do. Synthetic
+    commits and trees live in a temporary repository that borrows the real object
+    store, so the checkout's refs, index and worktree are never written.
+    """
+
+    CANONICAL_MAIN_HEAD = "aca75f52e1d00453d3f770358419a39357e2fafb"
+    PRE_MERGE_FIRST_PARENT = "d7b7c6a6c3b1c4eb762b81be4009e20e9047a14d"
+    PR229_CANDIDATE_HEAD = "616584ffe907884e0dd1cbf8a8fb136bb1c800c2"
+    NON_MERGE_AV_DESCENDANT = "913935326e6caf0003cf2563dbe0daf43dbc02eb"
+    AV_SUCCESSOR_PARENT = "886b7b306994fac352299748decce4cf8e75dd95"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="eg_lineage_")
+        self.addCleanup(self.directory.cleanup)
+        self.repository = Path(self.directory.name) / "repository"
+        self.scratch = Path(self.directory.name) / "scratch"
+        self.scratch.mkdir()
+        objects = _git("rev-parse", "--path-format=absolute", "--git-path", "objects")
+        self.repository.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.repository)], check=True,
+                       capture_output=True)
+        alternates = self.repository / ".git" / "objects" / "info" / "alternates"
+        alternates.write_bytes(f"{objects}\n".encode("utf-8"))
+        patchers = (
+            mock.patch(__name__ + ".REPO_ROOT", self.repository),
+            mock.patch.dict(os.environ, {
+                "GIT_AUTHOR_NAME": "lineage-test", "GIT_AUTHOR_EMAIL": "lineage-test@invalid",
+                "GIT_COMMITTER_NAME": "lineage-test",
+                "GIT_COMMITTER_EMAIL": "lineage-test@invalid",
+            }),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _commit(self, tree: str, parents: tuple[str, ...], message: str) -> str:
+        arguments = ["commit-tree", tree]
+        for parent in parents:
+            arguments += ["-p", parent]
+        return _git(*arguments, "-m", message)
+
+    def _tree(self, commit: str) -> str:
+        return _git("rev-parse", f"{commit}^{{tree}}")
+
+    def _parents(self, commit: str) -> list[str]:
+        return _git("log", "-1", "--format=%P", commit).split()
+
+    def _tree_with_replaced_file(self, base_tree: str, relative: str, content: bytes) -> str:
+        replacement = self.scratch / "replacement.bin"
+        replacement.write_bytes(content)
+        blob = _git("hash-object", "-w", "--no-filters", str(replacement))
+        mode = _git("ls-tree", base_tree, "--", relative).split()[0]
+        with mock.patch.dict(os.environ, {"GIT_INDEX_FILE": str(self.scratch / "drift.index")}):
+            _git("read-tree", base_tree)
+            _git("update-index", "--add", "--cacheinfo", f"{mode},{blob},{relative}")
+            return _git("write-tree")
+
+    def _assert_scope(self, head: str) -> dict[str, object]:
+        original_git = _git
+        parent = original_git("rev-parse", f"{head}^")
+        tree = original_git("rev-parse", f"{head}^{{tree}}")
+
+        def as_commit(*arguments: str) -> str:
+            if arguments == ("rev-parse", "HEAD"):
+                return head
+            if arguments == ("rev-parse", "HEAD^"):
+                return parent
+            if arguments == ("rev-parse", "HEAD^{tree}"):
+                return tree
+            if arguments == ("branch", "--show-current"):
+                return TARGET_BRANCH
+            return original_git(*arguments)
+
+        context = {"mode": LOCAL_ENDPOINT_MODE, "receipt_path": str(self.scratch / "custody.json")}
+        with mock.patch(__name__ + "._git", side_effect=as_commit):
+            return _assert_candidate_scope(context)
+
+    def _assert_rejected(self, head: str, message: str) -> None:
+        with self.assertRaisesRegex(RuntimeError, message):
+            self._assert_scope(head)
+
+    def test_a_accepted_av_successor_itself_passes(self):
+        candidate = self._assert_scope(AV_SUCCESSOR_HEAD)
+        self.assertEqual("AV_SUCCESSOR", candidate["lineage"])
+
+    def test_b_ordinary_non_merge_av_descendant_passes(self):
+        self.assertEqual(1, len(self._parents(self.NON_MERGE_AV_DESCENDANT)))
+        self.assertTrue(_is_ancestor(AV_SUCCESSOR_HEAD, self.NON_MERGE_AV_DESCENDANT))
+        candidate = self._assert_scope(self.NON_MERGE_AV_DESCENDANT)
+        self.assertEqual("AV_SUCCESSOR_DESCENDANT", candidate["lineage"])
+
+    def test_c_canonical_merged_main_passes_when_first_parent_lacks_lineage(self):
+        first_parent, second_parent = self._parents(self.CANONICAL_MAIN_HEAD)
+        self.assertEqual(self.PRE_MERGE_FIRST_PARENT, first_parent)
+        self.assertFalse(_is_ancestor(CONSTRUCTION_HEAD, first_parent))
+        self.assertTrue(_is_ancestor(CONSTRUCTION_HEAD, second_parent))
+        self.assertTrue(_is_ancestor(AV_SUCCESSOR_HEAD, self.CANONICAL_MAIN_HEAD))
+        candidate = self._assert_scope(self.CANONICAL_MAIN_HEAD)
+        self.assertEqual("AV_SUCCESSOR_DESCENDANT", candidate["lineage"])
+        self.assertEqual(sorted(AV_PROTECTED_RELATIVES), candidate["av_protected_paths_unchanged"])
+
+    def test_d_ac2_integration_merge_with_ac2_first_parent_passes(self):
+        ac2_line = self._commit(self._tree(self.PRE_MERGE_FIRST_PARENT),
+                                (self.PRE_MERGE_FIRST_PARENT,), "synthetic AC2 line")
+        integration = self._commit(self._tree(self.CANONICAL_MAIN_HEAD),
+                                   (ac2_line, self.CANONICAL_MAIN_HEAD),
+                                   "synthetic AC2 integration merge")
+        self.assertFalse(_is_ancestor(CONSTRUCTION_HEAD, ac2_line))
+        self.assertTrue(_is_ancestor(AV_SUCCESSOR_HEAD, integration))
+        candidate = self._assert_scope(integration)
+        self.assertEqual("AV_SUCCESSOR_DESCENDANT", candidate["lineage"])
+
+    def test_e_prior_pr229_candidate_topology_remains_accepted(self):
+        self.assertEqual(1, len(self._parents(self.PR229_CANDIDATE_HEAD)))
+        candidate = self._assert_scope(self.PR229_CANDIDATE_HEAD)
+        self.assertEqual("AV_SUCCESSOR_DESCENDANT", candidate["lineage"])
+
+    def test_f_head_not_descending_from_av_successor_fails(self):
+        self._assert_rejected(CONSTRUCTION_HEAD, "not a descendant of the accepted AV successor")
+        self._assert_rejected(self.PRE_MERGE_FIRST_PARENT, "unexpected candidate lineage")
+
+    def test_m_multi_parent_merges_without_av_lineage_fail(self):
+        tree = self._tree(self.CANONICAL_MAIN_HEAD)
+        unrelated = self._commit(tree, (self.PRE_MERGE_FIRST_PARENT, BASE_HEAD),
+                                 "synthetic unrelated merge")
+        self._assert_rejected(unrelated, "unexpected candidate lineage")
+        construction_only = self._commit(tree, (self.PRE_MERGE_FIRST_PARENT,
+                                                self.AV_SUCCESSOR_PARENT),
+                                         "synthetic merge carrying only construction lineage")
+        self._assert_rejected(construction_only, "not a descendant of the accepted AV successor")
+
+    def test_n_protected_drift_fails_even_when_av_lineage_is_present(self):
+        base_tree = self._tree(self.CANONICAL_MAIN_HEAD)
+        ac2_line = self._commit(self._tree(self.PRE_MERGE_FIRST_PARENT),
+                                (self.PRE_MERGE_FIRST_PARENT,), "synthetic AC2 line")
+        for relative in AV_PROTECTED_RELATIVES:
+            drifted = self._tree_with_replaced_file(base_tree, relative, b"drift\n")
+            linear = self._commit(drifted, (self.CANONICAL_MAIN_HEAD,), "synthetic linear drift")
+            merged = self._commit(drifted, (ac2_line, self.CANONICAL_MAIN_HEAD),
+                                  "synthetic AC2 merge drift")
+            for head in (linear, merged):
+                with self.subTest(path=relative, head=head):
+                    self.assertTrue(_is_ancestor(AV_SUCCESSOR_HEAD, head))
+                    self._assert_rejected(head, "protected AV-harness boundary drifted")
+
+    def test_k_staged_candidate_worktree_change_fails(self):
+        (self.repository / "staged.txt").write_text("staged\n", encoding="utf-8")
+        _git("add", "staged.txt")
+        self._assert_rejected(self.CANONICAL_MAIN_HEAD, "candidate worktree is not clean")
+
+    def test_l_untracked_candidate_file_fails(self):
+        (self.repository / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+        self._assert_rejected(self.CANONICAL_MAIN_HEAD, "candidate worktree is not clean")
 
 
 class SupervisorCustodyRegressionTests(unittest.TestCase):
@@ -2280,7 +2436,7 @@ class SupervisorHarnessCleanupTests(unittest.TestCase):
 
     def test_receipt_binds_candidate_helpers_test_owner_and_supervisor(self):
         receipt = _load_receipt(_receipt_path())
-        self.assertTrue(_valid_candidate_parent(receipt["candidate"]["parent"]))
+        self.assertTrue(_valid_candidate_lineage(receipt["candidate"]["head"]))
         self.assertEqual(AV_SUCCESSOR_HEAD, receipt["candidate"]["av_successor_head"])
         self.assertEqual(7, receipt["candidate"]["av_envelope_path_count"])
         self.assertEqual(42, receipt["candidate"]["protected_base_path_count"])
