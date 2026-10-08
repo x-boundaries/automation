@@ -6,7 +6,7 @@ from typing import Any, Protocol
 import re
 import uuid
 
-from .config import MAX_INVENTORY_CEILING, RuntimeConfig
+from .config import MAX_INVENTORY_CEILING, RuntimeConfig, is_within
 from .errors import (
     ACTION_REQUIRED,
     ALREADY_PRESENT,
@@ -31,6 +31,7 @@ from .publication import (
     FileInfo,
     cleanup_run_directory,
     create_run_directory,
+    ensure_no_reparse_components,
     filename_key,
     publish_no_replace,
     validate_filename,
@@ -72,11 +73,32 @@ class RunSummary:
     failure_stage: str | None = None
     failure_support_ref: str | None = None
     fetch_count: int = 0
+    archive_reused_count: int = 0
+    drive_staged_count: int = 0
+    delivered_count: int = 0
+    handled_count: int = 0
+    uncertain_count: int = 0
+    stream_results: list[dict[str, Any]] = field(default_factory=list)
+    # v3 acquire only: the per-stream retryability of a source failure. Never
+    # serialised; the core records it in the insert-only run row.
+    stream_exit_codes: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         document = self._base_dict()
         if self.pending_count is not None:
             document["pending_count"] = self.pending_count
+        if self.stream_results:
+            document.update(
+                {
+                    "archive_reused_count": self.archive_reused_count,
+                    "archive_staged_count": self.downloaded_count,
+                    "drive_staged_count": self.drive_staged_count,
+                    "delivered_count": self.delivered_count,
+                    "handled_count": self.handled_count,
+                    "uncertain_count": self.uncertain_count,
+                    "stream_results": self.stream_results,
+                }
+            )
         return document
 
     def _base_dict(self) -> dict[str, Any]:
@@ -592,3 +614,738 @@ def _reconcile_listed_present(state: StateStore, item: _PlannedRow) -> str:
         raise StateError("archive entry disappeared during reconciliation")
     except OSError as exc:
         raise StateError("archive entry could not be inspected") from exc
+
+
+DUAL_SUCCESS_STATUSES = frozenset({"EMPTY", "ALREADY_HANDLED", "DELIVERED", "COMPLETED"})
+DUAL_STREAMS = ("EB_BILL", "TENANT_BILL")
+DUAL_STAGE_EVENT_STATUSES = {
+    "inventory_started": frozenset({"STARTED"}),
+    "inventory_result": frozenset({"FAILED", "READY"}),
+    "latest_selection": frozenset({"AMBIGUOUS", "SELECTED", "CONFLICT"}),
+    "selection_committed": frozenset({"COMMITTED"}),
+    "fetch_decision": frozenset({"RECOVER", "REUSE", "FETCH", "NO_FETCH"}),
+    "fetch_started": frozenset({"STARTED"}),
+    "fetch_completed": frozenset({"FAILED", "SUCCESS"}),
+    "archive_started": frozenset({"RECOVERY", "VERIFY", "LEGACY_MOVE", "FETCH"}),
+    "archive_result": frozenset({"HOLD", "FAILED", "COMMITTED"}),
+    "drive_started": frozenset({"STARTED"}),
+    "drive_result": frozenset({"HOLD", "FAILED", "REPAIRED", "STAGED", "ALREADY_STAGED", "RECOVERED"}),
+    "delivery_intent": frozenset({"CREATED", "REUSED"}),
+    "dispatch_start": frozenset({"COMMITTED"}),
+    "delivery_no_send": frozenset({
+        "ALREADY_DELIVERED", "DELIVERY_OUTCOME_UNCERTAIN", "REQUEST_REJECTED",
+        "PREPARATION_FAILED", "AUTH_UNAVAILABLE", "AUTH_INVALID",
+    }),
+    "delivery_outcome": frozenset({
+        "DELIVERED", "ALREADY_DELIVERED", "DELIVERY_OUTCOME_UNCERTAIN", "REQUEST_REJECTED",
+    }),
+    "stream_complete": frozenset({
+        "PENDING", "EMPTY", "INVENTORY_READY", "ALREADY_HANDLED", "DELIVERED",
+        "DELIVERY_OUTCOME_UNCERTAIN", "SHARED_SINK_UNBOUND", "STREAM_BINDING_MISMATCH",
+        "UNBOUND", "STREAM_HELD", "ADAPTER_UNAVAILABLE", "SOURCE_FAILURE",
+        "LATEST_INVOICE_MISSING", "LATEST_AMBIGUOUS", "ARCHIVE_PATH_INVALID",
+        "LATEST_IDENTITY_CONFLICT", "SOURCE_REGRESSION", "ARCHIVE_RECOVERY_HOLD",
+        "ARCHIVE_FAILURE", "DRIVE_FAILURE", "REQUEST_REJECTED", "DELIVERY_FAILURE",
+        "ARCHIVE_READY",
+    }),
+}
+DUAL_STAGE_LOG_FIELDS = frozenset({
+    "stream", "support_ref", "inventory_count", "archive_reused_count", "archive_staged_count",
+    "drive_staged_count", "delivered_count", "handled_count", "uncertain_count",
+})
+
+
+def reconcile_dual_stream(
+    config,
+    adapters: dict[str, Any],
+    state,
+    logger: LoggerProtocol,
+    run_id: str,
+    *,
+    list_only: bool = False,
+) -> RunSummary:
+    """v3 `acquire`: select at most one latest invoice per independently bound
+    stream and make its canonical local archive available.
+
+    Google Drive upload and email delivery are deliberately absent here. They
+    are separate deterministic core commands (#226 G3) gated by durable state,
+    so this step never touches the Drive or email boundaries.
+    """
+    from .config import BOUND_ADMISSION, UNBOUND_ADMISSION
+    from .invoice import InventorySnapshot, Stream
+    from .publication import ensure_no_reparse_components, ensure_same_volume
+    from .state import StateV3Store, StreamStateConflictError
+
+    if not isinstance(state, StateV3Store):
+        raise StateError("dual-stream acquisition requires the v3 state store")
+    logger = _install_observational_logger(logger)
+    summary = RunSummary(run_id=run_id, status=ACTION_REQUIRED, exit_code=20)
+    details: dict[str, dict[str, Any]] = {}
+    failures: list[int] = []
+    drive = None
+
+    # Validate the shared roots before any adapter is contacted.
+    ensure_no_reparse_components(config.archive_root)
+    ensure_no_reparse_components(config.temp_root)
+    ensure_same_volume(config.temp_root, config.archive_root / "_volume_probe_")
+
+    # Snapshot every bound stream before any state change, acquisition, archive,
+    # Drive or delivery effect. Streams remain independently fail-closed below,
+    # but one stream's later inventory response cannot arrive after another
+    # stream has already started processing its latest invoice.
+    prepared_snapshots: dict[str, InventorySnapshot] = {}
+    for stream_name in DUAL_STREAMS:
+        entry = config.streams[stream_name]
+        detail = _dual_detail(stream_name, "PENDING", None)
+        details[stream_name] = detail
+        if not state.verify_stream_binding(stream_name, entry):
+            _dual_hold(detail, "STREAM_BINDING_MISMATCH", "EG_STREAM_BINDING_MISMATCH")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+        if entry.admission == UNBOUND_ADMISSION:
+            _dual_hold(detail, "UNBOUND", "EG_STREAM_UNBOUND")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+        if entry.admission != BOUND_ADMISSION:
+            _dual_hold(detail, "STREAM_HELD", "EG_STREAM_ADMISSION_HOLD")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+        adapter = adapters.get(stream_name)
+        if adapter is None:
+            _dual_hold(detail, "ADAPTER_UNAVAILABLE", "EG_SOURCE_ADAPTER_UNAVAILABLE")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+
+        try:
+            _safe_log(logger, "inventory_started", status="STARTED", stream=stream_name)
+            snapshot = adapter.inventory(config.inventory_safety_ceiling)
+            if not isinstance(snapshot, InventorySnapshot):
+                raise SourceContractError("EG_INVENTORY_SNAPSHOT_INVALID")
+            stream_enum = Stream(stream_name)
+            if (
+                snapshot.stream is not stream_enum
+                or snapshot.source_namespace != entry.source_namespace
+                or snapshot.date_profile != entry.date_profile
+                or len(snapshot.candidates) > config.inventory_safety_ceiling
+            ):
+                raise SourceContractError("EG_INVENTORY_BINDING_INVALID")
+            detail["inventory_count"] = len(snapshot.candidates)
+            summary.inventory_count += len(snapshot.candidates)
+        except AppError as exc:
+            _dual_hold(detail, "SOURCE_FAILURE", _dual_support_ref(exc, "EG_SOURCE_INVENTORY_FAILED"))
+            failures.append(exc.exit_code or 20)
+            summary.stream_exit_codes[stream_name] = exc.exit_code or 20
+            _safe_log(logger, "inventory_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+        except Exception:
+            _dual_hold(detail, "SOURCE_FAILURE", "EG_SOURCE_INVENTORY_FAILED")
+            failures.append(20)
+            _safe_log(logger, "inventory_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+        _safe_log(logger, "inventory_result", status="READY", stream=stream_name, inventory_count=detail["inventory_count"])
+        prepared_snapshots[stream_name] = snapshot
+
+    for stream_name in DUAL_STREAMS:
+        detail = details[stream_name]
+        if stream_name not in prepared_snapshots:
+            continue
+        snapshot = prepared_snapshots[stream_name]
+        adapter = adapters[stream_name]
+        stream_state = state.stream(stream_name)
+        if not snapshot.candidates:
+            if stream_state is not None and stream_state["watermark_day"] is not None:
+                _dual_hold(detail, "LATEST_INVOICE_MISSING", "EG_LATEST_INVOICE_MISSING")
+                failures.append(20)
+            else:
+                detail["status"] = "EMPTY"
+                detail["handled_count"] = 1
+                summary.handled_count += 1
+            _emit_stream_complete(logger, detail)
+            continue
+
+        latest_day = max(item.day_ordinal for item in snapshot.candidates)
+        latest = [item for item in snapshot.candidates if item.day_ordinal == latest_day]
+        if len(latest) != 1:
+            _dual_hold(detail, "LATEST_AMBIGUOUS", "EG_LATEST_AMBIGUOUS")
+            failures.append(20)
+            _safe_log(logger, "latest_selection", status="AMBIGUOUS", stream=stream_name, inventory_count=len(snapshot.candidates), support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+        candidate = latest[0]
+        _safe_log(logger, "latest_selection", status="SELECTED", stream=stream_name, inventory_count=len(snapshot.candidates))
+        try:
+            candidate_archive_path = _canonical_path(config.archive_root, stream_name, candidate.canonical_filename)
+            ensure_no_reparse_components(candidate_archive_path)
+        except AppError as exc:
+            _dual_hold(detail, "ARCHIVE_PATH_INVALID", _dual_support_ref(exc, "EG_ARCHIVE_PATH_INVALID"))
+            failures.append(exc.exit_code or 20)
+            _emit_stream_complete(logger, detail)
+            continue
+        stream_state = state.stream(stream_name)
+        if stream_state is None or stream_state["admission"] != BOUND_ADMISSION:
+            _dual_hold(detail, "STREAM_BINDING_MISMATCH", "EG_STREAM_BINDING_MISMATCH")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+
+        try:
+            existing = state.resolve_latest_candidate(candidate)
+        except StreamStateConflictError as exc:
+            _dual_hold(detail, "LATEST_IDENTITY_CONFLICT", exc.support_ref)
+            failures.append(20)
+            _safe_log(logger, "latest_selection", status="CONFLICT", stream=stream_name, inventory_count=len(snapshot.candidates), support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+
+        candidate_invoice_id = existing["invoice_id"] if existing is not None else _invoice_id(
+            candidate.source_namespace, stream_name, candidate.source_invoice_key
+        )
+        watermark_day = stream_state["watermark_day"]
+        if watermark_day is not None and candidate.day_ordinal < watermark_day:
+            _dual_hold(detail, "SOURCE_REGRESSION", "EG_SOURCE_REGRESSION")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+
+        if (
+            watermark_day == candidate.day_ordinal
+            and stream_state["watermark_invoice_id"] is not None
+            and stream_state["watermark_invoice_id"] != candidate_invoice_id
+        ):
+            _dual_hold(detail, "LATEST_IDENTITY_CONFLICT", "EG_LATEST_IDENTITY_CONFLICT")
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+        if list_only:
+            detail["status"] = "INVENTORY_READY"
+            detail["handled_count"] = int(_is_fully_handled(config, state, drive, existing))
+            _emit_stream_complete(logger, detail)
+            continue
+
+        if existing is not None and _is_fully_handled(config, state, drive, existing):
+            delivery_row = state.delivery_for_invoice(existing["invoice_id"])
+            _safe_log(logger, "fetch_decision", status="NO_FETCH", stream=stream_name)
+            if delivery_row is not None and delivery_row.get("state") == "DELIVERED":
+                _safe_log(
+                    logger, "delivery_no_send", status="ALREADY_DELIVERED", stream=stream_name,
+                    support_ref=delivery_row.get("support_ref") or "EG_MAIL_ALREADY_DELIVERED",
+                )
+            detail["status"] = "ALREADY_HANDLED"
+            detail["archive_reused_count"] = 1
+            detail["delivered_count"] = 1
+            detail["handled_count"] = 1
+            summary.archive_reused_count += 1
+            summary.delivered_count += 1
+            summary.handled_count += 1
+            _emit_stream_complete(logger, detail)
+            continue
+
+        try:
+            invoice_id = state.accept_latest(candidate, run_id, _dual_utc_now())
+        except StreamStateConflictError as exc:
+            _dual_hold(detail, "LATEST_IDENTITY_CONFLICT", exc.support_ref)
+            failures.append(20)
+            _emit_stream_complete(logger, detail)
+            continue
+        _safe_log(logger, "selection_committed", status="COMMITTED", stream=stream_name)
+        invoice = state.invoice(invoice_id)
+        if invoice is None or invoice["classification"] != "CLASSIFIED":
+            raise StateError("selected invoice could not be read back")
+        relpath = invoice["archive_relpath"]
+        archive_path = _canonical_path(config.archive_root, stream_name, invoice["canonical_filename"])
+
+        try:
+            archive_info, archive_action = _ensure_archive_available(
+                config, state, invoice, candidate, adapter, run_id, logger
+            )
+            if archive_action == "FETCHED":
+                summary.fetch_count += 1
+                summary.downloaded_count += 1
+                detail["archive_staged_count"] = 1
+            else:
+                summary.archive_reused_count += 1
+                detail["archive_reused_count"] = 1
+            invoice = state.invoice(invoice_id)
+            if invoice is None or invoice["archive_state"] != "COMMITTED":
+                raise StateError("archive commit was not durable")
+            archive_info = validate_pdf(archive_path)
+            if archive_info.byte_size != invoice["byte_size"] or archive_info.sha256 != invoice["sha256"]:
+                raise ArchiveConflictError("archive facts changed before Drive staging")
+        except StreamStateConflictError as exc:
+            _dual_hold(detail, "ARCHIVE_RECOVERY_HOLD", exc.support_ref)
+            failures.append(20)
+            _safe_log(logger, "archive_result", status="HOLD", stream=stream_name, support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+        except AppError as exc:
+            if isinstance(exc, (StateError, ConfigError)):
+                raise
+            _dual_hold(detail, "ARCHIVE_FAILURE", _dual_support_ref(exc, "EG_ARCHIVE_FAILURE"))
+            failures.append(exc.exit_code or 20)
+            _safe_log(logger, "archive_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+        except OSError:
+            _dual_hold(detail, "ARCHIVE_FAILURE", "EG_ARCHIVE_FAILURE")
+            failures.append(20)
+            _safe_log(logger, "archive_result", status="FAILED", stream=stream_name, support_ref=detail["support_ref"])
+            _emit_stream_complete(logger, detail)
+            continue
+        _safe_log(logger, "archive_result", status="COMMITTED", stream=stream_name, archive_reused_count=detail["archive_reused_count"], archive_staged_count=detail["archive_staged_count"])
+        # The canonical archive is committed and re-verified. Drive and email
+        # are the core's later, separately gated `drive-*` and `deliver` steps.
+        detail["status"] = "ARCHIVE_READY"
+        _emit_stream_complete(logger, detail)
+
+    summary.stream_results = [details[name] for name in DUAL_STREAMS]
+    summary.failure_count = len(failures)
+    summary.failures = [ACTION_REQUIRED] if failures else []
+    if failures:
+        summary.status = ACTION_REQUIRED
+        summary.exit_code = 10 if failures and all(code == 10 for code in failures) else 20
+    else:
+        if summary.downloaded_count:
+            summary.status = DOWNLOADED
+        elif summary.archive_reused_count or summary.handled_count:
+            summary.status = ALREADY_PRESENT
+        else:
+            summary.status = NO_NEW_BILLS
+        summary.exit_code = 0
+    summary.present_count = summary.archive_reused_count
+    return summary
+
+
+def _dual_detail(stream: str, status: str, support_ref: str | None) -> dict[str, Any]:
+    return {
+        "stream": stream,
+        "status": status,
+        "inventory_count": 0,
+        "archive_reused_count": 0,
+        "archive_staged_count": 0,
+        "drive_staged_count": 0,
+        "delivered_count": 0,
+        "handled_count": 0,
+        "uncertain_count": 0,
+        "delivery_outcome": None,
+        "support_ref": support_ref,
+    }
+
+
+def _dual_hold(detail: dict[str, Any], status: str, support_ref: str) -> None:
+    detail["status"] = status
+    detail["support_ref"] = support_ref if re.fullmatch(SUPPORT_REF_PATTERN, support_ref) else "EG_DUAL_STREAM_FAILURE"
+
+
+def _dual_support_ref(error: AppError, fallback: str) -> str:
+    ref = getattr(error, "support_ref", None)
+    return ref if type(ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, ref) else fallback
+
+
+class _DiscardingLogger:
+    def event(self, phase: str, status: str | None = None, **fields: Any) -> None:
+        return None
+
+
+def _install_observational_logger(logger):
+    try:
+        event = logger.event
+    except Exception:
+        return _DiscardingLogger()
+    if getattr(event, "_energygrid_observational", False):
+        return logger
+
+    def safe_event(phase: str, status: str | None = None, **fields: Any) -> None:
+        if type(phase) is not str or type(status) is not str:
+            return
+        allowed_statuses = DUAL_STAGE_EVENT_STATUSES.get(phase)
+        if allowed_statuses is None or status not in allowed_statuses:
+            return
+        safe_fields = {key: value for key, value in fields.items() if key in DUAL_STAGE_LOG_FIELDS}
+        stream = safe_fields.get("stream")
+        if stream is not None and stream not in DUAL_STREAMS:
+            return
+        support_ref = safe_fields.get("support_ref")
+        if support_ref is not None and (
+            type(support_ref) is not str or re.fullmatch(SUPPORT_REF_PATTERN, support_ref) is None
+        ):
+            return
+        safe_fields = {
+            key: value for key, value in safe_fields.items()
+            if not key.endswith("_count") or (type(value) is int and 0 <= value <= MAX_INVENTORY_CEILING)
+        }
+        try:
+            event(phase, status=status, **safe_fields)
+        except Exception:
+            return None
+
+    safe_event._energygrid_observational = True
+    try:
+        logger.event = safe_event
+        return logger
+    except Exception:
+        class LoggerProxy:
+            def event(self, phase: str, status: str | None = None, **fields: Any) -> None:
+                safe_event(phase, status=status, **fields)
+
+        return LoggerProxy()
+
+
+def _safe_log(logger, phase: str, *, status: str | None = None, **fields: Any) -> None:
+    try:
+        logger.event(phase, status=status, **fields)
+    except Exception:
+        return None
+
+
+def _emit_stream_complete(logger, detail: dict[str, Any]) -> None:
+    fields = {
+        key: detail[key]
+        for key in (
+            "inventory_count", "archive_reused_count", "archive_staged_count", "drive_staged_count",
+            "delivered_count", "handled_count", "uncertain_count", "support_ref",
+        )
+        if detail.get(key) is not None
+    }
+    _safe_log(logger, "stream_complete", status=detail["status"], stream=detail["stream"], **fields)
+
+
+def _dual_utc_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _invoice_id(namespace: str, stream: str, source_key: str) -> str:
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"energygrid-v2:{namespace}:{stream}:{source_key}"))
+
+
+def _canonical_path(root: Path, stream: str, filename: str) -> Path:
+    from .invoice import DATE_PROFILE_ISO_V1, parse_invoice_date, Stream
+
+    if stream not in {item.value for item in Stream} or type(filename) is not str:
+        raise ConfigError("canonical archive path is invalid")
+    folder = "EB Bill" if stream == "EB_BILL" else "Tenant Bill"
+    path = root / folder / filename
+    if not is_within(path, root) or path.name != filename or not filename.endswith(".pdf"):
+        raise ConfigError("canonical archive path is invalid")
+    try:
+        parsed = parse_invoice_date(filename[:-4], DATE_PROFILE_ISO_V1)
+    except AppError:
+        raise ConfigError("canonical archive path is invalid") from None
+    if filename != f"{parsed.isoformat()}.pdf":
+        raise ConfigError("canonical archive path is invalid")
+    return path
+
+
+def _create_dual_temp_directory(root: Path) -> Path:
+    from .publication import create_run_directory, ensure_no_reparse_components
+    ensure_no_reparse_components(root)
+    return create_run_directory(root, str(uuid.uuid4()))
+
+
+def _ensure_archive_available(config, state, invoice: dict, candidate, adapter, run_id: str, logger) -> tuple[FileInfo, str]:
+    from .state import StreamStateConflictError
+    from .publication import ensure_no_reparse_components, filename_key
+
+    invoice_id = invoice["invoice_id"]
+    relpath = invoice["archive_relpath"]
+    destination = _canonical_path(config.archive_root, invoice["stream"], invoice["canonical_filename"])
+    ensure_no_reparse_components(destination)
+    archive_kinds = {"ARCHIVE_PUBLISH", "LEGACY_MOVE"}
+    active = state.active_file_operation_conflicts(invoice_id, archive_kinds, relpath)
+    if len(active) > 1 or any(
+        operation["invoice_id"] != invoice_id or operation["target_relpath"] != relpath or operation["binding_id"] is not None
+        for operation in active
+    ):
+        for operation in active:
+            if operation["state"] == "PREPARED":
+                state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_OPERATION_CONFLICT")
+        raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_OPERATION_CONFLICT")
+
+    if active:
+        if invoice["archive_state"] == "COMMITTED":
+            state.hold_file_operation(active[0]["operation_id"], "EG_ARCHIVE_OPERATION_CONFLICT")
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_OPERATION_CONFLICT")
+        operation = active[0]
+        if operation["state"] != "PREPARED":
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_RECOVERY_HOLD")
+        _safe_log(logger, "fetch_decision", status="RECOVER", stream=invoice["stream"])
+        _safe_log(logger, "archive_started", status="RECOVERY", stream=invoice["stream"])
+        source_root = config.temp_root if operation["kind"] == "ARCHIVE_PUBLISH" else config.archive_root
+        info = _recover_archive_operation(state, invoice, destination, operation, source_root)
+        if info is None:
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_RECOVERY_AMBIGUOUS")
+        if operation["kind"] == "LEGACY_MOVE":
+            state.update_invoice_file_state(invoice_id, migration_state="COMPLETE")
+        return info, "REUSED"
+
+    histories = [
+        *state.file_operation_history(invoice_id, "ARCHIVE_PUBLISH", None, relpath),
+        *state.file_operation_history(invoice_id, "LEGACY_MOVE", None, relpath),
+    ]
+    if invoice["archive_state"] == "COMMITTED":
+        if destination.exists() or destination.is_symlink():
+            try:
+                ensure_no_reparse_components(destination)
+                info = validate_pdf(destination)
+            except StateError:
+                raise
+            except (OSError, AppError):
+                raise StreamStateConflictError(invoice["stream"], "EG_COMMITTED_ARCHIVE_CONFLICT") from None
+            if info.byte_size == invoice["byte_size"] and info.sha256 == invoice["sha256"]:
+                _safe_log(logger, "fetch_decision", status="REUSE", stream=invoice["stream"])
+                _safe_log(logger, "archive_started", status="VERIFY", stream=invoice["stream"])
+                return info, "REUSED"
+        raise StreamStateConflictError(invoice["stream"], "EG_COMMITTED_ARCHIVE_CONFLICT")
+
+    if histories:
+        if len(histories) != 1:
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_HISTORY_AMBIGUOUS")
+        operation = histories[0]
+        invoice_facts_missing = invoice.get("byte_size") is None and invoice.get("sha256") is None
+        committed_facts_are_authoritative = (
+            operation["kind"] == "ARCHIVE_PUBLISH"
+            and operation["source_role"] == "SOURCE_ACQUISITION"
+            and operation["evidence_ref"] in {"EG_ARCHIVE_HASH_VERIFIED", "EG_ARCHIVE_RECOVERY_HASH_VERIFIED"}
+        ) or (
+            operation["kind"] == "LEGACY_MOVE"
+            and operation["source_role"] == "LEGACY_ARCHIVE"
+            and operation["evidence_ref"] == "EG_ARCHIVE_RECOVERY_HASH_VERIFIED"
+        )
+        if (
+            operation["state"] != "COMMITTED" or operation["target_relpath"] != relpath
+            or operation["binding_id"] is not None
+            or (invoice_facts_missing and not committed_facts_are_authoritative)
+            or (
+                not invoice_facts_missing
+                and (
+                    operation["expected_size"] != invoice.get("byte_size")
+                    or operation["expected_sha256"] != invoice.get("sha256")
+                )
+            )
+        ):
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_HISTORY_CONFLICT")
+        if not destination.exists() or destination.is_symlink():
+            raise StreamStateConflictError(invoice["stream"], "EG_COMMITTED_ARCHIVE_MISSING")
+        ensure_no_reparse_components(destination)
+        info = validate_pdf(destination)
+        if info.byte_size != operation["expected_size"] or info.sha256 != operation["expected_sha256"]:
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_HISTORY_CONFLICT")
+        _safe_log(logger, "fetch_decision", status="REUSE", stream=invoice["stream"])
+        _safe_log(logger, "archive_started", status="RECOVERY", stream=invoice["stream"])
+        state.update_invoice_file_state(
+            invoice_id, archive_state="COMMITTED", byte_size=info.byte_size,
+            sha256=info.sha256, archived_at_utc=invoice.get("archived_at_utc") or _dual_utc_now(),
+        )
+        if operation["kind"] == "LEGACY_MOVE":
+            state.update_invoice_file_state(invoice_id, migration_state="COMPLETE")
+        return info, "REUSED"
+
+    legacy = state.legacy_archive_provenance(invoice_id)
+    if legacy is not None and legacy["status"] in {"ARCHIVED", "PRESENT_RECONCILED"}:
+        relative = Path(invoice.get("legacy_path") or "")
+        if (
+            relative.is_absolute() or len(relative.parts) != 1 or relative.name in {"", ".", ".."}
+            or filename_key(relative.name) != legacy["legacy_filename_key"]
+            or type(legacy["byte_size"]) is not int or legacy["byte_size"] <= 0
+            or type(legacy["sha256"]) is not str or re.fullmatch(r"[0-9a-f]{64}", legacy["sha256"], re.ASCII) is None
+            or invoice.get("byte_size") != legacy["byte_size"] or invoice.get("sha256") != legacy["sha256"]
+        ):
+            raise StreamStateConflictError(invoice["stream"], "EG_LEGACY_ARCHIVE_PROVENANCE_CONFLICT")
+        legacy_source = config.archive_root / relative
+        ensure_no_reparse_components(legacy_source)
+        if not is_within(legacy_source, config.archive_root):
+            raise StreamStateConflictError(invoice["stream"], "EG_LEGACY_ARCHIVE_PATH_CONFLICT")
+        expected = FileInfo(legacy["byte_size"], legacy["sha256"])
+        _safe_log(logger, "fetch_decision", status="RECOVER", stream=invoice["stream"])
+        _safe_log(logger, "archive_started", status="LEGACY_MOVE", stream=invoice["stream"])
+        operation = state.start_file_operation(
+            operation_id=str(uuid.uuid4()), invoice_id=invoice_id, kind="LEGACY_MOVE",
+            private_path_ref=str(legacy_source), target_relpath=relpath, binding_id=None,
+            info=expected, source_role="LEGACY_ARCHIVE", run_id=run_id, timestamp=_dual_utc_now(),
+        )
+        if operation["state"] != "PREPARED" or Path(operation["private_path_ref"]) != legacy_source:
+            if operation["state"] == "PREPARED":
+                state.hold_file_operation(operation["operation_id"], "EG_LEGACY_ARCHIVE_OPERATION_CONFLICT")
+            raise StreamStateConflictError(invoice["stream"], "EG_LEGACY_ARCHIVE_OPERATION_CONFLICT")
+        state.update_invoice_file_state(invoice_id, migration_state="MOVE_PLANNED")
+        info = _recover_archive_operation(state, invoice, destination, operation, config.archive_root)
+        if info is None:
+            raise StreamStateConflictError(invoice["stream"], "EG_LEGACY_ARCHIVE_RECOVERY_HOLD")
+        state.update_invoice_file_state(invoice_id, migration_state="COMPLETE")
+        return info, "REUSED"
+
+    if destination.exists() or destination.is_symlink():
+        raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_UNOWNED_DESTINATION")
+
+    _safe_log(logger, "fetch_decision", status="FETCH", stream=invoice["stream"])
+    _safe_log(logger, "archive_started", status="FETCH", stream=invoice["stream"])
+    run_dir = _create_dual_temp_directory(config.temp_root)
+    temp_path = run_dir / "latest.pdf"
+    keep_run_dir = False
+    try:
+        _safe_log(logger, "fetch_started", status="STARTED", stream=invoice["stream"])
+        try:
+            returned_name = adapter.acquire(candidate, temp_path)
+        except Exception as error:
+            support = _dual_support_ref(error, "EG_SOURCE_FETCH_FAILED") if isinstance(error, AppError) else "EG_SOURCE_FETCH_FAILED"
+            _safe_log(logger, "fetch_completed", status="FAILED", stream=invoice["stream"], support_ref=support)
+            raise
+        if type(returned_name) is not str or returned_name != candidate.source_filename:
+            _safe_log(logger, "fetch_completed", status="FAILED", stream=invoice["stream"], support_ref="EG_FETCH_HANDLE_NAME_MISMATCH")
+            raise SourceContractError("EG_FETCH_HANDLE_NAME_MISMATCH", stage="fetch")
+        _safe_log(logger, "fetch_completed", status="SUCCESS", stream=invoice["stream"])
+        archive_info = validate_pdf(temp_path)
+        if archive_info.byte_size > config.delivery.max_pdf_bytes:
+            raise SourceContractError("EG_FETCH_EXCEEDS_DELIVERY_LIMIT", stage="fetch")
+        operation = state.start_file_operation(
+            operation_id=str(uuid.uuid4()), invoice_id=invoice_id,
+            kind="ARCHIVE_PUBLISH", private_path_ref=str(temp_path), target_relpath=relpath,
+            binding_id=None, info=archive_info, source_role="SOURCE_ACQUISITION",
+            run_id=run_id, timestamp=_dual_utc_now(),
+        )
+        if operation["state"] != "PREPARED" or Path(operation["private_path_ref"]) != temp_path:
+            if operation["state"] == "PREPARED":
+                state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_OPERATION_CONFLICT")
+            raise StreamStateConflictError(invoice["stream"], "EG_ARCHIVE_OPERATION_CONFLICT")
+        keep_run_dir = True
+        ensure_no_reparse_components(config.archive_root)
+        ensure_no_reparse_components(destination)
+        publish_no_replace(temp_path, destination)
+        if validate_pdf(destination) != archive_info:
+            raise ArchiveConflictError("published archive bytes failed verification")
+        state.complete_file_operation(operation["operation_id"], _dual_utc_now(), evidence_ref="EG_ARCHIVE_HASH_VERIFIED")
+        state.update_invoice_file_state(
+            invoice_id, archive_state="COMMITTED", byte_size=archive_info.byte_size,
+            sha256=archive_info.sha256, archived_at_utc=_dual_utc_now(),
+        )
+        return archive_info, "FETCHED"
+    finally:
+        if not keep_run_dir or not temp_path.exists():
+            try:
+                cleanup_run_directory(run_dir, config.temp_root)
+            except (OSError, ConfigError):
+                pass
+
+
+def _recover_archive_operation(state, invoice: dict, destination: Path, operation: dict, source_root: Path) -> FileInfo | None:
+    import os
+    from .publication import ensure_no_reparse_components, filename_key
+
+    if operation["state"] != "PREPARED":
+        return None
+    kind = operation["kind"]
+    source_path = Path(os.path.abspath(operation["private_path_ref"]))
+    if kind == "ARCHIVE_PUBLISH":
+        if operation["source_role"] != "SOURCE_ACQUISITION":
+            state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+            return None
+    elif kind == "LEGACY_MOVE":
+        legacy_relative = Path(invoice.get("legacy_path") or "")
+        expected_legacy_source = Path(os.path.abspath(source_root / legacy_relative))
+        if (
+            operation["source_role"] != "LEGACY_ARCHIVE" or invoice.get("legacy_filename_key") is None
+            or legacy_relative.is_absolute() or len(legacy_relative.parts) != 1
+            or legacy_relative.name in {"", ".", ".."}
+            or filename_key(legacy_relative.name) != invoice.get("legacy_filename_key")
+            or source_path != expected_legacy_source
+        ):
+            state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+            return None
+    else:
+        state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+        return None
+    if (
+        operation["invoice_id"] != invoice["invoice_id"] or operation["target_relpath"] != invoice["archive_relpath"]
+        or operation["binding_id"] is not None or destination.name != invoice["canonical_filename"]
+    ):
+        state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+        return None
+    expected = FileInfo(operation["expected_size"], operation["expected_sha256"])
+    try:
+        ensure_no_reparse_components(source_path)
+        ensure_no_reparse_components(destination)
+        if not is_within(source_path, source_root):
+            state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+            return None
+        source_present = source_path.exists() or source_path.is_symlink()
+        target_present = destination.exists() or destination.is_symlink()
+        if source_present == target_present:
+            state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_AMBIGUOUS")
+            return None
+        if source_present:
+            if validate_pdf(source_path) != expected:
+                state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+                return None
+            publish_no_replace(source_path, destination)
+        info = validate_pdf(destination)
+        if info != expected:
+            state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_CONFLICT")
+            return None
+        state.complete_file_operation(operation["operation_id"], _dual_utc_now(), evidence_ref="EG_ARCHIVE_RECOVERY_HASH_VERIFIED")
+        state.update_invoice_file_state(
+            invoice["invoice_id"], archive_state="COMMITTED", byte_size=info.byte_size,
+            sha256=info.sha256, archived_at_utc=invoice.get("archived_at_utc") or _dual_utc_now(),
+        )
+        return info
+    except (OSError, AppError) as error:
+        if isinstance(error, StateError):
+            raise
+        try:
+            state.hold_file_operation(operation["operation_id"], "EG_ARCHIVE_RECOVERY_HOLD")
+        except Exception:
+            pass
+        return None
+
+
+def _is_fully_handled(config, state, drive, invoice: dict | None) -> bool:
+    """v3: latest + committed archive + DRIVE_VERIFIED under the ACTIVE
+    configured binding + DELIVERED email with matching facts. No local Drive
+    file is consulted; `drive` is unused and kept for call-site stability."""
+    if invoice is None or invoice.get("classification") != "CLASSIFIED" or state.has_open_archive_operation(invoice["invoice_id"]):
+        return False
+    watermark = state.stream(invoice["stream"])
+    if (
+        watermark is None
+        or watermark.get("watermark_day") != invoice.get("day_ordinal")
+        or watermark.get("watermark_invoice_id") != invoice.get("invoice_id")
+    ):
+        return False
+    if invoice.get("archive_state") != "COMMITTED":
+        return False
+    binding = state.active_binding(invoice["stream"])
+    configured = getattr(config.drive, "bindings", {}).get(invoice["stream"]) if hasattr(config.drive, "bindings") else None
+    if binding is None or configured is None or configured.binding_id != binding["binding_id"]:
+        return False
+    operation = state.drive_operation_for(invoice["invoice_id"], binding["binding_id"])
+    if (
+        operation is None or operation.get("state") != "DRIVE_VERIFIED"
+        or operation.get("remote_file_id") != operation.get("reserved_remote_file_id")
+        or operation.get("local_byte_size") != invoice.get("byte_size")
+        or operation.get("local_sha256") != invoice.get("sha256")
+    ):
+        return False
+    delivery_row = state.delivery_for_invoice(invoice["invoice_id"])
+    if delivery_row is None or delivery_row.get("state") != "DELIVERED":
+        return False
+    try:
+        archive_path = _canonical_path(config.archive_root, invoice["stream"], invoice["canonical_filename"])
+        ensure_no_reparse_components(archive_path)
+        archive_info = validate_pdf(archive_path)
+        if archive_info.byte_size != invoice["byte_size"] or archive_info.sha256 != invoice["sha256"]:
+            return False
+    except (OSError, AppError):
+        return False
+    return (
+        delivery_row.get("stream") == invoice["stream"]
+        and delivery_row.get("bill_date") == invoice["bill_date"]
+        and delivery_row.get("attachment_name") == invoice["canonical_filename"]
+        and delivery_row.get("byte_size") == invoice["byte_size"]
+        and delivery_row.get("sha256") == invoice["sha256"]
+    )

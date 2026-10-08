@@ -1,0 +1,993 @@
+{
+  "id": "energygridInvoiceDelivery01",
+  "name": "EnergyGrid - Invoice Delivery",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "REPLACE_WITH_INVOICE_DELIVERY_WEBHOOK_PATH",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "EnergyGrid Invoice Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst items = $input.all();\nconst RESULT_SCHEMA = 'energygrid.invoice_delivery_result.v1';\nconst ID_RE = /^egmail-v1-[0-9a-f]{32}$/;\nconst RUN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;\nconst SHA_RE = /^[0-9a-f]{64}$/;\nconst SENTINEL = 'egmail-v1-00000000000000000000000000000000';\nfunction rejection(supportRef, deliveryId) {\n  const id = typeof deliveryId === 'string' && ID_RE.test(deliveryId) ? deliveryId : SENTINEL;\n  return [{ json: { valid: false, response_code: 422, response: {\n    schema: RESULT_SCHEMA, delivery_id: id, outcome: 'REQUEST_REJECTED',\n    duplicate: false, support_ref: supportRef,\n  } } }];\n}\nfunction parseString(text, cursor) {\n  if (text[cursor.index] !== '\"') throw new Error('EG_MAIL_METADATA_JSON');\n  const start = cursor.index++;\n  let escaped = false;\n  while (cursor.index < text.length) {\n    const char = text[cursor.index++];\n    if (escaped) escaped = false;\n    else if (char === '\\\\') escaped = true;\n    else if (char === '\"') return JSON.parse(text.slice(start, cursor.index));\n  }\n  throw new Error('EG_MAIL_METADATA_JSON');\n}\nfunction parseStrictObject(text) {\n  if (typeof text !== 'string' || text.length < 2 || text.length > 4096) throw new Error('EG_MAIL_METADATA_JSON');\n  const cursor = { index: 0 };\n  const skipSpace = () => {\n    while (cursor.index < text.length && /\\s/.test(text[cursor.index])) cursor.index++;\n  };\n  const readValue = () => {\n    skipSpace();\n    const start = cursor.index;\n    let objects = 0, arrays = 0, inString = false, escaped = false;\n    while (cursor.index < text.length) {\n      const char = text[cursor.index];\n      if (inString) {\n        if (escaped) escaped = false;\n        else if (char === '\\\\') escaped = true;\n        else if (char === '\"') inString = false;\n        cursor.index++;\n        continue;\n      }\n      if (char === '\"') { inString = true; cursor.index++; }\n      else if (char === '{') { objects++; cursor.index++; }\n      else if (char === '[') { arrays++; cursor.index++; }\n      else if (char === '}') {\n        if (objects === 0 && arrays === 0) break;\n        objects--; cursor.index++;\n      } else if (char === ']') {\n        if (arrays === 0) throw new Error('EG_MAIL_METADATA_JSON');\n        arrays--; cursor.index++;\n      } else if (char === ',' && objects === 0 && arrays === 0) break;\n      else cursor.index++;\n    }\n    const raw = text.slice(start, cursor.index).trim();\n    if (!raw || inString || objects !== 0 || arrays !== 0) throw new Error('EG_MAIL_METADATA_JSON');\n    return JSON.parse(raw);\n  };\n  skipSpace();\n  if (text[cursor.index++] !== '{') throw new Error('EG_MAIL_METADATA_JSON');\n  const result = {}, seen = new Set();\n  skipSpace();\n  if (text[cursor.index] === '}') throw new Error('EG_MAIL_METADATA_KEYS');\n  while (cursor.index < text.length) {\n    skipSpace();\n    const key = parseString(text, cursor);\n    if (seen.has(key)) throw new Error('EG_MAIL_METADATA_DUPLICATE_KEY');\n    seen.add(key);\n    skipSpace();\n    if (text[cursor.index++] !== ':') throw new Error('EG_MAIL_METADATA_JSON');\n    result[key] = readValue();\n    skipSpace();\n    const delimiter = text[cursor.index++];\n    if (delimiter === '}') break;\n    if (delimiter !== ',') throw new Error('EG_MAIL_METADATA_JSON');\n  }\n  skipSpace();\n  if (cursor.index !== text.length) throw new Error('EG_MAIL_METADATA_JSON');\n  return result;\n}\nif (items.length !== 1 || !items[0] || !items[0].json) return rejection('EG_MAIL_REQUEST_SHAPE');\nconst item = items[0], body = item.json.body;\nif (!body || typeof body !== 'object' || Array.isArray(body)) return rejection('EG_MAIL_REQUEST_SHAPE');\nif (Object.keys(body).length !== 1 || !Object.prototype.hasOwnProperty.call(body, 'metadata')) return rejection('EG_MAIL_MULTIPART_FIELDS_INVALID');\nlet metadata;\ntry { metadata = parseStrictObject(body.metadata); }\ncatch (error) {\n  const reason = String(error && error.message || '');\n  return rejection(/^EG_MAIL_METADATA_[A-Z_]+$/.test(reason) ? reason : 'EG_MAIL_METADATA_JSON');\n}\nconst keys = ['schema', 'delivery_id', 'run_id', 'stream', 'bill_date', 'attachment_name', 'pdf_byte_size', 'pdf_sha256'];\nif (Object.keys(metadata).length !== keys.length ||\n    !keys.every((key) => Object.prototype.hasOwnProperty.call(metadata, key))) {\n  return rejection('EG_MAIL_METADATA_KEYS', metadata.delivery_id);\n}\nconst deliveryId = metadata.delivery_id;\nif (metadata.schema !== 'energygrid.invoice_delivery.v1' ||\n    typeof deliveryId !== 'string' || !ID_RE.test(deliveryId) ||\n    typeof metadata.run_id !== 'string' || !RUN_RE.test(metadata.run_id) ||\n    !['EB_BILL', 'TENANT_BILL'].includes(metadata.stream) ||\n    typeof metadata.bill_date !== 'string' ||\n    !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(metadata.bill_date) ||\n    Number.isNaN(Date.parse(metadata.bill_date + 'T00:00:00Z')) ||\n    new Date(metadata.bill_date + 'T00:00:00Z').toISOString().slice(0, 10) !== metadata.bill_date ||\n    metadata.attachment_name !== metadata.bill_date + '.pdf' ||\n    !Number.isSafeInteger(metadata.pdf_byte_size) || metadata.pdf_byte_size < 1 ||\n    metadata.pdf_byte_size > 15000000 ||\n    typeof metadata.pdf_sha256 !== 'string' || !SHA_RE.test(metadata.pdf_sha256)) {\n  return rejection('EG_MAIL_METADATA_INVALID', deliveryId);\n}\nconst binary = item.binary;\nif (!binary || Object.keys(binary).length !== 1 || !Object.prototype.hasOwnProperty.call(binary, 'pdf')) {\n  return rejection('EG_MAIL_BINARY_FIELDS_INVALID', deliveryId);\n}\nconst pdf = binary.pdf;\nif (!pdf || pdf.fileName !== metadata.attachment_name || pdf.mimeType !== 'application/pdf') {\n  return rejection('EG_MAIL_PDF_METADATA_INVALID', deliveryId);\n}\nlet bytes;\ntry { bytes = await this.helpers.getBinaryDataBuffer(0, 'pdf'); }\ncatch (error) { return rejection('EG_MAIL_PDF_READ_FAILED', deliveryId); }\nif (!Buffer.isBuffer(bytes) || bytes.length !== metadata.pdf_byte_size || bytes.length > 15000000 ||\n    bytes.length < 10 || bytes.subarray(0, 5).toString('ascii') !== '%PDF-' ||\n    !bytes.subarray(Math.max(0, bytes.length - 4096)).toString('latin1').trimEnd().endsWith('%%EOF')) {\n  return rejection('EG_MAIL_PDF_INVALID', deliveryId);\n}\nreturn [{ json: { valid: true, request: metadata }, binary: item.binary }];\n"
+      },
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "Validate Invoice Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        500
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000003",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000004",
+      "name": "Request Is Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        500
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "action": "hash",
+        "binaryData": true,
+        "binaryPropertyName": "pdf",
+        "type": "SHA256",
+        "dataPropertyName": "data",
+        "encoding": "hex"
+      },
+      "id": "00000000-0000-4000-8000-000000000005",
+      "name": "Hash PDF SHA256",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        960,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Merge Request And PDF Hash",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1200,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_DELIVERY_DATA_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "delivery_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.request.delivery_id }}"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 2
+      },
+      "id": "00000000-0000-4000-8000-000000000007",
+      "name": "Get Existing Delivery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1440,
+        360
+      ],
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 2,
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000008",
+      "name": "Merge Request And Stored State",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1680,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst items = $input.all();\nconst RESULT_SCHEMA = 'energygrid.invoice_delivery_result.v1';\nconst SENTINEL = 'egmail-v1-00000000000000000000000000000000';\nconst SUPPORT_RE = /^EG_[A-Z0-9_]{1,60}$/;\nfunction result(deliveryId, outcome, duplicate, supportRef) {\n  return { schema: RESULT_SCHEMA, delivery_id: deliveryId, outcome, duplicate, support_ref: supportRef };\n}\nfunction stop(deliveryId, outcome, duplicate, supportRef, responseCode) {\n  return [{ json: { should_send: false, response_code: responseCode,\n    response: result(deliveryId, outcome, duplicate, supportRef) } }];\n}\nconst requestItems = items.filter((item) => item && item.json && item.json.request);\nif (requestItems.length !== 1) {\n  return stop(SENTINEL, 'DELIVERY_OUTCOME_UNCERTAIN', false, 'EG_MAIL_REQUEST_CARDINALITY_INVALID', 503);\n}\nconst item = requestItems[0], json = item.json, request = json.request, hash = json.data;\nif (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash) || hash !== request.pdf_sha256) {\n  return stop(request.delivery_id, 'REQUEST_REJECTED', false, 'EG_MAIL_HASH_MISMATCH', 422);\n}\nconst lookupItems = items.filter((candidate) => candidate !== item);\nlet rows = [];\nif (lookupItems.length === 1 && lookupItems[0] && lookupItems[0].json &&\n    Object.keys(lookupItems[0].json).length === 0 &&\n    (!lookupItems[0].binary || Object.keys(lookupItems[0].binary).length === 0)) {\n  rows = [];\n} else if (lookupItems.length === 0) {\n  return stop(request.delivery_id, 'DELIVERY_OUTCOME_UNCERTAIN', false, 'EG_MAIL_TABLE_SENTINEL_MISSING', 503);\n} else if (lookupItems.length > 1) {\n  return stop(request.delivery_id, 'DELIVERY_OUTCOME_UNCERTAIN', false, 'EG_MAIL_TABLE_RESULT_AMBIGUOUS', 503);\n} else {\n  const lookup = lookupItems[0];\n  if (!lookup || !lookup.json || typeof lookup.json !== 'object' ||\n      !Object.prototype.hasOwnProperty.call(lookup.json, 'delivery_id') ||\n      !Object.prototype.hasOwnProperty.call(lookup.json, 'state')) {\n    return stop(request.delivery_id, 'DELIVERY_OUTCOME_UNCERTAIN', false, 'EG_MAIL_TABLE_ROW_INVALID', 503);\n  }\n  rows = [lookup.json];\n}\nif (rows.length === 0) {\n  return [{ json: { ...json, should_send: true, pdf_sha256: hash }, binary: item.binary }];\n}\nif (rows.length > 1) {\n  return stop(request.delivery_id, 'DELIVERY_OUTCOME_UNCERTAIN', false, 'EG_MAIL_TABLE_RESULT_AMBIGUOUS', 503);\n}\nconst row = rows[0];\nconst requiredRowKeys = ['delivery_id', 'run_id', 'stream', 'bill_date', 'attachment_name',\n  'pdf_sha256', 'pdf_byte_size', 'state', 'support_ref'];\nif (!requiredRowKeys.every((key) => Object.prototype.hasOwnProperty.call(row, key))) {\n  return stop(request.delivery_id, 'DELIVERY_OUTCOME_UNCERTAIN', false, 'EG_MAIL_TABLE_ROW_INVALID', 503);\n}\nconst sameFacts = row.delivery_id === request.delivery_id && row.run_id === request.run_id &&\n  row.stream === request.stream && row.bill_date === request.bill_date &&\n  row.attachment_name === request.attachment_name && row.pdf_sha256 === request.pdf_sha256 &&\n  row.pdf_byte_size === request.pdf_byte_size;\nif (!sameFacts) return stop(request.delivery_id, 'REQUEST_REJECTED', false, 'EG_MAIL_DELIVERY_ID_CONFLICT', 409);\nconst supportRef = typeof row.support_ref === 'string' && SUPPORT_RE.test(row.support_ref)\n  ? row.support_ref : 'EG_MAIL_PREVIOUS_OUTCOME';\nif (row.state === 'DELIVERED') return stop(request.delivery_id, 'ALREADY_DELIVERED', true, supportRef, 200);\nif (row.state === 'REQUEST_REJECTED') return stop(request.delivery_id, 'REQUEST_REJECTED', false, supportRef, 422);\nreturn stop(request.delivery_id, 'DELIVERY_OUTCOME_UNCERTAIN', false, supportRef, 503);\n"
+      },
+      "id": "00000000-0000-4000-8000-000000000009",
+      "name": "Decide Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000010",
+              "leftValue": "={{ $json.should_send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000011",
+      "name": "New Delivery Is Required",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_DELIVERY_DATA_TABLE_ID",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "delivery_id": "={{ $json.request.delivery_id }}",
+            "run_id": "={{ $json.request.run_id }}",
+            "stream": "={{ $json.request.stream }}",
+            "bill_date": "={{ $json.request.bill_date }}",
+            "attachment_name": "={{ $json.request.attachment_name }}",
+            "pdf_sha256": "={{ $json.pdf_sha256 }}",
+            "pdf_byte_size": "={{ $json.request.pdf_byte_size }}",
+            "state": "PENDING_SEND",
+            "support_ref": "EG_MAIL_PENDING"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "delivery_id",
+              "displayName": "delivery_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "stream",
+              "displayName": "stream",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "bill_date",
+              "displayName": "bill_date",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "attachment_name",
+              "displayName": "attachment_name",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "pdf_sha256",
+              "displayName": "pdf_sha256",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "support_ref",
+              "displayName": "support_ref",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "pdf_byte_size",
+              "displayName": "pdf_byte_size",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            }
+          ]
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000012",
+      "name": "Insert Pending Delivery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2400,
+        280
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000013",
+      "name": "Merge Pending Intent And Invoice",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2640,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "fromEmail": "REPLACE_WITH_APPROVED_SENDER",
+        "toEmail": "REPLACE_WITH_APPROVED_RECIPIENT",
+        "subject": "=EnergyGrid invoice - {{ $json.request.bill_date }}",
+        "emailFormat": "text",
+        "text": "=Attached is the {{ $json.request.stream }} invoice for {{ $json.request.bill_date }}.",
+        "options": {
+          "appendAttribution": false,
+          "fileAttachments": "pdf"
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000014",
+      "name": "Send Invoice Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2880,
+        360
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "00000000-0000-4000-8000-000000000015",
+      "name": "Merge Successful Email And Intent",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        3120,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_DELIVERY_DATA_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "delivery_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.request.delivery_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "state": "DELIVERED",
+            "support_ref": "EG_MAIL_ACCEPTED"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "support_ref",
+              "displayName": "support_ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            }
+          ]
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000016",
+      "name": "Mark Delivery Accepted",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3360,
+        360
+      ],
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_DELIVERY_DATA_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "delivery_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Decide Delivery').first().json.request.delivery_id }}"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 2
+      },
+      "id": "00000000-0000-4000-8000-000000000026",
+      "name": "Read Back Delivery Outcome",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3600,
+        360
+      ],
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst items = $input.all();\nconst request = $('Decide Delivery').first().json.request;\nconst valid = items.length === 1 && items[0] && items[0].json &&\n  items[0].json.delivery_id === request.delivery_id &&\n  items[0].json.run_id === request.run_id &&\n  items[0].json.stream === request.stream &&\n  items[0].json.bill_date === request.bill_date &&\n  items[0].json.attachment_name === request.attachment_name &&\n  items[0].json.pdf_sha256 === request.pdf_sha256 &&\n  items[0].json.pdf_byte_size === request.pdf_byte_size &&\n  items[0].json.state === 'DELIVERED' &&\n  items[0].json.support_ref === 'EG_MAIL_ACCEPTED';\nreturn [{ json: { response_code: valid ? 200 : 503, response: {\n  schema: 'energygrid.invoice_delivery_result.v1',\n  delivery_id: request.delivery_id,\n  outcome: valid ? 'DELIVERED' : 'DELIVERY_OUTCOME_UNCERTAIN',\n  duplicate: false,\n  support_ref: valid ? 'EG_MAIL_ACCEPTED' : 'EG_MAIL_OUTCOME_NOT_DURABLE',\n} } }];\n"
+      },
+      "id": "00000000-0000-4000-8000-000000000027",
+      "name": "Verify Delivery Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_DELIVERY_DATA_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "delivery_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Decide Delivery').first().json.request.delivery_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "state": "DELIVERY_OUTCOME_UNCERTAIN",
+            "support_ref": "EG_MAIL_SEND_UNCERTAIN"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "support_ref",
+              "displayName": "support_ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            }
+          ]
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000024",
+      "name": "Mark Delivery Outcome Uncertain",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3360,
+        680
+      ],
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.response_code }}"
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000017",
+      "name": "Respond With Delivery Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        3600,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000018",
+      "name": "Respond With Request Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ schema: 'energygrid.invoice_delivery_result.v1', delivery_id: $('Decide Delivery').first().json.request.delivery_id, outcome: 'DELIVERY_OUTCOME_UNCERTAIN', duplicate: false, support_ref: 'EG_MAIL_SEND_UNCERTAIN' }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000020",
+      "name": "Respond With Email Uncertain",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        3600,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ schema: 'energygrid.invoice_delivery_result.v1', delivery_id: 'egmail-v1-00000000000000000000000000000000', outcome: 'DELIVERY_OUTCOME_UNCERTAIN', duplicate: false, support_ref: 'EG_MAIL_WORKFLOW_FAILURE' }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      },
+      "id": "00000000-0000-4000-8000-000000000021",
+      "name": "Respond With Bounded Failure",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        1920,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## EnergyGrid invoice delivery boundary (inactive)\n\nThe authenticated loopback webhook accepts exactly one multipart text field named metadata and one PDF binary field named pdf. Metadata is a JSON string with the eight exact keys from energygrid.invoice_delivery.v1. Duplicate metadata keys, extra text fields, duplicate or extra binary files, mismatched filename, MIME, size or hash, and non-PDF bytes are rejected. Crypto hashes actual PDF bytes; Merge restores the validated binary for email. Success and error execution payloads are not saved.\n\nA Data Table is a secondary ledger keyed by delivery_id. Create columns delivery_id, run_id, stream, bill_date, attachment_name, pdf_sha256, pdf_byte_size, state, support_ref. Get and Insert are not atomic and provide no global concurrency control. Local SQLite write-once dispatch remains the only send permission. Send Email never retries; the success path reads back and verifies the bounded DELIVERED row before responding. A send error is recorded as DELIVERY_OUTCOME_UNCERTAIN before the bounded 503 response. Existing or uncertain deliveries are never resent.\n\nBind Header Auth and SMTP credentials, replace the webhook path, Data Table ID, approved sender and recipient only in an authorised local import copy. Keep the webhook on loopback. This inactive export is design evidence, not proof of import, activation, or execution.",
+        "height": 460,
+        "width": 740
+      },
+      "id": "00000000-0000-4000-8000-000000000022",
+      "name": "Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        80
+      ]
+    }
+  ],
+  "connections": {
+    "EnergyGrid Invoice Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Invoice Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Invoice Request": {
+      "main": [
+        [
+          {
+            "node": "Request Is Valid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Is Valid": {
+      "main": [
+        [
+          {
+            "node": "Hash PDF SHA256",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Request And PDF Hash",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Request Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash PDF SHA256": {
+      "main": [
+        [
+          {
+            "node": "Merge Request And PDF Hash",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Request And PDF Hash": {
+      "main": [
+        [
+          {
+            "node": "Get Existing Delivery",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Request And Stored State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Existing Delivery": {
+      "main": [
+        [
+          {
+            "node": "Merge Request And Stored State",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Request And Stored State": {
+      "main": [
+        [
+          {
+            "node": "Decide Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Delivery": {
+      "main": [
+        [
+          {
+            "node": "New Delivery Is Required",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Delivery Is Required": {
+      "main": [
+        [
+          {
+            "node": "Insert Pending Delivery",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Pending Intent And Invoice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Delivery Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Pending Delivery": {
+      "main": [
+        [
+          {
+            "node": "Merge Pending Intent And Invoice",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Pending Intent And Invoice": {
+      "main": [
+        [
+          {
+            "node": "Send Invoice Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Successful Email And Intent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Invoice Email": {
+      "main": [
+        [
+          {
+            "node": "Merge Successful Email And Intent",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Mark Delivery Outcome Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Successful Email And Intent": {
+      "main": [
+        [
+          {
+            "node": "Mark Delivery Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Delivery Accepted": {
+      "main": [
+        [
+          {
+            "node": "Read Back Delivery Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Back Delivery Outcome": {
+      "main": [
+        [
+          {
+            "node": "Verify Delivery Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Delivery Outcome": {
+      "main": [
+        [
+          {
+            "node": "Respond With Delivery Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Delivery Outcome Uncertain": {
+      "main": [
+        [
+          {
+            "node": "Respond With Email Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8000-000000000028",
+  "sourceWorkflowId": null
+}

@@ -1,0 +1,46 @@
+{
+  "schema": "energygrid.runtime.v3",
+  "source": "dual_stream",
+  "archive_root": "C:\\EnergyGrid\\archive",
+  "state_path": "C:\\EnergyGrid\\state\\bills.sqlite3",
+  "temp_root": "C:\\EnergyGrid\\temp",
+  "log_root": "C:\\EnergyGrid\\logs",
+  "inventory_safety_ceiling": 1000,
+  "timeout_seconds": 30,
+  "max_attempts": 2,
+  "streams": {
+    "EB_BILL": {
+      "admission": "UNBOUND",
+      "source_namespace": null,
+      "adapter_id": null,
+      "date_profile": null,
+      "evidence_ref": null,
+      "settings": null
+    },
+    "TENANT_BILL": {
+      "admission": "UNBOUND",
+      "source_namespace": null,
+      "adapter_id": null,
+      "date_profile": null,
+      "evidence_ref": null,
+      "settings": null
+    }
+  },
+  "drive": {
+    "webhook_url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_DRIVE_WEBHOOK_PATH",
+    "auth_header_name": "X-EnergyGrid-Drive",
+    "auth_token_env": "ENERGYGRID_DRIVE_TOKEN",
+    "timeout_seconds": 180,
+    "bindings": {
+      "EB_BILL": null,
+      "TENANT_BILL": null
+    }
+  },
+  "delivery": {
+    "url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_PRIVATE_PATH",
+    "auth_header_name": "X-EnergyGrid-Delivery",
+    "auth_token_env": "ENERGYGRID_DELIVERY_TOKEN",
+    "max_pdf_bytes": 15000000,
+    "timeout_seconds": 30
+  }
+}

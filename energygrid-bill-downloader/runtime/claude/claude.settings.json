@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Bash(egcore.cmd plan)",
+      "Bash(egcore.cmd status)",
+      "Bash(egcore.cmd acquire)",
+      "Bash(egcore.cmd drive-intent --stream EB_BILL)",
+      "Bash(egcore.cmd drive-intent --stream TENANT_BILL)",
+      "Bash(egcore.cmd drive-reconcile --stream EB_BILL)",
+      "Bash(egcore.cmd drive-reconcile --stream TENANT_BILL)",
+      "Bash(egcore.cmd drive-upload --stream EB_BILL)",
+      "Bash(egcore.cmd drive-upload --stream TENANT_BILL)",
+      "Bash(egcore.cmd deliver --stream EB_BILL)",
+      "Bash(egcore.cmd deliver --stream TENANT_BILL)"
+    ],
+    "deny": [
+      "Read",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit",
+      "Glob",
+      "Grep",
+      "LS",
+      "WebFetch",
+      "WebSearch",
+      "Task",
+      "Agent",
+      "TodoWrite",
+      "KillShell",
+      "BashOutput",
+      "SlashCommand",
+      "Skill",
+      "mcp__*"
+    ]
+  },
+  "enableAllProjectMcpServers": false,
+  "disableAllHooks": true,
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}

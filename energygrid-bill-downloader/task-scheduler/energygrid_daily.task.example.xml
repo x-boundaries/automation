@@ -1,33 +1,39 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Energy@Grid daily bill run - INERT Task Scheduler template (DL-XB-199 G3-101).
+  Energy@Grid daily bill run - INERT Task Scheduler template (integrated G3).
 
   This file registers nothing. It is a reviewed shape for a later, separately
   Owner-approved registration on the production host. Every REPLACE_WITH_*
   value is private host state and is substituted only in a local copy that is
   never committed. The template ships Enabled=false.
 
-  Contract (asserted by tests/test_scheduler_template.py):
-  - the action is the absolute Windows PowerShell 5.1 path invoking the
-    installed launcher with -File (never Python, never the mutable checkout);
+  Contract (asserted by tests/test_scheduler_template.py), #226 G3:
+  - one daily CalendarTrigger at 08:00 +08:00; replace only REPLACE_WITH_START_DATE
+    with the approved YYYY-MM-DD start date in a private local copy;
+  - the action is the absolute Windows PowerShell 5.1 path invoking the installed
+    bounded Claude supervisor (claude_supervisor.ps1) with -File and one private
+    settings path. The task never calls launcher.ps1, Python or Claude directly;
+    the supervisor reaches the launcher only through the core command allowlist;
   - -File, not -Command: -File returns the script's own exit code, while a
     -Command wrapper returns 0 when the script cannot even be loaded;
-  - -AuthorisedLauncherRootWriteSid takes ONE comma-separated argument; -File
-    delivers it as a single string, which the launcher splits;
-  - non-elevated (LeastPrivilege) run principal with a stored password, so
-    DPAPI user-scope credential import works unattended;
+  - success is the supervisor's exit 0, which it returns only when its own final
+    deterministic core status is terminal, has no outstanding uncertainty and is
+    NO_WORK or COMPLETED. Claude exit 0 alone is never success;
+  - non-elevated (LeastPrivilege) run principal with a stored password, so DPAPI
+    user-scope token and credential import work unattended; never LocalSystem;
   - MultipleInstancesPolicy IgnoreNew, plus the application's own single-run
     lock for manual overlap;
-  - a hard ExecutionTimeLimit and StartWhenAvailable after a missed start.
+  - a hard ExecutionTimeLimit of PT30M (Claude is killed at 20 minutes) and
+    StartWhenAvailable after a missed start.
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Energy@Grid daily direct-HTTP bill reconciliation through the governed launcher.</Description>
+    <Description>Energy@Grid daily bills through the bounded Claude supervisor and the deterministic core.</Description>
     <URI>\XB\EnergyGrid Daily Bills</URI>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
-      <StartBoundary>REPLACE_WITH_START_BOUNDARY</StartBoundary>
+      <StartBoundary>REPLACE_WITH_START_DATET08:00:00+08:00</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
@@ -63,7 +69,7 @@
   <Actions Context="Author">
     <Exec>
       <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
-      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "REPLACE_WITH_LAUNCHER_ROOT\launcher.ps1" -ConfigPath "REPLACE_WITH_PRIVATE_CONFIG_JSON_PATH" -PythonExe "REPLACE_WITH_PYTHON_314_EXECUTABLE_PATH" -CheckoutRoot "REPLACE_WITH_DEPLOYED_CHECKOUT_ROOT" -CredentialPath "REPLACE_WITH_PRIVATE_DPAPI_PSCREDENTIAL_CLIXML_PATH" -BrowserCachePath "REPLACE_WITH_PRIVATE_PLAYWRIGHT_BROWSER_CACHE_PATH" -ExpectedBranch REPLACE_WITH_EXPECTED_BRANCH_OR_ANY_BRANCH -AuthorisedLauncherRootWriteSid REPLACE_WITH_COMMA_SEPARATED_AUTHORISED_SIDS -Command run -LogRoot "REPLACE_WITH_PRIVATE_DIAGNOSTICS_ROOT"</Arguments>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "REPLACE_WITH_RUNTIME_ROOT\claude_supervisor.ps1" -SettingsPath "REPLACE_WITH_PRIVATE_SUPERVISOR_SETTINGS_JSON"</Arguments>
     </Exec>
   </Actions>
 </Task>

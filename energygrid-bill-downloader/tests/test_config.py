@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from energygrid_bill_downloader.config import is_within, load_runtime_config
+from energygrid_bill_downloader.config import is_within, load_runtime_config, load_dual_stream_config, load_config_file
 from energygrid_bill_downloader.errors import ConfigError
 
 
@@ -160,6 +160,151 @@ class ConfigTests(unittest.TestCase):
         raw = json.loads(example.read_text(encoding="utf-8"))
         self.assertEqual(raw["account_identity"], "REPLACE_WITH_PRIVATE_ACCOUNT_IDENTITY")
         self.assertNotIn("C&W", raw["account_identity"])
+
+
+class DualStreamConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def raw(self) -> dict[str, object]:
+        unbound = {
+            "admission": "UNBOUND", "source_namespace": None, "adapter_id": None,
+            "date_profile": None, "evidence_ref": None, "settings": None,
+        }
+        return {
+            "schema": "energygrid.runtime.v2",
+            "source": "dual_stream",
+            "archive_root": str(self.root / "archive"),
+            "state_path": str(self.root / "state" / "state.sqlite3"),
+            "temp_root": str(self.root / "temp"),
+            "log_root": str(self.root / "logs"),
+            "streams": {"EB_BILL": dict(unbound), "TENANT_BILL": dict(unbound)},
+            "drive": {"mode": "unbound", "root": None, "binding_id": None},
+            "delivery": {
+                "url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_PRIVATE_PATH",
+                "auth_header_name": "X-EnergyGrid-Delivery",
+                "auth_token_env": "ENERGYGRID_DELIVERY_TOKEN",
+                "max_pdf_bytes": 15_000_000,
+                "timeout_seconds": 30,
+            },
+        }
+
+    def test_example_is_deliberately_unbound_and_schema_complete(self) -> None:
+        path = Path(__file__).parents[1] / "config" / "energygrid.dual_stream.example.json"
+        raw = load_config_file(path)
+        config = load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        self.assertEqual("UNBOUND", config.streams["TENANT_BILL"].admission)
+        # #226 G3: the example is energygrid.runtime.v3 with the n8n Drive
+        # boundary and no folder binding committed.
+        self.assertEqual(("energygrid.runtime.v3", "n8n_drive_v3"), (config.schema, config.drive.mode))
+        self.assertEqual({"EB_BILL": None, "TENANT_BILL": None}, config.drive.bindings)
+        self.assertEqual((180, "ENERGYGRID_DRIVE_TOKEN", "X-EnergyGrid-Drive"),
+                         (config.drive.timeout_seconds, config.drive.auth_token_env, config.drive.auth_header_name))
+        self.assertEqual(15_000_000, config.delivery.max_pdf_bytes)
+
+    def test_exact_shape_rejects_unknown_keys_and_duplicate_json_fields(self) -> None:
+        raw = self.raw()
+        raw["unexpected"] = True
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        path = self.root / "duplicate.json"
+        path.write_text('{"schema":"energygrid.runtime.v2","schema":"energygrid.runtime.v2"}', encoding="utf-8")
+        with self.assertRaises(ConfigError):
+            load_config_file(path)
+
+    def test_tenant_stream_cannot_be_production_bound_without_accepted_evidence(self) -> None:
+        raw = self.raw()
+        raw["streams"]["TENANT_BILL"] = {
+            "admission": "BOUND", "source_namespace": "SYNTHETIC_TENANT",
+            "adapter_id": "DIRECT_HTTP_V1", "date_profile": "INVOICE_DATE_ISO_V1",
+            "evidence_ref": "EG_SYNTHETIC_SOURCE", "settings": {
+                "list_url": "https://example.invalid/list",
+                "fetch_url": "https://example.invalid/fetch",
+                "tenant_id": "SYNTHETIC-TENANT",
+            },
+        }
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+
+    def test_drive_binding_requires_separate_external_root_and_evidence_id(self) -> None:
+        raw = self.raw()
+        raw["drive"] = {
+            "mode": "local_stage", "root": str(self.root / "drive"), "binding_id": "SYNTHETIC_DRIVE",
+        }
+        config = load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        self.assertEqual("local_stage", config.drive.mode)
+        raw["drive"]["root"] = raw["archive_root"]
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+
+    def test_delivery_endpoint_rejects_remote_plain_http_and_invalid_size(self) -> None:
+        raw = self.raw()
+        raw["delivery"]["url"] = "http://example.invalid/webhook"
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        raw = self.raw()
+        raw["delivery"]["max_pdf_bytes"] = True
+        with self.assertRaises(ConfigError):
+            load_dual_stream_config(raw, checkout_root=self.root)
+
+
+class DriveV3ConfigTests(unittest.TestCase):
+    """#226 G3 private Drive binding block: folder IDs only, loopback n8n only."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def raw(self) -> dict:
+        import json
+
+        example = Path(__file__).parents[1] / "config" / "energygrid.dual_stream.example.json"
+        raw = json.loads(example.read_text(encoding="utf-8"))
+        raw.update(archive_root=str(self.root / "archive"), state_path=str(self.root / "state" / "s.sqlite3"),
+                   temp_root=str(self.root / "temp"), log_root=str(self.root / "logs"))
+        return raw
+
+    def binding(self, stream="EB_BILL", **overrides) -> dict:
+        from energygrid_bill_downloader.state import drive_binding_id
+
+        entry = {"account_ref": "01234567890123456789", "root_folder_id": "synthRootFolder000001",
+                 "folder_id": "synthEbBillFolder00001"}
+        entry.update(overrides)
+        entry.setdefault("binding_id", drive_binding_id(stream, entry["account_ref"], entry["root_folder_id"], entry["folder_id"]))
+        return entry
+
+    def test_bound_stream_accepts_exact_folder_identity(self) -> None:
+        raw = self.raw()
+        raw["drive"]["bindings"]["EB_BILL"] = self.binding()
+        config = load_dual_stream_config(raw, checkout_root=self.root / "repo")
+        self.assertEqual("synthEbBillFolder00001", config.drive.bindings["EB_BILL"].folder_id)
+        self.assertNotIn("synthEbBillFolder00001", repr(config))
+
+    def test_rejections(self) -> None:
+        cases = {
+            "binding id mismatch": lambda raw: raw["drive"]["bindings"].update(EB_BILL=self.binding(binding_id="egdb3-" + "0" * 32)),
+            "binding id for other stream": lambda raw: raw["drive"]["bindings"].update(TENANT_BILL=self.binding()),
+            "folder equals root": lambda raw: raw["drive"]["bindings"].update(EB_BILL=self.binding(folder_id="synthRootFolder000001")),
+            "path not id": lambda raw: raw["drive"]["bindings"].update(EB_BILL=self.binding(folder_id="My Drive/EnergyGrid")),
+            "extra binding key": lambda raw: raw["drive"]["bindings"].update(EB_BILL={**self.binding(), "path": "x"}),
+            "remote webhook": lambda raw: raw["drive"].update(webhook_url="http://drive.example.invalid/webhook/x"),
+            "https remote webhook": lambda raw: raw["drive"].update(webhook_url="https://n8n.example.invalid/webhook/x"),
+            "query webhook": lambda raw: raw["drive"].update(webhook_url="http://127.0.0.1:5678/webhook/x?token=y"),
+            "credential in config": lambda raw: raw["drive"].update(credential_id="abc"),
+            "legacy local stage": lambda raw: raw.update(drive={"mode": "local_stage", "root": str(self.root / "d"), "binding_id": "B"}),
+            "bad env name": lambda raw: raw["drive"].update(auth_token_env="lower"),
+            "timeout too large": lambda raw: raw["drive"].update(timeout_seconds=301),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                raw = self.raw()
+                mutate(raw)
+                with self.assertRaises(ConfigError):
+                    load_dual_stream_config(raw, checkout_root=self.root / "repo")
+
 
 if __name__ == "__main__":
     unittest.main()

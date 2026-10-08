@@ -17,8 +17,12 @@
 # operation only; it is not a mode any caller can select, and 'run' and 'list' are
 # unaffected. The fixed 'download-preflight-diagnostic' operation is always headless and
 # never dispatches a Download (DL-XB-199 G2-083).
-# -Command is a closed allowlist of four fixed operation names, and the child argument
-# vector stays a fixed five elements with nothing appended conditionally. Two
+# -Command is a closed allowlist of eleven fixed operation names: the four earlier names
+# plus the seven #226 G3 deterministic core commands (plan, status, acquire, drive-intent,
+# drive-upload, drive-reconcile, deliver). -Stream is a closed allowlist of NONE, EB_BILL
+# and TENANT_BILL. The child argument vector is the fixed five elements followed by a
+# fixed stream suffix looked up from a closed table keyed by -Stream (empty for NONE), so
+# no caller-supplied text ever reaches the child. Two
 # parameters are mandatory specifically so that omitting an argument can never silently
 # disable a security expectation: -ExpectedBranch takes the literal ANY_BRANCH sentinel
 # rather than being optional, and -AuthorisedLauncherRootWriteSid is the only route by
@@ -42,7 +46,8 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$BrowserCachePath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid,
-    [ValidateSet('run', 'list', 'login-diagnostic', 'download-preflight-diagnostic')][string]$Command = 'run',
+    [ValidateSet('run', 'list', 'login-diagnostic', 'download-preflight-diagnostic', 'plan', 'status', 'acquire', 'drive-intent', 'drive-upload', 'drive-reconcile', 'deliver')][string]$Command = 'run',
+    [ValidateSet('NONE', 'EB_BILL', 'TENANT_BILL')][string]$Stream = 'NONE',
     [string]$LogRoot,
     [switch]$ValidateOnly,
     [string]$RunId
@@ -50,6 +55,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:EgRunIdPattern = '\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 
 # The ONLY dot-source in this script, and a fixed join of this script's own directory with
 # the fixed library name. The launcher never enumerates the root to locate a library.
@@ -60,9 +66,9 @@ $launcherRoot = $PSScriptRoot
 # --------------------------------------------------------------------------------------
 # Ordered preflight state
 # --------------------------------------------------------------------------------------
-# The twenty-one stable check names, in the exact order design section 5.2 evaluates them.
-# Positions 1 to 18 are the NON-SECRET preflight. Every one of them completes before
-# position 19 is attempted, so credential import is literally the last check and a run that
+# The twenty-two stable check names, in the exact order design section 5.2 evaluates them.
+# Positions 1 to 19 are the NON-SECRET preflight. Every one of them completes before
+# position 20 is attempted, so credential import is literally the last group and a run that
 # will fail for any other reason never opens the credential artefact at all. That ordering
 # is a security property, not a performance preference.
 $script:EgOrderedCheckNames = @(
@@ -84,6 +90,7 @@ $script:EgOrderedCheckNames = @(
     'launcher_root_write_trustees_authorised',
     'launcher_files_not_reparse_points',
     'launcher_files_not_unexpectedly_readonly',
+    'run_id_valid',
     'credential_import_ok',
     'username_nonempty',
     'password_nonempty'
@@ -175,7 +182,11 @@ function Exit-EgPreflightFailure {
     # explicitly among the things it must not create, so validation emits its bounded
     # JSON document and nothing else.
     if (-not $ValidateOnly) {
-        Write-EgLauncherTerminalEvent -LogRoot ([string]$LogRoot) -RunId ([string]$RunId) `
+        $eventRunId = ''
+        if ($null -ne $RunId -and $RunId -cmatch $script:EgRunIdPattern) {
+            $eventRunId = $RunId
+        }
+        Write-EgLauncherTerminalEvent -LogRoot ([string]$LogRoot) -RunId $eventRunId `
             -Phase 'preflight' -Status 'FAILED' -SupportRef $script:EgFirstFailureRef
     }
     Exit-EgLauncher -ExitCode $script:EgLauncherExitCodes['PreflightFailed']
@@ -294,10 +305,15 @@ if (Test-EgPreflightShouldContinue) {
 }
 
 # --------------------------------------------------------------------------------------
-# Positions 19 to 21 - the credential artefact, and only now
+# Position 19 validates the optional shared RunId before any credential import.
+# Positions 20 to 22 - the credential artefact, and only now
 # --------------------------------------------------------------------------------------
 # Reached ONLY when every non-secret position above passed. A run that will fail for any
 # other reason never opens the credential artefact at all.
+
+$runIdValid = [string]::IsNullOrEmpty($RunId) -or ($RunId -cmatch $script:EgRunIdPattern)
+Set-EgCheckOutcome -Name 'run_id_valid' -Pass $runIdValid `
+    -SupportRef 'EG_LAUNCHER_RUN_ID_INVALID'
 
 $credential = $null
 $credentialUsable = $false
@@ -332,6 +348,10 @@ if ($ValidateOnly) {
     Exit-EgLauncher -ExitCode 0
 }
 
+if ([string]::IsNullOrEmpty($RunId)) {
+    $RunId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
+}
+
 if (-not $credentialUsable) {
     Exit-EgPreflightFailure
 }
@@ -339,7 +359,7 @@ if (-not $credentialUsable) {
 # --------------------------------------------------------------------------------------
 # Invocation
 # --------------------------------------------------------------------------------------
-# Exactly three process-scope variables are set immediately before the child starts and
+# Exactly four process-scope variables are set immediately before the child starts and
 # restored on the finally-equivalent path. No other environment change is made.
 
 $plainUsername = $credential.UserName
@@ -359,9 +379,17 @@ $injected = [ordered]@{}
 $injected[$script:EgCredentialVariableNames[0]] = $plainUsername
 $injected[$script:EgCredentialVariableNames[1]] = $plainPassword
 $injected[$script:EgBrowserCacheVariableName] = $BrowserCachePath
+$injected['ENERGYGRID_RUN_ID'] = $RunId
 
 $workingDirectory = Join-Path $CheckoutRoot 'energygrid-bill-downloader'
-$childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $ConfigPath)
+# The stream suffix is a constant from this closed table, never the caller's text. The
+# Python CLI separately refuses a suffix on a command that takes no stream.
+$script:EgStreamArguments = @{
+    'NONE'        = @()
+    'EB_BILL'     = @('--stream', 'EB_BILL')
+    'TENANT_BILL' = @('--stream', 'TENANT_BILL')
+}
+$childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $ConfigPath) + @($script:EgStreamArguments[$Stream])
 
 $childExitCode = $script:EgLauncherExitCodes['PreflightFailed']
 $restoreResult = $null

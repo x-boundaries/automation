@@ -13,6 +13,14 @@ on:
       - "n8n-workflows/energygrid_download_error_handler.workflow.json"
       - "n8n-workflows/energygrid_alert_ingress.workflow.json"
       - "tests/test_energygrid_n8n_error_handler.py"
+      # Invoice delivery (#226/#228): inactive sanitized export and focused offline test.
+      - "n8n-workflows/energygrid_invoice_delivery.workflow.json"
+      - "tests/test_energygrid_invoice_delivery_workflow.py"
+      # Drive upload and destination setup (#226 G3): inactive exports and focused offline tests.
+      - "n8n-workflows/energygrid_drive_upload.workflow.json"
+      - "n8n-workflows/energygrid_drive_destination_setup.workflow.json"
+      - "tests/test_energygrid_drive_upload_workflow.py"
+      - "tests/test_energygrid_drive_destination_setup_workflow.py"
       - "n8n-workflows/README.md"
       - "README.md"
       - ".gitignore"
@@ -107,6 +115,20 @@ jobs:
         # Node, which executes the committed n8n expressions offline; no n8n instance.
         shell: pwsh
         run: python -m unittest discover -s tests -p "test_energygrid_n8n_error_handler.py" -v
+      - name: EnergyGrid n8n invoice delivery focused offline test
+        # Root-level export coverage runs the committed Code-node JavaScript with Node;
+        # it does not import, activate, or execute an n8n workflow.
+        shell: pwsh
+        run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v
+      - name: EnergyGrid n8n Drive upload and destination setup focused offline tests
+        # #226 G3: Node executes the committed Code-node JavaScript with mocked Google
+        # responses and the Python core verifies the answers; no n8n or Google contact.
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p "test_energygrid_drive_upload_workflow.py" -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p "test_energygrid_drive_destination_setup_workflow.py" -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Scope and whitespace check
         shell: pwsh
         run: |
@@ -119,7 +141,13 @@ jobs:
             $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or
             $_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or
             $_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or
-            $_ -eq 'tests/test_energygrid_n8n_error_handler.py'
+            $_ -eq 'tests/test_energygrid_n8n_error_handler.py' -or
+            $_ -eq 'n8n-workflows/energygrid_invoice_delivery.workflow.json' -or
+            $_ -eq 'tests/test_energygrid_invoice_delivery_workflow.py' -or
+            $_ -eq 'n8n-workflows/energygrid_drive_upload.workflow.json' -or
+            $_ -eq 'n8n-workflows/energygrid_drive_destination_setup.workflow.json' -or
+            $_ -eq 'tests/test_energygrid_drive_upload_workflow.py' -or
+            $_ -eq 'tests/test_energygrid_drive_destination_setup_workflow.py'
           })
           if ($owned.Count -eq 0) {
             Write-Host "No EnergyGrid-owned path changed; EnergyGrid scope guard not applicable."
@@ -131,6 +159,12 @@ jobs:
                   $file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and
                   $file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and
                   $file -ne 'tests/test_energygrid_n8n_error_handler.py' -and
+                  $file -ne 'n8n-workflows/energygrid_invoice_delivery.workflow.json' -and
+                  $file -ne 'tests/test_energygrid_invoice_delivery_workflow.py' -and
+                  $file -ne 'n8n-workflows/energygrid_drive_upload.workflow.json' -and
+                  $file -ne 'n8n-workflows/energygrid_drive_destination_setup.workflow.json' -and
+                  $file -ne 'tests/test_energygrid_drive_upload_workflow.py' -and
+                  $file -ne 'tests/test_energygrid_drive_destination_setup_workflow.py' -and
                   $file -ne 'n8n-workflows/README.md' -and
                   $file -ne 'README.md' -and
                   $file -ne '.gitignore') {

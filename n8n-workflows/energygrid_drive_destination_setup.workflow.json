@@ -1,0 +1,1206 @@
+{
+  "id": "energygridDriveDestinationSetup01",
+  "name": "EnergyGrid - Drive Destination Setup",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000057",
+      "name": "Run Drive Destination Setup",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        600
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000058",
+      "name": "Get Setup Account",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/about",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "user(permissionId)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000059",
+      "name": "Record Account",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst about = $input.first().json;\nconst account = about && about.statusCode === 200 && about.body && about.body.user ? about.body.user.permissionId : null;\nif (typeof account !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(account)) throw new Error('EG_DRIVE_ACCOUNT_UNAVAILABLE');\nreturn [{ json: { account_ref: account, parent: 'root' } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000060",
+      "name": "Find Automation Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.parent + \"' in parents and name = 'Automation' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000061",
+      "name": "Check Automation Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst prior = $('Record Account').first().json;\nconst search = $input.first().json;\nconst files = search && search.statusCode === 200 && search.body && search.body.incompleteSearch === false &&\n  !search.body.nextPageToken && Array.isArray(search.body.files) ? search.body.files : null;\nif (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\nif (files.length === 0) throw new Error('EG_DRIVE_CHAIN_MISSING');\nconst folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\nif (files.length !== 1 || folders.length !== 1) throw new Error('EG_DRIVE_CHAIN_AMBIGUOUS');\nreturn [{ json: Object.assign({}, prior, { automation_id: folders[0].id }) }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000062",
+      "name": "Find _MandarinGallery Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.automation_id + \"' in parents and name = '_MandarinGallery' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000063",
+      "name": "Check _MandarinGallery Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst prior = $('Check Automation Folder').first().json;\nconst search = $input.first().json;\nconst files = search && search.statusCode === 200 && search.body && search.body.incompleteSearch === false &&\n  !search.body.nextPageToken && Array.isArray(search.body.files) ? search.body.files : null;\nif (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\nif (files.length === 0) throw new Error('EG_DRIVE_CHAIN_MISSING');\nconst folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\nif (files.length !== 1 || folders.length !== 1) throw new Error('EG_DRIVE_CHAIN_AMBIGUOUS');\nreturn [{ json: Object.assign({}, prior, { mandarin_gallery_id: folders[0].id }) }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000064",
+      "name": "Find Utilities Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.mandarin_gallery_id + \"' in parents and name = 'Utilities' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000065",
+      "name": "Check Utilities Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst prior = $('Check _MandarinGallery Folder').first().json;\nconst search = $input.first().json;\nconst files = search && search.statusCode === 200 && search.body && search.body.incompleteSearch === false &&\n  !search.body.nextPageToken && Array.isArray(search.body.files) ? search.body.files : null;\nif (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\nif (files.length === 0) throw new Error('EG_DRIVE_CHAIN_MISSING');\nconst folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\nif (files.length !== 1 || folders.length !== 1) throw new Error('EG_DRIVE_CHAIN_AMBIGUOUS');\nreturn [{ json: Object.assign({}, prior, { utilities_id: folders[0].id }) }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000066",
+      "name": "Find EnergyGrid Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.utilities_id + \"' in parents and name = 'EnergyGrid' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000067",
+      "name": "Check EnergyGrid Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst prior = $('Check Utilities Folder').first().json;\nconst search = $input.first().json;\nconst files = search && search.statusCode === 200 && search.body && search.body.incompleteSearch === false &&\n  !search.body.nextPageToken && Array.isArray(search.body.files) ? search.body.files : null;\nif (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\nif (files.length === 0) throw new Error('EG_DRIVE_CHAIN_MISSING');\nconst folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\nif (files.length !== 1 || folders.length !== 1) throw new Error('EG_DRIVE_CHAIN_AMBIGUOUS');\nreturn [{ json: Object.assign({}, prior, { root_folder_id: folders[0].id }) }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000068",
+      "name": "Find EB Bill Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Check EnergyGrid Folder').first().json.root_folder_id + \"' in parents and name = 'EB Bill' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000069",
+      "name": "Decide EB Bill Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst search = $input.first().json;\nconst files = search && search.statusCode === 200 && search.body && search.body.incompleteSearch === false &&\n  !search.body.nextPageToken && Array.isArray(search.body.files) ? search.body.files : null;\nif (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\nconst folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\nif (files.length === 0) return [{ json: { create_required: true } }];\nif (files.length === 1 && folders.length === 1) return [{ json: { create_required: false, folder_id: folders[0].id } }];\nthrow new Error('EG_DRIVE_CHILD_AMBIGUOUS');\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000070",
+      "name": "EB Bill Folder Needs Create",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3360,
+        600
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000071",
+              "leftValue": "={{ $json.create_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000072",
+      "name": "Create EB Bill Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        520
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "fields",
+              "value": "id"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: 'EB Bill', mimeType: 'application/vnd.google-apps.folder', parents: [$('Check EnergyGrid Folder').first().json.root_folder_id], appProperties: { egApp: 'xb-energygrid', egKind: 'dest-v3', egStream: 'EB_BILL' } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000073",
+      "name": "Recheck EB Bill Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3840,
+        520
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Check EnergyGrid Folder').first().json.root_folder_id + \"' in parents and name = 'EB Bill' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000074",
+      "name": "Confirm EB Bill Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nlet decided = null;\ntry { decided = $('Decide EB Bill Folder').first().json; } catch (error) {}\nlet recheck = null;\ntry { recheck = $('Recheck EB Bill Folder').first().json; } catch (error) {}\nlet folderId = decided && decided.create_required === false ? decided.folder_id : null;\nif (folderId === null) {\n  const files = recheck && recheck.statusCode === 200 && recheck.body && recheck.body.incompleteSearch === false &&\n    !recheck.body.nextPageToken && Array.isArray(recheck.body.files) ? recheck.body.files : null;\n  if (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\n  const folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\n  if (files.length !== 1 || folders.length !== 1) throw new Error('EG_DRIVE_CHILD_AMBIGUOUS');\n  folderId = folders[0].id;\n}\nreturn [{ json: { stream: 'EB_BILL', folder_id: folderId } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000075",
+      "name": "Find Tenant Bill Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4320,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Check EnergyGrid Folder').first().json.root_folder_id + \"' in parents and name = 'Tenant Bill' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000076",
+      "name": "Decide Tenant Bill Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst search = $input.first().json;\nconst files = search && search.statusCode === 200 && search.body && search.body.incompleteSearch === false &&\n  !search.body.nextPageToken && Array.isArray(search.body.files) ? search.body.files : null;\nif (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\nconst folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\nif (files.length === 0) return [{ json: { create_required: true } }];\nif (files.length === 1 && folders.length === 1) return [{ json: { create_required: false, folder_id: folders[0].id } }];\nthrow new Error('EG_DRIVE_CHILD_AMBIGUOUS');\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000077",
+      "name": "Tenant Bill Folder Needs Create",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4800,
+        600
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000078",
+              "leftValue": "={{ $json.create_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000079",
+      "name": "Create Tenant Bill Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5040,
+        520
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "fields",
+              "value": "id"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: 'Tenant Bill', mimeType: 'application/vnd.google-apps.folder', parents: [$('Check EnergyGrid Folder').first().json.root_folder_id], appProperties: { egApp: 'xb-energygrid', egKind: 'dest-v3', egStream: 'TENANT_BILL' } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000080",
+      "name": "Recheck Tenant Bill Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5280,
+        520
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Check EnergyGrid Folder').first().json.root_folder_id + \"' in parents and name = 'Tenant Bill' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000081",
+      "name": "Confirm Tenant Bill Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5520,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nlet decided = null;\ntry { decided = $('Decide Tenant Bill Folder').first().json; } catch (error) {}\nlet recheck = null;\ntry { recheck = $('Recheck Tenant Bill Folder').first().json; } catch (error) {}\nlet folderId = decided && decided.create_required === false ? decided.folder_id : null;\nif (folderId === null) {\n  const files = recheck && recheck.statusCode === 200 && recheck.body && recheck.body.incompleteSearch === false &&\n    !recheck.body.nextPageToken && Array.isArray(recheck.body.files) ? recheck.body.files : null;\n  if (files === null) throw new Error('EG_DRIVE_SEARCH_INCOMPLETE');\n  const folders = files.filter((file) => file.mimeType === 'application/vnd.google-apps.folder' && file.trashed === false);\n  if (files.length !== 1 || folders.length !== 1) throw new Error('EG_DRIVE_CHILD_AMBIGUOUS');\n  folderId = folders[0].id;\n}\nreturn [{ json: { stream: 'TENANT_BILL', folder_id: folderId } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000082",
+      "name": "Summarise Destination",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst root = $('Check EnergyGrid Folder').first().json;\nreturn [{ json: {\n  account_ref: $('Record Account').first().json.account_ref,\n  root_folder_id: root.root_folder_id,\n  eb_bill_folder_id: $('Confirm EB Bill Folder').first().json.folder_id,\n  tenant_bill_folder_id: $('Confirm Tenant Bill Folder').first().json.folder_id,\n} }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000083",
+      "name": "Setup Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        80
+      ],
+      "parameters": {
+        "content": "# EnergyGrid Drive destination setup (manual, inactive)\n\n- Manual Trigger only. Never called by Claude, the core or any other workflow.\n- Resolves My Drive / Automation / _MandarinGallery / Utilities / EnergyGrid one level at a time; never creates chain levels.\n- Finds or creates exactly once the EB Bill and Tenant Bill child folders, then searches again. Never deletes anything.\n- Any missing, ambiguous or incomplete result stops with a fixed EG_DRIVE_* reference.\n- The operator copies the resulting folder IDs into the private v3 config, then runs `drive-bind --apply`.\n",
+        "height": 360,
+        "width": 760
+      }
+    }
+  ],
+  "connections": {
+    "Record Account": {
+      "main": [
+        [
+          {
+            "node": "Find Automation Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Automation Folder": {
+      "main": [
+        [
+          {
+            "node": "Check Automation Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Automation Folder": {
+      "main": [
+        [
+          {
+            "node": "Find _MandarinGallery Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find _MandarinGallery Folder": {
+      "main": [
+        [
+          {
+            "node": "Check _MandarinGallery Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check _MandarinGallery Folder": {
+      "main": [
+        [
+          {
+            "node": "Find Utilities Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Utilities Folder": {
+      "main": [
+        [
+          {
+            "node": "Check Utilities Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Utilities Folder": {
+      "main": [
+        [
+          {
+            "node": "Find EnergyGrid Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find EnergyGrid Folder": {
+      "main": [
+        [
+          {
+            "node": "Check EnergyGrid Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Drive Destination Setup": {
+      "main": [
+        [
+          {
+            "node": "Get Setup Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Setup Account": {
+      "main": [
+        [
+          {
+            "node": "Record Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check EnergyGrid Folder": {
+      "main": [
+        [
+          {
+            "node": "Find EB Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find EB Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Decide EB Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide EB Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "EB Bill Folder Needs Create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "EB Bill Folder Needs Create": {
+      "main": [
+        [
+          {
+            "node": "Create EB Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Confirm EB Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create EB Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Recheck EB Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recheck EB Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Confirm EB Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm EB Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Find Tenant Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Tenant Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Decide Tenant Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Tenant Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Tenant Bill Folder Needs Create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tenant Bill Folder Needs Create": {
+      "main": [
+        [
+          {
+            "node": "Create Tenant Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Confirm Tenant Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Tenant Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Recheck Tenant Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recheck Tenant Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Confirm Tenant Bill Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Tenant Bill Folder": {
+      "main": [
+        [
+          {
+            "node": "Summarise Destination",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8000-000000000302",
+  "sourceWorkflowId": null
+}

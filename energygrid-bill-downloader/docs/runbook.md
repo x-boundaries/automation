@@ -1,11 +1,11 @@
 # Energy@Grid bill downloader runbook
 
-This project is a deterministic, local Windows utility. It is designed to log in
-once per run, inventory the one settled EB Bill results table, download every
-listed bill, reconcile the downloads against a private archive and SQLite
-manifest, and exit with a truthful status. It does not
-use n8n, email parsing, recurring LLM calls, AutoCount, or a live API in its
-normal path.
+This project is a deterministic, local Windows utility. Its legacy browser path
+inventories the settled EB Bill results table; its direct-HTTP path uses a
+bounded configured source. The repository-only dual-stream v2 successor adds
+separate EB Bill and Tenant Bill seams, local Drive staging, and a one-shot
+loopback email handoff. Tenant Bill remains unbound pending accepted #227
+evidence. The project does not use recurring LLM calls or AutoCount.
 
 ## Repository and private runtime boundary
 
@@ -19,6 +19,81 @@ rejects arbitrary in-checkout archive/runtime paths and overlapping paths.
 The eventual archive target is an owner-controlled path such as
 `C:\XB\_MandarinGallery\Utilities\EnergyGrid`. The example config is a shape
 only; it is not a live configuration and contains no credential values.
+
+## Dual-stream v3 contract: Claude, n8n Google Drive, deterministic core (#226 G3)
+
+The full contract is [v3_claude_n8n_drive_contract.md](v3_claude_n8n_drive_contract.md).
+Operator summary:
+
+- Cadence: Windows Task Scheduler (disabled template) -> `claude_supervisor.ps1` ->
+  pinned standalone Claude Code CLI -> `egcore.cmd` (eleven exact commands) ->
+  installed `launcher.ps1` -> Python core. Claude only sequences commands; business
+  success comes from the supervisor's own final `status`.
+- Drive: exact PDF bytes go to Google Drive through the inactive n8n
+  "EnergyGrid - Drive Upload" workflow, credential type `googleDriveOAuth2Api`
+  with `customScopes=true` and exactly `https://www.googleapis.com/auth/drive`.
+  Every operation reserves one pre-generated file ID (`files.generateIds`), frozen
+  in SQLite before any upload dispatch; every create and retry uses that ID.
+- `DRIVE_VERIFIED` needs the reserved ID, folder, name, MIME, the exact seven
+  appProperties, size and a SHA-256 (preferred) or MD5+size checksum. No checksum:
+  HOLD `EG_DRIVE_VERIFICATION_UNAVAILABLE`. Email waits for `DRIVE_VERIFIED`.
+- Uncertainty: a lost upload result becomes `DRIVE_UPLOAD_UNCERTAIN`; the next
+  reconcile reads the reserved ID first, then both conflict searches. A retry is
+  authorised only by the core, only in a later run, at most twice in total.
+- Migration: `migrate-state` with a v3 config plans by default; `--apply` backs up,
+  then migrates v1 or v2 to v3 in one transaction. Historical `DRIVE_STAGED` rows
+  are preserved and frozen; an open `DRIVE_STAGE` operation holds the migration.
+- Private setup (later, separate authority): Google credential binding, the manual
+  "EnergyGrid - Drive Destination Setup" run, the private v3 config, `drive-bind
+  --apply`, Drive and email Header Auth tokens, Claude install and DPAPI token
+  custody, supervisor install, controlled E2E, then Scheduler registration (disabled).
+
+## Dual-stream v2 repository contract (G3 #226/#228) - historical
+
+#226 G3 supersedes the local Drive stage and the combined `run` below; this section
+is retained as historical evidence. `config/energygrid.dual_stream.example.json`
+is now the v3 shape. The earlier closed v2 shape had example paths
+are examples, both source streams are `UNBOUND`, Drive is unbound, and its
+loopback delivery path is a placeholder. Copying or editing the example does
+not bind a source, Drive folder, webhook, or credential.
+
+For every production-bound stream, a run must finish both stream inventory
+attempts before any acquisition, archive, Drive, or email effect. Each complete
+inventory must have one unique candidate on its maximum admitted ISO date; older
+candidates are not backfilled. Archive names are deterministic:
+`EB Bill/YYYY-MM-DD.pdf` and `Tenant Bill/YYYY-MM-DD.pdf`. The Tenant Bill
+adapter stays `UNBOUND` until Web accepts a #227 terminal contract. Synthetic
+same-family HTTP, distinct HTTP, and browser seams do not change production
+admission.
+
+The local Drive-for-desktop stage copies and verifies exact PDF bytes at the
+canonical stream path. `DRIVE_STAGED` is the MVP sink result. It proves the
+local mirrored copy and hash, not remote cloud confirmation.
+
+Email uses an opaque delivery ID saved in SQLite. Before the only webhook POST,
+SQLite stores `PENDING_SEND` and atomically sets a write-once dispatch marker.
+After that marker, timeout, process failure, lost or malformed response, and
+ambiguous acceptance become `DELIVERY_OUTCOME_UNCERTAIN`; ordinary Scheduler
+runs never send again. `DELIVERED` also never sends again. The n8n Data Table is
+secondary evidence; its Get and Insert are not atomic and do not authorise sends.
+The inactive export accepts exactly one `metadata` text field and one validated
+PDF field, stores no success/error execution payload, sends once with retry
+disabled, records a bounded outcome, then responds.
+
+The repository migration code and fixtures cover additive SQLite v2 migration
+without reading or changing private live state. `migrate-state` defaults to a
+read-only plan. The `--apply` option writes a local state database and is not
+part of this repository-only handoff. The four historical PDFs remain
+unclassified until a separate authority supplies private evidence; tests use
+synthetic fixtures only. The Scheduler template stays disabled at 08:00
+`+08:00`; no task is registered here.
+
+The shared lower-case UUID RunId flows from the one-shot supervisor through the
+launcher and Python metadata to the delivery webhook. The inactive workflow
+contains no live webhook path, Header Auth binding, sender, recipient, SMTP
+credential, Data Table ID, or instance ID. Import, credential binding,
+activation, source contact, private-state migration, Drive staging, and email
+remain separate actions requiring their own authority.
 
 ## Runtime prerequisites
 
@@ -447,13 +522,15 @@ must check it after any change to the host.
 
 ### Launcher preconditions that still apply
 
-The launcher's position 10 is source-aware: with `"source": "direct_http"` it requires
-`direct_http` (with non-blank `list_url`, `fetch_url`, `tenant_id`) plus the four path
-keys, and not `portal_url` or `account_identity`. An absent `source` keeps the historical
-browser key set; any other value fails. The launcher still requires the private browser
-cache (position 13) and the DPAPI credential (positions 19-21) and injects that credential
-into the child, although the direct-HTTP source uses neither. Removing those gates changes
-the launcher security design and is left for an explicit Owner/Web decision.
+The launcher's position 10 is source-aware. `direct_http` requires its block and the four
+path keys; `dual_stream` requires schema `energygrid.runtime.v2` and the top-level
+`streams`, `drive`, and `delivery` blocks. The application owns nested config validation.
+An absent `source` keeps the historical browser key set; any other value fails. The
+launcher still requires the private browser cache (position 13) and the DPAPI credential
+(positions 19-21), and injects the four process-scoped variables including the shared
+RunId. The direct-HTTP and dual-stream application adapters do not read the browser
+credential, but removing the launcher's established gates requires a separate Owner/Web
+decision.
 
 ### Known MVP limitations (accepted or pending decision)
 
@@ -773,8 +850,14 @@ replaced.
 
 ## Later Task Scheduler handoff
 
+#226 G3: the template's action now runs the installed `claude_supervisor.ps1` with
+`-File` and one private `-SettingsPath`; the task never invokes `launcher.ps1`,
+Python or Claude directly. Success is the supervisor's exit 0, returned only when its
+final deterministic `status` is terminal, has no outstanding uncertainty and is
+`NO_WORK` or `COMPLETED`. The policy below is unchanged.
+
 `task-scheduler/energygrid_daily.task.example.xml` is the inert, reviewed task shape
-for the direct-HTTP MVP (DL-XB-199 G3-101): absolute Windows PowerShell 5.1 path,
+first introduced for the direct-HTTP MVP (DL-XB-199 G3-101): absolute Windows PowerShell 5.1 path,
 the installed `launcher.ps1` through `-File` (which preserves the launcher's exit
 code; a `-Command` wrapper reports 0 when the script cannot load), a non-elevated
 `LeastPrivilege` run principal with a stored password so the DPAPI credential

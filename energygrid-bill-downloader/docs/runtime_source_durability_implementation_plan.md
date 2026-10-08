@@ -1,8 +1,16 @@
 # Energy@Grid Runtime Source-Durability Implementation Plan
 
-Status: plan only. This change adds no launcher, no installer, no runtime
-implementation, no test, and no CI change. It is the task-by-task execution plan that a
-later, separately approved implementation change must follow.
+Status: original implementation plan with the G3 RunId amendment implemented in the
+launcher source and its synthetic contract tests. Remaining original plan material is
+historical design context unless the G3 amendment below explicitly updates it.
+
+#226 G3 amendment (v3): the Scheduled Task now runs the bounded Claude supervisor
+(`runtime/claude_supervisor.ps1`), which reaches this launcher only through `egcore.cmd`
+and the eleven-command core allowlist. The launcher gains seven core `-Command` names and
+a closed `-Stream` parameter (`NONE`, `EB_BILL`, `TENANT_BILL`) mapped through a fixed
+table; its preflight, credential handling and environment restoration are unchanged. The
+filesystem Drive stage is retired. Controlling contract:
+[v3_claude_n8n_drive_contract.md](v3_claude_n8n_drive_contract.md).
 
 Design lock: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY`.
 Controlling specification: `energygrid-bill-downloader/docs/runtime_source_durability_design.md`.
@@ -530,8 +538,9 @@ positions 1 to 18 all complete before position 19 is attempted.
 | 20 | `username_nonempty` | 5.2 step 9, section 8 |
 | 21 | `password_nonempty` | 5.2 step 9, section 8 |
 
-The count stays twenty-one. Check 16 is a replacement in the same ordered position, not an
-addition: `launcher_root_write_trustees_authorised` supersedes the earlier planned name
+The original plan count was twenty-one. G3 adds `run_id_valid` at position 19, before
+credential import, so the active launcher has 22 checks. Check 16 remains a replacement
+in the same ordered position, not an addition: `launcher_root_write_trustees_authorised` supersedes the earlier planned name
 `launcher_root_write_restricted_to_install_principal`, which design section 17.2 records as
 retired vocabulary that must not be emitted. Task 18 guards the retired string.
 
@@ -1790,9 +1799,9 @@ Entry-script binding contract in `launcher.ps1`:
      from `-BrowserCachePath`.
 3. Run the module. Prove RED.
 4. Implement `Test-EgBrowserCacheReady` and the constant, and extend the entry-script
-   snapshot to cover the third variable name.
+   snapshot to cover the fourth process variable name.
 5. Re-run. Prove GREEN.
-6. Regression: full project suite, plus Task 13, to confirm all three variables restore on
+6. Regression: full project suite, plus Task 13, to confirm the injected variables restore on
    the same path.
 7. Commit: `Bind and validate the private Playwright browser cache`.
 
@@ -2261,9 +2270,9 @@ Invocation contract, on success only:
 - Working directory is the `energygrid-bill-downloader` directory beneath `-CheckoutRoot`.
 - The child is `<PythonExe> -m energygrid_bill_downloader <Command> --config <ConfigPath>`.
 - The child's exit code is propagated verbatim.
-- Exactly three process-scope variables are set immediately before the child starts and
-  restored on the `finally`-equivalent path: the two credential names and the browser-cache
-  name. No other environment change is made.
+- Exactly four process-scope variables are set immediately before the child starts and
+  restored on the `finally`-equivalent path: the two credential names, browser-cache name,
+  and `ENERGYGRID_RUN_ID`. No other environment change is made.
 
 ### Steps
 
@@ -2432,7 +2441,7 @@ had not computed, which the fallback discipline in Global Constraints forbids.
 #### Steps 8 to 14 - launcher entry script and ordered preflight
 
 8. Add a child-stub builder to the test module: a scratch `.ps1` or `.cmd` that records the
-   three environment variables plus its working directory to a scratch JSON file and exits
+   four environment variables plus its working directory to a scratch JSON file and exits
    with a caller-chosen code. The application is never invoked; only the stub is.
 9. Write failing tests:
    - `test_the_launcher_exit_band_is_disjoint_from_the_application_band` (`EGRT-T19`,
@@ -2460,7 +2469,7 @@ had not computed, which the fallback discipline in Global Constraints forbids.
      derived from a directory enumeration, and that the only dot-source in `launcher.ps1`
      is a fixed `Join-Path $PSScriptRoot 'launcher_lib.ps1'`.
    - `test_the_preflight_check_order_matches_the_committed_contract` (Tier A): the
-     `checks` map key order from a `-ValidateOnly` run equals the twenty-one names in the
+     `checks` map key order from a `-ValidateOnly` run equals the twenty-two names in the
      Ordered preflight check names table, exactly.
    - `test_the_terminal_event_is_written_once_and_carries_no_private_data` (Tier A): a
      failing run with `-LogRoot` set appends exactly one `launcher_failed` line whose keys
@@ -3159,7 +3168,7 @@ never a SID.
   `Get-EgDeployedPackageMemberNames` (Task 8), the `Member` field of `Test-EgResidueName`
   and `New-EgResidueName` (Task 8), and `Get-EgDeployableSourceSet` (Task 10). The two
   executable names are declared once as `$script:EgManifestMemberNames` (Task 9).
-- The twenty-one stable preflight check names in the Ordered preflight check names table
+- The twenty-two active preflight check names in the Ordered preflight check names table
   are the same strings produced by Task 16's `CheckResult` objects and asserted by Task
   16's order test and Task 17's determinism tests.
 - The forty-nine live support references in the vocabulary table are the same set declared

@@ -29,9 +29,327 @@ from energygrid_bill_downloader.errors import (
     LayoutChangedError,
     LoginError,
 )
+from energygrid_bill_downloader.publication import FileInfo
+from energygrid_bill_downloader.state import StateStore, migrate_state_database
+
+
+def _dual_cli_fixture(root: Path, *, initialize_v2: bool = True) -> tuple[Path, Path, Path]:
+    example = Path(__file__).parents[1] / "config" / "energygrid.dual_stream.example.json"
+    raw = json.loads(example.read_text(encoding="utf-8"))
+    archive = root / "archive"
+    archive.mkdir()
+    state_path = root / "state" / "bills.sqlite3"
+    temp_root = root / "temp"
+    log_root = root / "logs"
+    raw.update(
+        archive_root=str(archive),
+        state_path=str(state_path),
+        temp_root=str(temp_root),
+        log_root=str(log_root),
+    )
+    # The committed example is v3 (#226 G3); historical v2 CLI coverage keeps
+    # the earlier closed v2 shape derived from it.
+    raw.update(schema="energygrid.runtime.v2", drive={"mode": "unbound", "root": None, "binding_id": None})
+    config_path = root / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    if initialize_v2:
+        migrate_state_database(state_path, apply=True)
+    return config_path, state_path, root
+
+
+def _v3_cli_fixture(root: Path) -> tuple[Path, Path]:
+    from fixtures.synthetic_dual_stream import create_v3_database
+
+    example = Path(__file__).parents[1] / "config" / "energygrid.dual_stream.example.json"
+    raw = json.loads(example.read_text(encoding="utf-8"))
+    (root / "archive").mkdir()
+    state_path = root / "state" / "bills.sqlite3"
+    raw.update(archive_root=str(root / "archive"), state_path=str(state_path),
+               temp_root=str(root / "temp"), log_root=str(root / "logs"))
+    config_path = root / "config.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    create_v3_database(state_path, bound=())
+    return config_path, state_path
+
+
+class CoreCommandCliTests(unittest.TestCase):
+    """#226 G3 public CLI boundary for the deterministic core commands."""
+
+    def invoke(self, argv: list[str]) -> tuple[int, str]:
+        stdout = io.StringIO()
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-4000-8000-000000000123"}), \
+                contextlib.redirect_stdout(stdout):
+            code = main(argv)
+        return code, stdout.getvalue()
+
+    def test_plan_and_status_emit_one_strict_json_line_of_fixed_words(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            code, out = self.invoke(["plan", "--config", str(config_path)])
+            self.assertEqual(0, code)
+            self.assertEqual(1, len(out.strip().splitlines()))
+            plan = json.loads(out)
+            self.assertEqual("energygrid.core.plan.v3", plan["schema"])
+            self.assertEqual({"action": "ACQUIRE_LATEST", "stream": None, "argv": "egcore.cmd acquire"}, plan["next"])
+            self.assertNotIn(temporary.replace("\\", "\\\\"), out)
+            code, out = self.invoke(["status", "--config", str(config_path)])
+            self.assertEqual((0, "INCOMPLETE"), (code, json.loads(out)["business_outcome"]))
+
+    def test_unbound_streams_acquire_records_holds_and_status_is_terminal_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            code, out = self.invoke(["acquire", "--config", str(config_path)])
+            self.assertEqual(0, code, out)
+            code, out = self.invoke(["status", "--config", str(config_path)])
+            status = json.loads(out)
+            self.assertEqual((True, "HOLD", False), (status["terminal"], status["business_outcome"], status["uncertainty_outstanding"]))
+
+    def test_caller_cannot_supply_ids_paths_or_extra_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            for argv in (
+                ["deliver", "--config", str(config_path)],
+                ["deliver", "--config", str(config_path), "--stream", "OTHER"],
+                ["drive-upload", "--config", str(config_path), "--stream", "EB_BILL", "--file-id", "x"],
+                ["plan", "--config", str(config_path), "--stream", "EB_BILL"],
+                ["submit-drive-result", "--config", str(config_path)],
+            ):
+                with self.subTest(argv=argv[0]):
+                    self.assertEqual(64, self.invoke(argv)[0])
+
+    def test_unplanned_stream_command_is_refused_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, state_path = _v3_cli_fixture(Path(temporary))
+            before = state_path.read_bytes()
+            code, out = self.invoke(["drive-upload", "--config", str(config_path), "--stream", "EB_BILL"])
+            self.assertEqual(64, code)
+            self.assertEqual(("REFUSED", "EG_CORE_ACTION_NOT_PLANNED", False),
+                             (json.loads(out)["outcome"], json.loads(out)["support_ref"], json.loads(out)["mutated"]))
+            self.assertEqual(before, state_path.read_bytes())
+
+    def test_v2_config_is_refused_by_core_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state, _ = _dual_cli_fixture(Path(temporary))
+            code, out = self.invoke(["plan", "--config", str(config_path)])
+            self.assertEqual((64, "EG_CORE_CONFIG_INVALID"), (code, json.loads(out)["support_ref"]))
+
+    def test_fallback_and_refusal_documents_carry_run_stop(self) -> None:
+        """#226 G2 fairness reclosure R15: every CLI fallback is one RUN_STOP result document."""
+        from energygrid_bill_downloader.errors import DependencyError, SourceTransportError, StateError
+
+        keys = {"schema", "command", "stream", "outcome", "support_ref", "mutated", "disposition"}
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            (Path(temporary) / "v2").mkdir()
+            v2_config, _v2_state, _ = _dual_cli_fixture(Path(temporary) / "v2")
+            code, out = self.invoke(["plan", "--config", str(v2_config)])
+            refused = json.loads(out)
+            self.assertEqual(keys, set(refused))
+            self.assertEqual((64, "REFUSED", "EG_CORE_CONFIG_INVALID", False, "RUN_STOP"),
+                             (code, refused["outcome"], refused["support_ref"], refused["mutated"], refused["disposition"]))
+            code, out = self.invoke(["drive-upload", "--config", str(config_path), "--stream", "EB_BILL"])
+            self.assertEqual((64, "EG_CORE_ACTION_NOT_PLANNED", "RUN_STOP"),
+                             (code, json.loads(out)["support_ref"], json.loads(out)["disposition"]))
+            for error, expected_code in ((StateError("forced"), 20), (SourceTransportError("EG_SYNTHETIC_DOWN"), 10),
+                                         (DependencyError("forced"), 20)):
+                with self.subTest(error=type(error).__name__), \
+                        mock.patch("energygrid_bill_downloader.orchestration.run_command", side_effect=error):
+                    code, out = self.invoke(["deliver", "--config", str(config_path), "--stream", "TENANT_BILL"])
+                    self.assertEqual(1, len(out.strip().splitlines()))
+                    failed = json.loads(out)
+                    self.assertEqual(keys, set(failed))
+                    self.assertEqual((expected_code, "FAILED", None, "RUN_STOP", "TENANT_BILL"),
+                                     (code, failed["outcome"], failed["mutated"], failed["disposition"], failed["stream"]))
+
+    def test_plan_and_status_keep_their_schemas_and_gain_only_stopped_for_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, _state = _v3_cli_fixture(Path(temporary))
+            self.assertEqual(0, self.invoke(["acquire", "--config", str(config_path)])[0])
+            for command, stream_keys in (
+                ("plan", {"action", "archive", "drive", "email", "support_ref", "stopped_for_run"}),
+                ("status", {"latest_present", "action", "archive", "drive", "drive_verification_method", "drive_attempts",
+                            "email", "legacy_local_stage", "support_ref", "outcome", "fully_handled", "stopped_for_run"}),
+            ):
+                with self.subTest(command=command):
+                    code, out = self.invoke([command, "--config", str(config_path)])
+                    document = json.loads(out)
+                    self.assertEqual(0, code)
+                    self.assertNotIn("disposition", document)
+                    for item in document["streams"].values():
+                        self.assertEqual(stream_keys, set(item))
+                        self.assertIs(False, item["stopped_for_run"])
+
+    def test_drive_bind_without_apply_is_a_plan_with_no_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path, state_path = _v3_cli_fixture(Path(temporary))
+            before = state_path.read_bytes()
+            code, out = self.invoke(["drive-bind", "--config", str(config_path)])
+            self.assertEqual(0, code)
+            self.assertEqual({"EB_BILL": "UNBOUND", "TENANT_BILL": "UNBOUND"}, json.loads(out)["streams"])
+            self.assertEqual(before, state_path.read_bytes())
+
+
+def _cli_tree_snapshot(root: Path) -> dict[str, tuple[bool, int, bytes | None]]:
+    if not root.exists():
+        return {}
+    paths = [root, *sorted(root.rglob("*"))]
+    return {
+        path.relative_to(root).as_posix() or ".": (
+            path.is_dir(), path.stat().st_mtime_ns, None if path.is_dir() else path.read_bytes()
+        )
+        for path in paths
+    }
 
 
 class CliTests(unittest.TestCase):
+    def test_run_id_is_shared_only_as_a_lowercase_uuid(self) -> None:
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-0000-0000-000000000123"}):
+            self.assertEqual("00000000-0000-0000-0000-000000000123", cli.resolve_run_id())
+        for value in ("", "00000000-0000-0000-0000-00000000012A", "not-a-uuid"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": value}):
+                with self.assertRaises(ConfigError):
+                    cli.resolve_run_id()
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": ""}):
+            del os.environ["ENERGYGRID_RUN_ID"]
+            generated = cli.resolve_run_id()
+        self.assertRegex(generated, r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+    def test_retired_dual_stream_list_is_a_read_only_refusal(self) -> None:
+        """#226 G3: the combined archive + filesystem Drive + email run is retired."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path, _state_path, _ = _dual_cli_fixture(root)
+            before = _cli_tree_snapshot(root)
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-0000-0000-000000000123"}), \
+                    contextlib.redirect_stdout(stdout):
+                exit_code = main(["list", "--config", str(config_path)])
+            self.assertEqual(64, exit_code)
+            self.assertEqual(
+                {"error_class": "DUAL_RUN_RETIRED", "status": "ACTION_REQUIRED", "support_ref": "EG_DUAL_RUN_RETIRED_USE_CORE"},
+                json.loads(stdout.getvalue()),
+            )
+            self.assertEqual(before, _cli_tree_snapshot(root))
+
+    def test_migration_plan_is_read_only_and_non_object_config_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path, state_path, _ = _dual_cli_fixture(root, initialize_v2=False)
+            with StateStore(state_path):
+                pass
+            mapping_path = root / "mapping.json"
+            mapping_path.write_text(
+                json.dumps({"schema": "energygrid.state_migration_mapping.v2", "entries": []}),
+                encoding="utf-8",
+            )
+            before = _cli_tree_snapshot(root)
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": "00000000-0000-0000-0000-000000000123"}), \
+                    contextlib.redirect_stdout(stdout):
+                exit_code = main([
+                    "migrate-state", "--config", str(config_path), "--mapping", str(mapping_path),
+                ])
+            self.assertEqual(0, exit_code)
+            self.assertEqual({"legacy_rows": 0, "status": "PLAN_READY"}, json.loads(stdout.getvalue()))
+            self.assertEqual(before, _cli_tree_snapshot(root))
+            self.assertFalse(list(root.glob("*.bak")))
+            malformed_config = root / "array-config.json"
+            malformed_config.write_text("[]", encoding="utf-8")
+            rejected = io.StringIO()
+            with contextlib.redirect_stdout(rejected):
+                self.assertEqual(
+                    64,
+                    main([
+                        "migrate-state", "--config", str(malformed_config), "--mapping", str(mapping_path),
+                    ]),
+                )
+            self.assertEqual("CONFIG_OR_DEPENDENCY", json.loads(rejected.getvalue())["error_class"])
+
+    def test_legacy_run_is_refused_before_runtime_side_effects(self) -> None:
+        examples = Path(__file__).parents[1] / "config"
+        effects = (
+            "SafeLogger",
+            "_ReadOnlyLogger",
+            "StateStore",
+            "StateV2Store",
+            "RunLock",
+            "cleanup_stale_owned_temp",
+            "PlaywrightPortal",
+            "DirectHttpSource",
+            "run_direct_http",
+            "reconcile_inventory",
+            "reconcile_listed_inventory",
+            "reconcile_dual_stream",
+            "notify_failure",
+            "send_alert",
+            "migrate_state_database",
+        )
+        archived_bytes = b"%PDF-1.4\nhistorical invoice\n%%EOF\n"
+
+        for source, example_name in (
+            ("browser", "energygrid.example.json"),
+            ("direct_http", "energygrid.direct_http.example.json"),
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                raw = json.loads((examples / example_name).read_text(encoding="utf-8"))
+                archive_root = root / "archive"
+                archive_root.mkdir()
+                (archive_root / "historical.pdf").write_bytes(archived_bytes)
+                state_path = root / "state" / "state.sqlite3"
+                raw.update(
+                    archive_root=str(archive_root),
+                    state_path=str(state_path),
+                    temp_root=str(root / "temp"),
+                    log_root=str(root / "logs"),
+                )
+                config_path = root / "config.json"
+                config_path.write_text(json.dumps(raw), encoding="utf-8")
+                with StateStore(state_path) as state:
+                    state.record_archived(
+                        "historical.pdf",
+                        "historical.pdf",
+                        FileInfo(len(archived_bytes), "a" * 64),
+                        now="2026-10-03T00:00:00+00:00",
+                    )
+
+                before = _cli_tree_snapshot(root)
+                with contextlib.ExitStack() as stack:
+                    boundaries = {
+                        name: stack.enter_context(mock.patch.object(cli, name))
+                        for name in effects
+                    }
+                    for _attempt in range(2):
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            exit_code = main(["run", "--config", str(config_path)])
+                        self.assertEqual(64, exit_code)
+                        self.assertEqual(
+                            {
+                                "error_class": "LEGACY_RUN_DISABLED",
+                                "status": "ACTION_REQUIRED",
+                                "support_ref": "EG_LEGACY_RUN_DISABLED",
+                            },
+                            json.loads(stdout.getvalue()),
+                        )
+                    for boundary in boundaries.values():
+                        boundary.assert_not_called()
+                self.assertEqual(before, _cli_tree_snapshot(root))
+
+    def test_legacy_run_invalid_configuration_keeps_its_bounded_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "invalid.json"
+            config_path.write_text("{}", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(["run", "--config", str(config_path)])
+            self.assertEqual(64, exit_code)
+            self.assertEqual(
+                {"status": ACTION_REQUIRED, "error_class": "CONFIG_OR_DEPENDENCY"},
+                json.loads(stdout.getvalue()),
+            )
+
     def test_only_locked_commands_and_overrides_are_exposed(self) -> None:
         args = build_parser().parse_args(
             [
@@ -101,10 +419,25 @@ class CliTests(unittest.TestCase):
                 '      - "n8n-workflows/energygrid_download_error_handler.workflow.json"',
                 '      - "n8n-workflows/energygrid_alert_ingress.workflow.json"',
                 '      - "tests/test_energygrid_n8n_error_handler.py"',
+                "      # Invoice delivery (#226/#228): inactive sanitized export and focused offline test.",
+                '      - "n8n-workflows/energygrid_invoice_delivery.workflow.json"',
+                '      - "tests/test_energygrid_invoice_delivery_workflow.py"',
+                "      # Drive upload and destination setup (#226 G3): inactive exports and focused offline tests.",
+                '      - "n8n-workflows/energygrid_drive_upload.workflow.json"',
+                '      - "n8n-workflows/energygrid_drive_destination_setup.workflow.json"',
+                '      - "tests/test_energygrid_drive_upload_workflow.py"',
+                '      - "tests/test_energygrid_drive_destination_setup_workflow.py"',
                 '      - "n8n-workflows/README.md"',
                 '      - "README.md"',
                 '      - ".gitignore"',
             ],
+        )
+        invoice_delivery_step = block_for(
+            job_lines, "- name: EnergyGrid n8n invoice delivery focused offline test", 6
+        )
+        self.assertIn(
+            '        run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v',
+            invoice_delivery_step,
         )
 
         scope_guard = block_for(lines, "foreach ($file in $files) {", 12)
@@ -118,6 +451,12 @@ class CliTests(unittest.TestCase):
                 "$file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and",
                 "$file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and",
                 "$file -ne 'tests/test_energygrid_n8n_error_handler.py' -and",
+                "$file -ne 'n8n-workflows/energygrid_invoice_delivery.workflow.json' -and",
+                "$file -ne 'tests/test_energygrid_invoice_delivery_workflow.py' -and",
+                "$file -ne 'n8n-workflows/energygrid_drive_upload.workflow.json' -and",
+                "$file -ne 'n8n-workflows/energygrid_drive_destination_setup.workflow.json' -and",
+                "$file -ne 'tests/test_energygrid_drive_upload_workflow.py' -and",
+                "$file -ne 'tests/test_energygrid_drive_destination_setup_workflow.py' -and",
                 "$file -ne 'n8n-workflows/README.md' -and",
                 "$file -ne 'README.md' -and",
                 "$file -ne '.gitignore') {",
@@ -141,12 +480,17 @@ class CliTests(unittest.TestCase):
                 "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or",
                 "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or",
                 "$_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or",
-                "$_ -eq 'tests/test_energygrid_n8n_error_handler.py'",
+                "$_ -eq 'tests/test_energygrid_n8n_error_handler.py' -or",
+                "$_ -eq 'n8n-workflows/energygrid_invoice_delivery.workflow.json' -or",
+                "$_ -eq 'tests/test_energygrid_invoice_delivery_workflow.py' -or",
+                "$_ -eq 'n8n-workflows/energygrid_drive_upload.workflow.json' -or",
+                "$_ -eq 'n8n-workflows/energygrid_drive_destination_setup.workflow.json' -or",
+                "$_ -eq 'tests/test_energygrid_drive_upload_workflow.py' -or",
+                "$_ -eq 'tests/test_energygrid_drive_destination_setup_workflow.py'",
             ],
         )
-        # The n8n error handler export and its focused test are EnergyGrid-owned, so either
-        # one alone arms the guard. `n8n-workflows/README.md` is a shared companion: it
-        # triggers the workflow and is permitted, but it never confers ownership.
+        # The EnergyGrid n8n exports and focused tests are owned paths. The workflow
+        # directory README is a shared companion: permitted, but never an ownership signal.
         self.assertNotIn("README.md", ownership_text)
         self.assertNotIn(".gitignore", ownership_text)
         self.assertIn("if ($owned.Count -eq 0) {", workflow)
@@ -306,6 +650,23 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, "an out-of-scope path must fail closed")
         self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
 
+    def test_n8n_invoice_delivery_change_with_test_and_directory_readme_is_accepted(self) -> None:
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_invoice_delivery.workflow.json",
+            "tests/test_energygrid_invoice_delivery_workflow.py",
+            "n8n-workflows/README.md",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    def test_n8n_invoice_delivery_change_with_an_unrelated_path_still_fails(self) -> None:
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_invoice_delivery.workflow.json",
+            "scripts/member_create_uat_approval.py",
+        ])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
+
     def test_n8n_directory_readme_alone_does_not_confer_energygrid_ownership(self) -> None:
         """It triggers the workflow as a shared companion, but owns nothing on its own."""
         result = self._run_scope_case([
@@ -370,38 +731,29 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
     )
 
     def write_config(self, root: Path) -> Path:
-        """Write a synthetic config whose private roots are all inside `root`."""
-        (root / "archive").mkdir()
-        config_path = root / "config.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    # Never contacted: every case replaces the portal class.
-                    "portal_url": "http://127.0.0.1:1/synthetic",
-                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
-                    "archive_root": str(root / "archive"),
-                    "state_path": str(root / "state" / "state.sqlite3"),
-                    "temp_root": str(root / "temp"),
-                    "log_root": str(root / "logs"),
-                    "timeout_seconds": 5,
-                    "max_attempts": 2,
-                    "inventory_safety_ceiling": 50,
-                }
-            ),
-            encoding="utf-8",
-        )
-        return config_path
+        """Use the public v2 command boundary with only a synthetic worker seam."""
+        return _dual_cli_fixture(root)[0]
 
     def run_cli(self, root: Path, portal_cls, command: str = "run") -> tuple[int, str]:
         config_path = self.write_config(root)
-        original = cli.PlaywrightPortal
-        cli.PlaywrightPortal = portal_cls
+        run_id = "00000000-0000-0000-0000-000000000123"
+
+        def synthetic_run(config, logger, supplied_run_id, *, list_only):
+            self.assertEqual(run_id, supplied_run_id)
+            self.assertFalse(list_only)
+            logger.event("login_start")
+            with portal_cls(config) as portal:
+                portal.login()
+            logger.event("login_complete")
+            logger.event("run_complete", status=NO_NEW_BILLS)
+            print(json.dumps(cli.RunSummary(run_id, NO_NEW_BILLS, 0).as_dict(), sort_keys=True))
+            return 0
+
         buffer = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buffer):
+        with mock.patch.dict(os.environ, {"ENERGYGRID_RUN_ID": run_id}), \
+                mock.patch.object(cli, "run_dual_stream", side_effect=synthetic_run), \
+                contextlib.redirect_stdout(buffer):
                 exit_code = cli.main([command, "--config", str(config_path)])
-        finally:
-            cli.PlaywrightPortal = original
         return exit_code, buffer.getvalue()
 
     @staticmethod
@@ -963,6 +1315,15 @@ class LoginDiagnosticCliTests(unittest.TestCase):
                 "login-diagnostic",
                 "navigation-diagnostic",
                 "download-preflight-diagnostic",
+                "migrate-state",
+                "plan",
+                "status",
+                "acquire",
+                "drive-intent",
+                "drive-upload",
+                "drive-reconcile",
+                "deliver",
+                "drive-bind",
             ],
         )
 

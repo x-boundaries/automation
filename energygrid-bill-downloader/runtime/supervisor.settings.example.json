@@ -1,0 +1,38 @@
+{
+  "schema": "energygrid.claude_supervisor_settings.v1",
+  "claude_exe_path": "REPLACE_WITH_PINNED_VERSIONED_CLAUDE_EXE_UNDER_USERPROFILE_LOCAL_SHARE_CLAUDE_VERSIONS",
+  "claude_exe_sha256": "REPLACE_WITH_LOWERCASE_SHA256_OF_PINNED_CLAUDE_EXE",
+  "claude_version": "REPLACE_WITH_EXACT_CLAUDE_VERSION_OUTPUT",
+  "claude_model": "REPLACE_WITH_PINNED_MODEL_ID",
+  "token_path": "REPLACE_WITH_PRIVATE_DPAPI_CURRENTUSER_SETUP_TOKEN_CLIXML_PATH",
+  "git_bash_path": "REPLACE_WITH_GIT_FOR_WINDOWS_BASH_EXE_PATH",
+  "work_dir": "REPLACE_WITH_RUNTIME_ROOT\\claude\\workspace",
+  "prompt_path": "REPLACE_WITH_RUNTIME_ROOT\\claude\\energygrid_orchestrator.prompt.md",
+  "claude_settings_path": "REPLACE_WITH_RUNTIME_ROOT\\claude\\workspace\\.claude\\settings.json",
+  "mcp_config_path": "REPLACE_WITH_RUNTIME_ROOT\\claude\\mcp.empty.json",
+  "egcore_bin_dir": "REPLACE_WITH_RUNTIME_ROOT\\bin",
+  "expected_sha256": {
+    "prompt": "REPLACE_WITH_SHA256_OF_REVIEWED_PROMPT",
+    "claude_settings": "REPLACE_WITH_SHA256_OF_REVIEWED_CLAUDE_SETTINGS",
+    "mcp_config": "REPLACE_WITH_SHA256_OF_REVIEWED_EMPTY_MCP_CONFIG",
+    "egcore_cmd": "REPLACE_WITH_SHA256_OF_REVIEWED_EGCORE_CMD",
+    "launcher_manifest": "REPLACE_WITH_SHA256_OF_INSTALLED_LAUNCHER_MANIFEST"
+  },
+  "launcher": {
+    "path": "REPLACE_WITH_LAUNCHER_ROOT\\launcher.ps1",
+    "manifest_path": "REPLACE_WITH_LAUNCHER_ROOT\\installation_manifest.json",
+    "config_path": "REPLACE_WITH_PRIVATE_V3_CONFIG_JSON_PATH",
+    "python_exe": "REPLACE_WITH_PYTHON_314_EXECUTABLE_PATH",
+    "checkout_root": "REPLACE_WITH_DEPLOYED_CHECKOUT_ROOT",
+    "credential_path": "REPLACE_WITH_PRIVATE_DPAPI_PSCREDENTIAL_CLIXML_PATH",
+    "browser_cache_path": "REPLACE_WITH_PRIVATE_PLAYWRIGHT_BROWSER_CACHE_PATH",
+    "expected_branch": "REPLACE_WITH_EXPECTED_BRANCH_OR_ANY_BRANCH",
+    "authorised_launcher_root_write_sid": ["REPLACE_WITH_AUTHORISED_LAUNCHER_ROOT_WRITE_SID"],
+    "log_root": "REPLACE_WITH_PRIVATE_DIAGNOSTICS_ROOT"
+  },
+  "receipt_root": "REPLACE_WITH_PRIVATE_SUPERVISOR_RECEIPT_ROOT",
+  "claude_timeout_seconds": 1200,
+  "max_turns": 40,
+  "max_budget_usd": "1.00",
+  "alert": null
+}

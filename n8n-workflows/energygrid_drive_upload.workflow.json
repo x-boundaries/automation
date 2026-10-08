@@ -1,0 +1,2338 @@
+{
+  "id": "energygridDriveUpload01",
+  "name": "EnergyGrid - Drive Upload",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "EnergyGrid Drive Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        600
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "REPLACE_WITH_DRIVE_WEBHOOK_PATH",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "Validate Drive Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction parseString(text, cursor) {\n  if (text[cursor.index] !== '\"') throw new Error('EG_DRIVE_METADATA_JSON');\n  const start = cursor.index++;\n  let escaped = false;\n  while (cursor.index < text.length) {\n    const char = text[cursor.index++];\n    if (escaped) escaped = false;\n    else if (char === '\\\\') escaped = true;\n    else if (char === '\"') return JSON.parse(text.slice(start, cursor.index));\n  }\n  throw new Error('EG_DRIVE_METADATA_JSON');\n}\nfunction parseStrictValue(text, cursor) {\n  const skip = () => { while (cursor.index < text.length && /\\s/.test(text[cursor.index])) cursor.index++; };\n  skip();\n  const char = text[cursor.index];\n  if (char === '{') {\n    cursor.index++;\n    const result = {}, seen = new Set();\n    skip();\n    if (text[cursor.index] === '}') { cursor.index++; return result; }\n    while (cursor.index < text.length) {\n      skip();\n      const key = parseString(text, cursor);\n      if (seen.has(key)) throw new Error('EG_DRIVE_METADATA_DUPLICATE_KEY');\n      seen.add(key);\n      skip();\n      if (text[cursor.index++] !== ':') throw new Error('EG_DRIVE_METADATA_JSON');\n      result[key] = parseStrictValue(text, cursor);\n      skip();\n      const delimiter = text[cursor.index++];\n      if (delimiter === '}') return result;\n      if (delimiter !== ',') throw new Error('EG_DRIVE_METADATA_JSON');\n    }\n    throw new Error('EG_DRIVE_METADATA_JSON');\n  }\n  if (char === '\"') return parseString(text, cursor);\n  const match = /^(null|true|false|-?[0-9]+)/.exec(text.slice(cursor.index));\n  if (!match) throw new Error('EG_DRIVE_METADATA_JSON');\n  cursor.index += match[0].length;\n  return JSON.parse(match[0]);\n}\nfunction parseStrictObject(text) {\n  if (typeof text !== 'string' || text.length < 2 || text.length > 4096) throw new Error('EG_DRIVE_METADATA_JSON');\n  const cursor = { index: 0 };\n  const value = parseStrictValue(text, cursor);\n  while (cursor.index < text.length && /\\s/.test(text[cursor.index])) cursor.index++;\n  if (cursor.index !== text.length || !value || typeof value !== 'object' || Array.isArray(value)) throw new Error('EG_DRIVE_METADATA_JSON');\n  return value;\n}\n\nconst items = $input.all();\nconst RESULT_SCHEMA = 'energygrid.drive_result.v3';\nconst SENTINEL = '00000000-0000-4000-8000-000000000000';\nconst OP_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\nconst UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;\nconst DRIVE_ID_RE = /^[A-Za-z0-9_-]{10,128}$/;\nconst BINDING_RE = /^egdb3-[0-9a-f]{32}$/;\nconst NAME_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}\\.pdf$/;\nconst KEYS = ['schema', 'mode', 'operation_id', 'invoice_id', 'stream', 'binding_id', 'folder_id', 'root_folder_id',\n  'reserved_file_id', 'remote_name', 'local_byte_size', 'local_sha256', 'local_md5', 'app_properties'];\nconst PROP_KEYS = ['egApp', 'egBnd', 'egInv', 'egOp', 'egSchema', 'egSha', 'egStream'];\nfunction rejection(supportRef, operationId, mode) {\n  return [{ json: { valid: false, response_code: 422, response: {\n    schema: RESULT_SCHEMA, mode: ['RESERVE_ID', 'RECONCILE', 'UPLOAD_IF_ABSENT', 'RESOLVE_DESTINATION'].includes(mode) ? mode : 'RECONCILE',\n    operation_id: typeof operationId === 'string' && OP_RE.test(operationId) ? operationId : SENTINEL,\n    outcome: 'REQUEST_REJECTED', generated_id: null, folder_check: 'UNAVAILABLE', reserved_lookup: 'NOT_REQUESTED',\n    search_complete: false, upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null, support_ref: supportRef,\n  } } }];\n}\nif (items.length !== 1 || !items[0] || !items[0].json) return rejection('EG_DRIVE_REQUEST_SHAPE');\nconst item = items[0], body = item.json.body;\nif (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1 ||\n    !Object.prototype.hasOwnProperty.call(body, 'metadata')) return rejection('EG_DRIVE_MULTIPART_FIELDS_INVALID');\nlet m;\ntry { m = parseStrictObject(body.metadata); }\ncatch (error) {\n  const reason = String(error && error.message || '');\n  return rejection(/^EG_DRIVE_METADATA_[A-Z_]+$/.test(reason) ? reason : 'EG_DRIVE_METADATA_JSON');\n}\nconst keys = Object.keys(m);\nif (keys.length !== KEYS.length || !KEYS.every((key, index) => keys[index] === key)) return rejection('EG_DRIVE_METADATA_KEYS', m.operation_id, m.mode);\nconst mode = m.mode;\nif (m.schema !== 'energygrid.drive_request.v3' || !['RESERVE_ID', 'RECONCILE', 'UPLOAD_IF_ABSENT', 'RESOLVE_DESTINATION'].includes(mode) ||\n    typeof m.operation_id !== 'string' || !OP_RE.test(m.operation_id) || !['EB_BILL', 'TENANT_BILL'].includes(m.stream) ||\n    typeof m.binding_id !== 'string' || !BINDING_RE.test(m.binding_id) ||\n    typeof m.folder_id !== 'string' || !DRIVE_ID_RE.test(m.folder_id) ||\n    typeof m.root_folder_id !== 'string' || !DRIVE_ID_RE.test(m.root_folder_id) || m.folder_id === m.root_folder_id) {\n  return rejection('EG_DRIVE_METADATA_INVALID', m.operation_id, mode);\n}\nconst binary = item.binary || {};\nif (mode === 'RESOLVE_DESTINATION') {\n  if (['invoice_id', 'reserved_file_id', 'remote_name', 'local_byte_size', 'local_sha256', 'local_md5', 'app_properties'].some((key) => m[key] !== null) ||\n      Object.keys(binary).length !== 0) return rejection('EG_DRIVE_METADATA_INVALID', m.operation_id, mode);\n  return [{ json: { valid: true, request: m } }];\n}\nconst props = m.app_properties;\nif (typeof m.invoice_id !== 'string' || !UUID_RE.test(m.invoice_id) ||\n    typeof m.remote_name !== 'string' || !NAME_RE.test(m.remote_name) ||\n    !Number.isSafeInteger(m.local_byte_size) || m.local_byte_size < 1 || m.local_byte_size > 15000000 ||\n    typeof m.local_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(m.local_sha256) ||\n    typeof m.local_md5 !== 'string' || !/^[0-9a-f]{32}$/.test(m.local_md5) ||\n    !props || typeof props !== 'object' || Array.isArray(props) ||\n    Object.keys(props).length !== PROP_KEYS.length || !PROP_KEYS.every((key) => typeof props[key] === 'string') ||\n    props.egApp !== 'xb-energygrid' || props.egSchema !== 'eg-drive-v3' || props.egStream !== m.stream ||\n    props.egInv !== m.invoice_id || props.egBnd !== m.binding_id || props.egOp !== m.operation_id || props.egSha !== m.local_sha256) {\n  return rejection('EG_DRIVE_METADATA_INVALID', m.operation_id, mode);\n}\nif (mode === 'RESERVE_ID') {\n  if (m.reserved_file_id !== null || Object.keys(binary).length !== 0) return rejection('EG_DRIVE_METADATA_INVALID', m.operation_id, mode);\n  return [{ json: { valid: true, request: m } }];\n}\nif (typeof m.reserved_file_id !== 'string' || !DRIVE_ID_RE.test(m.reserved_file_id)) return rejection('EG_DRIVE_METADATA_INVALID', m.operation_id, mode);\nif (mode === 'RECONCILE') {\n  if (Object.keys(binary).length !== 0) return rejection('EG_DRIVE_BINARY_FIELDS_INVALID', m.operation_id, mode);\n  return [{ json: { valid: true, request: m } }];\n}\nif (Object.keys(binary).length !== 1 || !Object.prototype.hasOwnProperty.call(binary, 'pdf')) return rejection('EG_DRIVE_BINARY_FIELDS_INVALID', m.operation_id, mode);\nconst pdf = binary.pdf;\nif (!pdf || pdf.fileName !== m.remote_name || pdf.mimeType !== 'application/pdf') return rejection('EG_DRIVE_PDF_METADATA_INVALID', m.operation_id, mode);\nlet bytes;\ntry { bytes = await this.helpers.getBinaryDataBuffer(0, 'pdf'); }\ncatch (error) { return rejection('EG_DRIVE_PDF_READ_FAILED', m.operation_id, mode); }\nif (!Buffer.isBuffer(bytes) || bytes.length !== m.local_byte_size || bytes.subarray(0, 5).toString('ascii') !== '%PDF-') {\n  return rejection('EG_DRIVE_PDF_INVALID', m.operation_id, mode);\n}\nreturn [{ json: { valid: true, request: m }, binary: item.binary }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "name": "Request Is Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        600
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000004",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "name": "Is Upload Request",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        520
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000006",
+              "leftValue": "={{ $json.request.mode }}",
+              "rightValue": "UPLOAD_IF_ABSENT",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000007",
+      "name": "Hash PDF SHA256",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        360
+      ],
+      "parameters": {
+        "action": "hash",
+        "binaryData": true,
+        "binaryPropertyName": "pdf",
+        "type": "SHA256",
+        "dataPropertyName": "pdf_sha256",
+        "encoding": "hex"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000008",
+      "name": "Hash PDF MD5",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        360
+      ],
+      "parameters": {
+        "action": "hash",
+        "binaryData": true,
+        "binaryPropertyName": "pdf",
+        "type": "MD5",
+        "dataPropertyName": "pdf_md5",
+        "encoding": "hex"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000009",
+      "name": "Check PDF Digests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        360
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst request = $('Validate Drive Request').first().json.request;\nconst hashed = $input.first().json;\nconst sha = $('Hash PDF SHA256').first().json.pdf_sha256;\nconst md5 = hashed.pdf_md5;\nif (sha !== request.local_sha256 || md5 !== request.local_md5) {\n  return [{ json: { valid: false, response_code: 422, response: {\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id, outcome: 'REQUEST_REJECTED',\n    generated_id: null, folder_check: 'UNAVAILABLE', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null, support_ref: 'EG_DRIVE_PDF_DIGEST_MISMATCH',\n  } } }];\n}\nreturn [{ json: { valid: true } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000010",
+      "name": "Digests Match",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1920,
+        360
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000011",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000012",
+      "name": "Get Destination Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        520
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent($('Validate Drive Request').first().json.request.folder_id) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000013",
+      "name": "Check Destination Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        520
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nconst request = $('Validate Drive Request').first().json.request;\nconst folder = $input.first().json;\nconst label = request.stream === 'EB_BILL' ? 'EB Bill' : 'Tenant Bill';\nconst status = folder && folder.statusCode;\nconst body = folder && folder.body;\nif (status === 404) return answer(200, baseResult(request, { outcome: 'DESTINATION_CHANGED', folder_check: 'FAIL', support_ref: 'EG_DRIVE_DESTINATION_CHANGED' }));\nif (status !== 200 || !body || typeof body !== 'object') {\n  return answer(503, baseResult(request, { outcome: 'DRIVE_UNAVAILABLE', folder_check: 'UNAVAILABLE', support_ref: 'EG_DRIVE_FOLDER_CHECK_UNAVAILABLE' }));\n}\nconst exact = body.id === request.folder_id && body.name === label && body.mimeType === 'application/vnd.google-apps.folder' &&\n  body.trashed === false && Array.isArray(body.parents) && body.parents.length === 1 && body.parents[0] === request.root_folder_id;\nif (!exact) return answer(200, baseResult(request, { outcome: 'DESTINATION_CHANGED', folder_check: 'FAIL', support_ref: 'EG_DRIVE_DESTINATION_CHANGED' }));\nreturn [{ json: { route: request.mode } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000014",
+      "name": "Folder Check Passed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        520
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000015",
+              "leftValue": "={{ $json.route === undefined ? 'RESPOND' : 'ROUTE' }}",
+              "rightValue": "ROUTE",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000016",
+      "name": "Is Reserve Request",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2880,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000017",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "RESERVE_ID",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000018",
+      "name": "Is Resolve Request",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        600
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000019",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "RESOLVE_DESTINATION",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000020",
+      "name": "Is Reconcile Request",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3360,
+        760
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000021",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "RECONCILE",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000022",
+      "name": "Is Upload Route",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        920
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000023",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "UPLOAD_IF_ABSENT",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000024",
+      "name": "Generate Drive File ID",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files/generateIds",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "count",
+              "value": "1"
+            },
+            {
+              "name": "space",
+              "value": "drive"
+            },
+            {
+              "name": "type",
+              "value": "files"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000025",
+      "name": "Build Reserve Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nconst request = $('Validate Drive Request').first().json.request;\nconst response = $input.first().json;\nconst ids = response && response.statusCode === 200 && response.body && Array.isArray(response.body.ids) ? response.body.ids : [];\nif (ids.length !== 1 || typeof ids[0] !== 'string' || !/^[A-Za-z0-9_-]{10,128}$/.test(ids[0])) {\n  return answer(503, baseResult(request, { outcome: 'DRIVE_UNAVAILABLE', support_ref: 'EG_DRIVE_RESERVATION_UNAVAILABLE' }));\n}\nreturn answer(200, baseResult(request, { outcome: 'ID_RESERVED', generated_id: ids[0], support_ref: 'EG_DRIVE_ID_RESERVED' }));\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000026",
+      "name": "Get Drive Account",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        440
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/about",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "user(permissionId)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000027",
+      "name": "Get EnergyGrid Root Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        440
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent($('Validate Drive Request').first().json.request.root_folder_id) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000028",
+      "name": "Build Resolve Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nconst request = $('Validate Drive Request').first().json.request;\nconst about = $('Get Drive Account').first().json;\nconst root = $input.first().json;\nconst account = about && about.statusCode === 200 && about.body && about.body.user ? about.body.user.permissionId : null;\nif (root && root.statusCode === 404) return answer(200, baseResult(request, { outcome: 'DESTINATION_CHANGED', folder_check: 'FAIL', support_ref: 'EG_DRIVE_DESTINATION_CHANGED' }));\nif (typeof account !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(account) || !root || root.statusCode !== 200 || !root.body) {\n  return answer(503, baseResult(request, { outcome: 'DRIVE_UNAVAILABLE', folder_check: 'UNAVAILABLE', support_ref: 'EG_DRIVE_RESOLVE_UNAVAILABLE' }));\n}\nconst exact = root.body.id === request.root_folder_id && root.body.name === 'EnergyGrid' &&\n  root.body.mimeType === 'application/vnd.google-apps.folder' && root.body.trashed === false;\nif (!exact) return answer(200, baseResult(request, { outcome: 'DESTINATION_CHANGED', folder_check: 'FAIL', support_ref: 'EG_DRIVE_DESTINATION_CHANGED' }));\nreturn answer(200, baseResult(request, { outcome: 'DESTINATION_RESOLVED', account_ref: account, support_ref: 'EG_DRIVE_DESTINATION_RESOLVED' }));\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000029",
+      "name": "Lookup Reserved File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        680
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent($('Validate Drive Request').first().json.request.reserved_file_id) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000030",
+      "name": "Search Invoice Identity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3840,
+        680
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"appProperties has { key='egInv' and value='\" + $('Validate Drive Request').first().json.request.invoice_id + \"' }\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000031",
+      "name": "Search Canonical Name",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        680
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Validate Drive Request').first().json.request.folder_id + \"' in parents and name = '\" + $('Validate Drive Request').first().json.request.remote_name + \"' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000032",
+      "name": "Classify Reconcile Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        680
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nfunction normalise(file) {\n  return {\n    id: file.id, name: file.name, mimeType: file.mimeType, parents: Array.isArray(file.parents) ? file.parents.slice() : [],\n    size: typeof file.size === 'string' ? file.size : null,\n    md5Checksum: typeof file.md5Checksum === 'string' ? file.md5Checksum : null,\n    sha256Checksum: typeof file.sha256Checksum === 'string' ? file.sha256Checksum : null,\n    appProperties: file.appProperties && typeof file.appProperties === 'object' ? Object.assign({}, file.appProperties) : null,\n    trashed: file.trashed === true,\n  };\n}\nfunction sameProperties(left, right) {\n  if (!left || !right) return false;\n  const a = Object.keys(left).sort(), b = Object.keys(right).sort();\n  return a.length === b.length && a.every((key, index) => key === b[index] && left[key] === right[key]);\n}\nfunction classify(request, lookup, byIdentity, byName, uploadResult) {\n  const reserved = request.reserved_file_id;\n  let reservedLookup = 'UNAVAILABLE';\n  const candidates = [];\n  const seen = new Set();\n  const add = (file) => {\n    if (!file || typeof file.id !== 'string' || !/^[A-Za-z0-9_-]{10,128}$/.test(file.id) || seen.has(file.id)) return;\n    seen.add(file.id);\n    candidates.push(normalise(file));\n  };\n  if (lookup && lookup.statusCode === 200 && lookup.body && lookup.body.id === reserved) { reservedLookup = 'FOUND'; add(lookup.body); }\n  else if (lookup && lookup.statusCode === 404) reservedLookup = 'NOT_FOUND';\n  let complete = true;\n  for (const search of [byIdentity, byName]) {\n    const body = search && search.body;\n    if (!search || search.statusCode !== 200 || !body || body.incompleteSearch !== false || body.nextPageToken || !Array.isArray(body.files)) {\n      complete = false;\n      continue;\n    }\n    for (const file of body.files) add(file);\n  }\n  const result = baseResult(request, { reserved_lookup: reservedLookup, search_complete: complete, upload_result: uploadResult,\n    candidates: candidates.slice(0, 5) });\n  if (reservedLookup === 'UNAVAILABLE' || !complete) {\n    return { code: 503, result: Object.assign(result, { outcome: 'DRIVE_UNAVAILABLE', support_ref: 'EG_DRIVE_READBACK_UNAVAILABLE' }) };\n  }\n  if (reservedLookup === 'NOT_FOUND' && candidates.length === 0) {\n    return { code: 200, result: Object.assign(result, { outcome: 'NOT_FOUND', support_ref: 'EG_DRIVE_NOT_FOUND' }) };\n  }\n  if (reservedLookup === 'FOUND' && candidates.length === 1) {\n    const file = candidates[0];\n    const exact = !file.trashed && file.parents.length === 1 && file.parents[0] === request.folder_id &&\n      sameProperties(file.appProperties, request.app_properties) && file.name === request.remote_name &&\n      file.mimeType === 'application/pdf' && file.size === String(request.local_byte_size) &&\n      (file.sha256Checksum === null || file.sha256Checksum === request.local_sha256) &&\n      (file.md5Checksum === null || file.md5Checksum === request.local_md5);\n    if (exact && file.sha256Checksum === null && file.md5Checksum === null) {\n      return { code: 200, result: Object.assign(result, { outcome: 'CHECKSUM_UNAVAILABLE', support_ref: 'EG_DRIVE_VERIFICATION_UNAVAILABLE' }) };\n    }\n    if (exact) {\n      const outcome = uploadResult === 'CREATED' || uploadResult === 'ALREADY_EXISTS' ? 'UPLOADED' : 'FOUND_EXACT';\n      return { code: 200, result: Object.assign(result, { outcome, support_ref: 'EG_DRIVE_EXACT' }) };\n    }\n  }\n  return { code: 200, result: Object.assign(result, { outcome: 'CONFLICT', support_ref: 'EG_DRIVE_CONFLICT' }) };\n}\n\nconst request = $('Validate Drive Request').first().json.request;\nconst verdict = classify(request, $('Lookup Reserved File').first().json, $('Search Invoice Identity').first().json,\n  $input.first().json, 'NOT_ATTEMPTED');\nreturn answer(verdict.code, verdict.result);\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000033",
+      "name": "Upload Lookup Reserved File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3840,
+        920
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent($('Validate Drive Request').first().json.request.reserved_file_id) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000034",
+      "name": "Upload Search Invoice Identity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        920
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"appProperties has { key='egInv' and value='\" + $('Validate Drive Request').first().json.request.invoice_id + \"' }\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000035",
+      "name": "Upload Search Canonical Name",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4320,
+        920
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Validate Drive Request').first().json.request.folder_id + \"' in parents and name = '\" + $('Validate Drive Request').first().json.request.remote_name + \"' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000036",
+      "name": "Classify Before Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        920
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nfunction normalise(file) {\n  return {\n    id: file.id, name: file.name, mimeType: file.mimeType, parents: Array.isArray(file.parents) ? file.parents.slice() : [],\n    size: typeof file.size === 'string' ? file.size : null,\n    md5Checksum: typeof file.md5Checksum === 'string' ? file.md5Checksum : null,\n    sha256Checksum: typeof file.sha256Checksum === 'string' ? file.sha256Checksum : null,\n    appProperties: file.appProperties && typeof file.appProperties === 'object' ? Object.assign({}, file.appProperties) : null,\n    trashed: file.trashed === true,\n  };\n}\nfunction sameProperties(left, right) {\n  if (!left || !right) return false;\n  const a = Object.keys(left).sort(), b = Object.keys(right).sort();\n  return a.length === b.length && a.every((key, index) => key === b[index] && left[key] === right[key]);\n}\nfunction classify(request, lookup, byIdentity, byName, uploadResult) {\n  const reserved = request.reserved_file_id;\n  let reservedLookup = 'UNAVAILABLE';\n  const candidates = [];\n  const seen = new Set();\n  const add = (file) => {\n    if (!file || typeof file.id !== 'string' || !/^[A-Za-z0-9_-]{10,128}$/.test(file.id) || seen.has(file.id)) return;\n    seen.add(file.id);\n    candidates.push(normalise(file));\n  };\n  if (lookup && lookup.statusCode === 200 && lookup.body && lookup.body.id === reserved) { reservedLookup = 'FOUND'; add(lookup.body); }\n  else if (lookup && lookup.statusCode === 404) reservedLookup = 'NOT_FOUND';\n  let complete = true;\n  for (const search of [byIdentity, byName]) {\n    const body = search && search.body;\n    if (!search || search.statusCode !== 200 || !body || body.incompleteSearch !== false || body.nextPageToken || !Array.isArray(body.files)) {\n      complete = false;\n      continue;\n    }\n    for (const file of body.files) add(file);\n  }\n  const result = baseResult(request, { reserved_lookup: reservedLookup, search_complete: complete, upload_result: uploadResult,\n    candidates: candidates.slice(0, 5) });\n  if (reservedLookup === 'UNAVAILABLE' || !complete) {\n    return { code: 503, result: Object.assign(result, { outcome: 'DRIVE_UNAVAILABLE', support_ref: 'EG_DRIVE_READBACK_UNAVAILABLE' }) };\n  }\n  if (reservedLookup === 'NOT_FOUND' && candidates.length === 0) {\n    return { code: 200, result: Object.assign(result, { outcome: 'NOT_FOUND', support_ref: 'EG_DRIVE_NOT_FOUND' }) };\n  }\n  if (reservedLookup === 'FOUND' && candidates.length === 1) {\n    const file = candidates[0];\n    const exact = !file.trashed && file.parents.length === 1 && file.parents[0] === request.folder_id &&\n      sameProperties(file.appProperties, request.app_properties) && file.name === request.remote_name &&\n      file.mimeType === 'application/pdf' && file.size === String(request.local_byte_size) &&\n      (file.sha256Checksum === null || file.sha256Checksum === request.local_sha256) &&\n      (file.md5Checksum === null || file.md5Checksum === request.local_md5);\n    if (exact && file.sha256Checksum === null && file.md5Checksum === null) {\n      return { code: 200, result: Object.assign(result, { outcome: 'CHECKSUM_UNAVAILABLE', support_ref: 'EG_DRIVE_VERIFICATION_UNAVAILABLE' }) };\n    }\n    if (exact) {\n      const outcome = uploadResult === 'CREATED' || uploadResult === 'ALREADY_EXISTS' ? 'UPLOADED' : 'FOUND_EXACT';\n      return { code: 200, result: Object.assign(result, { outcome, support_ref: 'EG_DRIVE_EXACT' }) };\n    }\n  }\n  return { code: 200, result: Object.assign(result, { outcome: 'CONFLICT', support_ref: 'EG_DRIVE_CONFLICT' }) };\n}\n\nconst request = $('Validate Drive Request').first().json.request;\nconst verdict = classify(request, $('Upload Lookup Reserved File').first().json, $('Upload Search Invoice Identity').first().json,\n  $input.first().json, 'NOT_ATTEMPTED');\n// Upload only when the reserved ID is positively absent and both complete\n// searches are empty. Every other verdict is answered without any create.\nif (verdict.result.outcome === 'NOT_FOUND') return [{ json: { upload_required: true } }];\nreturn [{ json: { upload_required: false, response_code: verdict.code, response: verdict.result } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000037",
+      "name": "Upload Is Required",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4800,
+        920
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000038",
+              "leftValue": "={{ $json.upload_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000039",
+      "name": "Start Resumable Upload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5040,
+        840
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/upload/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "uploadType",
+              "value": "resumable"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "fields",
+              "value": "id"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Upload-Content-Type",
+              "value": "application/pdf"
+            },
+            {
+              "name": "X-Upload-Content-Length",
+              "value": "={{ String($('Validate Drive Request').first().json.request.local_byte_size) }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ id: $('Validate Drive Request').first().json.request.reserved_file_id, name: $('Validate Drive Request').first().json.request.remote_name, parents: [$('Validate Drive Request').first().json.request.folder_id], mimeType: 'application/pdf', appProperties: $('Validate Drive Request').first().json.request.app_properties }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000040",
+      "name": "Check Upload Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5280,
+        840
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nconst request = $('Validate Drive Request').first().json.request;\nconst start = $input.first().json;\nconst headers = start && start.headers || {};\nconst location = headers.location || headers.Location;\nif (start && start.statusCode === 200 && typeof location === 'string' && location.startsWith('https://www.googleapis.com/upload/drive/v3/files?')) {\n  return [{ json: { session: 'OPEN', upload_url: location } }];\n}\nif (start && start.statusCode === 409) {\n  // The reserved ID already exists: a same-ID create never mints another file.\n  return [{ json: { session: 'EXISTS', upload_result: 'ALREADY_EXISTS' } }];\n}\nreturn [{ json: { session: 'FAILED', response_code: 503, response: baseResult(request, {\n  outcome: 'DRIVE_UNAVAILABLE', folder_check: 'PASS', reserved_lookup: 'NOT_FOUND', search_complete: true,\n  upload_result: 'FAILED', support_ref: 'EG_DRIVE_UPLOAD_SESSION_FAILED' }) } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000041",
+      "name": "Session Is Open",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5520,
+        840
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000042",
+              "leftValue": "={{ $json.session }}",
+              "rightValue": "OPEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000043",
+      "name": "Session Already Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5760,
+        1000
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8000-000000000044",
+              "leftValue": "={{ $json.session }}",
+              "rightValue": "EXISTS",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000045",
+      "name": "Attach PDF For Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        760
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst session = $input.first().json;\nreturn [{ json: { upload_url: session.upload_url }, binary: $('Validate Drive Request').first().binary }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000046",
+      "name": "Upload PDF Bytes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6000,
+        760
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $json.upload_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/pdf"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "pdf",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 150000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000047",
+      "name": "Record Upload Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6240,
+        760
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst put = $input.first().json;\nconst created = put && (put.statusCode === 200 || put.statusCode === 201);\nreturn [{ json: { upload_result: created ? 'CREATED' : 'FAILED' } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000048",
+      "name": "Readback Reserved File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6480,
+        880
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent($('Validate Drive Request').first().json.request.reserved_file_id) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000049",
+      "name": "Readback Search Invoice Identity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6720,
+        880
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"appProperties has { key='egInv' and value='\" + $('Validate Drive Request').first().json.request.invoice_id + \"' }\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000050",
+      "name": "Readback Search Canonical Name",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6960,
+        880
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Validate Drive Request').first().json.request.folder_id + \"' in parents and name = '\" + $('Validate Drive Request').first().json.request.remote_name + \"' and trashed = false\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,md5Checksum,sha256Checksum,appProperties,trashed)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000051",
+      "name": "Classify Upload Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7200,
+        880
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nfunction baseResult(request, extra) {\n  return Object.assign({\n    schema: 'energygrid.drive_result.v3', mode: request.mode, operation_id: request.operation_id,\n    generated_id: null, folder_check: 'PASS', reserved_lookup: 'NOT_REQUESTED', search_complete: false,\n    upload_result: 'NOT_ATTEMPTED', candidates: [], account_ref: null,\n  }, extra);\n}\nfunction answer(code, result) { return [{ json: { response_code: code, response: result } }]; }\n\nfunction normalise(file) {\n  return {\n    id: file.id, name: file.name, mimeType: file.mimeType, parents: Array.isArray(file.parents) ? file.parents.slice() : [],\n    size: typeof file.size === 'string' ? file.size : null,\n    md5Checksum: typeof file.md5Checksum === 'string' ? file.md5Checksum : null,\n    sha256Checksum: typeof file.sha256Checksum === 'string' ? file.sha256Checksum : null,\n    appProperties: file.appProperties && typeof file.appProperties === 'object' ? Object.assign({}, file.appProperties) : null,\n    trashed: file.trashed === true,\n  };\n}\nfunction sameProperties(left, right) {\n  if (!left || !right) return false;\n  const a = Object.keys(left).sort(), b = Object.keys(right).sort();\n  return a.length === b.length && a.every((key, index) => key === b[index] && left[key] === right[key]);\n}\nfunction classify(request, lookup, byIdentity, byName, uploadResult) {\n  const reserved = request.reserved_file_id;\n  let reservedLookup = 'UNAVAILABLE';\n  const candidates = [];\n  const seen = new Set();\n  const add = (file) => {\n    if (!file || typeof file.id !== 'string' || !/^[A-Za-z0-9_-]{10,128}$/.test(file.id) || seen.has(file.id)) return;\n    seen.add(file.id);\n    candidates.push(normalise(file));\n  };\n  if (lookup && lookup.statusCode === 200 && lookup.body && lookup.body.id === reserved) { reservedLookup = 'FOUND'; add(lookup.body); }\n  else if (lookup && lookup.statusCode === 404) reservedLookup = 'NOT_FOUND';\n  let complete = true;\n  for (const search of [byIdentity, byName]) {\n    const body = search && search.body;\n    if (!search || search.statusCode !== 200 || !body || body.incompleteSearch !== false || body.nextPageToken || !Array.isArray(body.files)) {\n      complete = false;\n      continue;\n    }\n    for (const file of body.files) add(file);\n  }\n  const result = baseResult(request, { reserved_lookup: reservedLookup, search_complete: complete, upload_result: uploadResult,\n    candidates: candidates.slice(0, 5) });\n  if (reservedLookup === 'UNAVAILABLE' || !complete) {\n    return { code: 503, result: Object.assign(result, { outcome: 'DRIVE_UNAVAILABLE', support_ref: 'EG_DRIVE_READBACK_UNAVAILABLE' }) };\n  }\n  if (reservedLookup === 'NOT_FOUND' && candidates.length === 0) {\n    return { code: 200, result: Object.assign(result, { outcome: 'NOT_FOUND', support_ref: 'EG_DRIVE_NOT_FOUND' }) };\n  }\n  if (reservedLookup === 'FOUND' && candidates.length === 1) {\n    const file = candidates[0];\n    const exact = !file.trashed && file.parents.length === 1 && file.parents[0] === request.folder_id &&\n      sameProperties(file.appProperties, request.app_properties) && file.name === request.remote_name &&\n      file.mimeType === 'application/pdf' && file.size === String(request.local_byte_size) &&\n      (file.sha256Checksum === null || file.sha256Checksum === request.local_sha256) &&\n      (file.md5Checksum === null || file.md5Checksum === request.local_md5);\n    if (exact && file.sha256Checksum === null && file.md5Checksum === null) {\n      return { code: 200, result: Object.assign(result, { outcome: 'CHECKSUM_UNAVAILABLE', support_ref: 'EG_DRIVE_VERIFICATION_UNAVAILABLE' }) };\n    }\n    if (exact) {\n      const outcome = uploadResult === 'CREATED' || uploadResult === 'ALREADY_EXISTS' ? 'UPLOADED' : 'FOUND_EXACT';\n      return { code: 200, result: Object.assign(result, { outcome, support_ref: 'EG_DRIVE_EXACT' }) };\n    }\n  }\n  return { code: 200, result: Object.assign(result, { outcome: 'CONFLICT', support_ref: 'EG_DRIVE_CONFLICT' }) };\n}\n\nconst request = $('Validate Drive Request').first().json.request;\nconst marker = $('Readback Reserved File').first().json;\nlet uploadResult = 'FAILED';\ntry { uploadResult = $('Record Upload Result').first().json.upload_result; } catch (error) {}\ntry { if ($('Check Upload Session').first().json.session === 'EXISTS') uploadResult = 'ALREADY_EXISTS'; } catch (error) {}\nif (!['CREATED', 'ALREADY_EXISTS', 'FAILED'].includes(uploadResult)) uploadResult = 'FAILED';\nconst verdict = classify(request, marker, $('Readback Search Invoice Identity').first().json, $input.first().json, uploadResult);\nif (verdict.result.outcome === 'NOT_FOUND') {\n  // A create was attempted but the reserved object is not observable yet:\n  // never claim success; the core records uncertainty and reconciles later.\n  verdict.code = 503;\n  verdict.result.outcome = 'DRIVE_UNAVAILABLE';\n  verdict.result.support_ref = 'EG_DRIVE_UPLOAD_NOT_OBSERVED';\n}\nreturn answer(verdict.code, verdict.result);\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000052",
+      "name": "Respond With Drive Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        7440,
+        600
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.response_code }}"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000053",
+      "name": "Respond With Request Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        900
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000054",
+      "name": "Respond With Drive Unavailable",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        4560,
+        1240
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ schema: 'energygrid.drive_result.v3', mode: $('Validate Drive Request').first().json.request.mode, operation_id: $('Validate Drive Request').first().json.request.operation_id, outcome: 'DRIVE_UNAVAILABLE', generated_id: null, folder_check: 'UNAVAILABLE', reserved_lookup: 'UNAVAILABLE', search_complete: false, upload_result: $('Validate Drive Request').first().json.request.mode === 'UPLOAD_IF_ABSENT' ? 'FAILED' : 'NOT_ATTEMPTED', candidates: [], account_ref: null, support_ref: 'EG_DRIVE_WORKFLOW_UNAVAILABLE' }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000055",
+      "name": "Respond With Bounded Failure",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        720,
+        1100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ schema: 'energygrid.drive_result.v3', mode: 'RECONCILE', operation_id: '00000000-0000-4000-8000-000000000000', outcome: 'DRIVE_UNAVAILABLE', generated_id: null, folder_check: 'UNAVAILABLE', reserved_lookup: 'UNAVAILABLE', search_complete: false, upload_result: 'FAILED', candidates: [], account_ref: null, support_ref: 'EG_DRIVE_WORKFLOW_FAILURE' }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000056",
+      "name": "Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        80
+      ],
+      "parameters": {
+        "content": "# EnergyGrid Drive upload boundary (inactive)\n\n- Loopback webhook with its own Header Auth; separate from the email workflow and never reaches SMTP.\n- Modes: RESERVE_ID (files.generateIds, creates nothing), RECONCILE (read-only), UPLOAD_IF_ABSENT, RESOLVE_DESTINATION (read-only).\n- Every create uses the core's frozen pre-generated file ID. A same-ID create answered 409 is read back, never re-minted.\n- Upload happens only when the reserved ID is absent and both complete conflict searches are empty. No overwrite, suffix or delete.\n- The core alone decides success from the raw read-back; an HTTP 200 is never success. No retries, no saved execution data.\n\n## Required manual configuration:\n\n- **EnergyGrid Drive Webhook**\n  - `Path`: replace REPLACE_WITH_DRIVE_WEBHOOK_PATH with the private loopback path in an authorised import copy.\n",
+        "height": 480,
+        "width": 760
+      }
+    }
+  ],
+  "connections": {
+    "EnergyGrid Drive Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Drive Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Drive Request": {
+      "main": [
+        [
+          {
+            "node": "Request Is Valid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Is Valid": {
+      "main": [
+        [
+          {
+            "node": "Is Upload Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Request Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Upload Request": {
+      "main": [
+        [
+          {
+            "node": "Hash PDF SHA256",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Destination Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash PDF SHA256": {
+      "main": [
+        [
+          {
+            "node": "Hash PDF MD5",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash PDF MD5": {
+      "main": [
+        [
+          {
+            "node": "Check PDF Digests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check PDF Digests": {
+      "main": [
+        [
+          {
+            "node": "Digests Match",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Digests Match": {
+      "main": [
+        [
+          {
+            "node": "Get Destination Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Request Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Destination Folder": {
+      "main": [
+        [
+          {
+            "node": "Check Destination Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Destination Folder": {
+      "main": [
+        [
+          {
+            "node": "Folder Check Passed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Folder Check Passed": {
+      "main": [
+        [
+          {
+            "node": "Is Reserve Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Reserve Request": {
+      "main": [
+        [
+          {
+            "node": "Generate Drive File ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Resolve Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Resolve Request": {
+      "main": [
+        [
+          {
+            "node": "Get Drive Account",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Reconcile Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Reconcile Request": {
+      "main": [
+        [
+          {
+            "node": "Lookup Reserved File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Upload Route",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Upload Route": {
+      "main": [
+        [
+          {
+            "node": "Upload Lookup Reserved File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Drive File ID": {
+      "main": [
+        [
+          {
+            "node": "Build Reserve Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reserve Result": {
+      "main": [
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Drive Account": {
+      "main": [
+        [
+          {
+            "node": "Get EnergyGrid Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get EnergyGrid Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Build Resolve Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Resolve Result": {
+      "main": [
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup Reserved File": {
+      "main": [
+        [
+          {
+            "node": "Search Invoice Identity",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Invoice Identity": {
+      "main": [
+        [
+          {
+            "node": "Search Canonical Name",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Canonical Name": {
+      "main": [
+        [
+          {
+            "node": "Classify Reconcile Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reconcile Result": {
+      "main": [
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Lookup Reserved File": {
+      "main": [
+        [
+          {
+            "node": "Upload Search Invoice Identity",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Search Invoice Identity": {
+      "main": [
+        [
+          {
+            "node": "Upload Search Canonical Name",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Search Canonical Name": {
+      "main": [
+        [
+          {
+            "node": "Classify Before Upload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Before Upload": {
+      "main": [
+        [
+          {
+            "node": "Upload Is Required",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Resumable Upload": {
+      "main": [
+        [
+          {
+            "node": "Check Upload Session",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Upload Session": {
+      "main": [
+        [
+          {
+            "node": "Session Is Open",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach PDF For Upload": {
+      "main": [
+        [
+          {
+            "node": "Upload PDF Bytes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload PDF Bytes": {
+      "main": [
+        [
+          {
+            "node": "Record Upload Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Upload Result": {
+      "main": [
+        [
+          {
+            "node": "Readback Reserved File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Readback Reserved File": {
+      "main": [
+        [
+          {
+            "node": "Readback Search Invoice Identity",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Readback Search Invoice Identity": {
+      "main": [
+        [
+          {
+            "node": "Readback Search Canonical Name",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Readback Search Canonical Name": {
+      "main": [
+        [
+          {
+            "node": "Classify Upload Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Upload Result": {
+      "main": [
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Is Required": {
+      "main": [
+        [
+          {
+            "node": "Start Resumable Upload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Session Is Open": {
+      "main": [
+        [
+          {
+            "node": "Attach PDF For Upload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Session Already Exists",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Session Already Exists": {
+      "main": [
+        [
+          {
+            "node": "Readback Reserved File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond With Drive Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8000-000000000301",
+  "sourceWorkflowId": null
+}

@@ -6,9 +6,11 @@ context. It inventories the complete available bill list, validates PDFs, and
 publishes each new bill exactly once to a private archive.
 
 This project is intentionally self-contained under this directory. It does not
-add n8n, email parsing, recurring LLM use, AutoCount integration, or a live API
-client. The browser is used only through the selectors in
-`energygrid_bill_downloader/portal.py`; all tests use the local synthetic portal.
+add AutoCount integration or recurring LLM use. The legacy browser source uses
+the selectors in `energygrid_bill_downloader/portal.py`; all tests use local
+synthetic sources. The dual-stream v2 repository path includes a bounded direct
+HTTP adapter and optional loopback email delivery, but requires no runtime n8n
+dependency; its inactive workflow export lives at the repository root.
 
 ## Direct-HTTP MVP daily path (DL-XB-199 G3-101)
 
@@ -26,6 +28,44 @@ reopened for scoped discovery. Details, the fail-closed reference table, the
 single-run lock and the alert contract are in `docs/runbook.md`.
 
 The browser source below remains the legacy default when `source` is absent.
+
+## Dual-stream v3 path (EnergyGrid #226 G3)
+
+The `energygrid.runtime.v3` configuration separates `EB_BILL` and `TENANT_BILL`.
+Daily work is a planned sequence of deterministic core commands sequenced by
+the bounded Claude supervisor: `acquire` (complete inventory, one unique latest
+per stream, canonical PDF below `EB Bill/` or `Tenant Bill/`, never a backfill),
+`drive-intent`, `drive-upload` / `drive-reconcile` (exact bytes to Google Drive
+through the inactive n8n "EnergyGrid - Drive Upload" workflow using one
+pre-generated Drive file ID per operation) and `deliver` (email only after
+`DRIVE_VERIFIED`). `DRIVE_VERIFIED` requires the reserved file ID, folder,
+canonical name, MIME type, the exact seven appProperties, size and a SHA-256 or
+MD5+size checksum read back from Google; size alone or an HTTP 200 never counts.
+Google Drive for desktop and filesystem `DRIVE_STAGED` are retired; historical
+`DRIVE_STAGED` rows are preserved and frozen. The combined v2 `run`/`list` is
+retired. See [the v3 contract](docs/v3_claude_n8n_drive_contract.md).
+
+Tenant Bill production admission remains `UNBOUND` pending accepted #227
+evidence. No endpoint, discriminator, or date format is inferred. The committed
+`config/energygrid.dual_stream.example.json` is an inert v3 shape with both
+streams and both Drive folder bindings unbound and all private paths as
+examples.
+
+Email dispatch is backed by SQLite. The runner durably creates `PENDING_SEND`
+and atomically writes a one-time dispatch marker before its single webhook
+request. A crash, timeout, invalid response, or lost result becomes
+`DELIVERY_OUTCOME_UNCERTAIN`; ordinary runs never resend that invoice. The n8n
+Data Table is secondary evidence and does not provide transactional uniqueness
+or send permission. See the [EnergyGrid runbook](docs/runbook.md) and the
+[inactive invoice-delivery workflow notes](../n8n-workflows/README.md).
+
+`migrate-state` plans are read-only unless `--apply` is explicitly supplied.
+With a v3 config it migrates v1 or v2 state to v3 in one backed-up transaction.
+Any migration of a real private database and any classification of historical
+PDFs require a separate reviewed handoff; repository tests use synthetic data
+only. The 08:00 +08:00 Scheduler XML remains disabled. Repository changes do
+not register a task, contact Energy@Grid, stage real files, import a workflow,
+or send email.
 
 ## Install and configure
 
