@@ -510,6 +510,144 @@ response IDs and message payloads stay private. Public-safe evidence is limited
 to outbox/job IDs, the HMAC source reference, hashes, state, version, attempt,
 template and bounded error codes.
 
+## Shopify-authoritative M1 create (#155 G3)
+
+Shopify is the authoritative member profile system. Milestone 1 is
+`NEW_CANONICAL_MEMBER_MG_CREATE_ONLY` in scope: a new, post-cutover customer
+classified `member-mg` is created once in AutoCount. Legacy/`XB Member`
+conversion, profile update sync, anti-entropy writeback and welcome/expiry
+communications are outside M1.
+
+```text
+Shopify HTTPS webhook -> dedicated shopify-webhook-receiver (direct HMAC)
+  -> durable gateway (PostgreSQL) -> asynchronous authoritative Shopify re-read
+  -> Shopify M1 job -> one outbound-only AC2 worker -> official MemberCommand
+```
+
+n8n is not part of the Shopify protected-customer ingress.
+
+### Receiver
+
+`xb_member_gateway.shopify_receiver` is a separate process with exactly one
+application route, `POST /v1/shopify/webhooks/customers` (plus `GET /livez`).
+It reads the exact raw bytes (bounded at 256 KiB, `Content-Length` only),
+verifies `X-Shopify-Hmac-Sha256` in constant time with the app client secret
+before parsing anything, and only then allowlists topic
+(`customers/create`, `customers/update`, `customer.tags_added`), shop domain and
+API version. It persists only bounded delivery metadata and the Customer GID in
+`shopify_webhook_receipts` (append-only, deduplicated on
+`X-Shopify-Webhook-Id`; a conflicting replay fails closed with 409). No raw
+body, body digest or profile value is stored or logged. It binds a private IP
+literal only; the public hostname/TLS/tunnel is a separate deployment binding.
+
+### Cutover baseline and admission
+
+The cutover `C` is the sealed baseline's `capture_started_at`: read from the
+gateway PostgreSQL clock (the clock of `shopify_webhook_receipts.received_at`),
+UTC, floored to a whole second, fixed before page 1. Earlier aborted or
+unsealed captures define nothing. Shopify `Customer.createdAt` (read-only,
+`read_customers`) is the only temporal classifier: historical iff
+`createdAt < C`, post-cutover iff `createdAt >= C` (equality is post-cutover).
+Webhook arrival time and page position never classify.
+
+`capture-baseline` refuses to start unless admission is disabled and an
+HMAC-verified receipt for the exact bound shop and API version was received
+strictly before `C` (also enforced by the baseline INSERT trigger). It scans
+every customer by cursor until `hasNextPage=false` (not a search query),
+requests `createdAt` for every node and fails closed on any non-retryable read
+error, malformed page, missing/repeated cursor, duplicate GID, page overrun or
+a missing/malformed/offset-less `createdAt`. Historical `member-mg` GIDs form the
+baseline; scanned `member-mg` GIDs with `createdAt >= C` become GID-only
+`PENDING` admissions (an existing admission row stays authoritative). The
+historical rows, the transition rows and the seal commit in one transaction;
+the sealed baseline stores GIDs only with a count and a sorted-GID SHA-256
+digest that the database recomputes. `createdAt` is never stored. Admission is
+disabled until `POST /v1/control/shopify-admission/enable` binds the sealed
+baseline after an independent application-side recompute; the binding is
+immutable.
+
+Baseline transient-read recovery (#155 Web-directed continuation). Only
+retryable reads are retried: GraphQL `THROTTLED` (`shopify_graphql_throttled`),
+HTTP 429/500/502/503/504 (`shopify_http_error`, retryable) and transport
+failure (`shopify_transport_failed`). Every other GraphQL, HTTP, response,
+page, cursor, node, identity or `createdAt` failure stays an immediate
+fail-closed capture failure with no sleep. A retry repeats the exact same
+cursor and request; a page contributes data only after it is structurally
+accepted whole, so a failed attempt contributes nothing, and `C` is read once
+before page 1 and never recomputed. Bounds: 6 attempts per page, 60 retries per
+capture, 900 seconds total sleep, 60 seconds per sleep, minimum 1 second, no
+jitter; every budget is checked before sleeping. The wait is:
+
+| Signal | Wait |
+|---|---|
+| `THROTTLED` with valid `extensions.cost` `requestedQueryCost` > `throttleStatus.maximumAvailable` | immediate `baseline_query_cost_exceeds_bucket` |
+| HTTP 429/503 with a numeric `Retry-After` (integer or decimal, e.g. `2.0`) | that value rounded up to whole seconds (minimum 1); above 60 -> immediate `baseline_read_retry_after_exceeds_bound` |
+| `THROTTLED` with complete valid `requestedQueryCost`/`currentlyAvailable`/`restoreRate` (> 0)/`maximumAvailable` | `ceil((requested - currentlyAvailable) / restoreRate)`, bounded to 1..60 (1 if already available) |
+| anything else retryable, or missing/non-numeric/non-finite/negative metadata | `min(2^(n-1), 60)` for the page's retry `n` |
+
+Exhaustion fails as `baseline_read_retry_exhausted:<client code>` (the CLI
+prints the bounded prefix only). A failed or exhausted capture seals nothing,
+writes no `CAPTURING`, baseline-member or capture-created transition row and
+enables nothing; webhook `PENDING` rows received independently meanwhile stay
+legitimate. A later operator rerun is a fresh capture with a fresh `C`. Retry
+errors carry only the code, the normalised Retry-After seconds and the numeric
+throttle budget: never a token, header dump, body, cursor, GID or provider
+message. The existing receiver-before-`C` check plus the seal-time trigger
+remain the receiver proof; admission-processor retry semantics are unchanged.
+
+The admission processor re-reads each pending GID with read-only Admin GraphQL
+(`read_customers` only) and decides:
+
+| Authoritative read | Outcome |
+|---|---|
+| no `member-mg` / customer absent | `NOT_ELIGIBLE` (re-evaluated on a later webhook) |
+| GID in sealed baseline | `EXCLUDED_BASELINE` (`MANUAL_REVIEW` `baseline_created_at_conflict` if the re-read reports `createdAt >= C`) |
+| `member-legacy` or `XB Member` tag | `MANUAL_REVIEW` |
+| `createdAt < C` and not in baseline | `MANUAL_REVIEW` (an update or later tag never invents a signup) |
+| Name or membership dates absent | bounded wait, then `MANUAL_REVIEW` |
+| malformed date/phone/email, expiry before start | `MANUAL_REVIEW` |
+| otherwise | `ADMITTED` exactly once (GID -> job unique) |
+
+### Protected transient payload
+
+The only protected values are the AutoCount create fields (Name, optional
+MobilePhone, optional EmailAddress, RegisterDate, ExpiryDate). They exist at
+rest only as an `xbpp1` AES-256-GCM envelope (PyCA `cryptography`) bound by
+associated data to the envelope version, key id and job id, in
+`shopify_protected_payloads`. The key is the runtime binding named by
+`protected_payload_key_env` (base64url of 32 random bytes) and must not alias
+any other credential. Shopify jobs carry `{}` as `canonical_payload` and no
+`response_id` (database-enforced). The envelope is immutable and may be deleted
+only when the job is terminal, no writer may still be live and no uncertain
+write remains; a commit-time trigger then scrubs it and records a PII-free
+`shopify_payload_scrubs` row. Readiness fails closed while any terminal resolved
+job still holds a payload.
+
+### Worker, MemberNo and AutoCount field floor
+
+The worker claim decrypts the payload in memory for the worker channel only.
+The worker reports a boolean-only legacy precheck (exact normalised phone
+against legacy MemberNo and MobilePhone, exact normalised email; name is never
+match authority); any hit or lookup failure is `MANUAL_REVIEW`. MemberNo comes
+only from `MemberCommand.GetNextMemberNo()`; a positively occupied candidate is
+re-generated up to `max_member_no_candidates` before the fence, a repeated or
+ambiguous candidate never advances, and after the fence no other MemberNo is
+ever selected. A candidate the worker probed FREE that another gateway job
+already durably holds (`member_no_allocation_race`) is positively occupied: it
+consumes the same `max_member_no_candidates` budget, the worker is told
+`gateway_bound_collision` and may request the next generated candidate, and a
+repeat of it is `member_no_generator_not_advancing` review. The adapter `shopify_m1` profile accepts only MemberNo, Name,
+RegisterDate, ExpiryDate, optional MobilePhone/EmailAddress; it owns
+`MemberType=Default`, `OpeningPoints=0`, `IsActive=T`, `Individual=T`; never
+assigns DOB; writes absent contact fields as DBNull (empty strings are
+rejected and never equal NULL on readback); calls `SaveMember` exactly once
+and requires exact null-aware readback. Protected values reach the child
+writer only on stdin and never appear in arguments, stdout/stderr, logs, the
+cycle status or operator projections. Uncertain writes are reconciled
+read-only with the same bound MemberNo (`-ReconcileOnce`).
+
+Shopify jobs never create or require the Forms `welcome_v1` outbox.
+
 ## Unsupported production prerequisites
 
 Before any separately controlled activation, an owner must positively verify:

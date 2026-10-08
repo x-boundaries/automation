@@ -18,5 +18,11 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   `n8n-offline`, `existing-member-regression`, and dependent
   `full-offline-regression`; no PostgreSQL service container is introduced.
 
+- Shopify M1 (#155 G3) adds the four Shopify schemas, the Shopify example
+  config, migration 0006 and `tests/test_member_gateway_shopify_ps.py` to the
+  path filters. `gateway-tests` installs exactly `cryptography==46.0.7` (the
+  protected-payload AEAD); it is the only permitted install besides tzdata.
+  The real-PostgreSQL migration tests remain local-only and skip in hosted CI.
+
 This status file records CI shape only; it is not a deployment approval or a
 claim that a remote check has passed before the branch is published.

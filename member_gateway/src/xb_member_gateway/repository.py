@@ -31,6 +31,8 @@ from .models import (
     ReconciliationCheckRecord, SOURCE_PAGE_ITEM_FIELDS, SOURCE_PAGE_SIZE, ScanEpoch, ScanEpochStatus,
     ScanPage, ScanPageState, SourceAdmissionMode, SourceCursor, SourceEvent, SourceRejection,
     WelcomeEmailOutbox, WelcomeEmailState, WriteIntentRecord, WriterExecutionHold, WriterHoldState,
+    SHOPIFY_FORM_ALIAS, SHOPIFY_MAPPING_VERSION, SHOPIFY_NOT_ELIGIBLE_CODES, SHOPIFY_REVIEW_CODES,
+    SHOPIFY_SOURCE_SYSTEM, ShopifyAdmission, ShopifyAdmissionState, ShopifyBaseline, ShopifyWebhookReceipt,
 )
 from .notifications import (
     WELCOME_INITIAL_DELAY, WELCOME_LEASE_SECONDS, WELCOME_MAX_ATTEMPTS, WELCOME_TEMPLATE_ID,
@@ -221,6 +223,121 @@ def welcome_result_target(outbox: WelcomeEmailOutbox, outcome: str) -> WelcomeEm
     raise WelcomeEmailError("welcome_email_outcome_invalid")
 
 
+# Shopify M1 shared validation. Every value accepted here is PII-free
+# delivery metadata, a GID, a digest, an envelope or a bounded code.
+SHOPIFY_LIVE_HOLD_STATES = frozenset({WriterHoldState.PENDING, WriterHoldState.REGISTERED, WriterHoldState.QUARANTINED})
+_SHOPIFY_GID_RE = re.compile(r"^gid://shopify/Customer/[1-9][0-9]{0,19}$")
+_SHOPIFY_WEBHOOK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,100}$")
+_SHOPIFY_JOB_ID_RE = re.compile(r"^job-[0-9a-f]{32}$")
+_SHOPIFY_ENVELOPE_RE = re.compile(r"^xbpp1\.[a-z0-9][a-z0-9-]{0,31}\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{24,8192}$")
+_APPROVAL_REFERENCE_RE = re.compile(r"^[A-Za-z0-9._:/#-]{1,160}$")
+LEGACY_PRECHECK_OUTCOMES = frozenset({"NO_CANDIDATE", "CANDIDATE_FOUND", "LOOKUP_FAILED"})
+
+
+def validate_source_systems(value: Any) -> frozenset[str]:
+    if not isinstance(value, tuple) or not value or any(item not in {"google_forms", SHOPIFY_SOURCE_SYSTEM} for item in value):
+        raise RepositoryError("claim_source_systems_invalid")
+    return frozenset(value)
+
+
+def shopify_baseline_digest(gids: list[str] | tuple[str, ...]) -> str:
+    import hashlib
+
+    return "sha256:" + hashlib.sha256("\n".join(sorted(gids)).encode("ascii")).hexdigest()
+
+
+def validate_shopify_receipt(receipt: ShopifyWebhookReceipt) -> None:
+    if not isinstance(receipt, ShopifyWebhookReceipt):
+        raise SourceConflict("shopify_receipt_invalid")
+    if not _SHOPIFY_WEBHOOK_ID_RE.fullmatch(receipt.webhook_id) or not _SHOPIFY_GID_RE.fullmatch(receipt.customer_gid):
+        raise SourceConflict("shopify_receipt_invalid")
+    if receipt.topic not in {"customers/create", "customers/update", "customer.tags_added"}:
+        raise SourceConflict("shopify_receipt_invalid")
+
+
+def validate_baseline_members(gids: Any) -> tuple[tuple[str, ...], int, str]:
+    if not isinstance(gids, (list, tuple)) or any(not isinstance(gid, str) or not _SHOPIFY_GID_RE.fullmatch(gid) for gid in gids):
+        raise SourceConflict("shopify_baseline_members_invalid")
+    if len(set(gids)) != len(gids):
+        raise SourceConflict("shopify_baseline_duplicate_gid")
+    members = tuple(sorted(gids))
+    return members, len(members), shopify_baseline_digest(members)
+
+
+def validate_cutover_partition(historical: Any, transition: Any, cutover_at: Any) -> tuple[tuple[str, ...], int, str, tuple[str, ...], datetime]:
+    """Historical baseline + transition GIDs for one whole-second UTC cutover.
+
+    The two sets come from one ``createdAt`` partition and must be disjoint;
+    a GID can never be both historical and admissible.
+    """
+
+    members, count, digest = validate_baseline_members(historical)
+    if not isinstance(transition, (list, tuple)) or any(not isinstance(gid, str) or not _SHOPIFY_GID_RE.fullmatch(gid) for gid in transition):
+        raise SourceConflict("shopify_transition_members_invalid")
+    if len(set(transition)) != len(transition):
+        raise SourceConflict("shopify_transition_duplicate_gid")
+    if set(transition) & set(members):
+        raise SourceConflict("shopify_baseline_transition_overlap")
+    if not isinstance(cutover_at, datetime) or cutover_at.tzinfo is None or cutover_at.microsecond != 0:
+        raise SourceConflict("shopify_cutover_not_whole_second")
+    return members, count, digest, tuple(sorted(transition)), cutover_at.astimezone(timezone.utc)
+
+
+def validate_approval_reference(value: Any) -> str:
+    if not isinstance(value, str) or not _APPROVAL_REFERENCE_RE.fullmatch(value):
+        raise SourceConflict("shopify_admission_approval_reference_required")
+    return value
+
+
+def validate_shopify_resolution(outcome: str, code: str | None) -> tuple[ShopifyAdmissionState, str | None]:
+    if outcome == "NOT_ELIGIBLE" and code in SHOPIFY_NOT_ELIGIBLE_CODES:
+        return ShopifyAdmissionState.NOT_ELIGIBLE, code
+    if outcome == "EXCLUDED_BASELINE" and code is None:
+        return ShopifyAdmissionState.EXCLUDED_BASELINE, None
+    if outcome == "MANUAL_REVIEW" and code in SHOPIFY_REVIEW_CODES:
+        return ShopifyAdmissionState.MANUAL_REVIEW, code
+    raise SourceConflict("shopify_resolution_invalid")
+
+
+def validate_shopify_admit(job_id: str, envelope: str, payload_digest: str, key_id: str) -> None:
+    import hashlib
+
+    if not isinstance(job_id, str) or not _SHOPIFY_JOB_ID_RE.fullmatch(job_id):
+        raise SourceConflict("shopify_admit_invalid")
+    if not isinstance(envelope, str) or not _SHOPIFY_ENVELOPE_RE.fullmatch(envelope) or envelope.split(".")[1] != key_id:
+        raise SourceConflict("shopify_admit_invalid")
+    if payload_digest != "sha256:" + hashlib.sha256(envelope.encode("ascii")).hexdigest():
+        raise SourceConflict("shopify_admit_invalid")
+
+
+def validate_legacy_precheck(outcome: Any, phone: Any, mobile: Any, email: Any) -> tuple[str, bool, bool, bool]:
+    if outcome not in LEGACY_PRECHECK_OUTCOMES or not all(isinstance(item, bool) for item in (phone, mobile, email)):
+        raise SourceConflict("shopify_precheck_invalid")
+    if (outcome == "CANDIDATE_FOUND") != (phone or mobile or email):
+        raise SourceConflict("shopify_precheck_invalid")
+    return outcome, phone, mobile, email
+
+
+def shopify_status_projection(*, enabled: bool, baseline: ShopifyBaseline | None, baseline_verified: bool, bound_baseline: str | None, counts: Mapping[str, int], review: Mapping[str, int], payloads: int, leftovers: int, job_states: Mapping[str, int]) -> dict[str, Any]:
+    """Operator-safe Shopify status: counts and codes only, no GID/MemberNo/value."""
+
+    return {
+        "schema_version": "xb.member.gateway.shopify_operator_status.v1",
+        "admission_enabled": bool(enabled),
+        "baseline_sealed": baseline is not None,
+        "baseline_verified": bool(baseline_verified),
+        "baseline_bound": bound_baseline is not None and baseline is not None and bound_baseline == baseline.baseline_id,
+        "baseline_member_count": None if baseline is None else baseline.member_count,
+        "admission_counts": {state.value: int(counts.get(state.value, 0)) for state in ShopifyAdmissionState},
+        "admission_review_codes": {code: int(review[code]) for code in sorted(review)},
+        "job_state_counts": {state.value: int(job_states.get(state.value, 0)) for state in JobState},
+        "manual_review_job_count": int(job_states.get(JobState.MANUAL_REVIEW.value, 0)),
+        "uncertain_job_count": int(job_states.get(JobState.WRITE_OUTCOME_UNCERTAIN.value, 0)),
+        "protected_payload_count": int(payloads),
+        "terminal_payload_leftover_count": int(leftovers),
+    }
+
+
 class MemberProbe(Protocol):
     def __call__(self, candidate: str) -> ProbeStatus:
         ...
@@ -271,6 +388,14 @@ class InMemoryRepository:
         self._outbox: dict[str, WelcomeEmailOutbox] = {}
         self._outbox_by_job: dict[str, str] = {}
         self._welcome_events: list[dict[str, Any]] = []
+        self._shopify_receipts: dict[str, tuple[ShopifyWebhookReceipt, str]] = {}
+        self._shopify_admissions: dict[str, ShopifyAdmission] = {}
+        self._shopify_baselines: dict[str, ShopifyBaseline] = {}
+        self._shopify_baseline_members: dict[str, frozenset[str]] = {}
+        self._shopify_control: dict[str, Any] = {"enabled": False, "baseline_id": None, "approval_reference": None, "state_version": 0}
+        self._shopify_payloads: dict[str, dict[str, str]] = {}
+        self._shopify_scrubs: dict[str, dict[str, str]] = {}
+        self._shopify_prechecks: dict[tuple[str, int], dict[str, Any]] = {}
         if source_cutover_watermark is not None:
             self.initialize_source_cursor(
                 "google_forms", "member_registration", "member-intake.v1",
@@ -825,11 +950,13 @@ class InMemoryRepository:
                 self._leases.pop(job.job_id, None)
                 count += 1
                 self._audit("lease_reclaimed", job, count=count)
+            self._sweep_shopify_payloads()
             return count
 
-    def claim_job(self, worker_id: str, *, lease_seconds: int = 600, now: datetime | None = None) -> JobRecord | None:
+    def claim_job(self, worker_id: str, *, lease_seconds: int = 600, now: datetime | None = None, source_systems: tuple[str, ...] = ("google_forms",)) -> JobRecord | None:
         if not worker_id or any(character.isspace() for character in worker_id):
             raise RepositoryError("worker_id_invalid")
+        sources = validate_source_systems(source_systems)
         current = utc_now(now)
         with self._lock:
             self._assert_kill_switch_clear()
@@ -838,7 +965,7 @@ class InMemoryRepository:
                 return None
             if self._active_leases(current):
                 return None
-            jobs = [job for job in self._jobs.values() if job.state in {JobState.QUEUED, JobState.RETRY_WAIT} and (not job.next_attempt_at or parse_timestamp(job.next_attempt_at) <= current) and job.attempt < job.max_attempts]
+            jobs = [job for job in self._jobs.values() if job.source_system in sources and job.state in {JobState.QUEUED, JobState.RETRY_WAIT} and (not job.next_attempt_at or parse_timestamp(job.next_attempt_at) <= current) and job.attempt < job.max_attempts]
             if not jobs:
                 return None
             job = sorted(jobs, key=lambda item: (item.created_at, item.job_id))[0]
@@ -942,6 +1069,8 @@ class InMemoryRepository:
                 raise AllocationConflict("positive_free_probe_required")
             if job.state != JobState.PRECHECKING:
                 raise AllocationConflict("allocation_requires_prechecking")
+            if job.is_shopify and not self.shopify_precheck_clear(job_id):
+                raise AllocationConflict("shopify_legacy_precheck_required")
             allocation = AllocationRecord(job_id, job.response_id, member_no, probe_reference, timestamp(current))
             self._allocations[job_id] = allocation
             self._allocations_by_member[member_no] = job_id
@@ -998,12 +1127,18 @@ class InMemoryRepository:
             self._move(job, JobState.MANUAL_REVIEW)
             job.last_error_code = "bound_member_no_recheck_not_free"
             self._audit("allocation_recheck_failed", job, error_code=job.last_error_code)
+            self._sweep_shopify_payloads()
             return self._copy(job)
 
     def get_allocation(self, job_id: str) -> AllocationRecord | None:
         with self._lock:
             self._job(job_id)
             return self._copy(self._allocations.get(job_id))
+
+    def member_no_owner(self, member_no: str) -> str | None:
+        """Job id durably bound to ``member_no`` (bindings are write-once)."""
+        with self._lock:
+            return self._allocations_by_member.get(member_no)
 
     def get_fresh_recheck(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> AllocationRecheck | None:
         current = utc_now(now)
@@ -1443,7 +1578,7 @@ class InMemoryRepository:
                     if reconciliation_case_id is None:
                         raise RepositoryError("reconciliation_case_required")
                     self._require_reconciliation_evidence(result, reconciliation_case_id)
-                if existing.status == ResultStatus.CREATED_VERIFIED:
+                if existing.status == ResultStatus.CREATED_VERIFIED and not job.is_shopify:
                     self._verify_welcome_outbox(job)
                 return self._copy(existing), True
             reconciliation_projection = False
@@ -1492,9 +1627,10 @@ class InMemoryRepository:
             job.last_error_code = result.error_code
             self._result_history.setdefault(result.job_id, []).append(self._copy(result))
             self._results[result.job_id] = self._copy(result)
-            if result.status == ResultStatus.CREATED_VERIFIED:
+            if result.status == ResultStatus.CREATED_VERIFIED and not job.is_shopify:
                 # Atomic with the positive result, on both the leased worker
-                # path and the exact-match reconciliation projection.
+                # path and the exact-match reconciliation projection. Shopify
+                # M1 jobs never create the historical Forms welcome outbox.
                 self._create_welcome_outbox(job, current)
             if require_lease:
                 confirmed = self._writer_holds.get(result.job_id)
@@ -1508,6 +1644,7 @@ class InMemoryRepository:
                 job.lease_owner = None
                 job.lease_expires_at = None
             self._audit("result_acknowledged", job, error_code=result.error_code)
+            self._sweep_shopify_payloads()
             return self._copy(result), False
 
     def _create_welcome_outbox(self, job: JobRecord, current: datetime) -> WelcomeEmailOutbox:
@@ -1682,6 +1819,7 @@ class InMemoryRepository:
             self._move(job, JobState(target))
             if error_code:
                 job.last_error_code = error_code
+            self._sweep_shopify_payloads()
             return self._copy(job)
 
     def probe_member_no(self, candidate: str) -> ProbeStatus:
@@ -1740,20 +1878,335 @@ class InMemoryRepository:
             return tuple(self._result_conflicts)
 
 
+    # ------------------------------------------------------------------
+    # Shopify-authoritative M1 (#155). Protected values exist here only as
+    # the AEAD envelope in ``_shopify_payloads`` and are swept at the end of
+    # every state-changing call once the job is terminally resolved.
+    # ------------------------------------------------------------------
+
+    def _shopify_scrub_eligible(self, job: JobRecord) -> bool:
+        if not job.is_shopify or job.state not in TERMINAL_STATES:
+            return False
+        hold = self._writer_holds.get(job.job_id)
+        if hold is not None and hold.state in SHOPIFY_LIVE_HOLD_STATES:
+            return False
+        if job.dispatch_fence_id is None:
+            return True
+        result = self._results.get(job.job_id)
+        return result is not None and result.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
+
+    def _sweep_shopify_payloads(self) -> None:
+        for job_id in list(self._shopify_payloads):
+            job = self._jobs.get(job_id)
+            if job is not None and self._shopify_scrub_eligible(job):
+                stored = self._shopify_payloads.pop(job_id)
+                self._shopify_scrubs[job_id] = {"key_id": stored["key_id"], "job_state": job.state.value, "scrubbed_at": timestamp()}
+                self._audit("shopify_protected_payload_scrubbed", job)
+
+    def record_shopify_webhook(self, receipt: ShopifyWebhookReceipt, *, now: datetime | None = None) -> bool:
+        validate_shopify_receipt(receipt)
+        current = utc_now(now)
+        with self._lock:
+            existing = self._shopify_receipts.get(receipt.webhook_id)
+            if existing is not None:
+                if existing[0].facts() != receipt.facts():
+                    self._audit("shopify_webhook_conflict", error_code="shopify_webhook_identity_conflict")
+                    raise SourceConflict("shopify_webhook_identity_conflict")
+                return True
+            self._shopify_receipts[receipt.webhook_id] = (receipt, timestamp(current))
+            admission = self._shopify_admissions.get(receipt.customer_gid)
+            if admission is None:
+                self._shopify_admissions[receipt.customer_gid] = ShopifyAdmission(
+                    receipt.customer_gid, hmac_reference(receipt.customer_gid, self._reference_key),
+                    ShopifyAdmissionState.PENDING, None, 0, timestamp(current), None, 0, None, timestamp(current),
+                )
+            elif admission.state == ShopifyAdmissionState.NOT_ELIGIBLE:
+                self._shopify_admissions[receipt.customer_gid] = replace(
+                    admission, state=ShopifyAdmissionState.PENDING, reason_code=None, next_check_at=timestamp(current),
+                    state_version=admission.state_version + 1, updated_at=timestamp(current),
+                )
+            self._audit("shopify_webhook_received")
+            return False
+
+    def get_shopify_admission(self, gid: str) -> ShopifyAdmission | None:
+        with self._lock:
+            return self._copy(self._shopify_admissions.get(gid))
+
+    def shopify_cutover_now(self, *, now: datetime | None = None) -> datetime:
+        """Cutover ``C``: the repository clock, UTC, floored to a whole second."""
+        return utc_now(now).replace(microsecond=0)
+
+    def _receiver_verified_before(self, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        return any(
+            receipt.shop_domain == shop_domain and receipt.api_version == api_version and parse_timestamp(received) < cutover_at
+            for receipt, received in self._shopify_receipts.values()
+        )
+
+    def shopify_receiver_verified_before(self, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        """True only if an HMAC-verified receipt for this exact binding was
+        recorded strictly before ``C`` (receipts exist only after HMAC)."""
+        with self._lock:
+            return self._receiver_verified_before(shop_domain, api_version, utc_now(cutover_at))
+
+    def store_shopify_baseline(self, gids: tuple[str, ...] | list[str], *, transition_gids: tuple[str, ...] | list[str] = (), shop_domain: str, api_version: str, capture_started_at: datetime, now: datetime | None = None) -> ShopifyBaseline:
+        """Atomically seal the historical baseline and make every scanned
+        post-cutover GID a durable GID-only PENDING admission (existing rows
+        stay authoritative). Nothing is kept if any check fails."""
+
+        members, count, digest, transition, cutover_at = validate_cutover_partition(gids, transition_gids, capture_started_at)
+        sealed_at = max(utc_now(now), cutover_at)
+        with self._lock:
+            if self._shopify_control["enabled"] or any(item.state == "SEALED" for item in self._shopify_baselines.values()):
+                raise SourceConflict("shopify_baseline_already_sealed")
+            if not self._receiver_verified_before(shop_domain, api_version, cutover_at):
+                raise SourceConflict("shopify_receiver_not_verified_before_cutover")
+            baseline_id = f"baseline-{uuid.uuid4().hex}"
+            # Independent recompute over the stored rows before sealing.
+            stored = frozenset(members)
+            if (len(stored), shopify_baseline_digest(sorted(stored))) != (count, digest):
+                raise SourceConflict("shopify_baseline_seal_mismatch")
+            baseline = ShopifyBaseline(baseline_id, "SEALED", shop_domain, api_version, timestamp(cutover_at), timestamp(sealed_at), count, digest)
+            self._shopify_baselines[baseline_id] = baseline
+            self._shopify_baseline_members[baseline_id] = stored
+            for gid in transition:
+                if gid not in self._shopify_admissions:
+                    self._shopify_admissions[gid] = ShopifyAdmission(
+                        gid, hmac_reference(gid, self._reference_key), ShopifyAdmissionState.PENDING, None, 0,
+                        timestamp(sealed_at), None, 0, None, timestamp(sealed_at),
+                    )
+            self._audit("shopify_baseline_sealed", count=count)
+            return self._copy(baseline)
+
+    def get_shopify_baseline(self) -> ShopifyBaseline | None:
+        with self._lock:
+            sealed = [item for item in self._shopify_baselines.values() if item.state == "SEALED"]
+            return self._copy(sealed[0]) if sealed else None
+
+    def verify_shopify_baseline(self, baseline_id: str) -> bool:
+        with self._lock:
+            baseline = self._shopify_baselines.get(baseline_id)
+            members = self._shopify_baseline_members.get(baseline_id)
+            if baseline is None or members is None or baseline.state != "SEALED":
+                return False
+            return (len(members), shopify_baseline_digest(sorted(members))) == (baseline.member_count, baseline.member_digest)
+
+    def enable_shopify_admission(self, baseline_id: str, approval_reference: str, *, now: datetime | None = None) -> None:
+        validate_approval_reference(approval_reference)
+        with self._lock:
+            if not self.verify_shopify_baseline(baseline_id):
+                raise SourceConflict("shopify_admission_baseline_verification_failed")
+            bound = self._shopify_control["baseline_id"]
+            if bound is not None and bound != baseline_id:
+                raise SourceConflict("shopify_admission_baseline_immutable")
+            self._shopify_control.update(enabled=True, baseline_id=baseline_id, approval_reference=approval_reference, state_version=self._shopify_control["state_version"] + 1)
+
+    def disable_shopify_admission(self, *, now: datetime | None = None) -> None:
+        with self._lock:
+            self._shopify_control.update(enabled=False, state_version=self._shopify_control["state_version"] + 1)
+
+    def shopify_admission_gate(self) -> tuple[str, datetime] | None:
+        with self._lock:
+            baseline_id = self._shopify_control["baseline_id"]
+            if not self._shopify_control["enabled"] or baseline_id is None or not self.verify_shopify_baseline(baseline_id):
+                return None
+            return baseline_id, parse_timestamp(self._shopify_baselines[baseline_id].capture_started_at)
+
+    def due_shopify_admissions(self, *, now: datetime | None = None, limit: int = 20) -> list[ShopifyAdmission]:
+        current = utc_now(now)
+        with self._lock:
+            due = [
+                item for item in self._shopify_admissions.values()
+                if item.state == ShopifyAdmissionState.PENDING and item.next_check_at is not None and parse_timestamp(item.next_check_at) <= current
+            ]
+            due.sort(key=lambda item: (item.next_check_at or "", item.customer_gid))
+            return [self._copy(item) for item in due[: max(0, limit)]]
+
+    def shopify_baseline_contains(self, baseline_id: str, gid: str) -> bool:
+        with self._lock:
+            return gid in self._shopify_baseline_members.get(baseline_id, frozenset())
+
+    def _shopify_pending(self, gid: str, expected_state_version: int) -> ShopifyAdmission:
+        admission = self._shopify_admissions.get(gid)
+        if admission is None:
+            raise SourceConflict("shopify_admission_not_found")
+        if admission.state != ShopifyAdmissionState.PENDING:
+            raise SourceConflict("shopify_admission_not_pending")
+        if admission.state_version != expected_state_version:
+            raise SourceConflict("shopify_admission_state_version_mismatch")
+        return admission
+
+    def wait_shopify_admission(self, gid: str, *, expected_state_version: int, code: str, next_check_at: datetime, now: datetime | None = None) -> ShopifyAdmission:
+        if code not in SHOPIFY_REVIEW_CODES:
+            raise SourceConflict("shopify_reason_code_invalid")
+        current = utc_now(now)
+        with self._lock:
+            admission = self._shopify_pending(gid, expected_state_version)
+            updated = replace(admission, reason_code=code, check_count=admission.check_count + 1, next_check_at=timestamp(utc_now(next_check_at)), state_version=admission.state_version + 1, updated_at=timestamp(current))
+            self._shopify_admissions[gid] = updated
+            return self._copy(updated)
+
+    def defer_shopify_admission(self, gid: str, *, expected_state_version: int, next_check_at: datetime, now: datetime | None = None) -> ShopifyAdmission:
+        current = utc_now(now)
+        with self._lock:
+            admission = self._shopify_pending(gid, expected_state_version)
+            updated = replace(admission, next_check_at=timestamp(utc_now(next_check_at)), state_version=admission.state_version + 1, updated_at=timestamp(current))
+            self._shopify_admissions[gid] = updated
+            return self._copy(updated)
+
+    def resolve_shopify_admission(self, gid: str, *, expected_state_version: int, outcome: str, code: str | None, baseline_id: str | None, now: datetime | None = None) -> ShopifyAdmission:
+        state, code = validate_shopify_resolution(outcome, code)
+        current = utc_now(now)
+        with self._lock:
+            admission = self._shopify_pending(gid, expected_state_version)
+            if state == ShopifyAdmissionState.EXCLUDED_BASELINE and (baseline_id is None or gid not in self._shopify_baseline_members.get(baseline_id, frozenset())):
+                raise SourceConflict("shopify_member_admission_baseline_required")
+            updated = replace(
+                admission, state=state, reason_code=code, check_count=admission.check_count + 1,
+                next_check_at=None, baseline_id=baseline_id,
+                state_version=admission.state_version + 1, updated_at=timestamp(current),
+            )
+            self._shopify_admissions[gid] = updated
+            self._audit("shopify_admission_resolved", error_code=code)
+            return self._copy(updated)
+
+    def admit_shopify_member(self, gid: str, *, expected_state_version: int, baseline_id: str, job_id: str, envelope: str, payload_digest: str, key_id: str, now: datetime | None = None) -> JobRecord:
+        validate_shopify_admit(job_id, envelope, payload_digest, key_id)
+        current = utc_now(now)
+        with self._lock:
+            admission = self._shopify_pending(gid, expected_state_version)
+            gate = self.shopify_admission_gate()
+            if gate is None or gate[0] != baseline_id:
+                raise SourceConflict("shopify_admission_disabled")
+            if gid in self._shopify_baseline_members.get(baseline_id, frozenset()):
+                raise SourceConflict("shopify_baseline_member_not_admissible")
+            if job_id in self._jobs or job_id in self._shopify_scrubs:
+                raise SourceConflict("shopify_job_identity_conflict")
+            job = JobRecord(
+                job_id=job_id, request_id=job_id, source_response_ref=admission.gid_ref, response_id=None,
+                payload_hash=payload_digest, operation="member.create", member_payload={}, created_at=timestamp(current),
+                source_system=SHOPIFY_SOURCE_SYSTEM, form_alias=SHOPIFY_FORM_ALIAS, mapping_version=SHOPIFY_MAPPING_VERSION,
+            )
+            self._move(job, JobState.VALIDATED)
+            self._move(job, JobState.QUEUED)
+            self._jobs[job_id] = job
+            self._probes[job_id] = []
+            self._shopify_payloads[job_id] = {"key_id": key_id, "envelope": envelope, "payload_digest": payload_digest}
+            self._shopify_admissions[gid] = replace(
+                admission, state=ShopifyAdmissionState.ADMITTED, reason_code=None, check_count=admission.check_count + 1,
+                next_check_at=None, job_id=job_id, baseline_id=baseline_id,
+                state_version=admission.state_version + 1, updated_at=timestamp(current),
+            )
+            self._audit("shopify_member_admitted", job)
+            return self._copy(job)
+
+    def get_shopify_protected_payload(self, job_id: str) -> str | None:
+        with self._lock:
+            job = self._job(job_id)
+            if not job.is_shopify:
+                raise RepositoryError("shopify_job_required")
+            stored = self._shopify_payloads.get(job_id)
+            return None if stored is None else stored["envelope"]
+
+    def shopify_payload_present(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._shopify_payloads
+
+    def shopify_scrub_record(self, job_id: str) -> dict[str, str] | None:
+        with self._lock:
+            return self._copy(self._shopify_scrubs.get(job_id))
+
+    def protected_payload_leftover_count(self) -> int:
+        with self._lock:
+            return sum(1 for job_id in self._shopify_payloads if self._shopify_scrub_eligible(self._jobs[job_id]))
+
+    def record_shopify_legacy_precheck(self, job_id: str, worker_id: str, *, outcome: str, phone_member_no_hit: bool, mobile_phone_hit: bool, email_hit: bool, now: datetime | None = None) -> JobRecord:
+        flags = validate_legacy_precheck(outcome, phone_member_no_hit, mobile_phone_hit, email_hit)
+        current = utc_now(now)
+        with self._lock:
+            try:
+                job = self._job(job_id)
+                if not job.is_shopify:
+                    raise RepositoryError("shopify_job_required")
+                self._assert_no_active_writer_hold()
+                self._lease(job, worker_id, current)
+                if job.dispatch_fenced or job.state not in {JobState.PRECHECKING, JobState.ALLOCATION_BOUND}:
+                    raise RepositoryError("shopify_precheck_state_invalid")
+                key = (job_id, job.attempt)
+                existing = self._shopify_prechecks.get(key)
+                if existing is not None:
+                    if existing["flags"] != flags:
+                        raise SourceConflict("shopify_precheck_conflict")
+                    return self._copy(job)
+                self._shopify_prechecks[key] = {"flags": flags, "recorded_at": timestamp(current)}
+                if outcome != "NO_CANDIDATE":
+                    self._move(job, JobState.MANUAL_REVIEW)
+                    job.last_error_code = "legacy_member_candidate_review" if outcome == "CANDIDATE_FOUND" else "legacy_lookup_failed_review"
+                    self._audit("shopify_legacy_precheck_review", job, error_code=job.last_error_code)
+                return self._copy(job)
+            finally:
+                self._sweep_shopify_payloads()
+
+    def shopify_precheck_clear(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._job(job_id)
+            entry = self._shopify_prechecks.get((job_id, job.attempt))
+            return entry is not None and entry["flags"][0] == "NO_CANDIDATE"
+
+    def claim_shopify_reconciliation(self, *, now: datetime | None = None) -> JobRecord | None:
+        current = utc_now(now)
+        with self._lock:
+            if self._active_writer_holds() or self._active_leases(current):
+                return None
+            candidates = []
+            for job in self._jobs.values():
+                hold = self._writer_holds.get(job.job_id)
+                case = next((item for item in self._reconciliation_cases.values() if item.job_id == job.job_id), None)
+                if (
+                    job.is_shopify and job.state == JobState.WRITE_OUTCOME_UNCERTAIN and job.job_id in self._shopify_payloads
+                    and hold is not None and hold.state == WriterHoldState.CLEARED and hold.termination_confirmed_at is not None
+                    and (case is None or case.state == ReconciliationCaseState.OPEN)
+                ):
+                    candidates.append(job)
+            candidates.sort(key=lambda item: (item.created_at, item.job_id))
+            return self._copy(candidates[0]) if candidates else None
+
+    def shopify_operator_status(self) -> dict[str, Any]:
+        with self._lock:
+            baseline = self.get_shopify_baseline()
+            counts = {state.value: 0 for state in ShopifyAdmissionState}
+            review: dict[str, int] = {}
+            for item in self._shopify_admissions.values():
+                counts[item.state.value] += 1
+                if item.state == ShopifyAdmissionState.MANUAL_REVIEW and item.reason_code:
+                    review[item.reason_code] = review.get(item.reason_code, 0) + 1
+            return shopify_status_projection(
+                enabled=self._shopify_control["enabled"], baseline=baseline,
+                baseline_verified=baseline is not None and self.verify_shopify_baseline(baseline.baseline_id),
+                bound_baseline=self._shopify_control["baseline_id"], counts=counts, review=review,
+                payloads=len(self._shopify_payloads), leftovers=self.protected_payload_leftover_count(),
+                job_states={state.value: sum(1 for job in self._jobs.values() if job.is_shopify and job.state == state) for state in JobState},
+            )
+
+
 class PostgresRepository:
     """PostgreSQL implementation of the same bounded repository contract."""
 
     _JOB_SELECT = """
-        SELECT j.job_id,COALESCE(obs.request_id,''),sr.source_response_ref,j.response_id,
+        SELECT j.job_id,COALESCE(obs.request_id,CASE WHEN j.source_system='shopify' THEN j.job_id ELSE '' END),
+               COALESCE(sr.source_response_ref,sa.gid_ref),j.response_id,
                j.payload_hash,j.operation,j.canonical_payload,j.created_at,j.state,
                j.state_version,j.attempt_count,j.max_attempts,j.next_attempt_at,
                j.lease_owner,j.lease_expires_at,j.allocation_member_no,
                j.allocation_probe_reference,j.write_intent_id,j.dispatch_fence_id,
                j.save_invocation_count,j.result_status,j.last_error_code,
-               'google_forms',COALESCE(obs.form_alias,''),COALESCE(obs.mapping_version,''),j.attempt_started_at,
+               j.source_system,
+               COALESCE(obs.form_alias,CASE WHEN j.source_system='shopify' THEN 'shopify_customer' ELSE '' END),
+               COALESCE(obs.mapping_version,CASE WHEN j.source_system='shopify' THEN 'shopify-member-m1.v1' ELSE '' END),
+               j.attempt_started_at,
                hold.lifecycle
         FROM xb_member_gateway.jobs j
-        JOIN xb_member_gateway.source_responses sr ON sr.response_id=j.response_id
+        LEFT JOIN xb_member_gateway.source_responses sr ON sr.response_id=j.response_id
+        LEFT JOIN xb_member_gateway.shopify_member_admissions sa ON sa.job_id=j.job_id
         LEFT JOIN LATERAL (
             SELECT request_id,form_alias,mapping_version FROM xb_member_gateway.source_observations
             WHERE response_id=j.response_id ORDER BY observed_at DESC,observation_id DESC LIMIT 1
@@ -1979,7 +2432,7 @@ class PostgresRepository:
     )
     _REQUIRED_MIGRATIONS = (
         "0001_member_gateway", "0002_result_event_history", "0003_writer_termination_quarantine",
-        "0004_forms_ingest_cursor", "0005_member_vertical_slice",
+        "0004_forms_ingest_cursor", "0005_member_vertical_slice", "0006_shopify_member_m1",
     )
 
     @classmethod
@@ -2149,13 +2602,17 @@ class PostgresRepository:
                 )
                 if int(cursor.fetchone()[0]) != 0:
                     raise RepositoryError("source_handling_receipt_missing")
-                # Historical success is never silently made email-eligible.
+                # Historical Forms success is never silently made email-eligible.
+                # Shopify M1 jobs neither require nor create the Forms outbox.
                 cursor.execute(
-                    "SELECT count(*) FROM xb_member_gateway.results r WHERE r.status='CREATED_VERIFIED' AND NOT EXISTS "
+                    "SELECT count(*) FROM xb_member_gateway.results r "
+                    "JOIN xb_member_gateway.jobs fj ON fj.job_id=r.job_id AND fj.source_system='google_forms' "
+                    "WHERE r.status='CREATED_VERIFIED' AND NOT EXISTS "
                     "(SELECT 1 FROM xb_member_gateway.welcome_email_outbox o WHERE o.job_id=r.job_id)"
                 )
                 if int(cursor.fetchone()[0]) != 0:
                     raise RepositoryError("created_verified_without_welcome_outbox")
+                self._assert_no_terminal_protected_payload(cursor)
 
     def begin_source_epoch(
         self, form_alias: str, mapping_version: str, *, admission_mode: SourceAdmissionMode,
@@ -2327,8 +2784,8 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT flag_name,enabled FROM xb_member_gateway.control_flags WHERE flag_name IN ('production_activation_enabled','kill_switch_enabled')")
                 controls = {str(row[0]): bool(row[1]) for row in cursor.fetchall()}
-                cursor.execute("SELECT count(*) FROM xb_member_gateway.schema_migrations WHERE version IN ('0001_member_gateway','0002_result_event_history','0003_writer_termination_quarantine','0004_forms_ingest_cursor','0005_member_vertical_slice')")
-                migrations_ready = int(cursor.fetchone()[0]) == 5
+                cursor.execute("SELECT count(*) FROM xb_member_gateway.schema_migrations WHERE version IN ('0001_member_gateway','0002_result_event_history','0003_writer_termination_quarantine','0004_forms_ingest_cursor','0005_member_vertical_slice','0006_shopify_member_m1')")
+                migrations_ready = int(cursor.fetchone()[0]) == 6
                 cursor.execute("SELECT count(*) FROM xb_member_gateway.source_ingest_cursors")
                 cursor_ready = int(cursor.fetchone()[0]) > 0
                 cursor.execute("SELECT count(*) FROM xb_member_gateway.leases WHERE active=TRUE AND expires_at>%s", (current,))
@@ -2748,9 +3205,10 @@ class PostgresRepository:
                 self._lock_writer_termination_gate(cursor)
                 return self._reclaim_expired_cursor(cursor, current)
 
-    def claim_job(self, worker_id: str, *, lease_seconds: int = 600, now: datetime | None = None) -> JobRecord | None:
+    def claim_job(self, worker_id: str, *, lease_seconds: int = 600, now: datetime | None = None, source_systems: tuple[str, ...] = ("google_forms",)) -> JobRecord | None:
         if not worker_id or any(character.isspace() for character in worker_id):
             raise RepositoryError("worker_id_invalid")
+        sources = sorted(validate_source_systems(source_systems))
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
@@ -2765,7 +3223,7 @@ class PostgresRepository:
                 )
                 if cursor.fetchone() is not None:
                     return None
-                cursor.execute("SELECT job_id FROM xb_member_gateway.jobs WHERE state IN ('QUEUED','RETRY_WAIT') AND (next_attempt_at IS NULL OR next_attempt_at<=%s) AND attempt_count<max_attempts ORDER BY created_at,job_id FOR UPDATE SKIP LOCKED LIMIT 1", (current,))
+                cursor.execute("SELECT job_id FROM xb_member_gateway.jobs WHERE state IN ('QUEUED','RETRY_WAIT') AND source_system = ANY(%s) AND (next_attempt_at IS NULL OR next_attempt_at<=%s) AND attempt_count<max_attempts ORDER BY created_at,job_id FOR UPDATE SKIP LOCKED LIMIT 1", (sources, current))
                 row = cursor.fetchone()
                 if row is None:
                     return None
@@ -2834,6 +3292,13 @@ class PostgresRepository:
                 row = cursor.fetchone()
                 return None if row is None else AllocationRecord(job_id,row[0],row[1],row[2],self._dt(row[3]) or "")
 
+    def member_no_owner(self, member_no: str) -> str | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT job_id FROM xb_member_gateway.member_allocations WHERE member_no=%s", (member_no,))
+                row = cursor.fetchone()
+                return None if row is None else str(row[0])
+
     def bind_allocation(self, job_id: str, member_no: str, probe_reference: str, worker_id: str, *, now: datetime | None = None) -> AllocationRecord:
         current = utc_now(now)
         with self._transaction() as connection:
@@ -2859,6 +3324,8 @@ class PostgresRepository:
                     raise AllocationConflict("member_no_allocation_race")
                 if job.state != JobState.PRECHECKING:
                     raise AllocationConflict("allocation_requires_prechecking")
+                if job.is_shopify and not self._shopify_precheck_clear_cursor(cursor, job):
+                    raise AllocationConflict("shopify_legacy_precheck_required")
                 cursor.execute("INSERT INTO xb_member_gateway.member_allocations(allocation_id,job_id,response_id,member_no,probe_reference,bound_at) VALUES(%s,%s,%s,%s,%s,%s)", (str(uuid.uuid4()),job_id,job.response_id,member_no,probe_reference,current))
                 self._advance(cursor,job,JobState.ALLOCATION_BOUND,current,{"allocation_member_no":member_no,"allocation_probe_reference":probe_reference})
                 return AllocationRecord(job_id,job.response_id,member_no,probe_reference,timestamp(current))
@@ -3113,7 +3580,7 @@ class PostgresRepository:
                         if reconciliation_case_id is None:
                             raise RepositoryError("reconciliation_case_required")
                         self._require_reconciliation_evidence(cursor, result, reconciliation_case_id)
-                    if existing[1] == ResultStatus.CREATED_VERIFIED.value:
+                    if existing[1] == ResultStatus.CREATED_VERIFIED.value and not job.is_shopify:
                         # Duplicate positive ack verifies, never creates/backfills.
                         self._verify_welcome_outbox_cursor(cursor, job)
                     return result, True
@@ -3156,9 +3623,10 @@ class PostgresRepository:
                     self._advance(cursor,job,target,current,{"result_status":result.status.value,"save_invocation_count":1,"last_error_code":result.error_code})
                 else:
                     cursor.execute("UPDATE xb_member_gateway.jobs SET result_status=%s,save_invocation_count=1,last_error_code=%s,updated_at=%s WHERE job_id=%s", (result.status.value,result.error_code,current,result.job_id))
-                if result.status == ResultStatus.CREATED_VERIFIED:
+                if result.status == ResultStatus.CREATED_VERIFIED and not job.is_shopify:
                     # Atomic with the first positive result on both the leased
                     # worker path and the exact-match reconciliation projection.
+                    # Shopify M1 jobs never create the Forms welcome outbox.
                     self._insert_welcome_outbox_cursor(cursor, job, current)
                 if require_lease:
                     cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (result.job_id,))
@@ -3364,3 +3832,429 @@ class PostgresRepository:
                 }:
                     raise WriterTerminationConflict("writer_termination_proof_required")
                 return self._advance(cursor,job,desired,current,{"last_error_code":error_code} if error_code else None)
+
+    # ------------------------------------------------------------------
+    # Shopify-authoritative M1 (#155). Mirrors the in-memory contract; the
+    # database additionally enforces seal recompute, admission gating,
+    # payload immutability and the commit-time terminal scrub (0006).
+    # ------------------------------------------------------------------
+
+    _ADMISSION_COLUMNS = "customer_gid,gid_ref,state,reason_code,check_count,next_check_at,job_id,state_version,baseline_id,updated_at"
+    _BASELINE_COLUMNS = "baseline_id,state,shop_domain,api_version,capture_started_at,sealed_at,member_count,member_digest"
+
+    @classmethod
+    def _admission_from_row(cls, row: tuple[Any, ...]) -> ShopifyAdmission:
+        return ShopifyAdmission(
+            str(row[0]), str(row[1]), ShopifyAdmissionState(row[2]), row[3], int(row[4]), cls._dt(row[5]),
+            row[6], int(row[7]), row[8], cls._dt(row[9]) or "",
+        )
+
+    @classmethod
+    def _baseline_from_row(cls, row: tuple[Any, ...]) -> ShopifyBaseline:
+        return ShopifyBaseline(str(row[0]), str(row[1]), str(row[2]), str(row[3]), cls._dt(row[4]) or "", cls._dt(row[5]), int(row[6]), str(row[7]))
+
+    def record_shopify_webhook(self, receipt: ShopifyWebhookReceipt, *, now: datetime | None = None) -> bool:
+        validate_shopify_receipt(receipt)
+        current = utc_now(now)
+        gid_ref = hmac_reference(receipt.customer_gid, self._reference_key_bytes())
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.shopify_webhook_receipts(webhook_id,topic,shop_domain,api_version,event_id,triggered_at,customer_gid,received_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (webhook_id) DO NOTHING RETURNING webhook_id",
+                    (receipt.webhook_id, receipt.topic, receipt.shop_domain, receipt.api_version, receipt.event_id, receipt.triggered_at, receipt.customer_gid, current),
+                )
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        "SELECT topic,shop_domain,api_version,event_id,triggered_at,customer_gid FROM xb_member_gateway.shopify_webhook_receipts WHERE webhook_id=%s",
+                        (receipt.webhook_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is None or tuple(row) != receipt.facts():
+                        raise SourceConflict("shopify_webhook_identity_conflict")
+                    return True
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.shopify_member_admissions(customer_gid,gid_ref,state,next_check_at,created_at,updated_at) "
+                    "VALUES(%s,%s,'PENDING',%s,%s,%s) ON CONFLICT (customer_gid) DO NOTHING",
+                    (receipt.customer_gid, gid_ref, current, current, current),
+                )
+                cursor.execute(
+                    "UPDATE xb_member_gateway.shopify_member_admissions SET state='PENDING',reason_code=NULL,next_check_at=%s,"
+                    "state_version=state_version+1,updated_at=%s WHERE customer_gid=%s AND state='NOT_ELIGIBLE'",
+                    (current, current, receipt.customer_gid),
+                )
+                return False
+
+    def get_shopify_admission(self, gid: str) -> ShopifyAdmission | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT {self._ADMISSION_COLUMNS} FROM xb_member_gateway.shopify_member_admissions WHERE customer_gid=%s", (gid,))
+                row = cursor.fetchone()
+                return None if row is None else self._admission_from_row(row)
+
+    def _verify_baseline_cursor(self, cursor: Any, baseline_id: str) -> ShopifyBaseline | None:
+        cursor.execute(f"SELECT {self._BASELINE_COLUMNS} FROM xb_member_gateway.shopify_cutover_baselines WHERE baseline_id=%s AND state='SEALED'", (baseline_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        baseline = self._baseline_from_row(row)
+        # Independent readback: recompute in the application from the rows,
+        # not from the stored seal or the SQL digest function.
+        cursor.execute("SELECT customer_gid FROM xb_member_gateway.shopify_baseline_members WHERE baseline_id=%s ORDER BY customer_gid COLLATE \"C\"", (baseline_id,))
+        members = [str(item[0]) for item in cursor.fetchall()]
+        if (len(members), shopify_baseline_digest(members)) != (baseline.member_count, baseline.member_digest):
+            return None
+        return baseline
+
+    def shopify_cutover_now(self) -> datetime:
+        """Cutover ``C`` from the gateway PostgreSQL clock (the same clock as
+        ``shopify_webhook_receipts.received_at``), UTC, whole second."""
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT date_trunc('second', clock_timestamp())")
+                value = cursor.fetchone()[0]
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise RepositoryError("shopify_cutover_clock_invalid")
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _receiver_verified_before_cursor(cursor: Any, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        cursor.execute(
+            "SELECT 1 FROM xb_member_gateway.shopify_webhook_receipts WHERE shop_domain=%s AND api_version=%s AND received_at<%s LIMIT 1",
+            (shop_domain, api_version, cutover_at),
+        )
+        return cursor.fetchone() is not None
+
+    def shopify_receiver_verified_before(self, shop_domain: str, api_version: str, cutover_at: datetime) -> bool:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._receiver_verified_before_cursor(cursor, shop_domain, api_version, utc_now(cutover_at))
+
+    def store_shopify_baseline(self, gids: tuple[str, ...] | list[str], *, transition_gids: tuple[str, ...] | list[str] = (), shop_domain: str, api_version: str, capture_started_at: datetime, now: datetime | None = None) -> ShopifyBaseline:
+        """One transaction: historical members, transition PENDING rows and the
+        SEALED state commit together (0006 also re-checks the receiver proof,
+        whole-second ``C`` and the recount/digest)."""
+
+        members, count, digest, transition, started = validate_cutover_partition(gids, transition_gids, capture_started_at)
+        current = max(utc_now(now), started)
+        reference_key = self._reference_key_bytes()
+        baseline_id = f"baseline-{uuid.uuid4().hex}"
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT admission_enabled FROM xb_member_gateway.shopify_admission_control WHERE control_id=1 FOR UPDATE")
+                control = cursor.fetchone()
+                if control is None or bool(control[0]):
+                    raise SourceConflict("shopify_baseline_already_sealed")
+                cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_cutover_baselines WHERE state='SEALED' LIMIT 1")
+                if cursor.fetchone() is not None:
+                    raise SourceConflict("shopify_baseline_already_sealed")
+                if not self._receiver_verified_before_cursor(cursor, shop_domain, api_version, started):
+                    raise SourceConflict("shopify_receiver_not_verified_before_cutover")
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.shopify_cutover_baselines(baseline_id,state,shop_domain,api_version,capture_started_at,member_count,member_digest) "
+                    "VALUES(%s,'CAPTURING',%s,%s,%s,%s,%s)",
+                    (baseline_id, shop_domain, api_version, started, count, digest),
+                )
+                for gid in members:
+                    cursor.execute("INSERT INTO xb_member_gateway.shopify_baseline_members(baseline_id,customer_gid) VALUES(%s,%s)", (baseline_id, gid))
+                for gid in transition:
+                    # GID-only; an existing admission row stays authoritative.
+                    cursor.execute(
+                        "INSERT INTO xb_member_gateway.shopify_member_admissions(customer_gid,gid_ref,state,next_check_at,created_at,updated_at) "
+                        "VALUES(%s,%s,'PENDING',%s,%s,%s) ON CONFLICT (customer_gid) DO NOTHING",
+                        (gid, hmac_reference(gid, reference_key), current, current, current),
+                    )
+                cursor.execute("UPDATE xb_member_gateway.shopify_cutover_baselines SET state='SEALED',sealed_at=%s WHERE baseline_id=%s AND state='CAPTURING'", (current, baseline_id))
+                if cursor.rowcount != 1:
+                    raise SourceConflict("shopify_baseline_seal_mismatch")
+                baseline = self._verify_baseline_cursor(cursor, baseline_id)
+                if baseline is None:
+                    raise SourceConflict("shopify_baseline_seal_mismatch")
+                return baseline
+
+    def get_shopify_baseline(self) -> ShopifyBaseline | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT {self._BASELINE_COLUMNS} FROM xb_member_gateway.shopify_cutover_baselines WHERE state='SEALED'")
+                row = cursor.fetchone()
+                return None if row is None else self._baseline_from_row(row)
+
+    def verify_shopify_baseline(self, baseline_id: str) -> bool:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._verify_baseline_cursor(cursor, baseline_id) is not None
+
+    def enable_shopify_admission(self, baseline_id: str, approval_reference: str, *, now: datetime | None = None) -> None:
+        validate_approval_reference(approval_reference)
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT baseline_id FROM xb_member_gateway.shopify_admission_control WHERE control_id=1 FOR UPDATE")
+                row = cursor.fetchone()
+                if row is None:
+                    raise RepositoryError("shopify_admission_control_missing")
+                if row[0] is not None and row[0] != baseline_id:
+                    raise SourceConflict("shopify_admission_baseline_immutable")
+                if self._verify_baseline_cursor(cursor, baseline_id) is None:
+                    raise SourceConflict("shopify_admission_baseline_verification_failed")
+                cursor.execute(
+                    "UPDATE xb_member_gateway.shopify_admission_control SET admission_enabled=TRUE,baseline_id=%s,approval_reference=%s,"
+                    "state_version=state_version+1,updated_at=%s WHERE control_id=1",
+                    (baseline_id, approval_reference, current),
+                )
+
+    def disable_shopify_admission(self, *, now: datetime | None = None) -> None:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE xb_member_gateway.shopify_admission_control SET admission_enabled=FALSE,state_version=state_version+1,updated_at=%s WHERE control_id=1", (current,))
+                if cursor.rowcount != 1:
+                    raise RepositoryError("shopify_admission_control_missing")
+
+    def _admission_gate_cursor(self, cursor: Any, *, for_update: bool = False) -> tuple[str, datetime] | None:
+        cursor.execute("SELECT admission_enabled,baseline_id FROM xb_member_gateway.shopify_admission_control WHERE control_id=1" + (" FOR UPDATE" if for_update else ""))
+        row = cursor.fetchone()
+        if row is None or not bool(row[0]) or row[1] is None:
+            return None
+        baseline = self._verify_baseline_cursor(cursor, str(row[1]))
+        if baseline is None:
+            return None
+        return baseline.baseline_id, parse_timestamp(baseline.capture_started_at)
+
+    def shopify_admission_gate(self) -> tuple[str, datetime] | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._admission_gate_cursor(cursor)
+
+    def due_shopify_admissions(self, *, now: datetime | None = None, limit: int = 20) -> list[ShopifyAdmission]:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT {self._ADMISSION_COLUMNS} FROM xb_member_gateway.shopify_member_admissions "
+                    "WHERE state='PENDING' AND next_check_at<=%s ORDER BY next_check_at,customer_gid LIMIT %s",
+                    (current, max(0, int(limit))),
+                )
+                return [self._admission_from_row(row) for row in cursor.fetchall()]
+
+    def shopify_baseline_contains(self, baseline_id: str, gid: str) -> bool:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_baseline_members WHERE baseline_id=%s AND customer_gid=%s", (baseline_id, gid))
+                return cursor.fetchone() is not None
+
+    def _shopify_pending_cursor(self, cursor: Any, gid: str, expected_state_version: int) -> ShopifyAdmission:
+        cursor.execute(f"SELECT {self._ADMISSION_COLUMNS} FROM xb_member_gateway.shopify_member_admissions WHERE customer_gid=%s FOR UPDATE", (gid,))
+        row = cursor.fetchone()
+        if row is None:
+            raise SourceConflict("shopify_admission_not_found")
+        admission = self._admission_from_row(row)
+        if admission.state != ShopifyAdmissionState.PENDING:
+            raise SourceConflict("shopify_admission_not_pending")
+        if admission.state_version != expected_state_version:
+            raise SourceConflict("shopify_admission_state_version_mismatch")
+        return admission
+
+    def wait_shopify_admission(self, gid: str, *, expected_state_version: int, code: str, next_check_at: datetime, now: datetime | None = None) -> ShopifyAdmission:
+        if code not in SHOPIFY_REVIEW_CODES:
+            raise SourceConflict("shopify_reason_code_invalid")
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._shopify_pending_cursor(cursor, gid, expected_state_version)
+                cursor.execute(
+                    f"UPDATE xb_member_gateway.shopify_member_admissions SET reason_code=%s,check_count=check_count+1,next_check_at=%s,"
+                    f"state_version=state_version+1,updated_at=%s WHERE customer_gid=%s RETURNING {self._ADMISSION_COLUMNS}",
+                    (code, utc_now(next_check_at), current, gid),
+                )
+                return self._admission_from_row(cursor.fetchone())
+
+    def defer_shopify_admission(self, gid: str, *, expected_state_version: int, next_check_at: datetime, now: datetime | None = None) -> ShopifyAdmission:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._shopify_pending_cursor(cursor, gid, expected_state_version)
+                cursor.execute(
+                    f"UPDATE xb_member_gateway.shopify_member_admissions SET next_check_at=%s,state_version=state_version+1,updated_at=%s "
+                    f"WHERE customer_gid=%s RETURNING {self._ADMISSION_COLUMNS}",
+                    (utc_now(next_check_at), current, gid),
+                )
+                return self._admission_from_row(cursor.fetchone())
+
+    def resolve_shopify_admission(self, gid: str, *, expected_state_version: int, outcome: str, code: str | None, baseline_id: str | None, now: datetime | None = None) -> ShopifyAdmission:
+        state, code = validate_shopify_resolution(outcome, code)
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._shopify_pending_cursor(cursor, gid, expected_state_version)
+                if state == ShopifyAdmissionState.EXCLUDED_BASELINE:
+                    cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_baseline_members WHERE baseline_id=%s AND customer_gid=%s", (baseline_id, gid))
+                    if baseline_id is None or cursor.fetchone() is None:
+                        raise SourceConflict("shopify_member_admission_baseline_required")
+                cursor.execute(
+                    f"UPDATE xb_member_gateway.shopify_member_admissions SET state=%s,reason_code=%s,check_count=check_count+1,next_check_at=NULL,"
+                    f"baseline_id=%s,state_version=state_version+1,updated_at=%s WHERE customer_gid=%s RETURNING {self._ADMISSION_COLUMNS}",
+                    (state.value, code, baseline_id, current, gid),
+                )
+                return self._admission_from_row(cursor.fetchone())
+
+    def admit_shopify_member(self, gid: str, *, expected_state_version: int, baseline_id: str, job_id: str, envelope: str, payload_digest: str, key_id: str, now: datetime | None = None) -> JobRecord:
+        validate_shopify_admit(job_id, envelope, payload_digest, key_id)
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                gate = self._admission_gate_cursor(cursor, for_update=True)
+                if gate is None or gate[0] != baseline_id:
+                    raise SourceConflict("shopify_admission_disabled")
+                self._shopify_pending_cursor(cursor, gid, expected_state_version)
+                cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_baseline_members WHERE baseline_id=%s AND customer_gid=%s", (baseline_id, gid))
+                if cursor.fetchone() is not None:
+                    raise SourceConflict("shopify_baseline_member_not_admissible")
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.jobs(job_id,response_id,operation,payload_hash,canonical_payload,state,state_version,attempt_count,max_attempts,created_at,source_system) "
+                    "VALUES(%s,NULL,'member.create',%s,'{}'::jsonb,'QUEUED',2,0,3,%s,'shopify')",
+                    (job_id, payload_digest, current),
+                )
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.shopify_protected_payloads(job_id,key_id,envelope,payload_digest,created_at) VALUES(%s,%s,%s,%s,%s)",
+                    (job_id, key_id, envelope, payload_digest, current),
+                )
+                cursor.execute(
+                    "UPDATE xb_member_gateway.shopify_member_admissions SET state='ADMITTED',reason_code=NULL,check_count=check_count+1,next_check_at=NULL,"
+                    "job_id=%s,baseline_id=%s,state_version=state_version+1,updated_at=%s WHERE customer_gid=%s AND state='PENDING'",
+                    (job_id, baseline_id, current, gid),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceConflict("shopify_admission_not_pending")
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.audit_events(event_type,job_id,operation,state) VALUES('shopify_member_admitted',%s,'member.create','QUEUED')",
+                    (job_id,),
+                )
+                return self._select_job(cursor, job_id)
+
+    def get_shopify_protected_payload(self, job_id: str) -> str | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                job = self._select_job(cursor, job_id)
+                if not job.is_shopify:
+                    raise RepositoryError("shopify_job_required")
+                cursor.execute("SELECT envelope FROM xb_member_gateway.shopify_protected_payloads WHERE job_id=%s", (job_id,))
+                row = cursor.fetchone()
+                return None if row is None else str(row[0])
+
+    def shopify_payload_present(self, job_id: str) -> bool:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM xb_member_gateway.shopify_protected_payloads WHERE job_id=%s", (job_id,))
+                return cursor.fetchone() is not None
+
+    def shopify_scrub_record(self, job_id: str) -> dict[str, str] | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT key_id,job_state,scrubbed_at FROM xb_member_gateway.shopify_payload_scrubs WHERE job_id=%s", (job_id,))
+                row = cursor.fetchone()
+                return None if row is None else {"key_id": str(row[0]), "job_state": str(row[1]), "scrubbed_at": self._dt(row[2]) or ""}
+
+    def _terminal_payload_count_cursor(self, cursor: Any) -> int:
+        cursor.execute(
+            "SELECT count(*) FROM xb_member_gateway.shopify_protected_payloads pp "
+            "WHERE xb_member_gateway.shopify_payload_scrub_eligible(pp.job_id)"
+        )
+        return int(cursor.fetchone()[0])
+
+    def _assert_no_terminal_protected_payload(self, cursor: Any) -> None:
+        if self._terminal_payload_count_cursor(cursor) != 0:
+            raise RepositoryError("terminal_job_protected_payload_present")
+
+    def protected_payload_leftover_count(self) -> int:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._terminal_payload_count_cursor(cursor)
+
+    def _shopify_precheck_clear_cursor(self, cursor: Any, job: JobRecord) -> bool:
+        cursor.execute("SELECT outcome FROM xb_member_gateway.shopify_legacy_prechecks WHERE job_id=%s AND attempt_count=%s", (job.job_id, job.attempt))
+        row = cursor.fetchone()
+        return row is not None and row[0] == "NO_CANDIDATE"
+
+    def shopify_precheck_clear(self, job_id: str) -> bool:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._shopify_precheck_clear_cursor(cursor, self._select_job(cursor, job_id))
+
+    def record_shopify_legacy_precheck(self, job_id: str, worker_id: str, *, outcome: str, phone_member_no_hit: bool, mobile_phone_hit: bool, email_hit: bool, now: datetime | None = None) -> JobRecord:
+        flags = validate_legacy_precheck(outcome, phone_member_no_hit, mobile_phone_hit, email_hit)
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                self._assert_no_active_writer_hold_cursor(cursor)
+                job = self._select_job(cursor, job_id, for_update=True)
+                if not job.is_shopify:
+                    raise RepositoryError("shopify_job_required")
+                self._require_lease(cursor, job, worker_id, current)
+                if job.dispatch_fenced or job.state not in {JobState.PRECHECKING, JobState.ALLOCATION_BOUND}:
+                    raise RepositoryError("shopify_precheck_state_invalid")
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.shopify_legacy_prechecks(job_id,attempt_count,outcome,phone_member_no_hit,mobile_phone_hit,email_hit,recorded_at) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (job_id,attempt_count) DO NOTHING RETURNING job_id",
+                    (job_id, job.attempt, *flags, current),
+                )
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        "SELECT outcome,phone_member_no_hit,mobile_phone_hit,email_hit FROM xb_member_gateway.shopify_legacy_prechecks WHERE job_id=%s AND attempt_count=%s",
+                        (job_id, job.attempt),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None or (str(existing[0]), bool(existing[1]), bool(existing[2]), bool(existing[3])) != flags:
+                        raise SourceConflict("shopify_precheck_conflict")
+                    return job
+                if outcome != "NO_CANDIDATE":
+                    code = "legacy_member_candidate_review" if outcome == "CANDIDATE_FOUND" else "legacy_lookup_failed_review"
+                    job = self._advance(cursor, job, JobState.MANUAL_REVIEW, current, {"last_error_code": code})
+                return job
+
+    def claim_shopify_reconciliation(self, *, now: datetime | None = None) -> JobRecord | None:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                cursor.execute("SELECT 1 FROM xb_member_gateway.writer_execution_holds WHERE lifecycle <> 'CLEARED' LIMIT 1")
+                if cursor.fetchone() is not None:
+                    return None
+                cursor.execute("SELECT 1 FROM xb_member_gateway.leases WHERE active=TRUE AND expires_at>%s LIMIT 1", (current,))
+                if cursor.fetchone() is not None:
+                    return None
+                cursor.execute(
+                    "SELECT sj.job_id FROM xb_member_gateway.jobs sj "
+                    "JOIN xb_member_gateway.writer_execution_holds h ON h.job_id=sj.job_id "
+                    "JOIN xb_member_gateway.shopify_protected_payloads pp ON pp.job_id=sj.job_id "
+                    "WHERE sj.source_system='shopify' AND sj.state='WRITE_OUTCOME_UNCERTAIN' AND h.lifecycle='CLEARED' "
+                    "AND h.termination_confirmed_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM xb_member_gateway.reconciliation_cases rc "
+                    "WHERE rc.job_id=sj.job_id AND rc.case_state<>'OPEN') ORDER BY sj.created_at,sj.job_id LIMIT 1"
+                )
+                row = cursor.fetchone()
+                return None if row is None else self._select_job(cursor, str(row[0]))
+
+    def shopify_operator_status(self) -> dict[str, Any]:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT admission_enabled,baseline_id FROM xb_member_gateway.shopify_admission_control WHERE control_id=1")
+                control = cursor.fetchone() or (False, None)
+                cursor.execute(f"SELECT {self._BASELINE_COLUMNS} FROM xb_member_gateway.shopify_cutover_baselines WHERE state='SEALED'")
+                row = cursor.fetchone()
+                baseline = None if row is None else self._baseline_from_row(row)
+                verified = baseline is not None and self._verify_baseline_cursor(cursor, baseline.baseline_id) is not None
+                cursor.execute("SELECT state,count(*) FROM xb_member_gateway.shopify_member_admissions GROUP BY state")
+                counts = {str(state): int(total) for state, total in cursor.fetchall()}
+                cursor.execute("SELECT reason_code,count(*) FROM xb_member_gateway.shopify_member_admissions WHERE state='MANUAL_REVIEW' GROUP BY reason_code")
+                review = {str(code): int(total) for code, total in cursor.fetchall() if code}
+                cursor.execute("SELECT count(*) FROM xb_member_gateway.shopify_protected_payloads")
+                payloads = int(cursor.fetchone()[0])
+                leftovers = self._terminal_payload_count_cursor(cursor)
+                cursor.execute("SELECT state,count(*) FROM xb_member_gateway.jobs sj WHERE sj.source_system='shopify' GROUP BY state")
+                job_counts = {str(state): int(total) for state, total in cursor.fetchall()}
+                return shopify_status_projection(
+                    enabled=bool(control[0]), baseline=baseline, baseline_verified=verified,
+                    bound_baseline=control[1], counts=counts, review=review, payloads=payloads, leftovers=leftovers,
+                    job_states=job_counts,
+                )

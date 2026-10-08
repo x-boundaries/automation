@@ -285,3 +285,103 @@ def load_config(path: str | Path) -> GatewayConfig:
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError("config_unreadable") from exc
     return GatewayConfig.from_mapping(raw, require_complete=True)
+
+
+# Shopify-authoritative M1 (#155). A separate closed document so the Forms
+# config v2 contract is unchanged; absent, the gateway behaves exactly as
+# before and never claims a Shopify job.
+SHOPIFY_TOPICS = ("customers/create", "customers/update", "customer.tags_added")
+_SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.myshopify\.com$")
+_API_VERSION_RE = re.compile(r"^20[2-9][0-9]-(01|04|07|10)$")
+_KEY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+@dataclass(frozen=True, slots=True)
+class ShopifyM1Config:
+    schema_version: str = "xb.member.shopify_m1.config.v1"
+    shopify_enabled: bool = False
+    shop_domain: str | None = None
+    api_version: str = "2026-10"
+    webhook_topics: tuple[str, ...] = SHOPIFY_TOPICS
+    profile_wait_max_checks: int = 5
+    profile_wait_seconds: int = 60
+    admission_poll_seconds: int = 5
+    max_member_no_candidates: int = 3
+    protected_payload_key_id: str = "k1"
+    webhook_secret_env: str = "XB_SHOPIFY_WEBHOOK_SECRET"
+    admin_token_env: str = "XB_SHOPIFY_ADMIN_TOKEN"
+    protected_payload_key_env: str = "XB_MEMBER_GATEWAY_PROTECTED_PAYLOAD_KEY"
+    receiver_bind_address_env: str = "XB_SHOPIFY_RECEIVER_BIND_ADDRESS"
+    receiver_bind_port_env: str = "XB_SHOPIFY_RECEIVER_BIND_PORT"
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any], *, require_complete: bool = False) -> "ShopifyM1Config":
+        if not isinstance(value, Mapping):
+            raise ConfigError("shopify_config_must_be_object")
+        fields = set(cls.__dataclass_fields__)
+        if set(value) - fields:
+            raise ConfigError("shopify_unknown_config_fields")
+        if require_complete and set(value) != fields:
+            raise ConfigError("shopify_required_config_fields_missing")
+        defaults = cls()
+        topics = value.get("webhook_topics", list(defaults.webhook_topics))
+        if not isinstance(topics, (list, tuple)) or not topics or len(set(topics)) != len(topics) or any(t not in SHOPIFY_TOPICS for t in topics):
+            raise ConfigError("shopify_webhook_topics_invalid")
+        result = cls(
+            schema_version=value.get("schema_version", defaults.schema_version),
+            shopify_enabled=_bool(value.get("shopify_enabled", defaults.shopify_enabled), "shopify_enabled"),
+            shop_domain=value.get("shop_domain", defaults.shop_domain),
+            api_version=value.get("api_version", defaults.api_version),
+            webhook_topics=tuple(topics),
+            profile_wait_max_checks=_positive(value.get("profile_wait_max_checks", defaults.profile_wait_max_checks), "profile_wait_max_checks"),
+            profile_wait_seconds=_positive(value.get("profile_wait_seconds", defaults.profile_wait_seconds), "profile_wait_seconds"),
+            admission_poll_seconds=_positive(value.get("admission_poll_seconds", defaults.admission_poll_seconds), "admission_poll_seconds"),
+            max_member_no_candidates=_positive(value.get("max_member_no_candidates", defaults.max_member_no_candidates), "max_member_no_candidates"),
+            protected_payload_key_id=value.get("protected_payload_key_id", defaults.protected_payload_key_id),
+            webhook_secret_env=_env(value.get("webhook_secret_env", defaults.webhook_secret_env), "webhook_secret_env"),
+            admin_token_env=_env(value.get("admin_token_env", defaults.admin_token_env), "admin_token_env"),
+            protected_payload_key_env=_env(value.get("protected_payload_key_env", defaults.protected_payload_key_env), "protected_payload_key_env"),
+            receiver_bind_address_env=_env(value.get("receiver_bind_address_env", defaults.receiver_bind_address_env), "receiver_bind_address_env"),
+            receiver_bind_port_env=_env(value.get("receiver_bind_port_env", defaults.receiver_bind_port_env), "receiver_bind_port_env"),
+        )
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        if self.schema_version != "xb.member.shopify_m1.config.v1":
+            raise ConfigError("shopify_config_schema_version_invalid")
+        if self.shop_domain is not None and (not isinstance(self.shop_domain, str) or not _SHOP_DOMAIN_RE.fullmatch(self.shop_domain)):
+            raise ConfigError("shopify_shop_domain_invalid")
+        if not isinstance(self.api_version, str) or not _API_VERSION_RE.fullmatch(self.api_version):
+            raise ConfigError("shopify_api_version_invalid")
+        if not isinstance(self.protected_payload_key_id, str) or not _KEY_ID_RE.fullmatch(self.protected_payload_key_id):
+            raise ConfigError("shopify_protected_payload_key_id_invalid")
+        if not 1 <= self.profile_wait_max_checks <= 20 or not 10 <= self.profile_wait_seconds <= 3600:
+            raise ConfigError("shopify_profile_wait_invalid")
+        if not 1 <= self.admission_poll_seconds <= 60:
+            raise ConfigError("shopify_admission_poll_invalid")
+        if not 1 <= self.max_member_no_candidates <= 5:
+            raise ConfigError("shopify_max_member_no_candidates_invalid")
+        names = (self.webhook_secret_env, self.admin_token_env, self.protected_payload_key_env, self.receiver_bind_address_env, self.receiver_bind_port_env)
+        if len({name.casefold() for name in names}) != len(names):
+            raise ConfigError("shopify_environment_bindings_must_differ")
+
+    def readiness_reasons(self) -> tuple[str, ...]:
+        reasons: list[str] = []
+        try:
+            self.validate()
+        except ConfigError as exc:
+            reasons.append(str(exc))
+        if not self.shopify_enabled:
+            reasons.append("shopify_disabled")
+        if self.shop_domain is None:
+            reasons.append("shopify_shop_domain_required")
+        return tuple(dict.fromkeys(reasons))
+
+
+def load_shopify_config(path: str | Path) -> ShopifyM1Config:
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError("shopify_config_unreadable") from exc
+    return ShopifyM1Config.from_mapping(raw, require_complete=True)

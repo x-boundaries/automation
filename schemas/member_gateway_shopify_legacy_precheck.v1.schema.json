@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_shopify_legacy_precheck.v1.schema.json",
+  "title": "XB member gateway Shopify legacy precheck request v1",
+  "description": "PII-free duplicate evidence: booleans only. Any hit or lookup failure routes the job to manual review.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "phone_member_no_hit",
+    "mobile_phone_hit",
+    "email_hit"
+  ],
+  "properties": {
+    "outcome": {
+      "enum": [
+        "NO_CANDIDATE",
+        "CANDIDATE_FOUND",
+        "LOOKUP_FAILED"
+      ]
+    },
+    "phone_member_no_hit": {
+      "type": "boolean"
+    },
+    "mobile_phone_hit": {
+      "type": "boolean"
+    },
+    "email_hit": {
+      "type": "boolean"
+    }
+  }
+}
