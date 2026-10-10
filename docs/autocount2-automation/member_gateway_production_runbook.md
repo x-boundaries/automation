@@ -307,6 +307,60 @@ writer-termination state and proof-required/hold-active indicators; it does
 not expose PID, process-start timestamp, host identity, nonce, or raw evidence.
 The result-status vocabulary remains the existing v1 vocabulary.
 
+## Shopify M1 receiver and admission (repository-only)
+
+Prerequisites for any separately approved Shopify M1 bring-up (none is
+performed or authorised by the repository change):
+
+1. Apply migration `0006_shopify_member_m1.sql` after `0001`-`0005`
+   (forward-only; existing Forms rows become `source_system='google_forms'`).
+2. Provide `config/member_shopify_m1.production.example.json` values through a
+   reviewed external copy: `shopify_enabled`, the exact `shop_domain`, and the
+   bound `api_version`. Secrets are environment bindings only:
+   `XB_SHOPIFY_WEBHOOK_SECRET` (app client secret), `XB_SHOPIFY_ADMIN_TOKEN`
+   (`read_customers` only), `XB_MEMBER_GATEWAY_PROTECTED_PAYLOAD_KEY`
+   (base64url 32 random bytes; distinct from every other credential) and the
+   receiver private bind address/port.
+3. Prove encryption in transit and the database/backup encryption boundary for
+   `shopify_protected_payloads` before activation.
+4. Receiver before cutover: start the dedicated receiver with
+   `python -m xb_member_gateway.shopify_receiver serve ...` (the public edge
+   forwards only `POST /v1/shopify/webhooks/customers` to it), activate the app
+   subscription for the bound API version, and confirm at least one
+   HMAC-verified delivery for the exact shop and API version is recorded.
+   Admission stays disabled, so deliveries only queue GID-only `PENDING` rows.
+5. Then run
+   `python -m xb_member_gateway.shopify_receiver capture-baseline --config <gw> --shopify-config <shopify>`.
+   It fixes `C` from the database clock, refuses to run without the step-4
+   receipt, and prints only the baseline id, historical member count, digest,
+   state and `transition_pending_count`. Record them as evidence. Shopify
+   throttling (`THROTTLED`, HTTP 429), HTTP 500/502/503/504 and transport
+   failures are retried on the same page within fixed bounds (6 attempts per
+   page, 60 retries, 900 seconds total wait, 60 seconds per wait; a numeric
+   `Retry-After` is honoured, rounded up), so a large store may take several
+   minutes. A failed capture leaves nothing; rerun from scratch (a fresh `C`).
+   `shopify_receiver_failed:baseline_read_retry_exhausted` means the bounds were
+   used up: wait for Shopify to recover, then rerun.
+   `baseline_query_cost_exceeds_bucket` or
+   `baseline_read_retry_after_exceeds_bound` fail at once without waiting:
+   record the code and escalate rather than looping reruns.
+6. Enable admission only with an approval reference:
+   `POST /v1/control/shopify-admission/enable` with `baseline_id` and
+   `approval_reference` (control principal). Disable with
+   `POST /v1/control/shopify-admission/disable`. Disable admission before any
+   bulk `member-mg` import or merge: Shopify would report those customers as
+   created after `C`.
+7. Start the gateway with `--shopify-config` so the worker can claim Shopify
+   jobs.
+8. Watch `GET /v1/operator/shopify-status` (counts and codes only). Manual
+   review re-reads Shopify under explicit authority; no protected copy is kept
+   for convenience.
+
+The AC2 VM stays a thin runtime: it receives only the AutoCount create fields,
+the bound MemberNo and non-PII references. Do not install Toolkit or agent
+skills there. Run uncertain-write reconciliation with the worker's
+`-ReconcileOnce` switch; it never calls SaveMember or selects a new MemberNo.
+
 ## Not performed by this run
 
 No live Google Forms/Sheets, n8n instance, PostgreSQL server, AutoCount account

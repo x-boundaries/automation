@@ -23,8 +23,12 @@ def reconcile_uncertain_write(
     repository: Any,
     worker_id: str | None = None,
     now: datetime | None = None,
+    expected: Mapping[str, Any] | None = None,
 ) -> ResultRecord:
-    """Use only the already bound MemberNo; this function never calls SaveMember."""
+    """Use only the already bound MemberNo; this function never calls SaveMember.
+
+    Shopify jobs carry no payload on the job record, so the caller passes the
+    expected record built from the retained transient payload."""
 
     if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
         raise ValueError("reconciliation_requires_uncertain_state")
@@ -54,7 +58,11 @@ def reconcile_uncertain_write(
         )
         return result
 
-    expected = build_member_record(job, fence.member_no)
+    if job.source_system == "shopify":
+        if expected is None:
+            raise ValueError("reconciliation_expected_record_required")
+    else:
+        expected = build_member_record(job, fence.member_no)
     if actual is None:
         # Positive absence does not authorize a second create.
         lookup_status = "absent"

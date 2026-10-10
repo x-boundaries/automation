@@ -9,7 +9,7 @@ Two layers:
   psycopg's real query converter (the same code path ``cursor.execute`` uses).
 * ``RealPostgresTestCase`` runs the real ``PostgresRepository`` through
   psycopg against a disposable local PostgreSQL named only by
-  ``XB_MEMBER_GATEWAY_TEST_DATABASE_URL``. It applies migrations 0001-0005 to
+  ``XB_MEMBER_GATEWAY_TEST_DATABASE_URL``. It applies migrations 0001-0006 to
   a freshly dropped schema, so it refuses any non-loopback host. Without that
   variable the real-database tests skip and report themselves as skipped.
 """
@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS = sorted((ROOT / "member_gateway/migrations").glob("000[1-5]_*.sql"))
+MIGRATIONS = sorted((ROOT / "member_gateway/migrations").glob("000[1-6]_*.sql"))
 TEST_DSN_ENV = "XB_MEMBER_GATEWAY_TEST_DATABASE_URL"
 HASH = "sha256:" + "a" * 64
 CUTOVER = "2026-09-15T00:00:00Z"
@@ -280,9 +280,9 @@ class RealPostgresSourceTests(RealPostgresTestCase):
                     cursor.execute(PostgresRepository._RESULTS_INSERT, params)
             connection.rollback()
 
-    def test_migrations_register_five_and_constraints_hold(self):
+    def test_migrations_register_six_and_constraints_hold(self):
         versions = {row[0] for row in self.sql("SELECT version FROM xb_member_gateway.schema_migrations")}
-        self.assertEqual(versions, {"0001_member_gateway", "0002_result_event_history", "0003_writer_termination_quarantine", "0004_forms_ingest_cursor", "0005_member_vertical_slice"})
+        self.assertEqual(versions, {"0001_member_gateway", "0002_result_event_history", "0003_writer_termination_quarantine", "0004_forms_ingest_cursor", "0005_member_vertical_slice", "0006_shopify_member_m1"})
         self.seed_cursor()
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "source_production_cutover_immutable"):
             self.sql("UPDATE xb_member_gateway.source_ingest_cursors SET production_cutover_exact='2026-09-16T00:00:00Z'")

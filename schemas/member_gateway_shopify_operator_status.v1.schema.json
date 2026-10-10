@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_shopify_operator_status.v1.schema.json",
+  "title": "XB member gateway Shopify M1 operator status v1",
+  "description": "Operator-safe counts and PII-free codes only: no GID, MemberNo or customer value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "admission_enabled",
+    "baseline_sealed",
+    "baseline_verified",
+    "baseline_bound",
+    "baseline_member_count",
+    "admission_counts",
+    "admission_review_codes",
+    "job_state_counts",
+    "manual_review_job_count",
+    "uncertain_job_count",
+    "protected_payload_count",
+    "terminal_payload_leftover_count"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "xb.member.gateway.shopify_operator_status.v1"
+    },
+    "admission_enabled": {
+      "type": "boolean"
+    },
+    "baseline_sealed": {
+      "type": "boolean"
+    },
+    "baseline_verified": {
+      "type": "boolean"
+    },
+    "baseline_bound": {
+      "type": "boolean"
+    },
+    "baseline_member_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "admission_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "PENDING",
+        "NOT_ELIGIBLE",
+        "EXCLUDED_BASELINE",
+        "MANUAL_REVIEW",
+        "ADMITTED"
+      ],
+      "properties": {
+        "PENDING": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "NOT_ELIGIBLE": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "EXCLUDED_BASELINE": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "MANUAL_REVIEW": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ADMITTED": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "admission_review_codes": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9_]{1,60}$"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "job_state_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "RECEIVED",
+        "VALIDATED",
+        "QUEUED",
+        "LEASED",
+        "PRECHECKING",
+        "ALLOCATION_BOUND",
+        "WRITE_INTENT_RECORDED",
+        "WRITING",
+        "READBACK",
+        "CREATED_VERIFIED",
+        "REJECTED_VALIDATION",
+        "RETRY_WAIT",
+        "AMBIGUOUS_LOOKUP",
+        "WRITE_OUTCOME_UNCERTAIN",
+        "WRITER_TERMINATION_UNCONFIRMED",
+        "CONFIRMED_NOT_CREATED",
+        "CREATED_READBACK_MISMATCH",
+        "MANUAL_REVIEW",
+        "DEAD_LETTER"
+      ],
+      "properties": {
+        "RECEIVED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "VALIDATED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "QUEUED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "LEASED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "PRECHECKING": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ALLOCATION_BOUND": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "WRITE_INTENT_RECORDED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "WRITING": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "READBACK": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "CREATED_VERIFIED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "REJECTED_VALIDATION": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "RETRY_WAIT": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "AMBIGUOUS_LOOKUP": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "WRITE_OUTCOME_UNCERTAIN": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "WRITER_TERMINATION_UNCONFIRMED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "CONFIRMED_NOT_CREATED": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "CREATED_READBACK_MISMATCH": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "MANUAL_REVIEW": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "DEAD_LETTER": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "manual_review_job_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "uncertain_job_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "protected_payload_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "terminal_payload_leftover_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

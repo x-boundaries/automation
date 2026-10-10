@@ -19,6 +19,8 @@ IMPLEMENTATION_FILES = (
     ROOT / "config/member_forms_gateway_bounded_import.v2.template.json",
     ROOT / "config/member_welcome_email_bounded_import.v1.template.json",
     ROOT / "member_gateway/migrations/0005_member_vertical_slice.sql",
+    ROOT / "member_gateway/migrations/0006_shopify_member_m1.sql",
+    ROOT / "config/member_shopify_m1.production.example.json",
 )
 
 

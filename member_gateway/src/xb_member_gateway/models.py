@@ -113,12 +113,18 @@ class MemberRecord:
         }
 
 
+SHOPIFY_SOURCE_SYSTEM = "shopify"
+SHOPIFY_FORM_ALIAS = "shopify_customer"
+SHOPIFY_MAPPING_VERSION = "shopify-member-m1.v1"
+SHOPIFY_JOB_SCHEMA_VERSION = "xb.member.gateway.job.v3"
+
+
 @dataclass(slots=True)
 class JobRecord:
     job_id: str
     request_id: str
     source_response_ref: str
-    response_id: str
+    response_id: str | None
     payload_hash: str
     operation: str
     member_payload: dict[str, Any]
@@ -147,6 +153,10 @@ class JobRecord:
     def dispatch_fenced(self) -> bool:
         return self.dispatch_fence_id is not None
 
+    @property
+    def is_shopify(self) -> bool:
+        return self.source_system == SHOPIFY_SOURCE_SYSTEM
+
     def safe_dict(self) -> dict[str, Any]:
         writer_state = self.writer_termination_state or (
             WriterHoldState.QUARANTINED.value
@@ -154,7 +164,9 @@ class JobRecord:
             else None
         )
         return {
-            "schema_version": "xb.member.gateway.job.v2",
+            # Forms jobs keep the exact v2 projection; Shopify M1 jobs use the
+            # source-aware v3 contract and never carry a member payload.
+            "schema_version": SHOPIFY_JOB_SCHEMA_VERSION if self.is_shopify else "xb.member.gateway.job.v2",
             "job_id": self.job_id,
             "request_id": self.request_id,
             "source_response_ref": self.source_response_ref,
@@ -186,7 +198,10 @@ class JobRecord:
 
     def worker_dict(self) -> dict[str, Any]:
         value = self.safe_dict()
-        value["member_payload"] = dict(self.member_payload)
+        if not self.is_shopify:
+            # Shopify protected values are attached only by the API after
+            # in-memory decryption; they never live on the job record.
+            value["member_payload"] = dict(self.member_payload)
         if self.allocation_member_no is not None:
             value["allocation"] = {"member_no": self.allocation_member_no}
         return value
@@ -592,3 +607,76 @@ class WelcomeEmailOutbox:
 class ReadbackCheck:
     match: bool
     mismatches: tuple[str, ...] = field(default_factory=tuple)
+
+
+class ShopifyAdmissionState(str, Enum):
+    """Per-GID admission state. Only PENDING and NOT_ELIGIBLE are re-evaluable."""
+
+    PENDING = "PENDING"
+    NOT_ELIGIBLE = "NOT_ELIGIBLE"
+    EXCLUDED_BASELINE = "EXCLUDED_BASELINE"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+    ADMITTED = "ADMITTED"
+
+
+SHOPIFY_ADMISSION_TERMINAL = frozenset(
+    {ShopifyAdmissionState.EXCLUDED_BASELINE, ShopifyAdmissionState.MANUAL_REVIEW, ShopifyAdmissionState.ADMITTED}
+)
+
+# PII-free review vocabulary; nothing else is ever stored with a review.
+SHOPIFY_REVIEW_CODES = frozenset({
+    "legacy_tag_present",
+    "preexisting_customer_not_new_signup",
+    "baseline_created_at_conflict",
+    "name_missing",
+    "membership_dates_missing",
+    "membership_date_malformed",
+    "membership_expiry_before_start",
+    "phone_malformed",
+    "email_malformed",
+    "created_at_malformed",
+    "profile_read_failed",
+})
+SHOPIFY_NOT_ELIGIBLE_CODES = frozenset({"not_member_mg", "customer_not_found"})
+
+
+@dataclass(frozen=True, slots=True)
+class ShopifyWebhookReceipt:
+    """Bounded delivery metadata only; the raw body is never represented."""
+
+    webhook_id: str
+    topic: str
+    shop_domain: str
+    api_version: str
+    event_id: str | None
+    triggered_at: str | None
+    customer_gid: str
+
+    def facts(self) -> tuple[Any, ...]:
+        return (self.topic, self.shop_domain, self.api_version, self.event_id, self.triggered_at, self.customer_gid)
+
+
+@dataclass(frozen=True, slots=True)
+class ShopifyAdmission:
+    customer_gid: str
+    gid_ref: str
+    state: ShopifyAdmissionState
+    reason_code: str | None
+    check_count: int
+    next_check_at: str | None
+    job_id: str | None
+    state_version: int
+    baseline_id: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ShopifyBaseline:
+    baseline_id: str
+    state: str
+    shop_domain: str
+    api_version: str
+    capture_started_at: str
+    sealed_at: str | None
+    member_count: int
+    member_digest: str

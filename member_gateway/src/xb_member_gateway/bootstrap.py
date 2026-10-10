@@ -6,9 +6,10 @@ import ipaddress
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from .api import GatewayApp, GatewayService, serve
+from .api import GatewayApp, GatewayService, ShopifyRuntime, serve
 from .auth import AuthenticationError, BearerTokenAuthenticator
-from .config import ConfigError, GatewayConfig, load_config
+from .config import ConfigError, GatewayConfig, ShopifyM1Config, load_config, load_shopify_config
+from .protected_payload import ProtectedPayloadCipher, ProtectedPayloadError
 from .repository import PostgresRepository, RepositoryError
 
 
@@ -65,13 +66,36 @@ def _private_bind_address(value: str) -> str:
     return value
 
 
+def shopify_runtime(
+    shopify_config: ShopifyM1Config,
+    environment: Mapping[str, str],
+    *,
+    forbidden_values: tuple[str, ...],
+) -> ShopifyRuntime:
+    """Bind the protected-payload key from the runtime environment only. The
+    key must not alias any other credential, and the AEAD must be available."""
+
+    key_value = _required(environment, shopify_config.protected_payload_key_env, "protected_payload_key_binding_missing")
+    if key_value in forbidden_values:
+        raise BootstrapError("protected_payload_key_must_be_distinct")
+    try:
+        cipher = ProtectedPayloadCipher.from_binding(shopify_config.protected_payload_key_id, key_value)
+    except ProtectedPayloadError as exc:
+        raise BootstrapError(exc.code) from None
+    return ShopifyRuntime(shopify_config, cipher)
+
+
 def compose_gateway(
     config_path: str,
     *,
     environment: Mapping[str, str],
     repository_factory: Callable[..., Any] = PostgresRepository,
+    shopify_config_path: str | None = None,
 ) -> GatewayComposition:
-    """Compose only after every fail-closed admission check succeeds."""
+    """Compose only after every fail-closed admission check succeeds.
+
+    Without ``shopify_config_path`` the gateway is exactly the Forms gateway
+    and never claims a Shopify job."""
 
     try:
         config = load_config(config_path)
@@ -106,9 +130,17 @@ def compose_gateway(
         if not 1 <= port <= 65535:
             raise BootstrapError("bind_port_invalid")
         authenticator = BearerTokenAuthenticator.from_environment(config, environment, strict=True)
+        shopify = None
+        if shopify_config_path is not None:
+            shopify_config = load_shopify_config(shopify_config_path)
+            if shopify_config.shopify_enabled:
+                shopify_names = (shopify_config.protected_payload_key_env,)
+                if any(name.casefold() in {item.casefold() for item in runtime_names} for name in shopify_names):
+                    raise BootstrapError("runtime_environment_bindings_must_differ")
+                shopify = shopify_runtime(shopify_config, environment, forbidden_values=(reference_key, dsn, *bearer_values))
         repository = repository_factory(dsn=dsn, reference_key=reference_key.encode("utf-8"))
         repository.verify_bootstrap_readiness(config)
-        service = GatewayService(config, repository, adapter_ready=config.autocount_adapter_ready)
+        service = GatewayService(config, repository, adapter_ready=config.autocount_adapter_ready, shopify=shopify)
         app = GatewayApp(service, authenticator)
         return GatewayComposition(config, repository, app, address, port)
     except BootstrapError:
@@ -130,8 +162,10 @@ def run(
     environment: Mapping[str, str],
     repository_factory: Callable[..., Any] = PostgresRepository,
     serve_gateway: Callable[[GatewayApp, str, int], None] = serve,
+    shopify_config_path: str | None = None,
 ) -> None:
     composition = compose_gateway(
-        config_path, environment=environment, repository_factory=repository_factory
+        config_path, environment=environment, repository_factory=repository_factory,
+        shopify_config_path=shopify_config_path,
     )
     serve_gateway(composition.app, composition.bind_address, composition.bind_port)

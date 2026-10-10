@@ -1,0 +1,17 @@
+{
+  "schema_version": "xb.member.shopify_m1.config.v1",
+  "shopify_enabled": false,
+  "shop_domain": null,
+  "api_version": "2026-10",
+  "webhook_topics": ["customers/create", "customers/update", "customer.tags_added"],
+  "profile_wait_max_checks": 5,
+  "profile_wait_seconds": 60,
+  "admission_poll_seconds": 5,
+  "max_member_no_candidates": 3,
+  "protected_payload_key_id": "k1",
+  "webhook_secret_env": "XB_SHOPIFY_WEBHOOK_SECRET",
+  "admin_token_env": "XB_SHOPIFY_ADMIN_TOKEN",
+  "protected_payload_key_env": "XB_MEMBER_GATEWAY_PROTECTED_PAYLOAD_KEY",
+  "receiver_bind_address_env": "XB_SHOPIFY_RECEIVER_BIND_ADDRESS",
+  "receiver_bind_port_env": "XB_SHOPIFY_RECEIVER_BIND_PORT"
+}

@@ -42,6 +42,33 @@ def build_member_record(job: JobRecord, member_no: str, *, adapter_defaults: Map
         raise ResultValidationError("member_payload_incomplete") from exc
 
 
+SHOPIFY_CALLER_FIELDS = ("MemberNo", "Name", "RegisterDate", "ExpiryDate", "MobilePhone", "EmailAddress")
+
+
+def build_shopify_member_record(create_payload: Mapping[str, Any], member_no: str) -> dict[str, Any]:
+    """Shopify M1 expected AutoCount record.
+
+    RegisterDate/ExpiryDate are the exact Shopify dates (never recomputed);
+    DOB is never assigned (expected ``None``); absent phone/email stay ``None``,
+    which never equals ``""``. Adapter-owned defaults are fixed here, not input.
+    """
+
+    from .protected_payload import ProtectedPayloadError, validate_create_payload
+
+    try:
+        payload = validate_create_payload(create_payload)
+    except ProtectedPayloadError as exc:
+        raise ResultValidationError("member_payload_incomplete") from exc
+    if not isinstance(member_no, str) or not member_no:
+        raise ResultValidationError("member_no_binding_invalid")
+    return {
+        "MemberNo": member_no, "MemberType": "Default", "Name": payload["name"],
+        "MobilePhone": payload["mobile_phone"], "EmailAddress": payload["email_address"], "DOB": None,
+        "RegisterDate": payload["register_date"], "ExpiryDate": payload["expiry_date"],
+        "OpeningPoints": 0, "IsActive": True, "Individual": True,
+    }
+
+
 def _mapping(value: MemberRecord | Mapping[str, Any]) -> Mapping[str, Any]:
     return value.to_dict() if isinstance(value, MemberRecord) else value
 
