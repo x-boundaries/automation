@@ -1,0 +1,368 @@
+name: xb155-acl-positive-diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened]
+    paths:
+      - ".github/workflows/xb155-acl-positive-diagnostic.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  one-shot-windows:
+    if: >-
+      github.repository == 'x-boundaries/automation' &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'opened' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'codex/xb155-acl-diagnostic-g0-002' &&
+      github.event.pull_request.head.repo.full_name == 'x-boundaries/automation'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout frozen product source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: x-boundaries/automation
+          ref: ad8bef9cd807a9d02c4497beb000735ec5ecfc32
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify frozen product commit identity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'ad8bef9cd807a9d02c4497beb000735ec5ecfc32'
+          $expectedTree = '7158011fe5adc3e5fee4a2ed871ece57a9fd26f7'
+          $expectedParent = '2753923a99da20191baa8dd51393267b3c625c80'
+          $actualHead = (git rev-parse HEAD).Trim()
+          $actualTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $parts = @((git rev-list --parents -n 1 HEAD).Trim() -split '\s+')
+          if ($actualHead -cne $expectedHead -or $actualTree -cne $expectedTree -or
+              $parts.Count -ne 2 -or $parts[0] -cne $expectedHead -or $parts[1] -cne $expectedParent) {
+            throw 'frozen_product_identity_mismatch'
+          }
+          Write-Output "product_head=$actualHead"
+          Write-Output "product_tree=$actualTree"
+          Write-Output "product_parent=$expectedParent"
+
+      - name: Run one synthetic positive Upgrade with temporary ACL instrumentation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or
+              $PSVersionTable.PSVersion.Minor -ne 1 -or [IntPtr]::Size -ne 8) {
+            throw 'native_64_bit_windows_powershell_5_1_required'
+          }
+          $runnerTempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          $runRoot = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP ('xb155-acl-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $runRoot.StartsWith($runnerTempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'diagnostic_temp_scope_invalid' }
+          $fixtureRoot = [IO.Path]::GetFullPath((Join-Path $runRoot 'fixture'))
+          if (-not $fixtureRoot.StartsWith($runRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'synthetic_fixture_scope_invalid' }
+          $harnessPath = Join-Path $runRoot 'acl-diagnostic.ps1'
+          $installerPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\install_ac2_member_gateway_worker.ps1'
+          $modulePath = Join-Path $env:GITHUB_WORKSPACE 'tests\test_member_gateway_worker_deployment.py'
+          $executionState = 'instrumentation_setup'
+
+          try {
+            New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop | Out-Null
+            $moduleText = [IO.File]::ReadAllText($modulePath)
+            $marker = "_LOCAL_UPGRADE_ROLLBACK_HARNESS = r'''"
+            $start = $moduleText.IndexOf($marker, [StringComparison]::Ordinal)
+            if ($start -lt 0 -or $moduleText.IndexOf($marker, $start + $marker.Length, [StringComparison]::Ordinal) -ge 0) {
+              throw 'diagnostic_source_locator_invalid'
+            }
+            $start += $marker.Length
+            $end = $moduleText.IndexOf("'''", $start, [StringComparison]::Ordinal)
+            if ($end -lt 0) { throw 'diagnostic_source_terminator_missing' }
+            $harness = $moduleText.Substring($start, $end - $start)
+            $boundary = '# Positive dispatcher path.'
+            $cut = $harness.IndexOf($boundary, [StringComparison]::Ordinal)
+            if ($cut -lt 0 -or $harness.IndexOf($boundary, $cut + $boundary.Length, [StringComparison]::Ordinal) -ge 0) {
+              throw 'positive_fixture_boundary_invalid'
+            }
+            $harness = $harness.Substring(0, $cut)
+
+            $addon = @'
+          $null = Initialize-XbFixture "positive"
+          $installBefore = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+          $taskBefore = Get-XbFixtureTaskSnapshot
+          $runtimeBefore = Get-XbFixtureRuntimeSnapshot
+          $paths = Get-XbWorkerUpgradePaths
+          $journalBefore = Test-Path -LiteralPath $paths.journal
+          $installBeforeMatchesBaseline = $false
+          try { Assert-XbWorkerUpgradePackageMatches -Root $script:InstallRoot -Expected $script:baseline; $installBeforeMatchesBaseline = $true } catch { }
+          $taskBeforeMatchesBaseline = ($taskBefore -ceq $script:taskBaseline)
+          $runtimeBeforeMatchesBaseline = ($runtimeBefore -ceq $script:runtimeBaseline)
+          $script:aclMode = if ($script:auditAclEvidence -ceq 'native') { 'native_sacl' } else { 'dacl_only_fallback' }
+          $script:aclPrivilege = 'query_error'
+          $whoami = Join-Path $env:SystemRoot 'System32\whoami.exe'
+          $privLines = @(& $whoami /priv 2>$null | ForEach-Object { [string]$_ })
+          if ($LASTEXITCODE -eq 0) {
+              $privRows = @($privLines | Where-Object { $_ -match '^\s*SeSecurityPrivilege\s+' })
+              if ($privRows.Count -eq 0) { $script:aclPrivilege = 'not_present' }
+              elseif ($privRows.Count -gt 1) { $script:aclPrivilege = 'ambiguous' }
+              elseif ($privRows[0] -match '(?i)\bEnabled\b') { $script:aclPrivilege = 'enabled' }
+              elseif ($privRows[0] -match '(?i)\bDisabled\b') { $script:aclPrivilege = 'disabled' }
+              else { $script:aclPrivilege = 'listed_state_unclassified' }
+          }
+          $script:aclActive = $false
+          $script:aclSetterActive = $false
+          $script:aclStage = ''
+          $script:aclCurrentRow = $null
+          $script:aclFailure = $null
+          $script:aclRows = New-Object System.Collections.ArrayList
+          $script:aclOrdinal = 0
+          $script:aclOriginalGetter = ${function:Get-XbWorkerUpgradeAclSddl}
+          $script:aclOriginalConvert = ${function:Convert-XbWorkerUpgradeAclSddl}
+
+          function Set-XbAclFailure {
+              param([string]$Stage, [object]$ErrorRecord, [string]$Role)
+              if ($null -ne $script:aclFailure) { return }
+              $type = 'none'
+              $hr = 'none'
+              if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception) {
+                  $type = [string]$ErrorRecord.Exception.GetType().FullName
+                  $hr = '0x{0:X8}' -f [int]$ErrorRecord.Exception.HResult
+              }
+              $script:aclFailure = [ordered]@{ stage = $Stage; target_role = $Role; exception_type = $type; hresult = $hr }
+              if ($null -ne $script:aclCurrentRow) {
+                  $script:aclCurrentRow.failure_stage = $Stage
+                  $script:aclCurrentRow.exception_type = $type
+                  $script:aclCurrentRow.hresult = $hr
+              }
+          }
+
+          function Invoke-XbAclStage {
+              param([string]$Stage, [scriptblock]$Operation)
+              $oldStage = $script:aclStage
+              $script:aclStage = $Stage
+              if ($null -ne $script:aclCurrentRow) { [void]$script:aclCurrentRow.operations.Add($Stage) }
+              try { return & $Operation }
+              catch {
+                  $role = if ($null -ne $script:aclCurrentRow) { [string]$script:aclCurrentRow.target_role } else { 'preimage' }
+                  Set-XbAclFailure -Stage $Stage -ErrorRecord $_ -Role $role
+                  throw
+              } finally { $script:aclStage = $oldStage }
+          }
+
+          function Get-XbAclRole {
+              $index = $script:aclOrdinal
+              $script:aclOrdinal++
+              if ($index -eq 0) { return 'candidate_root' }
+              if ($index -le @($packageFiles).Count) { return 'package_file' }
+              if ($index -eq (@($packageFiles).Count + 1)) { return 'manifest' }
+              return 'other'
+          }
+
+          function Get-XbAclFingerprint {
+              param([object]$Acl)
+              if ($null -eq $Acl) { return 'NULL' }
+              $values = New-Object 'System.Collections.Generic.List[string]'
+              for ($i = 0; $i -lt $Acl.Count; $i++) {
+                  $ace = $Acl[$i]
+                  $bytes = New-Object byte[] $ace.BinaryLength
+                  $ace.GetBinaryForm($bytes, 0)
+                  $values.Add([Convert]::ToBase64String($bytes))
+              }
+              $sorted = [string[]]$values.ToArray()
+              [Array]::Sort($sorted, [StringComparer]::Ordinal)
+              return [string]::Join(',', $sorted)
+          }
+
+          function Get-XbAclEquality {
+              param([string]$Expected, [string]$Actual)
+              try {
+                  $before = [Security.AccessControl.RawSecurityDescriptor]::new($Expected)
+                  $after = [Security.AccessControl.RawSecurityDescriptor]::new($Actual)
+                  $auto = [int]([Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor [Security.AccessControl.ControlFlags]::SystemAclAutoInherited)
+                  $beforeFlags = [int]$before.ControlFlags -band (-bnot $auto)
+                  $afterFlags = [int]$after.ControlFlags -band (-bnot $auto)
+                  $sacl = 'unobserved'
+                  if ($script:aclMode -ceq 'native_sacl') {
+                      $sacl = [bool]((Get-XbAclFingerprint $before.SystemAcl) -ceq (Get-XbAclFingerprint $after.SystemAcl))
+                  }
+                  return [ordered]@{
+                      owner = [bool](([string]$before.Owner) -ceq ([string]$after.Owner))
+                      group = [bool](([string]$before.Group) -ceq ([string]$after.Group))
+                      control_flags = [bool]($beforeFlags -eq $afterFlags)
+                      dacl = [bool]((Get-XbAclFingerprint $before.DiscretionaryAcl) -ceq (Get-XbAclFingerprint $after.DiscretionaryAcl))
+                      sacl = $sacl
+                  }
+              } catch {
+                  $saclValue = if ($script:aclMode -ceq 'native_sacl') { 'unknown' } else { 'unobserved' }
+                  return [ordered]@{ owner = 'unknown'; group = 'unknown'; control_flags = 'unknown'; dacl = 'unknown'; sacl = $saclValue }
+              }
+          }
+
+          Set-Item function:script:Get-XbWorkerUpgradeAclSddl {
+              param([Parameter(Mandatory)][string]$Path)
+              if (-not $script:aclActive) { return & $script:aclOriginalGetter -Path $Path }
+              $stage = if ($script:aclSetterActive) { 'readback' } else { 'Get-Acl' }
+              $role = if ($null -ne $script:aclCurrentRow) { [string]$script:aclCurrentRow.target_role } else { 'preimage' }
+              try {
+                  $acl = Invoke-XbAclStage -Stage $stage -Operation {
+                      if ($script:aclMode -ceq 'native_sacl') {
+                          Microsoft.PowerShell.Security\Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop
+                      } else {
+                          Microsoft.PowerShell.Security\Get-Acl -LiteralPath $Path -ErrorAction Stop
+                      }
+                  }
+                  if (-not $acl.AreAccessRulesCanonical) { throw 'acl_order_unproven' }
+                  return $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+              } catch {
+                  Set-XbAclFailure -Stage $stage -ErrorRecord $_ -Role $role
+                  throw 'upgrade_acl_unverifiable'
+              }
+          }
+
+          Set-Item function:script:Set-XbWorkerUpgradeAclSddl {
+              param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sddl)
+              $role = Get-XbAclRole
+              $row = [ordered]@{ target_role = $role; outcome = 'in_progress'; operations = (New-Object System.Collections.ArrayList); failure_stage = $null; exception_type = $null; hresult = $null; component_equality = $null }
+              [void]$script:aclRows.Add($row)
+              $oldActive = $script:aclSetterActive
+              $oldRow = $script:aclCurrentRow
+              $script:aclSetterActive = $true
+              $script:aclCurrentRow = $row
+              try {
+                  try {
+                      $acl = Invoke-XbAclStage -Stage 'Get-Acl' -Operation {
+                          if ($script:aclMode -ceq 'native_sacl') {
+                              Microsoft.PowerShell.Security\Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop
+                          } else {
+                              Microsoft.PowerShell.Security\Get-Acl -LiteralPath $Path -ErrorAction Stop
+                          }
+                      }
+                      Invoke-XbAclStage -Stage 'descriptor_application' -Operation {
+                          $acl.SetSecurityDescriptorSddlForm($Sddl, [Security.AccessControl.AccessControlSections]::All)
+                      } | Out-Null
+                      Invoke-XbAclStage -Stage 'Set-Acl' -Operation {
+                          Microsoft.PowerShell.Security\Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+                      } | Out-Null
+                  } catch {
+                      if ($null -eq $script:aclFailure) { Set-XbAclFailure -Stage $script:aclStage -ErrorRecord $_ -Role $role }
+                      $row.outcome = 'failed'
+                      throw 'upgrade_acl_preservation_failed'
+                  }
+                  $actual = Get-XbWorkerUpgradeAclSddl -Path $Path
+                  $row.component_equality = Get-XbAclEquality -Expected $Sddl -Actual $actual
+                  $actualNorm = Invoke-XbAclStage -Stage 'comparison' -Operation { & $script:aclOriginalConvert $actual }
+                  $expectedNorm = Invoke-XbAclStage -Stage 'comparison' -Operation { & $script:aclOriginalConvert $Sddl }
+                  if ($actualNorm -cne $expectedNorm) {
+                      Set-XbAclFailure -Stage 'comparison' -ErrorRecord $null -Role $role
+                      $row.outcome = 'failed'
+                      throw 'upgrade_acl_preservation_failed'
+                  }
+                  $row.outcome = 'preserved'
+              } finally {
+                  $script:aclSetterActive = $oldActive
+                  $script:aclCurrentRow = $oldRow
+              }
+          }
+
+          $script:aclActive = $true
+          $upgrade = Invoke-XbFixtureOperation 'Upgrade'
+          $script:aclActive = $false
+          $safeUpgrade = 'other_failure_sanitized'
+          if ($upgrade -ceq 'pass') { $safeUpgrade = 'pass' }
+          elseif ($upgrade -match '^upgrade_[a-z0-9_]+$') { $safeUpgrade = [string]$upgrade }
+
+          $journalState = 'absent'
+          $candidatePresent = $false
+          $previousPresent = $false
+          if (Test-Path -LiteralPath $paths.journal) {
+              try {
+                  $journal = Read-XbWorkerUpgradeJournal -Path $paths.journal
+                  $journalState = [string]$journal.state
+                  if ($journalState -notin @('preparing','staged','old_move_intent','new_move_intent','complete','rollback_new_intent','rollback_old_intent','rolled_back','aborted')) { $journalState = 'other' }
+                  $candidatePresent = Test-Path -LiteralPath ([string]$journal.candidate_root)
+                  $previousPresent = Test-Path -LiteralPath ([string]$journal.previous_root)
+              } catch { $journalState = 'unreadable' }
+          }
+          $installAfterMatches = $false
+          $taskAfterMatches = $false
+          $runtimeAfterMatches = $false
+          try { $installAfterMatches = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $installBefore) } catch { }
+          try { $taskAfterMatches = ((Get-XbFixtureTaskSnapshot) -ceq $taskBefore) } catch { }
+          try { $runtimeAfterMatches = ((Get-XbFixtureRuntimeSnapshot) -ceq $runtimeBefore) } catch { }
+
+          $failure = $script:aclFailure
+          $cleanup = 'failed'
+          try {
+              $expectedFixtureRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $script:HarnessPath) 'fixture'))
+              if ([IO.Path]::GetFullPath($WorkRoot) -cne $expectedFixtureRoot -or
+                  -not $expectedFixtureRoot.StartsWith([IO.Path]::GetFullPath((Split-Path -Parent $script:HarnessPath)) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                  throw 'synthetic_cleanup_scope_invalid'
+              }
+              Remove-Item -LiteralPath $expectedFixtureRoot -Recurse -Force -ErrorAction Stop
+              $cleanup = if (Test-Path -LiteralPath $expectedFixtureRoot) { 'residual' } else { 'removed' }
+          } catch { $cleanup = 'failed' }
+
+          $report = [ordered]@{
+              powershell = '5.1.x-64-bit'
+              acl_mode = $script:aclMode
+              se_security_privilege = $script:aclPrivilege
+              positive_upgrade_attempts = 1
+              positive_upgrade_outcome = $safeUpgrade
+              failure_stage = if ($null -ne $failure) { [string]$failure.stage } else { 'none' }
+              failure_target_role = if ($null -ne $failure) { [string]$failure.target_role } else { 'none' }
+              exception_type = if ($null -ne $failure) { [string]$failure.exception_type } else { 'none' }
+              hresult = if ($null -ne $failure) { [string]$failure.hresult } else { 'none' }
+              acl_targets = @($script:aclRows)
+              state_before = [ordered]@{
+                  install_matches_baseline = [bool]$installBeforeMatchesBaseline
+                  journal = if ($journalBefore) { 'present' } else { 'absent' }
+                  task_matches_baseline = [bool]$taskBeforeMatchesBaseline
+                  runtime_matches_baseline = [bool]$runtimeBeforeMatchesBaseline
+              }
+              state_after = [ordered]@{
+                  install_matches_before = $installAfterMatches
+                  journal = $journalState
+                  candidate_stage_present = [bool]$candidatePresent
+                  previous_stage_present = [bool]$previousPresent
+                  task_matches_before = $taskAfterMatches
+                  runtime_matches_before = $runtimeAfterMatches
+                  scheduler_task_mutations = 'none_in_memory_fixture'
+              }
+              cleanup = [ordered]@{ outcome = $cleanup; synthetic_fixture_root_present = (Test-Path -LiteralPath $WorkRoot) }
+          }
+          [Console]::Out.WriteLine('ACL_DIAGNOSTIC_JSON=' + ($report | ConvertTo-Json -Depth 8 -Compress))
+          exit 0
+          '@
+
+            [IO.File]::WriteAllText($harnessPath, $harness + [Environment]::NewLine + $addon, [Text.UTF8Encoding]::new($false))
+            $executionState = 'instrumentation_parse'
+            $parseTokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($harnessPath, [ref]$parseTokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -gt 0) { throw 'diagnostic_harness_parse_failed' }
+
+            $native = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $executionState = 'fixture_attempted'
+            $inner = @(& $native -NoLogo -NoProfile -NonInteractive -File $harnessPath -InstallerPath $installerPath -WorkRoot $fixtureRoot -HarnessMode all 2>&1)
+            $innerCode = $LASTEXITCODE
+            $records = @($inner | ForEach-Object { [string]$_ } | Where-Object { $_.StartsWith('ACL_DIAGNOSTIC_JSON=', [StringComparison]::Ordinal) })
+            if ($innerCode -ne 0 -or $records.Count -ne 1) {
+              Write-Output "diagnostic_execution=failed; harness_exit_code=$innerCode; report_count=$($records.Count)"
+              throw 'diagnostic_harness_execution_failed'
+            }
+            $payload = $records[0].Substring('ACL_DIAGNOSTIC_JSON='.Length) | ConvertFrom-Json -ErrorAction Stop
+            $executionState = 'completed'
+            Write-Output ('ACL_DIAGNOSTIC_JSON=' + ($payload | ConvertTo-Json -Depth 8 -Compress))
+          } catch {
+            $type = if ($null -ne $_.Exception) { [string]$_.Exception.GetType().FullName } else { 'unknown' }
+            $hr = if ($null -ne $_.Exception) { '0x{0:X8}' -f [int]$_.Exception.HResult } else { 'none' }
+            Write-Output "diagnostic_execution=$executionState; exception_type=$type; hresult=$hr"
+            throw 'diagnostic_step_failed'
+          } finally {
+            if (Test-Path -LiteralPath $runRoot) {
+              $resolvedRunRoot = [IO.Path]::GetFullPath($runRoot)
+              if ($resolvedRunRoot.StartsWith($runnerTempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                try { Remove-Item -LiteralPath $resolvedRunRoot -Recurse -Force -ErrorAction Stop; Write-Output 'diagnostic_temp_cleanup=removed' }
+                catch { Write-Output 'diagnostic_temp_cleanup=failed' }
+              } else { Write-Output 'diagnostic_temp_cleanup=scope_hold' }
+            }
+          }
