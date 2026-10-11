@@ -1,0 +1,652 @@
+name: xb155-acl-faithful-positive-diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened]
+    paths:
+      - ".github/workflows/xb155-acl-faithful-positive-diagnostic.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  one-shot-windows:
+    if: >-
+      github.repository == 'x-boundaries/automation' &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'opened' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'codex/xb155-acl-faithful-g0-004-wj' &&
+      github.event.pull_request.head.repo.full_name == 'x-boundaries/automation'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout frozen product source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: x-boundaries/automation
+          ref: ad8bef9cd807a9d02c4497beb000735ec5ecfc32
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify frozen product commit identity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'ad8bef9cd807a9d02c4497beb000735ec5ecfc32'
+          $expectedTree = '7158011fe5adc3e5fee4a2ed871ece57a9fd26f7'
+          $expectedParent = '2753923a99da20191baa8dd51393267b3c625c80'
+          $actualHead = (git rev-parse HEAD 2>$null).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'product_head_read_failed' }
+          $actualTree = (git rev-parse 'HEAD^{tree}' 2>$null).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'product_tree_read_failed' }
+          $parentLine = (git rev-list --parents -n 1 HEAD 2>$null).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'product_parent_read_failed' }
+          $parts = @($parentLine -split '\s+')
+          if ($actualHead -cne $expectedHead -or $actualTree -cne $expectedTree -or
+              $parts.Count -ne 2 -or $parts[0] -cne $expectedHead -or $parts[1] -cne $expectedParent) {
+            throw 'frozen_product_identity_mismatch'
+          }
+          Write-Output "product_head=$actualHead"
+          Write-Output "product_tree=$actualTree"
+          Write-Output "product_parent=$expectedParent"
+
+      - name: Run one synthetic positive Upgrade with passive ACL breakpoints
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or
+              $PSVersionTable.PSVersion.Minor -ne 1 -or [IntPtr]::Size -ne 8) {
+            throw 'native_64_bit_windows_powershell_5_1_required'
+          }
+          $localAppData = $env:LOCALAPPDATA
+          if ([string]::IsNullOrWhiteSpace($localAppData)) { throw 'localappdata_missing' }
+          $tempParent = [IO.Path]::GetFullPath((Join-Path $localAppData 'Temp'))
+          if (-not (Test-Path -LiteralPath $tempParent -PathType Container)) { throw 'original_temp_parent_missing' }
+          $tempParentPrefix = $tempParent.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          $runRoot = [IO.Path]::GetFullPath((Join-Path $tempParent ('xbg3-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $runRoot.StartsWith($tempParentPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+              [IO.Path]::GetFileName($runRoot) -notmatch '^xbg3-[0-9a-f]{32}$') {
+            throw 'original_temp_root_scope_invalid'
+          }
+          $workRoot = Join-Path $runRoot 'f'
+          $harnessPath = Join-Path $runRoot 'upgrade_rollback_harness.ps1'
+          $installerPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\install_ac2_member_gateway_worker.ps1'
+          $modulePath = Join-Path $env:GITHUB_WORKSPACE 'tests\test_member_gateway_worker_deployment.py'
+          $executionState = 'root_setup'
+          $rootCreated = $false
+          $attempts = 0
+          $report = $null
+          $setupFailure = $null
+          $cleanup = [ordered]@{
+            outcome = 'not_created'
+            fixture_root_removed = $false
+            xbg3_root_removed = $false
+          }
+
+          try {
+            New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop | Out-Null
+            $rootCreated = $true
+            New-Item -ItemType Directory -Path $workRoot -ErrorAction Stop | Out-Null
+
+            $executionState = 'source_blob_verification'
+            $installerBlob = (git hash-object -- $installerPath 2>$null).Trim()
+            if ($LASTEXITCODE -ne 0 -or $installerBlob -cne '8e5d16c174a88690f1bf2f2daec9ddd1d60f1415') {
+              throw 'frozen_installer_blob_mismatch'
+            }
+            $moduleBlob = (git hash-object -- $modulePath 2>$null).Trim()
+            if ($LASTEXITCODE -ne 0 -or $moduleBlob -cne '3501a55a0e8b80658fe0536f26f83e1a39ba4fb3') {
+              throw 'frozen_fixture_source_blob_mismatch'
+            }
+
+            $executionState = 'original_fixture_extraction'
+            $moduleText = [IO.File]::ReadAllText($modulePath)
+            $marker = "_LOCAL_UPGRADE_ROLLBACK_HARNESS = r'''"
+            $start = $moduleText.IndexOf($marker, [StringComparison]::Ordinal)
+            if ($start -lt 0) { throw 'original_fixture_source_marker_missing' }
+            if ($moduleText.IndexOf($marker, $start + $marker.Length, [StringComparison]::Ordinal) -ge 0) {
+              throw 'original_fixture_source_marker_ambiguous'
+            }
+            $start += $marker.Length
+            $end = $moduleText.IndexOf("'''", $start, [StringComparison]::Ordinal)
+            if ($end -lt 0) { throw 'original_fixture_source_terminator_missing' }
+            $harnessSource = $moduleText.Substring($start, $end - $start)
+            $boundary = '# Positive dispatcher path.'
+            $cut = $harnessSource.IndexOf($boundary, [StringComparison]::Ordinal)
+            if ($cut -lt 0 -or $harnessSource.IndexOf($boundary, $cut + $boundary.Length, [StringComparison]::Ordinal) -ge 0) {
+              throw 'original_positive_fixture_boundary_invalid'
+            }
+            $harnessPrefix = $harnessSource.Substring(0, $cut)
+
+            $addon = @'
+          $script:XB155AclRows = New-Object System.Collections.ArrayList
+          $script:XB155AclBreakpoints = New-Object System.Collections.ArrayList
+          $script:XB155AclOrdinal = 0
+          $script:XB155AclSetterActive = $false
+          $script:XB155AclStage = 'not_started'
+          $script:XB155AclRole = 'unknown'
+          $script:XB155AclCurrentRow = $null
+          $script:XB155AclFailure = $null
+          $script:XB155AclObserverFault = 'none'
+          $script:XB155AclAttemptCount = 0
+          $script:XB155AclUpgradeOutcome = 'not_run'
+          $script:XB155AclSetupFailure = $null
+          $script:XB155AclBreakpointsRemoved = $false
+          $script:XB155AclBefore = $null
+          $script:XB155AclAfter = $null
+          $script:XB155AclPrivilege = 'query_error'
+          $script:XB155AclMode = if ($script:auditAclEvidence -ceq 'native') {
+              'native_sacl'
+          } elseif ([string]$script:auditAclEvidence -like 'synthetic_dacl_only:*') {
+              'dacl_only_fallback'
+          } else {
+              'unknown'
+          }
+
+          function Get-XB155AclExistingRole {
+              param([Parameter(Mandatory)][string]$Path)
+              try {
+                  $full = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar)
+                  $install = [IO.Path]::GetFullPath($script:InstallRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+                  if ($full -ceq $install) { return 'installed_root' }
+                  if ($full.StartsWith($install + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                      if ([IO.Path]::GetFileName($full) -ceq 'installation-manifest.json') { return 'installed_manifest' }
+                      return 'installed_package_file'
+                  }
+                  return 'other'
+              } catch { return 'unknown' }
+          }
+
+          function Get-XB155AclFingerprint {
+              param([object]$Acl)
+              if ($null -eq $Acl) { return 'NULL' }
+              $values = New-Object 'System.Collections.Generic.List[string]'
+              for ($i = 0; $i -lt $Acl.Count; $i++) {
+                  $ace = $Acl[$i]
+                  $bytes = New-Object byte[] $ace.BinaryLength
+                  $ace.GetBinaryForm($bytes, 0)
+                  [void]$values.Add([Convert]::ToBase64String($bytes))
+              }
+              $sorted = [string[]]$values.ToArray()
+              [Array]::Sort($sorted, [StringComparer]::Ordinal)
+              return [string]::Join(',', $sorted)
+          }
+
+          function Get-XB155AclComponentEquality {
+              param([Parameter(Mandatory)][string]$Expected, [Parameter(Mandatory)][string]$Actual)
+              try {
+                  $before = [Security.AccessControl.RawSecurityDescriptor]::new($Expected)
+                  $after = [Security.AccessControl.RawSecurityDescriptor]::new($Actual)
+                  $auto = [int]([Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor [Security.AccessControl.ControlFlags]::SystemAclAutoInherited)
+                  $beforeFlags = [int]$before.ControlFlags -band (-bnot $auto)
+                  $afterFlags = [int]$after.ControlFlags -band (-bnot $auto)
+                  $sacl = 'unobserved'
+                  if ($script:XB155AclMode -ceq 'native_sacl') {
+                      $sacl = [bool]((Get-XB155AclFingerprint $before.SystemAcl) -ceq (Get-XB155AclFingerprint $after.SystemAcl))
+                  }
+                  return [ordered]@{
+                      owner = [bool](([string]$before.Owner) -ceq ([string]$after.Owner))
+                      group = [bool](([string]$before.Group) -ceq ([string]$after.Group))
+                      control_flags = [bool]($beforeFlags -eq $afterFlags)
+                      dacl = [bool]((Get-XB155AclFingerprint $before.DiscretionaryAcl) -ceq (Get-XB155AclFingerprint $after.DiscretionaryAcl))
+                      sacl = $sacl
+                  }
+              } catch {
+                  $saclValue = if ($script:XB155AclMode -ceq 'native_sacl') { 'unknown' } else { 'unobserved' }
+                  return [ordered]@{ owner = 'unknown'; group = 'unknown'; control_flags = 'unknown'; dacl = 'unknown'; sacl = $saclValue }
+              }
+          }
+
+          function Set-XB155AclFailure {
+              param([string]$Stage, [string]$Role, [object]$ErrorRecord)
+              if ($null -eq $script:XB155AclFailure) {
+                  $script:XB155AclFailure = [ordered]@{
+                      stage = if ([string]::IsNullOrWhiteSpace($Stage)) { 'unknown' } else { $Stage }
+                      target_role = if ([string]::IsNullOrWhiteSpace($Role)) { 'unknown' } else { $Role }
+                      exception_type = 'unobserved'
+                      hresult = 'unobserved'
+                  }
+              }
+              try {
+                  if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception) {
+                      if ([string]$script:XB155AclFailure.exception_type -eq 'unobserved') {
+                          $script:XB155AclFailure.exception_type = [string]$ErrorRecord.Exception.GetType().FullName
+                          $script:XB155AclFailure.hresult = '0x' + ([int]$ErrorRecord.Exception.HResult).ToString('X8')
+                      }
+                  }
+              } catch { }
+              if ($null -ne $script:XB155AclCurrentRow) {
+                  $script:XB155AclCurrentRow.failure_stage = [string]$script:XB155AclFailure.stage
+                  $script:XB155AclCurrentRow.exception_type = [string]$script:XB155AclFailure.exception_type
+                  $script:XB155AclCurrentRow.hresult = [string]$script:XB155AclFailure.hresult
+              }
+          }
+
+          function Write-XB155AclProgress {
+              param([string]$Stage, [string]$Role)
+              [Console]::Error.WriteLine('ACL_PROGRESS=' + $Stage + ';' + $Role)
+              [Console]::Error.Flush()
+          }
+
+          function Find-XB155OneLine {
+              param([string[]]$Lines, [string]$Text, [int]$Start = 0, [int]$End = -1)
+              if ($End -lt 0 -or $End -gt $Lines.Count) { $End = $Lines.Count }
+              $hits = New-Object System.Collections.ArrayList
+              for ($i = $Start; $i -lt $End; $i++) {
+                  if ($Lines[$i].Trim() -ceq $Text) { [void]$hits.Add($i + 1) }
+              }
+              if ($hits.Count -ne 1) { throw 'passive_debugger_anchor_not_unique' }
+              return [int]$hits[0]
+          }
+
+          function Add-XB155AclBreakpoint {
+              param([string]$ScriptPath, [int]$Line, [scriptblock]$Action)
+              $bp = Set-PSBreakpoint -Script $ScriptPath -Line $Line -Action $Action -PassThru -ErrorAction Stop
+              if (@($bp).Count -ne 1 -or -not [bool]$bp.Enabled -or [int]$bp.Line -ne $Line) {
+                  throw 'passive_debugger_breakpoint_registration_failed'
+              }
+              [void]$script:XB155AclBreakpoints.Add($bp)
+          }
+
+          $actionGetterGet = {
+              try {
+                  if ($script:XB155AclSetterActive) {
+                      $script:XB155AclStage = 'readback_get_acl'
+                      Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
+                  } else {
+                      $script:XB155AclStage = 'preimage_get_acl'
+                      $script:XB155AclRole = Get-XB155AclExistingRole -Path $Path
+                      Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
+                  }
+              } catch { $script:XB155AclObserverFault = 'stage_capture_failed' }
+          }
+          $actionGetterCanonical = {
+              try {
+                  $script:XB155AclStage = if ($script:XB155AclSetterActive) { 'readback_canonical_check' } else { 'preimage_canonical_check' }
+                  Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
+              } catch { $script:XB155AclObserverFault = 'stage_capture_failed' }
+          }
+          $actionGetterSddl = {
+              try {
+                  $script:XB155AclStage = if ($script:XB155AclSetterActive) { 'readback_descriptor_serialization' } else { 'preimage_descriptor_serialization' }
+                  Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
+              } catch { $script:XB155AclObserverFault = 'stage_capture_failed' }
+          }
+          $actionGetterCatch = {
+              $capturedError = $null
+              try { if ($Error.Count -gt 0) { $capturedError = $Error[0] } } catch { }
+              try { Set-XB155AclFailure -Stage $script:XB155AclStage -Role $script:XB155AclRole -ErrorRecord $capturedError } catch {
+                  $script:XB155AclObserverFault = 'failure_capture_failed'
+              }
+          }
+          $actionSetterGet = {
+              try {
+                  $index = [int]$script:XB155AclOrdinal
+                  $script:XB155AclOrdinal = $index + 1
+                  $role = if ($index -eq 0) { 'candidate_root' }
+                      elseif ($index -le 5) { 'package_file' }
+                      elseif ($index -eq 6) { 'manifest' }
+                      else { 'other' }
+                  $script:XB155AclRole = $role
+                  $script:XB155AclSetterActive = $true
+                  $script:XB155AclStage = 'set_get_acl'
+                  Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
+                  $row = [ordered]@{ target_role = $role; component_equality = $null; failure_stage = $null; exception_type = $null; hresult = $null }
+                  [void]$script:XB155AclRows.Add($row)
+                  $script:XB155AclCurrentRow = $row
+              } catch { $script:XB155AclObserverFault = 'target_capture_failed' }
+          }
+          $actionSetterApply = {
+              try { $script:XB155AclStage = 'descriptor_application'; Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole } catch { $script:XB155AclObserverFault = 'stage_capture_failed' }
+          }
+          $actionSetterSetAcl = {
+              try { $script:XB155AclStage = 'set_acl'; Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole } catch { $script:XB155AclObserverFault = 'stage_capture_failed' }
+          }
+          $actionSetterCatch = {
+              $capturedError = $null
+              try { if ($Error.Count -gt 0) { $capturedError = $Error[0] } } catch { }
+              try { Set-XB155AclFailure -Stage $script:XB155AclStage -Role $script:XB155AclRole -ErrorRecord $capturedError } catch {
+                  $script:XB155AclObserverFault = 'failure_capture_failed'
+              }
+          }
+          $actionSetterReadback = {
+              try { $script:XB155AclStage = 'readback_get_acl'; Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole } catch { $script:XB155AclObserverFault = 'stage_capture_failed' }
+          }
+          $actionSetterCompare = {
+              try {
+                  $script:XB155AclStage = 'post_readback_comparison'
+                  Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
+                  if ($null -ne $script:XB155AclCurrentRow) {
+                      $equality = Get-XB155AclComponentEquality -Expected $Sddl -Actual $actualSddl
+                      $script:XB155AclCurrentRow.component_equality = $equality
+                      $unequal = $false
+                      foreach ($key in @('owner','group','control_flags','dacl','sacl')) {
+                          if ($equality[$key] -is [bool] -and -not [bool]$equality[$key]) { $unequal = $true }
+                      }
+                      if ($unequal) { Set-XB155AclFailure -Stage 'post_readback_comparison' -Role $script:XB155AclRole -ErrorRecord $null }
+                  }
+              } catch { $script:XB155AclObserverFault = 'comparison_observer_failed' }
+          }
+          $actionOperationCatch = {
+              $capturedError = $null
+              try { if ($Error.Count -gt 0) { $capturedError = $Error[0] } } catch { }
+              try { Set-XB155AclFailure -Stage $script:XB155AclStage -Role $script:XB155AclRole -ErrorRecord $capturedError } catch {
+                  $script:XB155AclObserverFault = 'failure_capture_failed'
+              }
+          }
+
+          try {
+              if (@($packageFiles).Count -ne 5) { throw 'original_package_shape_unexpected' }
+              if ($script:XB155AclMode -notin @('native_sacl','dacl_only_fallback')) { throw 'original_acl_selection_unclassified' }
+
+              $copyBlob = (git hash-object -- $script:FixtureInstallerPath 2>$null).Trim()
+              if ($LASTEXITCODE -ne 0 -or $copyBlob -cne '8e5d16c174a88690f1bf2f2daec9ddd1d60f1415') {
+                  throw 'original_installer_copy_changed'
+              }
+
+              $null = Initialize-XbFixture 'positive'
+              $paths = Get-XbWorkerUpgradePaths
+              $installBefore = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+              $taskBefore = Get-XbFixtureTaskSnapshot
+              $runtimeBefore = Get-XbFixtureRuntimeSnapshot
+              $journalBefore = Test-Path -LiteralPath $paths.journal
+              $installBeforeMatchesBaseline = $false
+              try { Assert-XbWorkerUpgradePackageMatches -Root $script:InstallRoot -Expected $script:baseline; $installBeforeMatchesBaseline = $true } catch { }
+              $taskBeforeMatchesBaseline = ($taskBefore -ceq $script:taskBaseline)
+              $runtimeBeforeMatchesBaseline = ($runtimeBefore -ceq $script:runtimeBaseline)
+              $script:XB155AclBefore = [ordered]@{
+                  install_matches_baseline = [bool]$installBeforeMatchesBaseline
+                  journal_present = [bool]$journalBefore
+                  task_matches_baseline = [bool]$taskBeforeMatchesBaseline
+                  runtime_matches_baseline = [bool]$runtimeBeforeMatchesBaseline
+              }
+
+              $privLines = @(& (Join-Path $env:SystemRoot 'System32\whoami.exe') /priv 2>$null | ForEach-Object { [string]$_ })
+              if ($LASTEXITCODE -eq 0) {
+                  $privRows = @($privLines | Where-Object { $_ -match '^\s*SeSecurityPrivilege\s+' })
+                  if ($privRows.Count -eq 0) { $script:XB155AclPrivilege = 'not_present' }
+                  elseif ($privRows.Count -gt 1) { $script:XB155AclPrivilege = 'ambiguous' }
+                  elseif ($privRows[0] -match '(?i)\bEnabled\b') { $script:XB155AclPrivilege = 'enabled' }
+                  elseif ($privRows[0] -match '(?i)\bDisabled\b') { $script:XB155AclPrivilege = 'disabled' }
+                  else { $script:XB155AclPrivilege = 'listed_state_unclassified' }
+              }
+
+              $installerLines = [IO.File]::ReadAllLines($script:FixtureInstallerPath)
+              $getterStart = Find-XB155OneLine -Lines $installerLines -Text 'function Get-XbWorkerUpgradeAclSddl {'
+              $converterStart = Find-XB155OneLine -Lines $installerLines -Text 'function Convert-XbWorkerUpgradeAclSddl {'
+              $setterStart = Find-XB155OneLine -Lines $installerLines -Text 'function Set-XbWorkerUpgradeAclSddl {'
+              $journalSetterStart = Find-XB155OneLine -Lines $installerLines -Text 'function Set-XbWorkerUpgradeJournalAcl {'
+              $getAclGetterLine = Find-XB155OneLine -Lines $installerLines -Text '$acl = Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop' -Start ($getterStart - 1) -End ($converterStart - 1)
+              $getterCanonicalLine = Find-XB155OneLine -Lines $installerLines -Text 'if (-not $acl.AreAccessRulesCanonical) { throw "acl_order_unproven" }' -Start ($getterStart - 1) -End ($converterStart - 1)
+              $getterSddlLine = Find-XB155OneLine -Lines $installerLines -Text 'return $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)' -Start ($getterStart - 1) -End ($converterStart - 1)
+              $getterCatchLine = Find-XB155OneLine -Lines $installerLines -Text '} catch { throw "upgrade_acl_unverifiable" }' -Start ($getterStart - 1) -End ($converterStart - 1)
+              $setAclGetterLine = Find-XB155OneLine -Lines $installerLines -Text '$acl = Get-Acl -LiteralPath $Path -Audit -ErrorAction Stop' -Start ($setterStart - 1) -End ($journalSetterStart - 1)
+              $setterApplyLine = Find-XB155OneLine -Lines $installerLines -Text '$acl.SetSecurityDescriptorSddlForm($Sddl, [Security.AccessControl.AccessControlSections]::All)' -Start ($setterStart - 1) -End ($journalSetterStart - 1)
+              $setterSetAclLine = Find-XB155OneLine -Lines $installerLines -Text 'Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop' -Start ($setterStart - 1) -End ($journalSetterStart - 1)
+              $setterCatchLine = Find-XB155OneLine -Lines $installerLines -Text '} catch { throw "upgrade_acl_preservation_failed" }' -Start ($setterStart - 1) -End ($journalSetterStart - 1)
+              $setterReadbackLine = Find-XB155OneLine -Lines $installerLines -Text '$actualSddl = Get-XbWorkerUpgradeAclSddl -Path $Path' -Start ($setterStart - 1) -End ($journalSetterStart - 1)
+              $setterCompareLine = Find-XB155OneLine -Lines $installerLines -Text 'if ((Convert-XbWorkerUpgradeAclSddl $actualSddl) -cne (Convert-XbWorkerUpgradeAclSddl $Sddl)) { throw "upgrade_acl_preservation_failed" }' -Start ($setterStart - 1) -End ($journalSetterStart - 1)
+
+              $operationCatchText = 'try { $null = Invoke-XbWorkerInstaller; return "pass" } catch { $script:lastError = [string]$_.Exception.Message; return $script:lastError }'
+              $harnessLines = [IO.File]::ReadAllLines($script:HarnessPath)
+              $operationCatchLine = Find-XB155OneLine -Lines $harnessLines -Text $operationCatchText
+
+              if ($script:XB155AclMode -ceq 'native_sacl') {
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $getAclGetterLine -Action $actionGetterGet
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $getterCanonicalLine -Action $actionGetterCanonical
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $getterSddlLine -Action $actionGetterSddl
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $getterCatchLine -Action $actionGetterCatch
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setAclGetterLine -Action $actionSetterGet
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterApplyLine -Action $actionSetterApply
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterSetAclLine -Action $actionSetterSetAcl
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterCatchLine -Action $actionSetterCatch
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterReadbackLine -Action $actionSetterReadback
+                  Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterCompareLine -Action $actionSetterCompare
+              } else {
+                  $fallbackGetterStart = Find-XB155OneLine -Lines $harnessLines -Text 'Set-Item function:script:Get-XbWorkerUpgradeAclSddl {'
+                  $fallbackSetterStart = Find-XB155OneLine -Lines $harnessLines -Text 'Set-Item function:script:Set-XbWorkerUpgradeAclSddl {'
+                  $fallbackEnd = Find-XB155OneLine -Lines $harnessLines -Text 'Set-Item function:script:Assert-XbWorkerInstallLayout { }' -Start ($fallbackSetterStart - 1)
+                  $fallbackGetAclGetterLine = Find-XB155OneLine -Lines $harnessLines -Text '$acl = Get-Acl -LiteralPath $Path -ErrorAction Stop' -Start ($fallbackGetterStart - 1) -End ($fallbackSetterStart - 1)
+                  $fallbackGetterCanonicalLine = Find-XB155OneLine -Lines $harnessLines -Text 'if (-not $acl.AreAccessRulesCanonical) { throw "acl_order_unproven" }' -Start ($fallbackGetterStart - 1) -End ($fallbackSetterStart - 1)
+                  $fallbackGetterSddlLine = Find-XB155OneLine -Lines $harnessLines -Text 'return $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)' -Start ($fallbackGetterStart - 1) -End ($fallbackSetterStart - 1)
+                  $fallbackGetterCatchLine = Find-XB155OneLine -Lines $harnessLines -Text '} catch { throw "upgrade_acl_unverifiable" }' -Start ($fallbackGetterStart - 1) -End ($fallbackSetterStart - 1)
+                  $fallbackSetAclGetterLine = Find-XB155OneLine -Lines $harnessLines -Text '$acl = Get-Acl -LiteralPath $Path -ErrorAction Stop' -Start ($fallbackSetterStart - 1) -End ($fallbackEnd - 1)
+                  $fallbackSetterApplyLine = Find-XB155OneLine -Lines $harnessLines -Text '$acl.SetSecurityDescriptorSddlForm($Sddl, [Security.AccessControl.AccessControlSections]::All)' -Start ($fallbackSetterStart - 1) -End ($fallbackEnd - 1)
+                  $fallbackSetterSetAclLine = Find-XB155OneLine -Lines $harnessLines -Text 'Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop' -Start ($fallbackSetterStart - 1) -End ($fallbackEnd - 1)
+                  $fallbackSetterCatchLine = Find-XB155OneLine -Lines $harnessLines -Text '} catch { throw "upgrade_acl_preservation_failed" }' -Start ($fallbackSetterStart - 1) -End ($fallbackEnd - 1)
+                  $fallbackSetterReadbackLine = Find-XB155OneLine -Lines $harnessLines -Text '$actualSddl = Get-XbWorkerUpgradeAclSddl -Path $Path' -Start ($fallbackSetterStart - 1) -End ($fallbackEnd - 1)
+                  $fallbackSetterCompareLine = Find-XB155OneLine -Lines $harnessLines -Text 'if ((Convert-XbWorkerUpgradeAclSddl $actualSddl) -cne (Convert-XbWorkerUpgradeAclSddl $Sddl)) { throw "upgrade_acl_preservation_failed" }' -Start ($fallbackSetterStart - 1) -End ($fallbackEnd - 1)
+
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackGetAclGetterLine -Action $actionGetterGet
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackGetterCanonicalLine -Action $actionGetterCanonical
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackGetterSddlLine -Action $actionGetterSddl
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackGetterCatchLine -Action $actionGetterCatch
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackSetAclGetterLine -Action $actionSetterGet
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackSetterApplyLine -Action $actionSetterApply
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackSetterSetAclLine -Action $actionSetterSetAcl
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackSetterCatchLine -Action $actionSetterCatch
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackSetterReadbackLine -Action $actionSetterReadback
+                  Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $fallbackSetterCompareLine -Action $actionSetterCompare
+              }
+              Add-XB155AclBreakpoint -ScriptPath $script:HarnessPath -Line $operationCatchLine -Action $actionOperationCatch
+              if ($script:XB155AclBreakpoints.Count -ne 11) { throw 'passive_debugger_breakpoint_count_mismatch' }
+
+              [Console]::Out.WriteLine('ACL_MODE=' + $script:XB155AclMode + ';SE_SECURITY_PRIVILEGE=' + $script:XB155AclPrivilege)
+              [Console]::Out.Flush()
+              $script:XB155AclAttemptCount = 1
+              [Console]::Out.WriteLine('ACL_ATTEMPT_STARTED')
+              [Console]::Out.Flush()
+              $upgradeResult = Invoke-XbFixtureOperation 'Upgrade'
+              $script:XB155AclSetterActive = $false
+              if ($upgradeResult -ceq 'pass') { $script:XB155AclUpgradeOutcome = 'pass' }
+              elseif ($upgradeResult -match '^upgrade_[a-z0-9_]+$') { $script:XB155AclUpgradeOutcome = [string]$upgradeResult }
+              else { $script:XB155AclUpgradeOutcome = 'failure_sanitized' }
+
+              $paths = Get-XbWorkerUpgradePaths
+              $journalState = 'absent'
+              $candidatePresent = $false
+              $previousPresent = $false
+              if (Test-Path -LiteralPath $paths.journal) {
+                  try {
+                      $journal = Read-XbWorkerUpgradeJournal -Path $paths.journal
+                      $journalState = [string]$journal.state
+                      if ($journalState -notin @('preparing','staged','old_move_intent','new_move_intent','complete','rollback_new_intent','rollback_old_intent','rolled_back','aborted')) { $journalState = 'other' }
+                      $candidatePresent = Test-Path -LiteralPath ([string]$journal.candidate_root)
+                      $previousPresent = Test-Path -LiteralPath ([string]$journal.previous_root)
+                  } catch { $journalState = 'unreadable' }
+              }
+              $installAfter = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+              $taskAfter = Get-XbFixtureTaskSnapshot
+              $runtimeAfter = Get-XbFixtureRuntimeSnapshot
+              $script:XB155AclAfter = [ordered]@{
+                  install_matches_before = [bool]($installAfter -ceq $installBefore)
+                  journal = $journalState
+                  candidate_stage_present = [bool]$candidatePresent
+                  previous_stage_present = [bool]$previousPresent
+                  task_matches_before = [bool]($taskAfter -ceq $taskBefore)
+                  runtime_matches_before = [bool]($runtimeAfter -ceq $runtimeBefore)
+                  task_fixture = 'synthetic_in_memory_only'
+              }
+          } catch {
+              $errorRecord = $_
+              $type = 'unknown'
+              $hr = 'unobserved'
+              try {
+                  if ($null -ne $errorRecord.Exception) {
+                      $type = [string]$errorRecord.Exception.GetType().FullName
+                      $hr = '0x' + ([int]$errorRecord.Exception.HResult).ToString('X8')
+                  }
+              } catch { }
+              $script:XB155AclSetupFailure = [ordered]@{ type = $type; hresult = $hr }
+          } finally {
+              try {
+                  if ($script:XB155AclBreakpoints.Count -gt 0) {
+                      $ids = @($script:XB155AclBreakpoints | ForEach-Object { [int]$_.Id })
+                      Get-PSBreakpoint -Id $ids | Remove-PSBreakpoint -ErrorAction Stop
+                      $script:XB155AclBreakpointsRemoved = $true
+                  } else { $script:XB155AclBreakpointsRemoved = $true }
+              } catch { $script:XB155AclBreakpointsRemoved = $false }
+          }
+
+          $failure = $script:XB155AclFailure
+          $report = [ordered]@{
+              original_function_fidelity = if ($script:XB155AclAttemptCount -eq 1) { 'verified_source_copy_passive_debugger' } else { 'not_executed' }
+              positive_upgrade_attempts = [int]$script:XB155AclAttemptCount
+              positive_upgrade_outcome = [string]$script:XB155AclUpgradeOutcome
+              acl_selection = [string]$script:XB155AclMode
+              se_security_privilege = [string]$script:XB155AclPrivilege
+              failure_stage = if ($null -ne $failure) { [string]$failure.stage } elseif ($null -ne $script:XB155AclSetupFailure) { 'diagnostic_setup_failed' } else { 'none' }
+              failure_target_role = if ($null -ne $failure) { [string]$failure.target_role } else { 'unknown' }
+              exception_type = if ($null -ne $failure) { [string]$failure.exception_type } elseif ($null -ne $script:XB155AclSetupFailure) { [string]$script:XB155AclSetupFailure.type } else { 'none' }
+              hresult = if ($null -ne $failure) { [string]$failure.hresult } elseif ($null -ne $script:XB155AclSetupFailure) { [string]$script:XB155AclSetupFailure.hresult } else { 'none' }
+              acl_target_equality = @($script:XB155AclRows | ForEach-Object {
+                  [ordered]@{ target_role = [string]$_.target_role; components = $_.component_equality }
+              })
+              state_before = $script:XB155AclBefore
+              state_after = $script:XB155AclAfter
+              debugger_breakpoints_registered = [int]$script:XB155AclBreakpoints.Count
+              debugger_breakpoints_removed = [bool]$script:XB155AclBreakpointsRemoved
+              observer_fault = [string]$script:XB155AclObserverFault
+              setup_failure = [bool]($null -ne $script:XB155AclSetupFailure)
+          }
+          [Console]::Out.WriteLine('ACL_DIAGNOSTIC_JSON=' + ($report | ConvertTo-Json -Depth 8 -Compress))
+          exit 0
+          '@
+
+            $executionState = 'temporary_harness_creation'
+            [IO.File]::WriteAllText($harnessPath, $harnessPrefix + [Environment]::NewLine + $addon, [Text.UTF8Encoding]::new($false))
+            $parseTokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($harnessPath, [ref]$parseTokens, [ref]$parseErrors)
+            if (@($parseErrors).Count -gt 0) { throw 'temporary_harness_parse_failed' }
+
+            $executionState = 'native_harness_execution'
+            $native = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $arguments = @('-ExecutionPolicy','Bypass','-NoLogo','-NoProfile','-NonInteractive','-File',$harnessPath,'-InstallerPath',$installerPath,'-WorkRoot',$workRoot)
+            if (@($arguments | Where-Object { $_.Contains('"') }).Count -gt 0) { throw 'native_argument_quote_unexpected' }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $native
+            $psi.Arguments = (($arguments | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+            $psi.WorkingDirectory = $env:GITHUB_WORKSPACE
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $currentEnvironment = [Environment]::GetEnvironmentVariables()
+            foreach ($key in $currentEnvironment.Keys) {
+              if ([string]$key -cne 'PSModulePath') { $psi.EnvironmentVariables[[string]$key] = [string]$currentEnvironment[$key] }
+            }
+            $systemRoot = if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) { $env:SystemRoot } else { 'C:\Windows' }
+            $programFiles = if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) { $env:ProgramFiles } else { 'C:\Program Files' }
+            $systemModules = Join-Path $systemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+            $programModules = Join-Path $programFiles 'WindowsPowerShell\Modules'
+            $psi.EnvironmentVariables['PSModulePath'] = [string]::Join([IO.Path]::PathSeparator, @($systemModules,$programModules))
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $psi
+            if (-not $process.Start()) { throw 'native_harness_start_failed' }
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $finished = $process.WaitForExit(840000)
+            if (-not $finished) {
+              try { $process.Kill(); $process.WaitForExit() } catch { }
+            }
+            $childTimedOut = -not $finished
+            $childExitCode = if ($finished) { [int]$process.ExitCode } else { 124 }
+            $childOutput = $stdoutTask.Result
+            $childError = $stderrTask.Result
+            $records = @($childOutput | ForEach-Object { [string]$_ } | Where-Object { $_.StartsWith('ACL_DIAGNOSTIC_JSON=', [StringComparison]::Ordinal) })
+            if ($records.Count -eq 1) {
+              $report = $records[0].Substring('ACL_DIAGNOSTIC_JSON='.Length) | ConvertFrom-Json -ErrorAction Stop
+              $attempts = [int]$report.positive_upgrade_attempts
+              Add-Member -InputObject $report -NotePropertyName child_exit_code -NotePropertyValue ([int]$childExitCode) -Force
+              Add-Member -InputObject $report -NotePropertyName child_timed_out -NotePropertyValue ([bool]$childTimedOut) -Force
+              $executionState = 'report_received'
+            } elseif ($childTimedOut) {
+              $attempts = if ($childOutput.Contains('ACL_ATTEMPT_STARTED')) { 1 } else { 0 }
+              $lastProgress = @($childError -split '\r?\n' | Where-Object { $_.StartsWith('ACL_PROGRESS=', [StringComparison]::Ordinal) })
+              $progressFields = if ($lastProgress.Count -gt 0) { $lastProgress[$lastProgress.Count - 1].Substring('ACL_PROGRESS='.Length).Split(';') } else { @('unknown','unknown') }
+              $modeLine = @($childOutput -split '\r?\n' | Where-Object { $_.StartsWith('ACL_MODE=', [StringComparison]::Ordinal) })
+              $modeFields = if ($modeLine.Count -eq 1) { $modeLine[0].Substring('ACL_MODE='.Length).Split(';') } else { @() }
+              $mode = if ($modeFields.Count -ge 1) { [string]$modeFields[0] } else { 'unknown' }
+              $privilege = if ($modeFields.Count -eq 2 -and $modeFields[1].StartsWith('SE_SECURITY_PRIVILEGE=', [StringComparison]::Ordinal)) { $modeFields[1].Substring('SE_SECURITY_PRIVILEGE='.Length) } else { 'unknown' }
+              $report = [ordered]@{
+                original_function_fidelity = if ($attempts -eq 1) { 'verified_source_copy_passive_debugger' } else { 'not_executed' }
+                positive_upgrade_attempts = [int]$attempts
+                positive_upgrade_outcome = 'timed_out'
+                acl_selection = $mode
+                se_security_privilege = $privilege
+                failure_stage = [string]$progressFields[0]
+                failure_target_role = [string]$progressFields[1]
+                exception_type = 'unobserved'
+                hresult = 'unobserved'
+                acl_target_equality = @()
+                state_before = $null
+                state_after = $null
+                debugger_breakpoints_registered = 11
+                debugger_breakpoints_removed = $false
+                observer_fault = 'unobserved_after_timeout'
+                setup_failure = $false
+                child_exit_code = [int]$childExitCode
+                child_timed_out = $true
+              }
+              $executionState = 'native_harness_timed_out'
+            } else {
+              throw 'sanitized_diagnostic_report_missing_or_ambiguous'
+            }
+          } catch {
+            $type = 'unknown'
+            $hr = 'unobserved'
+            try {
+              if ($null -ne $_.Exception) {
+                $type = [string]$_.Exception.GetType().FullName
+                $hr = '0x' + ([int]$_.Exception.HResult).ToString('X8')
+              }
+            } catch { }
+            $setupFailure = [ordered]@{ state = $executionState; exception_type = $type; hresult = $hr }
+          } finally {
+            if ($rootCreated) {
+              try {
+                $resolvedRoot = [IO.Path]::GetFullPath($runRoot)
+                if (-not $resolvedRoot.StartsWith($tempParentPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                    [IO.Path]::GetFileName($resolvedRoot) -notmatch '^xbg3-[0-9a-f]{32}$') {
+                  throw 'cleanup_scope_invalid'
+                }
+                Remove-Item -LiteralPath $resolvedRoot -Recurse -Force -ErrorAction Stop
+                $rootRemoved = -not (Test-Path -LiteralPath $resolvedRoot)
+                $fixtureRemoved = -not (Test-Path -LiteralPath $workRoot)
+                $cleanup = [ordered]@{
+                  outcome = if ($rootRemoved -and $fixtureRemoved) { 'removed' } else { 'residual' }
+                  fixture_root_removed = [bool]$fixtureRemoved
+                  xbg3_root_removed = [bool]$rootRemoved
+                }
+              } catch {
+                $cleanup = [ordered]@{
+                  outcome = 'failed_or_scope_hold'
+                  fixture_root_removed = [bool](-not (Test-Path -LiteralPath $workRoot))
+                  xbg3_root_removed = [bool](-not (Test-Path -LiteralPath $runRoot))
+                }
+              }
+            }
+          }
+
+          if ($null -eq $report) {
+            $report = [ordered]@{
+              original_function_fidelity = 'unverified'
+              positive_upgrade_attempts = [int]$attempts
+              diagnostic_state = if ($null -ne $setupFailure) { [string]$setupFailure.state } else { 'unknown' }
+              exception_type = if ($null -ne $setupFailure) { [string]$setupFailure.exception_type } else { 'unobserved' }
+              hresult = if ($null -ne $setupFailure) { [string]$setupFailure.hresult } else { 'unobserved' }
+            }
+          }
+          Add-Member -InputObject $report -NotePropertyName cleanup -NotePropertyValue $cleanup -Force
+          Write-Output ('ACL_DIAGNOSTIC_JSON=' + ($report | ConvertTo-Json -Depth 9 -Compress))
+
+          if ($cleanup.outcome -cne 'removed') { throw 'synthetic_temp_cleanup_not_proven' }
+          if ([bool]$report.child_timed_out) { throw 'native_harness_timeout' }
+          if ([int]$report.child_exit_code -ne 0) { throw 'native_harness_exit_not_zero' }
+          if ($attempts -ne 1) { throw 'one_positive_upgrade_attempt_not_completed' }
+          if ($report.positive_upgrade_outcome -cne 'pass') { throw 'positive_upgrade_failed' }
+          if ([bool]$report.setup_failure -or [string]$report.observer_fault -cne 'none') { throw 'passive_observer_integrity_failed' }
+          if (-not [bool]$report.debugger_breakpoints_removed) { throw 'passive_debugger_cleanup_failed' }
