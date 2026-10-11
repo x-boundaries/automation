@@ -119,11 +119,10 @@ jobs:
                 if ($null -eq $attemptProperty -or $integerTypes -cnotcontains $valueType) {
                   $status = 'invalid_schema'
                 } else {
-                  $numericAttempts = [long]$attemptValue
-                  if ($numericAttempts -lt 0 -or $numericAttempts -gt 1) {
+                  if ($attemptValue -lt 0 -or $attemptValue -gt 1) {
                     $status = 'invalid_schema'
                   } else {
-                    $reportedAttempts = [int]$numericAttempts
+                    $reportedAttempts = [int]$attemptValue
                     $status = 'accepted'
                   }
                 }
@@ -166,10 +165,10 @@ jobs:
           $setupFailure = $null
           $childReportStatus = 'not_started'
           $childProtocolMarkers = [ordered]@{
-            acl_mode_present = $false
-            acl_attempt_started_present = $false
-            acl_diagnostic_json_line_count = 0
-            acl_progress_present = $false
+            acl_mode_present = 'unknown'
+            acl_attempt_started_present = 'unknown'
+            acl_diagnostic_json_line_count = 'unknown'
+            acl_progress_present = 'unknown'
           }
           $childLastObservedAclStage = 'unknown'
           $cleanup = [ordered]@{
@@ -719,8 +718,12 @@ jobs:
           if ($null -eq $report) {
             $report = [ordered]@{
               original_function_fidelity = 'unverified'
-              positive_upgrade_attempts = [int]$attempts
+              positive_upgrade_attempts = if ($null -ne $attempts) { [int]$attempts } else { 'unknown' }
               diagnostic_state = if ($null -ne $setupFailure) { [string]$setupFailure.state } else { 'unknown' }
+              child_report_status = [string]$childReportStatus
+              child_protocol_markers = $childProtocolMarkers
+              failure_stage = [string]$childLastObservedAclStage
+              failure_stage_source = if ($childLastObservedAclStage -ceq 'unknown') { 'unobserved' } else { 'last_observed_acl_progress_marker' }
               exception_type = if ($null -ne $setupFailure) { [string]$setupFailure.exception_type } else { 'unobserved' }
               hresult = if ($null -ne $setupFailure) { [string]$setupFailure.hresult } else { 'unobserved' }
             }
