@@ -17,7 +17,7 @@ jobs:
       github.event_name == 'pull_request' &&
       github.event.action == 'opened' &&
       github.event.pull_request.base.ref == 'main' &&
-      github.event.pull_request.head.ref == 'codex/xb155-candidate-root-acl-transform-witness-g0-008-wj' &&
+      github.event.pull_request.head.ref == 'codex/xb155-acl-enum-bor-hosted-reclosure-g3-010-wj' &&
       github.event.pull_request.head.repo.full_name == 'x-boundaries/automation'
     runs-on: windows-latest
     timeout-minutes: 20
