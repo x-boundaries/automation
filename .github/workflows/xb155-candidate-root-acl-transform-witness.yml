@@ -354,8 +354,8 @@ jobs:
           function Test-XB155AclDiagnosticControls {
               $sid = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::WorldSid, $null)
               $sample = [Security.AccessControl.RawAcl]::new([byte]2, 2)
-              $explicitFlags = [Security.AccessControl.AceFlags]::ObjectInherit -bor [Security.AccessControl.AceFlags]::ContainerInherit
-              $inheritedFlags = [Security.AccessControl.AceFlags]::NoPropagateInherit -bor [Security.AccessControl.AceFlags]::InheritOnly -bor [Security.AccessControl.AceFlags]::Inherited
+              $explicitFlags = [Security.AccessControl.AceFlags]([int][Security.AccessControl.AceFlags]::ObjectInherit -bor [int][Security.AccessControl.AceFlags]::ContainerInherit)
+              $inheritedFlags = [Security.AccessControl.AceFlags]([int][Security.AccessControl.AceFlags]::NoPropagateInherit -bor [int][Security.AccessControl.AceFlags]::InheritOnly -bor [int][Security.AccessControl.AceFlags]::Inherited)
               $explicitAce = [Security.AccessControl.CommonAce]::new($explicitFlags, [Security.AccessControl.AceQualifier]::AccessAllowed, 1, $sid, $false, $null)
               $inheritedAce = [Security.AccessControl.CommonAce]::new($inheritedFlags, [Security.AccessControl.AceQualifier]::AccessAllowed, 1, $sid, $false, $null)
               $sample.InsertAce(0, $explicitAce)
