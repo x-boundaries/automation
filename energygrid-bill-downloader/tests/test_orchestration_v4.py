@@ -282,6 +282,37 @@ class CrashAndRestartTests(OfflineV4RunTests):
         # Only the second session's Tenant Bill upload and email; the stale session made no call.
         self.assertEqual(2, len(self.ledger.effects))
 
+    def test_a_takeover_before_a_fetch_means_the_stale_session_fetches_nothing(self) -> None:
+        state = {"taken": False}
+        stale = self.standard_adapters()
+
+        def takeover(name: str) -> None:
+            if name == "before_fetch" and not state["taken"]:
+                state["taken"] = True
+                self.run_once(2, self.standard_adapters(), owner="session-b", now_ms=self.clock + 2 * SECOND)
+
+        with self.assertRaises(OfflineV4Error) as caught:
+            self.run_once(1, stale, checkpoint=takeover)
+        self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
+        self.assertEqual([], stale[EB].acquire_calls)
+        self.assertEqual(4, len(self.ledger.effects))
+
+    def test_a_takeover_between_streams_stops_before_the_other_stream_is_listed(self) -> None:
+        state = {"taken": False}
+        stale = self.standard_adapters()
+
+        def takeover(name: str) -> None:
+            if name == "after_admission" and not state["taken"]:
+                state["taken"] = True
+                self.run_once(2, self.standard_adapters(), owner="session-b", now_ms=self.clock + 2 * SECOND)
+
+        with self.assertRaises(OfflineV4Error) as caught:
+            self.run_once(1, stale, checkpoint=takeover)
+        self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
+        self.assertEqual(0, stale[TN].inventory_calls)
+        self.assertEqual([], stale[TN].acquire_calls)
+        self.assertEqual(4, len(self.ledger.effects))
+
     def test_a_takeover_during_admission_means_the_stale_session_publishes_nothing(self) -> None:
         state = {"taken": False}
 

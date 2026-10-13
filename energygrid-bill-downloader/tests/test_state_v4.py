@@ -234,6 +234,40 @@ class MigrationTests(_V4Base):
             migrate_state_database_v4(self.path, apply=True)
         self.assertEqual([("inspect", True), ("backup-locked", True)], seen)
 
+    def assert_still_v3(self) -> None:
+        connection = raw(self.path)
+        try:
+            self.assertEqual(3, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'energygrid_v4_%'").fetchone()[0])
+        finally:
+            connection.close()
+
+    def test_a_failed_v4_inspection_rolls_the_migration_back_to_v3(self) -> None:
+        from energygrid_bill_downloader import state as state_module
+
+        with mock.patch.object(state_module, "_inspect_v4_database", return_value="INCOMPATIBLE_V4"):
+            with self.assertRaises(OfflineV4Error) as caught:
+                migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual("EG_V4_SCHEMA_VALIDATION_FAILED", caught.exception.support_ref)
+        self.assert_still_v3()
+
+    def test_a_changed_predecessor_digest_rolls_the_migration_back_to_v3(self) -> None:
+        from energygrid_bill_downloader import state as state_module
+
+        real_digest = state_module._predecessor_digest
+        calls = {"count": 0}
+
+        def changed_after_the_migration(connection):
+            calls["count"] += 1
+            return real_digest(connection) if calls["count"] == 1 else "0" * 64
+
+        with mock.patch.object(state_module, "_predecessor_digest", side_effect=changed_after_the_migration):
+            with self.assertRaises(OfflineV4Error) as caught:
+                migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual("EG_V4_PREDECESSOR_CHANGED", caught.exception.support_ref)
+        self.assert_still_v3()
+
     def test_the_v3_store_refuses_a_migrated_database_instead_of_reading_it_as_v3(self) -> None:
         migrate_state_database_v4(self.path, apply=True)
         with self.assertRaises(StateError):

@@ -86,6 +86,11 @@ class DisplayFilenameTests(unittest.TestCase):
             "\u200bOCT 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
             "OCT 2026 - \u200bSEP 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
             "OCT\u200b 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            "Bill\x85x.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            "Bill\x7fx.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            "OCT 2026 - OCT\u16802026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "OCT 2026 - OCT 2026\u2028- invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "OCT 2026 - OCT 2026 \u2013 invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
         }
         for source, support_ref in refused.items():
             with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:

@@ -34,8 +34,8 @@ _PREFIX_RE = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 _FOLDED_PREFIX_RE = re.compile(
-    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*[0-9]{4}\s*-",
-    re.ASCII | re.IGNORECASE,
+    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*[0-9]{4}\s*[-\u2010-\u2015\u2212]",
+    re.IGNORECASE,
 )
 
 
@@ -57,7 +57,7 @@ def display_filename(source_filename: str, invoice_date: date) -> str:
     prefix = month_prefix(invoice_date)
     if type(source_filename) is not str or not source_filename:
         raise OfflineV4Error("EG_V4_DISPLAY_SOURCE_INVALID")
-    if any(unicodedata.category(char) == "Cf" for char in source_filename):
+    if any(unicodedata.category(char) in ("Cc", "Cf") for char in source_filename):
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
     if source_filename != source_filename.lstrip():
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
@@ -90,7 +90,7 @@ def display_key(name: str) -> str:
 def _validate_display(name: str) -> None:
     if len(name) > DISPLAY_NAME_MAX_LENGTH:
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
-    if any(ord(char) < 32 or char in WINDOWS_INVALID_FILENAME_CHARS or char == "\\" for char in name):
+    if any(unicodedata.category(char) == "Cc" or char in WINDOWS_INVALID_FILENAME_CHARS or char == "\\" for char in name):
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
     if name.endswith((".", " ")) or not name.lower().endswith(".pdf"):
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")

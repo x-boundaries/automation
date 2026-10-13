@@ -29,8 +29,9 @@ separate G2 permission boundary.
 | Source name | Kept verbatim after the prefix, extension included (`.pdf` or `.PDF`) |
 | Already prefixed, same month and year | Accepted; the prefix is normalised to uppercase, with no second prefix |
 | Any other `MMM YYYY - ` prefix, or a doubled prefix | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
-| Leading whitespace, or any format character (Unicode category Cf) | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
-| Other month-year text at the start, after NFKC folding and whitespace removal (for example a doubled prefix with two spaces or a non-breaking space) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
+| Leading whitespace, or any format (Cf) or control (Cc) character | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
+| Other month-year text at the start, after NFKC folding, with any Unicode whitespace or dash treated as a separator (for example a doubled prefix with two spaces, a non-breaking space or an en dash) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
+| The same month and year in another shape at the start (for example `OCT2026-` or `OCT 2026-03`) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT`. Fail closed: the rule is not guessed from the name. Confirm the real EnergyGrid filename shapes before cutover. |
 | Empty stem, non-PDF, control or path characters, reserved device name | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
 | Result longer than 260 characters | Refused, never truncated |
 | Collision within one stream (NFC plus casefold) | Refused at admission, `EG_V4_DISPLAY_NAME_COLLISION` |
@@ -177,4 +178,7 @@ python -m unittest discover -s tests
 - The lease is not renewed during a run. Its duration (600 s by default) must exceed the longest run.
   A longer run is taken over, and it then stops before its next external effect with `EG_V4_LEASE_LOST`.
   The intent it left DISPATCHED is recovered as UNKNOWN by the new owner, and it is not resent.
+- Filename shapes: a month-year text at the start that is not the exact `MMM YYYY - ` form is refused,
+  not normalised. If the real EnergyGrid filenames use another shape, the stream will be refused
+  until Web decides the rule. This must be confirmed before cutover.
 - Only the Windows `MoveFileExW` publication path is used, as in v3.

@@ -1440,6 +1440,7 @@ def admit_latest_offline_v4(
         temp_dir = create_run_directory(temp_root, run_id)
         try:
             fetched = temp_dir / f"{stream.lower()}-latest.pdf"
+            hook("before_fetch")
             state.assert_lease_held()
             try:
                 adapter.acquire(candidate, fetched)
