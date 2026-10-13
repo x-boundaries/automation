@@ -33,6 +33,10 @@ _PREFIX_RE = re.compile(
     r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC) [0-9]{4} - ",
     re.ASCII | re.IGNORECASE,
 )
+_FOLDED_PREFIX_RE = re.compile(
+    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*[0-9]{4}\s*-",
+    re.ASCII | re.IGNORECASE,
+)
 
 
 def month_prefix(invoice_date: date) -> str:
@@ -42,20 +46,32 @@ def month_prefix(invoice_date: date) -> str:
     return f"{MONTH_ABBREVIATIONS[invoice_date.month - 1]} {invoice_date.year:04d} - "
 
 
+def _folded(text: str) -> str:
+    """NFKC text without format characters and leading whitespace, used only to detect a prefix."""
+    kept = "".join(char for char in unicodedata.normalize("NFKC", text) if unicodedata.category(char) != "Cf")
+    return kept.lstrip()
+
+
 def display_filename(source_filename: str, invoice_date: date) -> str:
     """Return `MMM YYYY - <source filename>` with the prefix applied exactly once."""
     prefix = month_prefix(invoice_date)
     if type(source_filename) is not str or not source_filename:
         raise OfflineV4Error("EG_V4_DISPLAY_SOURCE_INVALID")
+    if any(unicodedata.category(char) == "Cf" for char in source_filename):
+        raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
     if source_filename != source_filename.lstrip():
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
-    remainder = source_filename
-    match = _PREFIX_RE.match(source_filename)
-    if match is not None:
-        if match.group(0).casefold() != prefix.casefold():
+    exact = _PREFIX_RE.match(source_filename)
+    if exact is not None:
+        if exact.group(0).casefold() != prefix.casefold():
             raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
-        remainder = source_filename[len(match.group(0)):]
-    if _PREFIX_RE.match(remainder) is not None:
+        remainder = source_filename[len(exact.group(0)):]
+    else:
+        # Any other month-year text at the start is a conflict, even with odd spacing.
+        if _FOLDED_PREFIX_RE.match(_folded(source_filename)) is not None:
+            raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
+        remainder = source_filename
+    if _FOLDED_PREFIX_RE.match(_folded(remainder)) is not None:
         raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
     if not remainder.lower().endswith(".pdf") or not remainder[: -len(".pdf")].strip():
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")

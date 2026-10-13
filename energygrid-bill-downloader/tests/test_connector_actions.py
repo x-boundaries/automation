@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -221,7 +222,10 @@ class StaticNoProviderProofTests(unittest.TestCase):
             "state.py": {"StateV4Store", "migrate_state_database_v4", "predecessor_digest", "_predecessor_digest",
                          "_inspect_v4_database", "_reference_v4_manifest", "_apply_v4_schema", "_move_intent",
                          "_v4_receipt_target", "_v4_receipt_digest", "_v4_invoice_key", "_v4_intent_id",
-                         "_v4_archive_relpath", "_refusal_from_sqlite", "_fetch_dicts"},
+                         "_v4_archive_relpath", "_refusal_from_sqlite", "_fetch_dicts",
+                         "_v4_admission_conflicts", "_backup_state_file_exclusive", "_v4_added_keys",
+                         "assert_lease_held", "acquire_lease", "release_lease", "check_admissible",
+                         "admit_invoice", "record_receipt", "seal_dispatch", "recover_unfinished"},
         }
         for module, names in targets.items():
             tree = ast.parse((PACKAGE / module).read_text(encoding="utf-8"), filename=module)
@@ -283,6 +287,8 @@ class RuntimeNoProviderProofTests(unittest.TestCase):
                 mock.patch.object(socket, "create_connection", recorder("socket.create_connection")),
                 mock.patch.object(urllib.request, "urlopen", recorder("urllib.urlopen")),
                 mock.patch.object(subprocess, "Popen", recorder("subprocess.Popen")),
+                mock.patch.object(subprocess, "run", recorder("subprocess.run")),
+                mock.patch.object(os, "system", recorder("os.system")),
             ]
             for patch in patches:
                 patch.start()

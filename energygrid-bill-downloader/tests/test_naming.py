@@ -77,6 +77,21 @@ class DisplayFilenameTests(unittest.TestCase):
             display_filename(" OCT 2026 - invoice.pdf", date(2026, 10, 1))
         self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
 
+    def test_doubled_prefix_hidden_by_spacing_or_format_characters_is_refused(self) -> None:
+        refused = {
+            "OCT 2026 -  OCT 2026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "OCT 2026 -\u00a0OCT 2026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "SEP 2026 -\u00a0invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "Jan 2026 - Electricity.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "\u200bOCT 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            "OCT 2026 - \u200bSEP 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            "OCT\u200b 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+        }
+        for source, support_ref in refused.items():
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 1))
+            self.assertEqual(support_ref, caught.exception.support_ref)
+
     def test_invalid_source_and_date_types_are_refused(self) -> None:
         cases = (
             (lambda: display_filename("", date(2026, 10, 1)), "EG_V4_DISPLAY_SOURCE_INVALID"),

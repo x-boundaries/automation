@@ -265,7 +265,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
         self.assertEqual(4, len(self.steps(result)))
         self.assertEqual(4, len(self.ledger.effects))
 
-    def test_a_run_whose_lease_was_taken_over_stops_before_recording_its_receipt(self) -> None:
+    def test_a_run_whose_lease_was_taken_over_stops_before_calling_the_provider(self) -> None:
         state = {"taken": False}
 
         def takeover(name: str) -> None:
@@ -277,10 +277,27 @@ class CrashAndRestartTests(OfflineV4RunTests):
         with self.assertRaises(OfflineV4Error) as caught:
             self.run_once(1, self.standard_adapters(), checkpoint=takeover)
         self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
-        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
-        self.assertEqual(0, len([e for e in self.effects(GMAIL) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
         self.assertEqual("UNKNOWN", self.intent_state("2026-10-01", DRIVE))
-        self.assertEqual(3, len(self.ledger.effects))
+        # Only the second session's Tenant Bill upload and email; the stale session made no call.
+        self.assertEqual(2, len(self.ledger.effects))
+
+    def test_a_takeover_during_admission_means_the_stale_session_publishes_nothing(self) -> None:
+        state = {"taken": False}
+
+        def takeover(name: str) -> None:
+            if name == "after_fetch" and not state["taken"]:
+                state["taken"] = True
+                adapters = {EB: self.adapter(EB), TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1")))}
+                self.run_once(2, adapters, owner="session-b", now_ms=self.clock + 2 * SECOND)
+
+        with self.assertRaises(OfflineV4Error) as caught:
+            self.run_once(1, self.standard_adapters(), checkpoint=takeover)
+        self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
+        self.assertFalse((self.archive / "EB Bill" / "2026-10-01.pdf").exists())
+        with StateV4Store(self.db) as store:
+            self.assertEqual(1, store.count("energygrid_v4_invoice"))
+        self.assertEqual(2, len(self.ledger.effects))
 
     def test_crash_after_archive_before_admission_reuses_the_identical_file_without_a_second_copy(self) -> None:
         with self.assertRaises(SimulatedCrash):
@@ -446,6 +463,29 @@ class PortalAndAdmissionTests(OfflineV4RunTests):
             self.assertEqual("EG_V4_CONNECTOR_NOT_FAKE", caught.exception.support_ref)
             self.assertEqual(0, store.count("energygrid_v4_invoice"))
         self.assertEqual(0, len(self.ledger.effects))
+
+
+class SentBytesAreHashedTests(OfflineV4RunTests):
+    def test_the_bytes_sent_are_hashed_not_only_the_validated_read(self) -> None:
+        from energygrid_bill_downloader import orchestration
+        from energygrid_bill_downloader.publication import FileInfo
+
+        with self.assertRaises(SimulatedCrash):
+            self.run_once(1, self.standard_adapters(), checkpoint=crash_at("before_seal"))
+        original = pdf("eb-1")
+        (self.archive / "EB Bill" / "2026-10-01.pdf").write_bytes(pdf("eb-2"))
+        real_validate = orchestration.validate_pdf
+
+        def validate_as_original(path):
+            if "Tenant" in str(path):
+                return real_validate(path)
+            return FileInfo(byte_size=len(original), sha256=sha(original))
+
+        with mock.patch.object(orchestration, "validate_pdf", side_effect=validate_as_original):
+            result = self.run_once(2, self.standard_adapters())
+        self.assertEqual("HOLD", self.intent_state("2026-10-01", DRIVE))
+        self.assertEqual("EG_V4_ARCHIVE_IDENTITY_CHANGED", result["drain"]["streams"][EB]["support_ref"])
+        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
 
 
 class PortalRegressionAndBoundaryTests(OfflineV4RunTests):

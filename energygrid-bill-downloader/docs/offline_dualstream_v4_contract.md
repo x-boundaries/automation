@@ -29,7 +29,8 @@ separate G2 permission boundary.
 | Source name | Kept verbatim after the prefix, extension included (`.pdf` or `.PDF`) |
 | Already prefixed, same month and year | Accepted; the prefix is normalised to uppercase, with no second prefix |
 | Any other `MMM YYYY - ` prefix, or a doubled prefix | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
-| Leading whitespace | Refused, `EG_V4_DISPLAY_NAME_INVALID`, so a doubled prefix cannot slip past |
+| Leading whitespace, or any format character (Unicode category Cf) | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
+| Other month-year text at the start, after NFKC folding and whitespace removal (for example a doubled prefix with two spaces or a non-breaking space) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
 | Empty stem, non-PDF, control or path characters, reserved device name | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
 | Result longer than 260 characters | Refused, never truncated |
 | Collision within one stream (NFC plus casefold) | Refused at admission, `EG_V4_DISPLAY_NAME_COLLISION` |
@@ -68,7 +69,7 @@ Guards the database enforces, so a direct SQL write cannot skip them:
 - The fixture `tests/fixtures/predecessor_v3_schema.sql` is generated from the unmodified frozen-main
   v3 code (`2753923`) and pinned by SHA-256 over LF-normalised bytes. It holds schema and
   configuration rows only, with no invoice, Drive or delivery data.
-- `predecessor_digest` covers every predecessor schema object and row. The only objects excluded are
+- `predecessor_digest` covers every predecessor schema object and every row of every predecessor table. The only objects excluded are
   the exact (type, name) keys that v4 adds. An extra trigger on a v3 table changes the digest.
 - A migration takes the write lock first. Inside that transaction it checks for COMPLETE_V3 and
   open v3 work, writes an exclusive backup, applies the v4 objects, and commits only if the
@@ -103,15 +104,20 @@ UNKNOWN --REJECTED / conflict--> HOLD;   VERIFIED --conflicting outcome--> HOLD;
    declare `OFFLINE_FAKE = True` (`connector_actions.require_fake_adapters`). Validate the run identity.
 2. Take the lease. The stored owner token is unique to this session. A lease held by a live session
    stops the run with no mutation (`EG_V4_LEASE_HELD`, exit 10).
-3. Fence every later write. Each write re-checks, inside its own transaction, that this session still
-   owns the lease. A session whose lease was taken over cannot write again (`EG_V4_LEASE_LOST`). A
-   takeover is possible only after the lease expires, and it stops the old session before its receipt.
+3. Fence every later step. Each write re-checks, inside its own transaction, that this session still
+   owns the lease. The session also checks ownership before each portal call, before each archive
+   publication and before each provider call. A session whose lease was taken over therefore stops
+   before any further external effect, and the run ends with `EG_V4_LEASE_LOST`. A takeover is possible
+   only after the lease expires.
 4. Recover: every `DISPATCHED` intent with no receipt becomes `UNKNOWN`.
 5. Admit: for each stream, take one inventory, pick the unique latest candidate and admit it, subject
    to section 3. A portal or fetch failure is recorded against its stream, and pending work still
-   drains. The archive is published before its admission row. A crash between them leaves a
-   byte-identical file that the next run reuses, but only while that invoice is still the stream's
-   latest. If a newer invoice is admitted first, the older archive file stays unadmitted and is not sent.
+   drains. The archive is published before its admission row. A crash between them leaves a file on
+   disk that the next run can reuse, but only while that invoice is still the stream's latest and the
+   portal returns the same bytes. If a newer invoice is admitted first, the older archive file stays
+   unadmitted and is not sent. If the portal returns different bytes for that identity, the stream is
+   refused with `EG_V4_ARCHIVE_CONFLICT`, the existing file is never overwritten, and the invoice is not
+   sent until an operator decides.
 6. Drain: each step picks the stream after the last served one (durable round-robin). Within a
    stream, only the oldest invoice that is not fully handled is considered, so earlier admissions
    always drain before newer ones. Per invoice, Drive dispatches before Gmail, and Gmail attaches
@@ -168,4 +174,7 @@ python -m unittest discover -s tests
   identity, so a later run does not refetch.
 - Audit rows (transitions and receipts) are append-only through the store and the triggers. A
   process with direct write access to the local SQLite file is outside this threat model.
+- The lease is not renewed during a run. Its duration (600 s by default) must exceed the longest run.
+  A longer run is taken over, and it then stops before its next external effect with `EG_V4_LEASE_LOST`.
+  The intent it left DISPATCHED is recovered as UNKNOWN by the new owner, and it is not resent.
 - Only the Windows `MoveFileExW` publication path is used, as in v3.

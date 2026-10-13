@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 import contextlib
 import hashlib
+from unittest import mock
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -203,6 +204,35 @@ class MigrationTests(_V4Base):
         finally:
             connection.close()
         self.assertNotEqual(before, predecessor_digest(self.path))
+
+    def test_the_migration_checks_and_backup_run_inside_the_write_lock(self) -> None:
+        from energygrid_bill_downloader import state as state_module
+
+        seen: list[tuple[str, bool]] = []
+        real_inspect = state_module._inspect_v3_database
+        real_backup = state_module._backup_state_file_exclusive
+
+        def inspect(connection):
+            seen.append(("inspect", connection.in_transaction))
+            return real_inspect(connection)
+
+        def backup(path, label):
+            # A second writer must be refused while the migration holds the lock.
+            other = sqlite3.connect(path, timeout=0, isolation_level=None)
+            try:
+                try:
+                    other.execute("BEGIN IMMEDIATE")
+                    seen.append(("backup-unlocked", False))
+                except sqlite3.OperationalError:
+                    seen.append(("backup-locked", True))
+            finally:
+                other.close()
+            return real_backup(path, label)
+
+        with mock.patch.object(state_module, "_inspect_v3_database", side_effect=inspect), \
+                mock.patch.object(state_module, "_backup_state_file_exclusive", side_effect=backup):
+            migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual([("inspect", True), ("backup-locked", True)], seen)
 
     def test_the_v3_store_refuses_a_migrated_database_instead_of_reading_it_as_v3(self) -> None:
         migrate_state_database_v4(self.path, apply=True)

@@ -1398,6 +1398,7 @@ def admit_latest_offline_v4(
         if adapter is None:
             results[stream] = outcome("ADAPTER_UNAVAILABLE", "EG_V4_ADAPTER_UNAVAILABLE")
             continue
+        state.assert_lease_held()
         try:
             snapshot = adapter.inventory(inventory_ceiling)
         except Exception as exc:
@@ -1439,6 +1440,7 @@ def admit_latest_offline_v4(
         temp_dir = create_run_directory(temp_root, run_id)
         try:
             fetched = temp_dir / f"{stream.lower()}-latest.pdf"
+            state.assert_lease_held()
             try:
                 adapter.acquire(candidate, fetched)
             except Exception as exc:
@@ -1462,6 +1464,7 @@ def admit_latest_offline_v4(
                     results[stream] = outcome("ARCHIVE_CONFLICT", "EG_V4_ARCHIVE_CONFLICT")
                     continue
             else:
+                state.assert_lease_held()
                 try:
                     publish_no_replace(fetched, destination)
                 except AppError:
@@ -1482,6 +1485,8 @@ def admit_latest_offline_v4(
             hook("after_admission")
             results[stream] = outcome("ADMITTED" if created else "ALREADY_ADMITTED")
         except OfflineV4Error as exc:
+            if exc.support_ref == "EG_V4_LEASE_LOST":
+                raise
             results[stream] = outcome("ADMISSION_REFUSED", exc.support_ref)
         finally:
             cleanup_run_directory(temp_dir, temp_root)

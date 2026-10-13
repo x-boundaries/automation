@@ -2880,6 +2880,14 @@ class StateV4Store:
             )
         self._owner = None
 
+    def assert_lease_held(self) -> None:
+        """Refuse, before an external effect, a session that no longer owns the lease. Reads only."""
+        row = self._conn().execute(
+            "SELECT owner_token FROM energygrid_v4_lease WHERE lease_name=?", (V4_LEASE_NAME,)
+        ).fetchone()
+        if self._owner is None or row is None or row[0] != self._owner:
+            raise OfflineV4Error("EG_V4_LEASE_LOST", status=RUN_IN_PROGRESS, exit_code=10)
+
     def cursor(self) -> str | None:
         row = self._conn().execute(
             "SELECT last_stream FROM energygrid_v4_cursor WHERE cursor_name=?", (V4_CURSOR_NAME,)

@@ -890,6 +890,9 @@ def _v4_perform(state, connectors, archive_root: Path, run_id: str, now_iso: str
     checkpoint("before_seal")
     state.seal_dispatch(intent_id, run_id=run_id, now_iso=now_iso)
     checkpoint("after_seal")
+    # A session that lost its lease must not call the provider. The recovery of the
+    # new owner marks this seal UNKNOWN, so nothing is resent.
+    state.assert_lease_held()
     try:
         outcome = connectors[action].perform(request)
     except SimulatedCrash:
