@@ -17,7 +17,7 @@ jobs:
       github.event_name == 'pull_request' &&
       github.event.action == 'opened' &&
       github.event.pull_request.base.ref == 'main' &&
-      github.event.pull_request.head.ref == 'codex/xb155-acl-enum-bor-hosted-reclosure-g3-010-wj' &&
+      github.event.pull_request.head.ref == 'codex/xb155-acl-controlflag-capture-g3-011-wj' &&
       github.event.pull_request.head.repo.full_name == 'x-boundaries/automation'
     runs-on: windows-latest
     timeout-minutes: 20
@@ -232,6 +232,8 @@ jobs:
           $script:XB155AclAfter = $null
           $script:XB155AclExpectedRootDaclFingerprint = $null
           $script:XB155AclComparisonWillFail = $null
+          $script:XB155AclParentBeforeCanonical = $null
+          $script:XB155AclParentCreateUnchanged = 'unobserved'
           $script:XB155AclControlsPassed = $false
           $script:XB155AclMode = if ($script:auditAclEvidence -ceq 'native') {
               'native_sacl'
@@ -319,6 +321,17 @@ jobs:
               return Get-XB155AclMetricsFromRawAcl -Acl $descriptor.DiscretionaryAcl -ExpectedFingerprint $ExpectedFingerprint
           }
 
+          function Get-XB155DaclControlBooleans {
+              # Booleans only. The SDDL text is parsed here and never printed.
+              param([Parameter(Mandatory)][string]$Sddl)
+              $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+              $flags = [int]$descriptor.ControlFlags
+              return [ordered]@{
+                  dacl_protected = [bool]($flags -band [int][Security.AccessControl.ControlFlags]::DiscretionaryAclProtected)
+                  dacl_auto_inherited = [bool]($flags -band [int][Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)
+              }
+          }
+
           function Add-XB155AclDaclStage {
               param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Role, [Parameter(Mandatory)][string]$Sddl, [switch]$CaptureExpected)
               $analysis = Get-XB155AclMetricsFromSddl -Sddl $Sddl -ExpectedFingerprint $script:XB155AclExpectedRootDaclFingerprint
@@ -326,10 +339,14 @@ jobs:
                   $script:XB155AclExpectedRootDaclFingerprint = [string]$analysis.fingerprint
                   $analysis = Get-XB155AclMetricsFromSddl -Sddl $Sddl -ExpectedFingerprint $script:XB155AclExpectedRootDaclFingerprint
               }
+              $controlBooleans = Get-XB155DaclControlBooleans -Sddl $Sddl
+              $equalToOriginal = if ($Role -ceq 'candidate_parent') { 'not_applicable' } else { $analysis.metrics.dacl_equal_to_expected_original }
               [void]$script:XB155AclStages.Add([ordered]@{
                   stage = $Name
                   target_role = $Role
-                  dacl_equal_to_expected_original = $analysis.metrics.dacl_equal_to_expected_original
+                  dacl_protected = [bool]$controlBooleans.dacl_protected
+                  dacl_auto_inherited = [bool]$controlBooleans.dacl_auto_inherited
+                  dacl_equal_to_expected_original = $equalToOriginal
                   total_aces = [int]$analysis.metrics.total_aces
                   inherited_aces = [int]$analysis.metrics.inherited_aces
                   explicit_aces = [int]$analysis.metrics.explicit_aces
@@ -345,7 +362,7 @@ jobs:
 
           function Test-XB155AclStageOrder {
               param([string[]]$Names)
-              $expected = @('A_original_expected','B_candidate_pre_application','C_in_memory_post_application','D_os_post_set_acl','E_product_readback')
+              $expected = @('A_original_expected','P_parent_before_candidate_create','Q_parent_after_candidate_create','R_candidate_after_create','B_candidate_pre_application','C_in_memory_post_application','D_os_post_set_acl','E_product_readback')
               if ($Names.Count -gt $expected.Count) { return $false }
               for ($i = 0; $i -lt $Names.Count; $i++) { if ($Names[$i] -cne $expected[$i]) { return $false } }
               return $true
@@ -364,8 +381,11 @@ jobs:
               $positive = Get-XB155AclMetricsFromRawAcl -Acl $sample -ExpectedFingerprint $expectedFingerprint
               $empty = [Security.AccessControl.RawAcl]::new([byte]2, 0)
               $negative = Get-XB155AclMetricsFromRawAcl -Acl $empty -ExpectedFingerprint $expectedFingerprint
-              $orderedPositive = Test-XB155AclStageOrder -Names @('A_original_expected','B_candidate_pre_application','C_in_memory_post_application','D_os_post_set_acl','E_product_readback')
-              $orderedNegative = Test-XB155AclStageOrder -Names @('A_original_expected','B_candidate_pre_application','D_os_post_set_acl','C_in_memory_post_application')
+              $orderedPositive = Test-XB155AclStageOrder -Names @('A_original_expected','P_parent_before_candidate_create','Q_parent_after_candidate_create','R_candidate_after_create','B_candidate_pre_application','C_in_memory_post_application','D_os_post_set_acl','E_product_readback')
+              $orderedNegative = Test-XB155AclStageOrder -Names @('A_original_expected','P_parent_before_candidate_create','Q_parent_after_candidate_create','B_candidate_pre_application','D_os_post_set_acl','C_in_memory_post_application')
+              $protectedControl = Get-XB155DaclControlBooleans -Sddl 'D:P(A;OICI;FA;;;WD)'
+              $unprotectedControl = Get-XB155DaclControlBooleans -Sddl 'D:(A;OICI;FA;;;WD)'
+              $autoInheritedControl = Get-XB155DaclControlBooleans -Sddl 'D:AI(A;OICI;FA;;;WD)'
               if (-not [bool]$positive.metrics.dacl_equal_to_expected_original -or
                   [int]$positive.metrics.total_aces -ne 2 -or [int]$positive.metrics.inherited_aces -ne 1 -or
                   [int]$positive.metrics.explicit_aces -ne 1 -or
@@ -376,7 +396,7 @@ jobs:
                   [int]$positive.metrics.inheritance_propagation_categories.inherited -ne 1 -or
                   [bool]$negative.metrics.dacl_equal_to_expected_original -or
                   [int]$negative.metrics.total_aces -ne 0 -or
-                  -not $orderedPositive -or $orderedNegative) {
+                  -not $orderedPositive -or $orderedNegative -or -not [bool]$protectedControl.dacl_protected -or [bool]$unprotectedControl.dacl_protected -or -not [bool]$autoInheritedControl.dacl_auto_inherited -or [bool]$autoInheritedControl.dacl_protected) {
                   throw 'categorical_observer_controls_failed'
               }
               return $true
@@ -579,6 +599,25 @@ jobs:
                   Write-XB155AclProgress -Stage $script:XB155AclStage -Role $script:XB155AclRole
               } catch { $script:XB155AclObserverFault = 'comparison_observer_failed' }
           }
+          $actionCandidateCreatePre = {
+              if (-not $script:XB155AclObservationActive) { return }
+              try {
+                  $parentAcl = Get-Acl -LiteralPath (Split-Path -Parent ([string]$journal.candidate_root)) -ErrorAction Stop
+                  $script:XB155AclParentBeforeCanonical = Convert-XbWorkerUpgradeAclSddl ($parentAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All))
+                  Add-XB155AclDaclStageFromAcl -Name 'P_parent_before_candidate_create' -Role 'candidate_parent' -Acl $parentAcl
+              } catch { $script:XB155AclObserverFault = 'parent_capture_failed' }
+          }
+          $actionCandidateCreatePost = {
+              if (-not $script:XB155AclObservationActive) { return }
+              try {
+                  $parentAcl = Get-Acl -LiteralPath (Split-Path -Parent ([string]$journal.candidate_root)) -ErrorAction Stop
+                  $parentCanonical = Convert-XbWorkerUpgradeAclSddl ($parentAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All))
+                  $script:XB155AclParentCreateUnchanged = [bool]($parentCanonical -ceq $script:XB155AclParentBeforeCanonical)
+                  Add-XB155AclDaclStageFromAcl -Name 'Q_parent_after_candidate_create' -Role 'candidate_parent' -Acl $parentAcl
+                  $candidateAcl = Get-Acl -LiteralPath ([string]$journal.candidate_root) -ErrorAction Stop
+                  Add-XB155AclDaclStageFromAcl -Name 'R_candidate_after_create' -Role 'candidate_root' -Acl $candidateAcl
+              } catch { $script:XB155AclObserverFault = 'candidate_create_capture_failed' }
+          }
           $actionUpgradeEntry = {
               $script:XB155AclAttemptCount = [int]$script:XB155AclAttemptCount + 1
               if ($script:XB155AclAttemptCount -gt 1) { throw 'diagnostic_upgrade_attempt_ceiling_exceeded' }
@@ -645,10 +684,16 @@ jobs:
               Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterCatchLine -Action $actionSetterCatch
               Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterReadbackLine -Action $actionSetterReadback
               Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $setterCompareLine -Action $actionSetterCompare
+              $upgradeStart = Find-XB155OneLine -Lines $installerLines -Text 'function Invoke-XbWorkerUpgrade {'
+              $rollbackStart = Find-XB155OneLine -Lines $installerLines -Text 'function Invoke-XbWorkerRollback {'
+              $candidateCreateLine = Find-XB155OneLine -Lines $installerLines -Text 'New-Item -ItemType Directory -Path $journal.candidate_root -ErrorAction Stop | Out-Null' -Start ($upgradeStart - 1) -End ($rollbackStart - 1)
+              $candidateCopyLine = Find-XB155OneLine -Lines $installerLines -Text 'foreach ($name in $packageFiles) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $journal.candidate_root $name) -ErrorAction Stop }' -Start ($upgradeStart - 1) -End ($rollbackStart - 1)
+              Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $candidateCreateLine -Action $actionCandidateCreatePre
+              Add-XB155AclBreakpoint -ScriptPath $script:FixtureInstallerPath -Line $candidateCopyLine -Action $actionCandidateCreatePost
               $upgradeBreakpoint = Set-PSBreakpoint -Command 'Invoke-XbWorkerUpgrade' -Action $actionUpgradeEntry -ErrorAction Stop
               if (@($upgradeBreakpoint).Count -ne 1 -or -not [bool]$upgradeBreakpoint.Enabled) { throw 'upgrade_entry_breakpoint_registration_failed' }
               [void]$script:XB155AclBreakpoints.Add($upgradeBreakpoint)
-              if ($script:XB155AclBreakpoints.Count -ne 11) { throw 'passive_debugger_breakpoint_count_mismatch' }
+              if ($script:XB155AclBreakpoints.Count -ne 13) { throw 'passive_debugger_breakpoint_count_mismatch' }
 
               [Console]::Out.WriteLine('ACL_MODE=' + $script:XB155AclMode + ';SE_SECURITY_PRIVILEGE=' + $script:XB155AclPrivilege)
               [Console]::Out.Flush()
@@ -718,6 +763,8 @@ jobs:
           }
 
           $failure = $script:XB155AclFailure
+          $stageNames = @($script:XB155AclStages | ForEach-Object { [string]$_.stage })
+          $missingPreApplication = @('A_original_expected','P_parent_before_candidate_create','Q_parent_after_candidate_create','R_candidate_after_create','B_candidate_pre_application' | Where-Object { $stageNames -notcontains $_ })
           $report = [ordered]@{
               original_function_fidelity = if ($script:XB155AclMode -ceq 'native_sacl' -and $script:XB155AclAttemptCount -eq 1) { 'verified_source_copy_passive_debugger' } else { 'unverified' }
               positive_upgrade_attempts = [int]$script:XB155AclAttemptCount
@@ -739,6 +786,8 @@ jobs:
               debugger_breakpoints_removed = [bool]$script:XB155AclBreakpointsRemoved
               observer_fault = [string]$script:XB155AclObserverFault
               setup_failure = [bool]($null -ne $script:XB155AclSetupFailure)
+              parent_create_unchanged = $script:XB155AclParentCreateUnchanged
+              stage_complete_pre_application = [bool]($missingPreApplication.Count -eq 0)
           }
           [Console]::Out.WriteLine('ACL_DIAGNOSTIC_JSON=' + ($report | ConvertTo-Json -Depth 10 -Compress))
           exit 0
@@ -873,6 +922,8 @@ jobs:
           if ([bool]$report.child_timed_out) { throw 'native_harness_timeout' }
           if ([int]$report.child_exit_code -ne 0) { throw 'native_harness_exit_not_zero' }
           if ($attempts -ne 1) { throw 'one_positive_upgrade_attempt_not_completed' }
-          if ($report.positive_upgrade_outcome -cne 'pass') { throw 'positive_upgrade_failed' }
+          if ([string]$report.diagnostic_controls -cne 'passed') { throw 'diagnostic_controls_not_passed' }
+          if ($report.stage_order_valid -ne $true -or $report.stage_complete_pre_application -ne $true) { throw 'diagnostic_stage_evidence_incomplete' }
+          if ($report.positive_upgrade_outcome -cne 'pass' -and $report.positive_upgrade_outcome -cnotmatch '^upgrade_[a-z0-9_]+$') { throw 'diagnostic_outcome_unclassified' }
           if ([bool]$report.setup_failure -or [string]$report.observer_fault -cne 'none') { throw 'passive_observer_integrity_failed' }
           if (-not [bool]$report.debugger_breakpoints_removed) { throw 'passive_debugger_cleanup_failed' }
