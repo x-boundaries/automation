@@ -77,25 +77,29 @@ class DisplayFilenameTests(unittest.TestCase):
             display_filename(" OCT 2026 - invoice.pdf", date(2026, 10, 1))
         self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
 
-    def test_doubled_prefix_hidden_by_spacing_or_format_characters_is_refused(self) -> None:
+    def test_doubled_prefix_hidden_by_spacing_is_refused_for_ascii_names(self) -> None:
         refused = {
             "OCT 2026 -  OCT 2026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
-            "OCT 2026 -\u00a0OCT 2026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
-            "SEP 2026 -\u00a0invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
             "Jan 2026 - Electricity.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
-            "\u200bOCT 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
-            "OCT 2026 - \u200bSEP 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
-            "OCT\u200b 2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
-            "Bill\x85x.pdf": "EG_V4_DISPLAY_NAME_INVALID",
             "Bill\x7fx.pdf": "EG_V4_DISPLAY_NAME_INVALID",
-            "OCT 2026 - OCT\u16802026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
-            "OCT 2026 - OCT 2026\u2028- invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
-            "OCT 2026 - OCT 2026 \u2013 invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "OCT\t2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
         }
         for source, support_ref in refused.items():
             with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
                 display_filename(source, date(2026, 10, 1))
             self.assertEqual(support_ref, caught.exception.support_ref)
+
+    def test_non_ascii_source_names_are_a_typed_shape_hold_never_a_guess(self) -> None:
+        for source in (
+            "OCT 2026 -\u00a0OCT 2026 - invoice.pdf",
+            "OCT 2026 - \u200bSEP 2026 - invoice.pdf",
+            "\u200bOCT 2026 - invoice.pdf",
+            "Caf\u00e9.pdf",
+            "OCT 2026 - OCT 2026 \u2013 invoice.pdf",
+        ):
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 1))
+            self.assertEqual("EG_V4_DISPLAY_SHAPE_UNSUPPORTED", caught.exception.support_ref)
 
     def test_invalid_source_and_date_types_are_refused(self) -> None:
         cases = (

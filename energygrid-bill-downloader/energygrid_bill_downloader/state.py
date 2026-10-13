@@ -2379,6 +2379,7 @@ _V4_TABLE_SQL = (
   admission_seq INTEGER NOT NULL UNIQUE CHECK(admission_seq >= 1),
   admitted_run_id TEXT NOT NULL CHECK(length(admitted_run_id)=36),
   admitted_at_utc TEXT NOT NULL,
+  predecessor_invoice_id TEXT REFERENCES energygrid_invoice_v2(invoice_id),
   UNIQUE(stream, source_namespace, source_invoice_key),
   UNIQUE(stream, display_key),
   UNIQUE(archive_relpath)
@@ -2622,7 +2623,7 @@ def migrate_state_database_v4(path: Path, *, apply: bool = False) -> dict[str, s
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
         try:
             connection.execute("PRAGMA foreign_keys=ON")
-            if _inspect_v3_database(connection) != "COMPLETE_V3" or _v3_has_resumable_work(connection):
+            if _inspect_v3_database(connection) not in {"COMPLETE_V3", "RESUMABLE_V3"} or _v4_cutover_blockers(connection):
                 raise OfflineV4Error("EG_V4_PREDECESSOR_NOT_COMPLETE_V3")
             return {"status": "PLAN_V4", "predecessor_digest": _predecessor_digest(connection)}
         finally:
@@ -2636,7 +2637,7 @@ def migrate_state_database_v4(path: Path, *, apply: bool = False) -> dict[str, s
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("BEGIN IMMEDIATE")
         try:
-            if _inspect_v3_database(connection) != "COMPLETE_V3" or _v3_has_resumable_work(connection):
+            if _inspect_v3_database(connection) not in {"COMPLETE_V3", "RESUMABLE_V3"} or _v4_cutover_blockers(connection):
                 raise OfflineV4Error("EG_V4_PREDECESSOR_NOT_COMPLETE_V3")
             before = _predecessor_digest(connection)
             _backup_state_file_exclusive(path, "v4-migration")
@@ -2654,6 +2655,114 @@ def migrate_state_database_v4(path: Path, *, apply: bool = False) -> dict[str, s
         return {"status": "MIGRATED_V4", "predecessor_digest": before}
     finally:
         connection.close()
+
+
+def _v4_cutover_blockers(connection: sqlite3.Connection) -> bool:
+    """Local v3 work that must settle before cutover. Provider evidence is not a blocker: cutover classifies it."""
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM energygrid_invoice_v2 WHERE classification='UNCLASSIFIED' "
+            "OR archive_state IN ('PREPARED','CONFLICT','UNVERIFIED') "
+            "OR migration_state IN ('UNCLASSIFIED','MOVE_PLANNED','HOLD') LIMIT 1"
+        ).fetchone()
+        or connection.execute("SELECT 1 FROM energygrid_stream_v2 WHERE admission='HOLD' LIMIT 1").fetchone()
+        or connection.execute(
+            "SELECT 1 FROM energygrid_file_operation_v2 WHERE kind!='DRIVE_STAGE' AND state IN ('PREPARED','HOLD') LIMIT 1"
+        ).fetchone()
+    )
+
+
+def _classify_predecessor_latest(connection: sqlite3.Connection, stream: str) -> dict:
+    """Classify one stream's CURRENT latest v3 invoice from frozen v3 evidence (#226 G3 cutover). Read only.
+
+    NONE: the stream has no classified v3 invoice.
+    DELIVERED: v3 delivered it. No action.
+    ADOPTABLE: archived, with no v3 Drive or delivery dispatch. One v4 delivery is eligible.
+    HOLD: a partial, uncertain or unsettled provider effect, a missing archive, or an ambiguous latest.
+    Older history is never classified, so it is never backfilled.
+    """
+    latest = connection.execute(
+        "SELECT invoice_id, day_ordinal FROM energygrid_invoice_v2 WHERE classification='CLASSIFIED' AND stream=? "
+        "ORDER BY day_ordinal DESC LIMIT 2",
+        (stream,),
+    ).fetchall()
+    if not latest:
+        return {"status": "NONE", "support_ref": None, "invoice": None}
+    if len(latest) == 2 and latest[0][1] == latest[1][1]:
+        return {"status": "HOLD", "support_ref": "EG_V4_PREDECESSOR_LATEST_AMBIGUOUS", "invoice": None}
+    row = connection.execute("SELECT * FROM energygrid_invoice_v2 WHERE invoice_id=?", (latest[0][0],)).fetchone()
+    invoice = _named_row(connection, "energygrid_invoice_v2", row)
+
+    def hold(reference: str) -> dict:
+        return {"status": "HOLD", "support_ref": reference, "invoice": invoice}
+
+    delivery = connection.execute(
+        "SELECT state, dispatch_started_at_utc FROM energygrid_delivery_v1 WHERE invoice_id=?", (invoice["invoice_id"],)
+    ).fetchone()
+    if delivery is not None:
+        if delivery[0] == "DELIVERED":
+            return {"status": "DELIVERED", "support_ref": None, "invoice": invoice}
+        if delivery[0] == "DELIVERY_OUTCOME_UNCERTAIN":
+            return hold("EG_V4_PREDECESSOR_DELIVERY_UNCERTAIN")
+        if delivery[0] == "REQUEST_REJECTED":
+            return hold("EG_V4_PREDECESSOR_DELIVERY_REJECTED")
+        if delivery[1] is not None:
+            return hold("EG_V4_PREDECESSOR_DELIVERY_DISPATCHED")
+    drive_states = [
+        item[0] for item in connection.execute(
+            "SELECT state FROM energygrid_drive_operation_v3 WHERE invoice_id=?", (invoice["invoice_id"],)
+        )
+    ]
+    if drive_states:
+        if all(state == "DRIVE_VERIFIED" for state in drive_states):
+            return hold("EG_V4_PREDECESSOR_DRIVE_VERIFIED_NOT_SENT")
+        return hold("EG_V4_PREDECESSOR_DRIVE_PARTIAL")
+    stage = connection.execute(
+        "SELECT 1 FROM energygrid_file_operation_v2 WHERE invoice_id=? AND kind='DRIVE_STAGE' LIMIT 1", (invoice["invoice_id"],)
+    ).fetchone()
+    if stage is not None or invoice["drive_state"] != "NOT_STAGED":
+        return hold("EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT")
+    if invoice["archive_state"] != "COMMITTED" or invoice["byte_size"] is None or invoice["sha256"] is None:
+        return hold("EG_V4_PREDECESSOR_ARCHIVE_NOT_COMMITTED")
+    return {"status": "ADOPTABLE", "support_ref": None, "invoice": invoice}
+
+
+def _insert_admission(conn: sqlite3.Connection, *, stream: str, source_namespace: str, source_invoice_key: str,
+                      invoice_date, display_filename: str, sha256: str, byte_size: int, run_id: str,
+                      now_iso: str, predecessor_invoice_id: str | None) -> dict:
+    """Insert one admission, its PENDING intents, status rows and transitions. The caller holds the write lock."""
+    from .naming import display_key
+
+    canonical = f"{invoice_date.isoformat()}.pdf"
+    relpath = _v4_archive_relpath(stream, canonical)
+    invoice_key = _v4_invoice_key(stream, source_namespace, source_invoice_key)
+    sequence = conn.execute("SELECT COALESCE(MAX(admission_seq), 0) + 1 FROM energygrid_v4_invoice").fetchone()[0]
+    conn.execute(
+        "INSERT INTO energygrid_v4_invoice (invoice_key, stream, source_namespace, source_invoice_key, "
+        "invoice_date, canonical_filename, archive_relpath, display_filename, display_key, sha256, byte_size, "
+        "admission_seq, admitted_run_id, admitted_at_utc, predecessor_invoice_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (invoice_key, stream, source_namespace, source_invoice_key, invoice_date.isoformat(), canonical, relpath,
+         display_filename, display_key(display_filename), sha256, byte_size, sequence, run_id, now_iso,
+         predecessor_invoice_id),
+    )
+    for action in V4_ACTIONS:
+        intent_id = _v4_intent_id(invoice_key, action)
+        conn.execute(
+            "INSERT INTO energygrid_v4_intent (intent_id, invoice_key, action, payload_sha256, created_run_id, "
+            "created_at_utc) VALUES (?,?,?,?,?,?)",
+            (intent_id, invoice_key, action, sha256, run_id, now_iso),
+        )
+        conn.execute(
+            "INSERT INTO energygrid_v4_intent_status (intent_id, state, version, support_ref, updated_run_id, "
+            "updated_at_utc) VALUES (?, 'PENDING', 1, NULL, ?, ?)",
+            (intent_id, run_id, now_iso),
+        )
+        conn.execute(
+            "INSERT INTO energygrid_v4_transition (intent_id, from_state, to_state, support_ref, run_id, at_utc) "
+            "VALUES (?, NULL, 'PENDING', NULL, ?, ?)",
+            (intent_id, run_id, now_iso),
+        )
+    return _fetch_dicts(conn, "SELECT * FROM energygrid_v4_invoice WHERE invoice_key=?", (invoice_key,))[0]
 
 
 def _v4_invoice_key(stream: str, source_namespace: str, source_invoice_key: str) -> str:
@@ -2954,32 +3063,11 @@ class StateV4Store:
                 conn, stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
                 invoice_date=invoice_date, display_filename=display_filename, canonical_filename=canonical,
             )
-            sequence = conn.execute("SELECT COALESCE(MAX(admission_seq), 0) + 1 FROM energygrid_v4_invoice").fetchone()[0]
-            conn.execute(
-                "INSERT INTO energygrid_v4_invoice (invoice_key, stream, source_namespace, source_invoice_key, "
-                "invoice_date, canonical_filename, archive_relpath, display_filename, display_key, sha256, byte_size, "
-                "admission_seq, admitted_run_id, admitted_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (invoice_key, stream, source_namespace, source_invoice_key, invoice_date.isoformat(), canonical,
-                 relpath, display_filename, dkey, sha256, byte_size, sequence, run_id, now_iso),
+            row = _insert_admission(
+                conn, stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
+                invoice_date=invoice_date, display_filename=display_filename, sha256=sha256, byte_size=byte_size,
+                run_id=run_id, now_iso=now_iso, predecessor_invoice_id=None,
             )
-            for action in V4_ACTIONS:
-                intent_id = _v4_intent_id(invoice_key, action)
-                conn.execute(
-                    "INSERT INTO energygrid_v4_intent (intent_id, invoice_key, action, payload_sha256, created_run_id, "
-                    "created_at_utc) VALUES (?,?,?,?,?,?)",
-                    (intent_id, invoice_key, action, sha256, run_id, now_iso),
-                )
-                conn.execute(
-                    "INSERT INTO energygrid_v4_intent_status (intent_id, state, version, support_ref, updated_run_id, "
-                    "updated_at_utc) VALUES (?, 'PENDING', 1, NULL, ?, ?)",
-                    (intent_id, run_id, now_iso),
-                )
-                conn.execute(
-                    "INSERT INTO energygrid_v4_transition (intent_id, from_state, to_state, support_ref, run_id, at_utc) "
-                    "VALUES (?, NULL, 'PENDING', NULL, ?, ?)",
-                    (intent_id, run_id, now_iso),
-                )
-            row = _fetch_dicts(conn, "SELECT * FROM energygrid_v4_invoice WHERE invoice_key=?", (invoice_key,))[0]
         return row, True
 
     # -- reads -----------------------------------------------------------
@@ -2991,6 +3079,55 @@ class StateV4Store:
             (stream, source_namespace, source_invoice_key),
         )
         return rows[0] if rows else None
+
+    def predecessor_latest(self, stream: str) -> dict:
+        """Classify the stream's current latest v3 invoice (read only). See _classify_predecessor_latest."""
+        return _classify_predecessor_latest(self._conn(), stream)
+
+    def adopt_predecessor_latest(self, stream: str, *, invoice_id: str, display_filename: str, sha256: str,
+                                 byte_size: int, run_id: str, now_iso: str) -> bool:
+        """Adopt the stream's current latest archived-but-undelivered v3 invoice as one v4 delivery.
+
+        The v4 admission links to the predecessor row and reuses its archive bytes. It never
+        fetches, never copies or renames the archive, and never writes to a predecessor table.
+        Returns False when an earlier run already adopted this identity.
+        """
+        from datetime import date
+
+        from .naming import display_key
+
+        with self._write() as conn:
+            classification = _classify_predecessor_latest(conn, stream)
+            invoice = classification["invoice"]
+            if classification["status"] != "ADOPTABLE" or invoice is None or invoice["invoice_id"] != invoice_id:
+                raise OfflineV4Error("EG_V4_PREDECESSOR_ADOPTION_STALE")
+            if (invoice["sha256"], invoice["byte_size"]) != (sha256, byte_size):
+                raise OfflineV4Error("EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH")
+            existing = _fetch_dicts(
+                conn,
+                "SELECT * FROM energygrid_v4_invoice WHERE stream=? AND source_namespace=? AND source_invoice_key=?",
+                (stream, invoice["source_namespace"], invoice["source_invoice_key"]),
+            )
+            if existing:
+                if existing[0]["predecessor_invoice_id"] == invoice_id:
+                    return False
+                raise OfflineV4Error("EG_V4_INVOICE_IDENTITY_CONFLICT")
+            if conn.execute(
+                "SELECT 1 FROM energygrid_v4_invoice WHERE stream=? AND display_key=?", (stream, display_key(display_filename))
+            ).fetchone():
+                raise OfflineV4Error("EG_V4_DISPLAY_NAME_COLLISION")
+            if conn.execute(
+                "SELECT 1 FROM energygrid_v4_invoice WHERE archive_relpath=?",
+                (_v4_archive_relpath(stream, invoice["canonical_filename"]),),
+            ).fetchone():
+                raise OfflineV4Error("EG_V4_ARCHIVE_PATH_COLLISION")
+            _insert_admission(
+                conn, stream=stream, source_namespace=invoice["source_namespace"],
+                source_invoice_key=invoice["source_invoice_key"],
+                invoice_date=date.fromisoformat(invoice["bill_date"]), display_filename=display_filename,
+                sha256=sha256, byte_size=byte_size, run_id=run_id, now_iso=now_iso, predecessor_invoice_id=invoice_id,
+            )
+        return True
 
     def invoices_for_stream(self, stream: str) -> list[dict]:
         return _fetch_dicts(

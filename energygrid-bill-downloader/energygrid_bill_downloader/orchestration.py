@@ -1005,6 +1005,9 @@ def run_offline_dual_stream_v4(
     except Exception:
         state.release_lease(owner_token)
         raise
+    for stream in V4_STREAMS:
+        if acquisition[stream]["status"] == "HOLD":
+            streams[stream] = {"state": "HOLD", "support_ref": acquisition[stream]["support_ref"]}
     state.release_lease(owner_token)
     return {
         "schema": V4_RESULT_SCHEMA,

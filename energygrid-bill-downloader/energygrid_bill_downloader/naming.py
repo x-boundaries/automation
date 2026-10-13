@@ -57,6 +57,9 @@ def display_filename(source_filename: str, invoice_date: date) -> str:
     prefix = month_prefix(invoice_date)
     if type(source_filename) is not str or not source_filename:
         raise OfflineV4Error("EG_V4_DISPLAY_SOURCE_INVALID")
+    if not source_filename.isascii():
+        # Only qualified ASCII names are supported. Other real shapes are a typed HOLD, never a guess.
+        raise OfflineV4Error("EG_V4_DISPLAY_SHAPE_UNSUPPORTED")
     if any(unicodedata.category(char) in ("Cc", "Cf") for char in source_filename):
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
     if source_filename != source_filename.lstrip():

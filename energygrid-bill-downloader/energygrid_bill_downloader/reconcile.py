@@ -1363,6 +1363,36 @@ def _v4_support_ref(error: BaseException, fallback: str) -> str:
     return fallback
 
 
+def _adopt_predecessor_latest(state, archive_root: Path, stream: str, invoice: dict, run_id: str, now_iso: str):
+    """Validate the predecessor archive and adopt it as one v4 delivery. Returns (status, support_ref).
+
+    No portal call and no archive write. Every failure is a HOLD for this stream, and nothing is sent.
+    """
+    from datetime import date
+
+    from .naming import display_filename
+
+    try:
+        path = _canonical_path(archive_root, stream, invoice["canonical_filename"])
+        ensure_no_reparse_components(path)
+        info = validate_pdf(path)
+    except (AppError, OSError):
+        return ("HOLD", "EG_V4_PREDECESSOR_ARCHIVE_UNREADABLE")
+    if (info.sha256, info.byte_size) != (invoice["sha256"], invoice["byte_size"]):
+        return ("HOLD", "EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH")
+    try:
+        presentation = display_filename(invoice["source_filename"], date.fromisoformat(invoice["bill_date"]))
+        created = state.adopt_predecessor_latest(
+            stream, invoice_id=invoice["invoice_id"], display_filename=presentation,
+            sha256=info.sha256, byte_size=info.byte_size, run_id=run_id, now_iso=now_iso,
+        )
+    except OfflineV4Error as exc:
+        if exc.support_ref == "EG_V4_LEASE_LOST":
+            raise
+        return ("HOLD", exc.support_ref)
+    return ("ADOPTED", None) if created else ("ADOPTED_EARLIER", None)
+
+
 def admit_latest_offline_v4(
     *,
     adapters: dict[str, Any],
@@ -1389,6 +1419,7 @@ def admit_latest_offline_v4(
     ensure_no_reparse_components(archive_root)
     ensure_no_reparse_components(temp_root)
     results: dict[str, dict[str, str | None]] = {}
+    predecessor: dict[str, str] = {}
 
     def outcome(status: str, support_ref: str | None = None) -> dict[str, str | None]:
         return {"status": status, "support_ref": support_ref}
@@ -1398,6 +1429,25 @@ def admit_latest_offline_v4(
         if adapter is None:
             results[stream] = outcome("ADAPTER_UNAVAILABLE", "EG_V4_ADAPTER_UNAVAILABLE")
             continue
+        predecessor_latest = state.predecessor_latest(stream)
+        predecessor[stream] = predecessor_latest["status"]
+        handled = None
+        handled_outcome = "ALREADY_ADMITTED"
+        if predecessor_latest["status"] == "HOLD":
+            results[stream] = outcome("HOLD", predecessor_latest["support_ref"])
+            continue
+        if predecessor_latest["status"] == "DELIVERED":
+            handled = predecessor_latest["invoice"]
+            handled_outcome = "PREDECESSOR_DELIVERED"
+        elif predecessor_latest["status"] == "ADOPTABLE":
+            adoption_status, adoption_ref = _adopt_predecessor_latest(
+                state, archive_root, stream, predecessor_latest["invoice"], run_id, now_iso
+            )
+            predecessor[stream] = adoption_status
+            if adoption_status == "HOLD":
+                results[stream] = outcome("HOLD", adoption_ref)
+                continue
+            handled = predecessor_latest["invoice"]
         state.assert_lease_held()
         try:
             snapshot = adapter.inventory(inventory_ceiling)
@@ -1420,6 +1470,12 @@ def admit_latest_offline_v4(
             results[stream] = outcome("LATEST_AMBIGUOUS", "EG_V4_LATEST_AMBIGUOUS")
             continue
         candidate = latest[0]
+        if handled is not None and (candidate.source_invoice_key, candidate.canonical_filename) == (
+            handled["source_invoice_key"], handled["canonical_filename"]
+        ):
+            # The portal's latest is the predecessor invoice already handled above: no fetch, no second copy.
+            results[stream] = outcome(handled_outcome)
+            continue
         try:
             presentation = display_filename(candidate.source_filename, candidate.invoice_date)
             decision = state.check_admissible(
@@ -1431,7 +1487,8 @@ def admit_latest_offline_v4(
                 invoice_date=candidate.invoice_date,
             )
         except OfflineV4Error as exc:
-            results[stream] = outcome("ADMISSION_REFUSED", exc.support_ref)
+            status = "HOLD" if exc.support_ref == "EG_V4_DISPLAY_SHAPE_UNSUPPORTED" else "ADMISSION_REFUSED"
+            results[stream] = outcome(status, exc.support_ref)
             continue
         if decision == "ALREADY_ADMITTED":
             results[stream] = outcome("ALREADY_ADMITTED")
@@ -1491,4 +1548,6 @@ def admit_latest_offline_v4(
             results[stream] = outcome("ADMISSION_REFUSED", exc.support_ref)
         finally:
             cleanup_run_directory(temp_dir, temp_root)
+    for stream, row in results.items():
+        row["predecessor"] = predecessor.get(stream, "NONE")
     return results

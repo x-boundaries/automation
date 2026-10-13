@@ -393,6 +393,170 @@ class AdmissionTests(_V4Base):
 SYNTH_NS = "SYNTHETIC-ENERGYGRID-NAMESPACE"
 
 
+PREDECESSOR_RUN = "00000000-0000-4000-8000-00000000c001"
+PREDECESSOR_SCENARIOS = (
+    "ADOPTABLE", "DELIVERED", "DRIVE_PARTIAL", "DRIVE_VERIFIED_NOT_SENT", "DELIVERY_UNCERTAIN",
+    "DELIVERY_REJECTED", "ARCHIVE_NOT_COMMITTED",
+)
+LATEST_SOURCE = {"EB_BILL": ("Invoice EB Sep.pdf", "2026-09-01"), "TENANT_BILL": ("Invoice TN Sep.pdf", "2026-09-02")}
+OLDER_SOURCE = {"EB_BILL": ("Invoice EB Aug.pdf", "2026-08-01"), "TENANT_BILL": ("Invoice TN Aug.pdf", "2026-08-02")}
+PINNED_PREDECESSOR_DIGEST = "c7bbba34210619b32afbd4eb2321d4eff304de09ec6244b4a8e6643f143983ba"
+T_ACCEPT = "2026-09-05T00:00:00+00:00"
+T_ARCHIVE = "2026-09-05T00:00:01+00:00"
+T_DRIVE = ("2026-09-05T00:00:02+00:00", "2026-09-05T00:00:03+00:00", "2026-09-05T00:00:04+00:00",
+           "2026-09-05T00:00:05+00:00")
+T_MAIL = ("2026-09-05T00:00:06+00:00", "2026-09-05T00:00:07+00:00", "2026-09-05T00:00:08+00:00")
+
+
+def predecessor_pdf(label: str) -> bytes:
+    return f"%PDF-1.4\n{label}\n%%EOF\n".encode("ascii")
+
+
+def _deterministic_uuid(label: str) -> str:
+    return "00000000-0000-4000-8000-" + hashlib.sha256(label.encode("ascii")).hexdigest()[:12]
+
+
+def _commit_predecessor_archive(state, archive_root: Path, invoice_id: str, payload: bytes) -> None:
+    from energygrid_bill_downloader.publication import validate_pdf
+
+    invoice = state.invoice(invoice_id)
+    path = archive_root / invoice["archive_relpath"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    info = validate_pdf(path)
+    operation = _deterministic_uuid("archive:" + invoice_id)
+    state.start_file_operation(
+        operation_id=operation, invoice_id=invoice_id, kind="ARCHIVE_PUBLISH", private_path_ref="EG_SYNTHETIC_TEMP",
+        target_relpath=invoice["archive_relpath"], binding_id=None, info=info, source_role="SOURCE_ACQUISITION",
+        run_id=PREDECESSOR_RUN, timestamp=T_ARCHIVE,
+    )
+    state.complete_file_operation(operation, T_ARCHIVE, evidence_ref="EG_SYNTHETIC_ARCHIVE_COMMIT")
+    state.update_invoice_file_state(
+        invoice_id, archive_state="COMMITTED", byte_size=info.byte_size, sha256=info.sha256, archived_at_utc=T_ARCHIVE,
+    )
+
+
+def _predecessor_drive(state, invoice: dict, *, verified: bool) -> None:
+    import json as _json
+
+    from energygrid_bill_downloader.state import canonical_json
+    from fixtures.synthetic_dual_stream import SYNTHETIC_ACCOUNT, SYNTHETIC_FOLDERS, SYNTHETIC_ROOT
+
+    stream = invoice["stream"]
+    binding = state.active_binding(stream) or state.insert_binding(
+        stream=stream, account_ref=SYNTHETIC_ACCOUNT, root_folder_id=SYNTHETIC_ROOT, folder_id=SYNTHETIC_FOLDERS[stream],
+        chain_sha256="0" * 64, run_id=PREDECESSOR_RUN, timestamp=T_DRIVE[0],
+    )
+    operation_id = _deterministic_uuid("drive:" + invoice["invoice_id"])
+    operation, _ = state.create_drive_intent(
+        invoice=invoice, binding=binding, local_md5=invoice["_md5"], operation_id=operation_id,
+        run_id=PREDECESSOR_RUN, timestamp=T_DRIVE[0],
+    )
+    file_id = "synthPredecessor" + operation_id.replace("-", "")[-16:]
+    state.reserve_drive_file_id(operation_id, file_id, PREDECESSOR_RUN, T_DRIVE[1])
+    state.begin_drive_dispatch(operation_id, PREDECESSOR_RUN, T_DRIVE[2])
+    if not verified:
+        return
+    resource = {
+        "id": file_id, "name": operation["remote_name"], "mimeType": "application/pdf",
+        "parents": [operation["folder_id"]], "size": str(operation["local_byte_size"]),
+        "md5Checksum": operation["local_md5"], "sha256Checksum": operation["local_sha256"],
+        "appProperties": _json.loads(operation["app_properties_json"]), "trashed": False,
+    }
+    receipt = {
+        "remote_file_id": file_id, "remote_parent_id": operation["folder_id"],
+        "remote_name_observed": operation["remote_name"], "remote_mime_type": "application/pdf",
+        "remote_size": operation["local_byte_size"], "remote_sha256": operation["local_sha256"],
+        "remote_md5": operation["local_md5"], "accepted_app_properties_json": operation["app_properties_json"],
+        "verification_method": "SHA256",
+        "receipt_sha256": hashlib.sha256(canonical_json(resource).encode("ascii")).hexdigest(),
+    }
+    state.finish_drive_operation(
+        operation_id, run_id=PREDECESSOR_RUN, timestamp=T_DRIVE[3], new_state="DRIVE_VERIFIED",
+        dispatch_outcome="VALID_RESULT", dispatch_support_ref="EG_DRIVE_RESULT", receipt=receipt,
+    )
+
+
+def _predecessor_delivery(state, invoice: dict, outcome: str) -> None:
+    from energygrid_bill_downloader.delivery import DELIVERY_SCHEMA
+
+    delivery_id = "egmail-v1-" + hashlib.sha256(("delivery:" + invoice["invoice_id"]).encode("ascii")).hexdigest()[:32]
+    metadata = {
+        "schema": DELIVERY_SCHEMA, "stream": invoice["stream"], "bill_date": invoice["bill_date"],
+        "attachment_name": invoice["canonical_filename"], "pdf_byte_size": invoice["byte_size"],
+        "pdf_sha256": invoice["sha256"],
+    }
+    state.prepare_delivery(invoice_id=invoice["invoice_id"], metadata=metadata, run_id=PREDECESSOR_RUN,
+                           timestamp=T_MAIL[0], delivery_id=delivery_id)
+    state.claim_delivery_dispatch(delivery_id, PREDECESSOR_RUN, T_MAIL[1])
+    state.record_delivery_outcome(
+        delivery_id, PREDECESSOR_RUN, T_MAIL[2], state=outcome, evidence="VALIDATED_N8N_RESULT",
+        support_ref="EG_SYNTHETIC_MAIL", accepted_at_utc=T_MAIL[2] if outcome == "DELIVERED" else None,
+    )
+
+
+def build_predecessor_v3(path: Path, archive_root: Path, scenarios: dict) -> dict:
+    """A bound complete-v3 database built only through the frozen v3 store API, with synthetic data.
+
+    Each stream gets an older archived-but-undelivered invoice (never a backfill candidate) and a
+    current latest in the named scenario. Identifiers and timestamps are deterministic.
+    """
+    from energygrid_bill_downloader.invoice import Stream
+    from fixtures.synthetic_dual_stream import candidate, create_v3_database
+
+    create_v3_database(path)
+    built: dict = {}
+    with StateV3Store(path) as state:
+        for stream_name, scenario in scenarios.items():
+            if scenario not in PREDECESSOR_SCENARIOS:
+                raise ValueError(scenario)
+            stream = Stream(stream_name)
+            older_name, older_day = OLDER_SOURCE[stream_name]
+            latest_name, latest_day = LATEST_SOURCE[stream_name]
+            older = state.accept_latest(candidate(stream, name=older_name, invoice_date=older_day), PREDECESSOR_RUN, T_ACCEPT)
+            _commit_predecessor_archive(state, archive_root, older, predecessor_pdf(older_name))
+            latest = state.accept_latest(candidate(stream, name=latest_name, invoice_date=latest_day), PREDECESSOR_RUN, T_ACCEPT)
+            if scenario != "ARCHIVE_NOT_COMMITTED":
+                _commit_predecessor_archive(state, archive_root, latest, predecessor_pdf(latest_name))
+                invoice = state.invoice(latest)
+                invoice["_md5"] = hashlib.md5(predecessor_pdf(latest_name)).hexdigest()
+                if scenario != "ADOPTABLE":
+                    _predecessor_drive(state, invoice, verified=scenario != "DRIVE_PARTIAL")
+                if scenario in ("DELIVERED", "DELIVERY_UNCERTAIN", "DELIVERY_REJECTED"):
+                    outcome = {"DELIVERED": "DELIVERED", "DELIVERY_UNCERTAIN": "DELIVERY_OUTCOME_UNCERTAIN",
+                               "DELIVERY_REJECTED": "REQUEST_REJECTED"}[scenario]
+                    _predecessor_delivery(state, invoice, outcome)
+            built[stream_name] = {"older": older, "latest": latest, "scenario": scenario}
+    return built
+
+
+class PredecessorBuilderTests(unittest.TestCase):
+    def test_the_built_predecessor_has_the_pinned_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pinned = root / "pinned.sqlite"
+            create_predecessor(pinned)
+            built = root / "built.sqlite"
+            build_predecessor_v3(built, root / "archive", {"EB_BILL": "ADOPTABLE", "TENANT_BILL": "DELIVERED"})
+            pinned_conn = raw(pinned)
+            built_conn = raw(built)
+            try:
+                from energygrid_bill_downloader.state import _schema_manifest
+
+                self.assertEqual(_schema_manifest(pinned_conn), _schema_manifest(built_conn))
+            finally:
+                pinned_conn.close()
+                built_conn.close()
+
+    def test_the_built_predecessor_rows_match_the_pinned_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = root / "built.sqlite"
+            build_predecessor_v3(built, root / "archive",
+                                 {"EB_BILL": "ADOPTABLE", "TENANT_BILL": "DELIVERED"})
+            self.assertEqual(PINNED_PREDECESSOR_DIGEST, predecessor_digest(built))
+
+
 class PredecessorAdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         from fixtures.synthetic_dual_stream import create_v3_database

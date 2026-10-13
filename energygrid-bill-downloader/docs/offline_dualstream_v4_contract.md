@@ -29,9 +29,9 @@ separate G2 permission boundary.
 | Source name | Kept verbatim after the prefix, extension included (`.pdf` or `.PDF`) |
 | Already prefixed, same month and year | Accepted; the prefix is normalised to uppercase, with no second prefix |
 | Any other `MMM YYYY - ` prefix, or a doubled prefix | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
+| Non-ASCII source name (only qualified ASCII names are supported) | Typed HOLD, `EG_V4_DISPLAY_SHAPE_UNSUPPORTED`. Never guessed. |
 | Leading whitespace, or any format (Cf) or control (Cc) character | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
-| Other month-year text at the start, after NFKC folding, with any Unicode whitespace or dash treated as a separator (for example a doubled prefix with two spaces, a non-breaking space or an en dash) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
-| The same month and year in another shape at the start (for example `OCT2026-` or `OCT 2026-03`) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT`. Fail closed: the rule is not guessed from the name. Confirm the real EnergyGrid filename shapes before cutover. |
+| Other month-year text at the start, in the exact or a non-standard shape (for example a doubled prefix with two spaces, `OCT2026-` or `OCT 2026-03`) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT`. Fail closed. |
 | Empty stem, non-PDF, control or path characters, reserved device name | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
 | Result longer than 260 characters | Refused, never truncated |
 | Collision within one stream (NFC plus casefold) | Refused at admission, `EG_V4_DISPLAY_NAME_COLLISION` |
@@ -72,13 +72,34 @@ Guards the database enforces, so a direct SQL write cannot skip them:
   configuration rows only, with no invoice, Drive or delivery data.
 - `predecessor_digest` covers every predecessor schema object and every row of every predecessor table. The only objects excluded are
   the exact (type, name) keys that v4 adds. An extra trigger on a v3 table changes the digest.
-- A migration takes the write lock first. Inside that transaction it checks for COMPLETE_V3 and
-  open v3 work, writes an exclusive backup, applies the v4 objects, and commits only if the
-  predecessor digest and the v4 inspection both still pass. Any failure rolls back.
-- v4 never re-admits v3 history. Admission refuses, with a closed reason:
-  - an identity that v3 already holds (`EG_V4_PREDECESSOR_IDENTITY_PRESENT`);
-  - an archive path that v3 already holds (`EG_V4_PREDECESSOR_ARCHIVE_PRESENT`);
-  - an invoice older than the newest predecessor invoice of the stream (`EG_V4_SOURCE_REGRESSION`).
+- A migration takes the write lock first. Inside that transaction it refuses only local integrity
+  blockers: an unclassified invoice, an archive that is not settled, a stream held in v3, or a prepared
+  file operation. Provider evidence is not a blocker, because cutover classifies it. It accepts a
+  COMPLETE_V3 or RESUMABLE_V3 database, writes an exclusive backup, applies the v4 objects, and commits
+  only if the predecessor digest and the v4 inspection both still pass. Any failure rolls back.
+- v4 never re-admits v3 history by portal identity. The stream's CURRENT latest v3 invoice is
+  classified from frozen v3 evidence. Older history is never classified, so it is never backfilled:
+
+  | Frozen v3 evidence for the current latest | Result |
+  |---|---|
+  | No delivery row, no Drive operation, no DRIVE_STAGE operation, archive COMMITTED | ADOPTABLE: one v4 delivery, no fetch |
+  | Delivery PENDING_SEND with no dispatch start, and no Drive evidence | ADOPTABLE |
+  | Delivery DELIVERED | DELIVERED: no action |
+  | Delivery DELIVERY_OUTCOME_UNCERTAIN, REQUEST_REJECTED, or dispatched | HOLD (`EG_V4_PREDECESSOR_DELIVERY_*`) |
+  | Drive operation not DRIVE_VERIFIED (partial or uncertain) | HOLD (`EG_V4_PREDECESSOR_DRIVE_PARTIAL`) |
+  | Drive operation DRIVE_VERIFIED, delivery not sent | HOLD (`EG_V4_PREDECESSOR_DRIVE_VERIFIED_NOT_SENT`). Web decision needed. |
+  | DRIVE_STAGE operation, or drive state not NOT_STAGED | HOLD (`EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT`) |
+  | Archive not COMMITTED | HOLD (`EG_V4_PREDECESSOR_ARCHIVE_NOT_COMMITTED`). v4 never fetches at cutover. |
+  | Two latest invoices with the same day | HOLD (`EG_V4_PREDECESSOR_LATEST_AMBIGUOUS`) |
+
+- Adoption validates the existing archive bytes against the frozen row (SHA-256 and size). It never
+  refetches, recopies or renames the archive. A failed check is a HOLD (`EG_V4_PREDECESSOR_ARCHIVE_UNREADABLE`
+  or `EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH`).
+- An adopted v4 admission links to its predecessor row (`predecessor_invoice_id`). It writes no
+  predecessor table and creates no second invoice identity. A stream whose latest is HOLD gets no new
+  admission and no inventory call.
+- An older invoice that the portal offers is refused with `EG_V4_PREDECESSOR_IDENTITY_PRESENT`. An
+  invoice older than the newest predecessor invoice is refused with `EG_V4_SOURCE_REGRESSION`.
 - The v3 store refuses a v4 database, and the v4 store refuses a plain v3 database.
 
 ## 4. Provider state machine
@@ -111,7 +132,10 @@ UNKNOWN --REJECTED / conflict--> HOLD;   VERIFIED --conflicting outcome--> HOLD;
    before any further external effect, and the run ends with `EG_V4_LEASE_LOST`. A takeover is possible
    only after the lease expires.
 4. Recover: every `DISPATCHED` intent with no receipt becomes `UNKNOWN`.
-5. Admit: for each stream, take one inventory, pick the unique latest candidate and admit it, subject
+5. Classify, adopt and admit: for each stream, first classify the current latest v3 invoice (section 3).
+   An ADOPTABLE latest is adopted once, with no portal call or fetch. A DELIVERED latest is no action.
+   A HOLD stops that stream's admissions and inventory call. Otherwise take one inventory, pick the
+   unique latest candidate and admit it, subject
    to section 3. A portal or fetch failure is recorded against its stream, and pending work still
    drains. The archive is published before its admission row. A crash between them leaves a file on
    disk that the next run can reuse, but only while that invoice is still the stream's latest and the
@@ -165,10 +189,10 @@ python -m unittest discover -s tests
 - No production database inspection or migration. The migration is proven only on the fixture and
   synthetic databases.
 - No CLI entry point for v4. `cli.py`, `egcore.cmd` and `claude_supervisor.ps1` are unchanged.
-- Predecessor-archived invoices are never delivered by v4. An invoice that v3 archived but did not
-  deliver is refused (`EG_V4_PREDECESSOR_IDENTITY_PRESENT`). The #199 migration rule (email the
-  existing archived latest once, with zero fetch, if it is undelivered) is not implemented here, and
-  it needs a Web decision before any cutover.
+- Cutover decisions still open for Web: a stream whose current latest is DRIVE_VERIFIED in v3 with no
+  delivery sent is HOLD, not adopted, because seeding a v4 Drive receipt from v3 is not implemented. A
+  REQUEST_REJECTED or otherwise dispatched-but-unsettled delivery is HOLD and is never resent. An archived
+  latest that v3 never archived is HOLD, because v4 does not fetch at cutover.
 - No automatic reconciliation of `UNKNOWN`. Resolution needs a late receipt or an operator decision,
   which is out of this slice.
 - Source content changes for an already admitted identity are not detected. Admission is by
@@ -178,7 +202,8 @@ python -m unittest discover -s tests
 - The lease is not renewed during a run. Its duration (600 s by default) must exceed the longest run.
   A longer run is taken over, and it then stops before its next external effect with `EG_V4_LEASE_LOST`.
   The intent it left DISPATCHED is recovered as UNKNOWN by the new owner, and it is not resent.
-- Filename shapes: a month-year text at the start that is not the exact `MMM YYYY - ` form is refused,
-  not normalised. If the real EnergyGrid filenames use another shape, the stream will be refused
-  until Web decides the rule. This must be confirmed before cutover.
+- Filename shapes: only qualified ASCII source names are supported, and only the exact `MMM YYYY - <source>`
+  form is produced. Any non-ASCII name, and any other month-year shape, is a typed HOLD or refusal. No real
+  portal basename compatibility is declared proven. An authorised read-only observation of real shapes is
+  needed before live UAT. A filename is never invented.
 - Only the Windows `MoveFileExW` publication path is used, as in v3.
