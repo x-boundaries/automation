@@ -29,6 +29,8 @@ from energygrid_bill_downloader.errors import OfflineV4Error
 from energygrid_bill_downloader.invoice import Stream
 from energygrid_bill_downloader.state import V4_ACTIONS, V4_STREAMS
 from energygrid_bill_downloader.orchestration import run_offline_dual_stream_v4
+from energygrid_bill_downloader.connector_actions import require_fake_adapters
+from fixtures.synthetic_dual_stream import SyntheticAdapter
 
 PACKAGE = Path(__file__).resolve().parents[1] / "energygrid_bill_downloader"
 # Modules that make up the offline v4 surface. Each one must stay free of provider reach.
@@ -40,6 +42,12 @@ FORBIDDEN_NAMES = frozenset({
     "DirectHttpSource", "DeliveryClient", "create_connection", "webhook", "playwright",
 })
 PDF_A = b"%PDF-1.4\nA\n%%EOF\n"
+
+
+class OfflineFakeAdapter(SyntheticAdapter):
+    """A test double declared as an offline fake, the only kind the offline core accepts."""
+
+    OFFLINE_FAKE = True
 
 
 def sha(data: bytes) -> str:
@@ -128,6 +136,18 @@ class FakeConnectorTests(unittest.TestCase):
 
 
 class ConnectorBoundaryTests(unittest.TestCase):
+    def test_only_declared_offline_fake_adapters_are_accepted(self) -> None:
+        require_fake_adapters({"EB_BILL": OfflineFakeAdapter(None), "TENANT_BILL": OfflineFakeAdapter(None)})
+        with self.assertRaises(OfflineV4Error) as caught:
+            require_fake_adapters({"EB_BILL": SyntheticAdapter(None)})
+        self.assertEqual("EG_V4_ADAPTER_NOT_FAKE", caught.exception.support_ref)
+        with self.assertRaises(OfflineV4Error) as caught:
+            require_fake_adapters({"EB_BILL": mock.Mock()})
+        self.assertEqual("EG_V4_ADAPTER_NOT_FAKE", caught.exception.support_ref)
+        with self.assertRaises(OfflineV4Error) as caught:
+            require_fake_adapters({"OTHER": OfflineFakeAdapter(None)})
+        self.assertEqual("EG_V4_ADAPTER_SET_INVALID", caught.exception.support_ref)
+
     def test_only_the_two_fake_classes_are_accepted(self) -> None:
         ledger = FakeProviderLedger()
         require_fake_connectors({ACTION_DRIVE_UPLOAD: FakeDriveConnector(ledger), ACTION_GMAIL_SEND: FakeGmailConnector(ledger)})
@@ -229,7 +249,7 @@ class RuntimeNoProviderProofTests(unittest.TestCase):
     """Runtime proof: a complete offline run opens no socket, starts no process and calls no real provider."""
 
     def test_full_offline_run_makes_no_network_process_or_real_provider_call(self) -> None:
-        from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, snapshot
+        from fixtures.synthetic_dual_stream import candidate, snapshot
         from energygrid_bill_downloader.state import StateV4Store, migrate_state_database_v4
         from test_state_v4 import create_predecessor
 
@@ -253,8 +273,8 @@ class RuntimeNoProviderProofTests(unittest.TestCase):
             eb = candidate(Stream.EB_BILL, name="Invoice EB.pdf", invoice_date="2026-10-01")
             tn = candidate(Stream.TENANT_BILL, name="Invoice TN.pdf", invoice_date="2026-10-02")
             adapters = {
-                "EB_BILL": SyntheticAdapter(snapshot(Stream.EB_BILL, (eb,)), {"Invoice EB.pdf": PDF_A}),
-                "TENANT_BILL": SyntheticAdapter(snapshot(Stream.TENANT_BILL, (tn,)), {"Invoice TN.pdf": PDF_A}),
+                "EB_BILL": OfflineFakeAdapter(snapshot(Stream.EB_BILL, (eb,)), {"Invoice EB.pdf": PDF_A}),
+                "TENANT_BILL": OfflineFakeAdapter(snapshot(Stream.TENANT_BILL, (tn,)), {"Invoice TN.pdf": PDF_A}),
             }
             ledger = FakeProviderLedger()
             connectors = {ACTION_DRIVE_UPLOAD: FakeDriveConnector(ledger), ACTION_GMAIL_SEND: FakeGmailConnector(ledger)}

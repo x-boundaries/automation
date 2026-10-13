@@ -72,6 +72,11 @@ class DisplayFilenameTests(unittest.TestCase):
             display_filename("XYZ 2026 - invoice.pdf", date(2026, 10, 1)),
         )
 
+    def test_leading_whitespace_is_refused_so_a_doubled_prefix_cannot_slip_past(self) -> None:
+        with self.assertRaises(OfflineV4Error) as caught:
+            display_filename(" OCT 2026 - invoice.pdf", date(2026, 10, 1))
+        self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
+
     def test_invalid_source_and_date_types_are_refused(self) -> None:
         cases = (
             (lambda: display_filename("", date(2026, 10, 1)), "EG_V4_DISPLAY_SOURCE_INVALID"),

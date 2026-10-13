@@ -175,3 +175,16 @@ def require_fake_connectors(connectors: dict[str, object]) -> None:
     for action, connector in connectors.items():
         if type(connector) is not expected[action]:
             raise OfflineV4Error("EG_V4_CONNECTOR_NOT_FAKE")
+
+
+def require_fake_adapters(adapters: dict[str, object]) -> None:
+    """Refuse any portal adapter that does not declare itself an offline fake.
+
+    An adapter is accepted only when its class sets OFFLINE_FAKE = True. Real portal and
+    HTTP source classes do not, so the offline core cannot reach them by accident.
+    """
+    if not set(adapters) <= {"EB_BILL", "TENANT_BILL"}:
+        raise OfflineV4Error("EG_V4_ADAPTER_SET_INVALID")
+    for adapter in adapters.values():
+        if getattr(type(adapter), "OFFLINE_FAKE", False) is not True:
+            raise OfflineV4Error("EG_V4_ADAPTER_NOT_FAKE")

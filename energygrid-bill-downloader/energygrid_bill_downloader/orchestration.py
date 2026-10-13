@@ -866,7 +866,8 @@ def _v4_perform(state, connectors, archive_root: Path, run_id: str, now_iso: str
     except (AppError, OSError):
         state.hold_pending(intent_id, support_ref="EG_V4_ARCHIVE_UNREADABLE", run_id=run_id, now_iso=now_iso)
         return "HOLD"
-    if info.sha256 != invoice["sha256"] or info.byte_size != invoice["byte_size"] or len(payload) != invoice["byte_size"]:
+    payload_sha = hashlib.sha256(payload).hexdigest()
+    if payload_sha != invoice["sha256"] or info.sha256 != payload_sha or len(payload) != invoice["byte_size"]:
         state.hold_pending(intent_id, support_ref="EG_V4_ARCHIVE_IDENTITY_CHANGED", run_id=run_id, now_iso=now_iso)
         return "HOLD"
     drive_ref = None
@@ -963,12 +964,13 @@ def run_offline_dual_stream_v4(
     leaves it to expire, as a real crash would.
     """
     from .config import assert_offline_fake_profile
-    from .connector_actions import require_fake_connectors
+    from .connector_actions import require_fake_adapters, require_fake_connectors
     from .reconcile import admit_latest_offline_v4
     from .state import V4_STREAMS, _valid_run_id
 
     assert_offline_fake_profile(provider_profile)
     require_fake_connectors(connectors)
+    require_fake_adapters(adapters)
     if not _valid_run_id(run_id):
         raise OfflineV4Error("EG_V4_RUN_ID_INVALID")
     hook = checkpoint or (lambda name: None)

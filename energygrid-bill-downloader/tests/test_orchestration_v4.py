@@ -22,8 +22,8 @@ from energygrid_bill_downloader.naming import display_filename
 from energygrid_bill_downloader.publication import filename_key
 from energygrid_bill_downloader.orchestration import run_offline_dual_stream_v4
 from energygrid_bill_downloader.state import StateV4Store, migrate_state_database_v4
-from fixtures.synthetic_dual_stream import SYNTHETIC_NAMESPACE, SyntheticAdapter, candidate, snapshot
-from test_state_v4 import create_predecessor
+from fixtures.synthetic_dual_stream import SYNTHETIC_NAMESPACE, SyntheticAdapter, candidate, create_v3_database, snapshot
+from test_state_v4 import create_predecessor, insert_predecessor
 
 
 EB = "EB_BILL"
@@ -57,8 +57,16 @@ def crash_at(point: str, *, nth: int = 1):
     return hook
 
 
+class OfflineFakeAdapter(SyntheticAdapter):
+    """A test double declared as an offline fake. The offline core accepts only these."""
+
+    OFFLINE_FAKE = True
+
+
 class FailingAdapter:
     """A portal that cannot list or fetch. Used for the acquisition-failure scenario."""
+
+    OFFLINE_FAKE = True
 
     def inventory(self, ceiling: int):
         raise SourceTransportError("EG_SYNTHETIC_PORTAL_DOWN")
@@ -72,7 +80,7 @@ class OfflineV4RunTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.db = self.root / "state.sqlite"
-        create_predecessor(self.db)
+        self.create_database()
         migrate_state_database_v4(self.db, apply=True)
         self.archive = self.root / "archive"
         self.archive.mkdir()
@@ -93,7 +101,10 @@ class OfflineV4RunTests(unittest.TestCase):
         source = Stream(stream)
         cands = tuple(candidate(source, name=name, invoice_date=day) for name, day, _data in items)
         files = {name: data for name, _day, data in items}
-        return SyntheticAdapter(snapshot(source, cands), files)
+        return OfflineFakeAdapter(snapshot(source, cands), files)
+
+    def create_database(self) -> None:
+        create_predecessor(self.db)
 
     def run_once(self, n: int, adapters: dict, *, checkpoint=None, drive=None, gmail=None,
                  owner: str = "session-a", now_ms: int | None = None) -> dict:
@@ -232,6 +243,45 @@ class CatchUpAndFairnessTests(OfflineV4RunTests):
 
 
 class CrashAndRestartTests(OfflineV4RunTests):
+    def test_crash_after_fetch_leaves_no_archive_and_no_admission(self) -> None:
+        with self.assertRaises(SimulatedCrash):
+            self.run_once(1, self.standard_adapters(), checkpoint=crash_at("after_fetch"))
+        self.assertFalse((self.archive / "EB Bill" / "2026-10-01.pdf").exists())
+        with StateV4Store(self.db) as store:
+            self.assertEqual(0, store.count("energygrid_v4_invoice"))
+        result = self.run_once(2, self.standard_adapters())
+        self.assertEqual({"ADMITTED"}, {row["status"] for row in result["acquisition"].values()})
+        self.assertEqual(4, len(self.ledger.effects))
+
+    def test_crash_after_acquisition_drains_the_admitted_work_on_the_next_run(self) -> None:
+        with self.assertRaises(SimulatedCrash):
+            self.run_once(1, self.standard_adapters(), checkpoint=crash_at("after_acquisition"))
+        self.assertEqual(0, len(self.ledger.effects))
+        result = self.run_once(2, self.standard_adapters())
+        self.assertEqual(
+            {EB: "ALREADY_ADMITTED", TN: "ALREADY_ADMITTED"},
+            {key: row["status"] for key, row in result["acquisition"].items()},
+        )
+        self.assertEqual(4, len(self.steps(result)))
+        self.assertEqual(4, len(self.ledger.effects))
+
+    def test_a_run_whose_lease_was_taken_over_stops_before_recording_its_receipt(self) -> None:
+        state = {"taken": False}
+
+        def takeover(name: str) -> None:
+            # Another session starts after this run's lease has expired, and drives the stream to completion.
+            if name == "after_seal" and not state["taken"]:
+                state["taken"] = True
+                self.run_once(2, self.standard_adapters(), owner="session-b", now_ms=self.clock + 2 * SECOND)
+
+        with self.assertRaises(OfflineV4Error) as caught:
+            self.run_once(1, self.standard_adapters(), checkpoint=takeover)
+        self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
+        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.effects(GMAIL) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual("UNKNOWN", self.intent_state("2026-10-01", DRIVE))
+        self.assertEqual(3, len(self.ledger.effects))
+
     def test_crash_after_archive_before_admission_reuses_the_identical_file_without_a_second_copy(self) -> None:
         with self.assertRaises(SimulatedCrash):
             self.run_once(1, self.standard_adapters(), checkpoint=crash_at("after_archive"))
@@ -311,7 +361,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
     def test_an_altered_archive_holds_the_pending_intent_and_sends_nothing_for_it(self) -> None:
         with self.assertRaises(SimulatedCrash):
             self.run_once(1, self.standard_adapters(), checkpoint=crash_at("before_seal"))
-        (self.archive / "EB Bill" / "2026-10-01.pdf").write_bytes(pdf("tampered"))
+        (self.archive / "EB Bill" / "2026-10-01.pdf").write_bytes(pdf("eb-2"))
         result = self.run_once(2, self.standard_adapters())
         self.assertEqual("HOLD", self.intent_state("2026-10-01", DRIVE))
         self.assertEqual("EG_V4_ARCHIVE_IDENTITY_CHANGED", result["drain"]["streams"][EB]["support_ref"])
@@ -396,6 +446,57 @@ class PortalAndAdmissionTests(OfflineV4RunTests):
             self.assertEqual("EG_V4_CONNECTOR_NOT_FAKE", caught.exception.support_ref)
             self.assertEqual(0, store.count("energygrid_v4_invoice"))
         self.assertEqual(0, len(self.ledger.effects))
+
+
+class PortalRegressionAndBoundaryTests(OfflineV4RunTests):
+    def test_a_portal_latest_that_goes_backwards_is_refused_and_the_older_invoice_is_not_sent(self) -> None:
+        newer = {
+            EB: self.adapter(EB, ("Invoice EB 5.pdf", "2026-10-05", pdf("eb-5"))),
+            TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1"))),
+        }
+        self.run_once(1, newer)
+        self.assertEqual(4, len(self.ledger.effects))
+        older = {
+            EB: self.adapter(EB, ("Invoice EB.pdf", "2026-10-01", pdf("eb-1"))),
+            TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1"))),
+        }
+        result = self.run_once(2, older)
+        self.assertEqual("ADMISSION_REFUSED", result["acquisition"][EB]["status"])
+        self.assertEqual("EG_V4_SOURCE_REGRESSION", result["acquisition"][EB]["support_ref"])
+        self.assertEqual(4, len(self.ledger.effects))
+        self.assertFalse(any(e["display_filename"] == "OCT 2026 - Invoice EB.pdf" for e in self.ledger.effects))
+
+    def test_a_plain_portal_adapter_is_refused_before_any_work_or_lease(self) -> None:
+        plain = SyntheticAdapter(
+            snapshot(Stream.EB_BILL, (candidate(Stream.EB_BILL, name="Invoice EB.pdf", invoice_date="2026-10-01"),)),
+            {"Invoice EB.pdf": pdf("eb-1")},
+        )
+        with self.assertRaises(OfflineV4Error) as caught:
+            self.run_once(1, {EB: plain, TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1")))})
+        self.assertEqual("EG_V4_ADAPTER_NOT_FAKE", caught.exception.support_ref)
+        self.assertEqual(0, len(self.ledger.effects))
+        with StateV4Store(self.db) as store:
+            self.assertEqual(0, store.count("energygrid_v4_invoice"))
+            store.acquire_lease("after-refusal", now_ms=1, ttl_ms=10)
+
+
+class PredecessorCutoverTests(OfflineV4RunTests):
+    """A v3 database that already holds the portal's latest invoice must not see it re-delivered."""
+
+    def create_database(self) -> None:
+        create_v3_database(self.db)
+
+    def setUp(self) -> None:
+        super().setUp()
+        insert_predecessor(self.db, source_filename="Invoice EB.pdf", day="2026-10-01")
+
+    def test_a_latest_invoice_that_v3_already_holds_is_never_redelivered(self) -> None:
+        result = self.run_once(1, self.standard_adapters())
+        self.assertEqual("ADMISSION_REFUSED", result["acquisition"][EB]["status"])
+        self.assertEqual("EG_V4_PREDECESSOR_IDENTITY_PRESENT", result["acquisition"][EB]["support_ref"])
+        self.assertEqual([(TN, DRIVE, "VERIFIED"), (TN, GMAIL, "VERIFIED")], self.steps(result))
+        self.assertEqual(2, len(self.ledger.effects))
+        self.assertFalse((self.archive / "EB Bill" / "2026-10-01.pdf").exists())
 
 
 class PredecessorIsolationTests(OfflineV4RunTests):

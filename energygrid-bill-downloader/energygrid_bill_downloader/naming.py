@@ -47,6 +47,8 @@ def display_filename(source_filename: str, invoice_date: date) -> str:
     prefix = month_prefix(invoice_date)
     if type(source_filename) is not str or not source_filename:
         raise OfflineV4Error("EG_V4_DISPLAY_SOURCE_INVALID")
+    if source_filename != source_filename.lstrip():
+        raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
     remainder = source_filename
     match = _PREFIX_RE.match(source_filename)
     if match is not None:

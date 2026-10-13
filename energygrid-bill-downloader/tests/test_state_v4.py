@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import contextlib
 import hashlib
 from pathlib import Path
 import sqlite3
@@ -30,6 +31,17 @@ SHA_A = "a" * 64
 SHA_B = "b" * 64
 
 
+@contextlib.contextmanager
+def leased(path: Path, owner: str = "test-session", now_ms: int = 1_000):
+    """A store with the v4 lease held, as the offline run holds it. Writes are fenced."""
+    with StateV4Store(path) as store:
+        store.acquire_lease(owner, now_ms=now_ms, ttl_ms=10**9)
+        try:
+            yield store
+        finally:
+            store.release_lease(owner)
+
+
 def fixture_text() -> str:
     return FIXTURE.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
 
@@ -38,6 +50,35 @@ def create_predecessor(path: Path) -> None:
     connection = sqlite3.connect(path, isolation_level=None)
     try:
         connection.executescript(fixture_text())
+    finally:
+        connection.close()
+
+
+def insert_predecessor(path: Path, *, source_filename: str, day: str, stream: str = "EB_BILL") -> None:
+    """A CLASSIFIED predecessor invoice row, written through the real v2 table and its guards.
+
+    The database must hold bound streams (see create_v3_database). Synthetic data only.
+    """
+    import uuid
+
+    from fixtures.synthetic_dual_stream import SYNTHETIC_EVIDENCE, SYNTHETIC_NAMESPACE
+
+    folder = "EB Bill" if stream == "EB_BILL" else "Tenant Bill"
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO energygrid_invoice_v2 (invoice_id, classification, stream, source_namespace, source_invoice_key, "
+            "source_filename, raw_date, date_profile, bill_date, day_ordinal, evidence_ref, canonical_filename, "
+            "archive_relpath, archive_state, migration_state, drive_state, created_at_utc, created_run_id) "
+            "VALUES (?, 'CLASSIFIED', ?, ?, ?, ?, ?, 'INVOICE_DATE_ISO_V1', ?, ?, ?, ?, ?, 'ABSENT', 'NOT_REQUIRED', "
+            "'NOT_STAGED', ?, ?)",
+            (
+                "egpre-" + uuid.uuid4().hex, stream, SYNTHETIC_NAMESPACE, filename_key(source_filename),
+                source_filename, day, day, date.fromisoformat(day).toordinal(), SYNTHETIC_EVIDENCE,
+                f"{day}.pdf", f"{folder}/{day}.pdf", NOW, RUN_ID,
+            ),
+        )
     finally:
         connection.close()
 
@@ -128,9 +169,40 @@ class MigrationTests(_V4Base):
         self.assertEqual("MIGRATED_V4", result["status"])
         self.assertEqual(before_digest, predecessor_digest(self.path))
         self.assertEqual(before_objects, predecessor_objects(self.path))
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             self.assertEqual("COMPLETE_V4", store.validation_status)
             self.assertEqual(0, store.count("energygrid_v4_invoice"))
+
+    def test_open_v3_work_blocks_the_migration_and_leaves_the_database_at_v3(self) -> None:
+        connection = raw(self.path)
+        connection.execute(
+            "INSERT INTO energygrid_invoice_v2 (invoice_id, classification, archive_state, migration_state, drive_state, "
+            "created_at_utc, created_run_id) VALUES ('egopen-1', 'UNCLASSIFIED', 'UNVERIFIED', 'UNCLASSIFIED', "
+            "'NOT_STAGED', ?, ?)",
+            (NOW, RUN_ID),
+        )
+        connection.close()
+        with self.assertRaises(OfflineV4Error) as caught:
+            migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual("EG_V4_PREDECESSOR_NOT_COMPLETE_V3", caught.exception.support_ref)
+        connection = raw(self.path)
+        try:
+            self.assertEqual(3, connection.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            connection.close()
+
+    def test_an_extra_trigger_on_a_predecessor_table_changes_the_digest(self) -> None:
+        before = predecessor_digest(self.path)
+        migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual(before, predecessor_digest(self.path))
+        connection = raw(self.path)
+        try:
+            connection.execute(
+                "CREATE TRIGGER energygrid_v4_probe BEFORE INSERT ON energygrid_stream_v2 BEGIN SELECT 1; END"
+            )
+        finally:
+            connection.close()
+        self.assertNotEqual(before, predecessor_digest(self.path))
 
     def test_the_v3_store_refuses_a_migrated_database_instead_of_reading_it_as_v3(self) -> None:
         migrate_state_database_v4(self.path, apply=True)
@@ -180,7 +252,7 @@ class MigrationTests(_V4Base):
 
 class AdmissionTests(_V4Base):
     def test_admission_creates_one_pending_drive_intent_and_one_pending_gmail_intent(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             invoice, created = admit(store)
             self.assertTrue(created)
             self.assertEqual("EB Bill/2026-10-01.pdf", invoice["archive_relpath"])
@@ -191,7 +263,7 @@ class AdmissionTests(_V4Base):
             self.assertEqual({SHA_A}, {row["payload_sha256"] for row in intents.values()})
 
     def test_identical_readmission_is_idempotent_and_writes_nothing(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             first, _ = admit(store)
             counts = [store.count(t) for t in ("energygrid_v4_invoice", "energygrid_v4_intent", "energygrid_v4_transition")]
             second, created = admit(store)
@@ -200,7 +272,7 @@ class AdmissionTests(_V4Base):
             self.assertEqual(counts, [store.count(t) for t in ("energygrid_v4_invoice", "energygrid_v4_intent", "energygrid_v4_transition")])
 
     def test_different_content_for_the_same_identity_is_a_conflict(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             admit(store)
             with self.assertRaises(OfflineV4Error) as caught:
                 admit(store, sha=SHA_B)
@@ -208,7 +280,7 @@ class AdmissionTests(_V4Base):
             self.assertEqual(1, store.count("energygrid_v4_invoice"))
 
     def test_display_name_collision_within_a_stream_is_refused(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             admit(store, name="a.pdf", invoice_date=date(2026, 10, 1))
             with self.assertRaises(OfflineV4Error) as caught:
                 admit(store, name="OCT 2026 - a.pdf", invoice_date=date(2026, 10, 15), sha=SHA_B)
@@ -216,39 +288,99 @@ class AdmissionTests(_V4Base):
             self.assertEqual(1, store.count("energygrid_v4_invoice"))
 
     def test_same_display_name_in_the_other_stream_is_not_a_collision(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             admit(store, name="a.pdf", invoice_date=date(2026, 10, 1), stream="EB_BILL")
             invoice, created = admit(store, name="a.pdf", invoice_date=date(2026, 10, 2), stream="TENANT_BILL", sha=SHA_B)
             self.assertTrue(created)
             self.assertEqual("Tenant Bill/2026-10-02.pdf", invoice["archive_relpath"])
 
     def test_two_invoices_on_the_same_date_in_one_stream_collide_on_the_archive_path(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             admit(store, name="first.pdf", invoice_date=date(2026, 10, 1))
             with self.assertRaises(OfflineV4Error) as caught:
                 admit(store, name="second.pdf", invoice_date=date(2026, 10, 1), sha=SHA_B)
             self.assertEqual("EG_V4_ARCHIVE_PATH_COLLISION", caught.exception.support_ref)
 
     def test_check_admissible_reports_the_same_identity_without_needing_bytes(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             admit(store)
             decision = store.check_admissible(
                 stream="EB_BILL", source_namespace="SYN-NS", source_invoice_key=filename_key("invoice-001.pdf"),
                 display_filename="OCT 2026 - invoice-001.pdf", canonical_filename="2026-10-01.pdf",
+                invoice_date=date(2026, 10, 1),
             )
             self.assertEqual("ALREADY_ADMITTED", decision)
 
+    def test_an_older_identity_than_the_newest_admission_is_a_regression(self) -> None:
+        with leased(self.path) as store:
+            admit(store, name="newer.pdf", invoice_date=date(2026, 10, 5))
+            with self.assertRaises(OfflineV4Error) as caught:
+                admit(store, name="older.pdf", invoice_date=date(2026, 10, 1), sha=SHA_B)
+            self.assertEqual("EG_V4_SOURCE_REGRESSION", caught.exception.support_ref)
+            self.assertEqual(1, store.count("energygrid_v4_invoice"))
+
     def test_admission_sequence_is_monotonic_across_streams(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             first, _ = admit(store, name="one.pdf", invoice_date=date(2026, 10, 1), stream="EB_BILL")
             second, _ = admit(store, name="two.pdf", invoice_date=date(2026, 10, 2), stream="TENANT_BILL")
             self.assertLess(first["admission_seq"], second["admission_seq"])
 
 
+SYNTH_NS = "SYNTHETIC-ENERGYGRID-NAMESPACE"
+
+
+class PredecessorAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from fixtures.synthetic_dual_stream import create_v3_database
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "state.sqlite"
+        create_v3_database(self.path)
+        migrate_state_database_v4(self.path, apply=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_an_identity_that_v3_already_holds_is_never_readmitted(self) -> None:
+        insert_predecessor(self.path, source_filename="Invoice.pdf", day="2026-10-01")
+        with leased(self.path) as store:
+            with self.assertRaises(OfflineV4Error) as caught:
+                admit(store, namespace=SYNTH_NS, name="Invoice.pdf", invoice_date=date(2026, 10, 1))
+            self.assertEqual("EG_V4_PREDECESSOR_IDENTITY_PRESENT", caught.exception.support_ref)
+            with self.assertRaises(OfflineV4Error) as caught:
+                store.check_admissible(
+                    stream="EB_BILL", source_namespace="SYNTHETIC-ENERGYGRID-NAMESPACE",
+                    source_invoice_key=filename_key("Invoice.pdf"), display_filename="OCT 2026 - Invoice.pdf",
+                    canonical_filename="2026-10-01.pdf", invoice_date=date(2026, 10, 1),
+                )
+            self.assertEqual("EG_V4_PREDECESSOR_IDENTITY_PRESENT", caught.exception.support_ref)
+            self.assertEqual(0, store.count("energygrid_v4_invoice"))
+
+    def test_a_different_identity_on_a_predecessor_archive_date_is_refused(self) -> None:
+        insert_predecessor(self.path, source_filename="first.pdf", day="2026-10-01")
+        with leased(self.path) as store:
+            with self.assertRaises(OfflineV4Error) as caught:
+                admit(store, namespace=SYNTH_NS, name="second.pdf", invoice_date=date(2026, 10, 1))
+            self.assertEqual("EG_V4_PREDECESSOR_ARCHIVE_PRESENT", caught.exception.support_ref)
+
+    def test_an_identity_older_than_the_predecessor_newest_is_a_regression(self) -> None:
+        insert_predecessor(self.path, source_filename="x.pdf", day="2026-10-10")
+        with leased(self.path) as store:
+            with self.assertRaises(OfflineV4Error) as caught:
+                admit(store, namespace=SYNTH_NS, name="y.pdf", invoice_date=date(2026, 10, 1))
+            self.assertEqual("EG_V4_SOURCE_REGRESSION", caught.exception.support_ref)
+
+    def test_a_newer_identity_is_admitted_after_the_predecessor(self) -> None:
+        insert_predecessor(self.path, source_filename="x.pdf", day="2026-10-01")
+        with leased(self.path) as store:
+            _invoice, created = admit(store, namespace=SYNTH_NS, name="y.pdf", invoice_date=date(2026, 10, 5))
+            self.assertTrue(created)
+
+
 class ImmutabilityAndTransitionTriggerTests(_V4Base):
     def setUp(self) -> None:
         super().setUp()
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             self.invoice, _ = admit(store)
             intents = self.intents(store, self.invoice)
             self.drive = intents["DRIVE_UPLOAD"]["intent_id"]
@@ -276,6 +408,96 @@ class ImmutabilityAndTransitionTriggerTests(_V4Base):
         self._expect("UPDATE energygrid_v4_transition SET to_state='HOLD'", "EG_V4_IMMUTABLE_ROW")
         self._expect("DELETE FROM energygrid_v4_dispatch", "EG_V4_IMMUTABLE_ROW")
 
+    def test_insert_or_replace_cannot_overwrite_any_immutable_row(self) -> None:
+        def replace_with_change(table: str, key_column: str, key_value, changed: str, value,
+                                tokens: tuple = ("EG_V4_IMMUTABLE_ROW",)) -> None:
+            connection = raw(self.path)
+            try:
+                columns = [item[1] for item in connection.execute(f"PRAGMA table_info({table})")]
+                row = dict(zip(columns, connection.execute(
+                    f"SELECT * FROM {table} WHERE {key_column}=?", (key_value,)).fetchone()))
+                row[changed] = value
+                placeholders = ",".join("?" for _ in columns)
+                with self.assertRaises(sqlite3.IntegrityError) as caught:
+                    connection.execute(
+                        f"INSERT OR REPLACE INTO {table} ({','.join(columns)}) VALUES ({placeholders})",
+                        tuple(row[c] for c in columns),
+                    )
+                self.assertTrue(any(token in str(caught.exception) for token in tokens), str(caught.exception))
+            finally:
+                connection.close()
+
+        invoice_key = self.invoice["invoice_key"]
+        replace_with_change("energygrid_v4_invoice", "invoice_key", invoice_key, "sha256", SHA_B)
+        replace_with_change("energygrid_v4_intent", "intent_id", self.gmail, "payload_sha256", SHA_B)
+        replace_with_change("energygrid_v4_dispatch", "intent_id", self.drive, "run_id", RUN_ID_2,
+                            tokens=("EG_V4_IMMUTABLE_ROW", "EG_V4_DISPATCH_NOT_PENDING"))
+        connection = raw(self.path)
+        seq = connection.execute("SELECT MIN(transition_seq) FROM energygrid_v4_transition").fetchone()[0]
+        receipt = connection.execute("SELECT MIN(receipt_seq) FROM energygrid_v4_receipt").fetchone()[0]
+        connection.close()
+        replace_with_change("energygrid_v4_transition", "transition_seq", seq, "to_state", "HOLD")
+        replace_with_change("energygrid_v4_receipt", "receipt_seq", receipt, "outcome", "REJECTED")
+        check = raw(self.path)
+        try:
+            self.assertEqual(SHA_A, check.execute(
+                "SELECT sha256 FROM energygrid_v4_invoice WHERE invoice_key=?", (invoice_key,)).fetchone()[0])
+        finally:
+            check.close()
+
+    def test_insert_or_replace_cannot_admit_a_second_row_on_a_unique_key(self) -> None:
+        connection = raw(self.path)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as caught:
+                connection.execute(
+                    "INSERT OR REPLACE INTO energygrid_v4_invoice (invoice_key, stream, source_namespace, "
+                    "source_invoice_key, invoice_date, canonical_filename, archive_relpath, display_filename, "
+                    "display_key, sha256, byte_size, admission_seq, admitted_run_id, admitted_at_utc) VALUES "
+                    "('egi4-" + "f" * 32 + "', 'EB_BILL', 'SYN-NS', 'other.pdf', '2026-10-01', '2026-10-01.pdf', "
+                    "'EB Bill/2026-10-01.pdf', 'OCT 2026 - other.pdf', 'oct 2026 - other.pdf', ?, 10, 99, ?, ?)",
+                    (SHA_B, RUN_ID, NOW),
+                )
+            self.assertIn("EG_V4_IMMUTABLE_ROW", str(caught.exception))
+        finally:
+            connection.close()
+        check = raw(self.path)
+        try:
+            self.assertEqual(1, check.execute("SELECT COUNT(*) FROM energygrid_v4_invoice").fetchone()[0])
+        finally:
+            check.close()
+
+    def test_a_status_row_cannot_be_inserted_or_replaced_outside_admission(self) -> None:
+        self._expect(
+            "INSERT OR REPLACE INTO energygrid_v4_intent_status (intent_id, state, version, support_ref, "
+            "updated_run_id, updated_at_utc) VALUES (?, 'VERIFIED', 1, NULL, ?, ?)",
+            "EG_V4_ILLEGAL_TRANSITION",
+            (self.gmail, RUN_ID, NOW),
+        )
+        self._expect(
+            "INSERT OR REPLACE INTO energygrid_v4_intent_status (intent_id, state, version, support_ref, "
+            "updated_run_id, updated_at_utc) VALUES (?, 'PENDING', 1, NULL, ?, ?)",
+            "EG_V4_ILLEGAL_TRANSITION",
+            (self.gmail, RUN_ID, NOW),
+        )
+
+    def test_verified_status_needs_a_receipt_whose_sha_is_the_archive_sha(self) -> None:
+        with leased(self.path) as store:
+            store.seal_dispatch(self.gmail, run_id=RUN_ID, now_iso=NOW)
+        connection = raw(self.path)
+        try:
+            connection.execute(
+                "INSERT INTO energygrid_v4_receipt (intent_id, digest, outcome, provider_ref, provider_sha256, run_id, at_utc) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (self.gmail, "d" * 64, "VERIFIED", "fake-wrong-sha", SHA_B, RUN_ID, NOW),
+            )
+        finally:
+            connection.close()
+        self._expect(
+            "UPDATE energygrid_v4_intent_status SET state='VERIFIED', version=version+1 WHERE intent_id=?",
+            "EG_V4_VERIFIED_WITHOUT_RECEIPT",
+            (self.gmail,),
+        )
+
     def test_status_cannot_skip_a_state_or_a_version(self) -> None:
         self._expect(
             "UPDATE energygrid_v4_intent_status SET state='VERIFIED', version=version+1 WHERE intent_id=?",
@@ -296,7 +518,7 @@ class ImmutabilityAndTransitionTriggerTests(_V4Base):
         )
 
     def test_verified_cannot_be_entered_without_a_verified_receipt(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             store.seal_dispatch(self.gmail, run_id=RUN_ID, now_iso=NOW)
         self._expect(
             "UPDATE energygrid_v4_intent_status SET state='VERIFIED', version=version+1 WHERE intent_id=?",
@@ -305,7 +527,7 @@ class ImmutabilityAndTransitionTriggerTests(_V4Base):
         )
 
     def test_gmail_cannot_be_dispatched_before_drive_is_verified(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             second_invoice, _ = admit(store, name="other.pdf", invoice_date=date(2026, 10, 2), sha=SHA_B)
             second_gmail = self.intents(store, second_invoice)["GMAIL_SEND"]["intent_id"]
             with self.assertRaises(OfflineV4Error) as caught:
@@ -341,6 +563,21 @@ class LeaseAndCursorTests(_V4Base):
             first.release_lease("session-a")
             second.acquire_lease("session-b", now_ms=3_000, ttl_ms=60_000)
 
+    def test_a_session_whose_lease_was_taken_over_cannot_write_again(self) -> None:
+        with StateV4Store(self.path) as first, StateV4Store(self.path) as second:
+            first.acquire_lease("session-a", now_ms=1_000, ttl_ms=10_000)
+            second.acquire_lease("session-b", now_ms=20_000, ttl_ms=10_000)
+            with self.assertRaises(OfflineV4Error) as caught:
+                first.set_cursor("EB_BILL", now_iso=NOW)
+            self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
+            self.assertIsNone(second.cursor())
+            first.release_lease("session-a")
+            with self.assertRaises(OfflineV4Error) as caught:
+                first.acquire_lease("session-a", now_ms=21_000, ttl_ms=10_000)
+            self.assertEqual("EG_V4_LEASE_HELD", caught.exception.support_ref)
+            second.set_cursor("TENANT_BILL", now_iso=NOW)
+            self.assertEqual("TENANT_BILL", second.cursor())
+
     def test_an_expired_lease_can_be_taken_over_after_a_crash(self) -> None:
         with StateV4Store(self.path) as first, StateV4Store(self.path) as second:
             first.acquire_lease("crashed", now_ms=1_000, ttl_ms=10_000)
@@ -354,14 +591,14 @@ class LeaseAndCursorTests(_V4Base):
                 second.acquire_lease("intruder", now_ms=2_000, ttl_ms=60_000)
 
     def test_lease_inputs_are_validated(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             for args in (("", 1, 1), ("x" * 129, 1, 1), ("ok", 1, 0), ("ok", "1", 1)):
                 with self.subTest(args=args), self.assertRaises(OfflineV4Error) as caught:
                     store.acquire_lease(args[0], now_ms=args[1], ttl_ms=args[2])
                 self.assertEqual("EG_V4_LEASE_INVALID", caught.exception.support_ref)
 
     def test_cursor_round_trips_and_rejects_unknown_streams(self) -> None:
-        with StateV4Store(self.path) as store:
+        with leased(self.path) as store:
             self.assertIsNone(store.cursor())
             store.set_cursor("TENANT_BILL", now_iso=NOW)
             self.assertEqual("TENANT_BILL", store.cursor())
@@ -374,10 +611,12 @@ class ProviderOutcomeTests(_V4Base):
         super().setUp()
         self.store = StateV4Store(self.path)
         self.store.__enter__()
+        self.store.acquire_lease("test-session", now_ms=1_000, ttl_ms=10**9)
         self.invoice, _ = admit(self.store)
         self.drive = self.intents(self.store, self.invoice)["DRIVE_UPLOAD"]["intent_id"]
 
     def tearDown(self) -> None:
+        self.store.release_lease("test-session")
         self.store.close()
         super().tearDown()
 

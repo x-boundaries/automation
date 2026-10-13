@@ -1427,6 +1427,7 @@ def admit_latest_offline_v4(
                 source_invoice_key=candidate.source_invoice_key,
                 display_filename=presentation,
                 canonical_filename=candidate.canonical_filename,
+                invoice_date=candidate.invoice_date,
             )
         except OfflineV4Error as exc:
             results[stream] = outcome("ADMISSION_REFUSED", exc.support_ref)
