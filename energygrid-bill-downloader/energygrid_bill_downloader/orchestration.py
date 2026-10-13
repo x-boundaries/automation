@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import SUPPORT_REF_PATTERN, AppError, ConfigError, RunLockedError, StateError
+from .errors import SUPPORT_REF_PATTERN, AppError, ConfigError, OfflineV4Error, RunLockedError, StateError
 from .publication import ensure_no_reparse_components, validate_pdf
 from .state import (
     DRIVE_MAX_BYTES,
@@ -792,3 +792,219 @@ def _deliver(core: CoreContext, state: StateV3Store, stream: str, ctx: dict) -> 
     if outcome.state == "DELIVERED":
         return _finish(core, "deliver", stream, "DELIVERED", outcome.support_ref, True, 0)
     return _finish(core, "deliver", stream, outcome.state, outcome.support_ref, True, 20)
+
+
+# ---------------------------------------------------------------------------
+# #226 G3 offline dual-stream v4: one run = recover, admit, then drain.
+#
+# Fake providers only. The run takes the v4 lease, marks every dispatch left open
+# by a crashed earlier run as UNKNOWN, admits the latest invoice per stream, and
+# drains every admitted invoice that is not yet fully handled. Streams alternate
+# in a durable round-robin, and each stream works its oldest unfinished invoice
+# first, so a newer admission never overtakes a pending older one. Drive is
+# dispatched before Gmail, and UNKNOWN or HOLD stops only that stream for the
+# rest of the run. Nothing is ever resent.
+# ---------------------------------------------------------------------------
+
+V4_RESULT_SCHEMA = "energygrid.offline.v4.result"
+V4_DRAIN_STEP_PADDING = 8
+
+
+def _v4_iso(now_ms: int) -> str:
+    return datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _v4_rotated(streams: tuple[str, ...], cursor: str | None) -> list[str]:
+    if cursor not in streams:
+        return list(streams)
+    index = streams.index(cursor) + 1
+    return list(streams[index:]) + list(streams[:index])
+
+
+def _v4_stream_step(state, stream: str) -> tuple[str, str | None, dict | None, dict | None]:
+    """Plan the next action for one stream: (kind, action-or-ref, invoice, intent).
+
+    kind is STEP, BLOCKED or IDLE. Only the oldest invoice that is not fully handled is considered.
+    """
+    from .connector_actions import ACTION_DRIVE_UPLOAD, ACTION_GMAIL_SEND
+
+    for invoice in state.invoices_for_stream(stream):
+        intents = state.intents_for_invoice(invoice["invoice_key"])
+        drive_row = intents[ACTION_DRIVE_UPLOAD]
+        gmail_row = intents[ACTION_GMAIL_SEND]
+        if drive_row["state"] == "VERIFIED" and gmail_row["state"] == "VERIFIED":
+            continue
+        for row in (drive_row, gmail_row):
+            if row["state"] in ("UNKNOWN", "HOLD"):
+                return ("BLOCKED", row["support_ref"] or "EG_V4_INTENT_HELD", None, None)
+        if drive_row["state"] == "PENDING":
+            return ("STEP", ACTION_DRIVE_UPLOAD, invoice, drive_row)
+        if drive_row["state"] == "VERIFIED" and gmail_row["state"] == "PENDING":
+            return ("STEP", ACTION_GMAIL_SEND, invoice, gmail_row)
+        return ("BLOCKED", "EG_V4_INTENT_IN_FLIGHT", None, None)
+    return ("IDLE", None, None, None)
+
+
+def _v4_perform(state, connectors, archive_root: Path, run_id: str, now_iso: str, checkpoint,
+                invoice: dict, action: str, intent: dict) -> str:
+    """Dispatch one intent: verify the archive, seal, call the fake provider, then record its receipt."""
+    from .connector_actions import (
+        ACTION_DRIVE_UPLOAD,
+        ACTION_GMAIL_SEND,
+        OUTCOME_UNKNOWN,
+        ActionOutcome,
+        ActionRequest,
+        SimulatedCrash,
+    )
+
+    intent_id = intent["intent_id"]
+    path = archive_root / invoice["archive_relpath"]
+    try:
+        ensure_no_reparse_components(path)
+        info = validate_pdf(path)
+        payload = path.read_bytes()
+    except (AppError, OSError):
+        state.hold_pending(intent_id, support_ref="EG_V4_ARCHIVE_UNREADABLE", run_id=run_id, now_iso=now_iso)
+        return "HOLD"
+    if info.sha256 != invoice["sha256"] or info.byte_size != invoice["byte_size"] or len(payload) != invoice["byte_size"]:
+        state.hold_pending(intent_id, support_ref="EG_V4_ARCHIVE_IDENTITY_CHANGED", run_id=run_id, now_iso=now_iso)
+        return "HOLD"
+    drive_ref = None
+    if action == ACTION_GMAIL_SEND:
+        drive_intent = state.intents_for_invoice(invoice["invoice_key"])[ACTION_DRIVE_UPLOAD]
+        drive_ref = state.verified_provider_ref(drive_intent["intent_id"])
+        if drive_ref is None:
+            state.hold_pending(intent_id, support_ref="EG_V4_DRIVE_NOT_VERIFIED", run_id=run_id, now_iso=now_iso)
+            return "HOLD"
+    request = ActionRequest(
+        intent_id=intent_id,
+        action=action,
+        stream=invoice["stream"],
+        display_filename=invoice["display_filename"],
+        sha256=invoice["sha256"],
+        byte_size=invoice["byte_size"],
+        payload=payload,
+        drive_provider_ref=drive_ref,
+    )
+    checkpoint("before_seal")
+    state.seal_dispatch(intent_id, run_id=run_id, now_iso=now_iso)
+    checkpoint("after_seal")
+    try:
+        outcome = connectors[action].perform(request)
+    except SimulatedCrash:
+        raise
+    except Exception:
+        # The effect may or may not have happened. Record UNKNOWN and never resend.
+        outcome = ActionOutcome(OUTCOME_UNKNOWN, "", "")
+    checkpoint("before_receipt")
+    result = state.record_receipt(
+        intent_id,
+        outcome=outcome.outcome,
+        provider_ref=outcome.provider_ref,
+        provider_sha256=outcome.provider_sha256,
+        run_id=run_id,
+        now_iso=now_iso,
+    )
+    checkpoint("after_receipt")
+    return result
+
+
+def _v4_drain(state, connectors, archive_root: Path, run_id: str, now_iso: str, checkpoint) -> dict:
+    from .state import V4_STREAMS
+
+    blocked: dict[str, str] = {}
+    steps: list[tuple[str, str, str]] = []
+    limit = state.count("energygrid_v4_intent") + V4_DRAIN_STEP_PADDING
+    while True:
+        plans: dict[str, tuple] = {}
+        for stream in V4_STREAMS:
+            if stream in blocked:
+                continue
+            plan = _v4_stream_step(state, stream)
+            if plan[0] == "BLOCKED":
+                blocked[stream] = plan[1]
+            elif plan[0] == "STEP":
+                plans[stream] = plan
+        ready = [stream for stream in _v4_rotated(V4_STREAMS, state.cursor()) if stream in plans]
+        if not ready:
+            break
+        if len(steps) >= limit:
+            raise OfflineV4Error("EG_V4_DRAIN_BOUND_EXCEEDED")
+        stream = ready[0]
+        _kind, action, invoice, intent = plans[stream]
+        result = _v4_perform(state, connectors, archive_root, run_id, now_iso, checkpoint, invoice, action, intent)
+        state.set_cursor(stream, now_iso=now_iso)
+        steps.append((stream, action, result))
+        if result in ("UNKNOWN", "HOLD"):
+            blocked[stream] = result
+    return {"steps": steps, "blocked": blocked}
+
+
+def run_offline_dual_stream_v4(
+    *,
+    state,
+    adapters: dict[str, Any],
+    connectors: dict[str, Any],
+    archive_root: Path,
+    temp_root: Path,
+    run_id: str,
+    owner_token: str,
+    provider_profile: str,
+    now_ms: int,
+    inventory_ceiling: int = 200,
+    lease_ttl_ms: int = 600_000,
+    checkpoint: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Run one offline dual-stream v4 pass with fake providers only (#226 G3).
+
+    Refuses before any work for a live profile, a non-fake connector or a bad run
+    identity. A lease held by another session stops the run with no mutation. The
+    lease is released on a normal return or an ordinary exception. A simulated crash
+    leaves it to expire, as a real crash would.
+    """
+    from .config import assert_offline_fake_profile
+    from .connector_actions import require_fake_connectors
+    from .reconcile import admit_latest_offline_v4
+    from .state import V4_STREAMS, _valid_run_id
+
+    assert_offline_fake_profile(provider_profile)
+    require_fake_connectors(connectors)
+    if not _valid_run_id(run_id):
+        raise OfflineV4Error("EG_V4_RUN_ID_INVALID")
+    hook = checkpoint or (lambda name: None)
+    now_iso = _v4_iso(now_ms)
+    state.acquire_lease(owner_token, now_ms=now_ms, ttl_ms=lease_ttl_ms)
+    try:
+        recovered = state.recover_unfinished(run_id, now_iso=now_iso)
+        acquisition = admit_latest_offline_v4(
+            adapters=adapters,
+            state=state,
+            archive_root=archive_root,
+            temp_root=temp_root,
+            run_id=run_id,
+            now_iso=now_iso,
+            inventory_ceiling=inventory_ceiling,
+            checkpoint=hook,
+        )
+        hook("after_acquisition")
+        drain = _v4_drain(state, connectors, archive_root, run_id, now_iso, hook)
+        streams: dict[str, dict[str, str | None]] = {}
+        for stream in V4_STREAMS:
+            kind, reference, _invoice, _intent = _v4_stream_step(state, stream)
+            if kind == "BLOCKED":
+                streams[stream] = {"state": "BLOCKED", "support_ref": reference}
+            elif kind == "STEP":
+                streams[stream] = {"state": "PENDING", "support_ref": None}
+            else:
+                streams[stream] = {"state": "DRAINED", "support_ref": None}
+    except Exception:
+        state.release_lease(owner_token)
+        raise
+    state.release_lease(owner_token)
+    return {
+        "schema": V4_RESULT_SCHEMA,
+        "run_id": run_id,
+        "recovered_unknown": recovered,
+        "acquisition": acquisition,
+        "drain": {"steps": drain["steps"], "blocked": drain["blocked"], "streams": streams},
+    }

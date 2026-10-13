@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import sqlite3
 import stat
 import re
@@ -8,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .errors import StateError
+from .errors import RUN_IN_PROGRESS, OfflineV4Error, StateError
 from .publication import FileInfo, filename_key
 
 
@@ -2339,3 +2341,687 @@ def migrate_state_database_v3(
         raise StateError("migration database could not be inspected or updated") from None
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------------------
+# #226 G3 offline dual-stream v4: additive schema, fake providers only.
+#
+# v4 adds admission, intent, status, transition, dispatch, receipt, lease and
+# cursor tables beside the frozen v3 schema. It never rewrites a v1-v3 table or
+# row. The archive keeps its date-only identity; the presentation name is stored
+# once per admission. Provider state moves only through the triggers below, so
+# a direct SQL write cannot skip Drive-before-Gmail, dispatch sealing or the
+# receipt that a VERIFIED state requires.
+# ---------------------------------------------------------------------------
+
+V4_SCHEMA_VERSION = 4
+V4_STREAMS = ("EB_BILL", "TENANT_BILL")
+V4_ACTIONS = ("DRIVE_UPLOAD", "GMAIL_SEND")
+V4_OUTCOMES = ("VERIFIED", "REJECTED", "UNKNOWN")
+V4_LEASE_NAME = "dual_stream_v4"
+V4_CURSOR_NAME = "fair_drain"
+_V4_STATES_SQL = "('PENDING','DISPATCHED','VERIFIED','UNKNOWN','HOLD')"
+_V4_IMMUTABLE_TABLES = ("invoice", "intent", "transition", "dispatch", "receipt")
+
+_V4_TABLE_SQL = (
+    """CREATE TABLE energygrid_v4_invoice (
+  invoice_key TEXT PRIMARY KEY CHECK(length(invoice_key)=37 AND substr(invoice_key,1,5)='egi4-' AND substr(invoice_key,6) NOT GLOB '*[^0-9a-f]*'),
+  stream TEXT NOT NULL CHECK(stream IN ('EB_BILL','TENANT_BILL')),
+  source_namespace TEXT NOT NULL CHECK(length(source_namespace) BETWEEN 1 AND 256),
+  source_invoice_key TEXT NOT NULL CHECK(length(source_invoice_key) BETWEEN 1 AND 260),
+  invoice_date TEXT NOT NULL CHECK(length(invoice_date)=10 AND invoice_date NOT GLOB '*[^0-9-]*'),
+  canonical_filename TEXT NOT NULL CHECK(canonical_filename=invoice_date||'.pdf'),
+  archive_relpath TEXT NOT NULL CHECK(archive_relpath=(CASE stream WHEN 'EB_BILL' THEN 'EB Bill/' ELSE 'Tenant Bill/' END)||canonical_filename),
+  display_filename TEXT NOT NULL CHECK(length(display_filename) BETWEEN 5 AND 260),
+  display_key TEXT NOT NULL CHECK(length(display_key) > 0),
+  sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+  byte_size INTEGER NOT NULL CHECK(byte_size > 0),
+  admission_seq INTEGER NOT NULL UNIQUE CHECK(admission_seq >= 1),
+  admitted_run_id TEXT NOT NULL CHECK(length(admitted_run_id)=36),
+  admitted_at_utc TEXT NOT NULL,
+  UNIQUE(stream, source_namespace, source_invoice_key),
+  UNIQUE(stream, display_key),
+  UNIQUE(archive_relpath)
+)""",
+    "CREATE INDEX energygrid_v4_invoice_stream_seq ON energygrid_v4_invoice(stream, admission_seq)",
+    """CREATE TABLE energygrid_v4_intent (
+  intent_id TEXT PRIMARY KEY CHECK(length(intent_id)=37 AND substr(intent_id,1,5)='egt4-' AND substr(intent_id,6) NOT GLOB '*[^0-9a-f]*'),
+  invoice_key TEXT NOT NULL REFERENCES energygrid_v4_invoice(invoice_key),
+  action TEXT NOT NULL CHECK(action IN ('DRIVE_UPLOAD','GMAIL_SEND')),
+  payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+  created_run_id TEXT NOT NULL CHECK(length(created_run_id)=36),
+  created_at_utc TEXT NOT NULL,
+  UNIQUE(invoice_key, action)
+)""",
+    f"""CREATE TABLE energygrid_v4_intent_status (
+  intent_id TEXT PRIMARY KEY REFERENCES energygrid_v4_intent(intent_id),
+  state TEXT NOT NULL CHECK(state IN {_V4_STATES_SQL}),
+  version INTEGER NOT NULL CHECK(version >= 1),
+  support_ref TEXT CHECK(support_ref IS NULL OR length(support_ref) BETWEEN 4 AND 64),
+  updated_run_id TEXT NOT NULL CHECK(length(updated_run_id)=36),
+  updated_at_utc TEXT NOT NULL
+)""",
+    f"""CREATE TABLE energygrid_v4_transition (
+  transition_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  intent_id TEXT NOT NULL REFERENCES energygrid_v4_intent(intent_id),
+  from_state TEXT CHECK(from_state IS NULL OR from_state IN {_V4_STATES_SQL}),
+  to_state TEXT NOT NULL CHECK(to_state IN {_V4_STATES_SQL}),
+  support_ref TEXT CHECK(support_ref IS NULL OR length(support_ref) BETWEEN 4 AND 64),
+  run_id TEXT NOT NULL CHECK(length(run_id)=36),
+  at_utc TEXT NOT NULL
+)""",
+    """CREATE TABLE energygrid_v4_dispatch (
+  intent_id TEXT PRIMARY KEY REFERENCES energygrid_v4_intent(intent_id),
+  run_id TEXT NOT NULL CHECK(length(run_id)=36),
+  sealed_at_utc TEXT NOT NULL
+)""",
+    """CREATE TABLE energygrid_v4_receipt (
+  receipt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  intent_id TEXT NOT NULL REFERENCES energygrid_v4_intent(intent_id),
+  digest TEXT NOT NULL CHECK(length(digest)=64 AND digest NOT GLOB '*[^0-9a-f]*'),
+  outcome TEXT NOT NULL CHECK(outcome IN ('VERIFIED','REJECTED','UNKNOWN')),
+  provider_ref TEXT NOT NULL CHECK(length(provider_ref) <= 128),
+  provider_sha256 TEXT NOT NULL CHECK(length(provider_sha256) IN (0,64) AND provider_sha256 NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL CHECK(length(run_id)=36),
+  at_utc TEXT NOT NULL,
+  UNIQUE(intent_id, digest)
+)""",
+    """CREATE TABLE energygrid_v4_lease (
+  lease_name TEXT PRIMARY KEY CHECK(lease_name='dual_stream_v4'),
+  owner_token TEXT NOT NULL CHECK(length(owner_token) BETWEEN 1 AND 128),
+  expires_epoch_ms INTEGER NOT NULL CHECK(expires_epoch_ms >= 0)
+)""",
+    """CREATE TABLE energygrid_v4_cursor (
+  cursor_name TEXT PRIMARY KEY CHECK(cursor_name='fair_drain'),
+  last_stream TEXT CHECK(last_stream IS NULL OR last_stream IN ('EB_BILL','TENANT_BILL')),
+  updated_at_utc TEXT NOT NULL
+)""",
+)
+
+_V4_IMMUTABLE_TRIGGER_SQL = tuple(
+    statement
+    for name in _V4_IMMUTABLE_TABLES
+    for statement in (
+        f"CREATE TRIGGER energygrid_v4_{name}_no_update BEFORE UPDATE ON energygrid_v4_{name} "
+        "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+        f"CREATE TRIGGER energygrid_v4_{name}_no_delete BEFORE DELETE ON energygrid_v4_{name} "
+        "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+    )
+)
+
+_V4_GUARD_TRIGGER_SQL = (
+    "CREATE TRIGGER energygrid_v4_status_no_delete BEFORE DELETE ON energygrid_v4_intent_status "
+    "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+    """CREATE TRIGGER energygrid_v4_status_guard BEFORE UPDATE ON energygrid_v4_intent_status
+WHEN NEW.intent_id <> OLD.intent_id OR NEW.version <> OLD.version + 1 OR NOT (
+  (OLD.state='PENDING' AND NEW.state IN ('DISPATCHED','HOLD'))
+  OR (OLD.state='DISPATCHED' AND NEW.state IN ('VERIFIED','UNKNOWN','HOLD'))
+  OR (OLD.state='UNKNOWN' AND NEW.state IN ('VERIFIED','HOLD'))
+  OR (OLD.state='VERIFIED' AND NEW.state='HOLD'))
+BEGIN SELECT RAISE(ABORT,'EG_V4_ILLEGAL_TRANSITION'); END""",
+    """CREATE TRIGGER energygrid_v4_status_dispatch_sealed BEFORE UPDATE ON energygrid_v4_intent_status
+WHEN NEW.state='DISPATCHED' AND NOT EXISTS (SELECT 1 FROM energygrid_v4_dispatch d WHERE d.intent_id=NEW.intent_id)
+BEGIN SELECT RAISE(ABORT,'EG_V4_DISPATCH_NOT_SEALED'); END""",
+    """CREATE TRIGGER energygrid_v4_status_verified_receipt BEFORE UPDATE ON energygrid_v4_intent_status
+WHEN NEW.state='VERIFIED' AND NOT EXISTS (
+  SELECT 1 FROM energygrid_v4_receipt r WHERE r.intent_id=NEW.intent_id AND r.outcome='VERIFIED')
+BEGIN SELECT RAISE(ABORT,'EG_V4_VERIFIED_WITHOUT_RECEIPT'); END""",
+    """CREATE TRIGGER energygrid_v4_dispatch_requires_pending BEFORE INSERT ON energygrid_v4_dispatch
+WHEN (SELECT s.state FROM energygrid_v4_intent_status s WHERE s.intent_id=NEW.intent_id) IS NOT 'PENDING'
+BEGIN SELECT RAISE(ABORT,'EG_V4_DISPATCH_NOT_PENDING'); END""",
+    """CREATE TRIGGER energygrid_v4_dispatch_drive_gate BEFORE INSERT ON energygrid_v4_dispatch
+WHEN (SELECT i.action FROM energygrid_v4_intent i WHERE i.intent_id=NEW.intent_id)='GMAIL_SEND'
+ AND NOT EXISTS (
+  SELECT 1 FROM energygrid_v4_intent g
+  JOIN energygrid_v4_intent d ON d.invoice_key=g.invoice_key AND d.action='DRIVE_UPLOAD'
+  JOIN energygrid_v4_intent_status s ON s.intent_id=d.intent_id
+  WHERE g.intent_id=NEW.intent_id AND s.state='VERIFIED')
+BEGIN SELECT RAISE(ABORT,'EG_V4_DRIVE_NOT_VERIFIED'); END""",
+    """CREATE TRIGGER energygrid_v4_receipt_requires_dispatch BEFORE INSERT ON energygrid_v4_receipt
+WHEN NOT EXISTS (SELECT 1 FROM energygrid_v4_dispatch d WHERE d.intent_id=NEW.intent_id)
+BEGIN SELECT RAISE(ABORT,'EG_V4_OUTCOME_WITHOUT_DISPATCH'); END""",
+)
+
+V4_SCHEMA_SQL = _V4_TABLE_SQL + _V4_IMMUTABLE_TRIGGER_SQL + _V4_GUARD_TRIGGER_SQL
+
+
+def _apply_v4_schema(connection: sqlite3.Connection) -> None:
+    for statement in V4_SCHEMA_SQL:
+        connection.execute(statement)
+
+
+def _reference_v4_manifest() -> dict[tuple[str, str], str | None]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(_LEGACY_BILLS_SCHEMA_SQL)
+        for statement in V2_SCHEMA_SQL:
+            connection.execute(statement)
+        _apply_v3_schema(connection)
+        _apply_v4_schema(connection)
+        return _schema_manifest(connection)
+    finally:
+        connection.close()
+
+
+def _inspect_v4_database(connection: sqlite3.Connection) -> str:
+    """Return a closed v4 schema/data status without repairing anything."""
+    try:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != V4_SCHEMA_VERSION:
+            return "INCOMPATIBLE_V4"
+        if connection.execute("PRAGMA journal_mode").fetchone()[0].lower() != "delete":
+            return "INCOMPATIBLE_V4"
+        if connection.execute("PRAGMA synchronous").fetchone()[0] != 2:
+            return "INCOMPATIBLE_V4"
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            return "INCOMPATIBLE_V4"
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            return "CORRUPT_OR_UNREADABLE_V4"
+        if _schema_manifest(connection) != _reference_v4_manifest():
+            return "INCOMPATIBLE_V4"
+        return "COMPLETE_V4"
+    except sqlite3.Error:
+        return "CORRUPT_OR_UNREADABLE_V4"
+
+
+def _predecessor_digest(connection: sqlite3.Connection) -> str:
+    """Digest of every v1-v3 schema object and every predecessor row.
+
+    A v4 migration must leave this value unchanged. Rows are sorted by their
+    text form so the digest does not depend on storage order.
+    """
+    digest = hashlib.sha256()
+    manifest = {
+        key: value
+        for key, value in _schema_manifest(connection).items()
+        if not key[1].startswith("energygrid_v4_")
+    }
+    digest.update(repr(sorted(manifest.items())).encode("utf-8"))
+    names = [
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "AND name NOT LIKE 'energygrid_v4_%' ORDER BY name"
+        )
+    ]
+    for name in names:
+        rows = connection.execute(f'SELECT * FROM "{name}"').fetchall()
+        digest.update(name.encode("utf-8") + b"\x00")
+        for text in sorted(repr(row) for row in rows):
+            digest.update(text.encode("utf-8") + b"\x00")
+    return digest.hexdigest()
+
+
+def predecessor_digest(path: Path) -> str:
+    """Read-only digest of a database's predecessor schema and rows (tests and audits)."""
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    try:
+        return _predecessor_digest(connection)
+    finally:
+        connection.close()
+
+
+def migrate_state_database_v4(path: Path, *, apply: bool = False) -> dict[str, str]:
+    """Additive v3 -> v4 offline migration (#226 G3). A default call is read-only.
+
+    Requires an existing COMPLETE_V3 database with no open v3 work. An apply
+    writes an exclusive-create backup, then adds only the v4 tables, indexes and
+    triggers in one transaction. It proves the predecessor digest is unchanged
+    and that the v4 inspection passes before it commits. Any failure rolls back.
+    """
+    if not _check_migration_path(path):
+        raise OfflineV4Error("EG_V4_PREDECESSOR_MISSING")
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        if _inspect_v3_database(connection) != "COMPLETE_V3":
+            raise OfflineV4Error("EG_V4_PREDECESSOR_NOT_COMPLETE_V3")
+        if _v3_has_resumable_work(connection):
+            raise OfflineV4Error("EG_V4_MIGRATION_V3_WORK_OPEN")
+        if not apply:
+            return {"status": "PLAN_V4", "predecessor_digest": _predecessor_digest(connection)}
+    finally:
+        connection.close()
+
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={V2_BUSY_TIMEOUT_MS}")
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        if _inspect_v3_database(connection) != "COMPLETE_V3" or _v3_has_resumable_work(connection):
+            raise OfflineV4Error("EG_V4_PREDECESSOR_NOT_COMPLETE_V3")
+        _backup_state_database(connection, path, "v4-migration")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            before = _predecessor_digest(connection)
+            _apply_v4_schema(connection)
+            connection.execute(f"PRAGMA user_version={V4_SCHEMA_VERSION}")
+            if _predecessor_digest(connection) != before:
+                raise OfflineV4Error("EG_V4_PREDECESSOR_CHANGED")
+            if _inspect_v4_database(connection) != "COMPLETE_V4":
+                raise OfflineV4Error("EG_V4_SCHEMA_VALIDATION_FAILED")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        return {"status": "MIGRATED_V4", "predecessor_digest": before}
+    finally:
+        connection.close()
+
+
+def _v4_invoice_key(stream: str, source_namespace: str, source_invoice_key: str) -> str:
+    material = f"energygrid.v4.invoice\n{stream}\n{source_namespace}\n{source_invoice_key}"
+    return "egi4-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _v4_intent_id(invoice_key: str, action: str) -> str:
+    material = f"energygrid.v4.intent\n{invoice_key}\n{action}"
+    return "egt4-" + hashlib.sha256(material.encode("ascii")).hexdigest()[:32]
+
+
+def _v4_archive_relpath(stream: str, canonical_filename: str) -> str:
+    folder = "EB Bill" if stream == "EB_BILL" else "Tenant Bill"
+    return f"{folder}/{canonical_filename}"
+
+
+def _v4_receipt_digest(intent_id: str, outcome: str, provider_ref: str, provider_sha256: str) -> str:
+    material = canonical_json(
+        {"intent_id": intent_id, "outcome": outcome, "provider_ref": provider_ref, "provider_sha256": provider_sha256}
+    )
+    return hashlib.sha256(material.encode("ascii")).hexdigest()
+
+
+def _v4_receipt_target(state: str, outcome: str, sha_ok: bool) -> tuple[str | None, str | None]:
+    """Map (current state, provider outcome) to (target state or None, support reference)."""
+    if state == "DISPATCHED":
+        if outcome == "VERIFIED":
+            return ("VERIFIED", None) if sha_ok else ("HOLD", "EG_V4_PROVIDER_SHA_MISMATCH")
+        if outcome == "UNKNOWN":
+            return ("UNKNOWN", "EG_V4_PROVIDER_UNKNOWN")
+        return ("HOLD", "EG_V4_PROVIDER_REJECTED")
+    if state == "UNKNOWN":
+        if outcome == "VERIFIED" and sha_ok:
+            return ("VERIFIED", None)
+        if outcome == "UNKNOWN":
+            return (None, None)
+        return ("HOLD", "EG_V4_LATE_OUTCOME_CONFLICT")
+    if state == "VERIFIED":
+        return ("HOLD", "EG_V4_CONFLICTING_OUTCOME")
+    return (None, None)
+
+
+def _move_intent(conn: sqlite3.Connection, intent_id: str, *, expected: str, target: str,
+                 support_ref: str | None, run_id: str, now_iso: str) -> None:
+    """Compare-and-set one status row and append its transition, inside an open write transaction."""
+    row = conn.execute("SELECT state, version FROM energygrid_v4_intent_status WHERE intent_id=?", (intent_id,)).fetchone()
+    if row is None or row[0] != expected:
+        raise OfflineV4Error("EG_V4_STATE_CHANGED")
+    cursor = conn.execute(
+        "UPDATE energygrid_v4_intent_status SET state=?, version=version+1, support_ref=?, updated_run_id=?, "
+        "updated_at_utc=? WHERE intent_id=? AND state=? AND version=?",
+        (target, support_ref, run_id, now_iso, intent_id, expected, row[1]),
+    )
+    if cursor.rowcount != 1:
+        raise OfflineV4Error("EG_V4_CAS_LOST")
+    conn.execute(
+        "INSERT INTO energygrid_v4_transition (intent_id, from_state, to_state, support_ref, run_id, at_utc) "
+        "VALUES (?,?,?,?,?,?)",
+        (intent_id, expected, target, support_ref, run_id, now_iso),
+    )
+
+
+def _fetch_dicts(conn: sqlite3.Connection, sql: str, parameters: tuple = ()) -> list[dict]:
+    cursor = conn.execute(sql, parameters)
+    names = [item[0] for item in cursor.description]
+    return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _refusal_from_sqlite(exc: sqlite3.Error) -> OfflineV4Error:
+    """Map a trigger or constraint message to its closed EG_V4 token, if it has one."""
+    message = str(exc)
+    if re.fullmatch(r"EG_V4_[A-Z0-9_]{1,56}", message):
+        return OfflineV4Error(message)
+    return OfflineV4Error("EG_V4_STATE_REFUSED")
+
+
+class StateV4Store:
+    """Offline v4 state (#226 G3). Opens only a COMPLETE_V4 database and never migrates it."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.connection: sqlite3.Connection | None = None
+        self.validation_status: str | None = None
+
+    def __enter__(self) -> "StateV4Store":
+        try:
+            if not stat.S_ISREG(self.path.lstat().st_mode):
+                raise OfflineV4Error("EG_V4_STATE_NOT_REGULAR")
+            for suffix in ("-wal", "-shm", "-journal"):
+                try:
+                    self.path.with_name(self.path.name + suffix).lstat()
+                except FileNotFoundError:
+                    continue
+                raise OfflineV4Error("EG_V4_STATE_SIDECAR_PRESENT")
+            uri = self.path.resolve().as_uri() + "?mode=rw"
+            self.connection = sqlite3.connect(uri, uri=True, timeout=V2_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+            conn = self.connection
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(f"PRAGMA busy_timeout={V2_BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA synchronous=FULL")
+            self.validation_status = _inspect_v4_database(conn)
+            if self.validation_status != "COMPLETE_V4":
+                raise OfflineV4Error("EG_V4_STATE_NOT_COMPLETE_V4")
+            return self
+        except (OSError, sqlite3.Error) as exc:
+            self.close()
+            raise OfflineV4Error("EG_V4_STATE_UNREADABLE") from exc
+        except BaseException:
+            self.close()
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def _conn(self) -> sqlite3.Connection:
+        if self.connection is None:
+            raise OfflineV4Error("EG_V4_STATE_NOT_OPEN")
+        return self.connection
+
+    @contextlib.contextmanager
+    def _write(self):
+        """One BEGIN IMMEDIATE transaction. Competing sessions serialise here."""
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except sqlite3.Error as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise _refusal_from_sqlite(exc) from None
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+
+    # -- lease and cursor ------------------------------------------------
+
+    def acquire_lease(self, owner_token: str, *, now_ms: int, ttl_ms: int) -> None:
+        if (type(owner_token) is not str or not 1 <= len(owner_token) <= 128
+                or type(now_ms) is not int or type(ttl_ms) is not int or ttl_ms <= 0):
+            raise OfflineV4Error("EG_V4_LEASE_INVALID")
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT owner_token, expires_epoch_ms FROM energygrid_v4_lease WHERE lease_name=?", (V4_LEASE_NAME,)
+            ).fetchone()
+            if row is not None and row[0] != owner_token and row[1] > now_ms:
+                raise OfflineV4Error("EG_V4_LEASE_HELD", status=RUN_IN_PROGRESS, exit_code=10)
+            conn.execute(
+                "INSERT INTO energygrid_v4_lease (lease_name, owner_token, expires_epoch_ms) VALUES (?,?,?) "
+                "ON CONFLICT(lease_name) DO UPDATE SET owner_token=excluded.owner_token, "
+                "expires_epoch_ms=excluded.expires_epoch_ms",
+                (V4_LEASE_NAME, owner_token, now_ms + ttl_ms),
+            )
+
+    def release_lease(self, owner_token: str) -> None:
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE energygrid_v4_lease SET expires_epoch_ms=0 WHERE lease_name=? AND owner_token=?",
+                (V4_LEASE_NAME, owner_token),
+            )
+
+    def cursor(self) -> str | None:
+        row = self._conn().execute(
+            "SELECT last_stream FROM energygrid_v4_cursor WHERE cursor_name=?", (V4_CURSOR_NAME,)
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def set_cursor(self, stream: str, *, now_iso: str) -> None:
+        if stream not in V4_STREAMS:
+            raise OfflineV4Error("EG_V4_STREAM_INVALID")
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO energygrid_v4_cursor (cursor_name, last_stream, updated_at_utc) VALUES (?,?,?) "
+                "ON CONFLICT(cursor_name) DO UPDATE SET last_stream=excluded.last_stream, "
+                "updated_at_utc=excluded.updated_at_utc",
+                (V4_CURSOR_NAME, stream, now_iso),
+            )
+
+    # -- admission -------------------------------------------------------
+
+    def check_admissible(self, *, stream: str, source_namespace: str, source_invoice_key: str,
+                         display_filename: str, canonical_filename: str) -> str:
+        """Return ALREADY_ADMITTED for the same identity, or ADMISSIBLE. Raises on any conflict."""
+        from .naming import display_key
+
+        conn = self._conn()
+        existing = self.invoice_by_identity(stream, source_namespace, source_invoice_key)
+        if existing is not None:
+            if (existing["display_filename"], existing["canonical_filename"]) == (display_filename, canonical_filename):
+                return "ALREADY_ADMITTED"
+            raise OfflineV4Error("EG_V4_INVOICE_IDENTITY_CONFLICT")
+        if conn.execute(
+            "SELECT 1 FROM energygrid_v4_invoice WHERE stream=? AND display_key=?", (stream, display_key(display_filename))
+        ).fetchone():
+            raise OfflineV4Error("EG_V4_DISPLAY_NAME_COLLISION")
+        if conn.execute(
+            "SELECT 1 FROM energygrid_v4_invoice WHERE archive_relpath=?",
+            (_v4_archive_relpath(stream, canonical_filename),),
+        ).fetchone():
+            raise OfflineV4Error("EG_V4_ARCHIVE_PATH_COLLISION")
+        return "ADMISSIBLE"
+
+    def admit_invoice(self, *, stream: str, source_namespace: str, source_invoice_key: str, invoice_date,
+                      display_filename: str, sha256: str, byte_size: int, run_id: str, now_iso: str) -> tuple[dict, bool]:
+        """Admit one archived invoice and create its DRIVE_UPLOAD and GMAIL_SEND intents as PENDING.
+
+        Returns (invoice row, created). An identical re-admission returns created=False and
+        writes nothing. Different content for the same identity is a conflict.
+        """
+        from datetime import date
+
+        from .naming import display_key
+
+        if type(invoice_date) is not date or stream not in V4_STREAMS:
+            raise OfflineV4Error("EG_V4_ADMISSION_INVALID")
+        canonical = f"{invoice_date.isoformat()}.pdf"
+        relpath = _v4_archive_relpath(stream, canonical)
+        invoice_key = _v4_invoice_key(stream, source_namespace, source_invoice_key)
+        dkey = display_key(display_filename)
+        with self._write() as conn:
+            existing = _fetch_dicts(
+                conn,
+                "SELECT * FROM energygrid_v4_invoice WHERE stream=? AND source_namespace=? AND source_invoice_key=?",
+                (stream, source_namespace, source_invoice_key),
+            )
+            if existing:
+                row = existing[0]
+                same = (row["display_filename"], row["canonical_filename"], row["sha256"], row["byte_size"])
+                if same == (display_filename, canonical, sha256, byte_size):
+                    return row, False
+                raise OfflineV4Error("EG_V4_INVOICE_IDENTITY_CONFLICT")
+            if conn.execute("SELECT 1 FROM energygrid_v4_invoice WHERE stream=? AND display_key=?", (stream, dkey)).fetchone():
+                raise OfflineV4Error("EG_V4_DISPLAY_NAME_COLLISION")
+            if conn.execute("SELECT 1 FROM energygrid_v4_invoice WHERE archive_relpath=?", (relpath,)).fetchone():
+                raise OfflineV4Error("EG_V4_ARCHIVE_PATH_COLLISION")
+            sequence = conn.execute("SELECT COALESCE(MAX(admission_seq), 0) + 1 FROM energygrid_v4_invoice").fetchone()[0]
+            conn.execute(
+                "INSERT INTO energygrid_v4_invoice (invoice_key, stream, source_namespace, source_invoice_key, "
+                "invoice_date, canonical_filename, archive_relpath, display_filename, display_key, sha256, byte_size, "
+                "admission_seq, admitted_run_id, admitted_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (invoice_key, stream, source_namespace, source_invoice_key, invoice_date.isoformat(), canonical,
+                 relpath, display_filename, dkey, sha256, byte_size, sequence, run_id, now_iso),
+            )
+            for action in V4_ACTIONS:
+                intent_id = _v4_intent_id(invoice_key, action)
+                conn.execute(
+                    "INSERT INTO energygrid_v4_intent (intent_id, invoice_key, action, payload_sha256, created_run_id, "
+                    "created_at_utc) VALUES (?,?,?,?,?,?)",
+                    (intent_id, invoice_key, action, sha256, run_id, now_iso),
+                )
+                conn.execute(
+                    "INSERT INTO energygrid_v4_intent_status (intent_id, state, version, support_ref, updated_run_id, "
+                    "updated_at_utc) VALUES (?, 'PENDING', 1, NULL, ?, ?)",
+                    (intent_id, run_id, now_iso),
+                )
+                conn.execute(
+                    "INSERT INTO energygrid_v4_transition (intent_id, from_state, to_state, support_ref, run_id, at_utc) "
+                    "VALUES (?, NULL, 'PENDING', NULL, ?, ?)",
+                    (intent_id, run_id, now_iso),
+                )
+            row = _fetch_dicts(conn, "SELECT * FROM energygrid_v4_invoice WHERE invoice_key=?", (invoice_key,))[0]
+        return row, True
+
+    # -- reads -----------------------------------------------------------
+
+    def invoice_by_identity(self, stream: str, source_namespace: str, source_invoice_key: str) -> dict | None:
+        rows = _fetch_dicts(
+            self._conn(),
+            "SELECT * FROM energygrid_v4_invoice WHERE stream=? AND source_namespace=? AND source_invoice_key=?",
+            (stream, source_namespace, source_invoice_key),
+        )
+        return rows[0] if rows else None
+
+    def invoices_for_stream(self, stream: str) -> list[dict]:
+        return _fetch_dicts(
+            self._conn(), "SELECT * FROM energygrid_v4_invoice WHERE stream=? ORDER BY admission_seq", (stream,)
+        )
+
+    def intents_for_invoice(self, invoice_key: str) -> dict[str, dict]:
+        rows = _fetch_dicts(
+            self._conn(),
+            "SELECT i.intent_id, i.action, i.payload_sha256, s.state, s.version, s.support_ref "
+            "FROM energygrid_v4_intent i JOIN energygrid_v4_intent_status s ON s.intent_id=i.intent_id "
+            "WHERE i.invoice_key=?",
+            (invoice_key,),
+        )
+        return {row["action"]: row for row in rows}
+
+    def intent(self, intent_id: str) -> dict | None:
+        rows = _fetch_dicts(
+            self._conn(),
+            "SELECT i.intent_id, i.invoice_key, i.action, i.payload_sha256, s.state, s.version, s.support_ref "
+            "FROM energygrid_v4_intent i JOIN energygrid_v4_intent_status s ON s.intent_id=i.intent_id "
+            "WHERE i.intent_id=?",
+            (intent_id,),
+        )
+        return rows[0] if rows else None
+
+    def receipts(self, intent_id: str) -> list[dict]:
+        return _fetch_dicts(
+            self._conn(), "SELECT * FROM energygrid_v4_receipt WHERE intent_id=? ORDER BY receipt_seq", (intent_id,)
+        )
+
+    def transitions(self, intent_id: str) -> list[dict]:
+        return _fetch_dicts(
+            self._conn(), "SELECT * FROM energygrid_v4_transition WHERE intent_id=? ORDER BY transition_seq", (intent_id,)
+        )
+
+    def dispatch_row(self, intent_id: str) -> dict | None:
+        rows = _fetch_dicts(self._conn(), "SELECT * FROM energygrid_v4_dispatch WHERE intent_id=?", (intent_id,))
+        return rows[0] if rows else None
+
+    def verified_provider_ref(self, intent_id: str) -> str | None:
+        row = self._conn().execute(
+            "SELECT provider_ref FROM energygrid_v4_receipt WHERE intent_id=? AND outcome='VERIFIED' "
+            "ORDER BY receipt_seq LIMIT 1",
+            (intent_id,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def count(self, table: str) -> int:
+        """Row count for one v4 table. The name is checked against a fixed list."""
+        if table not in {
+            "energygrid_v4_invoice", "energygrid_v4_intent", "energygrid_v4_intent_status",
+            "energygrid_v4_transition", "energygrid_v4_dispatch", "energygrid_v4_receipt",
+        }:
+            raise OfflineV4Error("EG_V4_TABLE_UNKNOWN")
+        return int(self._conn().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    # -- provider state --------------------------------------------------
+
+    def seal_dispatch(self, intent_id: str, *, run_id: str, now_iso: str) -> None:
+        """Durably seal one dispatch before any provider call: insert the seal, then PENDING -> DISPATCHED."""
+        with self._write() as conn:
+            row = conn.execute("SELECT state FROM energygrid_v4_intent_status WHERE intent_id=?", (intent_id,)).fetchone()
+            if row is None or row[0] != "PENDING":
+                raise OfflineV4Error("EG_V4_DISPATCH_NOT_PENDING")
+            if conn.execute("SELECT 1 FROM energygrid_v4_dispatch WHERE intent_id=?", (intent_id,)).fetchone():
+                raise OfflineV4Error("EG_V4_DISPATCH_ALREADY_SEALED")
+            conn.execute(
+                "INSERT INTO energygrid_v4_dispatch (intent_id, run_id, sealed_at_utc) VALUES (?,?,?)",
+                (intent_id, run_id, now_iso),
+            )
+            _move_intent(conn, intent_id, expected="PENDING", target="DISPATCHED", support_ref=None,
+                         run_id=run_id, now_iso=now_iso)
+
+    def hold_pending(self, intent_id: str, *, support_ref: str, run_id: str, now_iso: str) -> None:
+        """Hold an intent that was never dispatched. No provider effect can have happened."""
+        with self._write() as conn:
+            _move_intent(conn, intent_id, expected="PENDING", target="HOLD", support_ref=support_ref,
+                         run_id=run_id, now_iso=now_iso)
+
+    def recover_unfinished(self, run_id: str, *, now_iso: str) -> int:
+        """Mark each DISPATCHED intent that has no receipt as UNKNOWN. Nothing is resent."""
+        with self._write() as conn:
+            ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT s.intent_id FROM energygrid_v4_intent_status s WHERE s.state='DISPATCHED' "
+                    "AND NOT EXISTS (SELECT 1 FROM energygrid_v4_receipt r WHERE r.intent_id=s.intent_id) "
+                    "ORDER BY s.intent_id"
+                ).fetchall()
+            ]
+            for intent_id in ids:
+                _move_intent(conn, intent_id, expected="DISPATCHED", target="UNKNOWN",
+                             support_ref="EG_V4_DISPATCH_OUTCOME_UNKNOWN", run_id=run_id, now_iso=now_iso)
+            return len(ids)
+
+    def record_receipt(self, intent_id: str, *, outcome: str, provider_ref: str, provider_sha256: str,
+                       run_id: str, now_iso: str) -> str:
+        """Record one provider outcome and return the resulting state, or REPLAY.
+
+        An identical outcome already on record is a replay and changes nothing. A
+        different outcome after a terminal state is recorded as evidence and holds the
+        intent. A late VERIFIED for an UNKNOWN intent, with the exact archive SHA-256,
+        is accepted as proof of the effect. Nothing here ever causes a resend.
+        """
+        if outcome not in V4_OUTCOMES or type(provider_ref) is not str or type(provider_sha256) is not str:
+            raise OfflineV4Error("EG_V4_RECEIPT_INVALID")
+        with self._write() as conn:
+            found = _fetch_dicts(
+                conn,
+                "SELECT i.payload_sha256, s.state FROM energygrid_v4_intent i "
+                "JOIN energygrid_v4_intent_status s ON s.intent_id=i.intent_id WHERE i.intent_id=?",
+                (intent_id,),
+            )
+            if not found:
+                raise OfflineV4Error("EG_V4_INTENT_UNKNOWN")
+            state, payload_sha = found[0]["state"], found[0]["payload_sha256"]
+            digest = _v4_receipt_digest(intent_id, outcome, provider_ref, provider_sha256)
+            if conn.execute(
+                "SELECT 1 FROM energygrid_v4_receipt WHERE intent_id=? AND digest=?", (intent_id, digest)
+            ).fetchone():
+                return "REPLAY"
+            dispatched = conn.execute("SELECT 1 FROM energygrid_v4_dispatch WHERE intent_id=?", (intent_id,)).fetchone()
+            if state == "PENDING" or dispatched is None:
+                raise OfflineV4Error("EG_V4_OUTCOME_WITHOUT_DISPATCH")
+            conn.execute(
+                "INSERT INTO energygrid_v4_receipt (intent_id, digest, outcome, provider_ref, provider_sha256, run_id, at_utc) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (intent_id, digest, outcome, provider_ref, provider_sha256, run_id, now_iso),
+            )
+            target, support_ref = _v4_receipt_target(state, outcome, provider_sha256 == payload_sha)
+            if target is None:
+                return "RECORDED"
+            _move_intent(conn, intent_id, expected=state, target=target, support_ref=support_ref,
+                         run_id=run_id, now_iso=now_iso)
+            return target

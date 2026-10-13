@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -131,3 +132,18 @@ class RunLockedError(AppError):
         super().__init__("another run holds the single-run lock", status=RUN_IN_PROGRESS, exit_code=10)
         self.support_ref = "EG_RUN_ALREADY_ACTIVE"
         self.stage = "lock"
+
+
+class OfflineV4Error(AppError):
+    """Closed refusal of the #226 G3 offline dual-stream v4 core.
+
+    The message is fixed text. Filenames, invoice identities, intent IDs,
+    provider references, paths and dates never appear in it or in the support
+    reference, which must match the same closed EG_ token grammar as above.
+    """
+
+    def __init__(self, support_ref: str, status: str = STATE_INCONSISTENT, exit_code: int = 20) -> None:
+        if type(support_ref) is not str or re.fullmatch(SUPPORT_REF_PATTERN, support_ref) is None:
+            raise ValueError("offline v4 support reference is not a closed token")
+        super().__init__("offline dual-stream v4 refused", status=status, exit_code=exit_code)
+        self.support_ref = support_ref
