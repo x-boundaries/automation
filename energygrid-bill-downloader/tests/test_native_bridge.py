@@ -1314,6 +1314,62 @@ class SingleStreamPortalTests(unittest.TestCase):
                 self.assertEqual([], state.invoices_for_stream(EB))
 
 
+class TenantBindingTests(unittest.TestCase):
+    """The optional private Tenant source binds Tenant Bill next to the single-stream EB config."""
+
+    def config(self, root: Path, *, tenant_path: str | None = None) -> bridge.NativeConfig:
+        browser = root / "browser.json"
+        browser.write_text(json.dumps({
+            "portal_url": "https://portal.invalid/", "account_identity": "synthetic",
+            "archive_root": str(root / "v1" / "archive"), "state_path": str(root / "v1" / "state" / "v1.sqlite"),
+            "temp_root": str(root / "v1" / "temp"), "log_root": str(root / "v1" / "logs"),
+            "browser_cache_path": str(root / "v1" / "cache"), "timeout_seconds": 30, "max_attempts": 2,
+            "inventory_safety_ceiling": 200,
+        }), encoding="utf-8")
+        tenant_config = root / "tenant.json"
+        tenant_config.write_text(json.dumps({
+            "schema": "energygrid.tenant.v1", "login_url": "https://login.invalid/login",
+            "list_url": "https://service.invalid/list", "portal_type": "synthetic-portal",
+            "list_body": {"svcClaimDto": {"user_id": 1, "username": "synthetic", "role_id": 2},
+                          "request": {"item_kind": "bill", "filter_value_info": {"tenant_id": "SYNTHETIC"}}},
+            "service_headers": {}, "render_request_path": "/synthetic/bill", "credential_path": str(root / "cred.clixml"), "browser_config_path": str(browser),
+        }), encoding="utf-8")
+        raw = SingleStreamPortalTests().config(root)
+        values = {name: getattr(raw, name) for name in raw.__dataclass_fields__}
+        values["tenant_config_path"] = Path(tenant_path or tenant_config)
+        return bridge.NativeConfig(**values)
+
+    def test_the_tenant_source_binds_tenant_bill_without_touching_eb(self) -> None:
+        from energygrid_bill_downloader import native_cli
+        from energygrid_bill_downloader.invoice import DirectHttpAdapter
+        from energygrid_bill_downloader.tenant_source import TENANT_NAMESPACE, TenantBillAdapter
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = self.config(Path(directory))
+            adapters = native_cli._adapters(cfg)
+            self.assertIsInstance(adapters["EB_BILL"], DirectHttpAdapter)
+            self.assertIsInstance(adapters["TENANT_BILL"], TenantBillAdapter)
+            entries = native_cli._stream_entries(cfg)
+            self.assertEqual(("BOUND", "BOUND"), (entries["EB_BILL"].admission, entries["TENANT_BILL"].admission))
+            self.assertEqual(TENANT_NAMESPACE, entries["TENANT_BILL"].source_namespace)
+
+    def test_the_tenant_key_is_optional_and_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = ConfigTests().raw(root)
+            raw.pop("synthetic_root")
+            raw.update(mode=bridge.MODE_UAT_PORTAL, portal_config_path=str(root / "portal.json"))
+            self.assertIsNone(bridge.load_native_config(dict(raw), checkout_root=REPO_ROOT).tenant_config_path)
+            loaded = bridge.load_native_config(dict(raw, tenant_config_path=str(root / "t.json")), checkout_root=REPO_ROOT)
+            self.assertEqual(root / "t.json", loaded.tenant_config_path)
+            inside = str(REPO_ROOT / "tenant.json")
+            with self.assertRaises(ConfigError):
+                bridge.load_native_config(dict(raw, tenant_config_path=inside), checkout_root=REPO_ROOT)
+            synthetic = ConfigTests().raw(root)
+            with self.assertRaises(ConfigError):
+                bridge.load_native_config(dict(synthetic, tenant_config_path=str(root / "t.json")), checkout_root=REPO_ROOT)
+
+
 class BoundaryTests(unittest.TestCase):
     def test_bridge_modules_import_no_network_or_process_module(self) -> None:
         import ast

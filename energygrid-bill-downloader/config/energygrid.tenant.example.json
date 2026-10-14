@@ -1,0 +1,23 @@
+{
+  "schema": "energygrid.tenant.v1",
+  "login_url": "https://REPLACE_WITH_PORTAL_USER_SERVICE/login",
+  "list_url": "https://REPLACE_WITH_PORTAL_SERVICE/REPLACE_WITH_LIST_PATH",
+  "portal_type": "replace-with-portal-type",
+  "list_body": {
+    "svcClaimDto": {
+      "user_id": 0,
+      "username": "REPLACE_WITH_PORTAL_USERNAME",
+      "role_id": 0
+    },
+    "request": {
+      "item_kind": "bill",
+      "filter_value_info": {
+        "tenant_id": "REPLACE_WITH_TENANT_ID"
+      }
+    }
+  },
+  "service_headers": {},
+  "render_request_path": "/REPLACE_WITH_BILL_REQUEST_PATH",
+  "credential_path": "C:\\XB_Runtime\\energygrid-bill-downloader\\credentials\\REPLACE_WITH_CREDENTIAL_FILE.clixml",
+  "browser_config_path": "C:\\XB_Runtime\\energygrid-bill-downloader\\config\\REPLACE_WITH_BROWSER_CONFIG.json"
+}

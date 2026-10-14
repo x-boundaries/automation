@@ -61,8 +61,9 @@ def _load_config(path: str) -> bridge.NativeConfig:
 
 
 # The installed host still runs the single-stream direct-HTTP MVP config (EB Bill only). Its invoices
-# get this fixed source namespace in a native UAT database; the Tenant Bill stream stays UNBOUND until
-# its source is bound (#227), so it reports ADAPTER_UNAVAILABLE truthfully.
+# get this fixed source namespace in a native UAT database. The Tenant Bill stream is bound only by the
+# optional private `tenant_config_path`; without it the stream stays UNBOUND and reports
+# ADAPTER_UNAVAILABLE truthfully.
 SINGLE_STREAM_NAMESPACE = "ENERGYGRID-DIRECT-HTTP-V1-EB"
 SINGLE_STREAM_EVIDENCE = "EG_HTTP_COMPLETE_LIST_V1"
 
@@ -89,12 +90,36 @@ def _adapters(cfg: bridge.NativeConfig) -> dict[str, Any]:
         from .invoice import DirectHttpAdapter, Stream
 
         source = DirectHttpSource(portal.direct_http, portal.timeout_seconds, portal.max_attempts)
-        return {"EB_BILL": DirectHttpAdapter(source, stream=Stream.EB_BILL, source_namespace=SINGLE_STREAM_NAMESPACE,
-                                             evidence_ref=SINGLE_STREAM_EVIDENCE)}
+        adapters = {"EB_BILL": DirectHttpAdapter(source, stream=Stream.EB_BILL,
+                                                 source_namespace=SINGLE_STREAM_NAMESPACE,
+                                                 evidence_ref=SINGLE_STREAM_EVIDENCE)}
+        if cfg.tenant_config_path is not None:
+            adapters["TENANT_BILL"] = _tenant_adapter(cfg.tenant_config_path)
+        return adapters
+    if cfg.tenant_config_path is not None:
+        # The dual-stream config carries its own Tenant admission; two Tenant bindings are refused.
+        raise ConfigError("tenant_config_path is supported with the single-stream portal config only")
     # Dual-stream config: the reviewed direct-HTTP adapters, built exactly as the v3 core builds them.
     from .cli import build_dual_adapters
 
     return build_dual_adapters(portal)
+
+
+def _tenant_adapter(path: Path):
+    """HTTP sign-in and list daily; the headless render runs only when a new bill is admitted."""
+    from .config import load_config_file, load_runtime_config
+    from . import tenant_source as tenant
+
+    roots = checkout_roots()
+    settings = tenant.load_tenant_settings(
+        load_config_file(path),
+        private_path=lambda value, label: bridge._private_path(value, label, roots),
+    )
+    browser = load_runtime_config(load_config_file(settings.browser_config_path), checkout_root=CHECKOUT_ROOT)
+    credentials = tenant.dpapi_credentials(settings.credential_path)
+    source = tenant.TenantHttpSource(settings, credentials, browser.timeout_seconds, browser.max_attempts)
+    return tenant.TenantBillAdapter(source, tenant.PlaywrightTenantRenderer(browser, credentials,
+                                                                         settings.render_request_path))
 
 
 def _stream_entries(cfg: bridge.NativeConfig) -> dict:
@@ -105,12 +130,20 @@ def _stream_entries(cfg: bridge.NativeConfig) -> dict:
         kind, portal = _portal_config(cfg)
         if kind == "DUAL":
             return portal.streams
+        from .tenant_source import TENANT_ADAPTER_ID, TENANT_EVIDENCE, TENANT_NAMESPACE
+
+        tenant = DualStreamEntry(admission=UNBOUND_ADMISSION)
+        if cfg.tenant_config_path is not None:
+            tenant = DualStreamEntry(
+                admission=BOUND_ADMISSION, source_namespace=TENANT_NAMESPACE, adapter_id=TENANT_ADAPTER_ID,
+                date_profile=DATE_PROFILE_ISO_V1, evidence_ref=TENANT_EVIDENCE,
+            )
         return {
             "EB_BILL": DualStreamEntry(
                 admission=BOUND_ADMISSION, source_namespace=SINGLE_STREAM_NAMESPACE, adapter_id="DIRECT_HTTP_V1",
                 date_profile=DATE_PROFILE_ISO_V1, evidence_ref=SINGLE_STREAM_EVIDENCE,
             ),
-            "TENANT_BILL": DualStreamEntry(admission=UNBOUND_ADMISSION),
+            "TENANT_BILL": tenant,
         }
 
     return {

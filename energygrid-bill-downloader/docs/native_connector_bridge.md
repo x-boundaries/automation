@@ -110,6 +110,35 @@ A later backfill run skips only the then-newest date, so a bill that was newest 
 was missed by the schedule) is picked up then. A file the owner added by hand under another name cannot
 be recognised and would be written again under the owner name.
 
+## 4b. Tenant Bill source (`tenant_source.py`)
+
+The Tenant Bill sits in the main EMS portal, not the EB helper, and the portal has no server PDF: it
+renders the bill in the browser. The owner chose an HTTP check with a browser only for the download.
+Binding it is optional: `tenant_config_path` in a `UAT_PORTAL` config points at the private Tenant
+config (`config/energygrid.tenant.example.json`); without it Tenant Bill stays UNBOUND.
+
+- **Daily check (HTTP, no browser).** One sign-in with the stored credential, then one LIST call. The
+  sign-in must succeed for an enabled account, and the private list claim must name that same user and one
+  of its roles (`EG_TENANT_CLAIM_ACCOUNT_MISMATCH` otherwise). The list asks for one page larger than the
+  inventory ceiling; the returned count must equal the rows returned (`EG_TENANT_LIST_INCOMPLETE`). Every
+  row must belong to the configured tenant. Only `released` rows are candidates.
+- **Identity and name.** The printed Invoice No. is the source identity (`<Invoice No>.pdf`); the invoice
+  date is the first day of the billing cycle, so the name follows the billing month:
+  `AUG 2026 - EnergyGrid - Tenant Bill - <Invoice No>.pdf`.
+- **Render (only in `acquire`, only for an admitted bill).** A headless browser signs in through the
+  reviewed login, opens the Tenant Bill tab and that row's preview, and saves the preview's own download
+  (`bill.pdf`). The render must request exactly that row id (`EG_TENANT_RENDER_ROW_MISMATCH`), and the PDF
+  text, read through its ToUnicode maps, must show the row's Invoice No. (`EG_TENANT_PDF_INVOICE_MISMATCH`).
+  The render needs Playwright, so the host runs the CLI with the runtime venv Python. A bill must be on
+  the portal's first table page to be rendered (`EG_TENANT_RENDER_ROW_NOT_VISIBLE`).
+- **Credential.** The existing DPAPI-protected credential file is read in memory by a child PowerShell
+  process. The pair is never put in an environment variable, a command line, a file or a log, and the
+  browser never inherits it.
+- **Backfill** (section 4a) uses the same adapter, so older Tenant bills are rendered one by one.
+
+All Tenant endpoints, the list claim, the service headers and the credential path are private
+configuration. Failures use the closed `EG_TENANT_*` support references.
+
 ## 5. Filenames and destinations (owner requirement)
 
 - The user-facing downloaded archive, the Drive title and (when attached) the email attachment use the
@@ -160,7 +189,8 @@ be recognised and would be written again under the owner name.
 Closed shape, every key required. Paths (including `named_archive_root`) must be absolute, local (no
 UNC), free of reparse points and outside the Git checkout (and the main checkout of a worktree). Modes:
 `UAT_SYNTHETIC` (`synthetic_root`) or `UAT_PORTAL` (`portal_config_path`, the existing private dual-stream
-config used to build the reviewed direct-HTTP adapters). There is no production mode. `gmail` is
+config used to build the reviewed direct-HTTP adapters). `UAT_PORTAL` alone accepts one optional key,
+`tenant_config_path` (section 4b), with the single-stream portal config only. There is no production mode. `gmail` is
 `{account, to: [one recipient], subject_prefix, attach_pdf}`. `effect_ceiling` caps sealed Drive
 dispatches and sealed notifications (0 to 20) for the whole database. The real recipient and folder IDs
 belong only in the private config, never in this public repository.

@@ -125,6 +125,8 @@ class NativeConfig:
     synthetic_root: Path | None = field(default=None, repr=False)
     portal_config_path: Path | None = field(default=None, repr=False)
     inventory_ceiling: int = 200
+    # UAT_PORTAL only, optional: the private Tenant Bill source config (tenant_source.py). Absent = UNBOUND.
+    tenant_config_path: Path | None = field(default=None, repr=False)
 
 
 def _closed(value: Any, keys: set[str], label: str) -> dict[str, Any]:
@@ -184,7 +186,9 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
     if mode == MODE_UAT_SYNTHETIC:
         data = _closed(raw, common | {"synthetic_root"}, "native config")
     elif mode == MODE_UAT_PORTAL:
-        data = _closed(raw, common | {"portal_config_path"}, "native config")
+        # The Tenant source is the one optional key: present binds Tenant Bill, absent leaves it UNBOUND.
+        portal_keys = common | {"portal_config_path"}
+        data = _closed(raw, portal_keys | ({"tenant_config_path"} & set(raw)), "native config")
     else:
         raise ConfigError("native config mode must be UAT_SYNTHETIC or UAT_PORTAL")
     paths = {name: _private_path(data[name], name, checkout_root)
@@ -226,11 +230,13 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
     if type(attach_pdf) is not bool:
         raise ConfigError("gmail.attach_pdf must be true or false")
     ceiling = _closed(data["effect_ceiling"], {"drive_uploads", "gmail_sends"}, "effect_ceiling")
-    synthetic_root = portal_config = None
+    synthetic_root = portal_config = tenant_config = None
     if mode == MODE_UAT_SYNTHETIC:
         synthetic_root = _private_path(data["synthetic_root"], "synthetic_root", checkout_root)
     else:
         portal_config = _private_path(data["portal_config_path"], "portal_config_path", checkout_root)
+        if "tenant_config_path" in data:
+            tenant_config = _private_path(data["tenant_config_path"], "tenant_config_path", checkout_root)
     return NativeConfig(
         mode=mode,
         drive=NativeDriveSettings(account=_email(drive_raw["account"], "drive.account"), folder_ids=folders,
@@ -243,6 +249,7 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         max_gmail_sends=_ceiling(ceiling["gmail_sends"], "effect_ceiling.gmail_sends"),
         synthetic_root=synthetic_root,
         portal_config_path=portal_config,
+        tenant_config_path=tenant_config,
         **paths,
     )
 
