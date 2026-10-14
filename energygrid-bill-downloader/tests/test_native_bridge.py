@@ -77,6 +77,7 @@ class FakeNativeHost:
             encoded = corrupt(encoded)
         draft_id = self._id("DRAFT")
         self.drafts[draft_id] = {
+            "from": overrides.get("sender", step["gmail_account"]),
             "to": overrides.get("to", step["to"]), "cc": overrides.get("cc", []), "bcc": [],
             "subject": overrides.get("subject", step["subject"]),
             "attachments": overrides.get("attachments", [
@@ -87,7 +88,7 @@ class FakeNativeHost:
 
     def draft_evidence(self, draft_id: str) -> dict:
         draft = self.drafts[draft_id]
-        return {"draft_id": draft_id, "to": draft["to"], "cc": draft["cc"], "bcc": draft["bcc"],
+        return {"draft_id": draft_id, "from": draft["from"], "to": draft["to"], "cc": draft["cc"], "bcc": draft["bcc"],
                 "subject": draft["subject"],
                 "attachments": [{"filename": item["filename"], "mimeType": item["mimeType"],
                                  "size": len(item["bytes"])} for item in draft["attachments"]]}
@@ -102,6 +103,7 @@ class FakeNativeHost:
         t = self.test
         intent = step["intent_id"]
         evidence = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"],
                     "matches": self.search(step["folder_id"], step["display_filename"])}
         sealed = t.call(bridge.drive_seal, intent, evidence)
         if sealed["outcome"] != "SEALED" or crash_after_seal:
@@ -323,7 +325,7 @@ class DriveSafetyTests(NativeBridgeBase):
         self.assertNotEqual(intent, later["intent_id"])
         with self.assertRaises(NativeRefusal) as refused:
             self.call(bridge.drive_seal, intent, {"folder_id": step["folder_id"], "title": step["display_filename"],
-                                                   "complete": True, "matches": []})
+                                                   "query": step["precheck_query"], "complete": True, "matches": []})
         self.assertEqual("EG_NATIVE_INTENT_NOT_PENDING", refused.exception.support_ref)
         self.assertEqual(1, len(self.host.drive))
         # The operator (host) later finds the file it created and proves its bytes.
@@ -400,7 +402,8 @@ class DriveSafetyTests(NativeBridgeBase):
     def test_two_hosts_racing_the_same_step_seal_once(self) -> None:
         self.acquire()
         step = self.next()
-        evidence = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True, "matches": []}
+        evidence = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"], "matches": []}
         self.assertEqual("SEALED", self.call(bridge.drive_seal, step["intent_id"], evidence)["outcome"])
         with self.assertRaises(NativeRefusal):
             self.call(bridge.drive_seal, step["intent_id"], evidence)
@@ -409,9 +412,10 @@ class DriveSafetyTests(NativeBridgeBase):
     def test_incomplete_or_foreign_precheck_is_refused(self) -> None:
         self.acquire()
         step = self.next()
-        base = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True, "matches": []}
+        base = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True,
+                "query": step["precheck_query"], "matches": []}
         for change in ({"complete": False}, {"folder_id": "FOLDER_SOMEWHERE_ELSE_01"}, {"title": "x.pdf"},
-                       {"matches": None}):
+                       {"matches": None}, {"query": "parentId = 'x'"}):
             with self.subTest(change=change), self.assertRaises(NativeRefusal) as refused:
                 self.call(bridge.drive_seal, step["intent_id"], base | change)
             self.assertEqual("EG_NATIVE_PRECHECK_EVIDENCE_INVALID", refused.exception.support_ref)
@@ -488,6 +492,7 @@ class GmailSafetyTests(NativeBridgeBase):
             {"subject": "Something else"},
             {"attachments": [{"filename": "invoice.pdf", "mimeType": "application/pdf", "bytes": pdf("x")}]},
             {"attachments": []},
+            {"sender": "someone.else@example.com"},
         )
         for overrides in wrong:
             with self.subTest(overrides=list(overrides)), self.assertRaises(NativeRefusal):
@@ -560,13 +565,89 @@ class GmailWithoutReadbackTests(NativeBridgeBase):
 class EffectCeilingTests(NativeBridgeBase):
     ceilings = (1, 1)
 
-    def test_effect_ceiling_refuses_further_dispatch_without_state_change(self) -> None:
+    def test_a_stream_at_its_ceiling_never_starves_the_other_action(self) -> None:
         self.acquire()
-        self.host.drive_step(self.next())
+        results = self.host.drain()
+        # EB Drive, then EB Gmail (the Tenant Drive step is at the Drive ceiling and is skipped).
+        self.assertEqual(["VERIFIED", "VERIFIED", "CEILING_REACHED"], [row["outcome"] for row in results])
+        self.assertEqual(0, results[-1]["exit_code"])
+        self.assertEqual((1, 1), self.dispatches())
+        self.assertEqual(1, len(self.host.sent))
+        streams = self.status()["streams"]
+        self.assertEqual("DRAINED", streams[EB]["state"])
+        self.assertEqual(("PENDING", "DRIVE_UPLOAD"), (streams[TN]["state"], streams[TN]["next_action"]))
+
+    def test_a_seal_at_the_ceiling_is_refused_without_state_change(self) -> None:
+        self.acquire()
+        self.host.drain()
+        with StateV4Store(self.db) as state:
+            invoice = state.invoices_for_stream(TN)[0]
+            drive = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
+        evidence = {"folder_id": FOLDERS[TN], "title": invoice["display_filename"], "complete": True,
+                    "query": bridge.drive_title_query(FOLDERS[TN], invoice["display_filename"]), "matches": []}
         with self.assertRaises(NativeRefusal) as refused:
-            self.host.drain()
+            self.call(bridge.drive_seal, drive["intent_id"], evidence)
         self.assertEqual("EG_NATIVE_EFFECT_CEILING_REACHED", refused.exception.support_ref)
-        self.assertEqual((1, 0), self.dispatches())
+        self.assertEqual("PENDING", self.intent_state(drive["intent_id"]))
+
+
+class ZeroCeilingTests(NativeBridgeBase):
+    ceilings = (0, 0)
+
+    def test_zero_ceiling_plans_nothing_and_seals_nothing(self) -> None:
+        self.acquire()
+        step = self.next()
+        self.assertEqual(("CEILING_REACHED", 0), (step["outcome"], step["exit_code"]))
+        self.assertEqual((0, 0), self.dispatches())
+
+
+class ReviewFindingTests(NativeBridgeBase):
+    """Regressions for the Builder-side adversarial findings on 9d3a772."""
+
+    def test_readback_for_a_case_variant_file_id_does_not_verify(self) -> None:
+        self.acquire()
+        step = self.next()
+        sealed = self.host.drive_step(step, crash_after_seal=True)
+        created = self.host.create_file(sealed["create_file"])
+        self.readback("drive", step["intent_id"], created["id"], self.host.download(created["id"]))
+        variant = created | {"id": created["id"].lower()}
+        with self.assertRaises(NativeRefusal) as refused:
+            self.call(bridge.drive_record, step["intent_id"], {"outcome": "CREATED", "file": variant})
+        self.assertEqual("EG_NATIVE_DRIVE_READBACK_REQUIRED", refused.exception.support_ref)
+        self.assertEqual("DISPATCHED", self.intent_state(step["intent_id"]))
+
+    def test_status_shows_no_receipt_for_a_held_intent(self) -> None:
+        self.acquire()
+        while True:
+            step = self.next()
+            if step["outcome"] == "GMAIL_DRAFT":
+                break
+            self.host.drive_step(step)
+        sealed = self.host.gmail_step(step, crash_after_seal=True)
+        self.assertEqual("HOLD", self.call(bridge.gmail_record, step["intent_id"], {"outcome": "DENIED"})["outcome"])
+        late = {"outcome": "SENT", "draft_id": sealed["send_draft_id"], "message_id": "MSG000000000099"}
+        self.call(bridge.gmail_record, step["intent_id"], late)
+        self.assertEqual("HOLD", self.intent_state(step["intent_id"]))
+        invoice = self.status()["streams"][step["stream"]]["invoices"][0]
+        self.assertEqual(("HOLD", None), (invoice["gmail_send"]["state"], invoice["gmail_send"]["receipt"]))
+
+    def test_precheck_query_escapes_quotes_and_backslashes(self) -> None:
+        title = "O'Brien \\ x.pdf"
+        expected = "parentId = 'F1' and title = 'O\\'Brien \\\\ x.pdf'"
+        self.assertEqual(expected, bridge.drive_title_query("F1", title))
+
+    def test_a_display_name_with_an_apostrophe_runs_end_to_end(self) -> None:
+        self.acquire(self.adapters({EB: [("O'Brien EB Invoice.pdf", "2026-09-01")], TN: []}))
+        step = self.next()
+        self.assertIn("title = 'SEP 2026 - O\\'Brien EB Invoice.pdf'", step["precheck_query"])
+        self.host.drain()
+        self.assertEqual(["SEP 2026 - O'Brien EB Invoice.pdf"],
+                         [message["attachments"][0]["filename"] for message in self.host.sent])
+
+    def test_synthetic_fixture_refuses_path_like_filenames(self) -> None:
+        for name in ("../escape.pdf", "sub/dir.pdf", "..", ""):
+            with self.subTest(name=name), self.assertRaises(ConfigError):
+                bridge.write_synthetic_fixture(self.root / "portal-x", {EB: [(name, "2026-09-01")]})
 
 
 class LeaseTests(NativeBridgeBase):
@@ -658,6 +739,63 @@ class ConfigTests(unittest.TestCase):
                 change(raw)
                 with self.subTest(case=name), self.assertRaises(ConfigError):
                     bridge.load_native_config(raw, checkout_root=REPO_ROOT)
+
+
+class CliSafetyTests(unittest.TestCase):
+    def write_config(self, root: Path) -> Path:
+        raw = ConfigTests().raw(root)
+        path = root / "native.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        return path
+
+    def run_cli(self, *argv: str) -> tuple[int, dict, str]:
+        import contextlib
+        import io
+
+        from energygrid_bill_downloader import native_cli
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = native_cli.main(list(argv))
+        return code, json.loads(out.getvalue()), out.getvalue()
+
+    def test_init_uat_refuses_a_non_empty_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.write_config(root)
+            (root / "o").mkdir()
+            (root / "o" / "stale-evidence.json").write_text("{}")
+            code, result, _ = self.run_cli("init-uat", "--config", str(config))
+            self.assertEqual((64, "EG_NATIVE_UAT_DIRECTORY_NOT_EMPTY"), (code, result["support_ref"]))
+            self.assertFalse((root / "s.sqlite").exists())
+
+    def test_unexpected_failure_is_closed_json_never_a_traceback(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.write_config(root)
+            with mock.patch("energygrid_bill_downloader.native_cli._dispatch",
+                            side_effect=FileExistsError(str(root / "secret-path.json"))):
+                code, result, printed = self.run_cli("status", "--config", str(config))
+        self.assertEqual((20, "FAILED", "EG_NATIVE_UNEXPECTED_FAILURE"),
+                         (code, result["outcome"], result["support_ref"]))
+        self.assertNotIn("secret-path", printed)
+
+    def test_checkout_roots_include_the_main_checkout_of_a_worktree(self) -> None:
+        from energygrid_bill_downloader import native_cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            main = Path(directory) / "main"
+            worktree = main / ".claude" / "worktrees" / "w1"
+            (main / ".git" / "worktrees" / "w1").mkdir(parents=True)
+            worktree.mkdir(parents=True)
+            (worktree / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'w1'}\n", encoding="utf-8")
+            self.assertEqual((worktree, main), native_cli.checkout_roots(worktree))
+            raw = ConfigTests().raw(Path(directory) / "outside")
+            raw["state_path"] = str(main / "private" / "s.sqlite")
+            with self.assertRaises(ConfigError):
+                bridge.load_native_config(raw, checkout_root=native_cli.checkout_roots(worktree))
 
 
 class BoundaryTests(unittest.TestCase):

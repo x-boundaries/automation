@@ -128,17 +128,24 @@ def _email(value: Any, label: str) -> str:
     return text
 
 
-def _private_path(value: Any, label: str, checkout_root: Path | None) -> Path:
+def _roots(checkout_root: Path | tuple[Path, ...] | None) -> tuple[Path, ...]:
+    if checkout_root is None:
+        return ()
+    return (checkout_root,) if isinstance(checkout_root, Path) else tuple(checkout_root)
+
+
+def _private_path(value: Any, label: str, checkout_root: Path | tuple[Path, ...] | None) -> Path:
     text = _text(value, label, max_length=1024)
     path = Path(text)
     if not path.is_absolute() or text.startswith("\\\\") or text.startswith("//"):
         raise ConfigError(f"{label} must be an absolute local path (no UNC)")
     ensure_no_reparse_components(path)
-    if checkout_root is not None:
-        resolved = Path(os.path.abspath(path))
-        root = Path(os.path.abspath(checkout_root))
+    # Resolved comparison, so 8.3 short names and `..` cannot hide a checkout path.
+    resolved = path.resolve(strict=False)
+    for root in _roots(checkout_root):
+        root = root.resolve(strict=False)
         if resolved == root or root in resolved.parents:
-            # Private bills, payloads and state must never live in the Git checkout.
+            # Private bills, payloads and state must never live in a Git checkout.
             raise ConfigError(f"{label} must be outside the repository checkout")
     return path
 
@@ -149,7 +156,7 @@ def _ceiling(value: Any, label: str) -> int:
     return value
 
 
-def load_native_config(raw: Any, *, checkout_root: Path | None) -> NativeConfig:
+def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | None) -> NativeConfig:
     """Load the closed native bridge config. No key is optional and no value is coerced."""
     common = {"schema", "mode", "state_path", "archive_root", "temp_root", "outbox_root", "drive", "gmail",
               "effect_ceiling"}
@@ -309,6 +316,8 @@ def write_synthetic_fixture(root: Path, listing: dict[str, list[tuple[str, str]]
         inventory[stream] = []
         for filename, day in listing.get(stream, []):
             date.fromisoformat(day)
+            if type(filename) is not str or Path(filename).name != filename or filename in ("", ".", ".."):
+                raise ConfigError("synthetic listing filename must be a plain file name")
             (folder / filename).write_bytes(synthetic_pdf(f"{stream} {day} {filename}"))
             inventory[stream].append({"filename": filename, "date": day})
     (root / "inventory.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -429,10 +438,21 @@ def _verified_payload(state, cfg: NativeConfig, intent_id: str, invoice: dict, r
     return payload
 
 
-def _check_ceiling(state, cfg: NativeConfig, action: str) -> None:
+def _at_ceiling(state, cfg: NativeConfig, action: str) -> bool:
     limit = cfg.max_drive_uploads if action == "DRIVE_UPLOAD" else cfg.max_gmail_sends
-    if state.dispatch_count(action) >= limit:
+    return state.dispatch_count(action) >= limit
+
+
+def _check_ceiling(state, cfg: NativeConfig, action: str) -> None:
+    if _at_ceiling(state, cfg, action):
         raise NativeRefusal("EG_NATIVE_EFFECT_CEILING_REACHED")
+
+
+def drive_title_query(folder_id: str, title: str) -> str:
+    """The exact Drive search query for the precheck. String values are single-quoted with
+    backslash and quote escaped, so a title containing an apostrophe cannot break the query."""
+    escaped = title.replace("\\", "\\\\").replace("'", "\\'")
+    return f"parentId = '{folder_id}' and title = '{escaped}'"
 
 
 def subject_for(cfg: NativeConfig, invoice: dict) -> str:
@@ -482,14 +502,16 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
     with _session(state, now_ms):
         recovered = state.recover_unfinished(run_id, now_iso=now_iso)
         plans = {stream: _v4_stream_step(state, stream) for stream in V4_STREAMS}
-        ready = [stream for stream in _v4_rotated(V4_STREAMS, state.cursor()) if plans[stream][0] == "STEP"]
+        stepping = [stream for stream in _v4_rotated(V4_STREAMS, state.cursor()) if plans[stream][0] == "STEP"]
+        # A stream whose next action is at its effect ceiling is skipped, so it never starves the other.
+        ready = [stream for stream in stepping if not _at_ceiling(state, cfg, plans[stream][1])]
         if not ready:
-            return _result("next", "IDLE", EXIT_OK, run_id=run_id, recovered_unknown=recovered,
-                           streams=stream_report(state))
+            # Recovery may have written above, so this is a normal result, never a no-change refusal.
+            return _result("next", "CEILING_REACHED" if stepping else "IDLE", EXIT_OK, run_id=run_id,
+                           recovered_unknown=recovered, streams=stream_report(state))
         stream = ready[0]
         _kind, action, invoice, intent = plans[stream]
         intent_id = intent["intent_id"]
-        _check_ceiling(state, cfg, action)
         payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
         if payload is None:
             return _result("next", "HOLD", EXIT_HOLD, run_id=run_id, intent_id=intent_id, stream=stream,
@@ -510,7 +532,8 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
     }
     if action == "DRIVE_UPLOAD":
         return _result("next", "DRIVE_PRECHECK", EXIT_OK, **common, drive_account=cfg.drive.account,
-                       folder_id=cfg.drive.folder_ids[stream])
+                       folder_id=cfg.drive.folder_ids[stream],
+                       precheck_query=drive_title_query(cfg.drive.folder_ids[stream], invoice["display_filename"]))
     return _result("next", "GMAIL_DRAFT", EXIT_OK, **common, gmail_account=cfg.gmail.account,
                    to=list(cfg.gmail.to), subject=subject_for(cfg, invoice), body=body_for(cfg, invoice),
                    attachment_mime_type=PDF_MIME, require_attachment_readback=cfg.gmail.require_attachment_readback)
@@ -519,8 +542,8 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
 def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
     """Seal one Drive upload after a complete name-occupancy precheck of the configured folder.
 
-    evidence: {"folder_id": <id searched>, "title": <title searched>, "complete": true,
-               "matches": [{"id": ..., "title": ..., "parentId": ...}, ...]}
+    evidence: {"folder_id": <id searched>, "title": <title searched>, "query": <the exact precheck_query
+               from `next`>, "complete": true, "matches": [{"id": ..., "title": ..., "parentId": ...}, ...]}
     """
     intent_id = _check_intent_id(intent_id)
     now_iso = _iso(now_ms)
@@ -529,6 +552,7 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
         folder = cfg.drive.folder_ids[invoice["stream"]]
         matches = evidence.get("matches")
         if (evidence.get("folder_id") != folder or evidence.get("title") != invoice["display_filename"]
+                or evidence.get("query") != drive_title_query(folder, invoice["display_filename"])
                 or evidence.get("complete") is not True or type(matches) is not list):
             raise NativeRefusal("EG_NATIVE_PRECHECK_EVIDENCE_INVALID")
         _check_ceiling(state, cfg, "DRIVE_UPLOAD")
@@ -589,7 +613,14 @@ def gmail_readback(state, cfg: NativeConfig, intent_id: str, draft_id: str, enco
 
 
 def _attestation(cfg: NativeConfig, intent_id: str, kind: str, provider_id: str) -> dict | None:
-    return _read_json(cfg.outbox_root / f"{intent_id}.{kind}-readback.{provider_id}.json")
+    """The attestation for exactly this intent, kind and provider id. Windows file names are
+    case-insensitive, so the stored identity is compared as well as the file name."""
+    document = _read_json(cfg.outbox_root / f"{intent_id}.{kind}-readback.{provider_id}.json")
+    if document is None:
+        return None
+    if (document.get("intent_id"), document.get("kind"), document.get("provider_id")) != (intent_id, kind, provider_id):
+        return None
+    return document
 
 
 def _provider_outcome(evidence: dict, success: str) -> str:
@@ -666,8 +697,8 @@ def _seal_file(cfg: NativeConfig, intent_id: str) -> Path:
 def gmail_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
     """Verify a native Gmail draft against the Core, then seal and bind exactly that draft.
 
-    evidence (normalised from get_draft): {"draft_id", "to": [...], "cc": [], "bcc": [], "subject",
-    "attachments": [{"filename", "mimeType", "size"}]}. A mismatching draft is refused with no state
+    evidence (normalised from get_draft): {"draft_id", "from", "to": [...], "cc": [], "bcc": [], "subject",
+    "attachments": [{"filename", "mimeType", "size"}]}. `from` must be the configured Gmail account. A mismatching draft is refused with no state
     change: a draft is not delivery, so the host may discard it and draft again.
     """
     intent_id = _check_intent_id(intent_id)
@@ -682,7 +713,9 @@ def gmail_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
         if type(to) is not list or type(attachments) is not list or any(type(item) is not dict for item in attachments):
             raise NativeRefusal("EG_NATIVE_DRAFT_EVIDENCE_INVALID")
         expected_to = sorted(item.lower() for item in cfg.gmail.to)
-        if (sorted(str(item).lower() for item in to) != expected_to
+        sender = evidence.get("from")
+        if (type(sender) is not str or sender.lower() != cfg.gmail.account.lower()
+                or sorted(str(item).lower() for item in to) != expected_to
                 or evidence.get("cc") != [] or evidence.get("bcc") != []
                 or evidence.get("subject") != subject_for(cfg, invoice)):
             raise NativeRefusal("EG_NATIVE_DRAFT_ENVELOPE_MISMATCH")
@@ -765,7 +798,9 @@ def stream_report(state) -> dict[str, dict]:
                 **{action.lower(): {
                     "state": intents[action]["state"],
                     "support_ref": intents[action]["support_ref"],
-                    "receipt": state.verified_provider_ref(intents[action]["intent_id"]),
+                    # A receipt is shown only for a VERIFIED intent; a HOLD keeps its evidence in SQLite.
+                    "receipt": (state.verified_provider_ref(intents[action]["intent_id"])
+                                if intents[action]["state"] == "VERIFIED" else None),
                 } for action in ("DRIVE_UPLOAD", "GMAIL_SEND")},
             })
         report[stream] = {

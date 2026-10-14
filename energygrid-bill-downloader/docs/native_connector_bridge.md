@@ -27,10 +27,10 @@ later), `20` HOLD or uncertainty recorded, `64` refused with **no state change**
 
 | Command | Effect |
 |---|---|
-| `init-uat` | Creates a fresh isolated v3 database and migrates it to v4. Refuses an existing state file. |
+| `init-uat` | Creates a fresh isolated v3 database and migrates it to v4. Refuses an existing state file and a non-empty outbox or archive. |
 | `make-synthetic-fixture` | `UAT_SYNTHETIC` only: writes `inventory.json` and synthetic PDFs (two per stream). |
 | `acquire` | Recover, then admit the latest invoice of each stream (synthetic files or the real direct-HTTP portal). No provider effect. |
-| `next` | Recover, then plan one step (fair round-robin, FIFO per stream, Drive before Gmail). Writes `<outbox>/<intent>.pdf.b64` with the exact archive bytes. Never seals. |
+| `next` | Recover, then plan one step (fair round-robin, FIFO per stream, Drive before Gmail). A stream whose next action is at its effect ceiling is skipped; `CEILING_REACHED` when nothing else can run. Writes `<outbox>/<intent>.pdf.b64` with the exact archive bytes. Never seals. |
 | `drive-seal --intent I --evidence F` | Needs a complete name-occupancy precheck. Occupied name: HOLD. Otherwise seals and returns the `create_file` arguments. |
 | `drive-readback --intent I --file-id D --base64-file F` | The Core hashes what Drive returns and writes a write-once attestation. |
 | `drive-record --intent I --evidence F` | `CREATED` needs matching metadata and a matching readback: VERIFIED. Mismatch: REJECTED, HOLD. `DENIED`: HOLD. `ERROR`/`NO_RESPONSE`: UNKNOWN. |
@@ -42,10 +42,10 @@ later), `20` HOLD or uncertainty recorded, `64` refused with **no state change**
 ## 3. Host protocol (one loop)
 
 1. `acquire` once.
-2. `next`. On `IDLE` go to step 6. On `HOLD`, run `next` again (that stream stopped).
+2. `next`. On `IDLE` or `CEILING_REACHED` go to step 6. On `HOLD`, run `next` again (that stream stopped).
 3. `DRIVE_PRECHECK`:
-   1. Drive `search_files` with `parentId = '<folder_id>' and title = '<display_filename>'`, every page.
-      Write `{"folder_id", "title", "complete": true, "matches": [{"id", "title", "parentId"}]}`.
+   1. Drive `search_files` with exactly the `precheck_query` from `next` (quotes already escaped), every
+      page. Write `{"folder_id", "title", "query", "complete": true, "matches": [{"id", "title", "parentId"}]}`.
    2. `drive-seal`. Only on `SEALED`: Drive `create_file` with `title`, `parentId`,
       `contentMimeType: application/pdf`, `disableConversionToGoogleType: true` and `base64Content` set
       to the exact contents of `base64Content_path`.
@@ -57,7 +57,8 @@ later), `20` HOLD or uncertainty recorded, `64` refused with **no state change**
    1. Gmail `create_draft` with `to`, `subject`, `body` and one attachment
       `{content: <payload base64>, filename: <display_filename>, mimeType: application/pdf}`.
    2. Gmail `get_draft` (`FULL_CONTENT`). Save the attachment base64 when the connector returns it and run
-      `gmail-readback`. Write `{"draft_id", "to", "cc", "bcc", "subject", "attachments": [{"filename", "mimeType", "size"}]}`.
+      `gmail-readback`. Write `{"draft_id", "from", "to", "cc", "bcc", "subject", "attachments": [{"filename", "mimeType", "size"}]}`;
+      `from` is the draft sender and must be the configured Gmail account.
    3. `gmail-seal`. Only on `SEALED`: Gmail `send_message` with `draftId` set to `send_draft_id`.
    4. `gmail-record` with `{"outcome": "SENT", "draft_id", "message_id"}`.
 5. Go to step 2. Never call a connector for a step whose seal command did not answer `SEALED`.
@@ -75,7 +76,11 @@ own stream. A later `drive-record`/`gmail-record` with full evidence for the sam
   (Core hash of the downloaded bytes) catches it before any email. Gmail readback, when the connector
   returns attachment bytes, catches it before the send.
 - Evidence is **host-attested**: the Core verifies that what the host reports is consistent and exact,
-  but it cannot independently query Google. A faulty or hostile host is outside this model.
+  but it cannot independently query Google. A faulty or hostile host is outside this model. In
+  particular, `drive-readback` hashes whatever base64 the host supplies; it proves the bytes only if the
+  host really saved the `download_file_content` result. The email body text is not verified.
+- A later `drive-record` or `gmail-record` with a different outcome for an already VERIFIED intent is
+  kept as evidence and moves the intent to HOLD (v4 rule). Report each step once.
 - Invoice bytes are model-visible in the host session (tool arguments and results). Use a session
   whose transcript retention the owner accepts, and never paste payloads into GitHub or progress logs.
 - The native Drive connector returns `fileSize`, `mimeType`, `parentId` and `title`, but no
@@ -113,9 +118,9 @@ production database are out of scope.
 
 ## 8. Evidence
 
-`tests/test_native_bridge.py`: complete dual-stream journey, latest-only and no backfill, single
+`tests/test_native_bridge.py` (41 tests): complete dual-stream journey, latest-only and no backfill, single
 prefix, second run zero effects, newer invoice later, occupied Drive name, crash after seal, lost
 answer, size-preserving corruption (Drive and Gmail), readback required, metadata mismatch, denied and
 error outcomes, racing seals, precheck refusal, tampered archive, wrong drafts, bound-draft check,
 replay, Gmail crash after seal, Gmail before Drive, effect ceiling, lease held, v3 predecessor adoption
-without fetch, config refusals, no network imports in the bridge, closed CLI refusal output.
+without fetch, config refusals (including the main checkout of a worktree), junctions, ceiling without starvation, case-variant readback, apostrophe titles, no network imports in the bridge, closed CLI output.

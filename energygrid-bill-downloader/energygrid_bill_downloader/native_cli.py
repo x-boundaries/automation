@@ -21,6 +21,28 @@ from . import native_bridge as bridge
 from .errors import AppError, ConfigError
 
 CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def checkout_roots(root: Path = CHECKOUT_ROOT) -> tuple[Path, ...]:
+    """This checkout and, for a linked worktree, the main checkout that owns it.
+
+    A worktree's `.git` is a file `gitdir: <main>/.git/worktrees/<name>`. Private state must be
+    outside both, because either may be committed and pushed.
+    """
+    roots = [root]
+    marker = root / ".git"
+    try:
+        if marker.is_file():
+            text = marker.read_text(encoding="utf-8").strip()
+            if text.startswith("gitdir:"):
+                gitdir = Path(text[len("gitdir:"):].strip())
+                if not gitdir.is_absolute():
+                    gitdir = (root / gitdir)
+                if gitdir.parent.name == "worktrees":
+                    roots.append(gitdir.parent.parent.parent)
+    except OSError:
+        pass
+    return tuple(roots)
 DEFAULT_SYNTHETIC_LISTING = {
     # Two invoices per stream: only the latest is admitted, the older one is never backfilled.
     "EB_BILL": [("UAT-EB-0001 Synthetic.pdf", "2026-08-01"), ("UAT-EB-0002 Synthetic.pdf", "2026-09-01")],
@@ -35,7 +57,7 @@ def _now_ms() -> int:
 def _load_config(path: str) -> bridge.NativeConfig:
     from .config import load_config_file
 
-    return bridge.load_native_config(load_config_file(Path(path)), checkout_root=CHECKOUT_ROOT)
+    return bridge.load_native_config(load_config_file(Path(path)), checkout_root=checkout_roots())
 
 
 def _portal_dual_config(cfg: bridge.NativeConfig):
@@ -76,6 +98,11 @@ def _init_uat(cfg: bridge.NativeConfig, args) -> dict:
 
     if cfg.state_path.exists():
         raise bridge.NativeRefusal("EG_NATIVE_UAT_STATE_EXISTS")
+    # Outbox evidence and archive files are keyed by deterministic identities, so a fresh database
+    # must never reuse an earlier environment's files.
+    for directory in (cfg.outbox_root, cfg.archive_root):
+        if directory.exists() and any(directory.iterdir()):
+            raise bridge.NativeRefusal("EG_NATIVE_UAT_DIRECTORY_NOT_EMPTY")
     for directory in (cfg.state_path.parent, cfg.archive_root, cfg.temp_root, cfg.outbox_root):
         directory.mkdir(parents=True, exist_ok=True)
     migrate_state_database_v3(cfg.state_path, apply=True, streams=_stream_entries(cfg))
@@ -165,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(exc, ConfigError):
             # Config messages name the offending key only, never its value.
             result["detail"] = exc.message
+    except Exception as exc:  # noqa: BLE001 - closed output; state may have changed, so never exit 64
+        result = bridge._result(args.command, "FAILED", 20, support_ref="EG_NATIVE_UNEXPECTED_FAILURE",
+                                error_class=type(exc).__name__)
     print(json.dumps(result, sort_keys=True))
     return int(result["exit_code"])
 
