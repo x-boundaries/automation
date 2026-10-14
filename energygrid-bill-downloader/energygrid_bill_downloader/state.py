@@ -3246,6 +3246,16 @@ class StateV4Store:
             raise OfflineV4Error("EG_V4_TABLE_UNKNOWN")
         return int(self._conn().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
+    def dispatch_count(self, action: str) -> int:
+        """Sealed dispatches for one action, ever. Reads only. Used as an effect ceiling."""
+        if action not in ("DRIVE_UPLOAD", "GMAIL_SEND"):
+            raise OfflineV4Error("EG_V4_ACTION_UNKNOWN")
+        return int(self._conn().execute(
+            "SELECT COUNT(*) FROM energygrid_v4_dispatch d JOIN energygrid_v4_intent i ON i.intent_id=d.intent_id "
+            "WHERE i.action=?",
+            (action,),
+        ).fetchone()[0])
+
     # -- provider state --------------------------------------------------
 
     def seal_dispatch(self, intent_id: str, *, run_id: str, now_iso: str) -> None:

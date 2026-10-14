@@ -1,0 +1,27 @@
+{
+  "schema": "energygrid.native.v4.config.v1",
+  "mode": "UAT_SYNTHETIC",
+  "state_path": "C:\\EnergyGridUAT\\state\\energygrid-uat.sqlite",
+  "archive_root": "C:\\EnergyGridUAT\\archive",
+  "temp_root": "C:\\EnergyGridUAT\\temp",
+  "outbox_root": "C:\\EnergyGridUAT\\outbox",
+  "synthetic_root": "C:\\EnergyGridUAT\\synthetic-portal",
+  "drive": {
+    "account": "uat-drive-account@example.com",
+    "folder_ids": {
+      "EB_BILL": "REPLACE_WITH_UAT_EB_BILL_FOLDER_ID",
+      "TENANT_BILL": "REPLACE_WITH_UAT_TENANT_BILL_FOLDER_ID"
+    }
+  },
+  "gmail": {
+    "account": "uat-gmail-account@example.com",
+    "to": ["uat-recipient@example.com"],
+    "subject_template": "EnergyGrid UAT: {display_filename}",
+    "body_template": "EnergyGrid UAT delivery. Attached: {display_filename} ({stream_label}).",
+    "require_attachment_readback": true
+  },
+  "effect_ceiling": {
+    "drive_uploads": 2,
+    "gmail_sends": 2
+  }
+}

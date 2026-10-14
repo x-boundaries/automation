@@ -29,6 +29,12 @@ single-run lock and the alert contract are in `docs/runbook.md`.
 
 The browser source below remains the legacy default when `source` is absent.
 
+## Dual-stream v4 native connector UAT path (EnergyGrid #226 V3 G1)
+
+`python -m energygrid_bill_downloader.native_cli` drives the v4 Core through a stepwise protocol in
+which a Claude session performs the native Google Drive and Gmail connector calls and the Core seals,
+verifies and records each one. UAT only; see `docs/native_connector_bridge.md`.
+
 ## Dual-stream v3 path (EnergyGrid #226 G3)
 
 The `energygrid.runtime.v3` configuration separates `EB_BILL` and `TENANT_BILL`.

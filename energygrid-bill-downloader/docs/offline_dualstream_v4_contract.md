@@ -249,7 +249,9 @@ python -m unittest discover -s tests
   Other package modules keep their v3 behaviour and are not reached by v4.
 - No production database inspection or migration. The migration is proven only on the fixture and
   synthetic databases.
-- No CLI entry point for v4. `cli.py`, `egcore.cmd` and `claude_supervisor.ps1` are unchanged.
+- No v4 entry point in `cli.py`; `cli.py`, `egcore.cmd` and `claude_supervisor.ps1` are unchanged. The UAT-only
+  native connector bridge (`native_cli.py`, #226 V3 G1) is the v4 entry point for controlled UAT; see
+  `native_connector_bridge.md`. It has no production mode and adds no scheduling.
 - Cutover decisions still open for Web: a stream whose current latest is DRIVE_VERIFIED in v3 with no
   delivery sent is HOLD, not adopted, because seeding a v4 Drive receipt from v3 is not implemented. A
   REQUEST_REJECTED or otherwise dispatched-but-unsettled delivery is HOLD and is never resent. An archived
