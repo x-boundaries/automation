@@ -155,7 +155,6 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
 - [Member gateway production contract](docs/autocount2-automation/member_gateway_production_contract.md)
 - [Member gateway production runbook](docs/autocount2-automation/member_gateway_production_runbook.md)
-- [Member DirectLocal contract (#155 synthetic core)](docs/autocount2-automation/member_directlocal_contract.md)
 - [Single-member creation UAT runbook](docs/autocount2-automation/member_create_uat_runbook.md)
 - [AutoCount migration preflight and manifest runbook](docs/autocount2-automation/migration_preflight_manifest_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)

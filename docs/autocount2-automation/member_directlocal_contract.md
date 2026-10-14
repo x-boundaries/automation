@@ -158,6 +158,44 @@ python directlocal/xb_directlocal.py --state-root <root> status
 python directlocal/xb_directlocal.py --state-root <root> abandon-run --run-id <run-id> --confirm-suffix <last-8-hex>
 ```
 
+## E7 test-book path (one synthetic member on AED_TESTINGAPI)
+
+Separate from the DirectLocal core, whose synthetic hard-disarm is unchanged.
+
+| File | Role |
+|---|---|
+| `scripts/ac2_directlocal_e7_isolation_check.py` | Read-only outbound-isolation evidence and a pure `classify` verdict (`ISOLATED` / `NOT_PROVEN`) |
+| `scripts/ac2_directlocal_e7_testbook_create.ps1` | One-shot create through the unchanged adapter, pinned to `AED_TESTINGAPI` |
+| `tests/test_directlocal_e7_testbook_ps.py` | Fake-session tests and classifier tests |
+
+The previously accepted `ac2_member_create_uat_runner.ps1` is not reused: its
+MemberNo comes from the approved Forms package (not `GetNextMemberNo`) and it
+binds the book only by environment value.
+
+Order of guards in the create script:
+
+1. Host `DESKTOP-4I042L6`, an owned state directory whose marker names this
+   RUN/LOCK/book, no `XB_AC2_SESSION_FACTORY`, exclusive lock, one-shot
+   (`e7.intent.json`, `e7.fence.json`, `e7.claim` or `e7.outcome.json` present
+   refuses), and fresh `ISOLATED` evidence for the book.
+2. Reviewed vendor login with the database pinned to `AED_TESTINGAPI` for the
+   process (the environment's `AC2_PROBE_DATABASE_NAME` is never used). The
+   authenticated `DBSetting.DBName`, vendor `DB_NAME()` and vendor
+   `SERVERPROPERTY('MachineName')` must all match. A production, missing,
+   ambiguous or wrong identity is refused.
+3. No earlier E7 synthetic member (name prefix `XB DIRECTLOCAL E7 SYNTHETIC`).
+4. Write mode only (`-EnableTestBookWrite -ConfirmTargetAedTestingApi
+   -ConfirmOwnerRiskAccepted`): durable intent, at most three
+   `GetNextMemberNo` candidates each probed by `GetMember`, re-probe, fence with
+   deadline, exclusive claim, one `SaveMember` inside `New-XbAutoCountMember`
+   (`shopify_m1`, contact fields NULL), one `GetMember` readback, exact
+   comparison, and an outcome file with before/after audit counters.
+5. Any exception after the claim is `WRITE_OUTCOME_UNKNOWN_HOLD`. It is never
+   retried, and the same MemberNo is only re-read.
+
+The credential is read only from the executing process environment
+(`AC2_PROBE_USER_ID` / `AC2_PROBE_PASSWORD`). Run it from the Owner's console.
+
 ## Remaining effect gates (each needs separate explicit approval)
 
 | Gate | Effect |

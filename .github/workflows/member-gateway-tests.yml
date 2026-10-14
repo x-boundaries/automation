@@ -38,6 +38,9 @@ on:
       - "tests/test_directlocal_bridge_ps.py"
       - "tests/test_member_directlocal.py"
       - "directlocal/**"
+      - "scripts/ac2_directlocal_e7_testbook_create.ps1"
+      - "scripts/ac2_directlocal_e7_isolation_check.py"
+      - "tests/test_directlocal_e7_testbook_ps.py"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
@@ -101,6 +104,9 @@ on:
       - "tests/test_directlocal_bridge_ps.py"
       - "tests/test_member_directlocal.py"
       - "directlocal/**"
+      - "scripts/ac2_directlocal_e7_testbook_create.ps1"
+      - "scripts/ac2_directlocal_e7_isolation_check.py"
+      - "tests/test_directlocal_e7_testbook_ps.py"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
@@ -194,7 +200,8 @@ jobs:
           tests.test_member_gateway_adapter_ps
           tests.test_member_gateway_worker_cycle_ps
           tests.test_member_gateway_shopify_ps
-          tests.test_directlocal_bridge_ps -v
+          tests.test_directlocal_bridge_ps
+          tests.test_directlocal_e7_testbook_ps -v
 
   bounded-import-security:
     runs-on: windows-latest
