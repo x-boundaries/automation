@@ -1093,6 +1093,50 @@ class CliSafetyTests(unittest.TestCase):
                 bridge.load_native_config(raw, checkout_root=native_cli.checkout_roots(worktree))
 
 
+class SingleStreamPortalTests(unittest.TestCase):
+    """The installed host's single-stream direct-HTTP config: EB Bill bound, Tenant Bill unbound."""
+
+    def config(self, root: Path) -> bridge.NativeConfig:
+        portal = root / "portal.json"
+        portal.write_text(json.dumps({
+            "source": "direct_http",
+            "direct_http": {"list_url": "https://portal.invalid/list", "fetch_url": "https://portal.invalid/fetch",
+                            "tenant_id": "SYNTHETIC-TENANT"},
+            "archive_root": str(root / "v1" / "archive"), "state_path": str(root / "v1" / "state" / "v1.sqlite"),
+            "temp_root": str(root / "v1" / "temp"), "log_root": str(root / "v1" / "logs"),
+            "browser_cache_path": str(root / "v1" / "cache"), "timeout_seconds": 30, "max_attempts": 2,
+            "inventory_safety_ceiling": 200,
+        }), encoding="utf-8")
+        raw = ConfigTests().raw(root)
+        raw.pop("synthetic_root")
+        raw.update(mode=bridge.MODE_UAT_PORTAL, portal_config_path=str(portal))
+        return bridge.load_native_config(raw, checkout_root=REPO_ROOT)
+
+    def test_eb_bill_gets_the_reviewed_direct_http_adapter_and_tenant_stays_unbound(self) -> None:
+        from energygrid_bill_downloader import native_cli
+        from energygrid_bill_downloader.invoice import DirectHttpAdapter
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = self.config(Path(directory))
+            adapters = native_cli._adapters(cfg)
+            self.assertEqual(["EB_BILL"], list(adapters))
+            self.assertIsInstance(adapters["EB_BILL"], DirectHttpAdapter)
+            entries = native_cli._stream_entries(cfg)
+            self.assertEqual(("BOUND", "UNBOUND"), (entries["EB_BILL"].admission, entries["TENANT_BILL"].admission))
+            self.assertEqual(native_cli.SINGLE_STREAM_NAMESPACE, entries["EB_BILL"].source_namespace)
+
+    def test_init_uat_builds_an_isolated_database_for_the_single_stream_portal(self) -> None:
+        from energygrid_bill_downloader import native_cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = self.config(root)
+            result = native_cli._init_uat(cfg, None)
+            self.assertEqual("INITIALISED", result["outcome"])
+            with StateV4Store(cfg.state_path) as state:
+                self.assertEqual([], state.invoices_for_stream(EB))
+
+
 class BoundaryTests(unittest.TestCase):
     def test_bridge_modules_import_no_network_or_process_module(self) -> None:
         import ast

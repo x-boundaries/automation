@@ -60,28 +60,58 @@ def _load_config(path: str) -> bridge.NativeConfig:
     return bridge.load_native_config(load_config_file(Path(path)), checkout_root=checkout_roots())
 
 
-def _portal_dual_config(cfg: bridge.NativeConfig):
-    from .config import load_config_file, load_dual_stream_config
+# The installed host still runs the single-stream direct-HTTP MVP config (EB Bill only). Its invoices
+# get this fixed source namespace in a native UAT database; the Tenant Bill stream stays UNBOUND until
+# its source is bound (#227), so it reports ADAPTER_UNAVAILABLE truthfully.
+SINGLE_STREAM_NAMESPACE = "ENERGYGRID-DIRECT-HTTP-V1-EB"
+SINGLE_STREAM_EVIDENCE = "EG_HTTP_COMPLETE_LIST_V1"
+
+
+def _portal_config(cfg: bridge.NativeConfig):
+    """('DUAL', DualRuntimeConfig) or ('SINGLE', RuntimeConfig) for the private portal config."""
+    from .config import SOURCE_DIRECT_HTTP, load_config_file, load_dual_stream_config, load_runtime_config
 
     assert cfg.portal_config_path is not None
-    return load_dual_stream_config(load_config_file(cfg.portal_config_path), checkout_root=CHECKOUT_ROOT)
+    raw = load_config_file(cfg.portal_config_path)
+    if type(raw) is dict and "streams" not in raw and raw.get("source") == SOURCE_DIRECT_HTTP:
+        return "SINGLE", load_runtime_config(raw, checkout_root=CHECKOUT_ROOT)
+    return "DUAL", load_dual_stream_config(raw, checkout_root=CHECKOUT_ROOT)
 
 
 def _adapters(cfg: bridge.NativeConfig) -> dict[str, Any]:
     if cfg.mode == bridge.MODE_UAT_SYNTHETIC:
         assert cfg.synthetic_root is not None
         return {stream: bridge.SyntheticPortalAdapter(cfg.synthetic_root, stream) for stream in bridge.STREAM_LABELS}
-    # Real EnergyGrid portal: the reviewed direct-HTTP adapters, built exactly as the v3 core builds them.
+    kind, portal = _portal_config(cfg)
+    if kind == "SINGLE":
+        # The reviewed direct-HTTP source and adapter, for the one bound stream.
+        from .http_source import DirectHttpSource
+        from .invoice import DirectHttpAdapter, Stream
+
+        source = DirectHttpSource(portal.direct_http, portal.timeout_seconds, portal.max_attempts)
+        return {"EB_BILL": DirectHttpAdapter(source, stream=Stream.EB_BILL, source_namespace=SINGLE_STREAM_NAMESPACE,
+                                             evidence_ref=SINGLE_STREAM_EVIDENCE)}
+    # Dual-stream config: the reviewed direct-HTTP adapters, built exactly as the v3 core builds them.
     from .cli import build_dual_adapters
 
-    return build_dual_adapters(_portal_dual_config(cfg))
+    return build_dual_adapters(portal)
 
 
 def _stream_entries(cfg: bridge.NativeConfig) -> dict:
-    if cfg.mode == bridge.MODE_UAT_PORTAL:
-        return _portal_dual_config(cfg).streams
-    from .config import BOUND_ADMISSION, DualStreamEntry
+    from .config import BOUND_ADMISSION, UNBOUND_ADMISSION, DualStreamEntry
     from .invoice import DATE_PROFILE_ISO_V1
+
+    if cfg.mode == bridge.MODE_UAT_PORTAL:
+        kind, portal = _portal_config(cfg)
+        if kind == "DUAL":
+            return portal.streams
+        return {
+            "EB_BILL": DualStreamEntry(
+                admission=BOUND_ADMISSION, source_namespace=SINGLE_STREAM_NAMESPACE, adapter_id="DIRECT_HTTP_V1",
+                date_profile=DATE_PROFILE_ISO_V1, evidence_ref=SINGLE_STREAM_EVIDENCE,
+            ),
+            "TENANT_BILL": DualStreamEntry(admission=UNBOUND_ADMISSION),
+        }
 
     return {
         stream: DualStreamEntry(
