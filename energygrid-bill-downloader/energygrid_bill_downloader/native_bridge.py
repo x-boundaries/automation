@@ -100,6 +100,9 @@ class NativeConfig:
     archive_root: Path = field(repr=False)
     temp_root: Path = field(repr=False)
     outbox_root: Path = field(repr=False)
+    # User-facing archive: <root>/<EB Bill|Tenant Bill>/MMM YYYY - <portal filename>.pdf (owner requirement).
+    # archive_root keeps the frozen internal v4 identity <EB Bill|Tenant Bill>/YYYY-MM-DD.pdf.
+    named_archive_root: Path = field(repr=False)
     drive: NativeDriveSettings = field(repr=False)
     gmail: NativeGmailSettings = field(repr=False)
     max_drive_uploads: int
@@ -158,8 +161,8 @@ def _ceiling(value: Any, label: str) -> int:
 
 def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | None) -> NativeConfig:
     """Load the closed native bridge config. No key is optional and no value is coerced."""
-    common = {"schema", "mode", "state_path", "archive_root", "temp_root", "outbox_root", "drive", "gmail",
-              "effect_ceiling"}
+    common = {"schema", "mode", "state_path", "archive_root", "named_archive_root", "temp_root", "outbox_root",
+              "drive", "gmail", "effect_ceiling"}
     if type(raw) is not dict or raw.get("schema") != NATIVE_CONFIG_SCHEMA:
         raise ConfigError("native config schema is invalid")
     mode = raw.get("mode")
@@ -170,7 +173,11 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
     else:
         raise ConfigError("native config mode must be UAT_SYNTHETIC or UAT_PORTAL")
     paths = {name: _private_path(data[name], name, checkout_root)
-             for name in ("state_path", "archive_root", "temp_root", "outbox_root")}
+             for name in ("state_path", "archive_root", "named_archive_root", "temp_root", "outbox_root")}
+    internal = paths["archive_root"].resolve(strict=False)
+    named = paths["named_archive_root"].resolve(strict=False)
+    if internal == named or internal in named.parents or named in internal.parents:
+        raise ConfigError("named_archive_root must be separate from archive_root")
     drive_raw = _closed(data["drive"], {"account", "folder_ids"}, "drive")
     folders_raw = _closed(drive_raw["folder_ids"], {"EB_BILL", "TENANT_BILL"}, "drive.folder_ids")
     folders: dict[str, str] = {}
@@ -438,6 +445,61 @@ def _verified_payload(state, cfg: NativeConfig, intent_id: str, invoice: dict, r
     return payload
 
 
+def named_archive_path(cfg: NativeConfig, invoice: dict) -> Path:
+    return cfg.named_archive_root / STREAM_LABELS[invoice["stream"]] / invoice["display_filename"]
+
+
+def _named_archive_state(cfg: NativeConfig, invoice: dict) -> str:
+    """Read only: PRESENT (exact bytes), MISSING or CONFLICT."""
+    path = named_archive_path(cfg, invoice)
+    try:
+        ensure_no_reparse_components(path)
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return "MISSING"
+    except (AppError, OSError):
+        return "CONFLICT"
+    same = hashlib.sha256(data).hexdigest() == invoice["sha256"] and len(data) == invoice["byte_size"]
+    return "PRESENT" if same else "CONFLICT"
+
+
+def _ensure_named_archive(state, cfg: NativeConfig, invoice: dict, drive_intent_id: str, payload: bytes,
+                          run_id: str, now_iso: str) -> tuple[str, str | None]:
+    """Publish the user-facing copy once, never overwriting. Returns (status, support_ref).
+
+    PRESENT: the copy holds the exact archive bytes. HOLD: a different file already has that name, so
+    the PENDING Drive intent is held (no Drive or Gmail effect for the invoice). UNAVAILABLE: a transient
+    I/O failure; nothing was written to SQLite and a later call may succeed.
+    """
+    from .publication import publish_no_replace
+
+    status = _named_archive_state(cfg, invoice)
+    if status == "PRESENT":
+        return "PRESENT", None
+    if status == "MISSING":
+        path = named_archive_path(cfg, invoice)
+        temporary = path.with_name(f".eg-named-{uuid.uuid4().hex}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_no_reparse_components(path.parent)
+            with open(temporary, "xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            publish_no_replace(temporary, path)
+        except (AppError, OSError):
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            # The destination may have appeared meanwhile; re-judge it below without overwriting.
+        status = _named_archive_state(cfg, invoice)
+        if status == "PRESENT":
+            return "PRESENT", None
+        if status == "MISSING":
+            return "UNAVAILABLE", "EG_NATIVE_NAMED_ARCHIVE_UNAVAILABLE"
+    state.hold_pending(drive_intent_id, support_ref="EG_NATIVE_NAMED_ARCHIVE_CONFLICT", run_id=run_id, now_iso=now_iso)
+    return "HOLD", "EG_NATIVE_NAMED_ARCHIVE_CONFLICT"
+
+
 def _at_ceiling(state, cfg: NativeConfig, action: str) -> bool:
     limit = cfg.max_drive_uploads if action == "DRIVE_UPLOAD" else cfg.max_gmail_sends
     return state.dispatch_count(action) >= limit
@@ -489,8 +551,25 @@ def acquire(state, cfg: NativeConfig, adapters: dict[str, Any], *, run_id: str, 
             adapters=adapters, state=state, archive_root=cfg.archive_root, temp_root=cfg.temp_root,
             run_id=run_id, now_iso=now_iso, inventory_ceiling=cfg.inventory_ceiling,
         )
+        named: dict[str, list[dict]] = {}
+        for stream in STREAM_LABELS:
+            named[stream] = []
+            for invoice in state.invoices_for_stream(stream):
+                drive = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
+                if drive["state"] != "PENDING":
+                    named[stream].append({"display_filename": invoice["display_filename"],
+                                          "named_archive": _named_archive_state(cfg, invoice)})
+                    continue
+                payload = _verified_payload(state, cfg, drive["intent_id"], invoice, run_id, now_iso)
+                if payload is None:
+                    outcome, reference = "HOLD", state.intent(drive["intent_id"])["support_ref"]
+                else:
+                    outcome, reference = _ensure_named_archive(state, cfg, invoice, drive["intent_id"], payload,
+                                                               run_id, now_iso)
+                named[stream].append({"display_filename": invoice["display_filename"],
+                                      "named_archive": outcome, "support_ref": reference})
     return _result("acquire", "ACQUIRED", EXIT_OK, run_id=run_id, recovered_unknown=recovered,
-                   acquisition=acquisition)
+                   acquisition=acquisition, named_archive=named)
 
 
 def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
@@ -508,7 +587,7 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
         if not ready:
             # Recovery may have written above, so this is a normal result, never a no-change refusal.
             return _result("next", "CEILING_REACHED" if stepping else "IDLE", EXIT_OK, run_id=run_id,
-                           recovered_unknown=recovered, streams=stream_report(state))
+                           recovered_unknown=recovered, streams=stream_report(state, cfg))
         stream = ready[0]
         _kind, action, invoice, intent = plans[stream]
         intent_id = intent["intent_id"]
@@ -516,6 +595,13 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
         if payload is None:
             return _result("next", "HOLD", EXIT_HOLD, run_id=run_id, intent_id=intent_id, stream=stream,
                            support_ref=state.intent(intent_id)["support_ref"])
+        if action == "DRIVE_UPLOAD":
+            outcome, reference = _ensure_named_archive(state, cfg, invoice, intent_id, payload, run_id, now_iso)
+            if outcome != "PRESENT":
+                # Recovery may already have written, so a transient failure is a retry, never a 64 refusal.
+                return _result("next", outcome if outcome == "HOLD" else "RETRY_LATER",
+                               EXIT_HOLD if outcome == "HOLD" else EXIT_RETRY, run_id=run_id, intent_id=intent_id,
+                               stream=stream, support_ref=reference)
         if action == "GMAIL_SEND":
             drive_intent = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
             if state.verified_provider_ref(drive_intent["intent_id"]) is None:
@@ -560,6 +646,11 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
         if payload is None:
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
                            support_ref=state.intent(intent_id)["support_ref"])
+        outcome, reference = _ensure_named_archive(state, cfg, invoice, intent_id, payload, run_id, now_iso)
+        if outcome == "UNAVAILABLE":
+            raise NativeRefusal(reference)
+        if outcome == "HOLD":
+            return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id, support_ref=reference)
         if matches:
             # Never overwrite, suffix or create a variant. An operator decides.
             state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id, now_iso=now_iso)
@@ -777,7 +868,7 @@ def gmail_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
                    intent_id=intent_id)
 
 
-def stream_report(state) -> dict[str, dict]:
+def stream_report(state, cfg: NativeConfig | None = None) -> dict[str, dict]:
     """Per-stream drain truth, read only: DRAINED, PENDING (next step) or BLOCKED (with the held reference)."""
     from .orchestration import _v4_stream_step
     from .state import V4_STREAMS
@@ -795,6 +886,7 @@ def stream_report(state) -> dict[str, dict]:
             detail.append({
                 "display_filename": row["display_filename"],
                 "adopted_from_v3": row["predecessor_invoice_id"] is not None,
+                "named_archive": _named_archive_state(cfg, row) if cfg is not None else None,
                 **{action.lower(): {
                     "state": intents[action]["state"],
                     "support_ref": intents[action]["support_ref"],
@@ -814,8 +906,8 @@ def stream_report(state) -> dict[str, dict]:
     return report
 
 
-def status(state) -> dict:
-    report = stream_report(state)
+def status(state, cfg: NativeConfig | None = None) -> dict:
+    report = stream_report(state, cfg)
     order = ("BLOCKED", "PENDING", "DRAINED")
     overall = min((row["state"] for row in report.values()), key=order.index)
     return _result(

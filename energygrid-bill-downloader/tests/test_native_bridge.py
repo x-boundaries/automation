@@ -166,6 +166,7 @@ class NativeBridgeBase(unittest.TestCase):
     def make_config(self, **changes) -> bridge.NativeConfig:
         values = dict(
             mode=bridge.MODE_UAT_SYNTHETIC, state_path=self.db, archive_root=self.root / "archive",
+            named_archive_root=self.root / "bills",
             temp_root=self.root / "temp", outbox_root=self.root / "outbox",
             drive=bridge.NativeDriveSettings(account="uat@example.com", folder_ids=dict(FOLDERS)),
             gmail=bridge.NativeGmailSettings(
@@ -222,7 +223,7 @@ class NativeBridgeBase(unittest.TestCase):
 
     def status(self) -> dict:
         with StateV4Store(self.db) as state:
-            return bridge.status(state)
+            return bridge.status(state, self.cfg)
 
     def intent_state(self, intent_id: str) -> str:
         with StateV4Store(self.db) as state:
@@ -650,6 +651,94 @@ class ReviewFindingTests(NativeBridgeBase):
                 bridge.write_synthetic_fixture(self.root / "portal-x", {EB: [(name, "2026-09-01")]})
 
 
+class NamedArchiveTests(NativeBridgeBase):
+    """Owner requirement: the user-facing archive, Drive and email all use `MMM YYYY - <original>.pdf`."""
+
+    def named(self, stream: str, name: str) -> Path:
+        return self.cfg.named_archive_root / bridge.STREAM_LABELS[stream] / name
+
+    def test_user_facing_archive_uses_the_display_name_and_internal_identity_stays_date_only(self) -> None:
+        acquired = self.acquire()
+        self.assertEqual({EB: ["PRESENT"], TN: ["PRESENT"]},
+                         {k: [row["named_archive"] for row in v] for k, v in acquired["named_archive"].items()})
+        self.host.drain()
+        for stream, original, day in ((EB, "EB Invoice 0002.pdf", "2026-09-01"), (TN, "TN Invoice 0002.pdf", "2026-09-03")):
+            with self.subTest(stream=stream):
+                named = self.named(stream, f"SEP 2026 - {original}")
+                self.assertEqual(pdf(f"{stream} {original}"), named.read_bytes())
+                # Exactly one file per stream: the older invoice is never backfilled, prefix applied once.
+                self.assertEqual([named.name], [item.name for item in named.parent.iterdir()])
+                internal = self.cfg.archive_root / bridge.STREAM_LABELS[stream] / f"{day}.pdf"
+                self.assertEqual(named.read_bytes(), internal.read_bytes())
+        names = {row["title"] for row in self.host.drive.values()}
+        attachments = {message["attachments"][0]["filename"] for message in self.host.sent}
+        self.assertEqual(names, attachments)
+        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"}, names)
+        report = self.status()["streams"]
+        self.assertEqual(["PRESENT"], [row["named_archive"] for row in report[EB]["invoices"]])
+
+    def test_existing_identical_copy_is_kept_and_never_rewritten(self) -> None:
+        target = self.named(EB, "SEP 2026 - EB Invoice 0002.pdf")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(pdf("EB_BILL EB Invoice 0002.pdf"))
+        before = target.stat().st_mtime_ns
+        self.acquire()
+        self.host.drain()
+        self.assertEqual(before, target.stat().st_mtime_ns)
+        self.assertEqual(2, len(self.host.sent))
+
+    def test_a_different_file_at_the_name_holds_that_invoice_and_is_never_overwritten(self) -> None:
+        target = self.named(EB, "SEP 2026 - EB Invoice 0002.pdf")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"someone else's file")
+        acquired = self.acquire()
+        self.assertEqual(("HOLD", "EG_NATIVE_NAMED_ARCHIVE_CONFLICT"),
+                         (acquired["named_archive"][EB][0]["named_archive"], acquired["named_archive"][EB][0]["support_ref"]))
+        self.host.drain()
+        self.assertEqual(b"someone else's file", target.read_bytes())
+        streams = self.status()["streams"]
+        self.assertEqual(("BLOCKED", "EG_NATIVE_NAMED_ARCHIVE_CONFLICT"), (streams[EB]["state"], streams[EB]["support_ref"]))
+        self.assertEqual("DRAINED", streams[TN]["state"])
+        self.assertEqual({FOLDERS[TN]}, {row["parent"] for row in self.host.drive.values()})
+        self.assertEqual(1, len(self.host.sent))
+
+    def test_a_removed_copy_is_republished_before_the_drive_step(self) -> None:
+        self.acquire()
+        self.named(EB, "SEP 2026 - EB Invoice 0002.pdf").unlink()
+        self.host.drain()
+        self.assertTrue(self.named(EB, "SEP 2026 - EB Invoice 0002.pdf").is_file())
+        self.assertEqual(2, len(self.host.sent))
+
+    def test_a_transient_publication_failure_is_a_retry_with_no_seal(self) -> None:
+        from unittest import mock
+
+        with mock.patch("energygrid_bill_downloader.publication.publish_no_replace", side_effect=OSError("disk")):
+            acquired = self.acquire()
+            self.assertEqual("UNAVAILABLE", acquired["named_archive"][EB][0]["named_archive"])
+            step = self.next()
+            self.assertEqual(("RETRY_LATER", 10, "EG_NATIVE_NAMED_ARCHIVE_UNAVAILABLE"),
+                             (step["outcome"], step["exit_code"], step["support_ref"]))
+            self.assertEqual("PENDING", self.intent_state(step["intent_id"]))
+        self.assertEqual((0, 0), self.dispatches())
+        self.assertEqual([], list(self.cfg.named_archive_root.rglob("*.tmp")))
+        self.host.drain()
+        self.assertEqual(2, len(self.host.sent))
+
+    def test_seal_requires_the_named_copy(self) -> None:
+        from unittest import mock
+
+        self.acquire()
+        step = self.next()
+        self.named(step["stream"], step["display_filename"]).unlink()
+        evidence = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"], "matches": []}
+        with mock.patch("energygrid_bill_downloader.publication.publish_no_replace", side_effect=OSError("disk")), \
+                self.assertRaises(NativeRefusal) as refused:
+            self.call(bridge.drive_seal, step["intent_id"], evidence)
+        self.assertEqual("EG_NATIVE_NAMED_ARCHIVE_UNAVAILABLE", refused.exception.support_ref)
+        self.assertEqual((0, 0), self.dispatches())
+
+
 class LeaseTests(NativeBridgeBase):
     def test_a_live_lease_held_by_another_session_refuses_with_no_mutation(self) -> None:
         self.acquire()
@@ -686,6 +775,8 @@ class PredecessorCutoverTests(NativeBridgeBase):
         self.host.drain()
         self.assertEqual(1, len(self.host.sent))
         self.assertEqual("SEP 2026 - Invoice EB Sep.pdf", self.host.sent[0]["attachments"][0]["filename"])
+        named = self.cfg.named_archive_root / "EB Bill" / "SEP 2026 - Invoice EB Sep.pdf"
+        self.assertEqual(predecessor_pdf("Invoice EB Sep.pdf"), named.read_bytes())
         self.assertEqual("IDLE", self.next()["outcome"])
 
 
@@ -693,7 +784,8 @@ class ConfigTests(unittest.TestCase):
     def raw(self, root: Path) -> dict:
         return {
             "schema": bridge.NATIVE_CONFIG_SCHEMA, "mode": bridge.MODE_UAT_SYNTHETIC,
-            "state_path": str(root / "s.sqlite"), "archive_root": str(root / "a"), "temp_root": str(root / "t"),
+            "state_path": str(root / "s.sqlite"), "archive_root": str(root / "a"),
+            "named_archive_root": str(root / "n"), "temp_root": str(root / "t"),
             "outbox_root": str(root / "o"), "synthetic_root": str(root / "p"),
             "drive": {"account": "uat@example.com", "folder_ids": dict(FOLDERS)},
             "gmail": {"account": "uat@example.com", "to": [RECIPIENT], "subject_template": "Bill {display_filename}",
@@ -733,6 +825,10 @@ class ConfigTests(unittest.TestCase):
                 "ceiling too high": lambda r: r["effect_ceiling"].update(drive_uploads=21),
                 "ceiling not int": lambda r: r["effect_ceiling"].update(gmail_sends=True),
                 "portal key in synthetic mode": lambda r: r.update(portal_config_path=str(root / "c.json")),
+                "named root missing": lambda r: r.pop("named_archive_root"),
+                "named root equals archive": lambda r: r.update(named_archive_root=r["archive_root"]),
+                "named root inside archive": lambda r: r.update(named_archive_root=str(Path(r["archive_root"]) / "x")),
+                "archive inside named root": lambda r: r.update(archive_root=str(Path(r["named_archive_root"]) / "x")),
             }
             for name, change in cases.items():
                 raw = json.loads(json.dumps(self.raw(root)))
@@ -825,6 +921,7 @@ class BoundaryTests(unittest.TestCase):
                 code = native_cli.main(["status", "--config", str(missing)])
         self.assertEqual(64, code)
         printed = out.getvalue()
+        self.assertNotIn(str(missing), printed)
         self.assertNotIn("private-name-should-not-leak", printed)
         self.assertEqual("REFUSED", json.loads(printed)["outcome"])
 

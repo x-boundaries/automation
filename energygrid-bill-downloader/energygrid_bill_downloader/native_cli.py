@@ -100,10 +100,11 @@ def _init_uat(cfg: bridge.NativeConfig, args) -> dict:
         raise bridge.NativeRefusal("EG_NATIVE_UAT_STATE_EXISTS")
     # Outbox evidence and archive files are keyed by deterministic identities, so a fresh database
     # must never reuse an earlier environment's files.
-    for directory in (cfg.outbox_root, cfg.archive_root):
+    for directory in (cfg.outbox_root, cfg.archive_root, cfg.named_archive_root):
         if directory.exists() and any(directory.iterdir()):
             raise bridge.NativeRefusal("EG_NATIVE_UAT_DIRECTORY_NOT_EMPTY")
-    for directory in (cfg.state_path.parent, cfg.archive_root, cfg.temp_root, cfg.outbox_root):
+    for directory in (cfg.state_path.parent, cfg.archive_root, cfg.named_archive_root, cfg.temp_root,
+                      cfg.outbox_root):
         directory.mkdir(parents=True, exist_ok=True)
     migrate_state_database_v3(cfg.state_path, apply=True, streams=_stream_entries(cfg))
     result = migrate_state_database_v4(cfg.state_path, apply=True)
@@ -144,7 +145,7 @@ def _dispatch(args) -> dict:
     if command == "next":
         return _with_state(cfg, lambda s: bridge.next_step(s, cfg, run_id=run_id, now_ms=now))
     if command == "status":
-        return _with_state(cfg, bridge.status)
+        return _with_state(cfg, lambda s: bridge.status(s, cfg))
     if command in ("drive-seal", "drive-record", "gmail-seal", "gmail-record"):
         evidence = bridge.load_evidence(Path(args.evidence))
         function = {"drive-seal": bridge.drive_seal, "drive-record": bridge.drive_record,

@@ -29,7 +29,7 @@ later), `20` HOLD or uncertainty recorded, `64` refused with **no state change**
 |---|---|
 | `init-uat` | Creates a fresh isolated v3 database and migrates it to v4. Refuses an existing state file and a non-empty outbox or archive. |
 | `make-synthetic-fixture` | `UAT_SYNTHETIC` only: writes `inventory.json` and synthetic PDFs (two per stream). |
-| `acquire` | Recover, then admit the latest invoice of each stream (synthetic files or the real direct-HTTP portal). No provider effect. |
+| `acquire` | Recover, admit the latest invoice of each stream (synthetic files or the real direct-HTTP portal), then publish each not-yet-uploaded invoice's user-facing named archive copy (section 5). No provider effect. |
 | `next` | Recover, then plan one step (fair round-robin, FIFO per stream, Drive before Gmail). A stream whose next action is at its effect ceiling is skipped; `CEILING_REACHED` when nothing else can run. Writes `<outbox>/<intent>.pdf.b64` with the exact archive bytes. Never seals. |
 | `drive-seal --intent I --evidence F` | Needs a complete name-occupancy precheck. Occupied name: HOLD. Otherwise seals and returns the `create_file` arguments. |
 | `drive-readback --intent I --file-id D --base64-file F` | The Core hashes what Drive returns and writes a write-once attestation. |
@@ -88,15 +88,26 @@ own stream. A later `drive-record`/`gmail-record` with full evidence for the sam
 - Call-time permission: in a session with bypassed permissions, connector writes run without a
   prompt. For UAT use a session where Drive `create_file` and Gmail `send_message` ask each time.
 
-## 5. Filenames
+## 5. Filenames (owner requirement)
 
-Drive title and attachment name are the stored v4 display name `MMM YYYY - <portal filename>`, prefix
-applied once (`naming.py`). The local archive keeps the frozen v4 identity `<EB Bill|Tenant Bill>/YYYY-MM-DD.pdf`.
+The user-facing downloaded archive, the Drive title and the email attachment all use the stored v4
+display name `MMM YYYY - <original portal filename>`, prefix applied exactly once (`naming.py`):
+
+- User-facing archive: `<named_archive_root>/<EB Bill|Tenant Bill>/MMM YYYY - <original>.pdf`, the exact
+  archive bytes. It is written to a temporary file in the same folder and published with no-replace
+  semantics, then re-hashed. An identical existing copy is kept untouched. A different file already at
+  that name is never overwritten: the invoice's Drive step HOLDs (`EG_NATIVE_NAMED_ARCHIVE_CONFLICT`), so
+  it gets no Drive upload or email, and the other stream continues. A transient I/O failure is
+  `RETRY_LATER` (exit 10) from `next` and a no-change refusal from `drive-seal`.
+- The copy is published by `acquire` and is a hard precondition of every `drive-seal`, so nothing is
+  uploaded or emailed without it. `status` reports it per invoice (`PRESENT`, `MISSING`, `CONFLICT`).
+- Internal identity: `archive_root` keeps the frozen, immutable v4 `<EB Bill|Tenant Bill>/YYYY-MM-DD.pdf`
+  used by SQLite and the integrity checks. `named_archive_root` must be separate from it.
 
 ## 6. Configuration (`config/energygrid.native_uat.example.json`)
 
-Closed shape, every key required. Paths must be absolute, local (no UNC), free of reparse points and
-**outside the Git checkout**. Modes: `UAT_SYNTHETIC` (`synthetic_root`) or `UAT_PORTAL`
+Closed shape, every key required. Paths (including `named_archive_root`) must be absolute, local (no
+UNC), free of reparse points and **outside the Git checkout**. Modes: `UAT_SYNTHETIC` (`synthetic_root`) or `UAT_PORTAL`
 (`portal_config_path`, the existing private dual-stream config used to build the reviewed direct-HTTP
 adapters). There is no production mode. `effect_ceiling` caps sealed Drive and Gmail dispatches
 (0 to 20) for the whole database. `require_attachment_readback` is an explicit owner choice.
@@ -118,9 +129,9 @@ production database are out of scope.
 
 ## 8. Evidence
 
-`tests/test_native_bridge.py` (41 tests): complete dual-stream journey, latest-only and no backfill, single
+`tests/test_native_bridge.py` (47 tests): complete dual-stream journey, latest-only and no backfill, single
 prefix, second run zero effects, newer invoice later, occupied Drive name, crash after seal, lost
 answer, size-preserving corruption (Drive and Gmail), readback required, metadata mismatch, denied and
 error outcomes, racing seals, precheck refusal, tampered archive, wrong drafts, bound-draft check,
 replay, Gmail crash after seal, Gmail before Drive, effect ceiling, lease held, v3 predecessor adoption
-without fetch, config refusals (including the main checkout of a worktree), junctions, ceiling without starvation, case-variant readback, apostrophe titles, no network imports in the bridge, closed CLI output.
+without fetch, config refusals (including the main checkout of a worktree), junctions, ceiling without starvation, case-variant readback, apostrophe titles, the user-facing named archive (copy, no backfill, conflict HOLD without overwrite, identical copy kept, transient retry, seal precondition, adopted predecessor), no network imports in the bridge, closed CLI output.

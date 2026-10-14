@@ -3,6 +3,7 @@
   "mode": "UAT_SYNTHETIC",
   "state_path": "C:\\EnergyGridUAT\\state\\energygrid-uat.sqlite",
   "archive_root": "C:\\EnergyGridUAT\\archive",
+  "named_archive_root": "C:\\EnergyGridUAT\\EnergyGrid Bills",
   "temp_root": "C:\\EnergyGridUAT\\temp",
   "outbox_root": "C:\\EnergyGridUAT\\outbox",
   "synthetic_root": "C:\\EnergyGridUAT\\synthetic-portal",
