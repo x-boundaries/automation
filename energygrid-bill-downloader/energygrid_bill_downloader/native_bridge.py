@@ -16,6 +16,10 @@ Email is optional owner feedback in native_notify.py and never gates Drive work.
            drive-record (create evidence)   metadata + readback -> VERIFIED, else REJECTED/UNKNOWN
            drive-adopt  (existing file)     same name, exact bytes -> VERIFIED with no upload
 
+Drive modes: NATIVE_UPLOAD (the host sends the PDF as base64 through the native create_file tool)
+or LOCAL_SYNC (the Core writes the PDF into the folder that Google Drive for desktop syncs to the
+destination; no PDF bytes pass through the host, and the local mirror stands in for the readback).
+
 Authority stays in SQLite (StateV4Store). Every write is lease-fenced. A seal is
 durable before the host is told to act, and the host acts only on the seal
 command's answer. A crash or a lost answer after a seal leaves DISPATCHED, which
@@ -80,10 +84,17 @@ class NativeRefusal(OfflineV4Error):
 # ---------------------------------------------------------------------------
 
 
+DRIVE_NATIVE_UPLOAD = "NATIVE_UPLOAD"
+DRIVE_LOCAL_SYNC = "LOCAL_SYNC"
+
+
 @dataclass(frozen=True)
 class NativeDriveSettings:
     account: str = field(repr=False)
     folder_ids: dict[str, str] = field(repr=False)
+    mode: str = DRIVE_NATIVE_UPLOAD
+    # LOCAL_SYNC only: the local folder Google Drive for desktop keeps in sync with each stream's folder.
+    sync_folders: dict[str, Path] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -182,7 +193,13 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
     named = paths["named_archive_root"].resolve(strict=False)
     if internal == named or internal in named.parents or named in internal.parents:
         raise ConfigError("named_archive_root must be separate from archive_root")
-    drive_raw = _closed(data["drive"], {"account", "folder_ids"}, "drive")
+    drive_mode = data["drive"].get("mode") if type(data["drive"]) is dict else None
+    if drive_mode == DRIVE_LOCAL_SYNC:
+        drive_raw = _closed(data["drive"], {"account", "folder_ids", "mode", "sync_folders"}, "drive")
+    elif drive_mode == DRIVE_NATIVE_UPLOAD:
+        drive_raw = _closed(data["drive"], {"account", "folder_ids", "mode"}, "drive")
+    else:
+        raise ConfigError("drive.mode must be NATIVE_UPLOAD or LOCAL_SYNC")
     folders_raw = _closed(drive_raw["folder_ids"], {"EB_BILL", "TENANT_BILL"}, "drive.folder_ids")
     folders: dict[str, str] = {}
     for stream, folder in folders_raw.items():
@@ -190,6 +207,15 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
             raise ConfigError(f"drive.folder_ids.{stream} is invalid")
         folders[stream] = folder
     # Both streams may share one flat folder (Web #226:6168238127); the precheck guards name collisions.
+    sync_folders = None
+    if drive_mode == DRIVE_LOCAL_SYNC:
+        sync_raw = _closed(drive_raw["sync_folders"], {"EB_BILL", "TENANT_BILL"}, "drive.sync_folders")
+        sync_folders = {stream: _private_path(value, f"drive.sync_folders.{stream}", checkout_root)
+                        for stream, value in sync_raw.items()}
+        same_folder = folders["EB_BILL"] == folders["TENANT_BILL"]
+        same_sync = sync_folders["EB_BILL"].resolve(strict=False) == sync_folders["TENANT_BILL"].resolve(strict=False)
+        if same_folder != same_sync:
+            raise ConfigError("drive.sync_folders must map one to one onto drive.folder_ids")
     gmail_raw = _closed(data["gmail"], {"account", "to", "subject_prefix", "attach_pdf"}, "gmail")
     to = gmail_raw["to"]
     if type(to) is not list or len(to) != 1:
@@ -207,7 +233,8 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         portal_config = _private_path(data["portal_config_path"], "portal_config_path", checkout_root)
     return NativeConfig(
         mode=mode,
-        drive=NativeDriveSettings(account=_email(drive_raw["account"], "drive.account"), folder_ids=folders),
+        drive=NativeDriveSettings(account=_email(drive_raw["account"], "drive.account"), folder_ids=folders,
+                                  mode=drive_mode, sync_folders=sync_folders),
         gmail=NativeGmailSettings(
             account=_email(gmail_raw["account"], "gmail.account"), to=recipients, subject_prefix=subject_prefix,
             attach_pdf=attach_pdf,
@@ -461,7 +488,16 @@ def named_archive_path(cfg: NativeConfig, invoice: dict) -> Path:
 
 def _named_archive_state(cfg: NativeConfig, invoice: dict) -> str:
     """Read only: PRESENT (exact bytes), MISSING or CONFLICT."""
-    path = named_archive_path(cfg, invoice)
+    return _file_state(named_archive_path(cfg, invoice), invoice)
+
+
+def sync_path(cfg: NativeConfig, invoice: dict) -> Path:
+    assert cfg.drive.sync_folders is not None
+    return cfg.drive.sync_folders[invoice["stream"]] / invoice["display_filename"]
+
+
+def _file_state(path: Path, invoice: dict) -> str:
+    """Read only: PRESENT (the exact archive bytes), MISSING or CONFLICT."""
     try:
         ensure_no_reparse_components(path)
         data = path.read_bytes()
@@ -471,6 +507,27 @@ def _named_archive_state(cfg: NativeConfig, invoice: dict) -> str:
         return "CONFLICT"
     same = hashlib.sha256(data).hexdigest() == invoice["sha256"] and len(data) == invoice["byte_size"]
     return "PRESENT" if same else "CONFLICT"
+
+
+def _local_mirror_verdict(cfg: NativeConfig, invoice: dict) -> bool | None:
+    """LOCAL_SYNC: the Drive file's local mirror holds the exact archive bytes (True), other bytes
+    (False), or is not there yet (None). Drive for desktop serves it from the synced copy."""
+    state = _file_state(sync_path(cfg, invoice), invoice)
+    return None if state == "MISSING" else state == "PRESENT"
+
+
+def _write_sync_file(cfg: NativeConfig, invoice: dict, payload: bytes) -> bool:
+    """LOCAL_SYNC: create the file once in the synced folder (exclusive create, never overwrite)."""
+    path = sync_path(cfg, invoice)
+    try:
+        ensure_no_reparse_components(path.parent)
+        with open(path, "xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (AppError, OSError):
+        return _file_state(path, invoice) == "PRESENT"
+    return _file_state(path, invoice) == "PRESENT"
 
 
 def _ensure_named_archive(state, cfg: NativeConfig, invoice: dict, drive_intent_id: str, payload: bytes,
@@ -649,15 +706,18 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
                 return _result("next", outcome if outcome == "HOLD" else "RETRY_LATER",
                                EXIT_HOLD if outcome == "HOLD" else EXIT_RETRY, run_id=run_id, intent_id=intent_id,
                                stream=stream, support_ref=reference)
-            payload_path = _payload_path(cfg, intent_id)
-            _write_atomic(payload_path, base64.b64encode(payload))
+            extra: dict[str, Any] = {"drive_mode": cfg.drive.mode}
+            if cfg.drive.mode == DRIVE_NATIVE_UPLOAD:
+                payload_path = _payload_path(cfg, intent_id)
+                _write_atomic(payload_path, base64.b64encode(payload))
+                extra["payload_base64_path"] = str(payload_path)
             state.set_cursor(stream, now_iso=now_iso)
             folder = cfg.drive.folder_ids[stream]
             return _result(
                 "next", "DRIVE_PRECHECK", EXIT_OK, run_id=run_id, recovered_unknown=recovered, intent_id=intent_id,
                 stream=stream, display_filename=invoice["display_filename"], byte_size=invoice["byte_size"],
-                sha256=invoice["sha256"], payload_base64_path=str(payload_path), drive_account=cfg.drive.account,
-                folder_id=folder, precheck_query=drive_title_query(folder, invoice["display_filename"]),
+                sha256=invoice["sha256"], drive_account=cfg.drive.account, folder_id=folder,
+                precheck_query=drive_title_query(folder, invoice["display_filename"]), **extra,
             )
         with _notification_store(cfg) as store:
             packet = native_notify.plan(store, cfg, lambda key: _archive_payload(state, cfg, key))
@@ -709,6 +769,25 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
             state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id, now_iso=now_iso)
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
                            support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
+        if cfg.drive.mode == DRIVE_LOCAL_SYNC:
+            if _local_mirror_verdict(cfg, invoice) is False:
+                # A different local file already has this name: never overwrite it.
+                state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id,
+                                   now_iso=now_iso)
+                return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
+                               support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
+            state.assert_lease_held()
+            state.seal_dispatch(intent_id, run_id=run_id, now_iso=now_iso)
+            if not _write_sync_file(cfg, invoice, payload):
+                # Sealed but nothing was written for Drive to pick up: fail closed, never retried.
+                result = state.record_receipt(intent_id, outcome="REJECTED", provider_ref="gdrive:sync-write-failed",
+                                              provider_sha256="", run_id=run_id, now_iso=now_iso)
+                _sweep_notifications(state, cfg, now_iso)
+                return _result("drive-seal", result, EXIT_HOLD, intent_id=intent_id,
+                               support_ref="EG_NATIVE_DRIVE_SYNC_WRITE_FAILED")
+            return _result("drive-seal", "SEALED", EXIT_OK, intent_id=intent_id, sync_written=True,
+                           await_file={"title": invoice["display_filename"], "parentId": folder,
+                                       "fileSize": str(invoice["byte_size"])})
         payload_path = _payload_path(cfg, intent_id)
         _write_atomic(payload_path, base64.b64encode(payload))
         state.assert_lease_held()
@@ -817,14 +896,21 @@ def drive_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
                                           provider_sha256="", run_id=run_id, now_iso=now_iso)
             return _result("drive-record", result, EXIT_HOLD, intent_id=intent_id,
                            support_ref="EG_NATIVE_DRIVE_METADATA_MISMATCH")
-        attestation = _attestation(cfg, intent_id, "drive", file["id"])
-        if attestation is None:
-            # Nothing is written: the intent stays DISPATCHED until a readback is attested.
-            raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
-        verified = attestation.get("matches_archive") is True and attestation.get("sha256") == invoice["sha256"]
+        if cfg.drive.mode == DRIVE_LOCAL_SYNC:
+            verdict = _local_mirror_verdict(cfg, invoice)
+            if verdict is None:
+                raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+            verified, observed_sha = verdict, invoice["sha256"] if verdict else ""
+        else:
+            attestation = _attestation(cfg, intent_id, "drive", file["id"])
+            if attestation is None:
+                # Nothing is written: the intent stays DISPATCHED until a readback is attested.
+                raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+            verified = attestation.get("matches_archive") is True and attestation.get("sha256") == invoice["sha256"]
+            observed_sha = str(attestation.get("sha256", ""))
         result = state.record_receipt(
             intent_id, outcome="VERIFIED" if verified else "REJECTED", provider_ref=provider_ref,
-            provider_sha256=str(attestation.get("sha256", "")), run_id=run_id, now_iso=now_iso,
+            provider_sha256=observed_sha, run_id=run_id, now_iso=now_iso,
         )
         _sweep_notifications(state, cfg, now_iso)
     return _result("drive-record", result, EXIT_OK if result in ("VERIFIED", "REPLAY") else EXIT_HOLD,
@@ -845,9 +931,15 @@ def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run
         file = evidence.get("file")
         if type(file) is not dict or type(file.get("id")) is not str or not _PROVIDER_ID_RE.fullmatch(file["id"]):
             raise NativeRefusal("EG_NATIVE_DRIVE_EVIDENCE_INVALID")
-        attestation = _attestation(cfg, intent_id, "drive", file["id"])
-        if attestation is None:
-            raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+        if cfg.drive.mode == DRIVE_LOCAL_SYNC:
+            verdict = _local_mirror_verdict(cfg, invoice)
+            if verdict is None:
+                raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+            attestation = {"matches_archive": verdict, "sha256": invoice["sha256"] if verdict else ""}
+        else:
+            attestation = _attestation(cfg, intent_id, "drive", file["id"])
+            if attestation is None:
+                raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
         payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
         if payload is None:
             return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id,

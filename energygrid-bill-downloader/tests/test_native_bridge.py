@@ -941,6 +941,141 @@ class NamedArchiveTests(NativeBridgeBase):
         self.assertEqual((0, 0), self.dispatches())
 
 
+class LocalSyncTests(NativeBridgeBase):
+    """Google Drive for desktop: the Core writes into the synced folder; no PDF bytes pass the host."""
+
+    folders = {EB: FLAT, TN: FLAT}
+
+    def make_config(self, **changes) -> bridge.NativeConfig:
+        sync = self.root / "sync"
+        sync.mkdir(exist_ok=True)
+        drive = bridge.NativeDriveSettings(account="uat@example.com", folder_ids=dict(self.folders),
+                                           mode=bridge.DRIVE_LOCAL_SYNC, sync_folders={EB: sync, TN: sync})
+        return super().make_config(drive=drive, **changes)
+
+    def sync(self) -> None:
+        """Drive for desktop: upload any local file Drive does not have yet."""
+        known = {row["title"] for row in self.host.drive.values() if row["parent"] == FLAT}
+        for path in (self.root / "sync").iterdir():
+            if path.name not in known:
+                self.host.put(FLAT, path.name, path.read_bytes())
+
+    def sync_step(self, step: dict, *, synced: bool = True) -> dict:
+        evidence = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"], "matches": self.host.search(FLAT, step["display_filename"])}
+        sealed = self.call(bridge.drive_seal, step["intent_id"], evidence)
+        if sealed["outcome"] == "RECONCILE":
+            return self.call(bridge.drive_adopt, step["intent_id"],
+                             {"file": self.host.metadata(sealed["reconcile_file_id"])})
+        if sealed["outcome"] != "SEALED":
+            return sealed
+        self.assertTrue(sealed["sync_written"])
+        self.assertNotIn("create_file", sealed)
+        if synced:
+            self.sync()
+        found = self.host.search(FLAT, step["display_filename"])
+        if not found:
+            return self.call(bridge.drive_record, step["intent_id"], {"outcome": "NO_RESPONSE"})
+        return self.call(bridge.drive_record, step["intent_id"],
+                         {"outcome": "CREATED", "file": self.host.metadata(found[0]["id"])})
+
+    def drain_sync(self) -> list[dict]:
+        results = []
+        for _ in range(16):
+            step = self.next()
+            if step["outcome"] == "DRIVE_PRECHECK":
+                self.assertNotIn("payload_base64_path", step)
+                results.append(self.sync_step(step))
+            elif step["outcome"] == "NOTIFY_DRAFT":
+                results.append(self.host.notify_step(step))
+            elif step["outcome"] == "HOLD":
+                results.append(step)
+            else:
+                results.append(step)
+                break
+        return results
+
+    def test_both_streams_upload_through_the_synced_folder_and_verify(self) -> None:
+        self.acquire()
+        self.drain_sync()
+        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"},
+                         {row["title"] for row in self.host.drive.values()})
+        for row in self.host.drive.values():
+            stream = EB if "EB" in row["title"] else TN
+            self.assertEqual(pdf(f"{stream} {row['title'][len('SEP 2026 - '):]}"), row["bytes"])
+        self.assertEqual("DRAINED", self.status()["outcome"])
+        self.assertEqual(2, len(self.host.successes()))
+        self.assertEqual([], list(self.cfg.outbox_root.glob("*.pdf.b64")))
+
+    def test_second_run_writes_nothing_new(self) -> None:
+        self.acquire()
+        self.drain_sync()
+        before = sorted(path.name for path in (self.root / "sync").iterdir())
+        self.acquire()
+        self.assertEqual("IDLE", self.next()["outcome"])
+        self.assertEqual(before, sorted(path.name for path in (self.root / "sync").iterdir()))
+        self.assertEqual(2, len(self.host.drive))
+
+    def test_an_unsynced_upload_is_unknown_never_rewritten_and_resolves_late(self) -> None:
+        self.acquire()
+        step = self.next()
+        self.assertEqual("UNKNOWN", self.sync_step(step, synced=False)["outcome"])
+        sync_file = self.root / "sync" / step["display_filename"]
+        self.assertTrue(sync_file.is_file())
+        mtime = sync_file.stat().st_mtime_ns
+        self.drain_sync()
+        self.assertEqual(mtime, sync_file.stat().st_mtime_ns)
+        found = self.host.search(FLAT, step["display_filename"])
+        late = self.call(bridge.drive_record, step["intent_id"],
+                         {"outcome": "CREATED", "file": self.host.metadata(found[0]["id"])})
+        self.assertEqual("VERIFIED", late["outcome"])
+
+    def test_record_before_the_mirror_exists_is_refused_without_state_change(self) -> None:
+        self.acquire()
+        step = self.next()
+        evidence = {"folder_id": FLAT, "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"], "matches": []}
+        self.call(bridge.drive_seal, step["intent_id"], evidence)
+        self.sync()
+        found = self.host.search(FLAT, step["display_filename"])
+        (self.root / "sync" / step["display_filename"]).unlink()
+        with self.assertRaises(NativeRefusal) as refused:
+            self.call(bridge.drive_record, step["intent_id"],
+                      {"outcome": "CREATED", "file": self.host.metadata(found[0]["id"])})
+        self.assertEqual("EG_NATIVE_DRIVE_READBACK_REQUIRED", refused.exception.support_ref)
+        self.assertEqual("DISPATCHED", self.intent_state(step["intent_id"]))
+
+    def test_a_different_local_file_is_never_overwritten(self) -> None:
+        self.acquire()
+        step = self.next()
+        target = self.root / "sync" / step["display_filename"]
+        target.write_bytes(b"another bill")
+        held = self.sync_step(step)
+        self.assertEqual(("HOLD", "EG_NATIVE_DRIVE_NAME_OCCUPIED"), (held["outcome"], held["support_ref"]))
+        self.assertEqual(b"another bill", target.read_bytes())
+
+    def test_an_identical_file_already_in_drive_is_adopted_through_its_mirror(self) -> None:
+        name = "SEP 2026 - EB Invoice 0002.pdf"
+        manual = self.host.put(FLAT, name, pdf("EB_BILL EB Invoice 0002.pdf"))
+        (self.root / "sync" / name).write_bytes(pdf("EB_BILL EB Invoice 0002.pdf"))
+        self.acquire()
+        self.drain_sync()
+        self.assertEqual(2, len(self.host.drive))
+        self.assertEqual(f"gdrive:{manual}", self.status()["streams"][EB]["invoices"][0]["drive_upload"]["receipt"])
+
+    def test_a_same_name_drive_file_with_different_bytes_is_held(self) -> None:
+        name = "SEP 2026 - EB Invoice 0002.pdf"
+        genuine = bytearray(pdf("EB_BILL EB Invoice 0002.pdf"))
+        genuine[len(genuine) // 2] ^= 0x01
+        self.host.put(FLAT, name, bytes(genuine))
+        (self.root / "sync" / name).write_bytes(bytes(genuine))
+        self.acquire()
+        self.drain_sync()
+        self.assertEqual(("BLOCKED", "EG_NATIVE_DRIVE_NAME_OCCUPIED"),
+                         (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
+        self.assertEqual(bytes(genuine), (self.root / "sync" / name).read_bytes())
+
+
 class LeaseTests(NativeBridgeBase):
     def test_a_live_lease_held_by_another_session_refuses_with_no_mutation(self) -> None:
         self.acquire()
@@ -988,7 +1123,7 @@ class ConfigTests(unittest.TestCase):
             "state_path": str(root / "s.sqlite"), "archive_root": str(root / "a"),
             "named_archive_root": str(root / "n"), "temp_root": str(root / "t"),
             "outbox_root": str(root / "o"), "synthetic_root": str(root / "p"),
-            "drive": {"account": "uat@example.com", "folder_ids": {EB: FLAT, TN: FLAT}},
+            "drive": {"account": "uat@example.com", "folder_ids": {EB: FLAT, TN: FLAT}, "mode": "NATIVE_UPLOAD"},
             "gmail": {"account": SENDER, "to": [RECIPIENT], "subject_prefix": "EnergyGrid", "attach_pdf": False},
             "effect_ceiling": {"drive_uploads": 2, "gmail_sends": 2},
         }
@@ -1027,6 +1162,13 @@ class ConfigTests(unittest.TestCase):
                 "ceiling not int": lambda r: r["effect_ceiling"].update(gmail_sends=True),
                 "portal key in synthetic mode": lambda r: r.update(portal_config_path=str(root / "c.json")),
                 "named root missing": lambda r: r.pop("named_archive_root"),
+                "drive mode missing": lambda r: r["drive"].pop("mode"),
+                "unknown drive mode": lambda r: r["drive"].update(mode="SMTP"),
+                "sync folders without sync mode": lambda r: r["drive"].update(
+                    sync_folders={EB: str(root / "s"), TN: str(root / "s")}),
+                "sync mode without folders": lambda r: r["drive"].update(mode="LOCAL_SYNC"),
+                "sync folders not one to one": lambda r: r["drive"].update(
+                    mode="LOCAL_SYNC", sync_folders={EB: str(root / "s1"), TN: str(root / "s2")}),
                 "named root equals archive": lambda r: r.update(named_archive_root=r["archive_root"]),
                 "named root inside archive": lambda r: r.update(named_archive_root=str(Path(r["archive_root"]) / "x")),
                 "archive inside named root": lambda r: r.update(archive_root=str(Path(r["named_archive_root"]) / "x")),

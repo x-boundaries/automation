@@ -99,11 +99,25 @@ delivery; discard it.
 - Drive: `drive.folder_ids` may name the same existing folder for both streams (the owner's flat folder).
   No folder is created. Collisions are guarded by the precheck: a same-name file is adopted only when its
   bytes are identical; otherwise the invoice HOLDs and nothing is overwritten, renamed or duplicated.
+- Drive modes (`drive.mode`):
+  - `LOCAL_SYNC` (for real bills): Google Drive for desktop syncs `drive.sync_folders[stream]` with the
+    destination folder. For a folder shared with the account, add it to My Drive as a shortcut; Drive for
+    desktop then mirrors it under `G:\.shortcut-targets-by-id\<folder id>\<folder name>`. `drive-seal`
+    seals, then the Core creates the file there once (exclusive create, never overwrite) and returns
+    `sync_written` with the expected title, parent and size; the host polls `search_files` until the
+    file appears and calls `drive-record` with its metadata. The Core verifies the metadata and hashes the
+    local mirror. No PDF bytes pass through the host; no `drive-readback` is needed. A same-name Drive
+    file is adopted (`RECONCILE`, `drive-adopt`) only if its local mirror is byte-identical.
+  - `NATIVE_UPLOAD`: the host sends the base64 through `create_file` and reads it back. Practical only
+    for very small files: a real bill (about 47 KB, 62,000 base64 characters) is too large to carry
+    reliably in one model tool call.
 
 ## 6. Trust model
 
-- The PDF base64 is carried by the model (Drive `create_file` accepts inline base64 only). A copy error
-  that keeps the length is invisible to a size check; the Core readback hash catches it.
+- `NATIVE_UPLOAD`: the PDF base64 is carried by the model (Drive `create_file` accepts inline base64
+  only). A copy error that keeps the length is invisible to a size check; the Core readback hash catches
+  it. `LOCAL_SYNC`: the bytes are written by the Core and uploaded by Google's own sync client; the Core
+  hashes the synced local mirror, so verification relies on Drive for desktop serving the Drive copy.
 - Evidence is host-attested: the Core verifies that what the host reports is consistent and exact, but it
   cannot independently query Google. `drive-readback` hashes whatever base64 the host supplies; it proves
   the bytes only if the host really saved the `download_file_content` result. Draft evidence is parsed by
@@ -135,7 +149,7 @@ portal access, real bills, production state, Scheduler, merge and release each n
 
 ## 9. Evidence
 
-`tests/test_native_bridge.py` (58 tests): complete dual-stream journey with one success notification per
+`tests/test_native_bridge.py` (67 tests): complete dual-stream journey with one success notification per
 bill and the Drive link; latest-only and no backfill; second run zero effects; newer invoice later; Drive
 success independent of email (denied, uncertain and capped email); failure notifications once per
 incident with non-sensitive content; flat folder shared by both streams; adoption of an identical
@@ -144,4 +158,4 @@ cross-stream name collision; Drive crash, lost answer, corruption, metadata, den
 precheck and tampering; junctions; notification draft refusals (recipient, cc, subject, sender, body,
 attachment), Core-parsed evidence required, bound draft, undecodable RAW; optional attachment byte check;
 Drive and email ceilings; lease; v3 predecessor adoption; named archive; config and CLI refusals; no
-network imports in the bridge modules.
+network imports in the bridge modules; LOCAL_SYNC (Drive for desktop): upload through the synced folder, second run writes nothing, unsynced upload UNKNOWN then late receipt, record before the mirror exists refused, local name conflict never overwritten, identical Drive file adopted through its mirror, different bytes held.

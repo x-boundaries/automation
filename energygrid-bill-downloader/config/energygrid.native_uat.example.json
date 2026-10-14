@@ -12,6 +12,11 @@
     "folder_ids": {
       "EB_BILL": "REPLACE_WITH_FLAT_DRIVE_FOLDER_ID",
       "TENANT_BILL": "REPLACE_WITH_FLAT_DRIVE_FOLDER_ID"
+    },
+    "mode": "LOCAL_SYNC",
+    "sync_folders": {
+      "EB_BILL": "G:\\My Drive\\REPLACE_WITH_SYNCED_FOLDER",
+      "TENANT_BILL": "G:\\My Drive\\REPLACE_WITH_SYNCED_FOLDER"
     }
   },
   "gmail": {
