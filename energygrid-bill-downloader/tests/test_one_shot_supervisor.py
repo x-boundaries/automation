@@ -37,7 +37,12 @@ BASE_TREE = "a73bff398bc6e2b74a6dc63e767932709ed6b061"
 CONSTRUCTION_HEAD = "70d6eef6da55f9e8faead3c1ab8f647336e194ca"
 CONSTRUCTION_TREE = "28034420e436345586dc94f1624ac4483e97dbbb"
 TARGET_BRANCH = "codex/energygrid-226-dual-stream-latest-email"
-HELPERS = (HARNESS, FUNCTIONS, SUPPORT, PYTHON_FIXTURE, LAUNCHER, LAUNCHER_LIB)
+# Exact owner-approved EnergyGrid candidate branches (#226). Membership is an exact,
+# case-sensitive string match; no prefix, pattern or fork head is admitted. The offline
+# v4 Core PR branch (#242) is admitted alongside the historical #226 branch.
+OFFLINE_V4_BRANCH = "energygrid/226-offline-v4-core-ea9c19b"
+APPROVED_CANDIDATE_BRANCHES = frozenset({TARGET_BRANCH, OFFLINE_V4_BRANCH})
+HELPERS =(HARNESS, FUNCTIONS, SUPPORT, PYTHON_FIXTURE, LAUNCHER, LAUNCHER_LIB)
 HELPER_RELATIVES = tuple(item.relative_to(REPO_ROOT).as_posix() for item in HELPERS)
 # The accepted AV successor (#212/#226). It alone carries the historical exact
 # seven-path envelope against BASE_HEAD; a later product successor (#226 G3) is
@@ -891,14 +896,17 @@ def _execution_context(environment=None, *, actual_head: str | None = None) -> d
                 not isinstance(base, dict) or not isinstance(head_repo, dict) or \
                 not isinstance(base_repo, dict) or head_repo.get("full_name") != GITHUB_REPOSITORY or \
                 base_repo.get("full_name") != GITHUB_REPOSITORY or \
-                head.get("ref") != TARGET_BRANCH or base.get("ref") != "main" or \
+                head.get("ref") not in APPROVED_CANDIDATE_BRANCHES or \
+                base.get("ref") != "main" or \
                 not _full_sha(expected_head) or ref != f"refs/pull/{number}/merge":
             raise RuntimeError("pull request event binding is incomplete or inconsistent")
         expected_head = expected_head.lower()
     elif event_name == "workflow_dispatch":
         event_ref = event.get("ref")
-        if ref != f"refs/heads/{TARGET_BRANCH}" or event_ref not in {
-                TARGET_BRANCH, f"refs/heads/{TARGET_BRANCH}"}:
+        branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else None
+        # GITHUB_REF and the payload ref must name the same approved branch.
+        if branch not in APPROVED_CANDIDATE_BRANCHES or event_ref not in {
+                branch, f"refs/heads/{branch}"}:
             raise RuntimeError("workflow dispatch ref does not identify the candidate branch")
         expected_head = env["GITHUB_SHA"].lower()
     else:
@@ -1051,7 +1059,7 @@ def _assert_candidate_scope(context: dict[str, object] | None = None) -> dict[st
     branch = _git("branch", "--show-current")
     mode = context.get("mode")
     if mode == LOCAL_ENDPOINT_MODE:
-        if branch != TARGET_BRANCH:
+        if branch not in APPROVED_CANDIDATE_BRANCHES:
             raise RuntimeError(f"unexpected local candidate branch: {branch}")
     elif mode == HOSTED_EXACT_HEAD_MODE:
         expected_head = context.get("expected_head")
@@ -1684,6 +1692,9 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
         event_name: str,
         expected_head: str,
         github_sha: str | None = None,
+        branch: str = TARGET_BRANCH,
+        mutate_event=None,
+        github_ref: str | None = None,
     ) -> dict[str, str]:
         event_path = runner_temp / "event.json"
         if event_name == "pull_request":
@@ -1694,7 +1705,7 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
                     "number": 229,
                     "head": {
                         "sha": expected_head,
-                        "ref": TARGET_BRANCH,
+                        "ref": branch,
                         "repo": {"full_name": GITHUB_REPOSITORY},
                     },
                     "base": {
@@ -1706,10 +1717,14 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
             ref = "refs/pull/229/merge"
         else:
             event = {
-                "ref": TARGET_BRANCH,
+                "ref": branch,
                 "repository": {"full_name": GITHUB_REPOSITORY},
             }
-            ref = f"refs/heads/{TARGET_BRANCH}"
+            ref = f"refs/heads/{branch}"
+        if mutate_event is not None:
+            mutate_event(event)
+        if github_ref is not None:
+            ref = github_ref
         event_path.write_text(json.dumps(event), encoding="utf-8")
         return {
             "GITHUB_ACTIONS": "true",
@@ -2073,6 +2088,155 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
             with mock.patch(__name__ + "._git", side_effect=wrong):
                 with self.assertRaisesRegex(RuntimeError, "unexpected local candidate branch"):
                     _assert_candidate_scope(self._local_context(directory))
+
+    # Approved-branch binding (#226 V3 Milestone A). The PR #242 branch is admitted by
+    # exact name; every other repository, base, merge-ref, SHA and event check remains.
+
+    def test_h21_approved_branch_set_is_exact(self):
+        self.assertEqual(
+            frozenset({"codex/energygrid-226-dual-stream-latest-email",
+                       "energygrid/226-offline-v4-core-ea9c19b"}),
+            APPROVED_CANDIDATE_BRANCHES,
+        )
+
+    def test_h22_offline_v4_branch_pull_request_and_dispatch_are_accepted(self):
+        head = _git("rev-parse", "HEAD")
+        for event_name in ("pull_request", "workflow_dispatch"):
+            with self.subTest(event=event_name), \
+                    tempfile.TemporaryDirectory(prefix="eg_h22_hosted_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name=event_name, expected_head=head,
+                    github_sha=head, branch=OFFLINE_V4_BRANCH,
+                )
+                context = _execution_context(environment, actual_head=head)
+                self.assertEqual(HOSTED_EXACT_HEAD_MODE, context["mode"])
+                self.assertEqual(head.lower(), context["expected_head"])
+        with tempfile.TemporaryDirectory(prefix="eg_h22_local_") as directory:
+            local = self._as_commit(head, branch=OFFLINE_V4_BRANCH)
+            with mock.patch(__name__ + "._git", side_effect=local):
+                candidate = _assert_candidate_scope(self._local_context(directory))
+            self.assertEqual(OFFLINE_V4_BRANCH, candidate["branch"])
+
+    def test_h23_unapproved_or_lookalike_pull_request_branch_fails(self):
+        head = _git("rev-parse", "HEAD")
+        for branch in (
+            "codex/other-branch", "main", "", "ENERGYGRID/226-offline-v4-core-ea9c19b",
+            OFFLINE_V4_BRANCH + "-evil", "x/" + OFFLINE_V4_BRANCH,
+            "refs/heads/" + OFFLINE_V4_BRANCH, OFFLINE_V4_BRANCH + " ",
+            "claude/155-directlocal-synthetic-core-g3-001",
+        ):
+            with self.subTest(branch=branch), \
+                    tempfile.TemporaryDirectory(prefix="eg_h23_hosted_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name="pull_request", expected_head=head,
+                    branch=branch,
+                )
+                with self.assertRaisesRegex(RuntimeError, "binding is incomplete or inconsistent"):
+                    _execution_context(environment, actual_head=head)
+
+    def test_h24_approved_branch_does_not_relax_pull_request_identity(self):
+        head = _git("rev-parse", "HEAD")
+
+        def fork_head(event):
+            event["pull_request"]["head"]["repo"]["full_name"] = "attacker/automation"
+
+        def other_base_repo(event):
+            event["pull_request"]["base"]["repo"]["full_name"] = "attacker/automation"
+
+        def non_main_base(event):
+            event["pull_request"]["base"]["ref"] = OFFLINE_V4_BRANCH
+
+        def short_sha(event):
+            event["pull_request"]["head"]["sha"] = head[:12]
+
+        def missing_number(event):
+            del event["number"]
+            del event["pull_request"]["number"]
+
+        cases = (
+            ("fork head", fork_head, None, "binding is incomplete"),
+            ("other base repo", other_base_repo, None, "binding is incomplete"),
+            ("non-main base", non_main_base, None, "binding is incomplete"),
+            ("short sha", short_sha, None, "binding is incomplete"),
+            ("missing number", missing_number, None, "binding is incomplete"),
+            ("wrong merge ref", None, "refs/pull/230/merge", "binding is incomplete"),
+            ("head ref as GITHUB_REF", None, f"refs/heads/{OFFLINE_V4_BRANCH}",
+             "binding is incomplete"),
+        )
+        for name, mutate, github_ref, message in cases:
+            with self.subTest(case=name), \
+                    tempfile.TemporaryDirectory(prefix="eg_h24_hosted_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name="pull_request", expected_head=head,
+                    branch=OFFLINE_V4_BRANCH, mutate_event=mutate, github_ref=github_ref,
+                )
+                with self.assertRaisesRegex(RuntimeError, message):
+                    _execution_context(environment, actual_head=head)
+        with tempfile.TemporaryDirectory(prefix="eg_h24_sha_") as directory:
+            environment = self._hosted_environment(
+                Path(directory), event_name="pull_request", expected_head="f" * 40,
+                branch=OFFLINE_V4_BRANCH,
+            )
+            with self.assertRaisesRegex(RuntimeError, "actual HEAD does not match"):
+                _execution_context(environment, actual_head=head)
+        with tempfile.TemporaryDirectory(prefix="eg_h24_repo_") as directory:
+            environment = self._hosted_environment(
+                Path(directory), event_name="pull_request", expected_head=head,
+                branch=OFFLINE_V4_BRANCH,
+            )
+            environment["GITHUB_REPOSITORY"] = "attacker/automation"
+            with self.assertRaisesRegex(RuntimeError, "does not match the EnergyGrid hosted job"):
+                _execution_context(environment, actual_head=head)
+
+    def test_h25_workflow_dispatch_refs_must_name_the_same_approved_branch(self):
+        head = _git("rev-parse", "HEAD")
+
+        def payload_ref(value):
+            def mutate(event):
+                event["ref"] = value
+            return mutate
+
+        cases = (
+            ("unapproved branch", "codex/other-branch", None, None),
+            ("payload names other approved branch", OFFLINE_V4_BRANCH,
+             payload_ref(TARGET_BRANCH), None),
+            ("GITHUB_REF names other approved branch", OFFLINE_V4_BRANCH, None,
+             f"refs/heads/{TARGET_BRANCH}"),
+            ("tag ref", OFFLINE_V4_BRANCH, None, f"refs/tags/{OFFLINE_V4_BRANCH}"),
+            ("bare GITHUB_REF", OFFLINE_V4_BRANCH, None, OFFLINE_V4_BRANCH),
+            ("missing payload ref", OFFLINE_V4_BRANCH, payload_ref(None), None),
+        )
+        for name, branch, mutate, github_ref in cases:
+            with self.subTest(case=name), \
+                    tempfile.TemporaryDirectory(prefix="eg_h25_dispatch_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name="workflow_dispatch", expected_head=head,
+                    github_sha=head, branch=branch, mutate_event=mutate,
+                    github_ref=github_ref,
+                )
+                with self.assertRaisesRegex(RuntimeError, "workflow dispatch ref"):
+                    _execution_context(environment, actual_head=head)
+        with tempfile.TemporaryDirectory(prefix="eg_h25_full_ref_") as directory:
+            environment = self._hosted_environment(
+                Path(directory), event_name="workflow_dispatch", expected_head=head,
+                github_sha=head, branch=OFFLINE_V4_BRANCH,
+                mutate_event=payload_ref(f"refs/heads/{OFFLINE_V4_BRANCH}"),
+            )
+            self.assertEqual(head.lower(),
+                             _execution_context(environment, actual_head=head)["expected_head"])
+
+    def test_h26_unsupported_events_still_fail(self):
+        head = _git("rev-parse", "HEAD")
+        for event_name in ("push", "pull_request_target", "schedule"):
+            with self.subTest(event=event_name), \
+                    tempfile.TemporaryDirectory(prefix="eg_h26_hosted_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name="workflow_dispatch", expected_head=head,
+                    github_sha=head, branch=OFFLINE_V4_BRANCH,
+                )
+                environment["GITHUB_EVENT_NAME"] = event_name
+                with self.assertRaisesRegex(RuntimeError, "unsupported GitHub Actions event"):
+                    _execution_context(environment, actual_head=head)
 
 
 class CandidateLineageTopologyTests(unittest.TestCase):
