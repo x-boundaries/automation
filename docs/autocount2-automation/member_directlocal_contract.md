@@ -210,7 +210,9 @@ the printed SHA-256 is the custody link to the create script.
 1. Host `DESKTOP-4I042L6`; an owned workspace whose marker names this
    RUN/LOCK/book; the workspace root has no inherited ACEs and the workspace,
    `state` and `evidence` directories grant access only to the current user,
-   SYSTEM and Administrators; no `XB_AC2_SESSION_FACTORY`; exclusive lock;
+   SYSTEM and Administrators (any other SID, including OWNER RIGHTS, refuses;
+   ACLs are read through .NET, not `Get-Acl`, so a `pwsh` parent's
+   PSModulePath cannot disable the check); no `XB_AC2_SESSION_FACTORY`; exclusive lock;
    one-shot (`e7.intent.json`, `e7.fence.json`, `e7.claim` or
    `e7.outcome.json` present refuses).
 2. Evidence re-validated field by field: file inside the private `evidence`

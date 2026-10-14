@@ -144,12 +144,36 @@ def full_evidence(host_name: str, pins: dict[str, str], /, **overrides) -> dict:
 
 
 def make_private(path: Path) -> None:
-    """Protect a test directory like the real workspace (no inheritance, owner/SYSTEM/Admins)."""
+    """Protect a test directory like the real workspace (no inheritance, owner/SYSTEM/Admins).
 
-    sid = subprocess.run(["powershell", "-NoProfile", "-Command", "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value"],
-                         capture_output=True, text=True, check=True).stdout.strip()
-    subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
-                   capture_output=True, check=True)
+    The whole DACL is replaced: CPython >= 3.12.4 creates mkdtemp directories
+    with an explicit OWNER RIGHTS (S-1-3-4) entry that icacls /grant:r keeps.
+    """
+
+    script = ("$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
+              " $s = New-Object System.Security.AccessControl.DirectorySecurity;"
+              " $s.SetSecurityDescriptorSddlForm(\"D:P(A;OICI;FA;;;$sid)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\", 'Access');"
+              " [System.IO.Directory]::SetAccessControl($env:XB_E7_PRIVATE_DIR, $s)")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, check=True,
+                   env={**os.environ, "XB_E7_PRIVATE_DIR": str(path)})
+
+
+def write_pwsh_shadow_module(root: Path) -> str:
+    """Emulate a pwsh parent's PSModulePath: a Core-only Microsoft.PowerShell.Security
+    whose type data collides with Windows PowerShell's, so Get-Acl cannot load."""
+
+    module = root / "Microsoft.PowerShell.Security"
+    module.mkdir(parents=True)
+    (module / "Microsoft.PowerShell.Security.psd1").write_text(
+        '@{ GUID="A94C8C7E-9810-47C0-B8AF-65089C13A35A"; ModuleVersion="7.0.0.0"; CompatiblePSEditions=@("Core");'
+        ' PowerShellVersion="3.0"; NestedModules="Microsoft.PowerShell.Security.dll"; TypesToProcess="Security.types.ps1xml";'
+        ' CmdletsToExport="Get-Acl","Set-Acl","ConvertTo-SecureString","ConvertFrom-SecureString"; FunctionsToExport=@(); AliasesToExport=@() }',
+        encoding="ascii")
+    (module / "Security.types.ps1xml").write_text(
+        '<?xml version="1.0" encoding="utf-8" ?><Types><Type><Name>System.Security.AccessControl.ObjectSecurity</Name><Members>'
+        '<CodeProperty><Name>Path</Name><GetCodeReference><TypeName>Microsoft.PowerShell.Commands.SecurityDescriptorCommandsBase</TypeName>'
+        '<MethodName>GetPath</MethodName></GetCodeReference></CodeProperty></Members></Type></Types>', encoding="utf-8")
+    return os.pathsep.join([str(root), os.environ.get("PSModulePath", "")])
 
 
 @unittest.skipUnless(powershell() and os.name == "nt", "Windows PowerShell required")
@@ -197,12 +221,12 @@ class E7TestBookCreateTests(unittest.TestCase):
     def fake(self) -> dict:
         return json.loads(self.fake_file.read_text(encoding="utf-8-sig"))
 
-    def run_e7(self, write=False, delay_ms=0, fence_ttl=120, evidence: Path | None = None, sha: str | None = None):
+    def run_e7(self, write=False, delay_ms=0, fence_ttl=120, evidence: Path | None = None, sha: str | None = None, env: dict | None = None):
         args = [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.harness),
                 "-E7", str(E7), "-StateDir", str(self.state), "-Evidence", str(evidence or self.evidence), "-EvidenceSha", sha or self.evidence_sha,
                 "-FakeFile", str(self.fake_file), "-AcRoot", str(self.acroot), "-PinsJson", json.dumps(self.pins),
                 "-DelayMs", str(delay_ms), "-FenceTtl", str(fence_ttl)] + (["-Write"] if write else [])
-        proc = subprocess.run(args, capture_output=True, timeout=180, check=False)
+        proc = subprocess.run(args, capture_output=True, timeout=180, check=False, env=env)
         lines = proc.stdout.decode("utf-8", "replace").strip().splitlines()
         return proc.returncode, json.loads(lines[-1]), proc
 
@@ -367,6 +391,24 @@ class E7TestBookCreateTests(unittest.TestCase):
         subprocess.run(["icacls", str(self.root), "/inheritance:e"], capture_output=True, check=True)
         self.assertEqual(self.run_e7(write=True)[1]["code"], "workspace_acl_inherited")
         self.assert_untouched(sessions=0)
+
+    def test_owner_rights_entry_is_not_private(self):
+        # The DACL shape CPython >= 3.12.4 gives mkdtemp directories stays refused.
+        subprocess.run(["icacls", str(self.root), "/grant", "*S-1-3-4:(OI)(CI)F"], capture_output=True, check=True)
+        self.assertEqual(self.run_e7(write=True)[1]["code"], "workspace_acl_unsafe")
+        self.assert_untouched(sessions=0)
+
+    def test_acl_guard_survives_pwsh_shadowed_security_module(self):
+        # Hosted CI launches Windows PowerShell from a pwsh step; Get-Acl then cannot load.
+        env = {**os.environ, "PSModulePath": write_pwsh_shadow_module(self.root / "pwsh-modules")}
+        probe = subprocess.run([powershell(), "-NoProfile", "-NonInteractive", "-Command", "Get-Acl -LiteralPath $env:SystemRoot | Out-Null"],
+                               capture_output=True, env=env, check=False)
+        self.assertNotEqual(probe.returncode, 0, "shadow module must reproduce the hosted Get-Acl failure")
+        code, out, _ = self.run_e7(env=env)
+        self.assertEqual((code, out["status"], out["private_paths"]), (0, "DRY_RUN_PASSED", "verified"))
+        subprocess.run(["icacls", str(self.state), "/grant", "*S-1-5-32-545:(R)"], capture_output=True, check=True)
+        self.assertEqual(self.run_e7(write=True, env=env)[1]["code"], "state_acl_unsafe")
+        self.assert_untouched()
 
     def test_outbound_channels_must_be_quiet(self):
         for code_name, fake in {"user_script_present": {"user_scripts": 1}, "outbound_queue_not_empty": {"mail_queue": 2},

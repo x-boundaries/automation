@@ -112,8 +112,10 @@ function Assert-E7Private {
     # access (inherited or explicit). The workspace root must not inherit
     # (C:\ grants Authenticated Users Modify to new subfolders); its children
     # may inherit from it because every effective entry is checked here.
+    # Read through .NET, not Get-Acl: a pwsh parent's PSModulePath can shadow
+    # Microsoft.PowerShell.Security so Get-Acl cannot load in Windows PowerShell.
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Code, [switch]$AllowInherited)
-    $acl = Get-Acl -LiteralPath $Path
+    $acl = if ([System.IO.Directory]::Exists($Path)) { [System.IO.Directory]::GetAccessControl($Path) } else { [System.IO.File]::GetAccessControl($Path) }
     if (-not $AllowInherited -and -not $acl.AreAccessRulesProtected) { throw "${Code}_acl_inherited" }
     if ($script:E7AllowedSids -notcontains $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { throw "${Code}_owner_unsafe" }
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
