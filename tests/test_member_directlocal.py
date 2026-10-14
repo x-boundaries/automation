@@ -645,6 +645,22 @@ class WriteTests(DirectLocalTestCase):
                     self.assertEqual((bridge.write_calls, self.ac.saves), (0, 0))
                 self.assertLessEqual(self.ac.next_calls, dl.MAX_MEMBER_NO_CANDIDATES)
 
+    def test_values_wider_than_autocount_columns_go_to_review_before_any_lookup(self):
+        cases = [("name", {"first": "Synthetic", "last": "M" * 100}), ("email", {"email": "a" * 190 + "@example.test"})]
+        for name, kwargs in cases:
+            with self.subTest(field=name):
+                self.tearDown()
+                self.setUp()
+                self.admit_and_approve(**kwargs)
+                bridge = FakeBridge(self.ac)
+                result = self.write(bridge, **kwargs)
+                self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "autocount_field_width_exceeded"))
+                self.assertEqual((bridge.precheck_calls, bridge.write_calls, self.ac.next_calls, self.ac.saves), ([], 0, 0, 0))
+        self.tearDown()
+        self.setUp()
+        self.admit_and_approve(first="Synthetic", last="M" * 90)  # 100 characters exactly is accepted
+        self.assertEqual(self.write(FakeBridge(self.ac), first="Synthetic", last="M" * 90)["fence_state"], "CREATED_VERIFIED")
+
     def test_member_no_held_by_another_customer_counts_as_occupied(self):
         self.ledger.conn.execute("UPDATE customers SET member_no = 'M000201' WHERE customer_gid = ?", (NEW,))
         self.ledger.conn.execute("INSERT INTO customers(store_gid, customer_gid, state, updated_at) VALUES (?, ?, 'DISCOVERED', 'x')", (STORE, NEW_TWO))
@@ -959,6 +975,66 @@ class RunAbandonTests(DirectLocalTestCase):
             self.processor.abandon_run(second["run_id"], confirm_suffix=second["run_id"][-8:])
         self.assertEqual(raised.exception.code, "run_not_abandonable")
         self.assertEqual(self.ledger.conn.execute("PRAGMA user_version").fetchone()[0], dl.SCHEMA_VERSION)
+
+
+class IdentityShapeTests(unittest.TestCase):
+    """Qualified connector shape, replicated with a synthetic store only."""
+
+    SYN_GID = "gid://shopify/Shop/900000001"
+    SYN_DOMAIN = "synthetic-xb-directlocal-0000.myshopify.com"
+
+    def identity(self, response, **overrides) -> bytes:
+        value = record("toolu_identity_1", {"query": dl.IDENTITY_QUERY}, {}, T0)
+        value["tool_response"] = response
+        value.update(overrides)
+        return json.dumps(value).encode("utf-8")
+
+    def text(self, value) -> str:
+        return json.dumps(value, separators=(",", ":"))
+
+    def test_qualified_shape_yields_store_identity_only(self):
+        result = dl.inspect_identity_capture(self.identity(self.text({"data": {"shop": {"id": self.SYN_GID, "myshopifyDomain": self.SYN_DOMAIN}}})))
+        self.assertEqual((result["response_shape"], result["store_gid"], result["shop_domain"]), (dl.CONNECTOR_RESPONSE_SHAPE, self.SYN_GID, self.SYN_DOMAIN))
+
+    def test_rejections(self):
+        shop = {"id": self.SYN_GID, "myshopifyDomain": self.SYN_DOMAIN}
+        cases = {
+            "connector_response_shape_invalid": [
+                {"data": {"shop": shop}},  # object, not the qualified JSON text
+                "not json",
+                self.text({"data": {"shop": shop}, "errors": [{"message": "x"}]}),
+                self.text({"data": {"shop": shop}, "extensions": {"cost": {}}}),
+                self.text([{"type": "text", "text": "{}"}]),
+            ],
+            "identity_shape_invalid": [
+                self.text({"data": {"shop": shop, "customers": {"nodes": []}}}),
+                self.text({"data": {"shop": {**shop, "email": "owner@example.test"}}}),
+            ],
+            "identity_values_invalid": [
+                self.text({"data": {"shop": {"id": "gid://shopify/Customer/1", "myshopifyDomain": self.SYN_DOMAIN}}}),
+                self.text({"data": {"shop": {"id": self.SYN_GID, "myshopifyDomain": "evil.example.test"}}}),
+            ],
+        }
+        for code, responses in cases.items():
+            for response in responses:
+                with self.subTest(code=code, response=str(response)[:60]), self.assertRaises(dl.CaptureRejected) as raised:
+                    dl.inspect_identity_capture(self.identity(response))
+                self.assertEqual(raised.exception.code, code)
+        good = self.text({"data": {"shop": shop}})
+        for code, overrides in (
+            ("capture_not_identity", {"tool_input": page_input(None)}),
+            ("identity_variables_invalid", {"tool_input": {"query": dl.IDENTITY_QUERY, "first": 1}}),
+            ("capture_record_shape_invalid", {"tool_name": "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-shop-info"}),
+        ):
+            with self.subTest(code=code), self.assertRaises(dl.CaptureRejected) as raised:
+                dl.inspect_identity_capture(self.identity(good, **overrides))
+            self.assertEqual(raised.exception.code, code)
+
+    def test_ledger_ingestion_still_rejects_the_connector_shape(self):
+        raw = self.identity(self.text({"data": {"shop": {"id": STORE, "myshopifyDomain": DOMAIN}}}))
+        with self.assertRaises(dl.CaptureRejected) as raised:
+            dl.parse_capture(raw, mode="synthetic", store_gid=STORE, shop_domain=DOMAIN)
+        self.assertEqual(raised.exception.code, "capture_response_shape_invalid")
 
 
 class ClassifyTests(unittest.TestCase):

@@ -55,6 +55,14 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
   can only be initialised in `synthetic` mode with a `*.synthetic.invalid`
   domain; any other mode or shape fails with `capture_response_shape_unqualified`.
   Gate E1 must qualify the real hook-delivered shape before this changes.
+- Qualified 2026-10-14 (one attended read of the pinned `IDENTITY_QUERY`,
+  `shop { id myshopifyDomain }` only, through the live PreToolUse guard and
+  PostToolUse capture hook): the hook-delivered `tool_response` is a JSON
+  **text** that decodes to exactly `{"data": {...}}`
+  (`connector_graphql_json_text_v1`). `inspect-identity --capture <file>`
+  verifies such a capture and returns only the store identity. Errors,
+  extensions or any other wrapper are rejected. Ledger ingestion of real
+  connector data remains disabled (the ledger accepts only the synthetic shape).
 - The hook is not tamper-proof against an agent running as the same Windows
   user; this residual risk is acceptable only for attended operation.
 
@@ -89,6 +97,10 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
   `xxxxxxxx`), one unchanged adapter lookup per key plus exact email. Any hit,
   failed lookup or ambiguous result is `MANUAL_REVIEW`. The stored MobilePhone
   stays the unchanged `canonical_phone` value.
+- AutoCount column widths (test-book catalog, 2026-10-14): Name
+  `nvarchar(100)`, MobilePhone `nvarchar(25)`, EmailAddress `nvarchar(200)`,
+  MemberNo `nvarchar(20)`. Wider values go to `MANUAL_REVIEW`
+  (`autocount_field_width_exceeded`) before any lookup or write.
 - MemberNo: at most 3 `GetNextMemberNo` attempts per customer, ever; each
   attempt is committed before the call. Occupied or ledger-held candidates
   advance; a repeated, invalid or unprobeable candidate goes to review. The bound
@@ -150,12 +162,12 @@ python directlocal/xb_directlocal.py --state-root <root> abandon-run --run-id <r
 
 | Gate | Effect |
 |---|---|
-| E0 | Choose and permission-qualify `state_root`; create it |
-| E1 | Materialise the dedicated session settings/hooks; one no-PII identity read; qualify the hook-delivered response shape and pin the real store identity |
-| E2 | Prove deny/guard enforcement in the desktop Code tab without calling any write tool (denied read-only tool; unpinned harmless query) |
+| E0 | Production `state_root` with hardened permissions. (UAT used an owned workspace under `C:\XB`, which inherits Authenticated Users: Modify.) |
+| E1 | Done for identity: shape qualified and store identity observed. Still open: materialise the dedicated session folder from the template |
+| E2 | Prove deny enforcement live without calling any write tool. (Allow-path of the guard and capture hook observed live; deny-path proven offline only) |
 | E3 | Attended baseline capture of customer GIDs, `createdAt`, tags; clock check |
 | E4 | Real profile reads (model-mediated PII), retention and consent |
-| E5 | AutoCount login and read-only bridge ops on the test book |
+| E5 | AutoCount login and read-only bridge ops on the test book (catalog-level read-only SQL qualification done; the bridge remains synthetic-only) |
 | E6 | `GetNextMemberNo` side-effect qualification on the test book |
-| E7 | One synthetic `SaveMember` on the test book |
+| E7 | One synthetic `SaveMember` on the test book. Blocked until complete restoration including audit effects is proven, or the Owner accepts the risk: the Member table carries active `MemberChangeLog` / `UpdateMemberChangeCount` triggers, the book uses SIMPLE recovery, and the test book is a live-configured clone |
 | E8 / E9 | Scheduling; production book |

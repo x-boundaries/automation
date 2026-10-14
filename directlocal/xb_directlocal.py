@@ -90,8 +90,19 @@ HOLD_EXIT_CODE = 75
 # Test-only bridge target. A synthetic ledger accepts no other bridge.
 SYNTHETIC_BRIDGE_TARGET = "synthetic_fake_member_command"
 REAL_BRIDGE_TARGET = "real_autocount"
+# AutoCount 2.2 Member column widths (characters), read from the nominated
+# test book's catalog on 2026-10-14: Name nvarchar(100), MobilePhone
+# nvarchar(25), EmailAddress nvarchar(200), MemberNo nvarchar(20). Wider
+# values are never sent to SaveMember (they would fail or truncate).
+AUTOCOUNT_FIELD_WIDTHS = {"name": 100, "mobile_phone": 25, "email_address": 200}
 # Only response shapes qualified offline are accepted; see module docstring.
 QUALIFIED_RESPONSE_SHAPES = {"synthetic": "graphql_data_object_v1"}
+# Qualified 2026-10-14 from one attended identity read through the PostToolUse
+# hook: tool_response is a JSON *text* whose decoded value is exactly
+# {"data": {...}}. Hook-delivered JSON, not Shopify wire bytes. Used only for
+# store-identity inspection; ledger ingestion of real data stays disabled.
+CONNECTOR_RESPONSE_SHAPE = "connector_graphql_json_text_v1"
+SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.myshopify\.com$")
 
 BASELINE_QUERY = """query XbDirectLocalCustomerPage($first: Int!, $after: String) {
   shop { id myshopifyDomain }
@@ -122,7 +133,12 @@ def _sha256(text: str | bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-PINNED_QUERIES = {_sha256(BASELINE_QUERY): "baseline", _sha256(PROFILE_QUERY): "profile"}
+# Store identity only: no customer object is selected.
+IDENTITY_QUERY = """query XbDirectLocalShopIdentity {
+  shop { id myshopifyDomain }
+}"""
+
+PINNED_QUERIES = {_sha256(BASELINE_QUERY): "baseline", _sha256(PROFILE_QUERY): "profile", _sha256(IDENTITY_QUERY): "identity"}
 
 SHOP_GID_RE = re.compile(r"^gid://shopify/Shop/[1-9][0-9]{0,19}$")
 SYNTHETIC_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.synthetic\.invalid$")
@@ -216,6 +232,10 @@ def check_tool_input(tool_input: Any) -> str:
     kind = PINNED_QUERIES.get(_sha256(query)) if isinstance(query, str) else None
     if kind is None:
         raise CaptureRejected("query_not_pinned")
+    if kind == "identity":
+        if not set(tool_input) <= {"query", "variables"} or tool_input.get("variables", {}) != {}:
+            raise CaptureRejected("identity_variables_invalid")
+        return kind
     variables = tool_input.get("variables")
     if not isinstance(variables, Mapping):
         raise CaptureRejected("variables_invalid")
@@ -247,6 +267,50 @@ def _response_data(tool_response: Any, mode: str) -> Mapping[str, Any]:
     return tool_response["data"]
 
 
+def connector_response_data(tool_response: Any) -> Mapping[str, Any]:
+    """Decode the qualified connector shape. Errors, extensions or any other
+    wrapper fail closed (they were not part of the qualified shape)."""
+
+    if not isinstance(tool_response, str) or len(tool_response) > 4_194_304:
+        raise CaptureRejected("connector_response_shape_invalid")
+    try:
+        value = json.loads(tool_response)
+    except json.JSONDecodeError:
+        raise CaptureRejected("connector_response_shape_invalid") from None
+    if not isinstance(value, dict) or set(value) != {"data"} or not isinstance(value["data"], dict):
+        raise CaptureRejected("connector_response_shape_invalid")
+    return value["data"]
+
+
+def inspect_identity_capture(raw: bytes) -> dict[str, str]:
+    """Validate one hook-captured store-identity read and return only the
+    store identity (no customer object can be present)."""
+
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise CaptureRejected("capture_json_invalid") from None
+    expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
+    if not isinstance(record, dict) or set(record) != expected or record["schema_version"] != CAPTURE_SCHEMA or record["provenance"] != CAPTURE_PROVENANCE:
+        raise CaptureRejected("capture_record_shape_invalid")
+    if record["tool_name"] != CONNECTOR_TOOL or not isinstance(record["tool_use_id"], str) or not TOOL_USE_ID_RE.fullmatch(record["tool_use_id"]):
+        raise CaptureRejected("capture_record_shape_invalid")
+    if parse_created_at(record["captured_at"]) is None:
+        raise CaptureRejected("capture_timestamp_invalid")
+    if check_tool_input(record["tool_input"]) != "identity":
+        raise CaptureRejected("capture_not_identity")
+    data = connector_response_data(record["tool_response"])
+    shop = data.get("shop")
+    if set(data) != {"shop"} or not isinstance(shop, dict) or set(shop) != {"id", "myshopifyDomain"}:
+        raise CaptureRejected("identity_shape_invalid")
+    if not isinstance(shop["id"], str) or not SHOP_GID_RE.fullmatch(shop["id"]) or not isinstance(shop["myshopifyDomain"], str) or not SHOP_DOMAIN_RE.fullmatch(shop["myshopifyDomain"]):
+        raise CaptureRejected("identity_values_invalid")
+    return {
+        "response_shape": CONNECTOR_RESPONSE_SHAPE, "provenance": CAPTURE_PROVENANCE, "capture_sha256": _sha256(raw),
+        "tool_use_id": record["tool_use_id"], "store_gid": shop["id"], "shop_domain": shop["myshopifyDomain"],
+    }
+
+
 def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) -> Capture:
     """Strictly validate one hook capture record. Anything unexpected rejects."""
 
@@ -271,8 +335,11 @@ def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) ->
     data = _response_data(record["tool_response"], mode)
     if data.get("shop") != {"id": store_gid, "myshopifyDomain": shop_domain}:
         raise CaptureRejected("capture_store_identity_mismatch")
-    variables = record["tool_input"]["variables"]
-    if kind == "baseline":
+    variables = record["tool_input"].get("variables", {})
+    if kind == "identity":
+        if set(data) != {"shop"}:
+            raise CaptureRejected("identity_shape_invalid")
+    elif kind == "baseline":
         page = data.get("customers")
         if set(data) != {"shop", "customers"} or not isinstance(page, Mapping) or set(page) != {"pageInfo", "nodes"}:
             raise CaptureRejected("baseline_page_shape_invalid")
@@ -1171,6 +1238,10 @@ class Processor:
 
     def _write(self, gid: str, payload: Mapping[str, Any], bridge: BridgeClient) -> dict[str, Any]:
         self._require_synthetic_bridge(bridge)
+        for field, width in AUTOCOUNT_FIELD_WIDTHS.items():
+            value = payload.get(field)
+            if value is not None and len(value) > width:
+                return self._review(gid, "autocount_field_width_exceeded")
         with self.ledger.tx() as conn:
             if self._live_approval(conn, gid) is None:
                 return {"write": "not_started", "code": "write_approval_missing"}
@@ -1288,6 +1359,8 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--mode", required=True)
     init.add_argument("--store-gid", required=True)
     init.add_argument("--shop-domain", required=True)
+    inspect = commands.add_parser("inspect-identity")
+    inspect.add_argument("--capture", required=True)
     commands.add_parser("begin-baseline")
     commands.add_parser("begin-discovery")
     commands.add_parser("ingest-run")
@@ -1310,6 +1383,13 @@ def main(argv: list[str] | None = None) -> int:
         if name == "process":
             sub.add_argument("--enable-autocount-write", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "inspect-identity":  # read-only file check; no ledger is opened
+        try:
+            _emit(json.dumps(inspect_identity_capture(Path(args.capture).read_bytes()), sort_keys=True))
+            return 0
+        except (DirectLocalError, OSError) as exc:
+            _emit(json.dumps({"status": "refused", "code": getattr(exc, "code", "capture_unreadable")}))
+            return 2
     try:
         ledger = Ledger(validate_state_root(args.state_root))
     except DirectLocalError as exc:
