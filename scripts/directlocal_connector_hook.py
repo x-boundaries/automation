@@ -22,9 +22,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "member_gateway" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "directlocal"))
 
-from xb_member_gateway.directlocal import (  # noqa: E402
+from xb_directlocal import (  # noqa: E402
     CAPTURE_PROVENANCE,
     CAPTURE_SCHEMA,
     CONNECTOR_TOOL,

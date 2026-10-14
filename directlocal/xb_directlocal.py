@@ -48,7 +48,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
-from .shopify_admission import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# The reused admission functions live in the frozen gateway package; they are
+# imported read-only (stdlib-only modules) and never run as a service.
+_GATEWAY_SRC = str(REPO_ROOT / "member_gateway" / "src")
+if _GATEWAY_SRC not in sys.path:
+    sys.path.insert(0, _GATEWAY_SRC)
+
+from xb_member_gateway.shopify_admission import (  # noqa: E402
     BaselineCaptureError,
     ShopifyReadError,
     baseline_digest,
@@ -56,9 +63,8 @@ from .shopify_admission import (
     evaluate_profile,
     parse_created_at,
 )
-from .shopify_webhook import GID_RE
+from xb_member_gateway.shopify_webhook import GID_RE  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
 CAPTURE_SCHEMA = "xb.directlocal.capture.v1"
 CAPTURE_PROVENANCE = "claude_code_posttooluse_hook_delivered_json"
 CONNECTOR_TOOL = "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__graphql_query"
@@ -1153,7 +1159,7 @@ def _emit(text: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m xb_member_gateway.directlocal", description="DirectLocal #155 synthetic core")
+    parser = argparse.ArgumentParser(prog="python directlocal/xb_directlocal.py", description="DirectLocal #155 synthetic core")
     parser.add_argument("--state-root", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init-ledger")

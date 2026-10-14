@@ -11,7 +11,7 @@ files are unchanged.
 Attended Claude session (dedicated folder, generated from the settings template)
   -> connector graphql_query, pinned queries only (PreToolUse guard)
   -> PostToolUse hook writes hook-delivered JSON to <state_root>\inbox
-python -m xb_member_gateway.directlocal  (one OS-locked owner process)
+python directlocal/xb_directlocal.py  (one OS-locked owner process)
   -> strict capture checks -> SQLite ledger <state_root>\ledger.sqlite3
   -> reused shopify_admission.capture_member_mg_baseline / evaluate_profile
   -> powershell.exe -File scripts\ac2_directlocal_member_bridge.ps1 (one op per child)
@@ -20,11 +20,11 @@ python -m xb_member_gateway.directlocal  (one OS-locked owner process)
 
 | File | Role |
 |---|---|
-| `member_gateway/src/xb_member_gateway/directlocal.py` | Capture parsing, phone keys, ledger, baseline/discovery, admission, allocation, fence, recovery, reconcile, CLI |
+| `directlocal/xb_directlocal.py` | Capture parsing, phone keys, ledger, baseline/discovery, admission, allocation, fence, recovery, reconcile, CLI. Lives outside the hash-frozen `member_gateway/` tree and imports the reused stdlib-only admission functions from it read-only |
 | `scripts/ac2_directlocal_member_bridge.ps1` | Child bridge: `legacy-precheck`, `next-member-no`, `probe`, `reconcile`, `write-once` |
 | `scripts/directlocal_connector_hook.py` | `guard` (PreToolUse default-deny for MCP) and `capture` (PostToolUse inbox writer) |
 | `config/directlocal_claude_settings.template.json` | Dedicated-session settings template (deny list + hooks); placeholders only |
-| `member_gateway/tests/test_directlocal.py`, `tests/test_directlocal_bridge_ps.py` | Synthetic tests |
+| `tests/test_member_directlocal.py`, `tests/test_directlocal_bridge_ps.py` | Synthetic tests |
 
 ## Capture provenance and the fail-closed boundary
 
@@ -107,12 +107,11 @@ chosen and its permissions are qualified at gate E0; nothing is hardcoded.
 ## Synthetic command sequence
 
 ```powershell
-$env:PYTHONPATH = "member_gateway/src"
-python -m xb_member_gateway.directlocal --state-root <root> init-ledger --mode synthetic --store-gid gid://shopify/Shop/900000001 --shop-domain xb-test.synthetic.invalid
-python -m xb_member_gateway.directlocal --state-root <root> begin-baseline
-python -m xb_member_gateway.directlocal --state-root <root> ingest-run
-python -m xb_member_gateway.directlocal --state-root <root> process --capture <root>\inbox\<id>.json
-python -m xb_member_gateway.directlocal --state-root <root> status
+python directlocal/xb_directlocal.py --state-root <root> init-ledger --mode synthetic --store-gid gid://shopify/Shop/900000001 --shop-domain xb-test.synthetic.invalid
+python directlocal/xb_directlocal.py --state-root <root> begin-baseline
+python directlocal/xb_directlocal.py --state-root <root> ingest-run
+python directlocal/xb_directlocal.py --state-root <root> process --capture <root>\inbox\<id>.json
+python directlocal/xb_directlocal.py --state-root <root> status
 ```
 
 ## Remaining effect gates (each needs separate explicit approval)

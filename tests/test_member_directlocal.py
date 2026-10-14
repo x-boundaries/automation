@@ -18,9 +18,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from xb_member_gateway import directlocal as dl
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "directlocal"))
 
-ROOT = Path(__file__).resolve().parents[2]
+import xb_directlocal as dl  # noqa: E402
+
 HOOK = ROOT / "scripts" / "directlocal_connector_hook.py"
 TEMPLATE = ROOT / "config" / "directlocal_claude_settings.template.json"
 STORE = "gid://shopify/Shop/900000001"
@@ -890,8 +892,9 @@ class HookTests(unittest.TestCase):
 
 class CliTests(unittest.TestCase):
     def run_cli(self, root: Path, *args: str) -> tuple[int, dict]:
-        env = {**os.environ, "PYTHONPATH": str(ROOT / "member_gateway" / "src"), "LOCALAPPDATA": str(root / "not-the-state-root")}
-        proc = subprocess.run([sys.executable, "-m", "xb_member_gateway.directlocal", "--state-root", str(root), *args], capture_output=True, timeout=120, env=env, check=False)
+        env = {**os.environ, "LOCALAPPDATA": str(root / "not-the-state-root")}
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run([sys.executable, str(ROOT / "directlocal" / "xb_directlocal.py"), "--state-root", str(root), *args], capture_output=True, timeout=120, env=env, check=False)
         return proc.returncode, json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
 
     def test_cli_initialise_baseline_status(self):

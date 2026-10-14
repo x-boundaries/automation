@@ -36,6 +36,8 @@ on:
       - "scripts/directlocal_connector_hook.py"
       - "config/directlocal_claude_settings.template.json"
       - "tests/test_directlocal_bridge_ps.py"
+      - "tests/test_member_directlocal.py"
+      - "directlocal/**"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
@@ -97,6 +99,8 @@ on:
       - "scripts/directlocal_connector_hook.py"
       - "config/directlocal_claude_settings.template.json"
       - "tests/test_directlocal_bridge_ps.py"
+      - "tests/test_member_directlocal.py"
+      - "directlocal/**"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
@@ -159,7 +163,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD

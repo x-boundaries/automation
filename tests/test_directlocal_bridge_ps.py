@@ -18,10 +18,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "member_gateway" / "src"))
-sys.path.insert(0, str(ROOT / "member_gateway" / "tests"))
+sys.path.insert(0, str(ROOT / "directlocal"))
+sys.path.insert(0, str(ROOT / "tests"))
 
-from xb_member_gateway import directlocal as dl  # noqa: E402
+import xb_directlocal as dl  # noqa: E402
 
 BRIDGE = ROOT / "scripts" / "ac2_directlocal_member_bridge.ps1"
 PAYLOAD = {"email_address": "alpha@example.test", "expiry_date": "2028-10-14", "mobile_phone": "6580000001", "name": "Synthetic Member Alpha", "register_date": "2026-10-15"}
@@ -247,7 +247,7 @@ class DirectLocalEndToEndTests(unittest.TestCase):
     """Processor -> BridgeClient -> real PowerShell bridge -> fake MemberCommand."""
 
     def setUp(self):
-        import test_directlocal as fixtures
+        import test_member_directlocal as fixtures
 
         self.fx = fixtures
         self.bridge_tests = DirectLocalBridgeTests("test_read_operations")
