@@ -164,38 +164,93 @@ Separate from the DirectLocal core, whose synthetic hard-disarm is unchanged.
 
 | File | Role |
 |---|---|
-| `scripts/ac2_directlocal_e7_isolation_check.py` | Read-only outbound-isolation evidence and a pure `classify` verdict (`ISOLATED` / `NOT_PROVEN`) |
-| `scripts/ac2_directlocal_e7_testbook_create.ps1` | One-shot create through the unchanged adapter, pinned to `AED_TESTINGAPI` |
-| `tests/test_directlocal_e7_testbook_ps.py` | Fake-session tests and classifier tests |
+| `scripts/ac2_directlocal_e7_isolation_check.py` | Read-only, fail-closed outbound-isolation evidence (schema `xb155-e7-isolation-v2`) and a pure `classify` verdict (`ISOLATED` / `NOT_PROVEN`) |
+| `scripts/ac2_directlocal_e7_testbook_create.ps1` | One-shot create through the unchanged adapter, pinned to `AED_TESTINGAPI`; re-validates the evidence itself |
+| `scripts/ac2_directlocal_e7_owner_console.ps1` | Owner console procedure: fresh evidence, then the create script with locally typed credentials |
+| `tests/test_directlocal_e7_testbook_ps.py` | Fake-session tests, evidence/ACL/custody negatives, collector fail-closed and classifier tests |
 
 The previously accepted `ac2_member_create_uat_runner.ps1` is not reused: its
 MemberNo comes from the approved Forms package (not `GetNextMemberNo`) and it
 binds the book only by environment value.
 
-Order of guards in the create script:
+### Outbound qualification (2026-10-14, read-only)
 
-1. Host `DESKTOP-4I042L6`, an owned state directory whose marker names this
-   RUN/LOCK/book, no `XB_AC2_SESSION_FACTORY`, exclusive lock, one-shot
-   (`e7.intent.json`, `e7.fence.json`, `e7.claim` or `e7.outcome.json` present
-   refuses), and fresh `ISOLATED` evidence for the book.
-2. Reviewed vendor login with the database pinned to `AED_TESTINGAPI` for the
+- AutoCountServerService (LocalSystem; port 19500) touches the book only to
+  read `sys` metadata and poll `MailQueue` (it is the mail sender). The SQL
+  plan cache for the book's context holds no statement reading Member,
+  ChangeLog or ChangeCount. Accounting.exe polls `EInvoiceQueue`.
+- Member triggers write only ChangeLog/ChangeCount. `UserScript`,
+  `MailQueue`, `EInvoiceQueue` and `OneRewards_Member` are empty; POS sync
+  registrations predate the clone; both plug-ins have `AllowSync = F`.
+- An offline IL reachability scan from `MemberCommand.Create`,
+  `GetNextMemberNo`, `GetMember`, `NewMember`, `SaveMember` and the
+  `MemberEntity` accessors (529 methods, no truncation) found no MailQueue,
+  EInvoiceQueue, Notification, SMTP or MailKit reference. It did find two
+  vendor HTTPS paths that carry no member data: error telemetry to AutoCount HQ
+  (gated by `ErrorLogClientHelper.SubmitErrorLog`, default `False`, set only by
+  its static constructor in the loaded assemblies) and a country reference-list
+  fetch from the AutoCount licence API when the profile's country information
+  is missing. `MemberEntity` construction loads user scripts from `UserScript`.
+- The proof holds only for the pinned `AutoCount.dll` and
+  `AutoCount.Invoicing.dll` bytes; the collector and the create script both
+  refuse other builds.
+
+### Collector (fail closed)
+
+Each inspection (`host`, `processes`, `sessions`, `sql_capabilities`,
+`book_channels`, `scheduled_tasks`, `services`, `assemblies`) records
+`ok`/`code`. Non-elevated task/service inventories (which omit entries the user
+cannot read), tool exit failures, unparseable or implausibly small listings,
+SQL failures, failed samples and sessions that cannot be attributed to a local
+process all yield `NOT_PROVEN`. Evidence is written once (exclusive create) and
+the printed SHA-256 is the custody link to the create script.
+
+### Create script guards, in order
+
+1. Host `DESKTOP-4I042L6`; an owned workspace whose marker names this
+   RUN/LOCK/book; the workspace root has no inherited ACEs and the workspace,
+   `state` and `evidence` directories grant access only to the current user,
+   SYSTEM and Administrators; no `XB_AC2_SESSION_FACTORY`; exclusive lock;
+   one-shot (`e7.intent.json`, `e7.fence.json`, `e7.claim` or
+   `e7.outcome.json` present refuses).
+2. Evidence re-validated field by field: file inside the private `evidence`
+   directory, SHA-256 equal to `-IsolationEvidenceSha256`, schema, host, book,
+   `run_at`/`completed_at` within 30 minutes, every inspection `ok`, six clean
+   samples, every negative finding recomputed, assembly pins, then the verdict.
+   The live assemblies must also match the pins.
+3. Reviewed vendor login with the database pinned to `AED_TESTINGAPI` for the
    process (the environment's `AC2_PROBE_DATABASE_NAME` is never used). The
    authenticated `DBSetting.DBName`, vendor `DB_NAME()` and vendor
    `SERVERPROPERTY('MachineName')` must all match. A production, missing,
-   ambiguous or wrong identity is refused.
-3. No earlier E7 synthetic member (name prefix `XB DIRECTLOCAL E7 SYNTHETIC`).
-4. Write mode only (`-EnableTestBookWrite -ConfirmTargetAedTestingApi
+   ambiguous or wrong identity is refused. Vendor error telemetry must be off.
+4. Runtime outbound guard: `UserScript`, `MailQueue` and `EInvoiceQueue` empty.
+   No earlier E7 synthetic member, by `COUNT` only (no member details loaded).
+5. Write mode only (`-EnableTestBookWrite -ConfirmTargetAedTestingApi
    -ConfirmOwnerRiskAccepted`): durable intent, at most three
-   `GetNextMemberNo` candidates each probed by `GetMember`, re-probe, fence with
-   deadline, exclusive claim, one `SaveMember` inside `New-XbAutoCountMember`
-   (`shopify_m1`, contact fields NULL), one `GetMember` readback, exact
-   comparison, and an outcome file with before/after audit counters.
-5. Any exception after the claim is `WRITE_OUTCOME_UNKNOWN_HOLD`. It is never
-   retried, and the same MemberNo is only re-read.
+   `GetNextMemberNo` candidates each probed by `COUNT`, re-probe, queue
+   re-check, fence with deadline, exclusive claim, one `SaveMember` inside
+   `New-XbAutoCountMember` (`shopify_m1`, contact fields NULL), one `GetMember`
+   readback, exact comparison, queue re-check (a new queue row is
+   `CREATED_OUTBOUND_QUEUE_CHANGED_HOLD`), and an outcome file with
+   before/after audit counters (Member change counter, ChangeLog, EventLog,
+   Activity, queues). The intent, fence, claim and outcome records are
+   hash-chained.
+6. Any exception after the claim is `WRITE_OUTCOME_UNKNOWN_HOLD`. It is never
+   retried, and the same MemberNo is only counted.
 
-The credential is read only from the executing process environment
-(`AC2_PROBE_USER_ID` / `AC2_PROBE_PASSWORD`). Run it from the Owner's console.
+The real MemberNo stays in the private state records; stdout and `-JsonOut`
+carry only `member_ref` (`e7m-` plus 12 hex of its SHA-256).
 
+### Owner console procedure
+
+`ac2_directlocal_e7_owner_console.ps1 -Mode DryRun|Write` runs in an
+interactive, elevated console. It refuses redirected input/output and stale
+credential variables, runs the collector, prompts for the user ID and (as a
+`SecureString`) the password, and passes them only in the child process's
+environment block. The BSTR is zeroed and freed and the `SecureString` disposed
+in `finally`; the console's own environment never holds them. `Write` also
+requires typing `AED_TESTINGAPI`. Limitation: the adapter reads the password
+from an environment variable, so a managed copy exists briefly.
 ## Remaining effect gates (each needs separate explicit approval)
 
 | Gate | Effect |
@@ -207,5 +262,5 @@ The credential is read only from the executing process environment
 | E4 | Real profile reads (model-mediated PII), retention and consent |
 | E5 | AutoCount login and read-only bridge ops on the test book (catalog-level read-only SQL qualification done; the bridge remains synthetic-only) |
 | E6 | `GetNextMemberNo` side-effect qualification on the test book |
-| E7 | One synthetic `SaveMember` on the test book. Blocked until complete restoration including audit effects is proven, or the Owner accepts the risk: the Member table carries active `MemberChangeLog` / `UpdateMemberChangeCount` triggers, the book uses SIMPLE recovery, and the test book is a live-configured clone |
+| E7 | One synthetic `SaveMember` on the test book. Owner risk accepted (#155 comment 6166747236) for possible data loss and irreversible audit effects (the Member table carries active `MemberChangeLog` / `UpdateMemberChangeCount` triggers, the book uses SIMPLE recovery, and the test book is a live-configured clone). Runs only through the Owner console procedure above |
 | E8 / E9 | Scheduling; production book |
