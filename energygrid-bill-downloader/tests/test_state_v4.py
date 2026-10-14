@@ -370,10 +370,10 @@ class AdmissionTests(_V4Base):
             admit(store)
             decision = store.check_admissible(
                 stream="EB_BILL", source_namespace="SYN-NS", source_invoice_key=filename_key("invoice-001.pdf"),
-                display_filename="OCT 2026 - invoice-001.pdf", canonical_filename="2026-10-01.pdf",
+                source_filename="invoice-001.pdf", canonical_filename="2026-10-01.pdf",
                 invoice_date=date(2026, 10, 1),
             )
-            self.assertEqual("ALREADY_ADMITTED", decision)
+            self.assertEqual(("ALREADY_ADMITTED", "OCT 2026 - invoice-001.pdf"), decision)
 
     def test_an_older_identity_than_the_newest_admission_is_a_regression(self) -> None:
         with leased(self.path) as store:
@@ -397,6 +397,8 @@ PREDECESSOR_RUN = "00000000-0000-4000-8000-00000000c001"
 PREDECESSOR_SCENARIOS = (
     "ADOPTABLE", "DELIVERED", "DRIVE_PARTIAL", "DRIVE_VERIFIED_NOT_SENT", "DELIVERY_UNCERTAIN",
     "DELIVERY_REJECTED", "ARCHIVE_NOT_COMMITTED",
+    # #226 v4 correction (M3): a v3 PENDING_SEND delivery, prepared only or with its dispatch claimed.
+    "DELIVERY_PREPARED", "DELIVERY_DISPATCHED",
 )
 LATEST_SOURCE = {"EB_BILL": ("Invoice EB Sep.pdf", "2026-09-01"), "TENANT_BILL": ("Invoice TN Sep.pdf", "2026-09-02")}
 OLDER_SOURCE = {"EB_BILL": ("Invoice EB Aug.pdf", "2026-08-01"), "TENANT_BILL": ("Invoice TN Aug.pdf", "2026-08-02")}
@@ -526,8 +528,134 @@ def build_predecessor_v3(path: Path, archive_root: Path, scenarios: dict) -> dic
                     outcome = {"DELIVERED": "DELIVERED", "DELIVERY_UNCERTAIN": "DELIVERY_OUTCOME_UNCERTAIN",
                                "DELIVERY_REJECTED": "REQUEST_REJECTED"}[scenario]
                     _predecessor_delivery(state, invoice, outcome)
+                if scenario in ("DELIVERY_PREPARED", "DELIVERY_DISPATCHED"):
+                    _predecessor_pending_delivery(state, invoice, dispatched=scenario == "DELIVERY_DISPATCHED")
             built[stream_name] = {"older": older, "latest": latest, "scenario": scenario}
     return built
+
+
+def _predecessor_pending_delivery(state, invoice: dict, *, dispatched: bool) -> None:
+    """A v3 PENDING_SEND delivery (Drive is verified first, as v3 requires), optionally with a claimed dispatch."""
+    from energygrid_bill_downloader.delivery import DELIVERY_SCHEMA
+
+    delivery_id = "egmail-v1-" + hashlib.sha256(("delivery:" + invoice["invoice_id"]).encode("ascii")).hexdigest()[:32]
+    metadata = {
+        "schema": DELIVERY_SCHEMA, "stream": invoice["stream"], "bill_date": invoice["bill_date"],
+        "attachment_name": invoice["canonical_filename"], "pdf_byte_size": invoice["byte_size"],
+        "pdf_sha256": invoice["sha256"],
+    }
+    state.prepare_delivery(invoice_id=invoice["invoice_id"], metadata=metadata, run_id=PREDECESSOR_RUN,
+                           timestamp=T_MAIL[0], delivery_id=delivery_id)
+    if dispatched:
+        state.claim_delivery_dispatch(delivery_id, PREDECESSOR_RUN, T_MAIL[1])
+
+
+# -- frozen predecessor evidence for the #226 v4 correction (M1, M2, M4, M5) ------------------------
+
+def _predecessor_rows(path: Path, sql: str, parameters: tuple = ()) -> list[dict]:
+    connection = raw(path)
+    try:
+        cursor = connection.execute(sql, parameters)
+        names = [item[0] for item in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def inject_frozen_v2_evidence(path: Path, statements: tuple, triggers: tuple) -> None:
+    """Write historical v2 rows that the shipped v3 schema now refuses to create.
+
+    Synthetic only. Each named v3 guard trigger is dropped and recreated from its exact stored SQL in the
+    same transaction, so the schema is unchanged; callers assert the shipped v3 inspector still accepts the
+    database. This stands for v2-era evidence preserved across the v2 -> v3 migration.
+    """
+    connection = raw(path)
+    try:
+        saved = [
+            connection.execute("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?", (name,)).fetchone()[0]
+            for name in triggers
+        ]
+        connection.execute("BEGIN IMMEDIATE")
+        for name in triggers:
+            connection.execute(f'DROP TRIGGER "{name}"')
+        for statement, parameters in statements:
+            connection.execute(statement, parameters)
+        for sql in saved:
+            connection.execute(sql)
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+
+def add_v2_drive_stage(path: Path, invoice_id: str, op_state: str) -> None:
+    """One historical v2 DRIVE_STAGE file operation for the invoice, with the invoice still NOT_STAGED."""
+    invoice = _predecessor_rows(path, "SELECT * FROM energygrid_invoice_v2 WHERE invoice_id=?", (invoice_id,))[0]
+    stamp = "2026-09-05T00:00:09+00:00"
+    inject_frozen_v2_evidence(
+        path,
+        ((
+            "INSERT INTO energygrid_file_operation_v2 (operation_id, invoice_id, kind, state, private_path_ref, "
+            "target_relpath, binding_id, expected_size, expected_sha256, source_role, run_id, prepared_at_utc, "
+            "committed_at_utc, evidence_ref, support_ref) VALUES (?,?,'DRIVE_STAGE',?,'EG_SYNTHETIC_TEMP',?,"
+            "'synthV2Binding',?,?,'ARCHIVE_COMMITTED',?,?,?,?,?)",
+            (
+                _deterministic_uuid("v2-stage:" + invoice_id + op_state), invoice_id, op_state, invoice["archive_relpath"],
+                invoice["byte_size"], invoice["sha256"], PREDECESSOR_RUN, stamp,
+                stamp if op_state == "COMMITTED" else None,
+                "EG_SYNTHETIC_V2_STAGE" if op_state == "COMMITTED" else None,
+                "EG_SYNTHETIC_V2_HOLD" if op_state == "HOLD" else None,
+            ),
+        ),),
+        ("energygrid_file_operation_drive_stage_retired_v3",),
+    )
+
+
+def set_v2_drive_state(path: Path, invoice_id: str, drive_state: str) -> None:
+    """A historical v2 drive_state other than NOT_STAGED on the invoice, with no DRIVE_STAGE operation."""
+    inject_frozen_v2_evidence(
+        path,
+        (("UPDATE energygrid_invoice_v2 SET drive_state=? WHERE invoice_id=?", (drive_state, invoice_id)),),
+        ("energygrid_invoice_drive_legacy_freeze_v3",),
+    )
+
+
+def v3_status(path: Path) -> str:
+    connection = raw(path)
+    try:
+        return _inspect_v3_database(connection)
+    finally:
+        connection.close()
+
+
+def insert_predecessor_on_day(path: Path, *, source_filename: str, bill_date: str, day_ordinal: int,
+                              stream: str = "EB_BILL") -> str:
+    """A CLASSIFIED v3 row whose day_ordinal is forced (M2). Inconsistent with its bill_date on purpose.
+
+    A valid v3 database cannot hold two CLASSIFIED invoices of one stream on one day (the archive path
+    index is unique), so the latest-day ambiguity guard is defence in depth. This row reaches it.
+    """
+    import uuid
+
+    from fixtures.synthetic_dual_stream import SYNTHETIC_EVIDENCE, SYNTHETIC_NAMESPACE
+
+    folder = "EB Bill" if stream == "EB_BILL" else "Tenant Bill"
+    invoice_id = "egpre-" + uuid.uuid4().hex
+    connection = raw(path)
+    try:
+        connection.execute(
+            "INSERT INTO energygrid_invoice_v2 (invoice_id, classification, stream, source_namespace, source_invoice_key, "
+            "source_filename, raw_date, date_profile, bill_date, day_ordinal, evidence_ref, canonical_filename, "
+            "archive_relpath, archive_state, migration_state, drive_state, created_at_utc, created_run_id) "
+            "VALUES (?, 'CLASSIFIED', ?, ?, ?, ?, ?, 'INVOICE_DATE_ISO_V1', ?, ?, ?, ?, ?, 'ABSENT', 'NOT_REQUIRED', "
+            "'NOT_STAGED', ?, ?)",
+            (
+                invoice_id, stream, SYNTHETIC_NAMESPACE, filename_key(source_filename), source_filename, bill_date,
+                bill_date, day_ordinal, SYNTHETIC_EVIDENCE, f"{bill_date}.pdf", f"{folder}/{bill_date}.pdf", NOW, RUN_ID,
+            ),
+        )
+    finally:
+        connection.close()
+    return invoice_id
 
 
 class PredecessorBuilderTests(unittest.TestCase):
@@ -578,7 +706,7 @@ class PredecessorAdmissionTests(unittest.TestCase):
             with self.assertRaises(OfflineV4Error) as caught:
                 store.check_admissible(
                     stream="EB_BILL", source_namespace="SYNTHETIC-ENERGYGRID-NAMESPACE",
-                    source_invoice_key=filename_key("Invoice.pdf"), display_filename="OCT 2026 - Invoice.pdf",
+                    source_invoice_key=filename_key("Invoice.pdf"), source_filename="Invoice.pdf",
                     canonical_filename="2026-10-01.pdf", invoice_date=date(2026, 10, 1),
                 )
             self.assertEqual("EG_V4_PREDECESSOR_IDENTITY_PRESENT", caught.exception.support_ref)
@@ -937,6 +1065,506 @@ class ProviderOutcomeTests(_V4Base):
         self._record("VERIFIED")
         path = [(row["from_state"], row["to_state"]) for row in self.store.transitions(self.drive)]
         self.assertEqual([(None, "PENDING"), ("PENDING", "DISPATCHED"), ("DISPATCHED", "VERIFIED")], path)
+
+
+def _run_lock_is_free(directory: Path) -> bool:
+    """True when the shipped single-run lock on this directory can be taken now (it is released at once)."""
+    from energygrid_bill_downloader.errors import RunLockedError
+    from energygrid_bill_downloader.run_lock import RunLock
+
+    try:
+        with RunLock(directory):
+            return True
+    except RunLockedError:
+        return False
+
+
+def _v4_object_count(path: Path) -> int:
+    return len(_predecessor_rows(path, "SELECT name FROM sqlite_schema WHERE name LIKE 'energygrid_v4_%'"))
+
+
+def _user_version(path: Path) -> int:
+    return _predecessor_rows(path, "PRAGMA user_version")[0]["user_version"]
+
+
+class _BuiltPredecessorBase(unittest.TestCase):
+    """A bound v3 database built through the frozen v3 API: EB latest ADOPTABLE, Tenant latest DELIVERED."""
+
+    SCENARIOS = {"EB_BILL": "ADOPTABLE", "TENANT_BILL": "DELIVERED"}
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "state.sqlite"
+        self.archive = self.dir / "archive"
+        self.built = build_predecessor_v3(self.path, self.archive, self.SCENARIOS)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def backups(self) -> list[str]:
+        return sorted(p.name for p in self.dir.iterdir() if ".v4-migration-" in p.name)
+
+    def assert_refused_unchanged(self, call, support_ref: str, before_digest: str) -> OfflineV4Error:
+        with self.assertRaises(OfflineV4Error) as caught:
+            call()
+        self.assertEqual(support_ref, caught.exception.support_ref)
+        self.assertEqual(3, _user_version(self.path))
+        self.assertEqual(0, _v4_object_count(self.path))
+        self.assertEqual([], self.backups())
+        self.assertEqual(before_digest, predecessor_digest(self.path))
+        self.assertTrue(_run_lock_is_free(self.dir))
+        return caught.exception
+
+
+class MigrationBlockerTests(_BuiltPredecessorBase):
+    """M5a-M5i: each local v3 blocker refuses plan and apply on its own (#226 v4 correction F2/F6)."""
+
+    def _inflight_invoice(self) -> str:
+        from energygrid_bill_downloader.invoice import Stream
+        from fixtures.synthetic_dual_stream import candidate
+
+        with StateV3Store(self.path) as state:
+            return state.accept_latest(
+                candidate(Stream.EB_BILL, name="Invoice EB Oct.pdf", invoice_date="2026-10-01"), PREDECESSOR_RUN, T_ACCEPT,
+            )
+
+    def _archive_state(self, value: str) -> None:
+        invoice_id = self._inflight_invoice()
+        with StateV3Store(self.path) as state:
+            state.update_invoice_file_state(invoice_id, archive_state=value)
+
+    def _migration_state(self, value: str) -> None:
+        connection = raw(self.path)
+        try:
+            connection.execute("UPDATE energygrid_invoice_v2 SET migration_state=? WHERE invoice_id=?",
+                               (value, self.built["EB_BILL"]["older"]))
+        finally:
+            connection.close()
+
+    def _stream_hold(self) -> None:
+        connection = raw(self.path)
+        try:
+            connection.execute("UPDATE energygrid_stream_v2 SET admission='HOLD' WHERE stream='EB_BILL'")
+        finally:
+            connection.close()
+
+    def _file_operation(self, value: str) -> None:
+        from energygrid_bill_downloader.publication import validate_pdf
+
+        invoice_id = self._inflight_invoice()
+        staged = self.dir / "inflight.pdf"
+        staged.write_bytes(predecessor_pdf("Invoice EB Oct.pdf"))
+        with StateV3Store(self.path) as state:
+            invoice = state.invoice(invoice_id)
+            operation = _deterministic_uuid("inflight:" + invoice_id)
+            state.start_file_operation(
+                operation_id=operation, invoice_id=invoice_id, kind="ARCHIVE_PUBLISH", private_path_ref="EG_SYNTHETIC_TEMP",
+                target_relpath=invoice["archive_relpath"], binding_id=None, info=validate_pdf(staged),
+                source_role="SOURCE_ACQUISITION", run_id=PREDECESSOR_RUN, timestamp=T_ARCHIVE,
+            )
+            if value == "HOLD":
+                state.hold_file_operation(operation, "EG_SYNTHETIC_HOLD")
+        staged.unlink()
+
+    def _check_case(self, maker: str, value) -> None:
+        getattr(self, maker)(*(() if value is None else (value,)))
+        # The shipped v3 inspector still accepts the database, so only the v4 blocker clause can refuse it.
+        self.assertIn(v3_status(self.path), {"COMPLETE_V3", "RESUMABLE_V3"})
+        before = predecessor_digest(self.path)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.assert_refused_unchanged(
+                    lambda: migrate_state_database_v4(self.path, apply=apply), "EG_V4_PREDECESSOR_NOT_COMPLETE_V3", before,
+                )
+
+    def test_m5a_archive_prepared(self) -> None:
+        self._check_case("_archive_state", "PREPARED")
+
+    def test_m5b_archive_conflict(self) -> None:
+        self._check_case("_archive_state", "CONFLICT")
+
+    def test_m5c_archive_unverified(self) -> None:
+        self._check_case("_archive_state", "UNVERIFIED")
+
+    def test_m5d_migration_unclassified(self) -> None:
+        self._check_case("_migration_state", "UNCLASSIFIED")
+
+    def test_m5e_migration_move_planned(self) -> None:
+        self._check_case("_migration_state", "MOVE_PLANNED")
+
+    def test_m5f_migration_hold(self) -> None:
+        self._check_case("_migration_state", "HOLD")
+
+    def test_m5g_stream_admission_hold(self) -> None:
+        self._check_case("_stream_hold", None)
+
+    def test_m5h_non_drive_stage_file_operation_prepared(self) -> None:
+        self._check_case("_file_operation", "PREPARED")
+
+    def test_m5i_non_drive_stage_file_operation_hold(self) -> None:
+        self._check_case("_file_operation", "HOLD")
+
+    def test_m5_positive_the_clean_database_plans_and_migrates(self) -> None:
+        before = predecessor_digest(self.path)
+        self.assertEqual({"status": "PLAN_V4", "predecessor_digest": before}, migrate_state_database_v4(self.path))
+        self.assertEqual({"status": "MIGRATED_V4", "predecessor_digest": before},
+                         migrate_state_database_v4(self.path, apply=True))
+        self.assertEqual(before, predecessor_digest(self.path))
+        self.assertEqual(1, len(self.backups()))
+
+    def test_m5_positive_drive_stage_prepared_or_hold_is_not_a_blocker_but_the_classifier_holds(self) -> None:
+        for op_state in ("PREPARED", "HOLD"):
+            with self.subTest(op_state=op_state):
+                self.tearDown()
+                self.setUp()
+                add_v2_drive_stage(self.path, self.built["EB_BILL"]["latest"], op_state)
+                self.assertIn(v3_status(self.path), {"COMPLETE_V3", "RESUMABLE_V3"})
+                before = predecessor_digest(self.path)
+                self.assertEqual("PLAN_V4", migrate_state_database_v4(self.path)["status"])
+                self.assertEqual("MIGRATED_V4", migrate_state_database_v4(self.path, apply=True)["status"])
+                with StateV4Store(self.path) as store:
+                    latest = store.predecessor_latest("EB_BILL")
+                self.assertEqual(("HOLD", "EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT"),
+                                 (latest["status"], latest["support_ref"]))
+                self.assertEqual(before, predecessor_digest(self.path))
+
+
+class PredecessorClassifierTests(_BuiltPredecessorBase):
+    """M1-M4 at the classifier and adoption boundary. Orchestration-level runs are in test_orchestration_v4."""
+
+    def classify(self, stream: str = "EB_BILL") -> dict:
+        with StateV4Store(self.path) as store:
+            return store.predecessor_latest(stream)
+
+    def test_m1_v2_drive_stage_operation_alone_holds_the_latest(self) -> None:
+        for op_state in ("COMMITTED", "PREPARED", "HOLD"):
+            with self.subTest(op_state=op_state):
+                self.tearDown()
+                self.setUp()
+                add_v2_drive_stage(self.path, self.built["EB_BILL"]["latest"], op_state)
+                self.assertIn(v3_status(self.path), {"COMPLETE_V3", "RESUMABLE_V3"})
+                invoice = _predecessor_rows(self.path, "SELECT drive_state FROM energygrid_invoice_v2 WHERE invoice_id=?",
+                                            (self.built["EB_BILL"]["latest"],))[0]
+                self.assertEqual("NOT_STAGED", invoice["drive_state"])
+                migrate_state_database_v4(self.path, apply=True)
+                result = self.classify()
+                self.assertEqual(("HOLD", "EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT"), (result["status"], result["support_ref"]))
+                self.assertEqual(self.built["EB_BILL"]["latest"], result["invoice"]["invoice_id"])
+
+    def test_m1_v2_drive_state_alone_holds_the_latest(self) -> None:
+        for drive_state in ("PREPARED", "CONFLICT"):
+            with self.subTest(drive_state=drive_state):
+                self.tearDown()
+                self.setUp()
+                set_v2_drive_state(self.path, self.built["EB_BILL"]["latest"], drive_state)
+                self.assertIn(v3_status(self.path), {"COMPLETE_V3", "RESUMABLE_V3"})
+                self.assertEqual([], _predecessor_rows(
+                    self.path, "SELECT 1 FROM energygrid_file_operation_v2 WHERE kind='DRIVE_STAGE'"))
+                migrate_state_database_v4(self.path, apply=True)
+                result = self.classify()
+                self.assertEqual(("HOLD", "EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT"), (result["status"], result["support_ref"]))
+
+    def test_m1_positive_the_clean_latest_is_adoptable(self) -> None:
+        migrate_state_database_v4(self.path, apply=True)
+        result = self.classify()
+        self.assertEqual(("ADOPTABLE", None), (result["status"], result["support_ref"]))
+        self.assertEqual(self.built["EB_BILL"]["latest"], result["invoice"]["invoice_id"])
+
+    def test_m2_two_classified_invoices_on_the_latest_day_hold_with_no_invoice(self) -> None:
+        migrate_state_database_v4(self.path, apply=True)
+        latest_day = date.fromisoformat(LATEST_SOURCE["EB_BILL"][1]).toordinal()
+        insert_predecessor_on_day(self.path, source_filename="Invoice EB Sep B.pdf", bill_date="2026-08-31",
+                                  day_ordinal=latest_day)
+        result = self.classify()
+        self.assertEqual({"status": "HOLD", "support_ref": "EG_V4_PREDECESSOR_LATEST_AMBIGUOUS", "invoice": None}, result)
+
+    def test_m2_positive_distinct_latest_dates_resolve_and_an_older_day_tie_does_not_block(self) -> None:
+        migrate_state_database_v4(self.path, apply=True)
+        older_day = date.fromisoformat("2026-07-01").toordinal()
+        insert_predecessor_on_day(self.path, source_filename="Old A.pdf", bill_date="2026-07-01", day_ordinal=older_day)
+        insert_predecessor_on_day(self.path, source_filename="Old B.pdf", bill_date="2026-07-02", day_ordinal=older_day)
+        result = self.classify()
+        self.assertEqual(("ADOPTABLE", self.built["EB_BILL"]["latest"]), (result["status"], result["invoice"]["invoice_id"]))
+        newer = insert_predecessor_on_day(self.path, source_filename="Newer.pdf", bill_date="2026-09-20",
+                                          day_ordinal=date.fromisoformat("2026-09-20").toordinal())
+        result = self.classify()
+        self.assertEqual(newer, result["invoice"]["invoice_id"])
+        self.assertNotEqual("EG_V4_PREDECESSOR_LATEST_AMBIGUOUS", result["support_ref"])
+
+    def test_m3_a_claimed_but_unsettled_delivery_holds_with_the_dispatch_reference(self) -> None:
+        self.tearDown()
+        self.SCENARIOS = {"EB_BILL": "DELIVERY_DISPATCHED", "TENANT_BILL": "DELIVERED"}
+        self.setUp()
+        delivery = _predecessor_rows(self.path, "SELECT state, dispatch_started_at_utc FROM energygrid_delivery_v1 "
+                                                "WHERE invoice_id=?", (self.built["EB_BILL"]["latest"],))[0]
+        self.assertEqual("PENDING_SEND", delivery["state"])
+        self.assertIsNotNone(delivery["dispatch_started_at_utc"])
+        migrate_state_database_v4(self.path, apply=True)
+        result = self.classify()
+        self.assertEqual(("HOLD", "EG_V4_PREDECESSOR_DELIVERY_DISPATCHED"), (result["status"], result["support_ref"]))
+
+    def test_m3_positive_an_undispatched_pending_send_is_not_a_dispatch_hold(self) -> None:
+        # v3 accepts a PENDING_SEND delivery only after a DRIVE_VERIFIED receipt, so the undispatched case is
+        # classified past the dispatch guard and held by the Drive-verified rule, never as dispatched.
+        self.tearDown()
+        self.SCENARIOS = {"EB_BILL": "DELIVERY_PREPARED", "TENANT_BILL": "DELIVERED"}
+        self.setUp()
+        migrate_state_database_v4(self.path, apply=True)
+        result = self.classify()
+        self.assertEqual(("HOLD", "EG_V4_PREDECESSOR_DRIVE_VERIFIED_NOT_SENT"), (result["status"], result["support_ref"]))
+
+    def _adopt(self, store, **overrides):
+        latest = store.predecessor_latest("EB_BILL")["invoice"] or {}
+        arguments = {
+            "invoice_id": self.built["EB_BILL"]["latest"],
+            "display_filename": "SEP 2026 - Invoice EB Sep.pdf",
+            "sha256": latest.get("sha256"),
+            "byte_size": latest.get("byte_size"),
+            "run_id": RUN_ID,
+            "now_iso": NOW,
+        }
+        arguments.update(overrides)
+        return store.adopt_predecessor_latest("EB_BILL", **arguments)
+
+    def test_m4_stale_or_mismatched_adoption_is_refused_with_no_admission(self) -> None:
+        migrate_state_database_v4(self.path, apply=True)
+        before = predecessor_digest(self.path)
+        with leased(self.path) as store:
+            frozen = store.predecessor_latest("EB_BILL")["invoice"]
+            cases = (
+                ({"invoice_id": self.built["EB_BILL"]["older"]}, "EG_V4_PREDECESSOR_ADOPTION_STALE"),
+                ({"sha256": SHA_B}, "EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH"),
+                ({"byte_size": frozen["byte_size"] + 1}, "EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH"),
+            )
+            for overrides, support_ref in cases:
+                with self.subTest(overrides=overrides), self.assertRaises(OfflineV4Error) as caught:
+                    self._adopt(store, **overrides)
+                self.assertEqual(support_ref, caught.exception.support_ref)
+                self.assertEqual(0, store.count("energygrid_v4_invoice"))
+                self.assertEqual(0, store.count("energygrid_v4_intent"))
+        self.assertEqual(before, predecessor_digest(self.path))
+
+    def test_m4_a_classification_that_changes_before_the_fenced_write_is_stale(self) -> None:
+        migrate_state_database_v4(self.path, apply=True)
+        with leased(self.path) as store:
+            frozen = store.predecessor_latest("EB_BILL")
+            self.assertEqual("ADOPTABLE", frozen["status"])
+            # Between the read and the fenced write the stream's latest changes (a newer v3 row appears).
+            insert_predecessor(self.path, source_filename="Invoice EB Sep 20.pdf", day="2026-09-20")
+            with self.assertRaises(OfflineV4Error) as caught:
+                self._adopt(store, sha256=frozen["invoice"]["sha256"], byte_size=frozen["invoice"]["byte_size"])
+            self.assertEqual("EG_V4_PREDECESSOR_ADOPTION_STALE", caught.exception.support_ref)
+            self.assertEqual(0, store.count("energygrid_v4_invoice"))
+
+    def test_m4_positive_a_matching_adoption_succeeds_once_and_a_repeat_is_idempotent(self) -> None:
+        migrate_state_database_v4(self.path, apply=True)
+        with leased(self.path) as store:
+            self.assertTrue(self._adopt(store))
+            counts = [store.count(t) for t in ("energygrid_v4_invoice", "energygrid_v4_intent", "energygrid_v4_transition")]
+            self.assertFalse(self._adopt(store))
+            self.assertEqual(counts, [store.count(t) for t in ("energygrid_v4_invoice", "energygrid_v4_intent",
+                                                                "energygrid_v4_transition")])
+            adopted = store.adopted_predecessor("EB_BILL", self.built["EB_BILL"]["latest"])
+            self.assertEqual("EB Bill/2026-09-01.pdf", adopted["archive_relpath"])
+            self.assertIsNone(store.adopted_predecessor("TENANT_BILL", self.built["EB_BILL"]["latest"]))
+
+
+class MigrationRunLockTests(_BuiltPredecessorBase):
+    """M9, M9b: the v4 apply holds the shipped v3 single-run lock (#226 v4 correction F1)."""
+
+    def test_m9_apply_is_refused_while_a_cooperating_v3_writer_holds_the_run_lock(self) -> None:
+        from energygrid_bill_downloader.errors import RUN_IN_PROGRESS
+        from energygrid_bill_downloader.run_lock import RunLock
+
+        before = predecessor_digest(self.path)
+        state_bytes = self.path.read_bytes()
+        with RunLock(self.path.parent):  # exactly as cli.py and orchestration.py hold it around StateV3Store
+            with self.assertRaises(OfflineV4Error) as caught:
+                migrate_state_database_v4(self.path, apply=True)
+            self.assertEqual("EG_V4_RUN_LOCKED", caught.exception.support_ref)
+            self.assertEqual(10, caught.exception.exit_code)
+            self.assertEqual(RUN_IN_PROGRESS, caught.exception.status)
+        self.assertEqual(state_bytes, self.path.read_bytes())
+        self.assertEqual(3, _user_version(self.path))
+        self.assertEqual(0, _v4_object_count(self.path))
+        self.assertEqual([], self.backups())
+        self.assertEqual(before, predecessor_digest(self.path))
+
+    def test_m9_the_lock_identity_is_the_resolved_state_directory(self) -> None:
+        from energygrid_bill_downloader.run_lock import RunLock
+
+        (self.dir / "sub").mkdir()
+        unresolved = self.dir / "sub" / ".." / "state.sqlite"
+        with RunLock(self.dir):
+            with self.assertRaises(OfflineV4Error) as caught:
+                migrate_state_database_v4(unresolved, apply=True)
+        self.assertEqual("EG_V4_RUN_LOCKED", caught.exception.support_ref)
+        self.assertEqual(0, _v4_object_count(self.path))
+
+    def test_m9_plan_stays_lock_free_and_read_only(self) -> None:
+        from energygrid_bill_downloader.run_lock import RunLock
+
+        state_bytes = self.path.read_bytes()
+        with RunLock(self.path.parent):
+            self.assertEqual("PLAN_V4", migrate_state_database_v4(self.path)["status"])
+        self.assertEqual(state_bytes, self.path.read_bytes())
+
+    def test_m9_positive_an_unheld_apply_migrates_and_fresh_legacy_writers_are_then_refused(self) -> None:
+        from energygrid_bill_downloader.run_lock import RunLock
+        from energygrid_bill_downloader.state import StateStore
+
+        self.assertEqual("MIGRATED_V4", migrate_state_database_v4(self.path, apply=True)["status"])
+        with RunLock(self.path.parent):
+            with self.assertRaises(StateError):
+                with StateV3Store(self.path):
+                    pass
+            with self.assertRaises(StateError):
+                with StateStore(self.path):
+                    pass
+        self.assertEqual(4, _user_version(self.path))
+
+    def test_m9_the_lock_is_held_from_before_the_sqlite_open_until_after_the_final_check(self) -> None:
+        from energygrid_bill_downloader import state as state_module
+
+        held: list[tuple[str, bool]] = []
+        real_connect = sqlite3.connect
+        real_inspect_v4 = state_module._inspect_v4_database
+
+        def connect(*args, **kwargs):
+            if args and str(args[0]) == str(self.path):
+                held.append(("connect", not _run_lock_is_free(self.dir)))
+            return real_connect(*args, **kwargs)
+
+        def inspect_v4(connection):
+            held.append(("inspect_v4", not _run_lock_is_free(self.dir)))
+            return real_inspect_v4(connection)
+
+        with mock.patch.object(state_module.sqlite3, "connect", side_effect=connect), \
+                mock.patch.object(state_module, "_inspect_v4_database", side_effect=inspect_v4):
+            migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual([("connect", True), ("inspect_v4", True)], held)
+        self.assertTrue(_run_lock_is_free(self.dir))
+
+    def test_m9b_the_lock_is_released_after_success_and_after_every_refusal(self) -> None:
+        from energygrid_bill_downloader import state as state_module
+
+        # Blocker refusal.
+        connection = raw(self.path)
+        connection.execute("UPDATE energygrid_stream_v2 SET admission='HOLD' WHERE stream='EB_BILL'")
+        connection.close()
+        with self.assertRaises(OfflineV4Error):
+            migrate_state_database_v4(self.path, apply=True)
+        self.assertTrue(_run_lock_is_free(self.dir))
+        # Missing database.
+        with self.assertRaises(OfflineV4Error) as caught:
+            migrate_state_database_v4(self.dir / "absent.sqlite", apply=True)
+        self.assertEqual("EG_V4_PREDECESSOR_MISSING", caught.exception.support_ref)
+        self.assertTrue(_run_lock_is_free(self.dir))
+        # A failure after the schema apply, before the commit.
+        self.tearDown()
+        self.setUp()
+        with mock.patch.object(state_module, "_inspect_v4_database", return_value="INCOMPATIBLE_V4"):
+            with self.assertRaises(OfflineV4Error) as caught:
+                migrate_state_database_v4(self.path, apply=True)
+        self.assertEqual("EG_V4_SCHEMA_VALIDATION_FAILED", caught.exception.support_ref)
+        self.assertTrue(_run_lock_is_free(self.dir))
+        self.assertEqual(3, _user_version(self.path))
+        # An unexpected exception inside the apply.
+        with mock.patch.object(state_module, "_backup_state_file_exclusive", side_effect=OSError("synthetic")):
+            with self.assertRaises(OSError):
+                migrate_state_database_v4(self.path, apply=True)
+        self.assertTrue(_run_lock_is_free(self.dir))
+        # Success.
+        self.assertEqual("MIGRATED_V4", migrate_state_database_v4(self.path, apply=True)["status"])
+        self.assertTrue(_run_lock_is_free(self.dir))
+
+
+class ShippedV3LockStaticProofTests(unittest.TestCase):
+    """M9c: every shipped v3 store and migration entry point runs inside the single-run lock."""
+
+    PACKAGE = Path(__file__).resolve().parents[1] / "energygrid_bill_downloader"
+    WRITERS = {"StateV2Store", "StateV3Store", "migrate_state_database", "migrate_state_database_v3", "migrate"}
+
+    @staticmethod
+    def _callee(call) -> str | None:
+        import ast
+
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        return None
+
+    def _call_sites(self, module: str) -> list[tuple[int, str, str]]:
+        import ast
+
+        tree = ast.parse((self.PACKAGE / module).read_text(encoding="utf-8"), filename=module)
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        sites = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or self._callee(node) not in self.WRITERS:
+                continue
+            plan = any(k.arg == "apply" and isinstance(k.value, ast.Constant) and k.value.value is False
+                       for k in node.keywords)
+            lock = None
+            scope = parents.get(node)
+            while scope is not None and lock is None:
+                if isinstance(scope, ast.With):
+                    for item in scope.items:
+                        expr = item.context_expr
+                        if (isinstance(expr, ast.Call) and self._callee(expr) in {"RunLock", "lock_factory"}
+                                and [ast.unparse(a) for a in expr.args] == ["config.state_path.parent"]):
+                            lock = ast.unparse(expr)
+                scope = parents.get(scope)
+            sites.append((node.lineno, self._callee(node), "PLAN_READ_ONLY" if plan else (lock or "UNLOCKED")))
+        return sites
+
+    def test_m9c_shipped_v3_entry_points_are_enclosed_by_the_run_lock(self) -> None:
+        cli = [(name, lock) for _line, name, lock in self._call_sites("cli.py")]
+        orchestration = [(name, lock) for _line, name, lock in self._call_sites("orchestration.py")]
+        self.assertEqual(
+            sorted([
+                ("StateV3Store", "RunLock(config.state_path.parent)"),
+                ("migrate", "RunLock(config.state_path.parent)"),
+                ("migrate", "PLAN_READ_ONLY"),
+            ]),
+            sorted(cli),
+        )
+        self.assertEqual([("StateV3Store", "core.lock_factory(config.state_path.parent)")], orchestration)
+
+    def test_m9c_the_shipped_lock_factory_default_is_the_run_lock(self) -> None:
+        import ast
+
+        tree = ast.parse((self.PACKAGE / "orchestration.py").read_text(encoding="utf-8"))
+        assigned = [ast.unparse(node.value) for node in ast.walk(tree)
+                    if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == ["lock_factory"]]
+        self.assertEqual(["RunLock"], assigned)
+
+    def test_m9c_config_state_paths_are_resolved_and_v4_locks_the_resolved_parent(self) -> None:
+        import ast
+
+        from energygrid_bill_downloader.config import require_external
+
+        unresolved = Path(tempfile.gettempdir()) / "x" / ".." / "state.sqlite"
+        self.assertEqual(unresolved.resolve(), require_external(unresolved, None, "state_path"))
+        tree = ast.parse((self.PACKAGE / "state.py").read_text(encoding="utf-8"))
+        locks = [ast.unparse(node) for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and self._callee(node) == "RunLock"]
+        self.assertEqual(["RunLock(path.resolve(strict=False).parent)"], locks)
+
+    def test_m9c_the_v1_store_cannot_open_a_v3_or_v4_database(self) -> None:
+        from energygrid_bill_downloader.state import StateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite"
+            create_predecessor(path)
+            with self.assertRaises(StateError):
+                with StateStore(path):
+                    pass
+            with self.assertRaises(StateError):
+                with StateStore(path, read_only=True):
+                    pass
 
 
 if __name__ == "__main__":

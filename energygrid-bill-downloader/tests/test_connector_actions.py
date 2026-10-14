@@ -217,15 +217,20 @@ class StaticNoProviderProofTests(unittest.TestCase):
 
     def test_the_v4_orchestration_and_admission_functions_reach_no_provider_name(self) -> None:
         targets = {
-            "orchestration.py": {"run_offline_dual_stream_v4", "_v4_iso", "_v4_rotated", "_v4_stream_step", "_v4_perform", "_v4_drain"},
-            "reconcile.py": {"admit_latest_offline_v4", "_v4_support_ref"},
-            "state.py": {"StateV4Store", "migrate_state_database_v4", "predecessor_digest", "_predecessor_digest",
+            "orchestration.py": {"run_offline_dual_stream_v4", "_v4_iso", "_v4_rotated", "_v4_stream_step", "_v4_perform",
+                                 "_v4_drain", "_v4_stream_outcome", "_v4_overall"},
+            "reconcile.py": {"admit_latest_offline_v4", "_v4_support_ref", "_v4_admission_status",
+                             "_adopt_predecessor_latest"},
+            "state.py": {"StateV4Store", "migrate_state_database_v4", "_migrate_state_database_v4_locked",
+                         "_apply_state_database_v4", "predecessor_digest", "_predecessor_digest",
                          "_inspect_v4_database", "_reference_v4_manifest", "_apply_v4_schema", "_move_intent",
                          "_v4_receipt_target", "_v4_receipt_digest", "_v4_invoice_key", "_v4_intent_id",
                          "_v4_archive_relpath", "_refusal_from_sqlite", "_fetch_dicts",
-                         "_v4_admission_conflicts", "_backup_state_file_exclusive", "_v4_added_keys",
+                         "_v4_identity_refusals", "_v4_presentation_conflicts", "_backup_state_file_exclusive",
+                         "_v4_added_keys", "_v4_cutover_blockers", "_classify_predecessor_latest", "_insert_admission",
                          "assert_lease_held", "acquire_lease", "release_lease", "check_admissible",
-                         "admit_invoice", "record_receipt", "seal_dispatch", "recover_unfinished"},
+                         "admit_invoice", "record_receipt", "seal_dispatch", "recover_unfinished",
+                         "adopted_predecessor", "predecessor_latest", "adopt_predecessor_latest"},
         }
         for module, names in targets.items():
             tree = ast.parse((PACKAGE / module).read_text(encoding="utf-8"), filename=module)
@@ -309,6 +314,77 @@ class RuntimeNoProviderProofTests(unittest.TestCase):
                 [entry["action"] for entry in ledger.effects],
             )
             self.assertEqual("energygrid.offline.v4.result", result["schema"])
+
+    def test_migration_and_adoption_of_a_real_adoptable_predecessor_make_no_provider_call(self) -> None:
+        """An ADOPTABLE v3 latest is migrated and adopted with no network, process or provider reach."""
+        from fixtures.synthetic_dual_stream import candidate, snapshot
+        from energygrid_bill_downloader.state import StateV4Store, migrate_state_database_v4, predecessor_digest
+        from test_state_v4 import LATEST_SOURCE, build_predecessor_v3, predecessor_pdf
+
+        calls: list[str] = []
+
+        def recorder(label: str):
+            def fail(*args, **kwargs):
+                calls.append(label)
+                raise AssertionError(f"offline v4 must not call {label}")
+            return fail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "state.sqlite"
+            archive = root / "archive"
+            temp = root / "temp"
+            temp.mkdir()
+            built = build_predecessor_v3(db, archive, {"EB_BILL": "ADOPTABLE", "TENANT_BILL": "DELIVERED"})
+            adapters = {}
+            for stream in ("EB_BILL", "TENANT_BILL"):
+                name, day = LATEST_SOURCE[stream]
+                item = candidate(Stream(stream), name=name, invoice_date=day)
+                adapters[stream] = OfflineFakeAdapter(snapshot(Stream(stream), (item,)), {name: predecessor_pdf(name)})
+            ledger = FakeProviderLedger()
+            connectors = {ACTION_DRIVE_UPLOAD: FakeDriveConnector(ledger), ACTION_GMAIL_SEND: FakeGmailConnector(ledger)}
+            seen: dict = {}
+
+            def at_after_acquisition(name: str) -> None:
+                if name != "after_acquisition":
+                    return
+                with StateV4Store(db) as view:
+                    seen["effects"] = len(ledger.effects)
+                    seen["acquire_calls"] = {s: list(a.acquire_calls) for s, a in adapters.items()}
+                    seen["admissions"] = [(row["stream"], row["predecessor_invoice_id"]) for s in ("EB_BILL", "TENANT_BILL")
+                                          for row in view.invoices_for_stream(s)]
+                seen["digest"] = predecessor_digest(db)
+
+            patches = [
+                mock.patch.object(socket.socket, "connect", recorder("socket.connect")),
+                mock.patch.object(socket, "create_connection", recorder("socket.create_connection")),
+                mock.patch.object(urllib.request, "urlopen", recorder("urllib.urlopen")),
+                mock.patch.object(subprocess, "Popen", recorder("subprocess.Popen")),
+                mock.patch.object(subprocess, "run", recorder("subprocess.run")),
+                mock.patch.object(os, "system", recorder("os.system")),
+            ]
+            for patch in patches:
+                patch.start()
+            try:
+                before = predecessor_digest(db)
+                self.assertEqual("MIGRATED_V4", migrate_state_database_v4(db, apply=True)["status"])
+                with StateV4Store(db) as store:
+                    result = run_offline_dual_stream_v4(
+                        state=store, adapters=adapters, connectors=connectors, archive_root=archive, temp_root=temp,
+                        run_id="11111111-2222-4333-8444-555555555556", owner_token="runtime-adoption-proof",
+                        provider_profile=OFFLINE_FAKE_PROVIDER_PROFILE, now_ms=1_000_000, checkpoint=at_after_acquisition,
+                    )
+            finally:
+                for patch in reversed(patches):
+                    patch.stop()
+            self.assertEqual([], calls)
+            self.assertEqual(0, seen["effects"])
+            self.assertEqual({"EB_BILL": [], "TENANT_BILL": []}, seen["acquire_calls"])
+            self.assertEqual([("EB_BILL", built["EB_BILL"]["latest"])], seen["admissions"])
+            self.assertEqual(before, seen["digest"])
+            self.assertEqual("ADOPTED", result["acquisition"]["EB_BILL"]["predecessor"])
+            self.assertEqual(["DRIVE_UPLOAD", "GMAIL_SEND"], [entry["action"] for entry in ledger.effects])
+            self.assertEqual(before, predecessor_digest(db))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 # EnergyGrid dual-stream v4 offline core: contract
 
-Status: offline construction slice for #226 G3 (run `2026-10-13-xb-226-dualstream-offline-core-g3-001`).
+Status: offline construction slice for #226 G3 (run `2026-10-13-xb-226-dualstream-offline-core-g3-001`),
+corrected by the Web-directed v4 continuation (run `2026-10-14-xb-226-dualstream-offline-v4-web-directed-g3-001`)
+against the accepted targeted G2 contract (#226:6158953231).
 Scope: a deterministic local core with fake provider adapters only. This document does not grant
 live Gmail, Drive, SMTP, n8n, portal or Shopify effects, a Desktop scheduled task, a project hook,
 a production migration, or a G4 or UAT pass. Live delivery stays on HOLD until Web accepts the
@@ -27,16 +29,19 @@ separate G2 permission boundary.
 | Month | Uppercase English abbreviation `JAN`..`DEC` from the validated source invoice date |
 | Year | Four digits |
 | Source name | Kept verbatim after the prefix, extension included (`.pdf` or `.PDF`) |
-| Already prefixed, same month and year | Accepted; the prefix is normalised to uppercase, with no second prefix |
-| Any other `MMM YYYY - ` prefix, or a doubled prefix | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
-| Non-ASCII source name (only qualified ASCII names are supported) | Typed HOLD, `EG_V4_DISPLAY_SHAPE_UNSUPPORTED`. Never guessed. |
-| Leading whitespace, or any format (Cf) or control (Cc) character | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
-| Other month-year text at the start, in the exact or a non-standard shape (for example a doubled prefix with two spaces, `OCT2026-` or `OCT 2026-03`) | Refused, `EG_V4_DISPLAY_PREFIX_CONFLICT`. Fail closed. |
-| Empty stem, non-PDF, control or path characters, reserved device name | Refused, `EG_V4_DISPLAY_NAME_INVALID` |
-| Result longer than 260 characters | Refused, never truncated |
-| Collision within one stream (NFC plus casefold) | Refused at admission, `EG_V4_DISPLAY_NAME_COLLISION` |
+| Already prefixed, same month and year (any letter case) | Accepted once; the prefix is normalised to uppercase (`oct 2026 - x.pdf` in October 2026 gives `OCT 2026 - x.pdf`) |
+| A `MMM YYYY - ` token (any case, month or year) anywhere except as that one accepted leading prefix: another period, doubled, or embedded (`Invoice OCT 2026 - EB.pdf`, `x OCT 2026 - y.pdf`) | Ambiguous, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
+| The source name, or the remainder after the accepted prefix, starts with a month abbreviation, a full English month name or `SEPT`, then a non-letter and a four-digit year with any or no ASCII separator (`OCT 2026 invoice.pdf`, `OCTOBER 2026 - x.pdf`, `SEPT 2026 - x.pdf`, `OCT2026-invoice.pdf`, `OCT 2026 - OCT2026 x.pdf`) | Ambiguous, `EG_V4_DISPLAY_PREFIX_CONFLICT`. Never guessed. |
+| Accepted controls | `XYZ 2026 - invoice.pdf`, `Invoice Oct.pdf`, `Octopus 2026.pdf`, `10-2026 invoice.pdf`, `oct 2026 - x.pdf` each get exactly one canonical prefix |
+| Non-ASCII source name (only qualified ASCII names are supported) | `EG_V4_DISPLAY_SHAPE_UNSUPPORTED` |
+| Leading whitespace, or any format (Cf) or control (Cc) character | `EG_V4_DISPLAY_NAME_INVALID` |
+| Empty stem, non-PDF, control or path characters, reserved device name | `EG_V4_DISPLAY_NAME_INVALID` |
+| Result longer than 260 characters | `EG_V4_DISPLAY_NAME_INVALID`, never truncated |
+| Collision within one stream (NFC plus casefold) | `EG_V4_DISPLAY_NAME_COLLISION` |
 
-The display name is computed once and stored in the immutable admission row.
+Every `EG_V4_DISPLAY_*` fault of a stream's current latest candidate is a typed stream HOLD (section 5):
+zero fetch, zero archive write, zero admission and zero Drive or Gmail effect for that candidate. The
+display name is computed once and stored in the immutable admission row.
 
 ## 3. SQLite v4 (additive)
 
@@ -72,29 +77,57 @@ Guards the database enforces, so a direct SQL write cannot skip them:
   configuration rows only, with no invoice, Drive or delivery data.
 - `predecessor_digest` covers every predecessor schema object and every row of every predecessor table. The only objects excluded are
   the exact (type, name) keys that v4 adds. An extra trigger on a v3 table changes the digest.
-- A migration takes the write lock first. Inside that transaction it refuses only local integrity
-  blockers: an unclassified invoice, an archive that is not settled, a stream held in v3, or a prepared
-  file operation. Provider evidence is not a blocker, because cutover classifies it. It accepts a
-  COMPLETE_V3 or RESUMABLE_V3 database, writes an exclusive backup, applies the v4 objects, and commits
-  only if the predecessor digest and the v4 inspection both still pass. Any failure rolls back.
+- Migration lock (F1). `migrate_state_database_v4(path, apply=True)` first takes the shipped single-run
+  lock, `RunLock` on the resolved state directory (`path.resolve(strict=False).parent`). That is the same
+  lock file every shipped v3 writer holds for its whole run: `cli.py` (`RunLock(config.state_path.parent)`
+  around `StateV3Store` and the v3 migration apply) and `orchestration.run_command`
+  (`core.lock_factory(config.state_path.parent)`, default `RunLock`), where `config.state_path` is already
+  resolved. The lock is taken before SQLite is opened and held until the commit or rollback and the
+  close; it is released on every exit. If it is held, the apply is refused with `EG_V4_RUN_LOCKED`
+  (status `RUN_IN_PROGRESS`, exit 10): no backup, no schema change, `user_version` stays 3 and the
+  predecessor digest is unchanged. A plan (`apply=False`) stays read-only and lock-free. The v1 store
+  refuses any database newer than v1, so it cannot write a v3 or v4 database.
+- Inside the lock the apply takes the SQLite write lock first. Inside that transaction it refuses only
+  local integrity blockers, each on its own (plan and apply): `archive_state` PREPARED, CONFLICT or
+  UNVERIFIED; `migration_state` UNCLASSIFIED, MOVE_PLANNED or HOLD; a stream with `admission='HOLD'`;
+  a non-`DRIVE_STAGE` file operation that is PREPARED or HOLD (and an unclassified invoice). Provider
+  evidence, including a historical v2 `DRIVE_STAGE` operation in any state, is not a blocker, because
+  cutover classifies it. It accepts a COMPLETE_V3 or RESUMABLE_V3 database, writes an exclusive backup,
+  applies the v4 objects, and commits only if the predecessor digest and the v4 inspection both still
+  pass. Any failure rolls back.
+- Trust assumption: only the enumerated shipped v3 entry points write v3 state, and each holds the
+  single-run lock. A v3 handle opened without that lock before the migration (a non-cooperating stale
+  handle) can still write after it; that case is OUT_OF_MODEL here and is not fixed (section 8, D2).
 - v4 never re-admits v3 history by portal identity. The stream's CURRENT latest v3 invoice is
   classified from frozen v3 evidence. Older history is never classified, so it is never backfilled:
 
   | Frozen v3 evidence for the current latest | Result |
   |---|---|
   | No delivery row, no Drive operation, no DRIVE_STAGE operation, archive COMMITTED | ADOPTABLE: one v4 delivery, no fetch |
-  | Delivery PENDING_SEND with no dispatch start, and no Drive evidence | ADOPTABLE |
+  | Delivery PENDING_SEND with no dispatch start | Not a dispatch HOLD. v3 accepts a delivery only after a DRIVE_VERIFIED receipt, so it is held by the Drive rule below, never adopted |
   | Delivery DELIVERED | DELIVERED: no action |
-  | Delivery DELIVERY_OUTCOME_UNCERTAIN, REQUEST_REJECTED, or dispatched | HOLD (`EG_V4_PREDECESSOR_DELIVERY_*`) |
+  | Delivery DELIVERY_OUTCOME_UNCERTAIN, REQUEST_REJECTED, or PENDING_SEND with a claimed dispatch | HOLD (`EG_V4_PREDECESSOR_DELIVERY_UNCERTAIN`, `_REJECTED`, `_DISPATCHED`) |
   | Drive operation not DRIVE_VERIFIED (partial or uncertain) | HOLD (`EG_V4_PREDECESSOR_DRIVE_PARTIAL`) |
   | Drive operation DRIVE_VERIFIED, delivery not sent | HOLD (`EG_V4_PREDECESSOR_DRIVE_VERIFIED_NOT_SENT`). Web decision needed. |
-  | DRIVE_STAGE operation, or drive state not NOT_STAGED | HOLD (`EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT`) |
+  | DRIVE_STAGE operation (any state), or drive state not NOT_STAGED, each on its own | HOLD (`EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT`) |
   | Archive not COMMITTED | HOLD (`EG_V4_PREDECESSOR_ARCHIVE_NOT_COMMITTED`). v4 never fetches at cutover. |
-  | Two latest invoices with the same day | HOLD (`EG_V4_PREDECESSOR_LATEST_AMBIGUOUS`) |
+  | Two latest invoices with the same day | HOLD (`EG_V4_PREDECESSOR_LATEST_AMBIGUOUS`, no invoice). Defence in depth: the unique v3 archive path index prevents it in a valid v3 database. A tie on an older day does not block the unique latest. |
 
-- Adoption validates the existing archive bytes against the frozen row (SHA-256 and size). It never
-  refetches, recopies or renames the archive. A failed check is a HOLD (`EG_V4_PREDECESSOR_ARCHIVE_UNREADABLE`
-  or `EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH`).
+- First adoption validates the existing archive bytes against the frozen row (SHA-256 and size). It
+  never refetches, recopies or renames the archive. A failed check is a HOLD
+  (`EG_V4_PREDECESSOR_ARCHIVE_UNREADABLE` or `EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH`). Inside the
+  fenced write the latest is classified again: a different or no-longer-ADOPTABLE latest is
+  `EG_V4_PREDECESSOR_ADOPTION_STALE`, and a SHA-256 or size that differs from the frozen row is
+  `EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH`.
+- Adoption-first lookup (F3). Before any archive I/O, each run looks up a v4 admission for the same stream
+  and `predecessor_invoice_id`. If one exists the result is `ADOPTED_EARLIER`: no archive read, no path
+  resolution and no state write. So a delivered adopted invoice whose old archive was later changed,
+  deleted, locked or made unreadable never stops a newer legitimate invoice.
+- Send-time integrity. A pending adopted (or native) delivery is checked again when it is sent: the
+  exact bytes read must match the admitted SHA-256 and size. A mismatch or an unreadable file holds that
+  intent before any seal (`EG_V4_ARCHIVE_IDENTITY_CHANGED` or `EG_V4_ARCHIVE_UNREADABLE`). Nothing is
+  resent, repaired or discarded. A newer legitimate invoice is still admitted, but it waits behind the
+  held older work in that stream (oldest first).
 - An adopted v4 admission links to its predecessor row (`predecessor_invoice_id`). It writes no
   predecessor table and creates no second invoice identity. A stream whose latest is HOLD gets no new
   admission and no inventory call.
@@ -135,8 +168,16 @@ UNKNOWN --REJECTED / conflict--> HOLD;   VERIFIED --conflicting outcome--> HOLD;
 5. Classify, adopt and admit: for each stream, first classify the current latest v3 invoice (section 3).
    An ADOPTABLE latest is adopted once, with no portal call or fetch. A DELIVERED latest is no action.
    A HOLD stops that stream's admissions and inventory call. Otherwise take one inventory, pick the
-   unique latest candidate and admit it, subject
-   to section 3. A portal or fetch failure is recorded against its stream, and pending work still
+   unique latest candidate and decide it in this precedence, before any fetch:
+   1. the same identity already admitted with the same names: `ALREADY_ADMITTED`;
+   2. an identity conflict, a predecessor identity or archive, or a source regression: `ADMISSION_REFUSED`
+      (an older candidate is refused for regression even when its name is invalid or non-ASCII);
+   3. display computation, then display collision: any `EG_V4_DISPLAY_*` is a typed stream `HOLD`;
+   4. archive path collision: `ADMISSION_REFUSED`.
+   A display HOLD fetches nothing and writes no archive, admission or effect for that candidate, does
+   not stop older admitted work in that stream from draining, and is not stored: a later newer valid
+   candidate proceeds. Then fetch and admit, subject to section 3. A portal or fetch failure is recorded
+   against its stream, and pending work still
    drains. The archive is published before its admission row. A crash between them leaves a file on
    disk that the next run can reuse, but only while that invoice is still the stream's latest and the
    portal returns the same bytes. If a newer invoice is admitted first, the older archive file stays
@@ -152,6 +193,26 @@ UNKNOWN --REJECTED / conflict--> HOLD;   VERIFIED --conflicting outcome--> HOLD;
 
 An immediate second run with nothing new performs zero dispatches.
 
+### Run report (F5/F7)
+
+The result keeps acquisition and drain truth separate:
+
+- `acquisition[stream]`: status and `support_ref` of this run's admission step (and the predecessor result).
+- `drain.streams[stream]`: the drain truth after the drain, `BLOCKED` (with the held or UNKNOWN intent's
+  reference), `PENDING` or `DRAINED`. It is never overwritten by acquisition.
+- `streams[stream]`: `outcome`, `acquisition_status`, `acquisition_ref`, `drain_state`, `drain_ref`. Both
+  references stay visible, for example an acquisition display HOLD on a stream whose older dispatch is
+  BLOCKED by an UNKNOWN Drive upload.
+- `outcome` precedence: `BLOCKED` > `HOLD` > `PENDING` > `ACQUISITION_FAILED` / `REFUSED` > `DRAINED`.
+  `REFUSED` is `ADMISSION_REFUSED`; every other unhandled acquisition status (`PORTAL_ACQUISITION_FAILED`,
+  `FETCH_FAILED`, `ARCHIVE_CONFLICT`, `INVALID_PDF`, `INVENTORY_INVALID`, `LATEST_AMBIGUOUS`,
+  `ADAPTER_UNAVAILABLE`, `ARCHIVE_PUBLISH_FAILED`) is `ACQUISITION_FAILED`. `DRAINED` needs an idle drain
+  and an acquisition of `ADMITTED`, `ALREADY_ADMITTED`, `PREDECESSOR_DELIVERED` or `EMPTY`.
+- `overall` is `DRAINED` only when both streams are `DRAINED`; otherwise it is the most severe stream outcome.
+
+A predecessor HOLD stays permanent and fail-closed offline. Its audited operator resolution is a later
+live-cutover G2 decision (D1) and is not implemented here.
+
 ## 6. Connector facade (`connector_actions.py`)
 
 - Only in-memory fakes exist: `FakeDriveConnector`, `FakeGmailConnector`, `FakeProviderLedger`.
@@ -166,10 +227,10 @@ An immediate second run with nothing new performs zero dispatches.
 
 | Area | Test module |
 |---|---|
-| Month, prefix, conflicts, collisions, length, leading whitespace | `tests/test_naming.py` |
-| Pinned predecessor, migration and open-work refusal, digest, immutability (including `INSERT OR REPLACE`), guards, lease fencing, receipts, admission, predecessor cutover and regression | `tests/test_state_v4.py` |
-| Fake contract, live-profile refusal, adapter declaration, static import and name proof, runtime no-call proof | `tests/test_connector_actions.py` |
-| End to end: fairness, catch-up, second run, crashes at each checkpoint, lost response, lease takeover, portal failure and regression, plain-adapter refusal, predecessor cutover | `tests/test_orchestration_v4.py` |
+| Month, prefix, conflicts, ambiguity rules and positive controls (M14), collisions, length, leading whitespace | `tests/test_naming.py` |
+| Pinned predecessor, migration and open-work refusal, each blocker in plan and apply (M5a-M5i), run lock refusal, identity and release (M9, M9b), shipped v3 lock call sites (M9c), classifier (M1-M3), stale adoption (M4), digest, immutability (including `INSERT OR REPLACE`), guards, lease fencing, receipts, admission, predecessor cutover and regression | `tests/test_state_v4.py` |
+| Fake contract, live-profile refusal, adapter declaration, static import and name proof (including adoption, classification, admission and migration functions), runtime no-call proofs for a native run and for migration plus adoption of an ADOPTABLE predecessor | `tests/test_connector_actions.py` |
+| End to end: fairness, catch-up, second run, crashes at each checkpoint, lost response, lease takeover, portal failure and regression, plain-adapter refusal, predecessor cutover, M1-M3 run holds, adopted-archive liveness (M10), send-time integrity and FIFO (M11), display HOLD (M12, M14), regression precedence (M13), truthful report (M15), two-stream isolation with HOLD, UNKNOWN and no backfill | `tests/test_orchestration_v4.py` |
 
 Commands (run from `energygrid-bill-downloader/`):
 
@@ -203,7 +264,27 @@ python -m unittest discover -s tests
   A longer run is taken over, and it then stops before its next external effect with `EG_V4_LEASE_LOST`.
   The intent it left DISPATCHED is recovered as UNKNOWN by the new owner, and it is not resent.
 - Filename shapes: only qualified ASCII source names are supported, and only the exact `MMM YYYY - <source>`
-  form is produced. Any non-ASCII name, and any other month-year shape, is a typed HOLD or refusal. No real
-  portal basename compatibility is declared proven. An authorised read-only observation of real shapes is
-  needed before live UAT. A filename is never invented.
+  form is produced. For a current candidate, any non-ASCII name and any ambiguous month-year shape is a
+  typed HOLD; an older candidate is still a source-regression refusal. No real portal basename
+  compatibility is declared proven. An authorised read-only observation of real shapes is needed before
+  live UAT (D7). A filename is never invented.
 - Only the Windows `MoveFileExW` publication path is used, as in v3.
+- OUT_OF_MODEL: a non-cooperating stale v3 handle. A `StateV3Store` opened before the migration by code
+  that does not hold the single-run lock keeps writing after the migration. The original reproducer still
+  reproduces this. It is outside the enumerated shipped-v3-entry-point trust assumption (section 3) and is
+  not claimed fixed.
+
+### Deferred live-cutover decisions (not resolved or bypassed by the offline core)
+
+| Ref | Decision | Offline behaviour now |
+|---|---|---|
+| D1 | Audited operator resolution of a predecessor HOLD | Permanent fail-closed HOLD, no resolution command |
+| D2 | Defence in depth against a non-cooperating stale v3 handle (for example a per-write schema fence) | Deferred; OUT_OF_MODEL |
+| D3 | Real v3 Scheduler shutdown, proof that the live lock path equals the v4 lock path, and a supported v4 live entry point | Not implemented; no v4 CLI entry point |
+| D4 | Manual recovery of an unreadable or changed archive for pending work | Intent HOLD before seal, never resent |
+| D5 | Policy for a same-day invoice with a different identity | `EG_V4_ARCHIVE_PATH_COLLISION` refusal |
+| D6 | SQLite-level identity constraints (for example triggers for `predecessor_invoice_id` and v3 identities) | Deferred; enforced in Python |
+| D7 | Observation of actual EnergyGrid portal filenames | Not observed; ambiguous shapes HOLD |
+
+The separate native Gmail and Drive managed-guard G2 HOLD and the Owner host-consent requirement are
+independent of this document. Offline Core completion is not live UAT readiness.

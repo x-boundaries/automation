@@ -1005,9 +1005,8 @@ def run_offline_dual_stream_v4(
     except Exception:
         state.release_lease(owner_token)
         raise
-    for stream in V4_STREAMS:
-        if acquisition[stream]["status"] == "HOLD":
-            streams[stream] = {"state": "HOLD", "support_ref": acquisition[stream]["support_ref"]}
+    # drain.streams stays the drain truth. The per-stream outcome combines it with acquisition and keeps both refs.
+    outcomes = {stream: _v4_stream_outcome(acquisition[stream], streams[stream]) for stream in V4_STREAMS}
     state.release_lease(owner_token)
     return {
         "schema": V4_RESULT_SCHEMA,
@@ -1015,4 +1014,40 @@ def run_offline_dual_stream_v4(
         "recovered_unknown": recovered,
         "acquisition": acquisition,
         "drain": {"steps": drain["steps"], "blocked": drain["blocked"], "streams": streams},
+        "streams": outcomes,
+        "overall": _v4_overall(outcomes),
     }
+
+
+# Per-stream outcome, most severe first. DRAINED needs an idle drain and a handled acquisition.
+V4_OUTCOME_PRECEDENCE = ("BLOCKED", "HOLD", "PENDING", "ACQUISITION_FAILED", "REFUSED", "DRAINED")
+V4_ACQUISITION_HANDLED = frozenset({"ADMITTED", "ALREADY_ADMITTED", "PREDECESSOR_DELIVERED", "EMPTY"})
+
+
+def _v4_stream_outcome(acquisition: dict, drain: dict) -> dict[str, str | None]:
+    """One stream's outcome: BLOCKED > HOLD > PENDING > ACQUISITION_FAILED / REFUSED > DRAINED."""
+    status = acquisition["status"]
+    if drain["state"] == "BLOCKED":
+        outcome = "BLOCKED"
+    elif status == "HOLD":
+        outcome = "HOLD"
+    elif drain["state"] == "PENDING":
+        outcome = "PENDING"
+    elif status == "ADMISSION_REFUSED":
+        outcome = "REFUSED"
+    elif status not in V4_ACQUISITION_HANDLED:
+        outcome = "ACQUISITION_FAILED"
+    else:
+        outcome = "DRAINED"
+    return {
+        "outcome": outcome,
+        "acquisition_status": status,
+        "acquisition_ref": acquisition["support_ref"],
+        "drain_state": drain["state"],
+        "drain_ref": drain["support_ref"],
+    }
+
+
+def _v4_overall(outcomes: dict[str, dict]) -> str:
+    """DRAINED only when every stream is DRAINED; otherwise the most severe stream outcome."""
+    return min((row["outcome"] for row in outcomes.values()), key=V4_OUTCOME_PRECEDENCE.index)

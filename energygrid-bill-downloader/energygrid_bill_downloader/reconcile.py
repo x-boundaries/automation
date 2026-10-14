@@ -1363,15 +1363,25 @@ def _v4_support_ref(error: BaseException, fallback: str) -> str:
     return fallback
 
 
+def _v4_admission_status(support_ref: str) -> str:
+    """Every display fault of a current candidate is a HOLD; other admission refusals stay REFUSED."""
+    return "HOLD" if support_ref.startswith("EG_V4_DISPLAY_") else "ADMISSION_REFUSED"
+
+
 def _adopt_predecessor_latest(state, archive_root: Path, stream: str, invoice: dict, run_id: str, now_iso: str):
     """Validate the predecessor archive and adopt it as one v4 delivery. Returns (status, support_ref).
 
     No portal call and no archive write. Every failure is a HOLD for this stream, and nothing is sent.
+    An invoice adopted by an earlier run is ADOPTED_EARLIER before any archive I/O: the archive is not
+    read again here, so a later change to it cannot stop a newer invoice. A pending adopted delivery
+    still has its exact bytes checked at send time (orchestration._v4_perform).
     """
     from datetime import date
 
     from .naming import display_filename
 
+    if state.adopted_predecessor(stream, invoice["invoice_id"]) is not None:
+        return ("ADOPTED_EARLIER", None)
     try:
         path = _canonical_path(archive_root, stream, invoice["canonical_filename"])
         ensure_no_reparse_components(path)
@@ -1412,7 +1422,6 @@ def admit_latest_offline_v4(
     leaves a byte-identical file that the next run reuses without a second copy.
     """
     from .invoice import InventorySnapshot, Stream
-    from .naming import display_filename
     from .state import V4_STREAMS
 
     hook = checkpoint or (lambda name: None)
@@ -1477,18 +1486,17 @@ def admit_latest_offline_v4(
             results[stream] = outcome(handled_outcome)
             continue
         try:
-            presentation = display_filename(candidate.source_filename, candidate.invoice_date)
-            decision = state.check_admissible(
+            decision, presentation = state.check_admissible(
                 stream=stream,
                 source_namespace=snapshot.source_namespace,
                 source_invoice_key=candidate.source_invoice_key,
-                display_filename=presentation,
+                source_filename=candidate.source_filename,
                 canonical_filename=candidate.canonical_filename,
                 invoice_date=candidate.invoice_date,
             )
         except OfflineV4Error as exc:
-            status = "HOLD" if exc.support_ref == "EG_V4_DISPLAY_SHAPE_UNSUPPORTED" else "ADMISSION_REFUSED"
-            results[stream] = outcome(status, exc.support_ref)
+            # A display fault of the current latest is a typed stream HOLD; nothing is fetched. Not sticky.
+            results[stream] = outcome(_v4_admission_status(exc.support_ref), exc.support_ref)
             continue
         if decision == "ALREADY_ADMITTED":
             results[stream] = outcome("ALREADY_ADMITTED")
@@ -1545,7 +1553,7 @@ def admit_latest_offline_v4(
         except OfflineV4Error as exc:
             if exc.support_ref == "EG_V4_LEASE_LOST":
                 raise
-            results[stream] = outcome("ADMISSION_REFUSED", exc.support_ref)
+            results[stream] = outcome(_v4_admission_status(exc.support_ref), exc.support_ref)
         finally:
             cleanup_run_directory(temp_dir, temp_root)
     for stream, row in results.items():

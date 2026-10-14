@@ -2610,25 +2610,55 @@ def _backup_state_file_exclusive(path: Path, label: str) -> Path:
 
 
 def migrate_state_database_v4(path: Path, *, apply: bool = False) -> dict[str, str]:
-    """Additive v3 -> v4 offline migration (#226 G3). A default call is read-only.
+    """Additive v3 -> v4 offline migration (#226 G3). A default call is read-only and lock-free.
 
-    An apply takes the write lock before any check, so the v3 checks, the backup,
-    the migration and the predecessor comparison all see one committed state. It
-    refuses open v3 work, writes an exclusive backup, adds only the v4 objects, and
-    commits only if the predecessor digest and the v4 inspection both still pass.
+    An apply first takes the shipped single-run lock, `RunLock` on the resolved state
+    directory, which every shipped v3 writer holds for its whole run. It is held until
+    the commit or rollback and the close, and released on every exit. A held lock is
+    refused with `EG_V4_RUN_LOCKED` (exit 10) before the database is opened, so there
+    is no backup and no schema or digest change. Inside the lock the apply takes the
+    SQLite write lock before any check, so the v3 checks, the backup, the migration and
+    the predecessor comparison all see one committed state. It refuses open v3 work,
+    writes an exclusive backup, adds only the v4 objects, and commits only if the
+    predecessor digest and the v4 inspection both still pass.
     """
+    if apply:
+        return _migrate_state_database_v4_locked(path)
     if not _check_migration_path(path):
         raise OfflineV4Error("EG_V4_PREDECESSOR_MISSING")
-    if not apply:
-        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
-        try:
-            connection.execute("PRAGMA foreign_keys=ON")
-            if _inspect_v3_database(connection) not in {"COMPLETE_V3", "RESUMABLE_V3"} or _v4_cutover_blockers(connection):
-                raise OfflineV4Error("EG_V4_PREDECESSOR_NOT_COMPLETE_V3")
-            return {"status": "PLAN_V4", "predecessor_digest": _predecessor_digest(connection)}
-        finally:
-            connection.close()
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        if _inspect_v3_database(connection) not in {"COMPLETE_V3", "RESUMABLE_V3"} or _v4_cutover_blockers(connection):
+            raise OfflineV4Error("EG_V4_PREDECESSOR_NOT_COMPLETE_V3")
+        return {"status": "PLAN_V4", "predecessor_digest": _predecessor_digest(connection)}
+    finally:
+        connection.close()
 
+
+def _migrate_state_database_v4_locked(path: Path) -> dict[str, str]:
+    """Apply the v4 migration while holding the shipped v3 single-run lock (see migrate_state_database_v4)."""
+    from .errors import RunLockedError
+    from .run_lock import RunLock
+
+    if not path.is_absolute():
+        raise StateError("migration database path must be absolute")
+    # Same directory identity as the shipped v3 writers: RunLock(config.state_path.parent), resolved.
+    run_lock = RunLock(path.resolve(strict=False).parent)
+    try:
+        run_lock.__enter__()
+    except RunLockedError:
+        raise OfflineV4Error("EG_V4_RUN_LOCKED", status=RUN_IN_PROGRESS, exit_code=10) from None
+    try:
+        if not _check_migration_path(path):
+            raise OfflineV4Error("EG_V4_PREDECESSOR_MISSING")
+        return _apply_state_database_v4(path)
+    finally:
+        run_lock.__exit__(None, None, None)
+
+
+def _apply_state_database_v4(path: Path) -> dict[str, str]:
+    """The v4 schema apply. The caller holds the single-run lock."""
     connection = sqlite3.connect(path, isolation_level=None)
     try:
         connection.execute("PRAGMA foreign_keys=ON")
@@ -2696,17 +2726,17 @@ def _classify_predecessor_latest(connection: sqlite3.Connection, stream: str) ->
     def hold(reference: str) -> dict:
         return {"status": "HOLD", "support_ref": reference, "invoice": invoice}
 
-    delivery = connection.execute(
+    mail = connection.execute(
         "SELECT state, dispatch_started_at_utc FROM energygrid_delivery_v1 WHERE invoice_id=?", (invoice["invoice_id"],)
     ).fetchone()
-    if delivery is not None:
-        if delivery[0] == "DELIVERED":
+    if mail is not None:
+        if mail[0] == "DELIVERED":
             return {"status": "DELIVERED", "support_ref": None, "invoice": invoice}
-        if delivery[0] == "DELIVERY_OUTCOME_UNCERTAIN":
+        if mail[0] == "DELIVERY_OUTCOME_UNCERTAIN":
             return hold("EG_V4_PREDECESSOR_DELIVERY_UNCERTAIN")
-        if delivery[0] == "REQUEST_REJECTED":
+        if mail[0] == "REQUEST_REJECTED":
             return hold("EG_V4_PREDECESSOR_DELIVERY_REJECTED")
-        if delivery[1] is not None:
+        if mail[1] is not None:
             return hold("EG_V4_PREDECESSOR_DELIVERY_DISPATCHED")
     drive_states = [
         item[0] for item in connection.execute(
@@ -2832,16 +2862,14 @@ def _fetch_dicts(conn: sqlite3.Connection, sql: str, parameters: tuple = ()) -> 
     return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
 
-def _v4_admission_conflicts(conn: sqlite3.Connection, *, stream: str, source_namespace: str,
-                            source_invoice_key: str, invoice_date, display_filename: str,
-                            canonical_filename: str) -> None:
-    """Raise the closed refusal for any predecessor, regression or v4 collision. Writes nothing.
+def _v4_identity_refusals(conn: sqlite3.Connection, *, stream: str, source_namespace: str,
+                          source_invoice_key: str, invoice_date, canonical_filename: str) -> None:
+    """Raise the closed refusal for a predecessor identity, predecessor archive or source regression. Writes nothing.
 
     v3 history is never re-admitted: an identity or archive path that v3 already holds
     is refused, and no admission may be older than the newest one the stream already has.
+    These refusals take precedence over any display check (see check_admissible).
     """
-    from .naming import display_key
-
     relpath = _v4_archive_relpath(stream, canonical_filename)
     if conn.execute(
         "SELECT 1 FROM energygrid_invoice_v2 WHERE classification='CLASSIFIED' AND stream=? "
@@ -2862,6 +2890,14 @@ def _v4_admission_conflicts(conn: sqlite3.Connection, *, stream: str, source_nam
     ).fetchone()[0]
     if newest_admitted is not None and invoice_date.isoformat() < newest_admitted:
         raise OfflineV4Error("EG_V4_SOURCE_REGRESSION")
+
+
+def _v4_presentation_conflicts(conn: sqlite3.Connection, *, stream: str, display_filename: str,
+                               canonical_filename: str) -> None:
+    """Raise the display collision, then the archive path collision. Writes nothing."""
+    from .naming import display_key
+
+    relpath = _v4_archive_relpath(stream, canonical_filename)
     if conn.execute(
         "SELECT 1 FROM energygrid_v4_invoice WHERE stream=? AND display_key=?", (stream, display_key(display_filename))
     ).fetchone():
@@ -3017,18 +3053,33 @@ class StateV4Store:
     # -- admission -------------------------------------------------------
 
     def check_admissible(self, *, stream: str, source_namespace: str, source_invoice_key: str,
-                         display_filename: str, canonical_filename: str, invoice_date) -> str:
-        """Return ALREADY_ADMITTED for the same identity, or ADMISSIBLE. Raises on any conflict. Writes nothing."""
+                         source_filename: str, canonical_filename: str, invoice_date) -> tuple[str, str]:
+        """Decide one candidate in the accepted precedence. Returns (decision, display name). Writes nothing.
+
+        1. The same identity already admitted with the same names: ALREADY_ADMITTED.
+        2. Identity conflict, predecessor identity or archive, or source regression: raised refusal.
+        3. Display computation, then display collision: raised `EG_V4_DISPLAY_*` (the caller HOLDs).
+        4. Archive path collision: raised refusal.
+        """
+        from .naming import display_filename as presentation_name
+
         existing = self.invoice_by_identity(stream, source_namespace, source_invoice_key)
         if existing is not None:
-            if (existing["display_filename"], existing["canonical_filename"]) == (display_filename, canonical_filename):
-                return "ALREADY_ADMITTED"
+            try:
+                presentation = presentation_name(source_filename, invoice_date)
+            except OfflineV4Error:
+                presentation = None
+            if (existing["display_filename"], existing["canonical_filename"]) == (presentation, canonical_filename):
+                return "ALREADY_ADMITTED", presentation
             raise OfflineV4Error("EG_V4_INVOICE_IDENTITY_CONFLICT")
-        _v4_admission_conflicts(
-            self._conn(), stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
-            invoice_date=invoice_date, display_filename=display_filename, canonical_filename=canonical_filename,
+        conn = self._conn()
+        _v4_identity_refusals(
+            conn, stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
+            invoice_date=invoice_date, canonical_filename=canonical_filename,
         )
-        return "ADMISSIBLE"
+        presentation = presentation_name(source_filename, invoice_date)
+        _v4_presentation_conflicts(conn, stream=stream, display_filename=presentation, canonical_filename=canonical_filename)
+        return "ADMISSIBLE", presentation
 
     def admit_invoice(self, *, stream: str, source_namespace: str, source_invoice_key: str, invoice_date,
                       display_filename: str, sha256: str, byte_size: int, run_id: str, now_iso: str) -> tuple[dict, bool]:
@@ -3059,10 +3110,11 @@ class StateV4Store:
                 if same == (display_filename, canonical, sha256, byte_size):
                     return row, False
                 raise OfflineV4Error("EG_V4_INVOICE_IDENTITY_CONFLICT")
-            _v4_admission_conflicts(
+            _v4_identity_refusals(
                 conn, stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
-                invoice_date=invoice_date, display_filename=display_filename, canonical_filename=canonical,
+                invoice_date=invoice_date, canonical_filename=canonical,
             )
+            _v4_presentation_conflicts(conn, stream=stream, display_filename=display_filename, canonical_filename=canonical)
             row = _insert_admission(
                 conn, stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
                 invoice_date=invoice_date, display_filename=display_filename, sha256=sha256, byte_size=byte_size,
@@ -3077,6 +3129,15 @@ class StateV4Store:
             self._conn(),
             "SELECT * FROM energygrid_v4_invoice WHERE stream=? AND source_namespace=? AND source_invoice_key=?",
             (stream, source_namespace, source_invoice_key),
+        )
+        return rows[0] if rows else None
+
+    def adopted_predecessor(self, stream: str, predecessor_invoice_id: str) -> dict | None:
+        """The v4 admission that adopted this predecessor invoice in this stream, if any. Reads only."""
+        rows = _fetch_dicts(
+            self._conn(),
+            "SELECT * FROM energygrid_v4_invoice WHERE stream=? AND predecessor_invoice_id=?",
+            (stream, predecessor_invoice_id),
         )
         return rows[0] if rows else None
 

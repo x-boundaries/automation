@@ -436,17 +436,21 @@ class PortalAndAdmissionTests(OfflineV4RunTests):
         self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], eb_steps)
         self.assertEqual({EB: "DRAINED", TN: "DRAINED"}, {k: v["state"] for k, v in result["drain"]["streams"].items()})
 
-    def test_a_display_name_collision_is_refused_before_any_fetch_and_the_drain_continues(self) -> None:
+    def test_a_display_name_collision_is_a_hold_before_any_fetch_and_the_older_drain_continues(self) -> None:
         with self.assertRaises(SimulatedCrash):
             self.run_once(1, self.standard_adapters(), checkpoint=crash_at("before_seal"))
         eb_next = self.adapter(EB, ("OCT 2026 - Invoice EB.pdf", "2026-10-20", pdf("eb-20")))
         adapters = {EB: eb_next, TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1")))}
         result = self.run_once(2, adapters)
-        self.assertEqual("ADMISSION_REFUSED", result["acquisition"][EB]["status"])
+        self.assertEqual("HOLD", result["acquisition"][EB]["status"])
         self.assertEqual("EG_V4_DISPLAY_NAME_COLLISION", result["acquisition"][EB]["support_ref"])
         self.assertEqual([], eb_next.acquire_calls)
+        self.assertFalse((self.archive / "EB Bill" / "2026-10-20.pdf").exists())
         self.assertEqual(4, len(self.ledger.effects))
+        # The older admitted invoice drained; drain truth is kept and the outcome is the visible HOLD.
         self.assertEqual("DRAINED", result["drain"]["streams"][EB]["state"])
+        self.assertEqual("HOLD", result["streams"][EB]["outcome"])
+        self.assertEqual("HOLD", result["overall"])
 
     def test_a_second_session_is_refused_while_a_run_holds_the_lease_and_mutates_nothing(self) -> None:
         with StateV4Store(self.db) as holder:
@@ -576,7 +580,7 @@ class PredecessorCutoverTests(OfflineV4RunTests):
         self.assertFalse((self.archive / "EB Bill" / "2026-10-01.pdf").exists())
 
 
-class PredecessorScenarioTests(OfflineV4RunTests):
+class _PredecessorRunBase(OfflineV4RunTests):
     """Realistic v3 predecessor rows, built through the frozen v3 store API (see build_predecessor_v3)."""
 
     SCENARIOS = {EB: "ADOPTABLE", TN: "DELIVERED"}
@@ -590,7 +594,7 @@ class PredecessorScenarioTests(OfflineV4RunTests):
         name, day = LATEST_SOURCE[stream]
         return self.adapter(stream, (name, day, predecessor_pdf(name)))
 
-    def rebuild(self, label: str, scenarios: dict) -> None:
+    def rebuild(self, label: str, scenarios: dict, prepare=None) -> None:
         base = self.root / label
         base.mkdir()
         self.db = base / "state.sqlite"
@@ -599,11 +603,16 @@ class PredecessorScenarioTests(OfflineV4RunTests):
         self.temp = base / "temp"
         self.temp.mkdir()
         self.built = build_predecessor_v3(self.db, self.archive, scenarios)
+        if prepare is not None:
+            prepare(self.db)
         migrate_state_database_v4(self.db, apply=True)
         self.clock = 0
         self.ledger = FakeProviderLedger()
         self.drive = FakeDriveConnector(self.ledger)
         self.gmail = FakeGmailConnector(self.ledger)
+
+class PredecessorScenarioTests(_PredecessorRunBase):
+    """Cutover adoption, delivered no-action, typed predecessor HOLDs and no backfill."""
 
     def test_an_archived_undelivered_latest_is_adopted_once_with_zero_fetch_then_drive_then_gmail(self) -> None:
         adapters = {EB: self.portal_latest(EB), TN: self.portal_latest(TN)}
@@ -647,7 +656,9 @@ class PredecessorScenarioTests(OfflineV4RunTests):
         result = self.run_once(1, adapters)
         self.assertEqual("HOLD", result["acquisition"][EB]["status"])
         self.assertEqual("EG_V4_PREDECESSOR_DRIVE_PARTIAL", result["acquisition"][EB]["support_ref"])
-        self.assertEqual("HOLD", result["drain"]["streams"][EB]["state"])
+        self.assertEqual("DRAINED", result["drain"]["streams"][EB]["state"])
+        self.assertEqual("HOLD", result["streams"][EB]["outcome"])
+        self.assertEqual("EG_V4_PREDECESSOR_DRIVE_PARTIAL", result["streams"][EB]["acquisition_ref"])
         self.assertEqual([], adapters[EB].acquire_calls)
         self.assertEqual([], [e for e in self.ledger.effects if e["display_filename"].endswith("Invoice EB Sep.pdf")])
         self.assertEqual([(TN, DRIVE, "VERIFIED"), (TN, GMAIL, "VERIFIED")], self.steps(result))
@@ -737,6 +748,427 @@ class PredecessorScenarioTests(OfflineV4RunTests):
         with StateV4Store(self.db) as store:
             self.assertEqual(1, len([row for row in store.invoices_for_stream(EB)]))
             self.assertEqual(1, len([row for row in store.invoices_for_stream(EB) if row["predecessor_invoice_id"]]))
+
+
+def eb_sep_effects(ledger: FakeProviderLedger) -> list[tuple[str, str]]:
+    return [(e["action"], e["display_filename"]) for e in ledger.effects if e["display_filename"].endswith("Invoice EB Sep.pdf")]
+
+
+class PredecessorTransitionTests(_PredecessorRunBase):
+    """#226 v4 correction: M1-M3 at the run boundary, M10 and M11 adoption liveness and send-time integrity."""
+
+    OCTOBER = ("Invoice EB Oct.pdf", "2026-10-05", predecessor_pdf("Invoice EB Oct.pdf"))
+
+    def assert_eb_held_before_inventory(self, result: dict, adapters: dict, support_ref: str) -> None:
+        self.assertEqual({"status": "HOLD", "support_ref": support_ref, "predecessor": "HOLD"}, result["acquisition"][EB])
+        self.assertEqual(0, adapters[EB].inventory_calls)
+        self.assertEqual([], adapters[EB].acquire_calls)
+        with StateV4Store(self.db) as store:
+            self.assertEqual([], store.invoices_for_stream(EB))
+        self.assertEqual([], eb_sep_effects(self.ledger))
+        self.assertEqual("HOLD", result["streams"][EB]["outcome"])
+
+    def test_m1_v2_drive_stage_or_drive_state_evidence_holds_with_no_inventory_rows_or_effects(self) -> None:
+        from energygrid_bill_downloader.state import predecessor_digest
+        from test_state_v4 import add_v2_drive_stage, set_v2_drive_state
+
+        cases = (
+            ("stage", lambda db: add_v2_drive_stage(db, self._latest_id(db), "COMMITTED")),
+            ("state", lambda db: set_v2_drive_state(db, self._latest_id(db), "PREPARED")),
+        )
+        for label, prepare in cases:
+            with self.subTest(case=label):
+                self.rebuild(f"m1-{label}", {EB: "ADOPTABLE", TN: "ADOPTABLE"}, prepare=prepare)
+                before = predecessor_digest(self.db)
+                adapters = {EB: self.portal_latest(EB), TN: self.portal_latest(TN)}
+                result = self.run_once(1, adapters)
+                self.assert_eb_held_before_inventory(result, adapters, "EG_V4_PREDECESSOR_DRIVE_EVIDENCE_PRESENT")
+                self.assertEqual([(TN, DRIVE, "VERIFIED"), (TN, GMAIL, "VERIFIED")], self.steps(result))
+                self.assertEqual(before, predecessor_digest(self.db))
+
+    def _latest_id(self, db: Path) -> str:
+        from test_state_v4 import _predecessor_rows
+
+        return _predecessor_rows(db, "SELECT invoice_id FROM energygrid_invoice_v2 WHERE stream='EB_BILL' "
+                                     "AND classification='CLASSIFIED' ORDER BY day_ordinal DESC LIMIT 1")[0]["invoice_id"]
+
+    def test_m1_positive_a_clean_adoptable_latest_gets_drive_and_gmail_once(self) -> None:
+        self.rebuild("m1-clean", {EB: "ADOPTABLE", TN: "DELIVERED"})
+        result = self.run_once(1, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)})
+        self.assertEqual([(DRIVE, "SEP 2026 - Invoice EB Sep.pdf"), (GMAIL, "SEP 2026 - Invoice EB Sep.pdf")],
+                         eb_sep_effects(self.ledger))
+        self.assertEqual("DRAINED", result["overall"])
+
+    def test_m2_a_latest_day_tie_holds_with_no_inventory_rows_or_effects(self) -> None:
+        from energygrid_bill_downloader.state import predecessor_digest
+        from test_state_v4 import insert_predecessor_on_day
+
+        insert_predecessor_on_day(self.db, source_filename="Invoice EB Sep B.pdf", bill_date="2026-08-31",
+                                  day_ordinal=date(2026, 9, 1).toordinal())
+        before = predecessor_digest(self.db)
+        adapters = {EB: self.portal_latest(EB), TN: self.portal_latest(TN)}
+        result = self.run_once(1, adapters)
+        self.assert_eb_held_before_inventory(result, adapters, "EG_V4_PREDECESSOR_LATEST_AMBIGUOUS")
+        self.assertEqual(before, predecessor_digest(self.db))
+
+    def test_m3_a_dispatched_pending_send_holds_with_its_exact_reference(self) -> None:
+        self.rebuild("m3", {EB: "DELIVERY_DISPATCHED", TN: "DELIVERED"})
+        adapters = {EB: self.portal_latest(EB), TN: self.portal_latest(TN)}
+        result = self.run_once(1, adapters)
+        self.assert_eb_held_before_inventory(result, adapters, "EG_V4_PREDECESSOR_DELIVERY_DISPATCHED")
+        self.assertEqual([], self.ledger.effects)
+
+    # -- M10: an adopted and delivered predecessor is never re-read --------------------------------
+
+    def _deliver_september_then_change_archive(self, change) -> None:
+        first = self.run_once(1, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)})
+        self.assertEqual("ADOPTED", first["acquisition"][EB]["predecessor"])
+        self.assertEqual(2, len(eb_sep_effects(self.ledger)))
+        change(self.archive / "EB Bill" / "2026-09-01.pdf")
+
+    def test_m10_a_changed_or_missing_delivered_archive_does_not_block_october(self) -> None:
+        def changed(path: Path) -> None:
+            path.write_bytes(predecessor_pdf("Invoice EB Sep resaved"))
+
+        def deleted(path: Path) -> None:
+            path.unlink()
+
+        def unreadable(path: Path) -> None:
+            path.unlink()
+            path.mkdir()
+
+        for label, change in (("changed", changed), ("deleted", deleted), ("unreadable", unreadable)):
+            with self.subTest(change=label):
+                self.rebuild(f"m10-{label}", {EB: "ADOPTABLE", TN: "DELIVERED"})
+                self._deliver_september_then_change_archive(change)
+                result = self.run_once(2, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
+                self.assertEqual({"status": "ADMITTED", "support_ref": None, "predecessor": "ADOPTED_EARLIER"},
+                                 result["acquisition"][EB])
+                self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], self.steps(result))
+                self.assertEqual(2, len(eb_sep_effects(self.ledger)))
+                self.assertEqual(["OCT 2026 - Invoice EB Oct.pdf"] * 2,
+                                 [e["display_filename"] for e in self.ledger.effects if "Oct" in e["display_filename"]])
+                self.assertEqual(4, len(self.ledger.effects))
+                self.assertEqual("DRAINED", result["overall"])
+                again = self.run_once(3, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
+                self.assertEqual([], self.steps(again))
+                self.assertEqual(4, len(self.ledger.effects))
+
+    def test_m10_positive_a_first_time_adoption_of_a_changed_archive_still_holds(self) -> None:
+        self.rebuild("m10-first", {EB: "ADOPTABLE", TN: "DELIVERED"})
+        (self.archive / "EB Bill" / "2026-09-01.pdf").write_bytes(predecessor_pdf("Invoice EB Sep resaved"))
+        adapters = {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)}
+        result = self.run_once(1, adapters)
+        self.assertEqual("EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH", result["acquisition"][EB]["support_ref"])
+        self.assertEqual(0, adapters[EB].inventory_calls)
+        self.assertEqual([], self.ledger.effects)
+
+    # -- M11: a pending adopted delivery is checked at send time and never overtaken ----------------
+
+    def _september_pending(self, checkpoint) -> None:
+        self.rebuild(f"m11-{len(list(self.root.iterdir()))}", {EB: "ADOPTABLE", TN: "DELIVERED"})
+        with self.assertRaises(SimulatedCrash):
+            self.run_once(1, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)}, checkpoint=checkpoint)
+
+    def _eb_intents(self) -> dict[str, dict]:
+        with StateV4Store(self.db) as store:
+            return {
+                row["invoice_date"]: {
+                    action: {**intent, "sealed": store.dispatch_row(intent["intent_id"]) is not None}
+                    for action, intent in store.intents_for_invoice(row["invoice_key"]).items()
+                }
+                for row in store.invoices_for_stream(EB)
+            }
+
+    def test_m11_a_tampered_pending_adoption_holds_before_seal_and_october_waits(self) -> None:
+        cases = (
+            ("pre-drive", crash_at("after_acquisition"), DRIVE, 0),
+            ("gmail-pending", crash_at("before_seal", nth=2), GMAIL, 1),
+        )
+        for label, checkpoint, held_action, sep_effects in cases:
+            with self.subTest(case=label):
+                self._september_pending(checkpoint)
+                self.assertEqual(sep_effects, len(eb_sep_effects(self.ledger)))
+                (self.archive / "EB Bill" / "2026-09-01.pdf").write_bytes(predecessor_pdf("Invoice EB Sep X"))
+                result = self.run_once(2, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
+                self.assertEqual({"status": "ADMITTED", "support_ref": None, "predecessor": "ADOPTED_EARLIER"},
+                                 result["acquisition"][EB])
+                self.assertEqual([(EB, held_action, "HOLD")], self.steps(result))
+                intents = self._eb_intents()
+                self.assertEqual(("HOLD", "EG_V4_ARCHIVE_IDENTITY_CHANGED", False),
+                                 tuple(intents["2026-09-01"][held_action][k] for k in ("state", "support_ref", "sealed")))
+                self.assertEqual({"PENDING"}, {row["state"] for row in intents["2026-10-05"].values()})
+                self.assertEqual({False}, {row["sealed"] for row in intents["2026-10-05"].values()})
+                self.assertEqual(sep_effects, len(self.ledger.effects))
+                self.assertEqual(("BLOCKED", "EG_V4_ARCHIVE_IDENTITY_CHANGED", "ADMITTED"),
+                                 tuple(result["streams"][EB][k] for k in ("outcome", "drain_ref", "acquisition_status")))
+                again = self.run_once(3, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
+                self.assertEqual([], self.steps(again))
+                self.assertEqual(sep_effects, len(self.ledger.effects))
+                self.assertEqual("BLOCKED", again["streams"][EB]["outcome"])
+
+    def test_m11_positive_intact_pending_september_and_october_drain_in_fifo_order(self) -> None:
+        cases = (
+            ("pre-drive", crash_at("after_acquisition"),
+             [(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED"), (EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")]),
+            ("gmail-pending", crash_at("before_seal", nth=2),
+             [(EB, GMAIL, "VERIFIED"), (EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")]),
+        )
+        for label, checkpoint, expected_steps in cases:
+            with self.subTest(case=label):
+                self._september_pending(checkpoint)
+                result = self.run_once(2, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
+                self.assertEqual(expected_steps, self.steps(result))
+                names = [(e["action"], e["display_filename"]) for e in self.ledger.effects]
+                self.assertEqual([
+                    (DRIVE, "SEP 2026 - Invoice EB Sep.pdf"), (GMAIL, "SEP 2026 - Invoice EB Sep.pdf"),
+                    (DRIVE, "OCT 2026 - Invoice EB Oct.pdf"), (GMAIL, "OCT 2026 - Invoice EB Oct.pdf"),
+                ], names)
+                self.assertEqual("DRAINED", result["overall"])
+                again = self.run_once(3, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
+                self.assertEqual([], self.steps(again))
+                self.assertEqual(4, len(self.ledger.effects))
+
+    def test_pending_adopted_september_drains_while_the_newer_portal_acquisition_fails(self) -> None:
+        self._september_pending(crash_at("after_acquisition"))
+        result = self.run_once(2, {EB: self.portal_latest(EB, failing=True), TN: self.portal_latest(TN)})
+        self.assertEqual("PORTAL_ACQUISITION_FAILED", result["acquisition"][EB]["status"])
+        self.assertEqual("ADOPTED_EARLIER", result["acquisition"][EB]["predecessor"])
+        self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], self.steps(result))
+        self.assertEqual("DRAINED", result["drain"]["streams"][EB]["state"])
+        self.assertEqual("ACQUISITION_FAILED", result["streams"][EB]["outcome"])
+        self.assertEqual("ACQUISITION_FAILED", result["overall"])
+
+    def test_m13_an_older_candidate_with_a_bad_name_is_still_a_source_regression(self) -> None:
+        for name in ("Rechnung \u00f6.pdf", "OCT2026-x.pdf", "a\x7fb.pdf", "Invoice EB Aug 15.pdf"):
+            with self.subTest(name=name):
+                self.rebuild(f"m13-{len(list(self.root.iterdir()))}", {EB: "ADOPTABLE", TN: "DELIVERED"})
+                adapters = {EB: self.adapter(EB, (name, "2026-08-15", predecessor_pdf("older"))), TN: self.portal_latest(TN)}
+                result = self.run_once(1, adapters)
+                self.assertEqual({"status": "ADMISSION_REFUSED", "support_ref": "EG_V4_SOURCE_REGRESSION",
+                                  "predecessor": "ADOPTED"}, result["acquisition"][EB])
+                self.assertEqual([], adapters[EB].acquire_calls)
+                self.assertEqual("REFUSED", result["streams"][EB]["outcome"])
+
+
+class DisplayHoldTests(OfflineV4RunTests):
+    """M12-M14 at the run boundary: a current candidate's display fault is a typed, non-sticky stream HOLD."""
+
+    def run_with_eb(self, n: int, name: str, day: str = "2026-10-01", **kwargs):
+        eb = self.adapter(EB, (name, day, pdf(name.encode("unicode_escape").decode("ascii"))))
+        tn = self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1")))
+        return eb, self.run_once(n, {EB: eb, TN: tn}, **kwargs)
+
+    def test_m12_m14_current_display_faults_hold_with_zero_fetch_archive_admission_and_effects(self) -> None:
+        cases = (
+            ("Rechnung \u00f6.pdf", "EG_V4_DISPLAY_SHAPE_UNSUPPORTED"),
+            ("a\x7fb.pdf", "EG_V4_DISPLAY_NAME_INVALID"),
+            (" lead.pdf", "EG_V4_DISPLAY_NAME_INVALID"),
+            ("OCT2026-invoice.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+            ("Invoice OCT 2026 - EB.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+            ("x OCT 2026 - y.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+            ("OCT 2026 invoice.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+            ("OCTOBER 2026 - x.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+            ("SEPT 2026 - x.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+            ("OCT 2026 - OCT2026 x.pdf", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+        )
+        for name, support_ref in cases:
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                eb, result = self.run_with_eb(1, name)
+                self.assertEqual({"status": "HOLD", "support_ref": support_ref, "predecessor": "NONE"},
+                                 result["acquisition"][EB])
+                self.assertEqual(1, eb.inventory_calls)
+                self.assertEqual([], eb.acquire_calls)
+                self.assertFalse((self.archive / "EB Bill" / "2026-10-01.pdf").exists())
+                with StateV4Store(self.db) as store:
+                    self.assertEqual([], store.invoices_for_stream(EB))
+                self.assertEqual([(TN, DRIVE, "VERIFIED"), (TN, GMAIL, "VERIFIED")], self.steps(result))
+                self.assertEqual(("HOLD", support_ref, "DRAINED"),
+                                 tuple(result["streams"][EB][k] for k in ("outcome", "acquisition_ref", "drain_state")))
+                self.assertEqual("HOLD", result["overall"])
+
+    def test_m12_positive_a_plain_name_gets_one_prefix_and_a_hold_is_not_sticky(self) -> None:
+        _eb, held = self.run_with_eb(1, "OCT2026-invoice.pdf")
+        self.assertEqual("HOLD", held["acquisition"][EB]["status"])
+        eb, result = self.run_with_eb(2, "invoice.pdf", day="2026-10-05")
+        self.assertEqual("ADMITTED", result["acquisition"][EB]["status"])
+        self.assertEqual(["invoice.pdf"], eb.acquire_calls)
+        self.assertEqual(["OCT 2026 - invoice.pdf"] * 2,
+                         [e["display_filename"] for e in self.ledger.effects if "invoice.pdf" in e["display_filename"]])
+        self.assertEqual("DRAINED", result["overall"])
+
+    def test_m13_older_candidates_with_bad_names_are_regressions_not_display_holds(self) -> None:
+        self.run_with_eb(1, "Invoice EB 5.pdf", day="2026-10-05")
+        for n, name in enumerate(("Rechnung \u00f6.pdf", "OCT2026-x.pdf", " lead.pdf", "Invoice EB 1.pdf"), start=2):
+            with self.subTest(name=name):
+                eb, result = self.run_with_eb(n, name, day="2026-10-01")
+                self.assertEqual({"status": "ADMISSION_REFUSED", "support_ref": "EG_V4_SOURCE_REGRESSION",
+                                  "predecessor": "NONE"}, result["acquisition"][EB])
+                self.assertEqual([], eb.acquire_calls)
+                self.assertEqual("REFUSED", result["streams"][EB]["outcome"])
+        self.assertEqual(4, len(self.ledger.effects))
+
+
+def lost_first_drive(ledger: FakeProviderLedger) -> FakeDriveConnector:
+    """A Drive fake whose first call makes the effect and then loses the response (UNKNOWN)."""
+    return FakeDriveConnector(ledger, fail_after_effect=True)
+
+
+class TruthfulReportingTests(OfflineV4RunTests):
+    """M15: drain truth and acquisition truth are both visible; DRAINED is never claimed falsely."""
+
+    def test_m15_an_unknown_drive_stays_blocked_when_a_new_candidate_also_holds(self) -> None:
+        self.run_once(1, self.standard_adapters(), drive=lost_first_drive(self.ledger))
+        eb = self.adapter(EB, ("OCT2026-x.pdf", "2026-10-05", pdf("eb-5")))
+        result = self.run_once(2, {EB: eb, TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1")))})
+        self.assertEqual({"state": "BLOCKED", "support_ref": "EG_V4_PROVIDER_UNKNOWN"}, result["drain"]["streams"][EB])
+        self.assertEqual({
+            "outcome": "BLOCKED", "acquisition_status": "HOLD", "acquisition_ref": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "drain_state": "BLOCKED", "drain_ref": "EG_V4_PROVIDER_UNKNOWN",
+        }, result["streams"][EB])
+        self.assertEqual("DRAINED", result["streams"][TN]["outcome"])
+        self.assertEqual("BLOCKED", result["overall"])
+        self.assertEqual("EG_V4_PROVIDER_UNKNOWN", result["drain"]["blocked"][EB])
+
+    def test_m15_acquisition_failures_are_never_reported_drained(self) -> None:
+        class FetchFails(OfflineFakeAdapter):
+            pass
+
+        def fetch_failed():
+            source = Stream(EB)
+            return FetchFails(snapshot(source, (candidate(source, name="Invoice EB.pdf", invoice_date="2026-10-01"),)), {})
+
+        def archive_conflict():
+            folder = self.archive / "EB Bill"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "2026-10-01.pdf").write_bytes(pdf("someone else"))
+            return self.adapter(EB, ("Invoice EB.pdf", "2026-10-01", pdf("eb-1")))
+
+        cases = (
+            ("FETCH_FAILED", fetch_failed, "EG_SYNTHETIC_ARTIFACT_MISSING"),
+            ("PORTAL_ACQUISITION_FAILED", FailingAdapter, "EG_SYNTHETIC_PORTAL_DOWN"),
+            ("ARCHIVE_CONFLICT", archive_conflict, "EG_V4_ARCHIVE_CONFLICT"),
+        )
+        for status, make, support_ref in cases:
+            with self.subTest(status=status):
+                self.tearDown()
+                self.setUp()
+                result = self.run_once(1, {EB: make(), TN: self.adapter(TN, ("Invoice TN.pdf", "2026-10-02", pdf("tn-1")))})
+                self.assertEqual((status, support_ref), (result["acquisition"][EB]["status"], result["acquisition"][EB]["support_ref"]))
+                self.assertEqual("DRAINED", result["drain"]["streams"][EB]["state"])
+                self.assertEqual("ACQUISITION_FAILED", result["streams"][EB]["outcome"])
+                self.assertEqual("DRAINED", result["streams"][TN]["outcome"])
+                self.assertEqual("ACQUISITION_FAILED", result["overall"])
+
+    def test_m15_positive_fully_handled_streams_report_drained(self) -> None:
+        result = self.run_once(1, self.standard_adapters())
+        self.assertEqual({EB: "DRAINED", TN: "DRAINED"}, {k: v["outcome"] for k, v in result["streams"].items()})
+        self.assertEqual("DRAINED", result["overall"])
+        again = self.run_once(2, self.standard_adapters())
+        self.assertEqual("DRAINED", again["overall"])
+        empty = self.run_once(3, {EB: self.adapter(EB), TN: self.adapter(TN)})
+        self.assertEqual("DRAINED", empty["overall"])
+
+    def test_m15_outcome_precedence_table(self) -> None:
+        from energygrid_bill_downloader.orchestration import _v4_overall, _v4_stream_outcome
+
+        def acq(status, ref=None):
+            return {"status": status, "support_ref": ref}
+
+        def drain(state, ref=None):
+            return {"state": state, "support_ref": ref}
+
+        table = (
+            (acq("HOLD", "EG_V4_DISPLAY_NAME_INVALID"), drain("BLOCKED", "EG_V4_PROVIDER_UNKNOWN"), "BLOCKED"),
+            (acq("FETCH_FAILED", "EG_X"), drain("BLOCKED", "EG_V4_PROVIDER_UNKNOWN"), "BLOCKED"),
+            (acq("HOLD", "EG_V4_PREDECESSOR_DRIVE_PARTIAL"), drain("PENDING"), "HOLD"),
+            (acq("HOLD", "EG_V4_DISPLAY_NAME_INVALID"), drain("DRAINED"), "HOLD"),
+            (acq("FETCH_FAILED", "EG_X"), drain("PENDING"), "PENDING"),
+            (acq("ADMISSION_REFUSED", "EG_V4_SOURCE_REGRESSION"), drain("PENDING"), "PENDING"),
+            (acq("ADMISSION_REFUSED", "EG_V4_SOURCE_REGRESSION"), drain("DRAINED"), "REFUSED"),
+            (acq("LATEST_AMBIGUOUS", "EG_V4_LATEST_AMBIGUOUS"), drain("DRAINED"), "ACQUISITION_FAILED"),
+            (acq("INVENTORY_INVALID", "EG_V4_INVENTORY_INVALID"), drain("DRAINED"), "ACQUISITION_FAILED"),
+            (acq("ADAPTER_UNAVAILABLE", "EG_V4_ADAPTER_UNAVAILABLE"), drain("DRAINED"), "ACQUISITION_FAILED"),
+            (acq("ADMITTED"), drain("DRAINED"), "DRAINED"),
+            (acq("ALREADY_ADMITTED"), drain("DRAINED"), "DRAINED"),
+            (acq("PREDECESSOR_DELIVERED"), drain("DRAINED"), "DRAINED"),
+            (acq("EMPTY"), drain("DRAINED"), "DRAINED"),
+        )
+        for acquisition, drained, expected in table:
+            with self.subTest(acquisition=acquisition, drain=drained):
+                row = _v4_stream_outcome(acquisition, drained)
+                self.assertEqual(expected, row["outcome"])
+                self.assertEqual((acquisition["support_ref"], drained["support_ref"]), (row["acquisition_ref"], row["drain_ref"]))
+        drained = {"outcome": "DRAINED"}
+        self.assertEqual("DRAINED", _v4_overall({EB: drained, TN: drained}))
+        for other in ("BLOCKED", "HOLD", "PENDING", "ACQUISITION_FAILED", "REFUSED"):
+            self.assertEqual(other, _v4_overall({EB: drained, TN: {"outcome": other}}))
+        self.assertEqual("BLOCKED", _v4_overall({EB: {"outcome": "HOLD"}, TN: {"outcome": "BLOCKED"}}))
+
+
+class DualStreamIsolationTests(_PredecessorRunBase):
+    """Both streams together: a HOLD or BLOCKED stream never suspends the other, FIFO, no backfill, no duplicates."""
+
+    OCT = {EB: ("Invoice EB Oct.pdf", "2026-10-05"), TN: ("Invoice TN Oct.pdf", "2026-10-06")}
+
+    def october(self, stream: str):
+        name, day = self.OCT[stream]
+        return self.adapter(stream, (name, day, predecessor_pdf(name)))
+
+    def _held_stream_does_not_stop_the_adopting_stream(self, held: str, scenario: str, support_ref: str) -> None:
+        other = TN if held == EB else EB
+        self.rebuild(f"iso-{held}", {held: scenario, other: "ADOPTABLE"})
+        for n, other_adapter in ((1, self.portal_latest(other)), (2, self.october(other))):
+            held_adapter = self.portal_latest(held)
+            result = self.run_once(n, {held: held_adapter, other: other_adapter})
+            self.assertEqual(("HOLD", support_ref), (result["acquisition"][held]["status"], result["acquisition"][held]["support_ref"]))
+            self.assertEqual(0, held_adapter.inventory_calls)
+            self.assertEqual([(other, DRIVE, "VERIFIED"), (other, GMAIL, "VERIFIED")], self.steps(result))
+            self.assertEqual("DRAINED", result["streams"][other]["outcome"])
+            self.assertEqual("HOLD", result["streams"][held]["outcome"])
+        shown = [e["display_filename"] for e in self.ledger.effects]
+        prefix = "Invoice EB" if other == EB else "Invoice TN"
+        self.assertEqual([f"SEP 2026 - {prefix} Sep.pdf"] * 2 + [f"OCT 2026 - {prefix} Oct.pdf"] * 2, shown)
+        self.assertFalse(any(("Invoice EB" if held == EB else "Invoice TN") in name for name in shown))
+
+    def test_eb_predecessor_hold_while_tenant_adopts_september_and_admits_october(self) -> None:
+        self._held_stream_does_not_stop_the_adopting_stream(EB, "DRIVE_PARTIAL", "EG_V4_PREDECESSOR_DRIVE_PARTIAL")
+
+    def test_tenant_predecessor_hold_while_eb_adopts_september_and_admits_october(self) -> None:
+        self._held_stream_does_not_stop_the_adopting_stream(TN, "DELIVERY_UNCERTAIN", "EG_V4_PREDECESSOR_DELIVERY_UNCERTAIN")
+
+    def test_eb_display_hold_with_older_eb_pending_while_tenant_is_unknown(self) -> None:
+        self.rebuild("iso-unknown", {EB: "DELIVERED", TN: "ADOPTABLE"})
+        # Run 1: Tenant's adopted September Drive upload loses its response: UNKNOWN, never resent.
+        first = self.run_once(1, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)},
+                              drive=lost_first_drive(self.ledger))
+        self.assertEqual("BLOCKED", first["streams"][TN]["outcome"])
+        # Run 2: EB admits October, then the run dies before its seal: EB October is pending.
+        with self.assertRaises(SimulatedCrash):
+            self.run_once(2, {EB: self.october(EB), TN: self.portal_latest(TN)}, checkpoint=crash_at("before_seal"))
+        # Run 3: EB's next candidate has an ambiguous name. EB's older pending work still drains.
+        bad = self.adapter(EB, ("OCT2026-x.pdf", "2026-10-20", predecessor_pdf("bad")))
+        result = self.run_once(3, {EB: bad, TN: self.portal_latest(TN)})
+        self.assertEqual(("HOLD", "EG_V4_DISPLAY_PREFIX_CONFLICT"),
+                         (result["acquisition"][EB]["status"], result["acquisition"][EB]["support_ref"]))
+        self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], self.steps(result))
+        self.assertEqual([], bad.acquire_calls)
+        self.assertEqual(("HOLD", "DRAINED"), (result["streams"][EB]["outcome"], result["streams"][EB]["drain_state"]))
+        self.assertEqual(("BLOCKED", "EG_V4_PROVIDER_UNKNOWN"),
+                         (result["streams"][TN]["outcome"], result["streams"][TN]["drain_ref"]))
+        self.assertEqual("BLOCKED", result["overall"])
+        self.assertEqual(1, len([e for e in self.ledger.effects if "Invoice TN Sep" in e["display_filename"]]))
+        self.assertEqual(2, len([e for e in self.ledger.effects if "Invoice EB Oct" in e["display_filename"]]))
+
+    def test_older_history_is_never_backfilled_across_both_streams_and_reruns(self) -> None:
+        self.rebuild("iso-history", {EB: "ADOPTABLE", TN: "ADOPTABLE"})
+        for n in (1, 2, 3):
+            self.run_once(n, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)})
+        shown = sorted(e["display_filename"] for e in self.ledger.effects)
+        self.assertEqual(sorted(["SEP 2026 - Invoice EB Sep.pdf"] * 2 + ["SEP 2026 - Invoice TN Sep.pdf"] * 2), shown)
+        self.assertFalse(any("Aug" in name for name in shown))
 
 
 class PredecessorIsolationTests(OfflineV4RunTests):

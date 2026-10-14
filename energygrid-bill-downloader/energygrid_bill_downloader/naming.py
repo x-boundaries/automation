@@ -11,8 +11,13 @@ Drive copy name and the email attachment name, use the display name:
 - The source filename is kept verbatim after the prefix, extension included.
 - The prefix is applied exactly once. A source name that already starts with
   the same month and year (any letter case) is accepted and the prefix is
-  normalised to uppercase. Any other leading `MMM YYYY - ` prefix, and any
-  doubled prefix, is a conflict and fails closed.
+  normalised to uppercase.
+- Ambiguous shapes are refused, never guessed (`EG_V4_DISPLAY_PREFIX_CONFLICT`):
+  a `MMM YYYY - ` token (any letter case, any month and year) anywhere except
+  as the one accepted leading same-period prefix, or a source name or
+  remainder that starts with a month abbreviation, a full English month name
+  or `SEPT`, followed by a non-letter and a four-digit year with any or no
+  ASCII separator in between (for example `OCT2026-x.pdf`, `OCTOBER 2026 - x.pdf`).
 - Names are never truncated. An invalid or over-long result is refused.
 - Old archive files are never renamed. The display name is computed at
   presentation time and stored once, immutably, in the v4 admission row.
@@ -28,14 +33,20 @@ from .errors import OfflineV4Error
 from .publication import WINDOWS_INVALID_FILENAME_CHARS, WINDOWS_RESERVED_NAMES
 
 MONTH_ABBREVIATIONS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+MONTH_NAMES = (
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER",
+    "NOVEMBER", "DECEMBER",
+)
 DISPLAY_NAME_MAX_LENGTH = 260
+# The canonical prefix token, matched anywhere in a name.
 _PREFIX_RE = re.compile(
     r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC) [0-9]{4} - ",
     re.ASCII | re.IGNORECASE,
 )
-_FOLDED_PREFIX_RE = re.compile(
-    r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*[0-9]{4}\s*[-\u2010-\u2015\u2212]",
-    re.IGNORECASE,
+# A leading month token, a non-letter boundary, then a four-digit year after any or no ASCII separator.
+_LEADING_MONTH_YEAR_RE = re.compile(
+    r"(?:" + "|".join(MONTH_NAMES + ("SEPT",) + MONTH_ABBREVIATIONS) + r")[^A-Za-z0-9]*[0-9]{4}",
+    re.ASCII | re.IGNORECASE,
 )
 
 
@@ -44,12 +55,6 @@ def month_prefix(invoice_date: date) -> str:
     if type(invoice_date) is not date:
         raise OfflineV4Error("EG_V4_DISPLAY_DATE_INVALID")
     return f"{MONTH_ABBREVIATIONS[invoice_date.month - 1]} {invoice_date.year:04d} - "
-
-
-def _folded(text: str) -> str:
-    """NFKC text without format characters and leading whitespace, used only to detect a prefix."""
-    kept = "".join(char for char in unicodedata.normalize("NFKC", text) if unicodedata.category(char) != "Cf")
-    return kept.lstrip()
 
 
 def display_filename(source_filename: str, invoice_date: date) -> str:
@@ -65,16 +70,12 @@ def display_filename(source_filename: str, invoice_date: date) -> str:
     if source_filename != source_filename.lstrip():
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
     exact = _PREFIX_RE.match(source_filename)
-    if exact is not None:
-        if exact.group(0).casefold() != prefix.casefold():
-            raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
+    if exact is not None and exact.group(0).casefold() == prefix.casefold():
         remainder = source_filename[len(exact.group(0)):]
     else:
-        # Any other month-year text at the start is a conflict, even with odd spacing.
-        if _FOLDED_PREFIX_RE.match(_folded(source_filename)) is not None:
-            raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
         remainder = source_filename
-    if _FOLDED_PREFIX_RE.match(_folded(remainder)) is not None:
+    # Any prefix token left (another period, doubled or embedded) or a leading month-year shape is ambiguous.
+    if _PREFIX_RE.search(remainder) is not None or _LEADING_MONTH_YEAR_RE.match(remainder) is not None:
         raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
     if not remainder.lower().endswith(".pdf") or not remainder[: -len(".pdf")].strip():
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")

@@ -101,6 +101,60 @@ class DisplayFilenameTests(unittest.TestCase):
                 display_filename(source, date(2026, 10, 1))
             self.assertEqual("EG_V4_DISPLAY_SHAPE_UNSUPPORTED", caught.exception.support_ref)
 
+    def test_m14_embedded_and_leading_month_year_shapes_are_an_ambiguous_prefix_conflict(self) -> None:
+        # #226 v4 correction F4: never guess the intended original name.
+        refused = (
+            "Invoice OCT 2026 - EB.pdf",      # embedded canonical token
+            "x OCT 2026 - y.pdf",             # embedded canonical token
+            "x oct 2026 - y.pdf",             # embedded token in another letter case
+            "Bill SEP 2025 - y.pdf",          # embedded token for another period
+            "OCT 2026 invoice.pdf",           # leading month and year without the canonical separator
+            "OCTOBER 2026 - x.pdf",           # full month name
+            "October-2026 x.pdf",             # full month name, other separator and case
+            "SEPT 2026 - x.pdf",              # SEPT
+            "Sept_2026.pdf",                  # SEPT with an underscore
+            "OCT 2026 - OCT2026 x.pdf",       # remainder after the accepted prefix starts with a month-year
+            "OCT2026-invoice.pdf",            # no separator before the year
+            "JUNE2026.pdf",                   # full month name without a separator
+            "oct 2026 - SEP 2026 - x.pdf",    # doubled prefix with a different second period
+        )
+        for source in refused:
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 5))
+            self.assertEqual("EG_V4_DISPLAY_PREFIX_CONFLICT", caught.exception.support_ref)
+
+    def test_m14_positive_controls_get_exactly_one_canonical_prefix(self) -> None:
+        import re
+
+        token = re.compile(r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC) [0-9]{4} - ", re.IGNORECASE)
+        accepted = {
+            "XYZ 2026 - invoice.pdf": "OCT 2026 - XYZ 2026 - invoice.pdf",
+            "Invoice Oct.pdf": "OCT 2026 - Invoice Oct.pdf",
+            "Octopus 2026.pdf": "OCT 2026 - Octopus 2026.pdf",
+            "10-2026 invoice.pdf": "OCT 2026 - 10-2026 invoice.pdf",
+            "oct 2026 - x.pdf": "OCT 2026 - x.pdf",
+            "Mayfair 2026.pdf": "OCT 2026 - Mayfair 2026.pdf",
+            "invoice.pdf": "OCT 2026 - invoice.pdf",
+        }
+        for source, expected in accepted.items():
+            with self.subTest(source=source):
+                shown = display_filename(source, date(2026, 10, 5))
+                self.assertEqual(expected, shown)
+                self.assertEqual(1, len(token.findall(shown)))
+                self.assertTrue(shown.startswith("OCT 2026 - "))
+
+    def test_m14_invalid_and_non_ascii_classifications_are_preserved(self) -> None:
+        cases = {
+            "Rechnung \u00f6.pdf": "EG_V4_DISPLAY_SHAPE_UNSUPPORTED",
+            "OCT 2026 - \u00f6.pdf": "EG_V4_DISPLAY_SHAPE_UNSUPPORTED",
+            "a\x7fb.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            " lead.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+        }
+        for source, support_ref in cases.items():
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 5))
+            self.assertEqual(support_ref, caught.exception.support_ref)
+
     def test_invalid_source_and_date_types_are_refused(self) -> None:
         cases = (
             (lambda: display_filename("", date(2026, 10, 1)), "EG_V4_DISPLAY_SOURCE_INVALID"),
