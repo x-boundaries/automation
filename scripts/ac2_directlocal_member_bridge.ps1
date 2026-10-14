@@ -3,6 +3,15 @@
 # Protected values arrive only on stdin; stdout carries one PII-free JSON line;
 # arguments never carry customer data. Inert unless -EnableProductionAdapter.
 #
+# SYNTHETIC-ONLY (#155 G3 correction): this bridge never opens a real AutoCount
+# session. It refuses to run unless the caller passes -SessionFactory returning
+# a binding marked XbDirectLocalSyntheticFake, whose UserSession, DBSetting and
+# MemberCommand objects are not AutoCount types. The -File entrypoint cannot
+# receive a scriptblock, so a command-line invocation is always refused before
+# stdin is read, whatever flags, fence ids or AutoCount environment variables
+# exist. New-XbAutoCountSession is only ever reached through that checked
+# factory; its environment/assembly login path is unreachable from here.
+#
 # write-once is the only path that reaches SaveMember. It additionally needs a
 # fence id bound to the stdin payload, a payload digest match, an unexpired
 # deadline (self-terminating watchdog) and an exclusive CreateNew claim file
@@ -52,6 +61,42 @@ function Get-XbDirectLocalPayloadDigest {
     finally { $sha.Dispose() }
 }
 
+function Assert-XbDirectLocalNotAutoCount {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return }
+    if ($Value.GetType().Assembly.GetName().Name -like "AutoCount*") { throw "real_autocount_object_refused" }
+    foreach ($typeName in @($Value.PSObject.TypeNames)) {
+        if ([string]$typeName -match '^(Deserialized\.)?AutoCount\.') { throw "real_autocount_object_refused" }
+    }
+}
+
+function New-XbDirectLocalSyntheticSession {
+    # The only session source: a positively marked fake binding. Every
+    # MemberCommand it yields is re-checked before the adapter may use it.
+    if ($null -eq $SessionFactory) { throw "autocount_real_bridge_disabled" }
+    $bindings = @(& $SessionFactory)
+    if ($bindings.Count -ne 1 -or $null -eq $bindings[0]) { throw "synthetic_session_binding_invalid" }
+    $binding = $bindings[0]
+    if ((Get-XbAutoCountBindingValue -Binding $binding -Name "XbDirectLocalSyntheticFake") -ne $true) { throw "synthetic_session_marker_missing" }
+    $userSession = Get-XbAutoCountBindingValue -Binding $binding -Name "UserSession"
+    $dbSetting = Get-XbAutoCountBindingValue -Binding $binding -Name "DBSetting"
+    $innerFactory = Get-XbAutoCountBindingValue -Binding $binding -Name "MemberCommandFactory"
+    if ($innerFactory -isnot [scriptblock]) { throw "synthetic_session_binding_invalid" }
+    Assert-XbDirectLocalNotAutoCount -Value $userSession
+    Assert-XbDirectLocalNotAutoCount -Value $dbSetting
+    $assertFake = ${function:Assert-XbDirectLocalNotAutoCount}
+    $guardedFactory = {
+        param($Session)
+        $commands = @(& $innerFactory $Session)
+        foreach ($command in $commands) { & $assertFake -Value $command }
+        return $commands
+    }.GetNewClosure()
+    $checked = [pscustomobject]@{ UserSession = $userSession; DBSetting = $dbSetting; MemberCommandFactory = $guardedFactory }
+    # Validate the command type now, before any claim or adapter call.
+    [void](& $guardedFactory $checked)
+    return (New-XbAutoCountSession -EnableProductionAdapter:$EnableProductionAdapter -SessionFactory { $checked }.GetNewClosure())
+}
+
 function Assert-XbDirectLocalMemberNo {
     param([AllowNull()][string]$MemberNo)
     if ([string]::IsNullOrEmpty($MemberNo) -or $MemberNo -cnotmatch $script:XbDirectLocalMemberNoPattern) { throw "member_no_invalid" }
@@ -96,7 +141,7 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     if ($null -ne $payload.mobile_phone) { $member.MobilePhone = [string]$payload.mobile_phone }
     if ($null -ne $payload.email_address) { $member.EmailAddress = [string]$payload.email_address }
-    $session = New-XbAutoCountSession -EnableProductionAdapter:$EnableProductionAdapter -SessionFactory $SessionFactory
+    $session = New-XbDirectLocalSyntheticSession
 
     # Exclusive claim immediately before the sole SaveMember path.
     try {
@@ -133,6 +178,8 @@ $exitCode = 1
 $watchdog = $null
 try {
     if (-not $EnableProductionAdapter) { throw "autocount_adapter_disabled" }
+    # Synthetic-only: refused before stdin, claims or any adapter call.
+    if ($null -eq $SessionFactory) { throw "autocount_real_bridge_disabled" }
     if ($Operation -eq "write-once") {
         if ($FenceId -cnotmatch '^fence-[0-9a-f]{32}$') { throw "fence_id_invalid" }
         if ([string]::IsNullOrWhiteSpace($ClaimDirectory) -or -not (Test-Path -LiteralPath $ClaimDirectory -PathType Container)) { throw "claim_directory_invalid" }
@@ -153,7 +200,7 @@ try {
     }
     else {
         $request = Read-XbDirectLocalInput
-        $session = New-XbAutoCountSession -EnableProductionAdapter:$EnableProductionAdapter -SessionFactory $SessionFactory
+        $session = New-XbDirectLocalSyntheticSession
         switch ($Operation) {
             "legacy-precheck" { $result = Invoke-XbDirectLocalLegacyPrecheck -Session $session -Request $request }
             "next-member-no" { $result = [ordered]@{ member_no = (Get-XbAutoCountNextMemberNo -Session $session) } }

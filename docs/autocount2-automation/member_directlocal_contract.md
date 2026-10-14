@@ -5,6 +5,22 @@ Status: source-only synthetic core. No real Shopify read, AutoCount login,
 this document. The previous gateway/n8n/PostgreSQL path is not used and its
 files are unchanged.
 
+## Synthetic inertness (G3 correction)
+
+The core cannot reach a real AutoCount account book. Two independent layers
+enforce this; neither relies on Claude instructions, CLI flags, settings
+templates or approval rows:
+
+| Layer | Enforcement |
+|---|---|
+| Processor (`xb_directlocal.py`) | The only ledger mode is `synthetic`. `process --enable-autocount-write`, the internal write path and `reconcile` refuse any bridge whose `autocount_target` is not the test-only `SYNTHETIC_BRIDGE_TARGET` (`real_autocount_refused_synthetic_ledger`), before any capture is consumed or process started. The CLI only ever builds the real `BridgeClient`, so it is always refused. |
+| Bridge entrypoint (`ac2_directlocal_member_bridge.ps1`) | Refuses (`autocount_real_bridge_disabled`) unless the caller passes `-SessionFactory` returning a binding marked `XbDirectLocalSyntheticFake`, whose `UserSession`, `DBSetting` and every `MemberCommand` are not AutoCount types. `-File` cannot pass a scriptblock, so a command-line invocation is refused before stdin is read, regardless of `-EnableProductionAdapter`, fence ids or `XB_AC2_*` environment values. The adapter's environment/assembly login path is unreachable from the bridge. |
+
+Tests reach the fake MemberCommand only through that positively isolated
+interface (test-only target label plus marked fake host). Enabling a real
+account book requires a later, separately approved source change to both
+layers (gates E5-E7).
+
 ## Data path
 
 ```text
@@ -45,7 +61,12 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
 ## Cutover and baseline
 
 - `begin-baseline` fixes `C` (whole-second UTC) before any page is requested.
-  There is exactly one baseline run per ledger; `cutover_at` is immutable.
+  At most one non-abandoned baseline run exists per ledger; `cutover_at` is
+  immutable and a sealed run can never change.
+- An incomplete (`CAPTURING`) run can be abandoned with
+  `abandon-run --run-id <id> --confirm-suffix <last 8 hex>`. It becomes
+  `ABANDONED` (immutable), its unconsumed page captures are retired, and a new
+  baseline must take a strictly later cutover (`cutover_not_advanced`).
 - `ingest-run` chains unconsumed page captures from `after = null` and runs the
   reused exhaustive `capture_member_mg_baseline` (all customers, `sortKey: ID`,
   no tag search). A missing, conflicting, repeated, duplicated or unchained page,
@@ -88,9 +109,19 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
 - `NOT_WRITTEN_PROVEN` requires the claim file to be absent (the claim always
   precedes `SaveMember`). It is still terminal; there is no automatic retry.
 - Every command first runs recovery: an orphaned `FENCED` fence becomes
-  `MANUAL_REVIEW`; a `DISPATCHED` fence holds (exit 75) until its deadline plus
-  grace has passed and the recorded child is gone, then becomes uncertain (or
-  not-written if no claim exists).
+  `MANUAL_REVIEW`; a `DISPATCHED` or `WRITER_TERMINATION_UNCONFIRMED` fence
+  holds (exit 75) until its deadline plus grace has passed **and** the writer's
+  exit is proven against its recorded identity (PID plus process creation
+  instant). A vanished PID, or one now owned by a process with a different
+  creation instant (PID reuse), proves exit. A running child, a missing
+  identity or any indeterminate probe stays on HOLD (`writer_may_be_live`,
+  `writer_identity_unrecorded`, `writer_exit_unproven`). Once exit is proven
+  the fence becomes uncertain, or not-written only if no claim exists.
+- `release-writer-hold --fence-id <id> --confirm-suffix <last 8 hex>` is the
+  attended exit from a HOLD that cannot be proven: after the deadline, the
+  operator attests no bridge process remains and the fence becomes
+  `WRITE_OUTCOME_UNCERTAIN` (`operator_attested_writer_absent`), never
+  not-written.
 - `reconcile --capture <fresh profile>` re-derives the payload, requires the
   salted digest to match the fence, and compares read-only with the same bound
   MemberNo. It never calls `SaveMember`.
@@ -112,6 +143,7 @@ python directlocal/xb_directlocal.py --state-root <root> begin-baseline
 python directlocal/xb_directlocal.py --state-root <root> ingest-run
 python directlocal/xb_directlocal.py --state-root <root> process --capture <root>\inbox\<id>.json
 python directlocal/xb_directlocal.py --state-root <root> status
+python directlocal/xb_directlocal.py --state-root <root> abandon-run --run-id <run-id> --confirm-suffix <last-8-hex>
 ```
 
 ## Remaining effect gates (each needs separate explicit approval)

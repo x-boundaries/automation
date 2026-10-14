@@ -27,6 +27,17 @@ exclusive ``<fence_id>.claim`` file before ``SaveMember`` and refuses if it
 already exists. An uncertain outcome is only ever reconciled read-only with the
 same bound MemberNo.
 
+Synthetic inertness
+-------------------
+The only ledger mode is ``synthetic``. In it the processor refuses every
+AutoCount bridge whose ``autocount_target`` is not the test-only
+``SYNTHETIC_BRIDGE_TARGET`` (the real ``BridgeClient`` default is never
+accepted), and the PowerShell bridge itself refuses to run without a
+positively marked fake session factory, which its ``-File`` entrypoint cannot
+receive. No real AutoCount login, lookup, ``GetNextMemberNo`` or
+``SaveMember`` is reachable, whatever flags, approvals or fence ids a caller
+supplies.
+
 The ledger stores GIDs, MemberNos, counts, codes and salted digests only.
 """
 
@@ -76,6 +87,9 @@ APPROVAL_MAX_TTL_SECONDS = 1800
 WRITER_DEADLINE_SECONDS = 120
 WRITER_GRACE_SECONDS = 15
 HOLD_EXIT_CODE = 75
+# Test-only bridge target. A synthetic ledger accepts no other bridge.
+SYNTHETIC_BRIDGE_TARGET = "synthetic_fake_member_command"
+REAL_BRIDGE_TARGET = "real_autocount"
 # Only response shapes qualified offline are accepted; see module docstring.
 QUALIFIED_RESPONSE_SHAPES = {"synthetic": "graphql_data_object_v1"}
 
@@ -348,10 +362,10 @@ CREATE TABLE writer_owner(
   id INTEGER PRIMARY KEY CHECK (id = 1), epoch INTEGER NOT NULL, pid INTEGER NOT NULL, acquired_at TEXT NOT NULL);
 CREATE TABLE runs(
   run_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('BASELINE', 'DISCOVERY')),
-  cutover_at TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('CAPTURING', 'SEALED')),
+  cutover_at TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('CAPTURING', 'SEALED', 'ABANDONED')),
   started_at TEXT NOT NULL, sealed_at TEXT, page_count INTEGER, historical_count INTEGER,
   transition_count INTEGER, historical_digest TEXT);
-CREATE UNIQUE INDEX runs_single_baseline ON runs(kind) WHERE kind = 'BASELINE';
+CREATE UNIQUE INDEX runs_single_baseline ON runs(kind) WHERE kind = 'BASELINE' AND state <> 'ABANDONED';
 CREATE UNIQUE INDEX runs_single_open ON runs(state) WHERE state = 'CAPTURING';
 CREATE TABLE run_pages(
   run_id TEXT NOT NULL REFERENCES runs(run_id), page_index INTEGER NOT NULL,
@@ -378,7 +392,7 @@ CREATE TABLE fences(
   state TEXT NOT NULL CHECK (state IN ('FENCED', 'DISPATCHED', 'NOT_WRITTEN_PROVEN', 'CREATED_VERIFIED',
     'CREATED_READBACK_MISMATCH', 'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED',
     'RECONCILED_VERIFIED', 'MANUAL_REVIEW')),
-  code TEXT, deadline_at TEXT, child_pid INTEGER, exit_code INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  code TEXT, deadline_at TEXT, child_pid INTEGER, child_created TEXT, exit_code INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE events(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL,
   customer_gid TEXT, fence_id TEXT, code TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL UNIQUE);
@@ -390,6 +404,8 @@ CREATE TRIGGER runs_cutover_immutable BEFORE UPDATE OF cutover_at, kind, started
   BEGIN SELECT RAISE(ABORT, 'run_cutover_immutable'); END;
 CREATE TRIGGER runs_sealed_immutable BEFORE UPDATE ON runs WHEN OLD.state = 'SEALED'
   BEGIN SELECT RAISE(ABORT, 'run_sealed_immutable'); END;
+CREATE TRIGGER runs_abandoned_immutable BEFORE UPDATE ON runs WHEN OLD.state = 'ABANDONED'
+  BEGIN SELECT RAISE(ABORT, 'run_abandoned_immutable'); END;
 CREATE TRIGGER run_pages_immutable BEFORE UPDATE ON run_pages BEGIN SELECT RAISE(ABORT, 'run_pages_immutable'); END;
 CREATE TRIGGER run_pages_no_delete BEFORE DELETE ON run_pages BEGIN SELECT RAISE(ABORT, 'run_pages_immutable'); END;
 CREATE TRIGGER baseline_members_immutable BEFORE UPDATE ON baseline_members BEGIN SELECT RAISE(ABORT, 'baseline_immutable'); END;
@@ -432,6 +448,7 @@ CREATE TRIGGER events_append_only BEFORE UPDATE ON events BEGIN SELECT RAISE(ABO
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events_append_only'); END;
 """
 
+SCHEMA_VERSION = 2
 GENESIS_HASH = "sha256:" + "0" * 64
 CUSTOMER_TERMINAL = frozenset({"EXCLUDED_BASELINE", "MANUAL_REVIEW", "FENCED"})
 
@@ -464,12 +481,12 @@ class Ledger:
                 try:
                     for statement in _split_sql(SCHEMA):
                         self.conn.execute(statement)
-                    self.conn.execute("PRAGMA user_version=1")
+                    self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     self.conn.execute("COMMIT")
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
-            elif version != 1:
+            elif version != SCHEMA_VERSION:
                 raise DirectLocalError("ledger_schema_version_unsupported")
             self.conn.execute("BEGIN IMMEDIATE")
             row = self.conn.execute("SELECT epoch FROM writer_owner WHERE id = 1").fetchone()
@@ -591,8 +608,9 @@ class BridgeClient:
     """One short-lived PowerShell child per operation. Protected values travel
     only on stdin; arguments carry no customer data; stderr is discarded."""
 
-    def __init__(self, command: list[str], *, read_timeout_seconds: int = 120, popen: Callable[..., Any] = subprocess.Popen):
+    def __init__(self, command: list[str], *, autocount_target: str = REAL_BRIDGE_TARGET, read_timeout_seconds: int = 120, popen: Callable[..., Any] = subprocess.Popen):
         self.command = list(command)
+        self.autocount_target = autocount_target
         self.read_timeout_seconds = read_timeout_seconds
         self._popen = popen
 
@@ -645,7 +663,7 @@ class BridgeClient:
     def reconcile(self, member_no: str, payload_canonical_text: str) -> Mapping[str, Any]:
         return self._read("reconcile", {"member_no": member_no, "payload_canonical": payload_canonical_text})
 
-    def write_once(self, *, fence_id: str, claim_directory: Path, deadline: datetime, stdin_value: Mapping[str, Any], wait_seconds: float, on_started: Callable[[int], None]) -> WriteRun:
+    def write_once(self, *, fence_id: str, claim_directory: Path, deadline: datetime, stdin_value: Mapping[str, Any], wait_seconds: float, on_started: Callable[[int, str | None], None]) -> WriteRun:
         arguments = [
             "-Operation", "write-once", "-EnableProductionAdapter", "-FenceId", fence_id,
             "-ClaimDirectory", str(claim_directory), "-WriteDeadlineUtc", deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -654,7 +672,7 @@ class BridgeClient:
             process = self._start(arguments)
         except OSError:
             return WriteRun(started=False)
-        on_started(int(process.pid))
+        on_started(int(process.pid), child_creation_time(process))
         try:
             stdout, _ = process.communicate(self._stdin(stdin_value), timeout=max(wait_seconds, 1))
         except subprocess.TimeoutExpired:
@@ -696,30 +714,72 @@ def classify_write(run: WriteRun, *, claim_exists: bool) -> tuple[str, str | Non
     return ("WRITE_OUTCOME_UNCERTAIN", "writer_failed_after_claim") if claim_exists else ("NOT_WRITTEN_PROVEN", "writer_failed_before_claim")
 
 
-def process_alive(pid: int) -> bool:
-    """Conservative liveness: anything other than a proven-absent process is alive."""
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return kernel32
+
+
+def _creation_time(kernel32, handle) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)):
+        return None
+    return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+
+
+def child_creation_time(process: Any) -> str | None:
+    """Creation instant of a started child, so a reused PID is never mistaken
+    for it. ``None`` (unknown) keeps recovery on HOLD."""
+
+    handle = getattr(process, "_handle", None)
+    if os.name != "nt" or handle is None:
+        return None
+    return _creation_time(_kernel32(), int(handle))
+
+
+def probe_writer(pid: int, created: str | None) -> str:
+    """``running``, ``exited`` or ``unknown``. Only ``exited`` is proof: the
+    PID no longer exists, or it now belongs to a process with a different
+    creation instant (PID reuse). Any failure or missing identity is
+    ``unknown`` and recovery stays on HOLD."""
 
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _kernel32()
         handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
-            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
+            return "exited" if ctypes.get_last_error() == 87 else "unknown"  # 87: no such process
         try:
-            code = ctypes.c_ulong()
+            current = _creation_time(kernel32, handle)
+            if current is None or created is None:
+                return "unknown"
+            if current != created:
+                return "exited"
+            code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == 259  # STILL_ACTIVE
+                return "unknown"
+            return "running" if code.value == 259 else "exited"  # 259: STILL_ACTIVE
         finally:
             kernel32.CloseHandle(handle)
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        return "exited"
+    except OSError:
+        return "unknown"
+    return "unknown"  # present, but without a creation identity it cannot be ours or not
 
 
 # --------------------------------------------------------------------------
@@ -727,9 +787,9 @@ def process_alive(pid: int) -> bool:
 # --------------------------------------------------------------------------
 
 class Processor:
-    def __init__(self, ledger: Ledger, *, alive: Callable[[int], bool] = process_alive, writer_deadline_seconds: int = WRITER_DEADLINE_SECONDS, writer_grace_seconds: int = WRITER_GRACE_SECONDS):
+    def __init__(self, ledger: Ledger, *, writer_probe: Callable[[int, str | None], str] = probe_writer, writer_deadline_seconds: int = WRITER_DEADLINE_SECONDS, writer_grace_seconds: int = WRITER_GRACE_SECONDS):
         self.ledger = ledger
-        self.alive = alive
+        self.writer_probe = writer_probe
         self.writer_deadline_seconds = writer_deadline_seconds
         self.writer_grace_seconds = writer_grace_seconds
         self.inbox = ledger.root / "inbox"
@@ -753,6 +813,13 @@ class Processor:
         self.claims.mkdir(exist_ok=True)
         return {"status": "initialised", "mode": mode}
 
+    def _require_synthetic_bridge(self, bridge: Any) -> None:
+        """A synthetic ledger is inert: only the test-only fake bridge target is
+        accepted, so no real AutoCount process can ever be started from it."""
+
+        if self.ledger.meta()["mode"] != "synthetic" or getattr(bridge, "autocount_target", None) != SYNTHETIC_BRIDGE_TARGET:
+            raise DirectLocalError("real_autocount_refused_synthetic_ledger")
+
     def _cutover(self, conn: sqlite3.Connection) -> datetime:
         row = conn.execute("SELECT cutover_at FROM runs WHERE kind = 'BASELINE' AND state = 'SEALED'").fetchone()
         if row is None:
@@ -765,11 +832,14 @@ class Processor:
         with self.ledger.tx() as conn:
             if conn.execute("SELECT 1 FROM runs WHERE state = 'CAPTURING'").fetchone():
                 raise DirectLocalError("run_already_open")
-            baseline = conn.execute("SELECT state, cutover_at FROM runs WHERE kind = 'BASELINE'").fetchone()
+            baseline = conn.execute("SELECT state, cutover_at FROM runs WHERE kind = 'BASELINE' AND state <> 'ABANDONED'").fetchone()
             now = self.ledger.now().replace(microsecond=0)
             if kind == "BASELINE":
                 if baseline is not None:
                     raise DirectLocalError("baseline_already_exists")
+                previous = conn.execute("SELECT MAX(cutover_at) AS c FROM runs WHERE kind = 'BASELINE' AND state = 'ABANDONED'").fetchone()["c"]
+                if previous is not None and now <= parse_ts(previous):
+                    raise DirectLocalError("cutover_not_advanced")
                 cutover = ts(now)  # C: fixed before any page is requested
             elif kind == "DISCOVERY":
                 if baseline is None or baseline["state"] != "SEALED":
@@ -784,6 +854,33 @@ class Processor:
             )
             self.ledger.event(conn, f"run_started:{kind.lower()}")
         return {"run_id": run_id, "kind": kind, "cutover_at": cutover, "page_size": PAGE_SIZE, "query_sha256": _sha256(BASELINE_QUERY)}
+
+    def abandon_run(self, run_id: str, *, confirm_suffix: str) -> dict[str, Any]:
+        """Abandon an incomplete (CAPTURING) run; a sealed run never changes.
+        Its unconsumed page captures are recorded as consumed so a fresh run
+        (with a new, later cutover for a baseline) starts from a clean inbox."""
+
+        if not re.fullmatch(r"[0-9a-f]{8}", confirm_suffix or "") or not run_id.endswith(confirm_suffix):
+            raise DirectLocalError("abandon_confirmation_mismatch")
+        meta = self.ledger.meta()
+        with self.ledger.tx() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None or run["state"] != "CAPTURING":
+                raise DirectLocalError("run_not_abandonable")
+            now = ts(self.ledger.now())
+            retired = 0
+            for path in sorted(self.inbox.glob("*.json")):
+                try:
+                    capture = parse_capture(path.read_bytes(), mode=meta["mode"], store_gid=meta["store_gid"], shop_domain=meta["shop_domain"])
+                except CaptureRejected:
+                    continue  # never consumed; it still blocks any later ingest
+                if capture.kind != "baseline" or conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+                    continue
+                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'abandoned', ?)", (capture.capture_sha256, capture.tool_use_id, now))
+                retired += 1
+            conn.execute("UPDATE runs SET state = 'ABANDONED', sealed_at = ? WHERE run_id = ?", (now, run_id))
+            self.ledger.event(conn, f"run_abandoned:{run['kind'].lower()}")
+        return {"run_id": run_id, "state": "ABANDONED", "captures_retired": retired}
 
     def _inbox_captures(self, conn: sqlite3.Connection, meta: sqlite3.Row) -> list[tuple[Path, Capture]]:
         found = []
@@ -873,7 +970,6 @@ class Processor:
         with self.ledger.tx() as conn:
             for fence in conn.execute("SELECT * FROM fences WHERE state IN ('FENCED', 'DISPATCHED', 'WRITER_TERMINATION_UNCONFIRMED')").fetchall():
                 fence_id = fence["fence_id"]
-                pid = fence["child_pid"]
                 if fence["state"] == "FENCED":
                     # The child is only ever started after DISPATCHED commits.
                     self._fence_state(conn, fence, "MANUAL_REVIEW", "fence_orphaned_pre_dispatch")
@@ -881,10 +977,18 @@ class Processor:
                     continue
                 if fence["state"] == "DISPATCHED" and now < parse_ts(fence["deadline_at"]) + timedelta(seconds=self.writer_grace_seconds):
                     raise DirectLocalHold("writer_may_be_live")
-                if pid is not None and self.alive(pid):
-                    raise DirectLocalHold("writer_may_be_live")
+                # Exit must be proven against the recorded child identity
+                # (PID + creation instant). Unknown identity or an
+                # indeterminate probe stays on HOLD; only an attended
+                # release-writer-hold can move it on (to uncertain, never to
+                # not-written).
+                if fence["child_pid"] is None or fence["child_created"] is None:
+                    raise DirectLocalHold("writer_identity_unrecorded")
+                probe = self.writer_probe(fence["child_pid"], fence["child_created"])
+                if probe != "exited":
+                    raise DirectLocalHold("writer_may_be_live" if probe == "running" else "writer_exit_unproven")
                 claim = (self.claims / f"{fence_id}.claim").exists()
-                if fence["state"] == "DISPATCHED" and not claim and pid is not None:
+                if fence["state"] == "DISPATCHED" and not claim:
                     self._fence_state(conn, fence, "NOT_WRITTEN_PROVEN", "dispatch_owner_lost_before_claim")
                     counts["not_written"] += 1
                 else:
@@ -892,6 +996,22 @@ class Processor:
                     self._fence_state(conn, fence, "WRITE_OUTCOME_UNCERTAIN", code)
                     counts["uncertain"] += 1
         return counts
+
+    def release_writer_hold(self, fence_id: str, *, confirm_suffix: str) -> dict[str, Any]:
+        """Attended exit from a HOLD whose writer exit cannot be proven. The
+        operator attests no bridge process remains; the fence becomes
+        WRITE_OUTCOME_UNCERTAIN (reconcile read-only), never not-written."""
+
+        if not re.fullmatch(r"[0-9a-f]{8}", confirm_suffix or "") or not fence_id.endswith(confirm_suffix):
+            raise DirectLocalError("release_confirmation_mismatch")
+        with self.ledger.tx() as conn:
+            fence = conn.execute("SELECT * FROM fences WHERE fence_id = ?", (fence_id,)).fetchone()
+            if fence is None or fence["state"] not in ("DISPATCHED", "WRITER_TERMINATION_UNCONFIRMED"):
+                raise DirectLocalError("no_writer_hold")
+            if self.ledger.now() < parse_ts(fence["deadline_at"]) + timedelta(seconds=self.writer_grace_seconds):
+                raise DirectLocalHold("writer_may_be_live")
+            self._fence_state(conn, fence, "WRITE_OUTCOME_UNCERTAIN", "operator_attested_writer_absent")
+        return {"fence_state": "WRITE_OUTCOME_UNCERTAIN", "code": "operator_attested_writer_absent"}
 
     def _fence_state(self, conn: sqlite3.Connection, fence: sqlite3.Row, state: str, code: str | None, **extra: Any) -> None:
         columns = ", ".join(f"{name} = ?" for name in extra)
@@ -953,6 +1073,8 @@ class Processor:
             return False
 
     def process(self, capture_path: Path, *, bridge: BridgeClient | None = None, enable_write: bool = False) -> dict[str, Any]:
+        if enable_write:
+            self._require_synthetic_bridge(bridge)  # before any state change
         self.recover()
         meta = self.ledger.meta()
         outcome_map = {"ADMIT": "ADMITTED", "WAIT": "WAITING", "NOT_ELIGIBLE": "NOT_ELIGIBLE", "EXCLUDED_BASELINE": "EXCLUDED_BASELINE", "MANUAL_REVIEW": "MANUAL_REVIEW"}
@@ -968,8 +1090,6 @@ class Processor:
         result: dict[str, Any] = {"customer_state": state, "code": decision.code, "capture_discarded": self._discard(capture_path)}
         if state != "ADMITTED" or not enable_write:
             return result
-        if bridge is None:
-            raise DirectLocalError("bridge_required")
         result.update(self._write(gid, decision.create_payload or {}, bridge))
         return result
 
@@ -1050,6 +1170,7 @@ class Processor:
             return candidate, None
 
     def _write(self, gid: str, payload: Mapping[str, Any], bridge: BridgeClient) -> dict[str, Any]:
+        self._require_synthetic_bridge(bridge)
         with self.ledger.tx() as conn:
             if self._live_approval(conn, gid) is None:
                 return {"write": "not_started", "code": "write_approval_missing"}
@@ -1094,9 +1215,9 @@ class Processor:
             fence = conn.execute("SELECT * FROM fences WHERE fence_id = ?", (fence_id,)).fetchone()
             self._fence_state(conn, fence, "DISPATCHED", None, deadline_at=ts(deadline))
 
-        def on_started(pid: int) -> None:
+        def on_started(pid: int, created: str | None) -> None:
             with self.ledger.tx() as conn:
-                conn.execute("UPDATE fences SET child_pid = ?, updated_at = ? WHERE fence_id = ? AND state = 'DISPATCHED'", (pid, ts(self.ledger.now()), fence_id))
+                conn.execute("UPDATE fences SET child_pid = ?, child_created = ?, updated_at = ? WHERE fence_id = ? AND state = 'DISPATCHED'", (pid, created, ts(self.ledger.now()), fence_id))
 
         run = bridge.write_once(
             fence_id=fence_id, claim_directory=self.claims, deadline=deadline,
@@ -1112,6 +1233,7 @@ class Processor:
     def reconcile(self, capture_path: Path, *, bridge: BridgeClient) -> dict[str, Any]:
         """Read-only check of one uncertain write with the same MemberNo."""
 
+        self._require_synthetic_bridge(bridge)
         self.recover()
         meta = self.ledger.meta()
         with self.ledger.tx() as conn:
@@ -1171,6 +1293,12 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("ingest-run")
     commands.add_parser("recover")
     commands.add_parser("status")
+    abandon = commands.add_parser("abandon-run")
+    abandon.add_argument("--run-id", required=True)
+    abandon.add_argument("--confirm-suffix", required=True)
+    release = commands.add_parser("release-writer-hold")
+    release.add_argument("--fence-id", required=True)
+    release.add_argument("--confirm-suffix", required=True)
     approve = commands.add_parser("approve-write")
     approve.add_argument("--gid", required=True)
     approve.add_argument("--confirm-suffix", required=True)
@@ -1190,6 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         processor = Processor(ledger)
         bridge_script = getattr(args, "bridge_script", None)
+        # Always the real target: a synthetic ledger refuses it before any spawn.
         bridge = BridgeClient(default_bridge_command(Path(bridge_script) if bridge_script else None))
         if args.command == "init-ledger":
             result = processor.init_ledger(mode=args.mode, store_gid=args.store_gid, shop_domain=args.shop_domain)
@@ -1199,6 +1328,10 @@ def main(argv: list[str] | None = None) -> int:
             result = processor.begin_run("DISCOVERY")
         elif args.command == "ingest-run":
             result = processor.ingest_run()
+        elif args.command == "abandon-run":
+            result = processor.abandon_run(args.run_id, confirm_suffix=args.confirm_suffix)
+        elif args.command == "release-writer-hold":
+            result = processor.release_writer_hold(args.fence_id, confirm_suffix=args.confirm_suffix)
         elif args.command == "recover":
             result = processor.recover()
         elif args.command == "status":

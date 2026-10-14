@@ -102,7 +102,10 @@ class FakeAutoCount:
 
 
 class FakeBridge:
-    """Mirrors the PowerShell bridge contract, including the claim file."""
+    """Mirrors the PowerShell bridge contract, including the claim file.
+    Positively marked as the test-only synthetic target."""
+
+    autocount_target = dl.SYNTHETIC_BRIDGE_TARGET
 
     def __init__(self, ac: FakeAutoCount, *, write_mode: str = "ok", fail: tuple[str, ...] = (), precheck_result: dict | None = None):
         self.ac = ac
@@ -152,7 +155,7 @@ class FakeBridge:
         assert stdin_value["fence_id"] == fence_id
         if self.write_mode == "start_fail":
             return dl.WriteRun(started=False)
-        on_started(4242)
+        on_started(4242, "synthetic-created-1")
         if self.write_mode == "crash_before_claim":
             return dl.WriteRun(started=True, exit_code=1)
         if self.write_mode == "timeout_before_claim":
@@ -184,8 +187,8 @@ class DirectLocalTestCase(unittest.TestCase):
         self.temp = Path(tempfile.mkdtemp(prefix="xb-directlocal-"))
         self.clock = Clock(T0)
         self.ledger = dl.Ledger(self.temp, clock=self.clock)
-        self.alive = lambda pid: False
-        self.processor = dl.Processor(self.ledger, alive=lambda pid: self.alive(pid))
+        self.writer_status = "exited"
+        self.processor = dl.Processor(self.ledger, writer_probe=lambda pid, created: self.writer_status)
         self.processor.init_ledger(mode="synthetic", store_gid=STORE, shop_domain=DOMAIN)
         self.ac = FakeAutoCount()
         self.counter = 0
@@ -201,7 +204,7 @@ class DirectLocalTestCase(unittest.TestCase):
         self.ledger.close()
         self.clock.now += advance
         self.ledger = dl.Ledger(self.temp, clock=self.clock)
-        self.processor = dl.Processor(self.ledger, alive=lambda pid: self.alive(pid))
+        self.processor = dl.Processor(self.ledger, writer_probe=lambda pid, created: self.writer_status)
 
     def put(self, value: dict, name: str | None = None) -> Path:
         self.counter += 1
@@ -701,7 +704,7 @@ class WriteTests(DirectLocalTestCase):
         """No later attempt (fresh capture, new approval, recovery) writes again."""
 
         self.clock.now += timedelta(hours=1)
-        self.alive = lambda pid: False
+        self.writer_status = "exited"
         self.processor.recover()
         bridge = FakeBridge(self.ac)
         with self.assertRaises(dl.DirectLocalError) as raised:
@@ -762,10 +765,12 @@ class CrashRecoveryTests(DirectLocalTestCase):
         with self.assertRaises(dl.DirectLocalHold):
             self.processor.recover()  # before deadline + grace: writer may be live
         self.clock.now += timedelta(seconds=dl.WRITER_DEADLINE_SECONDS + dl.WRITER_GRACE_SECONDS + 1)
-        self.alive = lambda pid: True
-        with self.assertRaises(dl.DirectLocalHold):
-            self.processor.recover()  # recorded child pid still alive
-        self.alive = lambda pid: False
+        for status, code in (("running", "writer_may_be_live"), ("unknown", "writer_exit_unproven")):
+            self.writer_status = status
+            with self.assertRaises(dl.DirectLocalHold) as raised:
+                self.processor.recover()  # recorded child running, or exit not provable
+            self.assertEqual(raised.exception.code, code)
+        self.writer_status = "exited"
         self.assertEqual(self.processor.recover()["uncertain"], 1)
         self.assertEqual(self.fence()["state"], "WRITE_OUTCOME_UNCERTAIN")
         replay = FakeBridge(self.ac)
@@ -788,22 +793,66 @@ class CrashRecoveryTests(DirectLocalTestCase):
         result = self.processor.reconcile(self.fresh_profile(), bridge=FakeBridge(self.ac))
         self.assertEqual(result, {"fence_state": "MANUAL_REVIEW", "code": "confirmed_absent_manual_followup"})
 
-    def test_lost_pid_with_claim_is_uncertain(self):
+    def test_unrecorded_writer_identity_holds_until_attended_release(self):
         bridge = FakeBridge(self.ac, write_mode="parent_crash_after_save")
         original = bridge.write_once
-        bridge.write_once = lambda **kw: original(**{**kw, "on_started": lambda pid: None})
+        bridge.write_once = lambda **kw: original(**{**kw, "on_started": lambda pid, created: None})
         with self.assertRaises(SimulatedCrash):
             self.write(bridge)
         self.reopen(advance=timedelta(hours=1))
+        for _ in range(2):  # stays on HOLD however often recovery runs
+            with self.assertRaises(dl.DirectLocalHold) as raised:
+                self.processor.recover()
+            self.assertEqual(raised.exception.code, "writer_identity_unrecorded")
+        with self.assertRaises(dl.DirectLocalHold):
+            self.write(FakeBridge(self.ac))  # every command is blocked by the HOLD
+        fence_id = self.fence()["fence_id"]
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.release_writer_hold(fence_id, confirm_suffix="00000000")
+        self.assertEqual(raised.exception.code, "release_confirmation_mismatch")
+        result = self.processor.release_writer_hold(fence_id, confirm_suffix=fence_id[-8:])
+        self.assertEqual(result["code"], "operator_attested_writer_absent")
+        self.assertEqual(self.fence()["state"], "WRITE_OUTCOME_UNCERTAIN")
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.release_writer_hold(fence_id, confirm_suffix=fence_id[-8:])
+        self.assertEqual(raised.exception.code, "no_writer_hold")
+        self.assertEqual(self.ac.saves, 1)
+
+    def test_release_refused_before_deadline(self):
+        bridge = FakeBridge(self.ac, write_mode="parent_crash_after_save")
+        with self.assertRaises(SimulatedCrash):
+            self.write(bridge)
+        fence_id = self.fence()["fence_id"]
+        with self.assertRaises(dl.DirectLocalHold):
+            self.processor.release_writer_hold(fence_id, confirm_suffix=fence_id[-8:])
+        self.assertEqual(self.fence()["state"], "DISPATCHED")
+
+    def test_missing_claim_with_unproven_exit_is_never_not_written(self):
+        bridge = FakeBridge(self.ac)
+
+        def crash_before_claim(**kw):
+            kw["on_started"](4242, "synthetic-created-1")
+            raise SimulatedCrash()
+
+        bridge.write_once = crash_before_claim
+        with self.assertRaises(SimulatedCrash):
+            self.write(bridge)
+        self.reopen(advance=timedelta(hours=1))
+        self.writer_status = "unknown"
+        with self.assertRaises(dl.DirectLocalHold):
+            self.processor.recover()
+        self.writer_status = "exited"
         self.processor.recover()
-        self.assertEqual((self.fence()["state"], self.fence()["code"]), ("WRITE_OUTCOME_UNCERTAIN", "dispatch_owner_lost"))
+        self.assertEqual((self.fence()["state"], self.fence()["code"]), ("NOT_WRITTEN_PROVEN", "dispatch_owner_lost_before_claim"))
+        self.assertEqual(self.ac.saves, 0)
 
     def test_termination_unconfirmed_resolves_only_when_child_gone(self):
         self.write(FakeBridge(self.ac, write_mode="timeout_unconfirmed"))
-        self.alive = lambda pid: True
-        with self.assertRaises(dl.DirectLocalHold):
-            self.processor.recover()
-        self.alive = lambda pid: False
+        for status in ("running", "unknown"):
+            self.writer_status = status
+            with self.assertRaises(dl.DirectLocalHold):
+                self.processor.recover()
+        self.writer_status = "exited"
         self.processor.recover()
         self.assertEqual(self.fence()["state"], "WRITE_OUTCOME_UNCERTAIN")
         self.assertEqual(self.ac.saves, 1)
@@ -820,6 +869,96 @@ class CrashRecoveryTests(DirectLocalTestCase):
         result = self.write(bridge)
         self.assertEqual((result["fence_state"], result["code"]), ("WRITE_OUTCOME_UNCERTAIN", "fence_already_claimed"))
         self.assertEqual(self.ac.saves, 0)
+
+
+class SyntheticInertnessTests(DirectLocalTestCase):
+    """A synthetic ledger never starts a real AutoCount bridge process."""
+
+    def setUp(self):
+        super().setUp()
+        self.seal_baseline()
+        self.admit_and_approve()
+        self.spawned: list = []
+
+    def spy_popen(self, *args, **kwargs):
+        self.spawned.append(args)
+        raise AssertionError("a real bridge process must never be started")
+
+    def test_real_bridge_client_refused_before_any_spawn_or_state_change(self):
+        real = dl.BridgeClient(dl.default_bridge_command(), popen=self.spy_popen)
+        self.assertEqual(real.autocount_target, dl.REAL_BRIDGE_TARGET)
+        path = self.fresh_profile()
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.process(path, bridge=real, enable_write=True)
+        self.assertEqual(raised.exception.code, "real_autocount_refused_synthetic_ledger")
+        self.assertTrue(path.exists())  # refused before the capture was consumed
+        self.assertEqual(self.customer()["state"], "ADMITTED")
+        for bridge in (None, real, FakeBridge(self.ac)):
+            if bridge is not None and not isinstance(bridge, dl.BridgeClient):
+                bridge.autocount_target = dl.REAL_BRIDGE_TARGET  # mislabelled fake is refused too
+            with self.subTest(bridge=type(bridge).__name__), self.assertRaises(dl.DirectLocalError) as raised:
+                self.processor.process(self.fresh_profile(), bridge=bridge, enable_write=True)
+            self.assertEqual(raised.exception.code, "real_autocount_refused_synthetic_ledger")
+        self.assertEqual(self.spawned, [])
+        self.assertIsNone(self.fence())
+
+    def test_reconcile_refuses_real_bridge(self):
+        real = dl.BridgeClient(dl.default_bridge_command(), popen=self.spy_popen)
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.reconcile(self.fresh_profile(), bridge=real)
+        self.assertEqual(raised.exception.code, "real_autocount_refused_synthetic_ledger")
+        self.assertEqual(self.spawned, [])
+
+    def test_direct_write_path_refuses_real_bridge(self):
+        real = dl.BridgeClient(dl.default_bridge_command(), popen=self.spy_popen)
+        with self.assertRaises(dl.DirectLocalError):
+            self.processor._write(NEW, {"name": "x"}, real)
+        self.assertEqual(self.spawned, [])
+
+
+@unittest.skipUnless(os.name == "nt", "Windows process identity")
+class WriterProbeTests(unittest.TestCase):
+    def test_pid_reuse_and_indeterminate_identity(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            created = dl.child_creation_time(child)
+            self.assertIsNotNone(created)
+            self.assertEqual(dl.probe_writer(child.pid, created), "running")
+            self.assertEqual(dl.probe_writer(child.pid, None), "unknown")
+            self.assertEqual(dl.probe_writer(child.pid, str(int(created) + 1)), "exited")  # same PID, other process
+        finally:
+            child.kill()
+            child.wait(timeout=30)
+        self.assertEqual(dl.probe_writer(child.pid, created), "exited")
+
+
+class RunAbandonTests(DirectLocalTestCase):
+    def test_incomplete_baseline_abandoned_and_recaptured_with_new_cutover(self):
+        first = self.processor.begin_run("BASELINE")
+        self.put(record("toolu_old1", page_input(None), page_data([node(HISTORICAL, T0 - timedelta(days=1), ["member-mg"])], True, "cursor-1"), T0 + timedelta(seconds=1)))
+        with self.assertRaises(dl.DirectLocalError):
+            self.processor.ingest_run()
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.abandon_run(first["run_id"], confirm_suffix="deadbeef")
+        self.assertEqual(raised.exception.code, "abandon_confirmation_mismatch")
+        result = self.processor.abandon_run(first["run_id"], confirm_suffix=first["run_id"][-8:])
+        self.assertEqual((result["state"], result["captures_retired"]), ("ABANDONED", 1))
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.begin_run("BASELINE")  # same instant: cutover must advance
+        self.assertEqual(raised.exception.code, "cutover_not_advanced")
+        self.clock.now = T0 + timedelta(minutes=1)
+        second = self.processor.begin_run("BASELINE")
+        self.assertEqual(second["cutover_at"], "2026-10-14T00:01:00Z")
+        self.put(record("toolu_new1", page_input(None), page_data([node(HISTORICAL, T0 - timedelta(days=1), ["member-mg"]), node(NEW, T0 + timedelta(minutes=2), ["member-mg"])], False, None), T0 + timedelta(minutes=1, seconds=1)))
+        sealed = self.processor.ingest_run()
+        self.assertEqual((sealed["pages"], sealed["historical"], sealed["transition"]), (1, 1, 1))
+        for statement in ("UPDATE runs SET state = 'CAPTURING' WHERE state = 'ABANDONED'", "UPDATE runs SET state = 'ABANDONED' WHERE state = 'SEALED'", "DELETE FROM runs"):
+            with self.subTest(statement=statement), self.assertRaises(sqlite3.DatabaseError):
+                self.ledger.conn.execute(statement)
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.processor.abandon_run(second["run_id"], confirm_suffix=second["run_id"][-8:])
+        self.assertEqual(raised.exception.code, "run_not_abandonable")
+        self.assertEqual(self.ledger.conn.execute("PRAGMA user_version").fetchone()[0], dl.SCHEMA_VERSION)
 
 
 class ClassifyTests(unittest.TestCase):
@@ -891,8 +1030,8 @@ class HookTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def run_cli(self, root: Path, *args: str) -> tuple[int, dict]:
-        env = {**os.environ, "LOCALAPPDATA": str(root / "not-the-state-root")}
+    def run_cli(self, root: Path, *args: str, extra_env: dict | None = None) -> tuple[int, dict]:
+        env = {**os.environ, "LOCALAPPDATA": str(root / "not-the-state-root"), **(extra_env or {})}
         env.pop("PYTHONPATH", None)
         proc = subprocess.run([sys.executable, str(ROOT / "directlocal" / "xb_directlocal.py"), "--state-root", str(root), *args], capture_output=True, timeout=120, env=env, check=False)
         return proc.returncode, json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
@@ -911,6 +1050,17 @@ class CliTests(unittest.TestCase):
             code, status = self.run_cli(root, "status")
             self.assertEqual((code, status["customers"]), (0, {"DISCOVERED": 1}))
             self.assertEqual(self.run_cli(root / "absent", "status"), (2, {"status": "refused", "code": "state_root_missing"}))
+            profile_path = root / "inbox" / "toolu_cli_profile.json"
+            now = datetime.now(timezone.utc)
+            profile_path.write_text(json.dumps(profile_record("toolu_cli_profile", profile(NEW, created=captured), NEW, now)), encoding="utf-8")
+            code, refused = self.run_cli(root, "process", "--capture", str(profile_path), "--enable-autocount-write", extra_env={
+                "XB_AC2_SERVER_NAME": "synthetic-server", "XB_AC2_DATABASE_NAME": "synthetic-db", "XB_AC2_USER_ID": "synthetic",
+                "XB_AC2_PASSWORD_ENV_VAR": "XB_SYNTHETIC_PW", "XB_SYNTHETIC_PW": "not-a-secret", "XB_AC2_ASSEMBLY_PATH": str(root),
+                "SystemRoot": str(root / "no-powershell-here"),
+            })
+            self.assertEqual((code, refused), (2, {"status": "refused", "code": "real_autocount_refused_synthetic_ledger"}))
+            self.assertTrue(profile_path.exists())
+            self.assertEqual(list((root / "claims").iterdir()), [])
 
 
 def parse_iso(value: str) -> datetime:

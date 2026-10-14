@@ -8,6 +8,7 @@ account book. No AutoCount assembly, login, account book or network is used.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,8 @@ param(
     [switch]$EnableProductionAdapter,
     [string]$FenceId,
     [string]$ClaimDirectory,
-    [string]$WriteDeadlineUtc
+    [string]$WriteDeadlineUtc,
+    [ValidateSet("marked", "unmarked", "autocount_typed")][string]$HostMode = "marked"
 )
 $ErrorActionPreference = "Stop"
 $fields = @("MemberNo", "MemberType", "Name", "MobilePhone", "EmailAddress", "DOB", "RegisterDate", "ExpiryDate", "OpeningPoints", "IsActive", "Individual")
@@ -102,7 +104,12 @@ $command | Add-Member -MemberType ScriptMethod -Name LoadBrowseTable -Value {
     return ,$table
 }
 $factory = { param($Session) return $command }.GetNewClosure()
-$sessionFactory = { [pscustomobject]@{ UserSession = "fake"; DBSetting = "fake"; MemberCommandFactory = $factory } }.GetNewClosure()
+if ($HostMode -eq "autocount_typed") {
+    # Looks like a real AutoCount MemberCommand to the bridge's type check.
+    $command.PSObject.TypeNames.Insert(0, "AutoCount.BonusPoint.Member.MemberCommand")
+}
+$marked = ($HostMode -ne "unmarked")
+$sessionFactory = { [pscustomobject]@{ UserSession = "fake"; DBSetting = "fake"; MemberCommandFactory = $factory; XbDirectLocalSyntheticFake = $marked } }.GetNewClosure()
 & $Bridge -Operation $Operation -EnableProductionAdapter:$EnableProductionAdapter -FenceId $FenceId -ClaimDirectory $ClaimDirectory -WriteDeadlineUtc $WriteDeadlineUtc -SessionFactory $sessionFactory
 exit $LASTEXITCODE
 """
@@ -137,10 +144,14 @@ class DirectLocalBridgeTests(unittest.TestCase):
     def command(self) -> list[str]:
         return [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.host), "-Bridge", str(BRIDGE), "-StateFile", str(self.state)]
 
-    def run_bridge(self, operation: str, stdin: dict | None, *extra: str, enable: bool = True, timeout: int = 120):
-        args = self.command() + ["-Operation", operation] + (["-EnableProductionAdapter"] if enable else []) + list(extra)
+    def direct_command(self) -> list[str]:
+        """The bridge's own executable entrypoint, exactly as production would launch it."""
+        return [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(BRIDGE)]
+
+    def run_bridge(self, operation: str, stdin: dict | None, *extra: str, enable: bool = True, timeout: int = 120, command: list[str] | None = None, env: dict | None = None):
+        args = (command or self.command()) + ["-Operation", operation] + (["-EnableProductionAdapter"] if enable else []) + list(extra)
         data = b"" if stdin is None else (json.dumps(stdin) + "\n").encode("ascii")
-        proc = subprocess.run(args, input=data, capture_output=True, timeout=timeout, check=False)
+        proc = subprocess.run(args, input=data, capture_output=True, timeout=timeout, check=False, env=env)
         out = proc.stdout.decode("utf-8", "replace").strip().splitlines()
         return proc.returncode, (json.loads(out[-1]) if out else None), proc
 
@@ -159,6 +170,43 @@ class DirectLocalBridgeTests(unittest.TestCase):
         text = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")
         for value in PII:
             self.assertNotIn(value, text)
+
+    def test_direct_entrypoint_is_inert_even_with_autocount_environment(self):
+        # Every enabling flag, a valid fence and a full AutoCount runtime
+        # environment are supplied; no operation may reach the adapter.
+        assembly = self.temp / "fake-assembly-root"
+        assembly.mkdir()
+        env = {
+            **os.environ,
+            "XB_AC2_ASSEMBLY_PATH": str(assembly), "XB_AC2_SERVER_NAME": "synthetic-server", "XB_AC2_DATABASE_NAME": "synthetic-db",
+            "XB_AC2_USER_ID": "synthetic", "XB_AC2_PASSWORD_ENV_VAR": "XB_SYNTHETIC_PW", "XB_SYNTHETIC_PW": "not-a-secret",
+            "XB_AC2_SESSION_FACTORY": "New-SyntheticNeverDefined",
+        }
+        fence = "fence-" + "6" * 32
+        cases = [
+            ("legacy-precheck", {"phone_keys": ["6580000001"], "email_address": None}, []),
+            ("next-member-no", {}, []),
+            ("probe", {"member_no": "M000201"}, []),
+            ("reconcile", {"member_no": "M000201", "payload_canonical": dl.canonical_payload(PAYLOAD)}, []),
+            ("write-once", self.write_request(fence), self.write_args(fence)),
+        ]
+        for operation, request, extra in cases:
+            with self.subTest(operation=operation):
+                code, out, proc = self.run_bridge(operation, request, *extra, command=self.direct_command(), env=env)
+                self.assertEqual((code, out), (1, {"error": "autocount_real_bridge_disabled"}))
+                self.assert_clean(proc)
+        self.assertEqual(list(self.claims.iterdir()), [])
+        self.assertEqual(self.fake()["saves"], 0)
+
+    def test_unmarked_or_autocount_typed_session_is_refused(self):
+        fence = "fence-" + "7" * 32
+        for mode, error in (("unmarked", "synthetic_session_marker_missing"), ("autocount_typed", "real_autocount_object_refused")):
+            with self.subTest(mode=mode):
+                command = self.command() + ["-HostMode", mode]
+                self.assertEqual(self.run_bridge("probe", {"member_no": "M000201"}, command=command)[:2], (1, {"error": error}))
+                self.assertEqual(self.run_bridge("write-once", self.write_request(fence), *self.write_args(fence), command=command)[:2], (1, {"error": error}))
+                self.assertEqual(list(self.claims.iterdir()), [])
+        self.assertEqual(self.fake()["saves"], 0)
 
     def test_read_operations(self):
         self.assertEqual(self.run_bridge("probe", {"member_no": "M000201"})[:2], (0, {"status": "FREE"}))
@@ -256,14 +304,16 @@ class DirectLocalEndToEndTests(unittest.TestCase):
         self.root.mkdir()
         # Real time: the child's watchdog deadline is wall-clock.
         self.ledger = dl.Ledger(self.root)
-        self.processor = dl.Processor(self.ledger, alive=lambda pid: False, writer_deadline_seconds=6, writer_grace_seconds=3)
+        self.processor = dl.Processor(self.ledger, writer_deadline_seconds=6, writer_grace_seconds=3)  # real Windows writer probe
         self.processor.init_ledger(mode="synthetic", store_gid=fixtures.STORE, shop_domain=fixtures.DOMAIN)
         self.processor.begin_run("BASELINE")
         cutover = dl.parse_ts(self.ledger.conn.execute("SELECT cutover_at FROM runs").fetchone()[0])
         page = fixtures.record("toolu_page", fixtures.page_input(None), fixtures.page_data([fixtures.node(fixtures.NEW, cutover + timedelta(minutes=1), ["member-mg"])], False, None), cutover + timedelta(seconds=1))
         (self.root / "inbox" / "toolu_page.json").write_text(json.dumps(page), encoding="utf-8")
         self.processor.ingest_run()
-        self.client = dl.BridgeClient(self.bridge_tests.command())
+        # Positively isolated test-only interface: the synthetic target label
+        # plus the marked fake host. Neither alone reaches the adapter.
+        self.client = dl.BridgeClient(self.bridge_tests.command(), autocount_target=dl.SYNTHETIC_BRIDGE_TARGET)
         self.created = cutover + timedelta(minutes=1)
         self.counter = 0
 
@@ -290,6 +340,16 @@ class DirectLocalEndToEndTests(unittest.TestCase):
         with self.assertRaises(dl.DirectLocalError):
             self.processor.process(self.capture(), bridge=self.client, enable_write=True)
         self.assertEqual(self.bridge_tests.fake()["saves"], 1)
+
+    def test_synthetic_label_with_real_entrypoint_still_cannot_reach_adapter(self):
+        # Even if a caller labels the production command as synthetic, the
+        # bridge entrypoint refuses: the precheck fails closed to review.
+        mislabelled = dl.BridgeClient(self.bridge_tests.direct_command(), autocount_target=dl.SYNTHETIC_BRIDGE_TARGET)
+        self.admit()
+        result = self.processor.process(self.capture(), bridge=mislabelled, enable_write=True)
+        self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "legacy_lookup_failed"))
+        self.assertEqual(self.bridge_tests.fake()["saves"], 0)
+        self.assertIsNone(self.ledger.conn.execute("SELECT 1 FROM fences").fetchone())
 
     def test_hung_writer_is_uncertain_then_reconciled_read_only(self):
         self.bridge_tests.set_state(hang_after_save_ms=60000)
