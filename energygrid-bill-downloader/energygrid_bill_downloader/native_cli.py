@@ -130,7 +130,18 @@ def _with_state(cfg: bridge.NativeConfig, action: Callable[[Any], dict]) -> dict
         return action(state)
 
 
+def _notify(cfg: bridge.NativeConfig, now_ms: int, action: Callable[[Any], dict]) -> dict:
+    """Run one notification command inside the v4 lease, so it serialises with every bridge write."""
+    from .native_notify import NotificationStore, store_path
+    from .state import StateV4Store
+
+    with StateV4Store(cfg.state_path) as state, bridge._session(state, now_ms),             NotificationStore(store_path(cfg)) as store:
+        return action(store)
+
+
 def _dispatch(args) -> dict:
+    from . import native_notify as notify
+
     cfg = _load_config(args.config)
     command = args.command
     if command == "init-uat":
@@ -139,6 +150,7 @@ def _dispatch(args) -> dict:
         return _make_fixture(cfg, args)
     run_id = bridge.new_run_id()
     now = _now_ms()
+    now_iso = bridge._iso(now)
     if command == "acquire":
         adapters = _adapters(cfg)
         return _with_state(cfg, lambda s: bridge.acquire(s, cfg, adapters, run_id=run_id, now_ms=now))
@@ -146,15 +158,21 @@ def _dispatch(args) -> dict:
         return _with_state(cfg, lambda s: bridge.next_step(s, cfg, run_id=run_id, now_ms=now))
     if command == "status":
         return _with_state(cfg, lambda s: bridge.status(s, cfg))
-    if command in ("drive-seal", "drive-record", "gmail-seal", "gmail-record"):
+    if command in ("drive-seal", "drive-record", "drive-adopt"):
         evidence = bridge.load_evidence(Path(args.evidence))
         function = {"drive-seal": bridge.drive_seal, "drive-record": bridge.drive_record,
-                    "gmail-seal": bridge.gmail_seal, "gmail-record": bridge.gmail_record}[command]
+                    "drive-adopt": bridge.drive_adopt}[command]
         return _with_state(cfg, lambda s: function(s, cfg, args.intent, evidence, run_id=run_id, now_ms=now))
     if command == "drive-readback":
         return _with_state(cfg, lambda s: bridge.drive_readback(s, cfg, args.intent, args.file_id, Path(args.base64_file)))
-    if command == "gmail-readback":
-        return _with_state(cfg, lambda s: bridge.gmail_readback(s, cfg, args.intent, args.draft_id, Path(args.base64_file)))
+    if command == "notify-draft-evidence":
+        return _notify(cfg, now, lambda store: notify.draft_evidence(store, cfg, args.notification, args.draft_id,
+                                                                     Path(args.raw_file)))
+    if command == "notify-seal":
+        return _notify(cfg, now, lambda store: notify.seal(store, cfg, args.notification, args.draft_id, now_iso))
+    if command == "notify-record":
+        evidence = bridge.load_evidence(Path(args.evidence))
+        return _notify(cfg, now, lambda store: notify.record(store, args.notification, evidence, now_iso))
     raise bridge.NativeRefusal("EG_NATIVE_COMMAND_UNKNOWN")
 
 
@@ -166,17 +184,23 @@ def build_parser() -> argparse.ArgumentParser:
     fixture = sub.add_parser("make-synthetic-fixture")
     fixture.add_argument("--config", required=True)
     fixture.add_argument("--listing")
-    for name in ("drive-seal", "drive-record", "gmail-seal", "gmail-record"):
+    for name in ("drive-seal", "drive-record", "drive-adopt"):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
         command.add_argument("--intent", required=True)
         command.add_argument("--evidence", required=True)
-    for name, provider in (("drive-readback", "--file-id"), ("gmail-readback", "--draft-id")):
+    readback = sub.add_parser("drive-readback")
+    readback.add_argument("--config", required=True)
+    readback.add_argument("--intent", required=True)
+    readback.add_argument("--file-id", required=True)
+    readback.add_argument("--base64-file", required=True)
+    for name, extra in (("notify-draft-evidence", ("--draft-id", "--raw-file")), ("notify-seal", ("--draft-id",)),
+                        ("notify-record", ("--evidence",))):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
-        command.add_argument("--intent", required=True)
-        command.add_argument(provider, required=True)
-        command.add_argument("--base64-file", required=True)
+        command.add_argument("--notification", required=True)
+        for option in extra:
+            command.add_argument(option, required=True)
     return parser
 
 

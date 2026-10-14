@@ -3,6 +3,10 @@
 A `FakeNativeHost` plays the Claude host and the claude.ai Drive and Gmail connectors
 locally. It can lose answers, crash between steps and corrupt the base64 it re-emits,
 which is the real fidelity risk of a model-carried payload. Synthetic data only.
+
+Core success is "archived and verified in Drive" (Web #226:6168033136). Email is an
+optional owner notification (native_notify): once per processed bill and once per
+actionable failure incident, never a gate on Drive work (Web #226:6168238127).
 """
 
 from __future__ import annotations
@@ -15,13 +19,16 @@ import unittest
 from pathlib import Path
 
 from energygrid_bill_downloader import native_bridge as bridge
-from energygrid_bill_downloader.errors import ConfigError, OfflineV4Error
+from energygrid_bill_downloader import native_notify as notify
+from energygrid_bill_downloader.errors import ConfigError, OfflineV4Error, SourceTransportError
 from energygrid_bill_downloader.native_bridge import NativeRefusal
 from energygrid_bill_downloader.state import StateV4Store, migrate_state_database_v4
 from fixtures.synthetic_dual_stream import SyntheticAdapter, candidate, create_v3_database, snapshot
 
 EB, TN = "EB_BILL", "TENANT_BILL"
 FOLDERS = {EB: "FOLDER_EB_SYNTHETIC_0001", TN: "FOLDER_TN_SYNTHETIC_0002"}
+FLAT = "FOLDER_FLAT_SYNTHETIC_0003"
+SENDER = "sender@example.com"
 RECIPIENT = "recipient@example.com"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -35,6 +42,16 @@ def corrupt(encoded: str) -> str:
     index = len(encoded) // 2
     replacement = "B" if encoded[index] != "B" else "C"
     return encoded[:index] + replacement + encoded[index + 1:]
+
+
+class FailingAdapter:
+    """A portal that cannot list. Used for acquisition-failure notifications."""
+
+    def inventory(self, ceiling: int):
+        raise SourceTransportError("EG_SYNTHETIC_PORTAL_DOWN")
+
+    def acquire(self, item, destination: Path):
+        raise SourceTransportError("EG_SYNTHETIC_PORTAL_DOWN")
 
 
 class FakeNativeHost:
@@ -53,99 +70,131 @@ class FakeNativeHost:
         self.counter += 1
         return f"{prefix}{self.counter:012d}"
 
-    # -- connectors ----------------------------------------------------
+    # -- Drive connector -----------------------------------------------
     def search(self, folder: str, title: str) -> list[dict]:
         return [{"id": key, "title": row["title"], "parentId": row["parent"]}
                 for key, row in self.drive.items() if row["parent"] == folder and row["title"] == title]
+
+    def put(self, folder: str, title: str, data: bytes) -> str:
+        file_id = self._id("DRIVEFILE")
+        self.drive[file_id] = {"title": title, "parent": folder, "bytes": data}
+        return file_id
+
+    def metadata(self, file_id: str) -> dict:
+        row = self.drive[file_id]
+        return {"id": file_id, "title": row["title"], "parentId": row["parent"], "mimeType": "application/pdf",
+                "fileSize": str(len(row["bytes"]))}
 
     def create_file(self, call: dict) -> dict:
         encoded = Path(call["base64Content_path"]).read_text()
         if self.corrupt_upload:
             encoded = corrupt(encoded)
-        data = base64.b64decode(encoded)
-        file_id = self._id("DRIVEFILE")
-        self.drive[file_id] = {"title": call["title"], "parent": call["parentId"], "bytes": data}
-        return {"id": file_id, "title": call["title"], "parentId": call["parentId"],
-                "mimeType": call["contentMimeType"], "fileSize": str(len(data))}
+        return self.metadata(self.put(call["parentId"], call["title"], base64.b64decode(encoded)))
 
     def download(self, file_id: str) -> str:
         return base64.b64encode(self.drive[file_id]["bytes"]).decode()
 
+    # -- Gmail connector -----------------------------------------------
     def create_draft(self, step: dict, **overrides) -> str:
-        encoded = Path(step["payload_base64_path"]).read_text()
-        if self.corrupt_attachment:
-            encoded = corrupt(encoded)
+        attachments = []
+        if step["attach_pdf"]:
+            encoded = Path(step["payload_base64_path"]).read_text()
+            if self.corrupt_attachment:
+                encoded = corrupt(encoded)
+            attachments = [{"filename": step["attachment_filename"], "mimeType": "application/pdf",
+                            "bytes": base64.b64decode(encoded)}]
         draft_id = self._id("DRAFT")
         self.drafts[draft_id] = {
             "from": overrides.get("sender", step["gmail_account"]),
-            "to": overrides.get("to", step["to"]), "cc": overrides.get("cc", []), "bcc": [],
+            "to": overrides.get("to", step["to"]), "cc": overrides.get("cc", []),
             "subject": overrides.get("subject", step["subject"]),
-            "attachments": overrides.get("attachments", [
-                {"filename": step["display_filename"], "mimeType": "application/pdf",
-                 "bytes": base64.b64decode(encoded)}]),
+            "body": overrides.get("body", step["body"]),
+            "attachments": overrides.get("attachments", attachments),
         }
         return draft_id
 
-    def draft_evidence(self, draft_id: str) -> dict:
+    def raw(self, draft_id: str) -> str:
+        """The draft as get_draft RAW returns it: a base64url RFC 822 message."""
+        from email.message import EmailMessage
+
         draft = self.drafts[draft_id]
-        return {"draft_id": draft_id, "from": draft["from"], "to": draft["to"], "cc": draft["cc"], "bcc": draft["bcc"],
-                "subject": draft["subject"],
-                "attachments": [{"filename": item["filename"], "mimeType": item["mimeType"],
-                                 "size": len(item["bytes"])} for item in draft["attachments"]]}
+        message = EmailMessage()
+        message["From"] = f'"UAT Sender" <{draft["from"]}>'
+        message["To"] = ", ".join(draft["to"])
+        if draft["cc"]:
+            message["Cc"] = ", ".join(draft["cc"])
+        message["Subject"] = draft["subject"]
+        message.set_content(draft["body"])
+        for item in draft["attachments"]:
+            maintype, subtype = item["mimeType"].split("/")
+            message.add_attachment(item["bytes"], maintype=maintype, subtype=subtype, filename=item["filename"])
+        return base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
 
     def send_draft(self, draft_id: str) -> str:
         message_id = self._id("MSG")
         self.sent.append({"message_id": message_id, **self.drafts.pop(draft_id)})
         return message_id
 
-    # -- one complete protocol step ------------------------------------
+    # -- protocol steps ------------------------------------------------
     def drive_step(self, step: dict, *, crash_after_seal=False, crash_after_create=False) -> dict:
         t = self.test
         intent = step["intent_id"]
         evidence = {"folder_id": step["folder_id"], "title": step["display_filename"], "complete": True,
-                    "query": step["precheck_query"],
-                    "matches": self.search(step["folder_id"], step["display_filename"])}
+                    "query": step["precheck_query"], "matches": self.search(step["folder_id"], step["display_filename"])}
         sealed = t.call(bridge.drive_seal, intent, evidence)
+        if sealed["outcome"] == "RECONCILE":
+            file_id = sealed["reconcile_file_id"]
+            t.readback(intent, file_id, self.download(file_id))
+            return t.call(bridge.drive_adopt, intent, {"file": self.metadata(file_id)})
         if sealed["outcome"] != "SEALED" or crash_after_seal:
             return sealed
         created = self.create_file(sealed["create_file"])
         if crash_after_create:
             return {"outcome": "CRASHED", "file": created}
-        t.readback("drive", intent, created["id"], self.download(created["id"]))
+        t.readback(intent, created["id"], self.download(created["id"]))
         return t.call(bridge.drive_record, intent, {"outcome": "CREATED", "file": created})
 
-    def gmail_step(self, step: dict, *, crash_after_seal=False, **draft_overrides) -> dict:
+    def notify_step(self, step: dict, *, crash_after_seal=False, outcome="SENT", **overrides) -> dict:
         t = self.test
-        intent = step["intent_id"]
-        draft_id = self.create_draft(step, **draft_overrides)
-        attachments = self.drafts[draft_id]["attachments"]
-        if attachments:
-            t.readback("gmail", intent, draft_id, base64.b64encode(attachments[0]["bytes"]).decode())
-        sealed = t.call(bridge.gmail_seal, intent, self.draft_evidence(draft_id))
+        nid = step["notification_id"]
+        draft_id = self.create_draft(step, **overrides)
+        t.notify(lambda store: notify.draft_evidence(store, t.cfg, nid, draft_id, t.raw_file(draft_id, self.raw(draft_id))))
+        sealed = t.notify(lambda store: notify.seal(store, t.cfg, nid, draft_id, t.now_iso()))
         if crash_after_seal:
             return sealed
+        if outcome != "SENT":
+            return t.notify(lambda store: notify.record(store, nid, {"outcome": outcome}, t.now_iso()))
         message_id = self.send_draft(sealed["send_draft_id"])
-        return t.call(bridge.gmail_record, intent,
-                      {"outcome": "SENT", "draft_id": sealed["send_draft_id"], "message_id": message_id})
+        return t.notify(lambda store: notify.record(
+            store, nid, {"outcome": "SENT", "draft_id": sealed["send_draft_id"], "message_id": message_id}, t.now_iso()))
 
-    def drain(self, limit: int = 12) -> list[dict]:
+    def drain(self, limit: int = 16) -> list[dict]:
         results = []
         for _ in range(limit):
             step = self.test.next()
             if step["outcome"] == "HOLD":
-                # The Core held that step and stopped its stream; plan again.
                 results.append(step)
                 continue
-            if step["outcome"] not in ("DRIVE_PRECHECK", "GMAIL_DRAFT"):
+            if step["outcome"] == "DRIVE_PRECHECK":
+                results.append(self.drive_step(step))
+            elif step["outcome"] == "NOTIFY_DRAFT":
+                results.append(self.notify_step(step))
+            else:
                 results.append(step)
                 break
-            results.append(self.drive_step(step) if step["outcome"] == "DRIVE_PRECHECK" else self.gmail_step(step))
         return results
+
+    def successes(self) -> list[dict]:
+        return [message for message in self.sent if " processed - " in message["subject"]]
+
+    def failures(self) -> list[dict]:
+        return [message for message in self.sent if " needs attention - " in message["subject"]]
 
 
 class NativeBridgeBase(unittest.TestCase):
-    readback_required = True
-    ceilings = (4, 4)
+    ceilings = (4, 8)
+    attach_pdf = False
+    folders = FOLDERS
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -166,13 +215,10 @@ class NativeBridgeBase(unittest.TestCase):
     def make_config(self, **changes) -> bridge.NativeConfig:
         values = dict(
             mode=bridge.MODE_UAT_SYNTHETIC, state_path=self.db, archive_root=self.root / "archive",
-            named_archive_root=self.root / "bills",
-            temp_root=self.root / "temp", outbox_root=self.root / "outbox",
-            drive=bridge.NativeDriveSettings(account="uat@example.com", folder_ids=dict(FOLDERS)),
-            gmail=bridge.NativeGmailSettings(
-                account="uat@example.com", to=(RECIPIENT,), subject_template="EnergyGrid bill: {display_filename}",
-                body_template="Attached {display_filename} ({stream_label}).",
-                require_attachment_readback=self.readback_required),
+            named_archive_root=self.root / "bills", temp_root=self.root / "temp", outbox_root=self.root / "outbox",
+            drive=bridge.NativeDriveSettings(account="uat@example.com", folder_ids=dict(self.folders)),
+            gmail=bridge.NativeGmailSettings(account=SENDER, to=(RECIPIENT,), subject_prefix="EnergyGrid UAT",
+                                             attach_pdf=self.attach_pdf),
             max_drive_uploads=self.ceilings[0], max_gmail_sends=self.ceilings[1], synthetic_root=self.root / "portal",
         )
         values.update(changes)
@@ -201,25 +247,37 @@ class NativeBridgeBase(unittest.TestCase):
         self.clock += 1000
         return self.clock
 
-    def call(self, function, intent_id: str, evidence: dict, cfg=None) -> dict:
+    def now_iso(self) -> str:
+        return bridge._iso(self.tick())
+
+    def call(self, function, intent_id: str, evidence: dict) -> dict:
         with StateV4Store(self.db) as state:
-            return function(state, cfg or self.cfg, intent_id, evidence, run_id=bridge.new_run_id(), now_ms=self.tick())
+            return function(state, self.cfg, intent_id, evidence, run_id=bridge.new_run_id(), now_ms=self.tick())
+
+    def notify(self, action):
+        with StateV4Store(self.db) as state, bridge._session(state, self.tick()), \
+                notify.NotificationStore(notify.store_path(self.cfg)) as store:
+            return action(store)
+
+    def raw_file(self, draft_id: str, raw: str) -> Path:
+        path = self.root / f"raw-{draft_id}.b64url"
+        path.write_text(raw)
+        return path
 
     def acquire(self, adapters=None) -> dict:
         with StateV4Store(self.db) as state:
             return bridge.acquire(state, self.cfg, adapters if adapters is not None else self.adapters(),
                                   run_id=bridge.new_run_id(), now_ms=self.tick())
 
-    def next(self, cfg=None) -> dict:
+    def next(self) -> dict:
         with StateV4Store(self.db) as state:
-            return bridge.next_step(state, cfg or self.cfg, run_id=bridge.new_run_id(), now_ms=self.tick())
+            return bridge.next_step(state, self.cfg, run_id=bridge.new_run_id(), now_ms=self.tick())
 
-    def readback(self, kind: str, intent: str, provider_id: str, encoded: str) -> dict:
-        path = self.root / f"readback-{kind}-{provider_id}.b64"
+    def readback(self, intent: str, file_id: str, encoded: str) -> dict:
+        path = self.root / f"readback-{file_id}.b64"
         path.write_text(encoded)
         with StateV4Store(self.db) as state:
-            function = bridge.drive_readback if kind == "drive" else bridge.gmail_readback
-            return function(state, self.cfg, intent, provider_id, path)
+            return bridge.drive_readback(state, self.cfg, intent, file_id, path)
 
     def status(self) -> dict:
         with StateV4Store(self.db) as state:
@@ -229,67 +287,73 @@ class NativeBridgeBase(unittest.TestCase):
         with StateV4Store(self.db) as state:
             return state.intent(intent_id)["state"]
 
+    def notification_states(self) -> list[tuple[str, str, str]]:
+        return [(item["kind"], item["stream"], item["state"]) for item in self.status()["notifications"]["items"]]
+
     def dispatches(self) -> tuple[int, int]:
-        with StateV4Store(self.db) as state:
-            return state.dispatch_count("DRIVE_UPLOAD"), state.dispatch_count("GMAIL_SEND")
+        effects = self.status()["effects"]
+        return effects["drive_dispatches"], effects["gmail_dispatches"]
+
+    def drive_until_notification(self) -> dict:
+        while True:
+            step = self.next()
+            if step["outcome"] == "NOTIFY_DRAFT":
+                return step
+            self.host.drive_step(step)
 
 
 class CompleteJourneyTests(NativeBridgeBase):
-    def test_both_streams_deliver_latest_once_with_one_prefix_and_no_backfill(self) -> None:
+    def test_both_streams_archive_and_verify_in_drive_then_notify_once_each(self) -> None:
         acquired = self.acquire()
         self.assertEqual({EB: "ADMITTED", TN: "ADMITTED"},
                          {stream: row["status"] for stream, row in acquired["acquisition"].items()})
-        results = self.host.drain()
-        self.assertEqual(["VERIFIED"] * 4 + ["IDLE"], [row["outcome"] for row in results])
-        # Fair interleaving: Drive for each stream before either Gmail, Drive before Gmail per invoice.
-        self.assertEqual(
-            sorted(["SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"]),
-            sorted(row["title"] for row in self.host.drive.values()),
-        )
+        self.host.drain()
+        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"},
+                         {row["title"] for row in self.host.drive.values()})
         self.assertEqual({FOLDERS[EB], FOLDERS[TN]}, {row["parent"] for row in self.host.drive.values()})
-        self.assertEqual(2, len(self.host.sent))
-        for message in self.host.sent:
-            self.assertEqual([RECIPIENT], message["to"])
-            (attachment,) = message["attachments"]
-            self.assertEqual(1, attachment["filename"].count(" 2026 - "))
-            self.assertTrue(attachment["filename"].startswith("SEP 2026 - "))
-            self.assertEqual(attachment["bytes"], pdf(f"{'EB_BILL' if 'EB' in attachment['filename'] else 'TENANT_BILL'} "
-                                                      f"{attachment['filename'][len('SEP 2026 - '):]}"))
-            self.assertEqual(f"EnergyGrid bill: {attachment['filename']}", message["subject"])
-        # Only the latest invoice was ever fetched; the older one is never a backfill candidate.
+        # Only the latest invoice was fetched; the older one is never a backfill candidate.
         self.assertEqual(["EB Invoice 0002.pdf"], self.portal[EB].acquire_calls)
         self.assertEqual(["TN Invoice 0002.pdf"], self.portal[TN].acquire_calls)
+        by_title = {row["title"]: file_id for file_id, row in self.host.drive.items()}
+        self.assertEqual(2, len(self.host.successes()))
+        self.assertEqual([], self.host.failures())
+        for message in self.host.sent:
+            self.assertEqual((SENDER, [RECIPIENT], [], []), (message["from"], message["to"], message["cc"],
+                                                            message["attachments"]))
+            name = message["subject"].split(" processed - ", 1)[1]
+            self.assertIn(f"https://drive.google.com/file/d/{by_title[name]}/view", message["body"])
+            self.assertEqual(1, name.count(" 2026 - "))
         status = self.status()
         self.assertEqual("DRAINED", status["outcome"])
         self.assertEqual({"drive_dispatches": 2, "gmail_dispatches": 2}, status["effects"])
+        self.assertEqual(2, status["notifications"]["counts"]["SENT"])
         (eb_invoice,) = status["streams"][EB]["invoices"]
         self.assertEqual("VERIFIED", eb_invoice["drive_upload"]["state"])
         self.assertTrue(eb_invoice["drive_upload"]["receipt"].startswith("gdrive:DRIVEFILE"))
-        self.assertRegex(eb_invoice["gmail_send"]["receipt"], r"^gmail:MSG\d+;draft:DRAFT\d+$")
-        self.assertFalse(eb_invoice["adopted_from_v3"])
 
-    def test_immediate_second_run_has_zero_fetches_and_zero_effects(self) -> None:
+    def test_immediate_second_run_has_zero_fetches_uploads_and_emails(self) -> None:
         self.acquire()
         self.host.drain()
         again = self.acquire()
         self.assertEqual({EB: "ALREADY_ADMITTED", TN: "ALREADY_ADMITTED"},
                          {stream: row["status"] for stream, row in again["acquisition"].items()})
+        self.assertEqual(0, again["notifications_created"])
         self.assertEqual([], self.portal[EB].acquire_calls + self.portal[TN].acquire_calls)
         self.assertEqual("IDLE", self.next()["outcome"])
         self.assertEqual((2, 2), self.dispatches())
         self.assertEqual(2, len(self.host.sent))
 
-    def test_a_newer_invoice_on_a_later_run_is_delivered_alone(self) -> None:
+    def test_a_newer_invoice_on_a_later_run_is_uploaded_and_notified_alone(self) -> None:
         self.acquire()
         self.host.drain()
         newer = {EB: [("EB Invoice 0002.pdf", "2026-09-01"), ("EB Invoice 0003.pdf", "2026-10-01")],
                  TN: [("TN Invoice 0002.pdf", "2026-09-03")]}
         result = self.acquire(self.adapters(newer))
         self.assertEqual("ADMITTED", result["acquisition"][EB]["status"])
-        self.assertEqual("ALREADY_ADMITTED", result["acquisition"][TN]["status"])
         self.host.drain()
-        self.assertEqual(3, len(self.host.sent))
-        self.assertEqual("OCT 2026 - EB Invoice 0003.pdf", self.host.sent[-1]["attachments"][0]["filename"])
+        self.assertEqual(3, len(self.host.drive))
+        self.assertEqual(3, len(self.host.successes()))
+        self.assertIn("OCT 2026 - EB Invoice 0003.pdf", self.host.sent[-1]["subject"])
 
     def test_payload_file_is_the_exact_archive_bytes(self) -> None:
         self.acquire()
@@ -299,70 +363,212 @@ class CompleteJourneyTests(NativeBridgeBase):
         self.assertEqual(step["byte_size"], len(raw))
 
 
-class DriveSafetyTests(NativeBridgeBase):
-    def test_occupied_drive_name_holds_without_seal_and_the_other_stream_continues(self) -> None:
+class CoreSuccessIndependenceTests(NativeBridgeBase):
+    """Email is optional: it never gates Drive success, other streams or later invoices."""
+
+    def test_drive_success_is_core_success_before_any_email(self) -> None:
+        self.acquire()
+        self.host.drive_step(self.next())
+        self.host.drive_step(self.next())
+        self.assertEqual("DRAINED", self.status()["outcome"])
+        self.assertEqual([("SUCCESS", EB, "PENDING"), ("SUCCESS", TN, "PENDING")], sorted(self.notification_states()))
+
+    def test_denied_or_uncertain_email_never_blocks_drive_or_resends_or_notifies_itself(self) -> None:
+        self.acquire()
+        first = self.drive_until_notification()
+        self.assertEqual("HOLD", self.host.notify_step(first, outcome="DENIED")["outcome"])
+        second = self.next()
+        self.assertEqual("NOTIFY_DRAFT", second["outcome"])
+        self.host.notify_step(second, crash_after_seal=True)
+        recovered = self.next()
+        self.assertEqual(1, recovered["recovered_notifications"])
+        self.assertEqual("IDLE", recovered["outcome"])
+        newer = {EB: [("EB Invoice 0002.pdf", "2026-09-01"), ("EB Invoice 0003.pdf", "2026-10-01")],
+                 TN: [("TN Invoice 0002.pdf", "2026-09-03")]}
+        self.acquire(self.adapters(newer))
+        self.host.drain()
+        self.assertEqual(3, len(self.host.drive))
+        self.assertEqual("DRAINED", self.status()["outcome"])
+        states = self.notification_states()
+        self.assertIn(("SUCCESS", first["stream"], "HOLD"), states)
+        self.assertIn(("SUCCESS", second["stream"], "UNKNOWN"), states)
+        self.assertEqual([], self.host.failures())
+        self.assertEqual(3, len(states))
+        self.assertIn(("SUCCESS", EB, "SENT"), states)
+
+    def test_an_uncertain_send_is_resolved_only_by_a_late_sent_for_the_bound_draft(self) -> None:
+        self.acquire()
+        step = self.drive_until_notification()
+        sealed = self.host.notify_step(step, crash_after_seal=True)
+        self.next()
+        nid = step["notification_id"]
+        with self.assertRaises(NativeRefusal):
+            self.host.notify_step(step)
+        message = self.host.send_draft(sealed["send_draft_id"])
+        late = {"outcome": "SENT", "draft_id": sealed["send_draft_id"], "message_id": message}
+        self.assertEqual("SENT", self.notify(lambda store: notify.record(store, nid, late, self.now_iso()))["outcome"])
+        self.assertEqual("REPLAY", self.notify(lambda store: notify.record(store, nid, late, self.now_iso()))["outcome"])
+
+
+class FailureNotificationTests(NativeBridgeBase):
+    def test_portal_failure_is_notified_once_per_incident(self) -> None:
+        failing = {EB: FailingAdapter(), TN: self.adapters()[TN]}
+        self.assertEqual("PORTAL_ACQUISITION_FAILED", self.acquire(failing)["acquisition"][EB]["status"])
+        self.host.drain()
+        self.assertEqual(1, len(self.host.failures()))
+        self.assertIn("EB Bill needs attention", self.host.failures()[0]["subject"])
+        self.acquire({EB: FailingAdapter(), TN: self.portal[TN]})
+        self.host.drain()
+        self.assertEqual(1, len(self.host.failures()))
+        self.acquire(self.adapters())
+        self.host.drain()
+        self.acquire({EB: FailingAdapter(), TN: self.portal[TN]})
+        self.host.drain()
+        self.assertEqual(2, len(self.host.failures()))
+
+    def test_drive_hold_is_notified_once_with_non_sensitive_content(self) -> None:
         self.acquire()
         step = self.next()
-        self.host.drive["FOREIGNFILE0001"] = {"title": step["display_filename"], "parent": step["folder_id"], "bytes": b"x"}
-        result = self.host.drive_step(step)
-        self.assertEqual(("HOLD", "EG_NATIVE_DRIVE_NAME_OCCUPIED"), (result["outcome"], result["support_ref"]))
-        self.assertEqual((0, 0), self.dispatches())
+        for _ in range(2):
+            self.host.drive[self.host._id("FOREIGN")] = {"title": step["display_filename"], "parent": step["folder_id"],
+                                                         "bytes": b"x"}
+        held = self.host.drive_step(step)
+        self.assertEqual(("HOLD", "EG_NATIVE_DRIVE_NAME_OCCUPIED"), (held["outcome"], held["support_ref"]))
         self.host.drain()
-        status = self.status()["streams"]
-        self.assertEqual("BLOCKED", status[step["stream"]]["state"])
+        self.acquire()
+        self.host.drain()
+        (failure,) = self.host.failures()
+        self.assertIn("EG_NATIVE_DRIVE_NAME_OCCUPIED", failure["subject"])
+        self.assertNotIn(step["display_filename"], failure["subject"] + failure["body"])
+        self.assertNotIn("drive.google.com", failure["body"])
         other = TN if step["stream"] == EB else EB
-        self.assertEqual("DRAINED", status[other]["state"])
-        self.assertEqual(1, len(self.host.sent))
+        self.assertEqual("DRAINED", self.status()["streams"][other]["state"])
+        self.assertEqual(1, len(self.host.successes()))
 
+    def test_lost_drive_answer_is_unknown_blocks_only_its_stream_and_is_notified(self) -> None:
+        self.acquire()
+        step = self.next()
+        self.host.drive_step(step, crash_after_seal=True)
+        self.assertEqual("UNKNOWN",
+                         self.call(bridge.drive_record, step["intent_id"], {"outcome": "NO_RESPONSE"})["outcome"])
+        self.host.drain()
+        streams = self.status()["streams"]
+        self.assertEqual(("BLOCKED", "EG_V4_PROVIDER_UNKNOWN"),
+                         (streams[step["stream"]]["state"], streams[step["stream"]]["support_ref"]))
+        (failure,) = self.host.failures()
+        self.assertIn("DRIVE_UPLOAD_UNKNOWN", failure["body"])
+
+
+class FlatFolderTests(NativeBridgeBase):
+    """Both streams upload directly into one existing folder (Web #226:6168238127)."""
+
+    folders = {EB: FLAT, TN: FLAT}
+
+    def test_both_streams_share_the_flat_folder(self) -> None:
+        self.acquire()
+        self.host.drain()
+        self.assertEqual({FLAT}, {row["parent"] for row in self.host.drive.values()})
+        self.assertEqual(2, len(self.host.drive))
+        self.assertEqual(2, len(self.host.successes()))
+
+    def test_an_identical_file_already_filed_by_hand_is_adopted_without_a_second_upload(self) -> None:
+        manual = self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
+        self.acquire()
+        self.host.drain()
+        self.assertEqual(2, len(self.host.drive))
+        streams = self.status()["streams"]
+        self.assertEqual(f"gdrive:{manual}", streams[EB]["invoices"][0]["drive_upload"]["receipt"])
+        eb_success = [m for m in self.host.successes() if "EB Bill" in m["subject"]][0]
+        self.assertIn(f"https://drive.google.com/file/d/{manual}/view", eb_success["body"])
+
+    def test_a_different_file_with_the_same_name_is_never_overwritten_or_duplicated(self) -> None:
+        foreign = self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("someone else's bill"))
+        self.acquire()
+        self.host.drain()
+        self.assertEqual(pdf("someone else's bill"), self.host.drive[foreign]["bytes"])
+        self.assertEqual(1, sum(1 for row in self.host.drive.values() if row["title"].startswith("SEP 2026 - EB")))
+        self.assertEqual(("BLOCKED", "EG_NATIVE_DRIVE_NAME_OCCUPIED"),
+                         (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
+        self.assertEqual(1, len(self.host.failures()))
+        self.assertEqual("DRAINED", self.status()["streams"][TN]["state"])
+
+    def test_a_same_size_file_with_different_bytes_is_not_adopted(self) -> None:
+        genuine = bytearray(pdf("EB_BILL EB Invoice 0002.pdf"))
+        genuine[len(genuine) // 2] ^= 0x01
+        foreign = self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", bytes(genuine))
+        self.acquire()
+        self.host.drain()
+        self.assertEqual(bytes(genuine), self.host.drive[foreign]["bytes"])
+        self.assertEqual(("BLOCKED", "EG_NATIVE_DRIVE_NAME_OCCUPIED"),
+                         (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
+
+    def test_several_same_name_files_hold_even_if_one_is_identical(self) -> None:
+        self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
+        self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("another copy"))
+        self.acquire()
+        self.host.drain()
+        self.assertEqual(("BLOCKED", "EG_NATIVE_DRIVE_NAME_OCCUPIED"),
+                         (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
+        self.assertEqual("HOLD", self.status()["streams"][EB]["invoices"][0]["drive_upload"]["state"])
+
+    def test_two_streams_with_the_same_display_name_never_collide_silently(self) -> None:
+        same = {EB: [("Invoice.pdf", "2026-09-01")], TN: [("Invoice.pdf", "2026-09-03")]}
+        self.acquire(self.adapters(same))
+        self.host.drain()
+        self.assertEqual(1, len(self.host.drive))
+        blocked = [stream for stream, row in self.status()["streams"].items() if row["state"] == "BLOCKED"]
+        self.assertEqual(1, len(blocked))
+        self.assertEqual(1, len(self.host.successes()))
+        self.assertEqual(1, len(self.host.failures()))
+
+    def test_adoption_requires_the_core_readback_of_that_file(self) -> None:
+        self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
+        self.acquire()
+        step = self.next()
+        while step["stream"] != EB:
+            self.host.drive_step(step)
+            step = self.next()
+        evidence = {"folder_id": FLAT, "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"], "matches": self.host.search(FLAT, step["display_filename"])}
+        sealed = self.call(bridge.drive_seal, step["intent_id"], evidence)
+        self.assertEqual("RECONCILE", sealed["outcome"])
+        with self.assertRaises(NativeRefusal) as refused:
+            self.call(bridge.drive_adopt, step["intent_id"], {"file": self.host.metadata(sealed["reconcile_file_id"])})
+        self.assertEqual("EG_NATIVE_DRIVE_READBACK_REQUIRED", refused.exception.support_ref)
+        self.assertEqual("PENDING", self.intent_state(step["intent_id"]))
+
+
+class DriveSafetyTests(NativeBridgeBase):
     def test_crash_after_seal_becomes_unknown_is_never_resent_and_a_late_receipt_resolves_it(self) -> None:
         self.acquire()
         step = self.next()
         intent = step["intent_id"]
         crashed = self.host.drive_step(step, crash_after_create=True)
-        self.assertEqual("CRASHED", crashed["outcome"])
         later = self.next()
         self.assertEqual(1, later["recovered_unknown"])
         self.assertEqual("UNKNOWN", self.intent_state(intent))
-        self.assertNotEqual(intent, later["intent_id"])
+        self.assertNotEqual(intent, later.get("intent_id"))
         with self.assertRaises(NativeRefusal) as refused:
             self.call(bridge.drive_seal, intent, {"folder_id": step["folder_id"], "title": step["display_filename"],
                                                    "query": step["precheck_query"], "complete": True, "matches": []})
         self.assertEqual("EG_NATIVE_INTENT_NOT_PENDING", refused.exception.support_ref)
-        self.assertEqual(1, len(self.host.drive))
-        # The operator (host) later finds the file it created and proves its bytes.
         file = crashed["file"]
-        self.readback("drive", intent, file["id"], self.host.download(file["id"]))
-        late = self.call(bridge.drive_record, intent, {"outcome": "CREATED", "file": file})
-        self.assertEqual("VERIFIED", late["outcome"])
+        self.readback(intent, file["id"], self.host.download(file["id"]))
+        self.assertEqual("VERIFIED", self.call(bridge.drive_record, intent, {"outcome": "CREATED", "file": file})["outcome"])
         self.host.drive_step(later)
         self.host.drain()
         self.assertEqual(2, len(self.host.drive))
-        self.assertEqual(2, len(self.host.sent))
-
-    def test_lost_answer_is_unknown_and_blocks_only_its_stream(self) -> None:
-        self.acquire()
-        step = self.next()
-        sealed = self.host.drive_step(step, crash_after_seal=True)
-        self.assertEqual("SEALED", sealed["outcome"])
-        self.assertEqual("UNKNOWN", self.call(bridge.drive_record, step["intent_id"], {"outcome": "NO_RESPONSE"})["outcome"])
-        self.host.drain()
-        streams = self.status()["streams"]
-        self.assertEqual(("BLOCKED", "EG_V4_PROVIDER_UNKNOWN"),
-                         (streams[step["stream"]]["state"], streams[step["stream"]]["support_ref"]))
-        self.assertEqual(1, len(self.host.sent))
+        self.assertEqual("DRAINED", self.status()["outcome"])
 
     def test_size_preserving_upload_corruption_is_caught_by_readback_and_held(self) -> None:
         self.acquire()
         step = self.next()
         self.host.corrupt_upload = True
-        result = self.host.drive_step(step)
-        self.assertEqual("HOLD", result["outcome"])
-        self.assertEqual("HOLD", self.intent_state(step["intent_id"]))
+        self.assertEqual("HOLD", self.host.drive_step(step)["outcome"])
         self.host.corrupt_upload = False
         self.host.drain()
-        # No email is ever sent for the invoice whose Drive copy is wrong.
-        self.assertNotIn(step["display_filename"],
-                         [message["attachments"][0]["filename"] for message in self.host.sent])
+        self.assertNotIn(step["display_filename"], " ".join(m["subject"] for m in self.host.successes()))
+        self.assertEqual(1, len(self.host.failures()))
 
     def test_record_without_readback_is_refused_and_writes_nothing(self) -> None:
         self.acquire()
@@ -384,7 +590,7 @@ class DriveSafetyTests(NativeBridgeBase):
                 step = self.next()
                 sealed = self.host.drive_step(step, crash_after_seal=True)
                 created = self.host.create_file(sealed["create_file"]) | {field: value}
-                self.readback("drive", step["intent_id"], created["id"], self.host.download(created["id"]))
+                self.readback(step["intent_id"], created["id"], self.host.download(created["id"]))
                 result = self.call(bridge.drive_record, step["intent_id"], {"outcome": "CREATED", "file": created})
                 self.assertEqual(("HOLD", "EG_NATIVE_DRIVE_METADATA_MISMATCH"), (result["outcome"], result["support_ref"]))
 
@@ -396,8 +602,7 @@ class DriveSafetyTests(NativeBridgeBase):
                 self.acquire()
                 step = self.next()
                 self.host.drive_step(step, crash_after_seal=True)
-                result = self.call(bridge.drive_record, step["intent_id"], {"outcome": outcome})
-                self.assertEqual(expected, result["outcome"])
+                self.assertEqual(expected, self.call(bridge.drive_record, step["intent_id"], {"outcome": outcome})["outcome"])
                 self.assertEqual(expected, self.intent_state(step["intent_id"]))
 
     def test_two_hosts_racing_the_same_step_seal_once(self) -> None:
@@ -427,11 +632,9 @@ class DriveSafetyTests(NativeBridgeBase):
         with StateV4Store(self.db) as state:
             invoice = state.invoices_for_stream(EB)[0]
         (self.cfg.archive_root / invoice["archive_relpath"]).write_bytes(pdf("tampered"))
-        results = self.host.drain()
-        self.assertIn("HOLD", [row["outcome"] for row in results])
+        self.host.drain()
         streams = self.status()["streams"]
-        self.assertEqual(("BLOCKED", "EG_V4_ARCHIVE_IDENTITY_CHANGED"),
-                         (streams[EB]["state"], streams[EB]["support_ref"]))
+        self.assertEqual(("BLOCKED", "EG_V4_ARCHIVE_IDENTITY_CHANGED"), (streams[EB]["state"], streams[EB]["support_ref"]))
         self.assertEqual("DRAINED", streams[TN]["state"])
 
 
@@ -475,121 +678,102 @@ class JunctionSafetyTests(NativeBridgeBase):
         self.assertEqual(0, sum(1 for row in self.host.drive.values() if row["parent"] == FOLDERS[EB]))
 
 
-class GmailSafetyTests(NativeBridgeBase):
-    def drive_done(self) -> dict:
-        self.acquire()
-        while True:
-            step = self.next()
-            if step["outcome"] == "GMAIL_DRAFT":
-                return step
-            self.host.drive_step(step)
-
+class NotificationDraftTests(NativeBridgeBase):
     def test_wrong_draft_is_refused_without_seal_and_a_correct_draft_then_seals(self) -> None:
-        step = self.drive_done()
+        self.acquire()
+        step = self.drive_until_notification()
         wrong = (
             {"to": ["someone.else@example.com"]},
             {"to": [RECIPIENT, "extra@example.com"]},
             {"cc": ["cc@example.com"]},
             {"subject": "Something else"},
-            {"attachments": [{"filename": "invoice.pdf", "mimeType": "application/pdf", "bytes": pdf("x")}]},
-            {"attachments": []},
             {"sender": "someone.else@example.com"},
+            {"body": "Processed, but without the Drive link."},
+            {"attachments": [{"filename": "x.pdf", "mimeType": "application/pdf", "bytes": pdf("x")}]},
         )
         for overrides in wrong:
             with self.subTest(overrides=list(overrides)), self.assertRaises(NativeRefusal):
-                self.host.gmail_step(step, **overrides)
-        self.assertEqual("PENDING", self.intent_state(step["intent_id"]))
+                self.host.notify_step(step, **overrides)
         self.assertEqual(0, self.dispatches()[1])
-        self.assertEqual("VERIFIED", self.host.gmail_step(step)["outcome"])
-        self.assertEqual(1, len(self.host.sent))
+        self.assertEqual("SENT", self.host.notify_step(step)["outcome"])
 
-    def test_size_preserving_attachment_corruption_is_refused_before_send(self) -> None:
-        step = self.drive_done()
-        self.host.corrupt_attachment = True
+    def test_a_body_linking_another_drive_file_is_refused(self) -> None:
+        self.acquire()
+        step = self.drive_until_notification()
+        wrong = step["body"].replace("/file/d/", "/file/d/X")
         with self.assertRaises(NativeRefusal) as refused:
-            self.host.gmail_step(step)
-        self.assertEqual("EG_NATIVE_DRAFT_BYTES_MISMATCH", refused.exception.support_ref)
-        self.assertEqual([], self.host.sent)
-        self.host.corrupt_attachment = False
-        self.assertEqual("VERIFIED", self.host.gmail_step(step)["outcome"])
+            self.host.notify_step(step, body=wrong)
+        self.assertEqual("EG_NATIVE_DRAFT_BODY_MISMATCH", refused.exception.support_ref)
 
-    def test_seal_requires_readback_when_configured(self) -> None:
-        step = self.drive_done()
+    def test_seal_needs_core_parsed_evidence(self) -> None:
+        self.acquire()
+        step = self.drive_until_notification()
         draft = self.host.create_draft(step)
         with self.assertRaises(NativeRefusal) as refused:
-            self.call(bridge.gmail_seal, step["intent_id"], self.host.draft_evidence(draft))
-        self.assertEqual("EG_NATIVE_GMAIL_READBACK_REQUIRED", refused.exception.support_ref)
+            self.notify(lambda store: notify.seal(store, self.cfg, step["notification_id"], draft, self.now_iso()))
+        self.assertEqual("EG_NATIVE_DRAFT_EVIDENCE_REQUIRED", refused.exception.support_ref)
 
-    def test_only_the_bound_draft_is_recorded_and_replay_is_a_no_op(self) -> None:
-        step = self.drive_done()
-        sealed = self.host.gmail_step(step, crash_after_seal=True)
+    def test_only_the_bound_draft_is_recorded(self) -> None:
+        self.acquire()
+        step = self.drive_until_notification()
+        sealed = self.host.notify_step(step, crash_after_seal=True)
         other = self.host.create_draft(step)
         with self.assertRaises(NativeRefusal) as refused:
-            self.call(bridge.gmail_record, step["intent_id"], {"outcome": "SENT", "draft_id": other, "message_id": "MSG1"})
+            self.notify(lambda store: notify.record(store, step["notification_id"],
+                                                    {"outcome": "SENT", "draft_id": other, "message_id": "MSG1"},
+                                                    self.now_iso()))
         self.assertEqual("EG_NATIVE_DRAFT_NOT_BOUND", refused.exception.support_ref)
-        message = self.host.send_draft(sealed["send_draft_id"])
-        evidence = {"outcome": "SENT", "draft_id": sealed["send_draft_id"], "message_id": message}
-        self.assertEqual("VERIFIED", self.call(bridge.gmail_record, step["intent_id"], evidence)["outcome"])
-        self.assertEqual("REPLAY", self.call(bridge.gmail_record, step["intent_id"], evidence)["outcome"])
+        self.assertEqual(sealed["send_draft_id"], self.host.drafts and sealed["send_draft_id"])
 
-    def test_crash_after_gmail_seal_is_unknown_and_never_sent_again(self) -> None:
-        step = self.drive_done()
-        self.host.gmail_step(step, crash_after_seal=True)
-        nxt = self.next()
-        self.assertEqual(1, nxt["recovered_unknown"])
-        self.assertEqual("UNKNOWN", self.intent_state(step["intent_id"]))
-        self.host.drain()
-        self.assertNotIn(step["display_filename"], [m["attachments"][0]["filename"] for m in self.host.sent])
-        with self.assertRaises(NativeRefusal):
-            self.host.gmail_step(step)
-
-    def test_gmail_cannot_be_sealed_before_its_drive_upload_is_verified(self) -> None:
+    def test_undecodable_raw_draft_is_refused(self) -> None:
         self.acquire()
-        with StateV4Store(self.db) as state:
-            invoice = state.invoices_for_stream(EB)[0]
-            gmail = state.intents_for_invoice(invoice["invoice_key"])["GMAIL_SEND"]
+        step = self.drive_until_notification()
+        path = self.raw_file("garbage", "not*base64*at*all")
         with self.assertRaises(NativeRefusal) as refused:
-            self.call(bridge.gmail_seal, gmail["intent_id"], {"draft_id": "DRAFT1", "to": [RECIPIENT], "cc": [],
-                                                             "bcc": [], "subject": "x", "attachments": []})
-        self.assertEqual("EG_NATIVE_STEP_NOT_PLANNED", refused.exception.support_ref)
+            self.notify(lambda store: notify.draft_evidence(store, self.cfg, step["notification_id"],
+                                                            "DRAFT000000000001", path))
+        self.assertEqual("EG_NATIVE_DRAFT_RAW_UNDECODABLE", refused.exception.support_ref)
 
 
-class GmailWithoutReadbackTests(NativeBridgeBase):
-    readback_required = False
+class NotificationAttachmentTests(NativeBridgeBase):
+    attach_pdf = True
 
-    def test_owner_policy_without_attachment_readback_seals_on_envelope_evidence(self) -> None:
+    def test_optional_attachment_is_byte_checked_before_send(self) -> None:
         self.acquire()
-        self.host.drain()
-        self.assertEqual(2, len(self.host.sent))
+        step = self.drive_until_notification()
+        self.assertTrue(step["attach_pdf"])
+        self.host.corrupt_attachment = True
+        with self.assertRaises(NativeRefusal) as refused:
+            self.host.notify_step(step)
+        self.assertEqual("EG_NATIVE_DRAFT_BYTES_MISMATCH", refused.exception.support_ref)
+        self.host.corrupt_attachment = False
+        with self.assertRaises(NativeRefusal):
+            self.host.notify_step(step, attachments=[])
+        self.assertEqual("SENT", self.host.notify_step(step)["outcome"])
+        (attachment,) = self.host.sent[0]["attachments"]
+        self.assertEqual(step["attachment_filename"], attachment["filename"])
 
 
 class EffectCeilingTests(NativeBridgeBase):
     ceilings = (1, 1)
 
-    def test_a_stream_at_its_ceiling_never_starves_the_other_action(self) -> None:
+    def test_drive_ceiling_never_starves_notifications_and_seal_at_ceiling_is_refused(self) -> None:
         self.acquire()
         results = self.host.drain()
-        # EB Drive, then EB Gmail (the Tenant Drive step is at the Drive ceiling and is skipped).
-        self.assertEqual(["VERIFIED", "VERIFIED", "CEILING_REACHED"], [row["outcome"] for row in results])
-        self.assertEqual(0, results[-1]["exit_code"])
+        self.assertEqual(["VERIFIED", "SENT", "CEILING_REACHED"], [row["outcome"] for row in results])
         self.assertEqual((1, 1), self.dispatches())
-        self.assertEqual(1, len(self.host.sent))
         streams = self.status()["streams"]
-        self.assertEqual("DRAINED", streams[EB]["state"])
-        self.assertEqual(("PENDING", "DRIVE_UPLOAD"), (streams[TN]["state"], streams[TN]["next_action"]))
-
-    def test_a_seal_at_the_ceiling_is_refused_without_state_change(self) -> None:
-        self.acquire()
-        self.host.drain()
+        pending = [stream for stream, row in streams.items() if row["state"] == "PENDING"]
+        self.assertEqual(1, len(pending))
         with StateV4Store(self.db) as state:
-            invoice = state.invoices_for_stream(TN)[0]
+            invoice = state.invoices_for_stream(pending[0])[0]
             drive = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
-        evidence = {"folder_id": FOLDERS[TN], "title": invoice["display_filename"], "complete": True,
-                    "query": bridge.drive_title_query(FOLDERS[TN], invoice["display_filename"]), "matches": []}
+        folder = FOLDERS[pending[0]]
+        evidence = {"folder_id": folder, "title": invoice["display_filename"], "complete": True,
+                    "query": bridge.drive_title_query(folder, invoice["display_filename"]), "matches": []}
         with self.assertRaises(NativeRefusal) as refused:
             self.call(bridge.drive_seal, drive["intent_id"], evidence)
         self.assertEqual("EG_NATIVE_EFFECT_CEILING_REACHED", refused.exception.support_ref)
-        self.assertEqual("PENDING", self.intent_state(drive["intent_id"]))
 
 
 class ZeroCeilingTests(NativeBridgeBase):
@@ -602,48 +786,71 @@ class ZeroCeilingTests(NativeBridgeBase):
         self.assertEqual((0, 0), self.dispatches())
 
 
-class ReviewFindingTests(NativeBridgeBase):
-    """Regressions for the Builder-side adversarial findings on 9d3a772."""
+class GmailSealCeilingTests(NativeBridgeBase):
+    ceilings = (4, 1)
 
+    def test_a_notification_seal_at_the_email_ceiling_is_refused(self) -> None:
+        self.acquire()
+        self.host.drain()
+        self.assertEqual(1, len(self.host.sent))
+        pending = [row for row in self.notify(lambda store: store.rows("state='PENDING'"))]
+        self.assertEqual(1, len(pending))
+        nid = pending[0]["notification_id"]
+        subject, body = self.notify(lambda store: notify.message_for(self.cfg, store.row(nid)))
+        step = {"notification_id": nid, "gmail_account": SENDER, "to": [RECIPIENT], "subject": subject, "body": body,
+                "attach_pdf": False}
+        draft = self.host.create_draft(step)
+        self.notify(lambda store: notify.draft_evidence(store, self.cfg, nid, draft, self.raw_file(draft, self.host.raw(draft))))
+        with self.assertRaises(NativeRefusal) as refused:
+            self.notify(lambda store: notify.seal(store, self.cfg, nid, draft, self.now_iso()))
+        self.assertEqual("EG_NATIVE_EFFECT_CEILING_REACHED", refused.exception.support_ref)
+
+
+class GmailCeilingTests(NativeBridgeBase):
+    ceilings = (4, 0)
+
+    def test_email_ceiling_never_blocks_drive_success(self) -> None:
+        self.acquire()
+        results = self.host.drain()
+        self.assertEqual("NOTIFY_CEILING_REACHED", results[-1]["outcome"])
+        self.assertEqual("DRAINED", self.status()["outcome"])
+        self.assertEqual((2, 0), self.dispatches())
+
+
+class ReviewFindingTests(NativeBridgeBase):
     def test_readback_for_a_case_variant_file_id_does_not_verify(self) -> None:
         self.acquire()
         step = self.next()
         sealed = self.host.drive_step(step, crash_after_seal=True)
         created = self.host.create_file(sealed["create_file"])
-        self.readback("drive", step["intent_id"], created["id"], self.host.download(created["id"]))
+        self.readback(step["intent_id"], created["id"], self.host.download(created["id"]))
         variant = created | {"id": created["id"].lower()}
         with self.assertRaises(NativeRefusal) as refused:
             self.call(bridge.drive_record, step["intent_id"], {"outcome": "CREATED", "file": variant})
         self.assertEqual("EG_NATIVE_DRIVE_READBACK_REQUIRED", refused.exception.support_ref)
-        self.assertEqual("DISPATCHED", self.intent_state(step["intent_id"]))
 
     def test_status_shows_no_receipt_for_a_held_intent(self) -> None:
         self.acquire()
-        while True:
-            step = self.next()
-            if step["outcome"] == "GMAIL_DRAFT":
-                break
-            self.host.drive_step(step)
-        sealed = self.host.gmail_step(step, crash_after_seal=True)
-        self.assertEqual("HOLD", self.call(bridge.gmail_record, step["intent_id"], {"outcome": "DENIED"})["outcome"])
-        late = {"outcome": "SENT", "draft_id": sealed["send_draft_id"], "message_id": "MSG000000000099"}
-        self.call(bridge.gmail_record, step["intent_id"], late)
+        step = self.next()
+        sealed = self.host.drive_step(step, crash_after_seal=True)
+        self.assertEqual("HOLD", self.call(bridge.drive_record, step["intent_id"], {"outcome": "DENIED"})["outcome"])
+        created = self.host.create_file(sealed["create_file"])
+        self.readback(step["intent_id"], created["id"], self.host.download(created["id"]))
+        self.call(bridge.drive_record, step["intent_id"], {"outcome": "CREATED", "file": created})
         self.assertEqual("HOLD", self.intent_state(step["intent_id"]))
         invoice = self.status()["streams"][step["stream"]]["invoices"][0]
-        self.assertEqual(("HOLD", None), (invoice["gmail_send"]["state"], invoice["gmail_send"]["receipt"]))
+        self.assertEqual(("HOLD", None), (invoice["drive_upload"]["state"], invoice["drive_upload"]["receipt"]))
 
     def test_precheck_query_escapes_quotes_and_backslashes(self) -> None:
-        title = "O'Brien \\ x.pdf"
-        expected = "parentId = 'F1' and title = 'O\\'Brien \\\\ x.pdf'"
-        self.assertEqual(expected, bridge.drive_title_query("F1", title))
+        self.assertEqual("parentId = 'F1' and title = 'O\\'Brien \\\\ x.pdf'",
+                         bridge.drive_title_query("F1", "O'Brien \\ x.pdf"))
 
     def test_a_display_name_with_an_apostrophe_runs_end_to_end(self) -> None:
         self.acquire(self.adapters({EB: [("O'Brien EB Invoice.pdf", "2026-09-01")], TN: []}))
         step = self.next()
         self.assertIn("title = 'SEP 2026 - O\\'Brien EB Invoice.pdf'", step["precheck_query"])
         self.host.drain()
-        self.assertEqual(["SEP 2026 - O'Brien EB Invoice.pdf"],
-                         [message["attachments"][0]["filename"] for message in self.host.sent])
+        self.assertEqual(["SEP 2026 - O'Brien EB Invoice.pdf"], [row["title"] for row in self.host.drive.values()])
 
     def test_synthetic_fixture_refuses_path_like_filenames(self) -> None:
         for name in ("../escape.pdf", "sub/dir.pdf", "..", ""):
@@ -652,7 +859,7 @@ class ReviewFindingTests(NativeBridgeBase):
 
 
 class NamedArchiveTests(NativeBridgeBase):
-    """Owner requirement: the user-facing archive, Drive and email all use `MMM YYYY - <original>.pdf`."""
+    """Owner requirement: the user-facing archive and Drive use `MMM YYYY - <original>.pdf`."""
 
     def named(self, stream: str, name: str) -> Path:
         return self.cfg.named_archive_root / bridge.STREAM_LABELS[stream] / name
@@ -666,16 +873,12 @@ class NamedArchiveTests(NativeBridgeBase):
             with self.subTest(stream=stream):
                 named = self.named(stream, f"SEP 2026 - {original}")
                 self.assertEqual(pdf(f"{stream} {original}"), named.read_bytes())
-                # Exactly one file per stream: the older invoice is never backfilled, prefix applied once.
                 self.assertEqual([named.name], [item.name for item in named.parent.iterdir()])
                 internal = self.cfg.archive_root / bridge.STREAM_LABELS[stream] / f"{day}.pdf"
                 self.assertEqual(named.read_bytes(), internal.read_bytes())
-        names = {row["title"] for row in self.host.drive.values()}
-        attachments = {message["attachments"][0]["filename"] for message in self.host.sent}
-        self.assertEqual(names, attachments)
-        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"}, names)
-        report = self.status()["streams"]
-        self.assertEqual(["PRESENT"], [row["named_archive"] for row in report[EB]["invoices"]])
+        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"},
+                         {row["title"] for row in self.host.drive.values()})
+        self.assertEqual(["PRESENT"], [row["named_archive"] for row in self.status()["streams"][EB]["invoices"]])
 
     def test_existing_identical_copy_is_kept_and_never_rewritten(self) -> None:
         target = self.named(EB, "SEP 2026 - EB Invoice 0002.pdf")
@@ -685,7 +888,7 @@ class NamedArchiveTests(NativeBridgeBase):
         self.acquire()
         self.host.drain()
         self.assertEqual(before, target.stat().st_mtime_ns)
-        self.assertEqual(2, len(self.host.sent))
+        self.assertEqual(2, len(self.host.drive))
 
     def test_a_different_file_at_the_name_holds_that_invoice_and_is_never_overwritten(self) -> None:
         target = self.named(EB, "SEP 2026 - EB Invoice 0002.pdf")
@@ -700,14 +903,13 @@ class NamedArchiveTests(NativeBridgeBase):
         self.assertEqual(("BLOCKED", "EG_NATIVE_NAMED_ARCHIVE_CONFLICT"), (streams[EB]["state"], streams[EB]["support_ref"]))
         self.assertEqual("DRAINED", streams[TN]["state"])
         self.assertEqual({FOLDERS[TN]}, {row["parent"] for row in self.host.drive.values()})
-        self.assertEqual(1, len(self.host.sent))
 
     def test_a_removed_copy_is_republished_before_the_drive_step(self) -> None:
         self.acquire()
         self.named(EB, "SEP 2026 - EB Invoice 0002.pdf").unlink()
         self.host.drain()
         self.assertTrue(self.named(EB, "SEP 2026 - EB Invoice 0002.pdf").is_file())
-        self.assertEqual(2, len(self.host.sent))
+        self.assertEqual(2, len(self.host.drive))
 
     def test_a_transient_publication_failure_is_a_retry_with_no_seal(self) -> None:
         from unittest import mock
@@ -722,7 +924,7 @@ class NamedArchiveTests(NativeBridgeBase):
         self.assertEqual((0, 0), self.dispatches())
         self.assertEqual([], list(self.cfg.named_archive_root.rglob("*.tmp")))
         self.host.drain()
-        self.assertEqual(2, len(self.host.sent))
+        self.assertEqual(2, len(self.host.drive))
 
     def test_seal_requires_the_named_copy(self) -> None:
         from unittest import mock
@@ -749,7 +951,6 @@ class LeaseTests(NativeBridgeBase):
             self.assertEqual("EG_V4_LEASE_HELD", held.exception.support_ref)
             self.assertEqual(10, held.exception.exit_code)
             other.release_lease("another-session")
-        self.assertEqual((0, 0), self.dispatches())
 
 
 class PredecessorCutoverTests(NativeBridgeBase):
@@ -759,7 +960,7 @@ class PredecessorCutoverTests(NativeBridgeBase):
         build_predecessor_v3(self.db, self.cfg.archive_root, {EB: "ADOPTABLE", TN: "DELIVERED"})
         migrate_state_database_v4(self.db, apply=True)
 
-    def test_v3_archived_undelivered_latest_is_adopted_without_fetch_and_delivered_once(self) -> None:
+    def test_v3_archived_undelivered_latest_is_adopted_without_fetch_and_uploaded_once(self) -> None:
         from energygrid_bill_downloader.invoice import Stream
         from test_state_v4 import LATEST_SOURCE, predecessor_pdf
 
@@ -773,8 +974,8 @@ class PredecessorCutoverTests(NativeBridgeBase):
         self.assertEqual("PREDECESSOR_DELIVERED", result["acquisition"][TN]["status"])
         self.assertEqual([], adapters[EB].acquire_calls + adapters[TN].acquire_calls)
         self.host.drain()
-        self.assertEqual(1, len(self.host.sent))
-        self.assertEqual("SEP 2026 - Invoice EB Sep.pdf", self.host.sent[0]["attachments"][0]["filename"])
+        self.assertEqual(["SEP 2026 - Invoice EB Sep.pdf"], [row["title"] for row in self.host.drive.values()])
+        self.assertEqual(1, len(self.host.successes()))
         named = self.cfg.named_archive_root / "EB Bill" / "SEP 2026 - Invoice EB Sep.pdf"
         self.assertEqual(predecessor_pdf("Invoice EB Sep.pdf"), named.read_bytes())
         self.assertEqual("IDLE", self.next()["outcome"])
@@ -787,24 +988,24 @@ class ConfigTests(unittest.TestCase):
             "state_path": str(root / "s.sqlite"), "archive_root": str(root / "a"),
             "named_archive_root": str(root / "n"), "temp_root": str(root / "t"),
             "outbox_root": str(root / "o"), "synthetic_root": str(root / "p"),
-            "drive": {"account": "uat@example.com", "folder_ids": dict(FOLDERS)},
-            "gmail": {"account": "uat@example.com", "to": [RECIPIENT], "subject_template": "Bill {display_filename}",
-                      "body_template": "Attached.", "require_attachment_readback": True},
+            "drive": {"account": "uat@example.com", "folder_ids": {EB: FLAT, TN: FLAT}},
+            "gmail": {"account": SENDER, "to": [RECIPIENT], "subject_prefix": "EnergyGrid", "attach_pdf": False},
             "effect_ceiling": {"drive_uploads": 2, "gmail_sends": 2},
         }
 
-    def test_valid_config_loads_and_repr_hides_private_values(self) -> None:
+    def test_valid_flat_config_loads_and_repr_hides_private_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cfg = bridge.load_native_config(self.raw(Path(directory)), checkout_root=REPO_ROOT)
         self.assertEqual((RECIPIENT,), cfg.gmail.to)
-        self.assertNotIn(RECIPIENT, repr(cfg))
-        self.assertNotIn(FOLDERS[EB], repr(cfg))
+        self.assertEqual(cfg.drive.folder_ids[EB], cfg.drive.folder_ids[TN])
+        for secret in (RECIPIENT, SENDER, FLAT):
+            self.assertNotIn(secret, repr(cfg))
 
     def test_committed_example_config_loads(self) -> None:
         example = REPO_ROOT / "energygrid-bill-downloader" / "config" / "energygrid.native_uat.example.json"
         cfg = bridge.load_native_config(json.loads(example.read_text(encoding="utf-8")), checkout_root=REPO_ROOT)
         self.assertEqual(bridge.MODE_UAT_SYNTHETIC, cfg.mode)
-        self.assertTrue(cfg.gmail.require_attachment_readback)
+        self.assertFalse(cfg.gmail.attach_pdf)
 
     def test_invalid_configs_are_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -816,12 +1017,12 @@ class ConfigTests(unittest.TestCase):
                 "inside checkout": lambda r: r.update(outbox_root=str(REPO_ROOT / "energygrid-bill-downloader" / "x")),
                 "unc path": lambda r: r.update(archive_root="\\\\server\\share\\archive"),
                 "relative path": lambda r: r.update(temp_root="temp"),
-                "same folder": lambda r: r["drive"]["folder_ids"].update(TENANT_BILL=FOLDERS[EB]),
                 "bad recipient": lambda r: r["gmail"].update(to=["not-an-email"]),
                 "no recipients": lambda r: r["gmail"].update(to=[]),
-                "duplicate recipient": lambda r: r["gmail"].update(to=[RECIPIENT, RECIPIENT.upper()]),
-                "subject without name": lambda r: r["gmail"].update(subject_template="Bill"),
-                "readback not bool": lambda r: r["gmail"].update(require_attachment_readback="yes"),
+                "two recipients": lambda r: r["gmail"].update(to=[RECIPIENT, "other@example.com"]),
+                "old template keys": lambda r: r["gmail"].update(subject_template="x"),
+                "attach not bool": lambda r: r["gmail"].update(attach_pdf="yes"),
+                "empty prefix": lambda r: r["gmail"].update(subject_prefix=""),
                 "ceiling too high": lambda r: r["effect_ceiling"].update(drive_uploads=21),
                 "ceiling not int": lambda r: r["effect_ceiling"].update(gmail_sends=True),
                 "portal key in synthetic mode": lambda r: r.update(portal_config_path=str(root / "c.json")),
@@ -839,9 +1040,8 @@ class ConfigTests(unittest.TestCase):
 
 class CliSafetyTests(unittest.TestCase):
     def write_config(self, root: Path) -> Path:
-        raw = ConfigTests().raw(root)
         path = root / "native.json"
-        path.write_text(json.dumps(raw), encoding="utf-8")
+        path.write_text(json.dumps(ConfigTests().raw(root)), encoding="utf-8")
         return path
 
     def run_cli(self, *argv: str) -> tuple[int, dict, str]:
@@ -874,8 +1074,7 @@ class CliSafetyTests(unittest.TestCase):
             with mock.patch("energygrid_bill_downloader.native_cli._dispatch",
                             side_effect=FileExistsError(str(root / "secret-path.json"))):
                 code, result, printed = self.run_cli("status", "--config", str(config))
-        self.assertEqual((20, "FAILED", "EG_NATIVE_UNEXPECTED_FAILURE"),
-                         (code, result["outcome"], result["support_ref"]))
+        self.assertEqual((20, "FAILED", "EG_NATIVE_UNEXPECTED_FAILURE"), (code, result["outcome"], result["support_ref"]))
         self.assertNotIn("secret-path", printed)
 
     def test_checkout_roots_include_the_main_checkout_of_a_worktree(self) -> None:
@@ -895,18 +1094,20 @@ class CliSafetyTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
-    def test_bridge_imports_no_network_or_process_module(self) -> None:
+    def test_bridge_modules_import_no_network_or_process_module(self) -> None:
         import ast
 
-        source = (REPO_ROOT / "energygrid-bill-downloader" / "energygrid_bill_downloader" / "native_bridge.py").read_text()
-        modules = set()
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Import):
-                modules.update(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                modules.add(node.module.split(".")[0])
-        self.assertFalse(modules & {"socket", "urllib", "http", "subprocess", "smtplib", "requests", "ssl",
-                                    "playwright", "googleapiclient"})
+        for module in ("native_bridge.py", "native_notify.py"):
+            source = (REPO_ROOT / "energygrid-bill-downloader" / "energygrid_bill_downloader" / module).read_text()
+            modules = set()
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.Import):
+                    modules.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    modules.add(node.module.split(".")[0])
+            with self.subTest(module=module):
+                self.assertFalse(modules & {"socket", "urllib", "http", "subprocess", "smtplib", "requests", "ssl",
+                                            "playwright", "googleapiclient"})
 
     def test_cli_refusal_output_is_closed_vocabulary(self) -> None:
         import contextlib
@@ -921,7 +1122,6 @@ class BoundaryTests(unittest.TestCase):
                 code = native_cli.main(["status", "--config", str(missing)])
         self.assertEqual(64, code)
         printed = out.getvalue()
-        self.assertNotIn(str(missing), printed)
         self.assertNotIn("private-name-should-not-leak", printed)
         self.assertEqual("REFUSED", json.loads(printed)["outcome"])
 

@@ -8,21 +8,20 @@
   "outbox_root": "C:\\EnergyGridUAT\\outbox",
   "synthetic_root": "C:\\EnergyGridUAT\\synthetic-portal",
   "drive": {
-    "account": "uat-drive-account@example.com",
+    "account": "drive-account@example.com",
     "folder_ids": {
-      "EB_BILL": "REPLACE_WITH_UAT_EB_BILL_FOLDER_ID",
-      "TENANT_BILL": "REPLACE_WITH_UAT_TENANT_BILL_FOLDER_ID"
+      "EB_BILL": "REPLACE_WITH_FLAT_DRIVE_FOLDER_ID",
+      "TENANT_BILL": "REPLACE_WITH_FLAT_DRIVE_FOLDER_ID"
     }
   },
   "gmail": {
-    "account": "uat-gmail-account@example.com",
-    "to": ["uat-recipient@example.com"],
-    "subject_template": "EnergyGrid UAT: {display_filename}",
-    "body_template": "EnergyGrid UAT delivery. Attached: {display_filename} ({stream_label}).",
-    "require_attachment_readback": true
+    "account": "default-send-as-address@example.com",
+    "to": ["owner-recipient@example.com"],
+    "subject_prefix": "EnergyGrid",
+    "attach_pdf": false
   },
   "effect_ceiling": {
     "drive_uploads": 2,
-    "gmail_sends": 2
+    "gmail_sends": 4
   }
 }

@@ -3,16 +3,18 @@
 The v4 Core cannot call the claude.ai Google Drive and Gmail connectors: only the
 Claude host can. This module is the deterministic half of a stepwise protocol in
 which the Core decides, seals and verifies, and the host performs exactly one
-native connector call per sealed dispatch:
+native connector call per sealed dispatch.
 
-    acquire                                 portal -> archive -> admission (no provider effect)
-    next                                    plan one step; write the base64 payload; no seal
-    DRIVE  drive-seal   (precheck evidence) name not occupied -> seal -> host create_file
+Core success for a stream is "archived and verified in Drive" (Web #226:6168033136).
+Email is optional owner feedback in native_notify.py and never gates Drive work.
+
+    acquire                                 portal -> archive -> admission -> named archive copy
+    next                                    plan one Drive step (or one notification); no seal
+    DRIVE  drive-seal   (precheck evidence) name free -> seal -> host create_file
+                                            one same-name file -> RECONCILE (no state change)
            drive-readback (download base64) Core hashes what Drive returns
            drive-record (create evidence)   metadata + readback -> VERIFIED, else REJECTED/UNKNOWN
-    GMAIL  gmail-readback (draft attachment) Core hashes the draft attachment, when required
-           gmail-seal  (draft evidence)     recipient, subject, one attachment, name, size -> seal
-           gmail-record (send evidence)     the bound draft was sent -> VERIFIED
+           drive-adopt  (existing file)     same name, exact bytes -> VERIFIED with no upload
 
 Authority stays in SQLite (StateV4Store). Every write is lease-fenced. A seal is
 durable before the host is told to act, and the host acts only on the seal
@@ -86,11 +88,13 @@ class NativeDriveSettings:
 
 @dataclass(frozen=True)
 class NativeGmailSettings:
+    """Owner notifications. `account` is the expected sender (the account's default send-as address);
+    `to` is exactly one private recipient. A PDF attachment is optional and always byte-checked."""
+
     account: str = field(repr=False)
     to: tuple[str, ...] = field(repr=False)
-    subject_template: str = field(repr=False)
-    body_template: str = field(repr=False)
-    require_attachment_readback: bool = True
+    subject_prefix: str = field(repr=False)
+    attach_pdf: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,26 +189,16 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         if type(folder) is not str or not _DRIVE_ID_RE.fullmatch(folder):
             raise ConfigError(f"drive.folder_ids.{stream} is invalid")
         folders[stream] = folder
-    if folders["EB_BILL"] == folders["TENANT_BILL"]:
-        raise ConfigError("each stream needs its own Drive folder")
-    gmail_raw = _closed(
-        data["gmail"], {"account", "to", "subject_template", "body_template", "require_attachment_readback"}, "gmail"
-    )
+    # Both streams may share one flat folder (Web #226:6168238127); the precheck guards name collisions.
+    gmail_raw = _closed(data["gmail"], {"account", "to", "subject_prefix", "attach_pdf"}, "gmail")
     to = gmail_raw["to"]
-    if type(to) is not list or not 1 <= len(to) <= MAX_RECIPIENTS:
-        raise ConfigError("gmail.to must list 1 to 5 recipients")
+    if type(to) is not list or len(to) != 1:
+        raise ConfigError("gmail.to must list exactly one recipient")
     recipients = tuple(_email(item, "gmail.to") for item in to)
-    if len({item.lower() for item in recipients}) != len(recipients):
-        raise ConfigError("gmail.to has a duplicate recipient")
-    subject = _text(gmail_raw["subject_template"], "gmail.subject_template", max_length=200)
-    if subject.count("{display_filename}") != 1:
-        raise ConfigError("gmail.subject_template must contain {display_filename} exactly once")
-    body = gmail_raw["body_template"]
-    if type(body) is not str or not body.strip() or len(body) > 4000:
-        raise ConfigError("gmail.body_template is invalid")
-    readback = gmail_raw["require_attachment_readback"]
-    if type(readback) is not bool:
-        raise ConfigError("gmail.require_attachment_readback must be true or false")
+    subject_prefix = _text(gmail_raw["subject_prefix"], "gmail.subject_prefix", max_length=60)
+    attach_pdf = gmail_raw["attach_pdf"]
+    if type(attach_pdf) is not bool:
+        raise ConfigError("gmail.attach_pdf must be true or false")
     ceiling = _closed(data["effect_ceiling"], {"drive_uploads", "gmail_sends"}, "effect_ceiling")
     synthetic_root = portal_config = None
     if mode == MODE_UAT_SYNTHETIC:
@@ -215,8 +209,8 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         mode=mode,
         drive=NativeDriveSettings(account=_email(drive_raw["account"], "drive.account"), folder_ids=folders),
         gmail=NativeGmailSettings(
-            account=_email(gmail_raw["account"], "gmail.account"), to=recipients, subject_template=subject,
-            body_template=body, require_attachment_readback=readback,
+            account=_email(gmail_raw["account"], "gmail.account"), to=recipients, subject_prefix=subject_prefix,
+            attach_pdf=attach_pdf,
         ),
         max_drive_uploads=_ceiling(ceiling["drive_uploads"], "effect_ceiling.drive_uploads"),
         max_gmail_sends=_ceiling(ceiling["gmail_sends"], "effect_ceiling.gmail_sends"),
@@ -413,17 +407,33 @@ def _invoice_for_intent(state, intent_id: str) -> tuple[dict, dict]:
     return intent, rows[0]
 
 
-def _current_step(state, intent_id: str, action: str) -> tuple[dict, dict]:
-    """The intent must be PENDING and be exactly the next planned step of its stream (FIFO, Drive first)."""
-    from .orchestration import _v4_stream_step
+def drive_stream_step(state, stream: str) -> tuple[str, str | None, dict | None, dict | None]:
+    """Plan one stream's next Drive step: (STEP | BLOCKED | IDLE, support_ref, invoice, intent).
 
+    Core success is Drive only, so the v4 GMAIL_SEND intents are not used by the bridge. Invoices
+    are taken oldest first; a HOLD, UNKNOWN or in-flight Drive intent blocks only its own stream.
+    """
+    for invoice in state.invoices_for_stream(stream):
+        drive = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
+        if drive["state"] == "VERIFIED":
+            continue
+        if drive["state"] == "PENDING":
+            return "STEP", None, invoice, drive
+        if drive["state"] == "DISPATCHED":
+            return "BLOCKED", "EG_V4_INTENT_IN_FLIGHT", None, None
+        return "BLOCKED", drive["support_ref"] or "EG_V4_INTENT_HELD", None, None
+    return "IDLE", None, None, None
+
+
+def _current_step(state, intent_id: str, action: str) -> tuple[dict, dict]:
+    """The intent must be PENDING and be exactly the next planned Drive step of its stream (FIFO)."""
     intent, invoice = _invoice_for_intent(state, intent_id)
-    if intent["action"] != action:
+    if intent["action"] != action or action != "DRIVE_UPLOAD":
         raise NativeRefusal("EG_NATIVE_ACTION_MISMATCH")
     if intent["state"] != "PENDING":
         raise NativeRefusal("EG_NATIVE_INTENT_NOT_PENDING")
-    kind, planned_action, _invoice, planned = _v4_stream_step(state, invoice["stream"])
-    if kind != "STEP" or planned_action != action or planned["intent_id"] != intent_id:
+    kind, _ref, _invoice, planned = drive_stream_step(state, invoice["stream"])
+    if kind != "STEP" or planned["intent_id"] != intent_id:
         raise NativeRefusal("EG_NATIVE_STEP_NOT_PLANNED")
     return intent, invoice
 
@@ -501,8 +511,7 @@ def _ensure_named_archive(state, cfg: NativeConfig, invoice: dict, drive_intent_
 
 
 def _at_ceiling(state, cfg: NativeConfig, action: str) -> bool:
-    limit = cfg.max_drive_uploads if action == "DRIVE_UPLOAD" else cfg.max_gmail_sends
-    return state.dispatch_count(action) >= limit
+    return state.dispatch_count("DRIVE_UPLOAD") >= cfg.max_drive_uploads
 
 
 def _check_ceiling(state, cfg: NativeConfig, action: str) -> None:
@@ -517,14 +526,47 @@ def drive_title_query(folder_id: str, title: str) -> str:
     return f"parentId = '{folder_id}' and title = '{escaped}'"
 
 
-def subject_for(cfg: NativeConfig, invoice: dict) -> str:
-    return cfg.gmail.subject_template.replace("{display_filename}", invoice["display_filename"])
+def verified_drive_file_id(state, invoice: dict) -> str | None:
+    """The file id of the invoice's VERIFIED Drive upload, from the Core receipt, never from host text."""
+    drive_intent = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
+    if drive_intent["state"] != "VERIFIED":
+        return None
+    reference = state.verified_provider_ref(drive_intent["intent_id"])
+    if type(reference) is not str or not reference.startswith("gdrive:"):
+        return None
+    file_id = reference[len("gdrive:"):]
+    return file_id if _PROVIDER_ID_RE.fullmatch(file_id) else None
 
 
-def body_for(cfg: NativeConfig, invoice: dict) -> str:
-    return (cfg.gmail.body_template
-            .replace("{display_filename}", invoice["display_filename"])
-            .replace("{stream_label}", STREAM_LABELS[invoice["stream"]]))
+def _archive_payload(state, cfg: NativeConfig, invoice_key: str) -> bytes | None:
+    """Exact archive bytes of an admitted invoice for a notification attachment, or None. Reads only."""
+    for stream in STREAM_LABELS:
+        for invoice in state.invoices_for_stream(stream):
+            if invoice["invoice_key"] != invoice_key:
+                continue
+            try:
+                path = cfg.archive_root / invoice["archive_relpath"]
+                ensure_no_reparse_components(path)
+                payload = path.read_bytes()
+            except (AppError, OSError):
+                return None
+            same = hashlib.sha256(payload).hexdigest() == invoice["sha256"] and len(payload) == invoice["byte_size"]
+            return payload if same else None
+    return None
+
+
+def _notification_store(cfg: NativeConfig):
+    from .native_notify import NotificationStore, store_path
+
+    return NotificationStore(store_path(cfg))
+
+
+def _sweep_notifications(state, cfg: NativeConfig, now_iso: str) -> None:
+    """Record the success or failure notifications the current Drive state calls for (idempotent)."""
+    from . import native_notify
+
+    with _notification_store(cfg) as store:
+        native_notify.sweep(state, store, now_iso)
 
 
 def _payload_path(cfg: NativeConfig, intent_id: str) -> Path:
@@ -568,61 +610,67 @@ def acquire(state, cfg: NativeConfig, adapters: dict[str, Any], *, run_id: str, 
                                                                run_id, now_iso)
                 named[stream].append({"display_filename": invoice["display_filename"],
                                       "named_archive": outcome, "support_ref": reference})
+        from . import native_notify
+
+        with _notification_store(cfg) as store:
+            recovered_notifications = native_notify.recover(store, now_iso)
+            created = native_notify.sweep(state, store, now_iso, acquisition)
     return _result("acquire", "ACQUIRED", EXIT_OK, run_id=run_id, recovered_unknown=recovered,
+                   recovered_notifications=recovered_notifications, notifications_created=created,
                    acquisition=acquisition, named_archive=named)
 
 
 def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
-    """Plan the next native step (no seal). Writes the exact archive bytes as base64 for the host."""
-    from .orchestration import _v4_rotated, _v4_stream_step
+    """Plan the next native step (no seal): a Drive step first, otherwise one pending notification."""
+    from . import native_notify
+    from .orchestration import _v4_rotated
     from .state import V4_STREAMS
 
     now_iso = _iso(now_ms)
     with _session(state, now_ms):
         recovered = state.recover_unfinished(run_id, now_iso=now_iso)
-        plans = {stream: _v4_stream_step(state, stream) for stream in V4_STREAMS}
+        with _notification_store(cfg) as store:
+            recovered_notifications = native_notify.recover(store, now_iso)
+            native_notify.sweep(state, store, now_iso)
+        plans = {stream: drive_stream_step(state, stream) for stream in V4_STREAMS}
         stepping = [stream for stream in _v4_rotated(V4_STREAMS, state.cursor()) if plans[stream][0] == "STEP"]
-        # A stream whose next action is at its effect ceiling is skipped, so it never starves the other.
-        ready = [stream for stream in stepping if not _at_ceiling(state, cfg, plans[stream][1])]
-        if not ready:
-            # Recovery may have written above, so this is a normal result, never a no-change refusal.
-            return _result("next", "CEILING_REACHED" if stepping else "IDLE", EXIT_OK, run_id=run_id,
-                           recovered_unknown=recovered, streams=stream_report(state, cfg))
-        stream = ready[0]
-        _kind, action, invoice, intent = plans[stream]
-        intent_id = intent["intent_id"]
-        payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
-        if payload is None:
-            return _result("next", "HOLD", EXIT_HOLD, run_id=run_id, intent_id=intent_id, stream=stream,
-                           support_ref=state.intent(intent_id)["support_ref"])
-        if action == "DRIVE_UPLOAD":
+        ready = [] if _at_ceiling(state, cfg, "DRIVE_UPLOAD") else stepping
+        if ready:
+            stream = ready[0]
+            _kind, _ref, invoice, intent = plans[stream]
+            intent_id = intent["intent_id"]
+            payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
+            if payload is None:
+                return _result("next", "HOLD", EXIT_HOLD, run_id=run_id, intent_id=intent_id, stream=stream,
+                               support_ref=state.intent(intent_id)["support_ref"])
             outcome, reference = _ensure_named_archive(state, cfg, invoice, intent_id, payload, run_id, now_iso)
             if outcome != "PRESENT":
                 # Recovery may already have written, so a transient failure is a retry, never a 64 refusal.
                 return _result("next", outcome if outcome == "HOLD" else "RETRY_LATER",
                                EXIT_HOLD if outcome == "HOLD" else EXIT_RETRY, run_id=run_id, intent_id=intent_id,
                                stream=stream, support_ref=reference)
-        if action == "GMAIL_SEND":
-            drive_intent = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
-            if state.verified_provider_ref(drive_intent["intent_id"]) is None:
-                state.hold_pending(intent_id, support_ref="EG_V4_DRIVE_NOT_VERIFIED", run_id=run_id, now_iso=now_iso)
-                return _result("next", "HOLD", EXIT_HOLD, run_id=run_id, intent_id=intent_id, stream=stream,
-                               support_ref="EG_V4_DRIVE_NOT_VERIFIED")
-        payload_path = _payload_path(cfg, intent_id)
-        _write_atomic(payload_path, base64.b64encode(payload))
-        state.set_cursor(stream, now_iso=now_iso)
-    common = {
-        "run_id": run_id, "recovered_unknown": recovered, "intent_id": intent_id, "stream": stream,
-        "display_filename": invoice["display_filename"], "byte_size": invoice["byte_size"],
-        "sha256": invoice["sha256"], "payload_base64_path": str(payload_path),
-    }
-    if action == "DRIVE_UPLOAD":
-        return _result("next", "DRIVE_PRECHECK", EXIT_OK, **common, drive_account=cfg.drive.account,
-                       folder_id=cfg.drive.folder_ids[stream],
-                       precheck_query=drive_title_query(cfg.drive.folder_ids[stream], invoice["display_filename"]))
-    return _result("next", "GMAIL_DRAFT", EXIT_OK, **common, gmail_account=cfg.gmail.account,
-                   to=list(cfg.gmail.to), subject=subject_for(cfg, invoice), body=body_for(cfg, invoice),
-                   attachment_mime_type=PDF_MIME, require_attachment_readback=cfg.gmail.require_attachment_readback)
+            payload_path = _payload_path(cfg, intent_id)
+            _write_atomic(payload_path, base64.b64encode(payload))
+            state.set_cursor(stream, now_iso=now_iso)
+            folder = cfg.drive.folder_ids[stream]
+            return _result(
+                "next", "DRIVE_PRECHECK", EXIT_OK, run_id=run_id, recovered_unknown=recovered, intent_id=intent_id,
+                stream=stream, display_filename=invoice["display_filename"], byte_size=invoice["byte_size"],
+                sha256=invoice["sha256"], payload_base64_path=str(payload_path), drive_account=cfg.drive.account,
+                folder_id=folder, precheck_query=drive_title_query(folder, invoice["display_filename"]),
+            )
+        with _notification_store(cfg) as store:
+            packet = native_notify.plan(store, cfg, lambda key: _archive_payload(state, cfg, key))
+    common = {"run_id": run_id, "recovered_unknown": recovered, "recovered_notifications": recovered_notifications}
+    if packet is not None and packet["outcome"] == "NOTIFY_DRAFT":
+        return _result("next", "NOTIFY_DRAFT", EXIT_OK, **common, **{k: v for k, v in packet.items() if k != "outcome"})
+    if stepping:
+        outcome = "CEILING_REACHED"
+    elif packet is not None:
+        outcome = packet["outcome"]
+    else:
+        outcome = "IDLE"
+    return _result("next", outcome, EXIT_OK, **common, streams=stream_report(state, cfg))
 
 
 def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
@@ -651,8 +699,13 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
             raise NativeRefusal(reference)
         if outcome == "HOLD":
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id, support_ref=reference)
+        if len(matches) == 1 and type(matches[0]) is dict and type(matches[0].get("id")) is str \
+                and _PROVIDER_ID_RE.fullmatch(matches[0]["id"]):
+            # A file with this exact name already exists (for example filed by hand). Never overwrite or
+            # duplicate: the host downloads it and the Core adopts it only if the bytes are identical.
+            return _result("drive-seal", "RECONCILE", EXIT_OK, intent_id=intent_id, reconcile_file_id=matches[0]["id"])
         if matches:
-            # Never overwrite, suffix or create a variant. An operator decides.
+            # Several same-name files, or an unusable match: never overwrite or guess. An operator decides.
             state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id, now_iso=now_iso)
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
                            support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
@@ -697,10 +750,6 @@ def _readback(state, cfg: NativeConfig, intent_id: str, kind: str, provider_id: 
 
 def drive_readback(state, cfg: NativeConfig, intent_id: str, file_id: str, encoded_path: Path) -> dict:
     return _readback(state, cfg, intent_id, "drive", file_id, encoded_path)
-
-
-def gmail_readback(state, cfg: NativeConfig, intent_id: str, draft_id: str, encoded_path: Path) -> dict:
-    return _readback(state, cfg, intent_id, "gmail", draft_id, encoded_path)
 
 
 def _attestation(cfg: NativeConfig, intent_id: str, kind: str, provider_id: str) -> dict | None:
@@ -777,141 +826,102 @@ def drive_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
             intent_id, outcome="VERIFIED" if verified else "REJECTED", provider_ref=provider_ref,
             provider_sha256=str(attestation.get("sha256", "")), run_id=run_id, now_iso=now_iso,
         )
+        _sweep_notifications(state, cfg, now_iso)
     return _result("drive-record", result, EXIT_OK if result in ("VERIFIED", "REPLAY") else EXIT_HOLD,
                    intent_id=intent_id, provider_ref=provider_ref)
 
 
-def _seal_file(cfg: NativeConfig, intent_id: str) -> Path:
-    return _outbox(cfg) / f"{intent_id}.gmail-seal.json"
+def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
+    """Adopt the one existing same-name Drive file as this invoice's upload, only with identical bytes.
 
-
-def gmail_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
-    """Verify a native Gmail draft against the Core, then seal and bind exactly that draft.
-
-    evidence (normalised from get_draft): {"draft_id", "from", "to": [...], "cc": [], "bcc": [], "subject",
-    "attachments": [{"filename", "mimeType", "size"}]}. `from` must be the configured Gmail account. A mismatching draft is refused with no state
-    change: a draft is not delivery, so the host may discard it and draft again.
+    evidence: {"file": {"id", "title", "parentId", "mimeType", "fileSize"}} for the RECONCILE file, plus a
+    Core drive-readback attestation of that file. Exact match: seal and record VERIFIED with no upload,
+    so no duplicate is created. Any mismatch HOLDs the intent; nothing is overwritten or renamed.
     """
     intent_id = _check_intent_id(intent_id)
     now_iso = _iso(now_ms)
     with _session(state, now_ms):
-        _intent, invoice = _current_step(state, intent_id, "GMAIL_SEND")
-        draft_id = evidence.get("draft_id")
-        if type(draft_id) is not str or not _PROVIDER_ID_RE.fullmatch(draft_id):
-            raise NativeRefusal("EG_NATIVE_DRAFT_EVIDENCE_INVALID")
-        attachments = evidence.get("attachments")
-        to = evidence.get("to")
-        if type(to) is not list or type(attachments) is not list or any(type(item) is not dict for item in attachments):
-            raise NativeRefusal("EG_NATIVE_DRAFT_EVIDENCE_INVALID")
-        expected_to = sorted(item.lower() for item in cfg.gmail.to)
-        sender = evidence.get("from")
-        if (type(sender) is not str or sender.lower() != cfg.gmail.account.lower()
-                or sorted(str(item).lower() for item in to) != expected_to
-                or evidence.get("cc") != [] or evidence.get("bcc") != []
-                or evidence.get("subject") != subject_for(cfg, invoice)):
-            raise NativeRefusal("EG_NATIVE_DRAFT_ENVELOPE_MISMATCH")
-        if (len(attachments) != 1 or attachments[0].get("filename") != invoice["display_filename"]
-                or attachments[0].get("mimeType") != PDF_MIME
-                or str(attachments[0].get("size")) != str(invoice["byte_size"])):
-            raise NativeRefusal("EG_NATIVE_DRAFT_ATTACHMENT_MISMATCH")
-        if cfg.gmail.require_attachment_readback:
-            attestation = _attestation(cfg, intent_id, "gmail", draft_id)
-            if attestation is None:
-                raise NativeRefusal("EG_NATIVE_GMAIL_READBACK_REQUIRED")
-            if attestation.get("matches_archive") is not True or attestation.get("sha256") != invoice["sha256"]:
-                raise NativeRefusal("EG_NATIVE_DRAFT_BYTES_MISMATCH")
-        drive_intent = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
-        if drive_intent["state"] != "VERIFIED":
-            raise NativeRefusal("EG_V4_DRIVE_NOT_VERIFIED")
-        _check_ceiling(state, cfg, "GMAIL_SEND")
-        if _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso) is None:
-            return _result("gmail-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
+        _intent, invoice = _current_step(state, intent_id, "DRIVE_UPLOAD")
+        file = evidence.get("file")
+        if type(file) is not dict or type(file.get("id")) is not str or not _PROVIDER_ID_RE.fullmatch(file["id"]):
+            raise NativeRefusal("EG_NATIVE_DRIVE_EVIDENCE_INVALID")
+        attestation = _attestation(cfg, intent_id, "drive", file["id"])
+        if attestation is None:
+            raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+        payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
+        if payload is None:
+            return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id,
                            support_ref=state.intent(intent_id)["support_ref"])
+        outcome, reference = _ensure_named_archive(state, cfg, invoice, intent_id, payload, run_id, now_iso)
+        if outcome == "UNAVAILABLE":
+            raise NativeRefusal(reference)
+        if outcome == "HOLD":
+            return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id, support_ref=reference)
+        size = file.get("fileSize")
+        identical = (
+            file.get("parentId") == cfg.drive.folder_ids[invoice["stream"]]
+            and file.get("title") == invoice["display_filename"]
+            and file.get("mimeType") == PDF_MIME
+            and type(size) in (str, int) and str(size) == str(invoice["byte_size"])
+            and attestation.get("matches_archive") is True and attestation.get("sha256") == invoice["sha256"]
+        )
+        if not identical:
+            state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id, now_iso=now_iso)
+            return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id,
+                           support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
         state.assert_lease_held()
         state.seal_dispatch(intent_id, run_id=run_id, now_iso=now_iso)
-        # The binding is written after the durable seal. If it is lost, gmail-record refuses and the
-        # intent becomes UNKNOWN: fail-closed, never a second send.
-        _write_json_once(_seal_file(cfg, intent_id), {"intent_id": intent_id, "draft_id": draft_id})
-    return _result("gmail-seal", "SEALED", EXIT_OK, intent_id=intent_id, send_draft_id=draft_id)
-
-
-def gmail_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
-    """Record the outcome of sending the one bound draft.
-
-    evidence: {"outcome": "SENT" | "DENIED" | "ERROR" | "NO_RESPONSE", "draft_id", "message_id"}
-    """
-    intent_id = _check_intent_id(intent_id)
-    now_iso = _iso(now_ms)
-    with _session(state, now_ms):
-        _intent, invoice = _dispatched_intent(state, intent_id, "GMAIL_SEND")
-        outcome = _provider_outcome(evidence, "SENT")
-        if outcome == "DENIED":
-            result = state.record_receipt(intent_id, outcome="REJECTED", provider_ref="gmail:denied",
-                                          provider_sha256="", run_id=run_id, now_iso=now_iso)
-            return _result("gmail-record", result, EXIT_HOLD, intent_id=intent_id)
-        if outcome in ("ERROR", "NO_RESPONSE"):
-            result = state.record_receipt(intent_id, outcome="UNKNOWN", provider_ref="gmail:unknown",
-                                          provider_sha256="", run_id=run_id, now_iso=now_iso)
-            return _result("gmail-record", result, EXIT_HOLD, intent_id=intent_id)
-        binding = _read_json(_seal_file(cfg, intent_id))
-        draft_id, message_id = evidence.get("draft_id"), evidence.get("message_id")
-        if binding is None or binding.get("draft_id") != draft_id:
-            raise NativeRefusal("EG_NATIVE_DRAFT_NOT_BOUND")
-        if type(message_id) is not str or not _PROVIDER_ID_RE.fullmatch(message_id):
-            raise NativeRefusal("EG_NATIVE_GMAIL_EVIDENCE_INVALID")
-        # The bytes were proven on the bound draft (gmail-seal), and Gmail sends a draft as is.
-        result = state.record_receipt(
-            intent_id, outcome="VERIFIED", provider_ref=f"gmail:{message_id};draft:{draft_id}",
-            provider_sha256=invoice["sha256"], run_id=run_id, now_iso=now_iso,
-        )
-    return _result("gmail-record", result, EXIT_OK if result in ("VERIFIED", "REPLAY") else EXIT_HOLD,
-                   intent_id=intent_id)
+        result = state.record_receipt(intent_id, outcome="VERIFIED", provider_ref="gdrive:" + file["id"],
+                                      provider_sha256=invoice["sha256"], run_id=run_id, now_iso=now_iso)
+        _sweep_notifications(state, cfg, now_iso)
+    return _result("drive-adopt", "ADOPTED" if result == "VERIFIED" else result,
+                   EXIT_OK if result == "VERIFIED" else EXIT_HOLD, intent_id=intent_id, provider_ref="gdrive:" + file["id"])
 
 
 def stream_report(state, cfg: NativeConfig | None = None) -> dict[str, dict]:
-    """Per-stream drain truth, read only: DRAINED, PENDING (next step) or BLOCKED (with the held reference)."""
-    from .orchestration import _v4_stream_step
+    """Per-stream Core truth (Drive only), read only: DRAINED, PENDING (next step) or BLOCKED."""
     from .state import V4_STREAMS
 
     report: dict[str, dict] = {}
     for stream in V4_STREAMS:
-        kind, reference, invoice, _intent = _v4_stream_step(state, stream)
-        invoices = state.invoices_for_stream(stream)
-        delivered = []
+        kind, reference, _invoice, _intent = drive_stream_step(state, stream)
         detail = []
-        for row in invoices:
-            intents = state.intents_for_invoice(row["invoice_key"])
-            if all(intents[action]["state"] == "VERIFIED" for action in ("DRIVE_UPLOAD", "GMAIL_SEND")):
-                delivered.append(row["display_filename"])
+        for row in state.invoices_for_stream(stream):
+            drive = state.intents_for_invoice(row["invoice_key"])["DRIVE_UPLOAD"]
+            file_id = verified_drive_file_id(state, row)
             detail.append({
                 "display_filename": row["display_filename"],
                 "adopted_from_v3": row["predecessor_invoice_id"] is not None,
                 "named_archive": _named_archive_state(cfg, row) if cfg is not None else None,
-                **{action.lower(): {
-                    "state": intents[action]["state"],
-                    "support_ref": intents[action]["support_ref"],
-                    # A receipt is shown only for a VERIFIED intent; a HOLD keeps its evidence in SQLite.
-                    "receipt": (state.verified_provider_ref(intents[action]["intent_id"])
-                                if intents[action]["state"] == "VERIFIED" else None),
-                } for action in ("DRIVE_UPLOAD", "GMAIL_SEND")},
+                "drive_upload": {"state": drive["state"], "support_ref": drive["support_ref"],
+                                 "receipt": "gdrive:" + file_id if file_id else None},
             })
         report[stream] = {
             "state": {"STEP": "PENDING", "BLOCKED": "BLOCKED", "IDLE": "DRAINED"}[kind],
             "support_ref": reference if kind == "BLOCKED" else None,
-            "next_action": reference if kind == "STEP" else None,
-            "admitted": len(invoices),
-            "delivered": delivered,
+            "admitted": len(detail),
+            "delivered": [item["display_filename"] for item in detail if item["drive_upload"]["state"] == "VERIFIED"],
             "invoices": detail,
         }
     return report
 
 
 def status(state, cfg: NativeConfig | None = None) -> dict:
+    """Core outcome from Drive truth only; notifications are reported beside it and never change it."""
     report = stream_report(state, cfg)
     order = ("BLOCKED", "PENDING", "DRAINED")
     overall = min((row["state"] for row in report.values()), key=order.index)
+    notifications = None
+    if cfg is not None:
+        from . import native_notify
+
+        with _notification_store(cfg) as store:
+            notifications = native_notify.summary(store)
+            gmail_dispatches = store.sealed_count()
+    else:
+        gmail_dispatches = None
     return _result(
         "status", overall, EXIT_OK if overall != "BLOCKED" else EXIT_HOLD, streams=report,
-        effects={"drive_dispatches": state.dispatch_count("DRIVE_UPLOAD"),
-                 "gmail_dispatches": state.dispatch_count("GMAIL_SEND")},
+        notifications=notifications,
+        effects={"drive_dispatches": state.dispatch_count("DRIVE_UPLOAD"), "gmail_dispatches": gmail_dispatches},
     )
