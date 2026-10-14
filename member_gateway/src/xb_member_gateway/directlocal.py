@@ -49,7 +49,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from .shopify_admission import (
-    MEMBER_TAG,
     BaselineCaptureError,
     ShopifyReadError,
     baseline_digest,

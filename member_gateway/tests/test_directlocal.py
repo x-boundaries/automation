@@ -651,7 +651,6 @@ class WriteTests(DirectLocalTestCase):
     def test_bound_candidate_recheck_never_advances(self):
         self.admit_and_approve()
         bridge = FakeBridge(self.ac)
-        original = bridge.probe
         calls = []
 
         def probe(member_no):
@@ -663,7 +662,6 @@ class WriteTests(DirectLocalTestCase):
         self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "bound_member_no_recheck_failed"))
         self.assertEqual(calls, ["M000201", "M000201"])
         self.assertEqual((bridge.write_calls, self.ac.saves), (0, 0))
-        del original
 
     def test_crash_during_allocation_spends_the_attempt(self):
         self.admit_and_approve()
