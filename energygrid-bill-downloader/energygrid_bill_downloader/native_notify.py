@@ -237,8 +237,19 @@ def message_for(cfg: NativeConfig, row: dict) -> tuple[str, str]:
     return subject, body
 
 
+_GOOGLE_REDIRECT_RE = re.compile(r"https://www\.google\.com/url\?q=([^&\s]+)(?:&[^\s]*)?")
+
+
+def _unwrap_google_redirects(text: str) -> str:
+    """Gmail stores links in a draft as `https://www.google.com/url?q=<link>&source=gmail&...`.
+    Only that exact wrapper is unwrapped (percent-decoded) back to `<link>`; nothing else changes."""
+    def unwrap(match: re.Match) -> str:
+        return re.sub(r"%([0-9A-Fa-f]{2})", lambda escape: chr(int(escape.group(1), 16)), match.group(1))
+    return _GOOGLE_REDIRECT_RE.sub(unwrap, text)
+
+
 def _normalised(text: str) -> str:
-    return " ".join(text.split())
+    return " ".join(_unwrap_google_redirects(text).split())
 
 
 def attaches_pdf(cfg: NativeConfig, row: dict) -> bool:

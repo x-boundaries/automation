@@ -113,11 +113,18 @@ class FakeNativeHost:
         }
         return draft_id
 
-    def raw(self, draft_id: str) -> str:
-        """The draft as get_draft RAW returns it: a base64url RFC 822 message."""
+    def raw(self, draft_id: str, *, gmail_wraps_links: bool = False) -> str:
+        """The draft as get_draft RAW returns it: a base64url RFC 822 message. Real Gmail stores links
+        wrapped as https://www.google.com/url?q=<link>&source=gmail&ust=...&sa=E."""
+        import re
         from email.message import EmailMessage
 
-        draft = self.drafts[draft_id]
+        draft = dict(self.drafts[draft_id])
+        if gmail_wraps_links:
+            draft["body"] = re.sub(
+                r"https://drive\.google\.com/\S+",
+                lambda match: f"https://www.google.com/url?q={match.group(0)}&source=gmail&ust=1792080171266000&sa=E",
+                draft["body"])
         message = EmailMessage()
         message["From"] = f'"UAT Sender" <{draft["from"]}>'
         message["To"] = ", ".join(draft["to"])
@@ -696,6 +703,32 @@ class NotificationDraftTests(NativeBridgeBase):
                 self.host.notify_step(step, **overrides)
         self.assertEqual(0, self.dispatches()[1])
         self.assertEqual("SENT", self.host.notify_step(step)["outcome"])
+
+    def test_gmail_redirect_wrapped_link_is_accepted_only_for_the_right_file(self) -> None:
+        self.acquire()
+        step = self.drive_until_notification()
+        nid = step["notification_id"]
+        wrong = self.host.create_draft(step, body=step["body"].replace("/file/d/", "/file/d/X"))
+        self.notify(lambda store: notify.draft_evidence(
+            store, self.cfg, nid, wrong, self.raw_file(wrong, self.host.raw(wrong, gmail_wraps_links=True))))
+        with self.assertRaises(NativeRefusal) as refused:
+            self.notify(lambda store: notify.seal(store, self.cfg, nid, wrong, self.now_iso()))
+        self.assertEqual("EG_NATIVE_DRAFT_BODY_MISMATCH", refused.exception.support_ref)
+        right = self.host.create_draft(step)
+        self.notify(lambda store: notify.draft_evidence(
+            store, self.cfg, nid, right, self.raw_file(right, self.host.raw(right, gmail_wraps_links=True))))
+        sealed = self.notify(lambda store: notify.seal(store, self.cfg, nid, right, self.now_iso()))
+        self.assertEqual("SEALED", sealed["outcome"])
+
+    def test_only_the_exact_google_redirect_wrapper_is_unwrapped(self) -> None:
+        link = "https://drive.google.com/file/d/ABC123/view"
+        self.assertEqual(link, notify._unwrap_google_redirects(
+            f"https://www.google.com/url?q={link}&source=gmail&ust=1&sa=E"))
+        self.assertEqual(link, notify._unwrap_google_redirects(
+            "https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd%2FABC123%2Fview&sa=E"))
+        for other in (f"https://evil.example/url?q={link}", f"http://www.google.com/url?q={link}",
+                      f"https://www.google.com.evil/url?q={link}"):
+            self.assertNotEqual(link, notify._unwrap_google_redirects(other))
 
     def test_a_body_linking_another_drive_file_is_refused(self) -> None:
         self.acquire()
