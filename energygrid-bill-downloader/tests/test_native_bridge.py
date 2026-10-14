@@ -315,7 +315,7 @@ class CompleteJourneyTests(NativeBridgeBase):
         self.assertEqual({EB: "ADMITTED", TN: "ADMITTED"},
                          {stream: row["status"] for stream, row in acquired["acquisition"].items()})
         self.host.drain()
-        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"},
+        self.assertEqual({"SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", "SEP 2026 - EnergyGrid - Tenant Bill - TN Invoice 0002.pdf"},
                          {row["title"] for row in self.host.drive.values()})
         self.assertEqual({FOLDERS[EB], FOLDERS[TN]}, {row["parent"] for row in self.host.drive.values()})
         # Only the latest invoice was fetched; the older one is never a backfill candidate.
@@ -360,7 +360,7 @@ class CompleteJourneyTests(NativeBridgeBase):
         self.host.drain()
         self.assertEqual(3, len(self.host.drive))
         self.assertEqual(3, len(self.host.successes()))
-        self.assertIn("OCT 2026 - EB Invoice 0003.pdf", self.host.sent[-1]["subject"])
+        self.assertIn("OCT 2026 - EnergyGrid - EB Bill - EB Invoice 0003.pdf", self.host.sent[-1]["subject"])
 
     def test_payload_file_is_the_exact_archive_bytes(self) -> None:
         self.acquire()
@@ -479,7 +479,7 @@ class FlatFolderTests(NativeBridgeBase):
         self.assertEqual(2, len(self.host.successes()))
 
     def test_an_identical_file_already_filed_by_hand_is_adopted_without_a_second_upload(self) -> None:
-        manual = self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
+        manual = self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
         self.acquire()
         self.host.drain()
         self.assertEqual(2, len(self.host.drive))
@@ -489,11 +489,11 @@ class FlatFolderTests(NativeBridgeBase):
         self.assertIn(f"https://drive.google.com/file/d/{manual}/view", eb_success["body"])
 
     def test_a_different_file_with_the_same_name_is_never_overwritten_or_duplicated(self) -> None:
-        foreign = self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("someone else's bill"))
+        foreign = self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", pdf("someone else's bill"))
         self.acquire()
         self.host.drain()
         self.assertEqual(pdf("someone else's bill"), self.host.drive[foreign]["bytes"])
-        self.assertEqual(1, sum(1 for row in self.host.drive.values() if row["title"].startswith("SEP 2026 - EB")))
+        self.assertEqual(1, sum(1 for row in self.host.drive.values() if row["title"].startswith("SEP 2026 - EnergyGrid - EB Bill - EB")))
         self.assertEqual(("BLOCKED", "EG_NATIVE_DRIVE_NAME_OCCUPIED"),
                          (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
         self.assertEqual(1, len(self.host.failures()))
@@ -502,7 +502,7 @@ class FlatFolderTests(NativeBridgeBase):
     def test_a_same_size_file_with_different_bytes_is_not_adopted(self) -> None:
         genuine = bytearray(pdf("EB_BILL EB Invoice 0002.pdf"))
         genuine[len(genuine) // 2] ^= 0x01
-        foreign = self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", bytes(genuine))
+        foreign = self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", bytes(genuine))
         self.acquire()
         self.host.drain()
         self.assertEqual(bytes(genuine), self.host.drive[foreign]["bytes"])
@@ -510,26 +510,27 @@ class FlatFolderTests(NativeBridgeBase):
                          (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
 
     def test_several_same_name_files_hold_even_if_one_is_identical(self) -> None:
-        self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
-        self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("another copy"))
+        self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
+        self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", pdf("another copy"))
         self.acquire()
         self.host.drain()
         self.assertEqual(("BLOCKED", "EG_NATIVE_DRIVE_NAME_OCCUPIED"),
                          (self.status()["streams"][EB]["state"], self.status()["streams"][EB]["support_ref"]))
         self.assertEqual("HOLD", self.status()["streams"][EB]["invoices"][0]["drive_upload"]["state"])
 
-    def test_two_streams_with_the_same_display_name_never_collide_silently(self) -> None:
+    def test_the_same_source_name_on_both_streams_gets_two_distinct_names_in_the_flat_folder(self) -> None:
+        # The stream label in the display name keeps the two streams apart in one flat folder.
         same = {EB: [("Invoice.pdf", "2026-09-01")], TN: [("Invoice.pdf", "2026-09-03")]}
         self.acquire(self.adapters(same))
         self.host.drain()
-        self.assertEqual(1, len(self.host.drive))
-        blocked = [stream for stream, row in self.status()["streams"].items() if row["state"] == "BLOCKED"]
-        self.assertEqual(1, len(blocked))
-        self.assertEqual(1, len(self.host.successes()))
-        self.assertEqual(1, len(self.host.failures()))
+        self.assertEqual({"SEP 2026 - EnergyGrid - EB Bill - Invoice.pdf", "SEP 2026 - EnergyGrid - Tenant Bill - Invoice.pdf"},
+                         {row["title"] for row in self.host.drive.values()})
+        self.assertEqual("DRAINED", self.status()["outcome"])
+        self.assertEqual(2, len(self.host.successes()))
+        self.assertEqual(0, len(self.host.failures()))
 
     def test_adoption_requires_the_core_readback_of_that_file(self) -> None:
-        self.host.put(FLAT, "SEP 2026 - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
+        self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
         self.acquire()
         step = self.next()
         while step["stream"] != EB:
@@ -881,9 +882,9 @@ class ReviewFindingTests(NativeBridgeBase):
     def test_a_display_name_with_an_apostrophe_runs_end_to_end(self) -> None:
         self.acquire(self.adapters({EB: [("O'Brien EB Invoice.pdf", "2026-09-01")], TN: []}))
         step = self.next()
-        self.assertIn("title = 'SEP 2026 - O\\'Brien EB Invoice.pdf'", step["precheck_query"])
+        self.assertIn("title = 'SEP 2026 - EnergyGrid - EB Bill - O\\'Brien EB Invoice.pdf'", step["precheck_query"])
         self.host.drain()
-        self.assertEqual(["SEP 2026 - O'Brien EB Invoice.pdf"], [row["title"] for row in self.host.drive.values()])
+        self.assertEqual(["SEP 2026 - EnergyGrid - EB Bill - O'Brien EB Invoice.pdf"], [row["title"] for row in self.host.drive.values()])
 
     def test_synthetic_fixture_refuses_path_like_filenames(self) -> None:
         for name in ("../escape.pdf", "sub/dir.pdf", "..", ""):
@@ -892,7 +893,7 @@ class ReviewFindingTests(NativeBridgeBase):
 
 
 class NamedArchiveTests(NativeBridgeBase):
-    """Owner requirement: the user-facing archive and Drive use `MMM YYYY - <original>.pdf`."""
+    """Owner requirement: the user-facing archive and Drive use `MMM YYYY - EnergyGrid - <stream> - <original>.pdf`."""
 
     def named(self, stream: str, name: str) -> Path:
         return self.cfg.named_archive_root / bridge.STREAM_LABELS[stream] / name
@@ -904,17 +905,17 @@ class NamedArchiveTests(NativeBridgeBase):
         self.host.drain()
         for stream, original, day in ((EB, "EB Invoice 0002.pdf", "2026-09-01"), (TN, "TN Invoice 0002.pdf", "2026-09-03")):
             with self.subTest(stream=stream):
-                named = self.named(stream, f"SEP 2026 - {original}")
+                named = self.named(stream, f"SEP 2026 - EnergyGrid - {bridge.STREAM_LABELS[stream]} - {original}")
                 self.assertEqual(pdf(f"{stream} {original}"), named.read_bytes())
                 self.assertEqual([named.name], [item.name for item in named.parent.iterdir()])
                 internal = self.cfg.archive_root / bridge.STREAM_LABELS[stream] / f"{day}.pdf"
                 self.assertEqual(named.read_bytes(), internal.read_bytes())
-        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"},
+        self.assertEqual({"SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", "SEP 2026 - EnergyGrid - Tenant Bill - TN Invoice 0002.pdf"},
                          {row["title"] for row in self.host.drive.values()})
         self.assertEqual(["PRESENT"], [row["named_archive"] for row in self.status()["streams"][EB]["invoices"]])
 
     def test_existing_identical_copy_is_kept_and_never_rewritten(self) -> None:
-        target = self.named(EB, "SEP 2026 - EB Invoice 0002.pdf")
+        target = self.named(EB, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf")
         target.parent.mkdir(parents=True)
         target.write_bytes(pdf("EB_BILL EB Invoice 0002.pdf"))
         before = target.stat().st_mtime_ns
@@ -924,7 +925,7 @@ class NamedArchiveTests(NativeBridgeBase):
         self.assertEqual(2, len(self.host.drive))
 
     def test_a_different_file_at_the_name_holds_that_invoice_and_is_never_overwritten(self) -> None:
-        target = self.named(EB, "SEP 2026 - EB Invoice 0002.pdf")
+        target = self.named(EB, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf")
         target.parent.mkdir(parents=True)
         target.write_bytes(b"someone else's file")
         acquired = self.acquire()
@@ -939,9 +940,9 @@ class NamedArchiveTests(NativeBridgeBase):
 
     def test_a_removed_copy_is_republished_before_the_drive_step(self) -> None:
         self.acquire()
-        self.named(EB, "SEP 2026 - EB Invoice 0002.pdf").unlink()
+        self.named(EB, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf").unlink()
         self.host.drain()
-        self.assertTrue(self.named(EB, "SEP 2026 - EB Invoice 0002.pdf").is_file())
+        self.assertTrue(self.named(EB, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf").is_file())
         self.assertEqual(2, len(self.host.drive))
 
     def test_a_transient_publication_failure_is_a_retry_with_no_seal(self) -> None:
@@ -1031,11 +1032,12 @@ class LocalSyncTests(NativeBridgeBase):
     def test_both_streams_upload_through_the_synced_folder_and_verify(self) -> None:
         self.acquire()
         self.drain_sync()
-        self.assertEqual({"SEP 2026 - EB Invoice 0002.pdf", "SEP 2026 - TN Invoice 0002.pdf"},
+        self.assertEqual({"SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", "SEP 2026 - EnergyGrid - Tenant Bill - TN Invoice 0002.pdf"},
                          {row["title"] for row in self.host.drive.values()})
         for row in self.host.drive.values():
             stream = EB if "EB" in row["title"] else TN
-            self.assertEqual(pdf(f"{stream} {row['title'][len('SEP 2026 - '):]}"), row["bytes"])
+            prefix = f"SEP 2026 - EnergyGrid - {bridge.STREAM_LABELS[stream]} - "
+            self.assertEqual(pdf(f"{stream} {row['title'][len(prefix):]}"), row["bytes"])
         self.assertEqual("DRAINED", self.status()["outcome"])
         self.assertEqual(2, len(self.host.successes()))
         self.assertEqual([], list(self.cfg.outbox_root.glob("*.pdf.b64")))
@@ -1088,7 +1090,7 @@ class LocalSyncTests(NativeBridgeBase):
         self.assertEqual(b"another bill", target.read_bytes())
 
     def test_an_identical_file_already_in_drive_is_adopted_through_its_mirror(self) -> None:
-        name = "SEP 2026 - EB Invoice 0002.pdf"
+        name = "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf"
         manual = self.host.put(FLAT, name, pdf("EB_BILL EB Invoice 0002.pdf"))
         (self.root / "sync" / name).write_bytes(pdf("EB_BILL EB Invoice 0002.pdf"))
         self.acquire()
@@ -1097,7 +1099,7 @@ class LocalSyncTests(NativeBridgeBase):
         self.assertEqual(f"gdrive:{manual}", self.status()["streams"][EB]["invoices"][0]["drive_upload"]["receipt"])
 
     def test_a_same_name_drive_file_with_different_bytes_is_held(self) -> None:
-        name = "SEP 2026 - EB Invoice 0002.pdf"
+        name = "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf"
         genuine = bytearray(pdf("EB_BILL EB Invoice 0002.pdf"))
         genuine[len(genuine) // 2] ^= 0x01
         self.host.put(FLAT, name, bytes(genuine))
@@ -1142,9 +1144,9 @@ class PredecessorCutoverTests(NativeBridgeBase):
         self.assertEqual("PREDECESSOR_DELIVERED", result["acquisition"][TN]["status"])
         self.assertEqual([], adapters[EB].acquire_calls + adapters[TN].acquire_calls)
         self.host.drain()
-        self.assertEqual(["SEP 2026 - Invoice EB Sep.pdf"], [row["title"] for row in self.host.drive.values()])
+        self.assertEqual(["SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"], [row["title"] for row in self.host.drive.values()])
         self.assertEqual(1, len(self.host.successes()))
-        named = self.cfg.named_archive_root / "EB Bill" / "SEP 2026 - Invoice EB Sep.pdf"
+        named = self.cfg.named_archive_root / "EB Bill" / "SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"
         self.assertEqual(predecessor_pdf("Invoice EB Sep.pdf"), named.read_bytes())
         self.assertEqual("IDLE", self.next()["outcome"])
 

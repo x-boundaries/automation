@@ -3066,7 +3066,7 @@ class StateV4Store:
         existing = self.invoice_by_identity(stream, source_namespace, source_invoice_key)
         if existing is not None:
             try:
-                presentation = presentation_name(source_filename, invoice_date)
+                presentation = presentation_name(source_filename, invoice_date, stream=stream)
             except OfflineV4Error:
                 presentation = None
             if (existing["display_filename"], existing["canonical_filename"]) == (presentation, canonical_filename):
@@ -3077,7 +3077,7 @@ class StateV4Store:
             conn, stream=stream, source_namespace=source_namespace, source_invoice_key=source_invoice_key,
             invoice_date=invoice_date, canonical_filename=canonical_filename,
         )
-        presentation = presentation_name(source_filename, invoice_date)
+        presentation = presentation_name(source_filename, invoice_date, stream=stream)
         _v4_presentation_conflicts(conn, stream=stream, display_filename=presentation, canonical_filename=canonical_filename)
         return "ADMISSIBLE", presentation
 

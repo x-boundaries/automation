@@ -175,13 +175,13 @@ class HappyPathTests(OfflineV4RunTests):
             invoice = store.invoice_by_identity(EB, SYNTHETIC_NAMESPACE, filename_key("Invoice EB.pdf"))
             self.assertIsNotNone(invoice)
             self.assertEqual(sha(data), invoice["sha256"])
-            self.assertEqual("OCT 2026 - Invoice EB.pdf", invoice["display_filename"])
+            self.assertEqual("OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf", invoice["display_filename"])
             self.assertEqual("EB Bill/2026-10-01.pdf", invoice["archive_relpath"])
-        drive_copy = next(entry for entry in self.effects(DRIVE) if entry["display_filename"] == "OCT 2026 - Invoice EB.pdf")
-        attachment = next(entry for entry in self.effects(GMAIL) if entry["display_filename"] == "OCT 2026 - Invoice EB.pdf")
+        drive_copy = next(entry for entry in self.effects(DRIVE) if entry["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf")
+        attachment = next(entry for entry in self.effects(GMAIL) if entry["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf")
         self.assertEqual(sha(data), drive_copy["sha256"])
         self.assertEqual(sha(data), attachment["sha256"])
-        self.assertEqual(display_filename("Invoice EB.pdf", date(2026, 10, 1)), drive_copy["display_filename"])
+        self.assertEqual(display_filename("Invoice EB.pdf", date(2026, 10, 1), stream=EB), drive_copy["display_filename"])
 
     def test_an_immediate_second_run_creates_zero_uploads_and_zero_emails(self) -> None:
         first = self.run_once(1, self.standard_adapters())
@@ -231,7 +231,7 @@ class CatchUpAndFairnessTests(OfflineV4RunTests):
         )
         drive_names = [entry["display_filename"] for entry in self.effects(DRIVE)]
         self.assertEqual(
-            ["OCT 2026 - Invoice EB.pdf", "OCT 2026 - Invoice TN.pdf", "OCT 2026 - Invoice EB 5.pdf", "OCT 2026 - Invoice TN 6.pdf"],
+            ["OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf", "OCT 2026 - EnergyGrid - Tenant Bill - Invoice TN.pdf", "OCT 2026 - EnergyGrid - EB Bill - Invoice EB 5.pdf", "OCT 2026 - EnergyGrid - Tenant Bill - Invoice TN 6.pdf"],
             drive_names,
         )
         self.assertEqual(8, len(self.ledger.effects))
@@ -283,7 +283,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
         with self.assertRaises(OfflineV4Error) as caught:
             self.run_once(1, self.standard_adapters(), checkpoint=takeover)
         self.assertEqual("EG_V4_LEASE_LOST", caught.exception.support_ref)
-        self.assertEqual(0, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
         self.assertEqual("UNKNOWN", self.intent_state("2026-10-01", DRIVE))
         # Only the second session's Tenant Bill upload and email; the stale session made no call.
         self.assertEqual(2, len(self.ledger.effects))
@@ -374,7 +374,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
         self.assertEqual({"BLOCKED", "DRAINED"}, {row["state"] for row in result["drain"]["streams"].values()})
         self.assertEqual("EG_V4_DISPATCH_OUTCOME_UNKNOWN", result["drain"]["streams"][EB]["support_ref"])
         self.assertEqual([(TN, DRIVE, "VERIFIED"), (TN, GMAIL, "VERIFIED")], self.steps(result))
-        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
         again = self.run_once(3, self.standard_adapters())
         self.assertEqual([], self.steps(again))
         self.assertEqual(2, len(self.ledger.effects))
@@ -389,7 +389,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
         self.assertEqual("UNKNOWN", self.intent_state("2026-10-01", DRIVE))
         # Only TENANT_BILL's upload reaches the provider; the held EB upload is never resent.
         self.assertEqual(1, fresh_drive.calls)
-        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
         self.assertEqual("BLOCKED", result["drain"]["streams"][EB]["state"])
 
     def test_crash_after_a_verified_receipt_resumes_at_gmail_without_repeating_drive(self) -> None:
@@ -399,7 +399,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
         result = self.run_once(2, self.standard_adapters())
         self.assertEqual(EB, self.steps(result)[0][0])
         self.assertEqual(GMAIL, self.steps(result)[0][1])
-        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
         self.assertEqual(4, len(self.ledger.effects))
 
     def test_a_lost_provider_response_after_the_effect_holds_only_that_stream(self) -> None:
@@ -409,8 +409,8 @@ class CrashAndRestartTests(OfflineV4RunTests):
         self.assertEqual("BLOCKED", result["drain"]["streams"][EB]["state"])
         self.assertEqual("EG_V4_PROVIDER_UNKNOWN", result["drain"]["streams"][EB]["support_ref"])
         self.assertEqual("DRAINED", result["drain"]["streams"][TN]["state"])
-        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
-        self.assertEqual(0, len([e for e in self.effects(GMAIL) if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(1, len([e for e in self.effects(DRIVE) if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.effects(GMAIL) if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
 
     def test_an_altered_archive_holds_the_pending_intent_and_sends_nothing_for_it(self) -> None:
         with self.assertRaises(SimulatedCrash):
@@ -420,7 +420,7 @@ class CrashAndRestartTests(OfflineV4RunTests):
         self.assertEqual("HOLD", self.intent_state("2026-10-01", DRIVE))
         self.assertEqual("EG_V4_ARCHIVE_IDENTITY_CHANGED", result["drain"]["streams"][EB]["support_ref"])
         self.assertEqual(2, len(self.ledger.effects))
-        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
 
 
 class PortalAndAdmissionTests(OfflineV4RunTests):
@@ -526,7 +526,7 @@ class SentBytesAreHashedTests(OfflineV4RunTests):
             result = self.run_once(2, self.standard_adapters())
         self.assertEqual("HOLD", self.intent_state("2026-10-01", DRIVE))
         self.assertEqual("EG_V4_ARCHIVE_IDENTITY_CHANGED", result["drain"]["streams"][EB]["support_ref"])
-        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - Invoice EB.pdf"]))
+        self.assertEqual(0, len([e for e in self.ledger.effects if e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf"]))
 
 
 class PortalRegressionAndBoundaryTests(OfflineV4RunTests):
@@ -545,7 +545,7 @@ class PortalRegressionAndBoundaryTests(OfflineV4RunTests):
         self.assertEqual("ADMISSION_REFUSED", result["acquisition"][EB]["status"])
         self.assertEqual("EG_V4_SOURCE_REGRESSION", result["acquisition"][EB]["support_ref"])
         self.assertEqual(4, len(self.ledger.effects))
-        self.assertFalse(any(e["display_filename"] == "OCT 2026 - Invoice EB.pdf" for e in self.ledger.effects))
+        self.assertFalse(any(e["display_filename"] == "OCT 2026 - EnergyGrid - EB Bill - Invoice EB.pdf" for e in self.ledger.effects))
 
     def test_a_plain_portal_adapter_is_refused_before_any_work_or_lease(self) -> None:
         plain = SyntheticAdapter(
@@ -620,7 +620,7 @@ class PredecessorScenarioTests(_PredecessorRunBase):
         self.assertEqual("ADOPTED", result["acquisition"][EB]["predecessor"])
         self.assertEqual([], adapters[EB].acquire_calls)
         self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], self.steps(result))
-        self.assertEqual(["SEP 2026 - Invoice EB Sep.pdf"], [e["display_filename"] for e in self.effects(DRIVE)])
+        self.assertEqual(["SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"], [e["display_filename"] for e in self.effects(DRIVE)])
         self.assertEqual(hashlib.sha256(predecessor_pdf("Invoice EB Sep.pdf")).hexdigest(), self.effects(DRIVE)[0]["sha256"])
         self.assertEqual(2, len(self.ledger.effects))
         self.assertEqual("PREDECESSOR_DELIVERED", result["acquisition"][TN]["status"])
@@ -648,7 +648,7 @@ class PredecessorScenarioTests(_PredecessorRunBase):
         result = self.run_once(1, {EB: self.portal_latest(EB), TN: self.adapter(TN, newer)})
         self.assertEqual("PREDECESSOR_DELIVERED", result["acquisition"][EB]["status"])
         self.assertEqual([(TN, DRIVE, "VERIFIED"), (TN, GMAIL, "VERIFIED")], self.steps(result))
-        self.assertEqual(["OCT 2026 - Invoice TN Oct.pdf"], [e["display_filename"] for e in self.effects(DRIVE)])
+        self.assertEqual(["OCT 2026 - EnergyGrid - Tenant Bill - Invoice TN Oct.pdf"], [e["display_filename"] for e in self.effects(DRIVE)])
 
     def test_drive_partial_prior_dispatch_holds_only_that_stream_with_zero_fake_writes(self) -> None:
         self.rebuild("partial", {EB: "DRIVE_PARTIAL", TN: "ADOPTABLE"})
@@ -713,7 +713,7 @@ class PredecessorScenarioTests(_PredecessorRunBase):
         second = self.run_once(2, {EB: self.adapter(EB, newer), TN: self.portal_latest(TN)})
         self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], self.steps(second))
         self.assertEqual(
-            ["SEP 2026 - Invoice EB Sep.pdf", "OCT 2026 - Invoice EB Oct.pdf"],
+            ["SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf", "OCT 2026 - EnergyGrid - EB Bill - Invoice EB Oct.pdf"],
             [e["display_filename"] for e in self.effects(DRIVE)],
         )
 
@@ -795,7 +795,7 @@ class PredecessorTransitionTests(_PredecessorRunBase):
     def test_m1_positive_a_clean_adoptable_latest_gets_drive_and_gmail_once(self) -> None:
         self.rebuild("m1-clean", {EB: "ADOPTABLE", TN: "DELIVERED"})
         result = self.run_once(1, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)})
-        self.assertEqual([(DRIVE, "SEP 2026 - Invoice EB Sep.pdf"), (GMAIL, "SEP 2026 - Invoice EB Sep.pdf")],
+        self.assertEqual([(DRIVE, "SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"), (GMAIL, "SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf")],
                          eb_sep_effects(self.ledger))
         self.assertEqual("DRAINED", result["overall"])
 
@@ -846,7 +846,7 @@ class PredecessorTransitionTests(_PredecessorRunBase):
                                  result["acquisition"][EB])
                 self.assertEqual([(EB, DRIVE, "VERIFIED"), (EB, GMAIL, "VERIFIED")], self.steps(result))
                 self.assertEqual(2, len(eb_sep_effects(self.ledger)))
-                self.assertEqual(["OCT 2026 - Invoice EB Oct.pdf"] * 2,
+                self.assertEqual(["OCT 2026 - EnergyGrid - EB Bill - Invoice EB Oct.pdf"] * 2,
                                  [e["display_filename"] for e in self.ledger.effects if "Oct" in e["display_filename"]])
                 self.assertEqual(4, len(self.ledger.effects))
                 self.assertEqual("DRAINED", result["overall"])
@@ -921,8 +921,8 @@ class PredecessorTransitionTests(_PredecessorRunBase):
                 self.assertEqual(expected_steps, self.steps(result))
                 names = [(e["action"], e["display_filename"]) for e in self.ledger.effects]
                 self.assertEqual([
-                    (DRIVE, "SEP 2026 - Invoice EB Sep.pdf"), (GMAIL, "SEP 2026 - Invoice EB Sep.pdf"),
-                    (DRIVE, "OCT 2026 - Invoice EB Oct.pdf"), (GMAIL, "OCT 2026 - Invoice EB Oct.pdf"),
+                    (DRIVE, "SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"), (GMAIL, "SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"),
+                    (DRIVE, "OCT 2026 - EnergyGrid - EB Bill - Invoice EB Oct.pdf"), (GMAIL, "OCT 2026 - EnergyGrid - EB Bill - Invoice EB Oct.pdf"),
                 ], names)
                 self.assertEqual("DRAINED", result["overall"])
                 again = self.run_once(3, {EB: self.adapter(EB, self.OCTOBER), TN: self.portal_latest(TN)})
@@ -995,7 +995,7 @@ class DisplayHoldTests(OfflineV4RunTests):
         eb, result = self.run_with_eb(2, "invoice.pdf", day="2026-10-05")
         self.assertEqual("ADMITTED", result["acquisition"][EB]["status"])
         self.assertEqual(["invoice.pdf"], eb.acquire_calls)
-        self.assertEqual(["OCT 2026 - invoice.pdf"] * 2,
+        self.assertEqual(["OCT 2026 - EnergyGrid - EB Bill - invoice.pdf"] * 2,
                          [e["display_filename"] for e in self.ledger.effects if "invoice.pdf" in e["display_filename"]])
         self.assertEqual("DRAINED", result["overall"])
 
@@ -1129,8 +1129,8 @@ class DualStreamIsolationTests(_PredecessorRunBase):
             self.assertEqual("DRAINED", result["streams"][other]["outcome"])
             self.assertEqual("HOLD", result["streams"][held]["outcome"])
         shown = [e["display_filename"] for e in self.ledger.effects]
-        prefix = "Invoice EB" if other == EB else "Invoice TN"
-        self.assertEqual([f"SEP 2026 - {prefix} Sep.pdf"] * 2 + [f"OCT 2026 - {prefix} Oct.pdf"] * 2, shown)
+        prefix = "EB Bill - Invoice EB" if other == EB else "Tenant Bill - Invoice TN"
+        self.assertEqual([f"SEP 2026 - EnergyGrid - {prefix} Sep.pdf"] * 2 + [f"OCT 2026 - EnergyGrid - {prefix} Oct.pdf"] * 2, shown)
         self.assertFalse(any(("Invoice EB" if held == EB else "Invoice TN") in name for name in shown))
 
     def test_eb_predecessor_hold_while_tenant_adopts_september_and_admits_october(self) -> None:
@@ -1167,7 +1167,7 @@ class DualStreamIsolationTests(_PredecessorRunBase):
         for n in (1, 2, 3):
             self.run_once(n, {EB: self.portal_latest(EB), TN: self.portal_latest(TN)})
         shown = sorted(e["display_filename"] for e in self.ledger.effects)
-        self.assertEqual(sorted(["SEP 2026 - Invoice EB Sep.pdf"] * 2 + ["SEP 2026 - Invoice TN Sep.pdf"] * 2), shown)
+        self.assertEqual(sorted(["SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf"] * 2 + ["SEP 2026 - EnergyGrid - Tenant Bill - Invoice TN Sep.pdf"] * 2), shown)
         self.assertFalse(any("Aug" in name for name in shown))
 
 

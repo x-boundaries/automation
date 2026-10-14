@@ -169,6 +169,15 @@ def _notify(cfg: bridge.NativeConfig, now_ms: int, action: Callable[[Any], dict]
         return action(store)
 
 
+def _backfill(cfg: bridge.NativeConfig, now_ms: int, action: Callable[[Any], dict]) -> dict:
+    """Run one manual backfill command inside the v4 lease, so it never overlaps a scheduled run."""
+    from .native_backfill import BackfillLedger, ledger_path
+    from .state import StateV4Store
+
+    with StateV4Store(cfg.state_path) as state, bridge._session(state, now_ms), BackfillLedger(ledger_path(cfg)) as ledger:
+        return action(ledger)
+
+
 def _dispatch(args) -> dict:
     from . import native_notify as notify
 
@@ -203,6 +212,15 @@ def _dispatch(args) -> dict:
     if command == "notify-record":
         evidence = bridge.load_evidence(Path(args.evidence))
         return _notify(cfg, now, lambda store: notify.record(store, args.notification, evidence, now_iso))
+    if command in ("backfill-run", "backfill-record"):
+        from . import native_backfill as backfill
+
+        evidence = bridge.load_evidence(Path(args.drive_evidence))
+        if command == "backfill-run":
+            adapters = _adapters(cfg)
+            return _backfill(cfg, now, lambda ledger: backfill.run(cfg, ledger, adapters, evidence,
+                                                                   max_files=args.max, now_iso=now_iso))
+        return _backfill(cfg, now, lambda ledger: backfill.record(cfg, ledger, evidence, now_iso=now_iso))
     raise bridge.NativeRefusal("EG_NATIVE_COMMAND_UNKNOWN")
 
 
@@ -231,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--notification", required=True)
         for option in extra:
             command.add_argument(option, required=True)
+    for name in ("backfill-run", "backfill-record"):
+        command = sub.add_parser(name)
+        command.add_argument("--config", required=True)
+        command.add_argument("--drive-evidence", required=True)
+        if name == "backfill-run":
+            command.add_argument("--max", required=True, type=int)
     return parser
 
 

@@ -97,7 +97,7 @@ def admit(store: StateV4Store, *, name: str = "invoice-001.pdf", invoice_date: d
         source_namespace=namespace,
         source_invoice_key=filename_key(name),
         invoice_date=invoice_date,
-        display_filename=display_filename(name, invoice_date),
+        display_filename=display_filename(name, invoice_date, stream=stream),
         sha256=sha,
         byte_size=size,
         run_id=run,
@@ -320,7 +320,7 @@ class AdmissionTests(_V4Base):
             invoice, created = admit(store)
             self.assertTrue(created)
             self.assertEqual("EB Bill/2026-10-01.pdf", invoice["archive_relpath"])
-            self.assertEqual("OCT 2026 - invoice-001.pdf", invoice["display_filename"])
+            self.assertEqual("OCT 2026 - EnergyGrid - EB Bill - invoice-001.pdf", invoice["display_filename"])
             intents = self.intents(store, invoice)
             self.assertEqual({"DRIVE_UPLOAD", "GMAIL_SEND"}, set(intents))
             self.assertEqual({"PENDING"}, {row["state"] for row in intents.values()})
@@ -373,7 +373,7 @@ class AdmissionTests(_V4Base):
                 source_filename="invoice-001.pdf", canonical_filename="2026-10-01.pdf",
                 invoice_date=date(2026, 10, 1),
             )
-            self.assertEqual(("ALREADY_ADMITTED", "OCT 2026 - invoice-001.pdf"), decision)
+            self.assertEqual(("ALREADY_ADMITTED", "OCT 2026 - EnergyGrid - EB Bill - invoice-001.pdf"), decision)
 
     def test_an_older_identity_than_the_newest_admission_is_a_regression(self) -> None:
         with leased(self.path) as store:
@@ -1318,7 +1318,7 @@ class PredecessorClassifierTests(_BuiltPredecessorBase):
         latest = store.predecessor_latest("EB_BILL")["invoice"] or {}
         arguments = {
             "invoice_id": self.built["EB_BILL"]["latest"],
-            "display_filename": "SEP 2026 - Invoice EB Sep.pdf",
+            "display_filename": "SEP 2026 - EnergyGrid - EB Bill - Invoice EB Sep.pdf",
             "sha256": latest.get("sha256"),
             "byte_size": latest.get("byte_size"),
             "run_id": RUN_ID,

@@ -22,26 +22,31 @@ separate G2 permission boundary.
 
 ## 2. Presentation filename (`naming.py`)
 
-`MMM YYYY - <source filename>`, with the prefix applied exactly once:
+`MMM YYYY - EnergyGrid - <EB Bill|Tenant Bill> - <source filename>`, with the month applied exactly once
+(owner naming decision, #226 V3 G1 UAT; it replaces the earlier `MMM YYYY - <source filename>`). The
+stream label comes from the invoice stream; an unknown stream is `EG_V4_DISPLAY_STREAM_INVALID`. The rules
+below apply to the month token and the source name:
 
 | Rule | Behaviour |
 |---|---|
 | Month | Uppercase English abbreviation `JAN`..`DEC` from the validated source invoice date |
 | Year | Four digits |
 | Source name | Kept verbatim after the prefix, extension included (`.pdf` or `.PDF`) |
-| Already prefixed, same month and year (any letter case) | Accepted once; the prefix is normalised to uppercase (`oct 2026 - x.pdf` in October 2026 gives `OCT 2026 - x.pdf`) |
+| Already prefixed, same month and year (any letter case) | Accepted once; the month token is removed and the full prefix added (`oct 2026 - x.pdf` in October 2026 gives `OCT 2026 - EnergyGrid - EB Bill - x.pdf`) |
 | A `MMM YYYY - ` token (any case, month or year) anywhere except as that one accepted leading prefix: another period, doubled, or embedded (`Invoice OCT 2026 - EB.pdf`, `x OCT 2026 - y.pdf`) | Ambiguous, `EG_V4_DISPLAY_PREFIX_CONFLICT` |
 | The source name, or the remainder after the accepted prefix, starts with a month abbreviation, a full English month name or `SEPT`, then a non-letter and a four-digit year with any or no ASCII separator (`OCT 2026 invoice.pdf`, `OCTOBER 2026 - x.pdf`, `SEPT 2026 - x.pdf`, `OCT2026-invoice.pdf`, `OCT 2026 - OCT2026 x.pdf`) | Ambiguous, `EG_V4_DISPLAY_PREFIX_CONFLICT`. Never guessed. |
-| Accepted controls | `XYZ 2026 - invoice.pdf`, `Invoice Oct.pdf`, `Octopus 2026.pdf`, `10-2026 invoice.pdf`, `oct 2026 - x.pdf` each get exactly one canonical prefix |
+| Accepted controls | `XYZ 2026 - invoice.pdf`, `Invoice Oct.pdf`, `Octopus 2026.pdf`, `10-2026 invoice.pdf`, `oct 2026 - x.pdf` each get exactly one canonical month token |
 | Non-ASCII source name (only qualified ASCII names are supported) | `EG_V4_DISPLAY_SHAPE_UNSUPPORTED` |
 | Leading whitespace, or any format (Cf) or control (Cc) character | `EG_V4_DISPLAY_NAME_INVALID` |
 | Empty stem, non-PDF, control or path characters, reserved device name | `EG_V4_DISPLAY_NAME_INVALID` |
 | Result longer than 260 characters | `EG_V4_DISPLAY_NAME_INVALID`, never truncated |
-| Collision within one stream (NFC plus casefold) | `EG_V4_DISPLAY_NAME_COLLISION` |
+| Collision within one stream (NFC plus casefold) | `EG_V4_DISPLAY_NAME_COLLISION`. The stream label keeps the same source name on the two streams distinct. |
 
 Every `EG_V4_DISPLAY_*` fault of a stream's current latest candidate is a typed stream HOLD (section 5):
 zero fetch, zero archive write, zero admission and zero Drive or Gmail effect for that candidate. The
-display name is computed once and stored in the immutable admission row.
+display name is computed once and stored in the immutable admission row. A v4 state database whose rows
+were admitted under the earlier format refuses a re-run of those identities (`EG_V4_INVOICE_IDENTITY_CONFLICT`);
+UAT starts from a fresh state, and no production v4 state exists.
 
 ## 3. SQLite v4 (additive)
 
@@ -265,8 +270,8 @@ python -m unittest discover -s tests
 - The lease is not renewed during a run. Its duration (600 s by default) must exceed the longest run.
   A longer run is taken over, and it then stops before its next external effect with `EG_V4_LEASE_LOST`.
   The intent it left DISPATCHED is recovered as UNKNOWN by the new owner, and it is not resent.
-- Filename shapes: only qualified ASCII source names are supported, and only the exact `MMM YYYY - <source>`
-  form is produced. For a current candidate, any non-ASCII name and any ambiguous month-year shape is a
+- Filename shapes: only qualified ASCII source names are supported, and only the exact
+  `MMM YYYY - EnergyGrid - <stream label> - <source>` form is produced. For a current candidate, any non-ASCII name and any ambiguous month-year shape is a
   typed HOLD; an older candidate is still a source-regression refusal. No real portal basename
   compatibility is declared proven. An authorised read-only observation of real shapes is needed before
   live UAT (D7). A filename is never invented.

@@ -115,7 +115,7 @@ class NativeConfig:
     archive_root: Path = field(repr=False)
     temp_root: Path = field(repr=False)
     outbox_root: Path = field(repr=False)
-    # User-facing archive: <root>/<EB Bill|Tenant Bill>/MMM YYYY - <portal filename>.pdf (owner requirement).
+    # User-facing archive: <root>/<EB Bill|Tenant Bill>/MMM YYYY - EnergyGrid - <label> - <portal filename>.pdf.
     # archive_root keeps the frozen internal v4 identity <EB Bill|Tenant Bill>/YYYY-MM-DD.pdf.
     named_archive_root: Path = field(repr=False)
     drive: NativeDriveSettings = field(repr=False)

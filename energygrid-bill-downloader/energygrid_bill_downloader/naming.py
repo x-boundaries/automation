@@ -2,16 +2,21 @@
 
 The archive keeps its frozen date-only identity (`YYYY-MM-DD.pdf`, see
 `invoice.Candidate.canonical_filename`). Presentation surfaces, meaning the
-Drive copy name and the email attachment name, use the display name:
+Drive copy name, the user-facing named archive copy and the email text, use the display name:
 
-    MMM YYYY - <source filename>
+    MMM YYYY - EnergyGrid - <EB Bill|Tenant Bill> - <source filename>
+
+  for example `AUG 2026 - EnergyGrid - EB Bill - 2026-08-26_ACCOUNT_00001.pdf` (owner naming
+  decision, #226 V3 G1 UAT).
 
 - `MMM` is an uppercase English month abbreviation (JAN..DEC) taken from the
   validated source invoice date, never from the source filename.
+- The stream label comes from the invoice stream (the `invoice.STREAM_LABELS` text).
+  An unknown stream is refused (`EG_V4_DISPLAY_STREAM_INVALID`).
 - The source filename is kept verbatim after the prefix, extension included.
-- The prefix is applied exactly once. A source name that already starts with
-  the same month and year (any letter case) is accepted and the prefix is
-  normalised to uppercase.
+- The month prefix is applied exactly once. A source name that already starts
+  with the same `MMM YYYY - ` (any letter case) has that token removed before
+  the full prefix is added, so the month appears once and in uppercase.
 - Ambiguous shapes are refused, never guessed (`EG_V4_DISPLAY_PREFIX_CONFLICT`):
   a `MMM YYYY - ` token (any letter case, any month and year) anywhere except
   as the one accepted leading same-period prefix, or a source name or
@@ -38,6 +43,9 @@ MONTH_NAMES = (
     "NOVEMBER", "DECEMBER",
 )
 DISPLAY_NAME_MAX_LENGTH = 260
+DISPLAY_BRAND = "EnergyGrid"
+# Same labels as invoice.STREAM_LABELS (tested); kept here so naming imports no source module.
+STREAM_LABELS = {"EB_BILL": "EB Bill", "TENANT_BILL": "Tenant Bill"}
 # The canonical prefix token, matched anywhere in a name.
 _PREFIX_RE = re.compile(
     r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC) [0-9]{4} - ",
@@ -57,9 +65,18 @@ def month_prefix(invoice_date: date) -> str:
     return f"{MONTH_ABBREVIATIONS[invoice_date.month - 1]} {invoice_date.year:04d} - "
 
 
-def display_filename(source_filename: str, invoice_date: date) -> str:
-    """Return `MMM YYYY - <source filename>` with the prefix applied exactly once."""
+def display_prefix(invoice_date: date, stream: str) -> str:
+    """Return the full prefix, for example `OCT 2026 - EnergyGrid - EB Bill - `."""
+    month = month_prefix(invoice_date)
+    if not isinstance(stream, str) or stream not in STREAM_LABELS:
+        raise OfflineV4Error("EG_V4_DISPLAY_STREAM_INVALID")
+    return f"{month}{DISPLAY_BRAND} - {STREAM_LABELS[stream]} - "
+
+
+def display_filename(source_filename: str, invoice_date: date, *, stream: str) -> str:
+    """Return `MMM YYYY - EnergyGrid - <label> - <source filename>`, the month applied exactly once."""
     prefix = month_prefix(invoice_date)
+    full_prefix = display_prefix(invoice_date, stream)
     if type(source_filename) is not str or not source_filename:
         raise OfflineV4Error("EG_V4_DISPLAY_SOURCE_INVALID")
     if not source_filename.isascii():
@@ -79,7 +96,7 @@ def display_filename(source_filename: str, invoice_date: date) -> str:
         raise OfflineV4Error("EG_V4_DISPLAY_PREFIX_CONFLICT")
     if not remainder.lower().endswith(".pdf") or not remainder[: -len(".pdf")].strip():
         raise OfflineV4Error("EG_V4_DISPLAY_NAME_INVALID")
-    display = prefix + remainder
+    display = full_prefix + remainder
     _validate_display(display)
     return display
 

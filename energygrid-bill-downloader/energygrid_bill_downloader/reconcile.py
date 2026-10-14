@@ -1391,7 +1391,7 @@ def _adopt_predecessor_latest(state, archive_root: Path, stream: str, invoice: d
     if (info.sha256, info.byte_size) != (invoice["sha256"], invoice["byte_size"]):
         return ("HOLD", "EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH")
     try:
-        presentation = display_filename(invoice["source_filename"], date.fromisoformat(invoice["bill_date"]))
+        presentation = display_filename(invoice["source_filename"], date.fromisoformat(invoice["bill_date"]), stream=stream)
         created = state.adopt_predecessor_latest(
             stream, invoice_id=invoice["invoice_id"], display_filename=presentation,
             sha256=info.sha256, byte_size=info.byte_size, run_id=run_id, now_iso=now_iso,

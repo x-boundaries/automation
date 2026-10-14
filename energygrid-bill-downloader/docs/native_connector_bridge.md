@@ -56,6 +56,8 @@ later, `20` HOLD or uncertainty recorded, `64` refused with **no state change**.
 | `notify-seal --notification N --draft-id R` | Verifies the Core-parsed draft: sender is the configured account, exactly the one recipient, no cc/bcc, exact subject, the Core body (with the Drive link for SUCCESS) and the attachment rule. Then seals and binds that draft. A wrong draft changes nothing. |
 | `notify-record --notification N --evidence F` | `SENT` for the bound draft: SENT (also resolves UNKNOWN). `DENIED`: HOLD. `ERROR`/`NO_RESPONSE`: UNKNOWN. |
 | `status` | Per-stream Drive truth with receipts and named-archive state, the notification list, and dispatch counts. |
+| `backfill-run --drive-evidence F --max N` | Manual one-off only (section 4a). Writes the older bills of each bound stream into the synced folder, at most N (1 to 50). |
+| `backfill-record --drive-evidence F` | Verifies each backfilled file against a fresh Drive listing and its local mirror. |
 
 ## 4. Host protocol (one loop)
 
@@ -87,11 +89,34 @@ notification `SEALED`); the next `acquire` or `next` makes it `UNKNOWN`, which i
 record with full evidence for the same object resolves `UNKNOWN` (late receipt). An unsealed draft is not
 delivery; discard it.
 
+## 4a. Manual backfill of older bills (owner request, not scheduled)
+
+The scheduled loop above stays latest-only. On the owner's request, `native_backfill.py` fills in the
+older bills once. It is never part of the scheduled prompt and never touches the v4 admission state; its
+ledger is `<state>.backfill.sqlite`, and it runs inside the v4 lease. `LOCAL_SYNC` only.
+
+1. Drive `search_files` with exactly `parentId = '<folder id>' and title contains 'EnergyGrid - '`, every
+   page. Write `{"folder_id", "query", "complete": true, "files": [{"id", "title",
+   "parentId", "fileSize"}]}`.
+2. `backfill-run --max N`. One portal inventory per bound stream. The newest invoice date of each stream
+   is skipped (`SKIPPED_LATEST`): it belongs to the scheduled Core. A name already in the listing or the
+   ledger is skipped without a fetch. Each other bill is fetched, validated and written with exclusive
+   create into the synced folder and the named archive under the owner name. A different local file at
+   that name is a HOLD and is never overwritten. Bills beyond N are `DEFERRED` to a later run.
+3. After Drive for desktop syncs, repeat step 1 and run `backfill-record`. A file is VERIFIED only with a
+   single exact-title match in the configured folder, the exact size and a Core-hashed local mirror.
+
+A later backfill run skips only the then-newest date, so a bill that was newest at an earlier run (and
+was missed by the schedule) is picked up then. A file the owner added by hand under another name cannot
+be recognised and would be written again under the owner name.
+
 ## 5. Filenames and destinations (owner requirement)
 
 - The user-facing downloaded archive, the Drive title and (when attached) the email attachment use the
-  stored v4 display name `MMM YYYY - <original portal filename>`, prefix applied exactly once.
-- User-facing archive: `<named_archive_root>/<EB Bill|Tenant Bill>/MMM YYYY - <original>.pdf`, the exact
+  stored v4 display name `MMM YYYY - EnergyGrid - <EB Bill|Tenant Bill> - <original portal filename>`
+  (owner naming decision, UAT Stage B), for example
+  `AUG 2026 - EnergyGrid - EB Bill - 2026-08-26_ACCOUNT_00001.pdf`. The month is applied exactly once.
+- User-facing archive: `<named_archive_root>/<EB Bill|Tenant Bill>/<display name>`, the exact
   archive bytes, published with no-replace semantics and re-hashed. An identical existing copy is kept; a
   different file at that name is never overwritten and HOLDs that invoice's Drive step
   (`EG_NATIVE_NAMED_ARCHIVE_CONFLICT`). A transient I/O failure is `RETRY_LATER`. It is a precondition of
@@ -154,8 +179,13 @@ bill and the Drive link; latest-only and no backfill; second run zero effects; n
 success independent of email (denied, uncertain and capped email); failure notifications once per
 incident with non-sensitive content; flat folder shared by both streams; adoption of an identical
 hand-filed file; no adoption for different bytes (including same size) or several same-name files;
-cross-stream name collision; Drive crash, lost answer, corruption, metadata, denied, error, racing seals,
+the same source name on both streams gets two distinct names; Drive crash, lost answer, corruption, metadata, denied, error, racing seals,
 precheck and tampering; junctions; notification draft refusals (recipient, cc, subject, sender, body,
 attachment), Core-parsed evidence required, bound draft, undecodable RAW; optional attachment byte check;
 Drive and email ceilings; lease; v3 predecessor adoption; named archive; config and CLI refusals; no
 network imports in the bridge modules; LOCAL_SYNC (Drive for desktop): upload through the synced folder, second run writes nothing, unsynced upload UNKNOWN then late receipt, record before the mirror exists refused, local name conflict never overwritten, identical Drive file adopted through its mirror, different bytes held.
+`tests/test_native_backfill.py`: the latest is left to the schedule; older bills written once under the
+owner name; verification after sync; second run fetches nothing; names already in Drive skipped without a
+fetch; cap and deferral; a previously newest bill picked up later; no overwrite; fetch failure isolated;
+Drive duplicates held; both streams in one flat folder; exact Drive listing evidence; bounded cap;
+LOCAL_SYNC required.
