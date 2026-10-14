@@ -95,8 +95,8 @@ The scheduled loop above stays latest-only. On the owner's request, `native_back
 older bills once. It is never part of the scheduled prompt and never touches the v4 admission state; its
 ledger is `<state>.backfill.sqlite`, and it runs inside the v4 lease. `LOCAL_SYNC` only.
 
-1. Drive `search_files` with exactly `parentId = '<folder id>' and title contains 'EnergyGrid - '`, every
-   page. Write `{"folder_id", "query", "complete": true, "files": [{"id", "title",
+1. Drive `search_files` with exactly `parentId = '<folder id>' and title contains 'EnergyGrid'`, every
+   page (Drive search matches whole words; `'EnergyGrid - '` matches nothing). Write `{"folder_id", "query", "complete": true, "files": [{"id", "title",
    "parentId", "fileSize"}]}`.
 2. `backfill-run --max N`. One portal inventory per bound stream. The newest invoice date of each stream
    is skipped (`SKIPPED_LATEST`): it belongs to the scheduled Core. A name already in the listing or the

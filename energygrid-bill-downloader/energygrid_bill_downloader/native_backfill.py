@@ -62,8 +62,11 @@ def ledger_path(cfg: NativeConfig) -> Path:
 
 
 def drive_query(folder_id: str) -> str:
-    """The exact Drive listing the host runs before and after a backfill (all EnergyGrid files)."""
-    return f"parentId = '{folder_id}' and title contains 'EnergyGrid - '"
+    """The exact Drive listing the host runs before and after a backfill (all EnergyGrid files).
+
+    Drive search matches whole words and ignores punctuation, so `'EnergyGrid - '` finds nothing;
+    the word `EnergyGrid` is the reliable term. Extra matches are harmless (exact-title lookups)."""
+    return f"parentId = '{folder_id}' and title contains 'EnergyGrid'"
 
 
 class BackfillLedger:
