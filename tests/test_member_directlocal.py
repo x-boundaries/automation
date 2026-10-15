@@ -64,17 +64,27 @@ def page_data(nodes: list[dict], has_next: bool, end_cursor: str | None, *, stor
     return {"shop": {"id": store, "myshopifyDomain": domain}, "customers": {"pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}, "nodes": nodes}}
 
 
-def node(gid: str, created: datetime, tags: list[str]) -> dict:
-    return {"id": gid, "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ"), "tags": tags}
+def metafield_gid(gid: str) -> str:
+    return "gid://shopify/Metafield/" + gid.rsplit("/", 1)[1]
 
 
-def profile(gid: str, *, created: datetime, tags=("member-mg",), phone="+65 8000 0001", email="Alpha@Example.test", start="2026-10-15", expiry="2028-10-14", first="Synthetic", last="Member Alpha") -> dict:
+def node(gid: str, created: datetime, tags: list[str], *, registered: datetime | None | bool = True) -> dict:
+    """Baseline node. ``registered`` is the membership.start_date metafield
+    instant (default: same as createdAt); ``None`` means not written yet."""
+
+    when = created if registered is True else registered
+    registration = None if when is None else {"id": metafield_gid(gid), "createdAt": when.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    return {"id": gid, "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ"), "tags": tags, "registration": registration}
+
+
+def profile(gid: str, *, created: datetime, registered: datetime | None = None, tags=("member-mg",), phone="+65 8000 0001", email="Alpha@Example.test", start="2026-10-15", expiry="2028-10-14", first="Synthetic", last="Member Alpha", registration_id: str | None = None) -> dict:
+    when = created if registered is None else registered
     return {
         "id": gid, "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ"), "tags": list(tags),
         "firstName": first, "lastName": last,
         "defaultEmailAddress": None if email is None else {"emailAddress": email},
         "defaultPhoneNumber": None if phone is None else {"phoneNumber": phone},
-        "startDate": None if start is None else {"type": "date", "value": start},
+        "startDate": None if start is None else {"id": registration_id or metafield_gid(gid), "createdAt": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "date", "value": start},
         "expiryDate": None if expiry is None else {"type": "date", "value": expiry},
     }
 
@@ -179,7 +189,8 @@ class FakeBridge:
         if self.write_mode == "timeout_unconfirmed":
             return dl.WriteRun(started=True, timed_out=True, exited=False)
         match = self.write_mode != "mismatch"
-        return dl.WriteRun(started=True, exit_code=0, stdout=json.dumps({"save_invocation_count": 1, "readback_found": True, "readback_match": match}))
+        outcome = {"save_invocation_count": 1, "readback_found": True, "readback_match": match, "outbound_queue_changed": self.write_mode == "outbound_changed"}
+        return dl.WriteRun(started=True, exit_code=0, stdout=json.dumps(outcome))
 
 
 class DirectLocalTestCase(unittest.TestCase):
@@ -499,7 +510,8 @@ class AdmissionTests(DirectLocalTestCase):
     def test_admit_records_no_pii_and_discards_capture(self):
         path = self.fresh_profile()
         result = self.processor.process(path)
-        self.assertEqual(result, {"customer_state": "ADMITTED", "code": None, "capture_discarded": True})
+        self.assertEqual(result, {"customer_ref": self.processor._ref("c", NEW), "customer_state": "ADMITTED", "code": None, "capture_discarded": True})
+        self.assertRegex(result["customer_ref"], r"^c-[0-9a-f]{20}$")
         self.assertFalse(path.exists())
         self.assert_no_pii_at_rest()
 
@@ -645,21 +657,34 @@ class WriteTests(DirectLocalTestCase):
                     self.assertEqual((bridge.write_calls, self.ac.saves), (0, 0))
                 self.assertLessEqual(self.ac.next_calls, dl.MAX_MEMBER_NO_CANDIDATES)
 
-    def test_values_wider_than_autocount_columns_go_to_review_before_any_lookup(self):
-        cases = [("name", {"first": "Synthetic", "last": "M" * 100}), ("email", {"email": "a" * 190 + "@example.test"})]
-        for name, kwargs in cases:
+    def test_values_autocount_cannot_store_go_to_review_at_admission(self):
+        # nvarchar(n) counts UTF-16 code units: an astral character counts twice.
+        cases = [
+            ("name", {"first": "Synthetic", "last": "M" * 100}, "autocount_field_width_exceeded"),
+            ("email", {"email": "a" * 190 + "@example.test"}, "autocount_field_width_exceeded"),
+            ("astral_name", {"first": "S", "last": "\U0001F600" * 50}, "autocount_field_width_exceeded"),  # 1 + 1 + 100 units
+            ("control_character", {"first": "Synthetic", "last": "Member\x07Alpha"}, "autocount_text_invalid"),
+            ("unpaired_surrogate", {"first": "Synthetic", "last": "Member \ud800"}, "autocount_text_invalid"),
+        ]
+        for name, kwargs, code in cases:
             with self.subTest(field=name):
                 self.tearDown()
                 self.setUp()
-                self.admit_and_approve(**kwargs)
+                result = self.processor.process(self.fresh_profile(**kwargs))
+                self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", code))
                 bridge = FakeBridge(self.ac)
-                result = self.write(bridge, **kwargs)
-                self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "autocount_field_width_exceeded"))
+                with self.assertRaises(dl.DirectLocalError):
+                    self.write(bridge, **kwargs)  # terminal: never reaches any lookup or write
                 self.assertEqual((bridge.precheck_calls, bridge.write_calls, self.ac.next_calls, self.ac.saves), ([], 0, 0, 0))
-        self.tearDown()
-        self.setUp()
-        self.admit_and_approve(first="Synthetic", last="M" * 90)  # 100 characters exactly is accepted
-        self.assertEqual(self.write(FakeBridge(self.ac), first="Synthetic", last="M" * 90)["fence_state"], "CREATED_VERIFIED")
+        for last in ("M" * 90, "\U0001F600" * 44 + "M"):  # exactly 100 code units are accepted
+            with self.subTest(last=last[:3]):
+                self.tearDown()
+                self.setUp()
+                self.admit_and_approve(first="Synthetic", last=last)
+                self.assertEqual(self.write(FakeBridge(self.ac), first="Synthetic", last=last)["fence_state"], "CREATED_VERIFIED")
+
+    def test_utf16_code_units(self):
+        self.assertEqual((dl.utf16_code_units("abc"), dl.utf16_code_units("\u6c88"), dl.utf16_code_units("\U0001F600")), (3, 1, 2))
 
     def test_member_no_held_by_another_customer_counts_as_occupied(self):
         self.ledger.conn.execute("UPDATE customers SET member_no = 'M000201' WHERE customer_gid = ?", (NEW,))
@@ -704,6 +729,7 @@ class WriteTests(DirectLocalTestCase):
             "timeout_after_save": ("WRITE_OUTCOME_UNCERTAIN", "writer_timeout", 1),
             "timeout_unconfirmed": ("WRITER_TERMINATION_UNCONFIRMED", "writer_timeout_exit_unconfirmed", 1),
             "mismatch": ("CREATED_READBACK_MISMATCH", "readback_mismatch_manual_review", 1),
+            "outbound_changed": ("CREATED_OUTBOUND_QUEUE_CHANGED", "outbound_queue_changed_manual_review", 1),
         }
         for mode, (state, code, saves) in cases.items():
             with self.subTest(mode=mode):
@@ -807,7 +833,8 @@ class CrashRecoveryTests(DirectLocalTestCase):
     def test_reconcile_absent_member_is_manual_followup(self):
         self.write(FakeBridge(self.ac, write_mode="fail_after_claim"))
         result = self.processor.reconcile(self.fresh_profile(), bridge=FakeBridge(self.ac))
-        self.assertEqual(result, {"fence_state": "MANUAL_REVIEW", "code": "confirmed_absent_manual_followup"})
+        self.assertEqual((result["fence_state"], result["code"]), ("MANUAL_REVIEW", "confirmed_absent_manual_followup"))
+        self.assertRegex(result["member_ref"], r"^m-[0-9a-f]{20}$")
 
     def test_unrecorded_writer_identity_holds_until_attended_release(self):
         bridge = FakeBridge(self.ac, write_mode="parent_crash_after_save")
@@ -1042,7 +1069,9 @@ class ClassifyTests(unittest.TestCase):
         for stdout in ("", "not json", json.dumps({"save_invocation_count": 2, "readback_found": True, "readback_match": True}), json.dumps({"save_invocation_count": 1, "readback_found": "yes", "readback_match": True})):
             with self.subTest(stdout=stdout):
                 self.assertEqual(dl.classify_write(dl.WriteRun(True, 0, stdout), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"))
-        absent = json.dumps({"save_invocation_count": 1, "readback_found": False, "readback_match": False})
+        absent = json.dumps({"save_invocation_count": 1, "readback_found": False, "readback_match": False, "outbound_queue_changed": False})
+        missing_flag = json.dumps({"save_invocation_count": 1, "readback_found": True, "readback_match": True})
+        self.assertEqual(dl.classify_write(dl.WriteRun(True, 0, missing_flag), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"))
         self.assertEqual(dl.classify_write(dl.WriteRun(True, 0, absent), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "readback_absent"))
 
     def test_start_failure_with_claim_is_uncertain(self):

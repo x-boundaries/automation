@@ -97,6 +97,9 @@ MAX_MEMBER_NO_CANDIDATES = 3
 PROFILE_WAIT_MAX_CHECKS = 5
 CAPTURE_MAX_AGE_SECONDS = 900
 APPROVAL_MAX_TTL_SECONDS = 1800
+POLICY_APPROVAL_TTL_SECONDS = 300
+POLICY_MAX_TTL_HOURS = 168
+OUTLET_RE = re.compile(r"^[A-Z0-9]{2,10}$")
 WRITER_DEADLINE_SECONDS = 120
 WRITER_GRACE_SECONDS = 15
 HOLD_EXIT_CODE = 75
@@ -132,7 +135,7 @@ BASELINE_QUERY = """query XbDirectLocalCustomerPage($first: Int!, $after: String
   shop { id myshopifyDomain }
   customers(first: $first, after: $after, sortKey: ID) {
     pageInfo { hasNextPage endCursor }
-    nodes { id createdAt tags }
+    nodes { id createdAt tags registration: metafield(namespace: "membership", key: "start_date") { id createdAt } }
   }
 }"""
 
@@ -146,7 +149,7 @@ PROFILE_QUERY = """query XbDirectLocalCustomerProfile($id: ID!) {
     lastName
     defaultEmailAddress { emailAddress }
     defaultPhoneNumber { phoneNumber }
-    startDate: metafield(namespace: "membership", key: "start_date") { type value }
+    startDate: metafield(namespace: "membership", key: "start_date") { id createdAt type value }
     expiryDate: metafield(namespace: "membership", key: "expiry_date") { type value }
   }
 }"""
@@ -162,7 +165,22 @@ IDENTITY_QUERY = """query XbDirectLocalShopIdentity {
   shop { id myshopifyDomain }
 }"""
 
-PINNED_QUERIES = {_sha256(BASELINE_QUERY): "baseline", _sha256(PROFILE_QUERY): "profile", _sha256(IDENTITY_QUERY): "identity"}
+# Incremental discovery (2026-10-15): the store has about 4,300 customers, so
+# an exhaustive scan is ~90 connector calls. A recent run reads only customers
+# updated since a watermark; a registration always updates the customer, and
+# the periodic exhaustive discovery still catches any search-index lag.
+RECENT_QUERY = """query XbDirectLocalRecentCustomers($first: Int!, $after: String, $search: String!) {
+  shop { id myshopifyDomain }
+  customers(first: $first, after: $after, sortKey: UPDATED_AT, query: $search) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id createdAt tags registration: metafield(namespace: "membership", key: "start_date") { id createdAt } }
+  }
+}"""
+RECENT_SEARCH_RE = re.compile(r"^updated_at:>='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'$")
+RECENT_WATERMARK_MARGIN_SECONDS = 900
+
+PINNED_QUERIES = {_sha256(BASELINE_QUERY): "baseline", _sha256(RECENT_QUERY): "recent", _sha256(PROFILE_QUERY): "profile", _sha256(IDENTITY_QUERY): "identity"}
+PAGE_KINDS = frozenset({"baseline", "recent"})
 
 SHOP_GID_RE = re.compile(r"^gid://shopify/Shop/[1-9][0-9]{0,19}$")
 SYNTHETIC_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.synthetic\.invalid$")
@@ -246,6 +264,44 @@ def autocount_text_issue(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+METAFIELD_GID_RE = re.compile(r"^gid://shopify/Metafield/[1-9][0-9]{0,19}$")
+
+
+def registration_event(record: Mapping[str, Any], field: str) -> tuple[str | None, datetime | None]:
+    """(metafield GID, instant) of the membership registration.
+
+    Qualified 2026-10-15 (read-only, #155:6195382795): Shopify Forms (form
+    1178308) creates or matches the customer; ``membership.start_date`` is
+    written about three seconds later, also for an EXISTING customer whose
+    ``createdAt`` long predates the registration. So the registration instant
+    is that metafield's ``createdAt``, not ``Customer.createdAt``. A customer
+    without the metafield yet (registration still in flight) falls back to
+    ``Customer.createdAt``; an unparseable metafield yields ``(None, None)``.
+    """
+
+    node = record.get(field)
+    if node is None:
+        return None, parse_created_at(record.get("createdAt"))
+    if not isinstance(node, Mapping) or not isinstance(node.get("id"), str) or not METAFIELD_GID_RE.fullmatch(node["id"]):
+        return None, None
+    instant = parse_created_at(node.get("createdAt"))
+    return (node["id"], instant) if instant is not None else (None, None)
+
+
+def _registration_view(record: Mapping[str, Any], field: str) -> dict[str, Any]:
+    """The record with ``createdAt`` replaced by the registration instant, so
+    the reused cutover rules (``createdAt >= C`` is new) apply to the
+    registration event. An unparseable registration stays unparseable."""
+
+    event_id, instant = registration_event(record, field)
+    view = dict(record)
+    if instant is None:
+        view["createdAt"] = None
+    elif event_id is not None:
+        view["createdAt"] = record[field]["createdAt"]  # the validated original text
+    return view
+
+
 # --------------------------------------------------------------------------
 # Connector capture parsing
 # --------------------------------------------------------------------------
@@ -283,9 +339,12 @@ def check_tool_input(tool_input: Any) -> str:
     variables = tool_input.get("variables")
     if not isinstance(variables, Mapping):
         raise CaptureRejected("variables_invalid")
-    if kind == "baseline":
-        if not set(variables) <= {"first", "after"} or variables.get("first") != PAGE_SIZE or isinstance(variables.get("first"), bool):
+    if kind in PAGE_KINDS:
+        allowed = {"first", "after"} | ({"search"} if kind == "recent" else set())
+        if not set(variables) <= allowed or variables.get("first") != PAGE_SIZE or isinstance(variables.get("first"), bool):
             raise CaptureRejected("pagination_variables_invalid")
+        if kind == "recent" and (not isinstance(variables.get("search"), str) or not RECENT_SEARCH_RE.fullmatch(variables["search"])):
+            raise CaptureRejected("recent_search_invalid")
         if tool_input.get("first") != PAGE_SIZE or isinstance(tool_input.get("first"), bool):
             raise CaptureRejected("pagination_variables_invalid")
         after = variables.get("after")
@@ -385,14 +444,14 @@ def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) ->
     if kind == "identity":
         if set(data) != {"shop"}:
             raise CaptureRejected("identity_shape_invalid")
-    elif kind == "baseline":
+    elif kind in PAGE_KINDS:
         page = data.get("customers")
         if set(data) != {"shop", "customers"} or not isinstance(page, Mapping) or set(page) != {"pageInfo", "nodes"}:
             raise CaptureRejected("baseline_page_shape_invalid")
         info, nodes = page["pageInfo"], page["nodes"]
         if not isinstance(info, Mapping) or set(info) != {"hasNextPage", "endCursor"} or not isinstance(nodes, list):
             raise CaptureRejected("baseline_page_shape_invalid")
-        if len(nodes) > PAGE_SIZE or any(not isinstance(node, Mapping) or set(node) != {"id", "createdAt", "tags"} for node in nodes):
+        if len(nodes) > PAGE_SIZE or any(not isinstance(node, Mapping) or set(node) != {"id", "createdAt", "tags", "registration"} for node in nodes):
             raise CaptureRejected("baseline_page_shape_invalid")
     else:
         customer = data.get("customer")
@@ -542,9 +601,11 @@ def verify_private_state(root: Path) -> None:
             if issue:
                 raise DirectLocalError(issue)
         return
-    for path, _ in targets:
+    # POSIX: a 0700 root owned by this user already bars everyone else from
+    # everything below it; children need only the same owner.
+    for path, protected in targets:
         info = path.stat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if info.st_uid != os.getuid() or (protected and info.st_mode & 0o077):
             raise DirectLocalError("state_root_acl_unsafe")
 
 
@@ -622,7 +683,8 @@ CREATE TABLE runs(
   run_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('BASELINE', 'DISCOVERY')),
   cutover_at TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('CAPTURING', 'SEALED', 'ABANDONED')),
   started_at TEXT NOT NULL, sealed_at TEXT, page_count INTEGER, historical_count INTEGER,
-  transition_count INTEGER, historical_digest TEXT);
+  transition_count INTEGER, historical_digest TEXT, search TEXT,
+  CHECK (search IS NULL OR kind = 'DISCOVERY'));
 CREATE UNIQUE INDEX runs_single_baseline ON runs(kind) WHERE kind = 'BASELINE' AND state <> 'ABANDONED';
 CREATE UNIQUE INDEX runs_single_open ON runs(state) WHERE state = 'CAPTURING';
 CREATE TABLE run_pages(
@@ -636,13 +698,21 @@ CREATE TABLE customers(
   store_gid TEXT NOT NULL, customer_gid TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('DISCOVERED', 'NOT_ELIGIBLE', 'WAITING', 'ADMITTED', 'EXCLUDED_BASELINE', 'MANUAL_REVIEW', 'FENCED')),
   check_count INTEGER NOT NULL DEFAULT 0, decision_code TEXT, member_no TEXT UNIQUE, updated_at TEXT NOT NULL,
+  registration_id TEXT, registration_at TEXT, discovered_at TEXT,
   PRIMARY KEY (store_gid, customer_gid));
+CREATE TABLE admission_policies(
+  policy_id TEXT PRIMARY KEY, environment TEXT NOT NULL, autocount_book TEXT NOT NULL, store_gid TEXT NOT NULL,
+  max_creates INTEGER NOT NULL CHECK (max_creates BETWEEN 1 AND 500), created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  revoked_at TEXT);
+CREATE TABLE pos_observations(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, fence_id TEXT NOT NULL REFERENCES fences(fence_id), outlet TEXT NOT NULL,
+  observed_at TEXT NOT NULL, recorded_at TEXT NOT NULL);
 CREATE TABLE allocation_attempts(
   customer_gid TEXT NOT NULL, attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 3),
   candidate TEXT, status TEXT, created_at TEXT NOT NULL, PRIMARY KEY (customer_gid, attempt_no));
 CREATE TABLE approvals(
   approval_id TEXT PRIMARY KEY, customer_gid TEXT NOT NULL, created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL, consumed_at TEXT);
+  expires_at TEXT NOT NULL, consumed_at TEXT, policy_id TEXT REFERENCES admission_policies(policy_id));
 CREATE TABLE fences(
   fence_id TEXT PRIMARY KEY, customer_gid TEXT NOT NULL UNIQUE, member_no TEXT NOT NULL UNIQUE,
   approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(approval_id),
@@ -658,7 +728,7 @@ CREATE TABLE events(
 CREATE TRIGGER ledger_meta_immutable BEFORE UPDATE ON ledger_meta BEGIN SELECT RAISE(ABORT, 'ledger_meta_immutable'); END;
 CREATE TRIGGER ledger_meta_no_delete BEFORE DELETE ON ledger_meta BEGIN SELECT RAISE(ABORT, 'ledger_meta_immutable'); END;
 CREATE TRIGGER runs_no_delete BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT, 'run_immutable'); END;
-CREATE TRIGGER runs_cutover_immutable BEFORE UPDATE OF cutover_at, kind, started_at ON runs
+CREATE TRIGGER runs_cutover_immutable BEFORE UPDATE OF cutover_at, kind, started_at, search ON runs
   BEGIN SELECT RAISE(ABORT, 'run_cutover_immutable'); END;
 CREATE TRIGGER runs_sealed_immutable BEFORE UPDATE ON runs WHEN OLD.state = 'SEALED'
   BEGIN SELECT RAISE(ABORT, 'run_sealed_immutable'); END;
@@ -677,6 +747,19 @@ CREATE TRIGGER customers_no_delete BEFORE DELETE ON customers BEGIN SELECT RAISE
 CREATE TRIGGER customers_terminal BEFORE UPDATE OF state ON customers
   WHEN OLD.state IN ('EXCLUDED_BASELINE', 'MANUAL_REVIEW', 'FENCED') AND NEW.state IS NOT OLD.state
   BEGIN SELECT RAISE(ABORT, 'customer_state_terminal'); END;
+CREATE TRIGGER customers_registration_bound BEFORE UPDATE OF registration_id, registration_at, discovered_at ON customers
+  WHEN (OLD.registration_id IS NOT NULL AND NEW.registration_id IS NOT OLD.registration_id)
+    OR (OLD.registration_at IS NOT NULL AND NEW.registration_at IS NOT OLD.registration_at)
+    OR (OLD.discovered_at IS NOT NULL AND NEW.discovered_at IS NOT OLD.discovered_at)
+  BEGIN SELECT RAISE(ABORT, 'registration_immutable'); END;
+CREATE TRIGGER policies_no_delete BEFORE DELETE ON admission_policies BEGIN SELECT RAISE(ABORT, 'policy_immutable'); END;
+CREATE TRIGGER policies_revoke_only BEFORE UPDATE ON admission_policies
+  WHEN OLD.revoked_at IS NOT NULL OR NEW.policy_id IS NOT OLD.policy_id OR NEW.environment IS NOT OLD.environment
+    OR NEW.autocount_book IS NOT OLD.autocount_book OR NEW.store_gid IS NOT OLD.store_gid OR NEW.max_creates IS NOT OLD.max_creates
+    OR NEW.created_at IS NOT OLD.created_at OR NEW.expires_at IS NOT OLD.expires_at
+  BEGIN SELECT RAISE(ABORT, 'policy_immutable'); END;
+CREATE TRIGGER pos_observations_append_only BEFORE UPDATE ON pos_observations BEGIN SELECT RAISE(ABORT, 'pos_observation_immutable'); END;
+CREATE TRIGGER pos_observations_no_delete BEFORE DELETE ON pos_observations BEGIN SELECT RAISE(ABORT, 'pos_observation_immutable'); END;
 CREATE TRIGGER customers_member_no_bound BEFORE UPDATE OF member_no ON customers
   WHEN OLD.member_no IS NOT NULL AND NEW.member_no IS NOT OLD.member_no
   BEGIN SELECT RAISE(ABORT, 'member_no_immutable'); END;
@@ -686,7 +769,7 @@ CREATE TRIGGER attempts_recorded_once BEFORE UPDATE ON allocation_attempts WHEN 
 CREATE TRIGGER approvals_no_delete BEFORE DELETE ON approvals BEGIN SELECT RAISE(ABORT, 'approval_immutable'); END;
 CREATE TRIGGER approvals_consumed_once BEFORE UPDATE ON approvals
   WHEN OLD.consumed_at IS NOT NULL OR NEW.approval_id IS NOT OLD.approval_id OR NEW.customer_gid IS NOT OLD.customer_gid
-    OR NEW.expires_at IS NOT OLD.expires_at
+    OR NEW.expires_at IS NOT OLD.expires_at OR NEW.policy_id IS NOT OLD.policy_id
   BEGIN SELECT RAISE(ABORT, 'approval_immutable'); END;
 CREATE TRIGGER fences_no_delete BEFORE DELETE ON fences BEGIN SELECT RAISE(ABORT, 'fence_immutable'); END;
 CREATE TRIGGER fences_binding_immutable BEFORE UPDATE OF fence_id, customer_gid, member_no, approval_id, payload_digest, salt, owner_epoch, created_at ON fences
@@ -930,6 +1013,9 @@ class BridgeClient:
     def book_check(self) -> Mapping[str, Any]:
         return self._read("book-check", {})
 
+    def pos_sync_status(self) -> Mapping[str, Any]:
+        return self._read("pos-sync-status", {})
+
     def write_once(self, *, fence_id: str, claim_directory: Path, deadline: datetime, stdin_value: Mapping[str, Any], wait_seconds: float, on_started: Callable[[int, str | None], None]) -> WriteRun:
         arguments = [
             "-Operation", "write-once", "-EnableProductionAdapter", "-FenceId", fence_id,
@@ -1137,8 +1223,10 @@ class Processor:
         return parse_ts(row["cutover_at"])
 
     # -- runs (baseline / discovery) ----------------------------------------
-    def begin_run(self, kind: str) -> dict[str, Any]:
+    def begin_run(self, kind: str, *, recent: bool = False) -> dict[str, Any]:
         self.ledger.meta()
+        if recent and kind != "DISCOVERY":
+            raise DirectLocalError("run_kind_invalid")
         with self.ledger.tx() as conn:
             if conn.execute("SELECT 1 FROM runs WHERE state = 'CAPTURING'").fetchone():
                 raise DirectLocalError("run_already_open")
@@ -1157,13 +1245,29 @@ class Processor:
                 cutover = baseline["cutover_at"]
             else:
                 raise DirectLocalError("run_kind_invalid")
+            search = None
+            if recent:
+                # Watermark: the last sealed discovery start minus a margin for
+                # search-index lag, never before the cutover.
+                last = conn.execute("SELECT MAX(started_at) AS s FROM runs WHERE kind = 'DISCOVERY' AND state = 'SEALED'").fetchone()["s"]
+                mark = parse_ts(cutover) if last is None else max(parse_ts(cutover), parse_ts(last) - timedelta(seconds=RECENT_WATERMARK_MARGIN_SECONDS))
+                search = f"updated_at:>='{ts(mark)}'"
             run_id = f"run-{uuid.uuid4().hex}"
             conn.execute(
-                "INSERT INTO runs(run_id, kind, cutover_at, state, started_at) VALUES (?, ?, ?, 'CAPTURING', ?)",
-                (run_id, kind, cutover, ts(now)),
+                "INSERT INTO runs(run_id, kind, cutover_at, state, started_at, search) VALUES (?, ?, ?, 'CAPTURING', ?, ?)",
+                (run_id, kind, cutover, ts(now), search),
             )
-            self.ledger.event(conn, f"run_started:{kind.lower()}")
-        return {"run_id": run_id, "kind": kind, "cutover_at": cutover, "page_size": PAGE_SIZE, "query_sha256": _sha256(BASELINE_QUERY)}
+            self.ledger.event(conn, f"run_started:{kind.lower()}{':recent' if recent else ''}")
+        query = RECENT_QUERY if recent else BASELINE_QUERY
+        return {"run_id": run_id, "kind": kind, "cutover_at": cutover, "search": search, "page_size": PAGE_SIZE, "query_sha256": _sha256(query)}
+
+    @staticmethod
+    def _page_of(run: sqlite3.Row, capture: Capture) -> bool:
+        """Whether a page capture belongs to ``run`` (same query form and search)."""
+
+        if run["search"] is None:
+            return capture.kind == "baseline"
+        return capture.kind == "recent" and capture.variables.get("search") == run["search"]
 
     def abandon_run(self, run_id: str, *, confirm_suffix: str) -> dict[str, Any]:
         """Abandon an incomplete (CAPTURING) run; a sealed run never changes.
@@ -1184,7 +1288,7 @@ class Processor:
                     capture = parse_capture(path.read_bytes(), mode=meta["mode"], store_gid=meta["store_gid"], shop_domain=meta["shop_domain"])
                 except CaptureRejected:
                     continue  # never consumed; it still blocks any later ingest
-                if capture.kind != "baseline" or conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+                if capture.kind not in PAGE_KINDS or conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
                     continue
                 conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'abandoned', ?)", (capture.capture_sha256, capture.tool_use_id, now))
                 retired += 1
@@ -1209,7 +1313,7 @@ class Processor:
             pages: dict[str | None, Capture] = {}
             duplicates: list[Capture] = []  # identical re-captures, consumed with the run
             for _, capture in self._inbox_captures(conn, meta):
-                if capture.kind != "baseline":
+                if not self._page_of(run, capture):
                     continue
                 if conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
                     continue  # consumed by an earlier run: replay suppressed
@@ -1230,7 +1334,8 @@ class Processor:
                 if capture is None:
                     raise ShopifyReadError("capture_page_missing")
                 used.append(capture)
-                return capture.data["customers"]
+                page = capture.data["customers"]
+                return {"pageInfo": page["pageInfo"], "nodes": [_registration_view(node, "registration") for node in page["nodes"]]}
 
             try:
                 historical, transition = capture_member_mg_baseline(page_reader, cutover_at=parse_ts(run["cutover_at"]))
@@ -1240,14 +1345,14 @@ class Processor:
                 raise DirectLocalError("run_not_sealed:unchained_page_capture")
             now = ts(self.ledger.now())
             for capture in duplicates:
-                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'baseline', ?)", (capture.capture_sha256, capture.tool_use_id, now))
+                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, ?, ?)", (capture.capture_sha256, capture.tool_use_id, capture.kind, now))
             for index, capture in enumerate(used):
                 page = capture.data["customers"]
                 conn.execute(
                     "INSERT INTO run_pages(run_id, page_index, capture_sha256, has_next, node_count) VALUES (?, ?, ?, ?, ?)",
                     (run["run_id"], index, capture.capture_sha256, int(page["pageInfo"]["hasNextPage"]), len(page["nodes"])),
                 )
-                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'baseline', ?)", (capture.capture_sha256, capture.tool_use_id, now))
+                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, ?, ?)", (capture.capture_sha256, capture.tool_use_id, capture.kind, now))
             discovered = 0
             if run["kind"] == "BASELINE":
                 for gid in historical:
@@ -1260,8 +1365,8 @@ class Processor:
                 candidates = tuple(transition) + tuple(gid for gid in historical if gid not in baseline)
             for gid in candidates:
                 inserted = conn.execute(
-                    "INSERT OR IGNORE INTO customers(store_gid, customer_gid, state, updated_at) VALUES (?, ?, 'DISCOVERED', ?)",
-                    (meta["store_gid"], gid, now),
+                    "INSERT OR IGNORE INTO customers(store_gid, customer_gid, state, updated_at, discovered_at) VALUES (?, ?, 'DISCOVERED', ?, ?)",
+                    (meta["store_gid"], gid, now, now),
                 ).rowcount
                 if inserted:
                     discovered += 1
@@ -1354,7 +1459,27 @@ class Processor:
         gid = capture.variables["id"]
         in_baseline = conn.execute("SELECT 1 FROM baseline_members WHERE customer_gid = ?", (gid,)).fetchone() is not None
         required = customer["check_count"] + 1 >= PROFILE_WAIT_MAX_CHECKS if complete_required is None else complete_required
-        return evaluate_profile(capture.data["customer"], in_baseline=in_baseline, cutover_at=self._cutover(conn), profile_complete_required=required)
+        record = capture.data["customer"]
+        view = None if record is None else _registration_view(record, "startDate")
+        return evaluate_profile(view, in_baseline=in_baseline, cutover_at=self._cutover(conn), profile_complete_required=required)
+
+    def _bind_registration(self, conn: sqlite3.Connection, capture: Capture, customer: sqlite3.Row) -> str | None:
+        """Bind the registration event (metafield GID + instant) on first
+        sight; a later read naming a different event goes to review."""
+
+        record = capture.data["customer"]
+        if record is None:
+            return None
+        event_id, instant = registration_event(record, "startDate")
+        if event_id is None or instant is None:
+            return None  # in flight or malformed: evaluate_profile decides (wait / review)
+        at = instant.isoformat().replace("+00:00", "Z")
+        if customer["registration_id"] is None:
+            conn.execute("UPDATE customers SET registration_id = ?, registration_at = ? WHERE customer_gid = ?", (event_id, at, customer["customer_gid"]))
+            return None
+        if (customer["registration_id"], customer["registration_at"]) != (event_id, at):
+            return "registration_event_changed"
+        return None
 
     @staticmethod
     def _customer(conn: sqlite3.Connection, gid: str) -> sqlite3.Row:
@@ -1396,6 +1521,9 @@ class Processor:
                 raise DirectLocalError("customer_state_terminal")
             decision = self._decide(conn, capture, customer)
             state, code = outcome_map[decision.outcome], decision.code
+            changed = self._bind_registration(conn, capture, customer)
+            if changed and state in ("ADMITTED", "WAITING"):
+                state, code = "MANUAL_REVIEW", changed
             if state == "ADMITTED":
                 # A value AutoCount cannot store exactly is never admitted.
                 issue = autocount_text_issue(decision.create_payload or {})
@@ -1433,6 +1561,104 @@ class Processor:
             (gid, ts(self.ledger.now())),
         ).fetchone()
         return row["approval_id"] if row else None
+
+    # -- standing admission policy ---------------------------------------------
+    def _live_policy(self, conn: sqlite3.Connection) -> sqlite3.Row | None:
+        meta = self.ledger.meta()
+        return conn.execute(
+            "SELECT * FROM admission_policies WHERE revoked_at IS NULL AND expires_at > ? AND environment = ? AND autocount_book = ? AND store_gid = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (ts(self.ledger.now()), meta["environment"], meta["autocount_book"], meta["store_gid"]),
+        ).fetchone()
+
+    def _policy_approval(self, conn: sqlite3.Connection, gid: str) -> bool:
+        """Mint one single-use approval for an ADMITTED customer under the live
+        policy, within its create bound. Never for a customer that already
+        had one: a customer has at most one fence, ever."""
+
+        policy = self._live_policy(conn)
+        if policy is None or self.ledger.meta()["environment"] not in AUTHORISED_REAL_ENVIRONMENTS:
+            return False
+        if self._customer(conn, gid)["state"] != "ADMITTED":
+            return False
+        minted = conn.execute("SELECT COUNT(*) FROM approvals WHERE policy_id = ?", (policy["policy_id"],)).fetchone()[0]
+        if minted >= policy["max_creates"] or conn.execute("SELECT 1 FROM approvals WHERE customer_gid = ? AND policy_id IS NOT NULL", (gid,)).fetchone():
+            return False
+        now = self.ledger.now()
+        conn.execute(
+            "INSERT INTO approvals(approval_id, customer_gid, created_at, expires_at, policy_id) VALUES (?, ?, ?, ?, ?)",
+            (f"approval-{uuid.uuid4().hex}", gid, ts(now), ts(now + timedelta(seconds=POLICY_APPROVAL_TTL_SECONDS)), policy["policy_id"]),
+        )
+        self.ledger.event(conn, "write_auto_approved", customer_gid=gid, code=policy["policy_id"])
+        return True
+
+    def activate_policy(self, *, confirm_book: str, max_creates: int, ttl_hours: int) -> dict[str, Any]:
+        """Standing admission (#155:6195468717): after this one explicit,
+        bounded activation, each eligible registration receives a single-use
+        approval automatically. Bound to this ledger's environment, book and
+        store; capped; expiring; revocable. Production is refused by source."""
+
+        meta = self.ledger.meta()
+        if meta["mode"] != "connector" or meta["environment"] not in AUTHORISED_REAL_ENVIRONMENTS:
+            raise DirectLocalError(f"{meta['environment']}_environment_not_authorised")
+        if confirm_book != meta["autocount_book"]:
+            raise DirectLocalError("policy_book_confirmation_mismatch")
+        if not 1 <= max_creates <= 500 or not 1 <= ttl_hours <= POLICY_MAX_TTL_HOURS:
+            raise DirectLocalError("policy_bounds_invalid")
+        self.check_custody()
+        with self.ledger.tx() as conn:
+            if self._live_policy(conn) is not None:
+                raise DirectLocalError("policy_already_active")
+            policy_id = f"policy-{uuid.uuid4().hex}"
+            now = self.ledger.now()
+            conn.execute(
+                "INSERT INTO admission_policies(policy_id, environment, autocount_book, store_gid, max_creates, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (policy_id, meta["environment"], meta["autocount_book"], meta["store_gid"], max_creates, ts(now), ts(now + timedelta(hours=ttl_hours))),
+            )
+            self.ledger.event(conn, "policy_activated", code=policy_id)
+        return {"policy_id": policy_id, "max_creates": max_creates, "expires_in_hours": ttl_hours, "autocount_book": meta["autocount_book"]}
+
+    def revoke_policy(self) -> dict[str, Any]:
+        with self.ledger.tx() as conn:
+            policy = self._live_policy(conn)
+            if policy is None:
+                raise DirectLocalError("no_active_policy")
+            conn.execute("UPDATE admission_policies SET revoked_at = ? WHERE policy_id = ?", (ts(self.ledger.now()), policy["policy_id"]))
+            self.ledger.event(conn, "policy_revoked", code=policy["policy_id"])
+        return {"policy_id": policy["policy_id"], "state": "REVOKED"}
+
+    # -- POS visibility evidence ------------------------------------------------
+    def _fence_by_member_ref(self, conn: sqlite3.Connection, member_ref: str) -> sqlite3.Row:
+        for fence in conn.execute("SELECT * FROM fences"):
+            if hmac.compare_digest(self._ref("m", fence["member_no"]), member_ref or ""):
+                return fence
+        raise DirectLocalError("member_ref_unknown")
+
+    def record_pos_visible(self, *, member_ref: str, outlet: str, observed_at: str) -> dict[str, Any]:
+        """Operator-attested observation that the member is selectable at a
+        POS terminal of ``outlet`` (UAT evidence; never a write trigger)."""
+
+        if not OUTLET_RE.fullmatch(outlet or ""):
+            raise DirectLocalError("outlet_invalid")
+        observed = parse_ts(observed_at)
+        with self.ledger.tx() as conn:
+            fence = self._fence_by_member_ref(conn, member_ref)
+            if fence["state"] not in ("CREATED_VERIFIED", "RECONCILED_VERIFIED"):
+                raise DirectLocalError("member_not_verified_created")
+            if observed < parse_ts(fence["created_at"]) or observed > self.ledger.now() + timedelta(seconds=60):
+                raise DirectLocalError("pos_observation_time_invalid")
+            conn.execute("INSERT INTO pos_observations(fence_id, outlet, observed_at, recorded_at) VALUES (?, ?, ?, ?)", (fence["fence_id"], outlet, ts(observed), ts(self.ledger.now())))
+            self.ledger.event(conn, "pos_visible_recorded", customer_gid=fence["customer_gid"], fence_id=fence["fence_id"], code=outlet)
+        return {"member_ref": member_ref, "outlet": outlet, "recorded": True}
+
+    def pos_sync_status(self, bridge: BridgeClient) -> dict[str, Any]:
+        """Read-only HQ view of POS outlet sync (no member data): each outlet's
+        last finished sync and liveness, plus the Member change counter."""
+
+        if self.ledger.meta()["mode"] != "connector":
+            raise DirectLocalError("pos_sync_status_requires_connector_ledger")
+        self._require_bridge(bridge)
+        return dict(bridge.pos_sync_status())
 
     def _allocate(self, gid: str, bridge: BridgeClient) -> tuple[str | None, str | None]:
         with self.ledger.tx() as conn:
@@ -1490,7 +1716,7 @@ class Processor:
         if issue:
             return self._review(gid, issue)
         with self.ledger.tx() as conn:
-            if self._live_approval(conn, gid) is None:
+            if self._live_approval(conn, gid) is None and not self._policy_approval(conn, gid):
                 return {"write": "not_started", "code": "write_approval_missing"}
         try:
             precheck = bridge.precheck(duplicate_phone_keys(payload.get("mobile_phone")), payload.get("email_address"))
@@ -1610,7 +1836,7 @@ class Processor:
             started = parse_ts(run["started_at"])
             pages: dict[str | None, Capture] = {}
             for _, capture in self._inbox_captures(conn, meta):
-                if capture.kind != "baseline" or capture.captured_at < started:
+                if not self._page_of(run, capture) or capture.captured_at < started:
                     continue
                 if conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
                     continue
@@ -1619,7 +1845,10 @@ class Processor:
             for _ in range(len(pages) + 1):
                 capture = pages.get(after)
                 if capture is None:
-                    tool_input: dict[str, Any] = {"query": BASELINE_QUERY, "variables": {"first": PAGE_SIZE, "after": after}, "first": PAGE_SIZE}
+                    variables: dict[str, Any] = {"first": PAGE_SIZE, "after": after}
+                    if run["search"] is not None:
+                        variables["search"] = run["search"]
+                    tool_input: dict[str, Any] = {"query": RECENT_QUERY if run["search"] else BASELINE_QUERY, "variables": variables, "first": PAGE_SIZE}
                     if after is not None:
                         tool_input["after"] = after
                     return {"status": "request", "purpose": f"{run['kind'].lower()}_page", "tool_name": CONNECTOR_TOOL, "tool_input": tool_input}
@@ -1693,10 +1922,24 @@ class Processor:
         """PII-free evidence for UAT: keyed references, states and codes only."""
 
         conn = self.ledger.conn
-        fences = [
-            {"customer_ref": self._ref("c", r["customer_gid"]), "member_ref": self._ref("m", r["member_no"]), "state": r["state"], "code": r["code"], "created_at": r["created_at"]}
-            for r in conn.execute("SELECT customer_gid, member_no, state, code, created_at FROM fences ORDER BY created_at")
-        ]
+        def since(start: str | None, end: str | None) -> int | None:
+            return None if start is None or end is None else int((parse_ts(end) - parse_ts(start)).total_seconds())
+
+        fences = []
+        for r in conn.execute(
+            "SELECT f.fence_id, f.customer_gid, f.member_no, f.state, f.code, f.created_at, f.updated_at, c.registration_at, c.discovered_at "
+            "FROM fences f JOIN customers c ON c.customer_gid = f.customer_gid ORDER BY f.created_at"
+        ):
+            pos = conn.execute("SELECT outlet, MIN(observed_at) AS first FROM pos_observations WHERE fence_id = ? GROUP BY outlet ORDER BY outlet", (r["fence_id"],)).fetchall()
+            fences.append({
+                "customer_ref": self._ref("c", r["customer_gid"]), "member_ref": self._ref("m", r["member_no"]), "state": r["state"], "code": r["code"],
+                "latency_seconds": {
+                    "registration_to_discovered": since(r["registration_at"], r["discovered_at"]),
+                    "registration_to_fenced": since(r["registration_at"], r["created_at"]),
+                    "registration_to_outcome": since(r["registration_at"], r["updated_at"]),
+                    "registration_to_pos_visible": {row["outlet"]: since(r["registration_at"], row["first"]) for row in pos},
+                },
+            })
         reviews = [
             {"customer_ref": self._ref("c", r["customer_gid"]), "code": r["decision_code"]}
             for r in conn.execute("SELECT customer_gid, decision_code FROM customers WHERE state = 'MANUAL_REVIEW' ORDER BY updated_at")
@@ -1749,10 +1992,19 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--shop-domain", required=True)
     inspect = commands.add_parser("inspect-identity")
     inspect.add_argument("--capture", required=True)
-    for name in ("begin-baseline", "begin-discovery", "ingest-run", "recover", "status", "next-request", "purge-inbox", "pending", "uat-report"):
+    commands.add_parser("begin-discovery").add_argument("--recent", action="store_true")
+    for name in ("begin-baseline", "ingest-run", "recover", "status", "next-request", "purge-inbox", "pending", "uat-report", "revoke-policy"):
         commands.add_parser(name)
-    book = commands.add_parser("book-check")
-    book.add_argument("--bridge-script")
+    for name in ("book-check", "pos-sync-status"):
+        commands.add_parser(name).add_argument("--bridge-script")
+    policy = commands.add_parser("activate-policy")
+    policy.add_argument("--confirm-book", required=True)
+    policy.add_argument("--max-creates", type=int, required=True)
+    policy.add_argument("--ttl-hours", type=int, required=True)
+    pos = commands.add_parser("record-pos-visible")
+    pos.add_argument("--member-ref", required=True)
+    pos.add_argument("--outlet", required=True)
+    pos.add_argument("--observed-at", required=True)
     abandon = commands.add_parser("abandon-run")
     abandon.add_argument("--run-id", required=True)
     abandon.add_argument("--confirm-suffix", required=True)
@@ -1797,7 +2049,7 @@ def main(argv: list[str] | None = None) -> int:
             processor.check_custody()  # every command on a connector ledger
             simple = {
                 "begin-baseline": lambda: processor.begin_run("BASELINE"),
-                "begin-discovery": lambda: processor.begin_run("DISCOVERY"),
+                "begin-discovery": lambda: processor.begin_run("DISCOVERY", recent=args.recent),
                 "ingest-run": processor.ingest_run,
                 "recover": processor.recover,
                 "status": processor.status,
@@ -1805,6 +2057,7 @@ def main(argv: list[str] | None = None) -> int:
                 "purge-inbox": processor.purge_inbox,
                 "pending": processor.pending,
                 "uat-report": processor.uat_report,
+                "revoke-policy": processor.revoke_policy,
             }
             if args.command in simple:
                 result = simple[args.command]()
@@ -1816,6 +2069,12 @@ def main(argv: list[str] | None = None) -> int:
                 result = processor.approve_write(args.gid, confirm_suffix=args.confirm_suffix, ttl_seconds=args.ttl_seconds)
             elif args.command == "book-check":
                 result = processor.book_check(_bridge_for(processor, args.bridge_script))
+            elif args.command == "pos-sync-status":
+                result = processor.pos_sync_status(_bridge_for(processor, args.bridge_script))
+            elif args.command == "activate-policy":
+                result = processor.activate_policy(confirm_book=args.confirm_book, max_creates=args.max_creates, ttl_hours=args.ttl_hours)
+            elif args.command == "record-pos-visible":
+                result = processor.record_pos_visible(member_ref=args.member_ref, outlet=args.outlet, observed_at=args.observed_at)
             elif args.command == "process":
                 result = processor.process(Path(args.capture), bridge=_bridge_for(processor, args.bridge_script), enable_write=args.enable_autocount_write)
             else:

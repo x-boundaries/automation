@@ -23,7 +23,7 @@
 # without SaveMember. Claim and outcome files are never deleted here.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("book-check", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once")][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once")][string]$Operation,
     [switch]$EnableProductionAdapter,
     [string]$FenceId,
     [string]$ClaimDirectory,
@@ -224,6 +224,10 @@ try {
                 # identity and empty queues; nothing member-level is touched.
                 if ($null -ne $SessionFactory) { throw "book_check_requires_real_session" }
                 $result = [ordered]@{ book = $TargetBook; identity_verified = $true; outbound_quiet = $true }
+            }
+            "pos-sync-status" {
+                if ($null -ne $SessionFactory) { throw "pos_sync_status_requires_real_session" }
+                try { $result = Get-XbDlPosSyncState -DBSetting $session.DBSetting } catch { throw "pos_sync_state_unreadable" }
             }
             "legacy-precheck" { $result = Invoke-XbDirectLocalLegacyPrecheck -Session $session -Request $request }
             "next-member-no" { $result = [ordered]@{ member_no = (Get-XbAutoCountNextMemberNo -Session $session) } }

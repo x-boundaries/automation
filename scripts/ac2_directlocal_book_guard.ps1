@@ -101,6 +101,22 @@ function Test-XbDlOutboundChanged {
     catch { return $true }
 }
 
+function Get-XbDlPosSyncState {
+    # HQ-side POS sync liveness (AutoCount POS 5.2 SyncRegistration) and the
+    # Member change counter the incremental sync reads. No member data. Uses
+    # only the qualified DBSetting.ExecuteScalar path (one FOR JSON value).
+    param([Parameter(Mandatory)]$DBSetting)
+    $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql ("SELECT (SELECT Location AS location, SyncName AS sync_name, " +
+        "CONVERT(varchar(19), LastFinishSyncTime, 126) AS last_finish_sync_local, CONVERT(varchar(19), LastAliveTime, 126) AS last_alive_local " +
+        "FROM SyncRegistration ORDER BY Location, SyncName FOR JSON PATH, INCLUDE_NULL_VALUES)"))
+    $outlets = if ([string]::IsNullOrWhiteSpace($json)) { @() } else { @($json | ConvertFrom-Json) }
+    return [ordered]@{
+        server_now_local = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT CONVERT(varchar(19), GETDATE(), 126)")
+        member_change_counter = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'")
+        outlets = $outlets
+    }
+}
+
 function New-XbDlRealSession {
     # Every guard runs in this order; any failure stops before the next step.
     param([Parameter(Mandatory)][string]$Book, [Parameter(Mandatory)][string]$AcRoot)

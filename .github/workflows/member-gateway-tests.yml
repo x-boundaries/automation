@@ -42,6 +42,12 @@ on:
       - "scripts/ac2_directlocal_e7_isolation_check.py"
       - "scripts/ac2_directlocal_e7_owner_console.ps1"
       - "tests/test_directlocal_e7_testbook_ps.py"
+      - "scripts/ac2_directlocal_book_guard.ps1"
+      - "scripts/ac2_directlocal_owner_console.ps1"
+      - "tests/test_member_directlocal_realcore.py"
+      - "tests/test_directlocal_realbridge_ps.py"
+      - "docs/autocount2-automation/member_directlocal_contract.md"
+      - "docs/autocount2-automation/member_directlocal_uat_runbook.md"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
@@ -109,6 +115,12 @@ on:
       - "scripts/ac2_directlocal_e7_isolation_check.py"
       - "scripts/ac2_directlocal_e7_owner_console.ps1"
       - "tests/test_directlocal_e7_testbook_ps.py"
+      - "scripts/ac2_directlocal_book_guard.ps1"
+      - "scripts/ac2_directlocal_owner_console.ps1"
+      - "tests/test_member_directlocal_realcore.py"
+      - "tests/test_directlocal_realbridge_ps.py"
+      - "docs/autocount2-automation/member_directlocal_contract.md"
+      - "docs/autocount2-automation/member_directlocal_uat_runbook.md"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
@@ -171,7 +183,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD
@@ -203,6 +215,8 @@ jobs:
           tests.test_member_gateway_worker_cycle_ps
           tests.test_member_gateway_shopify_ps
           tests.test_directlocal_bridge_ps
+          tests.test_directlocal_realbridge_ps
+          tests.test_member_directlocal_realcore
           tests.test_directlocal_e7_testbook_ps -v
 
   bounded-import-security:
