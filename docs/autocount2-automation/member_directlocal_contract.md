@@ -31,7 +31,7 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
   -> strict capture checks -> SQLite ledger <state_root>\ledger.sqlite3
   -> reused shopify_admission.capture_member_mg_baseline / evaluate_profile
   -> powershell.exe -File scripts\ac2_directlocal_member_bridge.ps1 (one op per child)
-       -> scripts\ac2_member_gateway_autocount_adapter.ps1 (unchanged, shopify_m1)
+       -> scripts\ac2_member_gateway_autocount_adapter.ps1 (shopify_m1; only change: OpeningPoints decimal scale)
 ```
 
 | File | Role |
@@ -232,7 +232,9 @@ the printed SHA-256 is the custody link to the create script.
    `GetNextMemberNo` candidates each probed by `COUNT`, re-probe, queue
    re-check, fence with deadline, exclusive claim, one `SaveMember` inside
    `New-XbAutoCountMember` (`shopify_m1`, contact fields NULL), one `GetMember`
-   readback, exact comparison, queue re-check (a new queue row is
+   readback, exact comparison (`OpeningPoints`, SQL `decimal(19,2)`, is
+   compared at canonical scale so a reloaded `0.00` equals the assigned `0`;
+   NULL, non-zero and missing values still mismatch), queue re-check (a new queue row is
    `CREATED_OUTBOUND_QUEUE_CHANGED_HOLD`), and an outcome file with
    before/after audit counters (Member change counter, ChangeLog, EventLog,
    Activity, queues). The intent, fence, claim and outcome records are

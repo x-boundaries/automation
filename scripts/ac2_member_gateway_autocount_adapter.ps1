@@ -324,6 +324,11 @@ function Convert-XbAutoCountNormalizedValue {
         return $Value.ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if ($Value -is [bool]) { return $(if ($Value) { "T" } else { "F" }) }
+    # OpeningPoints is SQL decimal(19,2): the assigned [decimal]0 reloads as
+    # 0.00, so compare it at a canonical scale. Other fields keep their text.
+    if ($Field -ceq "OpeningPoints" -and $Value -is [decimal]) {
+        return $Value.ToString("0.############################", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
     if ($Value -is [byte] -or $Value -is [int16] -or $Value -is [int32] -or
         $Value -is [int64] -or $Value -is [decimal] -or $Value -is [double] -or
         $Value -is [single]) {
