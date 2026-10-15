@@ -529,6 +529,30 @@ class FlatFolderTests(NativeBridgeBase):
         self.assertEqual(2, len(self.host.successes()))
         self.assertEqual(0, len(self.host.failures()))
 
+    def _precheck_with(self, extra_titles: list[str]) -> dict:
+        """Seal EB with Drive's loose `title =` answer: the exact matches plus other named files."""
+        self.acquire()
+        step = self.next()
+        while step["stream"] != EB:
+            self.host.drive_step(step)
+            step = self.next()
+        loose = self.host.search(FLAT, step["display_filename"])
+        for title in extra_titles:
+            file_id = self.host.put(FLAT, title, pdf(title))
+            loose.append({"id": file_id, "title": title, "parentId": FLAT})
+        evidence = {"folder_id": FLAT, "title": step["display_filename"], "complete": True,
+                    "query": step["precheck_query"], "matches": loose}
+        return self.call(bridge.drive_seal, step["intent_id"], evidence)
+
+    def test_a_loose_drive_match_with_another_name_does_not_occupy_the_name(self) -> None:
+        # Observed live: Drive returned the EB bill for the Tenant bill's exact-title query.
+        sealed = self._precheck_with(["SEP 2026 - EnergyGrid - Tenant Bill - TN Invoice 0002.pdf"])
+        self.assertEqual("SEALED", sealed["outcome"])
+
+    def test_the_same_name_in_another_letter_case_still_occupies_the_name(self) -> None:
+        sealed = self._precheck_with(["sep 2026 - energygrid - eb bill - eb invoice 0002.pdf"])
+        self.assertEqual("RECONCILE", sealed["outcome"])
+
     def test_adoption_requires_the_core_readback_of_that_file(self) -> None:
         self.host.put(FLAT, "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf", pdf("EB_BILL EB Invoice 0002.pdf"))
         self.acquire()

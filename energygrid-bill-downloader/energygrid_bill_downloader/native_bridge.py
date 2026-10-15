@@ -381,6 +381,15 @@ def _session(state, now_ms: int) -> Iterator[None]:
         state.release_lease(OWNER_TOKEN)
 
 
+def _other_title(match: Any, title: str) -> bool:
+    """True only for a well-formed precheck match that names a different file (case-insensitive)."""
+    from .naming import display_key
+
+    if type(match) is not dict or type(match.get("title")) is not str or not match["title"]:
+        return False
+    return display_key(match["title"]) != display_key(title)
+
+
 def _check_intent_id(intent_id: Any) -> str:
     if type(intent_id) is not str or not _INTENT_ID_RE.fullmatch(intent_id):
         raise NativeRefusal("EG_NATIVE_INTENT_ID_INVALID")
@@ -766,6 +775,11 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
             raise NativeRefusal(reference)
         if outcome == "HOLD":
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id, support_ref=reference)
+        # Drive's `title =` search is not exact: it also returns other files that share words with the
+        # name (observed live: the EB bill for the Tenant bill's query). Only a well-formed match whose
+        # title differs from this name is ignored; an equal name in any letter case, or a malformed
+        # match, still occupies the name.
+        matches = [match for match in matches if not _other_title(match, invoice["display_filename"])]
         if len(matches) == 1 and type(matches[0]) is dict and type(matches[0].get("id")) is str \
                 and _PROVIDER_ID_RE.fullmatch(matches[0]["id"]):
             # A file with this exact name already exists (for example filed by hand). Never overwrite or
