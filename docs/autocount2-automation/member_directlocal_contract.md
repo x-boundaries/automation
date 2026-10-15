@@ -208,7 +208,8 @@ are unchanged.
   (`AED_XBOUNDARIES_JBM_FE`), program 5.2.16.33; terminals `T01`, `XB01`, `XB02`
   (outlet `XB03`), `XB05`; no member-type terminal filter.
 - `Member` has an active `ChangeCount` counter (the incremental sync source).
-  Outlet XB01 started sync cycles at 23:19:47 and 23:34:47 SGT: a 15-minute
+  Outlet XB01 started sync cycles at 23:19:47, 23:34:47 and 23:49:47 SGT (each
+  finished in under 0.1 s): a 15-minute
   interval set on the outlet (not stored at HQ), with liveness pings between.
   So a member saved at HQ becomes selectable at POS only after the outlet's next
   cycle (up to about 15 minutes) unless the outlet syncs on demand.

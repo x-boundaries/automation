@@ -128,7 +128,7 @@ Not possible on `AED_TESTINGAPI`. When E9 is approved, after the create:
 
 3. `uat-report` then shows `registration_to_pos_visible` per outlet.
 
-Observed 2026-10-15: outlet XB01 syncs every 15 minutes, so expect up to about
+Observed 2026-10-15 (three cycles): outlet XB01 syncs every 15 minutes, so expect up to about
 15 minutes after the save unless the outlet syncs on demand. A created member
 that is not selectable after the next completed sync is a P0 failure.
 
