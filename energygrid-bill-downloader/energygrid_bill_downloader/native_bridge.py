@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -69,6 +70,8 @@ _INTENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,128}", re.ASCII)
 # Exit codes follow the v3 core contract: 0 done or nothing to do, 10 retryable,
 # 20 HOLD or uncertainty recorded, 64 refused with no state change.
 EXIT_OK, EXIT_RETRY, EXIT_HOLD, EXIT_REFUSED = 0, 10, 20, 64
+CEILING_LIFETIME, CEILING_PER_PERIOD = "LIFETIME", "PER_PERIOD"
+MAX_CEILING_PERIOD_DAYS = 31
 
 
 class NativeRefusal(OfflineV4Error):
@@ -125,6 +128,10 @@ class NativeConfig:
     synthetic_root: Path | None = field(default=None, repr=False)
     portal_config_path: Path | None = field(default=None, repr=False)
     inventory_ceiling: int = 200
+    # P-4: LIFETIME (the UAT default: counts over the database's life) or PER_PERIOD (UTC calendar
+    # buckets of ceiling_period_days days anchored at the Unix epoch).
+    ceiling_mode: str = "LIFETIME"
+    ceiling_period_days: int | None = None
     # UAT_PORTAL only, optional: the private Tenant Bill source config (tenant_source.py). Absent = UNBOUND.
     tenant_config_path: Path | None = field(default=None, repr=False)
 
@@ -229,7 +236,19 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
     attach_pdf = gmail_raw["attach_pdf"]
     if type(attach_pdf) is not bool:
         raise ConfigError("gmail.attach_pdf must be true or false")
-    ceiling = _closed(data["effect_ceiling"], {"drive_uploads", "gmail_sends"}, "effect_ceiling")
+    ceiling_raw = data["effect_ceiling"]
+    ceiling_mode = ceiling_raw.get("mode", CEILING_LIFETIME) if type(ceiling_raw) is dict else None
+    if ceiling_mode == CEILING_PER_PERIOD:
+        ceiling = _closed(ceiling_raw, {"mode", "period_days", "drive_uploads", "gmail_sends"}, "effect_ceiling")
+        period_days = ceiling["period_days"]
+        if type(period_days) is not int or not 1 <= period_days <= MAX_CEILING_PERIOD_DAYS:
+            raise ConfigError(f"effect_ceiling.period_days must be an integer from 1 to {MAX_CEILING_PERIOD_DAYS}")
+    elif ceiling_mode == CEILING_LIFETIME:
+        keys = {"drive_uploads", "gmail_sends"} | ({"mode"} & set(ceiling_raw))
+        ceiling = _closed(ceiling_raw, keys, "effect_ceiling")
+        period_days = None
+    else:
+        raise ConfigError("effect_ceiling.mode must be LIFETIME or PER_PERIOD")
     synthetic_root = portal_config = tenant_config = None
     if mode == MODE_UAT_SYNTHETIC:
         synthetic_root = _private_path(data["synthetic_root"], "synthetic_root", checkout_root)
@@ -247,6 +266,8 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         ),
         max_drive_uploads=_ceiling(ceiling["drive_uploads"], "effect_ceiling.drive_uploads"),
         max_gmail_sends=_ceiling(ceiling["gmail_sends"], "effect_ceiling.gmail_sends"),
+        ceiling_mode=ceiling_mode,
+        ceiling_period_days=period_days,
         synthetic_root=synthetic_root,
         portal_config_path=portal_config,
         tenant_config_path=tenant_config,
@@ -367,6 +388,12 @@ def _iso(now_ms: int) -> str:
     return datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def ms_from_iso(value: str) -> int:
+    """Inverse of _iso (second precision, UTC)."""
+    parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp()) * 1000
+
+
 def new_run_id() -> str:
     return str(uuid.uuid4())
 
@@ -468,6 +495,39 @@ def drive_stream_step(state, stream: str) -> tuple[str, str | None, dict | None,
     return "IDLE", None, None, None
 
 
+def _archive_matches(cfg: NativeConfig, invoice: dict) -> bool:
+    """Read-only re-check that the archived bytes still are the admitted invoice (no state change)."""
+    path = cfg.archive_root / invoice["archive_relpath"]
+    try:
+        ensure_no_reparse_components(path)
+        payload = path.read_bytes()
+    except (AppError, OSError):
+        return False
+    return hashlib.sha256(payload).hexdigest() == invoice["sha256"] and len(payload) == invoice["byte_size"]
+
+
+def reconcile_candidate(state, cfg: NativeConfig, stream: str) -> tuple[dict, dict] | None:
+    """P-3: the head-of-stream LOCAL_SYNC Drive intent that was sealed but never recorded, if it can be
+    reconciled read-only: DISPATCHED or UNKNOWN, a sealed dispatch row, archive bytes still equal to
+    the Core hash, and the local mirror holding exactly those bytes. Reads only.
+
+    Only the oldest unresolved invoice of the stream is considered (FIFO), so a HOLD ahead of it is
+    never skipped. The host then runs the exact Drive poll (rule P1) and a late `drive-record`; nothing
+    is re-sealed, rewritten, re-uploaded or re-sent.
+    """
+    if cfg.drive.mode != DRIVE_LOCAL_SYNC:
+        return None
+    for invoice in state.invoices_for_stream(stream):
+        drive = state.intents_for_invoice(invoice["invoice_key"])["DRIVE_UPLOAD"]
+        if drive["state"] == "VERIFIED":
+            continue
+        if (drive["state"] in ("DISPATCHED", "UNKNOWN") and state.dispatch_row(drive["intent_id"]) is not None
+                and _archive_matches(cfg, invoice) and _local_mirror_verdict(cfg, invoice) is True):
+            return invoice, drive
+        return None
+    return None
+
+
 def _current_step(state, intent_id: str, action: str) -> tuple[dict, dict]:
     """The intent must be PENDING and be exactly the next planned Drive step of its stream (FIFO)."""
     intent, invoice = _invoice_for_intent(state, intent_id)
@@ -532,15 +592,80 @@ def _local_mirror_verdict(cfg: NativeConfig, invoice: dict) -> bool | None:
     return None if state == "MISSING" else state == "PRESENT"
 
 
-def _write_sync_file(cfg: NativeConfig, invoice: dict, payload: bytes) -> bool:
-    """LOCAL_SYNC: create the file once in the synced folder (exclusive create, never overwrite)."""
-    path = sync_path(cfg, invoice)
+STAGE_PREFIX = ".eg-stage-"
+STAGE_SUFFIX = ".part"
+_STAGE_NAME_RE = re.compile(r"\.eg-stage-[0-9a-f]{32}\.part", re.ASCII)
+
+
+def sync_folder_problem(folder: Path) -> str | None:
+    """None when a LOCAL_SYNC folder can be written now; otherwise a closed reference. Reads only.
+
+    Absent (Drive for desktop not mounted), not a directory, or containing a reparse point in its
+    path: no seal may happen (P-2), and nothing is ever written outside the configured folder.
+    """
     try:
-        ensure_no_reparse_components(path.parent)
-        with open(path, "xb") as handle:
+        ensure_no_reparse_components(folder)
+        metadata = folder.lstat()
+    except FileNotFoundError:
+        return "EG_NATIVE_SYNC_FOLDER_UNAVAILABLE"
+    except (AppError, OSError):
+        return "EG_NATIVE_SYNC_FOLDER_UNSAFE"
+    if not stat.S_ISDIR(metadata.st_mode):
+        return "EG_NATIVE_SYNC_FOLDER_UNAVAILABLE"
+    return None
+
+
+def clean_stale_stages(folder: Path) -> int:
+    """Remove staging files a crashed run left behind. Only exact Core staging names are touched.
+
+    Callers hold the v4 lease (or the backfill lease), so no live writer owns one of these files.
+    """
+    removed = 0
+    try:
+        ensure_no_reparse_components(folder)
+        entries = list(folder.iterdir())
+    except (AppError, OSError):
+        return 0
+    for entry in entries:
+        if not _STAGE_NAME_RE.fullmatch(entry.name):
+            continue
+        try:
+            if stat.S_ISREG(entry.lstat().st_mode):
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def publish_staged(folder: Path, name: str, payload: bytes) -> None:
+    """Publish `payload` as `folder/name` in one step, never replacing a file (H-4).
+
+    The bytes are first written and flushed to disk under a Core staging name in the same folder,
+    then moved to the final name with MoveFileExW (no replace, write-through). A crash or error at
+    any point leaves no partial file under the final name; the staging file is removed here or by
+    `clean_stale_stages` on the next run. Raises on failure; the caller re-judges the final name.
+    """
+    from .publication import publish_no_replace
+
+    ensure_no_reparse_components(folder)
+    staged = folder / f"{STAGE_PREFIX}{uuid.uuid4().hex}{STAGE_SUFFIX}"
+    try:
+        with open(staged, "xb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        publish_no_replace(staged, folder / name)
+    finally:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+
+
+def _write_sync_file(cfg: NativeConfig, invoice: dict, payload: bytes) -> bool:
+    """LOCAL_SYNC: publish the file once in the synced folder (staged, atomic, never overwrite)."""
+    path = sync_path(cfg, invoice)
+    try:
+        publish_staged(path.parent, path.name, payload)
     except (AppError, OSError):
         return _file_state(path, invoice) == "PRESENT"
     return _file_state(path, invoice) == "PRESENT"
@@ -583,12 +708,36 @@ def _ensure_named_archive(state, cfg: NativeConfig, invoice: dict, drive_intent_
     return "HOLD", "EG_NATIVE_NAMED_ARCHIVE_CONFLICT"
 
 
-def _at_ceiling(state, cfg: NativeConfig, action: str) -> bool:
-    return state.dispatch_count("DRIVE_UPLOAD") >= cfg.max_drive_uploads
+def ceiling_period(cfg: NativeConfig, now_ms: int) -> tuple[str, str | None]:
+    """(period key, period start ISO) for the effect ceilings (P-4). LIFETIME: ("LIFETIME", None).
+
+    PER_PERIOD buckets are whole UTC days counted from the Unix epoch, period_days long, so the
+    boundary is deterministic: no local time zone, no DST and no wall-clock reset moves it.
+    """
+    if cfg.ceiling_mode != CEILING_PER_PERIOD:
+        return CEILING_LIFETIME, None
+    day = now_ms // 86_400_000
+    bucket = day // cfg.ceiling_period_days
+    start_ms = bucket * cfg.ceiling_period_days * 86_400_000
+    start = _iso(start_ms)
+    return f"P{cfg.ceiling_period_days}D-{start[:10]}", start
 
 
-def _check_ceiling(state, cfg: NativeConfig, action: str) -> None:
-    if _at_ceiling(state, cfg, action):
+def drive_dispatches_counted(state, cfg: NativeConfig, now_ms: int) -> int:
+    """Sealed Drive dispatches that count against the ceiling now. A sealed dispatch counts whether or
+    not it later succeeded, so a possibly-made effect is never forgotten."""
+    _key, start = ceiling_period(cfg, now_ms)
+    if start is None:
+        return state.dispatch_count("DRIVE_UPLOAD")
+    return state.dispatch_count_since("DRIVE_UPLOAD", start)
+
+
+def _at_ceiling(state, cfg: NativeConfig, action: str, now_ms: int) -> bool:
+    return drive_dispatches_counted(state, cfg, now_ms) >= cfg.max_drive_uploads
+
+
+def _check_ceiling(state, cfg: NativeConfig, action: str, now_ms: int) -> None:
+    if _at_ceiling(state, cfg, action, now_ms):
         raise NativeRefusal("EG_NATIVE_EFFECT_CEILING_REACHED")
 
 
@@ -640,6 +789,78 @@ def _sweep_notifications(state, cfg: NativeConfig, now_iso: str) -> None:
 
     with _notification_store(cfg) as store:
         native_notify.sweep(state, store, now_iso)
+
+
+# ---------------------------------------------------------------------------
+# Hash provenance (H-3)
+#
+# A Drive receipt's provider_sha256 must equal the Core hash for a VERIFIED state (v4 trigger). In
+# LOCAL_SYNC that value comes from the synced local mirror, not from bytes Drive returned. This
+# bridge-owned, append-only store says which method produced each verification. Receipts recorded
+# before it existed are reported as UNRECORDED_LEGACY and are never relabelled.
+# ---------------------------------------------------------------------------
+
+HASH_LOCAL_MIRROR = "LOCAL_MIRROR_SHA256"
+HASH_PROVIDER_READBACK = "PROVIDER_READBACK_SHA256"
+HASH_UNRECORDED = "UNRECORDED_LEGACY"
+_PROVENANCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS drive_hash_provenance (
+  intent_id TEXT PRIMARY KEY CHECK (length(intent_id) BETWEEN 8 AND 128),
+  method TEXT NOT NULL CHECK (method IN ('LOCAL_MIRROR_SHA256','PROVIDER_READBACK_SHA256')),
+  sha256 TEXT NOT NULL CHECK (length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+  provider_ref TEXT NOT NULL CHECK (length(provider_ref) BETWEEN 1 AND 128),
+  recorded_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS drive_hash_provenance_no_update BEFORE UPDATE ON drive_hash_provenance
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS drive_hash_provenance_no_delete BEFORE DELETE ON drive_hash_provenance
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+"""
+
+
+def provenance_path(cfg: NativeConfig) -> Path:
+    return cfg.state_path.with_name(cfg.state_path.stem + ".provenance.sqlite")
+
+
+@contextlib.contextmanager
+def _provenance(cfg: NativeConfig, *, create: bool) -> Iterator[Any]:
+    import sqlite3
+
+    path = provenance_path(cfg)
+    if not create and not path.exists():
+        yield None
+        return
+    connection = sqlite3.connect(str(path), timeout=10, isolation_level=None)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.executescript(_PROVENANCE_SCHEMA)
+        yield connection
+    finally:
+        connection.close()
+
+
+def _record_provenance(cfg: NativeConfig, intent_id: str, method: str, sha256: str, provider_ref: str,
+                       now_iso: str) -> None:
+    """Write-once: the first method recorded for an intent stands. Called before the receipt, so a
+    crash between the two leaves an honest label for a receipt that may follow."""
+    with _provenance(cfg, create=True) as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO drive_hash_provenance (intent_id, method, sha256, provider_ref, recorded_at) "
+            "VALUES (?,?,?,?,?)",
+            (intent_id, method, sha256, provider_ref, now_iso),
+        )
+
+
+def hash_provenance(cfg: NativeConfig | None, intent_id: str) -> str:
+    """The recorded verification method for an intent, or UNRECORDED_LEGACY. Reads only."""
+    if cfg is None:
+        return HASH_UNRECORDED
+    with _provenance(cfg, create=False) as connection:
+        if connection is None:
+            return HASH_UNRECORDED
+        row = connection.execute("SELECT method FROM drive_hash_provenance WHERE intent_id=?", (intent_id,)).fetchone()
+    return row[0] if row is not None else HASH_UNRECORDED
 
 
 def _payload_path(cfg: NativeConfig, intent_id: str) -> Path:
@@ -707,7 +928,14 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
             native_notify.sweep(state, store, now_iso)
         plans = {stream: drive_stream_step(state, stream) for stream in V4_STREAMS}
         stepping = [stream for stream in _v4_rotated(V4_STREAMS, state.cursor()) if plans[stream][0] == "STEP"]
-        ready = [] if _at_ceiling(state, cfg, "DRIVE_UPLOAD") else stepping
+        drive_capped = bool(stepping) and _at_ceiling(state, cfg, "DRIVE_UPLOAD", now_ms)
+        ready = [] if drive_capped else stepping
+        if drive_capped:
+            # P-4: visible, at most one owner incident per stream per ceiling period. No email is made about
+            # the Gmail ceiling itself (that would be recursive); it is reported in status only.
+            period_key, _start = ceiling_period(cfg, now_ms)
+            with _notification_store(cfg) as store:
+                native_notify.ceiling_incidents(store, stepping, period_key, now_iso)
         if ready:
             stream = ready[0]
             _kind, _ref, invoice, intent = plans[stream]
@@ -723,6 +951,12 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
                                EXIT_HOLD if outcome == "HOLD" else EXIT_RETRY, run_id=run_id, intent_id=intent_id,
                                stream=stream, support_ref=reference)
             extra: dict[str, Any] = {"drive_mode": cfg.drive.mode}
+            if cfg.drive.mode == DRIVE_LOCAL_SYNC:
+                problem = sync_folder_problem(cfg.drive.sync_folders[stream])
+                if problem is not None:
+                    # P-2: do not send the host to a precheck it cannot complete. No state change.
+                    return _result("next", "RETRY_LATER", EXIT_RETRY, run_id=run_id, intent_id=intent_id,
+                                   stream=stream, support_ref=problem)
             if cfg.drive.mode == DRIVE_NATIVE_UPLOAD:
                 payload_path = _payload_path(cfg, intent_id)
                 _write_atomic(payload_path, base64.b64encode(payload))
@@ -736,17 +970,32 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
                 precheck_query=drive_title_query(folder, invoice["display_filename"]), **extra,
             )
         with _notification_store(cfg) as store:
-            packet = native_notify.plan(store, cfg, lambda key: _archive_payload(state, cfg, key))
+            packet = native_notify.plan(store, cfg, lambda key: _archive_payload(state, cfg, key), now_iso)
+        reconcile = None
+        for stream in _v4_rotated(V4_STREAMS, state.cursor()):
+            found = reconcile_candidate(state, cfg, stream)
+            if found is not None:
+                reconcile = (stream, *found)
+                break
     common = {"run_id": run_id, "recovered_unknown": recovered, "recovered_notifications": recovered_notifications}
     if packet is not None and packet["outcome"] == "NOTIFY_DRAFT":
         return _result("next", "NOTIFY_DRAFT", EXIT_OK, **common, **{k: v for k, v in packet.items() if k != "outcome"})
+    if reconcile is not None:
+        stream, invoice, intent = reconcile
+        folder = cfg.drive.folder_ids[stream]
+        return _result(
+            "next", "DRIVE_RECONCILE_PENDING", EXIT_OK, **common, intent_id=intent["intent_id"], stream=stream,
+            intent_state=intent["state"], display_filename=invoice["display_filename"], folder_id=folder,
+            precheck_query=drive_title_query(folder, invoice["display_filename"]),
+            await_file={"title": invoice["display_filename"], "parentId": folder, "fileSize": str(invoice["byte_size"])},
+        )
     if stepping:
         outcome = "CEILING_REACHED"
     elif packet is not None:
         outcome = packet["outcome"]
     else:
         outcome = "IDLE"
-    return _result("next", outcome, EXIT_OK, **common, streams=stream_report(state, cfg))
+    return _result("next", outcome, EXIT_OK, **common, streams=stream_report(state, cfg, now_ms))
 
 
 def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
@@ -765,7 +1014,7 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
                 or evidence.get("query") != drive_title_query(folder, invoice["display_filename"])
                 or evidence.get("complete") is not True or type(matches) is not list):
             raise NativeRefusal("EG_NATIVE_PRECHECK_EVIDENCE_INVALID")
-        _check_ceiling(state, cfg, "DRIVE_UPLOAD")
+        _check_ceiling(state, cfg, "DRIVE_UPLOAD", now_ms)
         payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
         if payload is None:
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
@@ -791,6 +1040,12 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
             return _result("drive-seal", "HOLD", EXIT_HOLD, intent_id=intent_id,
                            support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
         if cfg.drive.mode == DRIVE_LOCAL_SYNC:
+            folder_path = cfg.drive.sync_folders[invoice["stream"]]
+            problem = sync_folder_problem(folder_path)
+            if problem is not None:
+                # P-2: Drive for desktop not mounted (or the path is unsafe). No seal, no effect, no HOLD.
+                return _result("drive-seal", "RETRY_LATER", EXIT_RETRY, intent_id=intent_id, support_ref=problem)
+            clean_stale_stages(folder_path)
             if _local_mirror_verdict(cfg, invoice) is False:
                 # A different local file already has this name: never overwrite it.
                 state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id,
@@ -929,6 +1184,9 @@ def drive_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
                 raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
             verified = attestation.get("matches_archive") is True and attestation.get("sha256") == invoice["sha256"]
             observed_sha = str(attestation.get("sha256", ""))
+        if verified:
+            method = HASH_LOCAL_MIRROR if cfg.drive.mode == DRIVE_LOCAL_SYNC else HASH_PROVIDER_READBACK
+            _record_provenance(cfg, intent_id, method, observed_sha, provider_ref, now_iso)
         result = state.record_receipt(
             intent_id, outcome="VERIFIED" if verified else "REJECTED", provider_ref=provider_ref,
             provider_sha256=observed_sha, run_id=run_id, now_iso=now_iso,
@@ -983,6 +1241,8 @@ def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run
             return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id,
                            support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
         state.assert_lease_held()
+        method = HASH_LOCAL_MIRROR if cfg.drive.mode == DRIVE_LOCAL_SYNC else HASH_PROVIDER_READBACK
+        _record_provenance(cfg, intent_id, method, invoice["sha256"], "gdrive:" + file["id"], now_iso)
         state.seal_dispatch(intent_id, run_id=run_id, now_iso=now_iso)
         result = state.record_receipt(intent_id, outcome="VERIFIED", provider_ref="gdrive:" + file["id"],
                                       provider_sha256=invoice["sha256"], run_id=run_id, now_iso=now_iso)
@@ -991,13 +1251,92 @@ def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run
                    EXIT_OK if result == "VERIFIED" else EXIT_HOLD, intent_id=intent_id, provider_ref="gdrive:" + file["id"])
 
 
-def stream_report(state, cfg: NativeConfig | None = None) -> dict[str, dict]:
-    """Per-stream Core truth (Drive only), read only: DRAINED, PENDING (next step) or BLOCKED."""
+def _exact_drive_metadata(cfg: NativeConfig, invoice: dict, file: Any) -> bool:
+    """The Drive file is exactly this invoice's upload: id shape, folder, title, PDF type and size."""
+    if type(file) is not dict or type(file.get("id")) is not str or not _PROVIDER_ID_RE.fullmatch(file["id"]):
+        return False
+    size = file.get("fileSize")
+    return (
+        file.get("parentId") == cfg.drive.folder_ids[invoice["stream"]]
+        and file.get("title") == invoice["display_filename"]
+        and file.get("mimeType") == PDF_MIME
+        and type(size) in (str, int) and str(size) == str(invoice["byte_size"])
+    )
+
+
+def hold_release(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, reason_code: str, operator: str,
+                 run_id: str, now_ms: int) -> dict:
+    """Operator-only audited release of one Drive HOLD (P-7). Needs a version-5 state database.
+
+    evidence: {"mode": "NO_DISPATCH"}  -> PENDING, only if the intent was never dispatched; or
+              {"mode": "LATE_EVIDENCE", "file": {"id","title","parentId","mimeType","fileSize"}}
+              -> VERIFIED, only with exact Drive metadata plus the exact local mirror (LOCAL_SYNC) or a
+              matching Core readback attestation (NATIVE_UPLOAD). No provider effect is ever made here.
+    """
+    intent_id = _check_intent_id(intent_id)
+    now_iso = _iso(now_ms)
+    if type(evidence) is not dict:
+        raise NativeRefusal("EG_NATIVE_EVIDENCE_UNREADABLE")
+    evidence_sha = hashlib.sha256(
+        json.dumps({"intent_id": intent_id, "evidence": evidence}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with _session(state, now_ms):
+        if state.schema_version != 5:
+            raise NativeRefusal("EG_V5_SCHEMA_REQUIRED")
+        intent, invoice = _invoice_for_intent(state, intent_id)
+        if intent["action"] != "DRIVE_UPLOAD":
+            raise NativeRefusal("EG_NATIVE_ACTION_MISMATCH")
+        if intent["state"] != "HOLD":
+            raise NativeRefusal("EG_V5_RELEASE_NOT_HOLD")
+        mode = evidence.get("mode")
+        if mode == "NO_DISPATCH":
+            if reason_code == "LATE_EVIDENCE_VERIFIED" or state.dispatch_row(intent_id) is not None:
+                raise NativeRefusal("EG_V5_RELEASE_AFTER_DISPATCH")
+            result = state.hold_release(intent_id, to_state="PENDING", reason_code=reason_code, operator=operator,
+                                        evidence_sha256=evidence_sha, run_id=run_id, now_iso=now_iso)
+        elif mode == "LATE_EVIDENCE":
+            if reason_code != "LATE_EVIDENCE_VERIFIED" or state.dispatch_row(intent_id) is None:
+                raise NativeRefusal("EG_V5_RELEASE_WITHOUT_EVIDENCE")
+            file = evidence.get("file")
+            if not _exact_drive_metadata(cfg, invoice, file):
+                raise NativeRefusal("EG_NATIVE_DRIVE_METADATA_MISMATCH")
+            if cfg.drive.mode == DRIVE_LOCAL_SYNC:
+                matched, method = _local_mirror_verdict(cfg, invoice) is True, HASH_LOCAL_MIRROR
+            else:
+                attestation = _attestation(cfg, intent_id, "drive", file["id"])
+                matched = (attestation is not None and attestation.get("matches_archive") is True
+                           and attestation.get("sha256") == invoice["sha256"])
+                method = HASH_PROVIDER_READBACK
+            if not matched:
+                raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+            provider_ref = "gdrive:" + file["id"]
+            _record_provenance(cfg, intent_id, method, invoice["sha256"], provider_ref, now_iso)
+            result = state.hold_release(intent_id, to_state="VERIFIED", reason_code=reason_code, operator=operator,
+                                        evidence_sha256=evidence_sha, run_id=run_id, now_iso=now_iso,
+                                        provider_ref=provider_ref, provider_sha256=invoice["sha256"])
+            _sweep_notifications(state, cfg, now_iso)
+        else:
+            raise NativeRefusal("EG_V5_RELEASE_INVALID")
+    return _result("hold-release", result, EXIT_OK, intent_id=intent_id, released_to=result,
+                   evidence_sha256=evidence_sha)
+
+
+def stream_report(state, cfg: NativeConfig | None = None, now_ms: int | None = None) -> dict[str, dict]:
+    """Per-stream Core truth (Drive only), read only: DRAINED, PENDING (next step) or BLOCKED.
+
+    A stream whose next Drive step is held back by the effect ceiling is BLOCKED with
+    EG_NATIVE_EFFECT_CEILING_REACHED, not PENDING (P-4)."""
+    import time
+
     from .state import V4_STREAMS
 
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    capped = cfg is not None and _at_ceiling(state, cfg, "DRIVE_UPLOAD", now_ms)
     report: dict[str, dict] = {}
     for stream in V4_STREAMS:
         kind, reference, _invoice, _intent = drive_stream_step(state, stream)
+        if kind == "STEP" and capped:
+            kind, reference = "BLOCKED", "EG_NATIVE_EFFECT_CEILING_REACHED"
         detail = []
         for row in state.invoices_for_stream(stream):
             drive = state.intents_for_invoice(row["invoice_key"])["DRIVE_UPLOAD"]
@@ -1007,7 +1346,9 @@ def stream_report(state, cfg: NativeConfig | None = None) -> dict[str, dict]:
                 "adopted_from_v3": row["predecessor_invoice_id"] is not None,
                 "named_archive": _named_archive_state(cfg, row) if cfg is not None else None,
                 "drive_upload": {"state": drive["state"], "support_ref": drive["support_ref"],
-                                 "receipt": "gdrive:" + file_id if file_id else None},
+                                 "receipt": "gdrive:" + file_id if file_id else None,
+                                 "hash_provenance": hash_provenance(cfg, drive["intent_id"])
+                                 if drive["state"] == "VERIFIED" else None},
             })
         report[stream] = {
             "state": {"STEP": "PENDING", "BLOCKED": "BLOCKED", "IDLE": "DRAINED"}[kind],
@@ -1019,9 +1360,27 @@ def stream_report(state, cfg: NativeConfig | None = None) -> dict[str, dict]:
     return report
 
 
-def status(state, cfg: NativeConfig | None = None) -> dict:
+def ceiling_report(state, cfg: NativeConfig, store, now_ms: int) -> dict:
+    """Effect ceiling usage now (P-4). Reads only."""
+    from . import native_notify
+
+    period_key, start = ceiling_period(cfg, now_ms)
+    drive_used = drive_dispatches_counted(state, cfg, now_ms)
+    gmail_used = native_notify.sends_counted(store, cfg, _iso(now_ms))
+    return {
+        "mode": cfg.ceiling_mode, "period": period_key, "period_start": start,
+        "drive_uploads": {"used": drive_used, "limit": cfg.max_drive_uploads,
+                          "reached": drive_used >= cfg.max_drive_uploads},
+        "gmail_sends": {"used": gmail_used, "limit": cfg.max_gmail_sends, "reached": gmail_used >= cfg.max_gmail_sends},
+    }
+
+
+def status(state, cfg: NativeConfig | None = None, now_ms: int | None = None) -> dict:
     """Core outcome from Drive truth only; notifications are reported beside it and never change it."""
-    report = stream_report(state, cfg)
+    import time
+
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    report = stream_report(state, cfg, now_ms)
     order = ("BLOCKED", "PENDING", "DRAINED")
     overall = min((row["state"] for row in report.values()), key=order.index)
     notifications = None
@@ -1031,10 +1390,11 @@ def status(state, cfg: NativeConfig | None = None) -> dict:
         with _notification_store(cfg) as store:
             notifications = native_notify.summary(store)
             gmail_dispatches = store.sealed_count()
+            ceiling = ceiling_report(state, cfg, store, now_ms)
     else:
-        gmail_dispatches = None
+        gmail_dispatches = ceiling = None
     return _result(
         "status", overall, EXIT_OK if overall != "BLOCKED" else EXIT_HOLD, streams=report,
-        notifications=notifications,
+        notifications=notifications, ceiling=ceiling,
         effects={"drive_dispatches": state.dispatch_count("DRIVE_UPLOAD"), "gmail_dispatches": gmail_dispatches},
     )

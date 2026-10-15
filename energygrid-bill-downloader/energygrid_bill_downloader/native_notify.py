@@ -33,7 +33,7 @@ from typing import Any, Iterator
 
 from .native_bridge import (
     EXIT_HOLD, EXIT_OK, PDF_MIME, STREAM_LABELS, NativeConfig, NativeRefusal, _PROVIDER_ID_RE, _outbox,
-    _provider_outcome, _read_json, _result, _write_atomic, _write_json_once,
+    _provider_outcome, _read_json, _result, _write_atomic, _write_json_once, ceiling_period, ms_from_iso,
 )
 
 KIND_SUCCESS, KIND_FAILURE = "SUCCESS", "FAILURE"
@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS acquisition_watch (
   open_key TEXT,
   epoch INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS gmail_seal (
+  notification_id TEXT PRIMARY KEY REFERENCES notification(notification_id),
+  sealed_at TEXT NOT NULL CHECK (length(sealed_at) = 20)
+);
+CREATE TRIGGER IF NOT EXISTS gmail_seal_no_update BEFORE UPDATE ON gmail_seal
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_SEAL_LEDGER_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS gmail_seal_no_delete BEFORE DELETE ON gmail_seal
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_SEAL_LEDGER_IMMUTABLE'); END;
 """
 
 
@@ -124,6 +132,18 @@ class NotificationStore:
     def sealed_count(self) -> int:
         assert self.connection is not None
         return int(self.connection.execute("SELECT COUNT(*) FROM notification WHERE draft_id IS NOT NULL").fetchone()[0])
+
+    def sealed_count_since(self, since_iso: str) -> int:
+        """Sealed sends that may fall in the period starting at `since_iso` (P-4). A seal recorded in the
+        seal ledger counts by its seal time. An older seal with no ledger entry counts unless it is
+        provably earlier (last updated before the period), so an earlier send is never forgotten."""
+        assert self.connection is not None
+        return int(self.connection.execute(
+            "SELECT COUNT(*) FROM notification n LEFT JOIN gmail_seal g ON g.notification_id=n.notification_id "
+            "WHERE n.draft_id IS NOT NULL AND ((g.sealed_at IS NOT NULL AND g.sealed_at >= ?) "
+            "OR (g.sealed_at IS NULL AND n.updated_at >= ?))",
+            (since_iso, since_iso),
+        ).fetchone()[0])
 
     def _insert(self, conn: sqlite3.Connection, dedup_key: str, now_iso: str, **values: Any) -> bool:
         if conn.execute("SELECT 1 FROM notification WHERE dedup_key=?", (dedup_key,)).fetchone():
@@ -261,12 +281,31 @@ def attaches_pdf(cfg: NativeConfig, row: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def plan(store: NotificationStore, cfg: NativeConfig, archive_payload) -> dict | None:
+def sends_counted(store: NotificationStore, cfg: NativeConfig, now_iso: str) -> int:
+    """Sealed Gmail sends that count against the ceiling now (LIFETIME or the current PER_PERIOD)."""
+    _key, start = ceiling_period(cfg, ms_from_iso(now_iso))
+    return store.sealed_count() if start is None else store.sealed_count_since(start)
+
+
+def ceiling_incidents(store: NotificationStore, streams: list[str], period_key: str, now_iso: str) -> int:
+    """One FAILURE notification per stream per ceiling period when the Drive ceiling blocks its work.
+    The Gmail ceiling never creates a notification (sending one could only hit the same ceiling)."""
+    created = 0
+    with store.write() as conn:
+        for stream in streams:
+            created += store._insert(
+                conn, f"CEILING|DRIVE_UPLOAD|{stream}|{period_key}", now_iso, kind=KIND_FAILURE, stream=stream,
+                status_text="DRIVE_CEILING_REACHED", support_ref="EG_NATIVE_EFFECT_CEILING_REACHED",
+            )
+    return created
+
+
+def plan(store: NotificationStore, cfg: NativeConfig, archive_payload, now_iso: str) -> dict | None:
     """The oldest PENDING notification as a NOTIFY_DRAFT packet, or None. Writes only the payload file."""
     pending = store.rows("state='PENDING'")
     if not pending:
         return None
-    if store.sealed_count() >= cfg.max_gmail_sends:
+    if sends_counted(store, cfg, now_iso) >= cfg.max_gmail_sends:
         return {"outcome": "NOTIFY_CEILING_REACHED", "pending_notifications": len(pending)}
     row = pending[0]
     subject, body = message_for(cfg, row)
@@ -352,7 +391,9 @@ def seal(store: NotificationStore, cfg: NativeConfig, notification_id: str, draf
             or evidence.get("cc") != [] or evidence.get("bcc") != []
             or evidence.get("subject") != subject):
         raise NativeRefusal("EG_NATIVE_DRAFT_ENVELOPE_MISMATCH")
-    if type(evidence.get("body")) is not str or _normalised(body) not in _normalised(evidence["body"]):
+    # Exact equality after whitespace normalisation and Gmail's link-wrapper unwrap (H-1): appended or
+    # prepended text in the draft is a mismatch, not a superset that passes.
+    if type(evidence.get("body")) is not str or _normalised(body) != _normalised(evidence["body"]):
         raise NativeRefusal("EG_NATIVE_DRAFT_BODY_MISMATCH")
     attachments = evidence.get("attachments") or []
     if attaches_pdf(cfg, row):
@@ -363,10 +404,12 @@ def seal(store: NotificationStore, cfg: NativeConfig, notification_id: str, draf
             raise NativeRefusal("EG_NATIVE_DRAFT_BYTES_MISMATCH")
     elif attachments:
         raise NativeRefusal("EG_NATIVE_DRAFT_ATTACHMENT_MISMATCH")
-    if store.sealed_count() >= cfg.max_gmail_sends:
+    if sends_counted(store, cfg, now_iso) >= cfg.max_gmail_sends:
         raise NativeRefusal("EG_NATIVE_EFFECT_CEILING_REACHED")
     with store.write() as conn:
         store._move(conn, notification_id, ("PENDING",), "SEALED", now_iso, draft_id=draft_id)
+        # Durable seal time in the same transaction: the PER_PERIOD count survives restarts (P-4).
+        conn.execute("INSERT INTO gmail_seal (notification_id, sealed_at) VALUES (?,?)", (notification_id, now_iso))
     return _result("notify-seal", "SEALED", EXIT_OK, notification_id=notification_id, send_draft_id=draft_id)
 
 

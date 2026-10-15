@@ -116,6 +116,8 @@ def _tenant_adapter(path: Path):
         private_path=lambda value, label: bridge._private_path(value, label, roots),
     )
     browser = load_runtime_config(load_config_file(settings.browser_config_path), checkout_root=CHECKOUT_ROOT)
+    # The render signs in through this portal with the same credential: HTTPS only (H-6).
+    tenant.require_https(browser.portal_url, "tenant browser portal_url")
     credentials = tenant.dpapi_credentials(settings.credential_path)
     source = tenant.TenantHttpSource(settings, credentials, browser.timeout_seconds, browser.max_attempts)
     return tenant.TenantBillAdapter(source, tenant.PlaywrightTenantRenderer(browser, credentials,
@@ -229,7 +231,7 @@ def _dispatch(args) -> dict:
     if command == "next":
         return _with_state(cfg, lambda s: bridge.next_step(s, cfg, run_id=run_id, now_ms=now))
     if command == "status":
-        return _with_state(cfg, lambda s: bridge.status(s, cfg))
+        return _with_state(cfg, lambda s: bridge.status(s, cfg, now))
     if command in ("drive-seal", "drive-record", "drive-adopt"):
         evidence = bridge.load_evidence(Path(args.evidence))
         function = {"drive-seal": bridge.drive_seal, "drive-record": bridge.drive_record,
@@ -245,6 +247,20 @@ def _dispatch(args) -> dict:
     if command == "notify-record":
         evidence = bridge.load_evidence(Path(args.evidence))
         return _notify(cfg, now, lambda store: notify.record(store, args.notification, evidence, now_iso))
+    if command == "migrate-hold-recovery":
+        # Operator only (P-7): writes a version-5 COPY beside the state file. The live file is never
+        # written; switching to the copy is a separate, manual step with the scheduled task disabled.
+        from .state import migrate_hold_recovery_copy
+
+        destination = Path(args.dest)
+        if destination.parent.resolve() != cfg.state_path.parent.resolve():
+            raise bridge.NativeRefusal("EG_V5_MIGRATION_PATH_INVALID")
+        outcome = migrate_hold_recovery_copy(cfg.state_path, destination, now_ms=now)
+        return bridge._result("migrate-hold-recovery", outcome["status"], bridge.EXIT_OK, **outcome)
+    if command == "hold-release":
+        evidence = bridge.load_evidence(Path(args.evidence))
+        return _with_state(cfg, lambda s: bridge.hold_release(s, cfg, args.intent, evidence, reason_code=args.reason,
+                                                              operator=args.operator, run_id=run_id, now_ms=now))
     if command in ("backfill-run", "backfill-record"):
         from . import native_backfill as backfill
 
@@ -288,6 +304,16 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--drive-evidence", required=True)
         if name == "backfill-run":
             command.add_argument("--max", required=True, type=int)
+    # Operator-only commands (P-7). The scheduled host policy denies both.
+    migrate = sub.add_parser("migrate-hold-recovery")
+    migrate.add_argument("--config", required=True)
+    migrate.add_argument("--dest", required=True)
+    release = sub.add_parser("hold-release")
+    release.add_argument("--config", required=True)
+    release.add_argument("--intent", required=True)
+    release.add_argument("--evidence", required=True)
+    release.add_argument("--reason", required=True)
+    release.add_argument("--operator", required=True)
     return parser
 
 

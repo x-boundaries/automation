@@ -39,9 +39,11 @@ CONSTRUCTION_TREE = "28034420e436345586dc94f1624ac4483e97dbbb"
 TARGET_BRANCH = "codex/energygrid-226-dual-stream-latest-email"
 # Exact owner-approved EnergyGrid candidate branches (#226). Membership is an exact,
 # case-sensitive string match; no prefix, pattern or fork head is admitted. The offline
-# v4 Core PR branch (#242) is admitted alongside the historical #226 branch.
+# v4 Core PR branch (#242) is admitted alongside the historical #226 branch. The production
+# hardening branch is admitted by exact name only (Web #226:6186622535, H-9).
 OFFLINE_V4_BRANCH = "energygrid/226-offline-v4-core-ea9c19b"
-APPROVED_CANDIDATE_BRANCHES = frozenset({TARGET_BRANCH, OFFLINE_V4_BRANCH})
+HARDENING_BRANCH = "energygrid/226-prod-hardening-001"
+APPROVED_CANDIDATE_BRANCHES = frozenset({TARGET_BRANCH, OFFLINE_V4_BRANCH, HARDENING_BRANCH})
 HELPERS =(HARNESS, FUNCTIONS, SUPPORT, PYTHON_FIXTURE, LAUNCHER, LAUNCHER_LIB)
 HELPER_RELATIVES = tuple(item.relative_to(REPO_ROOT).as_posix() for item in HELPERS)
 # The accepted AV successor (#212/#226). It alone carries the historical exact
@@ -2095,9 +2097,49 @@ class HostedCustodyContextRegressionTests(unittest.TestCase):
     def test_h21_approved_branch_set_is_exact(self):
         self.assertEqual(
             frozenset({"codex/energygrid-226-dual-stream-latest-email",
-                       "energygrid/226-offline-v4-core-ea9c19b"}),
+                       "energygrid/226-offline-v4-core-ea9c19b",
+                       "energygrid/226-prod-hardening-001"}),
             APPROVED_CANDIDATE_BRANCHES,
         )
+
+    def test_h26b_hardening_branch_is_admitted_exactly_and_keeps_every_identity_check(self):
+        head = _git("rev-parse", "HEAD")
+        for event_name in ("pull_request", "workflow_dispatch"):
+            with self.subTest(event=event_name), \
+                    tempfile.TemporaryDirectory(prefix="eg_h26b_hosted_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name=event_name, expected_head=head,
+                    github_sha=head, branch=HARDENING_BRANCH,
+                )
+                self.assertEqual(HOSTED_EXACT_HEAD_MODE, _execution_context(environment, actual_head=head)["mode"])
+        for branch in (
+            "energygrid/226-prod-hardening-002", "energygrid/226-prod-hardening-001-evil",
+            "ENERGYGRID/226-prod-hardening-001", "x/" + HARDENING_BRANCH, HARDENING_BRANCH + " ",
+            "refs/heads/" + HARDENING_BRANCH, "energygrid/226-prod-hardening",
+        ):
+            with self.subTest(lookalike=branch), \
+                    tempfile.TemporaryDirectory(prefix="eg_h26b_lookalike_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name="pull_request", expected_head=head, branch=branch,
+                )
+                with self.assertRaisesRegex(RuntimeError, "binding is incomplete or inconsistent"):
+                    _execution_context(environment, actual_head=head)
+
+        def non_main_base(event):
+            event["pull_request"]["base"]["ref"] = OFFLINE_V4_BRANCH
+
+        def fork_head(event):
+            event["pull_request"]["head"]["repo"]["full_name"] = "attacker/automation"
+
+        for name, mutate in (("non-main base", non_main_base), ("fork head", fork_head)):
+            with self.subTest(identity=name), \
+                    tempfile.TemporaryDirectory(prefix="eg_h26b_identity_") as directory:
+                environment = self._hosted_environment(
+                    Path(directory), event_name="pull_request", expected_head=head,
+                    branch=HARDENING_BRANCH, mutate_event=mutate,
+                )
+                with self.assertRaisesRegex(RuntimeError, "binding is incomplete"):
+                    _execution_context(environment, actual_head=head)
 
     def test_h22_offline_v4_branch_pull_request_and_dispatch_are_accepted(self):
         head = _git("rev-parse", "HEAD")
