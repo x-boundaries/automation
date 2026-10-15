@@ -1,0 +1,1439 @@
+"""#155 DirectLocal core: attended Shopify connector capture -> local SQLite
+ledger -> existing AutoCount MemberCommand adapter (through a child bridge).
+
+No gateway, webhook receiver, PostgreSQL, n8n or network listener is used.
+
+Data path
+---------
+* A Claude Code PostToolUse hook (``scripts/directlocal_connector_hook.py``)
+  writes the hook-delivered ``tool_input``/``tool_response`` JSON of the pinned
+  connector queries into ``<state_root>/inbox``. That JSON is what Claude Code
+  hands the hook; it is NOT proof of the original Shopify wire bytes.
+* ``parse_capture`` verifies tool, pinned query, pagination variables, store
+  identity (``shop { id myshopifyDomain }`` in every response) and schema.
+  Only the ``synthetic`` response shape is qualified; real connector
+  responses fail closed (``capture_response_shape_unqualified``) until the
+  attended E1 gate qualifies the delivered shape.
+* The reused ``capture_member_mg_baseline`` / ``evaluate_profile`` take every
+  cutover and admission decision.
+
+Write safety
+------------
+A customer has at most one fence, ever. The fence is committed FENCED and then
+DISPATCHED (with a deadline) before the child writer starts; no code path moves
+a fence back to FENCED/DISPATCHED, so a crash, replay, timeout or retry can
+never start a second ``SaveMember`` for it. The child additionally creates an
+exclusive ``<fence_id>.claim`` file before ``SaveMember`` and refuses if it
+already exists. An uncertain outcome is only ever reconciled read-only with the
+same bound MemberNo.
+
+Synthetic inertness
+-------------------
+The only ledger mode is ``synthetic``. In it the processor refuses every
+AutoCount bridge whose ``autocount_target`` is not the test-only
+``SYNTHETIC_BRIDGE_TARGET`` (the real ``BridgeClient`` default is never
+accepted), and the PowerShell bridge itself refuses to run without a
+positively marked fake session factory, which its ``-File`` entrypoint cannot
+receive. No real AutoCount login, lookup, ``GetNextMemberNo`` or
+``SaveMember`` is reachable, whatever flags, approvals or fence ids a caller
+supplies.
+
+The ledger stores GIDs, MemberNos, counts, codes and salted digests only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# The reused admission functions live in the frozen gateway package; they are
+# imported read-only (stdlib-only modules) and never run as a service.
+_GATEWAY_SRC = str(REPO_ROOT / "member_gateway" / "src")
+if _GATEWAY_SRC not in sys.path:
+    sys.path.insert(0, _GATEWAY_SRC)
+
+from xb_member_gateway.shopify_admission import (  # noqa: E402
+    BaselineCaptureError,
+    ShopifyReadError,
+    baseline_digest,
+    capture_member_mg_baseline,
+    evaluate_profile,
+    parse_created_at,
+)
+from xb_member_gateway.shopify_webhook import GID_RE  # noqa: E402
+
+CAPTURE_SCHEMA = "xb.directlocal.capture.v1"
+CAPTURE_PROVENANCE = "claude_code_posttooluse_hook_delivered_json"
+CONNECTOR_TOOL = "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__graphql_query"
+PAGE_SIZE = 50  # the connector tool's maximum ``first``
+MAX_MEMBER_NO_CANDIDATES = 3
+PROFILE_WAIT_MAX_CHECKS = 5
+CAPTURE_MAX_AGE_SECONDS = 900
+APPROVAL_MAX_TTL_SECONDS = 1800
+WRITER_DEADLINE_SECONDS = 120
+WRITER_GRACE_SECONDS = 15
+HOLD_EXIT_CODE = 75
+# Test-only bridge target. A synthetic ledger accepts no other bridge.
+SYNTHETIC_BRIDGE_TARGET = "synthetic_fake_member_command"
+REAL_BRIDGE_TARGET = "real_autocount"
+# AutoCount 2.2 Member column widths (characters), read from the nominated
+# test book's catalog on 2026-10-14: Name nvarchar(100), MobilePhone
+# nvarchar(25), EmailAddress nvarchar(200), MemberNo nvarchar(20). Wider
+# values are never sent to SaveMember (they would fail or truncate).
+AUTOCOUNT_FIELD_WIDTHS = {"name": 100, "mobile_phone": 25, "email_address": 200}
+# Only response shapes qualified offline are accepted; see module docstring.
+QUALIFIED_RESPONSE_SHAPES = {"synthetic": "graphql_data_object_v1"}
+# Qualified 2026-10-14 from one attended identity read through the PostToolUse
+# hook: tool_response is a JSON *text* whose decoded value is exactly
+# {"data": {...}}. Hook-delivered JSON, not Shopify wire bytes. Used only for
+# store-identity inspection; ledger ingestion of real data stays disabled.
+CONNECTOR_RESPONSE_SHAPE = "connector_graphql_json_text_v1"
+SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.myshopify\.com$")
+
+BASELINE_QUERY = """query XbDirectLocalCustomerPage($first: Int!, $after: String) {
+  shop { id myshopifyDomain }
+  customers(first: $first, after: $after, sortKey: ID) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id createdAt tags }
+  }
+}"""
+
+PROFILE_QUERY = """query XbDirectLocalCustomerProfile($id: ID!) {
+  shop { id myshopifyDomain }
+  customer(id: $id) {
+    id
+    createdAt
+    tags
+    firstName
+    lastName
+    defaultEmailAddress { emailAddress }
+    defaultPhoneNumber { phoneNumber }
+    startDate: metafield(namespace: "membership", key: "start_date") { type value }
+    expiryDate: metafield(namespace: "membership", key: "expiry_date") { type value }
+  }
+}"""
+
+
+def _sha256(text: str | bytes) -> str:
+    data = text.encode("utf-8") if isinstance(text, str) else text
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+# Store identity only: no customer object is selected.
+IDENTITY_QUERY = """query XbDirectLocalShopIdentity {
+  shop { id myshopifyDomain }
+}"""
+
+PINNED_QUERIES = {_sha256(BASELINE_QUERY): "baseline", _sha256(PROFILE_QUERY): "profile", _sha256(IDENTITY_QUERY): "identity"}
+
+SHOP_GID_RE = re.compile(r"^gid://shopify/Shop/[1-9][0-9]{0,19}$")
+SYNTHETIC_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.synthetic\.invalid$")
+TOOL_USE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+MEMBER_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,19}$")
+CODE_RE = re.compile(r"^[a-z0-9_:.-]{1,80}$")
+_PHONE_DIGITS_RE = re.compile(r"^[0-9]{6,15}$")
+_CUSTOMER_FIELDS = frozenset({"id", "createdAt", "tags", "firstName", "lastName", "defaultEmailAddress", "defaultPhoneNumber", "startDate", "expiryDate"})
+
+
+class DirectLocalError(RuntimeError):
+    """Bounded refusal; only the code is ever rendered."""
+
+    def __init__(self, code: str):
+        self.code = code if CODE_RE.fullmatch(code or "") else "directlocal_error"
+        super().__init__(self.code)
+
+
+class CaptureRejected(DirectLocalError):
+    pass
+
+
+class DirectLocalHold(DirectLocalError):
+    """A writer may still be live; nothing else may run until it is resolved."""
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def ts(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(value: str) -> datetime:
+    parsed = parse_created_at(value)
+    if parsed is None:
+        raise DirectLocalError("timestamp_invalid")
+    return parsed
+
+
+# --------------------------------------------------------------------------
+# Singapore phone duplicate keys
+# --------------------------------------------------------------------------
+
+def duplicate_phone_keys(phone: str | None) -> tuple[str, ...]:
+    """Symmetric duplicate-lookup keys for a ``canonical_phone`` value.
+
+    ``65xxxxxxxx`` also matches ``xxxxxxxx`` and vice versa. The stored
+    AutoCount MobilePhone value is never changed by this; it is lookup only.
+    """
+
+    if phone is None:
+        return ()
+    if not isinstance(phone, str) or not _PHONE_DIGITS_RE.fullmatch(phone):
+        raise DirectLocalError("phone_key_input_invalid")
+    if len(phone) == 10 and phone.startswith("65"):
+        return (phone, phone[2:])
+    if len(phone) == 8:
+        return (phone, "65" + phone)
+    return (phone,)
+
+
+# --------------------------------------------------------------------------
+# Connector capture parsing
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class Capture:
+    kind: str  # baseline | profile
+    capture_sha256: str
+    tool_use_id: str
+    captured_at: datetime
+    variables: Mapping[str, Any]
+    data: Mapping[str, Any]
+
+    def __repr__(self) -> str:  # never render data (profile captures carry PII)
+        return f"Capture(kind={self.kind!r}, tool_use_id={self.tool_use_id!r})"
+
+
+def check_tool_input(tool_input: Any) -> str:
+    """Return the pinned query kind for an allowed connector call, else raise.
+
+    Shared by the PreToolUse guard and capture parsing so both enforce the
+    exact same allowlist.
+    """
+
+    if not isinstance(tool_input, Mapping) or not set(tool_input) <= {"query", "variables", "first", "after"}:
+        raise CaptureRejected("tool_input_shape_invalid")
+    query = tool_input.get("query")
+    kind = PINNED_QUERIES.get(_sha256(query)) if isinstance(query, str) else None
+    if kind is None:
+        raise CaptureRejected("query_not_pinned")
+    if kind == "identity":
+        if not set(tool_input) <= {"query", "variables"} or tool_input.get("variables", {}) != {}:
+            raise CaptureRejected("identity_variables_invalid")
+        return kind
+    variables = tool_input.get("variables")
+    if not isinstance(variables, Mapping):
+        raise CaptureRejected("variables_invalid")
+    if kind == "baseline":
+        if not set(variables) <= {"first", "after"} or variables.get("first") != PAGE_SIZE or isinstance(variables.get("first"), bool):
+            raise CaptureRejected("pagination_variables_invalid")
+        if tool_input.get("first") != PAGE_SIZE or isinstance(tool_input.get("first"), bool):
+            raise CaptureRejected("pagination_variables_invalid")
+        after = variables.get("after")
+        if after is not None and (not isinstance(after, str) or not after or len(after) > 1024):
+            raise CaptureRejected("pagination_variables_invalid")
+        if tool_input.get("after") != after:
+            raise CaptureRejected("pagination_variables_invalid")
+    else:
+        if set(variables) != {"id"} or not isinstance(variables["id"], str) or not GID_RE.fullmatch(variables["id"]):
+            raise CaptureRejected("profile_variables_invalid")
+        if "first" in tool_input or "after" in tool_input:
+            raise CaptureRejected("profile_variables_invalid")
+    return kind
+
+
+def _response_data(tool_response: Any, mode: str) -> Mapping[str, Any]:
+    shape = QUALIFIED_RESPONSE_SHAPES.get(mode)
+    if shape is None:
+        raise CaptureRejected("capture_response_shape_unqualified")
+    # graphql_data_object_v1: exactly {"data": {...}}; any GraphQL error rejects.
+    if not isinstance(tool_response, Mapping) or set(tool_response) != {"data"} or not isinstance(tool_response["data"], Mapping):
+        raise CaptureRejected("capture_response_shape_invalid")
+    return tool_response["data"]
+
+
+def connector_response_data(tool_response: Any) -> Mapping[str, Any]:
+    """Decode the qualified connector shape. Errors, extensions or any other
+    wrapper fail closed (they were not part of the qualified shape)."""
+
+    if not isinstance(tool_response, str) or len(tool_response) > 4_194_304:
+        raise CaptureRejected("connector_response_shape_invalid")
+    try:
+        value = json.loads(tool_response)
+    except json.JSONDecodeError:
+        raise CaptureRejected("connector_response_shape_invalid") from None
+    if not isinstance(value, dict) or set(value) != {"data"} or not isinstance(value["data"], dict):
+        raise CaptureRejected("connector_response_shape_invalid")
+    return value["data"]
+
+
+def inspect_identity_capture(raw: bytes) -> dict[str, str]:
+    """Validate one hook-captured store-identity read and return only the
+    store identity (no customer object can be present)."""
+
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise CaptureRejected("capture_json_invalid") from None
+    expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
+    if not isinstance(record, dict) or set(record) != expected or record["schema_version"] != CAPTURE_SCHEMA or record["provenance"] != CAPTURE_PROVENANCE:
+        raise CaptureRejected("capture_record_shape_invalid")
+    if record["tool_name"] != CONNECTOR_TOOL or not isinstance(record["tool_use_id"], str) or not TOOL_USE_ID_RE.fullmatch(record["tool_use_id"]):
+        raise CaptureRejected("capture_record_shape_invalid")
+    if parse_created_at(record["captured_at"]) is None:
+        raise CaptureRejected("capture_timestamp_invalid")
+    if check_tool_input(record["tool_input"]) != "identity":
+        raise CaptureRejected("capture_not_identity")
+    data = connector_response_data(record["tool_response"])
+    shop = data.get("shop")
+    if set(data) != {"shop"} or not isinstance(shop, dict) or set(shop) != {"id", "myshopifyDomain"}:
+        raise CaptureRejected("identity_shape_invalid")
+    if not isinstance(shop["id"], str) or not SHOP_GID_RE.fullmatch(shop["id"]) or not isinstance(shop["myshopifyDomain"], str) or not SHOP_DOMAIN_RE.fullmatch(shop["myshopifyDomain"]):
+        raise CaptureRejected("identity_values_invalid")
+    return {
+        "response_shape": CONNECTOR_RESPONSE_SHAPE, "provenance": CAPTURE_PROVENANCE, "capture_sha256": _sha256(raw),
+        "tool_use_id": record["tool_use_id"], "store_gid": shop["id"], "shop_domain": shop["myshopifyDomain"],
+    }
+
+
+def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) -> Capture:
+    """Strictly validate one hook capture record. Anything unexpected rejects."""
+
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise CaptureRejected("capture_json_invalid") from None
+    expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
+    if not isinstance(record, dict) or set(record) != expected:
+        raise CaptureRejected("capture_record_shape_invalid")
+    if record["schema_version"] != CAPTURE_SCHEMA or record["provenance"] != CAPTURE_PROVENANCE:
+        raise CaptureRejected("capture_record_shape_invalid")
+    if record["tool_name"] != CONNECTOR_TOOL:
+        raise CaptureRejected("capture_tool_not_allowed")
+    tool_use_id = record["tool_use_id"]
+    if not isinstance(tool_use_id, str) or not TOOL_USE_ID_RE.fullmatch(tool_use_id):
+        raise CaptureRejected("capture_tool_use_id_invalid")
+    captured_at = parse_created_at(record["captured_at"])
+    if captured_at is None:
+        raise CaptureRejected("capture_timestamp_invalid")
+    kind = check_tool_input(record["tool_input"])
+    data = _response_data(record["tool_response"], mode)
+    if data.get("shop") != {"id": store_gid, "myshopifyDomain": shop_domain}:
+        raise CaptureRejected("capture_store_identity_mismatch")
+    variables = record["tool_input"].get("variables", {})
+    if kind == "identity":
+        if set(data) != {"shop"}:
+            raise CaptureRejected("identity_shape_invalid")
+    elif kind == "baseline":
+        page = data.get("customers")
+        if set(data) != {"shop", "customers"} or not isinstance(page, Mapping) or set(page) != {"pageInfo", "nodes"}:
+            raise CaptureRejected("baseline_page_shape_invalid")
+        info, nodes = page["pageInfo"], page["nodes"]
+        if not isinstance(info, Mapping) or set(info) != {"hasNextPage", "endCursor"} or not isinstance(nodes, list):
+            raise CaptureRejected("baseline_page_shape_invalid")
+        if len(nodes) > PAGE_SIZE or any(not isinstance(node, Mapping) or set(node) != {"id", "createdAt", "tags"} for node in nodes):
+            raise CaptureRejected("baseline_page_shape_invalid")
+    else:
+        customer = data.get("customer")
+        if set(data) != {"shop", "customer"}:
+            raise CaptureRejected("profile_shape_invalid")
+        if customer is not None:
+            if not isinstance(customer, Mapping) or set(customer) != _CUSTOMER_FIELDS:
+                raise CaptureRejected("profile_shape_invalid")
+            if customer["id"] != variables["id"]:
+                raise CaptureRejected("profile_identity_mismatch")
+    return Capture(kind, _sha256(raw), tool_use_id, captured_at, dict(variables), data)
+
+
+# --------------------------------------------------------------------------
+# State root and single-owner lock
+# --------------------------------------------------------------------------
+
+def validate_state_root(path: str | Path, *, environ: Mapping[str, str] | None = None) -> Path:
+    """Refuse UNC, MSIX-redirected ``%LOCALAPPDATA%``, repo-internal and
+    missing roots. The root itself is never created here (an E0 decision)."""
+
+    env = os.environ if environ is None else environ
+    text = str(path)
+    if text.startswith("\\\\") or text.startswith("//"):
+        raise DirectLocalError("state_root_unc_refused")
+    root = Path(text)
+    if not root.is_absolute():
+        raise DirectLocalError("state_root_not_absolute")
+    resolved = root.resolve()
+    local_app_data = env.get("LOCALAPPDATA")
+    candidates = [REPO_ROOT.resolve()] + ([Path(local_app_data).resolve()] if local_app_data else [])
+    for forbidden in candidates:
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise DirectLocalError("state_root_location_refused")
+    if not resolved.is_dir():
+        raise DirectLocalError("state_root_missing")
+    return resolved
+
+
+class _OwnerLock:
+    """OS-level exclusive lock, released by the OS if the process dies."""
+
+    def __init__(self, path: Path):
+        self._handle = open(path, "a+b")  # noqa: SIM115 - held for the owner's lifetime
+        try:
+            self._handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._handle.close()
+            raise DirectLocalError("ledger_locked_by_another_owner") from None
+
+    def release(self) -> None:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._handle.close()
+
+
+# --------------------------------------------------------------------------
+# SQLite ledger
+# --------------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE ledger_meta(
+  id INTEGER PRIMARY KEY CHECK (id = 1), ledger_id TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode = 'synthetic'),
+  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE writer_owner(
+  id INTEGER PRIMARY KEY CHECK (id = 1), epoch INTEGER NOT NULL, pid INTEGER NOT NULL, acquired_at TEXT NOT NULL);
+CREATE TABLE runs(
+  run_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('BASELINE', 'DISCOVERY')),
+  cutover_at TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('CAPTURING', 'SEALED', 'ABANDONED')),
+  started_at TEXT NOT NULL, sealed_at TEXT, page_count INTEGER, historical_count INTEGER,
+  transition_count INTEGER, historical_digest TEXT);
+CREATE UNIQUE INDEX runs_single_baseline ON runs(kind) WHERE kind = 'BASELINE' AND state <> 'ABANDONED';
+CREATE UNIQUE INDEX runs_single_open ON runs(state) WHERE state = 'CAPTURING';
+CREATE TABLE run_pages(
+  run_id TEXT NOT NULL REFERENCES runs(run_id), page_index INTEGER NOT NULL,
+  capture_sha256 TEXT NOT NULL UNIQUE, has_next INTEGER NOT NULL, node_count INTEGER NOT NULL,
+  PRIMARY KEY (run_id, page_index));
+CREATE TABLE baseline_members(customer_gid TEXT PRIMARY KEY);
+CREATE TABLE captures(
+  capture_sha256 TEXT PRIMARY KEY, tool_use_id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, consumed_at TEXT NOT NULL);
+CREATE TABLE customers(
+  store_gid TEXT NOT NULL, customer_gid TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('DISCOVERED', 'NOT_ELIGIBLE', 'WAITING', 'ADMITTED', 'EXCLUDED_BASELINE', 'MANUAL_REVIEW', 'FENCED')),
+  check_count INTEGER NOT NULL DEFAULT 0, decision_code TEXT, member_no TEXT UNIQUE, updated_at TEXT NOT NULL,
+  PRIMARY KEY (store_gid, customer_gid));
+CREATE TABLE allocation_attempts(
+  customer_gid TEXT NOT NULL, attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 3),
+  candidate TEXT, status TEXT, created_at TEXT NOT NULL, PRIMARY KEY (customer_gid, attempt_no));
+CREATE TABLE approvals(
+  approval_id TEXT PRIMARY KEY, customer_gid TEXT NOT NULL, created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL, consumed_at TEXT);
+CREATE TABLE fences(
+  fence_id TEXT PRIMARY KEY, customer_gid TEXT NOT NULL UNIQUE, member_no TEXT NOT NULL UNIQUE,
+  approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(approval_id),
+  payload_digest TEXT NOT NULL, salt TEXT NOT NULL, owner_epoch INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('FENCED', 'DISPATCHED', 'NOT_WRITTEN_PROVEN', 'CREATED_VERIFIED',
+    'CREATED_READBACK_MISMATCH', 'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED',
+    'RECONCILED_VERIFIED', 'MANUAL_REVIEW')),
+  code TEXT, deadline_at TEXT, child_pid INTEGER, child_created TEXT, exit_code INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE events(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL,
+  customer_gid TEXT, fence_id TEXT, code TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL UNIQUE);
+
+CREATE TRIGGER ledger_meta_immutable BEFORE UPDATE ON ledger_meta BEGIN SELECT RAISE(ABORT, 'ledger_meta_immutable'); END;
+CREATE TRIGGER ledger_meta_no_delete BEFORE DELETE ON ledger_meta BEGIN SELECT RAISE(ABORT, 'ledger_meta_immutable'); END;
+CREATE TRIGGER runs_no_delete BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT, 'run_immutable'); END;
+CREATE TRIGGER runs_cutover_immutable BEFORE UPDATE OF cutover_at, kind, started_at ON runs
+  BEGIN SELECT RAISE(ABORT, 'run_cutover_immutable'); END;
+CREATE TRIGGER runs_sealed_immutable BEFORE UPDATE ON runs WHEN OLD.state = 'SEALED'
+  BEGIN SELECT RAISE(ABORT, 'run_sealed_immutable'); END;
+CREATE TRIGGER runs_abandoned_immutable BEFORE UPDATE ON runs WHEN OLD.state = 'ABANDONED'
+  BEGIN SELECT RAISE(ABORT, 'run_abandoned_immutable'); END;
+CREATE TRIGGER run_pages_immutable BEFORE UPDATE ON run_pages BEGIN SELECT RAISE(ABORT, 'run_pages_immutable'); END;
+CREATE TRIGGER run_pages_no_delete BEFORE DELETE ON run_pages BEGIN SELECT RAISE(ABORT, 'run_pages_immutable'); END;
+CREATE TRIGGER baseline_members_immutable BEFORE UPDATE ON baseline_members BEGIN SELECT RAISE(ABORT, 'baseline_immutable'); END;
+CREATE TRIGGER baseline_members_no_delete BEFORE DELETE ON baseline_members BEGIN SELECT RAISE(ABORT, 'baseline_immutable'); END;
+CREATE TRIGGER baseline_members_sealed_only BEFORE INSERT ON baseline_members
+  WHEN EXISTS (SELECT 1 FROM runs WHERE kind = 'BASELINE' AND state = 'SEALED')
+  BEGIN SELECT RAISE(ABORT, 'baseline_immutable'); END;
+CREATE TRIGGER captures_immutable BEFORE UPDATE ON captures BEGIN SELECT RAISE(ABORT, 'capture_ledger_immutable'); END;
+CREATE TRIGGER captures_no_delete BEFORE DELETE ON captures BEGIN SELECT RAISE(ABORT, 'capture_ledger_immutable'); END;
+CREATE TRIGGER customers_no_delete BEFORE DELETE ON customers BEGIN SELECT RAISE(ABORT, 'customer_immutable'); END;
+CREATE TRIGGER customers_terminal BEFORE UPDATE OF state ON customers
+  WHEN OLD.state IN ('EXCLUDED_BASELINE', 'MANUAL_REVIEW', 'FENCED') AND NEW.state IS NOT OLD.state
+  BEGIN SELECT RAISE(ABORT, 'customer_state_terminal'); END;
+CREATE TRIGGER customers_member_no_bound BEFORE UPDATE OF member_no ON customers
+  WHEN OLD.member_no IS NOT NULL AND NEW.member_no IS NOT OLD.member_no
+  BEGIN SELECT RAISE(ABORT, 'member_no_immutable'); END;
+CREATE TRIGGER attempts_no_delete BEFORE DELETE ON allocation_attempts BEGIN SELECT RAISE(ABORT, 'attempt_immutable'); END;
+CREATE TRIGGER attempts_recorded_once BEFORE UPDATE ON allocation_attempts WHEN OLD.status IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'attempt_immutable'); END;
+CREATE TRIGGER approvals_no_delete BEFORE DELETE ON approvals BEGIN SELECT RAISE(ABORT, 'approval_immutable'); END;
+CREATE TRIGGER approvals_consumed_once BEFORE UPDATE ON approvals
+  WHEN OLD.consumed_at IS NOT NULL OR NEW.approval_id IS NOT OLD.approval_id OR NEW.customer_gid IS NOT OLD.customer_gid
+    OR NEW.expires_at IS NOT OLD.expires_at
+  BEGIN SELECT RAISE(ABORT, 'approval_immutable'); END;
+CREATE TRIGGER fences_no_delete BEFORE DELETE ON fences BEGIN SELECT RAISE(ABORT, 'fence_immutable'); END;
+CREATE TRIGGER fences_binding_immutable BEFORE UPDATE OF fence_id, customer_gid, member_no, approval_id, payload_digest, salt, owner_epoch, created_at ON fences
+  BEGIN SELECT RAISE(ABORT, 'fence_immutable'); END;
+CREATE TRIGGER fences_transition BEFORE UPDATE OF state ON fences
+  WHEN NOT (
+       (OLD.state = 'FENCED' AND NEW.state IN ('DISPATCHED', 'MANUAL_REVIEW'))
+    OR (OLD.state = 'DISPATCHED' AND NEW.state IN ('NOT_WRITTEN_PROVEN', 'CREATED_VERIFIED', 'CREATED_READBACK_MISMATCH',
+                                                   'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED'))
+    OR (OLD.state = 'WRITER_TERMINATION_UNCONFIRMED' AND NEW.state = 'WRITE_OUTCOME_UNCERTAIN')
+    OR (OLD.state = 'WRITE_OUTCOME_UNCERTAIN' AND NEW.state IN ('RECONCILED_VERIFIED', 'MANUAL_REVIEW')))
+  BEGIN SELECT RAISE(ABORT, 'fence_transition_invalid'); END;
+CREATE TRIGGER fences_dispatch_deadline BEFORE UPDATE OF state ON fences
+  WHEN NEW.state = 'DISPATCHED' AND NEW.deadline_at IS NULL
+  BEGIN SELECT RAISE(ABORT, 'fence_deadline_required'); END;
+CREATE TRIGGER events_append_only BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events_append_only'); END;
+CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events_append_only'); END;
+"""
+
+SCHEMA_VERSION = 2
+GENESIS_HASH = "sha256:" + "0" * 64
+CUSTOMER_TERMINAL = frozenset({"EXCLUDED_BASELINE", "MANUAL_REVIEW", "FENCED"})
+
+
+def _event_hash(prev_hash: str, at: str, event_type: str, customer_gid: str | None, fence_id: str | None, code: str | None) -> str:
+    body = json.dumps([prev_hash, at, event_type, customer_gid, fence_id, code], separators=(",", ":"))
+    return _sha256(body)
+
+
+class Ledger:
+    """Single-owner SQLite ledger. Every mutation runs in ``tx()``."""
+
+    def __init__(self, state_root: Path, *, clock: Callable[[], datetime] = utc_now):
+        self.root = Path(state_root)
+        self.clock = clock
+        self._lock = _OwnerLock(self.root / "ledger.lock")
+        self.conn: sqlite3.Connection | None = None
+        try:
+            self.conn = sqlite3.connect(self.root / "ledger.sqlite3", isolation_level=None, timeout=0)
+            self.conn.row_factory = sqlite3.Row
+            if self.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
+                raise DirectLocalError("ledger_wal_unavailable")
+            for pragma in ("synchronous=FULL", "foreign_keys=ON", "trusted_schema=OFF"):
+                self.conn.execute(f"PRAGMA {pragma}")
+            if self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise DirectLocalError("ledger_integrity_check_failed")
+            version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == 0:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _split_sql(SCHEMA):
+                        self.conn.execute(statement)
+                    self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            elif version != SCHEMA_VERSION:
+                raise DirectLocalError("ledger_schema_version_unsupported")
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute("SELECT epoch FROM writer_owner WHERE id = 1").fetchone()
+            self.epoch = (row["epoch"] if row else 0) + 1
+            self.conn.execute(
+                "INSERT INTO writer_owner(id, epoch, pid, acquired_at) VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, pid = excluded.pid, acquired_at = excluded.acquired_at",
+                (self.epoch, os.getpid(), ts(self.now())),
+            )
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn is not None:
+                self.conn.close()
+            self._lock.release()
+            raise
+
+    def now(self) -> datetime:
+        value = self.clock()
+        if value.tzinfo is None:
+            raise DirectLocalError("clock_must_be_timezone_aware")
+        return value.astimezone(timezone.utc)
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute("SELECT epoch FROM writer_owner WHERE id = 1").fetchone()
+            if row is None or row["epoch"] != self.epoch:
+                raise DirectLocalError("ledger_owner_epoch_lost")
+            yield self.conn
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def event(self, conn: sqlite3.Connection, event_type: str, *, customer_gid: str | None = None, fence_id: str | None = None, code: str | None = None) -> None:
+        last = conn.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone()
+        prev = last["hash"] if last else GENESIS_HASH
+        at = ts(self.now())
+        conn.execute(
+            "INSERT INTO events(at, type, customer_gid, fence_id, code, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (at, event_type, customer_gid, fence_id, code, prev, _event_hash(prev, at, event_type, customer_gid, fence_id, code)),
+        )
+
+    def verify_events(self) -> int:
+        prev = GENESIS_HASH
+        count = 0
+        for row in self.conn.execute("SELECT * FROM events ORDER BY seq"):
+            if row["prev_hash"] != prev or row["hash"] != _event_hash(prev, row["at"], row["type"], row["customer_gid"], row["fence_id"], row["code"]):
+                raise DirectLocalError("event_chain_broken")
+            prev = row["hash"]
+            count += 1
+        return count
+
+    def meta(self) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM ledger_meta WHERE id = 1").fetchone()
+        if row is None:
+            raise DirectLocalError("ledger_not_initialised")
+        return row
+
+
+def _split_sql(script: str) -> list[str]:
+    """Split the static schema on statement ends, keeping trigger bodies whole."""
+
+    statements, buffer = [], []
+    for line in script.strip().splitlines():
+        buffer.append(line)
+        text = "\n".join(buffer).strip()
+        if text.endswith(";") and (not text.upper().startswith("CREATE TRIGGER") or text.upper().endswith("END;")):
+            statements.append(text)
+            buffer = []
+    if "\n".join(buffer).strip():
+        raise DirectLocalError("schema_parse_failed")
+    return statements
+
+
+# --------------------------------------------------------------------------
+# AutoCount child bridge client
+# --------------------------------------------------------------------------
+
+def default_bridge_command(bridge_script: Path | None = None) -> list[str]:
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    script = bridge_script or REPO_ROOT / "scripts" / "ac2_directlocal_member_bridge.ps1"
+    return [
+        str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"),
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class WriteRun:
+    started: bool
+    exit_code: int | None = None
+    stdout: str = ""
+    timed_out: bool = False
+    exited: bool = True
+
+
+class BridgeError(DirectLocalError):
+    pass
+
+
+def payload_digest(salt: str, payload_canonical: str) -> str:
+    return _sha256(f"{salt}:{payload_canonical}")
+
+
+def canonical_payload(payload: Mapping[str, Any]) -> str:
+    # ASCII-only so the child's console stdin encoding cannot alter it.
+    return json.dumps(dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+class BridgeClient:
+    """One short-lived PowerShell child per operation. Protected values travel
+    only on stdin; arguments carry no customer data; stderr is discarded."""
+
+    def __init__(self, command: list[str], *, autocount_target: str = REAL_BRIDGE_TARGET, read_timeout_seconds: int = 120, popen: Callable[..., Any] = subprocess.Popen):
+        self.command = list(command)
+        self.autocount_target = autocount_target
+        self.read_timeout_seconds = read_timeout_seconds
+        self._popen = popen
+
+    def _start(self, arguments: list[str]):
+        return self._popen(
+            self.command + arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    @staticmethod
+    def _stdin(value: Mapping[str, Any]) -> bytes:
+        return (json.dumps(dict(value), ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+
+    def _read(self, operation: str, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        try:
+            process = self._start(["-Operation", operation, "-EnableProductionAdapter"])
+        except OSError:
+            raise BridgeError("bridge_start_failed") from None
+        try:
+            stdout, _ = process.communicate(self._stdin(value), timeout=self.read_timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise BridgeError("bridge_read_timeout") from None
+        if process.returncode != 0:
+            raise BridgeError("bridge_read_failed")
+        try:
+            result = json.loads(stdout.decode("utf-8").strip().splitlines()[-1])
+        except (UnicodeDecodeError, json.JSONDecodeError, IndexError):
+            raise BridgeError("bridge_output_invalid") from None
+        if not isinstance(result, dict):
+            raise BridgeError("bridge_output_invalid")
+        return result
+
+    def precheck(self, phone_keys: tuple[str, ...], email_address: str | None) -> Mapping[str, Any]:
+        return self._read("legacy-precheck", {"phone_keys": list(phone_keys), "email_address": email_address})
+
+    def next_member_no(self) -> str:
+        value = self._read("next-member-no", {}).get("member_no")
+        if not isinstance(value, str):
+            raise BridgeError("bridge_output_invalid")
+        return value
+
+    def probe(self, member_no: str) -> str:
+        status = self._read("probe", {"member_no": member_no}).get("status")
+        if status not in ("FREE", "OCCUPIED"):
+            raise BridgeError("bridge_output_invalid")
+        return status
+
+    def reconcile(self, member_no: str, payload_canonical_text: str) -> Mapping[str, Any]:
+        return self._read("reconcile", {"member_no": member_no, "payload_canonical": payload_canonical_text})
+
+    def write_once(self, *, fence_id: str, claim_directory: Path, deadline: datetime, stdin_value: Mapping[str, Any], wait_seconds: float, on_started: Callable[[int, str | None], None]) -> WriteRun:
+        arguments = [
+            "-Operation", "write-once", "-EnableProductionAdapter", "-FenceId", fence_id,
+            "-ClaimDirectory", str(claim_directory), "-WriteDeadlineUtc", deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ]
+        try:
+            process = self._start(arguments)
+        except OSError:
+            return WriteRun(started=False)
+        on_started(int(process.pid), child_creation_time(process))
+        try:
+            stdout, _ = process.communicate(self._stdin(stdin_value), timeout=max(wait_seconds, 1))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                return WriteRun(started=True, timed_out=True, exited=False)
+            return WriteRun(started=True, exit_code=process.returncode, timed_out=True, exited=True)
+        return WriteRun(started=True, exit_code=process.returncode, stdout=stdout.decode("utf-8", "replace")[-4096:])
+
+
+def classify_write(run: WriteRun, *, claim_exists: bool) -> tuple[str, str | None]:
+    """Fence terminal state for one write-once child. Absence of the claim
+    file is the only proof that ``SaveMember`` was never reached."""
+
+    if not run.started:
+        return ("NOT_WRITTEN_PROVEN", "writer_start_failed") if not claim_exists else ("WRITE_OUTCOME_UNCERTAIN", "claim_without_writer_start")
+    if run.timed_out:
+        if not run.exited:
+            return "WRITER_TERMINATION_UNCONFIRMED", "writer_timeout_exit_unconfirmed"
+        return ("WRITE_OUTCOME_UNCERTAIN", "writer_timeout") if claim_exists else ("NOT_WRITTEN_PROVEN", "writer_timeout_before_claim")
+    if run.exit_code == 0:
+        try:
+            outcome = json.loads(run.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            outcome = None
+        valid = (
+            isinstance(outcome, dict) and outcome.get("save_invocation_count") == 1
+            and isinstance(outcome.get("readback_found"), bool) and isinstance(outcome.get("readback_match"), bool)
+        )
+        if not valid:
+            return "WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"
+        if not outcome["readback_found"]:
+            return "WRITE_OUTCOME_UNCERTAIN", "readback_absent"
+        return ("CREATED_VERIFIED", None) if outcome["readback_match"] else ("CREATED_READBACK_MISMATCH", "readback_mismatch_manual_review")
+    if run.exit_code == 3:
+        return "WRITE_OUTCOME_UNCERTAIN", "fence_already_claimed"
+    return ("WRITE_OUTCOME_UNCERTAIN", "writer_failed_after_claim") if claim_exists else ("NOT_WRITTEN_PROVEN", "writer_failed_before_claim")
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return kernel32
+
+
+def _creation_time(kernel32, handle) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)):
+        return None
+    return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+
+
+def child_creation_time(process: Any) -> str | None:
+    """Creation instant of a started child, so a reused PID is never mistaken
+    for it. ``None`` (unknown) keeps recovery on HOLD."""
+
+    handle = getattr(process, "_handle", None)
+    if os.name != "nt" or handle is None:
+        return None
+    return _creation_time(_kernel32(), int(handle))
+
+
+def probe_writer(pid: int, created: str | None) -> str:
+    """``running``, ``exited`` or ``unknown``. Only ``exited`` is proof: the
+    PID no longer exists, or it now belongs to a process with a different
+    creation instant (PID reuse). Any failure or missing identity is
+    ``unknown`` and recovery stays on HOLD."""
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = _kernel32()
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return "exited" if ctypes.get_last_error() == 87 else "unknown"  # 87: no such process
+        try:
+            current = _creation_time(kernel32, handle)
+            if current is None or created is None:
+                return "unknown"
+            if current != created:
+                return "exited"
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return "unknown"
+            return "running" if code.value == 259 else "exited"  # 259: STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return "exited"
+    except OSError:
+        return "unknown"
+    return "unknown"  # present, but without a creation identity it cannot be ours or not
+
+
+# --------------------------------------------------------------------------
+# Processor
+# --------------------------------------------------------------------------
+
+class Processor:
+    def __init__(self, ledger: Ledger, *, writer_probe: Callable[[int, str | None], str] = probe_writer, writer_deadline_seconds: int = WRITER_DEADLINE_SECONDS, writer_grace_seconds: int = WRITER_GRACE_SECONDS):
+        self.ledger = ledger
+        self.writer_probe = writer_probe
+        self.writer_deadline_seconds = writer_deadline_seconds
+        self.writer_grace_seconds = writer_grace_seconds
+        self.inbox = ledger.root / "inbox"
+        self.claims = ledger.root / "claims"
+
+    # -- setup ------------------------------------------------------------
+    def init_ledger(self, *, mode: str, store_gid: str, shop_domain: str) -> dict[str, Any]:
+        if mode not in QUALIFIED_RESPONSE_SHAPES:
+            raise DirectLocalError("capture_response_shape_unqualified")
+        if not SHOP_GID_RE.fullmatch(store_gid) or not SYNTHETIC_DOMAIN_RE.fullmatch(shop_domain):
+            raise DirectLocalError("synthetic_store_identity_invalid")
+        with self.ledger.tx() as conn:
+            if conn.execute("SELECT 1 FROM ledger_meta").fetchone():
+                raise DirectLocalError("ledger_already_initialised")
+            conn.execute(
+                "INSERT INTO ledger_meta(id, ledger_id, mode, store_gid, shop_domain, created_at) VALUES (1, ?, ?, ?, ?, ?)",
+                (f"ledger-{uuid.uuid4().hex}", mode, store_gid, shop_domain, ts(self.ledger.now())),
+            )
+            self.ledger.event(conn, "ledger_initialised")
+        self.inbox.mkdir(exist_ok=True)
+        self.claims.mkdir(exist_ok=True)
+        return {"status": "initialised", "mode": mode}
+
+    def _require_synthetic_bridge(self, bridge: Any) -> None:
+        """A synthetic ledger is inert: only the test-only fake bridge target is
+        accepted, so no real AutoCount process can ever be started from it."""
+
+        if self.ledger.meta()["mode"] != "synthetic" or getattr(bridge, "autocount_target", None) != SYNTHETIC_BRIDGE_TARGET:
+            raise DirectLocalError("real_autocount_refused_synthetic_ledger")
+
+    def _cutover(self, conn: sqlite3.Connection) -> datetime:
+        row = conn.execute("SELECT cutover_at FROM runs WHERE kind = 'BASELINE' AND state = 'SEALED'").fetchone()
+        if row is None:
+            raise DirectLocalError("baseline_not_sealed")
+        return parse_ts(row["cutover_at"])
+
+    # -- runs (baseline / discovery) ----------------------------------------
+    def begin_run(self, kind: str) -> dict[str, Any]:
+        self.ledger.meta()
+        with self.ledger.tx() as conn:
+            if conn.execute("SELECT 1 FROM runs WHERE state = 'CAPTURING'").fetchone():
+                raise DirectLocalError("run_already_open")
+            baseline = conn.execute("SELECT state, cutover_at FROM runs WHERE kind = 'BASELINE' AND state <> 'ABANDONED'").fetchone()
+            now = self.ledger.now().replace(microsecond=0)
+            if kind == "BASELINE":
+                if baseline is not None:
+                    raise DirectLocalError("baseline_already_exists")
+                previous = conn.execute("SELECT MAX(cutover_at) AS c FROM runs WHERE kind = 'BASELINE' AND state = 'ABANDONED'").fetchone()["c"]
+                if previous is not None and now <= parse_ts(previous):
+                    raise DirectLocalError("cutover_not_advanced")
+                cutover = ts(now)  # C: fixed before any page is requested
+            elif kind == "DISCOVERY":
+                if baseline is None or baseline["state"] != "SEALED":
+                    raise DirectLocalError("baseline_not_sealed")
+                cutover = baseline["cutover_at"]
+            else:
+                raise DirectLocalError("run_kind_invalid")
+            run_id = f"run-{uuid.uuid4().hex}"
+            conn.execute(
+                "INSERT INTO runs(run_id, kind, cutover_at, state, started_at) VALUES (?, ?, ?, 'CAPTURING', ?)",
+                (run_id, kind, cutover, ts(now)),
+            )
+            self.ledger.event(conn, f"run_started:{kind.lower()}")
+        return {"run_id": run_id, "kind": kind, "cutover_at": cutover, "page_size": PAGE_SIZE, "query_sha256": _sha256(BASELINE_QUERY)}
+
+    def abandon_run(self, run_id: str, *, confirm_suffix: str) -> dict[str, Any]:
+        """Abandon an incomplete (CAPTURING) run; a sealed run never changes.
+        Its unconsumed page captures are recorded as consumed so a fresh run
+        (with a new, later cutover for a baseline) starts from a clean inbox."""
+
+        if not re.fullmatch(r"[0-9a-f]{8}", confirm_suffix or "") or not run_id.endswith(confirm_suffix):
+            raise DirectLocalError("abandon_confirmation_mismatch")
+        meta = self.ledger.meta()
+        with self.ledger.tx() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None or run["state"] != "CAPTURING":
+                raise DirectLocalError("run_not_abandonable")
+            now = ts(self.ledger.now())
+            retired = 0
+            for path in sorted(self.inbox.glob("*.json")):
+                try:
+                    capture = parse_capture(path.read_bytes(), mode=meta["mode"], store_gid=meta["store_gid"], shop_domain=meta["shop_domain"])
+                except CaptureRejected:
+                    continue  # never consumed; it still blocks any later ingest
+                if capture.kind != "baseline" or conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+                    continue
+                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'abandoned', ?)", (capture.capture_sha256, capture.tool_use_id, now))
+                retired += 1
+            conn.execute("UPDATE runs SET state = 'ABANDONED', sealed_at = ? WHERE run_id = ?", (now, run_id))
+            self.ledger.event(conn, f"run_abandoned:{run['kind'].lower()}")
+        return {"run_id": run_id, "state": "ABANDONED", "captures_retired": retired}
+
+    def _inbox_captures(self, conn: sqlite3.Connection, meta: sqlite3.Row) -> list[tuple[Path, Capture]]:
+        found = []
+        for path in sorted(self.inbox.glob("*.json")):
+            capture = parse_capture(path.read_bytes(), mode=meta["mode"], store_gid=meta["store_gid"], shop_domain=meta["shop_domain"])
+            found.append((path, capture))
+        return found
+
+    def ingest_run(self) -> dict[str, Any]:
+        meta = self.ledger.meta()
+        with self.ledger.tx() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE state = 'CAPTURING'").fetchone()
+            if run is None:
+                raise DirectLocalError("no_open_run")
+            started = parse_ts(run["started_at"])
+            pages: dict[str | None, Capture] = {}
+            duplicates: list[Capture] = []  # identical re-captures, consumed with the run
+            for _, capture in self._inbox_captures(conn, meta):
+                if capture.kind != "baseline":
+                    continue
+                if conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+                    continue  # consumed by an earlier run: replay suppressed
+                if capture.captured_at < started:
+                    raise DirectLocalError("page_capture_predates_run")
+                after = capture.variables.get("after")
+                existing = pages.get(after)
+                if existing is not None:
+                    if existing.data != capture.data:
+                        raise DirectLocalError("page_capture_conflict")
+                    duplicates.append(capture)
+                    continue
+                pages[after] = capture
+            used: list[Capture] = []
+
+            def page_reader(after: str | None) -> Mapping[str, Any]:
+                capture = pages.get(after)
+                if capture is None:
+                    raise ShopifyReadError("capture_page_missing")
+                used.append(capture)
+                return capture.data["customers"]
+
+            try:
+                historical, transition = capture_member_mg_baseline(page_reader, cutover_at=parse_ts(run["cutover_at"]))
+            except BaselineCaptureError as exc:
+                raise DirectLocalError(f"run_not_sealed:{exc.code}") from None
+            if len(used) != len(pages):
+                raise DirectLocalError("run_not_sealed:unchained_page_capture")
+            now = ts(self.ledger.now())
+            for capture in duplicates:
+                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'baseline', ?)", (capture.capture_sha256, capture.tool_use_id, now))
+            for index, capture in enumerate(used):
+                page = capture.data["customers"]
+                conn.execute(
+                    "INSERT INTO run_pages(run_id, page_index, capture_sha256, has_next, node_count) VALUES (?, ?, ?, ?, ?)",
+                    (run["run_id"], index, capture.capture_sha256, int(page["pageInfo"]["hasNextPage"]), len(page["nodes"])),
+                )
+                conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'baseline', ?)", (capture.capture_sha256, capture.tool_use_id, now))
+            discovered = 0
+            if run["kind"] == "BASELINE":
+                for gid in historical:
+                    conn.execute("INSERT INTO baseline_members(customer_gid) VALUES (?)", (gid,))
+                candidates = transition
+            else:
+                baseline = {row["customer_gid"] for row in conn.execute("SELECT customer_gid FROM baseline_members")}
+                # Historical-by-createdAt GIDs missing from the sealed baseline
+                # are surfaced too; evaluate_profile sends them to review.
+                candidates = tuple(transition) + tuple(gid for gid in historical if gid not in baseline)
+            for gid in candidates:
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO customers(store_gid, customer_gid, state, updated_at) VALUES (?, ?, 'DISCOVERED', ?)",
+                    (meta["store_gid"], gid, now),
+                ).rowcount
+                if inserted:
+                    discovered += 1
+                    self.ledger.event(conn, "customer_discovered", customer_gid=gid)
+            conn.execute(
+                "UPDATE runs SET state = 'SEALED', sealed_at = ?, page_count = ?, historical_count = ?, transition_count = ?, historical_digest = ? WHERE run_id = ?",
+                (now, len(used), len(historical), len(transition), baseline_digest(list(historical)), run["run_id"]),
+            )
+            self.ledger.event(conn, f"run_sealed:{run['kind'].lower()}")
+        return {"run_id": run["run_id"], "kind": run["kind"], "pages": len(used), "historical": len(historical), "transition": len(transition), "discovered": discovered}
+
+    # -- recovery -----------------------------------------------------------
+    def recover(self) -> dict[str, int]:
+        counts = {"orphaned": 0, "uncertain": 0, "not_written": 0}
+        now = self.ledger.now()
+        with self.ledger.tx() as conn:
+            for fence in conn.execute("SELECT * FROM fences WHERE state IN ('FENCED', 'DISPATCHED', 'WRITER_TERMINATION_UNCONFIRMED')").fetchall():
+                fence_id = fence["fence_id"]
+                if fence["state"] == "FENCED":
+                    # The child is only ever started after DISPATCHED commits.
+                    self._fence_state(conn, fence, "MANUAL_REVIEW", "fence_orphaned_pre_dispatch")
+                    counts["orphaned"] += 1
+                    continue
+                if fence["state"] == "DISPATCHED" and now < parse_ts(fence["deadline_at"]) + timedelta(seconds=self.writer_grace_seconds):
+                    raise DirectLocalHold("writer_may_be_live")
+                # Exit must be proven against the recorded child identity
+                # (PID + creation instant). Unknown identity or an
+                # indeterminate probe stays on HOLD; only an attended
+                # release-writer-hold can move it on (to uncertain, never to
+                # not-written).
+                if fence["child_pid"] is None or fence["child_created"] is None:
+                    raise DirectLocalHold("writer_identity_unrecorded")
+                probe = self.writer_probe(fence["child_pid"], fence["child_created"])
+                if probe != "exited":
+                    raise DirectLocalHold("writer_may_be_live" if probe == "running" else "writer_exit_unproven")
+                claim = (self.claims / f"{fence_id}.claim").exists()
+                if fence["state"] == "DISPATCHED" and not claim:
+                    self._fence_state(conn, fence, "NOT_WRITTEN_PROVEN", "dispatch_owner_lost_before_claim")
+                    counts["not_written"] += 1
+                else:
+                    code = "dispatch_owner_lost" if fence["state"] == "DISPATCHED" else "writer_termination_resolved"
+                    self._fence_state(conn, fence, "WRITE_OUTCOME_UNCERTAIN", code)
+                    counts["uncertain"] += 1
+        return counts
+
+    def release_writer_hold(self, fence_id: str, *, confirm_suffix: str) -> dict[str, Any]:
+        """Attended exit from a HOLD whose writer exit cannot be proven. The
+        operator attests no bridge process remains; the fence becomes
+        WRITE_OUTCOME_UNCERTAIN (reconcile read-only), never not-written."""
+
+        if not re.fullmatch(r"[0-9a-f]{8}", confirm_suffix or "") or not fence_id.endswith(confirm_suffix):
+            raise DirectLocalError("release_confirmation_mismatch")
+        with self.ledger.tx() as conn:
+            fence = conn.execute("SELECT * FROM fences WHERE fence_id = ?", (fence_id,)).fetchone()
+            if fence is None or fence["state"] not in ("DISPATCHED", "WRITER_TERMINATION_UNCONFIRMED"):
+                raise DirectLocalError("no_writer_hold")
+            if self.ledger.now() < parse_ts(fence["deadline_at"]) + timedelta(seconds=self.writer_grace_seconds):
+                raise DirectLocalHold("writer_may_be_live")
+            self._fence_state(conn, fence, "WRITE_OUTCOME_UNCERTAIN", "operator_attested_writer_absent")
+        return {"fence_state": "WRITE_OUTCOME_UNCERTAIN", "code": "operator_attested_writer_absent"}
+
+    def _fence_state(self, conn: sqlite3.Connection, fence: sqlite3.Row, state: str, code: str | None, **extra: Any) -> None:
+        columns = ", ".join(f"{name} = ?" for name in extra)
+        conn.execute(
+            f"UPDATE fences SET state = ?, code = ?, updated_at = ?{', ' + columns if columns else ''} WHERE fence_id = ?",
+            (state, code, ts(self.ledger.now()), *extra.values(), fence["fence_id"]),
+        )
+        self.ledger.event(conn, f"fence:{state.lower()}", customer_gid=fence["customer_gid"], fence_id=fence["fence_id"], code=code)
+
+    # -- profile processing ---------------------------------------------------
+    def _consume_profile(self, conn: sqlite3.Connection, capture_path: Path, meta: sqlite3.Row) -> Capture:
+        path = Path(capture_path).resolve()
+        if path.parent != self.inbox.resolve():
+            raise DirectLocalError("capture_outside_inbox")
+        capture = parse_capture(path.read_bytes(), mode=meta["mode"], store_gid=meta["store_gid"], shop_domain=meta["shop_domain"])
+        if capture.kind != "profile":
+            raise DirectLocalError("capture_not_profile")
+        if conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+            raise DirectLocalError("capture_replayed")
+        age = (self.ledger.now() - capture.captured_at).total_seconds()
+        if age < -60 or age > CAPTURE_MAX_AGE_SECONDS:
+            raise DirectLocalError("capture_stale")
+        conn.execute(
+            "INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, 'profile', ?)",
+            (capture.capture_sha256, capture.tool_use_id, ts(self.ledger.now())),
+        )
+        return capture
+
+    def _decide(self, conn: sqlite3.Connection, capture: Capture, customer: sqlite3.Row, *, complete_required: bool | None = None):
+        gid = capture.variables["id"]
+        in_baseline = conn.execute("SELECT 1 FROM baseline_members WHERE customer_gid = ?", (gid,)).fetchone() is not None
+        required = customer["check_count"] + 1 >= PROFILE_WAIT_MAX_CHECKS if complete_required is None else complete_required
+        return evaluate_profile(capture.data["customer"], in_baseline=in_baseline, cutover_at=self._cutover(conn), profile_complete_required=required)
+
+    @staticmethod
+    def _customer(conn: sqlite3.Connection, gid: str) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM customers WHERE customer_gid = ?", (gid,)).fetchone()
+        if row is None:
+            raise DirectLocalError("customer_not_discovered")
+        return row
+
+    def _set_customer(self, conn: sqlite3.Connection, gid: str, state: str, code: str | None, *, count_check: bool = False) -> None:
+        conn.execute(
+            "UPDATE customers SET state = ?, decision_code = ?, check_count = check_count + ?, updated_at = ? WHERE customer_gid = ?",
+            (state, code, 1 if count_check else 0, ts(self.ledger.now()), gid),
+        )
+        self.ledger.event(conn, f"customer:{state.lower()}", customer_gid=gid, code=code)
+
+    def _review(self, gid: str, code: str) -> dict[str, Any]:
+        with self.ledger.tx() as conn:
+            self._set_customer(conn, gid, "MANUAL_REVIEW", code)
+        return {"customer_state": "MANUAL_REVIEW", "code": code}
+
+    def _discard(self, capture_path: Path) -> bool:
+        try:
+            Path(capture_path).unlink()
+            return True
+        except OSError:
+            return False
+
+    def process(self, capture_path: Path, *, bridge: BridgeClient | None = None, enable_write: bool = False) -> dict[str, Any]:
+        if enable_write:
+            self._require_synthetic_bridge(bridge)  # before any state change
+        self.recover()
+        meta = self.ledger.meta()
+        outcome_map = {"ADMIT": "ADMITTED", "WAIT": "WAITING", "NOT_ELIGIBLE": "NOT_ELIGIBLE", "EXCLUDED_BASELINE": "EXCLUDED_BASELINE", "MANUAL_REVIEW": "MANUAL_REVIEW"}
+        with self.ledger.tx() as conn:
+            capture = self._consume_profile(conn, capture_path, meta)
+            gid = capture.variables["id"]
+            customer = self._customer(conn, gid)
+            if customer["state"] in CUSTOMER_TERMINAL:
+                raise DirectLocalError("customer_state_terminal")
+            decision = self._decide(conn, capture, customer)
+            state = outcome_map[decision.outcome]
+            self._set_customer(conn, gid, state, decision.code, count_check=True)
+        result: dict[str, Any] = {"customer_state": state, "code": decision.code, "capture_discarded": self._discard(capture_path)}
+        if state != "ADMITTED" or not enable_write:
+            return result
+        result.update(self._write(gid, decision.create_payload or {}, bridge))
+        return result
+
+    def approve_write(self, gid: str, *, confirm_suffix: str, ttl_seconds: int = 900) -> dict[str, Any]:
+        # The operator retypes the GID's trailing digits; a mistyped GID never approves.
+        if not GID_RE.fullmatch(gid) or not re.fullmatch(r"[0-9]{4,20}", confirm_suffix or "") or not gid.endswith(confirm_suffix):
+            raise DirectLocalError("approval_confirmation_mismatch")
+        if not 60 <= ttl_seconds <= APPROVAL_MAX_TTL_SECONDS:
+            raise DirectLocalError("approval_ttl_invalid")
+        self.recover()
+        with self.ledger.tx() as conn:
+            if self._customer(conn, gid)["state"] != "ADMITTED":
+                raise DirectLocalError("approval_requires_admitted_customer")
+            approval_id = f"approval-{uuid.uuid4().hex}"
+            now = self.ledger.now()
+            conn.execute(
+                "INSERT INTO approvals(approval_id, customer_gid, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (approval_id, gid, ts(now), ts(now + timedelta(seconds=ttl_seconds))),
+            )
+            self.ledger.event(conn, "write_approved", customer_gid=gid)
+        return {"approval_id": approval_id, "expires_in_seconds": ttl_seconds}
+
+    def _live_approval(self, conn: sqlite3.Connection, gid: str) -> str | None:
+        row = conn.execute(
+            "SELECT approval_id FROM approvals WHERE customer_gid = ? AND consumed_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+            (gid, ts(self.ledger.now())),
+        ).fetchone()
+        return row["approval_id"] if row else None
+
+    def _allocate(self, gid: str, bridge: BridgeClient) -> tuple[str | None, str | None]:
+        with self.ledger.tx() as conn:
+            bound = self._customer(conn, gid)["member_no"]
+        if bound is not None:
+            return bound, None
+        while True:
+            with self.ledger.tx() as conn:
+                attempts = conn.execute("SELECT candidate FROM allocation_attempts WHERE customer_gid = ? ORDER BY attempt_no", (gid,)).fetchall()
+                if len(attempts) >= MAX_MEMBER_NO_CANDIDATES:
+                    return None, "member_no_candidates_exhausted"
+                attempt_no = len(attempts) + 1
+                # Committed before the generator call: a crash still spends it.
+                conn.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, created_at) VALUES (?, ?, ?)", (gid, attempt_no, ts(self.ledger.now())))
+                self.ledger.event(conn, "member_no_attempt", customer_gid=gid)
+            previous = {row["candidate"] for row in attempts}
+
+            def record(candidate: str | None, status: str) -> None:
+                with self.ledger.tx() as conn:
+                    conn.execute("UPDATE allocation_attempts SET candidate = ?, status = ? WHERE customer_gid = ? AND attempt_no = ?", (candidate, status, gid, attempt_no))
+
+            try:
+                candidate = bridge.next_member_no()
+            except BridgeError:
+                record(None, "GENERATOR_FAILED")
+                return None, "member_no_generator_failed"
+            if not MEMBER_NO_RE.fullmatch(candidate):
+                record(None, "GENERATOR_INVALID")
+                return None, "member_no_generator_invalid"
+            if candidate in previous:
+                record(candidate, "REPEATED")
+                return None, "member_no_generator_not_advancing"
+            with self.ledger.tx() as conn:
+                held = conn.execute("SELECT 1 FROM customers WHERE member_no = ?", (candidate,)).fetchone()
+            if held:
+                record(candidate, "LEDGER_HELD")
+                continue
+            try:
+                status = bridge.probe(candidate)
+            except BridgeError:
+                record(candidate, "PROBE_FAILED")
+                return None, "member_no_probe_failed"
+            if status == "OCCUPIED":
+                record(candidate, "OCCUPIED")
+                continue
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE allocation_attempts SET candidate = ?, status = 'FREE_BOUND' WHERE customer_gid = ? AND attempt_no = ?", (candidate, gid, attempt_no))
+                conn.execute("UPDATE customers SET member_no = ?, updated_at = ? WHERE customer_gid = ?", (candidate, ts(self.ledger.now()), gid))
+                self.ledger.event(conn, "member_no_bound", customer_gid=gid)
+            return candidate, None
+
+    def _write(self, gid: str, payload: Mapping[str, Any], bridge: BridgeClient) -> dict[str, Any]:
+        self._require_synthetic_bridge(bridge)
+        for field, width in AUTOCOUNT_FIELD_WIDTHS.items():
+            value = payload.get(field)
+            if value is not None and len(value) > width:
+                return self._review(gid, "autocount_field_width_exceeded")
+        with self.ledger.tx() as conn:
+            if self._live_approval(conn, gid) is None:
+                return {"write": "not_started", "code": "write_approval_missing"}
+        try:
+            precheck = bridge.precheck(duplicate_phone_keys(payload.get("mobile_phone")), payload.get("email_address"))
+        except BridgeError:
+            return self._review(gid, "legacy_lookup_failed")
+        flags = ("phone_member_no_hit", "mobile_phone_hit", "email_hit")
+        if precheck.get("outcome") != "NO_CANDIDATE" or any(precheck.get(flag) is not False for flag in flags):
+            code = {"CANDIDATE_FOUND": "legacy_candidate_found", "LOOKUP_FAILED": "legacy_lookup_failed"}.get(precheck.get("outcome"), "legacy_precheck_ambiguous")
+            return self._review(gid, code)
+        member_no, code = self._allocate(gid, bridge)
+        if member_no is None:
+            return self._review(gid, code or "member_no_allocation_failed")
+        try:
+            recheck = bridge.probe(member_no)
+        except BridgeError:
+            recheck = "PROBE_FAILED"
+        if recheck != "FREE":
+            return self._review(gid, "bound_member_no_recheck_failed")
+
+        salt = secrets.token_hex(16)
+        payload_text = canonical_payload(payload)
+        digest = payload_digest(salt, payload_text)
+        fence_id = f"fence-{uuid.uuid4().hex}"
+        with self.ledger.tx() as conn:
+            customer = self._customer(conn, gid)
+            approval_id = self._live_approval(conn, gid)
+            if customer["state"] != "ADMITTED" or customer["member_no"] != member_no or approval_id is None:
+                raise DirectLocalError("fence_preconditions_changed")
+            now = ts(self.ledger.now())
+            conn.execute("UPDATE approvals SET consumed_at = ? WHERE approval_id = ?", (now, approval_id))
+            conn.execute(
+                "INSERT INTO fences(fence_id, customer_gid, member_no, approval_id, payload_digest, salt, owner_epoch, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'FENCED', ?, ?)",
+                (fence_id, gid, member_no, approval_id, digest, salt, self.ledger.epoch, now, now),
+            )
+            self._set_customer(conn, gid, "FENCED", None)
+            self.ledger.event(conn, "fence:fenced", customer_gid=gid, fence_id=fence_id)
+        deadline = (self.ledger.now() + timedelta(seconds=self.writer_deadline_seconds)).replace(microsecond=0)
+        with self.ledger.tx() as conn:
+            fence = conn.execute("SELECT * FROM fences WHERE fence_id = ?", (fence_id,)).fetchone()
+            self._fence_state(conn, fence, "DISPATCHED", None, deadline_at=ts(deadline))
+
+        def on_started(pid: int, created: str | None) -> None:
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE fences SET child_pid = ?, child_created = ?, updated_at = ? WHERE fence_id = ? AND state = 'DISPATCHED'", (pid, created, ts(self.ledger.now()), fence_id))
+
+        run = bridge.write_once(
+            fence_id=fence_id, claim_directory=self.claims, deadline=deadline,
+            stdin_value={"fence_id": fence_id, "member_no": member_no, "salt": salt, "payload_canonical": payload_text, "payload_digest": digest},
+            wait_seconds=(deadline - self.ledger.now()).total_seconds() + self.writer_grace_seconds, on_started=on_started,
+        )
+        state, code = classify_write(run, claim_exists=(self.claims / f"{fence_id}.claim").exists())
+        with self.ledger.tx() as conn:
+            fence = conn.execute("SELECT * FROM fences WHERE fence_id = ?", (fence_id,)).fetchone()
+            self._fence_state(conn, fence, state, code, exit_code=run.exit_code)
+        return {"fence_state": state, "code": code, "member_no_bound": True}
+
+    def reconcile(self, capture_path: Path, *, bridge: BridgeClient) -> dict[str, Any]:
+        """Read-only check of one uncertain write with the same MemberNo."""
+
+        self._require_synthetic_bridge(bridge)
+        self.recover()
+        meta = self.ledger.meta()
+        with self.ledger.tx() as conn:
+            capture = self._consume_profile(conn, capture_path, meta)
+            gid = capture.variables["id"]
+            customer = self._customer(conn, gid)
+            fence = conn.execute("SELECT * FROM fences WHERE customer_gid = ?", (gid,)).fetchone()
+            if fence is None or fence["state"] != "WRITE_OUTCOME_UNCERTAIN":
+                raise DirectLocalError("no_uncertain_write")
+            decision = self._decide(conn, capture, customer, complete_required=True)
+        self._discard(capture_path)
+        if decision.outcome != "ADMIT" or payload_digest(fence["salt"], canonical_payload(decision.create_payload or {})) != fence["payload_digest"]:
+            with self.ledger.tx() as conn:
+                self._fence_state(conn, fence, "MANUAL_REVIEW", "reconcile_source_changed")
+            return {"fence_state": "MANUAL_REVIEW", "code": "reconcile_source_changed"}
+        try:
+            check = bridge.reconcile(fence["member_no"], canonical_payload(decision.create_payload or {}))
+        except BridgeError:
+            return {"fence_state": "WRITE_OUTCOME_UNCERTAIN", "code": "reconciliation_lookup_uncertain"}
+        found, match = check.get("found"), check.get("match")
+        if not isinstance(found, bool) or not isinstance(match, bool):
+            return {"fence_state": "WRITE_OUTCOME_UNCERTAIN", "code": "reconciliation_lookup_uncertain"}
+        state, code = ("RECONCILED_VERIFIED", None) if found and match else ("MANUAL_REVIEW", "readback_mismatch_manual_review" if found else "confirmed_absent_manual_followup")
+        with self.ledger.tx() as conn:
+            self._fence_state(conn, fence, state, code)
+        return {"fence_state": state, "code": code}
+
+    def status(self) -> dict[str, Any]:
+        conn = self.ledger.conn
+        return {
+            "events_verified": self.ledger.verify_events(),
+            "customers": {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM customers GROUP BY state")},
+            "fences": {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM fences GROUP BY state")},
+            "runs": [dict(row) for row in conn.execute("SELECT run_id, kind, state, cutover_at, page_count, historical_count, transition_count FROM runs ORDER BY started_at")],
+        }
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _emit(text: str) -> None:
+    # One bounded, PII-free JSON line per command (codes, counts, states only).
+    sys.stdout.write(text + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python directlocal/xb_directlocal.py", description="DirectLocal #155 synthetic core")
+    parser.add_argument("--state-root", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser("init-ledger")
+    init.add_argument("--mode", required=True)
+    init.add_argument("--store-gid", required=True)
+    init.add_argument("--shop-domain", required=True)
+    inspect = commands.add_parser("inspect-identity")
+    inspect.add_argument("--capture", required=True)
+    commands.add_parser("begin-baseline")
+    commands.add_parser("begin-discovery")
+    commands.add_parser("ingest-run")
+    commands.add_parser("recover")
+    commands.add_parser("status")
+    abandon = commands.add_parser("abandon-run")
+    abandon.add_argument("--run-id", required=True)
+    abandon.add_argument("--confirm-suffix", required=True)
+    release = commands.add_parser("release-writer-hold")
+    release.add_argument("--fence-id", required=True)
+    release.add_argument("--confirm-suffix", required=True)
+    approve = commands.add_parser("approve-write")
+    approve.add_argument("--gid", required=True)
+    approve.add_argument("--confirm-suffix", required=True)
+    approve.add_argument("--ttl-seconds", type=int, default=900)
+    for name in ("process", "reconcile"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--capture", required=True)
+        sub.add_argument("--bridge-script")
+        if name == "process":
+            sub.add_argument("--enable-autocount-write", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "inspect-identity":  # read-only file check; no ledger is opened
+        try:
+            _emit(json.dumps(inspect_identity_capture(Path(args.capture).read_bytes()), sort_keys=True))
+            return 0
+        except (DirectLocalError, OSError) as exc:
+            _emit(json.dumps({"status": "refused", "code": getattr(exc, "code", "capture_unreadable")}))
+            return 2
+    try:
+        ledger = Ledger(validate_state_root(args.state_root))
+    except DirectLocalError as exc:
+        _emit(json.dumps({"status": "refused", "code": exc.code}))
+        return 2
+    try:
+        processor = Processor(ledger)
+        bridge_script = getattr(args, "bridge_script", None)
+        # Always the real target: a synthetic ledger refuses it before any spawn.
+        bridge = BridgeClient(default_bridge_command(Path(bridge_script) if bridge_script else None))
+        if args.command == "init-ledger":
+            result = processor.init_ledger(mode=args.mode, store_gid=args.store_gid, shop_domain=args.shop_domain)
+        elif args.command == "begin-baseline":
+            result = processor.begin_run("BASELINE")
+        elif args.command == "begin-discovery":
+            result = processor.begin_run("DISCOVERY")
+        elif args.command == "ingest-run":
+            result = processor.ingest_run()
+        elif args.command == "abandon-run":
+            result = processor.abandon_run(args.run_id, confirm_suffix=args.confirm_suffix)
+        elif args.command == "release-writer-hold":
+            result = processor.release_writer_hold(args.fence_id, confirm_suffix=args.confirm_suffix)
+        elif args.command == "recover":
+            result = processor.recover()
+        elif args.command == "status":
+            result = processor.status()
+        elif args.command == "approve-write":
+            result = processor.approve_write(args.gid, confirm_suffix=args.confirm_suffix, ttl_seconds=args.ttl_seconds)
+        elif args.command == "process":
+            result = processor.process(Path(args.capture), bridge=bridge, enable_write=args.enable_autocount_write)
+        else:
+            result = processor.reconcile(Path(args.capture), bridge=bridge)
+        _emit(json.dumps(result, sort_keys=True, default=str))
+        return 0
+    except DirectLocalHold as exc:
+        _emit(json.dumps({"status": "hold", "code": exc.code}))
+        return HOLD_EXIT_CODE
+    except (DirectLocalError, sqlite3.IntegrityError) as exc:
+        code = exc.code if isinstance(exc, DirectLocalError) else "ledger_constraint_refused"
+        _emit(json.dumps({"status": "refused", "code": code}))
+        return 2
+    finally:
+        ledger.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
