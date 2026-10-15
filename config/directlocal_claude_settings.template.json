@@ -1,0 +1,67 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "deny": [
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__add-to-collection",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__bulk-update-product-status",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__create-collection",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__create-digital-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__create-digital-product-from-link",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__create-discount",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__create-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__find-mock-shop-catalogs",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__find-sample-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__generate-business-names",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__generate-domain-names",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-collection",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-digital-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-inventory-levels",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-new-store-previews",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-order",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__get-shop-info",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__graphql_mutation",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__graphql_schema",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__import-mock-shop-catalog",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__list-customers",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__list-orders",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__open-digital-products-install",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__publish-digital-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__run-analytics-query",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__search-collective-product-candidates",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__search_collections",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__search_docs_chunks",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__search_products",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__set-inventory",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__show-collective-products",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__switch-shop",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__test-digital-products-connection",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__update-collection",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__update-product",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__upload-digital-product-file",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__upload-digital-product-media",
+      "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__validate_graphql_codeblocks",
+      "mcp__plugin_small-business_shopify",
+      "Write(<STATE_ROOT>/**)",
+      "Edit(<STATE_ROOT>/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "python \"<REPO_ROOT>/scripts/directlocal_connector_hook.py\" guard" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__graphql_query",
+        "hooks": [
+          { "type": "command", "command": "python \"<REPO_ROOT>/scripts/directlocal_connector_hook.py\" capture --inbox \"<STATE_ROOT>/inbox\"" }
+        ]
+      }
+    ]
+  }
+}
