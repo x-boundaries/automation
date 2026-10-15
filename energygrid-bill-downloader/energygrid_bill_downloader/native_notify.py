@@ -266,7 +266,8 @@ def message_for(cfg: NativeConfig, row: dict) -> tuple[str, str]:
                 f"File: {row['display_filename']}\n"
                 f"Status: {row['status_text']}\n"
                 f"Reference: {row['support_ref']}\n"
-                "The next scheduled run uploads it once. Check the EnergyGrid status report.\n")
+                "The next scheduled run tries it again; it is never uploaded twice. "
+                "Check the EnergyGrid status report.\n")
     else:
         subject = f"{prefix}: {label} needs attention - {row['support_ref']}"
         body = (f"EnergyGrid could not complete the {label} stream.\n"

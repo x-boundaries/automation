@@ -2798,7 +2798,9 @@ def switch_hold_recovery_v5(state_path: Path, *, now_ms: int, history) -> dict[s
     backup = state_path.with_name(f"{state_path.name}{_V5_BACKUP_INFIX}{token}.bak")
 
     def bindings(reader: sqlite3.Connection, source_sha: str) -> list[tuple]:
-        return [("STATE", state_path.name, 1, 0, 0, source_sha), ("V4_BACKUP", backup.name, 1, 0, 0, source_sha),
+        # STATE.row_count is the receipt watermark: receipts after it were recorded by v5 code.
+        watermark = int(reader.execute("SELECT COALESCE(MAX(receipt_seq), 0) FROM energygrid_v4_receipt").fetchone()[0])
+        return [("STATE", state_path.name, 1, watermark, 0, source_sha), ("V4_BACKUP", backup.name, 1, 0, 0, source_sha),
                 *history(reader)]
 
     copied = migrate_hold_recovery_copy(state_path, temporary, now_ms=now_ms, bindings=bindings)
@@ -2837,13 +2839,18 @@ def switch_hold_recovery_v5(state_path: Path, *, now_ms: int, history) -> dict[s
 def rollback_hold_recovery_v5(state_path: Path, backup: Path, *, now_ms: int) -> dict[str, str]:
     """Return a switched state to its v4 backup (P-7 rollback). Operator only, task disabled.
 
-    The backup must be this state's read-only v4 backup (same folder, its name, COMPLETE_V4). If a v5
-    file is at the state filename it must name this backup with the same hash, hold no live lease,
-    carry no dispatch or receipt that the backup lacks (a rollback can never forget an effect) and no
-    audited release (the append-only audit is never erased). The v5 file is kept under a retired name; the backup stays untouched and a
-    verified copy of it is put at the state filename. Dependent stores are not touched.
+    The backup must be this state's v4 backup (same folder, its name, COMPLETE_V4), and the v5 file
+    being undone must name it with the same hash, hold no live lease, carry no dispatch or receipt
+    that the backup lacks (a rollback can never forget an effect) and no audited release (the
+    append-only audit is never erased). The backup stays untouched; a verified copy of it replaces the
+    v5 file in one ReplaceFileW step that keeps the v5 file under a retired name, so the state name
+    is never left empty. Dependent stores are not touched.
+
+    With no file at the state name, only an interrupted switch can be undone: exactly one
+    `<state>.v5-switch-*.tmp` copy must name this backup. It is consumed (renamed) before the restore,
+    so it can never authorise a second rollback; anything else is refused (EG_V5_ROLLBACK_STATE_MISSING).
     """
-    import shutil
+    import glob
     import uuid
 
     if not state_path.is_absolute() or not backup.is_absolute() or backup.parent.resolve() != state_path.parent.resolve():
@@ -2865,25 +2872,25 @@ def rollback_hold_recovery_v5(state_path: Path, backup: Path, *, now_ms: int) ->
     finally:
         reader.close()
     token = uuid.uuid4().hex
+    interrupted = None
     if state_path.exists():
         with StateV4Store(state_path) as state:
             if state.schema_version != V5_SCHEMA_VERSION:
                 raise OfflineV4Error("EG_V5_ROLLBACK_NOT_V5", exit_code=64)
-            conn = state._conn()
-            bound = conn.execute(
-                "SELECT filename, digest FROM energygrid_v5_history_binding WHERE store='V4_BACKUP'").fetchone()
-            if bound is None or tuple(bound) != (backup.name, backup_sha):
-                raise OfflineV4Error("EG_V5_ROLLBACK_BACKUP_MISMATCH", exit_code=64)
-            lease = conn.execute(
-                "SELECT expires_epoch_ms FROM energygrid_v4_lease WHERE lease_name=?", (V4_LEASE_NAME,)).fetchone()
-            if lease is not None and lease[0] > now_ms:
-                raise OfflineV4Error("EG_V5_SOURCE_LEASE_HELD", status=RUN_IN_PROGRESS, exit_code=10)
-            if not _effect_rows(conn) <= effects:
-                raise OfflineV4Error("EG_V5_ROLLBACK_AFTER_DISPATCH", exit_code=64)
-            if conn.execute("SELECT 1 FROM energygrid_v4_hold_release").fetchone():
-                # The release audit is append-only; a rollback would erase it. Rollback undoes the switch only.
-                raise OfflineV4Error("EG_V5_ROLLBACK_AFTER_RELEASE", exit_code=64)
-        _move_no_replace(state_path, state_path.with_name(f"{state_path.name}.v5-retired-{token}.bak"))
+            _check_rollback_source(state._conn(), backup.name, backup_sha, effects, now_ms)
+    else:
+        pattern = glob.escape(str(state_path.parent / state_path.name)) + ".v5-switch-*.tmp"
+        candidates = [Path(name) for name in glob.glob(pattern)
+                      if _v5_backup_binding(Path(name)) == (backup.name, backup_sha)]
+        if len(candidates) != 1:
+            raise OfflineV4Error("EG_V5_ROLLBACK_STATE_MISSING", exit_code=64)
+        connection = sqlite3.connect(candidates[0].resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        try:
+            _check_rollback_source(connection, backup.name, backup_sha, effects, now_ms)
+        finally:
+            connection.close()
+        interrupted = candidates[0]
+        _move_no_replace(interrupted, state_path.with_name(f"{state_path.name}.v5-switch-{token}.consumed"))
     restore = state_path.with_name(f"{state_path.name}.v4-restore-{token}.tmp")
     descriptor = os.open(restore, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     os.close(descriptor)
@@ -2893,7 +2900,10 @@ def rollback_hold_recovery_v5(state_path: Path, backup: Path, *, now_ms: int) ->
             os.fsync(handle.fileno())
         if _file_sha256(restore) != backup_sha:
             raise OfflineV4Error("EG_V5_SWITCH_INCOMPLETE")
-        _move_no_replace(restore, state_path)
+        if interrupted is None:
+            _replace_keeping(state_path, restore, state_path.with_name(f"{state_path.name}.v5-retired-{token}.bak"))
+        else:
+            _move_no_replace(restore, state_path)
     except BaseException:
         with contextlib.suppress(OSError):
             restore.unlink()
@@ -2902,6 +2912,59 @@ def rollback_hold_recovery_v5(state_path: Path, backup: Path, *, now_ms: int) ->
         if state.schema_version != V4_SCHEMA_VERSION:
             raise OfflineV4Error("EG_V5_SWITCH_INCOMPLETE")
     return {"status": "ROLLED_BACK_V4", "v4_sha256": backup_sha}
+
+
+def _v5_backup_binding(path: Path) -> tuple | None:
+    """(backup name, v4 hash) a v5 file was switched with, or None if it is not a readable v5 file."""
+    try:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    except sqlite3.Error:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT filename, digest FROM energygrid_v5_history_binding WHERE store='V4_BACKUP'").fetchone()
+        return tuple(row) if row is not None else None
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+
+
+def _check_rollback_source(conn: sqlite3.Connection, backup_name: str, backup_sha: str, effects: set,
+                           now_ms: int) -> None:
+    """The v5 file being undone names this backup and holds nothing a rollback would lose. Reads only."""
+    bound = conn.execute(
+        "SELECT filename, digest FROM energygrid_v5_history_binding WHERE store='V4_BACKUP'").fetchone()
+    if bound is None or tuple(bound) != (backup_name, backup_sha):
+        raise OfflineV4Error("EG_V5_ROLLBACK_BACKUP_MISMATCH", exit_code=64)
+    lease = conn.execute(
+        "SELECT expires_epoch_ms FROM energygrid_v4_lease WHERE lease_name=?", (V4_LEASE_NAME,)).fetchone()
+    if lease is not None and lease[0] > now_ms:
+        raise OfflineV4Error("EG_V5_SOURCE_LEASE_HELD", status=RUN_IN_PROGRESS, exit_code=10)
+    if not _effect_rows(conn) <= effects:
+        raise OfflineV4Error("EG_V5_ROLLBACK_AFTER_DISPATCH", exit_code=64)
+    if conn.execute("SELECT 1 FROM energygrid_v4_hold_release").fetchone():
+        # The release audit is append-only; a rollback would erase it. Rollback undoes the switch only.
+        raise OfflineV4Error("EG_V5_ROLLBACK_AFTER_RELEASE", exit_code=64)
+
+
+def _replace_keeping(replaced: Path, replacement: Path, retired: Path) -> None:
+    """Put `replacement` at `replaced` and keep the old file as `retired`, with Windows ReplaceFileW, so
+    the name is never left empty. It fails while any process has `replaced` open."""
+    import ctypes
+
+    if os.name != "nt":
+        raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10)
+    replace_file = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+    replace_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
+                             ctypes.c_void_p, ctypes.c_void_p]
+    replace_file.restype = ctypes.c_int
+    replacefile_write_through = 0x00000001
+    if not replace_file(str(replaced), str(replacement), str(retired), replacefile_write_through, None, None):
+        if not replaced.exists() and retired.exists():
+            # ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: the old file was moved aside; put it back unchanged.
+            _move_no_replace(retired, replaced)
+        raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10)
 
 
 def _effect_rows(connection: sqlite3.Connection) -> set[tuple]:
@@ -3705,6 +3768,13 @@ class StateV4Store:
         if self.schema_version != V5_SCHEMA_VERSION:
             return {}
         return {row["store"]: row for row in _fetch_dicts(self._conn(), "SELECT * FROM energygrid_v5_history_binding")}
+
+    def verified_drive_receipts_after(self, receipt_seq: int) -> list[str]:
+        """Intents with a hash-matching VERIFIED Drive receipt recorded after `receipt_seq`. Reads only."""
+        return [row[0] for row in self._conn().execute(
+            "SELECT r.intent_id FROM energygrid_v4_receipt r JOIN energygrid_v4_intent i ON i.intent_id=r.intent_id "
+            "WHERE r.receipt_seq > ? AND r.outcome='VERIFIED' AND r.provider_sha256=i.payload_sha256 "
+            "AND i.action='DRIVE_UPLOAD' ORDER BY r.receipt_seq", (receipt_seq,))]
 
     def no_dispatch_releases(self) -> list[dict]:
         """Every audited HOLD -> PENDING release (P-7), oldest first. Empty for version 4."""

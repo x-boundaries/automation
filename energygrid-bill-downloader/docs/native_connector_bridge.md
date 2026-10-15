@@ -153,6 +153,8 @@ The configured `state_path` never changes. The notification store (`<state>.noti
 3. **Before every later command,** a version-5 state is verified before the lease is taken, so a refusal writes nothing and makes no effect:
    - **Filename:** it must be opened under its bound filename; another name refuses with `EG_V5_STATE_REPOINTED`, before any store is opened or created.
    - **Stores:** each store that existed at the switch must still exist and still hold the same first rows. Sent emails must not have returned to pending. Otherwise the command refuses with `EG_V5_HISTORY_MISSING`.
+   - **Provenance:** every Drive upload verified since the switch must still have its provenance row, because provenance is always recorded before the receipt. A provenance store lost after the switch is therefore refused (`EG_V5_HISTORY_MISSING`), never read as `UNRECORDED_LEGACY`.
+   - **Limit:** notification and backfill rows added after the switch are protected by their own stores, exactly as in version 4. Putting an older copy of a store back after the switch is not detected for those later rows.
 4. **Release the HOLD** with `hold-release`. Each release writes one audit row bound to the HOLD's exact version, so it is one-time, and triggers re-check the same rules for any direct SQL write.
    - `{"mode": "NO_DISPATCH"}` returns a HOLD to PENDING only if the intent was never dispatched, never received a receipt and never passed through DISPATCHED, UNKNOWN or VERIFIED. It stages exactly one owner notice (`hold released`, reference `EG_V5_HOLD_RELEASED`) to the configured recipient. The notice goes through the normal draft, seal and send steps and is never sent by the operator command. It is derived from the audit row, so a crash right after the release is healed once by the next run.
    - `{"mode": "LATE_EVIDENCE", "file": {...}}` with reason `LATE_EVIDENCE_VERIFIED` makes a dispatched HOLD VERIFIED only with exact Drive metadata plus the exact local mirror (or a matching Core readback). There is no new effect, and the normal success notification follows.
@@ -161,12 +163,16 @@ The configured `state_path` never changes. The notification store (`<state>.noti
    - `EG_V5_ROLLBACK_AFTER_DISPATCH`: the v5 file holds a dispatch or provider receipt that the backup lacks, so restoring would forget an effect.
    - `EG_V5_ROLLBACK_AFTER_RELEASE`: the v5 file holds a release audit row, which is append-only and is never erased.
 
-   Otherwise:
-   - the v5 file is kept as `<state>.v5-retired-<id>.bak`;
-   - a hash-verified copy of the untouched backup is put back at the state filename;
+   The v5 file must also name this exact backup and hash (`EG_V5_ROLLBACK_BACKUP_MISMATCH`), and be closed in every other process (`EG_V5_SOURCE_IN_USE`). If all checks pass:
+   - one Windows `ReplaceFileW` step puts a hash-verified copy of the untouched backup at the state filename, so the name is never left empty;
+   - the same step keeps the v5 file as `<state>.v5-retired-<id>.bak`;
    - the dependent stores are not touched.
 
-   If a switch was interrupted after step 2.6 (no file at the state name), every command refuses and the same rollback restores the backup. A leftover `<state>.v5-switch-<id>.tmp` is refused under its own name and may be deleted.
+   With no file at the state name, only an interrupted switch can be undone. That is a switch that stopped after step 2.6.
+   - Every command refuses while the file is missing.
+   - The rollback needs exactly one `<state>.v5-switch-<id>.tmp` copy that names this backup, and runs the same checks against it.
+   - It renames that copy to `.consumed` before restoring, so the copy cannot authorise a second rollback.
+   - Anything else is refused (`EG_V5_ROLLBACK_STATE_MISSING`), so an older backup can never be restored over later effects.
 
 ## 4a. Manual backfill of older bills (owner request, not scheduled)
 
@@ -306,6 +312,6 @@ LOCAL_SYNC required.
 - A source change during the copy or before the rename leaves no v5 file.
 - The write lock is held during the copy.
 - A crash after the v4 rename fails closed.
-- Rollback works only without new effects.
+- Rollback works only without new effects. With the state file absent it refuses any backup except the one named by the single interrupted copy, and it never leaves the state name empty.
 - The audit rows and binding rows are immutable.
 - The `NO_DISPATCH` owner notice is staged once, healed once after a crash and never resent when uncertain.

@@ -855,10 +855,12 @@ class HoldRecoverySwitchTests(base.NativeBridgeBase):
         changed store-name derivation, would read or start other stores: both refused."""
         self.history()
         self.switch()
-        other = self.make_config(state_path=self.db.with_name("other.sqlite"))
-        with StateV4Store(self.db) as state, self.assertRaises(NativeRefusal) as mismatched:
-            bridge.next_step(state, other, run_id=bridge.new_run_id(), now_ms=self.tick())
-        self.assertEqual("EG_V5_STATE_REPOINTED", mismatched.exception.support_ref)
+        # Another stem, and the same stem with another suffix (identical store names): both refused.
+        for name in ("other.sqlite", "state.db"):
+            other = self.make_config(state_path=self.db.with_name(name))
+            with StateV4Store(self.db) as state, self.assertRaises(NativeRefusal) as mismatched:
+                bridge.next_step(state, other, run_id=bridge.new_run_id(), now_ms=self.tick())
+            self.assertEqual("EG_V5_STATE_REPOINTED", mismatched.exception.support_ref)
         renamed = lambda cfg: cfg.state_path.with_name(cfg.state_path.stem + ".notify-v2.sqlite")  # noqa: E731
         with mock.patch.object(notify, "store_path", side_effect=renamed), self.assertRaises(NativeRefusal) as derived:
             self.next()
@@ -1071,6 +1073,12 @@ class HoldRecoverySwitchTests(base.NativeBridgeBase):
         self.assertEqual("IDLE", self.next()["outcome"])
         self.host.drain()
         self.assertEqual(before, self.snapshot())
+        self.assertFalse(temporary.exists(), "the interrupted copy is consumed")
+        self.assertEqual(1, len([n for n in self.folder() if n.endswith(".consumed")]))
+        self.db.rename(self.db.with_name("moved-away.sqlite"))
+        with self.assertRaises(OfflineV4Error) as again:
+            state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        self.assertEqual("EG_V5_ROLLBACK_STATE_MISSING", again.exception.support_ref, "a consumed copy never re-authorises")
 
     def test_rollback_restores_v4_only_when_no_effect_happened_since_the_switch(self) -> None:
         self.history()
@@ -1103,6 +1111,77 @@ class HoldRecoverySwitchTests(base.NativeBridgeBase):
         with self.assertRaises(OfflineV4Error) as mismatch:
             state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
         self.assertEqual("EG_V5_ROLLBACK_BACKUP_MISMATCH", mismatch.exception.support_ref)
+
+    NEWER = {EB: [("EB Invoice 0002.pdf", "2026-09-01"), ("EB Invoice 0003.pdf", "2026-10-01")],
+             TN: [("TN Invoice 0001.pdf", "2026-08-03"), ("TN Invoice 0002.pdf", "2026-09-03")]}
+
+    def test_with_no_state_file_no_backup_is_restored_over_later_effects(self) -> None:
+        """Adversarial F1: an older backup must never be restored when the state file is absent."""
+        self.history()
+        first = self.switch()
+        backup1 = self.db.with_name(first["v4_backup"])
+        state_module.rollback_hold_recovery_v5(self.db, backup1, now_ms=self.tick())
+        self.acquire(self.adapters(self.NEWER))
+        self.host.drain()  # effects after the first rollback, which backup1 lacks
+        second = self.switch()
+        newest = {EB: [("EB Invoice 0003.pdf", "2026-10-01"), ("EB Invoice 0004.pdf", "2026-11-01")],
+                  TN: [("TN Invoice 0001.pdf", "2026-08-03"), ("TN Invoice 0002.pdf", "2026-09-03")]}
+        self.acquire(self.adapters(newest))
+        self.host.drain()  # an effect on v5 after the second switch, which neither backup has
+        self.db.rename(self.db.with_name("moved-away.sqlite"))  # operator move, or a crash
+        folder = self.folder()
+        for backup in (backup1, self.db.with_name(second["v4_backup"])):
+            with self.subTest(backup=backup.name), self.assertRaises(OfflineV4Error) as refused:
+                state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+            self.assertEqual("EG_V5_ROLLBACK_STATE_MISSING", refused.exception.support_ref)
+        self.assertEqual(folder, self.folder(), "nothing restored, renamed or created")
+        # A used v5 file presented as an interrupted copy is still checked: its later effects refuse.
+        posing = self.db.with_name(f"{self.db.name}.v5-switch-posing.tmp")
+        self.db.with_name("moved-away.sqlite").rename(posing)
+        with self.assertRaises(OfflineV4Error) as posed:
+            state_module.rollback_hold_recovery_v5(self.db, backup1, now_ms=self.tick())
+        self.assertEqual("EG_V5_ROLLBACK_STATE_MISSING", posed.exception.support_ref, "it names the second backup")
+        with self.assertRaises(OfflineV4Error) as checked:
+            state_module.rollback_hold_recovery_v5(self.db, self.db.with_name(second["v4_backup"]), now_ms=self.tick())
+        self.assertEqual("EG_V5_ROLLBACK_AFTER_DISPATCH", checked.exception.support_ref)
+        self.assertTrue(posing.exists() and not self.db.exists())
+
+    @unittest.skipUnless(os.name == "nt", "ReplaceFileW is Windows only")
+    def test_a_rollback_never_empties_the_state_name_and_refuses_an_open_file(self) -> None:
+        self.history()
+        result = self.switch()
+        backup = self.db.with_name(result["v4_backup"])
+        v5_bytes = self.db.read_bytes()
+        other = sqlite3.connect(str(self.db))
+        try:
+            other.execute("SELECT COUNT(*) FROM energygrid_v4_invoice").fetchone()
+            with self.assertRaises(OfflineV4Error) as busy:
+                state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        finally:
+            other.close()
+        self.assertEqual(("EG_V5_SOURCE_IN_USE", 10), (busy.exception.support_ref, busy.exception.exit_code))
+        self.assertEqual(v5_bytes, self.db.read_bytes())
+        self.assertFalse([n for n in self.folder() if ".v4-restore-" in n or ".v5-retired-" in n])
+        state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        retired = [n for n in self.folder() if ".v5-retired-" in n]
+        self.assertEqual(1, len(retired))
+        self.assertEqual(v5_bytes, self.db.with_name(retired[0]).read_bytes(), "the v5 file is kept unchanged")
+
+    def test_provenance_lost_after_the_switch_is_refused_not_relabelled(self) -> None:
+        """Adversarial F3: provenance created after the switch is history too."""
+        self.history()
+        bridge.provenance_path(self.cfg).unlink()  # a pre-H-3 install: legitimately absent
+        self.switch()
+        self.acquire(self.adapters(self.NEWER))
+        self.host.drain()  # v5 records PROVIDER_READBACK provenance for the new upload
+        sent = len(self.host.sent)
+        bridge.provenance_path(self.cfg).unlink()
+        for command in (self.next, self.status):
+            with self.assertRaises(NativeRefusal) as refused:
+                command()
+            self.assertEqual("EG_V5_HISTORY_MISSING", refused.exception.support_ref)
+        self.assertFalse(bridge.provenance_path(self.cfg).exists())
+        self.assertEqual(sent, len(self.host.sent))
 
     def test_the_binding_rows_are_immutable_to_direct_sql(self) -> None:
         self.history()

@@ -999,6 +999,15 @@ def verify_history(state, cfg: NativeConfig) -> None:
         # Sealed sends never return to PENDING, so their count can only grow (Gmail ceiling and no resend).
         if (rows, digest) != (binding["row_count"], binding["digest"]) or effects < binding["effect_count"]:
             raise NativeRefusal("EG_V5_HISTORY_MISSING")
+    # Provenance is always recorded before a verifying Drive receipt, so every one recorded since the
+    # switch must still have its row: a store lost after the switch is never read as UNRECORDED_LEGACY.
+    verified = state.verified_drive_receipts_after(bindings["STATE"]["row_count"])
+    if verified:
+        with _existing_store(provenance_path(cfg)) as connection:
+            recorded = set() if connection is None else {
+                row[0] for row in connection.execute("SELECT intent_id FROM drive_hash_provenance")}
+        if not set(verified) <= recorded:
+            raise NativeRefusal("EG_V5_HISTORY_MISSING")
 
 
 def _payload_path(cfg: NativeConfig, intent_id: str) -> Path:
