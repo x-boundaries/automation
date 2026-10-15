@@ -1162,7 +1162,17 @@ class HoldRecoverySwitchTests(base.NativeBridgeBase):
         self.assertEqual(("EG_V5_SOURCE_IN_USE", 10), (busy.exception.support_ref, busy.exception.exit_code))
         self.assertEqual(v5_bytes, self.db.read_bytes())
         self.assertFalse([n for n in self.folder() if ".v4-restore-" in n or ".v5-retired-" in n])
-        state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        move = state_module._move_no_replace
+        emptied = []
+
+        def watched_move(source: Path, destination: Path) -> None:
+            move(source, destination)
+            if not self.db.exists():
+                emptied.append(destination.name)
+
+        with mock.patch.object(state_module, "_move_no_replace", side_effect=watched_move):
+            state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        self.assertEqual([], emptied, "the state name is never left empty during a rollback")
         retired = [n for n in self.folder() if ".v5-retired-" in n]
         self.assertEqual(1, len(retired))
         self.assertEqual(v5_bytes, self.db.with_name(retired[0]).read_bytes(), "the v5 file is kept unchanged")
