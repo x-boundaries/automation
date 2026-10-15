@@ -200,7 +200,8 @@ def _notify(cfg: bridge.NativeConfig, now_ms: int, action: Callable[[Any], dict]
     from .native_notify import NotificationStore, store_path
     from .state import StateV4Store
 
-    with StateV4Store(cfg.state_path) as state, bridge._session(state, now_ms),             NotificationStore(store_path(cfg)) as store:
+    with StateV4Store(cfg.state_path) as state, bridge._session(state, now_ms, cfg), \
+            NotificationStore(store_path(cfg)) as store:
         return action(store)
 
 
@@ -209,7 +210,8 @@ def _backfill(cfg: bridge.NativeConfig, now_ms: int, action: Callable[[Any], dic
     from .native_backfill import BackfillLedger, ledger_path
     from .state import StateV4Store
 
-    with StateV4Store(cfg.state_path) as state, bridge._session(state, now_ms), BackfillLedger(ledger_path(cfg)) as ledger:
+    with StateV4Store(cfg.state_path) as state, bridge._session(state, now_ms, cfg), \
+            BackfillLedger(ledger_path(cfg)) as ledger:
         return action(ledger)
 
 
@@ -248,14 +250,15 @@ def _dispatch(args) -> dict:
         evidence = bridge.load_evidence(Path(args.evidence))
         return _notify(cfg, now, lambda store: notify.record(store, args.notification, evidence, now_iso))
     if command == "migrate-hold-recovery":
-        # Operator only (P-7): writes a version-5 COPY beside the state file. The live file is never
-        # written; switching to the copy is a separate, manual step with the scheduled task disabled.
-        from .state import migrate_hold_recovery_copy
+        # Operator only (P-7), scheduled task disabled: switch the configured state file to version 5
+        # under the SAME filename, so its notification, provenance and backfill stores keep their
+        # history; the v4 file is kept as a read-only backup. With --rollback: restore that backup.
+        from .state import rollback_hold_recovery_v5, switch_hold_recovery_v5
 
-        destination = Path(args.dest)
-        if destination.parent.resolve() != cfg.state_path.parent.resolve():
-            raise bridge.NativeRefusal("EG_V5_MIGRATION_PATH_INVALID")
-        outcome = migrate_hold_recovery_copy(cfg.state_path, destination, now_ms=now)
+        if args.rollback:
+            outcome = rollback_hold_recovery_v5(cfg.state_path, Path(args.rollback), now_ms=now)
+        else:
+            outcome = switch_hold_recovery_v5(cfg.state_path, now_ms=now, history=bridge.switch_history(cfg))
         return bridge._result("migrate-hold-recovery", outcome["status"], bridge.EXIT_OK, **outcome)
     if command == "hold-release":
         evidence = bridge.load_evidence(Path(args.evidence))
@@ -307,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Operator-only commands (P-7). The scheduled host policy denies both.
     migrate = sub.add_parser("migrate-hold-recovery")
     migrate.add_argument("--config", required=True)
-    migrate.add_argument("--dest", required=True)
+    migrate.add_argument("--rollback", metavar="V4_BACKUP")
     release = sub.add_parser("hold-release")
     release.add_argument("--config", required=True)
     release.add_argument("--intent", required=True)

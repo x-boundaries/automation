@@ -483,14 +483,13 @@ class PerPeriodCeilingTests(SyncBase):
 
 class HoldReleaseTests(SyncBase):
     def migrate(self) -> Path:
-        destination = self.db.with_name("state.v5.sqlite")
+        """The documented same-filename switch: the configuration is never repointed."""
         before = hashlib.sha256(self.db.read_bytes()).hexdigest()
-        result = state_module.migrate_hold_recovery_copy(self.db, destination, now_ms=self.tick())
-        self.assertEqual("MIGRATED_COPY_V5", result["status"])
-        self.assertEqual(before, hashlib.sha256(self.db.read_bytes()).hexdigest(), "source never written")
-        self.cfg = self.make_config(state_path=destination)
-        self.db = destination
-        return destination
+        result = state_module.switch_hold_recovery_v5(self.db, now_ms=self.tick(), history=bridge.switch_history(self.cfg))
+        self.assertEqual(("SWITCHED_V5", before), (result["status"], result["v4_sha256"]))
+        backup = self.db.with_name(result["v4_backup"])
+        self.assertEqual(before, hashlib.sha256(backup.read_bytes()).hexdigest(), "the v4 bytes are kept unchanged")
+        return backup
 
     def release(self, intent_id: str, evidence: dict, reason: str) -> dict:
         with StateV4Store(self.db) as state:
@@ -537,6 +536,73 @@ class HoldReleaseTests(SyncBase):
         self.assertEqual("VERIFIED", self.state_of(intent["intent_id"]))
         self.assertEqual(1, self.dispatches_now())
 
+    def notices(self) -> list[dict]:
+        return [row for row in self.notification_rows() if row["status_text"] == notify.HOLD_RELEASED_STATUS]
+
+    def released_mail(self) -> list[dict]:
+        return [message for message in self.host.sent if " hold released - " in message["subject"]]
+
+    def test_a_no_dispatch_release_stages_exactly_one_owner_notice(self) -> None:
+        intent = self.named_conflict_hold()
+        self.migrate()
+        sent_before = len(self.host.sent)
+        self.release(intent["intent_id"], {"mode": "NO_DISPATCH"}, "NAMED_ARCHIVE_CONFLICT_CLEARED")
+        self.assertEqual([("PENDING", EB, notify.HOLD_RELEASED_REF)],
+                         [(row["state"], row["stream"], row["support_ref"]) for row in self.notices()])
+        self.assertEqual(sent_before, len(self.host.sent), "staged only: the operator command never sends")
+        with self.assertRaises(NativeRefusal):
+            self.release(intent["intent_id"], {"mode": "NO_DISPATCH"}, "NAMED_ARCHIVE_CONFLICT_CLEARED")
+        self.assertEqual(1, len(self.notices()))
+        self.next_until(("IDLE",))
+        mail = self.released_mail()
+        self.assertEqual(1, len(mail))
+        self.assertEqual(([base.RECIPIENT], [], "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf"),
+                         (mail[0]["to"], mail[0]["cc"], mail[0]["body"].split("File: ")[1].split("\n")[0]))
+        self.assertEqual(1, self.dispatches_now())
+        sent = len(self.host.sent)
+        self.next_until(("IDLE",))  # restarts and repeats: no second notice, send or upload
+        self.assertEqual((sent, 1, 1), (len(self.host.sent), len(self.notices()), self.dispatches_now()))
+
+    def test_a_crash_right_after_the_release_is_healed_once_by_the_next_run(self) -> None:
+        intent = self.named_conflict_hold()
+        self.migrate()
+        with mock.patch.object(bridge, "_sweep_notifications", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.release(intent["intent_id"], {"mode": "NO_DISPATCH"}, "NAMED_ARCHIVE_CONFLICT_CLEARED")
+        self.assertEqual(("PENDING", []), (self.state_of(intent["intent_id"]), self.notices()))
+        self.next_until(("IDLE",))
+        self.next_until(("IDLE",))
+        self.assertEqual((1, 1), (len(self.notices()), len(self.released_mail())))
+
+    def test_an_uncertain_notice_send_is_never_resent(self) -> None:
+        intent = self.named_conflict_hold()
+        self.migrate()
+        self.release(intent["intent_id"], {"mode": "NO_DISPATCH"}, "NAMED_ARCHIVE_CONFLICT_CLEARED")
+        for _ in range(12):
+            step = self.next()
+            if step["outcome"] == "NOTIFY_DRAFT" and step["notification_id"] == self.notices()[0]["notification_id"]:
+                self.host.notify_step(step, outcome="NO_RESPONSE")
+                break
+            if step["outcome"] == "DRIVE_PRECHECK":
+                if self.seal(step)["outcome"] == "SEALED":
+                    self.sync()
+                    self.record_found(step["intent_id"], step["display_filename"])
+            elif step["outcome"] == "NOTIFY_DRAFT":
+                self.host.notify_step(step)
+        self.assertEqual("UNKNOWN", self.notices()[0]["state"])
+        self.next_until(("IDLE",))
+        self.assertEqual(("UNKNOWN", 0), (self.notices()[0]["state"], len(self.released_mail())))
+
+    def test_a_rollback_never_erases_a_release_audit(self) -> None:
+        intent = self.named_conflict_hold()
+        backup = self.migrate()
+        self.release(intent["intent_id"], {"mode": "NO_DISPATCH"}, "NAMED_ARCHIVE_CONFLICT_CLEARED")
+        v5_bytes = self.db.read_bytes()
+        with self.assertRaises(OfflineV4Error) as refused:
+            state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        self.assertEqual("EG_V5_ROLLBACK_AFTER_RELEASE", refused.exception.support_ref)
+        self.assertEqual(v5_bytes, self.db.read_bytes())
+
     def test_a_dispatched_hold_never_returns_to_pending(self) -> None:
         step, _metadata = self.dispatched_hold()
         self.migrate()
@@ -560,6 +626,7 @@ class HoldReleaseTests(SyncBase):
         self.assertEqual(1, self.dispatches_now())
         report = self.status_now()["streams"][EB]["invoices"][0]["drive_upload"]
         self.assertEqual(("VERIFIED", bridge.HASH_LOCAL_MIRROR), (report["state"], report["hash_provenance"]))
+        self.assertEqual([], self.notices(), "late evidence is notified as the normal success, not a release notice")
 
     def test_late_evidence_needs_the_exact_local_mirror(self) -> None:
         step, metadata = self.dispatched_hold()
@@ -637,15 +704,72 @@ class HoldRecoveryMigrationTests(base.NativeBridgeBase):
         self.host.drain()
         destination = self.db.with_name("v5.sqlite")
         result = state_module.migrate_hold_recovery_copy(self.db, destination, now_ms=self.tick())
-        with StateV4Store(destination) as state:
-            self.assertEqual(5, state.schema_version)
-            self.assertEqual(2, state.dispatch_count("DRIVE_UPLOAD"))
+        connection = sqlite3.connect(destination.as_uri() + "?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual("COMPLETE_V5", state_module._inspect_v4_database(connection))
+            self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM energygrid_v4_dispatch").fetchone()[0])
+        finally:
+            connection.close()
+        # A bare copy binds no state filename or history, so it is never a usable switch-over candidate.
+        with self.assertRaises(OfflineV4Error) as unbound:
+            StateV4Store(destination).__enter__()
+        self.assertEqual("EG_V5_HISTORY_BINDING_MISSING", unbound.exception.support_ref)
         with StateV4Store(self.db) as state:
             self.assertEqual(4, state.schema_version)
         with self.assertRaises(OfflineV4Error) as again:
             state_module.migrate_hold_recovery_copy(destination, destination.with_name("v6.sqlite"), now_ms=self.tick())
         self.assertEqual("EG_V5_ALREADY_MIGRATED", again.exception.support_ref)
         self.assertEqual(64, len(result["data_digest"]))
+
+    def test_a_source_change_during_the_copy_leaves_no_migrated_destination(self) -> None:
+        """B-1b: EG_V5_SOURCE_CHANGED removes only this attempt's destination; nothing else is touched."""
+        destination = self.db.with_name("v5.sqlite")
+        bystander = self.db.with_name("bystander.sqlite")
+        bystander.write_bytes(b"pre-existing")
+        folder = sorted(path.name for path in self.db.parent.iterdir())
+        apply = state_module._apply_v5_migration
+
+        def external_write(connection) -> None:
+            with self.db.open("ab") as handle:  # a non-SQLite writer the write lock cannot stop
+                handle.write(b"\0")
+            apply(connection)
+
+        with mock.patch.object(state_module, "_apply_v5_migration", side_effect=external_write):
+            with self.assertRaises(OfflineV4Error) as changed:
+                state_module.migrate_hold_recovery_copy(self.db, destination, now_ms=self.tick())
+        self.assertEqual("EG_V5_SOURCE_CHANGED", changed.exception.support_ref)
+        self.assertFalse(destination.exists(), "no stale migrated destination")
+        self.assertEqual(b"pre-existing", bystander.read_bytes())
+        self.assertTrue(self.db.read_bytes().endswith(b"\0"), "the source is preserved as found, never reverted")
+        self.assertEqual(folder, sorted(path.name for path in self.db.parent.iterdir()), "no file added or removed")
+
+    def test_the_copy_holds_the_source_write_lock_throughout(self) -> None:
+        """Deterministic lock proof (no timeout): a second writer is refused at once during the copy."""
+        observed = []
+        apply = state_module._apply_v5_migration
+
+        def competing_writer(connection) -> None:
+            other = sqlite3.connect(str(self.db), timeout=0, isolation_level=None)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                observed.append("acquired")
+            except sqlite3.OperationalError as exc:
+                observed.append(str(exc))
+            finally:
+                other.close()
+            apply(connection)
+
+        before = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        with mock.patch.object(state_module, "_apply_v5_migration", side_effect=competing_writer):
+            state_module.migrate_hold_recovery_copy(self.db, self.db.with_name("v5.sqlite"), now_ms=self.tick())
+        # Called for the migration and again for the schema reference check: locked both times.
+        self.assertTrue(observed)
+        self.assertEqual({"database is locked"}, set(observed))
+        self.assertEqual(before, hashlib.sha256(self.db.read_bytes()).hexdigest())
+        # Positive control: after the copy the lock is released and the source is writable again.
+        with StateV4Store(self.db) as state:
+            state.acquire_lease("after-copy", now_ms=self.tick(), ttl_ms=1000)
 
     def test_version_and_schema_must_agree(self) -> None:
         for version, migrate_schema in ((5, False), (4, True)):
@@ -660,6 +784,374 @@ class HoldRecoveryMigrationTests(base.NativeBridgeBase):
                     self.assertEqual("INCOMPATIBLE_V4", state_module._inspect_v4_database(connection))
                 finally:
                     connection.close()
+
+
+# ---------------------------------------------------------------------------
+# P-7 switch-over (G3, Web #226:6190091444): B-1 dependent-store history, B-1b, rollback
+# ---------------------------------------------------------------------------
+
+
+class HoldRecoverySwitchTests(base.NativeBridgeBase):
+    """The v4 -> v5 switch keeps the state filename, so the stores named after it keep their history."""
+
+    def history(self) -> None:
+        """Both streams delivered and notified (two sends), with provenance and one backfill row."""
+        self.acquire()
+        self.host.drain()
+        from energygrid_bill_downloader.native_backfill import BackfillLedger, ledger_path
+
+        with BackfillLedger(ledger_path(self.cfg)) as ledger, ledger.write() as conn:
+            conn.execute(
+                "INSERT INTO backfill (display_key, stream, display_filename, invoice_date, sha256, byte_size, state, "
+                "drive_file_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("jul 2026 - energygrid - eb bill - old.pdf", EB, "JUL 2026 - EnergyGrid - EB Bill - old.pdf",
+                 "2026-07-01", "a" * 64, 10, "VERIFIED", "FILE_BACKFILL_SYNTHETIC_1", self.now_iso(), self.now_iso()))
+
+    def snapshot(self) -> dict:
+        status = self.status()
+        from energygrid_bill_downloader.native_backfill import BackfillLedger, ledger_path
+
+        with BackfillLedger(ledger_path(self.cfg)) as ledger:
+            backfill = [(row["display_key"], row["state"]) for row in ledger.rows()]
+        return {
+            "sent": len(self.host.sent), "drafts": len(self.host.drafts),
+            "effects": status["effects"], "gmail_used": status["ceiling"]["gmail_sends"]["used"],
+            "notifications": status["notifications"]["counts"],
+            "provenance": sorted(item["drive_upload"]["hash_provenance"]
+                                 for stream in status["streams"].values() for item in stream["invoices"]),
+            "backfill": backfill,
+        }
+
+    def switch(self) -> dict:
+        return state_module.switch_hold_recovery_v5(self.db, now_ms=self.tick(), history=bridge.switch_history(self.cfg))
+
+    def folder(self) -> list[str]:
+        return sorted(path.name for path in self.db.parent.iterdir())
+
+    def test_the_switch_keeps_every_dependent_history_and_the_next_run_is_idle(self) -> None:
+        self.history()
+        before = self.snapshot()
+        self.assertEqual((2, 2, 2), (before["sent"], before["effects"]["gmail_dispatches"], before["gmail_used"]))
+        self.assertEqual([bridge.HASH_PROVIDER_READBACK] * 2, before["provenance"])
+        result = self.switch()
+        self.assertEqual("SWITCHED_V5", result["status"])
+        with StateV4Store(self.db) as state:
+            self.assertEqual(5, state.schema_version)
+            bound = state.history_bindings()
+        self.assertEqual({"STATE", "V4_BACKUP", "NOTIFICATIONS", "PROVENANCE", "BACKFILL"}, set(bound))
+        self.assertEqual((1, 2, 2), (bound["NOTIFICATIONS"]["present"], bound["NOTIFICATIONS"]["row_count"],
+                                     bound["NOTIFICATIONS"]["effect_count"]))
+        self.assertEqual(before, self.snapshot(), "notification, ceiling, provenance and backfill history unchanged")
+        self.assertEqual("IDLE", self.next()["outcome"])
+        self.host.drain()
+        self.assertEqual(before, self.snapshot(), "zero additional drafts, sends or uploads")
+        backup = self.db.with_name(result["v4_backup"])
+        self.assertFalse(os.access(backup, os.W_OK), "the v4 backup is read-only")
+        self.assertEqual(result["v4_sha256"], hashlib.sha256(backup.read_bytes()).hexdigest())
+        self.assertFalse([name for name in self.folder() if name.endswith(".tmp")], "no switch leftovers")
+
+    def test_store_names_must_derive_from_the_bound_state_filename(self) -> None:
+        """Equivalent bridge paths: a config naming another state file beside the right database, or a
+        changed store-name derivation, would read or start other stores: both refused."""
+        self.history()
+        self.switch()
+        other = self.make_config(state_path=self.db.with_name("other.sqlite"))
+        with StateV4Store(self.db) as state, self.assertRaises(NativeRefusal) as mismatched:
+            bridge.next_step(state, other, run_id=bridge.new_run_id(), now_ms=self.tick())
+        self.assertEqual("EG_V5_STATE_REPOINTED", mismatched.exception.support_ref)
+        renamed = lambda cfg: cfg.state_path.with_name(cfg.state_path.stem + ".notify-v2.sqlite")  # noqa: E731
+        with mock.patch.object(notify, "store_path", side_effect=renamed), self.assertRaises(NativeRefusal) as derived:
+            self.next()
+        self.assertEqual("EG_V5_STATE_REPOINTED", derived.exception.support_ref)
+        self.assertFalse(renamed(self.cfg).exists())
+        self.assertEqual("IDLE", self.next()["outcome"])
+
+    def test_a_stale_store_where_a_sent_email_is_pending_again_is_refused(self) -> None:
+        """An older copy of the notification store (same rows, before the send) would resend: refused."""
+        self.history()
+        self.switch()
+        before = self.snapshot()
+        with sqlite3.connect(str(notify.store_path(self.cfg))) as connection:
+            connection.execute("UPDATE notification SET state='PENDING', draft_id=NULL, message_id=NULL "
+                               "WHERE seq=(SELECT MIN(seq) FROM notification)")
+        connection.close()
+        with self.assertRaises(NativeRefusal) as refused:
+            self.next()
+        self.assertEqual("EG_V5_HISTORY_MISSING", refused.exception.support_ref)
+        self.assertEqual((before["sent"], before["drafts"]), (len(self.host.sent), len(self.host.drafts)))
+
+    def test_a_journal_left_beside_a_store_does_not_block_later_runs(self) -> None:
+        self.history()
+        self.switch()
+        for path in bridge.history_paths(self.cfg).values():
+            path.with_name(path.name + "-journal").write_bytes(b"")  # crash leftover, not a live transaction
+        self.assertEqual("IDLE", self.next()["outcome"])
+
+    def test_the_former_copy_and_repoint_procedure_is_refused_with_zero_effects(self) -> None:
+        """Negative control for B-1: the reviewer's counterexample now refuses instead of resending."""
+        self.history()
+        before = self.snapshot()
+        self.switch()
+        renamed = self.db.with_name("state.v5.sqlite")
+        renamed.write_bytes(self.db.read_bytes())
+        repointed = self.make_config(state_path=renamed)
+        with self.assertRaises(OfflineV4Error) as refused:
+            StateV4Store(renamed).__enter__()
+        self.assertEqual(("EG_V5_STATE_REPOINTED", 64), (refused.exception.support_ref, refused.exception.exit_code))
+        for path in bridge.history_paths(repointed).values():
+            self.assertFalse(path.exists(), "no empty store is started under the new name")
+        # The same name in another folder without its stores: refused before any effect.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / self.db.name).write_bytes(self.db.read_bytes())
+        moved = self.make_config(state_path=elsewhere / self.db.name)
+        with StateV4Store(moved.state_path) as state, self.assertRaises(NativeRefusal) as missing:
+            bridge.next_step(state, moved, run_id=bridge.new_run_id(), now_ms=self.tick())
+        self.assertEqual("EG_V5_HISTORY_MISSING", missing.exception.support_ref)
+        self.assertEqual([self.db.name], sorted(path.name for path in elsewhere.iterdir()))
+        self.assertEqual(before, self.snapshot())
+
+    def test_a_missing_or_emptied_store_after_the_switch_is_refused_with_zero_effects(self) -> None:
+        self.history()
+        self.switch()
+        before = self.snapshot()
+        for store, path in bridge.history_paths(self.cfg).items():
+            aside = path.with_name(path.name + ".aside")
+            with self.subTest(store=store, case="missing"):
+                path.rename(aside)
+                for command in (self.next, self.status, lambda: self.acquire()):
+                    with self.assertRaises(NativeRefusal) as refused:
+                        command()
+                    self.assertEqual("EG_V5_HISTORY_MISSING", refused.exception.support_ref)
+                with self.assertRaises(NativeRefusal):
+                    self.notify(lambda _store: None)
+                self.assertFalse(path.exists(), "a missing store is never recreated empty")
+            with self.subTest(store=store, case="emptied"):
+                sqlite3.connect(str(path)).close()
+                with self.assertRaises(NativeRefusal) as refused:
+                    self.next()
+                self.assertEqual("EG_V5_HISTORY_MISSING", refused.exception.support_ref)
+                path.unlink()
+            aside.rename(path)
+        self.assertEqual("IDLE", self.next()["outcome"], "positive control: restored stores pass")
+        self.host.drain()
+        self.assertEqual(before, self.snapshot())
+
+    def test_the_switch_refuses_missing_or_foreign_history_and_in_flight_effects(self) -> None:
+        self.history()
+        paths = bridge.history_paths(self.cfg)
+        source = self.db.read_bytes()
+
+        def refused_with(reference: str) -> None:
+            with self.assertRaises(OfflineV4Error) as refused:
+                self.switch()
+            self.assertEqual(reference, refused.exception.support_ref)
+            self.assertEqual(source, self.db.read_bytes(), "the v4 source is untouched")
+            self.assertFalse([n for n in self.folder() if ".v5-switch-" in n or ".v4-backup-" in n], "no leftovers")
+
+        aside = paths["NOTIFICATIONS"].with_name("aside")
+        paths["NOTIFICATIONS"].rename(aside)
+        refused_with("EG_V5_HISTORY_MISSING")
+        aside.rename(paths["NOTIFICATIONS"])
+        with sqlite3.connect(str(paths["PROVENANCE"])) as connection:
+            connection.execute("INSERT INTO drive_hash_provenance VALUES (?,?,?,?,?)",
+                               ("egt4-" + "f" * 32, bridge.HASH_LOCAL_MIRROR, "b" * 64, "gdrive:FOREIGN", "t"))
+        connection.close()
+        refused_with("EG_V5_HISTORY_MISMATCH")
+
+    def test_a_sealed_upload_with_no_outcome_refuses_the_switch(self) -> None:
+        self.acquire()
+        self.host.drive_step(self.next(), crash_after_seal=True)  # DISPATCHED with no outcome
+        source = self.db.read_bytes()
+        with self.assertRaises(OfflineV4Error) as dispatched:
+            self.switch()
+        self.assertEqual(("EG_V5_OPERATION_IN_FLIGHT", 10), (dispatched.exception.support_ref,
+                                                             dispatched.exception.exit_code))
+        self.assertEqual(source, self.db.read_bytes())
+        self.next()  # a normal run records it as UNKNOWN (never resent); the switch is then allowed
+        self.assertEqual("SWITCHED_V5", self.switch()["status"])
+
+    def test_a_sealed_owner_email_with_no_outcome_refuses_the_switch(self) -> None:
+        self.acquire()
+        self.host.notify_step(self.drive_until_notification(), crash_after_seal=True)
+        with self.assertRaises(OfflineV4Error) as sealed:
+            self.switch()
+        self.assertEqual("EG_V5_OPERATION_IN_FLIGHT", sealed.exception.support_ref)
+        self.assertFalse([n for n in self.folder() if ".v5-switch-" in n or ".v4-backup-" in n])
+
+    def test_absent_legacy_provenance_is_legitimate_and_never_relabelled(self) -> None:
+        self.history()
+        bridge.provenance_path(self.cfg).unlink()  # a pre-H-3 install never had the store
+        self.switch()
+        status = self.status()
+        self.assertEqual([bridge.HASH_UNRECORDED] * 2, sorted(
+            item["drive_upload"]["hash_provenance"] for stream in status["streams"].values() for item in stream["invoices"]))
+        newer = {EB: [("EB Invoice 0002.pdf", "2026-09-01"), ("EB Invoice 0003.pdf", "2026-10-01")],
+                 TN: [("TN Invoice 0001.pdf", "2026-08-03"), ("TN Invoice 0002.pdf", "2026-09-03")]}
+        self.acquire(self.adapters(newer))
+        self.host.drain()
+        labels = [(item["display_filename"], item["drive_upload"]["hash_provenance"])
+                  for item in self.status()["streams"][EB]["invoices"]]
+        self.assertEqual([bridge.HASH_UNRECORDED, bridge.HASH_PROVIDER_READBACK], [label for _name, label in labels])
+
+    def test_a_second_switch_and_a_held_lease_are_refused_without_leftovers(self) -> None:
+        self.history()
+        with StateV4Store(self.db) as state:
+            state.acquire_lease("held-by-run", now_ms=self.clock, ttl_ms=600_000)
+        held_bytes = self.db.read_bytes()
+        with self.assertRaises(OfflineV4Error) as held:
+            self.switch()
+        self.assertEqual(("EG_V5_SOURCE_LEASE_HELD", 10), (held.exception.support_ref, held.exception.exit_code))
+        self.assertEqual(held_bytes, self.db.read_bytes())
+        self.clock += 700_000
+        self.switch()
+        files = self.folder()
+        with self.assertRaises(OfflineV4Error) as again:
+            self.switch()
+        self.assertEqual("EG_V5_ALREADY_MIGRATED", again.exception.support_ref)
+        self.assertEqual(files, self.folder())
+
+    @unittest.skipUnless(os.name == "nt", "Windows refuses to rename a file another process has open")
+    def test_a_state_file_open_elsewhere_is_never_switched(self) -> None:
+        self.history()
+        source = self.db.read_bytes()
+        other = sqlite3.connect(str(self.db))  # e.g. a run that has the file open
+        try:
+            other.execute("SELECT COUNT(*) FROM energygrid_v4_invoice").fetchone()
+            with self.assertRaises(OfflineV4Error) as busy:
+                self.switch()
+        finally:
+            other.close()
+        self.assertEqual(("EG_V5_SOURCE_IN_USE", 10), (busy.exception.support_ref, busy.exception.exit_code))
+        self.assertEqual(source, self.db.read_bytes())
+        self.assertFalse([n for n in self.folder() if ".v5-switch-" in n or ".v4-backup-" in n])
+        self.switch()  # positive control once the file is closed
+
+    def test_a_change_between_the_copy_and_the_rename_is_put_back_unchanged(self) -> None:
+        self.history()
+        move = state_module._move_no_replace
+        calls = []
+
+        def write_then_move(source: Path, destination: Path) -> None:
+            if not calls:
+                with source.open("ab") as handle:
+                    handle.write(b"\0")
+            calls.append(destination.name)
+            move(source, destination)
+
+        with mock.patch.object(state_module, "_move_no_replace", side_effect=write_then_move):
+            with self.assertRaises(OfflineV4Error) as changed:
+                self.switch()
+        self.assertEqual("EG_V5_SOURCE_CHANGED", changed.exception.support_ref)
+        self.assertEqual(self.db.name, calls[-1], "the changed v4 file is put back at its name")
+        self.assertTrue(self.db.read_bytes().endswith(b"\0"))
+        self.assertFalse([n for n in self.folder() if ".v5-switch-" in n or ".v4-backup-" in n])
+
+    def test_a_crash_after_the_v4_rename_is_fail_closed_and_rolls_back(self) -> None:
+        self.history()
+        before = self.snapshot()
+        # The exact files a switch leaves if the process dies after step 2 (v4 renamed, v5 not in place).
+        temporary = self.db.with_name(f"{self.db.name}.v5-switch-crash.tmp")
+        backup = self.db.with_name(f"{self.db.name}.v4-backup-crash.bak")
+        history = bridge.switch_history(self.cfg)
+        state_module.migrate_hold_recovery_copy(
+            self.db, temporary, now_ms=self.tick(),
+            bindings=lambda reader, sha: [("STATE", self.db.name, 1, 0, 0, sha), ("V4_BACKUP", backup.name, 1, 0, 0, sha),
+                                          *history(reader)])
+        state_module._move_no_replace(self.db, backup)
+        backups = [backup.name]
+        self.assertFalse(self.db.exists())
+        with self.assertRaises(OfflineV4Error):
+            StateV4Store(temporary).__enter__()  # the leftover copy is never usable under its own name
+        with self.assertRaises(OfflineV4Error):
+            self.next()  # no state file: refused, nothing created, no effect
+        self.assertFalse(self.db.exists())
+        result = state_module.rollback_hold_recovery_v5(self.db, self.db.with_name(backups[0]), now_ms=self.tick())
+        self.assertEqual("ROLLED_BACK_V4", result["status"])
+        self.assertEqual("IDLE", self.next()["outcome"])
+        self.host.drain()
+        self.assertEqual(before, self.snapshot())
+
+    def test_rollback_restores_v4_only_when_no_effect_happened_since_the_switch(self) -> None:
+        self.history()
+        before = self.snapshot()
+        result = self.switch()
+        backup = self.db.with_name(result["v4_backup"])
+        with self.assertRaises(OfflineV4Error) as wrong:
+            state_module.rollback_hold_recovery_v5(self.db, self.db.with_name("state.sqlite.v4-backup-x.bak"),
+                                                   now_ms=self.tick())
+        self.assertEqual("EG_V5_MIGRATION_PATH_INVALID", wrong.exception.support_ref)
+        self.assertEqual("IDLE", self.next()["outcome"])
+        rolled = state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        self.assertEqual(("ROLLED_BACK_V4", result["v4_sha256"]), (rolled["status"], rolled["v4_sha256"]))
+        with StateV4Store(self.db) as state:
+            self.assertEqual(4, state.schema_version)
+        self.assertEqual(result["v4_sha256"], hashlib.sha256(backup.read_bytes()).hexdigest(), "backup untouched")
+        self.assertEqual("IDLE", self.next()["outcome"])
+        self.assertEqual(before, self.snapshot())
+        # After a new effect on v5, a rollback would forget it: refused.
+        second = self.switch()
+        newer = {EB: [("EB Invoice 0002.pdf", "2026-09-01"), ("EB Invoice 0003.pdf", "2026-10-01")],
+                 TN: [("TN Invoice 0001.pdf", "2026-08-03"), ("TN Invoice 0002.pdf", "2026-09-03")]}
+        self.acquire(self.adapters(newer))
+        self.host.drain()
+        v5_bytes = self.db.read_bytes()
+        with self.assertRaises(OfflineV4Error) as after:
+            state_module.rollback_hold_recovery_v5(self.db, self.db.with_name(second["v4_backup"]), now_ms=self.tick())
+        self.assertEqual("EG_V5_ROLLBACK_AFTER_DISPATCH", after.exception.support_ref)
+        self.assertEqual(v5_bytes, self.db.read_bytes())
+        with self.assertRaises(OfflineV4Error) as mismatch:
+            state_module.rollback_hold_recovery_v5(self.db, backup, now_ms=self.tick())
+        self.assertEqual("EG_V5_ROLLBACK_BACKUP_MISMATCH", mismatch.exception.support_ref)
+
+    def test_the_binding_rows_are_immutable_to_direct_sql(self) -> None:
+        self.history()
+        self.switch()
+        connection = sqlite3.connect(str(self.db), isolation_level=None)
+        try:
+            for statement in ("UPDATE energygrid_v5_history_binding SET filename='other.sqlite' WHERE store='STATE'",
+                              "DELETE FROM energygrid_v5_history_binding WHERE store='NOTIFICATIONS'"):
+                with self.subTest(statement=statement), self.assertRaisesRegex(sqlite3.Error, "EG_V4_IMMUTABLE_ROW"):
+                    connection.execute(statement)
+        finally:
+            connection.close()
+        self.assertEqual("IDLE", self.next()["outcome"])
+
+    def test_the_operator_cli_switches_and_rolls_back_under_the_same_filename(self) -> None:
+        import contextlib
+        import io
+
+        from energygrid_bill_downloader import native_cli
+
+        self.history()
+        raw = {
+            "schema": bridge.NATIVE_CONFIG_SCHEMA, "mode": bridge.MODE_UAT_SYNTHETIC, "state_path": str(self.db),
+            "archive_root": str(self.root / "archive"), "named_archive_root": str(self.root / "bills"),
+            "temp_root": str(self.root / "temp"), "outbox_root": str(self.root / "outbox"),
+            "synthetic_root": str(self.root / "portal"),
+            "drive": {"account": "uat@example.com", "folder_ids": dict(base.FOLDERS), "mode": "NATIVE_UPLOAD"},
+            "gmail": {"account": base.SENDER, "to": [base.RECIPIENT], "subject_prefix": "EnergyGrid UAT",
+                      "attach_pdf": False},
+            "effect_ceiling": {"drive_uploads": self.ceilings[0], "gmail_sends": self.ceilings[1]},
+        }
+        config = self.root / "native.json"
+        config.write_text(json.dumps(raw), encoding="utf-8")
+
+        def cli(*argv: str) -> tuple[int, dict]:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = native_cli.main(list(argv))
+            return code, json.loads(out.getvalue())
+
+        code, switched = cli("migrate-hold-recovery", "--config", str(config))
+        self.assertEqual((0, "SWITCHED_V5"), (code, switched["outcome"]))
+        code, status = cli("status", "--config", str(config))
+        self.assertEqual((0, 2), (code, status["effects"]["gmail_dispatches"]))
+        code, rolled = cli("migrate-hold-recovery", "--config", str(config),
+                           "--rollback", str(self.db.with_name(switched["v4_backup"])))
+        self.assertEqual((0, "ROLLED_BACK_V4"), (code, rolled["outcome"]))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            native_cli.build_parser().parse_args(["migrate-hold-recovery", "--config", str(config), "--dest", "x"])
 
 
 # ---------------------------------------------------------------------------

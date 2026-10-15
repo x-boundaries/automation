@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import uuid
 from dataclasses import dataclass, field
@@ -399,8 +400,12 @@ def new_run_id() -> str:
 
 
 @contextlib.contextmanager
-def _session(state, now_ms: int) -> Iterator[None]:
-    """Hold the v4 lease for one bridge command. A held lease refuses with exit 10 and no mutation."""
+def _session(state, now_ms: int, cfg: NativeConfig) -> Iterator[None]:
+    """Hold the v4 lease for one bridge command. A held lease refuses with exit 10 and no mutation.
+
+    A version-5 state is first checked against the dependent-store history bound at its switch
+    (verify_history); a mismatch refuses before the lease is taken, so nothing is written."""
+    verify_history(state, cfg)
     state.acquire_lease(OWNER_TOKEN, now_ms=now_ms, ttl_ms=LEASE_TTL_MS)
     try:
         yield
@@ -824,8 +829,6 @@ def provenance_path(cfg: NativeConfig) -> Path:
 
 @contextlib.contextmanager
 def _provenance(cfg: NativeConfig, *, create: bool) -> Iterator[Any]:
-    import sqlite3
-
     path = provenance_path(cfg)
     if not create and not path.exists():
         yield None
@@ -863,6 +866,141 @@ def hash_provenance(cfg: NativeConfig | None, intent_id: str) -> str:
     return row[0] if row is not None else HASH_UNRECORDED
 
 
+# ---------------------------------------------------------------------------
+# Dependent-store history across the P-7 v5 switch
+#
+# The notification, provenance and backfill stores are named after the state filename. The v5 switch
+# keeps that filename and records, per store, whether it existed and a digest of the identity of
+# every row it held then (energygrid_v5_history_binding). Rows are append-only in all three stores,
+# so before any v5 command the first row_count rows (in insertion order) must still match. A store
+# absent at the switch is legitimately absent (e.g. no H-3 provenance yet: UNRECORDED_LEGACY); a
+# store present at the switch that is now missing, emptied or different is refused with no effect.
+# ---------------------------------------------------------------------------
+
+_HISTORY_QUERIES = {
+    # store: (identity rows in insertion order, effect count among the first N rows or None)
+    "NOTIFICATIONS": ("SELECT notification_id, dedup_key, kind, stream FROM notification ORDER BY seq LIMIT ?",
+                      "SELECT COUNT(*) FROM (SELECT draft_id FROM notification ORDER BY seq LIMIT ?) "
+                      "WHERE draft_id IS NOT NULL"),
+    "PROVENANCE": ("SELECT intent_id, method, sha256, provider_ref FROM drive_hash_provenance ORDER BY rowid LIMIT ?",
+                   None),
+    "BACKFILL": ("SELECT display_key, stream, display_filename, invoice_date, sha256, byte_size FROM backfill "
+                 "ORDER BY rowid LIMIT ?", None),
+}
+
+
+def history_paths(cfg: NativeConfig) -> dict[str, Path]:
+    from .native_backfill import ledger_path
+    from .native_notify import store_path
+
+    return {"NOTIFICATIONS": store_path(cfg), "PROVENANCE": provenance_path(cfg), "BACKFILL": ledger_path(cfg)}
+
+
+@contextlib.contextmanager
+def _existing_store(path: Path) -> Iterator[Any]:
+    """An existing dependent store for reading, or None if absent; it is never created. It is opened
+    read-write only so that SQLite rolls back a hot journal left by a crash, exactly as the store's
+    own open would; nothing else is written. A non-regular or damaged store is refused."""
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise NativeRefusal("EG_V5_HISTORY_UNREADABLE")
+    except FileNotFoundError:
+        yield None
+        return
+    try:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, isolation_level=None,
+                                     timeout=10)
+    except sqlite3.Error:
+        raise NativeRefusal("EG_V5_HISTORY_UNREADABLE") from None
+    try:
+        if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise NativeRefusal("EG_V5_HISTORY_UNREADABLE")
+        yield connection
+    except sqlite3.Error:
+        raise NativeRefusal("EG_V5_HISTORY_UNREADABLE") from None
+    finally:
+        connection.close()
+
+
+def _fingerprint(connection: Any, store: str, limit: int) -> tuple[int, int, str]:
+    """(rows, effects, digest) over the identity of the first `limit` rows of a store (-1: all)."""
+    rows_sql, effects_sql = _HISTORY_QUERIES[store]
+    rows = connection.execute(rows_sql, (limit,)).fetchall()
+    effects = int(connection.execute(effects_sql, (limit,)).fetchone()[0]) if effects_sql else 0
+    digest = hashlib.sha256(repr(rows).encode("utf-8")).hexdigest()
+    return len(rows), effects, digest
+
+
+def switch_history(cfg: NativeConfig):
+    """The `history` callback of state.switch_hold_recovery_v5: validate and fingerprint every dependent
+    store against the v4 state, read under the v4 write lock. Refuses with no file written:
+    - history expected but missing: admitted invoices but no notification store;
+    - a store that belongs to another state: a notification or provenance row naming an invoice or
+      intent (with its hash) that this state does not have;
+    - an owner email sealed with no recorded outcome (in flight)."""
+
+    def history(reader) -> list[tuple]:
+        paths = history_paths(cfg)
+        invoices = {row[0] for row in reader.execute("SELECT invoice_key FROM energygrid_v4_invoice")}
+        intents = {row[0]: row[1] for row in reader.execute(
+            "SELECT intent_id, payload_sha256 FROM energygrid_v4_intent")}
+        bound = []
+        for store, path in paths.items():
+            with _existing_store(path) as connection:
+                if connection is None:
+                    if store == "NOTIFICATIONS" and invoices:
+                        raise NativeRefusal("EG_V5_HISTORY_MISSING")
+                    bound.append((store, path.name, 0, 0, 0, hashlib.sha256(b"").hexdigest()))
+                    continue
+                try:
+                    if store == "NOTIFICATIONS":
+                        if connection.execute("SELECT 1 FROM notification WHERE state='SEALED'").fetchone():
+                            raise NativeRefusal("EG_V5_OPERATION_IN_FLIGHT", exit_code=EXIT_RETRY)
+                        keys = {row[0] for row in connection.execute(
+                            "SELECT invoice_key FROM notification WHERE invoice_key IS NOT NULL")}
+                        if not keys <= invoices:
+                            raise NativeRefusal("EG_V5_HISTORY_MISMATCH")
+                    elif store == "PROVENANCE":
+                        for intent_id, sha256 in connection.execute("SELECT intent_id, sha256 FROM drive_hash_provenance"):
+                            if intents.get(intent_id) != sha256:
+                                raise NativeRefusal("EG_V5_HISTORY_MISMATCH")
+                    rows, effects, digest = _fingerprint(connection, store, -1)
+                except sqlite3.Error:
+                    raise NativeRefusal("EG_V5_HISTORY_UNREADABLE") from None
+                bound.append((store, path.name, 1, rows, effects, digest))
+        return bound
+
+    return history
+
+
+def verify_history(state, cfg: NativeConfig) -> None:
+    """Refuse a version-5 state whose dependent stores no longer hold the history bound at its switch,
+    or whose store names no longer derive from the bound state filename. Reads only; v4 is unchanged."""
+    bindings = state.history_bindings()
+    if state.schema_version != 5:
+        return
+    if bindings.get("STATE", {}).get("filename") != cfg.state_path.name:
+        raise NativeRefusal("EG_V5_STATE_REPOINTED")
+    for store, path in history_paths(cfg).items():
+        binding = bindings.get(store)
+        if binding is None:
+            raise NativeRefusal("EG_V5_HISTORY_BINDING_MISSING")
+        if binding["filename"] != path.name:
+            raise NativeRefusal("EG_V5_STATE_REPOINTED")
+        if not binding["present"]:
+            continue
+        with _existing_store(path) as connection:
+            if connection is None:
+                raise NativeRefusal("EG_V5_HISTORY_MISSING")
+            try:
+                rows, effects, digest = _fingerprint(connection, store, binding["row_count"])
+            except sqlite3.Error:
+                raise NativeRefusal("EG_V5_HISTORY_MISSING") from None
+        # Sealed sends never return to PENDING, so their count can only grow (Gmail ceiling and no resend).
+        if (rows, digest) != (binding["row_count"], binding["digest"]) or effects < binding["effect_count"]:
+            raise NativeRefusal("EG_V5_HISTORY_MISSING")
+
+
 def _payload_path(cfg: NativeConfig, intent_id: str) -> Path:
     return _outbox(cfg) / f"{intent_id}.pdf.b64"
 
@@ -881,7 +1019,7 @@ def acquire(state, cfg: NativeConfig, adapters: dict[str, Any], *, run_id: str, 
     from .reconcile import admit_latest_offline_v4
 
     now_iso = _iso(now_ms)
-    with _session(state, now_ms):
+    with _session(state, now_ms, cfg):
         recovered = state.recover_unfinished(run_id, now_iso=now_iso)
         acquisition = admit_latest_offline_v4(
             adapters=adapters, state=state, archive_root=cfg.archive_root, temp_root=cfg.temp_root,
@@ -921,7 +1059,7 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
     from .state import V4_STREAMS
 
     now_iso = _iso(now_ms)
-    with _session(state, now_ms):
+    with _session(state, now_ms, cfg):
         recovered = state.recover_unfinished(run_id, now_iso=now_iso)
         with _notification_store(cfg) as store:
             recovered_notifications = native_notify.recover(store, now_iso)
@@ -1006,7 +1144,7 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
     """
     intent_id = _check_intent_id(intent_id)
     now_iso = _iso(now_ms)
-    with _session(state, now_ms):
+    with _session(state, now_ms, cfg):
         _intent, invoice = _current_step(state, intent_id, "DRIVE_UPLOAD")
         folder = cfg.drive.folder_ids[invoice["stream"]]
         matches = evidence.get("matches")
@@ -1145,7 +1283,7 @@ def drive_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
     """
     intent_id = _check_intent_id(intent_id)
     now_iso = _iso(now_ms)
-    with _session(state, now_ms):
+    with _session(state, now_ms, cfg):
         _intent, invoice = _dispatched_intent(state, intent_id, "DRIVE_UPLOAD")
         outcome = _provider_outcome(evidence, "CREATED")
         if outcome == "DENIED":
@@ -1205,7 +1343,7 @@ def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run
     """
     intent_id = _check_intent_id(intent_id)
     now_iso = _iso(now_ms)
-    with _session(state, now_ms):
+    with _session(state, now_ms, cfg):
         _intent, invoice = _current_step(state, intent_id, "DRIVE_UPLOAD")
         file = evidence.get("file")
         if type(file) is not dict or type(file.get("id")) is not str or not _PROVIDER_ID_RE.fullmatch(file["id"]):
@@ -1280,7 +1418,7 @@ def hold_release(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, re
     evidence_sha = hashlib.sha256(
         json.dumps({"intent_id": intent_id, "evidence": evidence}, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    with _session(state, now_ms):
+    with _session(state, now_ms, cfg):
         if state.schema_version != 5:
             raise NativeRefusal("EG_V5_SCHEMA_REQUIRED")
         intent, invoice = _invoice_for_intent(state, intent_id)
@@ -1294,6 +1432,9 @@ def hold_release(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, re
                 raise NativeRefusal("EG_V5_RELEASE_AFTER_DISPATCH")
             result = state.hold_release(intent_id, to_state="PENDING", reason_code=reason_code, operator=operator,
                                         evidence_sha256=evidence_sha, run_id=run_id, now_iso=now_iso)
+            # One owner notice, staged for the normal draft/seal/send pipeline (never sent from here). The
+            # sweep derives it from the audit row, so a crash right after the release is healed by the next run.
+            _sweep_notifications(state, cfg, now_iso)
         elif mode == "LATE_EVIDENCE":
             if reason_code != "LATE_EVIDENCE_VERIFIED" or state.dispatch_row(intent_id) is None:
                 raise NativeRefusal("EG_V5_RELEASE_WITHOUT_EVIDENCE")
@@ -1387,6 +1528,7 @@ def status(state, cfg: NativeConfig | None = None, now_ms: int | None = None) ->
     if cfg is not None:
         from . import native_notify
 
+        verify_history(state, cfg)
         with _notification_store(cfg) as store:
             notifications = native_notify.summary(store)
             gmail_dispatches = store.sealed_count()

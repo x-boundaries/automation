@@ -58,8 +58,8 @@ later, `20` HOLD or uncertainty recorded, `64` refused with **no state change**.
 | `status` | Per-stream Drive truth with receipts and named-archive state, the notification list, and dispatch counts. |
 | `backfill-run --drive-evidence F --max N` | Manual one-off only (section 4a). Writes the older bills of each bound stream into the synced folder, at most N (1 to 50). |
 | `backfill-record --drive-evidence F` | Verifies each backfilled file against a fresh Drive listing and its local mirror. |
-| `migrate-hold-recovery --dest D` | Operator only (section 4d). Writes a version-5 copy of the state database beside it; the live file is never written. |
-| `hold-release --intent I --evidence F --reason R --operator O` | Operator only (section 4d), version-5 database only. Audited release of one Drive HOLD. |
+| `migrate-hold-recovery [--rollback B]` | Operator only (section 4d), scheduled task disabled. Switches the state database to version 5 under the **same filename**, keeping the v4 file as a read-only backup; `--rollback` restores that backup when no effect has happened since. |
+| `hold-release --intent I --evidence F --reason R --operator O` | Operator only (section 4d), version-5 database only. Audited release of one Drive HOLD; `NO_DISPATCH` also stages one owner notice. |
 
 ## 4. Host protocol (one loop)
 
@@ -134,16 +134,39 @@ delivery; discard it.
 
 ## 4d. Audited HOLD recovery (P-7, operator only)
 
-A v4 HOLD is terminal. Recovery needs a version-5 database made by `migrate-hold-recovery`:
+A v4 HOLD is terminal. Recovery needs the state database switched to version 5 by `migrate-hold-recovery`.
 
-1. **Make a version-5 copy.** Disable the scheduled task, then run `migrate-hold-recovery --dest <new file beside the state file>`.
-   - It refuses a held lease, SQLite sidecars, a source that is not COMPLETE_V4, an existing destination or another folder.
-   - It copies with the SQLite backup API and adds one append-only audit table. It replaces the status guard with a superset, checks that every existing row is identical, and never writes the source.
-2. **Switch to the copy.** Point the configuration at the copy; this is a manual step. Code without version-5 support refuses a version-5 database, so an older binary cannot run against the wider guard.
-3. **Release the HOLD** with `hold-release`. Each release writes one audit row bound to the HOLD's exact version, so it is one-time, and triggers re-check the same rules for any direct SQL write.
-   - `{"mode": "NO_DISPATCH"}` returns a HOLD to PENDING only if the intent was never dispatched, never received a receipt and never passed through DISPATCHED, UNKNOWN or VERIFIED.
-   - `{"mode": "LATE_EVIDENCE", "file": {...}}` with reason `LATE_EVIDENCE_VERIFIED` makes a dispatched HOLD VERIFIED only with exact Drive metadata plus the exact local mirror (or a matching Core readback). There is no new effect.
-4. **Rollback:** the untouched source file. Restore it only if no dispatch has happened since the switch.
+The configured `state_path` never changes. The notification store (`<state>.notifications.sqlite`, with the sent-email history and the Gmail ceiling count), the hash-provenance store (`<state>.provenance.sqlite`) and the backfill ledger (`<state>.backfill.sqlite`) are named after it. A differently named state file would start all three empty, so earlier emails could be sent again, the Gmail ceiling would restart from zero and provenance would read `UNRECORDED_LEGACY`. Never repoint the configuration to a copy.
+
+1. **Prepare.** Disable the scheduled task. Run `status` and check that nothing is in flight. A sealed upload or email with no recorded outcome refuses the switch (`EG_V5_OPERATION_IN_FLIGHT`); a normal `next` records it as UNKNOWN first, and it is never resent.
+2. **Switch** with `migrate-hold-recovery` (no other argument). In one command it:
+   1. Takes the state file's SQLite write lock and checks it: COMPLETE_V4, no SQLite sidecar files, no live lease and no sealed upload without an outcome. The lock is held, with nothing written, until step 5.
+   2. Checks each dependent store without creating or changing it (SQLite still rolls back a journal left by a crash, as any open does). A missing notification store for a state with admitted invoices refuses with `EG_V5_HISTORY_MISSING`. A store row naming an invoice or intent this state does not have refuses with `EG_V5_HISTORY_MISMATCH`. A sealed email without an outcome refuses with `EG_V5_OPERATION_IN_FLIGHT`. An absent provenance store is legitimate: older receipts stay `UNRECORDED_LEGACY` and are never relabelled.
+   3. Copies the file under the lock into a new temporary file beside it.
+   4. Migrates the copy in one transaction. It adds the append-only `hold_release` audit, the superset status guard and an immutable `history_binding` table. That table records the state filename, the v4 hash, the backup name, and for each store whether it existed plus a digest of every row it held.
+   5. Checks that the copy's rows and the source bytes are unchanged. A changed source (`EG_V5_SOURCE_CHANGED`) removes this attempt's copy and leaves every other file as it was.
+   6. Renames the v4 file to `<state>.v4-backup-<id>.bak`. Windows refuses the rename while any process has the file open (`EG_V5_SOURCE_IN_USE`, exit 10).
+   7. Checks the backup still has the verified hash. If it changed, it is put back at its name and the switch is refused.
+   8. Renames the v5 file to the state filename (never over a file), makes the backup read-only and reopens the result as version 5.
+
+   The result names `v4_backup`. Keep it.
+3. **Before every later command,** a version-5 state is verified before the lease is taken, so a refusal writes nothing and makes no effect:
+   - **Filename:** it must be opened under its bound filename; another name refuses with `EG_V5_STATE_REPOINTED`, before any store is opened or created.
+   - **Stores:** each store that existed at the switch must still exist and still hold the same first rows. Sent emails must not have returned to pending. Otherwise the command refuses with `EG_V5_HISTORY_MISSING`.
+4. **Release the HOLD** with `hold-release`. Each release writes one audit row bound to the HOLD's exact version, so it is one-time, and triggers re-check the same rules for any direct SQL write.
+   - `{"mode": "NO_DISPATCH"}` returns a HOLD to PENDING only if the intent was never dispatched, never received a receipt and never passed through DISPATCHED, UNKNOWN or VERIFIED. It stages exactly one owner notice (`hold released`, reference `EG_V5_HOLD_RELEASED`) to the configured recipient. The notice goes through the normal draft, seal and send steps and is never sent by the operator command. It is derived from the audit row, so a crash right after the release is healed once by the next run.
+   - `{"mode": "LATE_EVIDENCE", "file": {...}}` with reason `LATE_EVIDENCE_VERIFIED` makes a dispatched HOLD VERIFIED only with exact Drive metadata plus the exact local mirror (or a matching Core readback). There is no new effect, and the normal success notification follows.
+5. **Re-enable** the scheduled task. The next run is `IDLE` unless a released intent is now PENDING; such an intent is uploaded once.
+6. **Rollback:** `migrate-hold-recovery --rollback <v4_backup path>`, with the task disabled. It undoes the switch only. It refuses in two cases:
+   - `EG_V5_ROLLBACK_AFTER_DISPATCH`: the v5 file holds a dispatch or provider receipt that the backup lacks, so restoring would forget an effect.
+   - `EG_V5_ROLLBACK_AFTER_RELEASE`: the v5 file holds a release audit row, which is append-only and is never erased.
+
+   Otherwise:
+   - the v5 file is kept as `<state>.v5-retired-<id>.bak`;
+   - a hash-verified copy of the untouched backup is put back at the state filename;
+   - the dependent stores are not touched.
+
+   If a switch was interrupted after step 2.6 (no file at the state name), every command refuses and the same rollback restores the backup. A leftover `<state>.v5-switch-<id>.tmp` is refused under its own name and may be deleted.
 
 ## 4a. Manual backfill of older bills (owner request, not scheduled)
 
@@ -275,3 +298,14 @@ owner name; verification after sync; second run fetches nothing; names already i
 fetch; cap and deferral; a previously newest bill picked up later; no overwrite; fetch failure isolated;
 Drive duplicates held; both streams in one flat folder; exact Drive listing evidence; bounded cap;
 LOCAL_SYNC required.
+`tests/test_production_hardening.py`: P-2 to P-5, P-7 and H-1 to H-6. For the P-7 switch, it covers the following.
+
+- Notification, Gmail ceiling, provenance and backfill history are kept.
+- No resend after the switch, and the next run is `IDLE`.
+- Each of these is refused with zero effects: a repointed or moved state, a missing or emptied store, in-flight effects, and foreign store rows.
+- A source change during the copy or before the rename leaves no v5 file.
+- The write lock is held during the copy.
+- A crash after the v4 rename fails closed.
+- Rollback works only without new effects.
+- The audit rows and binding rows are immutable.
+- The `NO_DISPATCH` owner notice is staged once, healed once after a crash and never resent when uncertain.

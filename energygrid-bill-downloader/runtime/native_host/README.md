@@ -19,7 +19,7 @@ Placeholders, which are never committed with real values:
 
 ## 2. Defence in depth
 
-1. **Launcher:** the subcommand allow-list is enforced by the launcher itself, independent of any model or permission setting. This is tested in `tests/test_native_host_policy.py`.
+1. **Launcher:** the subcommand allow-list is enforced by the launcher itself, independent of any model or permission setting. This is tested in `tests/test_production_hardening.py` (`LauncherTemplateTests` and `HostPolicyTemplateTests`).
 2. **Permission policy:** decides which tools the host model may call at all. With `dontAsk`, an unlisted command spelling, such as `cmd /c ...`, `& '...'`, a direct `python -m ...`, or a compound command, is refused rather than run or prompted. Whether the installed Claude Code build really enforces each of these is **unproven** until §3 is done on the host.
 3. **Core:** every effect is still sealed, ceiling-bounded, verified and recorded by the Core. The host cannot widen a recipient or overwrite a Drive file through the CLI.
 

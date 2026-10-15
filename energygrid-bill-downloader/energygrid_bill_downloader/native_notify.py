@@ -8,6 +8,8 @@ per event to one private recipient:
 - FAILURE: an actionable incident, deduplicated: a Drive intent in HOLD or UNKNOWN (once
   per intent and state), or a failed acquisition (once per incident; a stream that
   recovers closes it, and a later failure opens a new one).
+- FAILURE (owner notice, P-7): an operator's audited `hold-release NO_DISPATCH`, once per
+  release (derived from the v5 audit row, so it survives a crash after the release).
 
 Gmail's own failures never create notifications (no recursion), never block Drive work
 or the other stream, and are never resent. A notification is PENDING until the host
@@ -37,6 +39,7 @@ from .native_bridge import (
 )
 
 KIND_SUCCESS, KIND_FAILURE = "SUCCESS", "FAILURE"
+HOLD_RELEASED_STATUS, HOLD_RELEASED_REF = "HOLD_RELEASED_NO_DISPATCH", "EG_V5_HOLD_RELEASED"
 STATES = ("PENDING", "SEALED", "SENT", "UNKNOWN", "HOLD")
 HANDLED_ACQUISITION = frozenset({"ADMITTED", "ALREADY_ADMITTED", "PREDECESSOR_DELIVERED", "EMPTY"})
 _NOTIFICATION_ID_RE = re.compile(r"egn-[0-9a-f]{32}", re.ASCII)
@@ -188,6 +191,9 @@ def sweep(state, store: NotificationStore, now_iso: str, acquisition: dict | Non
     from .native_bridge import verified_drive_file_id
 
     created = 0
+    releases: dict[str, list[dict]] = {}
+    for release in state.no_dispatch_releases():
+        releases.setdefault(release["stream"], []).append(release)
     with store.write() as conn:
         for stream in STREAM_LABELS:
             for invoice in state.invoices_for_stream(stream):
@@ -207,6 +213,12 @@ def sweep(state, store: NotificationStore, now_iso: str, acquisition: dict | Non
                         stream=stream, status_text=f"DRIVE_UPLOAD_{drive['state']}",
                         support_ref=drive["support_ref"] or "EG_V4_INTENT_HELD",
                     )
+            for release in releases.get(stream, ()):
+                created += store._insert(
+                    conn, f"HOLD_RELEASE|{release['intent_id']}|{release['from_version']}", now_iso,
+                    kind=KIND_FAILURE, stream=stream, status_text=HOLD_RELEASED_STATUS, support_ref=HOLD_RELEASED_REF,
+                    display_filename=release["display_filename"],
+                )
             if acquisition is None or stream not in acquisition:
                 continue
             status = acquisition[stream]["status"]
@@ -248,6 +260,13 @@ def message_for(cfg: NativeConfig, row: dict) -> tuple[str, str]:
         body = (f"EnergyGrid processed a new {label}.\n"
                 f"File: {row['display_filename']}\n"
                 f"Google Drive: {drive_link(row['drive_file_id'])}\n")
+    elif row["status_text"] == HOLD_RELEASED_STATUS:
+        subject = f"{prefix}: {label} hold released - {row['support_ref']}"
+        body = (f"An operator released a held {label} upload that was never sent to Google Drive.\n"
+                f"File: {row['display_filename']}\n"
+                f"Status: {row['status_text']}\n"
+                f"Reference: {row['support_ref']}\n"
+                "The next scheduled run uploads it once. Check the EnergyGrid status report.\n")
     else:
         subject = f"{prefix}: {label} needs attention - {row['support_ref']}"
         body = (f"EnergyGrid could not complete the {label} stream.\n"

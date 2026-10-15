@@ -408,7 +408,7 @@ class NativeAdmissionTests(unittest.TestCase):
             adapters = {"TENANT_BILL": tenant.TenantBillAdapter(http, renderer)}
             from energygrid_bill_downloader import native_bridge as bridge
 
-            with StateV4Store(db) as state, bridge._session(state, 1_000_000):
+            with StateV4Store(db) as state, bridge._session(state, 1_000_000, None):  # v4: no v5 history to verify
                 result = admit_latest_offline_v4(adapters=adapters, state=state, archive_root=root / "archive",
                                                  temp_root=root / "temp", run_id=bridge.new_run_id(),
                                                  now_iso="2026-10-15T00:00:01Z", inventory_ceiling=50)

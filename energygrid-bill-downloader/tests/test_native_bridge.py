@@ -262,7 +262,7 @@ class NativeBridgeBase(unittest.TestCase):
             return function(state, self.cfg, intent_id, evidence, run_id=bridge.new_run_id(), now_ms=self.tick())
 
     def notify(self, action):
-        with StateV4Store(self.db) as state, bridge._session(state, self.tick()), \
+        with StateV4Store(self.db) as state, bridge._session(state, self.tick(), self.cfg), \
                 notify.NotificationStore(notify.store_path(self.cfg)) as store:
             return action(store)
 
