@@ -90,6 +90,64 @@ class SddlTests(unittest.TestCase):
                 self.assertEqual(self.issue(good + other), "state_root_acl_unsafe")
         self.assertEqual(self.issue("garbage"), "state_root_acl_unverifiable")
 
+    def test_aliases_are_compared_as_canonical_sids(self):
+        # Hosted Windows CI runs as the renamed built-in Administrator (RID
+        # 500), which SDDL prints as "LA" (2026-10-16 CI failure).
+        builtin_admin = "S-1-5-21-1-2-3-500"
+        own = f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LA)"
+
+        def resolver(mapping):
+            return lambda token: dl._static_sid(token) or mapping.get(token)
+
+        is_user = resolver({"LA": builtin_admin})
+        self.assertIsNone(dl.sddl_custody_issue(own, user_sid=builtin_admin, require_protected=True, resolve=is_user))
+        self.assertIsNone(dl.sddl_custody_issue(own.replace("O:BA", "O:LA"), user_sid=builtin_admin, require_protected=True, resolve=is_user))
+        # The same alias naming someone else, or an alias nobody can resolve, is never private.
+        self.assertEqual(dl.sddl_custody_issue(own, user_sid=self.USER, require_protected=True, resolve=is_user), "state_root_acl_unsafe")
+        self.assertEqual(dl.sddl_custody_issue(own, user_sid=builtin_admin, require_protected=True), "state_root_acl_unverifiable")
+        self.assertEqual(dl.sddl_custody_issue(own.replace("O:BA", "O:LA"), user_sid=builtin_admin, require_protected=True), "state_root_acl_unverifiable")
+        for broad in ("(A;OICI;FA;;;OW)", "(A;OICIIO;FA;;;CO)", "(A;OICI;FR;;;AU)", "(A;OICI;FR;;;BU)", "(A;OICI;FR;;;WD)", "(A;OICI;FR;;;S-1-5-21-1-2-3-1002)"):
+            with self.subTest(ace=broad):
+                self.assertEqual(dl.sddl_custody_issue(own + broad, user_sid=builtin_admin, require_protected=True, resolve=is_user), "state_root_acl_unsafe")
+
+    def test_sanitised_classes_never_carry_sids(self):
+        sddl = f"O:{self.USER}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{self.USER})(A;OICI;FR;;;S-1-5-21-9-9-9-1005)(A;OICI;FR;;;OW)"
+        classes = dl.sddl_custody_classes(sddl, user_sid=self.USER)
+        self.assertEqual([a["principal"] for a in classes["aces"]], ["system(alias:SY)", "current_user", "other_account", "owner_rights(alias:OW)"])
+        self.assertNotIn("S-1-5-21", json.dumps(classes))
+
+
+@unittest.skipUnless(os.name == "nt", "Windows SID resolution")
+class WindowsAclDiagnosticTests(unittest.TestCase):
+    def test_windows_resolves_aliases(self):
+        self.assertEqual((dl._win_resolve_sid("SY"), dl._win_resolve_sid("BU"), dl._win_resolve_sid("OW")), ("S-1-5-18", "S-1-5-32-545", "S-1-3-4"))
+        self.assertRegex(dl._win_resolve_sid("LA") or "", r"^S-1-5-21-[0-9-]+-500$")
+        self.assertIsNone(dl._win_resolve_sid("ZZ"))
+
+    def test_prepared_root_is_private_with_sanitised_evidence(self):
+        holder = Path(tempfile.mkdtemp(prefix="xb-directlocal-acl-"))
+        try:
+            root = holder / "state"
+            dl.prepare_state_root(root, environ={})
+            rows = dl.describe_private_state(root)
+            evidence = json.dumps(rows, separators=(",", ":"))
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                # Public check-run annotation: classes only, no SID, name or path.
+                print(f"::notice title=xb155-acl-diagnostic::{evidence}")
+            self.assertNotIn("S-1-5-21", evidence)
+            self.assertEqual({row["role"]: row["verdict"] for row in rows}, {"root": "private", "inbox": "private", "claims": "private", "evidence": "private"}, evidence)
+            self.assertIn("P", rows[0]["dacl_flags"])
+            for grant in ("*S-1-1-0:(R)", "*S-1-3-4:(F)", "*S-1-5-11:(R)"):
+                with self.subTest(grant=grant):
+                    subprocess.run(["icacls", str(root), "/grant", grant], capture_output=True, check=True)
+                    with self.assertRaises(dl.DirectLocalError) as raised:
+                        dl.verify_private_state(root)
+                    self.assertEqual(raised.exception.code, "state_root_acl_unsafe")
+                    subprocess.run(["icacls", str(root), "/remove:g", grant.split(":")[0]], capture_output=True, check=True)
+            dl.verify_private_state(root)  # restored to private
+        finally:
+            shutil.rmtree(holder, ignore_errors=True)
+
 
 class PrepareStateRootTests(unittest.TestCase):
     def setUp(self):

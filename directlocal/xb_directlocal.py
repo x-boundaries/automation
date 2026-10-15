@@ -500,6 +500,50 @@ _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
 _SDDL_ALIASES = {"SY": _SYSTEM_SID, "BA": _ADMINISTRATORS_SID}
 _SDDL_RE = re.compile(r"^O:(?P<owner>[A-Z]{2}|S-1-[0-9-]+)D:(?P<flags>[A-Z]*)(?P<aces>(?:\([^()]*\))*)$")
+_SID_RE = re.compile(r"^S-1-[0-9]+(?:-[0-9]+){0,15}$")
+
+
+# Machine-independent SDDL aliases (for the offline resolver only). Machine-
+# or domain-relative aliases such as LA are unresolvable offline.
+_WELL_KNOWN_ALIASES = {**_SDDL_ALIASES, "CO": "S-1-3-0", "OW": "S-1-3-4", "AU": "S-1-5-11", "BU": "S-1-5-32-545", "WD": "S-1-1-0"}
+
+
+def _static_sid(token: str) -> str | None:
+    """Offline resolver: full SIDs pass through; fixed aliases map."""
+
+    return token if _SID_RE.fullmatch(token or "") else _WELL_KNOWN_ALIASES.get(token)
+
+
+def _win_resolve_sid(token: str) -> str | None:
+    """Canonical SID for an SDDL SID token, resolved by Windows itself.
+
+    SDDL prints some principals as two-letter aliases. Hosted Windows CI
+    (2026-10-16) runs as the renamed built-in Administrator (RID 500), which
+    SDDL prints as ``LA``; an alias-blind check misread the root's own grant
+    as foreign. ``None`` when Windows cannot resolve the token.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))
+    advapi32.ConvertSidToStringSidW.argtypes = (ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR))
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    sid = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(token, ctypes.byref(sid)):
+        return None
+    try:
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+            return None
+        try:
+            return text.value
+        finally:
+            kernel32.LocalFree(text)
+    finally:
+        kernel32.LocalFree(sid)
 
 
 def _win_current_user_sid() -> str:
@@ -562,15 +606,20 @@ def _win_sddl(path: Path) -> str:
         kernel32.LocalFree(descriptor)
 
 
-def sddl_custody_issue(sddl: str, *, user_sid: str, require_protected: bool) -> str | None:
+def sddl_custody_issue(sddl: str, *, user_sid: str, require_protected: bool, resolve: Callable[[str], str | None] = _static_sid) -> str | None:
     """Pure SDDL check. ``None`` when only the current user, SYSTEM and
-    Administrators own or are granted anything (deny entries are harmless)."""
+    Administrators own or are granted anything (deny entries are harmless).
+    Every owner and ACE principal is compared as a canonical SID; a token
+    that cannot be resolved is unverifiable, never assumed safe."""
 
     match = _SDDL_RE.fullmatch(sddl or "")
     if match is None:
         return "state_root_acl_unverifiable"
     allowed = {user_sid, _SYSTEM_SID, _ADMINISTRATORS_SID}
-    if _SDDL_ALIASES.get(match["owner"], match["owner"]) not in allowed:
+    owner = resolve(match["owner"])
+    if owner is None:
+        return "state_root_acl_unverifiable"
+    if owner not in allowed:
         return "state_root_owner_unsafe"
     if require_protected and "P" not in match["flags"]:
         return "state_root_acl_inherited"
@@ -583,9 +632,72 @@ def sddl_custody_issue(sddl: str, *, user_sid: str, require_protected: bool) -> 
             return "state_root_acl_unsafe"
         if parts[0] == "D":
             continue
-        if parts[0] != "A" or _SDDL_ALIASES.get(parts[5], parts[5]) not in allowed:
+        if parts[0] != "A":
+            return "state_root_acl_unsafe"
+        principal = resolve(parts[5])
+        if principal is None:
+            return "state_root_acl_unverifiable"
+        if principal not in allowed:
             return "state_root_acl_unsafe"
     return None
+
+
+_PRINCIPAL_CLASSES = {
+    _SYSTEM_SID: "system", _ADMINISTRATORS_SID: "administrators", "S-1-3-4": "owner_rights", "S-1-3-0": "creator_owner",
+    "S-1-5-11": "authenticated_users", "S-1-5-32-545": "users", "S-1-1-0": "everyone",
+}
+
+
+def sddl_custody_classes(sddl: str, *, user_sid: str, resolve: Callable[[str], str | None] = _static_sid) -> dict[str, Any]:
+    """Sanitised view of one descriptor for diagnostics: DACL flags, owner
+    class and per-ACE type, inheritance flags and principal class. Never a
+    SID, account name or path. An SDDL alias token (for example ``LA``) is a
+    public constant and is reported so the alias in use is visible."""
+
+    def principal(token: str) -> str:
+        sid = resolve(token)
+        if sid is None:
+            return "unresolvable"
+        if sid == user_sid:
+            name = "current_user"
+        elif sid in _PRINCIPAL_CLASSES:
+            name = _PRINCIPAL_CLASSES[sid]
+        elif sid.startswith("S-1-5-21-"):
+            name = "other_account"
+        else:
+            name = "other_well_known"
+        return f"{name}(alias:{token})" if not token.startswith("S-1-") else name
+
+    match = _SDDL_RE.fullmatch(sddl or "")
+    if match is None:
+        return {"parsed": False}
+    aces = []
+    for ace in re.findall(r"\(([^()]*)\)", match["aces"]):
+        parts = ace.split(";")
+        aces.append({"type": parts[0], "flags": parts[1], "principal": principal(parts[5])} if len(parts) == 6 else {"type": "unparsed"})
+    return {"parsed": True, "dacl_flags": match["flags"], "owner": principal(match["owner"]), "aces": aces}
+
+
+def describe_private_state(root: Path) -> list[dict[str, Any]]:
+    """Diagnostic counterpart of ``verify_private_state`` (Windows only):
+    sanitised classes for the root and its custody children, with the
+    verdict each would get. Read-only; no SID, name or path is returned."""
+
+    if os.name != "nt":
+        return []
+    user_sid = _win_current_user_sid()
+    rows = []
+    for name in (".", "inbox", "claims", "evidence", "ledger.sqlite3"):
+        path = root if name == "." else root / name
+        if not path.exists():
+            continue
+        sddl = _win_sddl(path)
+        rows.append({
+            "role": "root" if name == "." else name,
+            "verdict": sddl_custody_issue(sddl, user_sid=user_sid, require_protected=(name == "."), resolve=_win_resolve_sid) or "private",
+            **sddl_custody_classes(sddl, user_sid=user_sid, resolve=_win_resolve_sid),
+        })
+    return rows
 
 
 def verify_private_state(root: Path) -> None:
@@ -597,7 +709,7 @@ def verify_private_state(root: Path) -> None:
     if os.name == "nt":
         user_sid = _win_current_user_sid()
         for path, protected in targets:
-            issue = sddl_custody_issue(_win_sddl(path), user_sid=user_sid, require_protected=protected)
+            issue = sddl_custody_issue(_win_sddl(path), user_sid=user_sid, require_protected=protected, resolve=_win_resolve_sid)
             if issue:
                 raise DirectLocalError(issue)
         return
