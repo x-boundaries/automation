@@ -11,9 +11,11 @@ Data path
   hands the hook; it is NOT proof of the original Shopify wire bytes.
 * ``parse_capture`` verifies tool, pinned query, pagination variables, store
   identity (``shop { id myshopifyDomain }`` in every response) and schema.
-  Only the ``synthetic`` response shape is qualified; real connector
-  responses fail closed (``capture_response_shape_unqualified``) until the
-  attended E1 gate qualifies the delivered shape.
+  The response shape is bound to the ledger mode: ``synthetic`` accepts only
+  ``{"data": {...}}`` objects; ``connector`` accepts only the JSON text that
+  decodes to exactly ``{"data": {...}}`` (qualified 2026-10-14). Errors,
+  extensions, plain-text failures (disconnected or expired authentication)
+  and any other wrapper fail closed.
 * The reused ``capture_member_mg_baseline`` / ``evaluate_profile`` take every
   cutover and admission decision.
 
@@ -27,24 +29,35 @@ exclusive ``<fence_id>.claim`` file before ``SaveMember`` and refuses if it
 already exists. An uncertain outcome is only ever reconciled read-only with the
 same bound MemberNo.
 
-Synthetic inertness
--------------------
-The only ledger mode is ``synthetic``. In it the processor refuses every
-AutoCount bridge whose ``autocount_target`` is not the test-only
-``SYNTHETIC_BRIDGE_TARGET`` (the real ``BridgeClient`` default is never
-accepted), and the PowerShell bridge itself refuses to run without a
-positively marked fake session factory, which its ``-File`` entrypoint cannot
-receive. No real AutoCount login, lookup, ``GetNextMemberNo`` or
-``SaveMember`` is reachable, whatever flags, approvals or fence ids a caller
-supplies.
+Ledger modes and environment binding
+------------------------------------
+The mode, AutoCount environment and book are fixed when the ledger is
+initialised and can never change (SQLite triggers).
+
+* ``synthetic`` (environment ``synthetic``, no book): inert. The processor
+  refuses every bridge whose ``autocount_target`` is not the test-only
+  ``SYNTHETIC_BRIDGE_TARGET``, and the PowerShell bridge refuses to run
+  without a positively marked fake session factory, which its ``-File``
+  entrypoint cannot receive.
+* ``connector`` (real Shopify connector data): the store must be the
+  qualified store identity, the state root must be private (no inherited
+  ACEs; only the current user, SYSTEM and Administrators), and the
+  environment must be ``development`` (book ``AED_TESTINGAPI``). Only a real
+  bridge bound to that same book is accepted; the bridge then pins the book
+  for its process and proves it from the authenticated session. The
+  ``production`` environment is recognised but refused by this source (gate
+  E9 needs a separate source change).
 
 The ledger stores GIDs, MemberNos, counts, codes and salted digests only.
+Public output carries keyed, non-enumerable references (``c-``/``m-``
+prefixes, HMAC-SHA256 under a per-ledger random key), never a MemberNo.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -90,19 +103,30 @@ HOLD_EXIT_CODE = 75
 # Test-only bridge target. A synthetic ledger accepts no other bridge.
 SYNTHETIC_BRIDGE_TARGET = "synthetic_fake_member_command"
 REAL_BRIDGE_TARGET = "real_autocount"
-# AutoCount 2.2 Member column widths (characters), read from the nominated
-# test book's catalog on 2026-10-14: Name nvarchar(100), MobilePhone
-# nvarchar(25), EmailAddress nvarchar(200), MemberNo nvarchar(20). Wider
-# values are never sent to SaveMember (they would fail or truncate).
+# AutoCount 2.2 Member column widths, read from the nominated test book's
+# catalog on 2026-10-14: Name nvarchar(100), MobilePhone nvarchar(25),
+# EmailAddress nvarchar(200), MemberNo nvarchar(20). nvarchar(n) holds n
+# UTF-16 code units, so a character outside the BMP counts twice. Wider values
+# are never sent to SaveMember (they would fail or truncate).
 AUTOCOUNT_FIELD_WIDTHS = {"name": 100, "mobile_phone": 25, "email_address": 200}
-# Only response shapes qualified offline are accepted; see module docstring.
-QUALIFIED_RESPONSE_SHAPES = {"synthetic": "graphql_data_object_v1"}
+# C0 controls, DEL and unpaired surrogates are never sent to AutoCount.
+_AUTOCOUNT_TEXT_FORBIDDEN_RE = re.compile("[\x00-\x1f\x7f\ud800-\udfff]")
 # Qualified 2026-10-14 from one attended identity read through the PostToolUse
-# hook: tool_response is a JSON *text* whose decoded value is exactly
-# {"data": {...}}. Hook-delivered JSON, not Shopify wire bytes. Used only for
-# store-identity inspection; ledger ingestion of real data stays disabled.
+# hook and re-observed 2026-10-15: tool_response is a JSON *text* whose decoded
+# value is exactly {"data": {...}}. Hook-delivered JSON, not Shopify wire bytes.
 CONNECTOR_RESPONSE_SHAPE = "connector_graphql_json_text_v1"
+# Response shape per ledger mode; see module docstring.
+QUALIFIED_RESPONSE_SHAPES = {"synthetic": "graphql_data_object_v1", "connector": CONNECTOR_RESPONSE_SHAPE}
 SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.myshopify\.com$")
+# The only store a connector ledger may bind (non-PII identity observed
+# through the connector on 2026-10-14 and 2026-10-15).
+QUALIFIED_CONNECTOR_STORES = {"gid://shopify/Shop/48759472277": "xboundariessg.myshopify.com"}
+# AutoCount environment -> account book. Bound once at init-ledger.
+ENVIRONMENT_BOOKS = {"synthetic": None, "development": "AED_TESTINGAPI", "production": "AED_XBOUNDARIES"}
+# Environments this source may start a real bridge for. Production (E9)
+# requires a later, separately approved source change.
+AUTHORISED_REAL_ENVIRONMENTS = frozenset({"development"})
+MEMBER_REF_HEX = 20  # 80-bit keyed reference
 
 BASELINE_QUERY = """query XbDirectLocalCustomerPage($first: Int!, $after: String) {
   shop { id myshopifyDomain }
@@ -202,6 +226,26 @@ def duplicate_phone_keys(phone: str | None) -> tuple[str, ...]:
     return (phone,)
 
 
+def utf16_code_units(value: str) -> int:
+    """Length as SQL Server ``nvarchar`` counts it (UTF-16 code units)."""
+
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def autocount_text_issue(payload: Mapping[str, Any]) -> str | None:
+    """Review code if any text field cannot be stored exactly, else ``None``."""
+
+    for field, width in AUTOCOUNT_FIELD_WIDTHS.items():
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or _AUTOCOUNT_TEXT_FORBIDDEN_RE.search(value):
+            return "autocount_text_invalid"
+        if utf16_code_units(value) > width:
+            return "autocount_field_width_exceeded"
+    return None
+
+
 # --------------------------------------------------------------------------
 # Connector capture parsing
 # --------------------------------------------------------------------------
@@ -261,6 +305,8 @@ def _response_data(tool_response: Any, mode: str) -> Mapping[str, Any]:
     shape = QUALIFIED_RESPONSE_SHAPES.get(mode)
     if shape is None:
         raise CaptureRejected("capture_response_shape_unqualified")
+    if shape == CONNECTOR_RESPONSE_SHAPE:
+        return connector_response_data(tool_response)
     # graphql_data_object_v1: exactly {"data": {...}}; any GraphQL error rejects.
     if not isinstance(tool_response, Mapping) or set(tool_response) != {"data"} or not isinstance(tool_response["data"], Mapping):
         raise CaptureRejected("capture_response_shape_invalid")
@@ -364,11 +410,7 @@ def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) ->
 # State root and single-owner lock
 # --------------------------------------------------------------------------
 
-def validate_state_root(path: str | Path, *, environ: Mapping[str, str] | None = None) -> Path:
-    """Refuse UNC, MSIX-redirected ``%LOCALAPPDATA%``, repo-internal and
-    missing roots. The root itself is never created here (an E0 decision)."""
-
-    env = os.environ if environ is None else environ
+def _state_root_location(path: str | Path, env: Mapping[str, str]) -> Path:
     text = str(path)
     if text.startswith("\\\\") or text.startswith("//"):
         raise DirectLocalError("state_root_unc_refused")
@@ -381,9 +423,154 @@ def validate_state_root(path: str | Path, *, environ: Mapping[str, str] | None =
     for forbidden in candidates:
         if resolved == forbidden or forbidden in resolved.parents:
             raise DirectLocalError("state_root_location_refused")
+    return resolved
+
+
+def validate_state_root(path: str | Path, *, environ: Mapping[str, str] | None = None) -> Path:
+    """Refuse UNC, MSIX-redirected ``%LOCALAPPDATA%``, repo-internal and
+    missing roots. The root itself is never created here."""
+
+    resolved = _state_root_location(path, os.environ if environ is None else environ)
     if not resolved.is_dir():
         raise DirectLocalError("state_root_missing")
     return resolved
+
+
+# Only these principals may own or hold any access to connector-ledger state.
+_SYSTEM_SID = "S-1-5-18"
+_ADMINISTRATORS_SID = "S-1-5-32-544"
+_SDDL_ALIASES = {"SY": _SYSTEM_SID, "BA": _ADMINISTRATORS_SID}
+_SDDL_RE = re.compile(r"^O:(?P<owner>[A-Z]{2}|S-1-[0-9-]+)D:(?P<flags>[A-Z]*)(?P<aces>(?:\([^()]*\))*)$")
+
+
+def _win_current_user_sid() -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE))
+    advapi32.GetTokenInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    advapi32.ConvertSidToStringSidW.argtypes = (ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR))
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+        raise DirectLocalError("state_root_acl_unverifiable")
+    try:
+        buffer = ctypes.create_string_buffer(512)
+        size = wintypes.DWORD()
+        if not advapi32.GetTokenInformation(token, 1, buffer, len(buffer), ctypes.byref(size)):  # TokenUser
+            raise DirectLocalError("state_root_acl_unverifiable")
+        sid_pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
+            raise DirectLocalError("state_root_acl_unverifiable")
+        try:
+            return text.value
+        finally:
+            kernel32.LocalFree(text)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _win_sddl(path: Path) -> str:
+    """Owner + DACL of ``path`` as SDDL (read-only)."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = (wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD) + (ctypes.POINTER(ctypes.c_void_p),) * 5
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = (ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.ULONG))
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    info = 0x1 | 0x4  # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+    owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    if advapi32.GetNamedSecurityInfoW(str(path), 1, info, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor)) != 0:  # SE_FILE_OBJECT
+        raise DirectLocalError("state_root_acl_unverifiable")
+    try:
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, info, ctypes.byref(text), None):
+            raise DirectLocalError("state_root_acl_unverifiable")
+        try:
+            return text.value
+        finally:
+            kernel32.LocalFree(text)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def sddl_custody_issue(sddl: str, *, user_sid: str, require_protected: bool) -> str | None:
+    """Pure SDDL check. ``None`` when only the current user, SYSTEM and
+    Administrators own or are granted anything (deny entries are harmless)."""
+
+    match = _SDDL_RE.fullmatch(sddl or "")
+    if match is None:
+        return "state_root_acl_unverifiable"
+    allowed = {user_sid, _SYSTEM_SID, _ADMINISTRATORS_SID}
+    if _SDDL_ALIASES.get(match["owner"], match["owner"]) not in allowed:
+        return "state_root_owner_unsafe"
+    if require_protected and "P" not in match["flags"]:
+        return "state_root_acl_inherited"
+    aces = re.findall(r"\(([^()]*)\)", match["aces"])
+    if not aces:
+        return "state_root_acl_unverifiable"  # an empty or null DACL is never private
+    for ace in aces:
+        parts = ace.split(";")
+        if len(parts) != 6:
+            return "state_root_acl_unsafe"
+        if parts[0] == "D":
+            continue
+        if parts[0] != "A" or _SDDL_ALIASES.get(parts[5], parts[5]) not in allowed:
+            return "state_root_acl_unsafe"
+    return None
+
+
+def verify_private_state(root: Path) -> None:
+    """Refuse a connector-ledger state root that anyone but the current user,
+    SYSTEM and Administrators could read. The root must not inherit; the
+    ledger files and subdirectories are checked as they effectively are."""
+
+    targets = [(root, True)] + [(root / name, False) for name in ("inbox", "claims", "evidence", "ledger.sqlite3") if (root / name).exists()]
+    if os.name == "nt":
+        user_sid = _win_current_user_sid()
+        for path, protected in targets:
+            issue = sddl_custody_issue(_win_sddl(path), user_sid=user_sid, require_protected=protected)
+            if issue:
+                raise DirectLocalError(issue)
+        return
+    for path, _ in targets:
+        info = path.stat()
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise DirectLocalError("state_root_acl_unsafe")
+
+
+def prepare_state_root(path: str | Path, *, environ: Mapping[str, str] | None = None, runner: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+    """Create a new private state root (gate E0). The directory must not
+    exist; inheritance is removed and only the current user, SYSTEM and
+    Administrators are granted access. Nothing existing is modified."""
+
+    resolved = _state_root_location(path, os.environ if environ is None else environ)
+    if resolved.exists():
+        raise DirectLocalError("state_root_already_exists")
+    if not resolved.parent.is_dir():
+        raise DirectLocalError("state_root_parent_missing")
+    os.mkdir(resolved)
+    if os.name == "nt":
+        icacls = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "icacls.exe")
+        grants = [f"*{sid}:(OI)(CI)F" for sid in (_win_current_user_sid(), _SYSTEM_SID, _ADMINISTRATORS_SID)]
+        done = runner([icacls, str(resolved), "/inheritance:r", "/grant:r", *grants], capture_output=True, timeout=60, check=False)
+        if done.returncode != 0:
+            raise DirectLocalError("state_root_harden_failed")
+    else:
+        os.chmod(resolved, 0o700)
+    for name in ("inbox", "claims", "evidence"):
+        (resolved / name).mkdir()
+    verify_private_state(resolved)
+    return {"status": "prepared", "private": True}
 
 
 class _OwnerLock:
@@ -423,8 +610,12 @@ class _OwnerLock:
 SCHEMA = """
 CREATE TABLE ledger_meta(
   id INTEGER PRIMARY KEY CHECK (id = 1), ledger_id TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK (mode = 'synthetic'),
-  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, created_at TEXT NOT NULL);
+  mode TEXT NOT NULL CHECK (mode IN ('synthetic', 'connector')),
+  environment TEXT NOT NULL CHECK (environment IN ('synthetic', 'development', 'production')),
+  autocount_book TEXT, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64),
+  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, created_at TEXT NOT NULL,
+  CHECK ((mode = 'synthetic') = (environment = 'synthetic')),
+  CHECK ((environment = 'synthetic') = (autocount_book IS NULL)));
 CREATE TABLE writer_owner(
   id INTEGER PRIMARY KEY CHECK (id = 1), epoch INTEGER NOT NULL, pid INTEGER NOT NULL, acquired_at TEXT NOT NULL);
 CREATE TABLE runs(
@@ -457,7 +648,7 @@ CREATE TABLE fences(
   approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(approval_id),
   payload_digest TEXT NOT NULL, salt TEXT NOT NULL, owner_epoch INTEGER NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('FENCED', 'DISPATCHED', 'NOT_WRITTEN_PROVEN', 'CREATED_VERIFIED',
-    'CREATED_READBACK_MISMATCH', 'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED',
+    'CREATED_READBACK_MISMATCH', 'CREATED_OUTBOUND_QUEUE_CHANGED', 'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED',
     'RECONCILED_VERIFIED', 'MANUAL_REVIEW')),
   code TEXT, deadline_at TEXT, child_pid INTEGER, child_created TEXT, exit_code INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE events(
@@ -504,7 +695,7 @@ CREATE TRIGGER fences_transition BEFORE UPDATE OF state ON fences
   WHEN NOT (
        (OLD.state = 'FENCED' AND NEW.state IN ('DISPATCHED', 'MANUAL_REVIEW'))
     OR (OLD.state = 'DISPATCHED' AND NEW.state IN ('NOT_WRITTEN_PROVEN', 'CREATED_VERIFIED', 'CREATED_READBACK_MISMATCH',
-                                                   'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED'))
+                                                   'CREATED_OUTBOUND_QUEUE_CHANGED', 'WRITE_OUTCOME_UNCERTAIN', 'WRITER_TERMINATION_UNCONFIRMED'))
     OR (OLD.state = 'WRITER_TERMINATION_UNCONFIRMED' AND NEW.state = 'WRITE_OUTCOME_UNCERTAIN')
     OR (OLD.state = 'WRITE_OUTCOME_UNCERTAIN' AND NEW.state IN ('RECONCILED_VERIFIED', 'MANUAL_REVIEW')))
   BEGIN SELECT RAISE(ABORT, 'fence_transition_invalid'); END;
@@ -515,7 +706,9 @@ CREATE TRIGGER events_append_only BEFORE UPDATE ON events BEGIN SELECT RAISE(ABO
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events_append_only'); END;
 """
 
-SCHEMA_VERSION = 2
+# v3 (2026-10-15): mode/environment/book binding, ref key, outbound-queue
+# terminal state. v2 (synthetic-only) ledgers are refused, never migrated.
+SCHEMA_VERSION = 3
 GENESIS_HASH = "sha256:" + "0" * 64
 CUSTOMER_TERMINAL = frozenset({"EXCLUDED_BASELINE", "MANUAL_REVIEW", "FENCED"})
 
@@ -675,15 +868,19 @@ class BridgeClient:
     """One short-lived PowerShell child per operation. Protected values travel
     only on stdin; arguments carry no customer data; stderr is discarded."""
 
-    def __init__(self, command: list[str], *, autocount_target: str = REAL_BRIDGE_TARGET, read_timeout_seconds: int = 120, popen: Callable[..., Any] = subprocess.Popen):
+    def __init__(self, command: list[str], *, autocount_target: str = REAL_BRIDGE_TARGET, autocount_book: str | None = None, read_timeout_seconds: int = 120, popen: Callable[..., Any] = subprocess.Popen):
         self.command = list(command)
         self.autocount_target = autocount_target
+        self.autocount_book = autocount_book
         self.read_timeout_seconds = read_timeout_seconds
         self._popen = popen
 
     def _start(self, arguments: list[str]):
+        # The bound book is the bridge's only route to a real session; it is
+        # re-proved inside the child from the authenticated vendor session.
+        book = ["-TargetBook", self.autocount_book] if self.autocount_book else []
         return self._popen(
-            self.command + arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            self.command + arguments + book, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
@@ -730,6 +927,9 @@ class BridgeClient:
     def reconcile(self, member_no: str, payload_canonical_text: str) -> Mapping[str, Any]:
         return self._read("reconcile", {"member_no": member_no, "payload_canonical": payload_canonical_text})
 
+    def book_check(self) -> Mapping[str, Any]:
+        return self._read("book-check", {})
+
     def write_once(self, *, fence_id: str, claim_directory: Path, deadline: datetime, stdin_value: Mapping[str, Any], wait_seconds: float, on_started: Callable[[int, str | None], None]) -> WriteRun:
         arguments = [
             "-Operation", "write-once", "-EnableProductionAdapter", "-FenceId", fence_id,
@@ -769,13 +969,18 @@ def classify_write(run: WriteRun, *, claim_exists: bool) -> tuple[str, str | Non
             outcome = None
         valid = (
             isinstance(outcome, dict) and outcome.get("save_invocation_count") == 1
-            and isinstance(outcome.get("readback_found"), bool) and isinstance(outcome.get("readback_match"), bool)
+            and all(isinstance(outcome.get(key), bool) for key in ("readback_found", "readback_match", "outbound_queue_changed"))
         )
         if not valid:
             return "WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"
         if not outcome["readback_found"]:
             return "WRITE_OUTCOME_UNCERTAIN", "readback_absent"
-        return ("CREATED_VERIFIED", None) if outcome["readback_match"] else ("CREATED_READBACK_MISMATCH", "readback_mismatch_manual_review")
+        if not outcome["readback_match"]:
+            return "CREATED_READBACK_MISMATCH", "readback_mismatch_manual_review"
+        if outcome["outbound_queue_changed"]:
+            # A mail/e-invoice queue row appeared during the write: hold for review.
+            return "CREATED_OUTBOUND_QUEUE_CHANGED", "outbound_queue_changed_manual_review"
+        return "CREATED_VERIFIED", None
     if run.exit_code == 3:
         return "WRITE_OUTCOME_UNCERTAIN", "fence_already_claimed"
     return ("WRITE_OUTCOME_UNCERTAIN", "writer_failed_after_claim") if claim_exists else ("NOT_WRITTEN_PROVEN", "writer_failed_before_claim")
@@ -863,29 +1068,67 @@ class Processor:
         self.claims = ledger.root / "claims"
 
     # -- setup ------------------------------------------------------------
-    def init_ledger(self, *, mode: str, store_gid: str, shop_domain: str) -> dict[str, Any]:
+    def init_ledger(self, *, mode: str, store_gid: str, shop_domain: str, environment: str | None = None) -> dict[str, Any]:
         if mode not in QUALIFIED_RESPONSE_SHAPES:
             raise DirectLocalError("capture_response_shape_unqualified")
-        if not SHOP_GID_RE.fullmatch(store_gid) or not SYNTHETIC_DOMAIN_RE.fullmatch(shop_domain):
-            raise DirectLocalError("synthetic_store_identity_invalid")
+        if mode == "synthetic":
+            environment = environment or "synthetic"
+            if environment != "synthetic":
+                raise DirectLocalError("environment_mode_mismatch")
+            if not SHOP_GID_RE.fullmatch(store_gid) or not SYNTHETIC_DOMAIN_RE.fullmatch(shop_domain):
+                raise DirectLocalError("synthetic_store_identity_invalid")
+        else:
+            if environment not in ENVIRONMENT_BOOKS or environment == "synthetic":
+                raise DirectLocalError("environment_mode_mismatch")
+            if environment not in AUTHORISED_REAL_ENVIRONMENTS:
+                raise DirectLocalError(f"{environment}_environment_not_authorised")
+            if QUALIFIED_CONNECTOR_STORES.get(store_gid) != shop_domain:
+                raise DirectLocalError("connector_store_identity_not_qualified")
+            verify_private_state(self.ledger.root)
         with self.ledger.tx() as conn:
             if conn.execute("SELECT 1 FROM ledger_meta").fetchone():
                 raise DirectLocalError("ledger_already_initialised")
             conn.execute(
-                "INSERT INTO ledger_meta(id, ledger_id, mode, store_gid, shop_domain, created_at) VALUES (1, ?, ?, ?, ?, ?)",
-                (f"ledger-{uuid.uuid4().hex}", mode, store_gid, shop_domain, ts(self.ledger.now())),
+                "INSERT INTO ledger_meta(id, ledger_id, mode, environment, autocount_book, ref_key, store_gid, shop_domain, created_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"ledger-{uuid.uuid4().hex}", mode, environment, ENVIRONMENT_BOOKS[environment], secrets.token_hex(32), store_gid, shop_domain, ts(self.ledger.now())),
             )
-            self.ledger.event(conn, "ledger_initialised")
+            self.ledger.event(conn, f"ledger_initialised:{mode}:{environment}")
         self.inbox.mkdir(exist_ok=True)
         self.claims.mkdir(exist_ok=True)
-        return {"status": "initialised", "mode": mode}
+        return {"status": "initialised", "mode": mode, "environment": environment, "autocount_book": ENVIRONMENT_BOOKS[environment]}
 
-    def _require_synthetic_bridge(self, bridge: Any) -> None:
-        """A synthetic ledger is inert: only the test-only fake bridge target is
-        accepted, so no real AutoCount process can ever be started from it."""
+    def check_custody(self) -> None:
+        """A connector ledger holds real customer identifiers: its state root
+        must stay private for every command, not only at init."""
 
-        if self.ledger.meta()["mode"] != "synthetic" or getattr(bridge, "autocount_target", None) != SYNTHETIC_BRIDGE_TARGET:
-            raise DirectLocalError("real_autocount_refused_synthetic_ledger")
+        if self.ledger.meta()["mode"] == "connector":
+            verify_private_state(self.ledger.root)
+
+    def _require_bridge(self, bridge: Any) -> None:
+        """Bind the bridge to the ledger. A synthetic ledger is inert: only the
+        test-only fake target is accepted, so no real AutoCount process can be
+        started from it. A connector ledger accepts only a real bridge bound to
+        its own authorised book, and only while its state root is private."""
+
+        meta = self.ledger.meta()
+        target = getattr(bridge, "autocount_target", None)
+        if meta["mode"] == "synthetic":
+            if target != SYNTHETIC_BRIDGE_TARGET:
+                raise DirectLocalError("real_autocount_refused_synthetic_ledger")
+            return
+        if meta["environment"] not in AUTHORISED_REAL_ENVIRONMENTS:
+            raise DirectLocalError(f"{meta['environment']}_environment_not_authorised")
+        if target != REAL_BRIDGE_TARGET or getattr(bridge, "autocount_book", None) != meta["autocount_book"]:
+            raise DirectLocalError("bridge_book_binding_mismatch")
+        self.check_custody()
+
+    def _ref(self, kind: str, value: str) -> str:
+        """Keyed, non-enumerable public reference (``c-`` customer, ``m-``
+        member). Without the ledger's random key it cannot be reversed by
+        enumerating GIDs or MemberNos."""
+
+        key = bytes.fromhex(self.ledger.meta()["ref_key"])
+        return f"{kind}-" + hmac.new(key, f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:MEMBER_REF_HEX]
 
     def _cutover(self, conn: sqlite3.Connection) -> datetime:
         row = conn.execute("SELECT cutover_at FROM runs WHERE kind = 'BASELINE' AND state = 'SEALED'").fetchone()
@@ -1141,7 +1384,7 @@ class Processor:
 
     def process(self, capture_path: Path, *, bridge: BridgeClient | None = None, enable_write: bool = False) -> dict[str, Any]:
         if enable_write:
-            self._require_synthetic_bridge(bridge)  # before any state change
+            self._require_bridge(bridge)  # before any state change
         self.recover()
         meta = self.ledger.meta()
         outcome_map = {"ADMIT": "ADMITTED", "WAIT": "WAITING", "NOT_ELIGIBLE": "NOT_ELIGIBLE", "EXCLUDED_BASELINE": "EXCLUDED_BASELINE", "MANUAL_REVIEW": "MANUAL_REVIEW"}
@@ -1152,9 +1395,14 @@ class Processor:
             if customer["state"] in CUSTOMER_TERMINAL:
                 raise DirectLocalError("customer_state_terminal")
             decision = self._decide(conn, capture, customer)
-            state = outcome_map[decision.outcome]
-            self._set_customer(conn, gid, state, decision.code, count_check=True)
-        result: dict[str, Any] = {"customer_state": state, "code": decision.code, "capture_discarded": self._discard(capture_path)}
+            state, code = outcome_map[decision.outcome], decision.code
+            if state == "ADMITTED":
+                # A value AutoCount cannot store exactly is never admitted.
+                issue = autocount_text_issue(decision.create_payload or {})
+                if issue:
+                    state, code = "MANUAL_REVIEW", issue
+            self._set_customer(conn, gid, state, code, count_check=True)
+        result: dict[str, Any] = {"customer_ref": self._ref("c", gid), "customer_state": state, "code": code, "capture_discarded": self._discard(capture_path)}
         if state != "ADMITTED" or not enable_write:
             return result
         result.update(self._write(gid, decision.create_payload or {}, bridge))
@@ -1237,11 +1485,10 @@ class Processor:
             return candidate, None
 
     def _write(self, gid: str, payload: Mapping[str, Any], bridge: BridgeClient) -> dict[str, Any]:
-        self._require_synthetic_bridge(bridge)
-        for field, width in AUTOCOUNT_FIELD_WIDTHS.items():
-            value = payload.get(field)
-            if value is not None and len(value) > width:
-                return self._review(gid, "autocount_field_width_exceeded")
+        self._require_bridge(bridge)
+        issue = autocount_text_issue(payload)  # defence in depth; admission already checked
+        if issue:
+            return self._review(gid, issue)
         with self.ledger.tx() as conn:
             if self._live_approval(conn, gid) is None:
                 return {"write": "not_started", "code": "write_approval_missing"}
@@ -1299,12 +1546,12 @@ class Processor:
         with self.ledger.tx() as conn:
             fence = conn.execute("SELECT * FROM fences WHERE fence_id = ?", (fence_id,)).fetchone()
             self._fence_state(conn, fence, state, code, exit_code=run.exit_code)
-        return {"fence_state": state, "code": code, "member_no_bound": True}
+        return {"fence_state": state, "code": code, "member_no_bound": True, "member_ref": self._ref("m", member_no)}
 
     def reconcile(self, capture_path: Path, *, bridge: BridgeClient) -> dict[str, Any]:
         """Read-only check of one uncertain write with the same MemberNo."""
 
-        self._require_synthetic_bridge(bridge)
+        self._require_bridge(bridge)
         self.recover()
         meta = self.ledger.meta()
         with self.ledger.tx() as conn:
@@ -1330,16 +1577,144 @@ class Processor:
         state, code = ("RECONCILED_VERIFIED", None) if found and match else ("MANUAL_REVIEW", "readback_mismatch_manual_review" if found else "confirmed_absent_manual_followup")
         with self.ledger.tx() as conn:
             self._fence_state(conn, fence, state, code)
-        return {"fence_state": state, "code": code}
+        return {"fence_state": state, "code": code, "member_ref": self._ref("m", fence["member_no"])}
+
+    def _inbox_summary(self) -> dict[str, Any]:
+        files = sorted(self.inbox.glob("*.json"))
+        now = utc_now().timestamp()
+        oldest = max((now - path.stat().st_mtime for path in files), default=0)
+        return {"files": len(files), "oldest_seconds": int(oldest)}
 
     def status(self) -> dict[str, Any]:
         conn = self.ledger.conn
+        meta = self.ledger.meta()
         return {
+            "mode": meta["mode"], "environment": meta["environment"], "autocount_book": meta["autocount_book"],
+            "integrity": conn.execute("PRAGMA quick_check").fetchone()[0],
             "events_verified": self.ledger.verify_events(),
             "customers": {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM customers GROUP BY state")},
             "fences": {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM fences GROUP BY state")},
             "runs": [dict(row) for row in conn.execute("SELECT run_id, kind, state, cutover_at, page_count, historical_count, transition_count FROM runs ORDER BY started_at")],
+            "inbox": self._inbox_summary(),
         }
+
+    # -- attended operator helpers ---------------------------------------------
+    def next_request(self) -> dict[str, Any]:
+        """The exact connector call the attended session should make next.
+        Read-only: the PreToolUse guard still enforces the pinned queries."""
+
+        meta = self.ledger.meta()
+        conn = self.ledger.conn
+        run = conn.execute("SELECT * FROM runs WHERE state = 'CAPTURING'").fetchone()
+        if run is not None:
+            started = parse_ts(run["started_at"])
+            pages: dict[str | None, Capture] = {}
+            for _, capture in self._inbox_captures(conn, meta):
+                if capture.kind != "baseline" or capture.captured_at < started:
+                    continue
+                if conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+                    continue
+                pages.setdefault(capture.variables.get("after"), capture)
+            after: str | None = None
+            for _ in range(len(pages) + 1):
+                capture = pages.get(after)
+                if capture is None:
+                    tool_input: dict[str, Any] = {"query": BASELINE_QUERY, "variables": {"first": PAGE_SIZE, "after": after}, "first": PAGE_SIZE}
+                    if after is not None:
+                        tool_input["after"] = after
+                    return {"status": "request", "purpose": f"{run['kind'].lower()}_page", "tool_name": CONNECTOR_TOOL, "tool_input": tool_input}
+                info = capture.data["customers"]["pageInfo"]
+                if not info["hasNextPage"]:
+                    return {"status": "run_pages_complete", "next": "ingest-run"}
+                after = info["endCursor"]
+            raise DirectLocalError("run_page_chain_invalid")
+        row = conn.execute(
+            "SELECT customer_gid, state FROM customers WHERE state IN ('DISCOVERED', 'WAITING', 'ADMITTED') ORDER BY updated_at, customer_gid LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return {"status": "idle"}
+        return {
+            "status": "request", "purpose": "profile", "customer_ref": self._ref("c", row["customer_gid"]), "customer_state": row["state"],
+            "tool_name": CONNECTOR_TOOL, "tool_input": {"query": PROFILE_QUERY, "variables": {"id": row["customer_gid"]}},
+        }
+
+    def purge_inbox(self) -> dict[str, int]:
+        """Bounded retention for transient captures (profile captures carry
+        PII). Removes captures already consumed, rejected captures (for
+        example disconnected or expired-authentication responses), profile
+        captures past the freshness window, baseline pages no open run can
+        use, and stale hook temporaries. Unconsumed pages of the open run are
+        kept. Only counts are reported."""
+
+        meta = self.ledger.meta()
+        conn = self.ledger.conn
+        run = conn.execute("SELECT started_at FROM runs WHERE state = 'CAPTURING'").fetchone()
+        started = parse_ts(run["started_at"]) if run else None
+        now = self.ledger.now()
+        counts = {"consumed": 0, "rejected": 0, "expired_profile": 0, "orphan_page": 0, "stale_temporary": 0, "kept": 0, "delete_failed": 0}
+
+        def remove(path: Path, reason: str) -> None:
+            if self._discard(path):
+                counts[reason] += 1
+            else:
+                counts["delete_failed"] += 1
+
+        for path in sorted(self.inbox.glob(".*.tmp")):
+            if utc_now().timestamp() - path.stat().st_mtime > 3600:
+                remove(path, "stale_temporary")
+        for path in sorted(self.inbox.glob("*.json")):
+            try:
+                capture = parse_capture(path.read_bytes(), mode=meta["mode"], store_gid=meta["store_gid"], shop_domain=meta["shop_domain"])
+            except (CaptureRejected, OSError):
+                remove(path, "rejected")
+                continue
+            if conn.execute("SELECT 1 FROM captures WHERE capture_sha256 = ? OR tool_use_id = ?", (capture.capture_sha256, capture.tool_use_id)).fetchone():
+                remove(path, "consumed")
+            elif capture.kind == "profile" and (now - capture.captured_at).total_seconds() > CAPTURE_MAX_AGE_SECONDS:
+                remove(path, "expired_profile")
+            elif capture.kind != "profile" and (started is None or capture.captured_at < started):
+                remove(path, "orphan_page")
+            else:
+                counts["kept"] += 1
+        with self.ledger.tx() as tx:
+            self.ledger.event(tx, "inbox_purged", code=f"removed:{sum(v for k, v in counts.items() if k not in ('kept', 'delete_failed'))}")
+        return counts
+
+    def pending(self) -> dict[str, Any]:
+        """Customers awaiting a profile read or an approval. GIDs are local
+        identifiers for the attended operator; never paste them publicly."""
+
+        rows = self.ledger.conn.execute(
+            "SELECT customer_gid, state, decision_code, check_count FROM customers WHERE state IN ('DISCOVERED', 'WAITING', 'ADMITTED') ORDER BY updated_at, customer_gid"
+        ).fetchall()
+        return {"customers": [{"customer_ref": self._ref("c", r["customer_gid"]), "gid": r["customer_gid"], "state": r["state"], "code": r["decision_code"], "checks": r["check_count"]} for r in rows]}
+
+    def uat_report(self) -> dict[str, Any]:
+        """PII-free evidence for UAT: keyed references, states and codes only."""
+
+        conn = self.ledger.conn
+        fences = [
+            {"customer_ref": self._ref("c", r["customer_gid"]), "member_ref": self._ref("m", r["member_no"]), "state": r["state"], "code": r["code"], "created_at": r["created_at"]}
+            for r in conn.execute("SELECT customer_gid, member_no, state, code, created_at FROM fences ORDER BY created_at")
+        ]
+        reviews = [
+            {"customer_ref": self._ref("c", r["customer_gid"]), "code": r["decision_code"]}
+            for r in conn.execute("SELECT customer_gid, decision_code FROM customers WHERE state = 'MANUAL_REVIEW' ORDER BY updated_at")
+        ]
+        return {**self.status(), "fence_detail": fences, "manual_review": reviews, "allocation_attempts": conn.execute("SELECT COUNT(*) FROM allocation_attempts").fetchone()[0]}
+
+    def book_check(self, bridge: BridgeClient) -> dict[str, Any]:
+        """Read-only AutoCount qualification (gate E5): the bridge logs in to
+        the bound book, proves its identity and the outbound queues. No member
+        is read, numbered or written."""
+
+        if self.ledger.meta()["mode"] != "connector":
+            raise DirectLocalError("book_check_requires_connector_ledger")
+        self._require_bridge(bridge)
+        result = bridge.book_check()
+        if result.get("book") != self.ledger.meta()["autocount_book"] or result.get("identity_verified") is not True or result.get("outbound_quiet") is not True:
+            raise DirectLocalError("book_check_failed")
+        return {"book": result["book"], "identity_verified": True, "outbound_quiet": True}
 
 
 # --------------------------------------------------------------------------
@@ -1347,25 +1722,37 @@ class Processor:
 # --------------------------------------------------------------------------
 
 def _emit(text: str) -> None:
-    # One bounded, PII-free JSON line per command (codes, counts, states only).
+    # One bounded JSON line per command: codes, counts, states and keyed
+    # references. Only ``pending`` and ``next-request`` name Shopify GIDs
+    # (local identifiers the attended operator needs); none carries PII.
     sys.stdout.write(text + "\n")
 
 
+def _bridge_for(processor: Processor, bridge_script: str | None) -> BridgeClient:
+    command = default_bridge_command(Path(bridge_script) if bridge_script else None)
+    meta = processor.ledger.meta()
+    if meta["mode"] == "connector":
+        return BridgeClient(command, autocount_target=REAL_BRIDGE_TARGET, autocount_book=meta["autocount_book"])
+    # Always the real target: a synthetic ledger refuses it before any spawn.
+    return BridgeClient(command)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python directlocal/xb_directlocal.py", description="DirectLocal #155 synthetic core")
+    parser = argparse.ArgumentParser(prog="python directlocal/xb_directlocal.py", description="DirectLocal #155 member-sync core")
     parser.add_argument("--state-root", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("prepare-state-root")
     init = commands.add_parser("init-ledger")
     init.add_argument("--mode", required=True)
+    init.add_argument("--environment")
     init.add_argument("--store-gid", required=True)
     init.add_argument("--shop-domain", required=True)
     inspect = commands.add_parser("inspect-identity")
     inspect.add_argument("--capture", required=True)
-    commands.add_parser("begin-baseline")
-    commands.add_parser("begin-discovery")
-    commands.add_parser("ingest-run")
-    commands.add_parser("recover")
-    commands.add_parser("status")
+    for name in ("begin-baseline", "begin-discovery", "ingest-run", "recover", "status", "next-request", "purge-inbox", "pending", "uat-report"):
+        commands.add_parser(name)
+    book = commands.add_parser("book-check")
+    book.add_argument("--bridge-script")
     abandon = commands.add_parser("abandon-run")
     abandon.add_argument("--run-id", required=True)
     abandon.add_argument("--confirm-suffix", required=True)
@@ -1390,6 +1777,13 @@ def main(argv: list[str] | None = None) -> int:
         except (DirectLocalError, OSError) as exc:
             _emit(json.dumps({"status": "refused", "code": getattr(exc, "code", "capture_unreadable")}))
             return 2
+    if args.command == "prepare-state-root":  # creates a new private root; opens no ledger
+        try:
+            _emit(json.dumps(prepare_state_root(args.state_root), sort_keys=True))
+            return 0
+        except (DirectLocalError, OSError) as exc:
+            _emit(json.dumps({"status": "refused", "code": getattr(exc, "code", "state_root_prepare_failed")}))
+            return 2
     try:
         ledger = Ledger(validate_state_root(args.state_root))
     except DirectLocalError as exc:
@@ -1397,31 +1791,35 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         processor = Processor(ledger)
-        bridge_script = getattr(args, "bridge_script", None)
-        # Always the real target: a synthetic ledger refuses it before any spawn.
-        bridge = BridgeClient(default_bridge_command(Path(bridge_script) if bridge_script else None))
         if args.command == "init-ledger":
-            result = processor.init_ledger(mode=args.mode, store_gid=args.store_gid, shop_domain=args.shop_domain)
-        elif args.command == "begin-baseline":
-            result = processor.begin_run("BASELINE")
-        elif args.command == "begin-discovery":
-            result = processor.begin_run("DISCOVERY")
-        elif args.command == "ingest-run":
-            result = processor.ingest_run()
-        elif args.command == "abandon-run":
-            result = processor.abandon_run(args.run_id, confirm_suffix=args.confirm_suffix)
-        elif args.command == "release-writer-hold":
-            result = processor.release_writer_hold(args.fence_id, confirm_suffix=args.confirm_suffix)
-        elif args.command == "recover":
-            result = processor.recover()
-        elif args.command == "status":
-            result = processor.status()
-        elif args.command == "approve-write":
-            result = processor.approve_write(args.gid, confirm_suffix=args.confirm_suffix, ttl_seconds=args.ttl_seconds)
-        elif args.command == "process":
-            result = processor.process(Path(args.capture), bridge=bridge, enable_write=args.enable_autocount_write)
+            result = processor.init_ledger(mode=args.mode, store_gid=args.store_gid, shop_domain=args.shop_domain, environment=args.environment)
         else:
-            result = processor.reconcile(Path(args.capture), bridge=bridge)
+            processor.check_custody()  # every command on a connector ledger
+            simple = {
+                "begin-baseline": lambda: processor.begin_run("BASELINE"),
+                "begin-discovery": lambda: processor.begin_run("DISCOVERY"),
+                "ingest-run": processor.ingest_run,
+                "recover": processor.recover,
+                "status": processor.status,
+                "next-request": processor.next_request,
+                "purge-inbox": processor.purge_inbox,
+                "pending": processor.pending,
+                "uat-report": processor.uat_report,
+            }
+            if args.command in simple:
+                result = simple[args.command]()
+            elif args.command == "abandon-run":
+                result = processor.abandon_run(args.run_id, confirm_suffix=args.confirm_suffix)
+            elif args.command == "release-writer-hold":
+                result = processor.release_writer_hold(args.fence_id, confirm_suffix=args.confirm_suffix)
+            elif args.command == "approve-write":
+                result = processor.approve_write(args.gid, confirm_suffix=args.confirm_suffix, ttl_seconds=args.ttl_seconds)
+            elif args.command == "book-check":
+                result = processor.book_check(_bridge_for(processor, args.bridge_script))
+            elif args.command == "process":
+                result = processor.process(Path(args.capture), bridge=_bridge_for(processor, args.bridge_script), enable_write=args.enable_autocount_write)
+            else:
+                result = processor.reconcile(Path(args.capture), bridge=_bridge_for(processor, args.bridge_script))
         _emit(json.dumps(result, sort_keys=True, default=str))
         return 0
     except DirectLocalHold as exc:
