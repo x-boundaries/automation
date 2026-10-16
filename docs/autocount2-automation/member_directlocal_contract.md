@@ -140,6 +140,15 @@ membership.start_date metafield GID, its createdAt)`.
 - Duplicate precheck, symmetric `65xxxxxxxx` <-> `xxxxxxxx` phone keys, exact
   email, MemberNo allocation (<= 3 `GetNextMemberNo` per customer, ever) and
   re-probe are unchanged.
+- `GetNextMemberNo` only previews AutoCount's counter. A save under an explicit
+  number does not advance it: on `AED_TESTINGAPI` it kept returning `M-0002`,
+  which the E7 member holds (16 October 2026). When the preview repeats, the
+  allocator continues the generator's own format (same prefix and digit width,
+  never phone-derived) above every number already tried for this customer or
+  bound in this ledger. Each candidate is still ledger-checked and probed, and
+  the limit of 3 still applies. No digits, or a digit run that would grow, stays
+  `member_no_generator_not_advancing`. The production numbering format and
+  counter are decided at E9.
 
 ## Write authority
 
@@ -332,8 +341,8 @@ from an environment variable, so a managed copy exists briefly.
 | E2 | Prove deny enforcement live (no write tool called) | Allow path observed live; deny path offline |
 | E3 | Attended baseline capture (GIDs, `createdAt`, tags, registration metafield id/instant) | Owner read consent given (#155:6195382795); not run |
 | E4 | Real profile reads (model-mediated PII), retention | Owner read consent given; not run |
-| E5 | AutoCount login and `book-check` on the test book | Source ready (Owner console); not run |
-| E6 | `GetNextMemberNo` side-effect qualification | Open |
+| E5 | AutoCount login and `book-check` on the test book | PASS 2026-10-16 at `0b3f397` (after the resolve-guard fix) |
+| E6 | `GetNextMemberNo` side-effect qualification | Observed 2026-10-16: preview only, does not advance (no side effect seen) |
 | E7 | One synthetic `SaveMember` on the test book | Consumed 2026-10-15; never replayed |
 | E7b | One attended real-registration create on the test book | Needs a new scoped approval |
 | E8 | Unattended scheduling / standing policy activation | Needs approval and an unattended Shopify source (see runbook) |

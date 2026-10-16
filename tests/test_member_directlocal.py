@@ -632,7 +632,12 @@ class WriteTests(DirectLocalTestCase):
         cases = [
             ("two_occupied_then_free", {"occupied": ("M000201", "M000202")}, (), "CREATED_VERIFIED", "M000203"),
             ("three_occupied", {"occupied": ("M000201", "M000202", "M000203")}, (), "member_no_candidates_exhausted", None),
-            ("not_advancing", {"occupied": ("M000201",), "next": ["M000201", "M000201"]}, (), "member_no_generator_not_advancing", None),
+            # A preview counter that never advances: continue its format above what was tried.
+            ("not_advancing_continues_format", {"occupied": ("M000201",), "next": ["M000201"]}, (), "CREATED_VERIFIED", "M000202"),
+            ("not_advancing_hyphen_width", {"occupied": ("M-0002",), "next": ["M-0002"]}, (), "CREATED_VERIFIED", "M-0003"),
+            ("not_advancing_successors_occupied", {"occupied": ("M000201", "M000202", "M000203"), "next": ["M000201"]}, (), "member_no_candidates_exhausted", None),
+            ("not_advancing_no_digits", {"occupied": ("MEMBER",), "next": ["MEMBER"]}, (), "member_no_generator_not_advancing", None),
+            ("not_advancing_width_full", {"occupied": ("M-9",), "next": ["M-9"]}, (), "member_no_generator_not_advancing", None),
             ("generator_failed", {}, ("next",), "member_no_generator_failed", None),
             ("probe_failed", {}, ("probe",), "member_no_probe_failed", None),
             ("invalid_member_no", {"next": ["M 1"]}, (), "member_no_generator_invalid", None),
@@ -656,6 +661,22 @@ class WriteTests(DirectLocalTestCase):
                     self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", expected))
                     self.assertEqual((bridge.write_calls, self.ac.saves), (0, 0))
                 self.assertLessEqual(self.ac.next_calls, dl.MAX_MEMBER_NO_CANDIDATES)
+
+    def test_member_no_successor(self):
+        cases = [
+            ("M-0002", set(), "M-0003"),
+            ("M-0002", {"M-0002", None}, "M-0003"),
+            ("M-0002", {"M-0007", "M-0003"}, "M-0008"),  # above numbers the ledger bound
+            ("M-0002", {"M-00009", "X-0050", "M0099"}, "M-0003"),  # other formats ignored
+            ("M000201", {"M000201"}, "M000202"),
+            ("XB01-M000009", set(), "XB01-M000010"),
+            ("M-9999", set(), None),  # width would grow
+            ("MEMBER", set(), None),  # no trailing digits
+            ("0019", set(), "0020"),
+        ]
+        for seed, seen, expected in cases:
+            with self.subTest(seed=seed, seen=seen):
+                self.assertEqual(dl.member_no_successor(seed, seen), expected)
 
     def test_values_autocount_cannot_store_go_to_review_at_admission(self):
         # nvarchar(n) counts UTF-16 code units: an astral character counts twice.

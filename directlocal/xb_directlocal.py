@@ -1148,6 +1148,30 @@ def bridge_failure_code(stdout: bytes, returncode: int | None = None) -> str:
     return f"bridge_read_failed:{shape}:{exit_part}:l{min(count, 9)}"
 
 
+def _member_no_parts(value: str | None) -> tuple[str, int, int] | None:
+    match = re.fullmatch(r"(.*?)([0-9]+)", value or "")
+    return (match.group(1), len(match.group(2)), int(match.group(2))) if match else None
+
+
+def member_no_successor(seed: str, seen: set) -> str | None:
+    """The next number in the generator's own format (same prefix, same digit
+    width) above ``seed`` and every same-format value in ``seen``. None when
+    the format has no trailing digits or the width would grow."""
+    parts = _member_no_parts(seed)
+    if parts is None:
+        return None
+    prefix, width, top = parts
+    for value in seen:
+        other = _member_no_parts(value)
+        if other is not None and other[:2] == (prefix, width):
+            top = max(top, other[2])
+    digits = str(top + 1).zfill(width)
+    candidate = prefix + digits
+    if len(digits) != width or not MEMBER_NO_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
 def payload_digest(salt: str, payload_canonical: str) -> str:
     return _sha256(f"{salt}:{payload_canonical}")
 
@@ -1900,8 +1924,19 @@ class Processor:
                 record(None, "GENERATOR_INVALID")
                 return None, "member_no_generator_invalid"
             if candidate in previous:
-                record(candidate, "REPEATED")
-                return None, "member_no_generator_not_advancing"
+                # GetNextMemberNo previews a counter that a save under an
+                # explicit number does not advance (AED_TESTINGAPI, 16 Oct
+                # 2026: it kept returning the E7 member's number). Continue the
+                # official format above every number already tried here or
+                # bound in this ledger; the candidate is still ledger-checked
+                # and probed, within MAX_MEMBER_NO_CANDIDATES.
+                with self.ledger.tx() as conn:
+                    bound_nos = {row["member_no"] for row in conn.execute("SELECT member_no FROM customers WHERE member_no IS NOT NULL")}
+                successor = member_no_successor(candidate, previous | bound_nos)
+                if successor is None:
+                    record(candidate, "REPEATED")
+                    return None, "member_no_generator_not_advancing"
+                candidate = successor
             with self.ledger.tx() as conn:
                 held = conn.execute("SELECT 1 FROM customers WHERE member_no = ?", (candidate,)).fetchone()
             if held:
