@@ -410,7 +410,8 @@ class LaunchDirectoryHijackTests(unittest.TestCase):
     collector's process listing and the guard's pin function are exercised."""
 
     def setUp(self):
-        self.holder = Path(tempfile.mkdtemp(prefix="xb-a4-plant-"))
+        # resolve(): hosted runners give TEMP as an 8.3 short path, which .NET expands.
+        self.holder = Path(tempfile.mkdtemp(prefix="xb-a4-plant-")).resolve()
         self.plant = self.holder / "launch"
         self.plant.mkdir()
         system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
