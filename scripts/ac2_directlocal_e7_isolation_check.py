@@ -117,18 +117,46 @@ def classify(evidence: Mapping[str, Any]) -> list[str]:
     return sorted(set(blockers))
 
 
-def _run(args: list[str], timeout: int) -> str:
+# System tools, relative to the Windows system directory (G2 A4, 2026-10-16).
+# The collector runs elevated from the Owner consoles; a bare name would let
+# CreateProcess find a planted executable in the launch directory or on PATH.
+SYSTEM_TOOLS = {
+    "tasklist": ("tasklist.exe",),
+    "schtasks": ("schtasks.exe",),
+    "powershell": ("WindowsPowerShell", "v1.0", "powershell.exe"),
+}
+
+
+def system_directory() -> Path:
+    """The system directory from the kernel (GetSystemDirectoryW), not from PATH or %SystemRoot%."""
+
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    except (AttributeError, OSError) as exc:
+        raise InspectionError("system_directory_unavailable") from exc
+    path = Path(buffer.value)
+    if not 0 < length < len(buffer) or not path.is_absolute():
+        raise InspectionError("system_directory_unavailable")
+    return path
+
+
+def _run(tool: str, args: list[str], timeout: int) -> str:
+    system = system_directory()
+    executable = system.joinpath(*SYSTEM_TOOLS[tool])
+    try:
+        # Absolute executable and a trusted working directory: neither the
+        # launch directory nor PATH can supply the tool or what it loads.
+        proc = subprocess.run([str(executable), *args], capture_output=True, text=True, timeout=timeout, check=False, cwd=str(system))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise InspectionError(f"{Path(args[0]).stem}_failed") from exc
+        raise InspectionError(f"{tool}_failed") from exc
     if proc.returncode != 0:
-        raise InspectionError(f"{Path(args[0]).stem}_exit_nonzero")
+        raise InspectionError(f"{tool}_exit_nonzero")
     return proc.stdout
 
 
 def processes() -> dict[int, str]:
-    rows = [r for r in csv.reader(io.StringIO(_run(["tasklist", "/fo", "csv", "/nh"], 60))) if r]
+    rows = [r for r in csv.reader(io.StringIO(_run("tasklist", ["/fo", "csv", "/nh"], 60))) if r]
     table = {int(r[1]): r[0] for r in rows if len(r) > 1 and r[1].isdigit()}
     # Trustworthy only when every row parsed and this process is listed.
     if len(table) != len(rows) or len(table) < 20 or os.getpid() not in table:
@@ -147,7 +175,7 @@ def scheduled_task_hits() -> int:
     # Non-elevated listings silently omit tasks the user cannot read.
     if not is_elevated():
         raise InspectionError("task_listing_requires_elevation")
-    rows = [r for r in csv.reader(io.StringIO(_run(["schtasks", "/query", "/fo", "csv", "/v", "/nh"], 180))) if r]
+    rows = [r for r in csv.reader(io.StringIO(_run("schtasks", ["/query", "/fo", "csv", "/v", "/nh"], 180))) if r]
     if len(rows) < 20 or any(len(r) < 10 for r in rows):
         raise InspectionError("task_listing_untrustworthy")
     return sum(1 for r in rows if any(BOOK.lower() in cell.lower() for cell in r))
@@ -156,8 +184,8 @@ def scheduled_task_hits() -> int:
 def service_hits() -> list[str]:
     if not is_elevated():
         raise InspectionError("service_listing_requires_elevation")
-    raw = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                "Get-CimInstance Win32_Service -ErrorAction Stop | Select-Object Name, PathName | ConvertTo-Json -Compress"], 180)
+    raw = _run("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+                              "Get-CimInstance Win32_Service -ErrorAction Stop | Select-Object Name, PathName | ConvertTo-Json -Compress"], 180)
     try:
         services = json.loads(raw)
     except ValueError as exc:

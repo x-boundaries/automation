@@ -239,7 +239,7 @@ class DirectLocalBridgeTests(unittest.TestCase):
     def test_write_once_claims_saves_once_and_refuses_replay(self):
         fence = "fence-" + "1" * 32
         code, out, proc = self.run_bridge("write-once", self.write_request(fence), *self.write_args(fence))
-        self.assertEqual((code, out), (0, {"save_invocation_count": 1, "readback_found": True, "readback_match": True}))
+        self.assertEqual((code, out), (0, {"save_invocation_count": 1, "readback_found": True, "readback_match": True, "outbound_queue_changed": False}))
         self.assert_clean(proc)
         self.assertTrue((self.claims / f"{fence}.claim").exists())
         self.assertEqual(json.loads((self.claims / f"{fence}.outcome").read_text(encoding="ascii"))["readback_match"], True)

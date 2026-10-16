@@ -3,14 +3,18 @@
 # Protected values arrive only on stdin; stdout carries one PII-free JSON line;
 # arguments never carry customer data. Inert unless -EnableProductionAdapter.
 #
-# SYNTHETIC-ONLY (#155 G3 correction): this bridge never opens a real AutoCount
-# session. It refuses to run unless the caller passes -SessionFactory returning
-# a binding marked XbDirectLocalSyntheticFake, whose UserSession, DBSetting and
-# MemberCommand objects are not AutoCount types. The -File entrypoint cannot
-# receive a scriptblock, so a command-line invocation is always refused before
-# stdin is read, whatever flags, fence ids or AutoCount environment variables
-# exist. New-XbAutoCountSession is only ever reached through that checked
-# factory; its environment/assembly login path is unreachable from here.
+# Two session sources, chosen before stdin is read:
+#   synthetic: -SessionFactory returning a binding marked
+#     XbDirectLocalSyntheticFake, whose UserSession, DBSetting and every
+#     MemberCommand are not AutoCount types. -TargetBook is refused with it.
+#   real: -TargetBook naming a book this source authorises (AED_TESTINGAPI
+#     only). New-XbDlRealSession (ac2_directlocal_book_guard.ps1) checks host,
+#     assembly pins, pins the book for this process, proves the authenticated
+#     book identity, vendor telemetry off and empty outbound queues before any
+#     member operation. Credentials come only from the process environment,
+#     which only the Owner console procedure supplies.
+# With neither, the bridge refuses (autocount_real_bridge_disabled) before
+# stdin is read, whatever flags, fence ids or AutoCount environment exist.
 #
 # write-once is the only path that reaches SaveMember. It additionally needs a
 # fence id bound to the stdin payload, a payload digest match, an unexpired
@@ -19,17 +23,20 @@
 # without SaveMember. Claim and outcome files are never deleted here.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("legacy-precheck", "next-member-no", "probe", "reconcile", "write-once")][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once")][string]$Operation,
     [switch]$EnableProductionAdapter,
     [string]$FenceId,
     [string]$ClaimDirectory,
     [string]$WriteDeadlineUtc,
+    [string]$TargetBook,
+    [string]$AcRoot = "C:\Program Files\AutoCount\Accounting 2.2",
     [scriptblock]$SessionFactory
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "ac2_member_gateway_autocount_adapter.ps1")
+. (Join-Path $PSScriptRoot "ac2_directlocal_book_guard.ps1")
 
 $script:XbDirectLocalMemberNoPattern = '^[A-Za-z0-9][A-Za-z0-9._/-]{0,19}$'
 
@@ -97,6 +104,11 @@ function New-XbDirectLocalSyntheticSession {
     return (New-XbAutoCountSession -EnableProductionAdapter:$EnableProductionAdapter -SessionFactory { $checked }.GetNewClosure())
 }
 
+function New-XbDirectLocalSession {
+    if ($null -ne $SessionFactory) { return (New-XbDirectLocalSyntheticSession) }
+    return (New-XbDlRealSession -Book $TargetBook -AcRoot $AcRoot)
+}
+
 function Assert-XbDirectLocalMemberNo {
     param([AllowNull()][string]$MemberNo)
     if ([string]::IsNullOrEmpty($MemberNo) -or $MemberNo -cnotmatch $script:XbDirectLocalMemberNoPattern) { throw "member_no_invalid" }
@@ -141,7 +153,8 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     if ($null -ne $payload.mobile_phone) { $member.MobilePhone = [string]$payload.mobile_phone }
     if ($null -ne $payload.email_address) { $member.EmailAddress = [string]$payload.email_address }
-    $session = New-XbDirectLocalSyntheticSession
+    # A login, identity or outbound-queue failure here stops before the claim.
+    $session = New-XbDirectLocalSession
 
     # Exclusive claim immediately before the sole SaveMember path.
     try {
@@ -160,10 +173,12 @@ function Invoke-XbDirectLocalWriteOnce {
 
     $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile "shopify_m1"
     $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile "shopify_m1"
+    $outboundChanged = if ($null -ne $SessionFactory) { $false } else { Test-XbDlOutboundChanged -DBSetting $session.DBSetting }
     $result = [ordered]@{
         save_invocation_count = [int]$created.SaveInvocationCount
         readback_found = [bool]$check.Found
         readback_match = [bool]$check.Match
+        outbound_queue_changed = [bool]$outboundChanged
     }
     try {
         $outcomeBytes = [System.Text.Encoding]::ASCII.GetBytes(($result | ConvertTo-Json -Compress))
@@ -178,8 +193,10 @@ $exitCode = 1
 $watchdog = $null
 try {
     if (-not $EnableProductionAdapter) { throw "autocount_adapter_disabled" }
-    # Synthetic-only: refused before stdin, claims or any adapter call.
-    if ($null -eq $SessionFactory) { throw "autocount_real_bridge_disabled" }
+    # Session source decided before stdin, claims or any adapter call.
+    if ($null -eq $SessionFactory -and [string]::IsNullOrEmpty($TargetBook)) { throw "autocount_real_bridge_disabled" }
+    if ($null -ne $SessionFactory -and -not [string]::IsNullOrEmpty($TargetBook)) { throw "synthetic_session_with_target_book" }
+    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook }
     if ($Operation -eq "write-once") {
         if ($FenceId -cnotmatch '^fence-[0-9a-f]{32}$') { throw "fence_id_invalid" }
         if ([string]::IsNullOrWhiteSpace($ClaimDirectory) -or -not (Test-Path -LiteralPath $ClaimDirectory -PathType Container)) { throw "claim_directory_invalid" }
@@ -200,8 +217,18 @@ try {
     }
     else {
         $request = Read-XbDirectLocalInput
-        $session = New-XbDirectLocalSyntheticSession
+        $session = New-XbDirectLocalSession
         switch ($Operation) {
+            "book-check" {
+                # Read-only E5 qualification: New-XbDlRealSession already proved
+                # identity and empty queues; nothing member-level is touched.
+                if ($null -ne $SessionFactory) { throw "book_check_requires_real_session" }
+                $result = [ordered]@{ book = $TargetBook; identity_verified = $true; outbound_quiet = $true }
+            }
+            "pos-sync-status" {
+                if ($null -ne $SessionFactory) { throw "pos_sync_status_requires_real_session" }
+                try { $result = Get-XbDlPosSyncState -DBSetting $session.DBSetting } catch { throw "pos_sync_state_unreadable" }
+            }
             "legacy-precheck" { $result = Invoke-XbDirectLocalLegacyPrecheck -Session $session -Request $request }
             "next-member-no" { $result = [ordered]@{ member_no = (Get-XbAutoCountNextMemberNo -Session $session) } }
             "probe" {
