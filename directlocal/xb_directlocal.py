@@ -75,11 +75,16 @@ from typing import Any, Callable, Iterator, Mapping
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The reused admission functions live in the frozen gateway package; they are
 # imported read-only (stdlib-only modules) and never run as a service.
+# Appended, never prepended (G2 A2, 2026-10-16): a file in the gateway source
+# tree must not shadow a standard-library module. The Owner console also runs
+# this file with ``python -I -S -B``, so neither the script's own directory nor
+# site-packages is on the path.
 _GATEWAY_SRC = str(REPO_ROOT / "member_gateway" / "src")
 if _GATEWAY_SRC not in sys.path:
-    sys.path.insert(0, _GATEWAY_SRC)
+    sys.path.append(_GATEWAY_SRC)
 
 from xb_member_gateway.shopify_admission import (  # noqa: E402
+    AdmissionDecision,
     BaselineCaptureError,
     ShopifyReadError,
     baseline_digest,
@@ -277,6 +282,8 @@ def registration_event(record: Mapping[str, Any], field: str) -> tuple[str | Non
     is that metafield's ``createdAt``, not ``Customer.createdAt``. A customer
     without the metafield yet (registration still in flight) falls back to
     ``Customer.createdAt``; an unparseable metafield yields ``(None, None)``.
+    The fallback only routes discovery: an old customer outside the baseline
+    that is still missing the metafield waits (``Processor._decide``).
     """
 
     node = record.get(field)
@@ -380,7 +387,7 @@ def connector_response_data(tool_response: Any) -> Mapping[str, Any]:
         raise CaptureRejected("connector_response_shape_invalid")
     try:
         value = json.loads(tool_response)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         raise CaptureRejected("connector_response_shape_invalid") from None
     if not isinstance(value, dict) or set(value) != {"data"} or not isinstance(value["data"], dict):
         raise CaptureRejected("connector_response_shape_invalid")
@@ -393,7 +400,7 @@ def inspect_identity_capture(raw: bytes) -> dict[str, str]:
 
     try:
         record = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise CaptureRejected("capture_json_invalid") from None
     expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
     if not isinstance(record, dict) or set(record) != expected or record["schema_version"] != CAPTURE_SCHEMA or record["provenance"] != CAPTURE_PROVENANCE:
@@ -421,7 +428,7 @@ def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) ->
 
     try:
         record = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise CaptureRejected("capture_json_invalid") from None
     expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
     if not isinstance(record, dict) or set(record) != expected:
@@ -849,7 +856,8 @@ CREATE TABLE pos_observations(
   observed_at TEXT NOT NULL, recorded_at TEXT NOT NULL);
 CREATE TABLE allocation_attempts(
   customer_gid TEXT NOT NULL, attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 3),
-  candidate TEXT, status TEXT, created_at TEXT NOT NULL, PRIMARY KEY (customer_gid, attempt_no));
+  candidate TEXT, status TEXT, created_at TEXT NOT NULL, generator_preview TEXT,
+  derivation TEXT CHECK (derivation IN ('generator', 'successor')), PRIMARY KEY (customer_gid, attempt_no));
 CREATE TABLE approvals(
   approval_id TEXT PRIMARY KEY, customer_gid TEXT NOT NULL, created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL, consumed_at TEXT, policy_id TEXT REFERENCES admission_policies(policy_id));
@@ -929,9 +937,19 @@ CREATE TRIGGER events_append_only BEFORE UPDATE ON events BEGIN SELECT RAISE(ABO
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events_append_only'); END;
 """
 
-# v3 (2026-10-15): mode/environment/book binding, ref key, outbound-queue
-# terminal state. v2 (synthetic-only) ledgers are refused, never migrated.
-SCHEMA_VERSION = 3
+# v4 (2026-10-16, G2 A3): each allocation attempt records the generator's raw
+# preview and whether the candidate is that preview or a derived successor.
+# A v3 ledger is refused until the attended ``migrate-ledger`` command adds
+# those two columns; existing rows keep NULL (provenance not recorded before
+# v4) and nothing else changes. v3 (2026-10-15): mode/environment/book
+# binding, ref key, outbound-queue terminal state. v2 (synthetic-only)
+# ledgers are refused, never migrated.
+SCHEMA_VERSION = 4
+_MIGRATABLE_SCHEMA_VERSION = 3
+_SCHEMA_V4_MIGRATION = (
+    "ALTER TABLE allocation_attempts ADD COLUMN generator_preview TEXT",
+    "ALTER TABLE allocation_attempts ADD COLUMN derivation TEXT CHECK (derivation IN ('generator', 'successor'))",
+)
 GENESIS_HASH = "sha256:" + "0" * 64
 CUSTOMER_TERMINAL = frozenset({"EXCLUDED_BASELINE", "MANUAL_REVIEW", "FENCED"})
 
@@ -944,7 +962,7 @@ def _event_hash(prev_hash: str, at: str, event_type: str, customer_gid: str | No
 class Ledger:
     """Single-owner SQLite ledger. Every mutation runs in ``tx()``."""
 
-    def __init__(self, state_root: Path, *, clock: Callable[[], datetime] = utc_now):
+    def __init__(self, state_root: Path, *, clock: Callable[[], datetime] = utc_now, allow_migration: bool = False):
         self.root = Path(state_root)
         self.clock = clock
         self._lock = _OwnerLock(self.root / "ledger.lock")
@@ -969,8 +987,14 @@ class Ledger:
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
+                version = SCHEMA_VERSION
+            elif version == _MIGRATABLE_SCHEMA_VERSION:
+                # Only ``migrate-ledger`` opens it, and then only to migrate.
+                if not allow_migration:
+                    raise DirectLocalError("ledger_schema_migration_required")
             elif version != SCHEMA_VERSION:
                 raise DirectLocalError("ledger_schema_version_unsupported")
+            self.schema_version = version
             self.conn.execute("BEGIN IMMEDIATE")
             row = self.conn.execute("SELECT epoch FROM writer_owner WHERE id = 1").fetchone()
             self.epoch = (row["epoch"] if row else 0) + 1
@@ -985,6 +1009,21 @@ class Ledger:
                 self.conn.close()
             self._lock.release()
             raise
+
+    def migrate_schema(self) -> dict[str, Any]:
+        """Attended, additive v3 -> v4 migration (``migrate-ledger``): two
+        nullable allocation-provenance columns, one transaction, one event.
+        No existing row, binding, trigger or event is changed."""
+
+        if self.schema_version == SCHEMA_VERSION:
+            return {"status": "current", "schema_version": SCHEMA_VERSION}
+        with self.tx() as conn:
+            for statement in _SCHEMA_V4_MIGRATION:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self.event(conn, f"ledger_schema_migrated:v{SCHEMA_VERSION}")
+        self.schema_version = SCHEMA_VERSION
+        return {"status": "migrated", "schema_version": SCHEMA_VERSION}
 
     def now(self) -> datetime:
         value = self.clock()
@@ -1131,7 +1170,7 @@ def bridge_failure_code(stdout: bytes, returncode: int | None = None) -> str:
             envelope = json.loads(line.decode("utf-8"))
         except UnicodeDecodeError:
             shape = "output_not_utf8"
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):  # deep nesting: generic, never a crash (G2 O3)
             shape = "output_not_json"
         else:
             if not isinstance(envelope, dict):
@@ -1221,7 +1260,7 @@ class BridgeClient:
         line, _ = _last_output_line(stdout)
         try:
             result = json.loads(line.decode("utf-8")) if line is not None else None
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             raise BridgeError("bridge_output_invalid") from None
         if not isinstance(result, dict):
             raise BridgeError("bridge_output_invalid")
@@ -1286,7 +1325,7 @@ def classify_write(run: WriteRun, *, claim_exists: bool) -> tuple[str, str | Non
     if run.exit_code == 0:
         try:
             outcome = json.loads(run.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
+        except (json.JSONDecodeError, IndexError, RecursionError):
             outcome = None
         valid = (
             isinstance(outcome, dict) and outcome.get("save_invocation_count") == 1
@@ -1696,7 +1735,17 @@ class Processor:
         required = customer["check_count"] + 1 >= PROFILE_WAIT_MAX_CHECKS if complete_required is None else complete_required
         record = capture.data["customer"]
         view = None if record is None else _registration_view(record, "startDate")
-        return evaluate_profile(view, in_baseline=in_baseline, cutover_at=self._cutover(conn), profile_complete_required=required)
+        decision = evaluate_profile(view, in_baseline=in_baseline, cutover_at=self._cutover(conn), profile_complete_required=required)
+        # G2 A1 (2026-10-16): Forms tags member-mg about three seconds before
+        # it writes start_date, also for an EXISTING customer. Until that
+        # metafield exists the registration instant is unknown, so the
+        # Customer.createdAt fallback must not end an old customer's
+        # registration as pre-existing: it waits within the same bounded
+        # budget, and only an exhausted budget (for example a staff-applied
+        # tag with no registration) goes to review.
+        if decision.outcome == "MANUAL_REVIEW" and decision.code == "preexisting_customer_not_new_signup" and record.get("startDate") is None and not required:
+            return AdmissionDecision("WAIT", "registration_event_pending")
+        return decision
 
     def _bind_registration(self, conn: sqlite3.Connection, capture: Capture, customer: sqlite3.Row) -> str | None:
         """Bind the registration event (metafield GID + instant) on first
@@ -1910,10 +1959,18 @@ class Processor:
                 conn.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, created_at) VALUES (?, ?, ?)", (gid, attempt_no, ts(self.ledger.now())))
                 self.ledger.event(conn, "member_no_attempt", customer_gid=gid)
             previous = {row["candidate"] for row in attempts}
+            # G2 A3: the generator's raw preview and whether the candidate is
+            # that preview or a successor derived from it, recorded with the
+            # status in the attempt's single update. No extra vendor call.
+            preview: str | None = None
+            derivation: str | None = None
 
             def record(candidate: str | None, status: str) -> None:
                 with self.ledger.tx() as conn:
-                    conn.execute("UPDATE allocation_attempts SET candidate = ?, status = ? WHERE customer_gid = ? AND attempt_no = ?", (candidate, status, gid, attempt_no))
+                    conn.execute(
+                        "UPDATE allocation_attempts SET candidate = ?, status = ?, generator_preview = ?, derivation = ? WHERE customer_gid = ? AND attempt_no = ?",
+                        (candidate, status, preview, derivation, gid, attempt_no),
+                    )
 
             try:
                 candidate = bridge.next_member_no()
@@ -1921,8 +1978,9 @@ class Processor:
                 record(None, "GENERATOR_FAILED")
                 return None, "member_no_generator_failed"
             if not MEMBER_NO_RE.fullmatch(candidate):
-                record(None, "GENERATOR_INVALID")
+                record(None, "GENERATOR_INVALID")  # an invalid value is never stored
                 return None, "member_no_generator_invalid"
+            preview, derivation = candidate, "generator"
             if candidate in previous:
                 # GetNextMemberNo previews a counter that a save under an
                 # explicit number does not advance (AED_TESTINGAPI, 16 Oct
@@ -1936,7 +1994,7 @@ class Processor:
                 if successor is None:
                     record(candidate, "REPEATED")
                     return None, "member_no_generator_not_advancing"
-                candidate = successor
+                candidate, derivation = successor, "successor"
             with self.ledger.tx() as conn:
                 held = conn.execute("SELECT 1 FROM customers WHERE member_no = ?", (candidate,)).fetchone()
             if held:
@@ -1951,7 +2009,10 @@ class Processor:
                 record(candidate, "OCCUPIED")
                 continue
             with self.ledger.tx() as conn:
-                conn.execute("UPDATE allocation_attempts SET candidate = ?, status = 'FREE_BOUND' WHERE customer_gid = ? AND attempt_no = ?", (candidate, gid, attempt_no))
+                conn.execute(
+                    "UPDATE allocation_attempts SET candidate = ?, status = 'FREE_BOUND', generator_preview = ?, derivation = ? WHERE customer_gid = ? AND attempt_no = ?",
+                    (candidate, preview, derivation, gid, attempt_no),
+                )
                 conn.execute("UPDATE customers SET member_no = ?, updated_at = ? WHERE customer_gid = ?", (candidate, ts(self.ledger.now()), gid))
                 self.ledger.event(conn, "member_no_bound", customer_gid=gid)
             return candidate, None
@@ -2190,7 +2251,13 @@ class Processor:
             {"customer_ref": self._ref("c", r["customer_gid"]), "code": r["decision_code"]}
             for r in conn.execute("SELECT customer_gid, decision_code FROM customers WHERE state = 'MANUAL_REVIEW' ORDER BY updated_at")
         ]
-        return {**self.status(), "fence_detail": fences, "manual_review": reviews, "allocation_attempts": conn.execute("SELECT COUNT(*) FROM allocation_attempts").fetchone()[0]}
+        # Counts only: which candidates were the generator's own preview and
+        # which were derived successors (NULL: recorded before schema v4).
+        derivations = {row[0] or "unrecorded": row[1] for row in conn.execute("SELECT derivation, COUNT(*) FROM allocation_attempts WHERE status IS NOT NULL GROUP BY derivation")}
+        return {
+            **self.status(), "fence_detail": fences, "manual_review": reviews,
+            "allocation_attempts": conn.execute("SELECT COUNT(*) FROM allocation_attempts").fetchone()[0], "allocation_derivations": derivations,
+        }
 
     def book_check(self, bridge: BridgeClient) -> dict[str, Any]:
         """Read-only AutoCount qualification (gate E5): the bridge logs in to
@@ -2239,7 +2306,7 @@ def main(argv: list[str] | None = None) -> int:
     inspect = commands.add_parser("inspect-identity")
     inspect.add_argument("--capture", required=True)
     commands.add_parser("begin-discovery").add_argument("--recent", action="store_true")
-    for name in ("begin-baseline", "ingest-run", "recover", "status", "next-request", "purge-inbox", "pending", "uat-report", "revoke-policy"):
+    for name in ("begin-baseline", "ingest-run", "recover", "status", "next-request", "purge-inbox", "pending", "uat-report", "revoke-policy", "migrate-ledger"):
         commands.add_parser(name)
     for name in ("book-check", "pos-sync-status"):
         commands.add_parser(name).add_argument("--bridge-script")
@@ -2283,7 +2350,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(json.dumps({"status": "refused", "code": getattr(exc, "code", "state_root_prepare_failed")}))
             return 2
     try:
-        ledger = Ledger(validate_state_root(args.state_root))
+        ledger = Ledger(validate_state_root(args.state_root), allow_migration=args.command == "migrate-ledger")
     except DirectLocalError as exc:
         _emit(json.dumps({"status": "refused", "code": exc.code}))
         return 2
@@ -2304,6 +2371,7 @@ def main(argv: list[str] | None = None) -> int:
                 "pending": processor.pending,
                 "uat-report": processor.uat_report,
                 "revoke-policy": processor.revoke_policy,
+                "migrate-ledger": ledger.migrate_schema,
             }
             if args.command in simple:
                 result = simple[args.command]()

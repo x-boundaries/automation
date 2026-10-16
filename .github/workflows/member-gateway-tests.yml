@@ -44,6 +44,8 @@ on:
       - "tests/test_directlocal_e7_testbook_ps.py"
       - "scripts/ac2_directlocal_book_guard.ps1"
       - "scripts/ac2_directlocal_owner_console.ps1"
+      - "scripts/ac2_directlocal_code_custody.ps1"
+      - "tests/test_directlocal_code_custody_ps.py"
       - "tests/test_member_directlocal_realcore.py"
       - "tests/test_directlocal_realbridge_ps.py"
       - "tests/directlocal_acl_ci_diagnostic.py"
@@ -119,6 +121,8 @@ on:
       - "tests/test_directlocal_e7_testbook_ps.py"
       - "scripts/ac2_directlocal_book_guard.ps1"
       - "scripts/ac2_directlocal_owner_console.ps1"
+      - "scripts/ac2_directlocal_code_custody.ps1"
+      - "tests/test_directlocal_code_custody_ps.py"
       - "tests/test_member_directlocal_realcore.py"
       - "tests/test_directlocal_realbridge_ps.py"
       - "tests/directlocal_acl_ci_diagnostic.py"
@@ -225,6 +229,7 @@ jobs:
           tests.test_directlocal_realbridge_ps
           tests.test_member_directlocal_realcore
           tests.test_directlocal_e7_testbook_ps
+          tests.test_directlocal_code_custody_ps
 
   bounded-import-security:
     runs-on: windows-latest

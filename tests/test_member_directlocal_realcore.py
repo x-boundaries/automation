@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +91,16 @@ class BridgeFailureCodeTests(unittest.TestCase):
             with self.subTest(child=child):
                 self.assertEqual(self.code(1, json.dumps({"error": child}).encode() + b"\r\n"), f"bridge_read_failed:{child}")
         self.assertEqual(self.code(3, b'noise\n{"error":"fence_already_claimed"}\n'), "bridge_read_failed:fence_already_claimed")
+
+    def test_deeply_nested_json_fails_closed_without_recursion_error(self):
+        # G2 O3 (R3): json.loads raises RecursionError, not JSONDecodeError.
+        deep = b"[" * 200_000 + b"]" * 200_000
+        self.assertEqual(self.code(1, deep), "bridge_read_failed:output_not_json:x00000001:l1")
+        self.assertEqual(self.code(0, deep), "bridge_output_invalid")
+        self.assertEqual(dl.classify_write(dl.WriteRun(started=True, exit_code=0, stdout=deep.decode()), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"))
+        for parse in (lambda: dl.parse_capture(deep, mode="synthetic", store_gid=fx.STORE, shop_domain=fx.DOMAIN), lambda: dl.inspect_identity_capture(deep), lambda: dl.connector_response_data(deep.decode())):
+            with self.assertRaises(dl.CaptureRejected):
+                parse()
 
     def test_unknown_malformed_or_vendor_output_is_generic(self):
         # Only computed values qualify a generic failure: shape, exit, lines.
@@ -334,6 +344,48 @@ class RegistrationEventTests(fx.DirectLocalTestCase):
         self.assertEqual((result["customer_state"], result["code"]), ("ADMITTED", None))
         row = self.customer(OLD_CUSTOMER)
         self.assertEqual((row["registration_id"], row["registration_at"]), (fx.metafield_gid(OLD_CUSTOMER), "2026-10-14T01:00:00Z"))
+
+    def discover_old_in_flight(self, tags: list[str]) -> datetime:
+        """Old customer outside the baseline, tagged but without start_date yet."""
+
+        old = T0 - timedelta(days=400)
+        self.seal([fx.node(fx.HISTORICAL, T0 - timedelta(days=30), ["member-mg"]), fx.node(OLD_CUSTOMER, old, ["vip"], registered=None)])
+        found = self.discover([fx.node(OLD_CUSTOMER, old, tags, registered=None)], at=T0 + timedelta(hours=1, minutes=1))
+        self.assertEqual(found["discovered"], 1)
+        return old
+
+    def test_existing_customer_read_before_start_date_waits_then_is_admitted(self):
+        # G2 A1 (R1): Forms tags member-mg ~3 s before writing start_date.
+        old = self.discover_old_in_flight(["member-mg", "shopify-forms-1178308"])
+        result = self.read(OLD_CUSTOMER, created=old, start=None)
+        self.assertEqual((result["customer_state"], result["code"]), ("WAITING", "registration_event_pending"))
+        self.assertEqual((self.customer(OLD_CUSTOMER)["registration_id"], self.customer(OLD_CUSTOMER)["check_count"]), (None, 1))
+        registered = T0 + timedelta(hours=1, seconds=3)
+        result = self.read(OLD_CUSTOMER, created=old, registered=registered)
+        self.assertEqual((result["customer_state"], result["code"]), ("ADMITTED", None))
+        self.assertEqual(self.customer(OLD_CUSTOMER)["registration_at"], "2026-10-14T01:00:03Z")
+
+    def test_staff_tagged_old_customer_without_registration_is_bounded_to_review(self):
+        old = self.discover_old_in_flight(["member-mg"])
+        for check in range(1, dl.PROFILE_WAIT_MAX_CHECKS):
+            result = self.read(OLD_CUSTOMER, created=old, start=None)
+            self.assertEqual((result["customer_state"], result["code"]), ("WAITING", "registration_event_pending"), check)
+        result = self.read(OLD_CUSTOMER, created=old, start=None)
+        self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "preexisting_customer_not_new_signup"))
+        self.assertEqual(self.customer(OLD_CUSTOMER)["check_count"], dl.PROFILE_WAIT_MAX_CHECKS)
+        with self.assertRaises(dl.DirectLocalError) as raised:
+            self.read(OLD_CUSTOMER, created=old, registered=T0 + timedelta(hours=2))
+        self.assertEqual(raised.exception.code, "customer_state_terminal")
+
+    def test_old_customer_negatives_are_unchanged(self):
+        # A pre-cutover registration, or a legacy tag, is still decided at once.
+        old = self.discover_old_in_flight(["member-mg"])
+        result = self.read(OLD_CUSTOMER, created=old, registered=T0 - timedelta(days=2))
+        self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "preexisting_customer_not_new_signup"))
+        legacy = "gid://shopify/Customer/9000000012"
+        self.discover([fx.node(legacy, old, ["member-mg", "member-legacy"], registered=None)], at=T0 + timedelta(hours=3))
+        result = self.read(legacy, created=old, start=None, tags=("member-mg", "member-legacy"))
+        self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "legacy_tag_present"))
 
     def test_baseline_member_re_registering_stays_excluded(self):
         self.seal([fx.node(fx.HISTORICAL, T0 - timedelta(days=30), ["member-mg"])])
@@ -725,6 +777,43 @@ class RealCoreCliTests(unittest.TestCase):
             self.assertEqual((code, status["mode"], status["environment"], status["integrity"]), (0, "connector", "development", "ok"))
             self.assertEqual(self.run_cli(root, "activate-policy", "--confirm-book", "AED_XBOUNDARIES", "--max-creates", "1", "--ttl-hours", "1"), (2, {"status": "refused", "code": "policy_book_confirmation_mismatch"}))
             self.assertEqual(self.run_cli(root, "record-pos-visible", "--member-ref", "m-" + "1" * 20, "--outlet", "XB01", "--observed-at", "2026-10-14T00:00:00Z"), (2, {"status": "refused", "code": "member_ref_unknown"}))
+        finally:
+            shutil.rmtree(holder, ignore_errors=True)
+
+    def test_v3_ledger_needs_attended_additive_migration(self):
+        # G2 A3: a v3 ledger (the shape of the preserved UAT ledger) is refused
+        # until migrate-ledger adds the two provenance columns; nothing else changes.
+        holder = Path(tempfile.mkdtemp(prefix="xb-directlocal-v3-"))
+        try:
+            root = holder / "state"
+            self.assertEqual(self.run_cli(root, "prepare-state-root")[0], 0)
+            self.assertEqual(self.run_cli(root, "init-ledger", "--mode", "connector", "--environment", "development", "--store-gid", REAL_STORE, "--shop-domain", REAL_DOMAIN)[0], 0)
+            connection = sqlite3.connect(root / "ledger.sqlite3")
+            connection.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, candidate, status, created_at) VALUES ('gid://shopify/Customer/1', 1, 'M000201', 'FREE_BOUND', '2026-10-16T00:00:00Z')")
+            for column in ("derivation", "generator_preview"):
+                connection.execute(f"ALTER TABLE allocation_attempts DROP COLUMN {column}")
+            connection.execute("PRAGMA user_version=3")
+            connection.commit()
+            before = [tuple(row) for row in connection.execute("SELECT seq, type, hash FROM events ORDER BY seq")]
+            connection.close()
+            self.assertEqual(self.run_cli(root, "status"), (2, {"status": "refused", "code": "ledger_schema_migration_required"}))
+            self.assertEqual(self.run_cli(root, "migrate-ledger"), (0, {"status": "migrated", "schema_version": 4}))
+            self.assertEqual(self.run_cli(root, "migrate-ledger"), (0, {"status": "current", "schema_version": 4}))
+            code, status = self.run_cli(root, "status")
+            self.assertEqual((code, status["integrity"]), (0, "ok"))
+            connection = sqlite3.connect(root / "ledger.sqlite3")
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+                row = connection.execute("SELECT candidate, status, generator_preview, derivation FROM allocation_attempts").fetchone()
+                self.assertEqual(row, ("M000201", "FREE_BOUND", None, None))
+                after = [tuple(row) for row in connection.execute("SELECT seq, type, hash FROM events ORDER BY seq")]
+                self.assertEqual(after[:len(before)], before)
+                self.assertEqual([event[1] for event in after[len(before):]], ["ledger_schema_migrated:v4"])
+                self.assertEqual(status["events_verified"], len(after))  # hash chain intact
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, created_at, derivation) VALUES ('gid://shopify/Customer/2', 1, 'x', 'guessed')")
+            finally:
+                connection.close()
         finally:
             shutil.rmtree(holder, ignore_errors=True)
 

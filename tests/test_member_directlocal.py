@@ -662,6 +662,38 @@ class WriteTests(DirectLocalTestCase):
                     self.assertEqual((bridge.write_calls, self.ac.saves), (0, 0))
                 self.assertLessEqual(self.ac.next_calls, dl.MAX_MEMBER_NO_CANDIDATES)
 
+    def test_member_no_attempt_provenance(self):
+        # G2 A3: each attempt records the generator's raw preview and whether
+        # the candidate is that preview or a successor derived from it.
+        cases = [
+            ("preview_bound", {}, (), [(1, "M000201", "M000201", "generator", "FREE_BOUND")]),
+            ("successor_bound", {"occupied": ("M000201",), "next": ["M000201"]}, (),
+             [(1, "M000201", "M000201", "generator", "OCCUPIED"), (2, "M000202", "M000201", "successor", "FREE_BOUND")]),
+            ("successor_occupied", {"occupied": ("M000201", "M000202", "M000203"), "next": ["M000201"]}, (),
+             [(1, "M000201", "M000201", "generator", "OCCUPIED"), (2, "M000202", "M000201", "successor", "OCCUPIED"), (3, "M000203", "M000201", "successor", "OCCUPIED")]),
+            ("not_advancing_no_digits", {"occupied": ("MEMBER",), "next": ["MEMBER"]}, (),
+             [(1, "MEMBER", "MEMBER", "generator", "OCCUPIED"), (2, "MEMBER", "MEMBER", "generator", "REPEATED")]),
+            ("generator_failed", {}, ("next",), [(1, None, None, None, "GENERATOR_FAILED")]),
+            ("generator_invalid", {"next": ["M 1"]}, (), [(1, None, None, None, "GENERATOR_INVALID")]),
+        ]
+        for name, setup, fail, expected in cases:
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.admit_and_approve()
+                for occupied in setup.get("occupied", ()):
+                    self.ac.members[occupied] = {"mobile_phone": None, "email_address": None}
+                if "next" in setup:
+                    self.ac.next = setup["next"]
+                self.write(FakeBridge(self.ac, fail=fail))
+                rows = self.ledger.conn.execute("SELECT attempt_no, candidate, generator_preview, derivation, status FROM allocation_attempts ORDER BY attempt_no").fetchall()
+                self.assertEqual([tuple(row) for row in rows], expected)
+                self.assertLessEqual(self.ac.next_calls, len(expected))  # no extra generator call
+                with self.assertRaises(sqlite3.DatabaseError):
+                    self.ledger.conn.execute("UPDATE allocation_attempts SET derivation = 'generator', generator_preview = 'X' WHERE attempt_no = 1")
+        derivations = self.processor.uat_report()["allocation_derivations"]
+        self.assertEqual(derivations, {"unrecorded": 1})  # the last case: an invalid value is never stored
+
     def test_member_no_successor(self):
         cases = [
             ("M-0002", set(), "M-0003"),

@@ -21,12 +21,15 @@ param(
     # The exact source head reported for this procedure; any other checkout stops.
     [string]$ExpectedHead,
     [string]$Workspace = "C:\XB\xb155-e7-testingapi-uat",
-    [string]$Python = "python"
+    [string]$Python = "python",
+    # git runs only from this tree, after its custody is proven.
+    [string]$GitRoot = "C:\Program Files\Git"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "ac2_directlocal_code_custody.ps1")
 
 function Stop-E7Owner {
     param([Parameter(Mandatory)][string]$Code)
@@ -42,13 +45,21 @@ foreach ($name in @("XB_AC2_USER_ID", "XB_AC2_PASSWORD_ENV_VAR", "XB_AC2_SESSION
     # Stale credentials in the console environment would bypass the prompt.
     if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, "Process"))) { Stop-E7Owner "stale_credential_environment" }
 }
-$head = [string](& git -C $repo rev-parse HEAD 2>$null)
+if (@(Get-ChildItem Env: | Where-Object { $_.Name -like "GIT_*" }).Count -gt 0) { Stop-E7Owner "git_environment_override" }
+# Code custody (G2 A2, 2026-10-16) before any git or Python runs and before
+# any prompt; see ac2_directlocal_code_custody.ps1.
+try { $pythonExe = [string](Get-Command $Python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source } catch { Stop-E7Owner "interpreter_path_unsafe" }
+$custody = Get-XbDlOwnerRuntimeIssue -CodeRoot $repo -PythonExe $pythonExe -GitRoot $GitRoot
+if ($custody) { Stop-E7Owner $custody }
+$git = Join-Path $GitRoot "cmd\git.exe"
+$head = [string](& $git -c core.fsmonitor=false -C $repo rev-parse HEAD 2>$null)
 if ($ExpectedHead -notmatch '^[0-9a-f]{40}$' -or $head.Trim() -cne $ExpectedHead) { Stop-E7Owner "source_head_mismatch" }
-if (-not [string]::IsNullOrEmpty([string](& git -C $repo status --porcelain --untracked-files=no 2>$null))) { Stop-E7Owner "source_tree_modified" }
-Write-Host "Source head verified: $ExpectedHead"
+$dirty = [string](& $git -c core.fsmonitor=false -C $repo status --porcelain --untracked-files=all --ignored 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrEmpty($dirty)) { Stop-E7Owner "source_tree_not_exact" }
+Write-Host "Code custody and source head verified: $ExpectedHead"
 
 # 1. Fresh isolation evidence (read-only). Its printed SHA-256 is the custody link.
-$collector = & $Python (Join-Path $repo "scripts\ac2_directlocal_e7_isolation_check.py") (Join-Path $Workspace "evidence") | Select-Object -Last 1
+$collector = & $pythonExe -I -B (Join-Path $repo "scripts\ac2_directlocal_e7_isolation_check.py") (Join-Path $Workspace "evidence") | Select-Object -Last 1
 $iso = $collector | ConvertFrom-Json
 Write-Host ("Isolation: {0} blockers={1} failed={2}" -f $iso.verdict, (@($iso.blockers) -join ","), (@($iso.failed_inspections) -join ","))
 if ($iso.verdict -cne "ISOLATED") { Stop-E7Owner "isolation_not_proven" }

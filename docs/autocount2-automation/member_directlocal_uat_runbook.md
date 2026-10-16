@@ -3,7 +3,9 @@
 Operating procedure for the DirectLocal Core described in
 [member_directlocal_contract.md](member_directlocal_contract.md). All commands
 run on `DESKTOP-4I042L6` from the repository checkout at the reviewed head.
-`core` below means:
+Credential-bearing steps (C, F and `Reconcile`) run the Owner console, which
+refuses to start unless it runs from a protected runtime checkout (G2 A2; see
+"Owner console code custody" below). `core` below means:
 
 ```powershell
 python C:\XB\automation\directlocal\xb_directlocal.py --state-root C:\XB\xb155-directlocal-core-uat
@@ -78,7 +80,7 @@ powershell -ExecutionPolicy Bypass -File C:\XB\automation\scripts\ac2_directloca
 Expect `{"book": "AED_TESTINGAPI", "identity_verified": true, "outbound_quiet": true}`.
 `-Command PosSyncStatus` prints the outlets' last sync and the `Member` change counter.
 
-A refusal reads `bridge_read_failed:<code>` for a fixed child code. For example, `autocount_login_rejected` means SQL to the book works but the AutoCount user ID or password was refused; do not retry blindly. Otherwise it reads `bridge_read_failed:<shape>:x<exit>:l<lines>`, where every value is computed by the core and none is child text. `x800703e9` or `xc00000fd` means a stack overflow. Before 16 October 2026 that came from the adapter's scriptblock resolve handler recursing after a successful login; `Install-XbDlResolveGuard` in `ac2_directlocal_book_guard.ps1` now prevents it.
+A refusal reads `bridge_read_failed:<code>` for a fixed child code. For example, `autocount_login_rejected` is assigned by elimination: the reviewed AutoCount login failed, yet a separate SQL connection to the pinned book succeeded. A wrong user ID or password is the most likely cause, but the code does not prove it; check the credentials once and do not retry blindly. Otherwise it reads `bridge_read_failed:<shape>:x<exit>:l<lines>`, where every value is computed by the core and none is child text. `x800703e9` or `xc00000fd` means a stack overflow. Before 16 October 2026 that came from the adapter's scriptblock resolve handler recursing after a successful login; `Install-XbDlResolveGuard` in `ac2_directlocal_book_guard.ps1` now prevents it.
 
 ## D. Owner registration
 
@@ -93,8 +95,14 @@ Shopify.
 2. `core next-request` returns the profile request for the discovered customer
    (`customer_ref`). Call it in the dedicated session.
 3. `core process --capture C:\XB\xb155-directlocal-core-uat\inbox\<tool_use_id>.json`.
-   Expect `customer_state: ADMITTED` (or `WAITING` if the dates are not yet
-   written: read the profile again).
+   Expect `customer_state: ADMITTED`. `WAITING` means the registration is
+   still being written: `membership_dates_missing`, or
+   `registration_event_pending` for an existing customer whose
+   `membership.start_date` metafield does not exist yet (Forms tags
+   `member-mg` about three seconds before it writes that metafield). Read the
+   profile again. After five reads without it the customer goes to
+   `MANUAL_REVIEW` (`preexisting_customer_not_new_signup`; for example a
+   `member-mg` tag added by staff with no registration).
 4. `core purge-inbox`.
 
 ## F. One create on the test book (needs approval E7b)
@@ -139,7 +147,7 @@ that is not selectable after the next completed sync is a P0 failure.
 | Requirement | Offline evidence (test) | UAT step |
 |---|---|---|
 | New eligible member created once | `test_policy_admits_each_registration_once_without_per_member_approval`, `test_happy_path_writes_once_and_records_no_pii`, `test_full_synthetic_write_then_replay_is_refused` | F |
-| Existing customer registering after C | `test_existing_customer_registering_after_cutover_is_admitted`, `test_recent_run_finds_existing_customer_registration_and_advances_watermark` | D-E |
+| Existing customer registering after C | `test_existing_customer_registering_after_cutover_is_admitted`, `test_existing_customer_read_before_start_date_waits_then_is_admitted`, `test_staff_tagged_old_customer_without_registration_is_bounded_to_review`, `test_recent_run_finds_existing_customer_registration_and_advances_watermark` | D-E |
 | Existing / duplicate member | `test_symmetric_duplicates_and_lookup_failures_go_to_review`, `test_baseline_member_re_registering_stays_excluded` | Optional second registration |
 | Ineligible or historical customer | `test_decisions`, `test_registration_before_cutover_and_malformed_registration` | B |
 | Exact RegisterDate and ExpiryDate | `test_write_once_claims_saves_once_and_refuses_replay` (bridge readback) | F3 |
@@ -158,11 +166,54 @@ that is not selectable after the next completed sync is a P0 failure.
   scheduled. No Shopify configuration changes.
 - Stop: close the dedicated session; no process runs between commands.
 - Revoke automatic admission: `core revoke-policy`.
-- Rollback of source: check out the previous reviewed head; the ledger is
-  refused by older code (schema v3), so keep it read-only for evidence.
+- Ledger schema v4 (16 October 2026) records each MemberNo attempt's raw
+  generator preview and whether the candidate was derived from it. A v3
+  ledger, such as the existing UAT ledger, is refused
+  (`ledger_schema_migration_required`) until `core migrate-ledger` is run once.
+  That command adds two nullable columns and one ledger event in one
+  transaction. Existing rows, bindings and events are unchanged, and earlier
+  attempts show provenance as not recorded.
+- Rollback of source: check out the previous reviewed head; a v4 ledger is
+  refused by older code, so keep it read-only for evidence.
 - A created test-book member is not deleted by automation. Member triggers
   write `ChangeLog`/`ChangeCount`; removal, if wanted, is an Owner decision in
   AutoCount.
+
+## Owner console code custody (G2 A2, 16 October 2026)
+
+The Owner console holds the AutoCount credentials in an elevated process, so
+it must not run code another local principal can change. Before it runs git
+or Python, and before any prompt, it checks
+(`scripts/ac2_directlocal_code_custody.ps1`, read-only) three trees and every
+ancestor of each:
+
+- the code root (a standalone checkout, not a worktree);
+- the Python interpreter's directory (`-Python`);
+- the git installation (`-GitRoot`, default `C:\Program Files\Git`).
+
+Only the current user, SYSTEM, Administrators and TrustedInstaller may own,
+or hold any write-class right on, anything in them. Reparse points are
+refused. It then requires the exact reviewed head with no modified,
+untracked or ignored file, and it runs Python with `-I -B`, plus `-S` for the
+core.
+
+Read-only checks on 16 October 2026 showed that this guard stops on this VM
+today:
+
+- `C:\XB` grants Authenticated Users Modify (`code_root_ancestor_writable`).
+- The per-user Python install sits under `C:\Users\XB\AppData`, which grants
+  an app-package SID full control (`interpreter_ancestor_writable`).
+- `C:\Program Files\Git` passes.
+
+The next credential-bearing step therefore needs an Owner host decision: a
+protected runtime checkout, plus an all-users Python whose tree passes,
+installed under a protected location such as `C:\Program Files` and qualified
+on the host first. No host ACL change or move is made by this source or this
+runbook. Never run the console from `C:\XB\automation`.
+
+Residual: the guard proves custody when it runs; it is not a trusted
+bootstrap. The current user's own non-elevated processes are trusted by
+design.
 
 ## Path to unattended near-real-time (E8)
 

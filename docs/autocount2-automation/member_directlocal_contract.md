@@ -106,10 +106,19 @@ membership.start_date metafield GID, its createdAt)`.
 
 - Baseline and discovery partition `member-mg` GIDs by the registration
   instant (the metafield's `createdAt`; `Customer.createdAt` only while the
-  metafield is not yet written). `>= C` is new; `< C` is historical.
+  metafield is not yet written). `>= C` is new; `< C` is historical. A
+  historical GID that is not in the sealed baseline is still discovered.
 - The profile decision runs the unchanged `evaluate_profile` on a view whose
   `createdAt` is the registration instant, so an existing customer who
   registers after `C` is admitted and a baseline member stays excluded.
+- In flight (G2 A1, 16 October 2026): an existing customer outside the
+  baseline who has `member-mg` but no `start_date` metafield yet is `WAITING`
+  (`registration_event_pending`), not ruled pre-existing from
+  `Customer.createdAt`. It uses the same budget as missing dates (5 profile
+  reads). If the metafield never appears, for example a tag added by staff,
+  the last read sends it to `MANUAL_REVIEW`
+  (`preexisting_customer_not_new_signup`). Legacy tags, a baseline member and
+  a metafield dated before `C` are still decided at once.
 - The first read binds the event (immutable). A later read naming another
   metafield or instant goes to review (`registration_event_changed`).
 - One AutoCount member per customer GID, ever (unchanged fence rules).
@@ -140,15 +149,23 @@ membership.start_date metafield GID, its createdAt)`.
 - Duplicate precheck, symmetric `65xxxxxxxx` <-> `xxxxxxxx` phone keys, exact
   email, MemberNo allocation (<= 3 `GetNextMemberNo` per customer, ever) and
   re-probe are unchanged.
-- `GetNextMemberNo` only previews AutoCount's counter. A save under an explicit
-  number does not advance it: on `AED_TESTINGAPI` it kept returning `M-0002`,
-  which the E7 member holds (16 October 2026). When the preview repeats, the
+- Observed on `AED_TESTINGAPI` on 16 October 2026 (no vendor documentation
+  found): `GetNextMemberNo` previews AutoCount's counter, and a save under an
+  explicit number does not advance it. It kept returning the number the E7
+  test member then held. When the preview repeats, the
   allocator continues the generator's own format (same prefix and digit width,
   never phone-derived) above every number already tried for this customer or
   bound in this ledger. Each candidate is still ledger-checked and probed, and
   the limit of 3 still applies. No digits, or a digit run that would grow, stays
   `member_no_generator_not_advancing`. The production numbering format and
-  counter are decided at E9.
+  counter are decided at E9. Successor numbers run ahead of AutoCount's own
+  counter, so a later auto-numbered create could collide with them. That
+  remains an E9 production blocker unless the vendor qualifies the behaviour.
+- Provenance (G2 A3, schema v4): every attempt records, in the private
+  ledger and in the same update as its status, the generator's raw preview
+  and `derivation` (`generator` when the candidate is that preview,
+  `successor` when it was derived from it). No extra vendor call is made.
+  `uat-report` prints only counts per derivation.
 
 ## Write authority
 
@@ -192,7 +209,11 @@ are unchanged.
   only counts are reported. Profile files are also deleted after use.
 - The ledger keeps GIDs, MemberNos, registration ids/instants, counts, codes
   and salted digests only; events are hash-chained and append-only.
-- Schema v3 ledgers only; a v2 (synthetic-only) ledger is refused, not migrated.
+- Schema v4 ledgers only. A v3 ledger is refused
+  (`ledger_schema_migration_required`) until the attended `migrate-ledger`
+  command runs. It adds the two nullable provenance columns and one event in
+  one transaction and changes nothing else. A v2 (synthetic-only) ledger is
+  refused, not migrated.
 - Residual: profile responses pass through the Claude session (transcript and
   model). Owner consent #155:6195382795 covers the minimum fields.
 
@@ -238,6 +259,10 @@ python directlocal/xb_directlocal.py --state-root <root> status
 ## E7 test-book path (one synthetic member on AED_TESTINGAPI)
 
 Separate from the DirectLocal core. Consumed on 2026-10-15; its private intent, fence, claim and outcome records are retained unchanged and the script refuses any re-run.
+The Owner later deleted the E7 member in AutoCount, and E7b's create reused
+its number through the vendor's own preview. Identify the historical E7
+create by its fence, claim and outcome IDs and its ChangeLog insert and
+delete times, never by MemberNo.
 
 | File | Role |
 |---|---|
@@ -332,9 +357,39 @@ environment block. The BSTR is zeroed and freed and the `SecureString` disposed
 in `finally`; the console's own environment never holds them. `Write` also
 requires typing `AED_TESTINGAPI`. Limitation: the adapter reads the password
 from an environment variable, so a managed copy exists briefly.
+
+## Owner console code custody (G2 A2, 2026-10-16)
+
+Both credential-bearing consoles (`ac2_directlocal_owner_console.ps1` and the
+E7 console) dot-source `ac2_directlocal_code_custody.ps1`. Before they run git
+or Python, and before any prompt, they stop unless all of these hold:
+
+- The code root, the Python interpreter's directory and the git
+  installation, and every ancestor of each, contain no reparse point.
+- Inside each tree, no principal other than the current user, SYSTEM,
+  Administrators or TrustedInstaller owns, or holds any write-class right on,
+  any entry.
+- On an ancestor, no other principal can delete, take ownership of, rewrite
+  the DACL of, or delete children of the path.
+- The code root is a standalone checkout. git runs from the verified
+  installation with `core.fsmonitor=false` and no `GIT_*` variable.
+- The head is exact, with no modified, untracked or ignored file.
+
+Python then runs with `-I -B` (the collector, which needs `pyodbc`) or
+`-I -S -B` (the core). The core appends, never prepends, the gateway source
+path.
+
+This proves custody when the console runs; it is not a trusted bootstrap. It
+protects only when the console is installed in a tree that passes, which is a
+protected runtime checkout and an Owner host decision. The development
+checkout (`C:\XB`, Authenticated Users Modify) and the per-user Python under
+`AppData` (an app-package SID with full control) both fail it. Earlier
+attended E5/E7b runs from that checkout keep their technical evidence with
+this security qualification; no credential exposure is asserted.
+
 ## Remaining effect gates (each needs separate explicit approval)
 
-| Gate | Effect | Status 2026-10-15 |
+| Gate | Effect | Status 2026-10-16 |
 |---|---|---|
 | E0 | Create the private UAT/production `state_root` (`prepare-state-root`) | Source ready; tested offline |
 | E1 | Materialise the dedicated session folder from the template | Open |
@@ -344,6 +399,7 @@ from an environment variable, so a managed copy exists briefly.
 | E5 | AutoCount login and `book-check` on the test book | PASS 2026-10-16 at `0b3f397` (after the resolve-guard fix) |
 | E6 | `GetNextMemberNo` side-effect qualification | Observed 2026-10-16: preview only, does not advance (no side effect seen) |
 | E7 | One synthetic `SaveMember` on the test book | Consumed 2026-10-15; never replayed |
-| E7b | One attended real-registration create on the test book | Needs a new scoped approval |
-| E8 | Unattended scheduling / standing policy activation | Needs approval and an unattended Shopify source (see runbook) |
-| E9 | Production book (`AED_XBOUNDARIES`) source enablement, create and POS visibility | Needs a source change and approval; required for the POS acceptance |
+| E7b | One attended real-registration create on the test book | `CREATED_VERIFIED` 2026-10-16 (operator-reported; one `SaveMember`); security-qualified by A2 |
+| A2 host | Protected runtime checkout and all-users interpreter for the Owner console | Owner host decision; not granted. Blocks every further credential-bearing run |
+| E8 | Unattended scheduling / standing policy activation | Needs approval, an unattended Shopify source (see runbook) and the A2 host custody |
+| E9 | Production book (`AED_XBOUNDARIES`) source enablement, create and POS visibility | Needs a source change, approval, the A2 host custody and a qualified numbering counter; required for the POS acceptance |
