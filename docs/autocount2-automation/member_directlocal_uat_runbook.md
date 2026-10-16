@@ -211,9 +211,18 @@ today:
 
 The next credential-bearing step therefore needs an Owner host decision: a
 protected runtime checkout, plus an all-users Python whose tree passes,
-installed under a protected location such as `C:\Program Files` and qualified
-on the host first. No host ACL change or move is made by this source or this
-runbook. Never run the console from `C:\XB\automation`.
+installed at least two directory levels below a protected location such as
+`C:\Program Files` and qualified on the host first. No host ACL change or
+move is made by this source or this runbook. Never run the console from
+`C:\XB\automation`.
+
+The default all-users location `C:\Program Files\Python311` fails the G2 A6
+check: two levels above `python.exe` is the drive root, where any
+authenticated user can create a folder (`interpreter_build_root_writable`).
+For that Owner decision this source proposes a nested layout such as
+`C:\Program Files\XB-DirectLocal\Python311\python.exe`, where the new
+`XB-DirectLocal` folder keeps the default `C:\Program Files` permissions (the
+installer's custom location option). It has not been approved or created.
 
 ### Launching an Owner console (G2 A4 and O11)
 
@@ -222,7 +231,7 @@ runbook. Never run the console from `C:\XB\automation`.
 - Start Windows PowerShell and the console script by their full paths, as in
   C and F: `<PROTECTED_RUNTIME>` is the protected runtime checkout and
   `<PROTECTED_PYTHON>` the qualified all-users Python directory, both from the
-  Owner host decision. Never use `C:\XButomation`, a relative path or a
+  Owner host decision. Never use `C:\XB\automation`, a relative path or a
   bare `powershell` or `python`.
 - The console makes the verified code root its working directory and sets
   `NoDefaultCurrentDirectoryInExePath` before its first native command, and
@@ -234,6 +243,20 @@ runbook. Never run the console from `C:\XB\automation`.
   beside `python.exe` or in its parent directory stops the console
   (`interpreter_pyvenv_cfg_present`), and so does a parent directory to which
   anyone else can add a file (`interpreter_parent_writable`; G2 A5).
+- The rest of CPython's Windows startup path search is checked without
+  running Python (G2 A6; versions 3.11 to 3.13 only, otherwise
+  `interpreter_version_unqualified`). The console stops when
+  `PYTHONEXECUTABLE` or `__PYVENV_LAUNCHER__` is set
+  (`interpreter_environment_override`), when `python3XY.dll` or `Lib\os.py`
+  is missing beside `python.exe` (`interpreter_runtime_library_missing`,
+  `interpreter_stdlib_landmark_missing`), when a `._pth` file or
+  `pybuilddir.txt` is beside it (`interpreter_pth_present`,
+  `interpreter_build_marker_present`), or when the build root two levels
+  above `python.exe` holds `Modules\Setup.local` or lets anyone else add a
+  file or folder (`interpreter_build_landmark_present`,
+  `interpreter_build_root_writable`, `interpreter_build_modules_writable`).
+  `PYTHONHOME`, `PYTHONPATH` and the registry `PythonPath` keys are ignored
+  because every launch uses `-I`.
 
 Residual: the guard proves custody when it runs; it is not a trusted
 bootstrap. The current user's own non-elevated processes are trusted by

@@ -198,6 +198,50 @@ class CustodySddlTests(unittest.TestCase):
         )
         self.assertEqual(run_harness(body, program_files)["r"], "ok")
 
+    def test_build_root_rules(self):
+        # G2 A6: two levels above python.exe nobody else may add a file or a
+        # folder; read/execute stays allowed. The drive root shape fails.
+        user = "S-1-5-21-1-2-3-1001"
+        private = f"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})"
+        cases = {
+            "program_files_like": f"O:{TI}D:PAI(A;;FA;;;{TI})(A;CIIO;GA;;;{TI})(A;;{MODIFY};;;SY)(A;OICIIO;GA;;;SY)(A;;{MODIFY};;;BA)(A;OICIIO;GA;;;BA)(A;;{READ_EXECUTE};;;BU)(A;OICIIO;GXGR;;;BU)(A;OICIIO;GA;;;CO)(A;;{READ_EXECUTE};;;AC)(A;OICIIO;GXGR;;;AC)",
+            "drive_root_like": f"O:{TI}D:PAI(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_EXECUTE};;;BU)(A;CI;0x4;;;BU)",
+            "users_add_subdirectory": f"O:BA{private}(A;;0x4;;;BU)",
+            "users_add_file": f"O:BA{private}(A;;0x2;;;BU)",
+            "inherit_only_modify": f"O:BA{private}(A;OICIIO;{MODIFY};;;AU)",
+            "owner_untrusted": f"O:S-1-5-21-1-2-3-1002{private}",
+        }
+        source = Path(tempfile.mkdtemp(prefix="xb-custody-cases-")) / "cases.json"
+        try:
+            source.write_text(json.dumps(cases), encoding="utf-8")
+            body = (
+                "$cases = Get-Content -Raw -LiteralPath $args[1] | ConvertFrom-Json\n"
+                "$out = [ordered]@{}\n"
+                "foreach ($p in $cases.PSObject.Properties) {\n"
+                "  $r = Get-XbDlSddlWriteRisk -Sddl $p.Value -UserSid $args[2] -BuildRoot\n"
+                "  $out[$p.Name] = if ($r) { $r } else { 'ok' }\n"
+                "}\n"
+                "[Console]::Out.WriteLine(($out | ConvertTo-Json -Compress))\n"
+            )
+            verdicts = run_harness(body, str(source), user)
+        finally:
+            shutil.rmtree(source.parent, ignore_errors=True)
+        self.assertEqual(verdicts, {
+            "program_files_like": "ok", "drive_root_like": "writable", "users_add_subdirectory": "writable",
+            "users_add_file": "writable", "inherit_only_modify": "ok", "owner_untrusted": "owner_unsafe",
+        })
+
+    def test_real_program_files_is_an_accepted_build_root(self):
+        # Read-only: C:\Program Files is the build root of the proposed nested
+        # C:\Program Files\<folder>\PythonXY layout and must not false-block.
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        body = (
+            "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+            "$r = Get-XbDlSddlWriteRisk -Sddl (Get-XbDlPathSddl (New-Object IO.DirectoryInfo $args[1])) -UserSid $sid -BuildRoot\n"
+            "[Console]::Out.WriteLine((@{ r = $(if ($r) { $r } else { 'ok' }) } | ConvertTo-Json -Compress))\n"
+        )
+        self.assertEqual(run_harness(body, program_files)["r"], "ok")
+
 
 @unittest.skipUnless(windows_powershell(), "Windows PowerShell 5.1 required")
 class CustodyFilesystemTests(unittest.TestCase):
@@ -335,6 +379,205 @@ class CustodyFilesystemTests(unittest.TestCase):
         config = runtime.index("Get-XbDlInterpreterConfigIssue -InterpreterDir")
         self.assertLess(tree, config)
         self.assertLess(config, runtime.index('-Label "git"'))
+
+    def test_owner_runtime_checks_interpreter_startup_after_config_and_before_git(self):
+        # G2 A6 ordering: tree, pyvenv.cfg/parent, startup paths, then git.
+        text = CUSTODY.read_text(encoding="utf-8")
+        runtime = text[text.index("function Get-XbDlOwnerRuntimeIssue"):]
+        config = runtime.index("Get-XbDlInterpreterConfigIssue -InterpreterDir")
+        startup = runtime.index("Get-XbDlInterpreterStartupIssue -PythonExe $PythonExe")
+        self.assertLess(config, startup)
+        self.assertLess(startup, runtime.index('-Label "git"'))
+
+
+def base_interpreter_files() -> list[Path]:
+    """The real interpreter's executable, runtime DLL and C runtime, if this
+    Python is a regular Windows install (as on the hosted runners)."""
+
+    base = Path(sys.base_prefix)
+    required = [base / "python.exe", base / f"python3{sys.version_info.minor}.dll"]
+    if os.name != "nt" or not all(path.is_file() for path in required):
+        return []
+    optional = [base / name for name in ("python3.dll", "vcruntime140.dll", "vcruntime140_1.dll")]
+    return required + [path for path in optional if path.is_file()]
+
+
+@unittest.skipUnless(windows_powershell() and base_interpreter_files() and sys.version_info[:2] in ((3, 11), (3, 12), (3, 13)),
+                     "Windows PowerShell 5.1 and a regular CPython 3.11-3.13 install required")
+class InterpreterStartupTests(unittest.TestCase):
+    """G2 A6: the Windows startup path inputs of a synthetic interpreter copy
+    in a test-owned temporary tree. Only the test tree's DACLs are set; the
+    copied interpreter runs only in the control, which plants an empty
+    standard library directory and so stops before any Python code runs."""
+
+    def setUp(self):
+        # resolve(): hosted runners give TEMP as an 8.3 short path, which .NET expands.
+        self.holder = Path(tempfile.mkdtemp(prefix="xb-a6-startup-")).resolve()
+        self.user = dl._win_current_user_sid()
+        self.private = f"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{self.user})"
+        self.minor = sys.version_info.minor
+        self.env = {k: v for k, v in os.environ.items() if k.upper() not in ("PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")}
+
+    def tearDown(self):
+        # Remove junctions first so cleanup never follows one.
+        for link in (self.holder / "link", self.holder / "pf" / "Modules"):
+            subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True, check=False)
+        shutil.rmtree(self.holder, ignore_errors=True)
+
+    def install(self, *parts: str, root_sddl: str | None = None) -> Path:
+        """Copy the interpreter to holder/<parts>/Python3XY. The directory two
+        levels above python.exe (the build root) gets ``root_sddl``; every
+        other directory is private. Returns the python.exe path."""
+
+        build_root = self.holder.joinpath(*parts[:-1]) if len(parts) > 1 else self.holder
+        interpreter = self.holder.joinpath(*parts) / f"Python3{self.minor}"
+        (interpreter / "Lib").mkdir(parents=True)
+        for path in [self.holder.joinpath(*parts[:i]) for i in range(1, len(parts) + 1)] + [interpreter]:
+            set_dacl(path, self.private)
+        set_dacl(build_root, root_sddl or self.private)
+        for source in base_interpreter_files():
+            shutil.copy2(source, interpreter / source.name)
+        (interpreter / "Lib" / "os.py").write_text("# synthetic landmark\n", encoding="utf-8")
+        return interpreter / "python.exe"
+
+    def startup(self, python: Path, env: dict | None = None) -> str:
+        body = (
+            "$r = Get-XbDlInterpreterStartupIssue -PythonExe $args[1]\n"
+            "[Console]::Out.WriteLine((@{ r = $(if ($r) { $r } else { 'ok' }) } | ConvertTo-Json -Compress))\n"
+        )
+        return run_harness(body, str(python), env=env or self.env)["r"]
+
+    def test_protected_nested_install_is_accepted(self):
+        # C:\Program Files\<folder>\PythonXY shape: the build root is protected.
+        python = self.install("pf", "nested", root_sddl=self.private + f"(A;OICI;{READ_EXECUTE};;;BU)")
+        self.assertEqual(self.startup(python), "ok")
+
+    def test_shallow_install_under_a_drive_root_like_build_root_fails_closed(self):
+        # C:\Program Files\PythonXY shape: two levels up is the drive root,
+        # where Authenticated Users may create a folder.
+        python = self.install("drive", "pf", root_sddl=self.private + "(A;;LC;;;AU)(A;CI;0x4;;;BU)")
+        self.assertEqual(self.startup(python), "interpreter_build_root_writable")
+
+    def test_build_root_add_file_or_folder_for_others_fails_closed(self):
+        for name, grant in (("add_file", "(A;;0x2;;;AU)"), ("add_folder", "(A;;0x4;;;AU)"), ("generic_write", "(A;;GW;;;BU)")):
+            with self.subTest(grant=name):
+                python = self.install(name, "parent", root_sddl=self.private + grant)
+                self.assertEqual(self.startup(python), "interpreter_build_root_writable")
+
+    def test_build_landmark_fails_closed_even_when_protected(self):
+        python = self.install("pf", "nested")
+        modules = self.holder / "pf" / "Modules"
+        modules.mkdir()
+        set_dacl(modules, self.private)
+        self.assertEqual(self.startup(python), "ok")  # a protected Modules folder alone is fine
+        (modules / "Setup.local").write_text("", encoding="utf-8")
+        self.assertEqual(self.startup(python), "interpreter_build_landmark_present")
+        (modules / "Setup.local").unlink()
+        (modules / "Setup.local").mkdir()
+        self.assertEqual(self.startup(python), "interpreter_build_landmark_present")
+
+    def test_build_modules_folder_others_can_add_to_fails_closed(self):
+        python = self.install("pf", "nested")
+        modules = self.holder / "pf" / "Modules"
+        modules.mkdir()
+        set_dacl(modules, self.private + "(A;;0x2;;;AU)")
+        self.assertEqual(self.startup(python), "interpreter_build_modules_writable")
+
+    def test_build_modules_junction_fails_closed(self):
+        python = self.install("pf", "nested")
+        target = self.holder / "elsewhere"
+        target.mkdir()
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.holder / "pf" / "Modules"), str(target)], capture_output=True, check=False)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        try:
+            self.assertEqual(self.startup(python), "interpreter_build_root_reparse_point")
+        finally:
+            subprocess.run(["cmd", "/c", "rmdir", str(self.holder / "pf" / "Modules")], capture_output=True, check=False)
+
+    def test_build_root_reached_through_a_junction_fails_closed(self):
+        real = self.holder / "real"
+        real.mkdir()
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.holder / "link"), str(real)], capture_output=True, check=False)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        python = self.install("real", "parent")
+        linked = self.holder / "link" / "parent" / python.parent.name / "python.exe"
+        self.assertEqual(self.startup(linked), "interpreter_build_root_reparse_point")
+
+    def test_startup_inputs_beside_python_fail_closed(self):
+        python = self.install("pf", "nested")
+        here = python.parent
+        for name, expected in ((f"python3{self.minor}._pth", "interpreter_pth_present"), ("python._pth", "interpreter_pth_present"),
+                               ("pybuilddir.txt", "interpreter_build_marker_present")):
+            with self.subTest(input=name):
+                (here / name).write_text("..\\..\\elsewhere\n", encoding="utf-8")
+                set_dacl(here / name, self.private)  # even a trusted-owned, protected one
+                self.assertEqual(self.startup(python), expected)
+                (here / name).unlink()
+        self.assertEqual(self.startup(python), "ok")
+
+    def test_missing_stdlib_landmark_or_runtime_library_fails_closed(self):
+        python = self.install("pf", "nested")
+        (python.parent / "Lib" / "os.py").unlink()
+        self.assertEqual(self.startup(python), "interpreter_stdlib_landmark_missing")
+        (python.parent / "Lib" / "os.py").write_text("", encoding="utf-8")
+        (python.parent / f"python3{self.minor}.dll").unlink()
+        self.assertEqual(self.startup(python), "interpreter_runtime_library_missing")
+
+    def test_unversioned_or_mismatched_interpreter_fails_closed(self):
+        python = self.install("pf", "nested")
+        dll = python.parent / f"python3{self.minor}.dll"
+        dll.write_bytes(b"synthetic")  # no version resource
+        self.assertEqual(self.startup(python), "interpreter_version_unqualified")
+        python.write_bytes(b"synthetic")
+        self.assertEqual(self.startup(python), "interpreter_version_unqualified")
+
+    def test_startup_environment_overrides_fail_closed(self):
+        python = self.install("pf", "nested")
+        for name in ("PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+            with self.subTest(variable=name):
+                self.assertEqual(self.startup(python, env={**self.env, name: str(self.holder / "venv" / "python.exe")}),
+                                 "interpreter_environment_override")
+
+    def test_control_build_landmark_redirects_the_real_interpreter(self):
+        # The reviewed hazard on a real interpreter copy, inverted: the plant
+        # moves the standard library out of the verified tree under -I -S -B,
+        # and the guard refuses the same layout. The planted Lib is empty, so
+        # startup stops before any Python code runs.
+        python = self.install("drive", "pf", root_sddl=self.private + "(A;;LC;;;AU)")
+        build_root = self.holder / "drive"
+
+        def stdlib_dir() -> str:
+            proc = subprocess.run([str(python), "-I", "-S", "-B", "-c", "pass"], capture_output=True, text=True,
+                                  cwd=str(self.holder), env=self.env, timeout=120, check=False)
+            found = re.search(r"stdlib dir = '([^']*)'", proc.stderr)
+            self.assertIsNotNone(found, proc.stderr[-600:])
+            return found.group(1)
+
+        self.assertEqual(Path(stdlib_dir()), python.parent / "Lib")
+        (build_root / "Modules").mkdir()
+        (build_root / "Modules" / "Setup.local").write_text("", encoding="utf-8")
+        (build_root / "Lib").mkdir()
+        self.assertEqual(Path(stdlib_dir()), build_root / "Lib")
+        self.assertIn(self.startup(python), ("interpreter_build_root_writable", "interpreter_build_landmark_present"))
+
+
+class OperatorDocumentTextTests(unittest.TestCase):
+    """G2 O13: operator-facing DirectLocal documents carry no control byte
+    (a "\\a" once became BEL inside a security path warning)."""
+
+    DOCS = sorted((ROOT / "docs" / "autocount2-automation").glob("member_directlocal_*.md"))
+
+    def test_no_unexpected_control_bytes(self):
+        self.assertTrue(self.DOCS)
+        for doc in self.DOCS:
+            with self.subTest(doc=doc.name):
+                data = doc.read_bytes()
+                bad = sorted({byte for byte in data if (byte < 0x20 and byte not in (0x09, 0x0A, 0x0D)) or byte == 0x7F})
+                self.assertEqual(bad, [], f"{doc.name}: control bytes {bad}")
+
+    def test_runbook_unsafe_path_warning_is_printable(self):
+        text = (ROOT / "docs" / "autocount2-automation" / "member_directlocal_uat_runbook.md").read_text(encoding="utf-8")
+        self.assertIn("Never use `C:\\XB\\automation`, a relative path", text)
 
 
 class OwnerConsoleShapeTests(unittest.TestCase):

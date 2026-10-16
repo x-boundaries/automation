@@ -27,6 +27,12 @@
 # interpreter is therefore refused: its standard library lies outside the
 # verified tree.
 #
+# G2 A6: every other input that CPython 3.11-3.13 (Modules/getpath.py) uses
+# on Windows to choose its standard library before any Python code runs is
+# held to the same standard (Get-XbDlInterpreterStartupIssue). Each input
+# lives in a directory that only trusted principals can add to, so checking
+# that an input is absent is stable rather than a race.
+#
 # Limitation: this proves custody at the moment it runs; it is not a
 # trusted bootstrap. It protects only when the console itself is installed
 # in a tree that passes it (a protected runtime checkout, an Owner host
@@ -52,6 +58,17 @@ $script:XbDlCustodyAncestorMask = [int64](0x40 -bor 0x10000 -bor 0x40000 -bor 0x
 # library. So, beyond the ancestor rights, nobody else may add a file
 # there: write data/add file (0x2) or GENERIC_WRITE (0x40000000).
 $script:XbDlCustodyInterpreterParentMask = [int64]($script:XbDlCustodyAncestorMask -bor 0x2 -bor 0x40000000)
+# The build root two levels above python.exe (G2 A6, the Windows VPATH
+# "..\.."): a Modules\Setup.local there makes CPython load <root>\Lib as its
+# standard library, also under -I -S. So nobody else may add a file or a
+# subdirectory (0x4) there either.
+$script:XbDlCustodyBuildRootMask = [int64]($script:XbDlCustodyInterpreterParentMask -bor 0x4)
+# CPython releases whose Windows startup path logic (Modules/getpath.py)
+# was assessed for G2 A6; any other version fails closed.
+$script:XbDlQualifiedPythonMinors = @(11, 12, 13)
+# Read by CPython before -I is applied; either one moves sys.executable and
+# the pyvenv.cfg and ._pth search outside the verified tree.
+$script:XbDlPythonStartupEnvironment = @("PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__")
 $script:XbDlCustodyMaxEntries = 25000
 
 function Get-XbDlSddlWriteRisk {
@@ -62,15 +79,17 @@ function Get-XbDlSddlWriteRisk {
         [Parameter(Mandatory)][string]$UserSid,
         [switch]$Ancestor,
         # Ancestor semantics with the interpreter-parent mask (G2 A5).
-        [switch]$InterpreterParent
+        [switch]$InterpreterParent,
+        # Ancestor semantics with the build-root mask (G2 A6).
+        [switch]$BuildRoot
     )
     try { $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $Sddl } catch { return "acl_unverifiable" }
     $trusted = @($script:XbDlCustodyTrustedSids) + $UserSid
     if ($null -eq $descriptor.Owner -or $trusted -notcontains $descriptor.Owner.Value) { return "owner_unsafe" }
     # A null DACL grants everyone everything.
     if ($null -eq $descriptor.DiscretionaryAcl) { return "acl_unverifiable" }
-    if ($InterpreterParent) { $Ancestor = [switch]$true }
-    $mask = if ($InterpreterParent) { $script:XbDlCustodyInterpreterParentMask } elseif ($Ancestor) { $script:XbDlCustodyAncestorMask } else { $script:XbDlCustodyTreeMask }
+    if ($InterpreterParent -or $BuildRoot) { $Ancestor = [switch]$true }
+    $mask = if ($BuildRoot) { $script:XbDlCustodyBuildRootMask } elseif ($InterpreterParent) { $script:XbDlCustodyInterpreterParentMask } elseif ($Ancestor) { $script:XbDlCustodyAncestorMask } else { $script:XbDlCustodyTreeMask }
     foreach ($ace in $descriptor.DiscretionaryAcl) {
         if ($ace -isnot [Security.AccessControl.CommonAce]) { return "acl_unverifiable" }  # object, compound or unknown ACE
         if ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied) { continue }
@@ -185,6 +204,66 @@ function Get-XbDlInterpreterConfigIssue {
     return $null
 }
 
+function Get-XbDlInterpreterStartupIssue {
+    # G2 A6. -PythonExe is python.exe directly inside a tree that
+    # Get-XbDlTreeCustodyIssue and Get-XbDlInterpreterConfigIssue already
+    # verified. Checks, without running Python, the remaining inputs from
+    # which CPython 3.11-3.13 chooses its paths on Windows at startup:
+    #   environment  PYTHONEXECUTABLE and __PYVENV_LAUNCHER__ (read even under -I)
+    #   version      python.exe and python3XY.dll version resources, 3.11-3.13
+    #   runtime DLL  python3XY.dll beside python.exe, so the loader takes it
+    #                from the verified tree; its directory anchors the prefix,
+    #                the ._pth search and the zip path
+    #   ._pth        none beside python.exe (one replaces sys.path)
+    #   build tree   no pybuilddir.txt beside python.exe; no
+    #                <root>\Modules\Setup.local, where <root> is the Windows
+    #                VPATH "..\.." from the python.exe directory; nobody else
+    #                may add to <root> or to <root>\Modules
+    #   stdlib       Lib\os.py beside python.exe, so the landmark search stops
+    #                inside the verified tree
+    # PYTHONHOME, PYTHONPATH and the registry PythonPath keys are ignored
+    # under -I, which every console launch uses. site-packages, DLLs and the
+    # optional python3XY.zip all lie inside the verified tree.
+    param([Parameter(Mandatory)][string]$PythonExe)
+    foreach ($name in $script:XbDlPythonStartupEnvironment) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name))) { return "interpreter_environment_override" }
+    }
+    try {
+        $exe = New-Object IO.FileInfo -ArgumentList ([IO.Path]::GetFullPath($PythonExe))
+        $dir = $exe.Directory
+        # Version resources are read as data; nothing is loaded or run.
+        $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe.FullName)
+        if ($version.FileMajorPart -ne 3 -or $script:XbDlQualifiedPythonMinors -notcontains $version.FileMinorPart) { return "interpreter_version_unqualified" }
+        $dll = Join-Path $dir.FullName ("python3{0}.dll" -f $version.FileMinorPart)
+        if (-not [IO.File]::Exists($dll)) { return "interpreter_runtime_library_missing" }
+        $dllVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($dll)
+        if ($dllVersion.FileMajorPart -ne 3 -or $dllVersion.FileMinorPart -ne $version.FileMinorPart) { return "interpreter_version_unqualified" }
+        if (@($dir.GetFileSystemInfos("*._pth")).Count -gt 0) { return "interpreter_pth_present" }
+        $builddir = Join-Path $dir.FullName "pybuilddir.txt"
+        if ([IO.File]::Exists($builddir) -or [IO.Directory]::Exists($builddir)) { return "interpreter_build_marker_present" }
+        if (-not [IO.File]::Exists((Join-Path $dir.FullName "Lib\os.py"))) { return "interpreter_stdlib_landmark_missing" }
+        # "..\.." is resolved lexically and stops at the drive root, as in CPython.
+        $root = New-Object IO.DirectoryInfo -ArgumentList ([IO.Path]::GetFullPath((Join-Path $dir.FullName "..\..")))
+        if (Test-XbDlReparsePoint $root) { return "interpreter_build_root_reparse_point" }
+        $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $issue = Get-XbDlSddlWriteRisk -Sddl (Get-XbDlPathSddl $root) -UserSid $userSid -BuildRoot
+        if ($issue) { return "interpreter_build_root_$issue" }
+        $modules = Join-Path $root.FullName "Modules"
+        $landmark = Join-Path $modules "Setup.local"
+        # Any entry, including a dangling link, counts as present.
+        if ([IO.File]::Exists($landmark) -or [IO.Directory]::Exists($landmark)) { return "interpreter_build_landmark_present" }
+        if ([IO.Directory]::Exists($modules)) {
+            $modulesDir = New-Object IO.DirectoryInfo -ArgumentList $modules
+            if (Test-XbDlReparsePoint $modulesDir) { return "interpreter_build_root_reparse_point" }
+            $issue = Get-XbDlSddlWriteRisk -Sddl (Get-XbDlPathSddl $modulesDir) -UserSid $userSid -InterpreterParent
+            if ($issue) { return "interpreter_build_modules_$issue" }
+        }
+        elseif ([IO.File]::Exists($modules) -and (Test-XbDlReparsePoint (New-Object IO.FileInfo -ArgumentList $modules))) { return "interpreter_build_root_reparse_point" }
+    }
+    catch { return "interpreter_startup_unverifiable" }
+    return $null
+}
+
 function Enter-XbDlTrustedWorkingDirectory {
     # G2 A4 (16 October 2026). The Owner consoles call this once the code
     # root's custody is proven and before their first native command. A bare
@@ -226,6 +305,8 @@ function Get-XbDlOwnerRuntimeIssue {
     $issue = Get-XbDlTreeCustodyIssue -Root $interpreterDir -Label "interpreter"
     if ($issue) { return $issue }
     $issue = Get-XbDlInterpreterConfigIssue -InterpreterDir (New-Object IO.DirectoryInfo -ArgumentList ([IO.Path]::GetFullPath($interpreterDir)))
+    if ($issue) { return $issue }
+    $issue = Get-XbDlInterpreterStartupIssue -PythonExe $PythonExe
     if ($issue) { return $issue }
     if (-not [IO.File]::Exists((Join-Path $GitRoot "cmd\git.exe"))) { return "git_path_unsafe" }
     $issue = Get-XbDlTreeCustodyIssue -Root $GitRoot -Label "git"
