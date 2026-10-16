@@ -93,21 +93,43 @@ class BridgeFailureCodeTests(unittest.TestCase):
         self.assertEqual(self.code(3, b'noise\n{"error":"fence_already_claimed"}\n'), "bridge_read_failed:fence_already_claimed")
 
     def test_unknown_malformed_or_vendor_output_is_generic(self):
-        for stdout in (
-            b"", b"\n", b"not json", b"\xff\xfe", b"[]", b'"autocount_login_rejected"',
-            b'{"error":"some_new_code"}', b'{"error":"Login failed for user XB"}', b'{"error":7}',
-            b'{"error":"autocount_login_rejected","detail":"Server=HQ;User Id=XB"}',
-            b'{"error":"autocount_login_rejected"}\nLogin failed for user XB',
-            b'{"error":"AUTOCOUNT_LOGIN_REJECTED"}',
-        ):
+        # Only computed values qualify a generic failure: shape, exit, lines.
+        cases = (
+            (1, b"", "output_empty:x00000001:l0"),
+            (1, b"\r\n\n", "output_empty:x00000001:l0"),
+            (1, b"not json", "output_not_json:x00000001:l1"),
+            (1, b"\xff\xfe", "output_not_utf8:x00000001:l1"),
+            (1, b"[]", "output_not_json:x00000001:l1"),
+            (1, b'"autocount_login_rejected"', "output_not_json:x00000001:l1"),
+            (1, b'{"error":"some_new_code"}', "code_unlisted:x00000001:l1"),
+            (1, b'{"error":"Login failed for user XB"}', "code_unlisted:x00000001:l1"),
+            (1, b'{"error":"AUTOCOUNT_LOGIN_REJECTED"}', "code_unlisted:x00000001:l1"),
+            (1, b'{"error":7}', "envelope_invalid:x00000001:l1"),
+            (1, b'{"error":"autocount_login_rejected","detail":"Server=HQ;User Id=XB"}', "envelope_invalid:x00000001:l1"),
+            (1, b'{"error":"autocount_login_rejected"}\nLogin failed for user XB', "output_not_json:x00000001:l2"),
+            (-532462766, b'{"book":"AED_TESTINGAPI","identity_verified":true,"outbound_quiet":true}\r\n', "result_on_failed_exit:xe0434352:l1"),
+            (-1073741819, b"", "output_empty:xc0000005:l0"),
+            (1, b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk", "output_not_json:x00000001:l9"),
+        )
+        for returncode, stdout, suffix in cases:
             with self.subTest(stdout=stdout):
-                code = self.code(1, stdout)
-                self.assertEqual(code, "bridge_read_failed")
+                code = self.code(returncode, stdout)
+                self.assertEqual(code, f"bridge_read_failed:{suffix}")
+                self.assertRegex(code, dl.CODE_RE)
                 self.assertNotIn("XB", code)
+                self.assertNotIn("HQ", code)
+        self.assertEqual(dl.bridge_failure_code(b""), "bridge_read_failed:output_empty:xnone:l0")
+
+    def test_vendor_noise_before_the_envelope_cannot_hide_it(self):
+        noisy = b"\x93vendor \xe9 banner\r\nLogin failed for user XB\r\n" + b'{"error":"autocount_login_rejected"}\r\n'
+        self.assertEqual(self.code(1, noisy), "bridge_read_failed:autocount_login_rejected")
+        self.assertEqual(self.read(0, b"\x93vendor banner\r\n" + b'{"book":"AED_TESTINGAPI"}\r\n'), {"book": "AED_TESTINGAPI"})
+        self.assertEqual(self.code(0, b'{"book":"AED_TESTINGAPI"}\r\n\x93'), "bridge_output_invalid")
 
     def test_every_surfaced_code_is_a_valid_core_code(self):
         for child in dl.BRIDGE_CHILD_ERROR_CODES:
             self.assertRegex(f"bridge_read_failed:{child}", dl.CODE_RE)
+        self.assertRegex(dl.bridge_failure_code(b'{"book":1}', -2147483648), dl.CODE_RE)
 
     def test_allowlist_covers_exactly_the_child_scripts_fixed_codes(self):
         # Drift guard: a new throw in the bridge, guard or adapter must be

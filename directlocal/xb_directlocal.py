@@ -1109,18 +1109,43 @@ BRIDGE_CHILD_ERROR_CODES = frozenset({
 })
 
 
-def bridge_failure_code(stdout: bytes) -> str:
+def _last_output_line(stdout: bytes) -> tuple[bytes | None, int]:
+    # Only the last non-empty line is decoded, so vendor bytes printed earlier
+    # cannot hide the envelope. Returns (line, number of non-empty lines).
+    lines = [line for line in stdout.replace(b"\r", b"\n").split(b"\n") if line.strip()]
+    return (lines[-1] if lines else None), len(lines)
+
+
+def bridge_failure_code(stdout: bytes, returncode: int | None = None) -> str:
     """Map a failing child's stdout to a fixed code. Exactly one envelope shape
-    is trusted: a last line {"error": <allowlisted code>} with no other key."""
-    try:
-        envelope = json.loads(stdout.decode("utf-8").strip().splitlines()[-1])
-    except (UnicodeDecodeError, json.JSONDecodeError, IndexError):
-        return "bridge_read_failed"
-    if isinstance(envelope, dict) and set(envelope) == {"error"}:
-        code = envelope["error"]
-        if isinstance(code, str) and code in BRIDGE_CHILD_ERROR_CODES:
-            return f"bridge_read_failed:{code}"
-    return "bridge_read_failed"
+    is trusted: a last line {"error": <allowlisted code>} with no other key.
+
+    Anything else is generic, qualified only by values this function computes
+    (never child text): a fixed shape class, the exit code as unsigned hex and
+    the non-empty line count (capped), e.g. ``bridge_read_failed:output_empty:xe0434352:l0``.
+    """
+    line, count = _last_output_line(stdout)
+    shape = "output_empty"
+    if line is not None:
+        try:
+            envelope = json.loads(line.decode("utf-8"))
+        except UnicodeDecodeError:
+            shape = "output_not_utf8"
+        except json.JSONDecodeError:
+            shape = "output_not_json"
+        else:
+            if not isinstance(envelope, dict):
+                shape = "output_not_json"
+            elif "error" not in envelope:
+                shape = "result_on_failed_exit"
+            elif set(envelope) != {"error"} or not isinstance(envelope["error"], str):
+                shape = "envelope_invalid"
+            elif envelope["error"] in BRIDGE_CHILD_ERROR_CODES:
+                return f"bridge_read_failed:{envelope['error']}"
+            else:
+                shape = "code_unlisted"
+    exit_part = "xnone" if returncode is None else f"x{returncode & 0xFFFFFFFF:08x}"
+    return f"bridge_read_failed:{shape}:{exit_part}:l{min(count, 9)}"
 
 
 def payload_digest(salt: str, payload_canonical: str) -> str:
@@ -1168,10 +1193,11 @@ class BridgeClient:
             process.communicate()
             raise BridgeError("bridge_read_timeout") from None
         if process.returncode != 0:
-            raise BridgeError(bridge_failure_code(stdout))
+            raise BridgeError(bridge_failure_code(stdout, process.returncode))
+        line, _ = _last_output_line(stdout)
         try:
-            result = json.loads(stdout.decode("utf-8").strip().splitlines()[-1])
-        except (UnicodeDecodeError, json.JSONDecodeError, IndexError):
+            result = json.loads(line.decode("utf-8")) if line is not None else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
             raise BridgeError("bridge_output_invalid") from None
         if not isinstance(result, dict):
             raise BridgeError("bridge_output_invalid")

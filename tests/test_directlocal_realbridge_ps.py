@@ -222,8 +222,9 @@ class RealBridgeGuardTests(unittest.TestCase):
             "session_login": "autocount_login_rejected", "session_password": "autocount_password_missing",
             "session_prod": "production_book_not_authorised",
         })
-        for value in out.values():
-            self.assertIn(dl.bridge_failure_code(json.dumps({"error": value}).encode()), {f"bridge_read_failed:{value}", "bridge_read_failed"})
+        for key, value in out.items():
+            if key != "server_source":
+                self.assertEqual(dl.bridge_failure_code(json.dumps({"error": value}).encode(), 1), f"bridge_read_failed:{value}")
             self.assertNotIn("Login failed", str(value))
 
 
