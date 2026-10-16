@@ -12,6 +12,10 @@
 #     (ac2_directlocal_code_custody.ps1). A broadly writable development
 #     checkout therefore always stops here; only a protected runtime checkout
 #     (a separate Owner host decision) can pass;
+#   - then (G2 A4) makes the verified code root its working directory and
+#     sets NoDefaultCurrentDirectoryInExePath before its first native
+#     command, and starts the core there, so the launch directory can never
+#     supply an executable to an elevated child;
 #   - refuses another source head and any modified, untracked or ignored file;
 #   - runs Python isolated: -I (no script directory, user site or PYTHON*
 #     variables), -B (no bytecode written) and, for the core, -S (no
@@ -66,6 +70,9 @@ if ($EnableWrite -and $Command -ne "Process") { Stop-XbDlOwner "write_only_for_p
 try { $pythonExe = [string](Get-Command $Python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source } catch { Stop-XbDlOwner "interpreter_path_unsafe" }
 $custody = Get-XbDlOwnerRuntimeIssue -CodeRoot $repo -PythonExe $pythonExe -GitRoot $GitRoot
 if ($custody) { Stop-XbDlOwner $custody }
+# G2 A4: the verified code root is the working directory before any native command.
+$pinned = Enter-XbDlTrustedWorkingDirectory -Root $repo
+if ($pinned) { Stop-XbDlOwner $pinned }
 $git = Join-Path $GitRoot "cmd\git.exe"
 $head = [string](& $git -c core.fsmonitor=false -C $repo rev-parse HEAD 2>$null)
 if ($ExpectedHead -notmatch '^[0-9a-f]{40}$' -or $head.Trim() -cne $ExpectedHead) { Stop-XbDlOwner "source_head_mismatch" }
@@ -98,6 +105,7 @@ $process = $null
 try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $pythonExe
+    $psi.WorkingDirectory = $repo
     $quoted = @((Join-Path $repo "directlocal\xb_directlocal.py"), "--state-root", $StateRoot) + $core | ForEach-Object { '"{0}"' -f ($_ -replace '"', '') }
     $psi.Arguments = "-I -S -B " + ($quoted -join " ")
     $psi.UseShellExecute = $false

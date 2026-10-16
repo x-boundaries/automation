@@ -2252,8 +2252,14 @@ class Processor:
             for r in conn.execute("SELECT customer_gid, decision_code FROM customers WHERE state = 'MANUAL_REVIEW' ORDER BY updated_at")
         ]
         # Counts only: which candidates were the generator's own preview and
-        # which were derived successors (NULL: recorded before schema v4).
-        derivations = {row[0] or "unrecorded": row[1] for row in conn.execute("SELECT derivation, COUNT(*) FROM allocation_attempts WHERE status IS NOT NULL GROUP BY derivation")}
+        # which were derived successors. A NULL derivation is reported, never
+        # rewritten (G2 O12): "no_candidate" for GENERATOR_FAILED/INVALID,
+        # which never had a candidate in any schema; "unrecorded_pre_v4" for
+        # any other status, which only a row recorded before schema v4 has.
+        derivations = {row[0]: row[1] for row in conn.execute(
+            "SELECT CASE WHEN derivation IS NOT NULL THEN derivation "
+            "WHEN status IN ('GENERATOR_FAILED', 'GENERATOR_INVALID') THEN 'no_candidate' ELSE 'unrecorded_pre_v4' END AS bucket, COUNT(*) "
+            "FROM allocation_attempts WHERE status IS NOT NULL GROUP BY bucket ORDER BY bucket")}
         return {
             **self.status(), "fence_detail": fences, "manual_review": reviews,
             "allocation_attempts": conn.execute("SELECT COUNT(*) FROM allocation_attempts").fetchone()[0], "allocation_derivations": derivations,

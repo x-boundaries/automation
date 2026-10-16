@@ -73,8 +73,11 @@ The current store has about 4,300 customers, so this is about 90 calls.
 
 ## C. AutoCount read-only check (elevated Owner console)
 
+Launch it as in "Launching an Owner console" below: an elevated Windows
+PowerShell, absolute paths only, from the protected runtime.
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\XB\automation\scripts\ac2_directlocal_owner_console.ps1 -StateRoot C:\XB\xb155-directlocal-core-uat -Command BookCheck -ExpectedHead <reviewed head>
+& "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "<PROTECTED_RUNTIME>\scripts\ac2_directlocal_owner_console.ps1" -Python "<PROTECTED_PYTHON>\python.exe" -StateRoot C:\XB\xb155-directlocal-core-uat -Command BookCheck -ExpectedHead <reviewed head>
 ```
 
 Expect `{"book": "AED_TESTINGAPI", "identity_verified": true, "outbound_quiet": true}`.
@@ -108,10 +111,11 @@ Shopify.
 ## F. One create on the test book (needs approval E7b)
 
 1. `core pending` shows the GID. `core approve-write --gid <gid> --confirm-suffix <last 6 digits>`.
-2. Read a fresh profile (E2), then in the elevated console:
+2. Read a fresh profile (E2), then in the elevated console (launched as in
+   "Launching an Owner console" below):
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File C:\XB\automation\scripts\ac2_directlocal_owner_console.ps1 -StateRoot C:\XB\xb155-directlocal-core-uat -Command Process -Capture <capture path> -EnableWrite -ExpectedHead <reviewed head>
+   & "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "<PROTECTED_RUNTIME>\scripts\ac2_directlocal_owner_console.ps1" -Python "<PROTECTED_PYTHON>\python.exe" -StateRoot C:\XB\xb155-directlocal-core-uat -Command Process -Capture <capture path> -EnableWrite -ExpectedHead <reviewed head>
    ```
 
    Type `AED_TESTINGAPI` when asked. Expect `fence_state: CREATED_VERIFIED` and a `member_ref`.
@@ -210,6 +214,26 @@ protected runtime checkout, plus an all-users Python whose tree passes,
 installed under a protected location such as `C:\Program Files` and qualified
 on the host first. No host ACL change or move is made by this source or this
 runbook. Never run the console from `C:\XB\automation`.
+
+### Launching an Owner console (G2 A4 and O11)
+
+- Open Windows PowerShell with "Run as administrator". Do not use `cmd.exe`,
+  which searches the current directory for `powershell`.
+- Start Windows PowerShell and the console script by their full paths, as in
+  C and F: `<PROTECTED_RUNTIME>` is the protected runtime checkout and
+  `<PROTECTED_PYTHON>` the qualified all-users Python directory, both from the
+  Owner host decision. Never use `C:\XButomation`, a relative path or a
+  bare `powershell` or `python`.
+- The console makes the verified code root its working directory and sets
+  `NoDefaultCurrentDirectoryInExePath` before its first native command, and
+  the collector starts `tasklist`, `schtasks` and `powershell` from the
+  system directory by absolute path. The directory it was started from
+  therefore cannot supply an executable, but start it from a protected
+  directory anyway (the elevated default `C:\Windows\system32` is fine).
+- The interpreter must be a regular install, not a venv: a `pyvenv.cfg`
+  beside `python.exe` or in its parent directory stops the console
+  (`interpreter_pyvenv_cfg_present`), and so does a parent directory to which
+  anyone else can add a file (`interpreter_parent_writable`; G2 A5).
 
 Residual: the guard proves custody when it runs; it is not a trusted
 bootstrap. The current user's own non-elevated processes are trusted by

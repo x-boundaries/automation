@@ -692,7 +692,7 @@ class WriteTests(DirectLocalTestCase):
                 with self.assertRaises(sqlite3.DatabaseError):
                     self.ledger.conn.execute("UPDATE allocation_attempts SET derivation = 'generator', generator_preview = 'X' WHERE attempt_no = 1")
         derivations = self.processor.uat_report()["allocation_derivations"]
-        self.assertEqual(derivations, {"unrecorded": 1})  # the last case: an invalid value is never stored
+        self.assertEqual(derivations, {"no_candidate": 1})  # the last case: an invalid value is never stored (G2 O12)
 
     def test_member_no_successor(self):
         cases = [
@@ -1154,6 +1154,74 @@ class HookTests(unittest.TestCase):
         for event, code in cases:
             with self.subTest(event=str(event)[:80]):
                 self.assertEqual(self.run_hook(["guard"], event).returncode, code)
+
+    @staticmethod
+    def deep(depth: int = 50000) -> str:
+        return '{"a":' * depth + '"SYNTHETIC_PII_MARKER"' + "}" * depth
+
+    def malformed_events(self) -> dict[str, bytes]:
+        tool = json.dumps(dl.CONNECTOR_TOOL)
+        query = json.dumps(dl.PROFILE_QUERY)
+        return {
+            "deep_variables": f'{{"tool_name": {tool}, "tool_input": {{"query": {query}, "variables": {self.deep()}}}}}'.encode(),
+            "deep_tool_input": f'{{"tool_name": {tool}, "tool_input": {self.deep()}}}'.encode(),
+            "deep_array": b"[" * 100000 + b"]" * 100000,
+            "deep_before_tool_name": f'{{"x": {self.deep()}, "tool_name": {tool}}}'.encode(),
+            "malformed_utf8": b'{"tool_name": "\xff\xfe", "SYNTHETIC_PII_MARKER": 1}',
+            "truncated": f'{{"tool_name": {tool}, "tool_input": {{"query": '.encode(),
+            "empty": b"",
+            "list": b"[]",
+            "string": b'"SYNTHETIC_PII_MARKER"',
+            "null": b"null",
+            "number": b"42",
+        }
+
+    def test_guard_fails_closed_on_malformed_or_deeply_nested_input(self):
+        # G2 O10: a PreToolUse exit other than 2 does not block, so every
+        # parsing failure, RecursionError included, must exit 2 with a fixed message.
+        for name, raw in self.malformed_events().items():
+            with self.subTest(name=name):
+                proc = self.run_hook(["guard"], raw)
+                self.assertEqual(proc.returncode, 2, proc.stderr[-300:])
+                self.assertTrue(proc.stderr.startswith(b"DirectLocal guard: "), proc.stderr[-300:])
+                self.assertNotIn(b"Traceback", proc.stderr)
+                self.assertNotIn(b"SYNTHETIC_PII_MARKER", proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout, b"")
+        # Depth just below the parser limit is still checked by the allowlist, not passed.
+        shallow = {"tool_name": dl.CONNECTOR_TOOL, "tool_input": json.loads('{"query": ' + json.dumps(dl.PROFILE_QUERY) + ', "variables": ' + self.deep(200) + "}")}
+        self.assertEqual(self.run_hook(["guard"], json.dumps(shallow).encode()).returncode, 2)
+
+    def test_capture_never_persists_malformed_or_deeply_nested_input(self):
+        events = self.malformed_events()
+        good = {"session_id": "s", "tool_use_id": "toolu_synthetic_deep", "tool_name": dl.CONNECTOR_TOOL, "tool_input": page_input(None)}
+        prefix = json.dumps(good)[:-1]
+        events["deep_tool_response"] = f'{prefix}, "tool_response": {self.deep()}}}'.encode()
+        events["deep_after_valid_fields"] = f'{prefix}, "tool_response": {{"data": null}}, "extra": {self.deep()}}}'.encode()
+        with tempfile.TemporaryDirectory() as temp:
+            for name, raw in events.items():
+                with self.subTest(name=name):
+                    proc = self.run_hook(["capture", "--inbox", temp], raw)
+                    self.assertEqual(proc.returncode, 1, proc.stderr[-300:])
+                    self.assertTrue(proc.stderr.startswith(b"DirectLocal capture: "), proc.stderr[-300:])
+                    self.assertNotIn(b"Traceback", proc.stderr)
+                    self.assertNotIn(b"SYNTHETIC_PII_MARKER", proc.stdout + proc.stderr)
+                    self.assertEqual(list(Path(temp).iterdir()), [])  # no record, no temporary file
+
+    def test_hook_fails_closed_when_the_core_cannot_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lonely = Path(temp) / "scripts" / "directlocal_connector_hook.py"
+            lonely.parent.mkdir()
+            shutil.copy2(HOOK, lonely)
+            inbox = Path(temp) / "inbox"
+            inbox.mkdir()
+            event = json.dumps({"tool_name": dl.CONNECTOR_TOOL, "tool_input": page_input(None), "tool_use_id": "toolu_synthetic_3", "tool_response": {}}).encode()
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            for args, code in ((["guard"], 2), (["capture", "--inbox", str(inbox)], 1)):
+                with self.subTest(args=args[0]):
+                    proc = subprocess.run([sys.executable, str(lonely), *args], input=event, capture_output=True, timeout=60, env=env, check=False)
+                    self.assertEqual(proc.returncode, code, proc.stderr[-300:])
+                    self.assertIn(b"core unavailable", proc.stderr)
+            self.assertEqual(list(inbox.iterdir()), [])
 
     def test_capture_writes_exclusive_record_accepted_by_core(self):
         with tempfile.TemporaryDirectory() as temp:

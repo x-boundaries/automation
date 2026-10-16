@@ -165,7 +165,10 @@ membership.start_date metafield GID, its createdAt)`.
   ledger and in the same update as its status, the generator's raw preview
   and `derivation` (`generator` when the candidate is that preview,
   `successor` when it was derived from it). No extra vendor call is made.
-  `uat-report` prints only counts per derivation.
+  `uat-report` prints only counts per derivation (`generator`, `successor`),
+  plus `no_candidate` for `GENERATOR_FAILED`/`GENERATOR_INVALID` attempts and
+  `unrecorded_pre_v4` for an earlier attempt recorded before schema v4
+  (G2 O12). No historical row is rewritten.
 
 ## Write authority
 
@@ -374,6 +377,14 @@ or Python, and before any prompt, they stop unless all of these hold:
 - The code root is a standalone checkout. git runs from the verified
   installation with `core.fsmonitor=false` and no `GIT_*` variable.
 - The head is exact, with no modified, untracked or ignored file.
+- The interpreter has no `pyvenv.cfg` beside it or in its parent, and nobody
+  else can add a file to that parent (G2 A5; CPython reads `pyvenv.cfg`
+  there even under `-I`).
+- After custody passes, and before any native command, the console makes the
+  verified code root its working directory, sets
+  `NoDefaultCurrentDirectoryInExePath` and starts its children there (G2 A4).
+  The isolation collector starts `tasklist`, `schtasks` and `powershell` by
+  absolute path from the system directory (`GetSystemDirectoryW`).
 
 Python then runs with `-I -B` (the collector, which needs `pyodbc`) or
 `-I -S -B` (the core). The core appends, never prepends, the gateway source

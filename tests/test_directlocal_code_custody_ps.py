@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ import xb_directlocal as dl  # noqa: E402
 
 CUSTODY = ROOT / "scripts" / "ac2_directlocal_code_custody.ps1"
 CONSOLES = (ROOT / "scripts" / "ac2_directlocal_owner_console.ps1", ROOT / "scripts" / "ac2_directlocal_e7_owner_console.ps1")
+CHECKER = ROOT / "scripts" / "ac2_directlocal_e7_isolation_check.py"
 TI = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
 MODIFY = "0x1301bf"  # icacls (M)
 READ_EXECUTE = "0x1200a9"  # icacls (RX)
@@ -37,7 +39,7 @@ def windows_powershell() -> str | None:
     return str(path) if path.exists() else None
 
 
-def run_harness(body: str, *args: str) -> dict:
+def run_harness(body: str, *args: str, cwd: Path | None = None, env: dict | None = None) -> dict:
     """Dot-source the guard, run ``body`` and return its single JSON line."""
 
     script = Path(tempfile.mkdtemp(prefix="xb-custody-harness-")) / "harness.ps1"
@@ -45,7 +47,7 @@ def run_harness(body: str, *args: str) -> dict:
         script.write_text('$ErrorActionPreference = "Stop"\n. $args[0]\n' + body, encoding="utf-8")
         proc = subprocess.run(
             [windows_powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), str(CUSTODY), *args],
-            capture_output=True, timeout=180, check=False,
+            capture_output=True, timeout=180, check=False, cwd=None if cwd is None else str(cwd), env=env,
         )
         lines = [line for line in proc.stdout.decode("utf-8", "replace").splitlines() if line.startswith("{")]
         if proc.returncode != 0 or not lines:
@@ -142,6 +144,60 @@ class CustodySddlTests(unittest.TestCase):
         }
         self.assertEqual(self.verdicts(cases, user), expected)
 
+    def test_interpreter_parent_rules(self):
+        # G2 A5: the parent may not let anyone else add a file (pyvenv.cfg),
+        # on top of the ancestor rules; read/execute and create-folder stay allowed.
+        user = "S-1-5-21-1-2-3-1001"
+        other = "S-1-5-21-1-2-3-1002"
+        private = f"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})"
+        cases = {
+            "program_files_like": f"O:{TI}D:PAI(A;;FA;;;{TI})(A;CIIO;GA;;;{TI})(A;;{MODIFY};;;SY)(A;OICIIO;GA;;;SY)(A;;{MODIFY};;;BA)(A;OICIIO;GA;;;BA)(A;;{READ_EXECUTE};;;BU)(A;OICIIO;GXGR;;;BU)(A;OICIIO;GA;;;CO)(A;;{READ_EXECUTE};;;AC)(A;OICIIO;GXGR;;;AC)",
+            "drive_root_like": f"O:{TI}D:PAI(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;{READ_EXECUTE};;;BU)(A;CI;0x4;;;BU)",
+            "inherit_only_modify": f"O:BA{private}(A;OICIIO;{MODIFY};;;AU)",
+            "users_add_file": f"O:BA{private}(A;;0x2;;;BU)",
+            "users_generic_write": f"O:BA{private}(A;;GW;;;BU)",
+            "authenticated_users_modify_inherited": f"O:BAD:AI(A;OICIID;{MODIFY};;;AU)(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)",
+            "other_account_add_file": f"O:BA{private}(A;CI;0x2;;;{other})",
+            "delete_child": f"O:BA{private}(A;;0x40;;;BU)",
+            "owner_untrusted": f"O:{other}{private}",
+            "null_dacl": f"O:{user}D:NO_ACCESS_CONTROL",
+        }
+        source = Path(tempfile.mkdtemp(prefix="xb-custody-cases-")) / "cases.json"
+        try:
+            source.write_text(json.dumps(cases), encoding="utf-8")
+            body = (
+                "$cases = Get-Content -Raw -LiteralPath $args[1] | ConvertFrom-Json\n"
+                "$out = [ordered]@{}\n"
+                "foreach ($p in $cases.PSObject.Properties) {\n"
+                "  $r = Get-XbDlSddlWriteRisk -Sddl $p.Value -UserSid $args[2] -InterpreterParent\n"
+                "  $a = Get-XbDlSddlWriteRisk -Sddl $p.Value -UserSid $args[2] -Ancestor\n"
+                "  $out[$p.Name] = @($(if ($r) { $r } else { 'ok' }), $(if ($a) { $a } else { 'ok' }))\n"
+                "}\n"
+                "[Console]::Out.WriteLine(($out | ConvertTo-Json -Compress))\n"
+            )
+            verdicts = run_harness(body, str(source), user)
+        finally:
+            shutil.rmtree(source.parent, ignore_errors=True)
+        # [interpreter parent, ordinary ancestor]: add-file is the A5 difference.
+        self.assertEqual(verdicts, {
+            "program_files_like": ["ok", "ok"], "drive_root_like": ["ok", "ok"], "inherit_only_modify": ["ok", "ok"],
+            "users_add_file": ["writable", "ok"], "users_generic_write": ["writable", "ok"],
+            "authenticated_users_modify_inherited": ["writable", "writable"], "other_account_add_file": ["writable", "ok"],
+            "delete_child": ["writable", "writable"], "owner_untrusted": ["owner_unsafe", "owner_unsafe"],
+            "null_dacl": ["acl_unverifiable", "acl_unverifiable"],
+        })
+
+    def test_real_program_files_is_an_accepted_interpreter_parent(self):
+        # Read-only: the host's own C:\Program Files descriptor (the parent of
+        # an all-users C:\Program Files\PythonXY install) must not false-block.
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        body = (
+            "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+            "$r = Get-XbDlSddlWriteRisk -Sddl (Get-XbDlPathSddl (New-Object IO.DirectoryInfo $args[1])) -UserSid $sid -InterpreterParent\n"
+            "[Console]::Out.WriteLine((@{ r = $(if ($r) { $r } else { 'ok' }) } | ConvertTo-Json -Compress))\n"
+        )
+        self.assertEqual(run_harness(body, program_files)["r"], "ok")
+
 
 @unittest.skipUnless(windows_powershell(), "Windows PowerShell 5.1 required")
 class CustodyFilesystemTests(unittest.TestCase):
@@ -234,6 +290,52 @@ class CustodyFilesystemTests(unittest.TestCase):
         )
         self.assertEqual(run_harness(body, str(parent / "automation"))["r"], "code_root_ancestor_writable")
 
+    def interpreter_config(self, interpreter: Path) -> str:
+        body = (
+            "$r = Get-XbDlInterpreterConfigIssue -InterpreterDir (New-Object IO.DirectoryInfo $args[1])\n"
+            "[Console]::Out.WriteLine((@{ r = $(if ($r) { $r } else { 'ok' }) } | ConvertTo-Json -Compress))\n"
+        )
+        return run_harness(body, str(interpreter))["r"]
+
+    def interpreter_layout(self, parent_sddl: str) -> tuple[Path, Path]:
+        parent = self.holder / "pyparent"
+        interpreter = parent / "Python312"
+        interpreter.mkdir(parents=True)
+        set_dacl(parent, parent_sddl)
+        set_dacl(interpreter, self.private)
+        (interpreter / "python.exe").write_bytes(b"synthetic")
+        return parent, interpreter
+
+    def test_protected_interpreter_parent_is_accepted(self):
+        # The Program Files shape: others may read and execute only.
+        _, interpreter = self.interpreter_layout(self.private + f"(A;OICI;{READ_EXECUTE};;;BU)")
+        self.assertEqual(self.interpreter_config(interpreter), "ok")
+
+    def test_interpreter_parent_others_can_add_a_file_is_refused(self):
+        # G2 A5 reproduction shape: add-file on the parent lets anyone plant pyvenv.cfg.
+        _, interpreter = self.interpreter_layout(self.private + "(A;;0x2;;;AU)")
+        self.assertEqual(self.interpreter_config(interpreter), "interpreter_parent_writable")
+
+    def test_pyvenv_cfg_beside_or_above_the_interpreter_is_refused(self):
+        parent, interpreter = self.interpreter_layout(self.private)
+        for where in (parent, interpreter):
+            with self.subTest(where=where.name):
+                config = where / "pyvenv.cfg"
+                config.write_text("home = C:\\elsewhere\n", encoding="utf-8")
+                set_dacl(config, self.private)  # even a trusted-owned, protected one
+                self.assertEqual(self.interpreter_config(interpreter), "interpreter_pyvenv_cfg_present")
+                config.unlink()
+        (parent / "pyvenv.cfg").mkdir()
+        self.assertEqual(self.interpreter_config(interpreter), "interpreter_pyvenv_cfg_present")
+
+    def test_owner_runtime_checks_interpreter_config_before_git(self):
+        text = CUSTODY.read_text(encoding="utf-8")
+        runtime = text[text.index("function Get-XbDlOwnerRuntimeIssue"):]
+        tree = runtime.index('-Label "interpreter"')
+        config = runtime.index("Get-XbDlInterpreterConfigIssue -InterpreterDir")
+        self.assertLess(tree, config)
+        self.assertLess(config, runtime.index('-Label "git"'))
+
 
 class OwnerConsoleShapeTests(unittest.TestCase):
     """Both credential-bearing consoles prove custody before git, Python or a prompt."""
@@ -256,6 +358,38 @@ class OwnerConsoleShapeTests(unittest.TestCase):
         self.assertIn('$psi.Arguments = "-I -S -B " + ($quoted -join " ")', core)
         self.assertIn("$psi.FileName = $pythonExe", core)
 
+    def test_working_directory_pinned_before_the_first_native_command(self):
+        # G2 A4: custody, then the pin, then git, the collector and the child.
+        for console in CONSOLES:
+            with self.subTest(console=console.name):
+                text = console.read_text(encoding="utf-8")
+                guard = text.index("$custody = Get-XbDlOwnerRuntimeIssue")
+                pin = text.index("$pinned = Enter-XbDlTrustedWorkingDirectory -Root $repo")
+                self.assertLess(guard, pin)
+                self.assertIn("if ($pinned) { Stop-", text)
+                for later in ("& $git ", "& $pythonExe ", "= Read-Host", "$psi = New-Object System.Diagnostics.ProcessStartInfo"):
+                    self.assertLess(pin, text.index(later), later)
+                # No native command anywhere before the pin.
+                self.assertNotRegex(text[:pin], r"(?m)^\s*[^#\n]*(&\s*\$|\bStart-Process\b|::Start\()")
+                self.assertLess(text.index("$psi.WorkingDirectory = $repo"), text.index("[System.Diagnostics.Process]::Start($psi)"))
+                # Every native child is started by an absolute path.
+                for bare in ("& python", "& powershell", "& cmd", "& git", "tasklist", "schtasks"):
+                    self.assertNotIn(bare, text)
+        custody = CUSTODY.read_text(encoding="utf-8")
+        function = custody[custody.index("function Enter-XbDlTrustedWorkingDirectory"):custody.index("function Get-XbDlOwnerRuntimeIssue")]
+        for required in ('$env:NoDefaultCurrentDirectoryInExePath = "1"', "Set-Location -LiteralPath $full", "[Environment]::CurrentDirectory = $full", '"working_directory_unpinned"'):
+            self.assertIn(required, function)
+
+    def test_collector_starts_system_tools_by_absolute_path_only(self):
+        text = CHECKER.read_text(encoding="utf-8")
+        self.assertEqual(text.count("subprocess.run("), 1)
+        self.assertIn("subprocess.run([str(executable), *args]", text)
+        self.assertIn("cwd=str(system)", text)
+        self.assertIn("GetSystemDirectoryW", text)
+        self.assertEqual(sorted(re.findall(r'_run\("(\w+)"', text)), ["powershell", "schtasks", "tasklist"])
+        self.assertNotRegex(text, r'_run\(\[')
+        self.assertNotIn("shell=True", text)
+
     @unittest.skipUnless(windows_powershell(), "Windows PowerShell 5.1 required")
     def test_console_refuses_non_interactive_input_before_any_prompt(self):
         proc = subprocess.run(
@@ -266,6 +400,80 @@ class OwnerConsoleShapeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(json.loads(proc.stdout.decode().strip().splitlines()[-1]), {"status": "OWNER_PROCEDURE_STOPPED", "code": "owner_console_required"})
         self.assertNotIn(b"secret", proc.stdout + proc.stderr)
+
+
+@unittest.skipUnless(windows_powershell(), "Windows PowerShell 5.1 required")
+class LaunchDirectoryHijackTests(unittest.TestCase):
+    """G2 A4 reproduction, inverted: a harmless planted ``tasklist.exe`` (a
+    copy of hostname.exe) in the directory an elevated console was started
+    from must never run. No console, credential or AutoCount effect: only the
+    collector's process listing and the guard's pin function are exercised."""
+
+    def setUp(self):
+        self.holder = Path(tempfile.mkdtemp(prefix="xb-a4-plant-"))
+        self.plant = self.holder / "launch"
+        self.plant.mkdir()
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        shutil.copy2(system / "hostname.exe", self.plant / "tasklist.exe")
+        self.safe = self.holder / "runtime"
+        self.safe.mkdir()
+        self.probe = self.holder / "probe" / "bare_tasklist.py"
+        self.probe.parent.mkdir()
+        # A child that still uses a bare name; it reports which tasklist answered.
+        self.probe.write_text(
+            "import subprocess, sys\n"
+            "out = subprocess.run(['tasklist'], capture_output=True, text=True).stdout\n"
+            "print('PLANTED' if out.strip().lower() == sys.argv[1].lower() else 'REAL' if out.count('\\n') >= 20 else 'OTHER')\n",
+            encoding="utf-8")
+        self.host = subprocess.run([str(system / "hostname.exe")], capture_output=True, text=True, check=True).stdout.strip()
+        self.env = {k: v for k, v in os.environ.items() if k.lower() != "nodefaultcurrentdirectoryinexepath"}
+        self.env["PATH"] = os.pathsep.join([str(self.plant), self.env.get("PATH", "")])
+
+    def tearDown(self):
+        shutil.rmtree(self.holder, ignore_errors=True)
+
+    def test_control_planted_tasklist_runs_from_an_unpinned_launch_directory(self):
+        # Proves the plant is live: the reviewed hazard without any defence.
+        proc = subprocess.run([sys.executable, "-I", "-B", str(self.probe), self.host], capture_output=True, text=True,
+                              cwd=str(self.plant), env=self.env, timeout=120, check=False)
+        self.assertEqual(proc.stdout.strip(), "PLANTED", proc.stderr[-400:])
+
+    def test_collector_never_runs_the_planted_tasklist(self):
+        # The collector itself, started where the plant is and with the plant first on PATH.
+        script = ("import importlib.util, json, sys\n"
+                  "spec = importlib.util.spec_from_file_location('e7_isolation', sys.argv[1])\n"
+                  "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                  "print(json.dumps({'rows': len(m.processes())}))\n")
+        proc = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(CHECKER)], capture_output=True, text=True,
+                              cwd=str(self.plant), env=self.env, timeout=120, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-600:])
+        self.assertGreaterEqual(json.loads(proc.stdout.strip().splitlines()[-1])["rows"], 20)
+
+    def pinned_probe(self, setup: str) -> str:
+        body = setup + (
+            "$py = $args[1]\n"
+            "$out = & $py -I -B $args[2] $args[3]\n"
+            "[Console]::Out.WriteLine((@{ r = [string]($out | Select-Object -Last 1); cwd = [Environment]::CurrentDirectory } | ConvertTo-Json -Compress))\n"
+        )
+        result = run_harness(body, sys.executable, str(self.probe), self.host, str(self.safe), cwd=self.plant, env=self.env)
+        return result["r"].strip()
+
+    def test_console_pin_keeps_even_a_bare_child_name_off_the_launch_directory(self):
+        self.assertEqual(self.pinned_probe(""), "PLANTED")  # harness control: started in the plant
+        self.assertEqual(self.pinned_probe("$p = Enter-XbDlTrustedWorkingDirectory -Root $args[4]; if ($p) { throw $p }\n"), "REAL")
+        # Each defence alone is enough: the environment flag with the location left in the plant...
+        self.assertEqual(self.pinned_probe('$env:NoDefaultCurrentDirectoryInExePath = "1"\n'), "REAL")
+        # ...and the pinned location without the flag.
+        self.assertEqual(self.pinned_probe(
+            "$p = Enter-XbDlTrustedWorkingDirectory -Root $args[4]; if ($p) { throw $p }\n"
+            "Remove-Item Env:\\NoDefaultCurrentDirectoryInExePath\n"), "REAL")
+
+    def test_pin_reports_the_trusted_directory(self):
+        body = ("$p = Enter-XbDlTrustedWorkingDirectory -Root $args[1]\n"
+                "[Console]::Out.WriteLine((@{ r = $(if ($p) { $p } else { 'ok' }); cwd = [Environment]::CurrentDirectory; loc = (Get-Location).ProviderPath; flag = $env:NoDefaultCurrentDirectoryInExePath } | ConvertTo-Json -Compress))\n")
+        result = run_harness(body, str(self.safe), cwd=self.plant, env=self.env)
+        self.assertEqual(result, {"r": "ok", "cwd": str(self.safe), "loc": str(self.safe), "flag": "1"})
+        self.assertEqual(run_harness(body, str(self.holder / "absent"), cwd=self.plant, env=self.env)["r"], "working_directory_unpinned")
 
 
 class CoreImportIsolationTests(unittest.TestCase):

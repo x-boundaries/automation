@@ -3,6 +3,9 @@
 #
 # Run in an interactive, elevated Windows PowerShell console on DESKTOP-4I042L6
 # (elevation is needed for a complete scheduled-task/service inventory).
+# After code custody passes and before its first native command it makes the
+# verified code root its working directory (G2 A4), so the launch directory
+# can never supply an executable to an elevated child.
 # Credential handling:
 #   - refuses redirected stdin/stdout, so secrets can only be typed at the
 #     console and nothing a tool pipes in is accepted;
@@ -51,6 +54,10 @@ if (@(Get-ChildItem Env: | Where-Object { $_.Name -like "GIT_*" }).Count -gt 0) 
 try { $pythonExe = [string](Get-Command $Python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source } catch { Stop-E7Owner "interpreter_path_unsafe" }
 $custody = Get-XbDlOwnerRuntimeIssue -CodeRoot $repo -PythonExe $pythonExe -GitRoot $GitRoot
 if ($custody) { Stop-E7Owner $custody }
+# G2 A4: the verified code root is the working directory before any native
+# command, and NoDefaultCurrentDirectoryInExePath is set for every child.
+$pinned = Enter-XbDlTrustedWorkingDirectory -Root $repo
+if ($pinned) { Stop-E7Owner $pinned }
 $git = Join-Path $GitRoot "cmd\git.exe"
 $head = [string](& $git -c core.fsmonitor=false -C $repo rev-parse HEAD 2>$null)
 if ($ExpectedHead -notmatch '^[0-9a-f]{40}$' -or $head.Trim() -cne $ExpectedHead) { Stop-E7Owner "source_head_mismatch" }
@@ -77,6 +84,7 @@ $process = $null
 try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $PSHOME "powershell.exe"
+    $psi.WorkingDirectory = $repo
     $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
         ('"{0}"' -f (Join-Path $repo "scripts\ac2_directlocal_e7_testbook_create.ps1")),
         "-StateDir", ('"{0}"' -f (Join-Path $Workspace "state")),

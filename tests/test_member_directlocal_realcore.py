@@ -790,6 +790,7 @@ class RealCoreCliTests(unittest.TestCase):
             self.assertEqual(self.run_cli(root, "init-ledger", "--mode", "connector", "--environment", "development", "--store-gid", REAL_STORE, "--shop-domain", REAL_DOMAIN)[0], 0)
             connection = sqlite3.connect(root / "ledger.sqlite3")
             connection.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, candidate, status, created_at) VALUES ('gid://shopify/Customer/1', 1, 'M000201', 'FREE_BOUND', '2026-10-16T00:00:00Z')")
+            connection.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, candidate, status, created_at) VALUES ('gid://shopify/Customer/3', 1, NULL, 'GENERATOR_FAILED', '2026-10-16T00:00:01Z')")
             for column in ("derivation", "generator_preview"):
                 connection.execute(f"ALTER TABLE allocation_attempts DROP COLUMN {column}")
             connection.execute("PRAGMA user_version=3")
@@ -804,8 +805,8 @@ class RealCoreCliTests(unittest.TestCase):
             connection = sqlite3.connect(root / "ledger.sqlite3")
             try:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
-                row = connection.execute("SELECT candidate, status, generator_preview, derivation FROM allocation_attempts").fetchone()
-                self.assertEqual(row, ("M000201", "FREE_BOUND", None, None))
+                rows = connection.execute("SELECT candidate, status, generator_preview, derivation FROM allocation_attempts ORDER BY customer_gid").fetchall()
+                self.assertEqual(rows, [("M000201", "FREE_BOUND", None, None), (None, "GENERATOR_FAILED", None, None)])
                 after = [tuple(row) for row in connection.execute("SELECT seq, type, hash FROM events ORDER BY seq")]
                 self.assertEqual(after[:len(before)], before)
                 self.assertEqual([event[1] for event in after[len(before):]], ["ledger_schema_migrated:v4"])
@@ -814,6 +815,10 @@ class RealCoreCliTests(unittest.TestCase):
                     connection.execute("INSERT INTO allocation_attempts(customer_gid, attempt_no, created_at, derivation) VALUES ('gid://shopify/Customer/2', 1, 'x', 'guessed')")
             finally:
                 connection.close()
+            # G2 O12: the historic successful attempt is unknown provenance, the
+            # failed one simply never had a candidate; neither row is rewritten.
+            code, report = self.run_cli(root, "uat-report")
+            self.assertEqual((code, report["allocation_derivations"]), (0, {"no_candidate": 1, "unrecorded_pre_v4": 1}))
         finally:
             shutil.rmtree(holder, ignore_errors=True)
 
