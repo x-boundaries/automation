@@ -46,6 +46,8 @@ on:
       - "scripts/ac2_directlocal_owner_console.ps1"
       - "tests/test_member_directlocal_realcore.py"
       - "tests/test_directlocal_realbridge_ps.py"
+      - "tests/directlocal_acl_ci_diagnostic.py"
+      - "tests/_ci_annotated_unittest.py"
       - "docs/autocount2-automation/member_directlocal_contract.md"
       - "docs/autocount2-automation/member_directlocal_uat_runbook.md"
       - "tests/test_member_gateway_worker_static.py"
@@ -119,6 +121,8 @@ on:
       - "scripts/ac2_directlocal_owner_console.ps1"
       - "tests/test_member_directlocal_realcore.py"
       - "tests/test_directlocal_realbridge_ps.py"
+      - "tests/directlocal_acl_ci_diagnostic.py"
+      - "tests/_ci_annotated_unittest.py"
       - "docs/autocount2-automation/member_directlocal_contract.md"
       - "docs/autocount2-automation/member_directlocal_uat_runbook.md"
       - "tests/test_member_gateway_worker_static.py"
@@ -206,10 +210,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: DirectLocal state-root ACL diagnostic (sanitised classes; never fails)
+        shell: pwsh
+        run: python tests/directlocal_acl_ci_diagnostic.py
       - name: Run worker and adapter offline behavioral tests
         shell: pwsh
         run: >-
-          python -m unittest tests.test_member_gateway_worker_static
+          python tests/_ci_annotated_unittest.py tests.test_member_gateway_worker_static
           tests.test_member_gateway_worker_deployment
           tests.test_member_gateway_adapter_ps
           tests.test_member_gateway_worker_cycle_ps
@@ -217,7 +224,7 @@ jobs:
           tests.test_directlocal_bridge_ps
           tests.test_directlocal_realbridge_ps
           tests.test_member_directlocal_realcore
-          tests.test_directlocal_e7_testbook_ps -v
+          tests.test_directlocal_e7_testbook_ps
 
   bounded-import-security:
     runs-on: windows-latest
