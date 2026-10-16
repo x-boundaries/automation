@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -816,6 +817,20 @@ class CliTests(unittest.TestCase):
         self.assertTrue(set(names).difference({"test_one_shot_supervisor"}).issubset(found), found)
         with self.assertRaises(SystemExit):
             run_project_suite.build_suite({"test_no_such_module"})
+
+    def test_project_suite_runner_imports_the_package_when_run_as_the_workflow_runs_it(self) -> None:
+        """Run exactly as the workflow does (script path, project folder as cwd) on one module."""
+        project = Path(__file__).parents[1]
+        names = sorted(path.stem for path in (project / "tests").glob("test_*.py"))
+        excluded = [arg for name in names if name != "test_naming" for arg in ("--exclude-module", name)]
+        environment = {**os.environ, "PYTHONPATH": ""}
+        result = subprocess.run(
+            [sys.executable, "tests/run_project_suite.py", *excluded],
+            cwd=project, capture_output=True, text=True, check=False, env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertRegex(result.stderr, r"Ran [1-9]\d* tests")
+        self.assertNotIn("Failed to import test module", result.stderr)
 
     def test_invalid_cli_returns_contract_exit_code(self) -> None:
         self.assertEqual(main([]), 64)

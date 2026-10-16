@@ -38,7 +38,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--exclude-module", action="append", default=[], required=True)
     args = parser.parse_args(argv)
-    result = unittest.TextTestRunner(verbosity=2).run(build_suite(set(args.exclude_module)))
+    # Run as a script, Python puts tests/ first on sys.path; `python -m unittest` from the
+    # project folder puts the project folder there instead, which the package imports need.
+    sys.path.insert(0, str(TESTS_DIR.parent))
+    result =unittest.TextTestRunner(verbosity=2).run(build_suite(set(args.exclude_module)))
     return 0 if result.wasSuccessful() else 1
 
 
