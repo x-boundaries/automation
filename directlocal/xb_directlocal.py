@@ -721,7 +721,39 @@ def verify_private_state(root: Path) -> None:
             raise DirectLocalError("state_root_acl_unsafe")
 
 
-def prepare_state_root(path: str | Path, *, environ: Mapping[str, str] | None = None, runner: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+def _win_set_private_dacl(path: Path) -> None:
+    """Replace the whole DACL of ``path`` with exactly: current user, SYSTEM
+    and Administrators, full control, inheritable, protected (no inherited
+    ACEs). One SetNamedSecurityInfoW call, so no pre-existing ACE can
+    survive; hosted CI (2026-10-16) showed icacls leaving an explicit OWNER
+    RIGHTS ACE on a new directory under Python 3.12's temp tree."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG))
+    advapi32.GetSecurityDescriptorDacl.argtypes = (ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL))
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.SetNamedSecurityInfoW.argtypes = (wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    sddl = f"D:PAI(A;OICI;FA;;;{_SYSTEM_SID})(A;OICI;FA;;;{_ADMINISTRATORS_SID})(A;OICI;FA;;;{_win_current_user_sid()})"
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+        raise DirectLocalError("state_root_harden_failed")
+    try:
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)) or not present or not dacl:
+            raise DirectLocalError("state_root_harden_failed")
+        info = 0x4 | 0x80000000  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        if advapi32.SetNamedSecurityInfoW(str(path), 1, info, None, None, dacl, None) != 0:  # SE_FILE_OBJECT
+            raise DirectLocalError("state_root_harden_failed")
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def prepare_state_root(path: str | Path, *, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Create a new private state root (gate E0). The directory must not
     exist; inheritance is removed and only the current user, SYSTEM and
     Administrators are granted access. Nothing existing is modified."""
@@ -733,11 +765,7 @@ def prepare_state_root(path: str | Path, *, environ: Mapping[str, str] | None = 
         raise DirectLocalError("state_root_parent_missing")
     os.mkdir(resolved)
     if os.name == "nt":
-        icacls = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "icacls.exe")
-        grants = [f"*{sid}:(OI)(CI)F" for sid in (_win_current_user_sid(), _SYSTEM_SID, _ADMINISTRATORS_SID)]
-        done = runner([icacls, str(resolved), "/inheritance:r", "/grant:r", *grants], capture_output=True, timeout=60, check=False)
-        if done.returncode != 0:
-            raise DirectLocalError("state_root_harden_failed")
+        _win_set_private_dacl(resolved)
     else:
         os.chmod(resolved, 0o700)
     for name in ("inbox", "claims", "evidence"):

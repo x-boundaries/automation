@@ -124,6 +124,39 @@ class WindowsAclDiagnosticTests(unittest.TestCase):
         self.assertRegex(dl._win_resolve_sid("LA") or "", r"^S-1-5-21-[0-9-]+-500$")
         self.assertIsNone(dl._win_resolve_sid("ZZ"))
 
+    def test_exact_dacl_replaces_leftover_explicit_aces(self):
+        # Hosted CI 2026-10-16: an explicit OWNER RIGHTS ACE survived icacls on
+        # a new directory. The exact-DACL write must leave nothing but the
+        # three allowed principals, and the check must still refuse otherwise.
+        holder = Path(tempfile.mkdtemp(prefix="xb-directlocal-dacl-"))
+        try:
+            target = holder / "state"
+            target.mkdir()
+            for grant in ("*S-1-3-4:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)R"):
+                subprocess.run(["icacls", str(target), "/grant", grant], capture_output=True, check=True)
+            with self.assertRaises(dl.DirectLocalError):
+                dl.verify_private_state(target)
+            dl._win_set_private_dacl(target)
+            dl.verify_private_state(target)
+            classes = dl.sddl_custody_classes(dl._win_sddl(target), user_sid=dl._win_current_user_sid(), resolve=dl._win_resolve_sid)
+            self.assertEqual(sorted(a["principal"].split("(")[0] for a in classes["aces"]), ["administrators", "current_user", "system"])
+            self.assertIn("P", classes["dacl_flags"])
+        finally:
+            shutil.rmtree(holder, ignore_errors=True)
+
+    def test_prepare_under_python312_style_temp_parent(self):
+        # Parent DACL as CPython >= 3.12.4 mkdtemp writes it: protected,
+        # SYSTEM / Administrators / OWNER RIGHTS, inheritable.
+        holder = Path(tempfile.mkdtemp(prefix="xb-directlocal-312-"))
+        try:
+            subprocess.run(["icacls", str(holder), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-3-4:(OI)(CI)F"], capture_output=True, check=True)
+            root = holder / "state"
+            self.assertEqual(dl.prepare_state_root(root, environ={}), {"status": "prepared", "private": True})
+            self.assertEqual({row["verdict"] for row in dl.describe_private_state(root)}, {"private"})
+        finally:
+            subprocess.run(["icacls", str(holder), "/grant", f"*{dl._win_current_user_sid()}:(OI)(CI)F", "/T"], capture_output=True)
+            shutil.rmtree(holder, ignore_errors=True)
+
     def test_prepared_root_is_private_with_sanitised_evidence(self):
         holder = Path(tempfile.mkdtemp(prefix="xb-directlocal-acl-"))
         try:
