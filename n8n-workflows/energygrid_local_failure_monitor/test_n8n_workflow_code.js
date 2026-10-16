@@ -71,5 +71,12 @@ assert.equal(sender.type,'n8n-nodes-base.telegram');assert.equal(sender.retryOnF
 assert.equal(sender.parameters.chatId,'REPLACE_WITH_OWNER_TELEGRAM_CHAT_ID');assert.equal(sender.parameters.additionalFields.appendAttribution,false);
 assert.ok(!workflow.nodes.some(n=>n.credentials),'no credentials in the source export');
 assert.equal(workflow.connections['One Attempt Per Incident'].main[0][0].node,'Send Owner Telegram Alert');
+// The node's default is Markdown (Legacy), which eats the underscores in EG_ references and rejects an
+// unpaired one. HTML mode shows the text literally because alerts never contain <, > or &.
+assert.equal(sender.parameters.additionalFields.parse_mode,'HTML');
+const html={};const pendingAlert=report(html,'2026-10-16T04:30:00Z',pend('EG_MONITOR_PENDING_AFTER_RUN','bill-0123456789abcdef01234567'),pend())[0].json;
+let missed=[];const tick={};for(let m=0;m<=180;m+=5){missed=run('Check Missing Run (PC-On Only)',[{json:{}}],tick,at('2026-10-16T03:10:00Z')+m*60*1000);}
+for(const alert of [pendingAlert,missed[0].json]){assert.doesNotMatch(alert.subject+alert.message,/[<>&]/);}
+assert.match(pendingAlert.subject,/EG_MONITOR_PENDING_AFTER_RUN/);
 assert.equal(workflow.settings.availableInMCP,false);
 console.log('PASS: n8n Code nodes, PENDING-only alerts, incident lifecycle, missed-run PC-off policy, injection, and disabled alert gate');

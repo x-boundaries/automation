@@ -104,7 +104,8 @@
         "chatId": "REPLACE_WITH_OWNER_TELEGRAM_CHAT_ID",
         "text": "={{ $json.subject }}\n\n{{ $json.message }}",
         "additionalFields": {
-          "appendAttribution": false
+          "appendAttribution": false,
+          "parse_mode": "HTML"
         }
       },
       "id": "96e918a1-03be-5757-894c-bd7dfc2027b8",
