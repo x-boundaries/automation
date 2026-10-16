@@ -146,6 +146,10 @@ Boundedly update canonical bodies; comments hold history. Report failed/blocked 
 
 Git Completion is the scoped exception for version-control publication after requested edits. Unless asked for local-only/no-push work, validate, commit to a non-main branch, push, and open or update the PR.
 
+Task/product source changes require a non-main branch and PR. Never push task/product source to `main`.
+
+Evaluate separately authorised evidence custody only in a distinct repository whose exact identity and private visibility are independently verified. Owner authority must explicitly bind the repository, effect, ref, paths, and content; a repository name or prefix alone grants no authority. An owner-approved evidence-only ref update, including `main` in that verified private repository, is eligible only within those exact limits, with existing evidence preserved and independent readback of the resulting ref and content. Wrong or public repositories, absent authority, and task/product source adoption relabelled as evidence custody are prohibited. This rule never overrides explicit native denials or authorises retries of previously denied effects, secrets, credentials, private values, merge, install, deployment, or host permission changes.
+
 Before pushing:
 
 - Run the smallest relevant local validation.
@@ -160,13 +164,16 @@ When opening or updating a pull request:
 After pushing:
 
 - Check PR CI/status before reporting completion. If green, report completion; if pending, say it is unverified or wait when practical.
+- For GitHub CI, bind the intended repository, PR, and exact head. Prefer one tracked `gh run watch RUN_ID --repo OWNER/REPO --interval 60 --exit-status --compact` for a verified run, or `gh pr checks PR --repo OWNER/REPO --watch --interval 60` for the full PR check set.
+- Let `gh` handle polling. Suppress repetitive output, retain the watcher's terminal result, and avoid AI keepalive/status loops or duplicate watchers. Use verified completion events when supported; otherwise use the longest supported blocking wait with minimal re-entry. Respect deadlines, cancellation, disconnects, and permissions. Automatic wake and zero total Codex/OpenCode usage are not guaranteed; launch, interpretation, and timeout re-entry can consume usage.
+- Before claiming CI passed, verify the current PR head and every required check; one run may not cover them all.
 - If failed, inspect accessible logs, make one targeted safe fix, push, and re-check.
 - After two failed fix attempts, stop and report the blocker.
 - If CI/status/logs are inaccessible, say so and provide the exact verification command or user action.
 
 Never:
 
-- Push to `main`, secrets, credentials, live/runtime files, failed targeted validation, or safety-blocked changes.
+- Push task/product source to `main`, or push secrets, credentials, live/runtime files, failed targeted validation, or safety-blocked changes.
 - Claim CI passed unless checked.
 - Hide failing, pending, or inaccessible CI.
 
