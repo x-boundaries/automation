@@ -77,6 +77,55 @@ $out.pos_counter = $state.member_change_counter
 """
 
 
+# Classification of a failed reviewed login. Fake AutoCount types are compiled
+# into this throwaway process only; New-XbAutoCountSession and the assembly pin
+# check are stubbed so New-XbDlRealSession reaches its login catch offline.
+STAGE_HARNESS = r"""
+$ErrorActionPreference = "Stop"
+. $args[0]
+. $args[1]
+function Try-Code([scriptblock]$Block) { try { & $Block; return "ok" } catch { return $_.Exception.Message } }
+$out = [ordered]@{}
+$out.no_types = Get-XbDlSessionFailureStage -Book "AED_TESTINGAPI"
+Add-Type -TypeDefinition @'
+namespace AutoCount.Data {
+    public class DBSetting {
+        public static string Mode = "ok";
+        public static string LastServer;
+        public string DBName;
+        public static DBSetting CreateAutoCountDefaultDBSetting(string server, string database) {
+            LastServer = server;
+            if (Mode == "throw") { throw new System.Exception("Login failed for user 'XB' on HQ\\SQL"); }
+            DBSetting value = new DBSetting();
+            value.DBName = Mode == "other" ? "AED_OTHER" : database;
+            return value;
+        }
+        public object ExecuteScalar(string sql, object[] parameters) {
+            if (Mode == "scalar_throw") { throw new System.Exception("vendor detail"); }
+            return DBName;
+        }
+    }
+}
+namespace AutoCount.Authentication { public class UserSession { } }
+'@
+[Environment]::SetEnvironmentVariable("AC2_PROBE_SERVER_NAME", "probe-server", "Process")
+foreach ($mode in @("ok", "throw", "scalar_throw", "other")) {
+    [AutoCount.Data.DBSetting]::Mode = $mode
+    $out["stage_$mode"] = Get-XbDlSessionFailureStage -Book "AED_TESTINGAPI"
+}
+$out.server_source = [AutoCount.Data.DBSetting]::LastServer
+[AutoCount.Data.DBSetting]::Mode = "ok"
+function Assert-XbDlQualifiedAssemblies { param($Root) }
+$env:COMPUTERNAME = "DESKTOP-4I042L6"
+function New-XbAutoCountSession { param([switch]$EnableProductionAdapter) throw "autocount_session_initialization_failed" }
+$out.session_login = Try-Code { New-XbDlRealSession -Book "AED_TESTINGAPI" -AcRoot "unused" }
+function New-XbAutoCountSession { param([switch]$EnableProductionAdapter) throw "autocount_password_missing" }
+$out.session_password = Try-Code { New-XbDlRealSession -Book "AED_TESTINGAPI" -AcRoot "unused" }
+$out.session_prod = Try-Code { New-XbDlRealSession -Book "AED_XBOUNDARIES" -AcRoot "unused" }
+[Console]::Out.WriteLine(($out | ConvertTo-Json -Compress))
+"""
+
+
 def powershell() -> str | None:
     return shutil.which("powershell") or shutil.which("pwsh")
 
@@ -156,6 +205,26 @@ class RealBridgeGuardTests(unittest.TestCase):
             "book_prod": "production_book_not_authorised", "book_other": "target_book_not_authorised", "book_test": "ok",
             "pos_outlets": 1, "pos_location": "XB01", "pos_counter": 2826,
         })
+
+    def test_failed_login_stage_is_classified_without_vendor_text(self):
+        harness = self.temp / "stage_harness.ps1"
+        harness.write_text(STAGE_HARNESS, encoding="utf-8")
+        env = self.env()
+        env.pop("XB_AC2_SERVER_NAME", None)
+        proc = subprocess.run([powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness), str(ADAPTER), str(GUARD)], capture_output=True, timeout=120, check=False, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace")[-2000:])
+        out = json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
+        self.assertEqual(out, {
+            "no_types": "autocount_assembly_load_failed",
+            "stage_ok": "autocount_login_rejected", "stage_throw": "autocount_sql_connection_failed",
+            "stage_scalar_throw": "autocount_sql_connection_failed", "stage_other": "autocount_sql_book_mismatch",
+            "server_source": "probe-server",
+            "session_login": "autocount_login_rejected", "session_password": "autocount_password_missing",
+            "session_prod": "production_book_not_authorised",
+        })
+        for value in out.values():
+            self.assertIn(dl.bridge_failure_code(json.dumps({"error": value}).encode()), {f"bridge_read_failed:{value}", "bridge_read_failed"})
+            self.assertNotIn("Login failed", str(value))
 
 
 @unittest.skipUnless(powershell(), "no PowerShell executable available")

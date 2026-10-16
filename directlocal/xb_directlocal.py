@@ -1078,6 +1078,51 @@ class BridgeError(DirectLocalError):
     pass
 
 
+# Fixed codes the bridge child (and the adapter/guard it loads) may throw.
+# Only these are surfaced, as "bridge_read_failed:<code>"; anything else in a
+# failing child's output (vendor text, unknown codes, malformed lines) becomes
+# the generic "bridge_read_failed". stderr is never read.
+BRIDGE_CHILD_ERROR_CODES = frozenset({
+    "adapter_managed_defaults_are_not_caller_inputs", "autocount_adapter_disabled",
+    "autocount_assembly_load_failed", "autocount_assembly_missing", "autocount_assembly_path_invalid",
+    "autocount_assembly_path_missing", "autocount_authentication_failed",
+    "autocount_authentication_surface_missing", "autocount_build_not_qualified",
+    "autocount_connection_config_missing", "autocount_core_types_missing",
+    "autocount_login_rejected", "autocount_member_command_binding_invalid",
+    "autocount_member_field_missing", "autocount_member_field_read_only", "autocount_member_row_unavailable",
+    "autocount_new_member_failed", "autocount_password_missing", "autocount_real_bridge_disabled",
+    "autocount_session_binding_invalid", "autocount_session_factory_not_found",
+    "autocount_session_initialization_failed", "autocount_sql_book_mismatch", "autocount_sql_connection_failed",
+    "book_check_requires_real_session", "book_host_wrong", "book_identity_ambiguous", "book_identity_missing",
+    "book_identity_unverifiable", "book_identity_wrong", "bridge_failed", "bridge_input_missing",
+    "claim_create_failed", "claim_directory_invalid", "empty_string_not_null_equivalent",
+    "fence_already_claimed", "fence_binding_mismatch", "fence_id_invalid", "host_not_authorised",
+    "legacy_lookup_columns_missing", "legacy_lookup_input_invalid", "legacy_lookup_table_unavailable",
+    "member_date_invalid", "member_expiry_before_register", "member_field_not_allowed", "member_field_required",
+    "member_no_generator_failed", "member_no_invalid", "member_no_probe_failed", "member_no_required",
+    "outbound_queue_not_empty", "payload_digest_mismatch", "phone_keys_invalid", "pos_sync_state_unreadable",
+    "pos_sync_status_requires_real_session", "production_book_not_authorised", "production_book_refused",
+    "real_autocount_object_refused", "save_member_invocation_count_invalid", "session_factory_env_refused",
+    "synthetic_session_binding_invalid", "synthetic_session_marker_missing", "synthetic_session_with_target_book",
+    "target_book_not_authorised", "user_script_present", "vendor_error_telemetry_enabled",
+    "vendor_query_not_read_only", "writer_deadline_expired", "writer_deadline_invalid",
+})
+
+
+def bridge_failure_code(stdout: bytes) -> str:
+    """Map a failing child's stdout to a fixed code. Exactly one envelope shape
+    is trusted: a last line {"error": <allowlisted code>} with no other key."""
+    try:
+        envelope = json.loads(stdout.decode("utf-8").strip().splitlines()[-1])
+    except (UnicodeDecodeError, json.JSONDecodeError, IndexError):
+        return "bridge_read_failed"
+    if isinstance(envelope, dict) and set(envelope) == {"error"}:
+        code = envelope["error"]
+        if isinstance(code, str) and code in BRIDGE_CHILD_ERROR_CODES:
+            return f"bridge_read_failed:{code}"
+    return "bridge_read_failed"
+
+
 def payload_digest(salt: str, payload_canonical: str) -> str:
     return _sha256(f"{salt}:{payload_canonical}")
 
@@ -1123,7 +1168,7 @@ class BridgeClient:
             process.communicate()
             raise BridgeError("bridge_read_timeout") from None
         if process.returncode != 0:
-            raise BridgeError("bridge_read_failed")
+            raise BridgeError(bridge_failure_code(stdout))
         try:
             result = json.loads(stdout.decode("utf-8").strip().splitlines()[-1])
         except (UnicodeDecodeError, json.JSONDecodeError, IndexError):

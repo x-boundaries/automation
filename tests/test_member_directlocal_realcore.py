@@ -65,6 +65,65 @@ class RealBookFake(fx.FakeBridge):
     autocount_book = BOOK
 
 
+class _ExitedChild:
+    def __init__(self, returncode: int, stdout: bytes):
+        self.returncode = returncode
+        self._stdout = stdout
+
+    def communicate(self, _input=None, timeout=None):
+        return self._stdout, b"vendor stderr: Login failed for user 'sa' on SERVER\\SQL"
+
+
+class BridgeFailureCodeTests(unittest.TestCase):
+    """A failing child's one-line envelope is surfaced only for fixed codes."""
+
+    def read(self, returncode: int, stdout: bytes):
+        client = dl.BridgeClient(["bridge"], autocount_book=BOOK, popen=lambda *a, **k: _ExitedChild(returncode, stdout))
+        return client._read("book-check", {})
+
+    def code(self, returncode: int, stdout: bytes) -> str:
+        with self.assertRaises(dl.BridgeError) as caught:
+            self.read(returncode, stdout)
+        return caught.exception.code
+
+    def test_allowlisted_child_codes_are_surfaced(self):
+        for child in ("autocount_login_rejected", "autocount_sql_connection_failed", "autocount_session_initialization_failed", "book_identity_wrong", "bridge_failed"):
+            with self.subTest(child=child):
+                self.assertEqual(self.code(1, json.dumps({"error": child}).encode() + b"\r\n"), f"bridge_read_failed:{child}")
+        self.assertEqual(self.code(3, b'noise\n{"error":"fence_already_claimed"}\n'), "bridge_read_failed:fence_already_claimed")
+
+    def test_unknown_malformed_or_vendor_output_is_generic(self):
+        for stdout in (
+            b"", b"\n", b"not json", b"\xff\xfe", b"[]", b'"autocount_login_rejected"',
+            b'{"error":"some_new_code"}', b'{"error":"Login failed for user XB"}', b'{"error":7}',
+            b'{"error":"autocount_login_rejected","detail":"Server=HQ;User Id=XB"}',
+            b'{"error":"autocount_login_rejected"}\nLogin failed for user XB',
+            b'{"error":"AUTOCOUNT_LOGIN_REJECTED"}',
+        ):
+            with self.subTest(stdout=stdout):
+                code = self.code(1, stdout)
+                self.assertEqual(code, "bridge_read_failed")
+                self.assertNotIn("XB", code)
+
+    def test_every_surfaced_code_is_a_valid_core_code(self):
+        for child in dl.BRIDGE_CHILD_ERROR_CODES:
+            self.assertRegex(f"bridge_read_failed:{child}", dl.CODE_RE)
+
+    def test_allowlist_covers_exactly_the_child_scripts_fixed_codes(self):
+        # Drift guard: a new throw in the bridge, guard or adapter must be
+        # reviewed into the allowlist (or stays generic by design).
+        import re
+        found = set()
+        for name in ("ac2_directlocal_member_bridge.ps1", "ac2_directlocal_book_guard.ps1", "ac2_member_gateway_autocount_adapter.ps1"):
+            text = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+            found |= set(re.findall(r'(?:throw|return)\s+"([a-z0-9_]{1,64})"', text))
+        self.assertEqual(found, set(dl.BRIDGE_CHILD_ERROR_CODES))
+
+    def test_success_path_unchanged(self):
+        self.assertEqual(self.read(0, b'{"book":"AED_TESTINGAPI"}\n'), {"book": "AED_TESTINGAPI"})
+        self.assertEqual(self.code(0, b"not json"), "bridge_output_invalid")
+
+
 class SddlTests(unittest.TestCase):
     USER = "S-1-5-21-1-2-3-1001"
 

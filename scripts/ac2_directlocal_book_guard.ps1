@@ -117,6 +117,29 @@ function Get-XbDlPosSyncState {
     }
 }
 
+function Get-XbDlSessionFailureStage {
+    # Called only after the adapter's reviewed login failed. Read-only:
+    # loaded-type checks and one unauthenticated DBSetting with SELECT DB_NAME()
+    # on the pinned book. Returns a fixed code; never vendor text.
+    #   autocount_assembly_load_failed  vendor types never loaded
+    #   autocount_sql_connection_failed DBSetting to the pinned book failed
+    #   autocount_sql_book_mismatch     connected, but not to the pinned book
+    #   autocount_login_rejected        connection fine, so the login itself failed
+    param([Parameter(Mandatory)][string]$Book)
+    $dbSettingType = "AutoCount.Data.DBSetting" -as [type]
+    $userSessionType = "AutoCount.Authentication.UserSession" -as [type]
+    if ($null -eq $dbSettingType -or $null -eq $userSessionType) { return "autocount_assembly_load_failed" }
+    $server = Get-XbAutoCountRuntimeValue -Names @("XB_AC2_SERVER_NAME", "AC2_PROBE_SERVER_NAME")
+    try {
+        $factory = Find-XbAutoCountPublicStaticMethod -Type $dbSettingType -Name "CreateAutoCountDefaultDBSetting" -ParameterCount 2
+        $db = $factory.Invoke($null, @($server, $Book))
+        $name = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT DB_NAME()")
+    }
+    catch { return "autocount_sql_connection_failed" }
+    if ($name -cne $Book) { return "autocount_sql_book_mismatch" }
+    return "autocount_login_rejected"
+}
+
 function New-XbDlRealSession {
     # Every guard runs in this order; any failure stops before the next step.
     param([Parameter(Mandatory)][string]$Book, [Parameter(Mandatory)][string]$AcRoot)
@@ -126,7 +149,14 @@ function New-XbDlRealSession {
     Assert-XbDlQualifiedAssemblies -Root $AcRoot
     [Environment]::SetEnvironmentVariable("XB_AC2_DATABASE_NAME", $Book, "Process")
     [Environment]::SetEnvironmentVariable("XB_AC2_ASSEMBLY_PATH", $AcRoot, "Process")
-    $session = New-XbAutoCountSession -EnableProductionAdapter
+    try { $session = New-XbAutoCountSession -EnableProductionAdapter }
+    catch {
+        $code = [string]$_.Exception.Message
+        # The unchanged adapter folds every login-stage error into one code;
+        # classify the stage read-only (no vendor text leaves the process).
+        if ($code -ceq "autocount_session_initialization_failed") { $code = Get-XbDlSessionFailureStage -Book $Book }
+        throw $code
+    }
     # Vendor error telemetry (HTTPS to AutoCount HQ) is off unless a host sets it.
     $telemetry = "AutoCount.Application.ErrorLogClientHelper" -as [type]
     if ($null -eq $telemetry -or [bool]$telemetry::SubmitErrorLog) { throw "vendor_error_telemetry_enabled" }
