@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+import unittest
+
+from energygrid_bill_downloader.errors import OfflineV4Error
+from energygrid_bill_downloader.naming import (
+    DISPLAY_NAME_MAX_LENGTH,
+    MONTH_ABBREVIATIONS,
+    display_filename as stream_display_filename,
+    display_key,
+    display_prefix,
+    month_prefix,
+)
+from fixtures.synthetic_dual_stream import candidate
+
+EB = "OCT 2026 - EnergyGrid - EB Bill - "
+
+
+def display_filename(source, invoice_date, stream="EB_BILL"):
+    """The rule cases below use the EB stream; StreamLabelTests covers both streams."""
+    return stream_display_filename(source, invoice_date, stream=stream)
+
+
+class DisplayFilenameTests(unittest.TestCase):
+    def test_every_month_uses_the_uppercase_three_letter_abbreviation(self) -> None:
+        self.assertEqual(
+            ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"),
+            MONTH_ABBREVIATIONS,
+        )
+        for month in range(1, 13):
+            with self.subTest(month=month):
+                invoice_date = date(2026, month, 15)
+                expected = f"{MONTH_ABBREVIATIONS[month - 1]} 2026 - EnergyGrid - EB Bill - Invoice 001.pdf"
+                self.assertEqual(expected, display_filename("Invoice 001.pdf", invoice_date))
+
+    def test_prefix_is_month_then_four_digit_year_with_fixed_separator(self) -> None:
+        self.assertEqual("OCT 2026 - ", month_prefix(date(2026, 10, 13)))
+        self.assertEqual("JAN 2030 - ", month_prefix(date(2030, 1, 1)))
+
+    def test_source_name_is_kept_verbatim_after_the_prefix(self) -> None:
+        self.assertEqual(
+            EB + "Acme Inv #12 (rev).pdf",
+            display_filename("Acme Inv #12 (rev).pdf", date(2026, 10, 1)),
+        )
+
+    def test_extension_is_preserved_exactly(self) -> None:
+        self.assertEqual(EB + "invoice.PDF", display_filename("invoice.PDF", date(2026, 10, 1)))
+
+    def test_already_prefixed_name_is_not_prefixed_again(self) -> None:
+        self.assertEqual(
+            EB + "invoice.pdf",
+            display_filename("OCT 2026 - invoice.pdf", date(2026, 10, 1)),
+        )
+
+    def test_already_prefixed_name_in_other_letter_case_is_normalised_to_uppercase(self) -> None:
+        self.assertEqual(
+            EB + "invoice.pdf",
+            display_filename("oct 2026 - invoice.pdf", date(2026, 10, 1)),
+        )
+
+    def test_doubled_prefix_is_refused(self) -> None:
+        with self.assertRaises(OfflineV4Error) as caught:
+            display_filename("OCT 2026 - OCT 2026 - invoice.pdf", date(2026, 10, 1))
+        self.assertEqual("EG_V4_DISPLAY_PREFIX_CONFLICT", caught.exception.support_ref)
+
+    def test_other_month_prefix_is_a_conflict_not_a_second_prefix(self) -> None:
+        with self.assertRaises(OfflineV4Error) as caught:
+            display_filename("SEP 2026 - invoice.pdf", date(2026, 10, 1))
+        self.assertEqual("EG_V4_DISPLAY_PREFIX_CONFLICT", caught.exception.support_ref)
+
+    def test_other_year_prefix_is_a_conflict(self) -> None:
+        with self.assertRaises(OfflineV4Error) as caught:
+            display_filename("OCT 2025 - invoice.pdf", date(2026, 10, 1))
+        self.assertEqual("EG_V4_DISPLAY_PREFIX_CONFLICT", caught.exception.support_ref)
+
+    def test_text_that_is_not_a_month_prefix_is_content_and_gets_one_prefix(self) -> None:
+        self.assertEqual(
+            EB + "XYZ 2026 - invoice.pdf",
+            display_filename("XYZ 2026 - invoice.pdf", date(2026, 10, 1)),
+        )
+
+    def test_leading_whitespace_is_refused_so_a_doubled_prefix_cannot_slip_past(self) -> None:
+        with self.assertRaises(OfflineV4Error) as caught:
+            display_filename(" OCT 2026 - invoice.pdf", date(2026, 10, 1))
+        self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
+
+    def test_doubled_prefix_hidden_by_spacing_is_refused_for_ascii_names(self) -> None:
+        refused = {
+            "OCT 2026 -  OCT 2026 - invoice.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "Jan 2026 - Electricity.pdf": "EG_V4_DISPLAY_PREFIX_CONFLICT",
+            "Bill\x7fx.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            "OCT\t2026 - invoice.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+        }
+        for source, support_ref in refused.items():
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 1))
+            self.assertEqual(support_ref, caught.exception.support_ref)
+
+    def test_non_ascii_source_names_are_a_typed_shape_hold_never_a_guess(self) -> None:
+        for source in (
+            "OCT 2026 -\u00a0OCT 2026 - invoice.pdf",
+            "OCT 2026 - \u200bSEP 2026 - invoice.pdf",
+            "\u200bOCT 2026 - invoice.pdf",
+            "Caf\u00e9.pdf",
+            "OCT 2026 - OCT 2026 \u2013 invoice.pdf",
+        ):
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 1))
+            self.assertEqual("EG_V4_DISPLAY_SHAPE_UNSUPPORTED", caught.exception.support_ref)
+
+    def test_m14_embedded_and_leading_month_year_shapes_are_an_ambiguous_prefix_conflict(self) -> None:
+        # #226 v4 correction F4: never guess the intended original name.
+        refused = (
+            "Invoice OCT 2026 - EB.pdf",      # embedded canonical token
+            "x OCT 2026 - y.pdf",             # embedded canonical token
+            "x oct 2026 - y.pdf",             # embedded token in another letter case
+            "Bill SEP 2025 - y.pdf",          # embedded token for another period
+            "OCT 2026 invoice.pdf",           # leading month and year without the canonical separator
+            "OCTOBER 2026 - x.pdf",           # full month name
+            "October-2026 x.pdf",             # full month name, other separator and case
+            "SEPT 2026 - x.pdf",              # SEPT
+            "Sept_2026.pdf",                  # SEPT with an underscore
+            "OCT 2026 - OCT2026 x.pdf",       # remainder after the accepted prefix starts with a month-year
+            "OCT2026-invoice.pdf",            # no separator before the year
+            "JUNE2026.pdf",                   # full month name without a separator
+            "oct 2026 - SEP 2026 - x.pdf",    # doubled prefix with a different second period
+        )
+        for source in refused:
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 5))
+            self.assertEqual("EG_V4_DISPLAY_PREFIX_CONFLICT", caught.exception.support_ref)
+
+    def test_m14_positive_controls_get_exactly_one_canonical_prefix(self) -> None:
+        import re
+
+        token = re.compile(r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC) [0-9]{4} - ", re.IGNORECASE)
+        accepted = {
+            "XYZ 2026 - invoice.pdf": EB + "XYZ 2026 - invoice.pdf",
+            "Invoice Oct.pdf": EB + "Invoice Oct.pdf",
+            "Octopus 2026.pdf": EB + "Octopus 2026.pdf",
+            "10-2026 invoice.pdf": EB + "10-2026 invoice.pdf",
+            "oct 2026 - x.pdf": EB + "x.pdf",
+            "Mayfair 2026.pdf": EB + "Mayfair 2026.pdf",
+            "invoice.pdf": EB + "invoice.pdf",
+        }
+        for source, expected in accepted.items():
+            with self.subTest(source=source):
+                shown = display_filename(source, date(2026, 10, 5))
+                self.assertEqual(expected, shown)
+                self.assertEqual(1, len(token.findall(shown)))
+                self.assertTrue(shown.startswith(EB))
+
+    def test_m14_invalid_and_non_ascii_classifications_are_preserved(self) -> None:
+        cases = {
+            "Rechnung \u00f6.pdf": "EG_V4_DISPLAY_SHAPE_UNSUPPORTED",
+            "OCT 2026 - \u00f6.pdf": "EG_V4_DISPLAY_SHAPE_UNSUPPORTED",
+            "a\x7fb.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+            " lead.pdf": "EG_V4_DISPLAY_NAME_INVALID",
+        }
+        for source, support_ref in cases.items():
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 5))
+            self.assertEqual(support_ref, caught.exception.support_ref)
+
+    def test_invalid_source_and_date_types_are_refused(self) -> None:
+        cases = (
+            (lambda: display_filename("", date(2026, 10, 1)), "EG_V4_DISPLAY_SOURCE_INVALID"),
+            (lambda: display_filename(None, date(2026, 10, 1)), "EG_V4_DISPLAY_SOURCE_INVALID"),
+            (lambda: display_filename("invoice.pdf", "2026-10-01"), "EG_V4_DISPLAY_DATE_INVALID"),
+            (lambda: display_filename("invoice.pdf", datetime(2026, 10, 1)), "EG_V4_DISPLAY_DATE_INVALID"),
+        )
+        for call, support_ref in cases:
+            with self.subTest(support_ref=support_ref), self.assertRaises(OfflineV4Error) as caught:
+                call()
+            self.assertEqual(support_ref, caught.exception.support_ref)
+
+    def test_names_with_path_or_control_characters_are_refused(self) -> None:
+        for source in ("a/b.pdf", "a\\b.pdf", "a:b.pdf", "a*b.pdf", "a\x01b.pdf", "a?b.pdf"):
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 1))
+            self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
+
+    def test_name_without_a_pdf_extension_or_with_an_empty_stem_is_refused(self) -> None:
+        for source in ("invoice.txt", ".pdf", "OCT 2026 - .pdf", "   .pdf", "invoice.pdf."):
+            with self.subTest(source=source), self.assertRaises(OfflineV4Error) as caught:
+                display_filename(source, date(2026, 10, 1))
+            self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
+
+    def test_length_limit_is_inclusive_and_never_truncates(self) -> None:
+        prefix_length = len(display_prefix(date(2026, 10, 1), "EB_BILL"))
+        fits = "a" * (DISPLAY_NAME_MAX_LENGTH - prefix_length - len(".pdf")) + ".pdf"
+        self.assertEqual(DISPLAY_NAME_MAX_LENGTH, len(display_filename(fits, date(2026, 10, 1))))
+        too_long = fits[:-len(".pdf")] + "a.pdf"
+        with self.assertRaises(OfflineV4Error) as caught:
+            display_filename(too_long, date(2026, 10, 1))
+        self.assertEqual("EG_V4_DISPLAY_NAME_INVALID", caught.exception.support_ref)
+
+
+class StreamLabelTests(unittest.TestCase):
+    def test_owner_format_names_the_month_brand_stream_and_original_file(self) -> None:
+        # Owner naming decision (#226 V3 G1 UAT): `MMM YYYY - EnergyGrid - <stream> - <original>`.
+        self.assertEqual(
+            "AUG 2026 - EnergyGrid - EB Bill - 2026-08-26_ACCOUNT_00001.pdf",
+            stream_display_filename("2026-08-26_ACCOUNT_00001.pdf", date(2026, 8, 26), stream="EB_BILL"),
+        )
+        self.assertEqual(
+            "AUG 2026 - EnergyGrid - Tenant Bill - 2026-08-26_T0001.pdf",
+            stream_display_filename("2026-08-26_T0001.pdf", date(2026, 8, 26), stream="TENANT_BILL"),
+        )
+
+    def test_unknown_or_missing_stream_is_refused(self) -> None:
+        for stream in ("EB", "eb_bill", "", None, 1):
+            with self.subTest(stream=stream), self.assertRaises(OfflineV4Error) as caught:
+                stream_display_filename("invoice.pdf", date(2026, 10, 1), stream=stream)
+            self.assertEqual("EG_V4_DISPLAY_STREAM_INVALID", caught.exception.support_ref)
+        with self.assertRaises(TypeError):
+            stream_display_filename("invoice.pdf", date(2026, 10, 1))
+
+    def test_labels_match_the_invoice_stream_labels(self) -> None:
+        from energygrid_bill_downloader import invoice, naming
+
+        self.assertEqual({str(k): v for k, v in invoice.STREAM_LABELS.items()}, naming.STREAM_LABELS)
+
+    def test_same_source_name_on_two_streams_gives_two_different_names(self) -> None:
+        eb = stream_display_filename("invoice.pdf", date(2026, 10, 1), stream="EB_BILL")
+        tenant = stream_display_filename("invoice.pdf", date(2026, 10, 1), stream="TENANT_BILL")
+        self.assertNotEqual(display_key(eb), display_key(tenant))
+
+
+class DisplayKeyTests(unittest.TestCase):
+    def test_collision_key_ignores_letter_case_and_unicode_composition(self) -> None:
+        self.assertEqual(display_key("OCT 2026 - Invoice.pdf"), display_key("oct 2026 - invoice.pdf"))
+        self.assertEqual(display_key("Café.pdf"), display_key("Café.pdf"))
+
+    def test_collision_key_refuses_empty_input(self) -> None:
+        with self.assertRaises(OfflineV4Error):
+            display_key("")
+
+
+class CanonicalIdentityTests(unittest.TestCase):
+    def test_archive_identity_stays_date_only_while_presentation_gets_the_prefix(self) -> None:
+        item = candidate(name="Invoice 001.PDF", invoice_date="2026-10-01")
+        self.assertEqual("2026-10-01.pdf", item.canonical_filename)
+        self.assertEqual(EB + "Invoice 001.PDF", display_filename(item.source_filename, item.invoice_date))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .errors import ConfigError
+from .errors import ConfigError, OfflineV4Error
 
 
 MIN_TIMEOUT_SECONDS = 1
@@ -670,3 +670,15 @@ def _bounded_int(value: Any, minimum: int, maximum: int, label: str) -> int:
     if not minimum <= converted <= maximum:
         raise ConfigError(f"{label} is outside its allowed bounds")
     return converted
+
+
+# #226 G3 offline dual-stream v4: fake providers only. Live provider enablement
+# is not implemented in this slice, so no profile value and no setting can turn
+# it on. The offline core calls assert_offline_fake_profile before any work.
+OFFLINE_FAKE_PROVIDER_PROFILE = "OFFLINE_FAKE_V4"
+LIVE_PROVIDER_PROFILE_ENABLED = False
+
+
+def assert_offline_fake_profile(profile: object) -> None:
+    if LIVE_PROVIDER_PROFILE_ENABLED is not False or profile != OFFLINE_FAKE_PROVIDER_PROFILE:
+        raise OfflineV4Error("EG_V4_LIVE_PROFILE_REFUSED")

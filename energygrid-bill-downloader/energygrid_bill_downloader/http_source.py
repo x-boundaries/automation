@@ -390,7 +390,148 @@ def _build_opener() -> urllib.request.OpenerDirector:
     )
 
 
-class DirectHttpSource:
+class StrictPostTransport:
+    """The bounded, strictly framed POST transport shared by the bill sources.
+
+    Subclasses add the protocol. Retries cover transient transport failures only.
+    """
+
+    def __init__(
+        self,
+        timeout_seconds: float,
+        max_attempts: int,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delay_seconds: float | None = None,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self._timeout = timeout_seconds
+        self._max_attempts = max_attempts
+        self._sleep = sleep
+        # Read at construction so tests may patch the module constant.
+        self._retry_delay = RETRY_DELAY_SECONDS if retry_delay_seconds is None else retry_delay_seconds
+        self._opener = _build_opener()
+
+    # ------------------------------------------------------------- transport
+
+    def _post(
+        self,
+        url: str,
+        payload: dict[str, str],
+        *,
+        accept: str,
+        max_bytes: int,
+        stage: str,
+        oversize_ref: str,
+        count: Callable[[], None],
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, str]:
+        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        for attempt in range(1, self._max_attempts + 1):
+            count()
+            try:
+                return self._attempt(url, data, accept, max_bytes, stage, oversize_ref, extra_headers)
+            except _Transient:
+                if attempt >= self._max_attempts:
+                    raise SourceTransportError(REF_TRANSPORT_EXHAUSTED, stage=stage) from None
+                self._sleep(self._retry_delay * attempt)
+        raise SourceTransportError(REF_TRANSPORT_EXHAUSTED, stage=stage)  # pragma: no cover
+
+    def _attempt(
+        self,
+        url: str,
+        data: bytes,
+        accept: str,
+        max_bytes: int,
+        stage: str,
+        oversize_ref: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, str]:
+        headers = {"Content-Type": "application/json", "Accept": accept, "User-Agent": USER_AGENT}
+        for name, value in (extra_headers or {}).items():
+            # Extra headers add protocol fields only; they never replace the fixed ones.
+            if name.lower() in {key.lower() for key in headers}:
+                raise ValueError("extra header may not replace a fixed header")
+            headers[name] = value
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        try:
+            response = self._opener.open(request, timeout=self._timeout)
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            exc.close()
+            if code in RETRYABLE_HTTP_STATUSES:
+                raise _Transient() from None
+            if 300 <= code < 400:
+                raise SourceContractError(REF_REDIRECT_REFUSED, stage=stage) from None
+            raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage) from None
+        except ssl.SSLError:
+            # A certificate or TLS failure is host/identity drift, never transient.
+            raise SourceContractError(REF_TLS_REFUSED, stage=stage) from None
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (ssl.SSLError, ssl.CertificateError)):
+                raise SourceContractError(REF_TLS_REFUSED, stage=stage) from None
+            # Connection refused/reset, DNS failure and timeout before headers.
+            raise _Transient() from None
+        except (OSError, http.client.RemoteDisconnected):
+            raise _Transient() from None
+        except http.client.HTTPException:
+            raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+        with response:
+            if response.status != 200:
+                raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage)
+            try:
+                if not isinstance(response, _StrictHTTPResponse):
+                    raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+                response.verify_admission()
+            except http.client.HTTPException:
+                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+            content_type = response.headers.get("Content-Type", "")
+            transfer_encodings = response.headers.get_all("Transfer-Encoding", [])
+            content_lengths = response.headers.get_all("Content-Length", [])
+            chunked = response.chunked
+            expected: int | None = None
+            if transfer_encodings:
+                if (
+                    content_lengths
+                    or len(transfer_encodings) != 1
+                    or transfer_encodings[0].strip(" \t").lower() != "chunked"
+                    or not chunked
+                    or response.length is not None
+                ):
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+            else:
+                if chunked or len(content_lengths) != 1:
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
+                # HTTP optional whitespace is limited to ASCII SP and HTAB.
+                # Generic str.strip() also removes Unicode whitespace and
+                # other controls, which could normalize an invalid field.
+                length_value = content_lengths[0].strip(" \t")
+                if not length_value.isascii() or not length_value.isdecimal():
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+                try:
+                    expected = int(length_value)
+                except ValueError:
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+                if expected > max_bytes:
+                    raise SourceContractError(oversize_ref, stage=stage)
+                if response.length != expected:
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
+            try:
+                body = response.read(max_bytes + 1)
+            except http.client.IncompleteRead:
+                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+            except (socket.timeout, TimeoutError, ConnectionError):
+                raise _Transient() from None
+            except (OSError, http.client.HTTPException):
+                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+            if len(body) > max_bytes:
+                raise SourceContractError(oversize_ref, stage=stage)
+            if expected is not None and len(body) != expected:
+                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
+            return body, content_type
+
+
+class DirectHttpSource(StrictPostTransport):
     def __init__(
         self,
         settings: DirectHttpSettings,
@@ -399,15 +540,8 @@ class DirectHttpSource:
         sleep: Callable[[float], None] = time.sleep,
         retry_delay_seconds: float | None = None,
     ) -> None:
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
+        super().__init__(timeout_seconds, max_attempts, sleep, retry_delay_seconds)
         self._settings = settings
-        self._timeout = timeout_seconds
-        self._max_attempts = max_attempts
-        self._sleep = sleep
-        # Read at construction so tests may patch the module constant.
-        self._retry_delay = RETRY_DELAY_SECONDS if retry_delay_seconds is None else retry_delay_seconds
-        self._opener = _build_opener()
         # Bookkeeping for evidence and tests: operation attempt counts only.
         self.list_calls = 0
         self.fetch_calls = 0
@@ -497,120 +631,11 @@ class DirectHttpSource:
             handle.write(body)
         return row.filename
 
-    # ------------------------------------------------------------- transport
-
     def _count(self, operation: str) -> None:
         if operation == "list":
             self.list_calls += 1
         else:
             self.fetch_calls += 1
-
-    def _post(
-        self,
-        url: str,
-        payload: dict[str, str],
-        *,
-        accept: str,
-        max_bytes: int,
-        stage: str,
-        oversize_ref: str,
-        count: Callable[[], None],
-    ) -> tuple[bytes, str]:
-        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-        for attempt in range(1, self._max_attempts + 1):
-            count()
-            try:
-                return self._attempt(url, data, accept, max_bytes, stage, oversize_ref)
-            except _Transient:
-                if attempt >= self._max_attempts:
-                    raise SourceTransportError(REF_TRANSPORT_EXHAUSTED, stage=stage) from None
-                self._sleep(self._retry_delay * attempt)
-        raise SourceTransportError(REF_TRANSPORT_EXHAUSTED, stage=stage)  # pragma: no cover
-
-    def _attempt(
-        self, url: str, data: bytes, accept: str, max_bytes: int, stage: str, oversize_ref: str
-    ) -> tuple[bytes, str]:
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/json", "Accept": accept, "User-Agent": USER_AGENT},
-        )
-        try:
-            response = self._opener.open(request, timeout=self._timeout)
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-            exc.close()
-            if code in RETRYABLE_HTTP_STATUSES:
-                raise _Transient() from None
-            if 300 <= code < 400:
-                raise SourceContractError(REF_REDIRECT_REFUSED, stage=stage) from None
-            raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage) from None
-        except ssl.SSLError:
-            # A certificate or TLS failure is host/identity drift, never transient.
-            raise SourceContractError(REF_TLS_REFUSED, stage=stage) from None
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, (ssl.SSLError, ssl.CertificateError)):
-                raise SourceContractError(REF_TLS_REFUSED, stage=stage) from None
-            # Connection refused/reset, DNS failure and timeout before headers.
-            raise _Transient() from None
-        except (OSError, http.client.RemoteDisconnected):
-            raise _Transient() from None
-        except http.client.HTTPException:
-            raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-        with response:
-            if response.status != 200:
-                raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage)
-            try:
-                if not isinstance(response, _StrictHTTPResponse):
-                    raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
-                response.verify_admission()
-            except http.client.HTTPException:
-                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-            content_type = response.headers.get("Content-Type", "")
-            transfer_encodings = response.headers.get_all("Transfer-Encoding", [])
-            content_lengths = response.headers.get_all("Content-Length", [])
-            chunked = response.chunked
-            expected: int | None = None
-            if transfer_encodings:
-                if (
-                    content_lengths
-                    or len(transfer_encodings) != 1
-                    or transfer_encodings[0].strip(" \t").lower() != "chunked"
-                    or not chunked
-                    or response.length is not None
-                ):
-                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-            else:
-                if chunked or len(content_lengths) != 1:
-                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
-                # HTTP optional whitespace is limited to ASCII SP and HTAB.
-                # Generic str.strip() also removes Unicode whitespace and
-                # other controls, which could normalize an invalid field.
-                length_value = content_lengths[0].strip(" \t")
-                if not length_value.isascii() or not length_value.isdecimal():
-                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-                try:
-                    expected = int(length_value)
-                except ValueError:
-                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-                if expected > max_bytes:
-                    raise SourceContractError(oversize_ref, stage=stage)
-                if response.length != expected:
-                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
-            try:
-                body = response.read(max_bytes + 1)
-            except http.client.IncompleteRead:
-                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-            except (socket.timeout, TimeoutError, ConnectionError):
-                raise _Transient() from None
-            except (OSError, http.client.HTTPException):
-                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-            if len(body) > max_bytes:
-                raise SourceContractError(oversize_ref, stage=stage)
-            if expected is not None and len(body) != expected:
-                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
-            return body, content_type
 
 
 def _media_type(content_type: str) -> str:

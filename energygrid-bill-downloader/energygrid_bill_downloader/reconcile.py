@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 import re
 import uuid
 
@@ -22,6 +22,7 @@ from .errors import (
     ArchiveConflictError,
     ConfigError,
     InvalidPdfError,
+    OfflineV4Error,
     SUPPORT_REF_PATTERN,
     SourceContractError,
     StateError,
@@ -1349,3 +1350,212 @@ def _is_fully_handled(config, state, drive, invoice: dict | None) -> bool:
         and delivery_row.get("byte_size") == invoice["byte_size"]
         and delivery_row.get("sha256") == invoice["sha256"]
     )
+
+
+# ---------------------------------------------------------------------------
+# #226 G3 offline dual-stream v4: admit at most one new latest invoice per stream.
+# ---------------------------------------------------------------------------
+
+def _v4_support_ref(error: BaseException, fallback: str) -> str:
+    ref = getattr(error, "support_ref", None)
+    if type(ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, ref) is not None:
+        return ref
+    return fallback
+
+
+def _v4_admission_status(support_ref: str) -> str:
+    """Every display fault of a current candidate is a HOLD; other admission refusals stay REFUSED."""
+    return "HOLD" if support_ref.startswith("EG_V4_DISPLAY_") else "ADMISSION_REFUSED"
+
+
+def _adopt_predecessor_latest(state, archive_root: Path, stream: str, invoice: dict, run_id: str, now_iso: str):
+    """Validate the predecessor archive and adopt it as one v4 delivery. Returns (status, support_ref).
+
+    No portal call and no archive write. Every failure is a HOLD for this stream, and nothing is sent.
+    An invoice adopted by an earlier run is ADOPTED_EARLIER before any archive I/O: the archive is not
+    read again here, so a later change to it cannot stop a newer invoice. A pending adopted delivery
+    still has its exact bytes checked at send time (orchestration._v4_perform).
+    """
+    from datetime import date
+
+    from .naming import display_filename
+
+    if state.adopted_predecessor(stream, invoice["invoice_id"]) is not None:
+        return ("ADOPTED_EARLIER", None)
+    try:
+        path = _canonical_path(archive_root, stream, invoice["canonical_filename"])
+        ensure_no_reparse_components(path)
+        info = validate_pdf(path)
+    except (AppError, OSError):
+        return ("HOLD", "EG_V4_PREDECESSOR_ARCHIVE_UNREADABLE")
+    if (info.sha256, info.byte_size) != (invoice["sha256"], invoice["byte_size"]):
+        return ("HOLD", "EG_V4_PREDECESSOR_ARCHIVE_IDENTITY_MISMATCH")
+    try:
+        presentation = display_filename(invoice["source_filename"], date.fromisoformat(invoice["bill_date"]), stream=stream)
+        created = state.adopt_predecessor_latest(
+            stream, invoice_id=invoice["invoice_id"], display_filename=presentation,
+            sha256=info.sha256, byte_size=info.byte_size, run_id=run_id, now_iso=now_iso,
+        )
+    except OfflineV4Error as exc:
+        if exc.support_ref == "EG_V4_LEASE_LOST":
+            raise
+        return ("HOLD", exc.support_ref)
+    return ("ADOPTED", None) if created else ("ADOPTED_EARLIER", None)
+
+
+def admit_latest_offline_v4(
+    *,
+    adapters: dict[str, Any],
+    state,
+    archive_root: Path,
+    temp_root: Path,
+    run_id: str,
+    now_iso: str,
+    inventory_ceiling: int,
+    checkpoint: Callable[[str], None] | None = None,
+) -> dict[str, dict[str, str | None]]:
+    """Admit the latest invoice of each stream, offline only (#226 G3).
+
+    A portal or fetch failure is recorded against its stream and never stops the
+    drain of invoices admitted earlier. Nothing here touches Drive or email.
+    The archive is published before its admission row, so a crash between the two
+    leaves a byte-identical file that the next run reuses without a second copy.
+    """
+    from .invoice import InventorySnapshot, Stream
+    from .state import V4_STREAMS
+
+    hook = checkpoint or (lambda name: None)
+    ensure_no_reparse_components(archive_root)
+    ensure_no_reparse_components(temp_root)
+    results: dict[str, dict[str, str | None]] = {}
+    predecessor: dict[str, str] = {}
+
+    def outcome(status: str, support_ref: str | None = None) -> dict[str, str | None]:
+        return {"status": status, "support_ref": support_ref}
+
+    for stream in V4_STREAMS:
+        adapter = adapters.get(stream)
+        if adapter is None:
+            results[stream] = outcome("ADAPTER_UNAVAILABLE", "EG_V4_ADAPTER_UNAVAILABLE")
+            continue
+        predecessor_latest = state.predecessor_latest(stream)
+        predecessor[stream] = predecessor_latest["status"]
+        handled = None
+        handled_outcome = "ALREADY_ADMITTED"
+        if predecessor_latest["status"] == "HOLD":
+            results[stream] = outcome("HOLD", predecessor_latest["support_ref"])
+            continue
+        if predecessor_latest["status"] == "DELIVERED":
+            handled = predecessor_latest["invoice"]
+            handled_outcome = "PREDECESSOR_DELIVERED"
+        elif predecessor_latest["status"] == "ADOPTABLE":
+            adoption_status, adoption_ref = _adopt_predecessor_latest(
+                state, archive_root, stream, predecessor_latest["invoice"], run_id, now_iso
+            )
+            predecessor[stream] = adoption_status
+            if adoption_status == "HOLD":
+                results[stream] = outcome("HOLD", adoption_ref)
+                continue
+            handled = predecessor_latest["invoice"]
+        state.assert_lease_held()
+        try:
+            snapshot = adapter.inventory(inventory_ceiling)
+        except Exception as exc:
+            results[stream] = outcome("PORTAL_ACQUISITION_FAILED", _v4_support_ref(exc, "EG_V4_PORTAL_ACQUISITION_FAILED"))
+            continue
+        if (
+            not isinstance(snapshot, InventorySnapshot)
+            or snapshot.stream is not Stream(stream)
+            or len(snapshot.candidates) > inventory_ceiling
+        ):
+            results[stream] = outcome("INVENTORY_INVALID", "EG_V4_INVENTORY_INVALID")
+            continue
+        if not snapshot.candidates:
+            results[stream] = outcome("EMPTY")
+            continue
+        latest_day = max(item.day_ordinal for item in snapshot.candidates)
+        latest = [item for item in snapshot.candidates if item.day_ordinal == latest_day]
+        if len(latest) != 1:
+            results[stream] = outcome("LATEST_AMBIGUOUS", "EG_V4_LATEST_AMBIGUOUS")
+            continue
+        candidate = latest[0]
+        if handled is not None and (candidate.source_invoice_key, candidate.canonical_filename) == (
+            handled["source_invoice_key"], handled["canonical_filename"]
+        ):
+            # The portal's latest is the predecessor invoice already handled above: no fetch, no second copy.
+            results[stream] = outcome(handled_outcome)
+            continue
+        try:
+            decision, presentation = state.check_admissible(
+                stream=stream,
+                source_namespace=snapshot.source_namespace,
+                source_invoice_key=candidate.source_invoice_key,
+                source_filename=candidate.source_filename,
+                canonical_filename=candidate.canonical_filename,
+                invoice_date=candidate.invoice_date,
+            )
+        except OfflineV4Error as exc:
+            # A display fault of the current latest is a typed stream HOLD; nothing is fetched. Not sticky.
+            results[stream] = outcome(_v4_admission_status(exc.support_ref), exc.support_ref)
+            continue
+        if decision == "ALREADY_ADMITTED":
+            results[stream] = outcome("ALREADY_ADMITTED")
+            continue
+
+        temp_dir = create_run_directory(temp_root, run_id)
+        try:
+            fetched = temp_dir / f"{stream.lower()}-latest.pdf"
+            hook("before_fetch")
+            state.assert_lease_held()
+            try:
+                adapter.acquire(candidate, fetched)
+            except Exception as exc:
+                results[stream] = outcome("FETCH_FAILED", _v4_support_ref(exc, "EG_V4_FETCH_FAILED"))
+                continue
+            try:
+                info = validate_pdf(fetched)
+            except AppError:
+                results[stream] = outcome("INVALID_PDF", "EG_V4_INVALID_PDF")
+                continue
+            hook("after_fetch")
+            destination = _canonical_path(archive_root, stream, candidate.canonical_filename)
+            ensure_no_reparse_components(destination)
+            if destination.exists():
+                try:
+                    existing = validate_pdf(destination)
+                except AppError:
+                    results[stream] = outcome("ARCHIVE_CONFLICT", "EG_V4_ARCHIVE_CONFLICT")
+                    continue
+                if (existing.sha256, existing.byte_size) != (info.sha256, info.byte_size):
+                    results[stream] = outcome("ARCHIVE_CONFLICT", "EG_V4_ARCHIVE_CONFLICT")
+                    continue
+            else:
+                state.assert_lease_held()
+                try:
+                    publish_no_replace(fetched, destination)
+                except AppError:
+                    results[stream] = outcome("ARCHIVE_PUBLISH_FAILED", "EG_V4_ARCHIVE_PUBLISH_FAILED")
+                    continue
+            hook("after_archive")
+            _row, created = state.admit_invoice(
+                stream=stream,
+                source_namespace=snapshot.source_namespace,
+                source_invoice_key=candidate.source_invoice_key,
+                invoice_date=candidate.invoice_date,
+                display_filename=presentation,
+                sha256=info.sha256,
+                byte_size=info.byte_size,
+                run_id=run_id,
+                now_iso=now_iso,
+            )
+            hook("after_admission")
+            results[stream] = outcome("ADMITTED" if created else "ALREADY_ADMITTED")
+        except OfflineV4Error as exc:
+            if exc.support_ref == "EG_V4_LEASE_LOST":
+                raise
+            results[stream] = outcome(_v4_admission_status(exc.support_ref), exc.support_ref)
+        finally:
+            cleanup_run_directory(temp_dir, temp_root)
+    for stream, row in results.items():
+        row["predecessor"] = predecessor.get(stream, "NONE")
+    return results
