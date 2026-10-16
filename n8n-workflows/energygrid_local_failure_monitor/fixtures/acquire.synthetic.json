@@ -1,0 +1,10 @@
+{
+  "schema": "energygrid.native.v4.result.v1",
+  "command": "acquire",
+  "outcome": "ACQUIRED",
+  "run_id": "12345678-1234-1234-1234-123456789abc",
+  "acquisition": {
+    "EB_BILL": {"status": "ALREADY_ADMITTED"},
+    "TENANT_BILL": {"status": "LOGIN_FAILED", "support_ref": "EG_TENANT_AUTH_FAILED"}
+  }
+}
