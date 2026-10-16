@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -676,6 +677,160 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
         self.assertIn("not applicable", result.stdout)
+
+    # ---- #226: supervisor custody applicability routing ---- #
+    #
+    # The hosted supervisor custody tests bind an exact approved candidate branch. A shared
+    # trigger (for example n8n-workflows/README.md in the #249 monitor PR) or any other
+    # non-supervisor change must run every other suite without them, while a change to the
+    # supervisor or its protected harness still runs them and stays branch-bound. These cases
+    # execute the COMMITTED decision logic, as the scope-guard cases above do.
+
+    def _supervisor_custody_case(self, changed: list[str], event: str = "pull_request") -> bool:
+        workflow = (
+            Path(__file__).parents[2] / ".github" / "workflows"
+            / "energygrid-bill-downloader-tests.yml"
+        ).read_text(encoding="utf-8")
+        lines = workflow.splitlines()
+        start = next(
+            index for index, line in enumerate(lines)
+            if line.strip() == "- name: Decide supervisor custody applicability"
+        )
+        run_at = next(index for index in range(start, len(lines)) if lines[index].strip() == "run: |")
+        body: list[str] = []
+        for line in lines[run_at + 1:]:
+            if line.strip() and (len(line) - len(line.lstrip(" "))) <= 8:
+                break
+            body.append(line[10:])
+        decision = [
+            line for line in body
+            if not line.startswith("$base = ")
+            and not line.startswith("$files = @(git ")
+            and not line.startswith("if ($LASTEXITCODE")
+            and "GITHUB_OUTPUT" not in line
+        ]
+        self.assertEqual(len(body) - len(decision), 5, "only data-gathering and output lines are dropped")
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if shell is None:  # pragma: no cover - no PowerShell host available
+            self.skipTest("a PowerShell host is required to run the committed decision")
+        listing = ",".join("'{}'".format(path) for path in changed)
+        script = "$env:EVENT_NAME = '{}'\n$files = @({})\n{}\nWrite-Output \"RESULT=$value\"".format(
+            event, listing, "\n".join(decision)
+        )
+        result = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        verdicts = [line for line in result.stdout.splitlines() if line.startswith("RESULT=")]
+        self.assertEqual(len(verdicts), 1, result.stdout)
+        return verdicts[0] == "RESULT=true"
+
+    def test_monitor_only_readme_change_does_not_run_supervisor_custody(self) -> None:
+        """PR #249's shape: n8n README plus the monitor package."""
+        self.assertFalse(self._supervisor_custody_case([
+            "n8n-workflows/README.md",
+            "n8n-workflows/energygrid_local_failure_monitor.workflow.json",
+            "n8n-workflows/energygrid_local_failure_monitor/energygrid_monitor_report.py",
+        ]))
+        self.assertFalse(self._supervisor_custody_case(["n8n-workflows/README.md"]))
+
+    def test_core_and_ci_routing_changes_do_not_run_supervisor_custody(self) -> None:
+        """Core or workflow edits still run the whole project suite, minus custody only."""
+        self.assertFalse(self._supervisor_custody_case([
+            "energygrid-bill-downloader/energygrid_bill_downloader/native_bridge.py",
+            "energygrid-bill-downloader/tests/test_native_bridge.py",
+        ]))
+        self.assertFalse(self._supervisor_custody_case([
+            ".github/workflows/energygrid-bill-downloader-tests.yml",
+            "energygrid-bill-downloader/tests/test_cli.py",
+            "energygrid-bill-downloader/tests/run_project_suite.py",
+        ]))
+
+    def test_every_supervisor_owned_path_runs_supervisor_custody(self) -> None:
+        for path in (
+            "scripts/energygrid_one_shot_supervisor.ps1",
+            "energygrid-bill-downloader/tests/test_one_shot_supervisor.py",
+            "energygrid-bill-downloader/tests/fixtures/one_shot_supervisor_harness.ps1",
+            "energygrid-bill-downloader/tests/fixtures/one_shot_supervisor_functions.ps1",
+            "energygrid-bill-downloader/tests/fixtures/one_shot_supervisor_support.cs",
+            "energygrid-bill-downloader/tests/fixtures/energygrid_bill_downloader.py",
+            "energygrid-bill-downloader/tests/fixtures/supervisor_launcher/launcher.ps1",
+            "energygrid-bill-downloader/tests/fixtures/supervisor_launcher/launcher_lib.ps1",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self._supervisor_custody_case(["README.md", path]))
+
+    def test_supervisor_custody_matching_over_includes_and_dispatch_always_applies(self) -> None:
+        # Case variants could alias the real file on a Windows checkout: they must still apply.
+        self.assertTrue(self._supervisor_custody_case(["SCRIPTS/Energygrid_One_Shot_Supervisor.ps1"]))
+        # Lookalikes that are not the supervisor stay outside custody.
+        self.assertFalse(self._supervisor_custody_case(["scripts/energygrid_one_shot_supervisor.ps1.orig"]))
+        self.assertFalse(self._supervisor_custody_case(["energygrid-bill-downloader/tests/fixtures/other.ps1"]))
+        self.assertTrue(self._supervisor_custody_case([], event="workflow_dispatch"))
+
+    def test_supervisor_custody_routing_is_wired_and_never_skips_the_rest(self) -> None:
+        workflow = (
+            Path(__file__).parents[2] / ".github" / "workflows"
+            / "energygrid-bill-downloader-tests.yml"
+        ).read_text(encoding="utf-8")
+        # Deletions and renames list both sides, and a failed git call fails the job.
+        self.assertIn("git diff --name-only --no-renames $base HEAD", workflow)
+        self.assertEqual(workflow.count('if ($LASTEXITCODE -ne 0) { throw '), 2)
+        self.assertIn("            python -m unittest discover -s tests -v\n          } else {\n"
+                      "            python tests/run_project_suite.py --exclude-module test_one_shot_supervisor\n",
+                      workflow)
+        self.assertIn("        if: steps.supervisor_custody.outputs.applicable == 'true'\n"
+                      "        shell: powershell\n"
+                      '        run: python -m unittest discover -s energygrid-bill-downloader/tests '
+                      '-p "test_one_shot_supervisor.py" -v', workflow)
+        # Routing is the only conditional: no other step is skipped by it.
+        self.assertEqual(workflow.count("steps.supervisor_custody.outputs.applicable"), 2)
+        # The branch-bound custody guard itself is untouched by routing.
+        supervisor_tests = (Path(__file__).parent / "test_one_shot_supervisor.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "APPROVED_CANDIDATE_BRANCHES = frozenset({TARGET_BRANCH, OFFLINE_V4_BRANCH, HARDENING_BRANCH})",
+            supervisor_tests,
+        )
+
+    def test_project_suite_runner_leaves_out_exactly_the_named_module(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "run_project_suite", Path(__file__).parent / "run_project_suite.py"
+        )
+        run_project_suite = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run_project_suite)
+
+        names = run_project_suite.module_names()
+        self.assertIn("test_one_shot_supervisor", names)
+        self.assertIn("test_orchestration", names)  # a same-prefix sibling must stay in
+        suite = run_project_suite.build_suite({"test_one_shot_supervisor"})
+
+        def modules(item) -> set[str]:
+            if isinstance(item, unittest.TestSuite):
+                return set().union(*(modules(child) for child in item)) if item.countTestCases() else set()
+            return {type(item).__module__}
+
+        found = modules(suite)
+        self.assertNotIn("test_one_shot_supervisor", found)
+        self.assertTrue(set(names).difference({"test_one_shot_supervisor"}).issubset(found), found)
+        with self.assertRaises(SystemExit):
+            run_project_suite.build_suite({"test_no_such_module"})
+
+    def test_project_suite_runner_imports_the_package_when_run_as_the_workflow_runs_it(self) -> None:
+        """Run exactly as the workflow does (script path, project folder as cwd) on one module."""
+        project = Path(__file__).parents[1]
+        names = sorted(path.stem for path in (project / "tests").glob("test_*.py"))
+        excluded = [arg for name in names if name != "test_naming" for arg in ("--exclude-module", name)]
+        environment = {**os.environ, "PYTHONPATH": ""}
+        result = subprocess.run(
+            [sys.executable, "tests/run_project_suite.py", *excluded],
+            cwd=project, capture_output=True, text=True, check=False, env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertRegex(result.stderr, r"Ran [1-9]\d* tests")
+        self.assertNotIn("Failed to import test module", result.stderr)
 
     def test_invalid_cli_returns_contract_exit_code(self) -> None:
         self.assertEqual(main([]), 64)
