@@ -1,0 +1,219 @@
+{
+  "name": "EnergyGrid - Local Failure Monitor (inactive)",
+  "active": false,
+  "nodes": [
+    {
+      "id": "237613e6-a30f-5770-ad02-f8d976d5c8de",
+      "name": "Local Authenticated Report",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        80,
+        170
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "xb-energygrid-monitor-v1",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "ca113b2a-ed10-565a-b8ca-a7cfd115354a",
+      "name": "Validate Both Streams and Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        330,
+        170
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Validated reports only. Never trust caller-supplied message text, recipient, or filename.\nconst raw = $input.first()?.json?.body;\nconst own = (v) => v && typeof v === 'object' && !Array.isArray(v);\nconst sameKeys = (obj, keys) => own(obj) && Object.keys(obj).sort().join('|') === keys.slice().sort().join('|');\nif (!sameKeys(raw, ['schema','run_id','observed_at_utc','streams'])) throw new Error('EG_MONITOR_REPORT_SHAPE');\nif (raw.schema !== 'xb.energygrid.monitor.v1') throw new Error('EG_MONITOR_SCHEMA');\nif (typeof raw.run_id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(raw.run_id)) throw new Error('EG_MONITOR_RUN_ID');\nif (typeof raw.observed_at_utc !== 'string' || !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/.test(raw.observed_at_utc)) throw new Error('EG_MONITOR_TIMESTAMP');\nconst observedMs = Date.parse(raw.observed_at_utc);\nconst nowMs = Date.now();\nif (!Number.isFinite(observedMs) || Math.abs(nowMs - observedMs) > 30 * 60 * 1000) throw new Error('EG_MONITOR_OLD_REPORT');\nif (!sameKeys(raw.streams, ['EB_BILL','TENANT_BILL'])) throw new Error('EG_MONITOR_STREAMS');\nfunction sgDay(ms) {\n  const parts = new Intl.DateTimeFormat('en-GB', {timeZone:'Asia/Singapore', year:'numeric', month:'2-digit', day:'2-digit'}).formatToParts(new Date(ms));\n  const p = Object.fromEntries(parts.filter(x => x.type !== 'literal').map(x=>[x.type,x.value]));\n  return `${p.year}-${p.month}-${p.day}`;\n}\nconst day = sgDay(nowMs);\nconst valid = {};\nfor (const stream of ['EB_BILL','TENANT_BILL']) {\n  const row=raw.streams[stream];\n  if (!sameKeys(row, ['result','support_ref','incident_ref'])) throw new Error('EG_MONITOR_STREAM_SHAPE');\n  if (!['OK','FAILURE','PENDING'].includes(row.result)) throw new Error('EG_MONITOR_RESULT');\n  if (row.result === 'OK') {\n    if (row.support_ref !== null || row.incident_ref !== null) throw new Error('EG_MONITOR_OK_FIELDS');\n  } else {\n    if (typeof row.support_ref !== 'string' || !/^EG_[A-Z0-9_]{4,72}$/.test(row.support_ref)) throw new Error('EG_MONITOR_REF');\n    if (row.incident_ref !== null && (typeof row.incident_ref !== 'string' || !/^bill-[0-9a-f]{24}$/.test(row.incident_ref))) throw new Error('EG_MONITOR_INCIDENT');\n  }\n  valid[stream] = row;\n}\nconst state = $getWorkflowStaticData('global');\nstate.last_report_day_sgt = day;\nstate.last_report_utc = raw.observed_at_utc;\nstate.alert_series = state.alert_series || {};\nstate.open_incidents = state.open_incidents || {};\nconst alerts=[];\nfor (const stream of ['EB_BILL','TENANT_BILL']) {\n  const row=valid[stream];\n  if (row.result === 'OK') { state.open_incidents[stream] = null; continue; }\n  const signature = `${row.result}|${row.support_ref}|${row.incident_ref || ''}`;\n  if (!state.open_incidents[stream] || state.open_incidents[stream].signature !== signature) {\n    const next = Number(state.alert_series[stream] || 0) + 1;\n    state.alert_series[stream] = next;\n    state.open_incidents[stream] = { signature, episode: next };\n  }\n  const episode=state.open_incidents[stream].episode;\n  const label=stream === 'EB_BILL' ? 'EB Bill' : 'Tenant Bill';\n  const pending=row.result === 'PENDING';\n  alerts.push({json:{\n    dedupe_key:`eg-monitor:${stream}:${episode}`,\n    subject:`EnergyGrid: ${label} ${pending?'incomplete':'failed'} (${row.support_ref})`,\n    message:`EnergyGrid needs attention.\\nStream: ${label}\\nOutcome: ${row.result}\\nReference: ${row.support_ref}\\nRun: ${raw.run_id}\\nObserved (UTC): ${raw.observed_at_utc}\\n\\nReview EnergyGrid's local status. Do not retry uncertain uploads or emails.`,\n  }});\n}\nreturn alerts;"
+      }
+    },
+    {
+      "id": "1f0d4722-0aaa-57f3-8bf6-380c1d0a1bda",
+      "name": "Five Minute Local Monitor Tick",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        80,
+        450
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "62481575-0a92-5e5f-9290-54a1286e43f9",
+      "name": "Check Missing Run (PC-On Only)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        330,
+        450
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Local-PC-only missing-run check. No alert unless this n8n instance was ticking before the run.\nconst state=$getWorkflowStaticData('global');\nstate.heartbeat=state.heartbeat || {};\nconst h=state.heartbeat;\nconst now=Date.now();\nconst gap=Number(h.last_tick_ms || 0) ? now - Number(h.last_tick_ms) : Infinity;\nif (gap > 11*60*1000 || gap < 0) h.armed_day_sgt=null; // restart, sleep or long gap: do not complain.\nh.last_tick_ms=now;\nconst parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Singapore',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date(now));\nconst p=Object.fromEntries(parts.filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));\nconst day=`${p.year}-${p.month}-${p.day}`;\nconst minutes=(Number(p.hour)%24)*60 + Number(p.minute);\n// Expected user UAT check around 11:30 SGT. Arm only while the PC/n8n was already alive.\nif (minutes >= 11*60+10 && minutes < 11*60+30) h.armed_day_sgt=day;\nif (minutes < 14*60 || minutes >= 23*60 || h.armed_day_sgt !== day || state.last_report_day_sgt === day) return [];\nreturn [{json:{\n  dedupe_key:`eg-monitor:missed:${day}`,\n  subject:'EnergyGrid: scheduled bill check did not report',\n  message:`EnergyGrid did not submit a completed EB + Tenant run report by 14:00 SGT on ${day}.\\nThe PC/n8n monitor was active ahead of the usual check.\\nCheck the Claude task and EnergyGrid logs.\\nIf the PC was shut down briefly, this may be a false alarm. Do not automatically replay bill effects.`,\n}}];"
+      }
+    },
+    {
+      "id": "a30e9047-6e8e-5e47-9e1a-ee2a7832f93e",
+      "name": "Alerts Disabled Until Qualified",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        310
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Keep off during import and dry-run qualification. Set true only after headerAuth, SMTP,\n// host report bridge, dedup behaviour, and the old Claude failure-mail path are verified.\nconst ENABLE_OWNER_ALERTS = false;\nif (!ENABLE_OWNER_ALERTS) return [];\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "1a6221aa-f2ec-5cfa-bd15-5d79b732d657",
+      "name": "One Attempt Per Incident",
+      "type": "n8n-nodes-base.removeDuplicates",
+      "typeVersion": 2,
+      "position": [
+        815,
+        310
+      ],
+      "parameters": {
+        "operation": "removeItemsSeenInPreviousExecutions",
+        "dedupeValue": "={{ $json.dedupe_key }}",
+        "options": {
+          "scope": "workflow",
+          "historySize": 10000
+        }
+      }
+    },
+    {
+      "id": "96e918a1-03be-5757-894c-bd7dfc2027b8",
+      "name": "Send Owner Failure Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1050,
+        310
+      ],
+      "parameters": {
+        "fromEmail": "REPLACE_WITH_VERIFIED_SENDER",
+        "toEmail": "REPLACE_WITH_OWNER_EMAIL",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.message }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "continueOnFail": true,
+      "retryOnFail": false
+    },
+    {
+      "id": "2ab9cc30-abf4-5e59-8c6e-9b3217d89b3f",
+      "name": "Important: inactive safe template",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        580,
+        -10
+      ],
+      "parameters": {
+        "content": "# EnergyGrid local failure monitor — NOT INSTALLED OR ENABLED\n- **No credentials** are bundled. Bind Header Auth and a verified SMTP sender/owner recipient.\n- The report POST must come from the existing EnergyGrid host after completing its run, using `energygrid_monitor_report.py` with sanitized `acquire.json` + `status.json`.\n- Switch **ENABLE_OWNER_ALERTS** to `true` only after synthetic tests and after the Claude failure-email sender is disabled in the actual host, to prevent duplicates.\n- PC shut down / n8n stopped: intentionally no alert.\n- Never reuse dormant historic EnergyGrid alert exports without separate review.\n- Keep the workflow inactive until the local host is connected and manual acceptance passes.",
+        "width": 660,
+        "height": 225
+      }
+    }
+  ],
+  "connections": {
+    "Local Authenticated Report": {
+      "main": [
+        [
+          {
+            "node": "Validate Both Streams and Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Both Streams and Classify": {
+      "main": [
+        [
+          {
+            "node": "Alerts Disabled Until Qualified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Five Minute Local Monitor Tick": {
+      "main": [
+        [
+          {
+            "node": "Check Missing Run (PC-On Only)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Missing Run (PC-On Only)": {
+      "main": [
+        [
+          {
+            "node": "Alerts Disabled Until Qualified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerts Disabled Until Qualified": {
+      "main": [
+        [
+          {
+            "node": "One Attempt Per Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One Attempt Per Incident": {
+      "main": [
+        [
+          {
+            "node": "Send Owner Failure Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Singapore",
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": []
+}

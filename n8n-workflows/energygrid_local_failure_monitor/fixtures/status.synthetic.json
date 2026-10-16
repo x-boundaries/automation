@@ -1,0 +1,9 @@
+{
+  "schema": "energygrid.native.v4.result.v1",
+  "command": "status",
+  "outcome": "DRAINED",
+  "streams": {
+    "EB_BILL": {"state": "DRAINED", "support_ref": null, "invoices": []},
+    "TENANT_BILL": {"state": "DRAINED", "support_ref": null, "invoices": []}
+  }
+}
