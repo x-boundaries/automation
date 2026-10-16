@@ -140,6 +140,51 @@ function Get-XbDlSessionFailureStage {
     return "autocount_login_rejected"
 }
 
+function Install-XbDlResolveGuard {
+    # The unchanged adapter registers a PowerShell scriptblock as an
+    # AppDomain.AssemblyResolve handler and keeps it after a successful login.
+    # PowerShell's resources are neutral "en", so under any other UI culture
+    # (the host's en-US included) its first lookup of a resource set probes a
+    # satellite that does not exist; the failed bind runs the scriptblock, whose
+    # own resource lookup probes again: unbounded recursion and an uncatchable
+    # StackOverflowException in System.Management.Automation (E5, 16 Oct 2026).
+    # This compiled handler is registered first, so it runs before the
+    # adapter's on every resolve: it re-pins the neutral UI culture (PowerShell
+    # resets it per pipeline; a vendor may change it) and returns null, so it
+    # never changes what resolves. Idempotent per process.
+    if ($null -eq ("XbDirectLocal.ResolveGuard" -as [type])) {
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Globalization;
+using System.Reflection;
+using System.Threading;
+namespace XbDirectLocal {
+    public static class ResolveGuard {
+        static CultureInfo pinned;
+        public static bool Installed { get { return pinned != null; } }
+        public static void Install(CultureInfo culture) {
+            if (pinned != null) return;
+            pinned = culture;
+            CultureInfo.DefaultThreadCurrentUICulture = culture;
+            Thread.CurrentThread.CurrentUICulture = culture;
+            AppDomain.CurrentDomain.AssemblyResolve += Repin;
+        }
+        static Assembly Repin(object sender, ResolveEventArgs args) {
+            if (!Thread.CurrentThread.CurrentUICulture.Equals(pinned)) Thread.CurrentThread.CurrentUICulture = pinned;
+            return null;
+        }
+    }
+}
+'@
+        }
+        catch { throw "resolve_guard_unavailable" }
+    }
+    $neutral = [System.Management.Automation.PSObject].Assembly.GetCustomAttributes([System.Resources.NeutralResourcesLanguageAttribute], $false) | Select-Object -First 1
+    if ($null -eq $neutral -or [string]::IsNullOrWhiteSpace($neutral.CultureName)) { throw "resolve_guard_unavailable" }
+    [XbDirectLocal.ResolveGuard]::Install([System.Globalization.CultureInfo]::GetCultureInfo($neutral.CultureName))
+}
+
 function New-XbDlRealSession {
     # Every guard runs in this order; any failure stops before the next step.
     param([Parameter(Mandatory)][string]$Book, [Parameter(Mandatory)][string]$AcRoot)
@@ -149,6 +194,8 @@ function New-XbDlRealSession {
     Assert-XbDlQualifiedAssemblies -Root $AcRoot
     [Environment]::SetEnvironmentVariable("XB_AC2_DATABASE_NAME", $Book, "Process")
     [Environment]::SetEnvironmentVariable("XB_AC2_ASSEMBLY_PATH", $AcRoot, "Process")
+    # Must precede the adapter, whose resolve handler it has to run before.
+    Install-XbDlResolveGuard
     try { $session = New-XbAutoCountSession -EnableProductionAdapter }
     catch {
         $code = [string]$_.Exception.Message

@@ -78,6 +78,8 @@ powershell -ExecutionPolicy Bypass -File C:\XB\automation\scripts\ac2_directloca
 Expect `{"book": "AED_TESTINGAPI", "identity_verified": true, "outbound_quiet": true}`.
 `-Command PosSyncStatus` prints the outlets' last sync and the `Member` change counter.
 
+A refusal reads `bridge_read_failed:<code>` for a fixed child code. For example, `autocount_login_rejected` means SQL to the book works but the AutoCount user ID or password was refused; do not retry blindly. Otherwise it reads `bridge_read_failed:<shape>:x<exit>:l<lines>`, where every value is computed by the core and none is child text. `x800703e9` or `xc00000fd` means a stack overflow. Before 16 October 2026 that came from the adapter's scriptblock resolve handler recursing after a successful login; `Install-XbDlResolveGuard` in `ac2_directlocal_book_guard.ps1` now prevents it.
+
 ## D. Owner registration
 
 The Owner submits the Shopify membership form once (new or existing customer)

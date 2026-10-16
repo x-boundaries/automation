@@ -126,6 +126,29 @@ $out.session_prod = Try-Code { New-XbDlRealSession -Book "AED_XBOUNDARIES" -AcRo
 """
 
 
+# E5 root cause: the adapter's scriptblock AssemblyResolve handler re-enters on
+# PowerShell's own missing resource satellite until the stack overflows. Same
+# handler shape, no AutoCount: "guard" must survive, "none" is the control.
+RECURSION_HARNESS = r"""
+$ErrorActionPreference = "Stop"
+. $args[0]
+. $args[1]
+if ($args[2] -eq "guard") { Install-XbDlResolveGuard; Install-XbDlResolveGuard }
+$root = $args[3]
+[System.AppDomain]::CurrentDomain.add_AssemblyResolve([System.ResolveEventHandler] {
+    param($sender, $eventArgs)
+    $assemblyName = [System.Reflection.AssemblyName]::new($eventArgs.Name)
+    $candidate = Join-Path $root ($assemblyName.Name + ".dll")
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return [System.Reflection.Assembly]::LoadFrom($candidate) }
+    return $null
+})
+# A vendor login may also change the thread UI culture.
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::GetCultureInfo("en-SG")
+try { Get-Item -LiteralPath (Join-Path $root "definitely-missing") } catch { }
+[Console]::Out.WriteLine("survived")
+"""
+
+
 def powershell() -> str | None:
     return shutil.which("powershell") or shutil.which("pwsh")
 
@@ -205,6 +228,19 @@ class RealBridgeGuardTests(unittest.TestCase):
             "book_prod": "production_book_not_authorised", "book_other": "target_book_not_authorised", "book_test": "ok",
             "pos_outlets": 1, "pos_location": "XB01", "pos_counter": 2826,
         })
+
+    def test_resolve_guard_prevents_scriptblock_handler_recursion(self):
+        harness = self.temp / "recursion_harness.ps1"
+        harness.write_text(RECURSION_HARNESS, encoding="utf-8")
+
+        def run(mode: str):
+            return subprocess.run([powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness), str(ADAPTER), str(GUARD), mode, str(self.temp)], capture_output=True, timeout=120, check=False)
+
+        guarded = run("guard")
+        self.assertEqual((guarded.returncode, guarded.stdout.decode("utf-8", "replace").strip()), (0, "survived"), guarded.stderr.decode("utf-8", "replace")[-2000:])
+        control = run("none")  # proves the harness reproduces the E5 failure
+        self.assertNotEqual(control.returncode, 0)
+        self.assertNotIn(b"survived", control.stdout)
 
     def test_failed_login_stage_is_classified_without_vendor_text(self):
         harness = self.temp / "stage_harness.ps1"
