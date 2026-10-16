@@ -44,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "724fc4439fcd3de1966e82eae5adf6fee112b142",
+    "scripts/install_ac2_member_gateway_worker.ps1": "8e5d16c174a88690f1bf2f2daec9ddd1d60f1415",
     "scripts/ac2_member_gateway_worker.ps1": "5ef41368dffae4eecadf56a1de1606508f8eadb5",
     "scripts/ac2_member_gateway_worker_lib.ps1": "4d2140d944d0e5c4384bc8b35a748f5bf53ecb20",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "590f9e6f808d288da9da11edbbd2b030f871dc1e",
@@ -59,19 +59,9 @@ PROTECTED_WORKER_TREES = {
 WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)
 
 ALLOWED_FILES = {
-    ".github/workflows/member-gateway-tests.yml",
-    "config/ac2_member_gateway_worker.production.example.json",
-    "config/member_forms_gateway_bounded_import.v2.template.json",
     "docs/autocount2-automation/member_gateway_production_runbook.md",
-    "n8n-workflows/README.md",
-    "n8n-workflows/scripts/README.md",
-    "n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1",
     "scripts/install_ac2_member_gateway_worker.ps1",
-    "scripts/launch_ac2_member_gateway_worker.ps1",
-    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1",
     "tests/test_member_gateway_worker_deployment.py",
-    "tests/test_member_gateway_bounded_import_security.py",
-    "tests/test_member_gateway_ci.py",
 }
 
 
@@ -4291,6 +4281,853 @@ Set-Item function:script:Remove-XbWorkerScheduledTask $originalUnregister
 '''
 
 
+_LOCAL_UPGRADE_ROLLBACK_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$WorkRoot,
+    [ValidateSet("all", "crash", "recover")][string]$HarnessMode = "all",
+    [string]$FixtureName = "",
+    [ValidateSet("Upgrade", "Rollback")][string]$CrashOperation = "Upgrade",
+    [ValidateSet("journal", "move")][string]$CrashKind = "journal",
+    [string]$CrashTarget = "",
+    [ValidateSet("before", "after")][string]$CrashPhase = "before",
+    [int]$CrashIndex = 0
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:HarnessPath = $MyInvocation.MyCommand.Path
+$script:NativePowerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$script:SourceRoot = Join-Path $WorkRoot $(if ($HarnessMode -eq "recover") { "source-unavailable" } else { "synthetic-package-source" })
+if ($HarnessMode -eq "recover") {
+    $script:RecoveryDispatcherRoot = Join-Path $WorkRoot ("recovery-dispatcher-" + $FixtureName)
+    if (Test-Path -LiteralPath $script:RecoveryDispatcherRoot) { throw "recovery_dispatcher_path_exists" }
+    New-Item -ItemType Directory -Path $script:RecoveryDispatcherRoot -ErrorAction Stop | Out-Null
+    $script:FixtureInstallerPath = Join-Path $script:RecoveryDispatcherRoot "install_ac2_member_gateway_worker.ps1"
+    Copy-Item -LiteralPath $InstallerPath -Destination $script:FixtureInstallerPath -ErrorAction Stop
+    $dispatcherEntries = @(Get-ChildItem -LiteralPath $script:RecoveryDispatcherRoot -Force)
+    if ($dispatcherEntries.Count -ne 1 -or $dispatcherEntries[0].Name -cne "install_ac2_member_gateway_worker.ps1") { throw "recovery_dispatcher_not_isolated" }
+} else {
+    New-Item -ItemType Directory -Path $script:SourceRoot -Force | Out-Null
+    $script:FixtureInstallerPath = Join-Path $script:SourceRoot "install_ac2_member_gateway_worker.ps1"
+    Copy-Item -LiteralPath $InstallerPath -Destination $script:FixtureInstallerPath
+}
+$syntheticPackageFiles = @(
+    "ac2_member_gateway_worker.ps1",
+    "ac2_member_gateway_worker_lib.ps1",
+    "ac2_member_gateway_autocount_adapter.ps1",
+    "launch_ac2_member_gateway_worker.ps1",
+    "test_ac2_member_gateway_autocount_dependencies.ps1"
+)
+if ($HarnessMode -ne "recover") {
+    foreach ($name in $syntheticPackageFiles) { [IO.File]::WriteAllText((Join-Path $script:SourceRoot $name), ("synthetic payload: " + $name + "`n"), ([Text.UTF8Encoding]::new($false))) }
+    [IO.File]::WriteAllText((Join-Path $script:SourceRoot "synthetic-reviewed-identity.json"), "{}", ([Text.UTF8Encoding]::new($false)))
+}
+$script:fixtureTask = $null
+$script:fixtureView = $null
+$script:fixtureReview = $null
+$script:reviewOverride = $null
+$script:reviewCalls = 0
+$script:reviewForbidden = $false
+$script:lastError = ""
+$script:activeWorker = $false
+$script:processMode = "valid"
+$script:taskMode = "valid"
+$script:forbiddenCalls = 0
+$script:Fault = @{ enabled = $false; kind = ""; target = ""; phase = ""; index = 0; calls = 0; fired = $false }
+$script:exitAtFault = $false
+. $script:FixtureInstallerPath -LibraryOnly
+
+$script:auditAclEvidence = "native"
+try { $null = Get-Acl -LiteralPath $script:FixtureInstallerPath -Audit -ErrorAction Stop }
+catch {
+    if ([string]$_.Exception.Message -notmatch "SeSecurityPrivilege") { throw }
+    $script:auditAclEvidence = "synthetic_dacl_only: SeSecurityPrivilege unavailable"
+    # This desktop identity cannot query SACLs. Keep native filesystem/DACL
+    # coverage while reporting that the SACL preservation boundary is unqualified.
+    Set-Item function:script:Get-XbWorkerUpgradeAclSddl {
+        param([Parameter(Mandatory)][string]$Path)
+        try {
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            if (-not $acl.AreAccessRulesCanonical) { throw "acl_order_unproven" }
+            return $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+        } catch { throw "upgrade_acl_unverifiable" }
+    }
+    Set-Item function:script:Set-XbWorkerUpgradeAclSddl {
+        param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sddl)
+        try {
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $acl.SetSecurityDescriptorSddlForm($Sddl, [Security.AccessControl.AccessControlSections]::All)
+            Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        } catch { throw "upgrade_acl_preservation_failed" }
+        $actualSddl = Get-XbWorkerUpgradeAclSddl -Path $Path
+        if ((Convert-XbWorkerUpgradeAclSddl $actualSddl) -cne (Convert-XbWorkerUpgradeAclSddl $Sddl)) { throw "upgrade_acl_preservation_failed" }
+    }
+}
+
+Set-Item function:script:Assert-XbWorkerInstallLayout { }
+Set-Item function:script:Assert-XbWorkerAdministrator { }
+Set-Item function:script:Get-XbWorkerTaskIfPresent { return $script:fixtureTask }
+Set-Item function:script:Get-XbRegisteredWorkerTaskView { return $script:fixtureView }
+Set-Item function:script:Get-CimInstance {
+    param([string]$ClassName, [string]$Filter, [string]$ErrorAction)
+    if ($script:processMode -eq "missing_command_line") { return ,([pscustomobject]@{}) }
+    if ($script:activeWorker) { return ,([pscustomobject]@{ CommandLine = [IO.Path]::GetFullPath((Join-Path $script:InstallRoot "launch_ac2_member_gateway_worker.ps1")) }) }
+    return @()
+}
+Set-Item function:script:Read-XbReviewedPackageIdentity {
+    param([string]$Path, [string]$PackageRoot)
+    $script:reviewCalls++
+    if ($script:reviewForbidden) { throw "source_read_forbidden" }
+    if ($null -ne $script:reviewOverride) { return $script:reviewOverride }
+    return $script:fixtureReview
+}
+Set-Item function:script:Register-XbWorkerScheduledTask { $script:forbiddenCalls++; throw "forbidden_scheduler_registration" }
+Set-Item function:script:Remove-XbWorkerScheduledTask { $script:forbiddenCalls++; throw "forbidden_scheduler_removal" }
+Set-Item function:script:Remove-XbWorkerOwnedState { $script:forbiddenCalls++; throw "forbidden_owned_state_removal" }
+Set-Item function:script:Set-XbWorkerAcl { $script:forbiddenCalls++; throw "forbidden_install_acl_rewrite" }
+
+function New-XbFixtureReviewedIdentity {
+    param([string]$Commit = ("1" * 40), [string]$Tree = ("2" * 40))
+    $files = foreach ($name in $packageFiles) {
+        [ordered]@{ name = $name; sha256 = (Get-XbFileSha256 (Join-Path $script:SourceRoot $name)) }
+    }
+    return [pscustomobject]@{
+        schema_version = "xb.member.gateway.worker.reviewed-package.v1"
+        source = [pscustomobject]@{ commit = $Commit; tree = $Tree }
+        package_files = @($files)
+    }
+}
+
+function Set-XbFixtureTask {
+    $worker = "XBHOST\XB_G3_SYNTHETIC"
+    $launcher = [IO.Path]::GetFullPath((Join-Path $script:InstallRoot "launch_ac2_member_gateway_worker.ps1"))
+    $identity = Get-XbWorkerTaskIdentity -LauncherPath $launcher -WorkerAccount $worker
+    $state = "Disabled"
+    $triggers = $null
+    $execute = $identity.executable
+    $arguments = $identity.arguments
+    $principal = $identity.principal_user_id
+    $enabled = $false
+    $triggerCount = 0
+    $xmlTriggers = "<Triggers />"
+    switch ($script:taskMode) {
+        "enabled" { $state = "Ready"; $enabled = $true }
+        "triggered" { $triggers = @([pscustomobject]@{ Enabled = $true }); $triggerCount = 1; $xmlTriggers = "<Triggers><TimeTrigger /></Triggers>" }
+        "action" { $execute = "cmd.exe" }
+        "principal" { $principal = "XBHOST\FOREIGN" }
+    }
+    $script:fixtureTask = [pscustomobject]@{
+        TaskPath = $taskPath; TaskName = $taskName; State = $state; Triggers = $triggers
+        Actions = @([pscustomobject]@{ Execute = $execute; Arguments = $arguments; WorkingDirectory = "" })
+        Settings = [pscustomobject]@{ MultipleInstances = "IgnoreNew"; ExecutionTimeLimit = "PT10M"; RestartCount = 0; StartWhenAvailable = $false }
+        Principal = [pscustomobject]@{ UserId = $principal; LogonType = "Password"; RunLevel = "Limited" }
+    }
+    $comAction = [pscustomobject]@{ Type = 0; Path = $execute; Arguments = $arguments }
+    $actions = [pscustomobject]@{ Count = 1; Entry = $comAction }
+    Add-Member -InputObject $actions -MemberType ScriptMethod -Name Item -Value { param($Index) return $this.Entry }
+    $viewXml = '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Settings><Enabled>' + ([string]$enabled).ToLowerInvariant() + '</Enabled></Settings>' + $xmlTriggers + '</Task>'
+    $script:fixtureView = [pscustomobject]@{
+        Path = ($taskPath + $taskName); Enabled = $enabled; Xml = $viewXml
+        Definition = [pscustomobject]@{
+            Settings = [pscustomobject]@{ Enabled = $enabled }
+            Triggers = [pscustomobject]@{ Count = $triggerCount }
+            Actions = $actions
+        }
+    }
+}
+
+function Initialize-XbFixture {
+    param([Parameter(Mandatory)][string]$Name)
+    $base = Join-Path $WorkRoot $Name
+    New-Item -ItemType Directory -Path $base -Force | Out-Null
+    $script:InstallRoot = Join-Path $base "pf\X-Boundaries\MemberGatewayWorker"
+    $script:RuntimeRoot = Join-Path $base "pd\X-Boundaries\MemberGatewayWorker"
+    $script:taskPath = "\XB-G3-SYNTHETIC\"
+    $script:taskName = "Synthetic Worker"
+    $script:taskMode = "valid"
+    $script:reviewOverride = $null
+    $script:reviewForbidden = $false
+    $script:activeWorker = $false
+    $script:processMode = "valid"
+    $script:fixtureReview = New-XbFixtureReviewedIdentity -Commit ("0" * 40) -Tree ("0" * 40)
+    New-Item -ItemType Directory -Path $script:InstallRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $script:RuntimeRoot -Force | Out-Null
+    foreach ($name in $packageFiles) { Copy-Item -LiteralPath (Join-Path $script:SourceRoot $name) -Destination (Join-Path $script:InstallRoot $name) }
+    $installed = New-XbWorkerInstallationManifest -PackageRoot $script:SourceRoot -ReviewedIdentity $script:fixtureReview -WorkerAccount "XBHOST\XB_G3_SYNTHETIC"
+    ($installed | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath (Join-Path $script:InstallRoot "installation-manifest.json") -Encoding UTF8
+    New-Item -ItemType Directory -Path (Join-Path $script:RuntimeRoot "config") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $script:RuntimeRoot "secrets") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $script:RuntimeRoot "logs") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $script:RuntimeRoot "rollback") -Force | Out-Null
+    "synthetic opaque secret sentinel" | Set-Content -LiteralPath (Join-Path $script:RuntimeRoot "secrets\opaque.bin") -Encoding ASCII
+    "synthetic log sentinel" | Set-Content -LiteralPath (Join-Path $script:RuntimeRoot "logs\worker.log") -Encoding ASCII
+    "preexisting recovery sentinel" | Set-Content -LiteralPath (Join-Path $script:RuntimeRoot "rollback\keep.dat") -Encoding ASCII
+    Set-XbFixtureTask
+    $script:baseline = Get-XbWorkerPackageIdentity -Root $script:InstallRoot
+    $script:taskBaseline = Get-XbFixtureTaskSnapshot
+    $script:runtimeBaseline = Get-XbFixtureRuntimeSnapshot
+    [IO.File]::WriteAllText((Join-Path $base "runtime-baseline.json"), $script:runtimeBaseline, ([Text.UTF8Encoding]::new($false)))
+    return $base
+}
+
+function Get-XbFixtureTaskSnapshot {
+    return ConvertTo-Json -InputObject ([ordered]@{
+        path = [string]$script:fixtureTask.TaskPath; name = [string]$script:fixtureTask.TaskName; state = [string]$script:fixtureTask.State
+        triggers = (ConvertTo-Json -InputObject $script:fixtureTask.Triggers -Depth 4 -Compress)
+        execute = [string]$script:fixtureTask.Actions[0].Execute; arguments = [string]$script:fixtureTask.Actions[0].Arguments
+        principal = [string]$script:fixtureTask.Principal.UserId; logon = [string]$script:fixtureTask.Principal.LogonType; run_level = [string]$script:fixtureTask.Principal.RunLevel
+    }) -Depth 5 -Compress
+}
+
+function Get-XbFixtureRuntimeSnapshot {
+    $entries = foreach ($item in @(Get-ChildItem -LiteralPath $script:RuntimeRoot -Force -Recurse | Sort-Object FullName)) {
+        if ($item.PSIsContainer) { [ordered]@{ name = $item.FullName.Substring($script:RuntimeRoot.Length); kind = "directory" } }
+        else { [ordered]@{ name = $item.FullName.Substring($script:RuntimeRoot.Length); kind = "file"; sha256 = (Get-XbFileSha256 $item.FullName) } }
+    }
+    return ConvertTo-Json -InputObject @($entries) -Depth 6 -Compress
+}
+
+function Get-XbFixtureAclSnapshot {
+    param([Parameter(Mandatory)][string]$Root)
+    $acl = Get-XbWorkerUpgradeAclIdentity -Root $Root
+    $result = [ordered]@{ root = (Convert-XbWorkerUpgradeAclSddl ([string]$acl.root)); files = @() }
+    foreach ($entry in @($acl.files)) { $result.files += [ordered]@{ name = [string]$entry.name; sddl = (Convert-XbWorkerUpgradeAclSddl ([string]$entry.sddl)) } }
+    return ConvertTo-Json -InputObject $result -Depth 8 -Compress
+}
+
+function Get-XbFixtureTreeSnapshot {
+    param([Parameter(Mandatory)][string]$Root)
+    $entries = foreach ($item in @(Get-ChildItem -LiteralPath $Root -Force -Recurse | Sort-Object FullName)) {
+        if ($item.PSIsContainer) { [ordered]@{ name = $item.FullName.Substring($Root.Length); kind = "directory" } }
+        else { [ordered]@{ name = $item.FullName.Substring($Root.Length); kind = "file"; sha256 = (Get-XbFileSha256 $item.FullName) } }
+    }
+    return ConvertTo-Json -InputObject @($entries) -Depth 6 -Compress
+}
+
+function Invoke-XbFixtureOperation {
+    param([Parameter(Mandatory)][ValidateSet("Upgrade", "Rollback")][string]$Name)
+    $script:Operation = $Name
+    $script:ReviewedPackageManifestPath = if ($Name -eq "Upgrade") { Join-Path $script:SourceRoot "synthetic-reviewed-identity.json" } else { $null }
+    $script:WorkerAccount = $null
+    $script:TaskCredential = $null
+    $script:lastError = ""
+    try { $null = Invoke-XbWorkerInstaller; return "pass" } catch { $script:lastError = [string]$_.Exception.Message; return $script:lastError }
+}
+
+function Test-XbFixtureRestored {
+    $package = $false
+    try { Assert-XbWorkerUpgradePackageMatches -Root $script:InstallRoot -Expected $script:baseline; $package = $true } catch { }
+    return [ordered]@{
+        package = $package
+        task = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline)
+        runtime = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline)
+        forbidden_calls = $script:forbiddenCalls
+    }
+}
+
+$script:OriginalJournalWriter = ${function:Write-XbWorkerUpgradeJournal}
+$script:OriginalDirectoryMover = ${function:Move-XbWorkerUpgradeDirectory}
+Set-Item function:script:Write-XbWorkerUpgradeJournal {
+    param([Parameter(Mandatory)]$Journal)
+    $fault = $script:Fault
+    $match = $fault.enabled -and $fault.kind -eq "journal" -and [string]$Journal.state -ceq $fault.target -and -not $fault.fired
+    if ($match -and $fault.phase -eq "before") { $fault.fired = $true; if ($script:exitAtFault) { [Environment]::Exit(86) }; throw "synthetic_process_crash" }
+    & $script:OriginalJournalWriter -Journal $Journal
+    if ($match -and $fault.phase -eq "after") { $fault.fired = $true; if ($script:exitAtFault) { [Environment]::Exit(86) }; throw "synthetic_process_crash" }
+}
+Set-Item function:script:Move-XbWorkerUpgradeDirectory {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
+    $fault = $script:Fault
+    $fault.calls++
+    $match = $fault.enabled -and $fault.kind -eq "move" -and $fault.calls -eq $fault.index -and -not $fault.fired
+    if ($match -and $fault.phase -eq "before") { $fault.fired = $true; if ($script:exitAtFault) { [Environment]::Exit(86) }; throw "synthetic_process_crash" }
+    & $script:OriginalDirectoryMover -Source $Source -Destination $Destination
+    if ($match -and $fault.phase -eq "after") { $fault.fired = $true; if ($script:exitAtFault) { [Environment]::Exit(86) }; throw "synthetic_process_crash" }
+}
+
+function Set-XbFault {
+    param([string]$Kind, [string]$Target, [string]$Phase, [int]$Index = 0)
+    $script:Fault = @{ enabled = $true; kind = $Kind; target = $Target; phase = $Phase; index = $Index; calls = 0; fired = $false }
+}
+function Clear-XbFault { $script:Fault.enabled = $false }
+
+$out = [ordered]@{ positive = @{}; adversarial = @{} }
+
+function Invoke-XbFreshHarnessChild {
+    param(
+        [Parameter(Mandatory)][ValidateSet("crash", "recover")][string]$ChildMode,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Operation = "Upgrade",
+        [string]$Kind = "journal",
+        [string]$Target = "",
+        [string]$Phase = "before",
+        [int]$Index = 0
+    )
+    $arguments = @(
+        "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", $script:HarnessPath,
+        "-InstallerPath", $InstallerPath, "-WorkRoot", $WorkRoot, "-HarnessMode", $ChildMode, "-FixtureName", $Name
+    )
+    if ($ChildMode -eq "crash") {
+        $arguments += @("-CrashOperation", $Operation, "-CrashKind", $Kind, "-CrashTarget", $Target, "-CrashPhase", $Phase, "-CrashIndex", [string]$Index)
+    }
+    $childOutput = & $script:NativePowerShellPath @arguments 2>&1
+    return [pscustomobject]@{ exit_code = [int]$LASTEXITCODE; output = (@($childOutput | ForEach-Object { [string]$_ }) -join "`n") }
+}
+
+if ($HarnessMode -eq "recover") {
+    if ([string]::IsNullOrWhiteSpace($FixtureName)) { throw "fresh_recovery_fixture_required" }
+    $base = Join-Path $WorkRoot $FixtureName
+    $script:InstallRoot = Join-Path $base "pf\X-Boundaries\MemberGatewayWorker"
+    $script:RuntimeRoot = Join-Path $base "pd\X-Boundaries\MemberGatewayWorker"
+    $script:taskPath = "\XB-G3-SYNTHETIC\"
+    $script:taskName = "Synthetic Worker"
+    Set-XbFixtureTask
+    $paths = Get-XbWorkerUpgradePaths
+    $runtimeBaselinePath = Join-Path $base "runtime-baseline.json"
+    if (-not (Test-Path -LiteralPath $runtimeBaselinePath -PathType Leaf)) { throw "fresh_runtime_baseline_missing" }
+    $script:runtimeBaseline = [IO.File]::ReadAllText($runtimeBaselinePath)
+    $null = $script:runtimeBaseline | ConvertFrom-Json -ErrorAction Stop
+    $journalReadError = ""
+    if (Test-Path -LiteralPath $paths.journal) {
+        try { $script:baseline = (Read-XbWorkerUpgradeJournal -Path $paths.journal).old_identity }
+        catch { $journalReadError = [string]$_.Exception.Message; $script:baseline = Get-XbWorkerPackageIdentity -Root $script:InstallRoot }
+    } else { $script:baseline = Get-XbWorkerPackageIdentity -Root $script:InstallRoot }
+    $script:taskBaseline = Get-XbFixtureTaskSnapshot
+    $script:reviewForbidden = $true
+    $first = Invoke-XbFixtureOperation "Rollback"
+    $second = Invoke-XbFixtureOperation "Rollback"
+    $recovery = [ordered]@{
+        first = $first
+        repeated = $second
+        restored = (Test-XbFixtureRestored)
+        source_root_absent = (-not (Test-Path -LiteralPath $script:SourceRoot))
+        dispatcher_package_files_absent = (@($packageFiles | Where-Object { Test-Path -LiteralPath (Join-Path $script:RecoveryDispatcherRoot $_) }).Count -eq 0)
+        runtime_baseline = "pre-crash fixture evidence"
+        source_reads = $script:reviewCalls
+        forbidden_calls = $script:forbiddenCalls
+        journal_read_error = $journalReadError
+    }
+    [Console]::Out.Write(($recovery | ConvertTo-Json -Depth 8 -Compress))
+    exit 0
+}
+
+if ($HarnessMode -eq "crash") {
+    if ([string]::IsNullOrWhiteSpace($FixtureName) -or [string]::IsNullOrWhiteSpace($CrashTarget)) { throw "fresh_crash_fixture_required" }
+    $null = Initialize-XbFixture $FixtureName
+    if ($CrashOperation -eq "Rollback") {
+        if ($CrashTarget -in @("rollback_stage_cleanup", "aborted")) {
+            Set-XbFault -Kind journal -Target "staged" -Phase after
+            $seed = Invoke-XbFixtureOperation "Upgrade"
+            Clear-XbFault
+            if ($seed -ne "synthetic_process_crash") { [Console]::Error.WriteLine("fresh_crash_seed_failed:" + $seed); exit 88 }
+        } else {
+            $seed = Invoke-XbFixtureOperation "Upgrade"
+            if ($seed -ne "pass") { [Console]::Error.WriteLine("fresh_crash_seed_failed:" + $seed); exit 88 }
+        }
+    }
+    Set-XbFault -Kind $CrashKind -Target $CrashTarget -Phase $CrashPhase -Index $CrashIndex
+    $script:exitAtFault = $true
+    $unexpected = Invoke-XbFixtureOperation $CrashOperation
+    [Console]::Error.WriteLine("fresh_crash_boundary_not_reached:" + $unexpected)
+    exit 87
+}
+
+# Positive dispatcher path. Defer source-independent rollback until all other
+# fixtures have used their benign synthetic source package.
+$null = Initialize-XbFixture "positive"
+$out.positive.upgrade = Invoke-XbFixtureOperation "Upgrade"
+if ($out.positive.upgrade -ne "pass") { $out.positive.error = $script:lastError; [Console]::Out.WriteLine(($out | ConvertTo-Json -Depth 16 -Compress)); exit 2 }
+$upgradeJournal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+$out.positive.complete = [string]$upgradeJournal.state
+$out.positive.current_is_new = $false
+try { Assert-XbWorkerUpgradePackageMatches -Root $script:InstallRoot -Expected $upgradeJournal.new_identity; $out.positive.current_is_new = $true } catch { }
+$out.positive.layout_before_rollback = Assert-XbWorkerUpgradeLayout -Journal $upgradeJournal
+$out.positive.task_unchanged_after_upgrade = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline)
+$out.positive.runtime_unchanged_after_upgrade = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline)
+$script:positiveFixture = @{
+    install = $script:InstallRoot; runtime = $script:RuntimeRoot; task_path = $script:taskPath; task_name = $script:taskName
+    task = $script:fixtureTask; view = $script:fixtureView; baseline = $script:baseline
+    task_baseline = $script:taskBaseline; runtime_baseline = $script:runtimeBaseline
+}
+
+function Invoke-XbFreshProcessRecoveryCase {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet("Upgrade", "Rollback")][string]$Operation,
+        [Parameter(Mandatory)][ValidateSet("journal", "move")][string]$Kind,
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][ValidateSet("before", "after")][string]$Phase,
+        [int]$Index = 0,
+        [switch]$InjectRuntimeDrift
+    )
+    $fixture = "fresh-" + $Name
+    $crash = Invoke-XbFreshHarnessChild -ChildMode crash -Name $fixture -Operation $Operation -Kind $Kind -Target $Target -Phase $Phase -Index $Index
+    if ($crash.exit_code -ne 86) { throw ("fresh_process_crash_not_injected:" + $fixture + ":" + $crash.exit_code + ":" + $crash.output) }
+    if ($InjectRuntimeDrift) {
+        $runtimeDriftRoot = Join-Path (Join-Path $WorkRoot $fixture) "pd\X-Boundaries\MemberGatewayWorker"
+        $runtimeDriftPath = Join-Path $runtimeDriftRoot "logs\recovery-drift.txt"
+        [IO.File]::WriteAllText($runtimeDriftPath, "synthetic post-crash runtime drift`n", ([Text.UTF8Encoding]::new($false)))
+    }
+    $recovered = Invoke-XbFreshHarnessChild -ChildMode recover -Name $fixture
+    if ($recovered.exit_code -ne 0) { throw ("fresh_process_recovery_failed:" + $fixture + ":" + $recovered.exit_code + ":" + $recovered.output) }
+    try { $record = $recovered.output | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw ("fresh_process_recovery_report_invalid:" + $fixture + ":" + $recovered.output) }
+    return [ordered]@{
+        crash_exit = $crash.exit_code
+        first = [string]$record.first
+        repeated = [string]$record.repeated
+        restored = $record.restored
+        source_root_absent = [bool]$record.source_root_absent
+        dispatcher_package_files_absent = [bool]$record.dispatcher_package_files_absent
+        runtime_baseline = [string]$record.runtime_baseline
+        runtime_drift_injected = [bool]$InjectRuntimeDrift
+        source_reads = [int]$record.source_reads
+        forbidden_calls = [int]$record.forbidden_calls
+    }
+}
+
+$out.fresh_process_fault_recovery = [ordered]@{}
+foreach ($stateName in @("preparing", "staged", "old_move_intent", "new_move_intent", "complete")) {
+    foreach ($phase in @("before", "after")) {
+        $key = "upgrade_journal_" + $stateName + "_" + $phase
+        $out.fresh_process_fault_recovery[$key] = Invoke-XbFreshProcessRecoveryCase -Name $key -Operation Upgrade -Kind journal -Target $stateName -Phase $phase
+    }
+}
+foreach ($stateName in @("rollback_stage_cleanup", "aborted", "rollback_new_intent", "rollback_old_intent", "rolled_back")) {
+    foreach ($phase in @("before", "after")) {
+        $key = "rollback_journal_" + $stateName + "_" + $phase
+        $out.fresh_process_fault_recovery[$key] = Invoke-XbFreshProcessRecoveryCase -Name $key -Operation Rollback -Kind journal -Target $stateName -Phase $phase
+    }
+}
+foreach ($operation in @("Upgrade", "Rollback")) {
+    foreach ($index in 1, 2) {
+        foreach ($phase in @("before", "after")) {
+            $key = $operation.ToLowerInvariant() + "_rename_" + $index + "_" + $phase
+            $out.fresh_process_fault_recovery[$key] = Invoke-XbFreshProcessRecoveryCase -Name $key -Operation $operation -Kind move -Target "rename" -Phase $phase -Index $index
+        }
+    }
+}
+$out.fresh_process_fault_recovery["runtime_drift_control"] = Invoke-XbFreshProcessRecoveryCase -Name "runtime_drift_control" -Operation Upgrade -Kind journal -Target "complete" -Phase after -InjectRuntimeDrift
+
+# Source SHA, malformed package preimages, disabled-task contract, active worker, lock, stage/custody tampering.
+$null = Initialize-XbFixture "wrong-source-sha"
+$script:reviewOverride = New-XbFixtureReviewedIdentity
+$script:reviewOverride.package_files[0].sha256 = ("f" * 64)
+$snapshot = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$out.adversarial.wrong_source_sha = [ordered]@{ outcome = (Invoke-XbFixtureOperation "Upgrade"); unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $snapshot); runtime_unchanged = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline) }
+
+foreach ($case in @("missing_file", "extra_file", "duplicate_file", "tampered_manifest", "stale_package_sha")) {
+    $null = Initialize-XbFixture ("preimage-" + $case)
+    $manifestPath = Join-Path $script:InstallRoot "installation-manifest.json"
+    if ($case -eq "missing_file") { Remove-Item -LiteralPath (Join-Path $script:InstallRoot $packageFiles[0]) -Force }
+    elseif ($case -eq "extra_file") { "foreign" | Set-Content -LiteralPath (Join-Path $script:InstallRoot "unexpected.txt") }
+    elseif ($case -eq "tampered_manifest") { "{}" | Set-Content -LiteralPath $manifestPath }
+    else {
+        $m = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+        if ($case -eq "duplicate_file") { $m.package_files += $m.package_files[0] }
+        else { $m.package_files[0].sha256 = ("f" * 64) }
+        ($m | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+    }
+    $snapshot = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+    $out.adversarial[$case] = [ordered]@{ outcome = (Invoke-XbFixtureOperation "Upgrade"); unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $snapshot); runtime_unchanged = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline) }
+}
+
+$out.adversarial.task = @{}
+foreach ($mode in @("enabled", "triggered", "action", "principal")) {
+    $null = Initialize-XbFixture ("task-" + $mode)
+    $script:taskMode = $mode
+    Set-XbFixtureTask
+    $script:taskBaseline = Get-XbFixtureTaskSnapshot
+    $out.adversarial.task[$mode] = [ordered]@{ outcome = (Invoke-XbFixtureOperation "Upgrade"); unchanged = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline); package_unchanged = (Test-XbFixtureRestored).package }
+}
+
+$null = Initialize-XbFixture "active-worker"
+$script:activeWorker = $true
+$out.adversarial.active_worker = [ordered]@{ outcome = (Invoke-XbFixtureOperation "Upgrade"); package_unchanged = (Test-XbFixtureRestored).package }
+$script:activeWorker = $false
+
+$null = Initialize-XbFixture "unknown-worker-process"
+$script:processMode = "missing_command_line"
+$out.adversarial.unknown_worker_process = [ordered]@{ outcome = (Invoke-XbFixtureOperation "Upgrade"); package_unchanged = (Test-XbFixtureRestored).package }
+$script:processMode = "valid"
+
+$null = Initialize-XbFixture "hardlink-package-payload"
+$hardlinkPath = Join-Path $script:InstallRoot $packageFiles[0]
+$hardlinkTarget = Join-Path $WorkRoot "external-hardlink-target.bin"
+[IO.File]::WriteAllText($hardlinkTarget, "synthetic private sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$hardlinkTargetSha = Get-XbFileSha256 -Path $hardlinkTarget
+Remove-Item -LiteralPath $hardlinkPath -Force
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $hardlinkPath $hardlinkTarget
+$hardlinkCreated = (Test-Path -LiteralPath $hardlinkPath) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($hardlinkPath) -eq 2)
+$hardlinkSnapshot = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$script:hardlinkHashCalls = 0
+$script:OriginalFileHasher = ${function:Get-XbFileSha256}
+Set-Item function:script:Get-XbFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    if ([IO.Path]::GetFullPath($Path) -ceq [IO.Path]::GetFullPath($hardlinkPath)) { $script:hardlinkHashCalls++ }
+    & $script:OriginalFileHasher -Path $Path
+}
+$hardlinkOutcome = Invoke-XbFixtureOperation "Upgrade"
+Set-Item function:script:Get-XbFileSha256 $script:OriginalFileHasher
+$out.adversarial.hardlink_package_payload = [ordered]@{
+    created = $hardlinkCreated
+    outcome = $hardlinkOutcome
+    alias_hash_calls = $script:hardlinkHashCalls
+    external_preserved = ((Get-XbFileSha256 -Path $hardlinkTarget) -ceq $hardlinkTargetSha)
+    package_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $hardlinkSnapshot)
+}
+
+$null = Initialize-XbFixture "hardlink-package-manifest"
+$manifestLink = Join-Path $script:InstallRoot "installation-manifest.json"
+$manifestTarget = Join-Path $WorkRoot "external-manifest-target.bin"
+[IO.File]::WriteAllText($manifestTarget, "synthetic external manifest sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$manifestTargetSha = Get-XbFileSha256 -Path $manifestTarget
+Remove-Item -LiteralPath $manifestLink -Force
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $manifestLink $manifestTarget
+$manifestLinkCreated = (Test-Path -LiteralPath $manifestLink) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($manifestLink) -eq 2)
+$manifestLinkSnapshot = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$script:manifestReadCalls = 0
+Set-Item function:script:Get-Content {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Raw, [string]$Encoding)
+    if ([IO.Path]::GetFullPath($LiteralPath) -ceq [IO.Path]::GetFullPath($manifestLink)) { $script:manifestReadCalls++ }
+    Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+}
+$manifestLinkOutcome = Invoke-XbFixtureOperation "Upgrade"
+Remove-Item function:script:Get-Content
+$out.adversarial.hardlink_package_manifest = [ordered]@{
+    created = $manifestLinkCreated
+    outcome = $manifestLinkOutcome
+    manifest_read_calls = $script:manifestReadCalls
+    external_preserved = ((Get-XbFileSha256 -Path $manifestTarget) -ceq $manifestTargetSha)
+    package_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $manifestLinkSnapshot)
+}
+
+$null = Initialize-XbFixture "hardlink-reviewed-source"
+$reviewSourcePath = Join-Path $script:SourceRoot $packageFiles[0]
+$reviewSourceTarget = Join-Path $WorkRoot "external-reviewed-source-target.bin"
+[IO.File]::WriteAllText($reviewSourceTarget, "synthetic private source sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$reviewSourceTargetSha = Get-XbFileSha256 -Path $reviewSourceTarget
+Remove-Item -LiteralPath $reviewSourcePath -Force
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $reviewSourcePath $reviewSourceTarget
+$reviewSourceLinkCreated = (Test-Path -LiteralPath $reviewSourcePath) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($reviewSourcePath) -eq 2)
+$script:reviewCalls = 0
+$reviewSourceOutcome = Invoke-XbFixtureOperation "Upgrade"
+$out.adversarial.hardlink_reviewed_source = [ordered]@{
+    created = $reviewSourceLinkCreated
+    outcome = $reviewSourceOutcome
+    source_reads = $script:reviewCalls
+    external_preserved = ((Get-XbFileSha256 -Path $reviewSourceTarget) -ceq $reviewSourceTargetSha)
+    install_unchanged = (Test-XbFixtureRestored).package
+    runtime_unchanged = (Test-XbFixtureRestored).runtime
+}
+Remove-Item -LiteralPath $reviewSourcePath -Force
+[IO.File]::WriteAllText($reviewSourcePath, ("synthetic payload: " + $packageFiles[0] + "`n"), ([Text.UTF8Encoding]::new($false)))
+
+$null = Initialize-XbFixture "hardlink-reviewed-manifest"
+$reviewManifestPath = Join-Path $script:SourceRoot "synthetic-reviewed-identity.json"
+$reviewManifestTarget = Join-Path $WorkRoot "external-reviewed-manifest-target.bin"
+[IO.File]::WriteAllText($reviewManifestTarget, "synthetic private manifest sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$reviewManifestTargetSha = Get-XbFileSha256 -Path $reviewManifestTarget
+Remove-Item -LiteralPath $reviewManifestPath -Force
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $reviewManifestPath $reviewManifestTarget
+$reviewManifestLinkCreated = (Test-Path -LiteralPath $reviewManifestPath) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($reviewManifestPath) -eq 2)
+$script:reviewCalls = 0
+$reviewManifestOutcome = Invoke-XbFixtureOperation "Upgrade"
+$out.adversarial.hardlink_reviewed_manifest = [ordered]@{
+    created = $reviewManifestLinkCreated
+    outcome = $reviewManifestOutcome
+    source_reads = $script:reviewCalls
+    external_preserved = ((Get-XbFileSha256 -Path $reviewManifestTarget) -ceq $reviewManifestTargetSha)
+    install_unchanged = (Test-XbFixtureRestored).package
+    runtime_unchanged = (Test-XbFixtureRestored).runtime
+}
+Remove-Item -LiteralPath $reviewManifestPath -Force
+[IO.File]::WriteAllText($reviewManifestPath, "{}", ([Text.UTF8Encoding]::new($false)))
+
+$null = Initialize-XbFixture "hardlink-transaction-journal"
+$null = Invoke-XbFixtureOperation "Upgrade"
+$paths = Get-XbWorkerUpgradePaths
+$committedJournal = Read-XbWorkerUpgradeJournal -Path $paths.journal
+$journalLinkPreviousRoot = [string]$committedJournal.previous_root
+$journalLinkPrevious = Get-XbFixtureTreeSnapshot -Root $journalLinkPreviousRoot
+$externalJournal = Join-Path $WorkRoot "external-journal-target.bin"
+[IO.File]::WriteAllText($externalJournal, "synthetic external journal sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$externalJournalSha = Get-XbFileSha256 -Path $externalJournal
+Remove-Item -LiteralPath $paths.journal -Force
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $paths.journal $externalJournal
+$journalLinkCreated = (Test-Path -LiteralPath $paths.journal) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($paths.journal) -eq 2)
+$journalLinkInstall = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$journalLinkOutcome = Invoke-XbFixtureOperation "Rollback"
+$out.adversarial.hardlink_transaction_journal = [ordered]@{
+    created = $journalLinkCreated
+    outcome = $journalLinkOutcome
+    external_preserved = ((Get-XbFileSha256 -Path $externalJournal) -ceq $externalJournalSha)
+    install_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $journalLinkInstall)
+    previous_unchanged = ((Get-XbFixtureTreeSnapshot -Root $journalLinkPreviousRoot) -ceq $journalLinkPrevious)
+}
+
+$null = Initialize-XbFixture "hardlink-transaction-lock"
+$paths = Get-XbWorkerUpgradePaths
+$externalLock = Join-Path $WorkRoot "external-lock-target.bin"
+[IO.File]::WriteAllText($externalLock, "synthetic external lock sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$externalLockSha = Get-XbFileSha256 -Path $externalLock
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $paths.lock $externalLock
+$lockLinkCreated = (Test-Path -LiteralPath $paths.lock) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($paths.lock) -eq 2)
+$lockLinkInstall = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$lockLinkOutcome = Invoke-XbFixtureOperation "Rollback"
+$out.adversarial.hardlink_transaction_lock = [ordered]@{
+    created = $lockLinkCreated
+    outcome = $lockLinkOutcome
+    external_preserved = ((Get-XbFileSha256 -Path $externalLock) -ceq $externalLockSha)
+    install_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $lockLinkInstall)
+}
+
+$null = Initialize-XbFixture "hardlink-transaction-temp"
+$paths = Get-XbWorkerUpgradePaths
+$externalTemp = Join-Path $WorkRoot "external-temp-target.bin"
+[IO.File]::WriteAllText($externalTemp, "synthetic external temp sentinel`n", ([Text.UTF8Encoding]::new($false)))
+$externalTempSha = Get-XbFileSha256 -Path $externalTemp
+$null = & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /H $paths.journal_temp $externalTemp
+$tempLinkCreated = (Test-Path -LiteralPath $paths.journal_temp) -and ([XbWorkerUpgradeNativeFileInfo]::LinkCount($paths.journal_temp) -eq 2)
+$tempLinkInstall = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$tempLinkOutcome = Invoke-XbFixtureOperation "Rollback"
+$out.adversarial.hardlink_transaction_temp = [ordered]@{
+    created = $tempLinkCreated
+    outcome = $tempLinkOutcome
+    external_preserved = ((Get-XbFileSha256 -Path $externalTemp) -ceq $externalTempSha)
+    temp_preserved = (Test-Path -LiteralPath $paths.journal_temp)
+    install_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $tempLinkInstall)
+}
+
+$null = Initialize-XbFixture "concurrent-lock"
+$lockPath = (Get-XbWorkerUpgradePaths).lock
+$lockHandle = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+$out.adversarial.concurrent_upgrade = [ordered]@{ outcome = (Invoke-XbFixtureOperation "Upgrade"); package_unchanged = (Test-XbFixtureRestored).package }
+$lockHandle.Dispose()
+
+$null = Initialize-XbFixture "stage-corruption"
+Set-XbFault -Kind journal -Target "staged" -Phase after
+$null = Invoke-XbFixtureOperation "Upgrade"
+Clear-XbFault
+$journal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+$stageFile = Join-Path $journal.candidate_root $packageFiles[0]
+"tampered stage" | Set-Content -LiteralPath $stageFile -Encoding ASCII
+$installSnapshot = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$out.adversarial.stage_corruption = [ordered]@{
+    outcome = (Invoke-XbFixtureOperation "Rollback")
+    installed_old_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $installSnapshot)
+    task_unchanged = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline)
+    runtime_unchanged = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline)
+}
+
+$null = Initialize-XbFixture "custody-corruption"
+Set-XbFault -Kind move -Index 1 -Phase after
+$null = Invoke-XbFixtureOperation "Upgrade"
+Clear-XbFault
+$journal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+$custodyFile = Join-Path $journal.previous_root $packageFiles[0]
+"tampered custody" | Set-Content -LiteralPath $custodyFile -Encoding ASCII
+$custodySnapshot = Get-XbFixtureTreeSnapshot -Root $journal.previous_root
+$out.adversarial.recovery_custody_corruption = [ordered]@{
+    outcome = (Invoke-XbFixtureOperation "Rollback")
+    install_absent = (-not (Test-Path -LiteralPath $script:InstallRoot))
+    custody_unchanged = ((Get-XbFixtureTreeSnapshot -Root $journal.previous_root) -ceq $custodySnapshot)
+    task_unchanged = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline)
+    runtime_unchanged = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline)
+}
+
+$null = Initialize-XbFixture "partial-staging"
+Set-XbFault -Kind journal -Target "preparing" -Phase after
+$partialCrash = Invoke-XbFixtureOperation "Upgrade"
+Clear-XbFault
+$journal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+New-Item -ItemType Directory -Path $journal.candidate_root -ErrorAction Stop | Out-Null
+[IO.File]::WriteAllText((Join-Path $journal.candidate_root $packageFiles[0]), "interrupted synthetic copy")
+$partialRecovery = Invoke-XbFixtureOperation "Rollback"
+$out.adversarial.partial_staging_recovery = [ordered]@{ operation = $partialCrash; outcome = $partialRecovery; restored = (Test-XbFixtureRestored); candidate_absent = (-not (Test-Path -LiteralPath $journal.candidate_root)) }
+
+$null = Initialize-XbFixture "foreign-staging"
+Set-XbFault -Kind journal -Target "preparing" -Phase after
+$foreignCrash = Invoke-XbFixtureOperation "Upgrade"
+Clear-XbFault
+$journal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+New-Item -ItemType Directory -Path $journal.candidate_root -ErrorAction Stop | Out-Null
+[IO.File]::WriteAllText((Join-Path $journal.candidate_root "foreign.txt"), "unknown synthetic content")
+$foreignStageSnapshot = Get-XbFixtureTreeSnapshot -Root $journal.candidate_root
+$foreignRecovery = Invoke-XbFixtureOperation "Rollback"
+$out.adversarial.foreign_staging = [ordered]@{ operation = $foreignCrash; outcome = $foreignRecovery; install_unchanged = (Test-XbFixtureRestored).package; candidate_preserved = ((Get-XbFixtureTreeSnapshot -Root $journal.candidate_root) -ceq $foreignStageSnapshot) }
+
+# Reconcile disk states left by an interrupted temporary journal write in a new
+# PowerShell process, and reject a corrupt committed journal without changing it.
+$null = Initialize-XbFixture "journal-temp-no-commit"
+$paths = Get-XbWorkerUpgradePaths
+[IO.File]::WriteAllText($paths.journal_temp, '{"schema_version":"xb.member', ([Text.UTF8Encoding]::new($false)))
+$tempNoCommitInstall = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$tempNoCommitRecovery = Invoke-XbFreshHarnessChild -ChildMode recover -Name "journal-temp-no-commit"
+$tempNoCommitReport = $tempNoCommitRecovery.output | ConvertFrom-Json
+$out.adversarial.journal_temp_no_commit = [ordered]@{
+    fresh_process = ($tempNoCommitRecovery.exit_code -eq 0)
+    first = [string]$tempNoCommitReport.first
+    repeated = [string]$tempNoCommitReport.repeated
+    temp_absent = (-not (Test-Path -LiteralPath $paths.journal_temp))
+    install_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $tempNoCommitInstall)
+    restored = $tempNoCommitReport.restored
+}
+
+$null = Initialize-XbFixture "journal-temp-with-commit"
+$null = Invoke-XbFixtureOperation "Upgrade"
+$paths = Get-XbWorkerUpgradePaths
+[IO.File]::WriteAllText($paths.journal_temp, '{"interrupted":', ([Text.UTF8Encoding]::new($false)))
+$tempWithCommitRecovery = Invoke-XbFreshHarnessChild -ChildMode recover -Name "journal-temp-with-commit"
+$tempWithCommitReport = $tempWithCommitRecovery.output | ConvertFrom-Json
+$out.adversarial.journal_temp_with_commit = [ordered]@{
+    fresh_process = ($tempWithCommitRecovery.exit_code -eq 0)
+    first = [string]$tempWithCommitReport.first
+    repeated = [string]$tempWithCommitReport.repeated
+    temp_absent = (-not (Test-Path -LiteralPath $paths.journal_temp))
+    restored = $tempWithCommitReport.restored
+    source_reads = [int]$tempWithCommitReport.source_reads
+}
+
+$null = Initialize-XbFixture "corrupt-committed-journal"
+$null = Invoke-XbFixtureOperation "Upgrade"
+$paths = Get-XbWorkerUpgradePaths
+$corruptInstall = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$journal = Read-XbWorkerUpgradeJournal -Path $paths.journal
+$corruptPrevious = Get-XbFixtureTreeSnapshot -Root $journal.previous_root
+[IO.File]::WriteAllText($paths.journal, '{"torn":', ([Text.UTF8Encoding]::new($false)))
+$corruptJournalBytes = Get-XbFileSha256 -Path $paths.journal
+$corruptRecovery = Invoke-XbFreshHarnessChild -ChildMode recover -Name "corrupt-committed-journal"
+$corruptRecoveryReport = $corruptRecovery.output | ConvertFrom-Json
+$out.adversarial.corrupt_committed_journal = [ordered]@{
+    fresh_process = ($corruptRecovery.exit_code -eq 0)
+    first = [string]$corruptRecoveryReport.first
+    repeated = [string]$corruptRecoveryReport.repeated
+    journal_preserved = ((Get-XbFileSha256 -Path $paths.journal) -ceq $corruptJournalBytes)
+    install_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $corruptInstall)
+    previous_unchanged = ((Get-XbFixtureTreeSnapshot -Root $journal.previous_root) -ceq $corruptPrevious)
+    task_unchanged = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline)
+    runtime_unchanged = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline)
+}
+
+$out.adversarial.acl_preservation = @{}
+$null = Initialize-XbFixture "acl-preimage"
+$rootAcl = Get-Acl -LiteralPath $script:InstallRoot
+$rootAcl.SetAccessRuleProtection($true, $true)
+Set-Acl -LiteralPath $script:InstallRoot -AclObject $rootAcl
+$saclControl = [ordered]@{ supported = ($script:auditAclEvidence -eq "native"); evidence = $script:auditAclEvidence }
+$saclPath = Join-Path $script:InstallRoot $packageFiles[0]
+if ($saclControl.supported) {
+    $auditAcl = Get-Acl -LiteralPath $saclPath -Audit -ErrorAction Stop
+    $auditIdentity = [Security.Principal.SecurityIdentifier]::new("S-1-1-0")
+    $auditFlags = [Security.AccessControl.AuditFlags]::Success -bor [Security.AccessControl.AuditFlags]::Failure
+    $auditRule = [Security.AccessControl.FileSystemAuditRule]::new($auditIdentity, [Security.AccessControl.FileSystemRights]::ReadData, $auditFlags)
+    $null = $auditAcl.AddAuditRule($auditRule)
+    Set-Acl -LiteralPath $saclPath -AclObject $auditAcl -ErrorAction Stop
+    $saclControl.before = Convert-XbWorkerUpgradeAclSddl (Get-XbWorkerUpgradeAclSddl -Path $saclPath)
+}
+$script:baseline = Get-XbWorkerPackageIdentity -Root $script:InstallRoot
+$aclBefore = Get-XbFixtureAclSnapshot -Root $script:InstallRoot
+$out.adversarial.acl_preservation.upgrade = Invoke-XbFixtureOperation "Upgrade"
+$journal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+$aclAfterUpgrade = Get-XbFixtureAclSnapshot -Root $script:InstallRoot
+$out.adversarial.acl_preservation.upgrade_preserved = ($aclAfterUpgrade -ceq $aclBefore)
+if ($saclControl.supported) {
+    $saclAfterUpgrade = Convert-XbWorkerUpgradeAclSddl (Get-XbWorkerUpgradeAclSddl -Path (Join-Path $script:InstallRoot $packageFiles[0]))
+    $saclControl.upgrade_preserved = ($saclAfterUpgrade -ceq $saclControl.before)
+}
+$out.adversarial.acl_preservation.rollback = Invoke-XbFixtureOperation "Rollback"
+$aclAfterRollback = Get-XbFixtureAclSnapshot -Root $script:InstallRoot
+$out.adversarial.acl_preservation.rollback_preserved = ($aclAfterRollback -ceq $aclBefore)
+if ($saclControl.supported) {
+    $saclAfterRollback = Convert-XbWorkerUpgradeAclSddl (Get-XbWorkerUpgradeAclSddl -Path (Join-Path $script:InstallRoot $packageFiles[0]))
+    $saclControl.rollback_preserved = ($saclAfterRollback -ceq $saclControl.before)
+}
+$out.adversarial.acl_preservation.sacl_control = $saclControl
+
+$null = Initialize-XbFixture "acl-denied"
+$paths = Get-XbWorkerUpgradePaths
+$lockSeed = [IO.File]::Open($paths.lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+$lockSeed.Dispose()
+$parent = Split-Path -Parent $script:InstallRoot
+$parentAcl = Get-Acl -LiteralPath $parent
+$deniedSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$deny = [Security.AccessControl.FileSystemAccessRule]::new($deniedSid, [Security.AccessControl.FileSystemRights]::CreateDirectories, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Deny)
+$denyAcl = Get-Acl -LiteralPath $parent
+$denyAcl.AddAccessRule($deny)
+Set-Acl -LiteralPath $parent -AclObject $denyAcl
+$observedDeny = Get-Acl -LiteralPath $parent
+$denyApplied = @($observedDeny.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { [string]$_.IdentityReference -ceq [string]$deniedSid -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny -and (([int]$_.FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::CreateDirectories) -ne 0) }).Count -gt 0
+$deniedSnapshot = Get-XbFixtureTreeSnapshot -Root $script:InstallRoot
+$deniedOutcome = Invoke-XbFixtureOperation "Upgrade"
+Set-Acl -LiteralPath $parent -AclObject $parentAcl
+$out.adversarial.denied_permission = [ordered]@{ deny_applied = $denyApplied; outcome = $deniedOutcome; install_unchanged = ((Get-XbFixtureTreeSnapshot -Root $script:InstallRoot) -ceq $deniedSnapshot); runtime_unchanged = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline) }
+
+$null = Initialize-XbFixture "install-reparse"
+$movedInstall = $script:InstallRoot + ".owned"
+[IO.Directory]::Move($script:InstallRoot, $movedInstall)
+$null = & cmd.exe /c mklink /J $script:InstallRoot $movedInstall
+$junctionExists = ((Get-Item -LiteralPath $script:InstallRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+$out.adversarial.install_reparse = [ordered]@{ created = $junctionExists; outcome = (Invoke-XbFixtureOperation "Upgrade"); target_present = (Test-Path -LiteralPath (Join-Path $movedInstall "installation-manifest.json")) }
+if ($junctionExists) { $null = & cmd.exe /c rmdir $script:InstallRoot; [IO.Directory]::Move($movedInstall, $script:InstallRoot) }
+
+$null = Initialize-XbFixture "parent-reparse"
+$physicalParent = Split-Path -Parent (Split-Path -Parent $script:InstallRoot)
+$movedParent = $physicalParent + ".owned"
+[IO.Directory]::Move($physicalParent, $movedParent)
+$null = & cmd.exe /c mklink /J $physicalParent $movedParent
+$parentJunctionExists = ((Get-Item -LiteralPath $physicalParent -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+$parentOutcome = Invoke-XbFixtureOperation "Upgrade"
+$parentTargetPresent = Test-Path -LiteralPath (Join-Path $movedParent "X-Boundaries\MemberGatewayWorker\installation-manifest.json")
+if ($parentJunctionExists) { $null = & cmd.exe /c rmdir $physicalParent; [IO.Directory]::Move($movedParent, $physicalParent) }
+$out.adversarial.parent_reparse = [ordered]@{ created = $parentJunctionExists; outcome = $parentOutcome; target_present = $parentTargetPresent }
+
+$null = Initialize-XbFixture "state-reparse"
+Set-XbFault -Kind journal -Target "preparing" -Phase after
+$null = Invoke-XbFixtureOperation "Upgrade"
+Clear-XbFault
+$journal = Read-XbWorkerUpgradeJournal -Path (Get-XbWorkerUpgradePaths).journal
+$paths = Get-XbWorkerUpgradePaths
+$external = Join-Path $WorkRoot "state-alias-target"
+New-Item -ItemType Directory -Path $external -Force | Out-Null
+"external sentinel" | Set-Content -LiteralPath (Join-Path $external "keep.txt")
+$null = & cmd.exe /c mklink /J $journal.candidate_root $external
+$aliasExists = ((Get-Item -LiteralPath $journal.candidate_root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+$aliasOutcome = Invoke-XbFixtureOperation "Rollback"
+$externalSnapshot = Get-XbFixtureTreeSnapshot -Root $external
+if ($aliasExists) { $null = & cmd.exe /c rmdir $journal.candidate_root }
+$recoveredAfterAliasRemoval = Invoke-XbFixtureOperation "Rollback"
+$out.adversarial.state_reparse = [ordered]@{ created = $aliasExists; outcome = $aliasOutcome; external_preserved = ((Get-XbFixtureTreeSnapshot -Root $external) -ceq $externalSnapshot); recovered_after_removal = $recoveredAfterAliasRemoval; restored = (Test-XbFixtureRestored) }
+
+# Prove Rollback needs neither package source bytes nor worker/task credentials.
+$script:InstallRoot = $script:positiveFixture.install
+$script:RuntimeRoot = $script:positiveFixture.runtime
+$script:taskPath = $script:positiveFixture.task_path
+$script:taskName = $script:positiveFixture.task_name
+$script:fixtureTask = $script:positiveFixture.task
+$script:fixtureView = $script:positiveFixture.view
+$script:baseline = $script:positiveFixture.baseline
+$script:taskBaseline = $script:positiveFixture.task_baseline
+$script:runtimeBaseline = $script:positiveFixture.runtime_baseline
+$script:reviewForbidden = $true
+$script:reviewCalls = 0
+Remove-Item -LiteralPath $script:SourceRoot -Recurse -Force -ErrorAction Stop
+$out.positive.rollback = Invoke-XbFixtureOperation "Rollback"
+$out.positive.rollback_again = Invoke-XbFixtureOperation "Rollback"
+$out.positive.rollback_source_reads = $script:reviewCalls
+$out.positive.rollback_without_credentials = [string]::IsNullOrEmpty([string]$script:WorkerAccount) -and $null -eq $script:TaskCredential
+$script:reviewForbidden = $false
+$out.positive.restored = Test-XbFixtureRestored
+$out.positive.task_after_rollback = ((Get-XbFixtureTaskSnapshot) -ceq $script:taskBaseline)
+$out.positive.runtime_after_rollback = ((Get-XbFixtureRuntimeSnapshot) -ceq $script:runtimeBaseline)
+
+$out.forbidden_call_count = $script:forbiddenCalls
+$out.native = [ordered]@{ powershell = $PSVersionTable.PSVersion.ToString(); edition = $PSVersionTable.PSEdition; architecture_bits = ([IntPtr]::Size * 8); administrator_gate_stubbed = $true; scheduler_task_mutations = "none (task fixture held in memory)"; audit_acl_evidence = $script:auditAclEvidence }
+[Console]::Out.WriteLine(($out | ConvertTo-Json -Depth 16 -Compress))
+'''
+
+
 _HOSTED_TASK_BOUNDARY_HARNESS = r'''[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InstallerPath,
@@ -4939,6 +5776,69 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
         owned = _installer_function(self.source, "Remove-XbWorkerOwnedState")
         self.assertIn("if ($TaskMayExist) { Remove-XbWorkerScheduledTask }", owned)
 
+    def test_upgrade_and_rollback_are_separate_non_destructive_operations(self) -> None:
+        self.assertIn('[ValidateSet("Install", "Uninstall", "ValidateOnly", "Upgrade", "Rollback")]', self.source)
+        dispatcher = _installer_function(self.source, "Invoke-XbWorkerInstaller")
+        rollback = _installer_function(self.source, "Invoke-XbWorkerRollback")
+        upgrade = _installer_function(self.source, "Invoke-XbWorkerUpgrade")
+        self.assertLess(dispatcher.index('if ($Operation -ne "Rollback")'), dispatcher.index("Read-XbReviewedPackageIdentity"))
+        self.assertIn("Enter-XbWorkerUpgradeLock", dispatcher)
+        self.assertIn("Assert-XbWorkerAdministrator", dispatcher)
+        self.assertLess(dispatcher.index("Assert-XbWorkerUpgradeFileNoHardLinks -Path $ReviewedPackageManifestPath"), dispatcher.index("Read-XbReviewedPackageIdentity -Path $ReviewedPackageManifestPath"))
+        for forbidden in ("Read-XbReviewedPackageIdentity", "New-XbWorkerInstallationManifest", "Register-XbWorkerScheduledTask", "Remove-XbWorkerOwnedState", "Remove-XbWorkerScheduledTask", "Set-XbWorkerAcl"):
+            with self.subTest(rollback_forbidden=forbidden):
+                self.assertNotIn(forbidden, rollback)
+        for forbidden in ("Invoke-WebRequest", "Invoke-RestMethod", "System.Net.Http", "git.exe"):
+            with self.subTest(rollback_external_access=forbidden):
+                self.assertNotIn(forbidden, rollback)
+        self.assertLess(upgrade.index('Write-XbWorkerUpgradeJournal -Journal $journal'), upgrade.index('Move-XbWorkerUpgradeDirectory -Source $paths.install'))
+        self.assertIn('$journal.state = "old_move_intent"', upgrade)
+        self.assertIn('$journal.state = "new_move_intent"', upgrade)
+        self.assertIn('$journal.state = "complete"', upgrade)
+        for forbidden in ("Get-ChildItem -LiteralPath $RuntimeRoot", "Get-Content -LiteralPath $RuntimeRoot", "Set-XbWorkerAcl", "Register-XbWorkerScheduledTask", "Remove-XbWorkerOwnedState", "Start-ScheduledTask", "GetMember", "SaveMember", "AutoCount"):
+            with self.subTest(upgrade_forbidden=forbidden):
+                self.assertNotIn(forbidden, upgrade)
+
+    def test_journal_uses_flushed_write_through_moves_and_same_parent_directories(self) -> None:
+        writer = _installer_function(self.source, "Write-XbWorkerUpgradeJournal")
+        mover = _installer_function(self.source, "Move-XbWorkerUpgradeDirectory")
+        self.assertIn("$stream.Flush($true)", writer)
+        self.assertIn("[IO.FileOptions]::WriteThrough", writer)
+        self.assertIn("Use-XbWorkerUpgradeNativeMove", writer)
+        self.assertIn("[XbWorkerUpgradeNativeMove]::Move", writer)
+        self.assertIn("[IO.Path]::GetPathRoot", mover)
+        self.assertIn("Use-XbWorkerUpgradeNativeMove", mover)
+
+    def test_upgrade_identity_rejects_file_aliases_and_unverifiable_audit_acl(self) -> None:
+        file_identity = _installer_function(self.source, "Assert-XbWorkerUpgradeFileNoHardLinks")
+        package_identity = _installer_function(self.source, "Get-XbWorkerPackageIdentity")
+        journal_read = _installer_function(self.source, "Read-XbWorkerUpgradeJournal")
+        acl_read = _installer_function(self.source, "Get-XbWorkerUpgradeAclSddl")
+        journal_acl = _installer_function(self.source, "Set-XbWorkerUpgradeJournalAcl")
+        self.assertIn("NumberOfLinks", self.source)
+        self.assertIn('throw "upgrade_file_alias_ambiguous"', file_identity)
+        self.assertIn("Assert-XbWorkerUpgradeFileNoHardLinks -Path $manifestPath", package_identity)
+        self.assertIn("Assert-XbWorkerUpgradeFileNoHardLinks -Path $path", package_identity)
+        self.assertIn("Assert-XbWorkerUpgradeFileNoHardLinks -Path $Path", journal_read)
+        self.assertIn("Get-Acl -LiteralPath $Path -Audit", acl_read)
+        self.assertIn('throw "upgrade_acl_unverifiable"', acl_read)
+        self.assertIn("$acl.SetOwner($ownerSid)", journal_acl)
+
+    def test_unknown_worker_process_identity_fails_closed(self) -> None:
+        stopped = _installer_function(self.source, "Assert-XbWorkerStopped")
+        self.assertIn('throw "worker_process_state_unproven"', stopped)
+        self.assertIn('$process.PSObject.Properties["CommandLine"]', stopped)
+
+    def test_upgrade_allowlist_is_exact(self) -> None:
+        self.assertEqual(
+            ALLOWED_FILES,
+            {
+                "scripts/install_ac2_member_gateway_worker.ps1",
+                "tests/test_member_gateway_worker_deployment.py",
+                "docs/autocount2-automation/member_gateway_production_runbook.md",
+            },
+        )
+
     def test_hosted_guard_requires_exact_github_hosted_windows(self) -> None:
         hosted = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "Windows"}
         self.assertTrue(_hosted_windows_boundary_required(hosted))
@@ -5123,6 +6023,240 @@ class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
                 "unexpected_preserved": True,
             },
         )
+
+
+class MemberWorkerUpgradeRollbackBehaviorTests(unittest.TestCase):
+    """Native PowerShell 5.1 synthetic dispatcher and crash-recovery evidence."""
+
+    report: dict[str, object]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        powershell = _resolve_native_powershell()
+        if not powershell:
+            if _hosted_windows_boundary_required():
+                raise AssertionError("native Windows PowerShell is required on the hosted runner")
+            raise unittest.SkipTest("Windows PowerShell 5.1 is required for upgrade/rollback behavior validation")
+        local_temp = Path(os.environ["LOCALAPPDATA"]) / "Temp"
+        with tempfile.TemporaryDirectory(prefix="xbg3-", dir=local_temp) as temp_dir:
+            root = Path(temp_dir)
+            harness = root / "upgrade_rollback_harness.ps1"
+            harness.write_text(_LOCAL_UPGRADE_ROLLBACK_HARNESS, encoding="utf-8", newline="\n")
+            work_root = root / "f"
+            work_root.mkdir()
+            completed = subprocess.run(
+                [
+                    powershell, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness), "-InstallerPath", str(ROOT / INSTALLER_PATH), "-WorkRoot", str(work_root),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        try:
+            cls.report = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(completed.stdout + completed.stderr) from exc
+
+    def test_dispatcher_upgrade_and_source_independent_rollback(self) -> None:
+        positive = self.report["positive"]
+        self.assertEqual(positive["upgrade"], "pass")
+        self.assertEqual(positive["complete"], "complete")
+        self.assertTrue(positive["current_is_new"])
+        self.assertTrue(positive["task_unchanged_after_upgrade"])
+        self.assertTrue(positive["runtime_unchanged_after_upgrade"])
+        self.assertEqual(positive["rollback"], "pass", json.dumps(positive))
+        self.assertEqual(positive["rollback_again"], "pass")
+        self.assertEqual(positive["rollback_source_reads"], 0)
+        self.assertTrue(positive["rollback_without_credentials"], json.dumps(positive))
+        self.assertEqual(positive["restored"], {"package": True, "task": True, "runtime": True, "forbidden_calls": 0})
+        self.assertTrue(positive["task_after_rollback"])
+        self.assertTrue(positive["runtime_after_rollback"])
+
+    def test_every_journal_transition_recovers_before_and_after(self) -> None:
+        cases = {name: evidence for name, evidence in self.report["fresh_process_fault_recovery"].items() if "_journal_" in name}
+        self.assertEqual(len(cases), 20)
+        for name, evidence in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(evidence["crash_exit"], 86, evidence)
+                if name == "upgrade_journal_preparing_before":
+                    self.assertEqual(evidence["first"], "upgrade_transaction_missing")
+                    self.assertEqual(evidence["repeated"], "upgrade_transaction_missing")
+                else:
+                    self.assertEqual(evidence["first"], "pass")
+                    self.assertEqual(evidence["repeated"], "pass")
+                self.assertEqual(evidence["restored"], {"package": True, "task": True, "runtime": True, "forbidden_calls": 0})
+
+    def test_both_upgrade_and_rollback_directory_renames_recover(self) -> None:
+        cases = {name: evidence for name, evidence in self.report["fresh_process_fault_recovery"].items() if "_rename_" in name}
+        self.assertEqual(len(cases), 8)
+        for name, evidence in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(evidence["crash_exit"], 86, evidence)
+                self.assertEqual(evidence["first"], "pass")
+                self.assertEqual(evidence["repeated"], "pass")
+                self.assertEqual(evidence["restored"], {"package": True, "task": True, "runtime": True, "forbidden_calls": 0})
+
+    def test_every_fault_recovers_in_a_fresh_powershell_process(self) -> None:
+        cases = self.report["fresh_process_fault_recovery"]
+        self.assertEqual(len(cases), 29)
+        for name, evidence in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(evidence["crash_exit"], 86, evidence)
+                if name == "upgrade_journal_preparing_before":
+                    self.assertEqual(evidence["first"], "upgrade_transaction_missing")
+                    self.assertEqual(evidence["repeated"], "upgrade_transaction_missing")
+                else:
+                    self.assertEqual(evidence["first"], "pass")
+                    self.assertEqual(evidence["repeated"], "pass")
+                expected_restored = {"package": True, "task": True, "runtime": True, "forbidden_calls": 0}
+                if name == "runtime_drift_control":
+                    expected_restored["runtime"] = False
+                    self.assertTrue(evidence["runtime_drift_injected"])
+                else:
+                    self.assertFalse(evidence["runtime_drift_injected"])
+                self.assertEqual(evidence["restored"], expected_restored)
+                self.assertTrue(evidence["source_root_absent"])
+                self.assertTrue(evidence["dispatcher_package_files_absent"])
+                self.assertEqual(evidence["runtime_baseline"], "pre-crash fixture evidence")
+                self.assertEqual(evidence["source_reads"], 0)
+                self.assertEqual(evidence["forbidden_calls"], 0)
+
+    def test_precrash_runtime_baseline_detects_post_crash_drift(self) -> None:
+        evidence = self.report["fresh_process_fault_recovery"]["runtime_drift_control"]
+        self.assertTrue(evidence["runtime_drift_injected"])
+        self.assertEqual(evidence["runtime_baseline"], "pre-crash fixture evidence")
+        self.assertEqual(evidence["restored"], {"package": True, "task": True, "runtime": False, "forbidden_calls": 0})
+
+    def test_adversarial_package_task_owner_and_runtime_controls(self) -> None:
+        adversarial = self.report["adversarial"]
+        self.assertEqual(adversarial["wrong_source_sha"]["outcome"], "reviewed_package_source_bytes_mismatch")
+        self.assertTrue(adversarial["wrong_source_sha"]["unchanged"])
+        self.assertTrue(adversarial["wrong_source_sha"]["runtime_unchanged"])
+        for name in ("missing_file", "extra_file", "duplicate_file", "tampered_manifest", "stale_package_sha"):
+            with self.subTest(preimage=name):
+                self.assertNotEqual(adversarial[name]["outcome"], "pass")
+                self.assertTrue(adversarial[name]["unchanged"])
+                self.assertTrue(adversarial[name]["runtime_unchanged"])
+        for name in ("enabled", "triggered", "action", "principal"):
+            with self.subTest(task=name):
+                self.assertNotEqual(adversarial["task"][name]["outcome"], "pass")
+                self.assertTrue(adversarial["task"][name]["unchanged"])
+                self.assertTrue(adversarial["task"][name]["package_unchanged"])
+        self.assertEqual(adversarial["active_worker"]["outcome"], "worker_process_active")
+        self.assertTrue(adversarial["active_worker"]["package_unchanged"])
+        self.assertEqual(adversarial["unknown_worker_process"]["outcome"], "worker_process_state_unproven")
+        self.assertTrue(adversarial["unknown_worker_process"]["package_unchanged"])
+        self.assertTrue(adversarial["hardlink_package_payload"]["created"])
+        self.assertEqual(adversarial["hardlink_package_payload"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertEqual(adversarial["hardlink_package_payload"]["alias_hash_calls"], 0)
+        self.assertTrue(adversarial["hardlink_package_payload"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_package_payload"]["package_unchanged"])
+        self.assertTrue(adversarial["hardlink_package_manifest"]["created"])
+        self.assertEqual(adversarial["hardlink_package_manifest"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertEqual(adversarial["hardlink_package_manifest"]["manifest_read_calls"], 0)
+        self.assertTrue(adversarial["hardlink_package_manifest"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_package_manifest"]["package_unchanged"])
+        self.assertTrue(adversarial["hardlink_reviewed_source"]["created"])
+        self.assertEqual(adversarial["hardlink_reviewed_source"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertEqual(adversarial["hardlink_reviewed_source"]["source_reads"], 0)
+        self.assertTrue(adversarial["hardlink_reviewed_source"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_reviewed_source"]["install_unchanged"])
+        self.assertTrue(adversarial["hardlink_reviewed_source"]["runtime_unchanged"])
+        self.assertTrue(adversarial["hardlink_reviewed_manifest"]["created"])
+        self.assertEqual(adversarial["hardlink_reviewed_manifest"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertEqual(adversarial["hardlink_reviewed_manifest"]["source_reads"], 0)
+        self.assertTrue(adversarial["hardlink_reviewed_manifest"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_reviewed_manifest"]["install_unchanged"])
+        self.assertTrue(adversarial["hardlink_reviewed_manifest"]["runtime_unchanged"])
+        self.assertTrue(adversarial["hardlink_transaction_journal"]["created"])
+        self.assertEqual(adversarial["hardlink_transaction_journal"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertTrue(adversarial["hardlink_transaction_journal"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_transaction_journal"]["install_unchanged"])
+        self.assertTrue(adversarial["hardlink_transaction_journal"]["previous_unchanged"])
+        self.assertTrue(adversarial["hardlink_transaction_lock"]["created"])
+        self.assertEqual(adversarial["hardlink_transaction_lock"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertTrue(adversarial["hardlink_transaction_lock"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_transaction_lock"]["install_unchanged"])
+        self.assertTrue(adversarial["hardlink_transaction_temp"]["created"])
+        self.assertEqual(adversarial["hardlink_transaction_temp"]["outcome"], "upgrade_file_alias_ambiguous")
+        self.assertTrue(adversarial["hardlink_transaction_temp"]["external_preserved"])
+        self.assertTrue(adversarial["hardlink_transaction_temp"]["temp_preserved"])
+        self.assertTrue(adversarial["hardlink_transaction_temp"]["install_unchanged"])
+        self.assertEqual(adversarial["concurrent_upgrade"]["outcome"], "upgrade_maintenance_owner_present")
+        self.assertTrue(adversarial["concurrent_upgrade"]["package_unchanged"])
+        self.assertEqual(self.report["forbidden_call_count"], 0)
+
+    def test_acl_reparse_and_corruption_controls_fail_closed(self) -> None:
+        adversarial = self.report["adversarial"]
+        acl = adversarial["acl_preservation"]
+        self.assertEqual(acl["upgrade"], "pass", json.dumps(acl))
+        self.assertTrue(acl["upgrade_preserved"])
+        self.assertEqual(acl["rollback"], "pass")
+        self.assertTrue(acl["rollback_preserved"])
+        if acl["sacl_control"]["supported"]:
+            self.assertTrue(acl["sacl_control"]["upgrade_preserved"])
+            self.assertTrue(acl["sacl_control"]["rollback_preserved"])
+        else:
+            self.assertEqual(acl["sacl_control"]["evidence"], "synthetic_dacl_only: SeSecurityPrivilege unavailable")
+        self.assertTrue(adversarial["denied_permission"]["deny_applied"])
+        self.assertNotEqual(adversarial["denied_permission"]["outcome"], "pass")
+        self.assertTrue(adversarial["denied_permission"]["install_unchanged"])
+        self.assertTrue(adversarial["denied_permission"]["runtime_unchanged"])
+        self.assertTrue(adversarial["install_reparse"]["created"])
+        self.assertEqual(adversarial["install_reparse"]["outcome"], "upgrade_path_reparse_point")
+        self.assertTrue(adversarial["install_reparse"]["target_present"])
+        self.assertTrue(adversarial["parent_reparse"]["created"])
+        self.assertEqual(adversarial["parent_reparse"]["outcome"], "upgrade_path_reparse_point")
+        self.assertTrue(adversarial["parent_reparse"]["target_present"])
+        self.assertEqual(adversarial["stage_corruption"]["outcome"], "upgrade_stage_sha_mismatch")
+        self.assertTrue(adversarial["stage_corruption"]["installed_old_unchanged"])
+        self.assertTrue(adversarial["stage_corruption"]["task_unchanged"])
+        self.assertTrue(adversarial["stage_corruption"]["runtime_unchanged"])
+        self.assertNotEqual(adversarial["recovery_custody_corruption"]["outcome"], "pass")
+        self.assertTrue(adversarial["recovery_custody_corruption"]["install_absent"])
+        self.assertTrue(adversarial["recovery_custody_corruption"]["custody_unchanged"])
+        self.assertEqual(adversarial["partial_staging_recovery"]["operation"], "synthetic_process_crash")
+        self.assertEqual(adversarial["partial_staging_recovery"]["outcome"], "pass")
+        self.assertEqual(adversarial["partial_staging_recovery"]["restored"], {"package": True, "task": True, "runtime": True, "forbidden_calls": 0})
+        self.assertTrue(adversarial["partial_staging_recovery"]["candidate_absent"])
+        self.assertEqual(adversarial["foreign_staging"]["outcome"], "upgrade_stage_membership_invalid")
+        self.assertTrue(adversarial["foreign_staging"]["install_unchanged"])
+        self.assertTrue(adversarial["foreign_staging"]["candidate_preserved"])
+        self.assertTrue(adversarial["journal_temp_no_commit"]["fresh_process"])
+        self.assertEqual(adversarial["journal_temp_no_commit"]["first"], "upgrade_transaction_missing")
+        self.assertEqual(adversarial["journal_temp_no_commit"]["repeated"], "upgrade_transaction_missing")
+        self.assertTrue(adversarial["journal_temp_no_commit"]["temp_absent"])
+        self.assertTrue(adversarial["journal_temp_no_commit"]["install_unchanged"])
+        self.assertTrue(adversarial["journal_temp_no_commit"]["restored"]["package"])
+        self.assertTrue(adversarial["journal_temp_with_commit"]["fresh_process"])
+        self.assertEqual(adversarial["journal_temp_with_commit"]["first"], "pass")
+        self.assertEqual(adversarial["journal_temp_with_commit"]["repeated"], "pass")
+        self.assertTrue(adversarial["journal_temp_with_commit"]["temp_absent"])
+        self.assertEqual(adversarial["journal_temp_with_commit"]["source_reads"], 0)
+        self.assertTrue(adversarial["journal_temp_with_commit"]["restored"]["package"])
+        self.assertTrue(adversarial["corrupt_committed_journal"]["fresh_process"])
+        self.assertEqual(adversarial["corrupt_committed_journal"]["first"], "upgrade_journal_invalid")
+        self.assertEqual(adversarial["corrupt_committed_journal"]["repeated"], "upgrade_journal_invalid")
+        for preserved in ("journal_preserved", "install_unchanged", "previous_unchanged", "task_unchanged", "runtime_unchanged"):
+            self.assertTrue(adversarial["corrupt_committed_journal"][preserved])
+        self.assertTrue(adversarial["state_reparse"]["created"])
+        self.assertEqual(adversarial["state_reparse"]["outcome"], "upgrade_path_reparse_point")
+        self.assertTrue(adversarial["state_reparse"]["external_preserved"])
+        self.assertEqual(adversarial["state_reparse"]["recovered_after_removal"], "pass")
+        self.assertTrue(adversarial["state_reparse"]["restored"]["package"])
+
+    def test_native_runtime_and_fixture_boundary_are_reported(self) -> None:
+        self.assertTrue(self.report["native"]["powershell"].startswith("5.1."))
+        self.assertEqual(self.report["native"]["edition"], "Desktop")
+        self.assertEqual(self.report["native"]["architecture_bits"], 64)
+        self.assertTrue(self.report["native"]["administrator_gate_stubbed"])
+        self.assertEqual(self.report["native"]["scheduler_task_mutations"], "none (task fixture held in memory)")
+        self.assertIn(self.report["native"]["audit_acl_evidence"], ("native", "synthetic_dacl_only: SeSecurityPrivilege unavailable"))
 
 
 class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):

@@ -43,6 +43,62 @@ Do not run licensed AutoCount or a production worker on the development
 laptop. Use synthetic/offline validation only; deployment and activation
 remain separately authorised operations.
 
+## Existing worker package Upgrade and Rollback
+
+The installer exposes `Upgrade` and `Rollback` as package-only operations for
+an existing installation. They require Windows PowerShell 5.1 and an
+administrator session on the target Windows host. Both operations refuse an
+active worker process, an enabled or triggered task, a task action/principal
+mismatch, an unverified installation manifest, or a reparse-point or hardlink
+alias. The session must be able to read and apply the complete package security
+descriptor, including audit rules; if Windows denies SACL access (for example,
+because `SeSecurityPrivilege` is unavailable), the operation fails closed. The
+journal owner is set to the initiating user and its protected DACL grants full
+control only to that user, SYSTEM, and Administrators. The task is inspected
+through Task Scheduler but is never registered, unregistered, enabled, or
+started by either operation. The runtime root is not enumerated or opened, so
+config, secret, log, and existing rollback content stay untouched.
+
+`Upgrade` additionally requires the reviewed package identity used by the
+existing installer. It verifies all five package files and the complete
+replacement manifest in a same-parent candidate directory before changing the
+installed package. A protected journal records the old and replacement file
+hashes, complete package security descriptors, task identity, and one durable
+state at a time.
+The old installation directory is renamed to a uniquely named sibling recovery
+directory, then the candidate is renamed into the installation path. These are
+two separate same-volume renames; recovery checks the journal against every
+physical package identity before it chooses a next step. The previous package
+and manifest remain in recovery custody after a successful Upgrade.
+
+Use the reviewed installer package to begin an Upgrade:
+
+```powershell
+& $InstallerPath -Operation Upgrade -ReviewedPackageManifestPath $ReviewedManifestPath
+```
+
+`Rollback` uses only the durable journal and the package directories. It does
+not need the reviewed package manifest, a worker account, task credentials, a
+network connection, or the replacement package source. Run it from an
+available copy of the installer dispatcher:
+
+```powershell
+& $InstallerPath -Operation Rollback
+```
+
+Rollback reconciles interrupted staging, either package rename, or an earlier
+Rollback. After a completed rollback, the prior package is back at the install
+path and the replacement remains in recovery custody. Repeated Rollback is
+safe. If the journal, recovery package, or ACL evidence is missing, corrupt,
+or inconsistent, stop and preserve all state for owner review. Recovery may
+remove only membership-checked incomplete candidate contents in the
+`preparing` or `rollback_stage_cleanup` states; other candidate discrepancies
+fail closed. The single-transaction G3 flow refuses another Upgrade while
+earlier recovery custody remains. These commands describe the bounded
+installer interface; they do not authorize running it against the AC2 VM or
+any existing
+production installation.
+
 ## Safe repository checks
 
 Run the focused package tests, worker/static tests, schema and migration checks,
