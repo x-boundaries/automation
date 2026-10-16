@@ -262,7 +262,7 @@ class NativeBridgeBase(unittest.TestCase):
             return function(state, self.cfg, intent_id, evidence, run_id=bridge.new_run_id(), now_ms=self.tick())
 
     def notify(self, action):
-        with StateV4Store(self.db) as state, bridge._session(state, self.tick()), \
+        with StateV4Store(self.db) as state, bridge._session(state, self.tick(), self.cfg), \
                 notify.NotificationStore(notify.store_path(self.cfg)) as store:
             return action(store)
 
@@ -821,7 +821,9 @@ class EffectCeilingTests(NativeBridgeBase):
         self.assertEqual(["VERIFIED", "SENT", "CEILING_REACHED"], [row["outcome"] for row in results])
         self.assertEqual((1, 1), self.dispatches())
         streams = self.status()["streams"]
-        pending = [stream for stream, row in streams.items() if row["state"] == "PENDING"]
+        # P-4: a stream held back by the ceiling is reported BLOCKED with the ceiling reference, not PENDING.
+        pending = [stream for stream, row in streams.items()
+                   if (row["state"], row["support_ref"]) == ("BLOCKED", "EG_NATIVE_EFFECT_CEILING_REACHED")]
         self.assertEqual(1, len(pending))
         with StateV4Store(self.db) as state:
             invoice = state.invoices_for_stream(pending[0])[0]

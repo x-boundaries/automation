@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "PowerShell({{LAUNCHER}} new-run)",
+      "PowerShell({{LAUNCHER}} wait)",
+      "PowerShell({{LAUNCHER}} acquire)",
+      "PowerShell({{LAUNCHER}} next)",
+      "PowerShell({{LAUNCHER}} status)",
+      "PowerShell({{LAUNCHER}} drive-seal --intent *)",
+      "PowerShell({{LAUNCHER}} drive-record --intent *)",
+      "PowerShell({{LAUNCHER}} drive-adopt --intent *)",
+      "PowerShell({{LAUNCHER}} notify-draft-evidence --notification *)",
+      "PowerShell({{LAUNCHER}} notify-seal --notification *)",
+      "PowerShell({{LAUNCHER}} notify-record --notification *)",
+      "Edit({{RUNS_GLOB}})",
+      "Read({{RUNS_GLOB}})",
+      "mcp__{{DRIVE_MCP}}__search_files",
+      "mcp__{{DRIVE_MCP}}__get_file_metadata",
+      "mcp__{{GMAIL_MCP}}__create_draft",
+      "mcp__{{GMAIL_MCP}}__get_draft",
+      "mcp__{{GMAIL_MCP}}__send_message"
+    ],
+    "deny": [
+      "PowerShell({{LAUNCHER}} backfill-run *)",
+      "PowerShell({{LAUNCHER}} backfill-record *)",
+      "PowerShell({{LAUNCHER}} init-uat *)",
+      "PowerShell({{LAUNCHER}} make-synthetic-fixture *)",
+      "PowerShell({{LAUNCHER}} migrate-hold-recovery *)",
+      "PowerShell({{LAUNCHER}} hold-release *)",
+      "PowerShell({{LAUNCHER}} drive-readback *)",
+      "Bash",
+      "mcp__{{DRIVE_MCP}}__create_file",
+      "mcp__{{DRIVE_MCP}}__update_file",
+      "mcp__{{DRIVE_MCP}}__copy_file",
+      "mcp__{{DRIVE_MCP}}__trash_file",
+      "mcp__{{DRIVE_MCP}}__download_file_content",
+      "mcp__{{DRIVE_MCP}}__read_file_content",
+      "mcp__{{DRIVE_MCP}}__share_file",
+      "mcp__{{GMAIL_MCP}}__forward",
+      "mcp__{{GMAIL_MCP}}__reply",
+      "mcp__{{GMAIL_MCP}}__delete_draft",
+      "mcp__{{GMAIL_MCP}}__update_draft",
+      "mcp__{{GMAIL_MCP}}__trash_message",
+      "mcp__{{GMAIL_MCP}}__trash_thread",
+      "WebFetch",
+      "WebSearch"
+    ]
+  }
+}

@@ -23,7 +23,6 @@ the v4 lease session, so it serialises with the scheduled bridge.
 from __future__ import annotations
 
 import contextlib
-import os
 import sqlite3
 import uuid
 from pathlib import Path
@@ -32,10 +31,10 @@ from typing import Any, Iterator
 from .errors import AppError, OfflineV4Error
 from .native_bridge import (
     DRIVE_LOCAL_SYNC, EXIT_HOLD, EXIT_OK, STREAM_LABELS, NativeConfig, NativeRefusal, _PROVIDER_ID_RE, _file_state,
-    _result,
+    _result, clean_stale_stages, publish_staged, sync_folder_problem,
 )
 from .naming import display_filename, display_key
-from .publication import ensure_no_reparse_components, publish_no_replace, validate_pdf
+from .publication import publish_no_replace, validate_pdf
 
 MAX_BACKFILL_FILES = 50
 
@@ -196,12 +195,15 @@ def _write_one(cfg: NativeConfig, ledger: BackfillLedger, adapter: Any, candidat
         payload = temp.read_bytes()
         identity = {"sha256": info.sha256, "byte_size": info.byte_size}
         target = cfg.drive.sync_folders[stream] / name
+        problem = sync_folder_problem(target.parent)
+        if problem is not None:
+            # P-2: the synced folder is not available now. Nothing is written or recorded; a later run retries.
+            return {"result": "RETRY_LATER", "support_ref": problem}
         if _file_state(target, identity) == "MISSING":
-            ensure_no_reparse_components(target.parent)
-            with open(target, "xb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            clean_stale_stages(target.parent)
+            with contextlib.suppress(AppError, OSError):
+                # H-4: staged and atomic; the final name is never a partial file. Re-judged just below.
+                publish_staged(target.parent, name, payload)
         if _file_state(target, identity) != "PRESENT":
             state, support_ref = "HOLD", "EG_BACKFILL_SYNC_CONFLICT"
         else:

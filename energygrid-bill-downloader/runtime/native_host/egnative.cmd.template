@@ -1,0 +1,33 @@
+@echo off
+rem EnergyGrid native bridge: scheduled-host launcher template (P-5, #226 production hardening).
+rem Install by replacing the {{...}} placeholders, then lock the file admin-write only (README.md).
+rem The scheduled host may run ONLY the loop subcommands listed below. Every other subcommand,
+rem including the operator commands (backfill-*, init-uat, migrate-hold-recovery, hold-release,
+rem drive-readback, make-synthetic-fixture), is refused here with exit 64 before Python starts.
+rem Operators run the Python CLI directly, never through this launcher.
+setlocal
+set "EG_HOME={{EG_HOME}}"
+set "EG_PY=%EG_HOME%\runtime\venv\Scripts\python.exe"
+set "EG_CODE=%EG_HOME%\app\{{PINNED_COMMIT}}\energygrid-bill-downloader"
+set "EG_CONFIG=%EG_HOME%\runtime\config\native.json"
+set "EG_RUNS=%EG_HOME%\data\runs"
+set "PYTHONIOENCODING=utf-8"
+if /I "%~1"=="new-run" (
+  "%EG_PY%" -I -c "import datetime,pathlib,sys;p=pathlib.Path(sys.argv[1])/datetime.datetime.now().strftime('%%Y%%m%%d-%%H%%M%%S');p.mkdir(parents=True);print(p)" "%EG_RUNS%"
+  exit /b %ERRORLEVEL%
+)
+if /I "%~1"=="wait" (
+  "%EG_PY%" -I -c "import time;time.sleep(30);print('waited 30s')"
+  exit /b 0
+)
+rem Exact, case-sensitive match against the scheduled loop's subcommands.
+for %%A in (acquire next status drive-seal drive-record drive-adopt notify-draft-evidence notify-seal notify-record) do (
+  if "%~1"=="%%A" goto allowed
+)
+echo {"command": "launcher", "exit_code": 64, "outcome": "REFUSED", "support_ref": "EG_HOST_SUBCOMMAND_DENIED"}
+exit /b 64
+:allowed
+cd /d "%EG_CODE%" || exit /b 64
+"%EG_PY%" -m energygrid_bill_downloader.native_cli %* --config "%EG_CONFIG%"
+echo EXIT=%ERRORLEVEL%
+exit /b 0

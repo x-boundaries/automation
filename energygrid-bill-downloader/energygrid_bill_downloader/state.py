@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import sqlite3
 import stat
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2513,6 +2515,464 @@ BEGIN SELECT RAISE(ABORT,'EG_V4_OUTCOME_WITHOUT_DISPATCH'); END""",
 
 V4_SCHEMA_SQL = _V4_TABLE_SQL + _V4_IMMUTABLE_TRIGGER_SQL + _V4_GUARD_TRIGGER_SQL
 
+# ---------------------------------------------------------------------------
+# #226 production hardening P-7: audited HOLD release, schema version 5.
+#
+# A v4 HOLD is terminal. Version 5 adds one append-only audit table and replaces the status guard
+# with a superset that admits exactly two more transitions, each only with a matching audit row:
+#   HOLD -> PENDING   only if the intent was never dispatched, never received a receipt and never
+#                     passed through DISPATCHED, UNKNOWN or VERIFIED (so no effect can have happened);
+#   HOLD -> VERIFIED  only if it was dispatched and a VERIFIED receipt with the Core hash exists
+#                     (exact late evidence, never a new effect).
+# The migration runs only on a copy (migrate_hold_recovery_copy). Code without v5 support refuses a
+# v5 database (schema manifest mismatch), so an older binary can never run against the wider guard.
+#
+# The switch to v5 keeps the configured state filename (switch_hold_recovery_v5), because the bridge's
+# notification, provenance and backfill stores take their names from it. A v5 database records that
+# filename and the history each of those stores held at the switch (energygrid_v5_history_binding),
+# so a v5 file opened under another name, or beside a missing or emptied store, is refused.
+# ---------------------------------------------------------------------------
+
+V5_SCHEMA_VERSION = 5
+V5_RELEASE_REASONS = (
+    "NAMED_ARCHIVE_CONFLICT_CLEARED", "DRIVE_NAME_CONFLICT_CLEARED", "ARCHIVE_RESTORED",
+    "OPERATOR_REVIEWED_NO_EFFECT", "LATE_EVIDENCE_VERIFIED",
+)
+_V5_REASONS_SQL = "(" + ",".join(f"'{reason}'" for reason in V5_RELEASE_REASONS) + ")"
+
+_V5_MIGRATION_SQL = (
+    f"""CREATE TABLE energygrid_v4_hold_release (
+  release_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  intent_id TEXT NOT NULL REFERENCES energygrid_v4_intent(intent_id),
+  from_version INTEGER NOT NULL CHECK(from_version >= 1),
+  to_state TEXT NOT NULL CHECK(to_state IN ('PENDING','VERIFIED')),
+  reason_code TEXT NOT NULL CHECK(reason_code IN {_V5_REASONS_SQL}),
+  operator TEXT NOT NULL CHECK(length(operator) BETWEEN 1 AND 64),
+  evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL CHECK(length(run_id)=36),
+  at_utc TEXT NOT NULL,
+  UNIQUE(intent_id, from_version)
+)""",
+    "CREATE TRIGGER energygrid_v4_hold_release_no_update BEFORE UPDATE ON energygrid_v4_hold_release "
+    "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+    "CREATE TRIGGER energygrid_v4_hold_release_no_delete BEFORE DELETE ON energygrid_v4_hold_release "
+    "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+    """CREATE TRIGGER energygrid_v4_hold_release_requires_hold BEFORE INSERT ON energygrid_v4_hold_release
+WHEN NOT EXISTS (SELECT 1 FROM energygrid_v4_intent_status s
+  WHERE s.intent_id=NEW.intent_id AND s.state='HOLD' AND s.version=NEW.from_version)
+  OR EXISTS (SELECT 1 FROM energygrid_v4_hold_release o WHERE o.intent_id=NEW.intent_id AND o.from_version=NEW.from_version)
+BEGIN SELECT RAISE(ABORT,'EG_V5_RELEASE_NOT_HOLD'); END""",
+    """CREATE TRIGGER energygrid_v4_hold_release_pending_proof BEFORE INSERT ON energygrid_v4_hold_release
+WHEN NEW.to_state='PENDING' AND (
+  EXISTS (SELECT 1 FROM energygrid_v4_dispatch d WHERE d.intent_id=NEW.intent_id)
+  OR EXISTS (SELECT 1 FROM energygrid_v4_receipt r WHERE r.intent_id=NEW.intent_id)
+  OR EXISTS (SELECT 1 FROM energygrid_v4_transition t
+    WHERE t.intent_id=NEW.intent_id AND t.to_state IN ('DISPATCHED','UNKNOWN','VERIFIED')))
+BEGIN SELECT RAISE(ABORT,'EG_V5_RELEASE_AFTER_DISPATCH'); END""",
+    """CREATE TRIGGER energygrid_v4_hold_release_verified_proof BEFORE INSERT ON energygrid_v4_hold_release
+WHEN NEW.to_state='VERIFIED' AND (
+  NOT EXISTS (SELECT 1 FROM energygrid_v4_dispatch d WHERE d.intent_id=NEW.intent_id)
+  OR NOT EXISTS (SELECT 1 FROM energygrid_v4_receipt r JOIN energygrid_v4_intent i ON i.intent_id=r.intent_id
+    WHERE r.intent_id=NEW.intent_id AND r.outcome='VERIFIED' AND r.provider_sha256=i.payload_sha256))
+BEGIN SELECT RAISE(ABORT,'EG_V5_RELEASE_WITHOUT_EVIDENCE'); END""",
+    """CREATE TABLE energygrid_v5_history_binding (
+  store TEXT PRIMARY KEY CHECK(store IN ('STATE','V4_BACKUP','NOTIFICATIONS','PROVENANCE','BACKFILL')),
+  filename TEXT NOT NULL CHECK(length(filename) BETWEEN 1 AND 255),
+  present INTEGER NOT NULL CHECK(present IN (0,1)),
+  row_count INTEGER NOT NULL CHECK(row_count >= 0),
+  effect_count INTEGER NOT NULL CHECK(effect_count >= 0),
+  digest TEXT NOT NULL CHECK(length(digest)=64 AND digest NOT GLOB '*[^0-9a-f]*'),
+  bound_at_utc TEXT NOT NULL
+)""",
+    "CREATE TRIGGER energygrid_v5_history_binding_no_update BEFORE UPDATE ON energygrid_v5_history_binding "
+    "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+    "CREATE TRIGGER energygrid_v5_history_binding_no_delete BEFORE DELETE ON energygrid_v5_history_binding "
+    "BEGIN SELECT RAISE(ABORT,'EG_V4_IMMUTABLE_ROW'); END",
+    "DROP TRIGGER energygrid_v4_status_guard",
+    """CREATE TRIGGER energygrid_v4_status_guard BEFORE UPDATE ON energygrid_v4_intent_status
+WHEN NEW.intent_id <> OLD.intent_id OR NEW.version <> OLD.version + 1 OR NOT (
+  (OLD.state='PENDING' AND NEW.state IN ('DISPATCHED','HOLD'))
+  OR (OLD.state='DISPATCHED' AND NEW.state IN ('VERIFIED','UNKNOWN','HOLD'))
+  OR (OLD.state='UNKNOWN' AND NEW.state IN ('VERIFIED','HOLD'))
+  OR (OLD.state='VERIFIED' AND NEW.state='HOLD')
+  OR (OLD.state='HOLD' AND NEW.state IN ('PENDING','VERIFIED') AND EXISTS (
+    SELECT 1 FROM energygrid_v4_hold_release r
+    WHERE r.intent_id=NEW.intent_id AND r.from_version=OLD.version AND r.to_state=NEW.state)))
+BEGIN SELECT RAISE(ABORT,'EG_V4_ILLEGAL_TRANSITION'); END""",
+)
+
+
+def _apply_v5_migration(connection: sqlite3.Connection) -> None:
+    for statement in _V5_MIGRATION_SQL:
+        connection.execute(statement)
+
+
+def _reference_v5_manifest() -> dict[tuple[str, str], str | None]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(_LEGACY_BILLS_SCHEMA_SQL)
+        for statement in V2_SCHEMA_SQL:
+            connection.execute(statement)
+        _apply_v3_schema(connection)
+        _apply_v4_schema(connection)
+        _apply_v5_migration(connection)
+        return _schema_manifest(connection)
+    finally:
+        connection.close()
+
+
+def _table_data_digest(connection: sqlite3.Connection, *, exclude: frozenset[str] = frozenset()) -> str:
+    """Digest of every row of every table (sorted text form), except the named tables. Reads only."""
+    digest = hashlib.sha256()
+    names = [row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    for name in names:
+        if name in exclude:
+            continue
+        digest.update(name.encode("utf-8") + b"\x00")
+        rows = sorted(repr(row) for row in connection.execute(f'SELECT * FROM "{name}"'))
+        for row in rows:
+            digest.update(row.encode("utf-8") + b"\x00")
+    return digest.hexdigest()
+
+
+_V5_ADDED_TABLES = frozenset({"energygrid_v4_hold_release", "energygrid_v5_history_binding"})
+_V5_BACKUP_INFIX = ".v4-backup-"
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _bound_at(now_ms: int) -> str:
+    return datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def migrate_hold_recovery_copy(source: Path, destination: Path, *, now_ms: int, bindings=None) -> dict[str, str]:
+    """Write a version-5 copy of a COMPLETE_V4 state database (P-7). The source is never written.
+
+    Refuses: a source that is not a regular COMPLETE_V4 file, has SQLite sidecars, holds a live
+    lease or has a sealed dispatch with no outcome (a run may be in progress); an existing
+    destination; a destination outside the source's directory. The source's SQLite write lock is
+    held (no write is made) from the first check to the last, so no writer can change it meanwhile.
+    The copy is taken with the SQLite backup API, migrated in one transaction, and kept only if every
+    pre-existing row is identical, the schema is exactly the version-5 reference and the source bytes
+    are unchanged. On any refusal or failure the destination this call created is removed; a file
+    that existed before is never touched.
+
+    bindings(reader, source_sha256) -> rows for energygrid_v5_history_binding, read under the same
+    lock. Without them the copy has no STATE binding, so StateV4Store refuses to open it: a copy is
+    never a usable switch-over candidate by itself (see switch_hold_recovery_v5).
+    """
+    for path in (source, destination):
+        if not path.is_absolute():
+            raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID")
+    if destination.exists() or destination.parent.resolve() != source.parent.resolve() or destination == source:
+        raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID")
+    try:
+        if not stat.S_ISREG(source.lstat().st_mode):
+            raise OfflineV4Error("EG_V4_STATE_NOT_REGULAR")
+    except FileNotFoundError:
+        raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID") from None
+    for suffix in ("-wal", "-shm", "-journal"):
+        if source.with_name(source.name + suffix).exists():
+            raise OfflineV4Error("EG_V4_STATE_SIDECAR_PRESENT")
+    created = False
+    # Read-write only to take the write lock; nothing is written, and the transaction is rolled back.
+    reader = sqlite3.connect(source.resolve().as_uri() + "?mode=rw", uri=True, isolation_level=None,
+                             timeout=V2_BUSY_TIMEOUT_MS / 1000)
+    try:
+        reader.execute("PRAGMA foreign_keys=ON")
+        try:
+            reader.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10) from None
+        before = _file_sha256(source)
+        status = _inspect_v4_database(reader)
+        if status == "COMPLETE_V5":
+            raise OfflineV4Error("EG_V5_ALREADY_MIGRATED")
+        if status != "COMPLETE_V4":
+            raise OfflineV4Error("EG_V4_STATE_NOT_COMPLETE_V4")
+        lease = reader.execute(
+            "SELECT expires_epoch_ms FROM energygrid_v4_lease WHERE lease_name=?", (V4_LEASE_NAME,)).fetchone()
+        if lease is not None and lease[0] > now_ms:
+            raise OfflineV4Error("EG_V5_SOURCE_LEASE_HELD", status=RUN_IN_PROGRESS, exit_code=10)
+        if reader.execute("SELECT 1 FROM energygrid_v4_intent_status WHERE state='DISPATCHED'").fetchone():
+            # A sealed effect with no recorded outcome: let a run record it (or mark it UNKNOWN) first.
+            raise OfflineV4Error("EG_V5_OPERATION_IN_FLIGHT", status=RUN_IN_PROGRESS, exit_code=10)
+        source_rows = _table_data_digest(reader)
+        rows = list(bindings(reader, before)) if bindings is not None else []
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(descriptor)
+        created = True
+        # A byte copy, not the SQLite backup API: backup() from a connection that holds the write lock
+        # gets SQLITE_LOCKED, which Python's backup loop retries forever. Under that lock (rollback
+        # journal, no hot journal) the file is a committed snapshot, and the copy is checked by hash.
+        shutil.copyfile(source, destination)
+        with destination.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        if _file_sha256(destination) != before:
+            raise OfflineV4Error("EG_V5_SOURCE_CHANGED")
+        writer = sqlite3.connect(str(destination), isolation_level=None)
+        try:
+            writer.execute("PRAGMA foreign_keys=ON")
+            writer.execute("PRAGMA journal_mode=DELETE")
+            writer.execute("PRAGMA synchronous=FULL")
+            writer.execute("BEGIN IMMEDIATE")
+            try:
+                _apply_v5_migration(writer)
+                for row in rows:
+                    writer.execute(
+                        "INSERT INTO energygrid_v5_history_binding (store, filename, present, row_count, effect_count, "
+                        "digest, bound_at_utc) VALUES (?,?,?,?,?,?,?)", (*row, _bound_at(now_ms)))
+                writer.execute(f"PRAGMA user_version={V5_SCHEMA_VERSION}")
+                if _table_data_digest(writer, exclude=_V5_ADDED_TABLES) != source_rows:
+                    raise OfflineV4Error("EG_V5_MIGRATION_DATA_CHANGED")
+                if _inspect_v4_database(writer) != "COMPLETE_V5":
+                    raise OfflineV4Error("EG_V5_SCHEMA_VALIDATION_FAILED")
+                writer.execute("COMMIT")
+            except BaseException:
+                if writer.in_transaction:
+                    writer.execute("ROLLBACK")
+                raise
+        finally:
+            writer.close()
+        # Still under the source write lock, and inside the cleanup: a changed source leaves no copy.
+        if _file_sha256(source) != before:
+            raise OfflineV4Error("EG_V5_SOURCE_CHANGED")
+        destination_sha = _file_sha256(destination)
+    except sqlite3.Error:
+        reader.close()
+        if created:
+            with contextlib.suppress(OSError):
+                destination.unlink()
+        raise OfflineV4Error("EG_V4_STATE_UNREADABLE") from None
+    except BaseException:
+        reader.close()
+        if created:
+            # Only a file this call created is removed; an existing file is never touched.
+            with contextlib.suppress(OSError):
+                destination.unlink()
+        raise
+    with contextlib.suppress(sqlite3.Error):
+        if reader.in_transaction:
+            reader.execute("ROLLBACK")
+    reader.close()
+    return {"status": "MIGRATED_COPY_V5", "source_sha256": before, "destination_sha256": destination_sha,
+            "data_digest": source_rows}
+
+
+def _move_no_replace(source: Path, destination: Path) -> None:
+    """Rename within the folder, never over an existing file. On Windows this also fails while any
+    process has the file open (SQLite opens without delete sharing), which proves it is not in use."""
+    from .errors import AppError
+    from .publication import publish_no_replace
+
+    try:
+        publish_no_replace(source, destination)
+    except AppError:
+        raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10) from None
+
+
+def switch_hold_recovery_v5(state_path: Path, *, now_ms: int, history) -> dict[str, str]:
+    """Same-filename v4 -> v5 switch for audited HOLD recovery (P-7). Operator only, task disabled.
+
+    The configured state filename never changes, so the notification, provenance and backfill stores
+    (named after it) keep their identity and history. Steps:
+      1. migrate_hold_recovery_copy into a new temporary file beside the state, under the source write
+         lock, binding the state filename, the v4 hash and history(reader) for each dependent store;
+      2. rename the v4 file to an exclusive backup name (refused while any process has it open) and
+         check its bytes still equal the verified hash; a changed source is put back unchanged;
+      3. rename the v5 file to the state filename (never over a file), make the v4 backup read-only,
+         and reopen the result as COMPLETE_V5.
+    A failure before step 3 leaves the original v4 file at its name and no v5 file. Rollback:
+    rollback_hold_recovery_v5 with the backup this returns.
+    """
+    import uuid
+
+    if not state_path.is_absolute():
+        raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID")
+    token = uuid.uuid4().hex
+    temporary = state_path.with_name(f"{state_path.name}.v5-switch-{token}.tmp")
+    backup = state_path.with_name(f"{state_path.name}{_V5_BACKUP_INFIX}{token}.bak")
+
+    def bindings(reader: sqlite3.Connection, source_sha: str) -> list[tuple]:
+        # STATE.row_count is the receipt watermark: receipts after it were recorded by v5 code.
+        watermark = int(reader.execute("SELECT COALESCE(MAX(receipt_seq), 0) FROM energygrid_v4_receipt").fetchone()[0])
+        return [("STATE", state_path.name, 1, watermark, 0, source_sha), ("V4_BACKUP", backup.name, 1, 0, 0, source_sha),
+                *history(reader)]
+
+    copied = migrate_hold_recovery_copy(state_path, temporary, now_ms=now_ms, bindings=bindings)
+    v4_sha, v5_sha = copied["source_sha256"], copied["destination_sha256"]
+    try:
+        _move_no_replace(state_path, backup)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+    if _file_sha256(backup) != v4_sha:
+        # Written between the verified copy and the rename: put it back unchanged; no v5 file remains.
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        _move_no_replace(backup, state_path)
+        raise OfflineV4Error("EG_V5_SOURCE_CHANGED")
+    try:
+        _move_no_replace(temporary, state_path)
+    except BaseException:
+        if not state_path.exists():
+            with contextlib.suppress(OfflineV4Error):
+                _move_no_replace(backup, state_path)
+        if state_path.exists() and _file_sha256(state_path) == v4_sha:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10) from None
+        raise OfflineV4Error("EG_V5_SWITCH_INCOMPLETE") from None
+    os.chmod(backup, stat.S_IREAD)
+    with StateV4Store(state_path) as state:
+        if state.schema_version != V5_SCHEMA_VERSION or _file_sha256(state_path) != v5_sha:
+            raise OfflineV4Error("EG_V5_SWITCH_INCOMPLETE")
+    return {"status": "SWITCHED_V5", "v4_sha256": v4_sha, "v5_sha256": v5_sha, "v4_backup": backup.name,
+            "data_digest": copied["data_digest"]}
+
+
+def rollback_hold_recovery_v5(state_path: Path, backup: Path, *, now_ms: int) -> dict[str, str]:
+    """Return a switched state to its v4 backup (P-7 rollback). Operator only, task disabled.
+
+    The backup must be this state's v4 backup (same folder, its name, COMPLETE_V4), and the v5 file
+    being undone must name it with the same hash, hold no live lease, carry no dispatch or receipt
+    that the backup lacks (a rollback can never forget an effect) and no audited release (the
+    append-only audit is never erased). The backup stays untouched; a verified copy of it replaces the
+    v5 file in one ReplaceFileW step that keeps the v5 file under a retired name, so the state name
+    is never left empty. Dependent stores are not touched.
+
+    With no file at the state name, only an interrupted switch can be undone: exactly one
+    `<state>.v5-switch-*.tmp` copy must name this backup. It is consumed (renamed) before the restore,
+    so it can never authorise a second rollback; anything else is refused (EG_V5_ROLLBACK_STATE_MISSING).
+    """
+    import glob
+    import uuid
+
+    if not state_path.is_absolute() or not backup.is_absolute() or backup.parent.resolve() != state_path.parent.resolve():
+        raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID", exit_code=64)
+    if not (backup.name.startswith(state_path.name + _V5_BACKUP_INFIX) and backup.name.endswith(".bak")):
+        raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID", exit_code=64)
+    try:
+        if not stat.S_ISREG(backup.lstat().st_mode):
+            raise OfflineV4Error("EG_V4_STATE_NOT_REGULAR", exit_code=64)
+    except FileNotFoundError:
+        raise OfflineV4Error("EG_V5_MIGRATION_PATH_INVALID", exit_code=64) from None
+    backup_sha = _file_sha256(backup)
+    reader = sqlite3.connect(backup.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    try:
+        reader.execute("PRAGMA foreign_keys=ON")
+        if _inspect_v4_database(reader) != "COMPLETE_V4":
+            raise OfflineV4Error("EG_V4_STATE_NOT_COMPLETE_V4", exit_code=64)
+        effects = _effect_rows(reader)
+    finally:
+        reader.close()
+    token = uuid.uuid4().hex
+    interrupted = None
+    if state_path.exists():
+        with StateV4Store(state_path) as state:
+            if state.schema_version != V5_SCHEMA_VERSION:
+                raise OfflineV4Error("EG_V5_ROLLBACK_NOT_V5", exit_code=64)
+            _check_rollback_source(state._conn(), backup.name, backup_sha, effects, now_ms)
+    else:
+        pattern = glob.escape(str(state_path.parent / state_path.name)) + ".v5-switch-*.tmp"
+        candidates = [Path(name) for name in glob.glob(pattern)
+                      if _v5_backup_binding(Path(name)) == (backup.name, backup_sha)]
+        if len(candidates) != 1:
+            raise OfflineV4Error("EG_V5_ROLLBACK_STATE_MISSING", exit_code=64)
+        connection = sqlite3.connect(candidates[0].resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        try:
+            _check_rollback_source(connection, backup.name, backup_sha, effects, now_ms)
+        finally:
+            connection.close()
+        interrupted = candidates[0]
+        _move_no_replace(interrupted, state_path.with_name(f"{state_path.name}.v5-switch-{token}.consumed"))
+    restore = state_path.with_name(f"{state_path.name}.v4-restore-{token}.tmp")
+    descriptor = os.open(restore, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(descriptor)
+    try:
+        shutil.copyfile(backup, restore)
+        with restore.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        if _file_sha256(restore) != backup_sha:
+            raise OfflineV4Error("EG_V5_SWITCH_INCOMPLETE")
+        if interrupted is None:
+            _replace_keeping(state_path, restore, state_path.with_name(f"{state_path.name}.v5-retired-{token}.bak"))
+        else:
+            _move_no_replace(restore, state_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            restore.unlink()
+        raise
+    with StateV4Store(state_path) as state:
+        if state.schema_version != V4_SCHEMA_VERSION:
+            raise OfflineV4Error("EG_V5_SWITCH_INCOMPLETE")
+    return {"status": "ROLLED_BACK_V4", "v4_sha256": backup_sha}
+
+
+def _v5_backup_binding(path: Path) -> tuple | None:
+    """(backup name, v4 hash) a v5 file was switched with, or None if it is not a readable v5 file."""
+    try:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    except sqlite3.Error:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT filename, digest FROM energygrid_v5_history_binding WHERE store='V4_BACKUP'").fetchone()
+        return tuple(row) if row is not None else None
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+
+
+def _check_rollback_source(conn: sqlite3.Connection, backup_name: str, backup_sha: str, effects: set,
+                           now_ms: int) -> None:
+    """The v5 file being undone names this backup and holds nothing a rollback would lose. Reads only."""
+    bound = conn.execute(
+        "SELECT filename, digest FROM energygrid_v5_history_binding WHERE store='V4_BACKUP'").fetchone()
+    if bound is None or tuple(bound) != (backup_name, backup_sha):
+        raise OfflineV4Error("EG_V5_ROLLBACK_BACKUP_MISMATCH", exit_code=64)
+    lease = conn.execute(
+        "SELECT expires_epoch_ms FROM energygrid_v4_lease WHERE lease_name=?", (V4_LEASE_NAME,)).fetchone()
+    if lease is not None and lease[0] > now_ms:
+        raise OfflineV4Error("EG_V5_SOURCE_LEASE_HELD", status=RUN_IN_PROGRESS, exit_code=10)
+    if not _effect_rows(conn) <= effects:
+        raise OfflineV4Error("EG_V5_ROLLBACK_AFTER_DISPATCH", exit_code=64)
+    if conn.execute("SELECT 1 FROM energygrid_v4_hold_release").fetchone():
+        # The release audit is append-only; a rollback would erase it. Rollback undoes the switch only.
+        raise OfflineV4Error("EG_V5_ROLLBACK_AFTER_RELEASE", exit_code=64)
+
+
+def _replace_keeping(replaced: Path, replacement: Path, retired: Path) -> None:
+    """Put `replacement` at `replaced` and keep the old file as `retired`, with Windows ReplaceFileW, so
+    the name is never left empty. It fails while any process has `replaced` open."""
+    import ctypes
+
+    if os.name != "nt":
+        raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10)
+    replace_file = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+    replace_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
+                             ctypes.c_void_p, ctypes.c_void_p]
+    replace_file.restype = ctypes.c_int
+    replacefile_write_through = 0x00000001
+    if not replace_file(str(replaced), str(replacement), str(retired), replacefile_write_through, None, None):
+        if not replaced.exists() and retired.exists():
+            # ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: the old file was moved aside; put it back unchanged.
+            _move_no_replace(retired, replaced)
+        raise OfflineV4Error("EG_V5_SOURCE_IN_USE", status=RUN_IN_PROGRESS, exit_code=10)
+
+
+def _effect_rows(connection: sqlite3.Connection) -> set[tuple]:
+    """Every sealed dispatch and every recorded provider outcome. Reads only."""
+    dispatches = {("D", *row) for row in connection.execute("SELECT intent_id, run_id FROM energygrid_v4_dispatch")}
+    receipts = {("R", *row) for row in connection.execute("SELECT intent_id, digest FROM energygrid_v4_receipt")}
+    return dispatches | receipts
+
 
 def _apply_v4_schema(connection: sqlite3.Connection) -> None:
     for statement in V4_SCHEMA_SQL:
@@ -2536,7 +2996,8 @@ def _reference_v4_manifest() -> dict[tuple[str, str], str | None]:
 def _inspect_v4_database(connection: sqlite3.Connection) -> str:
     """Return a closed v4 schema/data status without repairing anything."""
     try:
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != V4_SCHEMA_VERSION:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version not in (V4_SCHEMA_VERSION, 5):
             return "INCOMPATIBLE_V4"
         if connection.execute("PRAGMA journal_mode").fetchone()[0].lower() != "delete":
             return "INCOMPATIBLE_V4"
@@ -2547,6 +3008,9 @@ def _inspect_v4_database(connection: sqlite3.Connection) -> str:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
             return "CORRUPT_OR_UNREADABLE_V4"
+        if version == 5:
+            # P-7 hold-recovery schema: exactly the v4 reference plus the version-5 migration.
+            return "COMPLETE_V5" if _schema_manifest(connection) == _reference_v5_manifest() else "INCOMPATIBLE_V4"
         if _schema_manifest(connection) != _reference_v4_manifest():
             return "INCOMPATIBLE_V4"
         return "COMPLETE_V4"
@@ -2909,7 +3373,7 @@ def _v4_presentation_conflicts(conn: sqlite3.Connection, *, stream: str, display
 def _refusal_from_sqlite(exc: sqlite3.Error) -> OfflineV4Error:
     """Map a trigger or constraint message to its closed EG_V4 token, if it has one."""
     message = str(exc)
-    if re.fullmatch(r"EG_V4_[A-Z0-9_]{1,56}", message):
+    if re.fullmatch(r"EG_V[45]_[A-Z0-9_]{1,56}", message):
         return OfflineV4Error(message)
     return OfflineV4Error("EG_V4_STATE_REFUSED")
 
@@ -2940,8 +3404,17 @@ class StateV4Store:
             conn.execute(f"PRAGMA busy_timeout={V2_BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA synchronous=FULL")
             self.validation_status = _inspect_v4_database(conn)
-            if self.validation_status != "COMPLETE_V4":
+            if self.validation_status not in ("COMPLETE_V4", "COMPLETE_V5"):
                 raise OfflineV4Error("EG_V4_STATE_NOT_COMPLETE_V4")
+            if self.validation_status == "COMPLETE_V5":
+                # A v5 database is valid only under the filename it was switched at (P-7): the bridge
+                # names its history stores after that filename, so another name would start them empty.
+                bound = conn.execute(
+                    "SELECT filename FROM energygrid_v5_history_binding WHERE store='STATE'").fetchone()
+                if bound is None:
+                    raise OfflineV4Error("EG_V5_HISTORY_BINDING_MISSING", exit_code=64)
+                if bound[0] != self.path.name:
+                    raise OfflineV4Error("EG_V5_STATE_REPOINTED", exit_code=64)
             return self
         except (OSError, sqlite3.Error) as exc:
             self.close()
@@ -3256,6 +3729,19 @@ class StateV4Store:
             (action,),
         ).fetchone()[0])
 
+    def dispatch_count_since(self, action: str, since_iso: str) -> int:
+        """Sealed dispatches for one action sealed at or after `since_iso` (UTC, second precision).
+        Reads only. Used by the PER_PERIOD effect ceiling (P-4)."""
+        if action not in ("DRIVE_UPLOAD", "GMAIL_SEND"):
+            raise OfflineV4Error("EG_V4_ACTION_UNKNOWN")
+        if type(since_iso) is not str or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", since_iso):
+            raise OfflineV4Error("EG_V4_TIME_INVALID")
+        return int(self._conn().execute(
+            "SELECT COUNT(*) FROM energygrid_v4_dispatch d JOIN energygrid_v4_intent i ON i.intent_id=d.intent_id "
+            "WHERE i.action=? AND d.sealed_at_utc >= ?",
+            (action, since_iso),
+        ).fetchone()[0])
+
     # -- provider state --------------------------------------------------
 
     def seal_dispatch(self, intent_id: str, *, run_id: str, now_iso: str) -> None:
@@ -3272,6 +3758,89 @@ class StateV4Store:
             )
             _move_intent(conn, intent_id, expected="PENDING", target="DISPATCHED", support_ref=None,
                          run_id=run_id, now_iso=now_iso)
+
+    @property
+    def schema_version(self) -> int:
+        return V5_SCHEMA_VERSION if self.validation_status == "COMPLETE_V5" else V4_SCHEMA_VERSION
+
+    def history_bindings(self) -> dict[str, dict]:
+        """The dependent-store history bound at the v5 switch, by store. Empty for version 4."""
+        if self.schema_version != V5_SCHEMA_VERSION:
+            return {}
+        return {row["store"]: row for row in _fetch_dicts(self._conn(), "SELECT * FROM energygrid_v5_history_binding")}
+
+    def verified_drive_receipts_after(self, receipt_seq: int) -> list[str]:
+        """Intents with a hash-matching VERIFIED Drive receipt recorded after `receipt_seq`. Reads only."""
+        return [row[0] for row in self._conn().execute(
+            "SELECT r.intent_id FROM energygrid_v4_receipt r JOIN energygrid_v4_intent i ON i.intent_id=r.intent_id "
+            "WHERE r.receipt_seq > ? AND r.outcome='VERIFIED' AND r.provider_sha256=i.payload_sha256 "
+            "AND i.action='DRIVE_UPLOAD' ORDER BY r.receipt_seq", (receipt_seq,))]
+
+    def no_dispatch_releases(self) -> list[dict]:
+        """Every audited HOLD -> PENDING release (P-7), oldest first. Empty for version 4."""
+        if self.schema_version != V5_SCHEMA_VERSION:
+            return []
+        return _fetch_dicts(
+            self._conn(),
+            "SELECT r.intent_id, r.from_version, r.reason_code, v.stream, v.display_filename "
+            "FROM energygrid_v4_hold_release r JOIN energygrid_v4_intent i ON i.intent_id=r.intent_id "
+            "JOIN energygrid_v4_invoice v ON v.invoice_key=i.invoice_key WHERE r.to_state='PENDING' ORDER BY r.release_seq",
+        )
+
+    def hold_releases(self, intent_id: str) -> list[dict]:
+        if self.schema_version != V5_SCHEMA_VERSION:
+            return []
+        return _fetch_dicts(
+            self._conn(), "SELECT * FROM energygrid_v4_hold_release WHERE intent_id=? ORDER BY release_seq", (intent_id,)
+        )
+
+    def hold_release(self, intent_id: str, *, to_state: str, reason_code: str, operator: str, evidence_sha256: str,
+                     run_id: str, now_iso: str, provider_ref: str | None = None,
+                     provider_sha256: str | None = None) -> str:
+        """Audited operator release of one HOLD (P-7). Needs a version-5 database. One transaction:
+
+        PENDING: the intent must never have been dispatched (the schema triggers re-check this).
+        VERIFIED: a VERIFIED receipt with the Core hash is recorded from the caller's exact evidence first.
+        The audit row binds the release to the HOLD's exact version, so a release is one-time.
+        """
+        if self.schema_version != V5_SCHEMA_VERSION:
+            raise OfflineV4Error("EG_V5_SCHEMA_REQUIRED")
+        if to_state not in ("PENDING", "VERIFIED") or reason_code not in V5_RELEASE_REASONS:
+            raise OfflineV4Error("EG_V5_RELEASE_INVALID")
+        if type(operator) is not str or not 1 <= len(operator) <= 64 or not operator.isprintable():
+            raise OfflineV4Error("EG_V5_RELEASE_INVALID")
+        if type(evidence_sha256) is not str or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256):
+            raise OfflineV4Error("EG_V5_RELEASE_INVALID")
+        with self._write() as conn:
+            found = _fetch_dicts(
+                conn,
+                "SELECT i.payload_sha256, s.state, s.version FROM energygrid_v4_intent i "
+                "JOIN energygrid_v4_intent_status s ON s.intent_id=i.intent_id WHERE i.intent_id=?",
+                (intent_id,),
+            )
+            if not found or found[0]["state"] != "HOLD":
+                raise OfflineV4Error("EG_V5_RELEASE_NOT_HOLD")
+            version, payload_sha = found[0]["version"], found[0]["payload_sha256"]
+            if to_state == "VERIFIED":
+                if type(provider_ref) is not str or provider_sha256 != payload_sha:
+                    raise OfflineV4Error("EG_V5_RELEASE_WITHOUT_EVIDENCE")
+                digest = _v4_receipt_digest(intent_id, "VERIFIED", provider_ref, provider_sha256)
+                if not conn.execute(
+                    "SELECT 1 FROM energygrid_v4_receipt WHERE intent_id=? AND digest=?", (intent_id, digest)
+                ).fetchone():
+                    conn.execute(
+                        "INSERT INTO energygrid_v4_receipt (intent_id, digest, outcome, provider_ref, provider_sha256, "
+                        "run_id, at_utc) VALUES (?,?,?,?,?,?,?)",
+                        (intent_id, digest, "VERIFIED", provider_ref, provider_sha256, run_id, now_iso),
+                    )
+            conn.execute(
+                "INSERT INTO energygrid_v4_hold_release (intent_id, from_version, to_state, reason_code, operator, "
+                "evidence_sha256, run_id, at_utc) VALUES (?,?,?,?,?,?,?,?)",
+                (intent_id, version, to_state, reason_code, operator, evidence_sha256, run_id, now_iso),
+            )
+            _move_intent(conn, intent_id, expected="HOLD", target=to_state, support_ref=None, run_id=run_id,
+                         now_iso=now_iso)
+        return to_state
 
     def hold_pending(self, intent_id: str, *, support_ref: str, run_id: str, now_iso: str) -> None:
         """Hold an intent that was never dispatched. No provider effect can have happened."""

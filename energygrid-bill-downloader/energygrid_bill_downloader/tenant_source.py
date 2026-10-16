@@ -116,6 +116,15 @@ class TenantSettings:
     browser_config_path: Path = field(repr=False)
 
 
+def require_https(url: str, label: str) -> str:
+    """Credential-bearing Tenant endpoints use HTTPS only (H-6). Plain HTTP is refused, never downgraded."""
+    from urllib.parse import urlparse
+
+    if type(url) is not str or urlparse(url).scheme != "https":
+        raise ConfigError(f"{label} must use https")
+    return url
+
+
 def load_tenant_settings(raw: Any, *, private_path: Callable[[Any, str], Path]) -> TenantSettings:
     """Load the closed private Tenant config. `private_path` enforces the outside-Git rule."""
     from .config import _validate_endpoint
@@ -152,8 +161,8 @@ def load_tenant_settings(raw: Any, *, private_path: Callable[[Any, str], Path]) 
     if type(render_path) is not str or not re.fullmatch(r"(?:/[A-Za-z0-9_.-]{1,64}){1,8}", render_path):
         raise ConfigError("tenant render_request_path is invalid")
     return TenantSettings(
-        login_url=_validate_endpoint(raw["login_url"], "tenant.login_url"),
-        list_url=_validate_endpoint(raw["list_url"], "tenant.list_url"),
+        login_url=require_https(_validate_endpoint(raw["login_url"], "tenant.login_url"), "tenant.login_url"),
+        list_url=require_https(_validate_endpoint(raw["list_url"], "tenant.list_url"), "tenant.list_url"),
         portal_type=portal_type,
         list_body=copy.deepcopy(body),
         service_headers=dict(headers),
@@ -177,7 +186,28 @@ _CLIXML_SCRIPT = (
 )
 
 
-def dpapi_credentials(path: Path, runner: Callable[..., Any] = subprocess.run) -> Credentials:
+def windows_system_directory() -> Path:
+    """The Windows system directory from the OS itself (GetSystemDirectoryW), never from PATH or an
+    environment variable such as SystemRoot that a caller could change."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(260)
+    length = ctypes.WinDLL("kernel32", use_last_error=True).GetSystemDirectoryW(buffer, len(buffer))
+    if not 0 < length < len(buffer):
+        raise OSError("system directory unavailable")
+    return Path(buffer.value)
+
+
+def powershell_executable(system_directory: Callable[[], Path] = windows_system_directory) -> Path:
+    """Absolute path of Windows PowerShell 5.1 under the system directory (H-5). Fails closed."""
+    candidate = system_directory() / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not candidate.is_absolute() or not candidate.is_file():
+        raise OSError("powershell.exe not found in the system directory")
+    return candidate
+
+
+def dpapi_credentials(path: Path, runner: Callable[..., Any] = subprocess.run,
+                      executable: Callable[[], Path] = powershell_executable) -> Credentials:
     """Return a loader that reads the credential once per process, in memory only."""
     cache: list[tuple[str, str]] = []
 
@@ -190,7 +220,7 @@ def dpapi_credentials(path: Path, runner: Callable[..., Any] = subprocess.run) -
         env["EG_TENANT_CREDENTIAL_PATH"] = str(path)
         try:
             completed = runner(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", _CLIXML_SCRIPT],
+                [str(executable()), "-NoProfile", "-NonInteractive", "-Command", _CLIXML_SCRIPT],
                 capture_output=True, env=env, timeout=60, check=False,
             )
             if completed.returncode != 0:
@@ -350,6 +380,8 @@ _BFRANGE_RE = re.compile(rb"beginbfrange(.*?)endbfrange", re.S)
 _PAIR_RE = re.compile(rb"<([0-9A-Fa-f]{2,8})>\s*<([0-9A-Fa-f]{2,64})>")
 _RANGE_RE = re.compile(rb"<([0-9A-Fa-f]{2,8})>\s*<([0-9A-Fa-f]{2,8})>\s*<([0-9A-Fa-f]{2,8})>")
 _HEX_RE = re.compile(rb"<([0-9A-Fa-f]+)>")
+# A text-showing operator: a TJ array, or a single hex string shown with Tj.
+_SHOW_RE = re.compile(rb"\[([^\]]*)\]\s*TJ|(<[0-9A-Fa-f]+>)\s*Tj")
 MAX_STREAMS = 2000
 MAX_INFLATED_BYTES = 64 * 1024 * 1024
 
@@ -398,17 +430,30 @@ def pdf_text_runs(pdf: bytes) -> list[str]:
     for data in streams:
         if b"TJ" not in data and b"Tj" not in data:
             continue
-        hexes = _HEX_RE.findall(data)
+        # One entry per text-showing operator, in document order. The hex strings inside one TJ array
+        # (split only by kerning numbers) form one shown string; separate operators never run together.
+        shows = [_HEX_RE.findall(match.group(1) or match.group(2)) for match in _SHOW_RE.finditer(data)]
         for mapping in maps:
-            runs.append("".join(
-                "".join(mapping.get(int(text[index:index + 4], 16), "\ufffd") for index in range(0, len(text) - 3, 4))
-                for text in hexes
+            runs.append("\n".join(
+                "".join(
+                    "".join(mapping.get(int(text[index:index + 4], 16), "\ufffd") for index in range(0, len(text) - 3, 4))
+                    for text in show
+                )
+                for show in shows
             ))
     return runs
 
 
+# Characters that may appear inside an Invoice No. (INVOICE_NO_RE). The match must not continue into
+# one of them on either side, so "...-00083" never matches inside "...-000831" (H-2).
+_TOKEN_CHAR = "A-Za-z0-9_-"
+
+
 def pdf_shows_invoice(pdf: bytes, invoice_no: str) -> bool:
-    return any(invoice_no in run for run in pdf_text_runs(pdf))
+    if type(invoice_no) is not str or not INVOICE_NO_RE.fullmatch(invoice_no):
+        return False
+    pattern = re.compile(f"(?<![{_TOKEN_CHAR}]){re.escape(invoice_no)}(?![{_TOKEN_CHAR}])")
+    return any(pattern.search(run) for run in pdf_text_runs(pdf))
 
 
 # ---------------------------------------------------------------------------
