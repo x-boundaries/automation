@@ -3,6 +3,10 @@
 This script reads Core-generated acquire/status JSON files only. It never touches
 EnergyGrid SQLite, Drive, Gmail or the existing scheduler. No retries, redirects,
 or non-local destinations are permitted.
+
+With --run-dir, both files must come from the same fresh `egnative.cmd new-run`
+folder, and that folder is reported at most once (monitor-report.json is created
+exclusively before the POST and is never overwritten).
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -25,6 +29,12 @@ REF_RE = re.compile(r"^EG_[A-Z0-9_]{4,72}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 URL_PATH = "/webhook/xb-energygrid-monitor-v1"
 MAX_REPORT_BYTES = 512 * 1024
+CORE_SCHEMA = "energygrid.native.v4.result.v1"
+RUN_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
+MAX_RUN_AGE = timedelta(hours=6)
+CLOCK_SKEW = timedelta(minutes=2)
+REPORT_EVIDENCE = "monitor-report.json"
+POST_EVIDENCE = "monitor-post.json"
 
 
 class ReportError(Exception):
@@ -80,7 +90,8 @@ def summarise(acquire: dict, status: dict, now: datetime | None = None) -> dict:
         elif drive_state == "DRAINED":
             result, support_ref, identity = "OK", None, None
         else:
-            result, support_ref = "FAILURE", "EG_MONITOR_DRIVE_STATE_INVALID"
+            # Not a Core state: refuse to report, so n8n's missed-report check raises the alert.
+            raise ReportError("EG_MONITOR_DRIVE_STATE_INVALID")
         report[stream] = {"result": result, "support_ref": support_ref, "incident_ref": identity}
     at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
     return {"schema": SCHEMA, "run_id": run_id, "observed_at_utc": at.isoformat().replace("+00:00", "Z"),
@@ -97,6 +108,45 @@ def _json_file(path: Path) -> dict:
     if not isinstance(obj, dict):
         raise ReportError("EG_MONITOR_INPUT_NOT_OBJECT")
     return obj
+
+
+def _core_result(obj: dict, command: str) -> dict:
+    if obj.get("schema") != CORE_SCHEMA or obj.get("command") != command:
+        raise ReportError("EG_MONITOR_NOT_CORE_" + command.upper())
+    if command == "acquire" and obj.get("outcome") != "ACQUIRED":
+        raise ReportError("EG_MONITOR_ACQUIRE_NOT_COMPLETED")
+    return obj
+
+
+def bind_run_dir(run_dir: Path, runs_root: Path, now: datetime | None = None) -> tuple[dict, dict]:
+    """Return (acquire, status) only when both belong to one fresh run folder under runs_root."""
+    now = now or datetime.now()  # naive local time, same clock as `egnative.cmd new-run`
+    try:
+        root = runs_root.resolve(strict=True)
+        folder = run_dir.resolve(strict=True)
+    except OSError as exc:
+        raise ReportError("EG_MONITOR_RUN_DIR_MISSING") from exc
+    if run_dir.is_symlink() or folder.parent != root or not RUN_DIR_RE.fullmatch(folder.name):
+        raise ReportError("EG_MONITOR_RUN_DIR_REFUSED")
+    started = datetime.strptime(folder.name, "%Y%m%d-%H%M%S")
+    if not (started - CLOCK_SKEW <= now <= started + MAX_RUN_AGE):
+        raise ReportError("EG_MONITOR_RUN_NOT_CURRENT")
+    paths = folder / "acquire.json", folder / "status.json"
+    acquire, status = (_json_file(path) for path in paths)
+    mtimes = [datetime.fromtimestamp(path.stat().st_mtime) for path in paths]
+    if not (started - CLOCK_SKEW <= mtimes[0] <= mtimes[1] <= now + CLOCK_SKEW):
+        raise ReportError("EG_MONITOR_RUN_FILES_NOT_CURRENT")
+    return _core_result(acquire, "acquire"), _core_result(status, "status")
+
+
+def _write_once(path: Path, obj: dict) -> None:
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2)
+    except FileExistsError as exc:
+        raise ReportError("EG_MONITOR_RUN_ALREADY_REPORTED") from exc
+    except OSError as exc:
+        raise ReportError("EG_MONITOR_EVIDENCE_UNWRITABLE") from exc
 
 
 def _validate_endpoint(endpoint: str) -> None:
@@ -137,21 +187,39 @@ def send(endpoint: str, token_file: Path, payload: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Report latest completed EnergyGrid Core run to local n8n")
-    p.add_argument("--acquire-file", type=Path, required=True)
-    p.add_argument("--status-file", type=Path, required=True)
+    p.add_argument("--run-dir", type=Path, help="egnative new-run folder holding acquire.json + status.json")
+    p.add_argument("--runs-root", type=Path, help="required with --run-dir: the EnergyGrid data/runs folder")
+    p.add_argument("--acquire-file", type=Path)
+    p.add_argument("--status-file", type=Path)
     p.add_argument("--endpoint", default="http://127.0.0.1:5678" + URL_PATH)
     p.add_argument("--token-file", type=Path)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     try:
-        report = summarise(_json_file(args.acquire_file), _json_file(args.status_file))
+        if args.run_dir is not None:
+            if args.runs_root is None or args.acquire_file or args.status_file:
+                raise ReportError("EG_MONITOR_ARGUMENTS_REFUSED")
+            report = summarise(*bind_run_dir(args.run_dir, args.runs_root))
+        elif args.acquire_file and args.status_file:
+            report = summarise(_json_file(args.acquire_file), _json_file(args.status_file))
+        else:
+            raise ReportError("EG_MONITOR_ARGUMENTS_REFUSED")
         if args.dry_run:
             print(json.dumps(report, indent=2))  # No file names, mail addresses or tokens.
             return 0
         if args.token_file is None:
             raise ReportError("EG_MONITOR_TOKEN_FILE_REQUIRED")
         _validate_endpoint(args.endpoint)
-        send(args.endpoint, args.token_file, report)
+        if args.run_dir is not None:
+            _write_once(args.run_dir / REPORT_EVIDENCE, report)  # claims this run: never posted twice
+        try:
+            send(args.endpoint, args.token_file, report)
+        except ReportError as exc:
+            if args.run_dir is not None:
+                _write_once(args.run_dir / POST_EVIDENCE, {"outcome": str(exc)})
+            raise
+        if args.run_dir is not None:
+            _write_once(args.run_dir / POST_EVIDENCE, {"outcome": "EG_MONITOR_LOCAL_REPORT_POST_ACCEPTED"})
         print("EG_MONITOR_LOCAL_REPORT_POST_ACCEPTED")
         return 0
     except ReportError as exc:

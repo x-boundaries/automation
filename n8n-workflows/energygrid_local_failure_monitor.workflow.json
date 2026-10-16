@@ -1,5 +1,5 @@
 {
-  "name": "EnergyGrid - Local Failure Monitor (inactive)",
+  "name": "EnergyGrid - Local Run Monitor",
   "active": false,
   "nodes": [
     {
@@ -30,7 +30,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Validated reports only. Never trust caller-supplied message text, recipient, or filename.\nconst raw = $input.first()?.json?.body;\nconst own = (v) => v && typeof v === 'object' && !Array.isArray(v);\nconst sameKeys = (obj, keys) => own(obj) && Object.keys(obj).sort().join('|') === keys.slice().sort().join('|');\nif (!sameKeys(raw, ['schema','run_id','observed_at_utc','streams'])) throw new Error('EG_MONITOR_REPORT_SHAPE');\nif (raw.schema !== 'xb.energygrid.monitor.v1') throw new Error('EG_MONITOR_SCHEMA');\nif (typeof raw.run_id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(raw.run_id)) throw new Error('EG_MONITOR_RUN_ID');\nif (typeof raw.observed_at_utc !== 'string' || !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/.test(raw.observed_at_utc)) throw new Error('EG_MONITOR_TIMESTAMP');\nconst observedMs = Date.parse(raw.observed_at_utc);\nconst nowMs = Date.now();\nif (!Number.isFinite(observedMs) || Math.abs(nowMs - observedMs) > 30 * 60 * 1000) throw new Error('EG_MONITOR_OLD_REPORT');\nif (!sameKeys(raw.streams, ['EB_BILL','TENANT_BILL'])) throw new Error('EG_MONITOR_STREAMS');\nfunction sgDay(ms) {\n  const parts = new Intl.DateTimeFormat('en-GB', {timeZone:'Asia/Singapore', year:'numeric', month:'2-digit', day:'2-digit'}).formatToParts(new Date(ms));\n  const p = Object.fromEntries(parts.filter(x => x.type !== 'literal').map(x=>[x.type,x.value]));\n  return `${p.year}-${p.month}-${p.day}`;\n}\nconst day = sgDay(nowMs);\nconst valid = {};\nfor (const stream of ['EB_BILL','TENANT_BILL']) {\n  const row=raw.streams[stream];\n  if (!sameKeys(row, ['result','support_ref','incident_ref'])) throw new Error('EG_MONITOR_STREAM_SHAPE');\n  if (!['OK','FAILURE','PENDING'].includes(row.result)) throw new Error('EG_MONITOR_RESULT');\n  if (row.result === 'OK') {\n    if (row.support_ref !== null || row.incident_ref !== null) throw new Error('EG_MONITOR_OK_FIELDS');\n  } else {\n    if (typeof row.support_ref !== 'string' || !/^EG_[A-Z0-9_]{4,72}$/.test(row.support_ref)) throw new Error('EG_MONITOR_REF');\n    if (row.incident_ref !== null && (typeof row.incident_ref !== 'string' || !/^bill-[0-9a-f]{24}$/.test(row.incident_ref))) throw new Error('EG_MONITOR_INCIDENT');\n  }\n  valid[stream] = row;\n}\nconst state = $getWorkflowStaticData('global');\nstate.last_report_day_sgt = day;\nstate.last_report_utc = raw.observed_at_utc;\nstate.alert_series = state.alert_series || {};\nstate.open_incidents = state.open_incidents || {};\nconst alerts=[];\nfor (const stream of ['EB_BILL','TENANT_BILL']) {\n  const row=valid[stream];\n  if (row.result === 'OK') { state.open_incidents[stream] = null; continue; }\n  const signature = `${row.result}|${row.support_ref}|${row.incident_ref || ''}`;\n  if (!state.open_incidents[stream] || state.open_incidents[stream].signature !== signature) {\n    const next = Number(state.alert_series[stream] || 0) + 1;\n    state.alert_series[stream] = next;\n    state.open_incidents[stream] = { signature, episode: next };\n  }\n  const episode=state.open_incidents[stream].episode;\n  const label=stream === 'EB_BILL' ? 'EB Bill' : 'Tenant Bill';\n  const pending=row.result === 'PENDING';\n  alerts.push({json:{\n    dedupe_key:`eg-monitor:${stream}:${episode}`,\n    subject:`EnergyGrid: ${label} ${pending?'incomplete':'failed'} (${row.support_ref})`,\n    message:`EnergyGrid needs attention.\\nStream: ${label}\\nOutcome: ${row.result}\\nReference: ${row.support_ref}\\nRun: ${raw.run_id}\\nObserved (UTC): ${raw.observed_at_utc}\\n\\nReview EnergyGrid's local status. Do not retry uncertain uploads or emails.`,\n  }});\n}\nreturn alerts;"
+        "jsCode": "// Validated reports only. Never trust caller-supplied message text, recipient, or filename.\nconst raw = $input.first()?.json?.body;\nconst own = (v) => v && typeof v === 'object' && !Array.isArray(v);\nconst sameKeys = (obj, keys) => own(obj) && Object.keys(obj).sort().join('|') === keys.slice().sort().join('|');\nif (!sameKeys(raw, ['schema','run_id','observed_at_utc','streams'])) throw new Error('EG_MONITOR_REPORT_SHAPE');\nif (raw.schema !== 'xb.energygrid.monitor.v1') throw new Error('EG_MONITOR_SCHEMA');\nif (typeof raw.run_id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(raw.run_id)) throw new Error('EG_MONITOR_RUN_ID');\nif (typeof raw.observed_at_utc !== 'string' || !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/.test(raw.observed_at_utc)) throw new Error('EG_MONITOR_TIMESTAMP');\nconst observedMs = Date.parse(raw.observed_at_utc);\nconst nowMs = Date.now();\nif (!Number.isFinite(observedMs) || Math.abs(nowMs - observedMs) > 30 * 60 * 1000) throw new Error('EG_MONITOR_OLD_REPORT');\nif (!sameKeys(raw.streams, ['EB_BILL','TENANT_BILL'])) throw new Error('EG_MONITOR_STREAMS');\nfunction sgDay(ms) {\n  const parts = new Intl.DateTimeFormat('en-GB', {timeZone:'Asia/Singapore', year:'numeric', month:'2-digit', day:'2-digit'}).formatToParts(new Date(ms));\n  const p = Object.fromEntries(parts.filter(x => x.type !== 'literal').map(x=>[x.type,x.value]));\n  return `${p.year}-${p.month}-${p.day}`;\n}\nconst day = sgDay(nowMs);\nconst valid = {};\nfor (const stream of ['EB_BILL','TENANT_BILL']) {\n  const row=raw.streams[stream];\n  if (!sameKeys(row, ['result','support_ref','incident_ref'])) throw new Error('EG_MONITOR_STREAM_SHAPE');\n  if (!['OK','FAILURE','PENDING'].includes(row.result)) throw new Error('EG_MONITOR_RESULT');\n  if (row.result === 'OK') {\n    if (row.support_ref !== null || row.incident_ref !== null) throw new Error('EG_MONITOR_OK_FIELDS');\n  } else {\n    if (typeof row.support_ref !== 'string' || !/^EG_[A-Z0-9_]{4,72}$/.test(row.support_ref)) throw new Error('EG_MONITOR_REF');\n    if (row.incident_ref !== null && (typeof row.incident_ref !== 'string' || !/^bill-[0-9a-f]{24}$/.test(row.incident_ref))) throw new Error('EG_MONITOR_INCIDENT');\n  }\n  valid[stream] = row;\n}\nconst state = $getWorkflowStaticData('global');\nstate.last_report_day_sgt = day;\nstate.last_report_utc = raw.observed_at_utc;\nstate.alert_series = state.alert_series || {};\nstate.open_incidents = state.open_incidents || {};\nconst alerts=[];\nfor (const stream of ['EB_BILL','TENANT_BILL']) {\n  const row=valid[stream];\n  if (row.result === 'OK') { state.open_incidents[stream] = null; continue; }\n  const signature = `${row.result}|${row.support_ref}|${row.incident_ref || ''}`;\n  if (!state.open_incidents[stream] || state.open_incidents[stream].signature !== signature) {\n    const next = Number(state.alert_series[stream] || 0) + 1;\n    state.alert_series[stream] = next;\n    state.open_incidents[stream] = { signature, episode: next };\n  }\n  // FAILURE is recorded only: the EnergyGrid Core already emails the owner for it (single sender).\n  // n8n alerts only for what the Core cannot report: a bill still PENDING after a finished run.\n  if (row.result !== 'PENDING') continue;\n  const episode=state.open_incidents[stream].episode;\n  const label=stream === 'EB_BILL' ? 'EB Bill' : 'Tenant Bill';\n  alerts.push({json:{\n    dedupe_key:`eg-monitor:${stream}:${episode}`,\n    subject:`EnergyGrid: ${label} incomplete (${row.support_ref})`,\n    message:`EnergyGrid needs attention.\\nStream: ${label}\\nOutcome: ${row.result}\\nReference: ${row.support_ref}\\nRun: ${raw.run_id}\\nObserved (UTC): ${raw.observed_at_utc}\\n\\nReview EnergyGrid's local status. Do not retry uncertain uploads or emails.`,\n  }});\n}\nreturn alerts;"
       }
     },
     {
@@ -64,7 +64,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Local-PC-only missing-run check. No alert unless this n8n instance was ticking before the run.\nconst state=$getWorkflowStaticData('global');\nstate.heartbeat=state.heartbeat || {};\nconst h=state.heartbeat;\nconst now=Date.now();\nconst gap=Number(h.last_tick_ms || 0) ? now - Number(h.last_tick_ms) : Infinity;\nif (gap > 11*60*1000 || gap < 0) h.armed_day_sgt=null; // restart, sleep or long gap: do not complain.\nh.last_tick_ms=now;\nconst parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Singapore',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date(now));\nconst p=Object.fromEntries(parts.filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));\nconst day=`${p.year}-${p.month}-${p.day}`;\nconst minutes=(Number(p.hour)%24)*60 + Number(p.minute);\n// Expected user UAT check around 11:30 SGT. Arm only while the PC/n8n was already alive.\nif (minutes >= 11*60+10 && minutes < 11*60+30) h.armed_day_sgt=day;\nif (minutes < 14*60 || minutes >= 23*60 || h.armed_day_sgt !== day || state.last_report_day_sgt === day) return [];\nreturn [{json:{\n  dedupe_key:`eg-monitor:missed:${day}`,\n  subject:'EnergyGrid: scheduled bill check did not report',\n  message:`EnergyGrid did not submit a completed EB + Tenant run report by 14:00 SGT on ${day}.\\nThe PC/n8n monitor was active ahead of the usual check.\\nCheck the Claude task and EnergyGrid logs.\\nIf the PC was shut down briefly, this may be a false alarm. Do not automatically replay bill effects.`,\n}}];"
+        "jsCode": "// Local-PC-only missing-run check. No alert unless this n8n instance was ticking before the run.\nconst state=$getWorkflowStaticData('global');\nstate.heartbeat=state.heartbeat || {};\nconst h=state.heartbeat;\nconst now=Date.now();\nconst gap=Number(h.last_tick_ms || 0) ? now - Number(h.last_tick_ms) : Infinity;\nif (gap > 11*60*1000 || gap < 0) h.armed_day_sgt=null; // restart, sleep or long gap: do not complain.\nh.last_tick_ms=now;\nconst parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Singapore',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date(now));\nconst p=Object.fromEntries(parts.filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));\nconst day=`${p.year}-${p.month}-${p.day}`;\nconst minutes=(Number(p.hour)%24)*60 + Number(p.minute);\n// Expected user UAT check around 11:30 SGT. Arm only while the PC/n8n was already alive.\nif (minutes >= 11*60+10 && minutes < 11*60+30) h.armed_day_sgt=day;\nif (minutes < 14*60 || minutes >= 23*60 || h.armed_day_sgt !== day || state.last_report_day_sgt === day) return [];\nreturn [{json:{\n  dedupe_key:`eg-monitor:missed:${day}`,\n  subject:'EnergyGrid: scheduled bill check did not report',\n  message:`EnergyGrid did not submit a completed EB + Tenant run report by 14:00 SGT on ${day}.\\nThe daily Claude task did not run, stopped early, or its report was refused.\\nThe PC/n8n monitor was active ahead of the usual check.\\nCheck the Claude task and EnergyGrid logs.\\nIf the PC was shut down briefly, this may be a false alarm. Do not automatically replay bill effects.`,\n}}];"
       }
     },
     {
@@ -78,7 +78,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Keep off during import and dry-run qualification. Set true only after headerAuth, SMTP,\n// host report bridge, dedup behaviour, and the old Claude failure-mail path are verified.\nconst ENABLE_OWNER_ALERTS = false;\nif (!ENABLE_OWNER_ALERTS) return [];\nreturn $input.all();"
+        "jsCode": "// Keep off during import and dry-run qualification. Set true only on the live copy after\n// headerAuth, the Telegram credential, the host report hook and dedup behaviour are verified.\nconst ENABLE_OWNER_ALERTS = false;\nif (!ENABLE_OWNER_ALERTS) return [];\nreturn $input.all();"
       }
     },
     {
@@ -100,24 +100,21 @@
       }
     },
     {
+      "parameters": {
+        "chatId": "REPLACE_WITH_OWNER_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.subject }}\n\n{{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
       "id": "96e918a1-03be-5757-894c-bd7dfc2027b8",
-      "name": "Send Owner Failure Email",
-      "type": "n8n-nodes-base.emailSend",
-      "typeVersion": 2.1,
+      "name": "Send Owner Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
       "position": [
         1050,
         310
       ],
-      "parameters": {
-        "fromEmail": "REPLACE_WITH_VERIFIED_SENDER",
-        "toEmail": "REPLACE_WITH_OWNER_EMAIL",
-        "subject": "={{ $json.subject }}",
-        "emailFormat": "text",
-        "text": "={{ $json.message }}",
-        "options": {
-          "appendAttribution": false
-        }
-      },
       "continueOnFail": true,
       "retryOnFail": false
     },
@@ -131,7 +128,7 @@
         -10
       ],
       "parameters": {
-        "content": "# EnergyGrid local failure monitor — NOT INSTALLED OR ENABLED\n- **No credentials** are bundled. Bind Header Auth and a verified SMTP sender/owner recipient.\n- The report POST must come from the existing EnergyGrid host after completing its run, using `energygrid_monitor_report.py` with sanitized `acquire.json` + `status.json`.\n- Switch **ENABLE_OWNER_ALERTS** to `true` only after synthetic tests and after the Claude failure-email sender is disabled in the actual host, to prevent duplicates.\n- PC shut down / n8n stopped: intentionally no alert.\n- Never reuse dormant historic EnergyGrid alert exports without separate review.\n- Keep the workflow inactive until the local host is connected and manual acceptance passes.",
+        "content": "# EnergyGrid local run monitor\n- Alerts only for what the EnergyGrid Claude task cannot report itself: no completed run report by 14:00 SGT (task missed, crashed or report refused), or a bill still PENDING after a finished run.\n- Bill success and failure emails stay with the EnergyGrid Core (single sender). Reported FAILURE streams are recorded here, never re-sent.\n- Reports come only from egmonitor.cmd after the daily run, with the X-EnergyGrid-Monitor-Key header.\n- PC shut down / n8n stopped: intentionally no alert.\n- ENABLE_OWNER_ALERTS stays false in this source export; it is set true only on the qualified live copy.\n\n## Required manual configuration:\n\n- **Send Owner Telegram Alert**\n  - `Chat ID`: the owner's private Telegram chat.",
         "width": 660,
         "height": 225
       }
@@ -197,7 +194,7 @@
       "main": [
         [
           {
-            "node": "Send Owner Failure Email",
+            "node": "Send Owner Telegram Alert",
             "type": "main",
             "index": 0
           }
