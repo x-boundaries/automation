@@ -161,6 +161,7 @@ The Core stays the only decider. For each PENDING notification:
 |---|---|
 | 200 `outcome: SENT`, echoed ids, valid `message_id` | SENT |
 | 422 `outcome: REFUSED` (validation, render digest, claim refused; before any send) | DENIED -> HOLD |
+| 401, 403 or 404 (Header Auth refused or no active webhook: the workflow never ran), or connection refused | DENIED -> HOLD |
 | 409 `outcome: DUPLICATE` (the workflow already holds this notification id) | ERROR -> UNKNOWN |
 | 502 `outcome: SEND_UNCERTAIN`, timeout, lost answer, any other status or body | ERROR / NO_RESPONSE -> UNKNOWN |
 
@@ -204,6 +205,25 @@ SEND request (exact keys; `null` where a field does not apply):
 
 Responses carry `schema: energygrid.owner_email.response.v1`, `mode`, the echoed `notification_id` and
 `dispatch_id`, `outcome` and, for SENT, `message_id`.
+
+### 4.4 Workflow build notes (official n8n Skills 1.2.0)
+
+Both exports were checked against the official `n8n-io/skills` 1.2.0 guidance (error handling, Data
+Tables, node configuration, HTTP pagination, the lifecycle antipattern scan) and the n8n 2.39.10 node
+sources. Deliberate choices:
+
+- Every fallible node's error output is wired and every path ends in a Respond node with an explicit,
+  cause-mapped code (4xx caller, 409 duplicate, 502 upstream, 500 internal).
+- The read-only Google GETs retry at most 3 times (5 s apart). The Gmail send never retries and the claim
+  writes do not retry: at most one attempt.
+- No workflow-level error workflow is set: every failure answers the Core, which is the single owner of
+  owner visibility (section 5). An error workflow would add a second notifier.
+- Request validation and the template render stay in one Code node, as in this repository's other
+  exports: closed-vocabulary checks across many fields plus three templates are not a single expression.
+  Small answer builders are expression-driven Respond nodes, and the render check is an IF node.
+- Data Table columns are camelCase (`notificationId`, `dispatchId`, `state`).
+- Not yet done (needs the instance): `validate_workflow` and `get_workflow_details` through the n8n MCP,
+  and the import-time checks of the official lifecycle checklist. These run at the inactive import step.
 
 ### 4.3 Legacy history (C5)
 

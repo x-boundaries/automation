@@ -688,6 +688,39 @@ class OwnerEmailTests(DailyBase):
         self.assertTrue(nid)
 
 
+class EmailEvidenceMappingTests(unittest.TestCase):
+    """Every n8n answer maps to exactly one typed record outcome; only an exact SENT echo is SENT."""
+
+    request = {"notification_id": "egn-" + "1" * 32, "dispatch_id": "egd-" + "2" * 32}
+
+    def body(self, **fields) -> dict:
+        return {"schema": notify.EMAIL_RESPONSE_SCHEMA, "mode": "SEND", **self.request, **fields}
+
+    def test_mapping(self) -> None:
+        A = loopback.Answer
+        cases = [
+            (A(loopback.OK, 200, self.body(outcome="SENT", message_id="18c0ffee")), "SENT"),
+            (A(loopback.OK, 200, self.body(outcome="SENT")), "ERROR"),
+            (A(loopback.OK, 200, self.body(outcome="SENT", message_id="bad id")), "ERROR"),
+            (A(loopback.OK, 200, {**self.body(outcome="SENT", message_id="18c0ffee"), "dispatch_id": "egd-" + "3" * 32}),
+             "ERROR"),
+            (A(loopback.HTTP_STATUS, 422, self.body(outcome="REFUSED", reason="EG_EMAIL_RENDER_MISMATCH")), "DENIED"),
+            (A(loopback.HTTP_STATUS, 409, self.body(outcome="DUPLICATE")), "ERROR"),
+            (A(loopback.HTTP_STATUS, 502, self.body(outcome="SEND_UNCERTAIN")), "ERROR"),
+            (A(loopback.HTTP_STATUS, 500, {"outcome": "FAILED"}), "ERROR"),
+            (A(loopback.HTTP_STATUS, 401, None), "DENIED"),
+            (A(loopback.HTTP_STATUS, 403, None), "DENIED"),
+            (A(loopback.HTTP_STATUS, 404, None), "DENIED"),
+            (A(loopback.NOT_SENT, support_ref="EG_N8N_UNREACHABLE"), "DENIED"),
+            (A(loopback.SENT_UNCERTAIN, support_ref="EG_N8N_TRANSPORT_UNCERTAIN"), "NO_RESPONSE"),
+        ]
+        for answer, outcome in cases:
+            with self.subTest(status=answer.status, outcome=answer.outcome):
+                evidence = daily.email_evidence(self.request, answer)
+                self.assertEqual((outcome, notify.TRANSPORT_N8N, self.request["dispatch_id"]),
+                                 (evidence["outcome"], evidence["transport"], evidence["draft_id"]))
+
+
 class LeaseAndCeilingTests(DailyBase):
     def test_lease_held_by_another_writer_withholds_and_changes_nothing(self) -> None:
         with StateV4Store(self.db) as other:

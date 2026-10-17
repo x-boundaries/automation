@@ -303,8 +303,9 @@ def email_evidence(request: dict, answer: loopback.Answer) -> dict:
         return {**base, "outcome": "DENIED", "support_ref": answer.support_ref}
     if answer.status == 422 and body.get("outcome") == "REFUSED" and body.get("schema") == notify.EMAIL_RESPONSE_SCHEMA:
         return {**base, "outcome": "DENIED", "support_ref": "EG_DAILY_EMAIL_REFUSED"}
-    if answer.status in (403, 404):
-        # n8n refused the request before running the workflow (Header Auth or no active webhook).
+    if answer.status in (401, 403, 404):
+        # n8n refused the request before running the workflow (Header Auth mismatch is 401 per the official
+        # n8n Skills; 403 was observed live for the monitor webhook) or no webhook is active (404).
         return {**base, "outcome": "DENIED", "support_ref": "EG_DAILY_EMAIL_WEBHOOK_REFUSED"}
     if answer.outcome == loopback.SENT_UNCERTAIN:
         return {**base, "outcome": "NO_RESPONSE", "support_ref": answer.support_ref}

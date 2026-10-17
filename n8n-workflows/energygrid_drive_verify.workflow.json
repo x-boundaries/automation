@@ -1,0 +1,463 @@
+{
+  "id": "energygridDriveVerify01",
+  "name": "EnergyGrid - Drive Verify",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8401-000000000001",
+      "name": "Drive Verify Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "xb-energygrid-drive-verify-v1",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000002",
+      "name": "Validate Verify Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Drive Verify: the request carries a nonce and nothing else. The folder is a fixed constant.\nconst FOLDER_ID = 'REPLACE_WITH_DRIVE_FOLDER_ID';\nconst SCHEMA = 'energygrid.drive_verify.response.v1';\n\nconst PROXY_HEADERS = ['cf-ray', 'cf-connecting-ip', 'cf-ipcountry', 'x-forwarded-for', 'x-forwarded-host', 'x-real-ip'];\nconst item = $input.first().json;\nconst headers = item && item.headers && typeof item.headers === 'object' ? item.headers : {};\nconst present = Object.keys(headers).map((key) => key.toLowerCase());\nif (PROXY_HEADERS.some((name) => present.includes(name))) {\n  // Defence in depth only: a proxy-marked request is answered 404 with no body. It is not the\n  // non-public boundary (that is the Cloudflare path exclusion or a private-only listener).\n  return [{ json: { route: 'NOT_FOUND' } }];\n}\nconst own = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);\nconst body = item ? item.body : undefined;\n\nconst keys = own(body) ? Object.keys(body).sort().join('|') : '';\nif (keys !== 'nonce|schema' || body.schema !== 'energygrid.drive_verify.request.v1'\n    || typeof body.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(body.nonce)) {\n  return [{ json: { route: 'REFUSED', response_code: 422,\n    response: { schema: SCHEMA, outcome: 'REFUSED', reason: 'EG_VERIFY_REQUEST_INVALID' } } }];\n}\nreturn [{ json: { route: 'OK', nonce: body.nonce, folder_id: FOLDER_ID } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000004",
+      "name": "Request Is Proxied",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8401-000000000003",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "NOT_FOUND",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000006",
+      "name": "Request Is Refused",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        380
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8401-000000000005",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "REFUSED",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000007",
+      "name": "Get Drive Account",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        460
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/about",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "user(emailAddress)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000008",
+      "name": "List Fixed Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        460
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Validate Verify Request').first().json.folder_id + \"' in parents and trashed = false\" }}"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,size,sha256Checksum,md5Checksum,trashed,shortcutDetails)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "pageToken",
+                    "value": "={{ $response.body.nextPageToken }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.nextPageToken }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20,
+              "requestInterval": 200
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000009",
+      "name": "Assemble Listing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Pass Google's own file metadata through unchanged (listed fields only). Complete only when the\n// last page has no nextPageToken and no page reported incompleteSearch. The Core decides the rest.\nconst SCHEMA = 'energygrid.drive_verify.response.v1';\nconst FIELDS = ['id', 'name', 'mimeType', 'parents', 'size', 'sha256Checksum', 'md5Checksum', 'trashed', 'shortcutDetails'];\nconst MAX_PAGES = 20;\nconst request = $('Validate Verify Request').first().json;\nconst about = $('Get Drive Account').first().json;\nconst fail = [{ json: { response_code: 502, response: { schema: SCHEMA, nonce: request.nonce, outcome: 'GOOGLE_UNAVAILABLE' } } }];\nconst user = about && about.statusCode === 200 && about.body && about.body.user ? about.body.user : null;\nif (!user || typeof user.emailAddress !== 'string' || !user.emailAddress) return fail;\nconst pages = $input.all().map((entry) => entry.json);\nif (pages.length < 1 || pages.length > MAX_PAGES) return fail;\nlet incomplete = false;\nconst files = [];\nfor (const page of pages) {\n  if (!page || page.statusCode !== 200 || !page.body || !Array.isArray(page.body.files)) return fail;\n  if (page.body.incompleteSearch === true) incomplete = true;\n  for (const file of page.body.files) {\n    if (!file || typeof file !== 'object' || Array.isArray(file)) return fail;\n    const copy = {};\n    for (const key of FIELDS) {\n      if (Object.prototype.hasOwnProperty.call(file, key)) copy[key] = file[key];\n    }\n    files.push(copy);\n  }\n}\nconst last = pages[pages.length - 1].body;\nconst tokenPresent = typeof last.nextPageToken === 'string' && last.nextPageToken.length > 0;\nreturn [{ json: { response_code: 200, response: {\n  schema: SCHEMA, nonce: request.nonce, folder_id: request.folder_id, reader_account: user.emailAddress,\n  complete: !incomplete && !tokenPresent, pages: pages.length, incomplete_search: incomplete,\n  next_page_token_present: tokenPresent, files,\n} } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000010",
+      "name": "Respond Google Unavailable",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        1680,
+        680
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.drive_verify.response.v1', nonce: $('Validate Verify Request').first().json.nonce, outcome: 'GOOGLE_UNAVAILABLE' } }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000011",
+      "name": "Respond Bounded Failure",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        680
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.drive_verify.response.v1', outcome: 'FAILED' } }}",
+        "options": {
+          "responseCode": 500
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000012",
+      "name": "Respond With Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        1680,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.response_code }}"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000013",
+      "name": "Respond Not Found",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        720,
+        160
+      ],
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 404
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8401-000000000014",
+      "name": "Drive Verify boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -60
+      ],
+      "parameters": {
+        "content": "# EnergyGrid Drive Verify (read only)\n- Lists the one fixed folder with Google's own metadata, including sha256Checksum, every page (at most 20).\n- Takes no query input: the request carries a nonce only. The EnergyGrid Core decides VERIFIED.\n- No create, update, delete, upload or share call. Header Auth plus the Cloudflare path exclusion keep it non-public.\n- Read-only GETs retry at most 3 times. Every failure answers the Core, which owns owner visibility.\n\n## Required manual configuration:\n\n- **Validate Verify Request**\n  - `FOLDER_ID`: the owner-selected flat EnergyGrid Drive folder id.",
+        "width": 620,
+        "height": 300
+      }
+    }
+  ],
+  "connections": {
+    "Drive Verify Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Verify Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Verify Request": {
+      "main": [
+        [
+          {
+            "node": "Request Is Proxied",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Is Proxied": {
+      "main": [
+        [
+          {
+            "node": "Respond Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Request Is Refused",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Is Refused": {
+      "main": [
+        [
+          {
+            "node": "Respond With Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Drive Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Drive Account": {
+      "main": [
+        [
+          {
+            "node": "List Fixed Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Google Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Fixed Folder": {
+      "main": [
+        [
+          {
+            "node": "Assemble Listing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Google Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Listing": {
+      "main": [
+        [
+          {
+            "node": "Respond With Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Google Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8000-000000000401",
+  "sourceWorkflowId": null
+}
