@@ -16,6 +16,13 @@ Data path
   decodes to exactly ``{"data": {...}}`` (qualified 2026-10-14). Errors,
   extensions, plain-text failures (disconnected or expired authentication)
   and any other wrapper fail closed.
+* A second, separately versioned provenance (#155 E8, 2026-10-17) carries the
+  same pinned queries read by the Claude-free poller
+  (``directlocal/xb_shopify_poller.py``) straight from the Shopify Admin
+  GraphQL API: ``shopify_admin_graphql_direct_http_v1`` with its own record
+  schema and ``xbdh-`` request ids. It is never written as, or accepted as, a
+  hook record. A run is sealed only when every page has one provenance, and
+  direct pages only in a run the poller started (``origin``).
 * The reused ``capture_member_mg_baseline`` / ``evaluate_profile`` take every
   cutover and admission decision.
 
@@ -97,6 +104,17 @@ from xb_member_gateway.shopify_webhook import GID_RE  # noqa: E402
 CAPTURE_SCHEMA = "xb.directlocal.capture.v1"
 CAPTURE_PROVENANCE = "claude_code_posttooluse_hook_delivered_json"
 CONNECTOR_TOOL = "mcp__27c48ff3-54ed-4728-aa90-a7906cba3158__graphql_query"
+# Direct HTTP capture (#155 E8): the same pinned queries, read by the local
+# poller over outbound HTTPS. Distinct schema, provenance and id namespace; the
+# record holds only the validated ``data`` object (``errors`` or ``extensions``
+# never reach a capture).
+DIRECT_CAPTURE_SCHEMA = "xb.directlocal.capture.direct_http.v1"
+DIRECT_CAPTURE_PROVENANCE = "shopify_admin_graphql_direct_http_v1"
+DIRECT_REQUEST_ID_PREFIX = "xbdh-"
+DIRECT_REQUEST_ID_RE = re.compile(r"^xbdh-[0-9a-f]{32}$")
+DIRECT_RUN_ORIGIN = "direct_http_poller_v1"
+RUN_ORIGINS = frozenset({DIRECT_RUN_ORIGIN})
+API_VERSION_RE = re.compile(r"^20[0-9]{2}-(?:01|04|07|10)$")
 PAGE_SIZE = 50  # the connector tool's maximum ``first``
 MAX_MEMBER_NO_CANDIDATES = 3
 PROFILE_WAIT_MAX_CHECKS = 5
@@ -321,6 +339,7 @@ class Capture:
     captured_at: datetime
     variables: Mapping[str, Any]
     data: Mapping[str, Any]
+    provenance: str = CAPTURE_PROVENANCE
 
     def __repr__(self) -> str:  # never render data (profile captures carry PII)
         return f"Capture(kind={self.kind!r}, tool_use_id={self.tool_use_id!r})"
@@ -423,31 +442,85 @@ def inspect_identity_capture(raw: bytes) -> dict[str, str]:
     }
 
 
+def direct_tool_input(query: Any, variables: Any) -> dict[str, Any]:
+    """The connector-equivalent tool input of one direct request, so the
+    direct path is checked by exactly the same ``check_tool_input`` allowlist
+    (pinned query text, page size, cursor and search shape)."""
+
+    tool_input: dict[str, Any] = {"query": query, "variables": variables}
+    kind = PINNED_QUERIES.get(_sha256(query)) if isinstance(query, str) else None
+    if kind in PAGE_KINDS and isinstance(variables, Mapping):
+        tool_input["first"] = variables.get("first")
+        if variables.get("after") is not None:
+            tool_input["after"] = variables["after"]
+    return tool_input
+
+
+def _parse_direct_record(record: dict, shop_domain: str) -> tuple[str, str, datetime, Mapping[str, Any], Mapping[str, Any]]:
+    """(kind, request id, captured_at, variables, data) of one direct-HTTP
+    capture written by the poller. Exact keys; the endpoint must be this
+    ledger's store; the response must be exactly ``{"data": {...}}``."""
+
+    expected = {"schema_version", "provenance", "captured_at", "request_id", "endpoint", "request", "response"}
+    if set(record) != expected or record["schema_version"] != DIRECT_CAPTURE_SCHEMA:
+        raise CaptureRejected("capture_record_shape_invalid")
+    request_id = record["request_id"]
+    if not isinstance(request_id, str) or not DIRECT_REQUEST_ID_RE.fullmatch(request_id):
+        raise CaptureRejected("capture_tool_use_id_invalid")
+    captured_at = parse_created_at(record["captured_at"])
+    if captured_at is None:
+        raise CaptureRejected("capture_timestamp_invalid")
+    endpoint = record["endpoint"]
+    if not isinstance(endpoint, dict) or set(endpoint) != {"host", "api_version"}:
+        raise CaptureRejected("capture_endpoint_invalid")
+    if endpoint["host"] != shop_domain:
+        raise CaptureRejected("capture_endpoint_mismatch")
+    if not isinstance(endpoint["api_version"], str) or not API_VERSION_RE.fullmatch(endpoint["api_version"]):
+        raise CaptureRejected("capture_endpoint_invalid")
+    request = record["request"]
+    if not isinstance(request, dict) or set(request) != {"query", "variables"} or not isinstance(request["variables"], dict):
+        raise CaptureRejected("tool_input_shape_invalid")
+    kind = check_tool_input(direct_tool_input(request["query"], request["variables"]))
+    response = record["response"]
+    if not isinstance(response, dict) or set(response) != {"data"} or not isinstance(response["data"], dict):
+        raise CaptureRejected("direct_response_shape_invalid")
+    return kind, request_id, captured_at, request["variables"], response["data"]
+
+
 def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) -> Capture:
-    """Strictly validate one hook capture record. Anything unexpected rejects."""
+    """Strictly validate one capture record (attended hook or direct HTTP).
+    Anything unexpected rejects."""
 
     try:
         record = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise CaptureRejected("capture_json_invalid") from None
-    expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
-    if not isinstance(record, dict) or set(record) != expected:
-        raise CaptureRejected("capture_record_shape_invalid")
-    if record["schema_version"] != CAPTURE_SCHEMA or record["provenance"] != CAPTURE_PROVENANCE:
-        raise CaptureRejected("capture_record_shape_invalid")
-    if record["tool_name"] != CONNECTOR_TOOL:
-        raise CaptureRejected("capture_tool_not_allowed")
-    tool_use_id = record["tool_use_id"]
-    if not isinstance(tool_use_id, str) or not TOOL_USE_ID_RE.fullmatch(tool_use_id):
-        raise CaptureRejected("capture_tool_use_id_invalid")
-    captured_at = parse_created_at(record["captured_at"])
-    if captured_at is None:
-        raise CaptureRejected("capture_timestamp_invalid")
-    kind = check_tool_input(record["tool_input"])
-    data = _response_data(record["tool_response"], mode)
+    if isinstance(record, dict) and record.get("provenance") == DIRECT_CAPTURE_PROVENANCE:
+        if mode not in QUALIFIED_RESPONSE_SHAPES:
+            raise CaptureRejected("capture_response_shape_unqualified")
+        kind, tool_use_id, captured_at, variables, data = _parse_direct_record(record, shop_domain)
+        provenance = DIRECT_CAPTURE_PROVENANCE
+    else:
+        expected = {"schema_version", "provenance", "captured_at", "session_id", "tool_use_id", "tool_name", "tool_input", "tool_response"}
+        if not isinstance(record, dict) or set(record) != expected:
+            raise CaptureRejected("capture_record_shape_invalid")
+        if record["schema_version"] != CAPTURE_SCHEMA or record["provenance"] != CAPTURE_PROVENANCE:
+            raise CaptureRejected("capture_record_shape_invalid")
+        if record["tool_name"] != CONNECTOR_TOOL:
+            raise CaptureRejected("capture_tool_not_allowed")
+        tool_use_id = record["tool_use_id"]
+        # The xbdh- namespace belongs to direct captures only.
+        if not isinstance(tool_use_id, str) or not TOOL_USE_ID_RE.fullmatch(tool_use_id) or tool_use_id.startswith(DIRECT_REQUEST_ID_PREFIX):
+            raise CaptureRejected("capture_tool_use_id_invalid")
+        captured_at = parse_created_at(record["captured_at"])
+        if captured_at is None:
+            raise CaptureRejected("capture_timestamp_invalid")
+        kind = check_tool_input(record["tool_input"])
+        data = _response_data(record["tool_response"], mode)
+        variables = record["tool_input"].get("variables", {})
+        provenance = CAPTURE_PROVENANCE
     if data.get("shop") != {"id": store_gid, "myshopifyDomain": shop_domain}:
         raise CaptureRejected("capture_store_identity_mismatch")
-    variables = record["tool_input"].get("variables", {})
     if kind == "identity":
         if set(data) != {"shop"}:
             raise CaptureRejected("identity_shape_invalid")
@@ -469,7 +542,7 @@ def parse_capture(raw: bytes, *, mode: str, store_gid: str, shop_domain: str) ->
                 raise CaptureRejected("profile_shape_invalid")
             if customer["id"] != variables["id"]:
                 raise CaptureRejected("profile_identity_mismatch")
-    return Capture(kind, _sha256(raw), tool_use_id, captured_at, dict(variables), data)
+    return Capture(kind, _sha256(raw), tool_use_id, captured_at, dict(variables), data, provenance)
 
 
 # --------------------------------------------------------------------------
@@ -1497,10 +1570,16 @@ class Processor:
         return parse_ts(row["cutover_at"])
 
     # -- runs (baseline / discovery) ----------------------------------------
-    def begin_run(self, kind: str, *, recent: bool = False) -> dict[str, Any]:
+    def begin_run(self, kind: str, *, recent: bool = False, origin: str | None = None) -> dict[str, Any]:
+        """``origin`` names a non-attended run starter (only the direct-HTTP
+        poller). It is recorded in the same transaction as the run, in the
+        hash-chained ``run_started`` event, and binds the run's provenance."""
+
         self.ledger.meta()
         if recent and kind != "DISCOVERY":
             raise DirectLocalError("run_kind_invalid")
+        if origin is not None and origin not in RUN_ORIGINS:
+            raise DirectLocalError("run_origin_invalid")
         with self.ledger.tx() as conn:
             if conn.execute("SELECT 1 FROM runs WHERE state = 'CAPTURING'").fetchone():
                 raise DirectLocalError("run_already_open")
@@ -1531,9 +1610,17 @@ class Processor:
                 "INSERT INTO runs(run_id, kind, cutover_at, state, started_at, search) VALUES (?, ?, ?, 'CAPTURING', ?, ?)",
                 (run_id, kind, cutover, ts(now), search),
             )
-            self.ledger.event(conn, f"run_started:{kind.lower()}{':recent' if recent else ''}")
+            self.ledger.event(conn, f"run_started:{kind.lower()}{':recent' if recent else ''}", code=None if origin is None else f"{origin}:{run_id}")
         query = RECENT_QUERY if recent else BASELINE_QUERY
         return {"run_id": run_id, "kind": kind, "cutover_at": cutover, "search": search, "page_size": PAGE_SIZE, "query_sha256": _sha256(query)}
+
+    def run_origin(self, conn: sqlite3.Connection, run_id: str) -> str | None:
+        """The recorded non-attended origin of a run, or ``None`` (attended)."""
+
+        for origin in sorted(RUN_ORIGINS):
+            if conn.execute("SELECT 1 FROM events WHERE type LIKE 'run_started:%' AND code = ?", (f"{origin}:{run_id}",)).fetchone():
+                return origin
+        return None
 
     @staticmethod
     def _page_of(run: sqlite3.Row, capture: Capture) -> bool:
@@ -1617,6 +1704,15 @@ class Processor:
                 raise DirectLocalError(f"run_not_sealed:{exc.code}") from None
             if len(used) != len(pages):
                 raise DirectLocalError("run_not_sealed:unchained_page_capture")
+            # One provenance per run, bound to who started it: direct pages
+            # only in a poller-started run, hook pages only in an attended one.
+            provenances = {capture.provenance for capture in used}
+            if len(provenances) > 1:
+                raise DirectLocalError("run_not_sealed:mixed_capture_provenance")
+            origin = self.run_origin(conn, run["run_id"])
+            expected = DIRECT_CAPTURE_PROVENANCE if origin == DIRECT_RUN_ORIGIN else CAPTURE_PROVENANCE
+            if provenances != {expected}:
+                raise DirectLocalError("run_not_sealed:run_origin_provenance_mismatch")
             now = ts(self.ledger.now())
             for capture in duplicates:
                 conn.execute("INSERT INTO captures(capture_sha256, tool_use_id, kind, consumed_at) VALUES (?, ?, ?, ?)", (capture.capture_sha256, capture.tool_use_id, capture.kind, now))
@@ -1649,7 +1745,7 @@ class Processor:
                 "UPDATE runs SET state = 'SEALED', sealed_at = ?, page_count = ?, historical_count = ?, transition_count = ?, historical_digest = ? WHERE run_id = ?",
                 (now, len(used), len(historical), len(transition), baseline_digest(list(historical)), run["run_id"]),
             )
-            self.ledger.event(conn, f"run_sealed:{run['kind'].lower()}")
+            self.ledger.event(conn, f"run_sealed:{run['kind'].lower()}", code=origin)
         return {"run_id": run["run_id"], "kind": run["kind"], "pages": len(used), "historical": len(historical), "transition": len(transition), "discovered": discovered}
 
     # -- recovery -----------------------------------------------------------
