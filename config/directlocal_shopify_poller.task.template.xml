@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  #155 E8 DirectLocal Shopify poller: Task Scheduler TEMPLATE. DISABLED.
+  Registering, enabling or running this task is a separate Owner approval
+  (see docs/autocount2-automation/member_directlocal_shopify_poller.md).
+  Replace every __PLACEHOLDER__ before use; nothing here is a real account,
+  path or secret. The principal is the authorised XB account (Password logon,
+  so its DPAPI token cache is usable). The action is run-once with no
+  AutoCount write mode.
+  One run every 2 minutes; a new start is ignored while a run is active;
+  a run is stopped after 10 minutes (the poller's own budget is shorter).
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>XB DirectLocal #155: read-only Shopify registration poller (no AutoCount writes). Template; disabled.</Description>
+    <URI>\XB\XB-DirectLocal-Shopify-Poller</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT2M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Poller">
+      <UserId>__XB_ACCOUNT_SID__</UserId>
+      <LogonType>Password</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>false</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Poller">
+    <Exec>
+      <Command>__PYTHON_EXE__</Command>
+      <Arguments>-I -S -B "__RUNTIME_ROOT__\directlocal\xb_shopify_poller.py" --config "__POLLER_CONFIG_PATH__" run-once --no-autocount-write</Arguments>
+      <WorkingDirectory>__RUNTIME_ROOT__</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
