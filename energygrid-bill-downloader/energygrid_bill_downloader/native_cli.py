@@ -264,9 +264,33 @@ def _dispatch(args) -> dict:
         evidence = bridge.load_evidence(Path(args.evidence))
         return _with_state(cfg, lambda s: bridge.hold_release(s, cfg, args.intent, evidence, reason_code=args.reason,
                                                               operator=args.operator, run_id=run_id, now_ms=now))
+    if command == "daily":
+        # The Claude-free daily run (docs/native_daily_claude_free.md). Adapters are built inside the run,
+        # so a portal or credential problem is a refused acquire with a withheld monitor report.
+        from . import native_daily
+
+        return native_daily.run(cfg, lambda: _adapters(cfg))
+    if command == "daily-preflight":
+        from . import native_daily
+
+        return native_daily.preflight(cfg)
+    if command == "drive-verify":
+        # Operator only: one Drive Verify listing, recorded as Core evidence for a later command.
+        from . import native_daily
+
+        if cfg.daily is None:
+            raise bridge.NativeRefusal("EG_DAILY_CONFIG_REQUIRED")
+        listing = native_daily.DailyRun(cfg, None, native_daily.client_for(cfg), native_daily.Clock()).listing()
+        if listing is None:
+            raise bridge.NativeRefusal("EG_DAILY_VERIFY_UNAVAILABLE", exit_code=bridge.EXIT_RETRY)
+        return bridge._result("drive-verify", "RECORDED", bridge.EXIT_OK, listing_nonce=listing["nonce"],
+                              files=len(listing["files"]))
     if command in ("backfill-run", "backfill-record"):
         from . import native_backfill as backfill
 
+        # Historical backfill is never part of the Claude-free run, and its host-attested Drive listing is
+        # not Google-side evidence.
+        bridge._require_classic(cfg, "EG_DAILY_BACKFILL_DISABLED")
         evidence = bridge.load_evidence(Path(args.drive_evidence))
         if command == "backfill-run":
             adapters = _adapters(cfg)
@@ -279,7 +303,7 @@ def _dispatch(args) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="energygrid-native", add_help=True)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("init-uat", "acquire", "next", "status"):
+    for name in ("init-uat", "acquire", "next", "status", "daily", "daily-preflight", "drive-verify"):
         sub.add_parser(name).add_argument("--config", required=True)
     fixture = sub.add_parser("make-synthetic-fixture")
     fixture.add_argument("--config", required=True)

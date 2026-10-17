@@ -1,0 +1,48 @@
+{
+  "schema": "energygrid.native.v4.config.v1",
+  "mode": "UAT_PORTAL",
+  "state_path": "C:\\XB\\_ScheduledTask\\EnergyGrid\\data\\REPLACE_WITH_EXISTING_STATE_FILE.sqlite",
+  "archive_root": "C:\\XB\\_ScheduledTask\\EnergyGrid\\data\\archive",
+  "named_archive_root": "C:\\XB\\_ScheduledTask\\EnergyGrid\\data\\EnergyGrid Bills",
+  "temp_root": "C:\\XB\\_ScheduledTask\\EnergyGrid\\data\\temp",
+  "outbox_root": "C:\\XB\\_ScheduledTask\\EnergyGrid\\data\\outbox",
+  "portal_config_path": "C:\\XB\\_ScheduledTask\\EnergyGrid\\runtime\\config\\REPLACE_WITH_PORTAL_CONFIG.json",
+  "tenant_config_path": "C:\\XB\\_ScheduledTask\\EnergyGrid\\runtime\\config\\REPLACE_WITH_TENANT_CONFIG.json",
+  "drive": {
+    "account": "drive-account@example.com",
+    "folder_ids": {
+      "EB_BILL": "REPLACE_WITH_FLAT_DRIVE_FOLDER_ID",
+      "TENANT_BILL": "REPLACE_WITH_FLAT_DRIVE_FOLDER_ID"
+    },
+    "mode": "LOCAL_SYNC",
+    "sync_folders": {
+      "EB_BILL": "G:\\My Drive\\REPLACE_WITH_SYNCED_FOLDER",
+      "TENANT_BILL": "G:\\My Drive\\REPLACE_WITH_SYNCED_FOLDER"
+    }
+  },
+  "gmail": {
+    "account": "default-send-as-address@example.com",
+    "to": ["owner-recipient@example.com"],
+    "subject_prefix": "EnergyGrid",
+    "attach_pdf": false
+  },
+  "effect_ceiling": {
+    "mode": "PER_PERIOD",
+    "period_days": 1,
+    "drive_uploads": 4,
+    "gmail_sends": 6
+  },
+  "daily": {
+    "schema": "energygrid.native_daily.v1",
+    "runs_root": "C:\\XB\\_ScheduledTask\\EnergyGrid\\data\\runs",
+    "drive_reader_account": "drive-reader@example.com",
+    "n8n": {
+      "port": 5678,
+      "token_file": "C:\\Users\\REPLACE_WITH_USER\\.energygrid-monitor\\webhook-token.txt",
+      "header_name": "X-EnergyGrid-Monitor-Key"
+    },
+    "verify_window_minutes": 20,
+    "verify_poll_seconds": 60,
+    "run_deadline_minutes": 75
+  }
+}
