@@ -9,6 +9,7 @@
     "client_id_env": "XB_SHOPIFY_POLLER_CLIENT_ID",
     "client_secret_env": "XB_SHOPIFY_POLLER_CLIENT_SECRET"
   },
+  "token_cache": "dpapi_current_user",
   "autocount_write_mode": "none",
   "profile_reads_enabled": false,
   "profile_discovered_since": null,

@@ -10,7 +10,9 @@ AutoCount process can happen. All identities are synthetic.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -264,13 +266,14 @@ class PollerCase(OfflineCase):
             "auth": {"method": "admin_api_access_token", "token_env": "XB_SHOPIFY_POLLER_TOKEN"},
             "autocount_write_mode": "none", "profile_reads_enabled": True,
         }
+        self.protector = None
 
     def config(self, **overrides) -> poller.PollerConfig:
         return poller.parse_config({**self.config_values, **overrides})
 
     def poll(self, *, advance: timedelta = timedelta(0), baseline: bool = False, **overrides) -> tuple[int, dict]:
         self.clock.now += advance
-        return poller.run_once(self.config(**overrides), environ=ENV, transport=self.shopify, sleep=self.clock.sleep, clock=self.clock, monotonic=self.clock.monotonic, baseline=baseline)
+        return poller.run_once(self.config(**overrides), environ=ENV, transport=self.shopify, sleep=self.clock.sleep, clock=self.clock, monotonic=self.clock.monotonic, baseline=baseline, token_protector=self.protector)
 
     def baseline(self) -> dict:
         code, report = self.poll(baseline=True)
@@ -317,6 +320,7 @@ class ConfigTests(PollerCase):
             "poller_config_max_run_seconds_invalid": {"max_run_seconds": True},
             "shopify_api_version_invalid": {"api_version": "unstable"},
             "poller_config_profile_scope_invalid": {"profile_discovered_since": "yesterday"},
+            "poller_config_token_cache_invalid": {"token_cache": "dpapi_current_user"},  # static legacy token is never cached
         }
         for code, override in cases.items():
             with self.subTest(code=code), self.assertRaises(dl.DirectLocalError) as raised:
@@ -916,6 +920,109 @@ class NoWriteAndPrivacyTests(PollerCase):
             self.assertNotIn(b"Alpha", path.read_bytes())
 
 
+class FakeProtector:
+    """Stands in for DPAPI off Windows: reversible, entropy-bound, and never
+    leaves the plaintext in the blob."""
+
+    name = "fake_protector"
+
+    def __init__(self):
+        self.fail_protect = False
+
+    def protect(self, data: bytes, entropy: bytes) -> bytes:
+        if self.fail_protect:
+            raise direct.ShopifyDirectError("token_cache_unsaved")
+        return b"FAKE1" + hashlib.sha256(entropy).digest() + bytes(byte ^ 0x5A for byte in data)
+
+    def unprotect(self, blob: bytes, entropy: bytes) -> bytes:
+        if blob[:5] != b"FAKE1" or blob[5:37] != hashlib.sha256(entropy).digest():
+            raise direct.ShopifyDirectError("token_cache_unreadable")
+        return bytes(byte ^ 0x5A for byte in blob[37:])
+
+
+class TokenReuseTests(PollerCase):
+    def setUp(self):
+        super().setUp()
+        self.config_values["auth"] = {"method": "client_credentials", "client_id_env": "XB_SHOPIFY_POLLER_CLIENT_ID", "client_secret_env": "XB_SHOPIFY_POLLER_CLIENT_SECRET"}
+        self.config_values["token_cache"] = "dpapi_current_user"
+        self.protector = FakeProtector()
+        self.cache_file = self.temp / poller.TOKEN_CACHE_FILE
+
+    def test_one_exchange_serves_every_two_minute_run_until_expiry(self):
+        self.baseline()
+        self.assertEqual(self.shopify.issued, 1)
+        for _ in range(30):  # one hour of scheduled runs
+            code, report = self.poll(advance=timedelta(minutes=2))
+            self.assertEqual((code, report["shopify"]["token_exchanges"], report["shopify"]["token_cache_hits"]), (0, 0, 1), report)
+        self.assertEqual(self.shopify.issued, 1)
+        raw = self.cache_file.read_bytes()
+        for secret in (b"shpca_", CLIENT_SECRET.encode(), CLIENT_ID.encode()):
+            self.assertNotIn(secret, raw)
+        code, report = self.poll(advance=timedelta(hours=23))  # inside the 5-minute refresh margin
+        self.assertEqual((report["shopify"]["token_exchanges"], report["shopify"]["token_cache_note"]), (1, "token_cache_expired"))
+        self.assertEqual(self.shopify.issued, 2)
+        code, report = self.poll(advance=timedelta(minutes=2))
+        self.assertEqual((report["shopify"]["token_exchanges"], self.shopify.issued), (0, 2))
+
+    def test_rejected_cached_token_is_dropped_and_exchanged_once(self):
+        self.baseline()
+        self.shopify.valid_tokens.clear()  # revoked on Shopify's side
+        code, report = self.poll(advance=timedelta(minutes=2))
+        self.assertEqual((code, report["shopify"]["auth_refreshes"], report["shopify"]["token_exchanges"]), (0, 1, 1), report)
+        code, report = self.poll(advance=timedelta(minutes=2))
+        self.assertEqual((report["shopify"]["token_exchanges"], self.shopify.issued), (0, 2))
+
+    def test_corrupt_or_foreign_cache_is_never_trusted(self):
+        self.baseline()
+        self.cache_file.write_bytes(b"not a protected blob")
+        code, report = self.poll(advance=timedelta(minutes=2))
+        self.assertEqual((code, report["shopify"]["token_exchanges"], report["shopify"]["token_cache_note"]), (0, 1, "token_cache_unreadable"))
+        self.assertTrue(self.cache_file.read_bytes().startswith(b"FAKE1"))
+        cache = direct.TokenCache(self.cache_file, self.protector, shop_domain=DOMAIN, client_id="another-client-id-000001")
+        self.assertIsNone(cache.load(self.clock.now))
+        self.assertEqual(cache.note, "token_cache_unreadable")
+        self.assertFalse(self.cache_file.exists())  # discarded, not reused
+        other = direct.TokenCache(self.temp / "x.dpapi", self.protector, shop_domain=DOMAIN, client_id=CLIENT_ID)
+        other.save("shpca_synthetic_issued_9999", self.clock.now + timedelta(hours=1), frozenset({"read_customers", "write_customers"}))
+        self.assertIsNone(other.load(self.clock.now))  # a cached scope set is re-checked
+
+    def test_unsaved_cache_is_visible_and_never_plaintext(self):
+        self.protector.fail_protect = True
+        self.baseline()
+        code, report = self.poll(advance=timedelta(minutes=2))
+        self.assertEqual((code, report["shopify"]["token_exchanges"], report["shopify"]["token_cache_note"]), (0, 1, "token_cache_unsaved"))
+        self.assertFalse(self.cache_file.exists())
+        self.assertEqual([p.name for p in self.temp.glob(".*.tmp")], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI")
+    def test_real_dpapi_round_trip_is_bound_to_store_and_client(self):
+        protector = direct.DpapiProtector()
+        cache = direct.TokenCache(self.cache_file, protector, shop_domain=DOMAIN, client_id=CLIENT_ID)
+        expires = self.clock.now + timedelta(hours=20)
+        cache.save("shpca_synthetic_issued_0001", expires, frozenset({"read_customers"}))
+        self.assertIsNone(cache.note)
+        raw = self.cache_file.read_bytes()
+        self.assertNotIn(b"shpca_", raw)
+        self.assertNotIn(DOMAIN.encode(), raw)
+        self.assertEqual(cache.load(self.clock.now), ("shpca_synthetic_issued_0001", expires.replace(microsecond=0)))
+        foreign = direct.TokenCache(self.cache_file, protector, shop_domain=DOMAIN, client_id="another-client-id-000001")
+        self.assertIsNone(foreign.load(self.clock.now))
+
+    @unittest.skipIf(os.name == "nt", "non-Windows hosts have no DPAPI")
+    def test_dpapi_cache_refuses_off_windows(self):
+        self.protector = None
+        self.baseline_without_cache()
+        code, report = self.poll(advance=timedelta(minutes=2))
+        self.assertEqual((code, report["code"]), (2, "token_cache_unavailable"))
+
+    def baseline_without_cache(self):
+        mode = self.config_values.pop("token_cache")
+        try:
+            self.baseline()
+        finally:
+            self.config_values["token_cache"] = mode
+
+
 # --------------------------------------------------------------------------
 # Core compatibility (direct provenance next to the attended hook path)
 # --------------------------------------------------------------------------
@@ -1034,6 +1141,7 @@ class SchedulerTemplateTests(unittest.TestCase):
         self.assertEqual(self.text("t:Settings/t:ExecutionTimeLimit"), "PT10M")
         self.assertEqual(self.text("t:Triggers/t:TimeTrigger/t:Repetition/t:Interval"), "PT2M")
         self.assertEqual(self.text("t:Principals/t:Principal/t:RunLevel"), "LeastPrivilege")
+        self.assertEqual(self.text("t:Principals/t:Principal/t:LogonType"), "Password")  # S4U cannot use DPAPI
         arguments = self.text("t:Actions/t:Exec/t:Arguments")
         self.assertTrue(arguments.startswith("-I -S -B "), arguments)
         self.assertIn("xb_shopify_poller.py", arguments)
@@ -1042,7 +1150,7 @@ class SchedulerTemplateTests(unittest.TestCase):
             self.assertNotIn(forbidden, arguments)
         self.assertEqual(len(self.root.findall("t:Actions/t:Exec", self.NS)), 1)
         # Placeholders only: no account, path or secret is baked in.
-        for placeholder in ("__POLLER_ACCOUNT_SID__", "__PYTHON_EXE__", "__RUNTIME_ROOT__", "__POLLER_CONFIG_PATH__"):
+        for placeholder in ("__XB_ACCOUNT_SID__", "__PYTHON_EXE__", "__RUNTIME_ROOT__", "__POLLER_CONFIG_PATH__"):
             self.assertIn(placeholder.encode(), self.raw)
 
     def test_execution_limit_exceeds_the_poller_run_budget(self):

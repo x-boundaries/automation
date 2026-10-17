@@ -18,21 +18,28 @@ Scope
 * Errors carry a fixed code, a retryable flag and numbers only: never a
   token, header, body, cursor, GID or provider message.
 
-Authentication (the token is held in memory only, never written)
------------------------------------------------------------------
-* ``client_credentials``: an app created in the Shopify Dev Dashboard in the
-  same organisation as the store. ``POST /admin/oauth/access_token`` with
-  ``grant_type=client_credentials`` returns a token that expires after about
-  24 hours (shopify.dev, client credentials grant, read 2026-10-17). It is
-  refreshed before expiry and once after a 401.
-* ``admin_api_access_token``: a static Admin API token of an existing custom
-  app. It cannot be refreshed; a 401 fails closed.
+Authentication (no secret is ever written in plaintext)
+-------------------------------------------------------
+* ``client_credentials``: an app created in the Shopify Dev Dashboard; the
+  app and the store must belong to the same Shopify organisation.
+  ``POST /admin/oauth/access_token`` with ``grant_type=client_credentials``
+  returns a token that expires after about 24 hours (shopify.dev, client
+  credentials grant, read 2026-10-17). It is refreshed 5 minutes before
+  expiry and once after a 401. Across runs the token is reused through
+  ``TokenCache``: the access token only (never the client secret), encrypted
+  with Windows DPAPI for the current user and bound by DPAPI entropy to the
+  store and client ID, in the private state root. Without the cache every run
+  exchanges once (bounded manual runs only).
+* ``admin_api_access_token``: the static Admin API token of an already
+  existing legacy custom app created in the Shopify admin (new ones cannot be
+  created since 1 January 2026). It cannot be refreshed; a 401 fails closed.
 * Either way the granted scopes must be exactly ``read_customers``; a write
   scope (or any other scope) refuses before any customer is read.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -244,12 +251,141 @@ class StaticTokenProvider:
         return False
 
 
+TOKEN_CACHE_SCHEMA = "xb.directlocal.shopify_token_cache.v1"
+TOKEN_CACHE_MAX_BYTES = 16_384
+
+
+class DpapiProtector:
+    """Windows DPAPI, current-user scope, no UI. Only this Windows user on
+    this machine can decrypt; the entropy binds a blob to one store and
+    client ID. ``protect``/``unprotect`` raise ``ShopifyDirectError``."""
+
+    name = "dpapi_current_user"
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise ShopifyDirectError("token_cache_unavailable")
+
+    @staticmethod
+    def _call(function_name: str, data: bytes, entropy: bytes) -> bytes:
+        import ctypes
+        from ctypes import wintypes
+
+        class Blob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        function = getattr(crypt32, function_name)
+        function.argtypes = (ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob))
+        function.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+        source = ctypes.create_string_buffer(data, len(data))
+        salt = ctypes.create_string_buffer(entropy, len(entropy))
+        blob_in = Blob(len(data), ctypes.cast(source, ctypes.POINTER(ctypes.c_char)))
+        blob_entropy = Blob(len(entropy), ctypes.cast(salt, ctypes.POINTER(ctypes.c_char)))
+        blob_out = Blob()
+        if not function(ctypes.byref(blob_in), None, ctypes.byref(blob_entropy), None, None, 0x1, ctypes.byref(blob_out)):  # CRYPTPROTECT_UI_FORBIDDEN
+            raise ShopifyDirectError("token_cache_unreadable" if function_name == "CryptUnprotectData" else "token_cache_unsaved")
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+
+    def protect(self, data: bytes, entropy: bytes) -> bytes:
+        return self._call("CryptProtectData", data, entropy)
+
+    def unprotect(self, blob: bytes, entropy: bytes) -> bytes:
+        return self._call("CryptUnprotectData", blob, entropy)
+
+
+class TokenCache:
+    """Cross-run reuse of one client-credentials access token.
+
+    The file holds only a protected blob of ``{schema, shop_domain,
+    expires_at, scope, access_token}``. Anything unreadable, foreign or
+    expiring is discarded (with a visible ``note``) and a fresh token is
+    exchanged; it is never trusted. The client secret is never cached."""
+
+    def __init__(self, path: Path, protector: Any, *, shop_domain: str, client_id: str):
+        self.path = Path(path)
+        self.protector = protector
+        self.shop_domain = shop_domain
+        # Entropy: a blob made for another store or app never decrypts here.
+        self._entropy = hashlib.sha256("\n".join((TOKEN_CACHE_SCHEMA, shop_domain, client_id)).encode("utf-8")).digest()
+        self.note: str | None = None
+
+    def __repr__(self) -> str:
+        return "TokenCache()"
+
+    def load(self, now: datetime) -> tuple[str, datetime] | None:
+        try:
+            if not self.path.exists():
+                return None
+            raw = self.path.read_bytes()
+        except OSError:
+            self.note = "token_cache_unreadable"
+            return None
+        try:
+            if len(raw) > TOKEN_CACHE_MAX_BYTES:
+                raise ShopifyDirectError("token_cache_unreadable")
+            value = json.loads(self.protector.unprotect(raw, self._entropy).decode("utf-8"))
+            if not isinstance(value, dict) or set(value) != {"schema", "shop_domain", "expires_at", "scope", "access_token"}:
+                raise ShopifyDirectError("token_cache_unreadable")
+            if value["schema"] != TOKEN_CACHE_SCHEMA or value["shop_domain"] != self.shop_domain:
+                raise ShopifyDirectError("token_cache_unreadable")
+            expires_at = dl.parse_created_at(value["expires_at"])
+            token = _secret(value["access_token"], "token_cache_unreadable")
+            require_minimal_scopes(_scopes(value["scope"]))
+            if expires_at is None:
+                raise ShopifyDirectError("token_cache_unreadable")
+        except (ShopifyDirectError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            self.note = "token_cache_unreadable"
+            self.clear()
+            return None
+        if now >= expires_at - timedelta(seconds=TOKEN_REFRESH_MARGIN_SECONDS):
+            self.note = "token_cache_expired"
+            self.clear()
+            return None
+        return token, expires_at
+
+    def save(self, token: str, expires_at: datetime, scopes: frozenset[str]) -> None:
+        value = {
+            "schema": TOKEN_CACHE_SCHEMA, "shop_domain": self.shop_domain, "scope": ",".join(sorted(scopes)), "access_token": token,
+            "expires_at": expires_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        try:
+            blob = self.protector.protect(json.dumps(value, sort_keys=True).encode("utf-8"), self._entropy)
+            with open(temporary, "wb") as handle:
+                handle.write(blob)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        except (ShopifyDirectError, OSError):
+            # Visible and narrow: this run keeps its in-memory token and the
+            # next run exchanges again. Never a plaintext fallback.
+            self.note = "token_cache_unsaved"
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    def clear(self) -> None:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.note = "token_cache_unclearable"
+
+
 class ClientCredentialsTokenProvider:
-    """Client-credentials grant; the token is cached in memory only."""
+    """Client-credentials grant; in memory, plus the optional ``TokenCache``."""
 
     method = "client_credentials"
 
-    def __init__(self, shop_domain: str, client_id: Any, client_secret: Any, *, transport: Transport, clock: Callable[[], datetime], timeout: int = 30):
+    def __init__(self, shop_domain: str, client_id: Any, client_secret: Any, *, transport: Transport, clock: Callable[[], datetime], timeout: int = 30, cache_protector: Any = None, cache_path: Path | None = None):
         self._url = store_url(shop_domain, "/admin/oauth/access_token")
         self._client_id = _secret(client_id, "shopify_token_missing")
         self._client_secret = _secret(client_secret, "shopify_token_missing")
@@ -258,7 +394,9 @@ class ClientCredentialsTokenProvider:
         self._timeout = timeout
         self._token: str | None = None
         self._expires_at: datetime | None = None
+        self.cache = None if cache_protector is None else TokenCache(cache_path, cache_protector, shop_domain=shop_domain, client_id=self._client_id)
         self.requests = 0
+        self.cache_hits = 0
 
     def __repr__(self) -> str:
         return "ClientCredentialsTokenProvider()"
@@ -268,6 +406,11 @@ class ClientCredentialsTokenProvider:
         if self._token is not None and self._expires_at is not None and now < self._expires_at - timedelta(seconds=TOKEN_REFRESH_MARGIN_SECONDS):
             return self._token
         self._token = self._expires_at = None
+        cached = self.cache.load(now) if self.cache is not None else None
+        if cached is not None:
+            self._token, self._expires_at = cached
+            self.cache_hits += 1
+            return self._token
         body = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": self._client_id, "client_secret": self._client_secret}).encode("ascii")
         self.requests += 1
         response = self._transport(self._url, body, {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, self._timeout)
@@ -288,12 +431,19 @@ class ClientCredentialsTokenProvider:
         expires_in = value.get("expires_in")
         if isinstance(expires_in, bool) or not isinstance(expires_in, int) or not TOKEN_MIN_LIFETIME_SECONDS <= expires_in <= TOKEN_MAX_LIFETIME_SECONDS:
             raise ShopifyDirectError("shopify_token_response_invalid")
-        require_minimal_scopes(_scopes(value.get("scope")))
+        scopes = _scopes(value.get("scope"))
+        require_minimal_scopes(scopes)
         self._token, self._expires_at = token, now + timedelta(seconds=expires_in)
+        if self.cache is not None:
+            self.cache.save(token, self._expires_at, scopes)
         return token
 
     def invalidate(self) -> bool:
+        """After a 401: forget the token in memory and in the cache."""
+
         self._token = self._expires_at = None
+        if self.cache is not None:
+            self.cache.clear()
         return True
 
 

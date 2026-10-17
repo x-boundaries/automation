@@ -4,7 +4,9 @@
   Registering, enabling or running this task is a separate Owner approval
   (see docs/autocount2-automation/member_directlocal_shopify_poller.md).
   Replace every __PLACEHOLDER__ before use; nothing here is a real account,
-  path or secret. The action is run-once with no AutoCount write mode.
+  path or secret. The principal is the authorised XB account (Password logon,
+  so its DPAPI token cache is usable). The action is run-once with no
+  AutoCount write mode.
   One run every 2 minutes; a new start is ignored while a run is active;
   a run is stopped after 10 minutes (the poller's own budget is shorter).
 -->
@@ -25,7 +27,7 @@
   </Triggers>
   <Principals>
     <Principal id="Poller">
-      <UserId>__POLLER_ACCOUNT_SID__</UserId>
+      <UserId>__XB_ACCOUNT_SID__</UserId>
       <LogonType>Password</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>

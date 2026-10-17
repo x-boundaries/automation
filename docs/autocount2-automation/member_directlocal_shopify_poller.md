@@ -159,6 +159,36 @@ The poller modules do not import `subprocess` and contain no bridge
 construction. Tests assert all of this and patch `subprocess.Popen` and
 sockets to fail for every test.
 
+## Shopify authentication and token reuse
+
+- New apps are created in the Shopify Dev Dashboard. Since 1 January 2026
+  Shopify no longer lets merchants create new legacy custom apps in the store
+  admin, so `admin_api_access_token` exists only for an already existing
+  pre-2026 legacy app; a new app uses `client_credentials`.
+- Client credentials work only when the app and the store belong to the same
+  Shopify organisation in the Dev Dashboard (owning or having installed the
+  store is not enough; Shopify answers `shop_not_permitted`). Scopes come
+  from the released app version, not the token request.
+- Token reuse across runs (`token_cache = dpapi_current_user`): one exchange
+  serves every 2-minute run until 5 minutes before the token expires (about
+  one exchange a day instead of about 720). The cache file
+  `<state_root>\shopify-token-cache.dpapi` holds only the access token, its
+  expiry, scope and store, encrypted with Windows DPAPI for the account that
+  runs the poller (`CryptProtectData`, current user, no UI) and bound by
+  DPAPI entropy to the store and client ID. The client secret is never
+  cached. A cache that cannot be decrypted, belongs to another store or app,
+  names other scopes or is about to expire is deleted and a new token is
+  exchanged (`token_cache_note`); a 401 deletes it before the one refresh; a
+  cache that cannot be written leaves the run on its in-memory token
+  (`token_cache_unsaved`). Nothing is ever written in plaintext.
+- The DPAPI key belongs to the Windows user, so the task must run with a
+  logon that loads that user's DPAPI keys (`Password` or interactive token).
+  An S4U ("do not store password") task cannot decrypt the cache. With
+  `token_cache = none` every run exchanges once; use that only for bounded
+  manual runs.
+- Every run still checks the store identity and that the token's scopes are
+  exactly `read_customers` before any customer read.
+
 ## Configuration
 
 `config/directlocal_shopify_poller.example.json`. Unknown keys are refused;
@@ -168,8 +198,9 @@ each named variable is set, without reading it out.
 
 | Key | Default | Bound |
 |---|---|---|
-| `auth.method` | - | `client_credentials` (Dev Dashboard app, same organisation as the store; about 24 h tokens, refreshed in memory) or `admin_api_access_token` (existing custom app token; cannot refresh) |
-| `api_version` | - | `YYYY-01/04/07/10`; the example `2026-07` must be confirmed against Shopify's supported versions at live setup |
+| `auth.method` | - | `client_credentials` (an app created in the Shopify Dev Dashboard; the app and the store must be in the same Shopify organisation; tokens last about 24 h) or `admin_api_access_token` (only for an already existing legacy custom app created in the Shopify admin before 2026; cannot refresh) |
+| `token_cache` | `none` | `dpapi_current_user` (example) or `none`; only with `client_credentials` (see "Shopify authentication and token reuse") |
+| `api_version` | - | `YYYY-01/04/07/10`. The example `2026-07` is a stable Admin API version, accessible until 16 July 2027 15:00 UTC (shopify.dev API versioning, read 2026-10-17); move to a newer stable version before then |
 | `profile_reads_enabled` | - | `false` in the example: discovery only (GIDs, timestamps, tags, metafield ids) |
 | `full_scan_interval_hours` | 24 | 1-168 |
 | `recent_max_pages` / `full_scan_max_pages` | 40 / 200 | 1-100 / 1-400 |
@@ -181,41 +212,44 @@ each named variable is set, without reading it out.
 
 Owner actions and approvals needed before any live read (none is granted):
 
-1. Create a Shopify app for this store in the Shopify Dev Dashboard (same
-   organisation as the store), with the single Admin API scope
-   `read_customers`, and install it on `xboundariessg.myshopify.com`. For
-   profile reads, the app also needs protected customer data access for
-   name, email and phone; without it Shopify returns `ACCESS_DENIED`. If a
-   custom app created in the Shopify admin is used instead, its token must
-   have only `read_customers`.
-2. Decide where the client ID and secret (or token) live on
-   `DESKTOP-4I042L6` and how the run receives them as the named environment
-   variables. This source never writes a credential; a DPAPI-protected store
-   or Credential Manager entry of the account that runs the task is the
-   expected mechanism and needs its own review.
+1. Create a Shopify app in the Shopify Dev Dashboard, in the same Shopify
+   organisation as `xboundariessg.myshopify.com`, with the single Admin API
+   scope `read_customers`, and install it on that store. For profile reads,
+   the app also needs protected customer data access for name, email and
+   phone; without it Shopify returns `ACCESS_DENIED`. Only if a legacy
+   custom app created in the admin before 2026 already exists may its static
+   token be used instead, and it must have only `read_customers`.
+2. Decide how the client ID and secret reach the run as the named
+   environment variables on `DESKTOP-4I042L6`, in the authorised `XB`
+   account context. This source never writes the client secret; its custody
+   (for example a DPAPI-protected entry of `XB`) needs its own review.
 3. Use a fresh private state root (`prepare-state-root`, `init-ledger`)
    rather than the A7 UAT ledger, then `baseline --no-autocount-write
    --confirm-new-cutover` (about 90 exhaustive reads; fixes the cutover C).
 4. Run `run-once --no-autocount-write` by hand with
    `profile_reads_enabled = false` (identity, scope and discovery only),
    then, with separate consent, with profile reads for a bounded test.
-   Confirm the API version and the token endpoint's behaviour on that run.
+   On two consecutive runs with `token_cache = dpapi_current_user`, confirm
+   `token_exchanges` 1 then 0 (`token_cache_hits` 1).
 
 Registering and enabling the scheduled task is a later approval, as are
-unattended AutoCount writes.
+unattended AutoCount writes. Activation-only prerequisite for the scheduled
+cadence: `token_cache = dpapi_current_user` with a task logon that can use
+`XB`'s DPAPI keys (not S4U), proven by step 4.
 
 ## Scheduled task (template only; do not run under this source)
 
 The template is `Enabled = false`, one action, `PT2M` repetition,
 `MultipleInstancesPolicy = IgnoreNew`, `ExecutionTimeLimit = PT10M`,
-`LeastPrivilege`, placeholders for the account SID, interpreter, runtime root
-and config path. The interpreter is the protected all-users Python of the
+`LeastPrivilege`, `Password` logon (needed for the DPAPI token cache), and
+placeholders for the `XB` account SID, interpreter, runtime root and config
+path. The interpreter is the protected all-users Python of the
 installed runtime, launched with `-I -S -B`.
 
 When an approval names it, registration would be (registers disabled):
 
 ```powershell
-Register-ScheduledTask -TaskName 'XB-DirectLocal-Shopify-Poller' -TaskPath '\XB\' -Xml (Get-Content -Raw -LiteralPath <filled template>) -User <account> -Password <typed>
+Register-ScheduledTask -TaskName 'XB-DirectLocal-Shopify-Poller' -TaskPath '\XB\' -Xml (Get-Content -Raw -LiteralPath <filled template>) -User XB -Password <typed>
 ```
 
 ### Rollback
@@ -225,7 +259,8 @@ Register-ScheduledTask -TaskName 'XB-DirectLocal-Shopify-Poller' -TaskPath '\XB\
    with `Stop-ScheduledTask`).
 2. Remove the task: `Unregister-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-DirectLocal-Shopify-Poller' -Confirm:$false`.
 3. Revoke Shopify access: uninstall the app or rotate its secret/token in
-   Shopify; remove the stored credential.
+   Shopify; remove the stored credential and delete
+   `shopify-token-cache.dpapi` (an encrypted short-lived token).
 4. Keep the state root: the ledger is evidence and is never deleted. An open
    poller run is abandoned by the next poller run or by the Core's attended
    `abandon-run`. Deleting `shopify-poller-state.json` only resets backoff.
@@ -238,11 +273,14 @@ This PR adds no route from the poller to AutoCount. A later stage needs, each
 with its own approval and qualification:
 
 - A non-interactive AutoCount credential mechanism. The current bridge
-  receives credentials only from the interactive, elevated Owner console. An
-  unattended runner needs a dedicated Windows account, its credential
-  protected for that account only (DPAPI or Credential Manager), the A2 code
-  custody guard on a protected runtime, and a launcher that passes it only to
-  the bridge child.
+  receives credentials only from the interactive, elevated Owner console.
+  Owner has kept the single internal `XB` account model (#155:6233700944):
+  an unattended runner would run in the authorised `XB` context unless the
+  Owner changes that decision; no other Windows account, account change or
+  account-separation task is part of this design. Non-interactive custody of
+  the AutoCount credential, the protected runtime launch (A2 code custody)
+  and a launcher that passes the credential only to the bridge child each
+  need separate Owner approval. No unattended write is authorised.
 - An explicit poller write mode wired to the Core's standing policy
   (`activate-policy`, bounded creates and TTL), keeping the one-fence rule.
 - E9 for production: `AED_XBOUNDARIES` stays refused by source until the
@@ -251,12 +289,13 @@ with its own approval and qualification:
 
 ## Residual risks
 
-- Same-user tampering: any process running as the poller account can write
-  the inbox or state files, as with the attended hook. The ledger's
-  hash chain and single-owner lock do not stop a same-user attacker.
-- Each run requests a new client-credentials token (about 720 a day); the
-  token endpoint's limits are not documented in the page read on 2026-10-17
-  and must be observed in the live read-only run.
+- Same-user trust: any process running as `XB` can write the inbox or
+  state files, and can decrypt the DPAPI token cache, as with the attended
+  hook. This is the Owner's accepted single-account model; the ledger's hash
+  chain and single-owner lock do not stop a same-user process.
+- Without the token cache each run exchanges a token (about 720 a day at the
+  2-minute cadence); Shopify recommends reusing the token until it expires.
+  The scheduled cadence therefore requires `token_cache = dpapi_current_user`.
 - `UPDATED_AT` pagination under heavy churn can fail repeatedly with
   duplicate GIDs; the daily exhaustive run is the backstop.
 - The POS latency is still set by the outlet's 15-minute sync interval.

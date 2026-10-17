@@ -62,6 +62,8 @@ REPORT_SCHEMA = "xb.directlocal.shopify_poller.run.v1"
 STATE_SCHEMA = "xb.directlocal.shopify_poller.state.v1"
 STATE_FILE = "shopify-poller-state.json"
 LOG_FILE = "shopify-poller-runs.jsonl"
+TOKEN_CACHE_FILE = "shopify-token-cache.dpapi"
+TOKEN_CACHE_MODES = frozenset({"none", "dpapi_current_user"})
 LOG_MAX_BYTES = 1_048_576
 AUTOCOUNT_WRITE_MODES = frozenset({"none"})  # the only mode this source has
 AUTH_METHODS = frozenset({"client_credentials", "admin_api_access_token"})
@@ -120,13 +122,14 @@ class PollerConfig:
     full_scan_max_pages: int
     http_timeout_seconds: int
     max_run_seconds: int
+    token_cache: str = "none"
 
 
 def parse_config(value: Any) -> PollerConfig:
     if not isinstance(value, dict):
         raise dl.DirectLocalError("poller_config_invalid")
     required = {"schema", "state_root", "store_gid", "shop_domain", "api_version", "auth", "autocount_write_mode", "profile_reads_enabled"}
-    optional = {"profile_discovered_since", *_BOUNDS}
+    optional = {"profile_discovered_since", "token_cache", *_BOUNDS}
     if not required <= set(value) or not set(value) <= required | optional:
         raise dl.DirectLocalError("poller_config_keys_invalid")
     if value["schema"] != CONFIG_SCHEMA:
@@ -151,6 +154,11 @@ def parse_config(value: Any) -> PollerConfig:
     env = {key: auth[key] for key in names}
     if any(not isinstance(name, str) or not ENV_NAME_RE.fullmatch(name) for name in env.values()) or len(set(env.values())) != len(env):
         raise dl.DirectLocalError("poller_config_auth_invalid")
+    # Cross-run token reuse exists only for the refreshable grant; a static
+    # legacy token is never copied anywhere.
+    token_cache = value.get("token_cache", "none")
+    if token_cache not in TOKEN_CACHE_MODES or (token_cache != "none" and method != "client_credentials"):
+        raise dl.DirectLocalError("poller_config_token_cache_invalid")
     since = None
     if value.get("profile_discovered_since") is not None:
         since = dl.parse_created_at(value["profile_discovered_since"])
@@ -165,7 +173,7 @@ def parse_config(value: Any) -> PollerConfig:
     return PollerConfig(
         state_root=value["state_root"], store_gid=value["store_gid"], shop_domain=value["shop_domain"], api_version=value["api_version"],
         auth_method=method, auth_env=env, autocount_write_mode=value["autocount_write_mode"],
-        profile_reads_enabled=value["profile_reads_enabled"], profile_discovered_since=since, **numbers,
+        profile_reads_enabled=value["profile_reads_enabled"], profile_discovered_since=since, token_cache=token_cache, **numbers,
     )
 
 
@@ -183,12 +191,18 @@ def load_config(path: str | Path) -> PollerConfig:
     return parse_config(value)
 
 
-def token_provider(config: PollerConfig, environ: Mapping[str, str], transport: direct.Transport, clock: Callable[[], datetime]) -> Any:
+def token_provider(config: PollerConfig, environ: Mapping[str, str], transport: direct.Transport, clock: Callable[[], datetime], *, root: Path | None = None, protector: Any = None) -> Any:
+    """``protector`` replaces Windows DPAPI in offline tests only."""
+
     if config.auth_method == "admin_api_access_token":
         return direct.StaticTokenProvider(environ.get(config.auth_env["token_env"]))
+    cache_protector = None
+    if config.token_cache == "dpapi_current_user":
+        cache_protector = protector if protector is not None else direct.DpapiProtector()
     return direct.ClientCredentialsTokenProvider(
         config.shop_domain, environ.get(config.auth_env["client_id_env"]), environ.get(config.auth_env["client_secret_env"]),
         transport=transport, clock=clock, timeout=config.http_timeout_seconds,
+        cache_protector=cache_protector, cache_path=None if root is None else root / TOKEN_CACHE_FILE,
     )
 
 
@@ -384,7 +398,7 @@ def _customer_counts(ledger: dl.Ledger) -> dict[str, int]:
     return {row[0]: row[1] for row in ledger.conn.execute("SELECT state, COUNT(*) FROM customers GROUP BY state ORDER BY state")}
 
 
-def run_once(config: PollerConfig, *, environ: Mapping[str, str] | None = None, transport: direct.Transport | None = None, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], datetime] = dl.utc_now, monotonic: Callable[[], float] = time.monotonic, baseline: bool = False) -> tuple[int, dict[str, Any]]:
+def run_once(config: PollerConfig, *, environ: Mapping[str, str] | None = None, transport: direct.Transport | None = None, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], datetime] = dl.utc_now, monotonic: Callable[[], float] = time.monotonic, baseline: bool = False, token_protector: Any = None) -> tuple[int, dict[str, Any]]:
     """One bounded poller run. ``baseline`` (attended only) instead seals the
     ledger's first, exhaustive baseline, which fixes the cutover C."""
 
@@ -438,7 +452,7 @@ def run_once(config: PollerConfig, *, environ: Mapping[str, str] | None = None, 
                 processor.purge_inbox()
             live = transport if transport is not None else direct.UrllibTransport()
             poller.client = direct.ShopifyDirectClient(
-                shop_domain=config.shop_domain, api_version=config.api_version, token_provider=token_provider(config, environ, live, ledger.now),
+                shop_domain=config.shop_domain, api_version=config.api_version, token_provider=token_provider(config, environ, live, ledger.now, root=root, protector=token_protector),
                 transport=live, sleep=sleep, monotonic=monotonic, deadline=started + config.max_run_seconds, timeout=config.http_timeout_seconds,
             )
             poller.client.verify_session(store_gid=meta["store_gid"])
@@ -470,6 +484,9 @@ def run_once(config: PollerConfig, *, environ: Mapping[str, str] | None = None, 
             if poller.client is not None:
                 stats = poller.client.stats
                 report["shopify"] = {"requests": stats.requests, "retries": stats.retries, "wait_seconds": stats.wait_seconds, "auth_refreshes": stats.auth_refreshes, "min_available": stats.min_available}
+                tokens = poller.client._tokens
+                if isinstance(tokens, direct.ClientCredentialsTokenProvider):
+                    report["shopify"].update(token_exchanges=tokens.requests, token_cache=config.token_cache, token_cache_hits=tokens.cache_hits, token_cache_note=tokens.cache.note if tokens.cache is not None else None)
         report["customers"] = _customer_counts(ledger)
         now = ledger.now()
         if status == "ok":
@@ -503,7 +520,7 @@ def check_config(config: PollerConfig, environ: Mapping[str, str]) -> dict[str, 
 
     dl.validate_state_root(config.state_root, environ=environ)
     present = {name: bool(environ.get(name)) for name in config.auth_env.values()}
-    return {"status": "config_valid", "auth_method": config.auth_method, "env_present": present, "autocount_write_mode": config.autocount_write_mode, "profile_reads_enabled": config.profile_reads_enabled}
+    return {"status": "config_valid", "auth_method": config.auth_method, "env_present": present, "autocount_write_mode": config.autocount_write_mode, "profile_reads_enabled": config.profile_reads_enabled, "token_cache": config.token_cache}
 
 
 def main(argv: list[str] | None = None) -> int:
