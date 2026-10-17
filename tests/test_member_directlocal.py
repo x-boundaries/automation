@@ -64,17 +64,27 @@ def page_data(nodes: list[dict], has_next: bool, end_cursor: str | None, *, stor
     return {"shop": {"id": store, "myshopifyDomain": domain}, "customers": {"pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}, "nodes": nodes}}
 
 
-def node(gid: str, created: datetime, tags: list[str]) -> dict:
-    return {"id": gid, "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ"), "tags": tags}
+def metafield_gid(gid: str) -> str:
+    return "gid://shopify/Metafield/" + gid.rsplit("/", 1)[1]
 
 
-def profile(gid: str, *, created: datetime, tags=("member-mg",), phone="+65 8000 0001", email="Alpha@Example.test", start="2026-10-15", expiry="2028-10-14", first="Synthetic", last="Member Alpha") -> dict:
+def node(gid: str, created: datetime, tags: list[str], *, registered: datetime | None | bool = True) -> dict:
+    """Baseline node. ``registered`` is the membership.start_date metafield
+    instant (default: same as createdAt); ``None`` means not written yet."""
+
+    when = created if registered is True else registered
+    registration = None if when is None else {"id": metafield_gid(gid), "createdAt": when.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    return {"id": gid, "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ"), "tags": tags, "registration": registration}
+
+
+def profile(gid: str, *, created: datetime, registered: datetime | None = None, tags=("member-mg",), phone="+65 8000 0001", email="Alpha@Example.test", start="2026-10-15", expiry="2028-10-14", first="Synthetic", last="Member Alpha", registration_id: str | None = None) -> dict:
+    when = created if registered is None else registered
     return {
         "id": gid, "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ"), "tags": list(tags),
         "firstName": first, "lastName": last,
         "defaultEmailAddress": None if email is None else {"emailAddress": email},
         "defaultPhoneNumber": None if phone is None else {"phoneNumber": phone},
-        "startDate": None if start is None else {"type": "date", "value": start},
+        "startDate": None if start is None else {"id": registration_id or metafield_gid(gid), "createdAt": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "date", "value": start},
         "expiryDate": None if expiry is None else {"type": "date", "value": expiry},
     }
 
@@ -179,7 +189,8 @@ class FakeBridge:
         if self.write_mode == "timeout_unconfirmed":
             return dl.WriteRun(started=True, timed_out=True, exited=False)
         match = self.write_mode != "mismatch"
-        return dl.WriteRun(started=True, exit_code=0, stdout=json.dumps({"save_invocation_count": 1, "readback_found": True, "readback_match": match}))
+        outcome = {"save_invocation_count": 1, "readback_found": True, "readback_match": match, "outbound_queue_changed": self.write_mode == "outbound_changed"}
+        return dl.WriteRun(started=True, exit_code=0, stdout=json.dumps(outcome))
 
 
 class DirectLocalTestCase(unittest.TestCase):
@@ -499,7 +510,8 @@ class AdmissionTests(DirectLocalTestCase):
     def test_admit_records_no_pii_and_discards_capture(self):
         path = self.fresh_profile()
         result = self.processor.process(path)
-        self.assertEqual(result, {"customer_state": "ADMITTED", "code": None, "capture_discarded": True})
+        self.assertEqual(result, {"customer_ref": self.processor._ref("c", NEW), "customer_state": "ADMITTED", "code": None, "capture_discarded": True})
+        self.assertRegex(result["customer_ref"], r"^c-[0-9a-f]{20}$")
         self.assertFalse(path.exists())
         self.assert_no_pii_at_rest()
 
@@ -620,7 +632,12 @@ class WriteTests(DirectLocalTestCase):
         cases = [
             ("two_occupied_then_free", {"occupied": ("M000201", "M000202")}, (), "CREATED_VERIFIED", "M000203"),
             ("three_occupied", {"occupied": ("M000201", "M000202", "M000203")}, (), "member_no_candidates_exhausted", None),
-            ("not_advancing", {"occupied": ("M000201",), "next": ["M000201", "M000201"]}, (), "member_no_generator_not_advancing", None),
+            # A preview counter that never advances: continue its format above what was tried.
+            ("not_advancing_continues_format", {"occupied": ("M000201",), "next": ["M000201"]}, (), "CREATED_VERIFIED", "M000202"),
+            ("not_advancing_hyphen_width", {"occupied": ("M-0002",), "next": ["M-0002"]}, (), "CREATED_VERIFIED", "M-0003"),
+            ("not_advancing_successors_occupied", {"occupied": ("M000201", "M000202", "M000203"), "next": ["M000201"]}, (), "member_no_candidates_exhausted", None),
+            ("not_advancing_no_digits", {"occupied": ("MEMBER",), "next": ["MEMBER"]}, (), "member_no_generator_not_advancing", None),
+            ("not_advancing_width_full", {"occupied": ("M-9",), "next": ["M-9"]}, (), "member_no_generator_not_advancing", None),
             ("generator_failed", {}, ("next",), "member_no_generator_failed", None),
             ("probe_failed", {}, ("probe",), "member_no_probe_failed", None),
             ("invalid_member_no", {"next": ["M 1"]}, (), "member_no_generator_invalid", None),
@@ -645,21 +662,82 @@ class WriteTests(DirectLocalTestCase):
                     self.assertEqual((bridge.write_calls, self.ac.saves), (0, 0))
                 self.assertLessEqual(self.ac.next_calls, dl.MAX_MEMBER_NO_CANDIDATES)
 
-    def test_values_wider_than_autocount_columns_go_to_review_before_any_lookup(self):
-        cases = [("name", {"first": "Synthetic", "last": "M" * 100}), ("email", {"email": "a" * 190 + "@example.test"})]
-        for name, kwargs in cases:
+    def test_member_no_attempt_provenance(self):
+        # G2 A3: each attempt records the generator's raw preview and whether
+        # the candidate is that preview or a successor derived from it.
+        cases = [
+            ("preview_bound", {}, (), [(1, "M000201", "M000201", "generator", "FREE_BOUND")]),
+            ("successor_bound", {"occupied": ("M000201",), "next": ["M000201"]}, (),
+             [(1, "M000201", "M000201", "generator", "OCCUPIED"), (2, "M000202", "M000201", "successor", "FREE_BOUND")]),
+            ("successor_occupied", {"occupied": ("M000201", "M000202", "M000203"), "next": ["M000201"]}, (),
+             [(1, "M000201", "M000201", "generator", "OCCUPIED"), (2, "M000202", "M000201", "successor", "OCCUPIED"), (3, "M000203", "M000201", "successor", "OCCUPIED")]),
+            ("not_advancing_no_digits", {"occupied": ("MEMBER",), "next": ["MEMBER"]}, (),
+             [(1, "MEMBER", "MEMBER", "generator", "OCCUPIED"), (2, "MEMBER", "MEMBER", "generator", "REPEATED")]),
+            ("generator_failed", {}, ("next",), [(1, None, None, None, "GENERATOR_FAILED")]),
+            ("generator_invalid", {"next": ["M 1"]}, (), [(1, None, None, None, "GENERATOR_INVALID")]),
+        ]
+        for name, setup, fail, expected in cases:
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.admit_and_approve()
+                for occupied in setup.get("occupied", ()):
+                    self.ac.members[occupied] = {"mobile_phone": None, "email_address": None}
+                if "next" in setup:
+                    self.ac.next = setup["next"]
+                self.write(FakeBridge(self.ac, fail=fail))
+                rows = self.ledger.conn.execute("SELECT attempt_no, candidate, generator_preview, derivation, status FROM allocation_attempts ORDER BY attempt_no").fetchall()
+                self.assertEqual([tuple(row) for row in rows], expected)
+                self.assertLessEqual(self.ac.next_calls, len(expected))  # no extra generator call
+                with self.assertRaises(sqlite3.DatabaseError):
+                    self.ledger.conn.execute("UPDATE allocation_attempts SET derivation = 'generator', generator_preview = 'X' WHERE attempt_no = 1")
+        derivations = self.processor.uat_report()["allocation_derivations"]
+        self.assertEqual(derivations, {"no_candidate": 1})  # the last case: an invalid value is never stored (G2 O12)
+
+    def test_member_no_successor(self):
+        cases = [
+            ("M-0002", set(), "M-0003"),
+            ("M-0002", {"M-0002", None}, "M-0003"),
+            ("M-0002", {"M-0007", "M-0003"}, "M-0008"),  # above numbers the ledger bound
+            ("M-0002", {"M-00009", "X-0050", "M0099"}, "M-0003"),  # other formats ignored
+            ("M000201", {"M000201"}, "M000202"),
+            ("XB01-M000009", set(), "XB01-M000010"),
+            ("M-9999", set(), None),  # width would grow
+            ("MEMBER", set(), None),  # no trailing digits
+            ("0019", set(), "0020"),
+        ]
+        for seed, seen, expected in cases:
+            with self.subTest(seed=seed, seen=seen):
+                self.assertEqual(dl.member_no_successor(seed, seen), expected)
+
+    def test_values_autocount_cannot_store_go_to_review_at_admission(self):
+        # nvarchar(n) counts UTF-16 code units: an astral character counts twice.
+        cases = [
+            ("name", {"first": "Synthetic", "last": "M" * 100}, "autocount_field_width_exceeded"),
+            ("email", {"email": "a" * 190 + "@example.test"}, "autocount_field_width_exceeded"),
+            ("astral_name", {"first": "S", "last": "\U0001F600" * 50}, "autocount_field_width_exceeded"),  # 1 + 1 + 100 units
+            ("control_character", {"first": "Synthetic", "last": "Member\x07Alpha"}, "autocount_text_invalid"),
+            ("unpaired_surrogate", {"first": "Synthetic", "last": "Member \ud800"}, "autocount_text_invalid"),
+        ]
+        for name, kwargs, code in cases:
             with self.subTest(field=name):
                 self.tearDown()
                 self.setUp()
-                self.admit_and_approve(**kwargs)
+                result = self.processor.process(self.fresh_profile(**kwargs))
+                self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", code))
                 bridge = FakeBridge(self.ac)
-                result = self.write(bridge, **kwargs)
-                self.assertEqual((result["customer_state"], result["code"]), ("MANUAL_REVIEW", "autocount_field_width_exceeded"))
+                with self.assertRaises(dl.DirectLocalError):
+                    self.write(bridge, **kwargs)  # terminal: never reaches any lookup or write
                 self.assertEqual((bridge.precheck_calls, bridge.write_calls, self.ac.next_calls, self.ac.saves), ([], 0, 0, 0))
-        self.tearDown()
-        self.setUp()
-        self.admit_and_approve(first="Synthetic", last="M" * 90)  # 100 characters exactly is accepted
-        self.assertEqual(self.write(FakeBridge(self.ac), first="Synthetic", last="M" * 90)["fence_state"], "CREATED_VERIFIED")
+        for last in ("M" * 90, "\U0001F600" * 44 + "M"):  # exactly 100 code units are accepted
+            with self.subTest(last=last[:3]):
+                self.tearDown()
+                self.setUp()
+                self.admit_and_approve(first="Synthetic", last=last)
+                self.assertEqual(self.write(FakeBridge(self.ac), first="Synthetic", last=last)["fence_state"], "CREATED_VERIFIED")
+
+    def test_utf16_code_units(self):
+        self.assertEqual((dl.utf16_code_units("abc"), dl.utf16_code_units("\u6c88"), dl.utf16_code_units("\U0001F600")), (3, 1, 2))
 
     def test_member_no_held_by_another_customer_counts_as_occupied(self):
         self.ledger.conn.execute("UPDATE customers SET member_no = 'M000201' WHERE customer_gid = ?", (NEW,))
@@ -704,6 +782,7 @@ class WriteTests(DirectLocalTestCase):
             "timeout_after_save": ("WRITE_OUTCOME_UNCERTAIN", "writer_timeout", 1),
             "timeout_unconfirmed": ("WRITER_TERMINATION_UNCONFIRMED", "writer_timeout_exit_unconfirmed", 1),
             "mismatch": ("CREATED_READBACK_MISMATCH", "readback_mismatch_manual_review", 1),
+            "outbound_changed": ("CREATED_OUTBOUND_QUEUE_CHANGED", "outbound_queue_changed_manual_review", 1),
         }
         for mode, (state, code, saves) in cases.items():
             with self.subTest(mode=mode):
@@ -807,7 +886,8 @@ class CrashRecoveryTests(DirectLocalTestCase):
     def test_reconcile_absent_member_is_manual_followup(self):
         self.write(FakeBridge(self.ac, write_mode="fail_after_claim"))
         result = self.processor.reconcile(self.fresh_profile(), bridge=FakeBridge(self.ac))
-        self.assertEqual(result, {"fence_state": "MANUAL_REVIEW", "code": "confirmed_absent_manual_followup"})
+        self.assertEqual((result["fence_state"], result["code"]), ("MANUAL_REVIEW", "confirmed_absent_manual_followup"))
+        self.assertRegex(result["member_ref"], r"^m-[0-9a-f]{20}$")
 
     def test_unrecorded_writer_identity_holds_until_attended_release(self):
         bridge = FakeBridge(self.ac, write_mode="parent_crash_after_save")
@@ -1042,7 +1122,9 @@ class ClassifyTests(unittest.TestCase):
         for stdout in ("", "not json", json.dumps({"save_invocation_count": 2, "readback_found": True, "readback_match": True}), json.dumps({"save_invocation_count": 1, "readback_found": "yes", "readback_match": True})):
             with self.subTest(stdout=stdout):
                 self.assertEqual(dl.classify_write(dl.WriteRun(True, 0, stdout), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"))
-        absent = json.dumps({"save_invocation_count": 1, "readback_found": False, "readback_match": False})
+        absent = json.dumps({"save_invocation_count": 1, "readback_found": False, "readback_match": False, "outbound_queue_changed": False})
+        missing_flag = json.dumps({"save_invocation_count": 1, "readback_found": True, "readback_match": True})
+        self.assertEqual(dl.classify_write(dl.WriteRun(True, 0, missing_flag), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "writer_outcome_invalid"))
         self.assertEqual(dl.classify_write(dl.WriteRun(True, 0, absent), claim_exists=True), ("WRITE_OUTCOME_UNCERTAIN", "readback_absent"))
 
     def test_start_failure_with_claim_is_uncertain(self):
@@ -1072,6 +1154,74 @@ class HookTests(unittest.TestCase):
         for event, code in cases:
             with self.subTest(event=str(event)[:80]):
                 self.assertEqual(self.run_hook(["guard"], event).returncode, code)
+
+    @staticmethod
+    def deep(depth: int = 50000) -> str:
+        return '{"a":' * depth + '"SYNTHETIC_PII_MARKER"' + "}" * depth
+
+    def malformed_events(self) -> dict[str, bytes]:
+        tool = json.dumps(dl.CONNECTOR_TOOL)
+        query = json.dumps(dl.PROFILE_QUERY)
+        return {
+            "deep_variables": f'{{"tool_name": {tool}, "tool_input": {{"query": {query}, "variables": {self.deep()}}}}}'.encode(),
+            "deep_tool_input": f'{{"tool_name": {tool}, "tool_input": {self.deep()}}}'.encode(),
+            "deep_array": b"[" * 100000 + b"]" * 100000,
+            "deep_before_tool_name": f'{{"x": {self.deep()}, "tool_name": {tool}}}'.encode(),
+            "malformed_utf8": b'{"tool_name": "\xff\xfe", "SYNTHETIC_PII_MARKER": 1}',
+            "truncated": f'{{"tool_name": {tool}, "tool_input": {{"query": '.encode(),
+            "empty": b"",
+            "list": b"[]",
+            "string": b'"SYNTHETIC_PII_MARKER"',
+            "null": b"null",
+            "number": b"42",
+        }
+
+    def test_guard_fails_closed_on_malformed_or_deeply_nested_input(self):
+        # G2 O10: a PreToolUse exit other than 2 does not block, so every
+        # parsing failure, RecursionError included, must exit 2 with a fixed message.
+        for name, raw in self.malformed_events().items():
+            with self.subTest(name=name):
+                proc = self.run_hook(["guard"], raw)
+                self.assertEqual(proc.returncode, 2, proc.stderr[-300:])
+                self.assertTrue(proc.stderr.startswith(b"DirectLocal guard: "), proc.stderr[-300:])
+                self.assertNotIn(b"Traceback", proc.stderr)
+                self.assertNotIn(b"SYNTHETIC_PII_MARKER", proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout, b"")
+        # Depth just below the parser limit is still checked by the allowlist, not passed.
+        shallow = {"tool_name": dl.CONNECTOR_TOOL, "tool_input": json.loads('{"query": ' + json.dumps(dl.PROFILE_QUERY) + ', "variables": ' + self.deep(200) + "}")}
+        self.assertEqual(self.run_hook(["guard"], json.dumps(shallow).encode()).returncode, 2)
+
+    def test_capture_never_persists_malformed_or_deeply_nested_input(self):
+        events = self.malformed_events()
+        good = {"session_id": "s", "tool_use_id": "toolu_synthetic_deep", "tool_name": dl.CONNECTOR_TOOL, "tool_input": page_input(None)}
+        prefix = json.dumps(good)[:-1]
+        events["deep_tool_response"] = f'{prefix}, "tool_response": {self.deep()}}}'.encode()
+        events["deep_after_valid_fields"] = f'{prefix}, "tool_response": {{"data": null}}, "extra": {self.deep()}}}'.encode()
+        with tempfile.TemporaryDirectory() as temp:
+            for name, raw in events.items():
+                with self.subTest(name=name):
+                    proc = self.run_hook(["capture", "--inbox", temp], raw)
+                    self.assertEqual(proc.returncode, 1, proc.stderr[-300:])
+                    self.assertTrue(proc.stderr.startswith(b"DirectLocal capture: "), proc.stderr[-300:])
+                    self.assertNotIn(b"Traceback", proc.stderr)
+                    self.assertNotIn(b"SYNTHETIC_PII_MARKER", proc.stdout + proc.stderr)
+                    self.assertEqual(list(Path(temp).iterdir()), [])  # no record, no temporary file
+
+    def test_hook_fails_closed_when_the_core_cannot_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lonely = Path(temp) / "scripts" / "directlocal_connector_hook.py"
+            lonely.parent.mkdir()
+            shutil.copy2(HOOK, lonely)
+            inbox = Path(temp) / "inbox"
+            inbox.mkdir()
+            event = json.dumps({"tool_name": dl.CONNECTOR_TOOL, "tool_input": page_input(None), "tool_use_id": "toolu_synthetic_3", "tool_response": {}}).encode()
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            for args, code in ((["guard"], 2), (["capture", "--inbox", str(inbox)], 1)):
+                with self.subTest(args=args[0]):
+                    proc = subprocess.run([sys.executable, str(lonely), *args], input=event, capture_output=True, timeout=60, env=env, check=False)
+                    self.assertEqual(proc.returncode, code, proc.stderr[-300:])
+                    self.assertIn(b"core unavailable", proc.stderr)
+            self.assertEqual(list(inbox.iterdir()), [])
 
     def test_capture_writes_exclusive_record_accepted_by_core(self):
         with tempfile.TemporaryDirectory() as temp:

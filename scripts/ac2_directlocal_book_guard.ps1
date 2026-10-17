@@ -1,0 +1,213 @@
+# DirectLocal #155: AutoCount book guard for the real bridge session.
+#
+# Dot-sourced by ac2_directlocal_member_bridge.ps1. Mirrors the E7 test-book
+# guards (scripts/ac2_directlocal_e7_testbook_create.ps1, unchanged) so every
+# real bridge child proves, before any member lookup, numbering or write:
+#   - the target book is authorised by this source (AED_TESTINGAPI only; the
+#     production book is refused until a separately approved change, gate E9);
+#   - host DESKTOP-4I042L6 and no XB_AC2_SESSION_FACTORY override;
+#   - the live AutoCount assemblies equal the pins the outbound qualification
+#     was made against;
+#   - the book is pinned for this process (the environment's
+#     AC2_PROBE_DATABASE_NAME is never used) and the authenticated
+#     DBSetting.DBName, vendor DB_NAME() and vendor MachineName all match;
+#   - vendor error telemetry is off;
+#   - UserScript, MailQueue and EInvoiceQueue are empty.
+# Credentials are never read here: the adapter reads them from the process
+# environment, which only the Owner console procedure provides.
+
+Set-StrictMode -Version Latest
+
+$script:XbDlHost = "DESKTOP-4I042L6"
+$script:XbDlAuthorisedBooks = @("AED_TESTINGAPI")
+$script:XbDlForbiddenBooks = @("AED_XBOUNDARIES")
+# Must equal QUALIFIED_ASSEMBLIES in ac2_directlocal_e7_isolation_check.py.
+$script:XbDlQualifiedAssemblies = [ordered]@{
+    "AutoCount.dll" = "8e86273018c01c715e440c7975f759951f4a0e979fc3edb0c281db6696090f93"
+    "AutoCount.Invoicing.dll" = "5c748b71e54f13313968276530fe110412a4d97a3c9b44d8f43100379849967f"
+}
+
+function Assert-XbDlAuthorisedBook {
+    param([AllowNull()][AllowEmptyString()][string]$Book)
+    if ($script:XbDlForbiddenBooks -ccontains $Book) { throw "production_book_not_authorised" }
+    if ($script:XbDlAuthorisedBooks -cnotcontains $Book) { throw "target_book_not_authorised" }
+}
+
+function Get-XbDlSha256Hex {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString("x2") }) -join "") } finally { $sha.Dispose() }
+}
+
+function Assert-XbDlQualifiedAssemblies {
+    param([Parameter(Mandatory)][string]$Root, $Pins = $script:XbDlQualifiedAssemblies)
+    foreach ($name in $Pins.Keys) {
+        $path = Join-Path $Root $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "autocount_build_not_qualified" }
+        if ((Get-XbDlSha256Hex -Bytes ([System.IO.File]::ReadAllBytes($path))) -cne [string]$Pins[$name]) { throw "autocount_build_not_qualified" }
+    }
+}
+
+function Get-XbDlScalar {
+    # Read-only vendor query through the authenticated DBSetting; "?" parameters.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)][string]$Sql, [object[]]$Params = @())
+    if ($Sql -notmatch '^\s*SELECT\b' -or $Sql -match '(?i)\b(insert|update|delete|merge|drop|alter|create|exec|into)\b') { throw "vendor_query_not_read_only" }
+    return $DBSetting.ExecuteScalar($Sql, [object[]]$Params)
+}
+
+function Assert-XbDlBookIdentity {
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Book, [Parameter(Mandatory)][string]$ExpectedHost)
+    try {
+        $db = $Session.DBSetting
+        $declared = [string]$db.DBName
+        $vendorDb = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT DB_NAME()")
+        $vendorHost = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT CAST(SERVERPROPERTY('MachineName') AS nvarchar(128))")
+    }
+    catch { throw "book_identity_unverifiable" }
+    foreach ($name in @($declared, $vendorDb)) {
+        if ($script:XbDlForbiddenBooks -ccontains $name) { throw "production_book_refused" }
+    }
+    if ([string]::IsNullOrWhiteSpace($declared) -or [string]::IsNullOrWhiteSpace($vendorDb)) { throw "book_identity_missing" }
+    if ($declared -cne $vendorDb) { throw "book_identity_ambiguous" }
+    if ($vendorDb -cne $Book) { throw "book_identity_wrong" }
+    if ($vendorHost -ine $ExpectedHost) { throw "book_host_wrong" }
+}
+
+function Get-XbDlOutboundCounts {
+    param([Parameter(Mandatory)]$DBSetting)
+    [ordered]@{
+        user_script_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT COUNT_BIG(*) FROM UserScript")
+        mail_queue_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT COUNT_BIG(*) FROM MailQueue")
+        einvoice_queue_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT COUNT_BIG(*) FROM EInvoiceQueue")
+    }
+}
+
+function Assert-XbDlOutboundQuiet {
+    # MemberEntity loads user scripts; AutoCountServerService dispatches
+    # MailQueue; Accounting.exe dispatches EInvoiceQueue. All must be empty.
+    param([Parameter(Mandatory)]$Counts)
+    if ($Counts.user_script_rows -ne 0) { throw "user_script_present" }
+    if ($Counts.mail_queue_rows -ne 0 -or $Counts.einvoice_queue_rows -ne 0) { throw "outbound_queue_not_empty" }
+}
+
+function Test-XbDlOutboundChanged {
+    # After SaveMember: any new queue row (or an unreadable queue) holds the
+    # created member for review. Never throws.
+    param([Parameter(Mandatory)]$DBSetting)
+    try {
+        $after = Get-XbDlOutboundCounts -DBSetting $DBSetting
+        return ($after.user_script_rows -ne 0 -or $after.mail_queue_rows -ne 0 -or $after.einvoice_queue_rows -ne 0)
+    }
+    catch { return $true }
+}
+
+function Get-XbDlPosSyncState {
+    # HQ-side POS sync liveness (AutoCount POS 5.2 SyncRegistration) and the
+    # Member change counter the incremental sync reads. No member data. Uses
+    # only the qualified DBSetting.ExecuteScalar path (one FOR JSON value).
+    param([Parameter(Mandatory)]$DBSetting)
+    $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql ("SELECT (SELECT Location AS location, SyncName AS sync_name, " +
+        "CONVERT(varchar(19), LastFinishSyncTime, 126) AS last_finish_sync_local, CONVERT(varchar(19), LastAliveTime, 126) AS last_alive_local " +
+        "FROM SyncRegistration ORDER BY Location, SyncName FOR JSON PATH, INCLUDE_NULL_VALUES)"))
+    $outlets = if ([string]::IsNullOrWhiteSpace($json)) { @() } else { @($json | ConvertFrom-Json) }
+    return [ordered]@{
+        server_now_local = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT CONVERT(varchar(19), GETDATE(), 126)")
+        member_change_counter = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'")
+        outlets = $outlets
+    }
+}
+
+function Get-XbDlSessionFailureStage {
+    # Called only after the adapter's reviewed login failed. Read-only:
+    # loaded-type checks and one unauthenticated DBSetting with SELECT DB_NAME()
+    # on the pinned book. Returns a fixed code; never vendor text.
+    #   autocount_assembly_load_failed  vendor types never loaded
+    #   autocount_sql_connection_failed DBSetting to the pinned book failed
+    #   autocount_sql_book_mismatch     connected, but not to the pinned book
+    #   autocount_login_rejected        connection fine, so the login itself failed
+    param([Parameter(Mandatory)][string]$Book)
+    $dbSettingType = "AutoCount.Data.DBSetting" -as [type]
+    $userSessionType = "AutoCount.Authentication.UserSession" -as [type]
+    if ($null -eq $dbSettingType -or $null -eq $userSessionType) { return "autocount_assembly_load_failed" }
+    $server = Get-XbAutoCountRuntimeValue -Names @("XB_AC2_SERVER_NAME", "AC2_PROBE_SERVER_NAME")
+    try {
+        $factory = Find-XbAutoCountPublicStaticMethod -Type $dbSettingType -Name "CreateAutoCountDefaultDBSetting" -ParameterCount 2
+        $db = $factory.Invoke($null, @($server, $Book))
+        $name = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT DB_NAME()")
+    }
+    catch { return "autocount_sql_connection_failed" }
+    if ($name -cne $Book) { return "autocount_sql_book_mismatch" }
+    return "autocount_login_rejected"
+}
+
+function Install-XbDlResolveGuard {
+    # The unchanged adapter registers a PowerShell scriptblock as an
+    # AppDomain.AssemblyResolve handler and keeps it after a successful login.
+    # PowerShell's resources are neutral "en", so under any other UI culture
+    # (the host's en-US included) its first lookup of a resource set probes a
+    # satellite that does not exist; the failed bind runs the scriptblock, whose
+    # own resource lookup probes again: unbounded recursion and an uncatchable
+    # StackOverflowException in System.Management.Automation (E5, 16 Oct 2026).
+    # This compiled handler is registered first, so it runs before the
+    # adapter's on every resolve: it re-pins the neutral UI culture (PowerShell
+    # resets it per pipeline; a vendor may change it) and returns null, so it
+    # never changes what resolves. Idempotent per process.
+    if ($null -eq ("XbDirectLocal.ResolveGuard" -as [type])) {
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Globalization;
+using System.Reflection;
+using System.Threading;
+namespace XbDirectLocal {
+    public static class ResolveGuard {
+        static CultureInfo pinned;
+        public static bool Installed { get { return pinned != null; } }
+        public static void Install(CultureInfo culture) {
+            if (pinned != null) return;
+            pinned = culture;
+            CultureInfo.DefaultThreadCurrentUICulture = culture;
+            Thread.CurrentThread.CurrentUICulture = culture;
+            AppDomain.CurrentDomain.AssemblyResolve += Repin;
+        }
+        static Assembly Repin(object sender, ResolveEventArgs args) {
+            if (!Thread.CurrentThread.CurrentUICulture.Equals(pinned)) Thread.CurrentThread.CurrentUICulture = pinned;
+            return null;
+        }
+    }
+}
+'@
+        }
+        catch { throw "resolve_guard_unavailable" }
+    }
+    $neutral = [System.Management.Automation.PSObject].Assembly.GetCustomAttributes([System.Resources.NeutralResourcesLanguageAttribute], $false) | Select-Object -First 1
+    if ($null -eq $neutral -or [string]::IsNullOrWhiteSpace($neutral.CultureName)) { throw "resolve_guard_unavailable" }
+    [XbDirectLocal.ResolveGuard]::Install([System.Globalization.CultureInfo]::GetCultureInfo($neutral.CultureName))
+}
+
+function New-XbDlRealSession {
+    # Every guard runs in this order; any failure stops before the next step.
+    param([Parameter(Mandatory)][string]$Book, [Parameter(Mandatory)][string]$AcRoot)
+    Assert-XbDlAuthorisedBook -Book $Book
+    if ($env:COMPUTERNAME -ine $script:XbDlHost) { throw "host_not_authorised" }
+    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("XB_AC2_SESSION_FACTORY", "Process"))) { throw "session_factory_env_refused" }
+    Assert-XbDlQualifiedAssemblies -Root $AcRoot
+    [Environment]::SetEnvironmentVariable("XB_AC2_DATABASE_NAME", $Book, "Process")
+    [Environment]::SetEnvironmentVariable("XB_AC2_ASSEMBLY_PATH", $AcRoot, "Process")
+    # Must precede the adapter, whose resolve handler it has to run before.
+    Install-XbDlResolveGuard
+    try { $session = New-XbAutoCountSession -EnableProductionAdapter }
+    catch {
+        $code = [string]$_.Exception.Message
+        # The unchanged adapter folds every login-stage error into one code;
+        # classify the stage read-only (no vendor text leaves the process).
+        if ($code -ceq "autocount_session_initialization_failed") { $code = Get-XbDlSessionFailureStage -Book $Book }
+        throw $code
+    }
+    # Vendor error telemetry (HTTPS to AutoCount HQ) is off unless a host sets it.
+    $telemetry = "AutoCount.Application.ErrorLogClientHelper" -as [type]
+    if ($null -eq $telemetry -or [bool]$telemetry::SubmitErrorLog) { throw "vendor_error_telemetry_enabled" }
+    Assert-XbDlBookIdentity -Session $session -Book $Book -ExpectedHost $script:XbDlHost
+    Assert-XbDlOutboundQuiet -Counts (Get-XbDlOutboundCounts -DBSetting $session.DBSetting)
+    return $session
+}

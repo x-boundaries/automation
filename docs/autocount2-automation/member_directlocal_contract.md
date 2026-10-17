@@ -1,111 +1,188 @@
-# Member DirectLocal Contract (#155, synthetic core)
+# Member DirectLocal Contract (#155)
 
-Status: source-only synthetic core. No real Shopify read, AutoCount login,
-`GetNextMemberNo` or `SaveMember` against any account book is authorised by
-this document. The previous gateway/n8n/PostgreSQL path is not used and its
-files are unchanged.
+Status (2026-10-15): real-operation Core source for the development book
+(`AED_TESTINGAPI`), built under #155:6195037656 and the scope delta
+#155:6195382795 / 6195468717 / 6195563312. This document authorises no live
+effect. Shopify is read-only (automation-originated Shopify writes are
+forbidden). Every AutoCount login, `GetNextMemberNo`, `GetMember` or
+`SaveMember` on any book, any production access and any scheduling still needs
+its own scoped Owner approval. The previous gateway/n8n/PostgreSQL path is not
+used and its files are unchanged. Operating steps: [UAT runbook](member_directlocal_uat_runbook.md).
 
-## Synthetic inertness (G3 correction)
+## Ledger modes, environment binding and inertness
 
-The core cannot reach a real AutoCount account book. Two independent layers
-enforce this; neither relies on Claude instructions, CLI flags, settings
-templates or approval rows:
+The mode, environment and book are fixed by `init-ledger` and can never change
+(SQLite `CHECK` constraints and triggers).
 
-| Layer | Enforcement |
-|---|---|
-| Processor (`xb_directlocal.py`) | The only ledger mode is `synthetic`. `process --enable-autocount-write`, the internal write path and `reconcile` refuse any bridge whose `autocount_target` is not the test-only `SYNTHETIC_BRIDGE_TARGET` (`real_autocount_refused_synthetic_ledger`), before any capture is consumed or process started. The CLI only ever builds the real `BridgeClient`, so it is always refused. |
-| Bridge entrypoint (`ac2_directlocal_member_bridge.ps1`) | Refuses (`autocount_real_bridge_disabled`) unless the caller passes `-SessionFactory` returning a binding marked `XbDirectLocalSyntheticFake`, whose `UserSession`, `DBSetting` and every `MemberCommand` are not AutoCount types. `-File` cannot pass a scriptblock, so a command-line invocation is refused before stdin is read, regardless of `-EnableProductionAdapter`, fence ids or `XB_AC2_*` environment values. The adapter's environment/assembly login path is unreachable from the bridge. |
+| Mode | Environment / book | Bridge accepted | Store |
+|---|---|---|---|
+| `synthetic` | `synthetic` / none | Only the test-only `SYNTHETIC_BRIDGE_TARGET` fake; the real `BridgeClient` is refused (`real_autocount_refused_synthetic_ledger`) before any spawn or state change | `*.synthetic.invalid` |
+| `connector` | `development` / `AED_TESTINGAPI` | Only a real bridge bound to the same book (`bridge_book_binding_mismatch` otherwise), and only while the state root is private | The qualified store pin `gid://shopify/Shop/48759472277` / `xboundariessg.myshopify.com` |
+| `connector` | `production` / `AED_XBOUNDARIES` | Refused at init (`production_environment_not_authorised`). Gate E9 needs a separately approved source change | - |
 
-Tests reach the fake MemberCommand only through that positively isolated
-interface (test-only target label plus marked fake host). Enabling a real
-account book requires a later, separately approved source change to both
-layers (gates E5-E7).
+Bridge entrypoint (`ac2_directlocal_member_bridge.ps1`): without
+`-SessionFactory` and without `-TargetBook` it refuses
+(`autocount_real_bridge_disabled`) before stdin is read, exactly as before. A
+synthetic factory with `-TargetBook` is refused. With `-TargetBook`,
+`ac2_directlocal_book_guard.ps1` runs, in order, before any member operation:
+authorised book (`AED_TESTINGAPI` only; `production_book_not_authorised`), host
+`DESKTOP-4I042L6`, no `XB_AC2_SESSION_FACTORY`, assembly pins equal to the E7
+qualification, book pinned for the process, vendor login, telemetry off,
+`DBSetting.DBName` = `DB_NAME()` = book and `MachineName` = host, then empty
+`UserScript`/`MailQueue`/`EInvoiceQueue`. A failure before the claim leaves no
+claim, so the parent proves `NOT_WRITTEN`. After `SaveMember` the queues are
+re-read; any row (or an unreadable queue) makes the fence
+`CREATED_OUTBOUND_QUEUE_CHANGED` (manual review).
+
+Credentials reach the bridge only from `scripts/ac2_directlocal_owner_console.ps1`
+(interactive, elevated, fresh `ISOLATED` evidence in `<state_root>\evidence`,
+exact source head, credentials typed into a `SecureString` and passed only to
+the child process environment).
 
 ## Data path
 
 ```text
-Attended Claude session (dedicated folder, generated from the settings template)
-  -> connector graphql_query, pinned queries only (PreToolUse guard)
+Attended Claude session (dedicated folder, settings from the template)
+  -> python directlocal/xb_directlocal.py next-request   (exact pinned tool input)
+  -> connector graphql_query (PreToolUse guard: pinned queries only)
   -> PostToolUse hook writes hook-delivered JSON to <state_root>\inbox
 python directlocal/xb_directlocal.py  (one OS-locked owner process)
   -> strict capture checks -> SQLite ledger <state_root>\ledger.sqlite3
   -> reused shopify_admission.capture_member_mg_baseline / evaluate_profile
-  -> powershell.exe -File scripts\ac2_directlocal_member_bridge.ps1 (one op per child)
-       -> scripts\ac2_member_gateway_autocount_adapter.ps1 (shopify_m1; only change: OpeningPoints decimal scale)
+     on the registration view (see below)
+  -> powershell.exe -File scripts\ac2_directlocal_member_bridge.ps1 -TargetBook AED_TESTINGAPI
+       -> ac2_directlocal_book_guard.ps1 -> ac2_member_gateway_autocount_adapter.ps1 (unchanged, shopify_m1)
 ```
 
 | File | Role |
 |---|---|
-| `directlocal/xb_directlocal.py` | Capture parsing, phone keys, ledger, baseline/discovery, admission, allocation, fence, recovery, reconcile, CLI. Lives outside the hash-frozen `member_gateway/` tree and imports the reused stdlib-only admission functions from it read-only |
-| `scripts/ac2_directlocal_member_bridge.ps1` | Child bridge: `legacy-precheck`, `next-member-no`, `probe`, `reconcile`, `write-once` |
+| `directlocal/xb_directlocal.py` | Capture parsing, ledger, custody, baseline/discovery, registration events, admission, standing policy, allocation, fence, recovery, reconcile, retention, UAT evidence, CLI |
+| `scripts/ac2_directlocal_member_bridge.ps1` | Child bridge: `book-check`, `pos-sync-status`, `legacy-precheck`, `next-member-no`, `probe`, `reconcile`, `write-once` |
+| `scripts/ac2_directlocal_book_guard.ps1` | Real-session guard (above) and the read-only POS sync state |
+| `scripts/ac2_directlocal_owner_console.ps1` | Owner console for `BookCheck`, `PosSyncStatus`, `Process`, `Reconcile` |
 | `scripts/directlocal_connector_hook.py` | `guard` (PreToolUse default-deny for MCP) and `capture` (PostToolUse inbox writer) |
-| `config/directlocal_claude_settings.template.json` | Dedicated-session settings template (deny list + hooks); placeholders only |
-| `tests/test_member_directlocal.py`, `tests/test_directlocal_bridge_ps.py` | Synthetic tests |
+| `config/directlocal_claude_settings.template.json` | Dedicated-session settings template (deny list + hooks) |
+| `tests/test_member_directlocal*.py`, `tests/test_directlocal_*_ps.py` | Offline tests |
 
-## Capture provenance and the fail-closed boundary
+## Capture provenance and shapes
 
-- A capture record is the structured JSON Claude Code hands to a PostToolUse
-  hook (`provenance = claude_code_posttooluse_hook_delivered_json`). It is not
-  the original Shopify wire bytes and is never described as such.
-- Every capture must use a pinned query (`sha256` match), `first = 50` in both
-  the tool input and variables, matching `after`, a GID-shaped profile `id`,
-  exact response keys, and `shop { id myshopifyDomain }` equal to the ledger's
-  immutable store identity.
-- Only the `synthetic` response shape (`{"data": {...}}`) is qualified. A ledger
-  can only be initialised in `synthetic` mode with a `*.synthetic.invalid`
-  domain; any other mode or shape fails with `capture_response_shape_unqualified`.
-  Gate E1 must qualify the real hook-delivered shape before this changes.
-- Qualified 2026-10-14 (one attended read of the pinned `IDENTITY_QUERY`,
-  `shop { id myshopifyDomain }` only, through the live PreToolUse guard and
-  PostToolUse capture hook): the hook-delivered `tool_response` is a JSON
-  **text** that decodes to exactly `{"data": {...}}`
-  (`connector_graphql_json_text_v1`). `inspect-identity --capture <file>`
-  verifies such a capture and returns only the store identity. Errors,
-  extensions or any other wrapper are rejected. Ledger ingestion of real
-  connector data remains disabled (the ledger accepts only the synthetic shape).
-- The hook is not tamper-proof against an agent running as the same Windows
-  user; this residual risk is acceptable only for attended operation.
+- A capture is the structured JSON Claude Code hands to the PostToolUse hook
+  (`claude_code_posttooluse_hook_delivered_json`). It is never described as
+  Shopify wire bytes.
+- Pinned queries (SHA-256 of the exact text): `identity`, `baseline`
+  (exhaustive, `sortKey: ID`), `recent` (`sortKey: UPDATED_AT`, one search
+  `updated_at:>='<UTC>'`), `profile`. `first = 50` in tool input and
+  variables; `after` must match; GID-shaped ids; exact keys; `shop` must equal
+  the ledger's store.
+- `connector` ledgers accept only `connector_graphql_json_text_v1`: a JSON
+  text decoding to exactly `{"data": {...}}` (qualified 2026-10-14, re-observed
+  2026-10-15). Objects, `errors` (expired authentication, throttling, partial
+  results), `extensions`, plain-text failures (disconnected server) and any
+  other wrapper are rejected; a rejected capture blocks `ingest-run` and
+  `next-request` until `purge-inbox` removes it.
+- Residual risk: the hook is not tamper-proof against an agent running as the
+  same Windows user; acceptable only for attended operation.
 
-## Cutover and baseline
+## Registration event (G0, 2026-10-15, read-only)
 
-- `begin-baseline` fixes `C` (whole-second UTC) before any page is requested.
-  At most one non-abandoned baseline run exists per ledger; `cutover_at` is
-  immutable and a sealed run can never change.
-- An incomplete (`CAPTURING`) run can be abandoned with
-  `abandon-run --run-id <id> --confirm-suffix <last 8 hex>`. It becomes
-  `ABANDONED` (immutable), its unconsumed page captures are retired, and a new
-  baseline must take a strictly later cutover (`cutover_not_advanced`).
-- `ingest-run` chains unconsumed page captures from `after = null` and runs the
-  reused exhaustive `capture_member_mg_baseline` (all customers, `sortKey: ID`,
-  no tag search). A missing, conflicting, repeated, duplicated or unchained page,
-  or a capture taken before the run started, never seals.
-- Sealed: `member-mg` GIDs with `createdAt < C` become the immutable historical
-  baseline; `createdAt >= C` become `DISCOVERED` customers. Discovery runs repeat
-  the same full scan with the same `C`; pre-cutover GIDs missing from the
-  baseline are surfaced and `evaluate_profile` sends them to review.
+Observed through the connector (identifiers and timestamps only):
 
-## Admission, duplicates and MemberNo
+- Registrations come from the **Shopify Forms** app (form `1178308`): the app
+  creates or matches the customer and adds `member-mg` and
+  `shopify-forms-1178308`; about three seconds later the customer metafields
+  `membership.start_date`, `membership.expiry_date` and `membership.source`
+  (`mg-qr`) are created. Expiry was exactly start + 2 years in the samples; the
+  Core copies both dates unchanged and never recomputes them.
+- Two of the four newest registrations were **existing customers** (created
+  2024-07 and 2026-03, enrolled 2026-10-14/15). A `Customer.createdAt` cutover
+  would wrongly send them to review.
+- The Forms submission itself is not visible to this connector (no Forms-owned
+  metaobject definition is exposed), and the Google Sheet `Members (from
+  Shopify)` has only seven human headers (no GID, submission id or timestamp;
+  #225). Neither is an event source.
 
-- `process --capture <profile>` consumes a fresh (<= 900 s) unconsumed profile
-  capture for a discovered GID and applies `evaluate_profile` unchanged
-  (`member-mg`, legacy tags, exact Shopify dates, bounded wait).
-  Captures are recorded by hash and `tool_use_id`, so a replay is refused.
-  The profile file is deleted after use (best-effort, not a secure erase).
-- Writing requires `--enable-autocount-write` **and** an unexpired, unused
-  approval from `approve-write --gid <gid> --confirm-suffix <trailing digits>`.
-- Duplicate precheck: keys from `duplicate_phone_keys` (`65xxxxxxxx` <->
-  `xxxxxxxx`), one unchanged adapter lookup per key plus exact email. Any hit,
-  failed lookup or ambiguous result is `MANUAL_REVIEW`. The stored MobilePhone
-  stays the unchanged `canonical_phone` value.
-- AutoCount column widths (test-book catalog, 2026-10-14): Name
-  `nvarchar(100)`, MobilePhone `nvarchar(25)`, EmailAddress `nvarchar(200)`,
-  MemberNo `nvarchar(20)`. Wider values go to `MANUAL_REVIEW`
-  (`autocount_field_width_exceeded`) before any lookup or write.
-- MemberNo: at most 3 `GetNextMemberNo` attempts per customer, ever; each
-  attempt is committed before the call. Occupied or ledger-held candidates
-  advance; a repeated, invalid or unprobeable candidate goes to review. The bound
-  candidate is re-probed and never replaced. `GetNextMemberNo` is treated as
-  possibly consuming a number until gate E6 proves otherwise.
+Rule implemented: the registration event is `(customer GID,
+membership.start_date metafield GID, its createdAt)`.
+
+- Baseline and discovery partition `member-mg` GIDs by the registration
+  instant (the metafield's `createdAt`; `Customer.createdAt` only while the
+  metafield is not yet written). `>= C` is new; `< C` is historical. A
+  historical GID that is not in the sealed baseline is still discovered.
+- The profile decision runs the unchanged `evaluate_profile` on a view whose
+  `createdAt` is the registration instant, so an existing customer who
+  registers after `C` is admitted and a baseline member stays excluded.
+- In flight (G2 A1, 16 October 2026): an existing customer outside the
+  baseline who has `member-mg` but no `start_date` metafield yet is `WAITING`
+  (`registration_event_pending`), not ruled pre-existing from
+  `Customer.createdAt`. It uses the same budget as missing dates (5 profile
+  reads). If the metafield never appears, for example a tag added by staff,
+  the last read sends it to `MANUAL_REVIEW`
+  (`preexisting_customer_not_new_signup`). Legacy tags, a baseline member and
+  a metafield dated before `C` are still decided at once.
+- The first read binds the event (immutable). A later read naming another
+  metafield or instant goes to review (`registration_event_changed`).
+- One AutoCount member per customer GID, ever (unchanged fence rules).
+
+## Discovery runs
+
+- `begin-baseline` fixes `C` before any page; one non-abandoned baseline;
+  exhaustive scan; sealed runs never change (unchanged).
+- `begin-discovery` repeats the exhaustive scan (about 90 connector calls for
+  the current 4,336 customers).
+- `begin-discovery --recent` reads only customers updated since a watermark:
+  the cutover for the first recent run, then the last sealed discovery start
+  minus 15 minutes (search-index lag margin). The search string is stored with
+  the run and every page must carry it. Periodic exhaustive discovery remains
+  the backstop for index lag.
+
+## Admission, duplicates, MemberNo and text
+
+- `evaluate_profile` unchanged: `member-mg`, legacy tags, exact dates, bounded
+  wait. Captures are single-use (hash and `tool_use_id`) and must be <= 900 s old.
+- Text AutoCount cannot store exactly goes to `MANUAL_REVIEW` at admission,
+  before any lookup: widths are counted in UTF-16 code units, as `nvarchar`
+  counts them (Name 100, MobilePhone 25, EmailAddress 200), so a character
+  outside the BMP counts twice (`autocount_field_width_exceeded`); C0 controls,
+  DEL and unpaired surrogates are `autocount_text_invalid`. The payload crosses
+  the process boundary as ASCII-escaped JSON, so CJK and astral characters
+  round-trip exactly (tested through the real bridge).
+- Duplicate precheck, symmetric `65xxxxxxxx` <-> `xxxxxxxx` phone keys, exact
+  email, MemberNo allocation (<= 3 `GetNextMemberNo` per customer, ever) and
+  re-probe are unchanged.
+- Observed on `AED_TESTINGAPI` on 16 October 2026 (no vendor documentation
+  found): `GetNextMemberNo` previews AutoCount's counter, and a save under an
+  explicit number does not advance it. It kept returning the number the E7
+  test member then held. When the preview repeats, the
+  allocator continues the generator's own format (same prefix and digit width,
+  never phone-derived) above every number already tried for this customer or
+  bound in this ledger. Each candidate is still ledger-checked and probed, and
+  the limit of 3 still applies. No digits, or a digit run that would grow, stays
+  `member_no_generator_not_advancing`. The production numbering format and
+  counter are decided at E9. Successor numbers run ahead of AutoCount's own
+  counter, so a later auto-numbered create could collide with them. That
+  remains an E9 production blocker unless the vendor qualifies the behaviour.
+- Provenance (G2 A3, schema v4): every attempt records, in the private
+  ledger and in the same update as its status, the generator's raw preview
+  and `derivation` (`generator` when the candidate is that preview,
+  `successor` when it was derived from it). No extra vendor call is made.
+  `uat-report` prints only counts per derivation (`generator`, `successor`),
+  plus `no_candidate` for `GENERATOR_FAILED`/`GENERATOR_INVALID` attempts and
+  `unrecorded_pre_v4` for an earlier attempt recorded before schema v4
+  (G2 O12). No historical row is rewritten.
+
+## Write authority
+
+- Attended: `approve-write --gid <gid> --confirm-suffix <trailing digits>`
+  (single use, <= 30 minutes), as before.
+- Standing policy (#155:6195468717): `activate-policy --confirm-book <book>
+  --max-creates N --ttl-hours H` (connector ledger, authorised environment
+  only; N <= 500, H <= 168; one live policy; immutable except revocation).
+  While live, `process --enable-autocount-write` mints one single-use approval
+  (5 minutes) for an `ADMITTED` customer, at most once per customer and at
+  most N per policy, then runs the unchanged write path. `revoke-policy` ends
+  it. Duplicates, ambiguity, invalid fields, crashes and uncertain outcomes
+  still go to review or HOLD; nothing ever starts a second `SaveMember`.
+- Production activation of a policy is impossible in this source (E9).
 
 ## Write fence and recovery
 
@@ -113,39 +190,64 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
 |---|---|
 | Approval consumed, fence inserted | `FENCED` (one per customer, one per MemberNo) |
 | Before the child starts | `DISPATCHED` + deadline |
-| Child: digest + fence check, exclusive `<fence>.claim`, `SaveMember`, read-back, `<fence>.outcome` | claim/outcome files |
-| Parent classifies | `CREATED_VERIFIED`, `CREATED_READBACK_MISMATCH`, `WRITE_OUTCOME_UNCERTAIN`, `NOT_WRITTEN_PROVEN` or `WRITER_TERMINATION_UNCONFIRMED` |
+| Child: digest + fence check, real-session guard, exclusive `<fence>.claim`, `SaveMember`, read-back, queue re-check, `<fence>.outcome` | claim/outcome files |
+| Parent classifies | `CREATED_VERIFIED`, `CREATED_READBACK_MISMATCH`, `CREATED_OUTBOUND_QUEUE_CHANGED`, `WRITE_OUTCOME_UNCERTAIN`, `NOT_WRITTEN_PROVEN` or `WRITER_TERMINATION_UNCONFIRMED` |
 
-- No transition leads back to `FENCED`/`DISPATCHED` (SQLite triggers), so no
-  crash, replay, timeout or retry can dispatch a second write.
-- `NOT_WRITTEN_PROVEN` requires the claim file to be absent (the claim always
-  precedes `SaveMember`). It is still terminal; there is no automatic retry.
-- Every command first runs recovery: an orphaned `FENCED` fence becomes
-  `MANUAL_REVIEW`; a `DISPATCHED` or `WRITER_TERMINATION_UNCONFIRMED` fence
-  holds (exit 75) until its deadline plus grace has passed **and** the writer's
-  exit is proven against its recorded identity (PID plus process creation
-  instant). A vanished PID, or one now owned by a process with a different
-  creation instant (PID reuse), proves exit. A running child, a missing
-  identity or any indeterminate probe stays on HOLD (`writer_may_be_live`,
-  `writer_identity_unrecorded`, `writer_exit_unproven`). Once exit is proven
-  the fence becomes uncertain, or not-written only if no claim exists.
-- `release-writer-hold --fence-id <id> --confirm-suffix <last 8 hex>` is the
-  attended exit from a HOLD that cannot be proven: after the deadline, the
-  operator attests no bridge process remains and the fence becomes
-  `WRITE_OUTCOME_UNCERTAIN` (`operator_attested_writer_absent`), never
-  not-written.
-- `reconcile --capture <fresh profile>` re-derives the payload, requires the
-  salted digest to match the fence, and compares read-only with the same bound
-  MemberNo. It never calls `SaveMember`.
-- The ledger holds GIDs, MemberNos, counts, codes and salted digests only.
-  Events are hash-chained and append-only; a second process cannot open the
-  ledger (OS lock) and a stale owner epoch cannot commit.
+The writer outcome must carry `save_invocation_count = 1` and the booleans
+`readback_found`, `readback_match` and `outbound_queue_changed`; anything else
+is uncertain. Recovery, HOLD, `release-writer-hold` and read-only `reconcile`
+are unchanged.
 
-## State root
+## State root custody and retention
 
-`--state-root` must be an existing absolute local path that is not UNC, not
-under `%LOCALAPPDATA%` (MSIX redirection) and not inside the repository. It is
-chosen and its permissions are qualified at gate E0; nothing is hardcoded.
+- `prepare-state-root` creates a new root (refuses an existing path, UNC,
+  `%LOCALAPPDATA%`, the repository): inheritance removed; only the current
+  user, SYSTEM and Administrators granted; `inbox`, `claims`, `evidence`.
+- A connector ledger re-verifies on every command (owner and DACL read
+  through `GetNamedSecurityInfoW` as SDDL): the root must be protected and no
+  ACE on the root, `inbox`, `claims`, `evidence` or the ledger may grant
+  anyone else (`state_root_acl_inherited` / `_unsafe` / `_owner_unsafe`).
+- `purge-inbox` removes consumed captures, rejected captures, profile
+  captures past 900 s, pages no open run can use and stale hook temporaries;
+  only counts are reported. Profile files are also deleted after use.
+- The ledger keeps GIDs, MemberNos, registration ids/instants, counts, codes
+  and salted digests only; events are hash-chained and append-only.
+- Schema v4 ledgers only. A v3 ledger is refused
+  (`ledger_schema_migration_required`) until the attended `migrate-ledger`
+  command runs. It adds the two nullable provenance columns and one event in
+  one transaction and changes nothing else. A v2 (synthetic-only) ledger is
+  refused, not migrated.
+- Residual: profile responses pass through the Claude session (transcript and
+  model). Owner consent #155:6195382795 covers the minimum fields.
+
+## Keyed references and evidence
+
+- Public output carries `c-` (customer) and `m-` (member) references:
+  HMAC-SHA256 under a per-ledger random 256-bit key, 80 bits shown. They cannot
+  be reversed by enumerating GIDs or MemberNos, and differ between ledgers.
+  Only `pending` and `next-request` print GIDs (local operator identifiers).
+- `uat-report`: states, codes, refs and latency seconds from the registration
+  instant to discovery, fence, outcome and each recorded POS observation.
+- `record-pos-visible --member-ref --outlet --observed-at`: operator-attested,
+  append-only; only for a verified create; never a write trigger.
+- `pos-sync-status` (Owner console): HQ-side outlet sync liveness and the
+  `Member` change counter (no member data).
+
+## POS synchronisation (G0, 2026-10-15, read-only)
+
+- HQ: `AED_XBOUNDARIES` on this VM with AutoCount POS 5.2 Backend and the
+  `AutoCount Pos Sync Server - XBOUNDARIES` service. Outlet front-end databases
+  register in `SyncRegistration`: `XB01` (`AED_XBOUNDARIES_FE`, live) and `XB05`
+  (`AED_XBOUNDARIES_JBM_FE`), program 5.2.16.33; terminals `T01`, `XB01`, `XB02`
+  (outlet `XB03`), `XB05`; no member-type terminal filter.
+- `Member` has an active `ChangeCount` counter (the incremental sync source).
+  Outlet XB01 started sync cycles at 23:19:47, 23:34:47 and 23:49:47 SGT (each
+  finished in under 0.1 s): a 15-minute
+  interval set on the outlet (not stored at HQ), with liveness pings between.
+  So a member saved at HQ becomes selectable at POS only after the outlet's next
+  cycle (up to about 15 minutes) unless the outlet syncs on demand.
+- `AED_TESTINGAPI` has no live POS registration (its rows predate the clone),
+  so POS selectability cannot be proven on the test book.
 
 ## Synthetic command sequence
 
@@ -155,12 +257,15 @@ python directlocal/xb_directlocal.py --state-root <root> begin-baseline
 python directlocal/xb_directlocal.py --state-root <root> ingest-run
 python directlocal/xb_directlocal.py --state-root <root> process --capture <root>\inbox\<id>.json
 python directlocal/xb_directlocal.py --state-root <root> status
-python directlocal/xb_directlocal.py --state-root <root> abandon-run --run-id <run-id> --confirm-suffix <last-8-hex>
 ```
 
 ## E7 test-book path (one synthetic member on AED_TESTINGAPI)
 
-Separate from the DirectLocal core, whose synthetic hard-disarm is unchanged.
+Separate from the DirectLocal core. Consumed on 2026-10-15; its private intent, fence, claim and outcome records are retained unchanged and the script refuses any re-run.
+The Owner later deleted the E7 member in AutoCount, and E7b's create reused
+its number through the vendor's own preview. Identify the historical E7
+create by its fence, claim and outcome IDs and its ChangeLog insert and
+delete times, never by MemberNo.
 
 | File | Role |
 |---|---|
@@ -255,16 +360,57 @@ environment block. The BSTR is zeroed and freed and the `SecureString` disposed
 in `finally`; the console's own environment never holds them. `Write` also
 requires typing `AED_TESTINGAPI`. Limitation: the adapter reads the password
 from an environment variable, so a managed copy exists briefly.
+
+## Owner console code custody (G2 A2, 2026-10-16)
+
+Both credential-bearing consoles (`ac2_directlocal_owner_console.ps1` and the
+E7 console) dot-source `ac2_directlocal_code_custody.ps1`. Before they run git
+or Python, and before any prompt, they stop unless all of these hold:
+
+- The code root, the Python interpreter's directory and the git
+  installation, and every ancestor of each, contain no reparse point.
+- Inside each tree, no principal other than the current user, SYSTEM,
+  Administrators or TrustedInstaller owns, or holds any write-class right on,
+  any entry.
+- On an ancestor, no other principal can delete, take ownership of, rewrite
+  the DACL of, or delete children of the path.
+- The code root is a standalone checkout. git runs from the verified
+  installation with `core.fsmonitor=false` and no `GIT_*` variable.
+- The head is exact, with no modified, untracked or ignored file.
+- The interpreter has no `pyvenv.cfg` beside it or in its parent, and nobody
+  else can add a file to that parent (G2 A5; CPython reads `pyvenv.cfg`
+  there even under `-I`).
+- After custody passes, and before any native command, the console makes the
+  verified code root its working directory, sets
+  `NoDefaultCurrentDirectoryInExePath` and starts its children there (G2 A4).
+  The isolation collector starts `tasklist`, `schtasks` and `powershell` by
+  absolute path from the system directory (`GetSystemDirectoryW`).
+
+Python then runs with `-I -B` (the collector, which needs `pyodbc`) or
+`-I -S -B` (the core). The core appends, never prepends, the gateway source
+path.
+
+This proves custody when the console runs; it is not a trusted bootstrap. It
+protects only when the console is installed in a tree that passes, which is a
+protected runtime checkout and an Owner host decision. The development
+checkout (`C:\XB`, Authenticated Users Modify) and the per-user Python under
+`AppData` (an app-package SID with full control) both fail it. Earlier
+attended E5/E7b runs from that checkout keep their technical evidence with
+this security qualification; no credential exposure is asserted.
+
 ## Remaining effect gates (each needs separate explicit approval)
 
-| Gate | Effect |
-|---|---|
-| E0 | Production `state_root` with hardened permissions. (UAT used an owned workspace under `C:\XB`, which inherits Authenticated Users: Modify.) |
-| E1 | Done for identity: shape qualified and store identity observed. Still open: materialise the dedicated session folder from the template |
-| E2 | Prove deny enforcement live without calling any write tool. (Allow-path of the guard and capture hook observed live; deny-path proven offline only) |
-| E3 | Attended baseline capture of customer GIDs, `createdAt`, tags; clock check |
-| E4 | Real profile reads (model-mediated PII), retention and consent |
-| E5 | AutoCount login and read-only bridge ops on the test book (catalog-level read-only SQL qualification done; the bridge remains synthetic-only) |
-| E6 | `GetNextMemberNo` side-effect qualification on the test book |
-| E7 | One synthetic `SaveMember` on the test book. Owner risk accepted (#155 comment 6166747236) for possible data loss and irreversible audit effects (the Member table carries active `MemberChangeLog` / `UpdateMemberChangeCount` triggers, the book uses SIMPLE recovery, and the test book is a live-configured clone). Runs only through the Owner console procedure above |
-| E8 / E9 | Scheduling; production book |
+| Gate | Effect | Status 2026-10-16 |
+|---|---|---|
+| E0 | Create the private UAT/production `state_root` (`prepare-state-root`) | Source ready; tested offline |
+| E1 | Materialise the dedicated session folder from the template | Open |
+| E2 | Prove deny enforcement live (no write tool called) | Allow path observed live; deny path offline |
+| E3 | Attended baseline capture (GIDs, `createdAt`, tags, registration metafield id/instant) | Owner read consent given (#155:6195382795); not run |
+| E4 | Real profile reads (model-mediated PII), retention | Owner read consent given; not run |
+| E5 | AutoCount login and `book-check` on the test book | PASS 2026-10-16 at `0b3f397` (after the resolve-guard fix) |
+| E6 | `GetNextMemberNo` side-effect qualification | Observed 2026-10-16: preview only, does not advance (no side effect seen) |
+| E7 | One synthetic `SaveMember` on the test book | Consumed 2026-10-15; never replayed |
+| E7b | One attended real-registration create on the test book | `CREATED_VERIFIED` 2026-10-16 (operator-reported; one `SaveMember`); security-qualified by A2 |
+| A2 host | Protected runtime checkout and all-users interpreter for the Owner console | Owner host decision; not granted. Blocks every further credential-bearing run |
+| E8 | Unattended scheduling / standing policy activation | Needs approval, an unattended Shopify source (see runbook) and the A2 host custody |
+| E9 | Production book (`AED_XBOUNDARIES`) source enablement, create and POS visibility | Needs a source change, approval, the A2 host custody and a qualified numbering counter; required for the POS acceptance |
