@@ -54,7 +54,10 @@ class Recorder(BaseHTTPRequestHandler):
             self._reply(200, b"[" + b"0," * (loopback.MAX_ANSWER_BYTES // 2) + b"0]")
         elif behaviour == "SLOW":
             time.sleep(2)
-            self._reply(200, b"{}")
+            try:
+                self._reply(200, b"{}")
+            except ConnectionError:
+                pass  # the client has already timed out, which is the point of this case
         elif behaviour == "422":
             self._reply(422, b'{"outcome":"REFUSED"}')
         else:
