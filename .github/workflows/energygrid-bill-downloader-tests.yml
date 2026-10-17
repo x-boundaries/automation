@@ -21,6 +21,11 @@ on:
       - "n8n-workflows/energygrid_drive_destination_setup.workflow.json"
       - "tests/test_energygrid_drive_upload_workflow.py"
       - "tests/test_energygrid_drive_destination_setup_workflow.py"
+      # Claude-free daily run (#226 V3 G1): inactive Drive Verify and Owner Email exports and focused tests.
+      - "n8n-workflows/energygrid_drive_verify.workflow.json"
+      - "n8n-workflows/energygrid_owner_email.workflow.json"
+      - "tests/test_energygrid_drive_verify_workflow.py"
+      - "tests/test_energygrid_owner_email_workflow.py"
       - "n8n-workflows/README.md"
       - "README.md"
       - ".gitignore"
@@ -169,6 +174,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest discover -s tests -p "test_energygrid_drive_destination_setup_workflow.py" -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: EnergyGrid n8n Drive Verify and Owner Email focused offline tests
+        # #226 V3 G1 Claude-free daily run: Node executes the committed Code nodes and Respond expressions,
+        # and the Python Core checks the answers and the render digest; no n8n, Google or Gmail contact.
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p "test_energygrid_drive_verify_workflow.py" -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p "test_energygrid_owner_email_workflow.py" -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Scope and whitespace check
         shell: pwsh
         run: |
@@ -187,7 +201,11 @@ jobs:
             $_ -eq 'n8n-workflows/energygrid_drive_upload.workflow.json' -or
             $_ -eq 'n8n-workflows/energygrid_drive_destination_setup.workflow.json' -or
             $_ -eq 'tests/test_energygrid_drive_upload_workflow.py' -or
-            $_ -eq 'tests/test_energygrid_drive_destination_setup_workflow.py'
+            $_ -eq 'tests/test_energygrid_drive_destination_setup_workflow.py' -or
+            $_ -eq 'n8n-workflows/energygrid_drive_verify.workflow.json' -or
+            $_ -eq 'n8n-workflows/energygrid_owner_email.workflow.json' -or
+            $_ -eq 'tests/test_energygrid_drive_verify_workflow.py' -or
+            $_ -eq 'tests/test_energygrid_owner_email_workflow.py'
           })
           if ($owned.Count -eq 0) {
             Write-Host "No EnergyGrid-owned path changed; EnergyGrid scope guard not applicable."
@@ -205,6 +223,10 @@ jobs:
                   $file -ne 'n8n-workflows/energygrid_drive_destination_setup.workflow.json' -and
                   $file -ne 'tests/test_energygrid_drive_upload_workflow.py' -and
                   $file -ne 'tests/test_energygrid_drive_destination_setup_workflow.py' -and
+                  $file -ne 'n8n-workflows/energygrid_drive_verify.workflow.json' -and
+                  $file -ne 'n8n-workflows/energygrid_owner_email.workflow.json' -and
+                  $file -ne 'tests/test_energygrid_drive_verify_workflow.py' -and
+                  $file -ne 'tests/test_energygrid_owner_email_workflow.py' -and
                   $file -ne 'n8n-workflows/README.md' -and
                   $file -ne 'README.md' -and
                   $file -ne '.gitignore') {

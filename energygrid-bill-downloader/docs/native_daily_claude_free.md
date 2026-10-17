@@ -318,4 +318,28 @@ task -> register the Windows task disabled, run it once by hand (expected IDLE, 
 
 Rollback: disable the Windows task -> deactivate the two workflows -> re-enable the WORK-profile Claude task
 on the unchanged `af84e54` launcher. State is untouched apart from additive rows in the provenance and
-notification stores, which `af84e54` does not read for dispatch.
+notification stores, which `af84e54` does not read for dispatch. Offline proof (G1, 17 Oct 2026): after two
+synthetic daily runs, `af84e547` code opened the same state with the classic config and reported
+`DRAINED`, both bills `ALREADY_ADMITTED` and VERIFIED, `next` = `IDLE`, two SENT notices, zero new
+notifications and no extra dispatch.
+
+## 10. Owner UAT (owner PC `DESKTOP-Q43QKQF`)
+
+Each step names who acts and what it may change. Steps 1 to 3 change nothing live. Steps 4 onward each need
+their own explicit owner approval in #226 naming the target and operation; none is implied by this list.
+
+| Step | Who | Effect | Pass when |
+|---|---|---|---|
+| 1. Offline suite on the owner PC from the merged commit (or this PR head) | G1 | none | all EnergyGrid suites green with the installed venv Python |
+| 2. C1 qualification in the n8n UI: for each candidate existing credential report service, exact scope text, OAuth client publishing status, and whether its account can open the flat folder (Drive) or equals the configured sender (Gmail) | owner | none (read only) | a Drive reader and a Gmail sender credential qualify, or the owner approves the smallest new one |
+| 3. C7 read-back of the remotely managed Cloudflare tunnel's ingress rules for the n8n hostname | owner | none (read only) | the exact rule set is known |
+| 4. Create the email claim Data Table; import both workflows **inactive** with placeholders replaced and credentials bound in a local import copy | owner/G1 | n8n data and inactive workflows | the workflow JSON read back shows the bindings; MCP access stays off |
+| 5. Add the Cloudflare path exclusion (section 6) | owner | Cloudflare | a public request to each path is refused at Cloudflare and n8n records no execution |
+| 6. Install `app\<commit>` beside `af84e54` (blob-verified), render and lock `egdaily.ps1`, write the private `daily` block | owner/G1 | host files | standard-user negative controls cannot modify script, app or config |
+| 7. Activate both workflows, then `daily-preflight` | owner/G1 | n8n activation, one read-only Drive listing | `PASS`: no PENDING or SEALED notice, both probes ready, Google SHA-256 matches the latest bill of each stream |
+| 8. Disable the WORK-profile Claude task and read it back | owner | scheduler | disabled state read back |
+| 9. Register the Windows task disabled; run it once by hand | owner | one daily run (normally IDLE) | `daily.json` IDLE, zero Drive or email effects, monitor report accepted |
+| 10. Enable at 11:30; observe the next new bill end to end (or an approved controlled bill) | owner | production run | the bill is in the flat folder once, VERIFIED by Google SHA-256, one owner email, monitor silent |
+
+UAT acceptance is the owner's statement after step 9 (and step 10 when a bill arrives). Rollback at any step
+is the order above in reverse; before step 8 nothing on the old route has changed.

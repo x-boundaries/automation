@@ -5,7 +5,8 @@
 Every command prints exactly one line of JSON and exits 0 (done or nothing to do),
 10 (lease held, retry later), 20 (HOLD or uncertainty recorded) or 64 (refused, no
 state change). The config, state, archive and outbox live outside the Git checkout.
-See docs/native_connector_bridge.md for the host protocol.
+See docs/native_connector_bridge.md for the host protocol, and docs/native_daily_claude_free.md for the
+Claude-free `daily`, `daily-preflight` and `drive-verify` commands.
 """
 
 from __future__ import annotations
