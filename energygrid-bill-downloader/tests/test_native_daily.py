@@ -530,6 +530,103 @@ class RemotePolicyTests(DailyBase):
         self.assertTrue(raw)
 
 
+class PostLatchRecoveryTests(DailyBase):
+    """Web #226:6235489184: once `daily` has latched a state, a bill found later is recovered only through the
+    native route (an attended `daily` run once the cause is fixed). The Claude bridge route is refused and
+    changes nothing; the latch, Google's SHA-256 requirement and the notification history stay as they are."""
+
+    NEW = {EB: [("EB Invoice 0002.pdf", "2026-09-01"), ("EB Invoice 0003.pdf", "2026-10-01")],
+           TN: [("TN Invoice 0002.pdf", "2026-09-03"), ("TN Invoice 0003.pdf", "2026-10-03")]}
+    NEW_NAMES = ["OCT 2026 - EnergyGrid - EB Bill - EB Invoice 0003.pdf",
+                 "OCT 2026 - EnergyGrid - Tenant Bill - TN Invoice 0003.pdf"]
+
+    def effects(self) -> tuple:
+        with notify.NotificationStore(notify.store_path(self.cfg)) as store:
+            notices = sorted((row["notification_id"], row["state"], row["draft_id"]) for row in store.rows())
+        return (sorted(self.drive_states()), self.dispatches(), sorted(p.name for p in (self.root / "sync").iterdir()),
+                sorted(row["name"] for row in self.n8n.cloud.values()), len(self.n8n.sent), notices,
+                sorted(p.name for p in self.cfg.outbox_root.iterdir() if not p.name.endswith(".drive-listing.json")))
+
+    def test_new_bills_after_the_latch_wait_unfiled_then_recover_once_through_an_attended_daily_run(self) -> None:
+        daily_cfg = self.cfg
+        self.run_daily()
+        self.assertTrue(bridge.remote_policy_latched(daily_cfg))
+        self.assertEqual(2, len(self.n8n.successes()))
+
+        # New EB and Tenant bills arrive while Drive Verify is down: acquired and archived, nothing filed or sent.
+        self.n8n.verify_up = False
+        outage = self.run_daily(self.adapters(self.NEW))
+        self.assertEqual(["EB Invoice 0003.pdf"], self.portal[EB].acquire_calls)
+        self.assertEqual(["TN Invoice 0003.pdf"], self.portal[TN].acquire_calls)
+        self.assertEqual(["PENDING", "PENDING", "VERIFIED", "VERIFIED"], sorted(self.drive_states()))
+        self.assertEqual("PENDING", outage["status_outcome"])  # the unchanged monitor alerts on a PENDING bill
+        for name in self.NEW_NAMES:
+            self.assertNotIn(name, [p.name for p in (self.root / "sync").iterdir()])
+        self.assertEqual(2, len(self.n8n.sent))
+        waiting = self.effects()
+
+        # The Claude bridge route on the same state (classic config, host-attested evidence) is refused and
+        # changes nothing: the latch holds under every config and is never cleared.
+        self.cfg = self.classic_cfg()
+        self.assertTrue(self.status()["remote_verify"]["required"])
+        step = self.next()
+        self.assertEqual("DRIVE_PRECHECK", step["outcome"])
+        evidence = {"folder_id": FLAT, "title": step["display_filename"], "query": step["precheck_query"],
+                    "complete": True, "matches": []}
+        with self.assertRaises(NativeRefusal) as caught:
+            self.call(bridge.drive_seal, step["intent_id"], evidence)
+        self.assertEqual("EG_DRIVE_REMOTE_VERIFY_REQUIRED", caught.exception.support_ref)
+        with self.assertRaises(NativeRefusal) as caught:
+            self.notify(lambda store: notify.seal(store, self.cfg, "egn-" + "1" * 32, "DRAFT1", self.now_iso()))
+        self.assertEqual("EG_DAILY_GMAIL_DRAFT_PATH_DISABLED", caught.exception.support_ref)
+        with bridge._provenance(self.cfg, create=False) as connection, self.assertRaises(sqlite3.DatabaseError):
+            connection.execute("DELETE FROM remote_verify_policy")
+        self.assertTrue(bridge.remote_policy_latched(self.cfg))
+        self.assertEqual(waiting, self.effects())
+
+        # Recovery: Drive Verify is back and the owner runs `daily` once by hand (the same entry point the
+        # scheduler uses). Each new bill is filed once, VERIFIED by Google's SHA-256, and emailed once.
+        self.cfg = daily_cfg
+        self.n8n.verify_up = True
+        recovered = self.run_daily(self.adapters(self.NEW))
+        self.assertEqual(("COMPLETED", daily.SUBMIT, "DRAINED"),
+                         (recovered["outcome"], recovered["monitor_report"], recovered["status_outcome"]))
+        self.assertEqual(["VERIFIED"] * 4, self.drive_states())
+        status = self.run_json(recovered, "status.json")
+        new = [invoice["drive_upload"] for stream in (EB, TN) for invoice in status["streams"][stream]["invoices"]
+               if invoice["display_filename"] in self.NEW_NAMES]
+        self.assertEqual([("VERIFIED", "GOOGLE_SHA256")] * 2, [(u["state"], u["remote_attestation"]) for u in new])
+        self.assertEqual(sorted(self.NEW_NAMES + [
+            "SEP 2026 - EnergyGrid - EB Bill - EB Invoice 0002.pdf",
+            "SEP 2026 - EnergyGrid - Tenant Bill - TN Invoice 0002.pdf"]), sorted(r["name"] for r in self.n8n.cloud.values()))
+        self.assertEqual(4, len(self.n8n.successes()))
+        self.assertEqual(sorted(self.NEW_NAMES), sorted(m["subject"].split(" - ", 1)[1] for m in self.n8n.successes()[2:]))
+        self.assertEqual([], self.n8n.failures())
+
+        # A further run, scheduled or attended, makes zero effects: nothing is filed or sent twice.
+        settled = self.effects()
+        again = self.run_daily(self.adapters(self.NEW))
+        self.assertEqual(daily.SUBMIT, again["monitor_report"])
+        self.assertEqual(settled, self.effects())
+        self.assertEqual([{"step": "next", "outcome": "IDLE"}], self.run_json(again, "daily.json")["steps"])
+
+    def test_a_listing_without_googles_sha256_never_verifies_a_new_bill_after_the_latch(self) -> None:
+        self.run_daily()
+        self.n8n.sha_ready = False
+        waiting = self.run_daily(self.adapters(self.NEW))
+        # The first new upload is written and synced but not VERIFIED; the run stops there (host rule P1).
+        self.assertEqual(["DISPATCHED", "PENDING", "VERIFIED", "VERIFIED"], sorted(self.drive_states()))
+        self.assertEqual(2, len(self.n8n.successes()))
+        self.assertIn("EG_DAILY_DRIVE_SYNC_PENDING",
+                      [s.get("support_ref") for s in self.run_json(waiting, "daily.json")["steps"]])
+        # md5 and size alone never verify; once Google reports its SHA-256 the next run records it, once.
+        self.n8n.sha_ready = True
+        self.run_daily(self.adapters(self.NEW))
+        self.run_daily(self.adapters(self.NEW))
+        self.assertEqual(["VERIFIED"] * 4, self.drive_states())
+        self.assertEqual(4, len(self.n8n.successes()))
+
+
 class OwnerEmailTests(DailyBase):
     def test_email_unavailable_never_blocks_drive_and_sends_later_once(self) -> None:
         self.n8n.email_up = False

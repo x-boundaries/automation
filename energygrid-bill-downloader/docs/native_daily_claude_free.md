@@ -27,7 +27,11 @@ the state path and every dependent store (notifications, provenance, backfill) a
 ## 2. Daily configuration block
 
 The private native config (`energygrid.native.v4.config.v1`) gains one optional key, `daily`. Without it
-every command behaves exactly as before. With it:
+every command behaves exactly as before. The daily config is its **own file**,
+`runtime\config\native.daily.json` (the classic config plus `daily`, same state path). The classic
+`runtime\config\native.json` that `egnative.cmd` reads stays byte-unchanged: the installed `af84e547` code
+refuses any config that carries `daily` (offline proof, 17 Oct 2026: `ConfigError`), so writing the block
+into the shared file would stop the Claude route before it is disabled. With `daily`:
 
 ```json
 "daily": {
@@ -135,7 +139,10 @@ store, and from then on every config that opens this state requires it. When req
 - The operator command `drive-verify` obtains one listing through the same client and records it; it is
   not in the scheduled launcher's allow-list.
 
-The installed `af84e547` rollback code does not open the new tables, so rollback reads the state unchanged.
+The latch is enforced by this code only. The installed `af84e547` code has no latch table and does not read
+it: offline proof (17 Oct 2026) on a state latched by `daily`, with a classic config, `af84e547` acquired a
+new EB bill and **sealed its upload on host-attested evidence**. Running `af84e547` against a latched state
+therefore bypasses Google-side verification; it is not a rollback (section 9.2).
 
 ## 4. Owner email through n8n (C4, C5)
 
@@ -231,8 +238,9 @@ sources. Deliberate choices:
   already guarantee it, and replay tests cover it.
 - The v4 `GMAIL_SEND` intents (two legacy PENDING on the UAT host, and one per new invoice) are never read
   for dispatch by the bridge or the daily runner. Tests cover it.
-- `daily-preflight` (read-only) requires notification PENDING = 0 and SEALED = 0 and a SUCCESS row for every
-  VERIFIED invoice; otherwise it answers HOLD for an owner decision. It never deletes or suppresses a row.
+- `daily-preflight` requires notification PENDING = 0 and SEALED = 0 and a SUCCESS row for every VERIFIED
+  invoice; otherwise it answers HOLD for an owner decision. It never deletes or suppresses a row. It is
+  **stateful**, not read-only (section 8).
 
 ## 5. Failure visibility (C6)
 
@@ -273,7 +281,8 @@ exposure is a separate follow-up and is not changed here.
 ## 7. Scheduler and host (C8, C9)
 
 - `runtime/scheduler/egdaily.ps1.template`: no parameters (any argument exits 64), fixed install paths, runs
-  the venv Python with `-E -s -X utf8 -m energygrid_bill_downloader.native_cli daily`. It reads the one
+  the venv Python with `-E -s -X utf8 -m energygrid_bill_downloader.native_cli daily --config
+  runtime\config\native.daily.json` (its own config file, section 2). It reads the one
   result line and runs `monitor\egmonitor.cmd <run folder>` once only when the line says
   `monitor_report: SUBMIT` and the folder is a direct `YYYYMMDD-HHMMSS` child of the runs root.
 - `task-scheduler/energygrid_daily_native.task.example.xml`: disabled, one daily trigger at 11:30 +08:00,
@@ -289,8 +298,18 @@ exposure is a separate follow-up and is not changed here.
 | Command | Effect |
 |---|---|
 | `daily` | The whole run (section 1). One JSON line with `run_dir` and `monitor_report`. Exit 0 done, 10 retry later, 20 HOLD/uncertainty/withheld, 64 refused. |
-| `daily-preflight` | Read-only cutover check: config, latch state, notification invariants (section 4.3), n8n health, both probes and one Drive listing that must show the latest VERIFIED invoice of each stream with a matching Google SHA-256. Records only the listing evidence. |
-| `drive-verify` | Operator: obtain and record one listing; prints its nonce and counts. |
+| `daily-preflight` | **Stateful** cutover check (it does not latch): config, latch state, notification invariants (section 4.3), n8n health, both probes and one Drive listing that must show the latest VERIFIED invoice of each stream with a matching Google SHA-256. |
+| `drive-verify` | Operator: obtain and record one listing; prints its nonce and counts. Stateful in the same way. |
+
+`daily-preflight` is not a read-only command. Against a state it can:
+
+- create the provenance store's remote-verification tables and triggers if they are absent (additive SQLite
+  schema in `<state>.provenance.sqlite`);
+- write one listing file to the outbox and one `drive_remote_listing` row;
+- run two live n8n executions: an Owner Email `PROBE` (no send) and Drive Verify (a live Google read).
+
+Run it only against the production state under an explicit grant that names those effects (UAT step 7),
+never under a read-only grant.
 
 ## 9. Cutover holds and order (each step needs its own grant)
 
@@ -306,40 +325,100 @@ Typed holds (none blocks the source PR or offline UAT):
   new binding is `gmail.send openid email` on that account (owner consent).
 - `C7_NONPUBLIC_INGRESS_UNVERIFIED`: section 6.
 - `C8_WORK_PROFILE_TASK_UNVERIFIED`: the WORK-profile Claude task is disabled and read back before the
-  Windows task is enabled; never two writers.
+  first `daily` against the production state; never two writers.
+- `D1_POST_LATCH_ROLLBACK_POLICY_UNDECIDED`: the owner's recorded choice in section 9.3, before UAT step 9.
 - Existing: production effect ceilings are not chosen (the daily needs `PER_PERIOD`), the n8n Data Table for
   the email claim must be created, image digests recorded.
 
-Order: source PR reviewed and merged -> credentials qualified -> both workflows imported **inactive**, Data
-Table created -> C7 rule read back -> install `app\<merge commit>` beside `af84e54`, render and lock
-`egdaily.ps1` -> `daily-preflight` passes -> activate both workflows -> disable and read back the Claude
-task -> register the Windows task disabled, run it once by hand (expected IDLE, zero effects, monitor OK)
--> enable at 11:30.
+### 9.1 Order (Web #226:6234979007 and #226:6235489184)
 
-Rollback: disable the Windows task -> deactivate the two workflows -> re-enable the WORK-profile Claude task
-on the unchanged `af84e54` launcher. State is untouched apart from additive rows in the provenance and
-notification stores, which `af84e54` does not read for dispatch. Offline proof (G1, 17 Oct 2026): after two
-synthetic daily runs, `af84e547` code opened the same state with the classic config and reported
-`DRAINED`, both bills `ALREADY_ADMITTED` and VERIFIED, `next` = `IDLE`, two SENT notices, zero new
-notifications and no extra dispatch.
+Source review and UAT preparation need **no merge and no scheduler activation**. The unmerged PR head is
+installed in an isolated, inactive candidate slot beside `af84e54` and owner UAT runs on it. The fresh
+final V3 G2 follows the owner's UAT acceptance. Merge, promotion and the 11:30 schedule come after that,
+each with its own approval and read-back:
 
-## 10. Owner UAT (owner PC `DESKTOP-Q43QKQF`)
+1. Owner-PC UAT on the exact candidate head (section 10, steps 1 to 9). The Windows task is not registered
+   or enabled.
+2. Owner UAT acceptance (an explicit statement, never inferred).
+3. Fresh, independent final V3 G2 on the exact candidate.
+4. Web: merge, then guarded promotion: install the reviewed commit (blob-verified; the candidate slot when
+   it is the same tree), register the Windows task **disabled**, run it once by hand (expected IDLE, zero
+   effects, monitor accepted), then enable at 11:30 and observe the next bill end to end.
+
+Between UAT step 9 and the 11:30 enable nothing files bills on a schedule. When a bill is due, the owner
+runs the attended `daily` of section 9.2, which is the same command the task will run.
+
+### 9.2 Recovery after the latch (tested)
+
+The first `daily` against a state writes the append-only latch (section 3.3), whatever its outcome,
+including IDLE. From then on this code verifies every Drive step by Google's SHA-256 under **every**
+config. The Claude bridge commands are refused with no state change (`EG_DRIVE_REMOTE_VERIFY_REQUIRED`,
+`EG_DAILY_READBACK_DISABLED`, `EG_DAILY_GMAIL_DRAFT_PATH_DISABLED`, `EG_DAILY_BACKFILL_DISABLED`). The
+latch and the provenance rows cannot be updated or deleted (triggers) and are never cleared by hand.
+
+- **The recovery route is the native route itself.** If a run fails (scheduler, n8n, Google, Gmail),
+  fix the cause and run `daily` once by hand: `egdaily.ps1` with no arguments, or the Windows task's Run.
+  Offline proof `tests/test_native_daily.py::PostLatchRecoveryTests` covers this. New EB and Tenant bills
+  found while Drive Verify is down are acquired and archived, but nothing is written to the synced folder,
+  filed or emailed. Status says PENDING, so the unchanged monitor alerts. A classic-config Claude bridge
+  session in between is refused and changes nothing, and the latch survives it. After the repair, one
+  attended `daily` files each new bill once, VERIFIED by Google's SHA-256, with one email each. A further
+  run makes zero effects. A listing without Google's SHA-256 never verifies a bill (md5 or size alone never
+  do); the next run records it once Google reports it.
+- **Fail-closed limitation.** While Drive Verify cannot answer (n8n down, Drive credential revoked, Google
+  unavailable), no new bill reaches the Drive folder or the owner email. No verification-preserving
+  fallback route exists. The bill waits in the internal archive, visible to the monitor, until the native
+  route is repaired.
+- **The WORK-profile Claude task is not a rollback after the latch.** The installed `af84e547` code does
+  not read the latch. On a latched state it would seal a new bill on host-attested evidence (offline
+  proof, section 3.3), which bypasses Google-side verification. With `native.daily.json` separate, its
+  classic `native.json` still loads, so nothing stops it technically. After UAT step 9 it stays disabled.
+  Re-enabling it is the owner policy downgrade of section 9.3 (c), never a rollback step.
+- Never restore the state, the notification store, the provenance store or the outbox from a backup, and
+  never re-seal or re-send by hand (`runbook.md`).
+
+### 9.3 Rollback by phase and the owner decision `D1`
+
+- **Before the first `daily` on the production state** (UAT steps 1 to 8): genuine rollback. Deactivate
+  the two workflows, leave or remove the candidate slot and `native.daily.json`, and keep (or re-enable)
+  the WORK-profile Claude task on the unchanged `af84e54` launcher. The only state additions are the
+  stateful preflight's listing rows, tables and files, which `af84e547` never reads.
+- **After it** (UAT step 9 onward): section 9.2. Disable the Windows task if one exists and deactivate the
+  workflows only to stop the native route; nothing old resumes by itself.
+- Earlier offline proof (G1 builder, 17 Oct 2026): after two synthetic daily runs with no new bill,
+  `af84e547` reopened the state with the classic config: `DRAINED`, both bills `ALREADY_ADMITTED` and
+  VERIFIED, `next` = `IDLE`, two SENT notices, no extra dispatch. It shows that settled history is read
+  unchanged. It does not prove recovery for a bill that arrives after the latch (Web #226:6235489184). That
+  case is the bypass in section 3.3.
+
+`D1`, the owner's recorded choice before UAT step 9:
+
+- (a) **Native-only recovery after the latch** (recommended). The WORK-profile Claude task retires from
+  bill filing at UAT step 9. Recovery is fix-forward with the attended `daily`. During a Drive Verify outage
+  the section 9.2 limitation applies. If final G2 later rejects the candidate, a return to `af84e547` is a
+  new owner decision under (c), not an automatic rollback.
+- (b) As (a), but UAT step 9 first runs against an isolated copy of the state in the candidate slot, so
+  the production state stays unlatched until promotion. Copying private state needs its own grant.
+- (c) Keep the Claude task as an emergency fallback after the latch. The owner then explicitly accepts
+  host-attested (not Google SHA-256) verification for any bill it files. Each use is recorded in #226.
+
+## 10. Owner UAT on the unmerged candidate (owner PC `DESKTOP-Q43QKQF`)
 
 Each step names who acts and what it may change. Steps 1 to 3 change nothing live. Steps 4 onward each need
 their own explicit owner approval in #226 naming the target and operation; none is implied by this list.
 
 | Step | Who | Effect | Pass when |
 |---|---|---|---|
-| 1. Offline suite on the owner PC from the merged commit (or this PR head) | G1 | none | all EnergyGrid suites green with the installed venv Python |
-| 2. C1 qualification in the n8n UI: for each candidate existing credential report service, exact scope text, OAuth client publishing status, and whether its account can open the flat folder (Drive) or equals the configured sender (Gmail) | owner | none (read only) | a Drive reader and a Gmail sender credential qualify, or the owner approves the smallest new one |
+| 1. Offline suite on the owner PC from the exact candidate head | G1 | none | all EnergyGrid suites green with the installed venv Python |
+| 2. C1 read in the n8n UI: for each candidate existing credential, report service, exact scope text, OAuth client publishing status, and whether its account can open the flat folder (Drive) or equals the configured sender (Gmail) | owner | none (read only) | a Drive reader and a Gmail sender credential qualify, or the owner approves the smallest new one |
 | 3. C7 read-back of the remotely managed Cloudflare tunnel's ingress rules for the n8n hostname | owner | none (read only) | the exact rule set is known |
-| 4. Create the email claim Data Table; import both workflows **inactive** with placeholders replaced and credentials bound in a local import copy | owner/G1 | n8n data and inactive workflows | the workflow JSON read back shows the bindings; MCP access stays off |
+| 4. Create the email claim Data Table; import both workflows **inactive**, with placeholders replaced and credentials bound in a local import copy | owner/G1 | n8n data and inactive workflows | the workflow JSON read back shows the bindings; MCP access stays off |
 | 5. Add the Cloudflare path exclusion (section 6) | owner | Cloudflare | a public request to each path is refused at Cloudflare and n8n records no execution |
-| 6. Install `app\<commit>` beside `af84e54` (blob-verified), render and lock `egdaily.ps1`, write the private `daily` block | owner/G1 | host files | standard-user negative controls cannot modify script, app or config |
-| 7. Activate both workflows, then `daily-preflight` | owner/G1 | n8n activation, one read-only Drive listing | `PASS`: no PENDING or SEALED notice, both probes ready, Google SHA-256 matches the latest bill of each stream |
-| 8. Disable the WORK-profile Claude task and read it back | owner | scheduler | disabled state read back |
-| 9. Register the Windows task disabled; run it once by hand | owner | one daily run (normally IDLE) | `daily.json` IDLE, zero Drive or email effects, monitor report accepted |
-| 10. Enable at 11:30; observe the next new bill end to end (or an approved controlled bill) | owner | production run | the bill is in the flat folder once, VERIFIED by Google SHA-256, one owner email, monitor silent |
+| 6. Install the candidate slot `app\<candidate head>` beside `af84e54` (blob-verified), render and lock `egdaily.ps1`, write the private `native.daily.json`; the classic `native.json` and the WORK task stay unchanged; register no Windows task | owner/G1 | host files | standard-user negative controls cannot modify script, app or configs; `af84e54` still loads `native.json` |
+| 7. Activate both workflows, then `daily-preflight` (**stateful**: provenance tables, one listing row and file, n8n PROBE and Drive Verify executions; section 8) | owner/G1 | n8n activation, one Google read, additive local evidence | `PASS`: no PENDING or SEALED notice, both probes ready, Google SHA-256 matches the latest bill of each stream |
+| 8. Record `D1` (section 9.3); disable the WORK-profile Claude task and read it back | owner | scheduler | `D1` recorded; disabled state read back |
+| 9. One attended `daily` (run `egdaily.ps1` by hand; the first latch, section 9.2) | owner/G1 | one daily run (normally IDLE) | `daily.json` IDLE, zero Drive or email effects, monitor report accepted |
 
-UAT acceptance is the owner's statement after step 9 (and step 10 when a bill arrives). Rollback at any step
-is the order above in reverse; before step 8 nothing on the old route has changed.
+UAT acceptance is the owner's statement after step 9 (and after the first real bill, when the owner wants
+that in UAT). Then: final fresh V3 G2, then section 9.1 item 4. Rollback before step 9 is section 9.3;
+from step 9 onward it is section 9.2.

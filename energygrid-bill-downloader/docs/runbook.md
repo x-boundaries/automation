@@ -26,20 +26,30 @@ The full contract is [native_daily_claude_free.md](native_daily_claude_free.md).
 
 - Cadence: Windows Task Scheduler at 11:30 SGT (disabled template
   `task-scheduler/energygrid_daily_native.task.example.xml`, same interactive user) -> the installed,
-  admin-write locked `runtime\egdaily.ps1` (no arguments) -> `native_cli daily` -> one monitor report
-  through the unchanged `egmonitor.cmd` when the run says `SUBMIT`.
+  admin-write locked `runtime\egdaily.ps1` (no arguments) -> `native_cli daily` with its own
+  `runtime\config\native.daily.json` -> one monitor report through the unchanged `egmonitor.cmd` when the
+  run says `SUBMIT`. The classic `native.json` used by `egnative.cmd` is never edited (`af84e547` refuses a
+  config with `daily`).
 - Drive: the Core writes the synced copy; VERIFIED needs Google's own `sha256Checksum` from the n8n Drive
   Verify listing, exact metadata and the local mirror. md5 or size alone never verify. Once a state has
-  run with `daily`, every config must verify this way (latched).
+  run with `daily` (even an IDLE run), this code requires that verification under every config (latched);
+  the installed `af84e547` code does not read the latch.
 - Email: optional, at most one attempt per notification through the n8n Owner Email workflow; UNKNOWN and
   HOLD are never resent. An undelivered or uncertain FAILURE notice withholds the monitor report, so the
   monitor's 14:00 missed-report alert fires.
 - Never restore the state file, the notification store or the outbox from a backup: the outbox dispatch
   markers and the n8n claim are what stop a second email, and a restore removes protection.
-- Before the cutover, `native_cli daily-preflight` must answer PASS (no PENDING or SEALED notification,
-  every VERIFIED bill already notified, n8n healthy, both probes and Google SHA-256 for the latest bills).
-- Rollback: disable the Windows task, deactivate the two workflows, re-enable the WORK-profile Claude task
-  on the unchanged `af84e54` launcher.
+- Before the first `daily` against the production state, `native_cli daily-preflight` must answer PASS (no
+  PENDING or SEALED notification, every VERIFIED bill already notified, n8n healthy, both probes and Google
+  SHA-256 for the latest bills). It is **stateful**: it can add provenance tables, records one listing row
+  and file, and runs live n8n PROBE and Drive Verify executions. Never run it under a read-only grant.
+- Order: owner UAT on the unmerged candidate in an inactive slot, owner acceptance, fresh final V3 G2,
+  then merge and promotion; no merge or 11:30 enable is needed for UAT (contract section 9.1).
+- Rollback before the first `daily` on the production state: deactivate the two workflows and keep (or
+  re-enable) the WORK-profile Claude task on the unchanged `af84e54` launcher. After it, the Claude task is
+  **not** a rollback: recovery is fix-forward, running `daily` once by hand after the cause is fixed, and
+  during a Drive Verify outage new bills wait unfiled and visible to the monitor (contract sections 9.2
+  and 9.3, owner decision `D1`).
 
 ## Dual-stream v3 contract: Claude, n8n Google Drive, deterministic core (#226 G3)
 

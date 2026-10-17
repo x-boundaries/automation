@@ -93,6 +93,9 @@ class RunnerTemplateStatic(unittest.TestCase):
         self.assertIn("if ($args.Count -ne 0)", text)
         self.assertIn("-m energygrid_bill_downloader.native_cli daily --config $Config", text)
         self.assertIn("-E -s -X utf8", text)
+        # Its own config file: the classic native.json (egnative.cmd, installed af84e547) is never the daily one.
+        self.assertIn(r"$Config = Join-Path $EgHome 'runtime\config\native.daily.json'", text)
+        self.assertNotIn(r"'runtime\config\native.json'", text)
         self.assertEqual({"{{EG_HOME}}", "{{PINNED_COMMIT}}"},
                          {token for token in ("{{EG_HOME}}", "{{PINNED_COMMIT}}", "{{LAUNCHER}}") if token in text})
         lowered = "\n".join(line for line in text.lower().splitlines() if not line.lstrip().startswith("#"))
@@ -105,7 +108,9 @@ class RunnerTemplateBehaviour(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory()
-        cls.home = Path(cls._tmp.name) / "EnergyGrid"
+        # Resolved, as the fake CLI and PowerShell see it: an 8.3 short TEMP (for example RUNNER~1 on hosted
+        # Windows runners) must not make the same folder compare unequal to its long form.
+        cls.home = Path(cls._tmp.name).resolve() / "EnergyGrid"
         venv = cls.home / "runtime" / "venv"
         subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, timeout=180)
         package = cls.home / "app" / COMMIT / "energygrid-bill-downloader" / "energygrid_bill_downloader"
@@ -145,7 +150,7 @@ class RunnerTemplateBehaviour(unittest.TestCase):
         completed = self.run_script("SUBMIT")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual([str(self.home / "data" / "runs" / "20261020-113000")], self.monitor_calls())
-        self.assertEqual(["daily", "--config", str(self.home / "runtime" / "config" / "native.json")],
+        self.assertEqual(["daily", "--config", str(self.home / "runtime" / "config" / "native.daily.json")],
                          json.loads((self.home / "cli_args.json").read_text(encoding="utf-8")))
         log = (self.home / "data" / "egdaily.log").read_text(encoding="utf-8-sig")
         self.assertIn("exit=0 monitor_report=SUBMIT submitted=True", log)

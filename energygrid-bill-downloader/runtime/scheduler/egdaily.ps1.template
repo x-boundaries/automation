@@ -15,7 +15,9 @@ if ($args.Count -ne 0) {
 $EgHome = '{{EG_HOME}}'
 $Python = Join-Path $EgHome 'runtime\venv\Scripts\python.exe'
 $Code = Join-Path $EgHome 'app\{{PINNED_COMMIT}}\energygrid-bill-downloader'
-$Config = Join-Path $EgHome 'runtime\config\native.json'
+# The daily config is its own file: the classic native.json stays byte-unchanged for egnative.cmd, because
+# the installed af84e547 code refuses any config that carries a `daily` block.
+$Config = Join-Path $EgHome 'runtime\config\native.daily.json'
 $RunsRoot = Join-Path $EgHome 'data\runs'
 $Monitor = Join-Path $EgHome 'monitor\egmonitor.cmd'
 $Log = Join-Path $EgHome 'data\egdaily.log'
