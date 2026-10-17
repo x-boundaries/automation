@@ -35,7 +35,8 @@ from typing import Any, Iterator
 
 from .native_bridge import (
     EXIT_HOLD, EXIT_OK, PDF_MIME, STREAM_LABELS, NativeConfig, NativeRefusal, _PROVIDER_ID_RE, _outbox,
-    _provider_outcome, _read_json, _result, _write_atomic, _write_json_once, ceiling_period, ms_from_iso,
+    _provider_outcome, _read_json, _require_classic, _result, _write_atomic, _write_json_once, ceiling_period,
+    ms_from_iso,
 )
 
 KIND_SUCCESS, KIND_FAILURE = "SUCCESS", "FAILURE"
@@ -43,6 +44,16 @@ HOLD_RELEASED_STATUS, HOLD_RELEASED_REF = "HOLD_RELEASED_NO_DISPATCH", "EG_V5_HO
 STATES = ("PENDING", "SEALED", "SENT", "UNKNOWN", "HOLD")
 HANDLED_ACQUISITION = frozenset({"ADMITTED", "ALREADY_ADMITTED", "PREDECESSOR_DELIVERED", "EMPTY"})
 _NOTIFICATION_ID_RE = re.compile(r"egn-[0-9a-f]{32}", re.ASCII)
+# Owner email through n8n (daily run): the Core mints the dispatch id it binds into `draft_id`.
+DISPATCH_PREFIX = "egd-"
+TRANSPORT_N8N = "N8N_OWNER_EMAIL"
+EMAIL_REQUEST_SCHEMA = "energygrid.owner_email.request.v1"
+EMAIL_RESPONSE_SCHEMA = "energygrid.owner_email.response.v1"
+_DISPATCH_ID_RE = re.compile(r"egd-[0-9a-f]{32}", re.ASCII)
+MARKER_HOLD_DISPATCH_ID = DISPATCH_PREFIX + "0" * 32
+_STATUS_TEXT_RE = re.compile(r"[A-Z][A-Z0-9_]{2,63}", re.ASCII)
+_SUPPORT_REF_RE = re.compile(r"EG_[A-Z0-9_]{2,72}", re.ASCII)
+_DRIVE_FILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{10,200}", re.ASCII)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notification (
@@ -296,6 +307,87 @@ def attaches_pdf(cfg: NativeConfig, row: dict) -> bool:
     return cfg.gmail.attach_pdf and row["kind"] == KIND_SUCCESS
 
 
+def render_sha256(cfg: NativeConfig, row: dict) -> str:
+    """SHA-256 of `subject + "\\n" + body` (UTF-8): the exact message the n8n workflow must render."""
+    subject, body = message_for(cfg, row)
+    return hashlib.sha256(f"{subject}\n{body}".encode("utf-8")).hexdigest()
+
+
+def _plain_name(value: Any) -> bool:
+    return (type(value) is str and 1 <= len(value) <= 255 and value.isprintable() and value.lower().endswith(".pdf")
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
+
+
+def email_request(cfg: NativeConfig, row: dict) -> dict:
+    """The closed SEND request for one SEALED n8n notification (docs/native_daily_claude_free.md 4.2).
+
+    Refuses (no send) any row whose fields fall outside the workflow's closed vocabulary, so the Core
+    never asks n8n to render something it would refuse."""
+    dispatch_id = row["draft_id"]
+    success = row["kind"] == KIND_SUCCESS
+    released = row["status_text"] == HOLD_RELEASED_STATUS
+    valid = (
+        type(dispatch_id) is str and _DISPATCH_ID_RE.fullmatch(dispatch_id) is not None
+        and row["kind"] in (KIND_SUCCESS, KIND_FAILURE) and row["stream"] in STREAM_LABELS
+        and type(row["status_text"]) is str and _STATUS_TEXT_RE.fullmatch(row["status_text"]) is not None
+        and (row["support_ref"] is None if success else
+             type(row["support_ref"]) is str and _SUPPORT_REF_RE.fullmatch(row["support_ref"]) is not None)
+        and (type(row["drive_file_id"]) is str and _DRIVE_FILE_ID_RE.fullmatch(row["drive_file_id"]) is not None
+             if success else row["drive_file_id"] is None)
+        and (_plain_name(row["display_filename"]) if success or released else True)
+    )
+    if not valid:
+        raise NativeRefusal("EG_DAILY_EMAIL_FIELDS_INVALID")
+    display = row["display_filename"] if success or released else None
+    return {
+        "schema": EMAIL_REQUEST_SCHEMA, "mode": "SEND", "notification_id": row["notification_id"],
+        "dispatch_id": dispatch_id, "kind": row["kind"], "stream": row["stream"], "status_text": row["status_text"],
+        "support_ref": row["support_ref"], "display_filename": display, "drive_file_id": row["drive_file_id"],
+        "render_sha256": render_sha256(cfg, row),
+    }
+
+
+def _dispatch_marker(cfg: NativeConfig, notification_id: str) -> Path:
+    return _outbox(cfg) / f"{notification_id}.n8n-dispatch.json"
+
+
+def seal_n8n(store: NotificationStore, cfg: NativeConfig, notification_id: str, now_iso: str) -> dict:
+    """SEAL one PENDING notification for the single n8n POST (C4). Returns the SEND request.
+
+    1. A write-once outbox dispatch marker is created exclusively. If one already exists for a PENDING
+       row (a restored store, or a crash between the two writes), the row goes to HOLD and nothing is
+       ever sent for it.
+    2. One transaction: PENDING -> SEALED with the Core-minted dispatch id bound into `draft_id`, plus
+       the seal-ledger row. Only the process whose seal committed may POST.
+    """
+    import uuid
+
+    if cfg.daily is None:
+        raise NativeRefusal("EG_DAILY_CONFIG_REQUIRED")
+    row = store.row(notification_id)
+    if row["state"] != "PENDING":
+        raise NativeRefusal("EG_NATIVE_NOTIFICATION_NOT_PENDING")
+    if attaches_pdf(cfg, row):
+        raise NativeRefusal("EG_NATIVE_DRAFT_ATTACHMENT_MISMATCH")
+    if sends_counted(store, cfg, now_iso) >= cfg.max_gmail_sends:
+        raise NativeRefusal("EG_NATIVE_EFFECT_CEILING_REACHED")
+    dispatch_id = DISPATCH_PREFIX + uuid.uuid4().hex
+    request = email_request(cfg, {**row, "draft_id": dispatch_id})
+    marker = {"notification_id": notification_id, "dispatch_id": dispatch_id,
+              "render_sha256": request["render_sha256"], "sealed_at": now_iso}
+    try:
+        _write_json_once(_dispatch_marker(cfg, notification_id), marker)
+    except FileExistsError:
+        # HOLD needs a bound id: the reserved all-zero dispatch id, which uuid4 never mints.
+        with store.write() as conn:
+            store._move(conn, notification_id, ("PENDING",), "HOLD", now_iso, draft_id=MARKER_HOLD_DISPATCH_ID)
+        raise NativeRefusal("EG_DAILY_EMAIL_DISPATCH_MARKER_EXISTS", exit_code=EXIT_HOLD) from None
+    with store.write() as conn:
+        store._move(conn, notification_id, ("PENDING",), "SEALED", now_iso, draft_id=dispatch_id)
+        conn.execute("INSERT INTO gmail_seal (notification_id, sealed_at) VALUES (?,?)", (notification_id, now_iso))
+    return request
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -356,6 +448,7 @@ def draft_evidence(store: NotificationStore, cfg: NativeConfig, notification_id:
     from email.parser import BytesParser
     from email.utils import getaddresses
 
+    _require_classic(cfg, "EG_DAILY_GMAIL_DRAFT_PATH_DISABLED")
     store.row(notification_id)
     if type(draft_id) is not str or not _PROVIDER_ID_RE.fullmatch(draft_id):
         raise NativeRefusal("EG_NATIVE_PROVIDER_ID_INVALID")
@@ -397,6 +490,10 @@ def draft_evidence(store: NotificationStore, cfg: NativeConfig, notification_id:
 
 def seal(store: NotificationStore, cfg: NativeConfig, notification_id: str, draft_id: str, now_iso: str) -> dict:
     """Verify the Core-parsed draft, then SEAL and bind exactly that draft. A wrong draft changes nothing."""
+    _require_classic(cfg, "EG_DAILY_GMAIL_DRAFT_PATH_DISABLED")
+    if type(draft_id) is str and draft_id.startswith(DISPATCH_PREFIX):
+        # A Core-minted n8n dispatch id is never a Gmail draft (typed transports never mix).
+        raise NativeRefusal("EG_NATIVE_DRAFT_ID_INVALID")
     row = store.row(notification_id)
     if row["state"] != "PENDING":
         raise NativeRefusal("EG_NATIVE_NOTIFICATION_NOT_PENDING")
@@ -444,6 +541,12 @@ def record(store: NotificationStore, notification_id: str, evidence: dict, now_i
     outcome = _provider_outcome(evidence, "SENT")
     if row["state"] == "PENDING":
         raise NativeRefusal("EG_NATIVE_NOT_DISPATCHED")
+    # Typed transports: an n8n dispatch (egd- id) is recorded only with n8n transport evidence, and n8n
+    # transport evidence never resolves a Gmail draft dispatch.
+    n8n_row = type(row["draft_id"]) is str and row["draft_id"].startswith(DISPATCH_PREFIX)
+    if n8n_row != (evidence.get("transport") == TRANSPORT_N8N) or (
+            "transport" in evidence and evidence["transport"] != TRANSPORT_N8N):
+        raise NativeRefusal("EG_NATIVE_TRANSPORT_MISMATCH")
     if outcome == "SENT":
         message_id = evidence.get("message_id")
         if evidence.get("draft_id") != row["draft_id"]:

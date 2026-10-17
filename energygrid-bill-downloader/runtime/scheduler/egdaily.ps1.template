@@ -1,0 +1,65 @@
+# EnergyGrid Claude-free daily run (#226 V3 G1): the only command the Windows task runs.
+# Install by replacing the {{...}} placeholders, then lock this file admin-write only
+# (docs/native_daily_claude_free.md section 7). It takes NO arguments and runs no model.
+# 1. The Core daily run (one JSON result line).
+# 2. Only when that line says monitor_report SUBMIT: the unchanged monitor reporter, once, for that run folder.
+#    WITHHELD (or any unreadable result) skips the report, so the n8n monitor raises its missed-report alert.
+param()
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+if ($args.Count -ne 0) {
+    Write-Output '{"command": "egdaily", "exit_code": 64, "outcome": "REFUSED", "support_ref": "EG_DAILY_ARGUMENTS_REFUSED"}'
+    exit 64
+}
+
+$EgHome = '{{EG_HOME}}'
+$Python = Join-Path $EgHome 'runtime\venv\Scripts\python.exe'
+$Code = Join-Path $EgHome 'app\{{PINNED_COMMIT}}\energygrid-bill-downloader'
+# The daily config is its own file: the classic native.json stays byte-unchanged for egnative.cmd, because
+# the installed af84e547 code refuses any config that carries a `daily` block.
+$Config = Join-Path $EgHome 'runtime\config\native.daily.json'
+$RunsRoot = Join-Path $EgHome 'data\runs'
+$Monitor = Join-Path $EgHome 'monitor\egmonitor.cmd'
+$Log = Join-Path $EgHome 'data\egdaily.log'
+
+function Write-RunLog([string]$Line) {
+    # Closed values only: exit code, outcome words and EG_ references. No paths, names or addresses.
+    try {
+        Add-Content -LiteralPath $Log -Value ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $Line) -Encoding UTF8
+    } catch {
+        # The log is a convenience; the Core's run folder is the evidence.
+    }
+}
+
+Set-Location -LiteralPath $Code
+# -E -s: ignore PYTHON* variables and the user site; -X utf8: UTF-8 I/O. The module runs from the pinned copy.
+$output = @(& $Python -E -s -X utf8 -m energygrid_bill_downloader.native_cli daily --config $Config)
+$exitCode = $LASTEXITCODE
+$line = @($output | Where-Object { $_ -is [string] -and $_.StartsWith('{') }) | Select-Object -Last 1
+
+$result = $null
+if ($null -ne $line) {
+    try { $result = $line | ConvertFrom-Json } catch { $result = $null }
+}
+$report = 'UNREADABLE'
+if ($null -ne $result -and ($result.PSObject.Properties.Name -contains 'monitor_report')) { $report = [string]$result.monitor_report }
+$reasons = ''
+if ($null -ne $result -and ($result.PSObject.Properties.Name -contains 'withheld_reasons')) { $reasons = (@($result.withheld_reasons) -join ',') }
+
+$submitted = $false
+if ($null -ne $result -and [string]$result.command -ceq 'daily' -and $report -ceq 'SUBMIT' -and
+        ($result.PSObject.Properties.Name -contains 'run_dir')) {
+    $runDir = [string]$result.run_dir
+    $root = [System.IO.Path]::GetFullPath($RunsRoot).TrimEnd('\')
+    $full = [System.IO.Path]::GetFullPath($runDir).TrimEnd('\')
+    $leaf = Split-Path -Leaf $full
+    # Exactly one fresh run folder directly under the runs root (the reporter checks it again).
+    if ((Split-Path -Parent $full) -ieq $root -and $leaf -match '^\d{8}-\d{6}$' -and (Test-Path -LiteralPath $full -PathType Container)) {
+        & $Monitor $full | Out-Null
+        $submitted = $true
+    } else {
+        $report = 'RUN_DIR_REFUSED'
+    }
+}
+Write-RunLog ('exit={0} monitor_report={1} submitted={2} withheld={3}' -f $exitCode, $report, $submitted, $reasons)
+exit $exitCode

@@ -110,6 +110,24 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - Status: Manual Trigger only, inactive, MCP-disabled, no saved executions, `googleDriveOAuth2Api` predefined credential type with no binding, no delete. Never called by Claude, the core or another workflow.
 - Focused offline coverage: [tests/test_energygrid_drive_destination_setup_workflow.py](../tests/test_energygrid_drive_destination_setup_workflow.py).
 
+### energygrid_drive_verify.workflow.json
+
+- Purpose: read-only Google-side verification for the Claude-free EnergyGrid daily run (#226 V3 G1, live name `EnergyGrid - Drive Verify`). One authenticated loopback POST carrying only a nonce lists the one fixed flat Drive folder (every page, at most 20) with Google's own `sha256Checksum`, and returns the files unchanged plus completeness flags and the reader account. The EnergyGrid Core alone decides VERIFIED (Google SHA-256 plus exact metadata plus the local mirror).
+- Architecture: Header Auth webhook (`xb-energygrid-drive-verify-v1`, response node) -> proxy-header refusal and strict nonce validation -> Drive `about.get` -> paginated `files.list` of the fixed folder -> assemble -> one response. Every error output answers with a cause-mapped code.
+- Status: source-controlled, inactive, MCP-disabled, no saved executions, credential-free, no webhook id. The folder id ships as the placeholder `REPLACE_WITH_DRIVE_FOLDER_ID`. Credential type `googleDriveOAuth2Api` (n8n 2.39.10 supports `customScopes`); a qualifying existing credential is reused first (C1). Only read-only GETs, which retry at most 3 times.
+- Contract and cutover holds: [native_daily_claude_free.md](../energygrid-bill-downloader/docs/native_daily_claude_free.md).
+- Focused offline coverage: [tests/test_energygrid_drive_verify_workflow.py](../tests/test_energygrid_drive_verify_workflow.py).
+
+### energygrid_owner_email.workflow.json
+
+- Purpose: at most one optional owner email per EnergyGrid notification for the Claude-free daily run (#226 V3 G1, live name `EnergyGrid - Owner Email`). `PROBE` answers readiness, the sender account (OpenID userinfo of the sender credential) and the recipient hash without sending. `SEND` renders subject and body from fixed templates and closed fields, refuses a render digest mismatch with the Core before any send, checks and writes a Data Table claim, then sends once.
+- Delivery authority: the EnergyGrid Core's durable seal and outbox dispatch marker. The Data Table lookup and insert are not atomic and are secondary evidence only. The Gmail node has no retry and no attribution; recipient and subject prefix are fixed in the workflow and never taken from the request.
+- Status: source-controlled, inactive, MCP-disabled, no saved executions, credential-free, no webhook id. Placeholders: `REPLACE_WITH_SUBJECT_PREFIX`, `REPLACE_WITH_OWNER_RECIPIENT`, `REPLACE_WITH_EMAIL_CLAIM_TABLE_ID`. Credential type `gmailOAuth2` (the Gmail node at 2.39.10 accepts no generic Google credential). No workflow-level error workflow: every failure answers the Core, which owns owner visibility.
+- Contract and cutover holds: [native_daily_claude_free.md](../energygrid-bill-downloader/docs/native_daily_claude_free.md).
+- Focused offline coverage: [tests/test_energygrid_owner_email_workflow.py](../tests/test_energygrid_owner_email_workflow.py).
+
+Committing either file performs no import, activation, execution, Drive read or Gmail send. Import (inactive), credential binding, the Data Table creation, the Cloudflare path exclusion and activation each need separate explicit current-turn approval in #226.
+
 ## Directory Rules
 
 - Do not rename existing workflow files during unrelated work. Existing filenames are canonical and are referenced by tests, README links, and runbooks.

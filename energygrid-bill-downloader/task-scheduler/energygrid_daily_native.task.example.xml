@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Energy@Grid Claude-free daily run - INERT Task Scheduler template (#226 V3 G1).
+
+  This file registers nothing. It is a reviewed shape for a later, separately Owner-approved
+  registration on the owner PC, after the WORK-profile Claude task is disabled and read back
+  (never two writers). Every REPLACE_WITH_* value is private host state and is substituted only
+  in a local copy that is never committed. The template ships Enabled=false.
+
+  Contract (asserted by tests/test_native_daily_scheduler.py):
+  - one daily CalendarTrigger at 11:30 +08:00 (the n8n monitor's report deadline is 14:00 SGT;
+    the Core run is bounded by run_deadline_minutes);
+  - the action is the absolute Windows PowerShell 5.1 path running the installed, admin-write
+    locked runtime\egdaily.ps1 with -File and no arguments: no model, no other command;
+  - the same interactive user, non-elevated (InteractiveToken, LeastPrivilege): the Tenant DPAPI
+    credential (CurrentUser) and Google Drive for desktop exist only in that user's session;
+  - MultipleInstancesPolicy IgnoreNew, plus the Core's own v4 lease;
+  - StartWhenAvailable after a missed start, and a hard ExecutionTimeLimit of PT2H.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Energy@Grid daily bills through the deterministic Core (no model).</Description>
+    <URI>\XB\EnergyGrid Daily Bills Native</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>REPLACE_WITH_START_DATET11:30:00+08:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>REPLACE_WITH_RUN_PRINCIPAL</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>false</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "REPLACE_WITH_EG_HOME\runtime\egdaily.ps1"</Arguments>
+    </Exec>
+  </Actions>
+</Task>

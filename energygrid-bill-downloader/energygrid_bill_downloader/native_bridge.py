@@ -112,6 +112,26 @@ class NativeGmailSettings:
     attach_pdf: bool = False
 
 
+DAILY_SCHEMA = "energygrid.native_daily.v1"
+_HEADER_NAME_RE = re.compile(r"X-[A-Za-z0-9-]{1,60}", re.ASCII)
+
+
+@dataclass(frozen=True)
+class NativeDailySettings:
+    """The Claude-free daily run (docs/native_daily_claude_free.md section 2). n8n is on 127.0.0.1;
+    the webhook paths are fixed in n8n_loopback. The token file holds the existing monitor Header Auth
+    value (C1: one host principal, one credential)."""
+
+    runs_root: Path = field(repr=False)
+    drive_reader_account: str = field(repr=False)
+    n8n_port: int
+    token_file: Path = field(repr=False)
+    header_name: str
+    verify_window_minutes: int
+    verify_poll_seconds: int
+    run_deadline_minutes: int
+
+
 @dataclass(frozen=True)
 class NativeConfig:
     mode: str
@@ -135,6 +155,8 @@ class NativeConfig:
     ceiling_period_days: int | None = None
     # UAT_PORTAL only, optional: the private Tenant Bill source config (tenant_source.py). Absent = UNBOUND.
     tenant_config_path: Path | None = field(default=None, repr=False)
+    # Optional: the Claude-free daily run. Present = Google-side SHA-256 verification is required.
+    daily: NativeDailySettings | None = field(default=None, repr=False)
 
 
 def _closed(value: Any, keys: set[str], label: str) -> dict[str, Any]:
@@ -191,6 +213,8 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
     if type(raw) is not dict or raw.get("schema") != NATIVE_CONFIG_SCHEMA:
         raise ConfigError("native config schema is invalid")
     mode = raw.get("mode")
+    # `daily` is optional in both modes: present selects the Claude-free daily run (n8n verification).
+    common = common | ({"daily"} & set(raw)) if type(raw) is dict else common
     if mode == MODE_UAT_SYNTHETIC:
         data = _closed(raw, common | {"synthetic_root"}, "native config")
     elif mode == MODE_UAT_PORTAL:
@@ -257,6 +281,16 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         portal_config = _private_path(data["portal_config_path"], "portal_config_path", checkout_root)
         if "tenant_config_path" in data:
             tenant_config = _private_path(data["tenant_config_path"], "tenant_config_path", checkout_root)
+    daily = None
+    if "daily" in data:
+        daily = _daily_settings(data["daily"], checkout_root)
+        # One fixed Drive Verify folder and a Core-written synced copy (section 2 of the daily doc).
+        if drive_mode != DRIVE_LOCAL_SYNC:
+            raise ConfigError("daily needs drive.mode LOCAL_SYNC")
+        if folders["EB_BILL"] != folders["TENANT_BILL"]:
+            raise ConfigError("daily needs one Drive folder for both streams")
+        if attach_pdf:
+            raise ConfigError("daily needs gmail.attach_pdf false")
     return NativeConfig(
         mode=mode,
         drive=NativeDriveSettings(account=_email(drive_raw["account"], "drive.account"), folder_ids=folders,
@@ -272,7 +306,39 @@ def load_native_config(raw: Any, *, checkout_root: Path | tuple[Path, ...] | Non
         synthetic_root=synthetic_root,
         portal_config_path=portal_config,
         tenant_config_path=tenant_config,
+        daily=daily,
         **paths,
+    )
+
+
+def _bounded_int(value: Any, label: str, low: int, high: int) -> int:
+    if type(value) is not int or not low <= value <= high:
+        raise ConfigError(f"{label} must be an integer from {low} to {high}")
+    return value
+
+
+def _daily_settings(value: Any, checkout_root: Path | tuple[Path, ...] | None) -> NativeDailySettings:
+    raw = _closed(value, {"schema", "runs_root", "drive_reader_account", "n8n", "verify_window_minutes",
+                          "verify_poll_seconds", "run_deadline_minutes"}, "daily")
+    if raw["schema"] != DAILY_SCHEMA:
+        raise ConfigError("daily.schema is invalid")
+    n8n = _closed(raw["n8n"], {"port", "token_file", "header_name"}, "daily.n8n")
+    header = n8n["header_name"]
+    if type(header) is not str or not _HEADER_NAME_RE.fullmatch(header):
+        raise ConfigError("daily.n8n.header_name is invalid")
+    window = _bounded_int(raw["verify_window_minutes"], "daily.verify_window_minutes", 1, 60)
+    deadline = _bounded_int(raw["run_deadline_minutes"], "daily.run_deadline_minutes", 10, 150)
+    if window >= deadline:
+        raise ConfigError("daily.verify_window_minutes must be shorter than daily.run_deadline_minutes")
+    return NativeDailySettings(
+        runs_root=_private_path(raw["runs_root"], "daily.runs_root", checkout_root),
+        drive_reader_account=_email(raw["drive_reader_account"], "daily.drive_reader_account"),
+        n8n_port=_bounded_int(n8n["port"], "daily.n8n.port", 1, 65535),
+        token_file=_private_path(n8n["token_file"], "daily.n8n.token_file", checkout_root),
+        header_name=header,
+        verify_window_minutes=window,
+        verify_poll_seconds=_bounded_int(raw["verify_poll_seconds"], "daily.verify_poll_seconds", 15, 300),
+        run_deadline_minutes=deadline,
     )
 
 
@@ -820,6 +886,37 @@ CREATE TRIGGER IF NOT EXISTS drive_hash_provenance_no_update BEFORE UPDATE ON dr
 BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
 CREATE TRIGGER IF NOT EXISTS drive_hash_provenance_no_delete BEFORE DELETE ON drive_hash_provenance
 BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TABLE IF NOT EXISTS drive_remote_listing (
+  nonce TEXT PRIMARY KEY CHECK (length(nonce)=32 AND nonce NOT GLOB '*[^0-9a-f]*'),
+  folder_id TEXT NOT NULL CHECK (length(folder_id) BETWEEN 10 AND 200),
+  listing_sha256 TEXT NOT NULL CHECK (length(listing_sha256)=64 AND listing_sha256 NOT GLOB '*[^0-9a-f]*'),
+  file_count INTEGER NOT NULL CHECK (file_count >= 0),
+  obtained_at TEXT NOT NULL CHECK (length(obtained_at)=20)
+);
+CREATE TABLE IF NOT EXISTS drive_remote_attestation (
+  intent_id TEXT PRIMARY KEY CHECK (length(intent_id) BETWEEN 8 AND 128),
+  file_id TEXT NOT NULL CHECK (length(file_id) BETWEEN 1 AND 200),
+  sha256 TEXT NOT NULL CHECK (length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+  byte_size INTEGER NOT NULL CHECK (byte_size > 0),
+  listing_nonce TEXT NOT NULL REFERENCES drive_remote_listing(nonce),
+  recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS remote_verify_policy (
+  policy TEXT PRIMARY KEY CHECK (policy='GOOGLE_SHA256_REQUIRED'),
+  latched_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS drive_remote_listing_no_update BEFORE UPDATE ON drive_remote_listing
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS drive_remote_listing_no_delete BEFORE DELETE ON drive_remote_listing
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS drive_remote_attestation_no_update BEFORE UPDATE ON drive_remote_attestation
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS drive_remote_attestation_no_delete BEFORE DELETE ON drive_remote_attestation
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS remote_verify_policy_no_update BEFORE UPDATE ON remote_verify_policy
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
+CREATE TRIGGER IF NOT EXISTS remote_verify_policy_no_delete BEFORE DELETE ON remote_verify_policy
+BEGIN SELECT RAISE(ABORT,'EG_NATIVE_PROVENANCE_IMMUTABLE'); END;
 """
 
 
@@ -864,6 +961,224 @@ def hash_provenance(cfg: NativeConfig | None, intent_id: str) -> str:
             return HASH_UNRECORDED
         row = connection.execute("SELECT method FROM drive_hash_provenance WHERE intent_id=?", (intent_id,)).fetchone()
     return row[0] if row is not None else HASH_UNRECORDED
+
+
+# ---------------------------------------------------------------------------
+# Google-side verification for the Claude-free daily run (C2, C3)
+#
+# Drive Verify (n8n) lists the one fixed folder completely and returns Google's own metadata,
+# including sha256Checksum. The Core alone decides: a listing is recorded write-once (outbox file
+# plus a digest row) and later steps name it by nonce, so no step trusts host-written evidence.
+# VERIFIED needs Google's SHA-256 equal to the Core hash plus the exact local mirror; md5 or size
+# alone never verify. Once a state has run with `daily`, the policy is latched in the provenance
+# store and every config that opens the state must verify remotely.
+# ---------------------------------------------------------------------------
+
+REMOTE_POLICY = "GOOGLE_SHA256_REQUIRED"
+REMOTE_ATTESTED = "GOOGLE_SHA256"
+LISTING_REQUEST_SCHEMA = "energygrid.drive_verify.request.v1"
+LISTING_RESPONSE_SCHEMA = "energygrid.drive_verify.response.v1"
+MAX_LISTING_FILES = 5000
+MAX_LISTING_PAGES = 20
+# A precheck or adoption listing older than this is stale; a record listing must postdate the seal.
+LISTING_FRESH_MS = 15 * 60_000
+_NONCE_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_LISTING_FILE_KEYS = {"id", "name", "mimeType", "parents", "size", "sha256Checksum", "md5Checksum", "trashed",
+                      "shortcutDetails"}
+_LISTING_KEYS = {"schema", "nonce", "folder_id", "reader_account", "complete", "pages", "incomplete_search",
+                 "next_page_token_present", "files"}
+
+
+def new_nonce() -> str:
+    return uuid.uuid4().hex
+
+
+def remote_policy_latched(cfg: NativeConfig) -> bool:
+    """True once this state has run with `daily` (append-only latch in the provenance store). Reads only."""
+    with _provenance(cfg, create=False) as connection:
+        if connection is None:
+            return False
+        return connection.execute("SELECT 1 FROM remote_verify_policy WHERE policy=?", (REMOTE_POLICY,)).fetchone() is not None
+
+
+def remote_required(cfg: NativeConfig) -> bool:
+    """Google-side verification is required: the config has `daily`, or the state was latched by it."""
+    return cfg.daily is not None or remote_policy_latched(cfg)
+
+
+def latch_remote_policy(cfg: NativeConfig, now_iso: str) -> None:
+    """Write-once: from now on this state needs Google-side verification under every config."""
+    with _provenance(cfg, create=True) as connection:
+        connection.execute("INSERT OR IGNORE INTO remote_verify_policy (policy, latched_at) VALUES (?,?)",
+                           (REMOTE_POLICY, now_iso))
+
+
+def _require_classic(cfg: NativeConfig, support_ref: str) -> None:
+    """Refuse a host-attested (Claude bridge) command once Google-side verification is required."""
+    if remote_required(cfg):
+        raise NativeRefusal(support_ref)
+
+
+def _daily_folder(cfg: NativeConfig) -> str:
+    # load_native_config guarantees one folder for both streams when `daily` is set; a latched state
+    # opened by another config must still name one folder.
+    folders = set(cfg.drive.folder_ids.values())
+    if len(folders) != 1:
+        raise NativeRefusal("EG_DRIVE_REMOTE_FOLDER_NOT_SINGLE")
+    return next(iter(folders))
+
+
+def _listing_file(item: Any, folder: str) -> dict:
+    if type(item) is not dict or not set(item) <= _LISTING_FILE_KEYS or not {"id", "name", "mimeType", "parents"} <= set(item):
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    name, parents = item["name"], item["parents"]
+    if (type(item["id"]) is not str or not _PROVIDER_ID_RE.fullmatch(item["id"])
+            or type(name) is not str or not 1 <= len(name) <= 1024 or type(item["mimeType"]) is not str
+            or type(parents) is not list or not all(type(parent) is str for parent in parents) or folder not in parents):
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    if "size" in item and (type(item["size"]) is not str or not item["size"].isdigit()):
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    if "sha256Checksum" in item and (type(item["sha256Checksum"]) is not str
+                                     or not _SHA256_RE.fullmatch(item["sha256Checksum"])):
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    if "trashed" in item and type(item["trashed"]) is not bool:
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    return item
+
+
+def _listing_path(cfg: NativeConfig, nonce: str) -> Path:
+    return _outbox(cfg) / f"{nonce}.drive-listing.json"
+
+
+def record_remote_listing(cfg: NativeConfig, nonce: str, response: Any, now_iso: str) -> dict:
+    """Accept one Drive Verify answer for `nonce` and record it write-once. Returns the listing.
+
+    Refused (EXIT_RETRY, nothing recorded) unless it is complete, echoes the nonce, names the configured
+    folder and the configured reader account, and every file is well-formed and in the folder."""
+    if cfg.daily is None or type(nonce) is not str or not _NONCE_RE.fullmatch(nonce):
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID")
+    folder = _daily_folder(cfg)
+    if type(response) is not dict or set(response) != _LISTING_KEYS:
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    files = response["files"]
+    reader = response["reader_account"]
+    pages = response["pages"]
+    if (response["schema"] != LISTING_RESPONSE_SCHEMA or response["nonce"] != nonce
+            or response["folder_id"] != folder or type(reader) is not str
+            or reader.lower() != cfg.daily.drive_reader_account.lower()
+            or type(pages) is not int or not 1 <= pages <= MAX_LISTING_PAGES
+            or type(files) is not list or len(files) > MAX_LISTING_FILES):
+        raise NativeRefusal("EG_DRIVE_LISTING_INVALID", exit_code=EXIT_RETRY)
+    if (response["complete"] is not True or response["incomplete_search"] is not False
+            or response["next_page_token_present"] is not False):
+        # An incomplete listing can never prove absence or uniqueness.
+        raise NativeRefusal("EG_DRIVE_LISTING_INCOMPLETE", exit_code=EXIT_RETRY)
+    listing = {"schema": LISTING_RESPONSE_SCHEMA, "nonce": nonce, "folder_id": folder,
+               "files": [_listing_file(item, folder) for item in files], "obtained_at": now_iso}
+    data = json.dumps(listing, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    path = _listing_path(cfg, nonce)
+    with open(path, "xb") as handle:  # a nonce is used once; an existing file is never replaced
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with _provenance(cfg, create=True) as connection:
+        connection.execute(
+            "INSERT INTO drive_remote_listing (nonce, folder_id, listing_sha256, file_count, obtained_at) "
+            "VALUES (?,?,?,?,?)", (nonce, folder, digest, len(files), now_iso))
+    return listing
+
+
+def load_remote_listing(cfg: NativeConfig, nonce: Any) -> dict:
+    """A listing this Core recorded: the outbox file must still hash to its recorded digest. Reads only."""
+    if type(nonce) is not str or not _NONCE_RE.fullmatch(nonce):
+        raise NativeRefusal("EG_DRIVE_LISTING_UNKNOWN")
+    with _provenance(cfg, create=False) as connection:
+        row = None if connection is None else connection.execute(
+            "SELECT folder_id, listing_sha256, obtained_at FROM drive_remote_listing WHERE nonce=?", (nonce,)).fetchone()
+    if row is None:
+        raise NativeRefusal("EG_DRIVE_LISTING_UNKNOWN")
+    try:
+        path = cfg.outbox_root / f"{nonce}.drive-listing.json"
+        ensure_no_reparse_components(path)
+        data = path.read_bytes()
+    except (AppError, OSError):
+        raise NativeRefusal("EG_DRIVE_LISTING_UNKNOWN") from None
+    if hashlib.sha256(data).hexdigest() != row[1]:
+        raise NativeRefusal("EG_DRIVE_LISTING_TAMPERED")
+    listing = json.loads(data.decode("utf-8"))
+    if listing.get("nonce") != nonce or listing.get("folder_id") != row[0] or listing.get("obtained_at") != row[2]:
+        raise NativeRefusal("EG_DRIVE_LISTING_TAMPERED")
+    return listing
+
+
+def name_occupants(listing: dict, title: str) -> list[dict]:
+    """Every listed file whose name has the invoice's display key (NFC, casefold): shortcuts, other types
+    and other letter cases occupy the name too."""
+    from .naming import display_key
+
+    key = display_key(title)
+    return [item for item in listing["files"] if display_key(item["name"]) == key]
+
+
+def remote_verdict(cfg: NativeConfig, invoice: dict, item: dict) -> str:
+    """Google's view of the one occupant: MATCH, PENDING (no SHA-256 or size yet) or MISMATCH."""
+    folder = cfg.drive.folder_ids[invoice["stream"]]
+    if (item["name"] != invoice["display_filename"] or item["parents"] != [folder] or item["mimeType"] != PDF_MIME
+            or item.get("trashed") is True or "shortcutDetails" in item):
+        return "MISMATCH"
+    sha, size = item.get("sha256Checksum"), item.get("size")
+    if sha is None or size is None:
+        return "PENDING"
+    return "MATCH" if sha == invoice["sha256"] and size == str(invoice["byte_size"]) else "MISMATCH"
+
+
+def _listing_evidence(cfg: NativeConfig, evidence: dict, keys: set[str], folder: str, *, now_ms: int,
+                      not_before_iso: str | None = None) -> dict:
+    """The recorded listing named by remote-mode evidence. Fresh for a precheck or adoption; obtained at or
+    after the seal for a record or late release."""
+    if cfg.drive.mode != DRIVE_LOCAL_SYNC:
+        # Google-side verification is defined for the Core-written synced copy only.
+        raise NativeRefusal("EG_DRIVE_REMOTE_NEEDS_LOCAL_SYNC")
+    if type(evidence) is not dict or set(evidence) != keys:
+        raise NativeRefusal("EG_DRIVE_REMOTE_VERIFY_REQUIRED")
+    listing = load_remote_listing(cfg, evidence.get("listing_nonce"))
+    if listing["folder_id"] != folder:
+        raise NativeRefusal("EG_DRIVE_LISTING_FOLDER_MISMATCH")
+    obtained = ms_from_iso(listing["obtained_at"])
+    if not_before_iso is None:
+        if not now_ms - LISTING_FRESH_MS <= obtained <= now_ms + 120_000:
+            raise NativeRefusal("EG_DRIVE_LISTING_STALE", exit_code=EXIT_RETRY)
+    elif obtained < ms_from_iso(not_before_iso):
+        raise NativeRefusal("EG_DRIVE_LISTING_BEFORE_SEAL", exit_code=EXIT_RETRY)
+    return listing
+
+
+def _record_remote_attestation(cfg: NativeConfig, intent_id: str, item: dict, invoice: dict, nonce: str,
+                               now_iso: str) -> None:
+    """Write-once, before the provenance row and the receipt: Google's SHA-256 for this intent's file."""
+    with _provenance(cfg, create=True) as connection:
+        existing = connection.execute(
+            "SELECT file_id, sha256 FROM drive_remote_attestation WHERE intent_id=?", (intent_id,)).fetchone()
+        if existing is not None:
+            if tuple(existing) != (item["id"], invoice["sha256"]):
+                raise NativeRefusal("EG_DRIVE_REMOTE_ATTESTATION_CONFLICT")
+            return
+        connection.execute(
+            "INSERT INTO drive_remote_attestation (intent_id, file_id, sha256, byte_size, listing_nonce, recorded_at) "
+            "VALUES (?,?,?,?,?,?)", (intent_id, item["id"], invoice["sha256"], invoice["byte_size"], nonce, now_iso))
+
+
+def remote_attestation(cfg: NativeConfig | None, intent_id: str) -> str | None:
+    """GOOGLE_SHA256 when a Google-side attestation exists for the intent, else None. Reads only."""
+    if cfg is None:
+        return None
+    with _provenance(cfg, create=False) as connection:
+        if connection is None:
+            return None
+        row = connection.execute("SELECT 1 FROM drive_remote_attestation WHERE intent_id=?", (intent_id,)).fetchone()
+    return REMOTE_ATTESTED if row is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1061,8 +1376,11 @@ def acquire(state, cfg: NativeConfig, adapters: dict[str, Any], *, run_id: str, 
                    acquisition=acquisition, named_archive=named)
 
 
-def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
-    """Plan the next native step (no seal): a Drive step first, otherwise one pending notification."""
+def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int, plan_notifications: bool = True) -> dict:
+    """Plan the next native step (no seal): a Drive step first, otherwise one pending notification.
+
+    plan_notifications=False (daily run, owner email unavailable this run) leaves every notification
+    PENDING and plans the next Drive reconcile instead, so an email outage never blocks Drive work."""
     from . import native_notify
     from .orchestration import _v4_rotated
     from .state import V4_STREAMS
@@ -1116,8 +1434,10 @@ def next_step(state, cfg: NativeConfig, *, run_id: str, now_ms: int) -> dict:
                 sha256=invoice["sha256"], drive_account=cfg.drive.account, folder_id=folder,
                 precheck_query=drive_title_query(folder, invoice["display_filename"]), **extra,
             )
-        with _notification_store(cfg) as store:
-            packet = native_notify.plan(store, cfg, lambda key: _archive_payload(state, cfg, key), now_iso)
+        packet = None
+        if plan_notifications:
+            with _notification_store(cfg) as store:
+                packet = native_notify.plan(store, cfg, lambda key: _archive_payload(state, cfg, key), now_iso)
         reconcile = None
         for stream in _v4_rotated(V4_STREAMS, state.cursor()):
             found = reconcile_candidate(state, cfg, stream)
@@ -1150,17 +1470,24 @@ def drive_seal(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_
 
     evidence: {"folder_id": <id searched>, "title": <title searched>, "query": <the exact precheck_query
                from `next`>, "complete": true, "matches": [{"id": ..., "title": ..., "parentId": ...}, ...]}
+    When Google-side verification is required: {"listing_nonce": <a fresh listing this Core recorded>}.
     """
     intent_id = _check_intent_id(intent_id)
     now_iso = _iso(now_ms)
     with _session(state, now_ms, cfg):
         _intent, invoice = _current_step(state, intent_id, "DRIVE_UPLOAD")
         folder = cfg.drive.folder_ids[invoice["stream"]]
-        matches = evidence.get("matches")
-        if (evidence.get("folder_id") != folder or evidence.get("title") != invoice["display_filename"]
-                or evidence.get("query") != drive_title_query(folder, invoice["display_filename"])
-                or evidence.get("complete") is not True or type(matches) is not list):
-            raise NativeRefusal("EG_NATIVE_PRECHECK_EVIDENCE_INVALID")
+        if remote_required(cfg):
+            # C3: occupancy from a complete fixed-folder listing; the Core alone applies the name rules.
+            listing = _listing_evidence(cfg, evidence, {"listing_nonce"}, folder, now_ms=now_ms)
+            matches = [{"id": item["id"], "title": item["name"], "parentId": folder}
+                       for item in name_occupants(listing, invoice["display_filename"])]
+        else:
+            matches = evidence.get("matches")
+            if (evidence.get("folder_id") != folder or evidence.get("title") != invoice["display_filename"]
+                    or evidence.get("query") != drive_title_query(folder, invoice["display_filename"])
+                    or evidence.get("complete") is not True or type(matches) is not list):
+                raise NativeRefusal("EG_NATIVE_PRECHECK_EVIDENCE_INVALID")
         _check_ceiling(state, cfg, "DRIVE_UPLOAD", now_ms)
         payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
         if payload is None:
@@ -1251,6 +1578,8 @@ def _readback(state, cfg: NativeConfig, intent_id: str, kind: str, provider_id: 
 
 
 def drive_readback(state, cfg: NativeConfig, intent_id: str, file_id: str, encoded_path: Path) -> dict:
+    # Host-supplied bytes are not Google-side evidence; the daily run never uses them.
+    _require_classic(cfg, "EG_DAILY_READBACK_DISABLED")
     return _readback(state, cfg, intent_id, "drive", file_id, encoded_path)
 
 
@@ -1295,6 +1624,8 @@ def drive_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
     with _session(state, now_ms, cfg):
         _intent, invoice = _dispatched_intent(state, intent_id, "DRIVE_UPLOAD")
         outcome = _provider_outcome(evidence, "CREATED")
+        if remote_required(cfg):
+            return _remote_record(state, cfg, invoice, intent_id, evidence, outcome, run_id=run_id, now_ms=now_ms)
         if outcome == "DENIED":
             result = state.record_receipt(intent_id, outcome="REJECTED", provider_ref="gdrive:denied",
                                           provider_sha256="", run_id=run_id, now_iso=now_iso)
@@ -1343,6 +1674,51 @@ def drive_record(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, ru
                    intent_id=intent_id, provider_ref=provider_ref)
 
 
+def _remote_record(state, cfg: NativeConfig, invoice: dict, intent_id: str, evidence: dict, outcome: str, *,
+                   run_id: str, now_ms: int) -> dict:
+    """drive-record when Google-side verification is required (inside the caller's session).
+
+    The file is taken from a listing obtained at or after the seal, never from host text. Nothing is
+    written unless exactly one file occupies the name: none yet, or Google's SHA-256 not yet available,
+    is a retry; two or more is refused for an operator, as host rule P1 did. One occupant that is not
+    exactly ours (or whose Google SHA-256 differs) is REJECTED. A match is VERIFIED only with the exact
+    local mirror; the Google attestation is written before the provenance row and the receipt."""
+    now_iso = _iso(now_ms)
+    if outcome != "CREATED":
+        # The Core wrote the synced file itself; there is no provider call to have been denied or lost.
+        raise NativeRefusal("EG_DRIVE_REMOTE_OUTCOME_INVALID")
+    folder = cfg.drive.folder_ids[invoice["stream"]]
+    sealed_at = state.dispatch_row(intent_id)["sealed_at_utc"]
+    listing = _listing_evidence(cfg, evidence, {"outcome", "listing_nonce"}, folder, now_ms=now_ms,
+                                not_before_iso=sealed_at)
+    occupants = name_occupants(listing, invoice["display_filename"])
+    if not occupants:
+        raise NativeRefusal("EG_DRIVE_REMOTE_FILE_NOT_LISTED", exit_code=EXIT_RETRY)
+    if len(occupants) > 1:
+        raise NativeRefusal("EG_DRIVE_REMOTE_NAME_NOT_UNIQUE")
+    item = occupants[0]
+    provider_ref = "gdrive:" + item["id"]
+    verdict = remote_verdict(cfg, invoice, item)
+    if verdict == "PENDING":
+        raise NativeRefusal("EG_DRIVE_REMOTE_SHA256_UNAVAILABLE", exit_code=EXIT_RETRY)
+    mirror = _local_mirror_verdict(cfg, invoice) if verdict == "MATCH" else False
+    if mirror is None:
+        raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+    if verdict != "MATCH" or mirror is not True:
+        result = state.record_receipt(intent_id, outcome="REJECTED", provider_ref=provider_ref, provider_sha256="",
+                                      run_id=run_id, now_iso=now_iso)
+        _sweep_notifications(state, cfg, now_iso)
+        return _result("drive-record", result, EXIT_HOLD, intent_id=intent_id,
+                       support_ref="EG_DRIVE_REMOTE_MISMATCH")
+    _record_remote_attestation(cfg, intent_id, item, invoice, listing["nonce"], now_iso)
+    _record_provenance(cfg, intent_id, HASH_LOCAL_MIRROR, invoice["sha256"], provider_ref, now_iso)
+    result = state.record_receipt(intent_id, outcome="VERIFIED", provider_ref=provider_ref,
+                                  provider_sha256=invoice["sha256"], run_id=run_id, now_iso=now_iso)
+    _sweep_notifications(state, cfg, now_iso)
+    return _result("drive-record", result, EXIT_OK if result in ("VERIFIED", "REPLAY") else EXIT_HOLD,
+                   intent_id=intent_id, provider_ref=provider_ref, remote_attestation=REMOTE_ATTESTED)
+
+
 def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run_id: str, now_ms: int) -> dict:
     """Adopt the one existing same-name Drive file as this invoice's upload, only with identical bytes.
 
@@ -1354,6 +1730,8 @@ def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run
     now_iso = _iso(now_ms)
     with _session(state, now_ms, cfg):
         _intent, invoice = _current_step(state, intent_id, "DRIVE_UPLOAD")
+        if remote_required(cfg):
+            return _remote_adopt(state, cfg, invoice, intent_id, evidence, run_id=run_id, now_ms=now_ms)
         file = evidence.get("file")
         if type(file) is not dict or type(file.get("id")) is not str or not _PROVIDER_ID_RE.fullmatch(file["id"]):
             raise NativeRefusal("EG_NATIVE_DRIVE_EVIDENCE_INVALID")
@@ -1396,6 +1774,52 @@ def drive_adopt(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, run
         _sweep_notifications(state, cfg, now_iso)
     return _result("drive-adopt", "ADOPTED" if result == "VERIFIED" else result,
                    EXIT_OK if result == "VERIFIED" else EXIT_HOLD, intent_id=intent_id, provider_ref="gdrive:" + file["id"])
+
+
+def _remote_adopt(state, cfg: NativeConfig, invoice: dict, intent_id: str, evidence: dict, *, run_id: str,
+                  now_ms: int) -> dict:
+    """drive-adopt when Google-side verification is required (inside the caller's session).
+
+    The one existing same-name file is adopted only when Google's SHA-256, its exact metadata and the
+    local mirror all match: no upload, so no duplicate. Google's SHA-256 not yet available is a retry
+    with no state change; anything else that differs HOLDs the intent and nothing is overwritten."""
+    now_iso = _iso(now_ms)
+    folder = cfg.drive.folder_ids[invoice["stream"]]
+    listing = _listing_evidence(cfg, evidence, {"listing_nonce"}, folder, now_ms=now_ms)
+    occupants = name_occupants(listing, invoice["display_filename"])
+    verdict = remote_verdict(cfg, invoice, occupants[0]) if len(occupants) == 1 else "MISMATCH"
+    if not occupants:
+        # The name is free after all: nothing to adopt. `next` offers a fresh precheck.
+        raise NativeRefusal("EG_DRIVE_REMOTE_FILE_NOT_LISTED", exit_code=EXIT_RETRY)
+    if verdict == "PENDING":
+        raise NativeRefusal("EG_DRIVE_REMOTE_SHA256_UNAVAILABLE", exit_code=EXIT_RETRY)
+    payload = _verified_payload(state, cfg, intent_id, invoice, run_id, now_iso)
+    if payload is None:
+        return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id,
+                       support_ref=state.intent(intent_id)["support_ref"])
+    outcome, reference = _ensure_named_archive(state, cfg, invoice, intent_id, payload, run_id, now_iso)
+    if outcome == "UNAVAILABLE":
+        raise NativeRefusal(reference)
+    if outcome == "HOLD":
+        return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id, support_ref=reference)
+    mirror = _local_mirror_verdict(cfg, invoice) if verdict == "MATCH" else False
+    if mirror is None:
+        raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED", exit_code=EXIT_RETRY)
+    if verdict != "MATCH" or mirror is not True:
+        state.hold_pending(intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED", run_id=run_id, now_iso=now_iso)
+        return _result("drive-adopt", "HOLD", EXIT_HOLD, intent_id=intent_id, support_ref="EG_NATIVE_DRIVE_NAME_OCCUPIED")
+    item = occupants[0]
+    provider_ref = "gdrive:" + item["id"]
+    state.assert_lease_held()
+    _record_remote_attestation(cfg, intent_id, item, invoice, listing["nonce"], now_iso)
+    _record_provenance(cfg, intent_id, HASH_LOCAL_MIRROR, invoice["sha256"], provider_ref, now_iso)
+    state.seal_dispatch(intent_id, run_id=run_id, now_iso=now_iso)
+    result = state.record_receipt(intent_id, outcome="VERIFIED", provider_ref=provider_ref,
+                                  provider_sha256=invoice["sha256"], run_id=run_id, now_iso=now_iso)
+    _sweep_notifications(state, cfg, now_iso)
+    return _result("drive-adopt", "ADOPTED" if result == "VERIFIED" else result,
+                   EXIT_OK if result == "VERIFIED" else EXIT_HOLD, intent_id=intent_id, provider_ref=provider_ref,
+                   remote_attestation=REMOTE_ATTESTED)
 
 
 def _exact_drive_metadata(cfg: NativeConfig, invoice: dict, file: Any) -> bool:
@@ -1443,6 +1867,24 @@ def hold_release(state, cfg: NativeConfig, intent_id: str, evidence: dict, *, re
                                         evidence_sha256=evidence_sha, run_id=run_id, now_iso=now_iso)
             # One owner notice, staged for the normal draft/seal/send pipeline (never sent from here). The
             # sweep derives it from the audit row, so a crash right after the release is healed by the next run.
+            _sweep_notifications(state, cfg, now_iso)
+        elif mode == "LATE_EVIDENCE" and remote_required(cfg):
+            if reason_code != "LATE_EVIDENCE_VERIFIED" or state.dispatch_row(intent_id) is None:
+                raise NativeRefusal("EG_V5_RELEASE_WITHOUT_EVIDENCE")
+            # C2: the same Google-side proof as drive-record, from a listing obtained after the seal.
+            folder = cfg.drive.folder_ids[invoice["stream"]]
+            listing = _listing_evidence(cfg, evidence, {"mode", "listing_nonce"}, folder, now_ms=now_ms,
+                                        not_before_iso=state.dispatch_row(intent_id)["sealed_at_utc"])
+            occupants = name_occupants(listing, invoice["display_filename"])
+            if (len(occupants) != 1 or remote_verdict(cfg, invoice, occupants[0]) != "MATCH"
+                    or _local_mirror_verdict(cfg, invoice) is not True):
+                raise NativeRefusal("EG_NATIVE_DRIVE_READBACK_REQUIRED")
+            provider_ref = "gdrive:" + occupants[0]["id"]
+            _record_remote_attestation(cfg, intent_id, occupants[0], invoice, listing["nonce"], now_iso)
+            _record_provenance(cfg, intent_id, HASH_LOCAL_MIRROR, invoice["sha256"], provider_ref, now_iso)
+            result = state.hold_release(intent_id, to_state="VERIFIED", reason_code=reason_code, operator=operator,
+                                        evidence_sha256=evidence_sha, run_id=run_id, now_iso=now_iso,
+                                        provider_ref=provider_ref, provider_sha256=invoice["sha256"])
             _sweep_notifications(state, cfg, now_iso)
         elif mode == "LATE_EVIDENCE":
             if reason_code != "LATE_EVIDENCE_VERIFIED" or state.dispatch_row(intent_id) is None:
@@ -1498,6 +1940,8 @@ def stream_report(state, cfg: NativeConfig | None = None, now_ms: int | None = N
                 "drive_upload": {"state": drive["state"], "support_ref": drive["support_ref"],
                                  "receipt": "gdrive:" + file_id if file_id else None,
                                  "hash_provenance": hash_provenance(cfg, drive["intent_id"])
+                                 if drive["state"] == "VERIFIED" else None,
+                                 "remote_attestation": remote_attestation(cfg, drive["intent_id"])
                                  if drive["state"] == "VERIFIED" else None},
             })
         report[stream] = {
@@ -1548,4 +1992,5 @@ def status(state, cfg: NativeConfig | None = None, now_ms: int | None = None) ->
         "status", overall, EXIT_OK if overall != "BLOCKED" else EXIT_HOLD, streams=report,
         notifications=notifications, ceiling=ceiling,
         effects={"drive_dispatches": state.dispatch_count("DRIVE_UPLOAD"), "gmail_dispatches": gmail_dispatches},
+        remote_verify={"required": remote_required(cfg)} if cfg is not None else None,
     )
