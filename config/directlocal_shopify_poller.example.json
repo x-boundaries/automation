@@ -1,0 +1,22 @@
+{
+  "schema": "xb.directlocal.shopify_poller.config.v1",
+  "state_root": "C:\\XB\\xb155-directlocal-poller",
+  "store_gid": "gid://shopify/Shop/48759472277",
+  "shop_domain": "xboundariessg.myshopify.com",
+  "api_version": "2026-07",
+  "auth": {
+    "method": "client_credentials",
+    "client_id_env": "XB_SHOPIFY_POLLER_CLIENT_ID",
+    "client_secret_env": "XB_SHOPIFY_POLLER_CLIENT_SECRET"
+  },
+  "autocount_write_mode": "none",
+  "profile_reads_enabled": false,
+  "profile_discovered_since": null,
+  "max_profile_reads_per_run": 10,
+  "profile_retry_seconds": 100,
+  "full_scan_interval_hours": 24,
+  "recent_max_pages": 40,
+  "full_scan_max_pages": 200,
+  "http_timeout_seconds": 30,
+  "max_run_seconds": 480
+}

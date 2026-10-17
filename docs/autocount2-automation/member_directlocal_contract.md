@@ -62,6 +62,7 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
 | `scripts/ac2_directlocal_owner_console.ps1` | Owner console for `BookCheck`, `PosSyncStatus`, `Process`, `Reconcile` |
 | `scripts/directlocal_connector_hook.py` | `guard` (PreToolUse default-deny for MCP) and `capture` (PostToolUse inbox writer) |
 | `config/directlocal_claude_settings.template.json` | Dedicated-session settings template (deny list + hooks) |
+| `directlocal/xb_shopify_direct.py`, `directlocal/xb_shopify_poller.py` | Claude-free read-only Shopify poller (E8 source; no AutoCount route): [poller contract](member_directlocal_shopify_poller.md) |
 | `tests/test_member_directlocal*.py`, `tests/test_directlocal_*_ps.py` | Offline tests |
 
 ## Capture provenance and shapes
@@ -82,6 +83,13 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
   `next-request` until `purge-inbox` removes it.
 - Residual risk: the hook is not tamper-proof against an agent running as the
   same Windows user; acceptable only for attended operation.
+- Direct HTTP (E8, 2026-10-17): the Claude-free poller writes the same pinned
+  queries as `shopify_admin_graphql_direct_http_v1` records (schema
+  `xb.directlocal.capture.direct_http.v1`, ids `xbdh-...`, response exactly
+  `{"data": {...}}`). Hook records cannot use that id namespace. A run seals
+  only with one provenance matching its recorded origin (direct pages only in
+  a run begun with `origin=direct_http_poller_v1`). No schema change (v4).
+  Details: [poller contract](member_directlocal_shopify_poller.md).
 
 ## Registration event (G0, 2026-10-15, read-only)
 
@@ -412,5 +420,5 @@ this security qualification; no credential exposure is asserted.
 | E7 | One synthetic `SaveMember` on the test book | Consumed 2026-10-15; never replayed |
 | E7b | One attended real-registration create on the test book | `CREATED_VERIFIED` 2026-10-16 (operator-reported; one `SaveMember`); security-qualified by A2 |
 | A2 host | Protected runtime checkout and all-users interpreter for the Owner console | Owner host decision; not granted. Blocks every further credential-bearing run |
-| E8 | Unattended scheduling / standing policy activation | Needs approval, an unattended Shopify source (see runbook) and the A2 host custody |
+| E8 | Unattended scheduling / standing policy activation | Claude-free read-only poller source and disabled task template ready (offline-tested, 2026-10-17). Live Shopify app/credential, live reads, task activation and any unattended write each need approval; writes also need a non-interactive AutoCount credential mechanism and the A2 host custody |
 | E9 | Production book (`AED_XBOUNDARIES`) source enablement, create and POS visibility | Needs a source change, approval, the A2 host custody and a qualified numbering counter; required for the POS acceptance |

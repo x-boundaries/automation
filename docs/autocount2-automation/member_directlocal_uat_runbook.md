@@ -274,6 +274,11 @@ attended UAT but not for unattended, immediate production:
 | Scheduled Claude session running the same loop | interval + session start | Approve scheduling and unattended model-mediated PII | No new credential; slower and less private |
 | Shopify Flow `Send HTTP request` (Grow plan qualifies) to the VM | seconds | Flow change and a public HTTPS ingress | Adds a listener; not proposed |
 
+Chosen (Owner, #155:6234660572): the local poller. Its source, offline tests,
+disabled task template, rollback and the next live read-only approval steps
+are in [member_directlocal_shopify_poller.md](member_directlocal_shopify_poller.md).
+It has no AutoCount write mode.
+
 POS: with HQ creation in about 1-2 minutes, end-to-end latency is dominated by
 the outlet's 15-minute sync interval. Shortening it is an outlet POS setting
 (Owner decision).
