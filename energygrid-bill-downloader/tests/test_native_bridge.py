@@ -1368,16 +1368,28 @@ class TenantBindingTests(unittest.TestCase):
     def test_the_tenant_source_binds_tenant_bill_without_touching_eb(self) -> None:
         from energygrid_bill_downloader import native_cli
         from energygrid_bill_downloader.invoice import DirectHttpAdapter
-        from energygrid_bill_downloader.tenant_source import TENANT_NAMESPACE, TenantBillAdapter
+        from energygrid_bill_downloader.tenant_source import TenantBillAdapter
 
         with tempfile.TemporaryDirectory() as directory:
             cfg = self.config(Path(directory))
             adapters = native_cli._adapters(cfg)
             self.assertIsInstance(adapters["EB_BILL"], DirectHttpAdapter)
             self.assertIsInstance(adapters["TENANT_BILL"], TenantBillAdapter)
+            # The legacy v2 stream table binds only DIRECT_HTTP_V1, so Tenant stays UNBOUND there (as on the
+            # production state); the Core binds Tenant through tenant_config_path at acquire.
             entries = native_cli._stream_entries(cfg)
-            self.assertEqual(("BOUND", "BOUND"), (entries["EB_BILL"].admission, entries["TENANT_BILL"].admission))
-            self.assertEqual(TENANT_NAMESPACE, entries["TENANT_BILL"].source_namespace)
+            self.assertEqual(("BOUND", "UNBOUND"), (entries["EB_BILL"].admission, entries["TENANT_BILL"].admission))
+
+    def test_init_uat_builds_an_isolated_database_with_the_tenant_source_bound(self) -> None:
+        from energygrid_bill_downloader import native_cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = self.config(Path(directory))
+            result = native_cli._init_uat(cfg, None)
+            self.assertEqual("INITIALISED", result["outcome"])
+            with StateV4Store(cfg.state_path) as state:
+                self.assertEqual([], state.invoices_for_stream(EB))
+                self.assertEqual([], state.invoices_for_stream(TN))
 
     def test_the_tenant_key_is_optional_and_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

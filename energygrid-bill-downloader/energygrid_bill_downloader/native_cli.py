@@ -133,14 +133,10 @@ def _stream_entries(cfg: bridge.NativeConfig) -> dict:
         kind, portal = _portal_config(cfg)
         if kind == "DUAL":
             return portal.streams
-        from .tenant_source import TENANT_ADAPTER_ID, TENANT_EVIDENCE, TENANT_NAMESPACE
-
+        # The legacy v2 stream table can bind only DIRECT_HTTP_V1 (its CHECK constraint), so Tenant Bill stays
+        # UNBOUND there even when `tenant_config_path` is set: the native Core binds Tenant through that config
+        # at acquire, exactly as on the installed production state (owner UAT 18 Oct 2026).
         tenant = DualStreamEntry(admission=UNBOUND_ADMISSION)
-        if cfg.tenant_config_path is not None:
-            tenant = DualStreamEntry(
-                admission=BOUND_ADMISSION, source_namespace=TENANT_NAMESPACE, adapter_id=TENANT_ADAPTER_ID,
-                date_profile=DATE_PROFILE_ISO_V1, evidence_ref=TENANT_EVIDENCE,
-            )
         return {
             "EB_BILL": DualStreamEntry(
                 admission=BOUND_ADMISSION, source_namespace=SINGLE_STREAM_NAMESPACE, adapter_id="DIRECT_HTTP_V1",
