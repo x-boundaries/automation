@@ -144,8 +144,6 @@ class RunDirBindingTests(unittest.TestCase):
     def test_refused_acquire_is_not_reported(self):
         core_files(self.run);a=json.loads((self.run/'acquire.json').read_text(encoding='utf-8'));a['outcome']='REFUSED'
         (self.run/'acquire.json').write_text(json.dumps(a),encoding='utf-8')
-        # Keep the Core's file order (acquire not newer than status), so the outcome check is what refuses it.
-        st=(self.run/'status.json').stat().st_mtime;os.utime(self.run/'acquire.json',(st,st))
         with self.assertRaisesRegex(ReportError,'EG_MONITOR_ACQUIRE_NOT_COMPLETED'):bind_run_dir(self.run,self.root)
 
     def test_run_reported_at_most_once_without_retry(self):

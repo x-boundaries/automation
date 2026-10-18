@@ -15,7 +15,7 @@
 
 - `../energygrid_local_failure_monitor.workflow.json`: the n8n export (8 nodes): authenticated local webhook, strict report validation, PC-on-only missed-run check, send gate, `Remove Duplicates` (one attempt per incident key) and the Telegram sender (no retry, continue on fail).
 - `energygrid_monitor_report.py`: standard-library reporter. With `--run-dir` it accepts only `acquire.json` + `status.json` from one fresh `egnative.cmd new-run` folder directly under the runs root (folder age at most 6 hours, files written after the folder and in acquire-then-status order, Core schema and command checked, acquire `ACQUIRED`). It writes `monitor-report.json` exclusively **before** the POST, so a run is reported at most once, then `monitor-post.json` with the outcome. No retries, redirects or non-local endpoints. Unknown Core states refuse to report, which surfaces as the missed-report alert.
-- `egmonitor.cmd`: host wrapper. It is installed in a `monitor` folder of an EnergyGrid home and derives that home (`EG_HOME`) from its own location, so the same file serves every install (the original `C:\XB\_ScheduledTask\EnergyGrid` and the protected `C:\Program Files\EnergyGrid`). It runs that home's venv Python on that home's reporter with that home's `data\runs` as the runs root, and the private token file.
+- `egmonitor.cmd`: host wrapper with fixed paths: venv Python, installed reporter, runs root and the private token file. It is installed beside the EnergyGrid launcher in a `monitor` folder.
 - `test_energygrid_monitor.py`, `test_n8n_workflow_code.js`: synthetic tests, with no credentials or provider effects.
 
 ## Host hook (installed)
