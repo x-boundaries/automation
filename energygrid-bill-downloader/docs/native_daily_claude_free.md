@@ -270,12 +270,19 @@ Header Auth is required on both webhooks. Each workflow's first node after the w
 The cutover requires one of:
 
 - a validated, read-back Cloudflare rule on the remotely managed tunnel that refuses every request whose path
-  starts with `/webhook/xb-energygrid-drive-verify-v1` or `/webhook/xb-energygrid-owner-email-v1` (and the
-  `/webhook-test/` and `/webhook-waiting/` equivalents) on every tunnel hostname that reaches n8n; or
+  **contains** `xb-energygrid-drive-verify-v1` or `xb-energygrid-owner-email-v1`, **case-insensitively**, on every
+  tunnel hostname that reaches n8n (path regex `(?i)xb-energygrid-(drive-verify|owner-email)-v1`, service
+  `http_status:404`, ordered before the n8n catch-all). A prefix rule anchored on `^/webhook...` is **not**
+  enough: n8n routes `/WEBHOOK/...`, `/WEBHOOK-TEST/...` and `/Webhook-Waiting/...` case-insensitively, so
+  case variants passed a case-sensitive Cloudflare rule and reached n8n (owner UAT, 18 Oct 2026); or
 - a private-only listener or network for these paths.
 
-Proof at cutover (section 9): a public request to each path is refused at Cloudflare and never reaches n8n
-(no n8n execution recorded), and the same-PC authenticated positive control passes. The monitor webhook's own
+Proof at cutover (section 9): a public request to each path is refused at Cloudflare and never reaches n8n,
+and the same-PC authenticated positive control passes. The workflows save no executions, so "no execution
+recorded" is not evidence on its own: the proof is the response fingerprint (Cloudflare's empty 404 versus
+n8n's own JSON or HTML 404), with an unregistered control path that must reach n8n. The probe set covers the
+canonical paths, `-test`/`-waiting`, trailing slash, query, suffix, upper and mixed case, percent-encoding,
+repeated slashes, dot segments and backslash, both with the workflows inactive and active. The monitor webhook's own
 exposure is a separate follow-up and is not changed here.
 
 ## 7. Scheduler and host (C8, C9)
@@ -404,8 +411,10 @@ latch and the provenance rows cannot be updated or deleted (triggers) and are ne
 
 ## 10. Owner UAT on the unmerged candidate (owner PC `DESKTOP-Q43QKQF`)
 
-Each step names who acts and what it may change. Steps 1 to 3 change nothing live. Steps 4 onward each need
-their own explicit owner approval in #226 naming the target and operation; none is implied by this list.
+Each step names who acts and what it may change. Steps 1 to 3 change nothing live. Steps 4 to 5 had their own
+owner grants. Web #226:6246056987 then replaced the per-step approvals with **one continuous, owner-authorised
+UAT on an isolated state** (section 10.1). That authority does not cover the production-state steps 8 and 9,
+the 11:30 schedule, Claude retirement or merge.
 
 | Step | Who | Effect | Pass when |
 |---|---|---|---|
@@ -422,3 +431,37 @@ their own explicit owner approval in #226 naming the target and operation; none 
 UAT acceptance is the owner's statement after step 9 (and after the first real bill, when the owner wants
 that in UAT). Then: final fresh V3 G2, then section 9.1 item 4. Rollback before step 9 is section 9.3;
 from step 9 onward it is section 9.2.
+
+### 10.1 Continuous owner UAT on an isolated state (18 Oct 2026, Web #226:6246056987)
+
+Candidate `37322b2` was installed in its own admin-locked slot beside `af84e54` (blob-verified). The locked
+no-argument `runtime\egdaily.ps1` reads a `native.daily.json` that points **only** at an isolated UAT state, its
+own archive, outbox and runs root, and a temporary UAT Drive subfolder. Ceilings: `LIFETIME`, 2 Drive uploads
+and 2 owner emails. The classic `native.json`, `egnative.cmd` and the production state stayed byte-identical,
+and the production state was never latched. Every run used the installed runner exactly as the Windows task
+action would. No Windows task was registered.
+
+| Run | Posture | Result |
+|---|---|---|
+| R1 | Drive Verify and Owner Email inactive | real EB and Tenant portal acquisition (latest bill each), archived; Drive Verify 404, nothing written to Drive, no email; status PENDING (the monitor would alert) |
+| R2 | Drive Verify active, Owner Email inactive | each bill sealed, written once by the Core, VERIFIED by Google's SHA-256; PROBE failed, so both notifications stayed PENDING, nothing sent |
+| R3 | both active | PROBE READY; exactly one SUCCESS email per bill (2 SENT, owner received both); DRAINED |
+| R4 | replay | IDLE, zero Drive or email effects |
+
+Independent readback: the UAT Drive folder holds exactly two PDFs, each with Google SHA-256 equal to the Core
+archive and the synced bytes; the n8n claim table holds two SENT rows whose dispatch ids match the Core. The
+runner refused an argument (exit 64), and it never submitted a UAT run folder to the production monitor
+(`RUN_DIR_REFUSED`, because the UAT runs root is not the production runs root). Each run was classified by
+the unchanged monitor reporter in `--dry-run` (no POST): R1 PENDING, R2 to R4 OK.
+
+Found and fixed during UAT:
+
+- `init-uat` failed (`IntegrityError`) when the Tenant source is configured: the legacy v2 stream table can bind
+  only `DIRECT_HTTP_V1`. Tenant now stays UNBOUND there, as on the production state; the Core binds Tenant
+  through `tenant_config_path` at acquire (`37322b2`, with a test).
+- C7: the Cloudflare rule must be case-insensitive and unanchored (section 6). The owner changed it, and 54 of
+  54 public variants were then refused at Cloudflare with the workflows inactive and active.
+
+Still owner decisions before production (sections 9.1 and 9.3): the production sender (the n8n Gmail
+credential is bound to the Drive and recipient account, not to the classic config's `gmail.account`), UAT
+acceptance, then final G2, steps 8 and 9 on the production state, and the 11:30 schedule.
