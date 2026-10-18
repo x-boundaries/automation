@@ -60,6 +60,17 @@ class Recorder(BaseHTTPRequestHandler):
                 pass  # the client has already timed out, which is the point of this case
         elif behaviour == "422":
             self._reply(422, b'{"outcome":"REFUSED"}')
+        elif behaviour == "GARBAGE":
+            # Not an HTTP status line: http.client raises BadStatusLine after the request went out.
+            self.wfile.write(b"garbage\r\n\r\n")
+            self.close_connection = True
+        elif behaviour == "TRUNCATED":
+            # A promised body that never fully arrives: http.client raises IncompleteRead while reading.
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b'{"outcome"')
+            self.close_connection = True
         else:
             self._reply(200, b'{"outcome":"SENT"}')
 
@@ -134,6 +145,16 @@ class LoopbackClientTests(unittest.TestCase):
         answer = self.client.post(loopback.EMAIL_PATH, {}, 1)
         self.assertEqual(loopback.SENT_UNCERTAIN, answer.outcome)
         self.assertEqual(1, len(Recorder.requests))
+
+    def test_a_malformed_or_truncated_answer_is_uncertain_not_an_exception(self) -> None:
+        # G2 H1: http.client.HTTPException is not an OSError; it must map to SENT_UNCERTAIN (never resent).
+        for behaviour in ("GARBAGE", "TRUNCATED"):
+            with self.subTest(behaviour=behaviour):
+                Recorder.requests = []
+                Recorder.behaviour = behaviour
+                answer = self.client.post(loopback.EMAIL_PATH, {}, 5)
+                self.assertEqual((loopback.SENT_UNCERTAIN, "EG_N8N_TRANSPORT_UNCERTAIN"), (answer.outcome, answer.support_ref))
+                self.assertEqual(1, len(Recorder.requests))
 
     def test_connection_refused_is_not_sent(self) -> None:
         with socket.socket() as probe:

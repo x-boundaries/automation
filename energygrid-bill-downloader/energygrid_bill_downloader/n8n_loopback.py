@@ -16,6 +16,7 @@ verification or delivery.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -83,7 +84,7 @@ class LoopbackClient:
         try:
             with self._opener.open(request, timeout=HEALTH_TIMEOUT_SECONDS) as response:
                 return response.status == 200
-        except (urllib.error.URLError, OSError, ValueError):
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
             return False
 
     def post(self, path: str, document: dict, timeout: int) -> Answer:
@@ -97,12 +98,16 @@ class LoopbackClient:
                                          headers={"Content-Type": "application/json", self._header: token})
         try:
             with self._opener.open(request, timeout=timeout) as response:
-                return _answer(response.status, response.read(MAX_ANSWER_BYTES + 1))
+                payload = response.read(MAX_ANSWER_BYTES + 1)
+                if len(payload) <= MAX_ANSWER_BYTES and getattr(response, "length", None):
+                    # Fewer bytes arrived than the answer announced: a truncated answer is not an answer.
+                    return Answer(SENT_UNCERTAIN, support_ref="EG_N8N_TRANSPORT_UNCERTAIN")
+                return _answer(response.status, payload)
         except urllib.error.HTTPError as exc:
             # A non-2xx answer (including a refused redirect) is still an answer from n8n.
             try:
                 payload = exc.read(MAX_ANSWER_BYTES + 1)
-            except OSError:
+            except (OSError, http.client.HTTPException):
                 payload = b""
             finally:
                 exc.close()
@@ -113,7 +118,9 @@ class LoopbackClient:
             return Answer(SENT_UNCERTAIN, support_ref="EG_N8N_TRANSPORT_UNCERTAIN")
         except ConnectionRefusedError:
             return Answer(NOT_SENT, support_ref="EG_N8N_UNREACHABLE")
-        except (OSError, ValueError):
+        except (http.client.HTTPException, OSError, ValueError):
+            # http.client.HTTPException (BadStatusLine, IncompleteRead, ...) is not an OSError (G2 H1). The
+            # request had already gone out, so it is uncertain and never resent.
             return Answer(SENT_UNCERTAIN, support_ref="EG_N8N_TRANSPORT_UNCERTAIN")
 
 
