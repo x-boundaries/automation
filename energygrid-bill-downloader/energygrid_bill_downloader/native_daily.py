@@ -373,7 +373,9 @@ def run(cfg: bridge.NativeConfig, adapters: Callable[[], dict], *, client: Any =
 
 
 def preflight(cfg: bridge.NativeConfig, *, client: Any = None, now_ms: int | None = None) -> dict:
-    """Read-only cutover check (docs/native_daily_claude_free.md section 8). Writes only listing evidence."""
+    """Stateful cutover check (docs/native_daily_claude_free.md section 8). It does not latch, but it is not
+    read-only: it may create the provenance remote-verification tables, writes one listing file and one
+    `drive_remote_listing` row, and runs two live n8n executions (an Owner Email PROBE and Drive Verify)."""
     import sqlite3
 
     from .native_notify import store_path
