@@ -1,0 +1,964 @@
+{
+  "id": "energygridOwnerEmail01",
+  "name": "EnergyGrid - Owner Email",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8402-000000000001",
+      "name": "Owner Email Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "xb-energygrid-owner-email-v1",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000002",
+      "name": "Validate Email Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Owner Email: strict closed request, fixed recipient and subject prefix, render from fixed templates.\nconst SUBJECT_PREFIX = 'REPLACE_WITH_SUBJECT_PREFIX';\nconst RECIPIENT = 'REPLACE_WITH_OWNER_RECIPIENT';\nconst SCHEMA = 'energygrid.owner_email.response.v1';\nconst LABELS = { EB_BILL: 'EB Bill', TENANT_BILL: 'Tenant Bill' };\nconst SEND_KEYS = ['dispatch_id', 'display_filename', 'drive_file_id', 'kind', 'mode', 'notification_id',\n  'render_sha256', 'schema', 'status_text', 'stream', 'support_ref'].join('|');\n\nconst PROXY_HEADERS = ['cf-ray', 'cf-connecting-ip', 'cf-ipcountry', 'x-forwarded-for', 'x-forwarded-host', 'x-real-ip'];\nconst item = $input.first().json;\nconst headers = item && item.headers && typeof item.headers === 'object' ? item.headers : {};\nconst present = Object.keys(headers).map((key) => key.toLowerCase());\nif (PROXY_HEADERS.some((name) => present.includes(name))) {\n  // Defence in depth only: a proxy-marked request is answered 404 with no body. It is not the\n  // non-public boundary (that is the Cloudflare path exclusion or a private-only listener).\n  return [{ json: { route: 'NOT_FOUND' } }];\n}\nconst own = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);\nconst body = item ? item.body : undefined;\n\nconst keys = own(body) ? Object.keys(body).sort().join('|') : '';\nconst refuse = (mode, nid, did) => [{ json: { route: 'REFUSED', response_code: 422, response: {\n  schema: SCHEMA, mode, notification_id: nid, dispatch_id: did, outcome: 'REFUSED', reason: 'EG_EMAIL_REQUEST_INVALID' } } }];\nif (!own(body) || body.schema !== 'energygrid.owner_email.request.v1') return refuse(null, null, null);\nif (body.mode === 'PROBE') {\n  if (keys !== 'mode|nonce|schema' || typeof body.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(body.nonce)) {\n    return refuse('PROBE', null, null);\n  }\n  return [{ json: { route: 'PROBE', nonce: body.nonce, recipient_lower: RECIPIENT.toLowerCase() } }];\n}\nif (body.mode !== 'SEND') return refuse(null, null, null);\nconst nid = typeof body.notification_id === 'string' && /^egn-[0-9a-f]{32}$/.test(body.notification_id) ? body.notification_id : null;\nconst did = typeof body.dispatch_id === 'string' && /^egd-[0-9a-f]{32}$/.test(body.dispatch_id) ? body.dispatch_id : null;\nif (keys !== SEND_KEYS || !nid || !did) return refuse('SEND', nid, did);\nconst plainName = (value) => typeof value === 'string' && value.length >= 1 && value.length <= 255\n  && !/[\\u0000-\\u001f\\u007f]/.test(value) && value.toLowerCase().endsWith('.pdf');\nconst success = body.kind === 'SUCCESS';\nconst released = body.status_text === 'HOLD_RELEASED_NO_DISPATCH';\nconst valid = (body.kind === 'SUCCESS' || body.kind === 'FAILURE')\n  && Object.prototype.hasOwnProperty.call(LABELS, body.stream)\n  && typeof body.status_text === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(body.status_text)\n  && typeof body.render_sha256 === 'string' && /^[0-9a-f]{64}$/.test(body.render_sha256)\n  && (success\n    ? body.support_ref === null && plainName(body.display_filename)\n      && typeof body.drive_file_id === 'string' && /^[A-Za-z0-9_-]{10,200}$/.test(body.drive_file_id)\n    : typeof body.support_ref === 'string' && /^EG_[A-Z0-9_]{2,72}$/.test(body.support_ref)\n      && body.drive_file_id === null && (released ? plainName(body.display_filename) : body.display_filename === null));\nif (!valid) return refuse('SEND', nid, did);\nconst label = LABELS[body.stream];\nlet subject;\nlet text;\nif (success) {\n  subject = `${SUBJECT_PREFIX}: ${label} processed - ${body.display_filename}`;\n  text = `EnergyGrid processed a new ${label}.\\nFile: ${body.display_filename}\\n`\n    + `Google Drive: https://drive.google.com/file/d/${body.drive_file_id}/view\\n`;\n} else if (released) {\n  subject = `${SUBJECT_PREFIX}: ${label} hold released - ${body.support_ref}`;\n  text = `An operator released a held ${label} upload that was never sent to Google Drive.\\n`\n    + `File: ${body.display_filename}\\nStatus: ${body.status_text}\\nReference: ${body.support_ref}\\n`\n    + 'The next scheduled run tries it again; it is never uploaded twice. Check the EnergyGrid status report.\\n';\n} else {\n  subject = `${SUBJECT_PREFIX}: ${label} needs attention - ${body.support_ref}`;\n  text = `EnergyGrid could not complete the ${label} stream.\\nStatus: ${body.status_text}\\nReference: ${body.support_ref}\\n`\n    + 'Uncertain uploads are never retried automatically. Check the EnergyGrid status report.\\n';\n}\nreturn [{ json: { route: 'SEND', request: body, subject, text, canonical: subject + '\\n' + text, recipient: RECIPIENT } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000004",
+      "name": "Request Is Proxied",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8402-000000000003",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "NOT_FOUND",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000006",
+      "name": "Request Is Refused",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        380
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8402-000000000005",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "REFUSED",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000008",
+      "name": "Is Probe",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8402-000000000007",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "PROBE",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000009",
+      "name": "Hash Recipient",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "action": "hash",
+        "binaryData": false,
+        "type": "SHA256",
+        "value": "={{ $('Validate Email Request').first().json.recipient_lower }}",
+        "dataPropertyName": "recipient_sha256",
+        "encoding": "hex"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000010",
+      "name": "Get Sender Identity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://openidconnect.googleapis.com/v1/userinfo",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "gmailOAuth2",
+        "sendQuery": false,
+        "queryParameters": {
+          "parameters": []
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000011",
+      "name": "Build Probe Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const SCHEMA = 'energygrid.owner_email.response.v1';\nconst request = $('Validate Email Request').first().json;\nconst hashed = $('Hash Recipient').first().json;\nconst who = $input.first().json;\nconst email = who && who.statusCode === 200 && who.body ? who.body.email : undefined;\nif (typeof email !== 'string' || !email || who.body.email_verified !== true) {\n  return [{ json: { response_code: 502, response: { schema: SCHEMA, mode: 'PROBE', nonce: request.nonce, ready: false } } }];\n}\nreturn [{ json: { response_code: 200, response: { schema: SCHEMA, mode: 'PROBE', nonce: request.nonce, ready: true,\n  sender_account: email, recipient_sha256: hashed.recipient_sha256 } } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000012",
+      "name": "Hash Render",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        620
+      ],
+      "parameters": {
+        "action": "hash",
+        "binaryData": false,
+        "type": "SHA256",
+        "value": "={{ $('Validate Email Request').first().json.canonical }}",
+        "dataPropertyName": "render_sha256_actual",
+        "encoding": "hex"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000014",
+      "name": "Render Matches",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8402-000000000013",
+              "leftValue": "={{ $('Hash Render').first().json.render_sha256_actual }}",
+              "rightValue": "={{ $('Validate Email Request').first().json.request.render_sha256 }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000015",
+      "name": "Find Existing Claim",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1920,
+        620
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_CLAIM_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "notificationId",
+              "condition": "eq",
+              "keyValue": "={{ $('Validate Email Request').first().json.request.notification_id }}"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 2
+      },
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000017",
+      "name": "Claim Is New",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8402-000000000016",
+              "leftValue": "={{ !$('Find Existing Claim').first().json.notificationId }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000018",
+      "name": "Insert Claim",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2400,
+        540
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_CLAIM_TABLE_ID",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "notificationId": "={{ $('Validate Email Request').first().json.request.notification_id }}",
+            "dispatchId": "={{ $('Validate Email Request').first().json.request.dispatch_id }}",
+            "state": "CLAIMED"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "notificationId",
+              "displayName": "notificationId",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "dispatchId",
+              "displayName": "dispatchId",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            },
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            }
+          ]
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000019",
+      "name": "Send Owner Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2640,
+        540
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $('Validate Email Request').first().json.recipient }}",
+        "subject": "={{ $('Validate Email Request').first().json.subject }}",
+        "emailType": "text",
+        "message": "={{ $('Validate Email Request').first().json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "retryOnFail": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000020",
+      "name": "Mark Claim Sent",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2880,
+        460
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_CLAIM_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "notificationId",
+              "condition": "eq",
+              "keyValue": "={{ $('Validate Email Request').first().json.request.notification_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "state": "SENT"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            }
+          ]
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000021",
+      "name": "Mark Claim Uncertain",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2880,
+        700
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_EMAIL_CLAIM_TABLE_ID",
+          "mode": "id"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "notificationId",
+              "condition": "eq",
+              "keyValue": "={{ $('Validate Email Request').first().json.request.notification_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "state": "UNCERTAIN"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "readOnly": false
+            }
+          ]
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000022",
+      "name": "Build Sent Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Gmail accepted the message once. A missing id is reported as uncertain, never as SENT.\nconst request = $('Validate Email Request').first().json.request;\nconst sent = $('Send Owner Email').first().json;\nconst id = sent && typeof sent.id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(sent.id) ? sent.id : null;\nconst base = { schema: 'energygrid.owner_email.response.v1', mode: 'SEND', notification_id: request.notification_id,\n  dispatch_id: request.dispatch_id };\nif (!id) return [{ json: { response_code: 502, response: { ...base, outcome: 'SEND_UNCERTAIN' } } }];\nreturn [{ json: { response_code: 200, response: { ...base, outcome: 'SENT', message_id: id } } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000023",
+      "name": "Respond Send Uncertain",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        3120,
+        700
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.owner_email.response.v1', mode: 'SEND', notification_id: $('Validate Email Request').first().json.request.notification_id, dispatch_id: $('Validate Email Request').first().json.request.dispatch_id, outcome: 'SEND_UNCERTAIN' } }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000024",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        2400,
+        780
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.owner_email.response.v1', mode: 'SEND', notification_id: $('Validate Email Request').first().json.request.notification_id, dispatch_id: $('Validate Email Request').first().json.request.dispatch_id, outcome: 'DUPLICATE' } }}",
+        "options": {
+          "responseCode": 409
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000025",
+      "name": "Respond Claim Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        2640,
+        860
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.owner_email.response.v1', mode: 'SEND', notification_id: $('Validate Email Request').first().json.request.notification_id, dispatch_id: $('Validate Email Request').first().json.request.dispatch_id, outcome: 'REFUSED', reason: 'EG_EMAIL_CLAIM_FAILED' } }}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000026",
+      "name": "Respond Render Mismatch",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        1680,
+        780
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.owner_email.response.v1', mode: 'SEND', notification_id: $('Validate Email Request').first().json.request.notification_id, dispatch_id: $('Validate Email Request').first().json.request.dispatch_id, outcome: 'REFUSED', reason: 'EG_EMAIL_RENDER_MISMATCH' } }}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000027",
+      "name": "Respond Bounded Failure",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        680
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { schema: 'energygrid.owner_email.response.v1', outcome: 'FAILED' } }}",
+        "options": {
+          "responseCode": 500
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000028",
+      "name": "Respond With Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        3360,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.response_code }}"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000029",
+      "name": "Respond Not Found",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        720,
+        160
+      ],
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 404
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000030",
+      "name": "Owner Email boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -120
+      ],
+      "parameters": {
+        "content": "# EnergyGrid Owner Email (single attempt)\n- PROBE answers readiness, the sender account and the recipient hash. It never reaches the Gmail node.\n- SEND renders the fixed templates, refuses a render digest mismatch, checks and writes the claim, then sends once.\n- The claim lookup and insert are NOT one atomic operation: secondary evidence only. The EnergyGrid Core seal is the authority.\n- Gmail has no retry and no attribution. An error or a lost answer is uncertain and is never resent.\n\n## Required manual configuration:\n\n- **Validate Email Request**\n  - `SUBJECT_PREFIX`: the same subject prefix as the private EnergyGrid config.\n  - `RECIPIENT`: the one owner recipient of the private EnergyGrid config.\n- **Find Existing Claim**, **Insert Claim**, **Mark Claim Sent**, **Mark Claim Uncertain**\n  - `Data table`: the EnergyGrid email claim table (string columns notificationId, dispatchId, state).\n- No workflow-level error workflow: every failure answers the Core, which owns owner visibility.",
+        "width": 760,
+        "height": 380
+      }
+    }
+  ],
+  "connections": {
+    "Owner Email Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Email Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Email Request": {
+      "main": [
+        [
+          {
+            "node": "Request Is Proxied",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Is Proxied": {
+      "main": [
+        [
+          {
+            "node": "Respond Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Request Is Refused",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Is Refused": {
+      "main": [
+        [
+          {
+            "node": "Respond With Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Probe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Probe": {
+      "main": [
+        [
+          {
+            "node": "Hash Recipient",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Hash Render",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash Recipient": {
+      "main": [
+        [
+          {
+            "node": "Get Sender Identity",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Sender Identity": {
+      "main": [
+        [
+          {
+            "node": "Build Probe Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Probe Answer": {
+      "main": [
+        [
+          {
+            "node": "Respond With Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash Render": {
+      "main": [
+        [
+          {
+            "node": "Render Matches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bounded Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Matches": {
+      "main": [
+        [
+          {
+            "node": "Find Existing Claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Render Mismatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Existing Claim": {
+      "main": [
+        [
+          {
+            "node": "Claim Is New",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Claim Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Is New": {
+      "main": [
+        [
+          {
+            "node": "Insert Claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Claim": {
+      "main": [
+        [
+          {
+            "node": "Send Owner Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Claim Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Owner Email": {
+      "main": [
+        [
+          {
+            "node": "Mark Claim Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Claim Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Claim Sent": {
+      "main": [
+        [
+          {
+            "node": "Build Sent Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Claim Uncertain": {
+      "main": [
+        [
+          {
+            "node": "Respond Send Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Sent Answer": {
+      "main": [
+        [
+          {
+            "node": "Respond With Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Send Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8000-000000000402",
+  "sourceWorkflowId": null
+}

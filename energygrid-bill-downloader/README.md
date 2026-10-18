@@ -35,6 +35,15 @@ The browser source below remains the legacy default when `source` is absent.
 which a Claude session performs the native Google Drive and Gmail connector calls and the Core seals,
 verifies and records each one. UAT only; see `docs/native_connector_bridge.md`.
 
+## Claude-free daily run (EnergyGrid #226 V3 G1)
+
+`python -m energygrid_bill_downloader.native_cli daily --config <private native config with daily>` runs
+the same v4 Core with no model: acquire, the Core-written Google Drive for desktop copy verified by
+Google's own SHA-256 through an authenticated loopback n8n Drive Verify workflow, at most one owner email
+per notification through n8n, then status. A Windows task runs it through the locked, no-argument
+`runtime/scheduler/egdaily.ps1.template`. Source and offline tests only; the installed UAT host is
+unchanged until a separately authorised cutover. See `docs/native_daily_claude_free.md`.
+
 ## Dual-stream v3 path (EnergyGrid #226 G3)
 
 The `energygrid.runtime.v3` configuration separates `EB_BILL` and `TENANT_BILL`.
