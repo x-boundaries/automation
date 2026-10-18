@@ -299,6 +299,16 @@ exposure is a separate follow-up and is not changed here.
   the locked no-argument script and installed code (blob-verified), and negative controls showing the
   standard user cannot modify the script, the app folder or the config. M-5 stays in force for the Claude
   rollback route.
+- **Every executed file counts, including its parents** (G2 CB1, 18 Oct 2026). Locking the runner and app is
+  not enough when the venv, its base CPython, Chromium or the monitor are user-writable, or when any parent
+  folder can be renamed by the standard user (the folder could then be swapped for another tree at the same
+  path). The production install therefore uses one admin-owned `EG_HOME` under `C:\Program Files\EnergyGrid`
+  holding the runner, the app slot, the configs, a dedicated CPython (administrative MSI extraction of the
+  signed release, no registration), a venv with hash-locked wheels, the Playwright Chromium and the monitor.
+  Only its `data` folder (runs and the runner log) is writable by the task principal. State, archives and
+  outbox stay at their own path (data, not code). Proof required at install: every installed item and every
+  parent refuses write, delete, rename, WRITE_DAC and WRITE_OWNER for the non-elevated principal, and the
+  interpreter's `sys.path` is closed inside the tree.
 
 ## 8. Commands
 
@@ -372,6 +382,12 @@ latch and the provenance rows cannot be updated or deleted (triggers) and are ne
   attended `daily` files each new bill once, VERIFIED by Google's SHA-256, with one email each. A further
   run makes zero effects. A listing without Google's SHA-256 never verifies a bill (md5 or size alone never
   do); the next run records it once Google reports it.
+- **Never run a manual `daily` while the scheduled one is running** (G2 H2). Task Scheduler's `IgnoreNew`
+  only stops a second *scheduled* instance, and the Core's v4 lease serialises each command, not the whole
+  run. Two overlapping runs still file one Drive copy and send one success email, but the second can record a
+  spurious FAILURE notice. Before a manual run, check that the task is not `Running` (Task Scheduler, or
+  `Get-ScheduledTask -TaskPath '\XB\' -TaskName 'EnergyGrid Daily Bills Native'`), and that no newer run
+  folder than the one you are recovering exists under the runs root.
 - **Fail-closed limitation.** While Drive Verify cannot answer (n8n down, Drive credential revoked, Google
   unavailable), no new bill reaches the Drive folder or the owner email. No verification-preserving
   fallback route exists. The bill waits in the internal archive, visible to the monitor, until the native
@@ -462,6 +478,25 @@ Found and fixed during UAT:
 - C7: the Cloudflare rule must be case-insensitive and unanchored (section 6). The owner changed it, and 54 of
   54 public variants were then refused at Cloudflare with the workflows inactive and active.
 
-Still owner decisions before production (sections 9.1 and 9.3): the production sender (the n8n Gmail
-credential is bound to the Drive and recipient account, not to the classic config's `gmail.account`), UAT
-acceptance, then final G2, steps 8 and 9 on the production state, and the 11:30 schedule.
+Correction (G2 H3): notification ids are deterministic per invoice, so the two UAT claim rows carry the
+**same** ids as production's two historic SENT notices for the same AUG bills; they do not "never collide".
+They are terminal and are kept on purpose as an extra duplicate barrier. Never delete them or re-send.
+
+Decisions taken afterwards: the owner accepted the UAT (#226:6248016743) and kept the n8n Gmail credential's
+account (the Drive and recipient account) as the production sender instead of the classic config's
+`gmail.account`. The final G2 passed the source with cutover holds (#226:6248548156). CB1 was closed by the
+protected runtime (section 7), the OAuth app is Internal (owner attestation), and the owner accepted the
+default (broader) Drive and Gmail OAuth scopes for the first release (least-privilege narrowing is a later item).
+The UAT Drive subfolder, UAT state and staging copies were removed to the recycle bin and Drive trash after
+their evidence was archived privately (19 Oct 2026).
+
+### 10.2 Production cutover (19 Oct 2026, owner grant #226:6251345304)
+
+PR #253 merged as `2749a27` (tree identical to the reviewed head). The protected production
+`native.daily.json` binds the original state, archive, outbox and flat folder, EB and Tenant, the accepted
+sender and `PER_PERIOD` 1 day / 4 uploads / 6 emails, with `runs_root` = the protected `data\runs`. Both
+workflows were activated; C7 (54 of 54 public variants refused) and C1 were re-proved and the stateful
+`daily-preflight` passed with no hold. The WORK-account Claude routine was paused, then deleted by the owner.
+Task `\XB\EnergyGrid Daily Bills Native` was registered disabled, one attended `daily` ran (IDLE, latch
+`GOOGLE_SHA256_REQUIRED` written, real monitor report accepted), then the task was enabled at 11:30 SGT.
+From here on, recovery is native-only fix-forward (section 9.2); the old route is never resumed.

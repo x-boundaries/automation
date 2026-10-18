@@ -315,12 +315,12 @@
       "typeVersion": 1,
       "position": [
         240,
-        -60
+        -540
       ],
       "parameters": {
-        "content": "# EnergyGrid Drive Verify (read only)\n- Lists the one fixed folder with Google's own metadata, including sha256Checksum, every page (at most 20).\n- Takes no query input: the request carries a nonce only. The EnergyGrid Core decides VERIFIED.\n- No create, update, delete, upload or share call. Header Auth plus the Cloudflare path exclusion keep it non-public.\n- Read-only GETs retry at most 3 times. Every failure answers the Core, which owns owner visibility.\n\n## Required manual configuration:\n\n- **Validate Verify Request**\n  - `FOLDER_ID`: the owner-selected flat EnergyGrid Drive folder id.",
-        "width": 620,
-        "height": 300
+        "content": "# START HERE: What is EnergyGrid - Drive Verify?\n\n**Purpose:** Checks that an EB Bill or Tenant Bill PDF *already downloaded and filed by the Python automation* has reached the correct Google Drive folder intact.\n\n**Follow the nodes from left to right:**\n1. **Webhook / Validate / Request Is ...** Receive one authenticated private request; reject invalid or public/proxy-marked requests.\n2. **Get Drive Account / List Fixed Folder** Read the Google account and the files in one approved folder, including every page and Google's SHA-256 checksum.\n3. **Assemble Listing / Respond ...** Return the file details, or a clear failure answer, to Python.\n\n**Who confirms success?** Python compares Google's checksum with its archived PDF and checks the exact name, folder and size. Only Python marks a bill **VERIFIED**. If the check cannot complete, the bill stays pending or held.\n\n**This workflow does NOT** log in to EnergyGrid, download bills, upload or delete Drive files, or send emails.\n\n**Maintainer:** keep Header Auth and the Cloudflare path exclusion. Set `FOLDER_ID` in **Validate Verify Request** to the approved folder. Google reads may retry but must never change files. Full contract: `energygrid-bill-downloader/docs/native_daily_claude_free.md` sections 3 and 6.\n\n---\n\n## Maintainer reference\n\n- Lists the one fixed folder with Google's own metadata, including sha256Checksum, every page (at most 20).\n- Takes no query input: the request carries a nonce only. The EnergyGrid Core decides VERIFIED.\n- No create, update, delete, upload or share call. Header Auth plus the Cloudflare path exclusion keep it non-public.\n- Read-only GETs retry at most 3 times. Every failure answers the Core, which owns owner visibility.\n\n## Required manual configuration:\n\n- **Validate Verify Request**\n  - `FOLDER_ID`: the owner-selected flat EnergyGrid Drive folder id.",
+        "width": 760,
+        "height": 780
       }
     }
   ],
