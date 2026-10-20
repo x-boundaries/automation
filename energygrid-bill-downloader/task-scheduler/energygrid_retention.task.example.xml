@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EnergyGrid run-evidence retention (#257) - INERT Task Scheduler template.
+
+  This file registers nothing. It is the reviewed shape for a later, separately owner-approved
+  administrator install (docs/run_log_retention.md section 6). Every REPLACE_WITH_* value is private
+  host state, substituted only in a local copy that is never committed.
+
+  Contract (asserted by tests/test_retention.py):
+  - DISABLED twice: the task (Settings/Enabled) and its trigger ship false;
+  - one daily CalendarTrigger at 19:00 +08:00: after the 14:00 SGT monitor checkpoint, inside the
+    tool's own 15:00-23:00 SGT apply window, far from the 11:30 daily bill task;
+  - no catch-up (StartWhenAvailable false): a missed evening is simply skipped, never run near 11:30;
+  - IgnoreNew plus the tool's own lock, and a hard PT1H limit;
+  - the action is the absolute Windows PowerShell 5.1 path running the installed, admin-write locked
+    maintenance\egretention.ps1 with -File and NO -Apply: the registered task is a dry run until the
+    owner separately approves adding -Apply;
+  - the same non-elevated principal as the daily task, because only it can write the data folder.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>EnergyGrid run-evidence retention (dry run unless -Apply was separately approved).</Description>
+    <URI>\XB\EnergyGrid Run Evidence Retention</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>REPLACE_WITH_START_DATET19:00:00+08:00</StartBoundary>
+      <Enabled>false</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>REPLACE_WITH_RUN_PRINCIPAL</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>false</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "REPLACE_WITH_EG_HOME\maintenance\egretention.ps1"</Arguments>
+    </Exec>
+  </Actions>
+</Task>

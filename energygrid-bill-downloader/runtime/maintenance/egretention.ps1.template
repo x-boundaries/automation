@@ -1,0 +1,106 @@
+# EnergyGrid run-evidence retention (#257): the only command the (DISABLED by default) maintenance task runs.
+# Install by replacing the EG_HOME placeholder, then lock this file admin-write only (docs/run_log_retention.md section 6).
+# No argument: DRY RUN (classify and write a private report; nothing is archived, pruned or rotated).
+# -Apply: archive incidents, prune proven-clean runs older than 90 complete SGT days, rotate the summary log.
+# Before Python starts, every executed file and its folders must refuse writes from anyone but SYSTEM,
+# Administrators and TrustedInstaller, and the private retention folder must not be readable by broad groups.
+# Output is one JSON line with counts and closed EG_RET_ references only.
+param([switch]$Apply)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Write-EgRefusal([string]$Ref) {
+    Write-Output ('{"exit_code": 64, "outcome": "REFUSED", "refs": ["' + $Ref + '"], "schema": "energygrid.retention.summary.v1"}')
+    exit 64
+}
+
+if ($args.Count -ne 0) { Write-EgRefusal 'EG_RET_ARGUMENTS_REFUSED' }
+
+# BEGIN EG RETENTION ACL FUNCTIONS (exercised in memory by tests/test_retention.py)
+$script:EgProtectedSids = @(
+    'S-1-5-18',                                                     # LocalSystem
+    'S-1-5-32-544',                                                 # BUILTIN\Administrators
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # NT SERVICE\TrustedInstaller
+)
+$script:EgCreatorOwnerSid = 'S-1-3-0'
+# Write-capable rights: WriteData, AppendData, WriteEA, DeleteChild, WriteAttributes, DELETE, WRITE_DAC,
+# WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE.
+$script:EgWriteMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+# Read-capable rights: ReadData, GENERIC_ALL, GENERIC_READ.
+$script:EgReadMask = 0x1 -bor 0x10000000 -bor [int]0x80000000
+
+function Get-EgRawDescriptor($Security) {
+    $binary = $Security.GetSecurityDescriptorBinaryForm()
+    return New-Object System.Security.AccessControl.RawSecurityDescriptor($binary, 0)
+}
+
+function Test-EgProtectedSecurity($Security) {
+    # True only when the owner and every allow entry that grants any write-capable right (effective or
+    # inherit-only) are SYSTEM, Administrators or TrustedInstaller. No DACL or an unreadable descriptor is a
+    # refusal. The one exception is the INHERIT-ONLY CREATOR OWNER entry Windows puts on Program Files
+    # folders: it grants nothing on the object itself and only applies to children created by someone who
+    # already holds a (checked) write right. An effective CREATOR OWNER write entry is still refused.
+    try { $raw = Get-EgRawDescriptor $Security } catch { return $false }
+    $present = [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent
+    if ((($raw.ControlFlags -band $present) -eq 0) -or $null -eq $raw.DiscretionaryAcl) { return $false }
+    if ($null -eq $raw.Owner -or ($script:EgProtectedSids -notcontains $raw.Owner.Value)) { return $false }
+    $inheritOnly = [int][System.Security.AccessControl.AceFlags]::InheritOnly
+    foreach ($ace in @($raw.DiscretionaryAcl)) {
+        if ($ace -isnot [System.Security.AccessControl.CommonAce]) { continue }
+        if ($ace.AceType -ne [System.Security.AccessControl.AceType]::AccessAllowed) { continue }
+        if ((([int]$ace.AccessMask) -band $script:EgWriteMask) -eq 0) { continue }
+        if ($ace.SecurityIdentifier.Value -ceq $script:EgCreatorOwnerSid -and
+            (([int]$ace.AceFlags) -band $inheritOnly) -ne 0) { continue }
+        if ($script:EgProtectedSids -notcontains $ace.SecurityIdentifier.Value) { return $false }
+    }
+    return $true
+}
+
+function Test-EgPrivateSecurity($Security, [string]$RunnerSid) {
+    # True only when every allow entry that grants read is SYSTEM, Administrators, the task principal or
+    # CREATOR OWNER (which resolves to the creating principal): no Users, Everyone or Authenticated Users.
+    try { $raw = Get-EgRawDescriptor $Security } catch { return $false }
+    $present = [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent
+    if ((($raw.ControlFlags -band $present) -eq 0) -or $null -eq $raw.DiscretionaryAcl) { return $false }
+    $allowed = @($script:EgProtectedSids) + @($RunnerSid, $script:EgCreatorOwnerSid)
+    foreach ($ace in @($raw.DiscretionaryAcl)) {
+        if ($ace -isnot [System.Security.AccessControl.CommonAce]) { continue }
+        if ($ace.AceType -ne [System.Security.AccessControl.AceType]::AccessAllowed) { continue }
+        if ((([int]$ace.AccessMask) -band $script:EgReadMask) -eq 0) { continue }
+        if ($allowed -notcontains $ace.SecurityIdentifier.Value) { return $false }
+    }
+    return $true
+}
+# END EG RETENTION ACL FUNCTIONS
+
+$EgHome = '{{EG_HOME}}'
+$Python = Join-Path $EgHome 'runtime\venv\Scripts\python.exe'
+$Script = Join-Path $EgHome 'maintenance\energygrid_retention.py'
+$Retention = Join-Path $EgHome 'data\retention'
+
+# Every executed item and its folders, up to and including EG_HOME (docs/native_daily_claude_free.md CB1).
+$protected = @(
+    $EgHome,
+    (Join-Path $EgHome 'maintenance'), $Script, $PSCommandPath,
+    (Join-Path $EgHome 'runtime'), (Join-Path $EgHome 'runtime\venv'), (Join-Path $EgHome 'runtime\venv\Scripts'),
+    $Python, (Join-Path $EgHome 'runtime\venv\pyvenv.cfg')
+)
+foreach ($item in $protected) {
+    $security = $null
+    try { $security = Get-Acl -LiteralPath $item } catch { Write-EgRefusal 'EG_RET_ACL_UNREADABLE' }
+    if (-not (Test-EgProtectedSecurity $security)) { Write-EgRefusal 'EG_RET_ACL_NOT_PROTECTED' }
+}
+if (Test-Path -LiteralPath $Retention) {
+    $runner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $security = $null
+    try { $security = Get-Acl -LiteralPath $Retention } catch { Write-EgRefusal 'EG_RET_ACL_UNREADABLE' }
+    if (-not (Test-EgPrivateSecurity $security $runner)) { Write-EgRefusal 'EG_RET_RETENTION_NOT_PRIVATE' }
+}
+
+# -I: isolated mode (no PYTHON* variables, no user site, no script folder on sys.path). Standard library only.
+$arguments = @('-I', '-X', 'utf8', $Script)
+if ($Apply) { $arguments += '--apply' }
+$output = @(& $Python @arguments)
+$exitCode = $LASTEXITCODE
+$output | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1 | Write-Output
+exit $exitCode

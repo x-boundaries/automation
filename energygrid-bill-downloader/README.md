@@ -44,6 +44,11 @@ per notification through n8n, then status. A Windows task runs it through the lo
 `runtime/scheduler/egdaily.ps1.template`. Source and offline tests only; the installed UAT host is
 unchanged until a separately authorised cutover. See `docs/native_daily_claude_free.md`.
 
+Run-evidence retention (#257): `runtime/maintenance/energygrid_retention.py` keeps clean daily run folders
+for 90 complete SGT days, then prunes only independently proven clean runs. It archives every incident
+privately with SHA-256 readback and rotates `egdaily.log` without truncating it. Dry run by default; the
+task template ships disabled. Source and offline tests only. See `docs/run_log_retention.md`.
+
 ## Dual-stream v3 path (EnergyGrid #226 G3)
 
 The `energygrid.runtime.v3` configuration separates `EB_BILL` and `TENANT_BILL`.
