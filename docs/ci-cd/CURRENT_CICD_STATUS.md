@@ -14,9 +14,18 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   Docker, credential, live Google, live n8n, live AutoCount, live PostgreSQL, or
   customer-data step.
 - Production activation is disabled in the committed example configuration.
-- The five named hosted jobs remain `gateway-tests`, `powershell-static`,
-  `n8n-offline`, `existing-member-regression`, and dependent
+- The hosted jobs are `gateway-tests`, `powershell-static`,
+  `bounded-import-security`, `n8n-offline`, `existing-member-regression`, and
   `full-offline-regression`; no PostgreSQL service container is introduced.
+- `full-offline-regression` runs in parallel with the targeted jobs (#211). It
+  runs `tests/_run_ci_full_suite.py --skip-member-gateway-targeted`, which
+  skips only the whole modules that the windows-latest `powershell-static` and
+  `bounded-import-security` jobs run on the same asserted exact head (same OS
+  and Python). Modules run only by the ubuntu jobs stay in the Windows full
+  suite. `tests/test_member_gateway_ci.py` proves the skip list equals those
+  jobs' module lists and that the targeted shard plus the remainder equals the
+  accepted test set. The member-create-uat workflow calls the runner without
+  the flag and still runs the whole accepted set.
 
 - Shopify M1 (#155 G3) adds the four Shopify schemas, the Shopify example
   config, migration 0006 and `tests/test_member_gateway_shopify_ps.py` to the

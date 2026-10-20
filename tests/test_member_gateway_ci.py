@@ -1,10 +1,29 @@
+import contextlib
+import importlib.util
+import io
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/member-gateway-tests.yml"
+FULL_SUITE_RUNNER = ROOT / "tests/_run_ci_full_suite.py"
+FULL_SUITE_COMMAND = "python tests/_run_ci_full_suite.py --skip-member-gateway-targeted"
+
+
+def _load_full_suite_runner():
+    spec = importlib.util.spec_from_file_location("_run_ci_full_suite", FULL_SUITE_RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _job_block(text, name):
+    block = text.split("\n  " + name + ":\n", 1)[1]
+    following = re.search(r"\n  [a-z0-9-]+:\n", block)
+    return block[: following.start()] if following else block
 
 
 class MemberGatewayCiTests(unittest.TestCase):
@@ -84,10 +103,73 @@ class MemberGatewayCiTests(unittest.TestCase):
         self.assertNotIn("secrets.", job)
         self.assertNotIn("docker", job.lower())
         self.assertNotIn("import:workflow", job)
-        self.assertIn(
-            "needs: [gateway-tests, powershell-static, bounded-import-security, n8n-offline, existing-member-regression]",
-            self.text,
-        )
+
+    def _assert_parallel_full_suite_skips_only_targeted_windows_modules(self, text, runner):
+        self.assertNotIn("needs:", text)
+        full = _job_block(text, "full-offline-regression")
+        self.assertEqual(text.count("run: python tests/_run_ci_full_suite.py"), 1)
+        self.assertEqual(full.count("        run: " + FULL_SUITE_COMMAND + "\n"), 1)
+        self.assertEqual(set(runner.MEMBER_GATEWAY_TARGETED_JOBS), {"powershell-static", "bounded-import-security"})
+        for name in ("full-offline-regression", *runner.MEMBER_GATEWAY_TARGETED_JOBS):
+            job = _job_block(text, name)
+            # Same OS, interpreter and asserted exact head as the parallel full suite.
+            self.assertIn("    runs-on: windows-latest\n", job, name)
+            self.assertIn('          python-version: "3.12"\n', job, name)
+            self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", job, name)
+            self.assertIn('test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"', job, name)
+            self.assertNotIn("continue-on-error", job, name)
+            self.assertNotIn("\n    if:", job, name)
+        for name, modules in runner.MEMBER_GATEWAY_TARGETED_JOBS.items():
+            job = _job_block(text, name)
+            self.assertEqual(tuple(re.findall(r"\btests\.(test_\w+)", job)), modules, name)
+        self.assertEqual(len(runner.MEMBER_GATEWAY_TARGETED_MODULES), sum(map(len, runner.MEMBER_GATEWAY_TARGETED_JOBS.values())))
+
+    def test_full_suite_runs_in_parallel_and_skips_only_targeted_windows_modules(self):
+        self._assert_parallel_full_suite_skips_only_targeted_windows_modules(self.text, _load_full_suite_runner())
+
+    def test_parallel_full_suite_guard_rejects_drift(self):
+        runner = _load_full_suite_runner()
+        ps_job = _job_block(self.text, "powershell-static")
+        for mutated in (
+            self.text.replace("    runs-on: windows-latest\n    steps:", "    runs-on: windows-latest\n    needs: [powershell-static]\n    steps:", 1),
+            self.text.replace("          tests.test_directlocal_code_custody_ps\n", "", 1),
+            self.text.replace("tests.test_member_welcome_email_bounded_import_security -v", "tests.test_member_gateway_ci -v", 1),
+            self.text.replace(ps_job, ps_job.replace("runs-on: windows-latest", "runs-on: ubuntu-latest"), 1),
+            self.text.replace(FULL_SUITE_COMMAND, "python tests/_run_ci_full_suite.py --skip-member-gateway-targeted --extra", 1),
+        ):
+            self.assertNotEqual(mutated, self.text)
+            with self.assertRaises(AssertionError):
+                self._assert_parallel_full_suite_skips_only_targeted_windows_modules(mutated, runner)
+
+    def test_shard_union_equals_accepted_original_test_set(self):
+        runner = _load_full_suite_runner()
+        loader = unittest.TestLoader()
+        discovered = loader.discover(str(runner.TESTS_DIR))
+        self.assertEqual(loader.errors, [])
+        accepted_ids = {test.id() for test in runner.accepted_tests(discovered)}
+        self.assertFalse(any("test_import_n8n_workflows_live_dry_run" in test_id for test_id in accepted_ids))
+        kept, skipped = runner.partition(runner.accepted_tests(discovered), runner.MEMBER_GATEWAY_TARGETED_MODULES)
+        kept_ids = {test.id() for test in kept}
+        targeted_ids = set()
+        for name, modules in runner.MEMBER_GATEWAY_TARGETED_JOBS.items():
+            # Loaded independently, by module name, the way the targeted job loads them.
+            shard = {test.id() for test in runner._flatten(loader.loadTestsFromNames(modules))}
+            self.assertTrue(shard, name)
+            self.assertEqual({test_id.split(".", 1)[0] for test_id in shard}, set(modules), name)
+            targeted_ids |= shard
+        self.assertEqual(loader.errors, [])
+        self.assertEqual(kept_ids & targeted_ids, set())
+        self.assertEqual(kept_ids | targeted_ids, accepted_ids)
+        self.assertEqual({test.id() for test in skipped}, targeted_ids)
+
+    def test_full_suite_runner_fails_closed_on_unknown_argument_or_missing_module(self):
+        runner = _load_full_suite_runner()
+        trivial = unittest.TestSuite([unittest.FunctionTestCase(lambda: None)])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(runner.main(["--skip-everything"]), 2)
+            with mock.patch.object(runner.unittest.TestLoader, "discover", return_value=trivial):
+                self.assertEqual(runner.main([]), 0)
+                self.assertEqual(runner.main([runner.SKIP_MEMBER_GATEWAY_TARGETED_FLAG]), 2)
 
     def test_bounded_import_files_are_narrowly_triggered(self):
         for required_path in (
