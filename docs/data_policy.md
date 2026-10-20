@@ -31,3 +31,50 @@ You MUST NOT store any of the following in this repository:
 Real data should live in approved, secure storage outside of GitHub (e.g., shared drives, secure vaults).
 
 If local testing requires actual files, ensure they are placed in ignored folders such as `data/`, `exports/`, `outputs/`, or `exceptions/`.
+
+## Personal-data guard
+
+This repository is public. A personal email address or phone number in any pushed
+commit is published, even if a later commit removes it, so the guard checks every
+line a change adds.
+
+- Scanner: `scripts/pii_guard.py` (Python standard library only). It flags email
+  addresses, Singapore numbers (`+65`, and bare 8-digit numbers starting with 6, 8
+  or 9) and other `+`-prefixed international numbers.
+- Allowlist: `config/pii_guard_allowlist.json` covers reserved domains
+  (`example.com`, `example.org`, `example.net`, `.example`, `.test`, `.invalid`,
+  `.localhost`), GitHub noreply identities and named X-Boundaries role mailboxes.
+  Every entry needs a reason, and `tests/test_pii_guard.py` pins the exact set, so
+  widening it is a reviewed change.
+- Opt-out marker for a justified line: put `pii-guard: allow (<reason>)` on the
+  same line. A marker without a reason does not count.
+- Use reserved examples such as `name@example.com` in docs, fixtures and tests. In
+  test code, build realistic-looking values at runtime from fragments.
+
+One-time setup per clone (git cannot enable a tracked hook by itself):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The tracked `.githooks/pre-commit` hook then blocks a commit whose staged
+additions contain a hit, and fails closed if Python 3.9+ or the scanner is
+missing. Run the scanner by hand at any time:
+
+```bash
+python scripts/pii_guard.py --staged
+python scripts/pii_guard.py --range origin/main..HEAD
+python scripts/pii_guard.py --tree HEAD --report-only
+```
+
+Exit codes are 0 (clean), 1 (hit) and 2 (error). Output is redacted unless
+`--show-values` is passed, which is for local use only.
+
+CI: `.github/workflows/pii-guard.yml` runs on every pull request and scans each
+commit in the pull-request range, not just the final diff. A hit, a missing or
+empty range, an unknown commit or a parse error fails the job.
+
+If the guard flags a value on a branch, remove it from the commit that added it
+(amend or rebase the branch before merge); a follow-up commit that deletes it
+still leaves it in the published history. If a value has already reached `main`,
+tell the owner; do not rewrite shared history without their approval.

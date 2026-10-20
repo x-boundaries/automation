@@ -46,5 +46,19 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   protected-payload AEAD); it is the only permitted install besides tzdata.
   The real-PostgreSQL migration tests remain local-only and skip in hosted CI.
 
+- Personal-data guard (#211 CI hygiene) adds `.github/workflows/pii-guard.yml`.
+  It runs on every pull request with no path filter, checks out the literal
+  head with full history and runs `scripts/pii_guard.py --range
+  "${BASE_SHA}..${HEAD_SHA}"`, scanning each commit in the range (merge commits
+  contribute only lines new to every parent) for likely email addresses and
+  phone numbers outside `config/pii_guard_allowlist.json`. It fails closed on a
+  hit, a missing or empty range, an unknown commit or a parse error, and it
+  redacts matched values in the log. `tests/test_pii_guard.py` pins the trigger,
+  checkout, exact run lines and allowlist, and rejects `continue-on-error`,
+  `|| true`, `if:` conditions, path filters, a dropped or narrowed range and
+  report-only or value-printing flags. The tracked `.githooks/pre-commit` hook
+  needs the one-time `git config core.hooksPath .githooks` per clone; see
+  `docs/data_policy.md`.
+
 This status file records CI shape only; it is not a deployment approval or a
 claim that a remote check has passed before the branch is published.
