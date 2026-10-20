@@ -1262,32 +1262,38 @@ class WrapperTemplate(unittest.TestCase):
         return result.returncode, json.loads(result.stdout.strip().splitlines()[-1])
 
     @staticmethod
-    def icacls(path: Path, *args: str) -> None:
-        subprocess.run(["icacls", str(path), *args], check=True, capture_output=True, timeout=60)
-
-    @staticmethod
     def current_sid() -> str:
         output = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True,
                                 text=True, timeout=60).stdout
         return output.strip().split(",")[-1].strip('"')
 
-    def private_grants(self) -> list[str]:
-        # The documented install: inheritance broken, inheritable grants for SYSTEM, Administrators and the
-        # task principal only (docs section 6).
-        return ["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F",
-                f"*{self.current_sid()}:(OI)(CI)M"]
+    def private_sddl(self, extra: str = "") -> str:
+        # The documented install: inheritance broken (P), inheritable (OICI) entries for SYSTEM, Administrators
+        # and the task principal (Modify) only (docs section 6). The whole DACL is written, so no entry the
+        # scratch folder was created with (an inherited or token-default one) can survive.
+        return f"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{self.current_sid()}){extra}"
+
+    @staticmethod
+    def set_dacl(path: Path, sddl: str) -> None:
+        command = ("$s = New-Object System.Security.AccessControl.DirectorySecurity; "
+                   "$s.SetSecurityDescriptorSddlForm($env:EG_SDDL, [System.Security.AccessControl.AccessControlSections]"
+                   "::Access); [System.IO.Directory]::SetAccessControl($env:EG_PATH, $s)")
+        subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command], check=True,
+                       capture_output=True, timeout=60, env={**os.environ, "EG_PATH": str(path), "EG_SDDL": sddl})
 
     def sddl(self, path: Path) -> str:
+        """The DACL as SDDL, or a marker when this process cannot read it."""
         command = ("$p=$env:EG_PATH; if ([System.IO.Directory]::Exists($p)) { $s=[System.IO.Directory]::"
                    "GetAccessControl($p) } else { $s=[System.IO.File]::GetAccessControl($p) }; "
                    "$s.GetSecurityDescriptorSddlForm('Access')")
-        return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command], check=True,
-                              capture_output=True, text=True, timeout=60,
-                              env={**os.environ, "EG_PATH": str(path)}).stdout.strip()
+        result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+                                capture_output=True, text=True, timeout=60, env={**os.environ, "EG_PATH": str(path)})
+        return result.stdout.strip() if result.returncode == 0 else "<UNREADABLE>"
 
     def assert_refused_before_python(self, wrapper: Path, retention: Path, ref: str, present: set[str]) -> None:
         code, summary = self.run_wrapper(wrapper)
-        self.assertEqual((code, summary["refs"]), (64, [ref]), summary)
+        acl = self.sddl(retention) if retention.exists() else "<MISSING>"
+        self.assertEqual((code, summary["refs"]), (64, [ref]), (summary, acl))
         found = {entry.name for entry in retention.iterdir()} if retention.exists() else set()
         self.assertEqual(found, present, "Python never ran: no lock, report or tool folder was created")
 
@@ -1303,23 +1309,26 @@ class WrapperTemplate(unittest.TestCase):
 
         broad, wrapper = self.retention_home("users-read")
         broad.mkdir()
-        self.icacls(broad, *self.private_grants(), "*S-1-5-32-545:(OI)(CI)RX")
+        self.set_dacl(broad, self.private_sddl("(A;OICI;0x1200a9;;;BU)"))  # BUILTIN\Users read and execute
         self.assert_refused_before_python(wrapper, broad, "EG_RET_RETENTION_NOT_PRIVATE", set())
 
         child, wrapper = self.retention_home("broad-child")
         child.mkdir()
-        self.icacls(child, *self.private_grants())
+        self.set_dacl(child, self.private_sddl())
         (child / "reports").mkdir()
-        self.icacls(child / "reports", "/grant", "*S-1-1-0:(OI)(CI)R")
+        self.set_dacl(child / "reports", "D:(A;OICI;0x1200a9;;;WD)")  # inherits the root's, plus Everyone read
         self.assert_refused_before_python(wrapper, child, "EG_RET_RETENTION_NOT_PRIVATE", {"reports"})
 
     def test_unreadable_retention_acl_is_refused_before_python(self) -> None:
         retention, wrapper = self.retention_home("unreadable")
         retention.mkdir()
-        # Only an OWNER RIGHTS entry without READ_CONTROL: the owner loses its implicit right to read the ACL.
-        # DELETE and SYNCHRONIZE stay, so the empty folder can still be removed afterwards.
-        self.icacls(retention, "/inheritance:r", "/grant:r", "*S-1-3-4:(D,S,WDAC)")
+        # Only an OWNER RIGHTS entry with DELETE, WRITE_DAC and SYNCHRONIZE: the owner loses its implicit
+        # READ_CONTROL, so the ACL cannot be read; the empty folder can still be removed afterwards.
+        self.set_dacl(retention, "D:P(A;;0x150000;;;OW)")
         try:
+            if self.sddl(retention) != "<UNREADABLE>":
+                # A process holding an enabled backup privilege reads any ACL: the case cannot be built here.
+                self.skipTest("this process can still read an ACL that denies it READ_CONTROL")
             code, summary = self.run_wrapper(wrapper)
             self.assertEqual((code, summary["refs"]), (64, ["EG_RET_ACL_UNREADABLE"]), summary)
         finally:
@@ -1329,9 +1338,10 @@ class WrapperTemplate(unittest.TestCase):
     def test_protected_retention_folder_runs_and_children_inherit_private(self) -> None:
         retention, wrapper = self.retention_home("protected")
         retention.mkdir()
-        self.icacls(retention, *self.private_grants())
+        self.set_dacl(retention, self.private_sddl())
         code, summary = self.run_wrapper(wrapper)
-        self.assertEqual((code, summary["mode"], summary["outcome"]), (0, "DRY_RUN", "COMPLETED"), summary)
+        self.assertEqual((code, summary.get("mode"), summary["outcome"]), (0, "DRY_RUN", "COMPLETED"),
+                         (summary, self.sddl(retention)))
         report = next((retention / "reports").iterdir())
         broad = (";;;BU)", ";;;WD)", ";;;AU)")  # SDDL aliases: Users, Everyone, Authenticated Users
         for path in (retention, retention / "reports", retention / "incident-archive", report):

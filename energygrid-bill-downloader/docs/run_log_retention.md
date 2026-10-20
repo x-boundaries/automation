@@ -244,7 +244,9 @@ Each step needs its own owner grant naming the target and the effect.
      them.
    - Read back the root and, after the first dry run, one report file and one subfolder with `icacls`.
      The root must show no inherited entries, and nothing may show a `BUILTIN\Users`, `Everyone` or
-     `NT AUTHORITY\Authenticated Users` entry.
+     `NT AUTHORITY\Authenticated Users` entry. `/grant:r` replaces only the named principals' entries,
+     so remove any other explicit entry the folder was created with until only the three grants remain.
+     The wrapper refuses otherwise.
 3. **Negative ACL proof** as the non-elevated task principal:
    - Writing, renaming or deleting `egretention.ps1`, `energygrid_retention.py` or `maintenance` fails.
    - Changing their ACL or owner fails.
@@ -329,5 +331,7 @@ runs it. The tests cover:
   - natively, against real folders: a missing, an inheriting, a Users-readable and an unreadable
     retention folder, and a broadly readable subfolder, are each refused before Python runs. A protected
     folder runs, and the subfolders and report the tool creates inherit no Users, Everyone or
-    Authenticated Users entry. These render the wrapper with the admin-ownership loop removed, because a
-    scratch folder cannot be admin-owned; that loop has its own test above.
+    Authenticated Users entry. Each scratch DACL is written whole (SDDL) and printed on failure. The
+    unreadable case is skipped, never passed, if the test process can still read the ACL (for example
+    with an enabled backup privilege). These tests render the wrapper with the admin-ownership loop
+    removed, because a scratch folder cannot be admin-owned; that loop has its own test above.
