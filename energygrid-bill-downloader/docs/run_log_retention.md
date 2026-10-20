@@ -75,7 +75,9 @@ A run folder is pruned only when **all** of the following are true. Anything els
    - So 89 and 90 are kept and 91 is eligible. The SGT date is used, not UTC: 00:30 SGT is already the
      next day.
 9. **No same-day incident.** If any run on the same SGT day was preserved, the clean run of that day is
-   kept too.
+   kept too. An `UNSAFE` entry (a junction, link, reparse point or file posing as a run) still counts: its
+   SGT day is taken from its exact `YYYYMMDD-HHMMSS` name alone, without following or reading it. An
+   impossible date in the name gives no day.
 
 Preserved kinds:
 
@@ -91,16 +93,26 @@ Preserved runs stay **indefinitely** until a separate owner decision.
 
 ## 3. What `--apply` does, in order
 
-1. **Gates.**
+1. **Gates, before any change.**
+   - `data\retention` must already exist (`EG_RET_RETENTION_MISSING` otherwise). The tool never creates
+     it; the protected install does (section 6). Before the gates the tool creates only its lock file and
+     its own empty subfolders inside it.
    - The tool takes an OS byte-range lock, so only one instance runs. A second instance gets
      `EG_RET_LOCK_HELD`.
    - It refuses outside 15:00 to 23:00 SGT (`EG_RET_OUTSIDE_WINDOW`).
-   - It **holds every effect** if any of these is true:
-     - a run folder is younger than 4 hours (`EG_RET_WRITER_MAY_BE_ACTIVE`: the 11:30 task or a manual
-       run may still be writing);
-     - a run is dated in the future;
+   - It **holds every effect**, including the recovery in step 2, if any of these is true:
+     - an entry named like a run is younger than 4 hours (`EG_RET_WRITER_MAY_BE_ACTIVE`: the 11:30 task
+       or a manual run may still be writing). This reads the names only, so a young junction or file
+       posing as a run fences too;
+     - an entry named like a run is dated in the future (`EG_RET_FUTURE_RUN_PRESENT`);
+     - the runs root cannot be listed (`EG_RET_RUNS_UNREADABLE`);
      - an interrupted operation cannot be settled.
-2. **Settle interrupted work.**
+   - While the writer fence holds, an interrupted prune is left exactly as it is
+     (`EG_RET_RECOVERY_DEFERRED`; a dry run reports `EG_RET_RECOVERY_PENDING`). The first `--apply`
+     whose gates are clear settles it.
+   - The window and the writer fence are checked again immediately before each prune and before the log
+     rotation.
+2. **Settle interrupted work** (only when every gate is clear).
    - Its own leftover archive staging and compaction temp files are removed. The originals were never
      touched.
    - Prune journals are completed, but only where the quarantined bytes still match the journal.
@@ -122,6 +134,18 @@ Preserved runs stay **indefinitely** until a separate owner decision.
    4. Re-verify every hash. On a mismatch, rename the folder back.
    5. Delete the five files and the folder.
    6. Write a permanent ledger record of names and hashes, with no content, in `data\retention\pruned\`.
+
+   **A failed or doubtful prune holds everything after it** in that execution: no further prune, no log
+   rotation and no compaction. A run that changed between classification and its re-proof holds the same
+   way (`EG_RET_RUN_CHANGED_BEFORE_PRUNE`). The failure's own reference is reported with one of:
+
+   | Hold | State left | Next `--apply` |
+   |---|---|---|
+   | `EG_RET_PRUNE_HOLD_NOTHING_CHANGED` | The run is intact in `data\runs`, with no journal or quarantine (for example the rename was refused while a file was open). | Re-judges and retries it. |
+   | `EG_RET_PRUNE_HOLD_RESUMABLE` | A journal, and either the run still in place or a quarantine whose remaining files all match the journal. | Settles it (step 2) once the gates are clear. |
+   | `EG_RET_PRUNE_HOLD_OPERATOR` | Anything else: a substituted folder, changed quarantined bytes, a missing or invalid journal, or the run in both places. | Holds again. Nothing is deleted or restored; an operator decides. |
+
+   A failed prune is never counted as pruned and gets no ledger record until it is settled.
 5. **Summary log.**
    - When the live log's first line is at least 31 complete days old, or the log reaches 1 MiB, it is
      **renamed** into `data\retention\egdaily-log\`.
@@ -161,7 +185,7 @@ Exit codes:
 |---|---|
 | 0 | Completed. |
 | 20 | Held, or completed with errors. Read the refs and the report. |
-| 64 | Refused: bad argument, tree refused, lock held, outside the window or ACL refused. |
+| 64 | Refused: bad argument, tree refused, `data\retention` missing, lock held, outside the window or ACL refused. |
 
 The private report `data\retention\reports\<stamp>-<mode>-<id>.json` records per run the kind, reason,
 complete days, action and file hashes. It also holds the log plan and the before and after inventory
@@ -173,7 +197,8 @@ evidence is the summary line only.
 | Interrupted at | Next `--apply` |
 |---|---|
 | After journal, before rename | The run is still in place. The journal is discarded and the run is re-judged. |
-| After rename or mid-delete | The remaining quarantined files are re-hashed against the journal, then deleted and recorded. |
+| After rename or mid-delete | The remaining quarantined files are re-hashed against the journal, then deleted and recorded. Not while the writer fence holds: then nothing is touched (`EG_RET_RECOVERY_DEFERRED`). |
+| A prune failed without a crash | Everything after it was held in that run. What it left is settled as above, or held for the operator (`EG_RET_PRUNE_HOLD_*`, section 3 step 4). |
 | Quarantined bytes changed | Held with `EG_RET_PRUNE_DIGEST_MISMATCH`. Nothing is deleted and nothing else is pruned. An operator decides. |
 | Archive staging | Staging is removed and the archive is redone and verified before any prune. |
 | Log compaction | The temp file is removed. The old segment was whole the whole time, and it is compacted again. |
@@ -204,14 +229,35 @@ Each step needs its own owner grant naming the target and the effect.
      SYSTEM, Administrators and TrustedInstaller may hold write, delete, WRITE_DAC or WRITE_OWNER.
      The executed items are EG_HOME, the venv, `pyvenv.cfg`, `python.exe` and the base CPython from
      #226 CB1.
-   - Create `data\retention` with inheritance broken. Grant it only to SYSTEM, Administrators and the
-     task principal (Modify). Users, Everyone and Authenticated Users get no read.
+   - Create `data\retention` **before the first run**. The wrapper refuses with
+     `EG_RET_RETENTION_MISSING` if it is absent, and the tool never creates it. Break inheritance and grant
+     it only to SYSTEM, Administrators and the task principal (Modify), all **inheritable to subfolders
+     and files**, for example:
+
+     ```bat
+     icacls "<EG_HOME>\data\retention" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "<task principal>:(OI)(CI)M"
+     ```
+
+     Users, Everyone and Authenticated Users get no read, not even inherit-only. The tool creates its
+     subfolders (`incident-archive`, `prune-quarantine`, `prune-journal`, `pruned`, `egdaily-log`,
+     `reports`) and files inside it, so they inherit exactly these entries. Do not set explicit ACLs on
+     them.
+   - Read back the root and, after the first dry run, one report file and one subfolder with `icacls`.
+     The root must show no inherited entries, and nothing may show a `BUILTIN\Users`, `Everyone` or
+     `NT AUTHORITY\Authenticated Users` entry.
 3. **Negative ACL proof** as the non-elevated task principal:
    - Writing, renaming or deleting `egretention.ps1`, `energygrid_retention.py` or `maintenance` fails.
    - Changing their ACL or owner fails.
    - A standard second user cannot list `data\retention`.
-   - The wrapper itself refuses (exit 64, `EG_RET_ACL_NOT_PROTECTED` or `EG_RET_RETENTION_NOT_PRIVATE`) if
-     any of this is wrong.
+   - The wrapper itself refuses before Python starts (exit 64) if any of this is wrong:
+     - `EG_RET_ACL_NOT_PROTECTED`: an executed item or folder is writable by someone else;
+     - `EG_RET_RETENTION_MISSING`: `data\retention` does not exist;
+     - `EG_RET_RETENTION_NOT_PLAIN`: it, or one of the tool's subfolders, is a junction or other reparse
+       point;
+     - `EG_RET_RETENTION_NOT_PRIVATE`: its inheritance is not broken, or it or an existing subfolder
+       grants read (effective, inherited or inherit-only) to anyone but SYSTEM, Administrators, the task
+       principal or CREATOR OWNER;
+     - `EG_RET_ACL_UNREADABLE`: an ACL cannot be read.
 4. **Scratch rehearsal on the owner PC.**
    - Copy the installed pair into a throwaway `EG_HOME` holding **copies** of some run folders, never the
      live ones. Run a dry run, then `--apply` inside the window.
@@ -245,7 +291,8 @@ Each step needs its own owner grant naming the target and the effect.
 runs it. The tests cover:
 
 - **Age:** 89, 90 and 91 complete days; the SGT versus UTC boundary; folder name versus recorded start;
-  back-dated file times; same-day incidents; future runs.
+  back-dated file times; same-day incidents; future runs; an unsafe entry (a file, or on Windows a
+  junction) keeping the clean run of its SGT day.
 - **Evidence:** 33 doubtful-evidence variants, plus separate extra-file and invalid-name tests, each preserved with the expected kind. These include:
   - withheld runs, uncertain, held or probe-failed email, and pending, held or unknown notifications;
   - pending or blocked streams, unverified invoices, failed acquisition, recovered work and named-archive
@@ -258,7 +305,15 @@ runs it. The tests cover:
   non-run entries.
 - **Apply:** prune plus archive with consumer readback; non-target state, sidecars, outbox, PDFs and
   config unchanged; a summary line with no names; repeat-run idempotence; window refusal; writer-active
-  hold; the lock; argument refusal; a tampered existing archive.
+  hold; the lock; argument refusal; a tampered existing archive; a missing `data\retention` refused with
+  nothing created.
+- **Gates before recovery:** an interrupted prune with leftover staging and temp files, plus a young, a
+  future-dated or a young unsafe entry. Nothing at all changes until the fence clears; then recovery,
+  the next prune and the rotation complete. A dry run reports the pending recovery.
+- **Prune failure holds:** a failure before the rename, after the rename and mid-delete, a changed
+  quarantine, and a run that changed before its re-proof. Each has a second eligible run, a log due for
+  rotation and a segment due for compaction. Nothing after the failure changes, the right
+  `EG_RET_PRUNE_HOLD_*` is reported, and the next run settles it or keeps holding.
 - **Interruptions:** after the journal, after the rename, mid-delete, a tampered quarantine, a quarantine
   with no journal, archive staging, compaction temp files.
 - **Log:** dry run, rotation and compaction rules (abnormal lines, incident days, the 90-day boundary,
@@ -268,4 +323,11 @@ runs it. The tests cover:
   - wrapper parse;
   - in-memory ACL verdicts (protected and private, including inherit-only CREATOR OWNER and Users,
     Everyone and Authenticated Users entries);
-  - the rendered wrapper refuses a user-writable install before Python runs.
+  - in-memory verdicts for the retention root (inheritance broken, inherit-only broad read) and an
+    inheriting subfolder;
+  - the rendered wrapper refuses a user-writable install before Python runs;
+  - natively, against real folders: a missing, an inheriting, a Users-readable and an unreadable
+    retention folder, and a broadly readable subfolder, are each refused before Python runs. A protected
+    folder runs, and the subfolders and report the tool creates inherit no Users, Everyone or
+    Authenticated Users entry. These render the wrapper with the admin-ownership loop removed, because a
+    scratch folder cannot be admin-owned; that loop has its own test above.

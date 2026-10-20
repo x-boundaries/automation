@@ -24,8 +24,13 @@ Safety floor (docs/run_log_retention.md):
   only then deleted, so an interrupted run resumes or stops safely on the next invocation.
 - egdaily.log is rotated by one rename (refused by Windows while the daily runner holds it open), never
   truncated. Only rotated copies are compacted, and only old clean lines on non-incident days are dropped.
-- Only one instance runs (OS byte-range lock). --apply runs only inside APPLY_WINDOW and never while a
-  run folder younger than ACTIVE_FENCE exists (the daily writer may still be active).
+- Only one instance runs (OS byte-range lock). --apply runs only inside APPLY_WINDOW, and nothing (not even
+  interrupted-work recovery) changes while a run-named entry younger than ACTIVE_FENCE or dated in the
+  future exists (the daily writer may still be active). These gates are checked before any change.
+- A failed or doubtful prune holds every later prune and log change in that execution; what it left is
+  settled by the next run whose gates are clear, or held for the operator.
+- data\\retention must already exist (the protected install creates it with a private ACL); the tool never
+  creates it.
 
 Output: one JSON summary line with counts and closed EG_RET_ references only; no file names, bill
 numbers, addresses or tokens. The private report under data\\retention\\reports holds per-run detail.
@@ -267,13 +272,18 @@ def installed_home() -> Path:
 
 
 def check_tree(layout: Layout) -> None:
-    """The runs root and every ancestor are plain directories; the tool's own folders are created and checked."""
+    """The runs root and every ancestor are plain directories. data\\retention must already exist: only the
+    protected install creates it, with a private inheritable ACL the wrapper verifies before Python starts,
+    so a folder the tool made itself could inherit broad read access. Its subfolders are created inside it."""
     if len(Path(os.path.abspath(layout.home)).parts) < 2:
         raise RetentionError("EG_RET_TREE_REFUSED")
     _check_components(layout.runs)
     if os.path.lexists(layout.log) and not _plain_file(os.lstat(layout.log)):
         raise RetentionError("EG_RET_LOG_NOT_PLAIN")
-    for folder in layout.own_dirs():
+    if not os.path.lexists(layout.retention):
+        raise RetentionError("EG_RET_RETENTION_MISSING")
+    _check_components(layout.retention)
+    for folder in layout.own_dirs()[1:]:
         try:
             os.mkdir(folder)
         except FileExistsError:
@@ -465,21 +475,32 @@ def _judge(folder: Path, started: datetime, present: dict[str, bytes], mtimes: d
         _need(started - CLOCK_SKEW <= written <= started + RUN_SPAN, "EG_RET_EVIDENCE_TIME_INCONSISTENT")
 
 
+def run_start(name: str) -> datetime | None:
+    """The SGT start a run-folder name encodes, from the name alone (no filesystem access). None if invalid."""
+    if not RUN_DIR_RE.fullmatch(name):
+        return None
+    try:
+        return datetime.strptime(name, "%Y%m%d-%H%M%S").replace(tzinfo=SGT)
+    except ValueError:
+        return None
+
+
 def classify(layout: Layout, name: str, now: datetime) -> Run:
     """Read-only classification of one runs-root entry whose name has the run-folder pattern."""
     folder = layout.runs / name
-    # Type first: a link or junction is never parsed, read or archived, whatever its name says.
+    # The date comes from the direct child's name only, so an unsafe entry still marks its SGT day as
+    # preserved. Type next: a link or junction is never followed, read or archived, whatever its name says.
+    started = run_start(name)
+    days = complete_days(started.date(), now.astimezone(SGT).date()) if started else None
     try:
         st = os.lstat(folder)
     except OSError:
-        return Run(name, UNSAFE, "EG_RET_RUN_DIR_UNREADABLE")
+        return Run(name, UNSAFE, "EG_RET_RUN_DIR_UNREADABLE", started, days)
     if not _plain_dir(st):
-        return Run(name, UNSAFE, "EG_RET_RUN_DIR_NOT_PLAIN")
-    try:
-        started = datetime.strptime(name, "%Y%m%d-%H%M%S").replace(tzinfo=SGT)
-    except ValueError:
+        return Run(name, UNSAFE, "EG_RET_RUN_DIR_NOT_PLAIN", started, days)
+    if started is None:
         return Run(name, INCOMPLETE, "EG_RET_RUN_NAME_INVALID")
-    run = Run(name, INCOMPLETE, None, started, complete_days(started.date(), now.astimezone(SGT).date()))
+    run = Run(name, INCOMPLETE, None, started, days)
     if started > now + CLOCK_SKEW:
         run.kind, run.reason = FUTURE, "EG_RET_RUN_IN_FUTURE"
         return run
@@ -529,6 +550,7 @@ def scan(layout: Layout, now: datetime) -> tuple[list[Run], int]:
             runs.append(classify(layout, name, now))
         else:
             skipped += 1
+    # UNSAFE entries carry the date of their name, so a junction or file posing as a run keeps its day too.
     incident_days = {run.started.date() for run in runs if run.kind in PRESERVED_KINDS and run.started}
     for run in runs:
         if run.kind != SUCCESS:
@@ -764,6 +786,48 @@ def resume_prunes(layout: Layout, now: datetime) -> tuple[int, list[str]]:
     return completed, errors
 
 
+def recovery_pending(layout: Layout) -> bool:
+    """Read-only: does an interrupted prune (a journal or a quarantined folder) wait to be settled?"""
+    for folder in (layout.journal, layout.quarantine):
+        with os.scandir(folder) as entries:
+            if any(True for _entry in entries):
+                return True
+    return False
+
+
+PRUNE_HOLD_UNCHANGED = "EG_RET_PRUNE_HOLD_NOTHING_CHANGED"  # the run is intact in place: retried next time
+PRUNE_HOLD_RESUMABLE = "EG_RET_PRUNE_HOLD_RESUMABLE"        # journal + matching quarantine: the next run settles it
+PRUNE_HOLD_OPERATOR = "EG_RET_PRUNE_HOLD_OPERATOR"          # anything else: left exactly as found for the operator
+
+
+def prune_hold(layout: Layout, name: str, ref: str | None) -> str:
+    """Read-only, after a failed prune: can the next run settle what is left, or must an operator decide?
+
+    Never deletes or restores anything itself; the caller holds every later effect either way."""
+    if ref == "EG_RET_PRUNE_SUBSTITUTED":
+        return PRUNE_HOLD_OPERATOR
+    journal_path, held = layout.journal / f"{name}.json", layout.quarantine / name
+    try:
+        in_runs, in_quarantine = os.path.lexists(layout.runs / name), os.path.lexists(held)
+        if not os.path.lexists(journal_path):
+            return PRUNE_HOLD_UNCHANGED if in_runs and not in_quarantine else PRUNE_HOLD_OPERATOR
+        if in_runs and in_quarantine:
+            return PRUNE_HOLD_OPERATOR
+        journal = _parse_json(_read_plain(journal_path, MAX_EVIDENCE_BYTES))
+        if type(journal) is not dict or journal.get("schema") != JOURNAL_SCHEMA or journal.get("run") != name \
+                or type(journal.get("files")) is not dict:
+            return PRUNE_HOLD_OPERATOR
+        if in_quarantine:
+            # The same test resume_prunes applies: every remaining file still matches the journal.
+            _check_components(held)
+            remaining = _folder_digest(held)
+            if any(journal["files"].get(file_name) != digest for file_name, digest in remaining.items()):
+                return PRUNE_HOLD_OPERATOR
+    except (OSError, RetentionError, UnicodeError, ValueError):
+        return PRUNE_HOLD_OPERATOR
+    return PRUNE_HOLD_RESUMABLE
+
+
 # -- egdaily.log ------------------------------------------------------------------------------------
 
 
@@ -894,6 +958,32 @@ def in_window(moment: datetime) -> bool:
     return APPLY_WINDOW[0] <= local < APPLY_WINDOW[1]
 
 
+def writer_fence(layout: Layout, now: datetime) -> list[str]:
+    """Read-only writer gate, from the runs root's entry names alone (never their type or content), so it
+    can run before anything else: a run-named entry younger than ACTIVE_FENCE (the daily writer may still
+    be active) or dated ahead of the clock holds every effect. An unreadable runs root holds too."""
+    try:
+        with os.scandir(layout.runs) as entries:
+            starts = [start for start in (run_start(entry.name) for entry in entries) if start is not None]
+    except OSError:
+        return ["EG_RET_RUNS_UNREADABLE"]
+    holds = []
+    if any(start > now + CLOCK_SKEW for start in starts):
+        holds.append("EG_RET_FUTURE_RUN_PRESENT")
+    if any(start <= now + CLOCK_SKEW and now - start < ACTIVE_FENCE for start in starts):
+        holds.append("EG_RET_WRITER_MAY_BE_ACTIVE")
+    return holds
+
+
+def effect_gate(layout: Layout, clock: Callable[[], datetime]) -> str | None:
+    """Re-checked immediately before each prune and the log rotation: the window, then the writer fence."""
+    moment = clock().astimezone(SGT)
+    if not in_window(moment):
+        return "EG_RET_WINDOW_CLOSED"
+    fence = writer_fence(layout, moment)
+    return fence[0] if fence else None
+
+
 def _counts() -> dict[str, int]:
     return {key: 0 for key in ("considered", "eligible", "pruned", "retained", "protected", "archived",
                                "archive_verified", "skipped", "errors", "log_rotated", "log_segments_compacted",
@@ -915,32 +1005,44 @@ def _inventory(layout: Layout, runs: list[Run]) -> dict[str, dict[str, str]]:
 def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> dict:
     """The whole maintenance pass under the instance lock. Returns the summary (and writes the report).
 
-    Order: settle interrupted work, classify, archive every incident, then (only if all of that is clean)
-    prune, rotate and compact. Any doubt on the way becomes a hold that skips every later effect."""
+    Order: the read-only gates (window, writer fence) before ANY change; then settle interrupted work,
+    classify, archive every incident and (only if all of that is clean) prune, rotate and compact. Any doubt
+    on the way becomes a hold that skips every later effect. Before the gates the tool creates only its lock
+    file and its own empty subfolders inside the protected data\\retention."""
     now = clock().astimezone(SGT)
     mode = "APPLY" if apply else "DRY_RUN"
     counts = _counts()
     refs: list[str] = []
     holds: list[str] = []
+
+    def hold(ref: str) -> None:
+        if ref not in holds:
+            holds.append(ref)
+
     check_tree(layout)
     with Lock(layout.retention / "retention.lock"):
         if apply and not in_window(now):
             raise RetentionError("EG_RET_OUTSIDE_WINDOW")
-        if apply:
+        # 0. Gates first: while a writer may be active, not even the tool's own leftovers are cleaned up.
+        for ref in writer_fence(layout, now):
+            hold(ref)
+        if apply and not holds:
             for cleaner in (clean_archive_staging, clean_compact_temps):
                 try:
                     cleaner(layout)
                 except (OSError, RetentionError) as exc:
-                    holds.append(getattr(exc, "ref", "EG_RET_CLEANUP_FAILED"))
+                    hold(getattr(exc, "ref", "EG_RET_CLEANUP_FAILED"))
             completed, errors = resume_prunes(layout, now)
             counts["resumed"] = completed
-            holds += errors
+            for ref in errors:
+                hold(ref)
+        elif recovery_pending(layout):
+            # Journal and quarantine stay exactly as they are until a run whose gates are clear settles them.
+            hold("EG_RET_RECOVERY_DEFERRED" if apply else "EG_RET_RECOVERY_PENDING")
         runs, counts["skipped"] = scan(layout, now)
         counts["considered"] = len(runs)
-        if any(run.kind == FUTURE for run in runs):
-            holds.append("EG_RET_FUTURE_RUN_PRESENT")
-        if any(run.started and run.kind != FUTURE and now - run.started < ACTIVE_FENCE for run in runs):
-            holds.append("EG_RET_WRITER_MAY_BE_ACTIVE")
+        for ref in writer_fence(layout, now):  # a run may have started while interrupted work was settled
+            hold(ref)
         before = _inventory(layout, runs)
         today = now.date()
         keep_days = {run.started.date() for run in runs if run.kind in PRESERVED_KINDS and run.started}
@@ -969,11 +1071,12 @@ def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> di
             except (OSError, RetentionError) as exc:
                 run.action = "ARCHIVE_FAILED"
                 refs.append(getattr(exc, "ref", "EG_RET_ARCHIVE_FAILED"))
-                if "EG_RET_PRUNE_SKIPPED_ARCHIVE_INCOMPLETE" not in holds:
-                    holds.append("EG_RET_PRUNE_SKIPPED_ARCHIVE_INCOMPLETE")
+                hold("EG_RET_PRUNE_SKIPPED_ARCHIVE_INCOMPLETE")
 
         # 2. Prune runs that are proven clean and old enough, re-proving each one just before it goes.
+        #    A failed or doubtful prune holds every later prune and log change in this execution.
         pruned: set[str] = set()
+        targets: set[str] = set()
         for run in runs:
             if not run.eligible:
                 continue
@@ -984,35 +1087,41 @@ def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> di
             if holds:
                 run.action = "HELD"
                 continue
-            if not in_window(clock()):
+            gate = effect_gate(layout, clock)
+            if gate:
                 run.action = "HELD"
-                holds.append("EG_RET_WINDOW_CLOSED")
+                hold(gate)
                 continue
             fresh = classify(layout, run.name, clock().astimezone(SGT))
             if fresh.kind != SUCCESS or fresh.files != run.files:
                 run.action = "CHANGED_SKIPPED"
-                refs.append("EG_RET_RUN_CHANGED_BEFORE_PRUNE")
+                hold("EG_RET_RUN_CHANGED_BEFORE_PRUNE")
                 continue
+            targets.add(run.name)
             try:
                 prune(layout, run, now)
                 run.action = "PRUNED"
                 pruned.add(run.name)
                 counts["pruned"] += 1
             except (OSError, RetentionError) as exc:
+                # Never a completion: what is left (journal, quarantine) stays for resume or the operator.
+                ref = getattr(exc, "ref", None)
                 run.action = "PRUNE_FAILED"
-                refs.append(getattr(exc, "ref", "EG_RET_PRUNE_FAILED"))
+                refs.append(ref or "EG_RET_PRUNE_FAILED")
+                hold(prune_hold(layout, run.name, ref))
 
         # 3. The summary log: rotate the live file by one rename, compact only rotated copies.
         if log_ok:
             try:
                 if rotation_due(layout, today):
+                    gate = effect_gate(layout, clock) if apply and not holds else None
                     if not apply:
                         log["rotation"] = "WOULD_ROTATE"
                     elif holds:
                         log["rotation"] = "HELD"
-                    elif not in_window(clock()):
+                    elif gate:
                         log["rotation"] = "HELD"
-                        holds.append("EG_RET_WINDOW_CLOSED")
+                        hold(gate)
                     else:
                         log["rotation"] = rotate_log(layout, now)
                         if log["rotation"] == "ROTATED":
@@ -1035,9 +1144,10 @@ def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> di
             except (OSError, RetentionError) as exc:
                 refs.append(getattr(exc, "ref", "EG_RET_LOG_FAILED"))
 
-        # 4. Independent after-check: every run folder that was not pruned is byte-identical.
-        after = _inventory(layout, [run for run in runs if run.name not in pruned])
-        changed = sorted(name for name, digest in before.items() if name not in pruned and after.get(name) != digest)
+        # 4. Independent after-check: every run folder that was not a prune target is byte-identical.
+        #    (A failed target is already held above and reported by its PRUNE_HOLD reference.)
+        after = _inventory(layout, [run for run in runs if run.name not in targets])
+        changed = sorted(name for name, digest in before.items() if name not in targets and after.get(name) != digest)
         if changed:
             refs.append("EG_RET_NON_TARGET_CHANGED")
 

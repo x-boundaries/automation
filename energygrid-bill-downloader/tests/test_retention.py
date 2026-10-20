@@ -112,6 +112,8 @@ class Home:
         self.root = base / "EnergyGrid"
         self.runs = self.root / "data" / "runs"
         self.runs.mkdir(parents=True)
+        # The protected install creates data\retention with its private ACL (docs section 6); the tool never does.
+        (self.root / "data" / "retention").mkdir()
         (self.root / "maintenance").mkdir()
         shutil.copy2(SCRIPT, self.root / "maintenance" / SCRIPT.name)
         # Non-targets the tool must never touch.
@@ -196,6 +198,28 @@ class RetentionCase(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SimulatedCrash):
             ret.main(list(argv), home=self.home.root, clock=lambda: NOW)
         ret._fault = self._fault
+
+    def fail_at(self, point: str, before=None) -> None:
+        """An ordinary OSError (not a crash) once at `point`, after running `before` if given."""
+        def fault(name: str) -> None:
+            if name == point:
+                ret._fault = self._fault
+                if before:
+                    before()
+                raise OSError("injected failure")
+
+        ret._fault = fault
+
+    def write_log(self, lines: list[bytes], bom: bool = True) -> Path:
+        path = self.home.root / "data" / "egdaily.log"
+        path.write_bytes((ret.BOM if bom else b"") + b"".join(lines))
+        return path
+
+    def write_segment(self, name: str, lines: list[bytes]) -> Path:
+        folder = self.home.retention / "egdaily-log"
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_bytes(b"".join(lines))
+        return folder / name
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -472,14 +496,18 @@ class LinksAndPaths(RetentionCase):
 
     def test_run_held_open_is_not_pruned(self) -> None:
         folder = self.home.clean_run(150)
+        second = self.home.clean_run(149)  # also eligible: must wait for the next execution
+        second_before = tree_digest(second)
         with open(folder / "daily.json", "rb"):
             code, summary = self.home.main("--apply")
         self.assertEqual(code, 20)
         self.assertIn("EG_RET_RUN_IN_USE", summary["refs"])
+        self.assertIn("EG_RET_PRUNE_HOLD_NOTHING_CHANGED", summary["refs"])
         self.assertTrue((folder / "daily.json").exists())
+        self.assertEqual(tree_digest(second), second_before)
         self.assertEqual(list((self.home.retention / "prune-journal").iterdir()), [])
         code, summary = self.home.main("--apply")
-        self.assertEqual((code, summary["counts"]["pruned"]), (0, 1))
+        self.assertEqual((code, summary["counts"]["pruned"]), (0, 2))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -575,7 +603,7 @@ class Apply(RetentionCase):
             with self.subTest(argv=argv):
                 code, summary = self.home.main(*argv)
                 self.assertEqual((code, summary["refs"]), (64, ["EG_RET_ARGUMENTS_REFUSED"]))
-        self.assertFalse(self.home.retention.exists(), "a refused call creates nothing")
+        self.assertEqual(list(self.home.retention.iterdir()), [], "a refused call creates nothing")
 
     def test_existing_archive_that_no_longer_verifies_holds_every_prune(self) -> None:
         old = self.home.clean_run(91)
@@ -679,7 +707,7 @@ class Interrupted(RetentionCase):
 
 
 # ---------------------------------------------------------------------------------------------------
-# egdaily.log rotation and compaction
+# Web pre-G2 safety findings (#257:6282090315): gates first, prune failure holds, unsafe-run dates, ACL
 # ---------------------------------------------------------------------------------------------------
 
 
@@ -690,12 +718,264 @@ def log_line(day: date, tail: str, at: str = "11:30:35") -> bytes:
 CLEAN = "exit=0 monitor_report=SUBMIT submitted=True withheld="
 
 
-class SummaryLog(RetentionCase):
-    def write_log(self, lines: list[bytes], bom: bool = True) -> Path:
-        path = self.home.root / "data" / "egdaily.log"
-        path.write_bytes((ret.BOM if bom else b"") + b"".join(lines))
-        return path
+class WriterFenceBeforeRecovery(RetentionCase):
+    """Finding 1: no cleanup, resumed deletion, archive, prune or log change while a writer may be active."""
 
+    def interrupted_with_leftovers(self) -> tuple[Path, Path, Path]:
+        old = self.home.clean_run(91)
+        self.crash_at("prune:after-rename")
+        self.crash("--apply")
+        held = self.home.retention / "prune-quarantine" / old.name
+        self.assertTrue(held.is_dir())
+        staging = self.home.retention / "incident-archive" / ".staging-20260101-113001-0123abcd"
+        staging.mkdir()
+        (staging / "daily.json").write_bytes(b"{}")
+        temp = self.home.retention / "egdaily-log" / ".egdaily.20260101-190000.log.compact-0123abcd.tmp"
+        temp.write_bytes(b"partial")
+        second = self.home.clean_run(95)
+        log = self.write_log([log_line(day_with_complete_days(120), CLEAN), log_line(TODAY, CLEAN)])
+        return held, second, log
+
+    def assert_held_unchanged(self, before: dict, summary: dict, code: int, *refs: str) -> None:
+        # Effects first, so a regression shows what was destroyed rather than a missing reference.
+        self.assertEqual((summary["counts"]["resumed"], summary["counts"]["pruned"],
+                          summary["counts"]["log_rotated"]), (0, 0, 0), summary)
+        reports = self.home.retention / "reports"
+        self.assertEqual(tree_digest(self.home.root, exclude=reports), before,
+                         "no staging cleanup, temp cleanup, resumed delete, prune or rotation")
+        self.assertEqual(code, 20, summary)
+        for ref in refs:
+            self.assertIn(ref, summary["refs"])
+        self.assertIn("EG_RET_RECOVERY_DEFERRED", summary["refs"])
+
+    def test_young_run_holds_interrupted_recovery_until_the_fence_clears(self) -> None:
+        held, second, log = self.interrupted_with_leftovers()
+        self.home.run(NOW - timedelta(hours=3), drop=("monitor-report.json", "monitor-post.json"))
+        before = tree_digest(self.home.root, exclude=self.home.retention / "reports")
+        code, summary = self.home.main("--apply")
+        self.assert_held_unchanged(before, summary, code, "EG_RET_WRITER_MAY_BE_ACTIVE")
+        self.assertEqual(len(list(held.iterdir())), 5)
+        # 90 minutes later the young run is 4.5 hours old: still inside the window, the fence has cleared.
+        code, summary = self.home.main("--apply", now=NOW + timedelta(minutes=90))
+        self.assertEqual(code, 0, summary)
+        self.assertEqual((summary["counts"]["resumed"], summary["counts"]["pruned"],
+                          summary["counts"]["log_rotated"]), (1, 1, 1))
+        self.assertFalse(held.exists())
+        self.assertFalse(second.exists())
+        self.assertFalse(log.exists())
+        self.assertEqual(sorted(p.name for p in (self.home.retention / "incident-archive").iterdir()), [])
+        self.assertTrue((self.home.retention / "pruned" / f"{held.name}.json").exists())
+
+    def test_future_run_holds_interrupted_recovery(self) -> None:
+        held, _second, _log = self.interrupted_with_leftovers()
+        self.home.run(NOW + timedelta(days=2))
+        before = tree_digest(self.home.root, exclude=self.home.retention / "reports")
+        code, summary = self.home.main("--apply")
+        self.assert_held_unchanged(before, summary, code, "EG_RET_FUTURE_RUN_PRESENT")
+
+    def test_young_unsafe_entry_still_fences(self) -> None:
+        # The fence reads names only: a young entry that is not even a plain folder still means "writer active".
+        held, _second, _log = self.interrupted_with_leftovers()
+        (self.home.runs / (NOW - timedelta(hours=1)).strftime("%Y%m%d-%H%M%S")).write_bytes(b"not a folder")
+        before = tree_digest(self.home.root, exclude=self.home.retention / "reports")
+        code, summary = self.home.main("--apply")
+        self.assert_held_unchanged(before, summary, code, "EG_RET_WRITER_MAY_BE_ACTIVE")
+
+    def test_dry_run_reports_pending_recovery_without_settling_it(self) -> None:
+        held, _second, _log = self.interrupted_with_leftovers()
+        before = tree_digest(self.home.root, exclude=self.home.retention / "reports")
+        code, summary = self.home.main()
+        self.assertEqual(code, 0, summary)
+        self.assertIn("EG_RET_RECOVERY_PENDING", summary["refs"])
+        self.assertEqual(tree_digest(self.home.root, exclude=self.home.retention / "reports"), before)
+
+
+class PruneFailureHolds(RetentionCase):
+    """Finding 2: a failed or uncertain prune stops every later prune and log change in that execution."""
+
+    def setup_tree(self) -> tuple[Path, Path, Path, Path]:
+        first = self.home.clean_run(95)    # oldest name: pruned first
+        second = self.home.clean_run(91)
+        log = self.write_log([log_line(day_with_complete_days(120), CLEAN), log_line(TODAY, CLEAN)])
+        segment = self.write_segment("egdaily.20260601-190000.log",
+                                     [log_line(day_with_complete_days(130), CLEAN), log_line(TODAY, CLEAN)])
+        return first, second, log, segment
+
+    def assert_nothing_after(self, code: int, summary: dict, second: Path, snapshot: dict, hold: str) -> None:
+        # Effects first, so a regression shows what changed rather than a missing reference.
+        self.assertEqual((summary["counts"]["pruned"], summary["counts"]["log_rotated"],
+                          summary["counts"]["log_segments_compacted"]), (0, 0, 0), summary)
+        self.assertEqual(tree_digest(second), snapshot["second"], "the next eligible run is untouched")
+        self.assertEqual(self.home.root.joinpath("data", "egdaily.log").read_bytes(), snapshot["log"])
+        self.assertEqual(snapshot["segment_path"].read_bytes(), snapshot["segment"])
+        self.assertEqual(code, 20, summary)
+        self.assertEqual(summary["outcome"], "HOLD")
+        self.assertIn(hold, summary["refs"])
+        self.assertEqual(self.home.report()["log"]["rotation"], "HELD")
+        self.assertEqual(self.home.run_entry(second)["action"], "HELD")
+        self.assertEqual(self.home.report()["inventory"]["changed_non_targets"], [])
+
+    def snapshot(self, second: Path, log: Path, segment: Path) -> dict:
+        return {"second": tree_digest(second), "log": log.read_bytes(), "segment": segment.read_bytes(),
+                "segment_path": segment}
+
+    def test_failure_after_rename_holds_then_resumes_next_time(self) -> None:
+        first, second, log, segment = self.setup_tree()
+        snap = self.snapshot(second, log, segment)
+        self.fail_at("prune:after-rename")
+        code, summary = self.home.main("--apply")
+        self.assert_nothing_after(code, summary, second, snap, "EG_RET_PRUNE_HOLD_RESUMABLE")
+        held = self.home.retention / "prune-quarantine" / first.name
+        self.assertEqual(len(list(held.iterdir())), 5, "quarantine evidence kept for recovery")
+        self.assertTrue((self.home.retention / "prune-journal" / f"{first.name}.json").exists())
+        self.assertFalse((self.home.retention / "pruned" / f"{first.name}.json").exists(), "not a completion")
+        self.assertEqual(self.home.run_entry(first)["action"], "PRUNE_FAILED")
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 0, summary)
+        self.assertEqual((summary["counts"]["resumed"], summary["counts"]["pruned"],
+                          summary["counts"]["log_rotated"]), (1, 1, 1))
+        self.assertFalse(second.exists())
+
+    def test_failure_mid_delete_holds_and_is_never_a_completion(self) -> None:
+        first, second, log, segment = self.setup_tree()
+        snap = self.snapshot(second, log, segment)
+        self.fail_at("prune:mid-delete")
+        code, summary = self.home.main("--apply")
+        self.assert_nothing_after(code, summary, second, snap, "EG_RET_PRUNE_HOLD_RESUMABLE")
+        held = self.home.retention / "prune-quarantine" / first.name
+        self.assertEqual(len(list(held.iterdir())), 4)
+        self.assertFalse((self.home.retention / "pruned" / f"{first.name}.json").exists())
+        code, summary = self.home.main("--apply")
+        self.assertEqual((code, summary["counts"]["resumed"]), (0, 1), summary)
+        ledger = json.loads((self.home.retention / "pruned" / f"{first.name}.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["state"], "PRUNED")
+
+    def test_failure_with_changed_quarantine_needs_the_operator(self) -> None:
+        first, second, log, segment = self.setup_tree()
+        snap = self.snapshot(second, log, segment)
+        held = self.home.retention / "prune-quarantine" / first.name
+        self.fail_at("prune:after-rename", before=lambda: (held / "status.json").write_bytes(b"{}"))
+        code, summary = self.home.main("--apply")
+        self.assert_nothing_after(code, summary, second, snap, "EG_RET_PRUNE_HOLD_OPERATOR")
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 20)
+        self.assertIn("EG_RET_PRUNE_DIGEST_MISMATCH", summary["refs"])
+        self.assertEqual((held / "status.json").read_bytes(), b"{}", "left exactly as found")
+        self.assertEqual(tree_digest(second), snap["second"])
+
+    def test_failure_before_rename_changes_nothing_and_still_holds(self) -> None:
+        first, second, log, segment = self.setup_tree()
+        snap = self.snapshot(second, log, segment)
+        self.fail_at("prune:after-journal")
+        code, summary = self.home.main("--apply")
+        self.assert_nothing_after(code, summary, second, snap, "EG_RET_PRUNE_HOLD_RESUMABLE")
+        self.assertTrue(first.is_dir(), "the rename never happened")
+        code, summary = self.home.main("--apply")
+        self.assertEqual((code, summary["counts"]["pruned"]), (0, 2), summary)
+
+    def test_run_changed_before_prune_holds(self) -> None:
+        first, second, log, segment = self.setup_tree()
+        snap = self.snapshot(second, log, segment)
+        original, calls = ret.classify, {"n": 0}
+
+        def changed(layout, name, now):
+            run = original(layout, name, now)
+            if name == first.name:
+                calls["n"] += 1
+                if calls["n"] > 1:  # the re-proof just before the prune sees different bytes
+                    run.files = dict(run.files, **{"daily.json": "0" * 64})
+            return run
+
+        ret.classify = changed
+        try:
+            code, summary = self.home.main("--apply")
+        finally:
+            ret.classify = original
+        self.assert_nothing_after(code, summary, second, snap, "EG_RET_RUN_CHANGED_BEFORE_PRUNE")
+        self.assertTrue(first.is_dir())
+
+
+class UnsafeRunKeepsItsDate(RetentionCase):
+    """Finding 3: an unsafe run-named entry keeps the date its name encodes, so its day stays preserved."""
+
+    def test_unsafe_entry_on_the_same_day_keeps_the_clean_run(self) -> None:
+        clean = self.home.clean_run(150, hour=11)
+        day = day_with_complete_days(150)
+        unsafe = self.home.runs / f"{day:%Y%m%d}-150000"
+        unsafe.write_bytes(b"a file where a run folder should be")
+        code, summary = self.home.main("--apply")
+        self.assertEqual(summary["counts"]["pruned"], 0, summary)
+        self.assertTrue(clean.is_dir())
+        self.assertEqual(self.home.run_entry(clean)["reason"], "EG_RET_SAME_DAY_INCIDENT")
+        entry = self.home.run_entry(unsafe)
+        self.assertEqual((entry["kind"], entry["complete_days"]), ("UNSAFE", 150))
+        self.assertEqual(unsafe.read_bytes(), b"a file where a run folder should be")
+
+    def test_unsafe_entry_with_an_impossible_date_has_no_day(self) -> None:
+        (self.home.runs / "20261399-150000").write_bytes(b"x")
+        clean = self.home.clean_run(150)
+        code, summary = self.home.main("--apply")
+        self.assertEqual((code, summary["counts"]["pruned"]), (0, 1), summary)
+        self.assertFalse(clean.exists())
+        self.assertEqual(self.home.run_entry(self.home.runs / "20261399-150000")["complete_days"], None)
+
+    @unittest.skipUnless(os.name == "nt", "junctions")
+    def test_same_day_junction_run_is_neither_followed_nor_lets_the_clean_run_go(self) -> None:
+        clean = self.home.clean_run(150, hour=11)
+        day = day_with_complete_days(150)
+        started = datetime(day.year, day.month, day.day, 15, 0, 0, tzinfo=SGT)
+        outside = Path(self._tmp.name) / "outside-same-day"
+        outside.mkdir()
+        for name, doc in clean_docs(started).items():
+            (outside / name).write_text(json.dumps(doc), encoding="utf-8")
+        link = self.home.runs / started.strftime("%Y%m%d-%H%M%S")
+        make_junction(link, outside)
+        outside_before = tree_digest(outside)
+        clean_before = tree_digest(clean)
+        day_line = log_line(day, CLEAN)
+        self.write_log([day_line, log_line(TODAY, CLEAN)])
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(summary["counts"]["pruned"], 0)
+        self.assertEqual(tree_digest(clean), clean_before)
+        self.assertEqual(self.home.run_entry(clean)["reason"], "EG_RET_SAME_DAY_INCIDENT")
+        entry = self.home.run_entry(link)
+        self.assertEqual((entry["kind"], entry["complete_days"]), ("UNSAFE", 150))
+        self.assertTrue(os.path.lexists(link))
+        self.assertEqual(tree_digest(outside), outside_before)
+        self.assertFalse((self.home.retention / "incident-archive" / link.name).exists())
+        segments = list((self.home.retention / "egdaily-log").iterdir())
+        self.assertEqual(len(segments), 1)
+        self.assertIn(day_line, segments[0].read_bytes(), "the unsafe run's day is an incident day for the log")
+
+
+class RetentionFolderRequired(RetentionCase):
+    """Finding 4 (tool side): the tool never creates the private folder; the protected install does."""
+
+    def test_missing_retention_folder_is_refused_and_nothing_is_created(self) -> None:
+        self.home.clean_run(150)
+        self.home.retention.rmdir()
+        before = tree_digest(self.home.root)
+        for argv in ((), ("--apply",)):
+            with self.subTest(argv=argv):
+                code, summary = self.home.main(*argv)
+                self.assertEqual((code, summary["refs"]), (64, ["EG_RET_RETENTION_MISSING"]))
+        self.assertFalse(self.home.retention.exists())
+        self.assertEqual(tree_digest(self.home.root), before)
+
+    def test_retention_folder_that_is_not_a_folder_is_refused(self) -> None:
+        self.home.retention.rmdir()
+        self.home.retention.write_bytes(b"")
+        code, summary = self.home.main()
+        self.assertEqual((code, summary["outcome"]), (64, "REFUSED"))
+
+
+# ---------------------------------------------------------------------------------------------------
+# egdaily.log rotation and compaction
+# ---------------------------------------------------------------------------------------------------
+
+
+class SummaryLog(RetentionCase):
     def test_dry_run_reports_rotation_without_touching_the_log(self) -> None:
         path = self.write_log([log_line(day_with_complete_days(120), CLEAN), log_line(TODAY, CLEAN)])
         before = path.read_bytes()
@@ -845,10 +1125,10 @@ ACL_PROBE = r'''
 $ErrorActionPreference = 'Stop'
 . ([scriptblock]::Create([System.IO.File]::ReadAllText($env:EG_ACL_FUNCTIONS)))
 function Sid([string]$Value) { New-Object System.Security.Principal.SecurityIdentifier $Value }
-function New-Sec([string]$Owner, [object[]]$Rules, [switch]$Directory) {
+function New-Sec([string]$Owner, [object[]]$Rules, [switch]$Directory, [switch]$Inherited) {
     if ($Directory) { $sec = New-Object System.Security.AccessControl.DirectorySecurity }
     else { $sec = New-Object System.Security.AccessControl.FileSecurity }
-    $sec.SetAccessRuleProtection($true, $false)
+    $sec.SetAccessRuleProtection((-not $Inherited), $false)
     $sec.SetOwner((Sid $Owner))
     foreach ($rule in $Rules) {
         $inherit = 'None'; $propagate = 'None'
@@ -871,6 +1151,10 @@ $result = [ordered]@{
   private_ok = Test-EgPrivateSecurity (New-Sec $admins @(@($system, 'FullControl'), @($admins, 'FullControl'), @($runner, 'Modify')) -Directory) $runner
   private_users_read = Test-EgPrivateSecurity (New-Sec $admins @(@($admins, 'FullControl'), @($runner, 'Modify'), @($users, 'ReadAndExecute')) -Directory) $runner
   private_everyone_read = Test-EgPrivateSecurity (New-Sec $admins @(@($runner, 'Modify'), @($everyone, 'Read')) -Directory) $runner
+  root_protected_ok = Test-EgPrivateSecurity (New-Sec $admins @(@($admins, 'FullControl'), @($runner, 'Modify', 'None')) -Directory) $runner -RequireProtected
+  root_inheriting = Test-EgPrivateSecurity (New-Sec $admins @(@($admins, 'FullControl'), @($runner, 'Modify', 'None')) -Directory -Inherited) $runner -RequireProtected
+  root_users_inherit_only_read = Test-EgPrivateSecurity (New-Sec $admins @(@($runner, 'Modify', 'None'), @($users, 'ReadAndExecute', 'InheritOnly')) -Directory) $runner -RequireProtected
+  child_inheriting_ok = Test-EgPrivateSecurity (New-Sec $admins @(@($admins, 'FullControl'), @($runner, 'Modify')) -Directory -Inherited) $runner
 }
 $result | ConvertTo-Json -Compress
 '''
@@ -915,6 +1199,8 @@ class WrapperTemplate(unittest.TestCase):
             "protected_users_modify": False, "protected_auth_write": False, "protected_runner_delete": False,
             "protected_users_inherit_only_write": False, "protected_runner_owner": False,
             "private_ok": True, "private_users_read": False, "private_everyone_read": False,
+            "root_protected_ok": True, "root_inheriting": False, "root_users_inherit_only_read": False,
+            "child_inheriting_ok": True,
         })
 
     def test_rendered_wrapper_refuses_a_user_writable_install_before_python(self) -> None:
@@ -943,6 +1229,120 @@ class WrapperTemplate(unittest.TestCase):
                 expected = "EG_RET_ARGUMENTS_REFUSED" if extra == ["unexpected"] else "EG_RET_ACL_NOT_PROTECTED"
                 self.assertEqual(ref, expected)
         self.assertFalse((home / "data" / "retention").exists(), "Python never ran")
+
+    def test_wrapper_children_match_the_tool_folders(self) -> None:
+        source = WRAPPER.read_text(encoding="utf-8")
+        layout = ret.Layout(Path("X:/EnergyGrid"))
+        for folder in layout.own_dirs()[1:]:
+            self.assertIn(f"'{folder.name}'", source)
+        self.assertEqual(layout.own_dirs()[0], layout.retention)
+
+    # -- Finding 4: the private retention folder, natively ------------------------------------------
+
+    def retention_home(self, label: str) -> tuple[Path, Path]:
+        """A scratch install whose rendered wrapper skips only the admin-ownership loop (a temp folder can
+        never be admin-owned) and runs this interpreter. The retention gate under test is unchanged."""
+        home = self.tmp / label / "EnergyGrid"
+        (home / "maintenance").mkdir(parents=True)
+        (home / "data" / "runs").mkdir(parents=True)
+        shutil.copy2(SCRIPT, home / "maintenance" / SCRIPT.name)
+        source = WRAPPER.read_text(encoding="utf-8").replace("{{EG_HOME}}", str(home))
+        for old, new in (("foreach ($item in $protected) {", "foreach ($item in @()) {"),
+                         ("$Python = Join-Path $EgHome 'runtime\\venv\\Scripts\\python.exe'",
+                          f"$Python = '{sys.executable}'")):
+            self.assertEqual(source.count(old), 1, old)
+            source = source.replace(old, new)
+        wrapper = home / "maintenance" / "egretention.ps1"
+        wrapper.write_text(source, encoding="utf-8")
+        return home / "data" / "retention", wrapper
+
+    def run_wrapper(self, wrapper: Path) -> tuple[int, dict]:
+        result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                                 str(wrapper)], capture_output=True, text=True, timeout=180)
+        return result.returncode, json.loads(result.stdout.strip().splitlines()[-1])
+
+    @staticmethod
+    def icacls(path: Path, *args: str) -> None:
+        subprocess.run(["icacls", str(path), *args], check=True, capture_output=True, timeout=60)
+
+    @staticmethod
+    def current_sid() -> str:
+        output = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True,
+                                text=True, timeout=60).stdout
+        return output.strip().split(",")[-1].strip('"')
+
+    def private_grants(self) -> list[str]:
+        # The documented install: inheritance broken, inheritable grants for SYSTEM, Administrators and the
+        # task principal only (docs section 6).
+        return ["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F",
+                f"*{self.current_sid()}:(OI)(CI)M"]
+
+    def sddl(self, path: Path) -> str:
+        command = ("$p=$env:EG_PATH; if ([System.IO.Directory]::Exists($p)) { $s=[System.IO.Directory]::"
+                   "GetAccessControl($p) } else { $s=[System.IO.File]::GetAccessControl($p) }; "
+                   "$s.GetSecurityDescriptorSddlForm('Access')")
+        return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command], check=True,
+                              capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "EG_PATH": str(path)}).stdout.strip()
+
+    def assert_refused_before_python(self, wrapper: Path, retention: Path, ref: str, present: set[str]) -> None:
+        code, summary = self.run_wrapper(wrapper)
+        self.assertEqual((code, summary["refs"]), (64, [ref]), summary)
+        found = {entry.name for entry in retention.iterdir()} if retention.exists() else set()
+        self.assertEqual(found, present, "Python never ran: no lock, report or tool folder was created")
+
+    def test_missing_retention_folder_is_refused_before_python(self) -> None:
+        retention, wrapper = self.retention_home("missing")
+        self.assert_refused_before_python(wrapper, retention, "EG_RET_RETENTION_MISSING", set())
+        self.assertFalse(retention.exists())
+
+    def test_inherited_or_broadly_readable_retention_folder_is_refused_before_python(self) -> None:
+        inherited, wrapper = self.retention_home("inherited")
+        inherited.mkdir()  # plain mkdir: inherits whatever the parent grants, inheritance not broken
+        self.assert_refused_before_python(wrapper, inherited, "EG_RET_RETENTION_NOT_PRIVATE", set())
+
+        broad, wrapper = self.retention_home("users-read")
+        broad.mkdir()
+        self.icacls(broad, *self.private_grants(), "*S-1-5-32-545:(OI)(CI)RX")
+        self.assert_refused_before_python(wrapper, broad, "EG_RET_RETENTION_NOT_PRIVATE", set())
+
+        child, wrapper = self.retention_home("broad-child")
+        child.mkdir()
+        self.icacls(child, *self.private_grants())
+        (child / "reports").mkdir()
+        self.icacls(child / "reports", "/grant", "*S-1-1-0:(OI)(CI)R")
+        self.assert_refused_before_python(wrapper, child, "EG_RET_RETENTION_NOT_PRIVATE", {"reports"})
+
+    def test_unreadable_retention_acl_is_refused_before_python(self) -> None:
+        retention, wrapper = self.retention_home("unreadable")
+        retention.mkdir()
+        # Only an OWNER RIGHTS entry without READ_CONTROL: the owner loses its implicit right to read the ACL.
+        # DELETE and SYNCHRONIZE stay, so the empty folder can still be removed afterwards.
+        self.icacls(retention, "/inheritance:r", "/grant:r", "*S-1-3-4:(D,S,WDAC)")
+        try:
+            code, summary = self.run_wrapper(wrapper)
+            self.assertEqual((code, summary["refs"]), (64, ["EG_RET_ACL_UNREADABLE"]), summary)
+        finally:
+            os.rmdir(retention)
+        self.assertFalse(retention.exists())
+
+    def test_protected_retention_folder_runs_and_children_inherit_private(self) -> None:
+        retention, wrapper = self.retention_home("protected")
+        retention.mkdir()
+        self.icacls(retention, *self.private_grants())
+        code, summary = self.run_wrapper(wrapper)
+        self.assertEqual((code, summary["mode"], summary["outcome"]), (0, "DRY_RUN", "COMPLETED"), summary)
+        report = next((retention / "reports").iterdir())
+        broad = (";;;BU)", ";;;WD)", ";;;AU)")  # SDDL aliases: Users, Everyone, Authenticated Users
+        for path in (retention, retention / "reports", retention / "incident-archive", report):
+            with self.subTest(path=path.name):
+                text = self.sddl(path)
+                self.assertTrue(text.startswith("D:"), text)
+                self.assertFalse(any(alias in text for alias in broad), text)
+        self.assertIn("D:P", self.sddl(retention), "inheritance broken on the root")
+        # A second run now also checks the existing subfolders, and still passes.
+        code, summary = self.run_wrapper(wrapper)
+        self.assertEqual((code, summary["outcome"]), (0, "COMPLETED"), summary)
 
 
 if __name__ == "__main__":
