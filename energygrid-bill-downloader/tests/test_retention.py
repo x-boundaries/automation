@@ -924,10 +924,20 @@ class WrapperTemplate(unittest.TestCase):
         shutil.copy2(SCRIPT, home / "maintenance" / SCRIPT.name)
         wrapper = home / "maintenance" / "egretention.ps1"
         wrapper.write_text(WRAPPER.read_text(encoding="utf-8").replace("{{EG_HOME}}", str(home)), encoding="utf-8")
+        # A Security module that cannot load, first on the module path: this is what Windows PowerShell meets
+        # when started from PowerShell 7 (CI's pwsh steps). The ACL check must not depend on that module.
+        module = self.tmp / "modules" / "Microsoft.PowerShell.Security"
+        module.mkdir(parents=True)
+        (module / "Microsoft.PowerShell.Security.psm1").write_text("throw 'incompatible module'\n", encoding="utf-8")
+        (module / "Microsoft.PowerShell.Security.psd1").write_text(
+            "@{ ModuleVersion='9.9.9'; RootModule='Microsoft.PowerShell.Security.psm1'; FunctionsToExport=@('Get-Acl') }\n",
+            encoding="utf-8")
+        env = {**os.environ, "PSModulePath": str(self.tmp / "modules") + os.pathsep + os.environ.get("PSModulePath", "")}
         for extra in ([], ["-Apply"], ["unexpected"]):
             with self.subTest(extra=extra):
                 result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                         "-File", str(wrapper), *extra], capture_output=True, text=True, timeout=120)
+                                         "-File", str(wrapper), *extra], capture_output=True, text=True, timeout=120,
+                                        env=env)
                 self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
                 ref = json.loads(result.stdout.strip().splitlines()[-1])["refs"][0]
                 expected = "EG_RET_ARGUMENTS_REFUSED" if extra == ["unexpected"] else "EG_RET_ACL_NOT_PROTECTED"
