@@ -2,6 +2,8 @@ import contextlib
 import importlib.util
 import io
 import re
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +20,22 @@ def _load_full_suite_runner():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _targeted_test_steps(runner):
+    """Exact text of the targeted test steps: whole modules, no filter, condition or trailing command."""
+    powershell = runner.MEMBER_GATEWAY_TARGETED_JOBS["powershell-static"]
+    bounded = runner.MEMBER_GATEWAY_TARGETED_JOBS["bounded-import-security"]
+    return {
+        "powershell-static": {
+            "Run worker and adapter offline behavioral tests": "run: >-\n          python tests/_ci_annotated_unittest.py "
+            + "\n          ".join("tests." + module for module in powershell),
+        },
+        "bounded-import-security": {
+            "Run bounded import security regressions": "run: python -m unittest tests.%s -v" % bounded[0],
+            "Run welcome-email bounded import security regressions": "run: python -m unittest tests.%s -v" % bounded[1],
+        },
+    }
 
 
 def _job_block(text, name):
@@ -123,6 +141,13 @@ class MemberGatewayCiTests(unittest.TestCase):
             job = _job_block(text, name)
             self.assertEqual(tuple(re.findall(r"\btests\.(test_\w+)", job)), modules, name)
         self.assertEqual(len(runner.MEMBER_GATEWAY_TARGETED_MODULES), sum(map(len, runner.MEMBER_GATEWAY_TARGETED_JOBS.values())))
+        for name, steps in _targeted_test_steps(runner).items():
+            job = _job_block(text, name)
+            for step_name, run in steps.items():
+                marker = "      - name: " + step_name + "\n"
+                self.assertEqual(job.count(marker), 1, step_name)
+                step = marker + job.split(marker, 1)[1].split("\n      - ", 1)[0].rstrip("\n")
+                self.assertEqual(step, marker + "        shell: pwsh\n        " + run, step_name)
 
     def test_full_suite_runs_in_parallel_and_skips_only_targeted_windows_modules(self):
         self._assert_parallel_full_suite_skips_only_targeted_windows_modules(self.text, _load_full_suite_runner())
@@ -136,6 +161,26 @@ class MemberGatewayCiTests(unittest.TestCase):
             self.text.replace("tests.test_member_welcome_email_bounded_import_security -v", "tests.test_member_gateway_ci -v", 1),
             self.text.replace(ps_job, ps_job.replace("runs-on: windows-latest", "runs-on: ubuntu-latest"), 1),
             self.text.replace(FULL_SUITE_COMMAND, "python tests/_run_ci_full_suite.py --skip-member-gateway-targeted --extra", 1),
+            self.text.replace(
+                "tests.test_member_gateway_bounded_import_security -v",
+                "tests.test_member_gateway_bounded_import_security.NoSuchClass -v",
+                1,
+            ),
+            self.text.replace(
+                "python -m unittest tests.test_member_gateway_bounded_import_security -v",
+                "python -m unittest -k nothing_matches tests.test_member_gateway_bounded_import_security -v",
+                1,
+            ),
+            self.text.replace(
+                "      - name: Run worker and adapter offline behavioral tests\n",
+                "      - name: Run worker and adapter offline behavioral tests\n        if: ${{ false }}\n",
+                1,
+            ),
+            self.text.replace(
+                "tests.test_member_welcome_email_bounded_import_security -v",
+                "tests.test_member_welcome_email_bounded_import_security -v; exit 0",
+                1,
+            ),
         ):
             self.assertNotEqual(mutated, self.text)
             with self.assertRaises(AssertionError):
@@ -170,6 +215,30 @@ class MemberGatewayCiTests(unittest.TestCase):
             with mock.patch.object(runner.unittest.TestLoader, "discover", return_value=trivial):
                 self.assertEqual(runner.main([]), 0)
                 self.assertEqual(runner.main([runner.SKIP_MEMBER_GATEWAY_TARGETED_FLAG]), 2)
+
+    def test_full_suite_runner_reports_targeted_import_failure_and_still_fails_closed(self):
+        runner = _load_full_suite_runner()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "test_xb211_fake_targeted.py").write_text('raise ImportError("xb211 targeted import boom")\n', encoding="utf-8")
+            Path(tmp, "test_xb211_fake_remainder.py").write_text(
+                "import unittest\n\n\nclass Remainder(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+                encoding="utf-8",
+            )
+            saved_path = list(sys.path)
+            try:
+                with mock.patch.object(runner, "TESTS_DIR", Path(tmp)), mock.patch.object(
+                    runner, "MEMBER_GATEWAY_TARGETED_MODULES", frozenset({"test_xb211_fake_targeted"})
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(runner.main([runner.SKIP_MEMBER_GATEWAY_TARGETED_FLAG]), 2)
+            finally:
+                sys.path[:] = saved_path
+                for module in ("test_xb211_fake_targeted", "test_xb211_fake_remainder"):
+                    sys.modules.pop(module, None)
+        self.assertIn("xb211 targeted import boom", stdout.getvalue())
+        self.assertIn("failing closed", stdout.getvalue())
+        # The remainder (and the failed import itself) still ran before failing closed.
+        self.assertIn("Ran 2 tests", stderr.getvalue())
 
     def test_bounded_import_files_are_narrowly_triggered(self):
         for required_path in (

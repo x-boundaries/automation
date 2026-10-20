@@ -83,22 +83,28 @@ def main(argv):
     if unknown:
         print(f"CI suite: unknown argument(s) {unknown}")
         return 2
-    all_tests = list(_flatten(unittest.TestLoader().discover(str(TESTS_DIR))))
+    loader = unittest.TestLoader()
+    all_tests = list(_flatten(loader.discover(str(TESTS_DIR))))
     tests = accepted_tests(all_tests)
     print(f"CI suite: excluded {len(all_tests) - len(tests)} environment-gated test(s) from {sorted(EXCLUDED_MODULES)}")
     skip_modules = MEMBER_GATEWAY_TARGETED_MODULES if SKIP_MEMBER_GATEWAY_TARGETED_FLAG in argv else frozenset()
     kept, skipped = partition(tests, skip_modules)
+    # A skip-listed module that contributes no test (import failure or drifted list)
+    # fails closed, after the remainder has run so that log stays useful.
     missing = sorted(skip_modules - {module_name(test) for test in skipped})
     if missing:
-        # A skip-listed module that contributes no test means the list drifted; fail closed.
-        print(f"CI suite: targeted module(s) not discovered: {missing}")
-        return 2
+        print(f"CI suite: targeted module(s) contributed no test and will fail this run: {missing}")
+        for error in loader.errors:
+            print(error)
     if skip_modules:
         print(
-            f"CI suite: skipped {len(skipped)} test(s) in {len(skip_modules)} module(s) already run by the "
-            f"member-gateway targeted Windows jobs on this exact head: {sorted(skip_modules)}"
+            f"CI suite: skipped {len(skipped)} test(s) in {len(skip_modules) - len(missing)} module(s) already run by "
+            f"the member-gateway targeted Windows jobs on this exact head: {sorted(set(skip_modules) - set(missing))}"
         )
     result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite(kept))
+    if missing:
+        print(f"CI suite: failing closed; targeted module(s) contributed no test: {missing}")
+        return 2
     return 0 if result.wasSuccessful() else 1
 
 
