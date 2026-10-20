@@ -128,6 +128,15 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 
 Committing either file performs no import, activation, execution, Drive read or Gmail send. Import (inactive), credential binding, the Data Table creation, the Cloudflare path exclusion and activation each need separate explicit current-turn approval in #226.
 
+### simba_invoice_intake.workflow.json
+
+- Purpose: Claude-free intake for SIMBA invoice emails (#244, live name `SIMBA Invoices - Email To Drive`). A Gmail Trigger polls the intake mailbox every minute; each email is handled one at a time. A genuine SIMBA email (Gmail's top `Authentication-Results` shows SIMBA's domain and Amazon SES) sent to an address in the configured billing address list has its invoice PDF filed in that account's Drive folder. Forwards, unknown accounts, unclear content and PDFs that cannot be downloaded go to a review folder. The PDF address is read out of SIMBA's SES tracking link without calling the tracker; the amount is never used.
+- Architecture: Gmail Trigger -> Intake Settings -> one-email loop -> Gmail API `format=full` read -> classify (Code) -> Drive duplicate search by `simbaIntakeKey` property -> PDF download (exact HTTPS host, no redirects) -> SHA-256 -> PDF check -> resumable Drive upload -> read-back verification.
+- Status: source-controlled, inactive, MCP-disabled, credential-free, `staticData: null`, no webhook. Folder IDs and the `billing_addresses` list (`address = BROADBAND|MOBILE` pairs, so a billing address change is a settings edit only) ship as `REPLACE_WITH_...` placeholders in the `Intake Settings` node. Credential types `gmailOAuth2` and `googleDriveOAuth2Api`. Failed executions are kept (the trigger does not re-offer an email after a failed run); successful runs are not saved. The validator's expected warnings are the public SIMBA sender address and the Google API URLs.
+- Runbook: [SIMBA invoice intake](../docs/simba_invoice_intake.md).
+- Committing this file performs no import, activation, execution, Gmail read or Drive write. Import, credential binding and activation each need separate explicit current-turn approval in #244.
+- Focused offline coverage: [tests/test_simba_invoice_intake_workflow.py](../tests/test_simba_invoice_intake_workflow.py), run by `.github/workflows/simba-invoice-intake-tests.yml`.
+
 ## Directory Rules
 
 - Do not rename existing workflow files during unrelated work. Existing filenames are canonical and are referenced by tests, README links, and runbooks.
