@@ -229,7 +229,6 @@ jobs:
         shell: pwsh
         run: >-
           python tests/_ci_annotated_unittest.py tests.test_member_gateway_worker_static
-          tests.test_member_gateway_worker_deployment
           tests.test_member_gateway_adapter_ps
           tests.test_member_gateway_worker_cycle_ps
           tests.test_member_gateway_shopify_ps
@@ -239,6 +238,30 @@ jobs:
           tests.test_member_directlocal_poller
           tests.test_directlocal_e7_testbook_ps
           tests.test_directlocal_code_custody_ps
+
+  powershell-worker-tooling:
+    # The worker tooling module is the largest single module, so it runs in its own
+    # parallel job instead of serially inside powershell-static (#211).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run worker tooling offline tests
+        shell: pwsh
+        run: python tests/_ci_annotated_unittest.py tests.test_member_gateway_worker_deployment
 
   bounded-import-security:
     runs-on: windows-latest
@@ -317,8 +340,9 @@ jobs:
           python -m unittest             tests.test_member_intake_validate             tests.test_member_intake_decision_review             tests.test_member_create_uat_contract             tests.test_member_create_uat_result_precheck             tests.test_member_create_uat_n8n_mapping             tests.test_member_intake_n8n_dry_run_docs
 
   # Runs in parallel with the targeted jobs. It skips only the modules that the
-  # windows-latest powershell-static and bounded-import-security jobs run on the same
-  # asserted exact head; tests/test_member_gateway_ci.py proves the shard union.
+  # windows-latest powershell-static, powershell-worker-tooling and
+  # bounded-import-security jobs run on the same asserted exact head;
+  # tests/test_member_gateway_ci.py proves the shard union.
   full-offline-regression:
     runs-on: windows-latest
     steps:

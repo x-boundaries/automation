@@ -25,11 +25,15 @@ def _load_full_suite_runner():
 def _targeted_test_steps(runner):
     """Exact text of the targeted test steps: whole modules, no filter, condition or trailing command."""
     powershell = runner.MEMBER_GATEWAY_TARGETED_JOBS["powershell-static"]
+    (tooling,) = runner.MEMBER_GATEWAY_TARGETED_JOBS["powershell-worker-tooling"]
     bounded = runner.MEMBER_GATEWAY_TARGETED_JOBS["bounded-import-security"]
     return {
         "powershell-static": {
             "Run worker and adapter offline behavioral tests": "run: >-\n          python tests/_ci_annotated_unittest.py "
             + "\n          ".join("tests." + module for module in powershell),
+        },
+        "powershell-worker-tooling": {
+            "Run worker tooling offline tests": "run: python tests/_ci_annotated_unittest.py tests.%s" % tooling,
         },
         "bounded-import-security": {
             "Run bounded import security regressions": "run: python -m unittest tests.%s -v" % bounded[0],
@@ -127,7 +131,10 @@ class MemberGatewayCiTests(unittest.TestCase):
         full = _job_block(text, "full-offline-regression")
         self.assertEqual(text.count("run: python tests/_run_ci_full_suite.py"), 1)
         self.assertEqual(full.count("        run: " + FULL_SUITE_COMMAND + "\n"), 1)
-        self.assertEqual(set(runner.MEMBER_GATEWAY_TARGETED_JOBS), {"powershell-static", "bounded-import-security"})
+        self.assertEqual(
+            set(runner.MEMBER_GATEWAY_TARGETED_JOBS),
+            {"powershell-static", "powershell-worker-tooling", "bounded-import-security"},
+        )
         for name in ("full-offline-regression", *runner.MEMBER_GATEWAY_TARGETED_JOBS):
             job = _job_block(text, name)
             # Same OS, interpreter and asserted exact head as the parallel full suite.
@@ -141,8 +148,11 @@ class MemberGatewayCiTests(unittest.TestCase):
             job = _job_block(text, name)
             self.assertEqual(tuple(re.findall(r"\btests\.(test_\w+)", job)), modules, name)
         self.assertEqual(len(runner.MEMBER_GATEWAY_TARGETED_MODULES), sum(map(len, runner.MEMBER_GATEWAY_TARGETED_JOBS.values())))
+        self.assertEqual(set(_targeted_test_steps(runner)), set(runner.MEMBER_GATEWAY_TARGETED_JOBS))
         for name, steps in _targeted_test_steps(runner).items():
             job = _job_block(text, name)
+            self.assertNotIn("strategy:", job, name)
+            self.assertEqual(job.count("      - name: Run "), len(steps), name)
             for step_name, run in steps.items():
                 marker = "      - name: " + step_name + "\n"
                 self.assertEqual(job.count(marker), 1, step_name)
@@ -155,7 +165,39 @@ class MemberGatewayCiTests(unittest.TestCase):
     def test_parallel_full_suite_guard_rejects_drift(self):
         runner = _load_full_suite_runner()
         ps_job = _job_block(self.text, "powershell-static")
+        tooling_job = _job_block(self.text, "powershell-worker-tooling")
+        tooling_run = "run: python tests/_ci_annotated_unittest.py tests.test_member_gateway_worker_deployment"
         for mutated in (
+            self.text.replace(tooling_run, "run: python tests/_ci_annotated_unittest.py", 1),
+            self.text.replace(tooling_run, tooling_run + ".WorkerDeploymentTests", 1),
+            self.text.replace(tooling_run, tooling_run + "; exit 0", 1),
+            self.text.replace(tooling_run, tooling_run + " -k nothing_matches", 1),
+            self.text.replace(
+                "      - name: Run worker tooling offline tests\n",
+                "      - name: Run worker tooling offline tests\n        if: ${{ false }}\n",
+                1,
+            ),
+            self.text.replace(
+                "      - name: Run worker tooling offline tests\n",
+                "      - name: Run worker tooling offline tests\n        continue-on-error: true\n",
+                1,
+            ),
+            self.text.replace(tooling_job, tooling_job.replace("    runs-on: windows-latest\n", "    if: false\n    runs-on: windows-latest\n", 1), 1),
+            self.text.replace(tooling_job, tooling_job.replace("runs-on: windows-latest", "runs-on: ubuntu-latest"), 1),
+            self.text.replace(
+                tooling_job,
+                tooling_job.replace(
+                    "    runs-on: windows-latest\n",
+                    "    runs-on: windows-latest\n    strategy:\n      matrix:\n        leg: [a]\n        exclude:\n          - leg: a\n",
+                    1,
+                ),
+                1,
+            ),
+            self.text.replace(
+                "          tests.test_directlocal_code_custody_ps\n",
+                "          tests.test_directlocal_code_custody_ps\n          tests.test_member_gateway_worker_deployment\n",
+                1,
+            ),
             self.text.replace("    runs-on: windows-latest\n    steps:", "    runs-on: windows-latest\n    needs: [powershell-static]\n    steps:", 1),
             self.text.replace("          tests.test_directlocal_code_custody_ps\n", "", 1),
             self.text.replace("tests.test_member_welcome_email_bounded_import_security -v", "tests.test_member_gateway_ci -v", 1),
