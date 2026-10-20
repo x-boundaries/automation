@@ -848,17 +848,209 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Failed to import test module", result.stderr)
 
     # ---- #211: CI shards ---- #
+    #
+    # The guard below and the runner union check are what stop a later edit from narrowing
+    # or masking the sharded suite. Each mutation case is an edit a G2 review showed could
+    # otherwise land unnoticed; every one must be rejected.
+
+    _CI_WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "energygrid-bill-downloader-tests.yml"
+    _CI_RUNNER = Path(__file__).parent / "run_project_suite.py"
+
+    # Steps every leg must run: no `if:` anywhere in their block.
+    _CI_UNCONDITIONAL_STEPS = (
+        "- uses: actions/checkout@v4",
+        "- name: Assert literal exact-head checkout",
+        "- name: Assert native Windows PowerShell 5.1 supervisor boundary",
+        "- uses: actions/setup-python@v5",
+        "- name: Install pinned test dependency",
+        "- name: Provision Chromium with official Playwright mechanism",
+        "- name: Decide supervisor custody applicability",
+        "- name: Project synthetic test suite",
+    )
+    # Exact non-comment text of the steps whose exit status is the evidence.
+    _CI_PINNED_STEPS = {
+        "- name: Assert literal exact-head checkout": [
+            "      - name: Assert literal exact-head checkout",
+            "        shell: bash",
+            "        env:",
+            "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}",
+            "        run: |",
+            '          ACTUAL_SHA="$(git rev-parse HEAD)"',
+            '          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"',
+        ],
+        "- name: Project synthetic test suite": [
+            "      - name: Project synthetic test suite",
+            "        env:",
+            "          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/energygrid-playwright",
+            "        shell: pwsh",
+            "        working-directory: energygrid-bill-downloader",
+            "        run: |",
+            "          if ('${{ steps.supervisor_custody.outputs.applicable }}' -eq 'true') {",
+            "            python tests/run_project_suite.py --shard ${{ matrix.shard }}",
+            "          } else {",
+            "            python tests/run_project_suite.py --shard ${{ matrix.shard }}"
+            " --exclude-module test_one_shot_supervisor",
+            "          }",
+            "          exit $LASTEXITCODE",
+        ],
+        "- name: EnergyGrid one-shot supervisor focused test suite": [
+            "      - name: EnergyGrid one-shot supervisor focused test suite",
+            "        if: matrix.shard == 'rest' && steps.supervisor_custody.outputs.applicable == 'true'",
+            "        shell: powershell",
+            '        run: python -m unittest discover -s energygrid-bill-downloader/tests'
+            ' -p "test_one_shot_supervisor.py" -v',
+        ],
+        "- name: EnergyGrid n8n error handler focused test": [
+            "      - name: EnergyGrid n8n error handler focused test",
+            "        if: matrix.shard == 'rest'",
+            "        shell: pwsh",
+            '        run: python -m unittest discover -s tests -p "test_energygrid_n8n_error_handler.py" -v',
+        ],
+        "- name: EnergyGrid n8n invoice delivery focused offline test": [
+            "      - name: EnergyGrid n8n invoice delivery focused offline test",
+            "        if: matrix.shard == 'rest'",
+            "        shell: pwsh",
+            '        run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v',
+        ],
+        "- name: EnergyGrid n8n Drive upload and destination setup focused offline tests": [
+            "      - name: EnergyGrid n8n Drive upload and destination setup focused offline tests",
+            "        if: matrix.shard == 'rest'",
+            "        shell: pwsh",
+            "        run: |",
+            '          python -m unittest discover -s tests -p "test_energygrid_drive_upload_workflow.py" -v',
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            '          python -m unittest discover -s tests -p "test_energygrid_drive_destination_setup_workflow.py" -v',
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        ],
+        "- name: EnergyGrid n8n Drive Verify and Owner Email focused offline tests": [
+            "      - name: EnergyGrid n8n Drive Verify and Owner Email focused offline tests",
+            "        if: matrix.shard == 'rest'",
+            "        shell: pwsh",
+            "        run: |",
+            '          python -m unittest discover -s tests -p "test_energygrid_drive_verify_workflow.py" -v',
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            '          python -m unittest discover -s tests -p "test_energygrid_owner_email_workflow.py" -v',
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        ],
+    }
+    # One-off steps gated to the rest leg; the artifact name must not repeat across legs.
+    _CI_REST_ONLY_STEPS = {
+        "- name: PowerShell parse-only check": "if: matrix.shard == 'rest'",
+        "- name: Scope and whitespace check": "if: matrix.shard == 'rest'",
+        "- name: Write bounded supervisor synthetic summary": "if: always() && matrix.shard == 'rest'",
+        "- name: Upload supervisor synthetic summary": "if: always() && matrix.shard == 'rest'",
+    }
 
     @staticmethod
-    def _load_project_suite_runner():
-        import importlib.util
+    def _load_project_suite_runner(source: str | None = None):
+        """Load the committed runner, or a mutated copy of its source bound to the same path."""
+        import types
 
-        spec = importlib.util.spec_from_file_location(
-            "run_project_suite", Path(__file__).parent / "run_project_suite.py"
-        )
-        runner = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(runner)
+        path = Path(__file__).parent / "run_project_suite.py"
+        runner = types.ModuleType("run_project_suite_under_test")
+        runner.__file__ = str(path)
+        text = path.read_text(encoding="utf-8") if source is None else source
+        exec(compile(text, str(path), "exec"), runner.__dict__)
         return runner
+
+    @staticmethod
+    def _test_ids(item) -> list[str]:
+        if isinstance(item, unittest.TestSuite):
+            return [test_id for child in item for test_id in CliTests._test_ids(child)]
+        return [item.id()]
+
+    def _plain_discover_ids(self) -> list[str]:
+        """Independent of the runner: what `python -m unittest discover -s tests` loads."""
+        tests_dir = str(Path(__file__).parent)
+        with mock.patch.object(sys, "path", list(sys.path)):
+            return self._test_ids(unittest.TestLoader().discover(tests_dir, top_level_dir=tests_dir))
+
+    @classmethod
+    def _ci_shard_guard_violations(cls, workflow: str, shards) -> list[str]:
+        lines = workflow.splitlines()
+        violations: list[str] = []
+
+        def indentation(line: str) -> int:
+            return len(line) - len(line.lstrip(" "))
+
+        def block_for(source: list[str], marker: str, line_indent: int) -> list[str]:
+            starts = [i for i, line in enumerate(source) if indentation(line) == line_indent and line.strip() == marker]
+            if len(starts) != 1:
+                violations.append(f"expected exactly one {marker!r}, found {len(starts)}")
+                return []
+            end = next(
+                (i for i in range(starts[0] + 1, len(source))
+                 if source[i].strip() and indentation(source[i]) <= line_indent),
+                len(source),
+            )
+            return source[starts[0]:end]
+
+        def code(block: list[str]) -> list[str]:
+            return [line for line in block if line.strip() and not line.strip().startswith("#")]
+
+        def step_ifs(block: list[str]) -> list[str]:
+            return [line.strip() for line in block if indentation(line) == 8 and line.strip().startswith("if:")]
+
+        if "continue-on-error" in workflow:
+            violations.append("continue-on-error masks a failed leg or step")
+        jobs = block_for(lines, "jobs:", 0)
+        if [line.strip() for line in code(jobs) if indentation(line) == 2] != ["synthetic-windows:"]:
+            violations.append("jobs must be exactly synthetic-windows")
+        job = block_for(lines, "synthetic-windows:", 2)
+        if [line.strip().split(":")[0] for line in code(job) if indentation(line) == 4] != ["runs-on", "strategy", "steps"]:
+            violations.append("job keys must be exactly runs-on, strategy, steps")
+        expected_strategy = [
+            "    strategy:", "      fail-fast: false", "      matrix:", "        shard:",
+            *(f"          - {shard}" for shard in shards),
+        ]
+        if code(block_for(job, "strategy:", 4)) != expected_strategy:
+            violations.append("strategy must be fail-fast false with exactly one leg per shard")
+        for marker in cls._CI_UNCONDITIONAL_STEPS:
+            step = block_for(job, marker, 6)
+            if step and step_ifs(step):
+                violations.append(f"{marker} must run on every leg")
+        for marker, expected in cls._CI_PINNED_STEPS.items():
+            if code(block_for(job, marker, 6)) != expected:
+                violations.append(f"{marker} differs from its pinned text")
+        for marker, gate in cls._CI_REST_ONLY_STEPS.items():
+            step = code(block_for(job, marker, 6))
+            if step_ifs(step) != [gate] or len(step) < 2 or step[1].strip() != gate:
+                violations.append(f"{marker} must be gated exactly by {gate!r}")
+        return violations
+
+    def _runner_union_violations(self, runner, plain: list[str], excluded: tuple[str, ...] = ()) -> list[str]:
+        """Drive main() leg by leg, as CI does, and compare the union with plain discover."""
+        collected: dict[str, list[str]] = {}
+        violations: list[str] = []
+        current: list[str] = []
+
+        class RecordingRunner:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def run(self, suite):
+                collected[current[-1]] = CliTests._test_ids(suite)
+                return mock.Mock(wasSuccessful=mock.Mock(return_value=True))
+
+        for shard in runner.SHARDS:
+            current.append(shard)
+            argv = ["--shard", shard, *(arg for name in excluded for arg in ("--exclude-module", name))]
+            with mock.patch.object(unittest, "TextTestRunner", RecordingRunner), \
+                    mock.patch.object(sys, "path", list(sys.path)):
+                if runner.main(argv) != 0:
+                    violations.append(f"main() failed for shard {shard}")
+        sharded = [test_id for ids in collected.values() for test_id in ids]
+        expected = [test_id for test_id in plain if test_id.split(".")[0] not in excluded]
+        if set(collected) != set(runner.SHARDS):
+            violations.append("not every shard ran")
+        if len(sharded) != len(set(sharded)):
+            violations.append("a test runs in more than one shard")
+        if sorted(set(sharded)) != sorted(expected):
+            violations.append(
+                "shard union differs from plain discover: "
+                f"{len(set(expected) - set(sharded))} missing, {len(set(sharded) - set(expected))} extra"
+            )
+        return violations
 
     def test_ci_shard_union_is_exactly_the_full_accepted_suite(self) -> None:
         runner = self._load_project_suite_runner()
@@ -871,23 +1063,36 @@ class CliTests(unittest.TestCase):
         self.assertIn("test_one_shot_supervisor", per_shard[runner.REST_SHARD])
         self.assertIn("test_cli", per_shard[runner.REST_SHARD])
 
-        def test_ids(item) -> list[str]:
-            if isinstance(item, unittest.TestSuite):
-                return [test_id for child in item for test_id in test_ids(child)]
-            return [item.id()]
+        # Test by test against an independent plain discover (which also recurses into
+        # packages): with custody applicable nothing is excluded, otherwise only custody is.
+        plain = self._plain_discover_ids()
+        self.assertGreater(len(plain), 0)
+        self.assertFalse([test_id for test_id in plain if "_FailedTest" in test_id], plain[:5])
+        self.assertEqual(self._runner_union_violations(runner, plain), [])
+        self.assertEqual(self._runner_union_violations(runner, plain, ("test_one_shot_supervisor",)), [])
 
-        # Test by test, over the suite the non-custody legs accept: every test runs in exactly
-        # one shard and the legs together run the whole suite.
-        excluded = {"test_one_shot_supervisor"}
-        full = test_ids(runner.build_suite(excluded))
-        sharded = [
-            test_id for shard in runner.SHARDS
-            for test_id in test_ids(runner.build_suite(excluded, shard=shard))
-        ]
-        self.assertGreater(len(full), 0)
-        self.assertEqual(len(sharded), len(set(sharded)), "a test runs in more than one shard")
-        self.assertEqual(sorted(sharded), sorted(full))
-        self.assertFalse([test_id for test_id in full if "unittest.loader._FailedTest" in test_id], full[:5])
+    def test_ci_shard_union_rejects_runner_mutations(self) -> None:
+        source = self._CI_RUNNER.read_text(encoding="utf-8")
+        plain = self._plain_discover_ids()
+        mutations = {
+            "main() ignores --shard": (
+                "build_suite(set(args.exclude_module), shard=args.shard)",
+                "build_suite(set(args.exclude_module), shard=REST_SHARD)",
+            ),
+            "build_suite drops a module": (
+                "        if name not in excluded:\n",
+                '        if name not in excluded and name != "test_naming":\n',
+            ),
+            "rest drops a module": (
+                "return [name for name in available if name not in claimed]",
+                "return [name for name in available if name not in claimed][1:]",
+            ),
+        }
+        for label, (old, new) in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertEqual(source.count(old), 1, label)
+                mutant = self._load_project_suite_runner(source.replace(old, new))
+                self.assertNotEqual(self._runner_union_violations(mutant, plain), [], label)
 
     def test_ci_shards_fail_closed_on_unknown_or_drifted_groups(self) -> None:
         runner = self._load_project_suite_runner()
@@ -908,38 +1113,82 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             runner.build_suite({"test_runtime_launcher"}, shard="runtime-launcher")
 
-    def test_ci_matrix_legs_are_exactly_the_declared_shards(self) -> None:
+    def test_ci_matrix_and_gates_are_exactly_the_declared_shards(self) -> None:
         runner = self._load_project_suite_runner()
-        workflow = (
-            Path(__file__).parents[2] / ".github" / "workflows"
-            / "energygrid-bill-downloader-tests.yml"
-        ).read_text(encoding="utf-8")
-        lines = workflow.splitlines()
-        start = lines.index("        shard:")
-        legs = []
-        for line in lines[start + 1:]:
-            if not line.startswith("          - "):
-                break
-            legs.append(line.strip()[2:])
-        self.assertEqual(legs, list(runner.SHARDS))
-        self.assertIn("  synthetic-windows:\n", workflow)
-        self.assertIn("      fail-fast: false\n", workflow)
-        # One leg owns the one-off steps; the uploaded artifact name must not repeat across legs.
-        for step_name in (
-            "PowerShell parse-only check",
-            "EnergyGrid n8n error handler focused test",
-            "EnergyGrid n8n invoice delivery focused offline test",
-            "EnergyGrid n8n Drive upload and destination setup focused offline tests",
-            "EnergyGrid n8n Drive Verify and Owner Email focused offline tests",
-            "Scope and whitespace check",
-        ):
-            self.assertIn(f"      - name: {step_name}\n        if: matrix.shard == 'rest'\n", workflow)
-        for step_name in ("Write bounded supervisor synthetic summary", "Upload supervisor synthetic summary"):
-            self.assertIn(f"      - name: {step_name}\n        if: always() && matrix.shard == 'rest'\n", workflow)
-        # Every leg still proves the literal head and runs its shard.
-        for step_name in ("Assert literal exact-head checkout", "Project synthetic test suite"):
-            step_at = lines.index(f"      - name: {step_name}")
-            self.assertFalse(lines[step_at + 1].strip().startswith("if:"), step_name)
+        workflow = self._CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(self._ci_shard_guard_violations(workflow, runner.SHARDS), [])
+
+    def test_ci_shard_guard_rejects_narrowing_or_masking_edits(self) -> None:
+        runner = self._load_project_suite_runner()
+        workflow = self._CI_WORKFLOW.read_text(encoding="utf-8")
+        suite_tail = "        shell: pwsh\n        working-directory: energygrid-bill-downloader\n        run: |\n"
+        mutations = {
+            "drop a leg": ("          - portal-hardening\n", ""),
+            "duplicate a leg": ("          - rest\n", "          - rest\n          - rest\n"),
+            "matrix exclude": (
+                "          - rest\n", "          - rest\n        exclude:\n          - shard: portal-hardening\n",
+            ),
+            "matrix include": (
+                "          - rest\n", "          - rest\n        include:\n          - shard: rest\n            extra: true\n",
+            ),
+            "suite if after name": (
+                "      - name: Project synthetic test suite\n",
+                "      - name: Project synthetic test suite\n        if: false\n",
+            ),
+            "suite if after env": (suite_tail, "        if: false\n" + suite_tail),
+            "exact-head if after shell": (
+                "      - name: Assert literal exact-head checkout\n        shell: bash\n",
+                "      - name: Assert literal exact-head checkout\n        shell: bash\n        if: false\n",
+            ),
+            "exact-head if after env": (
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n",
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n        if: false\n",
+            ),
+            "PS 5.1 boundary gated to rest": (
+                "      - name: Assert native Windows PowerShell 5.1 supervisor boundary\n",
+                "      - name: Assert native Windows PowerShell 5.1 supervisor boundary\n"
+                "        if: matrix.shard == 'rest'\n",
+            ),
+            "custody decision if: false": (
+                "        id: supervisor_custody\n", "        id: supervisor_custody\n        if: false\n",
+            ),
+            "suite exit 0": ("          }\n          exit $LASTEXITCODE\n", "          }\n          exit 0\n"),
+            "suite applicable line ; exit 0": (
+                "--shard ${{ matrix.shard }}\n", "--shard ${{ matrix.shard }}; exit 0\n",
+            ),
+            "suite excluded line ; exit 0": (
+                "--exclude-module test_one_shot_supervisor\n          }",
+                "--exclude-module test_one_shot_supervisor; exit 0\n          }",
+            ),
+            "PS 5.1 custody ; exit 0": (
+                '-p "test_one_shot_supervisor.py" -v\n', '-p "test_one_shot_supervisor.py" -v; exit 0\n',
+            ),
+            "n8n error handler ; exit 0": (
+                '-p "test_energygrid_n8n_error_handler.py" -v\n',
+                '-p "test_energygrid_n8n_error_handler.py" -v; exit 0\n',
+            ),
+            "continue-on-error on the suite step": (
+                "      - name: Project synthetic test suite\n",
+                "      - name: Project synthetic test suite\n        continue-on-error: true\n",
+            ),
+            "continue-on-error on the job": (
+                "    runs-on: windows-latest\n", "    runs-on: windows-latest\n    continue-on-error: true\n",
+            ),
+            "job-level if": ("    runs-on: windows-latest\n", "    runs-on: windows-latest\n    if: false\n"),
+            "upload on every leg": (
+                "      - name: Upload supervisor synthetic summary\n        if: always() && matrix.shard == 'rest'\n",
+                "      - name: Upload supervisor synthetic summary\n        if: always()\n",
+            ),
+            "parse check on every leg": (
+                "      - name: PowerShell parse-only check\n        if: matrix.shard == 'rest'\n",
+                "      - name: PowerShell parse-only check\n",
+            ),
+        }
+        for label, (old, new) in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertEqual(workflow.count(old), 1, label)
+                mutated = workflow.replace(old, new)
+                self.assertNotEqual(self._ci_shard_guard_violations(mutated, runner.SHARDS), [], label)
 
     def test_invalid_cli_returns_contract_exit_code(self) -> None:
         self.assertEqual(main([]), 64)
