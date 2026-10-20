@@ -15,17 +15,30 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   customer-data step.
 - Production activation is disabled in the committed example configuration.
 - The hosted jobs are `gateway-tests`, `powershell-static`,
-  `bounded-import-security`, `n8n-offline`, `existing-member-regression`, and
-  `full-offline-regression`; no PostgreSQL service container is introduced.
+  `powershell-worker-tooling`, `bounded-import-security`, `n8n-offline`,
+  `existing-member-regression`, and `full-offline-regression`; no PostgreSQL
+  service container is introduced. `powershell-worker-tooling` runs only
+  `tests.test_member_gateway_worker_deployment`, the largest single module, in
+  parallel with `powershell-static` (#211).
 - `full-offline-regression` runs in parallel with the targeted jobs (#211). It
   runs `tests/_run_ci_full_suite.py --skip-member-gateway-targeted`, which
-  skips only the whole modules that the windows-latest `powershell-static` and
-  `bounded-import-security` jobs run on the same asserted exact head (same OS
-  and Python). Modules run only by the ubuntu jobs stay in the Windows full
-  suite. `tests/test_member_gateway_ci.py` proves the skip list equals those
-  jobs' module lists and that the targeted shard plus the remainder equals the
-  accepted test set. The member-create-uat workflow calls the runner without
-  the flag and still runs the whole accepted set.
+  skips only the whole modules that the windows-latest `powershell-static`,
+  `powershell-worker-tooling` and `bounded-import-security` jobs run on the
+  same asserted exact head (same OS and Python). Modules run only by the ubuntu
+  jobs stay in the Windows full suite. `tests/test_member_gateway_ci.py` proves
+  the skip list equals those jobs' module lists and that the targeted shard
+  plus the remainder equals the accepted test set.
+- The member-create-uat workflow's `windows-full-suite` job is a four-leg
+  `fail-fast: false` matrix (#211): `focused`, `mg-deployment`,
+  `bounded-import` and `rest`, each running
+  `tests/_run_ci_full_suite.py --shard <leg>` on the same asserted exact head.
+  `rest` is the complement of the named whole-module groups, so new modules
+  land there automatically; an unknown shard or a group module that
+  contributes no test fails closed. The focused create-UAT modules run once, in
+  the `focused` leg, instead of twice. `tests/test_member_create_uat_ci.py`
+  pins the matrix and the exact run line, rejects narrowing, conditions,
+  exit-code masking and matrix include/exclude, and proves test by test
+  against a plain discover that the four legs partition the accepted set.
 
 - Shopify M1 (#155 G3) adds the four Shopify schemas, the Shopify example
   config, migration 0006 and `tests/test_member_gateway_shopify_ps.py` to the

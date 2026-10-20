@@ -5,7 +5,8 @@ name: member-create-uat-tests
 # Windows is the authoritative target: the laptop development machine, the physical
 # host, and the AutoCount VM are all Windows, and the runner's exclusive-create
 # locking and PowerShell behaviour are Windows-oriented. Windows therefore runs the
-# full repository suite plus a PowerShell parse check. Ubuntu runs only the portable
+# full repository suite, as parallel shards, plus a PowerShell parse check on every
+# shard. Ubuntu runs only the portable
 # focused create-UAT tests (pure Python plus the platform-neutral PowerShell library
 # via pwsh) to prove cross-platform correctness of the portable components. No CI job
 # contacts AutoCount, n8n, Google, or any live environment; the runner's AutoCount
@@ -81,8 +82,16 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # The full repository suite runs as four parallel whole-module shards on the same
+  # asserted exact head (#211). `rest` is the complement of the named groups in
+  # tests/_run_ci_full_suite.py, and tests/test_member_create_uat_ci.py proves the
+  # legs equal the runner's shards and partition the accepted set test by test.
   windows-full-suite:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [focused, mg-deployment, bounded-import, rest]
     steps:
       # Check out the LITERAL head commit, never the synthetic pull-request merge ref, so the
       # tree under test is exactly the reviewed commit. On workflow_dispatch the pull_request
@@ -130,15 +139,11 @@ jobs:
             }
           }
           if ($failed) { exit 1 }
-      - name: Focused create UAT tests
-        shell: pwsh
-        run: |
-          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps tests.test_ac2_member_expiry_capability_probe
-      - name: Full repository test suite (excludes the Docker/n8n live-import module)
+      - name: Full repository test suite shard (excludes the Docker/n8n live-import module)
         shell: pwsh
         # The n8n live-import dry-run module needs a Docker/n8n environment absent on
         # stock CI; it and the complete suite are validated locally on the dev/VM host.
-        run: python tests/_run_ci_full_suite.py
+        run: python tests/_run_ci_full_suite.py --shard ${{ matrix.shard }}
 
   ubuntu-focused:
     runs-on: ubuntu-latest
