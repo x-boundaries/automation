@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 
@@ -357,6 +358,12 @@ NEGATIVE_EVIDENCE = {
     "not utf-8": (None, (), {"monitor-post.json": b'{"outcome": "\xff"}'}, "INCOMPLETE"),
     "wrong core schema": (_set(("status.json", "schema"), "energygrid.native.v3.result.v1"), (), None, "INCOMPLETE"),
     "json array not object": (None, (), {"acquire.json": b"[]"}, "INCOMPLETE"),
+    # G2 L2: valid JSON of the wrong type must classify, not raise in a set membership test.
+    "step name is a list": (_set(("daily.json", "steps"), [{"step": ["drive-seal"], "outcome": "SEALED"},
+                                                          {"step": "next", "outcome": "IDLE"}]), (), None,
+                            "INCOMPLETE"),
+    "acquisition status is an object": (_set(("acquire.json", "acquisition", "EB_BILL", "status"), {"x": 1}), (),
+                                        None, "INCOMPLETE"),
 }
 
 
@@ -859,7 +866,9 @@ class PruneFailureHolds(RetentionCase):
         self.assert_nothing_after(code, summary, second, snap, "EG_RET_PRUNE_HOLD_OPERATOR")
         code, summary = self.home.main("--apply")
         self.assertEqual(code, 20)
-        self.assertIn("EG_RET_PRUNE_DIGEST_MISMATCH", summary["refs"])
+        # G2 L1: the recorded operator hold stops the next run before it even tries to settle the quarantine.
+        self.assertIn("EG_RET_OPERATOR_HOLD", summary["refs"])
+        self.assertEqual(summary["counts"]["resumed"], 0)
         self.assertEqual((held / "status.json").read_bytes(), b"{}", "left exactly as found")
         self.assertEqual(tree_digest(second), snap["second"])
 
@@ -971,6 +980,243 @@ class RetentionFolderRequired(RetentionCase):
 
 
 # ---------------------------------------------------------------------------------------------------
+# Web G2 adjudication (#257:6283829403): L1 durable operator hold, L3 incident-day log lines,
+# I1 incomplete incident archive
+# ---------------------------------------------------------------------------------------------------
+
+
+class OperatorHoldPersists(RetentionCase):
+    """L1: once a failed prune needs an operator, no later scheduled --apply deletes what it left."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(setattr, ret, "_folder_digest", ret._folder_digest)
+        self.quarantine = self.home.retention / "prune-quarantine"
+        self.marker = self.home.retention / "operator-hold.json"
+
+    def setup_tree(self) -> tuple[Path, Path, Path]:
+        first = self.home.clean_run(95)    # oldest name: pruned first
+        second = self.home.clean_run(91)
+        segment = self.write_segment("egdaily.20260601-190000.log",
+                                     [log_line(day_with_complete_days(130), CLEAN), log_line(TODAY, CLEAN)])
+        return first, second, segment
+
+    def assert_operator_hold_kept(self, first: Path, second: Path, segment: Path) -> None:
+        held = self.quarantine / first.name
+        held_before, second_before, segment_before = tree_digest(held), tree_digest(second), segment.read_bytes()
+        self.assertTrue(held_before, "the quarantined evidence is present")
+        for attempt in (1, 2):
+            with self.subTest(later_apply=attempt):
+                code, summary = self.home.main("--apply")
+                # Effects first, so a regression shows what was destroyed rather than a missing reference.
+                self.assertEqual((summary["counts"]["resumed"], summary["counts"]["pruned"],
+                                  summary["counts"]["log_segments_compacted"]), (0, 0, 0), summary)
+                self.assertEqual(tree_digest(held), held_before, "the operator's evidence is never deleted")
+                self.assertTrue((self.home.retention / "prune-journal" / f"{first.name}.json").exists())
+                self.assertFalse((self.home.retention / "pruned" / f"{first.name}.json").exists())
+                self.assertEqual(tree_digest(second), second_before)
+                self.assertEqual(segment.read_bytes(), segment_before)
+                self.assertEqual(code, 20, summary)
+                self.assertIn("EG_RET_OPERATOR_HOLD", summary["refs"])
+        code, summary = self.home.main()
+        self.assertEqual(code, 0, summary)
+        self.assertIn("EG_RET_OPERATOR_HOLD", summary["refs"], "a dry run reports the hold")
+        self.assertTrue(self.marker.is_file(), "the tool never clears the operator hold itself")
+
+    def test_substituted_prune_target_is_never_deleted_by_a_later_apply(self) -> None:
+        first, second, segment = self.setup_tree()
+        real_rename, swapped = os.rename, {"done": False}
+
+        def racing_rename(src, dst):
+            if not swapped["done"] and Path(dst).parent == self.quarantine:
+                # Between the identity check and the rename, the run folder is swapped for a look-alike copy
+                # with the same bytes: what reaches quarantine is not the folder that was judged.
+                swapped["done"] = True
+                aside = Path(self._tmp.name) / "swapped-out"
+                real_rename(src, aside)
+                shutil.copytree(aside, src)
+            return real_rename(src, dst)
+
+        with mock.patch.object(ret.os, "rename", racing_rename):
+            code, summary = self.home.main("--apply")
+        self.assertTrue(swapped["done"])
+        self.assertEqual(code, 20, summary)
+        self.assertIn("EG_RET_PRUNE_SUBSTITUTED", summary["refs"])
+        self.assertIn("EG_RET_PRUNE_HOLD_OPERATOR", summary["refs"])
+        self.assert_operator_hold_kept(first, second, segment)
+
+    def test_transiently_unreadable_quarantine_is_never_deleted_by_a_later_apply(self) -> None:
+        first, second, segment = self.setup_tree()
+        original = ret._folder_digest
+
+        def unreadable_once() -> None:
+            def digest(folder):
+                ret._folder_digest = original  # readable again from the next look on
+                raise PermissionError("synthetic: quarantine briefly unreadable")
+            ret._folder_digest = digest
+
+        self.fail_at("prune:after-rename", before=unreadable_once)
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 20, summary)
+        self.assertIn("EG_RET_PRUNE_HOLD_OPERATOR", summary["refs"])
+        self.assertIs(ret._folder_digest, original)
+        self.assert_operator_hold_kept(first, second, segment)
+
+    def test_resume_failure_needing_the_operator_persists_after_the_bytes_match_again(self) -> None:
+        first, second, segment = self.setup_tree()
+        self.crash_at("prune:after-rename")
+        self.crash("--apply")
+        status = self.quarantine / first.name / "status.json"
+        original = status.read_bytes()
+        status.write_bytes(b"{}")
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 20, summary)
+        self.assertIn("EG_RET_PRUNE_DIGEST_MISMATCH", summary["refs"])
+        status.write_bytes(original)  # the bytes match the journal again: still the operator's decision
+        self.assert_operator_hold_kept(first, second, segment)
+
+    def test_resumable_failure_writes_no_operator_hold_and_settles_next_time(self) -> None:
+        first, second, segment = self.setup_tree()
+        self.fail_at("prune:mid-delete")
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 20, summary)
+        self.assertIn("EG_RET_PRUNE_HOLD_RESUMABLE", summary["refs"])
+        self.assertNotIn("EG_RET_OPERATOR_HOLD", summary["refs"])
+        self.assertFalse(self.marker.exists())
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 0, summary)
+        self.assertEqual((summary["counts"]["resumed"], summary["counts"]["pruned"]), (1, 1))
+        self.assertFalse((self.quarantine / first.name).exists())
+        self.assertFalse(second.exists())
+
+    def test_only_the_operator_releases_the_hold(self) -> None:
+        first, _second, _segment = self.setup_tree()
+        self.fail_at("prune:after-rename", before=lambda: (self.quarantine / first.name / "status.json")
+                     .write_bytes(b"{}"))
+        self.home.main("--apply")
+        self.assertTrue(self.marker.is_file())
+        record = json.loads(self.marker.read_text(encoding="utf-8"))
+        self.assertEqual((record["schema"], record["run"]), ("energygrid.retention.operator_hold.v1", first.name))
+        # The operator decides: here, the quarantined run is put back in place and the hold file removed.
+        shutil.rmtree(self.quarantine / first.name)
+        self.home.run(ret.run_start(first.name))
+        (self.home.retention / "prune-journal" / f"{first.name}.json").unlink()
+        self.marker.unlink()
+        code, summary = self.home.main("--apply")
+        self.assertEqual((code, summary["counts"]["pruned"]), (0, 2), summary)
+
+
+class IncidentDayLogLines(RetentionCase):
+    """L3: a torn or malformed line keeps every other line of its day; an undated one keeps its neighbours'."""
+
+    def compact(self, *segments: list[bytes]) -> list[bytes]:
+        paths = [self.write_segment(f"egdaily.2026060{index + 1}-190000.log", lines)
+                 for index, lines in enumerate(segments)]
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 0, summary)
+        return [path.read_bytes() if path.exists() else b"" for path in paths]
+
+    def test_torn_line_with_a_leading_date_keeps_its_day(self) -> None:
+        day, other = day_with_complete_days(120), day_with_complete_days(121)
+        torn = f"{day.isoformat()}T11:3\r\n".encode("ascii")  # cut mid-timestamp
+        lines = [log_line(other, CLEAN), torn, log_line(day, CLEAN, "15:00:00")]
+        self.assertEqual(self.compact(lines), [torn + lines[2]], "only the unrelated old clean line goes")
+
+    def test_torn_line_running_into_the_next_record_keeps_both_days(self) -> None:
+        first, second, far = (day_with_complete_days(days) for days in (120, 119, 140))
+        merged = f"{first.isoformat()}T11:30:3{second.isoformat()}T11:30:35 {CLEAN}\r\n".encode("ascii")
+        lines = [log_line(far, CLEAN), log_line(first, CLEAN, "09:00:00"), merged, log_line(second, CLEAN, "15:00:00")]
+        self.assertEqual(self.compact(lines), [b"".join(lines[1:])])
+
+    def test_undated_fragment_keeps_both_neighbouring_days_across_segments(self) -> None:
+        far, before, after = (day_with_complete_days(days) for days in (140, 120, 119))
+        fragment = b"\x00\x00\x00 monitor_report=SUB\r\n"
+        older = [log_line(far, CLEAN), log_line(before, CLEAN)]
+        newer = [fragment, log_line(after, CLEAN)]
+        self.assertEqual(self.compact(older, newer), [older[1], b"".join(newer)])
+
+    def test_clean_days_far_from_any_doubt_are_still_compacted(self) -> None:
+        lines = [log_line(day_with_complete_days(days), CLEAN) for days in (150, 140, 130)]
+        self.assertEqual(self.compact(lines), [b""])
+
+
+class IncompleteArchiveHolds(RetentionCase):
+    """I1: an archive that had to leave evidence out is not completed custody: no prune and no log change."""
+
+    def check_held(self, incident: Path) -> dict:
+        eligible = self.home.clean_run(91)
+        segment = self.write_segment("egdaily.20260601-190000.log",
+                                     [log_line(day_with_complete_days(130), CLEAN), log_line(TODAY, CLEAN)])
+        incident_before, eligible_before, segment_before = (tree_digest(incident), tree_digest(eligible),
+                                                            segment.read_bytes())
+        for attempt in ("first apply", "repeat apply with the archive already published"):
+            with self.subTest(attempt):
+                code, summary = self.home.main("--apply")
+                counts = summary.get("counts", {})
+                self.assertEqual((counts.get("pruned"), counts.get("log_segments_compacted")), (0, 0), summary)
+                self.assertEqual(tree_digest(eligible), eligible_before)
+                self.assertEqual(segment.read_bytes(), segment_before)
+                self.assertEqual(tree_digest(incident), incident_before, "the original incident is untouched")
+                self.assertEqual(code, 20, summary)
+                self.assertIn("EG_RET_ARCHIVE_INCOMPLETE", summary["refs"])
+                self.assertIn("EG_RET_PRUNE_SKIPPED_ARCHIVE_INCOMPLETE", summary["refs"])
+                self.assertEqual(summary["counts"]["archive_verified"], 0, "never counted as a verified archive")
+                self.assertEqual(self.home.run_entry(incident)["action"], "ARCHIVE_INCOMPLETE")
+                self.assertEqual(self.home.run_entry(eligible)["action"], "HELD")
+        manifest = ret.verify_archive(self.home.retention / "incident-archive" / incident.name)
+        self.assertIsNotNone(manifest, "what could be copied safely is in private custody and reads back")
+        self.assertIs(manifest["complete"], False)
+        self.assertTrue(manifest["excluded"])
+        return manifest
+
+    def test_oversized_evidence(self) -> None:
+        incident = self.home.clean_run(200, raw={"status.json": b" " * (ret.MAX_EVIDENCE_BYTES + 1)})
+        manifest = self.check_held(incident)
+        self.assertEqual(manifest["excluded"], [{"name": "status.json", "reason": "EG_RET_ARCHIVE_TOO_LARGE"}])
+
+    def test_excluded_unsafe_name(self) -> None:
+        incident = self.home.clean_run(200)
+        (incident / "operator note 1.txt").write_text("synthetic", encoding="utf-8")
+        manifest = self.check_held(incident)
+        self.assertEqual(manifest["excluded"], [{"name": "operator note 1.txt",
+                                                 "reason": "EG_RET_ARCHIVE_NAME_REFUSED"}])
+
+    def test_file_limit(self) -> None:
+        incident = self.home.clean_run(200)
+        for index in range(ret.MAX_ARCHIVE_FILES):
+            (incident / f"extra{index:02d}.json").write_text("{}", encoding="utf-8")
+        manifest = self.check_held(incident)
+        self.assertEqual({item["reason"] for item in manifest["excluded"]}, {"EG_RET_ARCHIVE_FILE_LIMIT"})
+
+    def test_complete_archive_whose_source_gained_excluded_evidence_holds(self) -> None:
+        incident = self.home.clean_run(200, drop=("monitor-post.json",))
+        code, summary = self.home.main("--apply")
+        self.assertEqual(code, 0, summary)
+        (incident / "operator note 1.txt").write_text("synthetic", encoding="utf-8")
+        eligible = self.home.clean_run(92)
+        code, summary = self.home.main("--apply")
+        self.assertEqual(summary["counts"]["pruned"], 0, summary)
+        self.assertTrue(eligible.is_dir())
+        self.assertEqual(code, 20, summary)
+        self.assertIn("EG_RET_ARCHIVE_INCOMPLETE", summary["refs"])
+
+    def test_manifest_claiming_complete_despite_exclusions_is_invalid(self) -> None:
+        incident = self.home.clean_run(200)
+        (incident / "operator note 1.txt").write_text("synthetic", encoding="utf-8")
+        self.home.main("--apply")
+        archive = self.home.retention / "incident-archive" / incident.name
+        manifest = json.loads((archive / "manifest.json").read_text(encoding="utf-8"))
+        manifest["complete"] = True
+        (archive / "manifest.json").write_bytes(ret._json_bytes(manifest))
+        self.assertIsNone(ret.verify_archive(archive))
+        eligible = self.home.clean_run(92)
+        code, summary = self.home.main("--apply")
+        self.assertEqual((code, summary["counts"]["pruned"]), (20, 0), summary)
+        self.assertIn("EG_RET_ARCHIVE_EXISTING_INVALID", summary["refs"])
+        self.assertTrue(eligible.is_dir())
+
+
+# ---------------------------------------------------------------------------------------------------
 # egdaily.log rotation and compaction
 # ---------------------------------------------------------------------------------------------------
 
@@ -993,9 +1239,10 @@ class SummaryLog(RetentionCase):
         lines = [
             log_line(old_abnormal, CLEAN, "09:00:00"),                                  # same day as an abnormal line
             log_line(old_abnormal, "exit=20 monitor_report=WITHHELD submitted=False withheld=EG_DAILY_CORE_REFUSED"),
+            # Unparseable: kept, and (G2 L3) it also keeps both neighbouring days, already preserved here.
+            b"garbage without a date\r\n",
             log_line(incident_run_day, CLEAN),                                          # a preserved run's day
             log_line(old_clean, CLEAN),                                                 # dropped
-            b"garbage without a date\r\n",                                              # unparseable: kept
             log_line(day_with_complete_days(125), "exit=0 monitor_report=UNREADABLE submitted=False withheld="),
             log_line(boundary, CLEAN),                                                  # exactly 90: kept
             log_line(TODAY - timedelta(days=1), CLEAN),
@@ -1009,7 +1256,7 @@ class SummaryLog(RetentionCase):
         self.assertEqual(len(segments), 1)
         kept = segments[0].read_bytes()
         self.assertTrue(kept.startswith(ret.BOM))
-        expected = ret.BOM + b"".join(line for index, line in enumerate(lines) if index != 3)
+        expected = ret.BOM + b"".join(line for index, line in enumerate(lines) if index != 4)
         self.assertEqual(kept, expected)
         self.assertEqual(summary["counts"]["log_lines_dropped"], 1)
         # The daily runner's next Add-Content simply starts a new file.

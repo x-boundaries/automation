@@ -106,7 +106,9 @@ Preserved runs stay **indefinitely** until a separate owner decision.
        posing as a run fences too;
      - an entry named like a run is dated in the future (`EG_RET_FUTURE_RUN_PRESENT`);
      - the runs root cannot be listed (`EG_RET_RUNS_UNREADABLE`);
-     - an interrupted operation cannot be settled.
+     - an interrupted operation cannot be settled;
+     - an operator hold is recorded (`EG_RET_OPERATOR_HOLD`): `data\retention\operator-hold.json` exists
+       (see step 4). Only an operator removes it; the tool never does.
    - While the writer fence holds, an interrupted prune is left exactly as it is
      (`EG_RET_RECOVERY_DEFERRED`; a dry run reports `EG_RET_RECOVERY_PENDING`). The first `--apply`
      whose gates are clear settles it.
@@ -116,7 +118,10 @@ Preserved runs stay **indefinitely** until a separate owner decision.
    - Its own leftover archive staging and compaction temp files are removed. The originals were never
      touched.
    - Prune journals are completed, but only where the quarantined bytes still match the journal.
-   - A mismatch, or a quarantine folder with no journal, is left exactly as found and holds the run.
+   - A mismatch, an unreadable quarantine, an invalid journal, or a quarantine folder with no journal, is
+     left exactly as found and holds the run. It is classified like a failed prune (step 4): anything not
+     plainly resumable records the operator hold, so a later run never settles it just because the files
+     match again.
 3. **Archive every incident first.**
    - INCIDENT and INCOMPLETE runs are **copied** to `data\retention\incident-archive\<run>\`. Only plain
      files are copied: up to 16 files of at most 1 MiB each, with safe names.
@@ -126,6 +131,15 @@ Preserved runs stay **indefinitely** until a separate owner decision.
    - The original run is never altered.
    - An existing archive is re-verified on every run.
    - Any archive failure holds every prune and every log change for that run of the tool.
+   - **An incomplete archive is not completed custody.** If any file had to be left out (an unsafe name, not
+     a plain file, over 1 MiB, or beyond the 16-file limit), the archive is still published with what could
+     be copied safely, with `complete: false` and an `excluded` list, and read back. The run's action is
+     `ARCHIVE_INCOMPLETE` and the tool reports `EG_RET_ARCHIVE_INCOMPLETE` and holds every prune and log
+     change (`EG_RET_PRUNE_SKIPPED_ARCHIVE_INCOMPLETE`). An already published incomplete archive, or a
+     complete one whose source now holds evidence that cannot be archived, holds the same way on every
+     later run and is never counted as `archive_verified`. A manifest whose `complete` disagrees with its
+     `excluded` list fails verification (`EG_RET_ARCHIVE_EXISTING_INVALID`). The original incident evidence
+     stays in `data\runs`; an operator decides how to keep the excluded files.
 4. **Prune** each eligible run:
    1. Re-classify it immediately before acting. It must still be clean and its hashes unchanged.
    2. Write a journal with the file hashes.
@@ -143,9 +157,18 @@ Preserved runs stay **indefinitely** until a separate owner decision.
    |---|---|---|
    | `EG_RET_PRUNE_HOLD_NOTHING_CHANGED` | The run is intact in `data\runs`, with no journal or quarantine (for example the rename was refused while a file was open). | Re-judges and retries it. |
    | `EG_RET_PRUNE_HOLD_RESUMABLE` | A journal, and either the run still in place or a quarantine whose remaining files all match the journal. | Settles it (step 2) once the gates are clear. |
-   | `EG_RET_PRUNE_HOLD_OPERATOR` | Anything else: a substituted folder, changed quarantined bytes, a missing or invalid journal, or the run in both places. | Holds again. Nothing is deleted or restored; an operator decides. |
+   | `EG_RET_PRUNE_HOLD_OPERATOR` | Anything else: a substituted folder, changed or unreadable quarantined bytes, a missing or invalid journal, or the run in both places. | Holds again (`EG_RET_OPERATOR_HOLD`), even if the files later match the journal. Nothing is deleted or restored; an operator decides. |
 
    A failed prune is never counted as pruned and gets no ledger record until it is settled.
+
+   **The operator hold is durable.** On `EG_RET_PRUNE_HOLD_OPERATOR` (or an operator-only failure in step 2)
+   the tool writes `data\retention\operator-hold.json` once, recording the run and the reference, with no
+   file content. While it exists every run, including a dry run, reports `EG_RET_OPERATOR_HOLD` and an
+   `--apply` makes no recovery, archive, prune or log change. If it cannot be written the tool also reports
+   `EG_RET_OPERATOR_HOLD_NOT_RECORDED`. To release it, an operator inspects `prune-journal` and
+   `prune-quarantine` as a whole, settles them (for example puts the quarantined run back in `data\runs` and
+   removes its journal), and only then deletes `operator-hold.json`. Deleting it without settling lets the
+   next `--apply` treat what is left as ordinary recovery.
 5. **Summary log.**
    - When the live log's first line is at least 31 complete days old, or the log reaches 1 MiB, it is
      **renamed** into `data\retention\egdaily-log\`.
@@ -158,6 +181,11 @@ Preserved runs stay **indefinitely** until a separate owner decision.
      abnormal line and no preserved run. A clean line is exactly
      `exit=0 monitor_report=SUBMIT submitted=True withheld=`.
    - Abnormal and unparseable lines, and every line of an incident day, are kept.
+   - A malformed line (torn mid-write, run into the next record, corrupted) makes an incident day of every
+     valid `YYYY-MM-DD` it contains. A malformed line with no valid date cannot be placed exactly, so the
+     days of its nearest dated neighbours, reading segments oldest first and then the live log, are
+     incident days. The log is append-only and segments are whole renamed slices of it, so this covers
+     every day the line could belong to.
    - An unreadable log or segment stops all compaction.
 6. **Independent after-check.** Every run folder that was not pruned is re-hashed. Any difference is
    reported as `EG_RET_NON_TARGET_CHANGED`.
@@ -199,7 +227,7 @@ evidence is the summary line only.
 | After journal, before rename | The run is still in place. The journal is discarded and the run is re-judged. |
 | After rename or mid-delete | The remaining quarantined files are re-hashed against the journal, then deleted and recorded. Not while the writer fence holds: then nothing is touched (`EG_RET_RECOVERY_DEFERRED`). |
 | A prune failed without a crash | Everything after it was held in that run. What it left is settled as above, or held for the operator (`EG_RET_PRUNE_HOLD_*`, section 3 step 4). |
-| Quarantined bytes changed | Held with `EG_RET_PRUNE_DIGEST_MISMATCH`. Nothing is deleted and nothing else is pruned. An operator decides. |
+| Quarantined bytes changed | Held with `EG_RET_PRUNE_DIGEST_MISMATCH` and the durable operator hold. Nothing is deleted and nothing else is pruned, on this or any later run, until an operator settles it and removes `operator-hold.json`. |
 | Archive staging | Staging is removed and the archive is redone and verified before any prune. |
 | Log compaction | The temp file is removed. The old segment was whole the whole time, and it is compacted again. |
 
@@ -229,6 +257,11 @@ Each step needs its own owner grant naming the target and the effect.
      SYSTEM, Administrators and TrustedInstaller may hold write, delete, WRITE_DAC or WRITE_OWNER.
      The executed items are EG_HOME, the venv, `pyvenv.cfg`, `python.exe` and the base CPython from
      #226 CB1.
+   - The wrapper checks only the listed files and their folders. It does not check every base CPython
+     file or the venv's `site-packages` (including `.pth` files), and `-I` is not relied on to stop
+     `.pth` execution. Before installation or activation, the separately authorised native phase must
+     prove on the owner PC, as an administrator, that the base CPython tree and `site-packages` are
+     protected the same way, with a negative proof that the task principal cannot change them (#257 G2 I2).
    - Create `data\retention` **before the first run**. The wrapper refuses with
      `EG_RET_RETENTION_MISSING` if it is absent, and the tool never creates it. Break inheritance and grant
      it only to SYSTEM, Administrators and the task principal (Modify), all **inheritable to subfolders
@@ -295,7 +328,7 @@ runs it. The tests cover:
 - **Age:** 89, 90 and 91 complete days; the SGT versus UTC boundary; folder name versus recorded start;
   back-dated file times; same-day incidents; future runs; an unsafe entry (a file, or on Windows a
   junction) keeping the clean run of its SGT day.
-- **Evidence:** 33 doubtful-evidence variants, plus separate extra-file and invalid-name tests, each preserved with the expected kind. These include:
+- **Evidence:** 35 doubtful-evidence variants (including wrong-type step and acquisition values), plus separate extra-file and invalid-name tests, each preserved with the expected kind. These include:
   - withheld runs, uncertain, held or probe-failed email, and pending, held or unknown notifications;
   - pending or blocked streams, unverified invoices, failed acquisition, recovered work and named-archive
     conflicts;
@@ -318,6 +351,17 @@ runs it. The tests cover:
   `EG_RET_PRUNE_HOLD_*` is reported, and the next run settles it or keeps holding.
 - **Interruptions:** after the journal, after the rename, mid-delete, a tampered quarantine, a quarantine
   with no journal, archive staging, compaction temp files.
+- **Durable operator hold (G2 L1):** a prune target substituted by a same-bytes copy during the rename, a
+  quarantine that is unreadable only at classification, and a resume-time mismatch whose bytes are later
+  restored. Each is followed by two more `--apply` runs and a dry run: nothing is resumed, pruned or
+  compacted and the hold file stays. A resumable failure writes no hold and settles next time; the hold
+  is released only by the operator.
+- **Incident-day log lines (G2 L3):** a torn line with a leading date, a torn line run into the next
+  record, and an undated fragment between two segments keep every other line of the affected days; clean
+  days far from any doubt are still compacted.
+- **Incomplete archive (G2 I1):** oversized, unsafe-name and over-the-limit evidence, each with an eligible
+  clean run and a segment due for compaction, on a first and a repeat `--apply`; a complete archive whose
+  source later gains excluded evidence; a manifest that claims `complete` despite exclusions.
 - **Log:** dry run, rotation and compaction rules (abnormal lines, incident days, the 90-day boundary,
   BOM, unparseable lines), a writer holding the log open, a fully old segment, an unterminated last line.
 - **Templates:**

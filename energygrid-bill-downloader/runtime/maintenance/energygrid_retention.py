@@ -28,7 +28,11 @@ Safety floor (docs/run_log_retention.md):
   interrupted-work recovery) changes while a run-named entry younger than ACTIVE_FENCE or dated in the
   future exists (the daily writer may still be active). These gates are checked before any change.
 - A failed or doubtful prune holds every later prune and log change in that execution; what it left is
-  settled by the next run whose gates are clear, or held for the operator.
+  settled by the next run whose gates are clear, or held for the operator. An operator hold is written to
+  data\\retention\\operator-hold.json and holds every later effect until an operator removes that file;
+  the tool never removes it.
+- An incident archive that had to leave any evidence out (manifest complete=false) is not completed
+  custody: it holds every prune and log change, on this and every later run.
 - data\\retention must already exist (the protected install creates it with a private ACL); the tool never
   creates it.
 
@@ -55,6 +59,7 @@ SUMMARY_SCHEMA = "energygrid.retention.summary.v1"
 REPORT_SCHEMA = "energygrid.retention.report.v1"
 ARCHIVE_SCHEMA = "energygrid.retention.incident_archive.v1"
 JOURNAL_SCHEMA = "energygrid.retention.prune.v1"
+OPERATOR_HOLD_SCHEMA = "energygrid.retention.operator_hold.v1"
 
 SGT = timezone(timedelta(hours=8), "SGT")  # Singapore has no daylight saving
 RETENTION_COMPLETE_DAYS = 90       # prune only when MORE than this many complete SGT days have passed
@@ -80,6 +85,7 @@ COMPACT_TMP_RE = re.compile(r"\.egdaily\.\d{8}-\d{6}\.log\.compact-[0-9a-f]{8}\.
 RUN_ID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.ASCII)
 ISO_Z_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
 LOG_LINE_RE = re.compile(rb"(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2} (.*)", re.DOTALL)
+LOG_DATE_RE = re.compile(rb"\d{4}-\d{2}-\d{2}")  # any date inside a malformed (for example torn) line
 LOG_CLEAN_TAIL = b"exit=0 monitor_report=SUBMIT submitted=True withheld="
 BOM = b"\xef\xbb\xbf"
 
@@ -261,6 +267,10 @@ class Layout:
     def reports(self) -> Path:
         return self.retention / "reports"
 
+    @property
+    def operator_hold(self) -> Path:
+        return self.retention / "operator-hold.json"
+
     def own_dirs(self) -> tuple[Path, ...]:
         return (self.retention, self.archive, self.quarantine, self.journal, self.ledger, self.segments,
                 self.reports)
@@ -375,8 +385,10 @@ def _judge_daily(daily: Any, started: datetime) -> tuple[str, datetime]:
     _need(email["uncertain"] == 0 and email["held"] == 0, "EG_RET_EMAIL_UNCERTAIN_OR_HELD", INCIDENT)
     _need(email["probe"] in (None, "READY"), "EG_RET_EMAIL_PROBE_NOT_READY", INCIDENT)
     steps = daily.get("steps")
-    _need(type(steps) is list and len(steps) >= 1 and all(type(item) is dict for item in steps),
-          "EG_RET_DAILY_STEPS_INVALID")
+    # String step and outcome only: a list or object would raise in the CLEAN_STEPS set lookup below.
+    _need(type(steps) is list and len(steps) >= 1 and all(
+        type(item) is dict and type(item.get("step")) is str and type(item.get("outcome")) is str for item in steps),
+        "EG_RET_DAILY_STEPS_INVALID")
     last = steps[-1]
     _need(last.get("step") == "next" and last.get("outcome") == "IDLE" and "support_ref" not in last,
           "EG_RET_DAILY_NOT_IDLE", INCIDENT)
@@ -401,7 +413,8 @@ def _judge_acquire(acquire: Any, run_id: str) -> None:
     _need(type(acquisition) is dict and set(acquisition) == set(STREAMS), "EG_RET_ACQUISITION_STREAMS")
     for stream in STREAMS:
         entry = acquisition[stream]
-        _need(type(entry) is dict and entry.get("status") in GOOD_ACQUISITION and entry.get("support_ref") is None,
+        _need(type(entry) is dict and type(entry.get("status")) is str, "EG_RET_ACQUISITION_STREAMS")
+        _need(entry.get("status") in GOOD_ACQUISITION and entry.get("support_ref") is None,
               "EG_RET_ACQUISITION_NOT_CLEAN", INCIDENT)
     named = acquire.get("named_archive")
     _need(type(named) is dict and set(named) == set(STREAMS), "EG_RET_NAMED_ARCHIVE_STREAMS")
@@ -574,8 +587,11 @@ def verify_archive(folder: Path) -> dict | None:
         manifest = _parse_json(_read_plain(folder / "manifest.json", MAX_EVIDENCE_BYTES))
         if type(manifest) is not dict or manifest.get("schema") != ARCHIVE_SCHEMA:
             return None
-        files = manifest.get("files")
-        if type(files) is not list:
+        files, excluded = manifest.get("files"), manifest.get("excluded")
+        if type(files) is not list or type(excluded) is not list:
+            return None
+        # "complete" must be a real boolean that agrees with the exclusions: never complete with anything left out.
+        if type(manifest.get("complete")) is not bool or manifest["complete"] != (not excluded):
             return None
         expected = {"manifest.json"}
         for item in files:
@@ -635,17 +651,22 @@ def _remove_tree_of_plain_files(folder: Path) -> None:
 def archive_incident(layout: Layout, run: Run, now: datetime) -> str:
     """Copy a preserved run's evidence into the private archive and read it back. The original stays.
 
-    Returns ARCHIVED (new, verified) or ARCHIVE_VERIFIED (already archived and still matching)."""
+    Returns ARCHIVED (new, verified, complete), ARCHIVE_VERIFIED (already archived, complete and still
+    matching) or ARCHIVE_INCOMPLETE (what could be copied safely is archived and verified, but some evidence
+    had to be left out, so the caller must hold every prune and log change)."""
     target = layout.archive / run.name
     if os.path.lexists(target):
         manifest = verify_archive(target)
         if manifest is None:
             raise RetentionError("EG_RET_ARCHIVE_EXISTING_INVALID")
-        current = {name: _sha256(data) for name, data in _archive_sources(layout, run)[0]}
+        chosen, excluded = _archive_sources(layout, run)
+        current = {name: _sha256(data) for name, data in chosen}
         archived = {item["name"]: item["sha256"] for item in manifest["files"]}
         if current != archived:
             raise RetentionError("EG_RET_ARCHIVE_SOURCE_CHANGED")
-        return "ARCHIVE_VERIFIED"
+        # An archive published incomplete stays incomplete; so does one whose source now holds evidence
+        # that could not be archived. Neither is ever reported as a verified archive.
+        return "ARCHIVE_INCOMPLETE" if excluded or not manifest["complete"] else "ARCHIVE_VERIFIED"
     chosen, excluded = _archive_sources(layout, run)
     staging = layout.archive / f".staging-{run.name}-{secrets.token_hex(4)}"
     os.mkdir(staging)
@@ -668,7 +689,7 @@ def archive_incident(layout: Layout, run: Run, now: datetime) -> str:
     os.rename(staging, target)  # one step: the archive either exists complete or not at all
     if verify_archive(target) is None:
         raise RetentionError("EG_RET_ARCHIVE_READBACK_FAILED")
-    return "ARCHIVED"
+    return "ARCHIVE_INCOMPLETE" if excluded else "ARCHIVED"
 
 
 def clean_archive_staging(layout: Layout) -> int:
@@ -753,15 +774,45 @@ def prune(layout: Layout, run: Run, now: datetime) -> None:
     _finish_prune(layout, run.name, journal, now)
 
 
+OPERATOR_HOLD = "EG_RET_OPERATOR_HOLD"
+
+
+def record_operator_hold(layout: Layout, name: str | None, ref: str, now: datetime) -> list[str]:
+    """Make an operator-only hold durable: data\\retention\\operator-hold.json, written once.
+
+    While the file exists every later run holds every effect (no recovery, archive, prune or log change).
+    Only an operator removes it, after deciding what to do with what the prune left; the tool never does.
+    Returns the refs to report: the hold, plus a loud ref if the file could not be written."""
+    refs = [OPERATOR_HOLD]
+    if not os.path.lexists(layout.operator_hold):  # the first recorded cause stays; one file holds them all
+        record = {"schema": OPERATOR_HOLD_SCHEMA, "run": name, "ref": ref,
+                  "at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        try:
+            _write_new(layout.operator_hold, _json_bytes(record))
+        except OSError:
+            refs.append("EG_RET_OPERATOR_HOLD_NOT_RECORDED")
+    return refs
+
+
 def resume_prunes(layout: Layout, now: datetime) -> tuple[int, list[str]]:
-    """Settle journals left by an interrupted run. Returns (completed, error refs)."""
+    """Settle journals left by an interrupted run. Returns (completed, error refs).
+
+    A failure is classified exactly like a failed prune (prune_hold): if what is left is not plainly
+    resumable, the operator hold is recorded, so a later run cannot settle it just because it now looks fine."""
     completed, errors = 0, []
+
+    def operator(name: str | None, ref: str) -> None:
+        for item in record_operator_hold(layout, name, ref, now):
+            if item not in errors:
+                errors.append(item)
+
     with os.scandir(layout.journal) as entries:
         names = sorted(entry.name for entry in entries)
     for file_name in names:
         name = file_name[:-5] if file_name.endswith(".json") else ""
         if not RUN_DIR_RE.fullmatch(name):
             errors.append("EG_RET_JOURNAL_UNEXPECTED")
+            operator(None, "EG_RET_JOURNAL_UNEXPECTED")
             continue
         try:
             journal = _parse_json(_read_plain(layout.journal / file_name, MAX_EVIDENCE_BYTES))
@@ -778,11 +829,15 @@ def resume_prunes(layout: Layout, now: datetime) -> tuple[int, list[str]]:
             _finish_prune(layout, name, journal, now)
             completed += 1
         except (OSError, RetentionError, UnicodeError, ValueError) as exc:
-            errors.append(getattr(exc, "ref", "EG_RET_JOURNAL_RESUME_FAILED"))
+            ref = getattr(exc, "ref", "EG_RET_JOURNAL_RESUME_FAILED")
+            errors.append(ref)
+            if prune_hold(layout, name, ref) == PRUNE_HOLD_OPERATOR:
+                operator(name, ref)
     with os.scandir(layout.quarantine) as entries:
-        for entry in entries:
-            if not os.path.lexists(layout.journal / f"{entry.name}.json"):
-                errors.append("EG_RET_QUARANTINE_WITHOUT_JOURNAL")  # left untouched for the operator
+        orphans = [entry.name for entry in entries if not os.path.lexists(layout.journal / f"{entry.name}.json")]
+    for orphan in orphans:
+        errors.append("EG_RET_QUARANTINE_WITHOUT_JOURNAL")  # left untouched for the operator
+        operator(orphan if RUN_DIR_RE.fullmatch(orphan) else None, "EG_RET_QUARANTINE_WITHOUT_JOURNAL")
     return completed, errors
 
 
@@ -854,18 +909,49 @@ def _segments(layout: Layout) -> list[str]:
         return sorted(entry.name for entry in entries if SEGMENT_RE.fullmatch(entry.name))
 
 
+def _dates_in(line: bytes) -> set[date]:
+    """Every valid YYYY-MM-DD anywhere in a malformed line: a torn record keeps its own leading date, and a
+    record that ran into the next one carries both."""
+    found: set[date] = set()
+    for match in LOG_DATE_RE.finditer(line):
+        try:
+            found.add(date.fromisoformat(match.group().decode("ascii")))
+        except ValueError:
+            continue
+    return found
+
+
 def log_incident_days(layout: Layout) -> set[date]:
-    """Days with any abnormal line, in the live log or in any rotated segment. Raises if any is unreadable,
-    because an unread line could be an incident: the caller then compacts nothing."""
+    """Days that must keep every line, from the live log and every rotated segment. Raises if any is
+    unreadable, because an unread line could be an incident: the caller then compacts nothing.
+
+    - A well-formed abnormal line marks its own day.
+    - A malformed line (torn, merged, corrupted) marks every valid date it contains.
+    - A malformed line with no valid date cannot be placed exactly. The log is append-only and segments
+      are whole renamed slices of it, so read in order (segments oldest first, then the live log) the line
+      lies between its nearest dated neighbours: both of their days are marked, which covers every day
+      the line could belong to that has any other line."""
     days: set[date] = set()
-    sources = [layout.log] if os.path.lexists(layout.log) else []
-    sources += [layout.segments / name for name in _segments(layout)]
+    sources = [layout.segments / name for name in _segments(layout)]
+    sources += [layout.log] if os.path.lexists(layout.log) else []
+    last_day: date | None = None
+    undated_pending = False
     for path in sources:
         lines = _log_lines(_read_plain(path, MAX_SEGMENT_BYTES))
         for index, line in enumerate(lines):
             day, clean = _line_day(line, index == 0)
-            if day is not None and not clean:
-                days.add(day)
+            found = {day} if day is not None else _dates_in(line)
+            if not found:
+                undated_pending = True
+                if last_day is not None:
+                    days.add(last_day)
+                continue
+            if undated_pending:
+                days.add(min(found))
+                undated_pending = False
+            if not clean:
+                days |= found
+            last_day = max(found)
     return days
 
 
@@ -1024,6 +1110,9 @@ def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> di
         if apply and not in_window(now):
             raise RetentionError("EG_RET_OUTSIDE_WINDOW")
         # 0. Gates first: while a writer may be active, not even the tool's own leftovers are cleaned up.
+        #    A recorded operator hold (any file or entry at that path) holds everything until an operator acts.
+        if os.path.lexists(layout.operator_hold):
+            hold(OPERATOR_HOLD)
         for ref in writer_fence(layout, now):
             hold(ref)
         if apply and not holds:
@@ -1067,7 +1156,12 @@ def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> di
                 continue
             try:
                 run.action = archive_incident(layout, run, now)
-                counts["archived" if run.action == "ARCHIVED" else "archive_verified"] += 1
+                if run.action == "ARCHIVE_INCOMPLETE":
+                    # Some evidence could not be copied: not completed separate custody, so nothing destructive.
+                    refs.append("EG_RET_ARCHIVE_INCOMPLETE")
+                    hold("EG_RET_PRUNE_SKIPPED_ARCHIVE_INCOMPLETE")
+                else:
+                    counts["archived" if run.action == "ARCHIVED" else "archive_verified"] += 1
             except (OSError, RetentionError) as exc:
                 run.action = "ARCHIVE_FAILED"
                 refs.append(getattr(exc, "ref", "EG_RET_ARCHIVE_FAILED"))
@@ -1108,7 +1202,11 @@ def execute(layout: Layout, *, apply: bool, clock: Callable[[], datetime]) -> di
                 ref = getattr(exc, "ref", None)
                 run.action = "PRUNE_FAILED"
                 refs.append(ref or "EG_RET_PRUNE_FAILED")
-                hold(prune_hold(layout, run.name, ref))
+                verdict = prune_hold(layout, run.name, ref)
+                hold(verdict)
+                if verdict == PRUNE_HOLD_OPERATOR:
+                    for item in record_operator_hold(layout, run.name, ref or "EG_RET_PRUNE_FAILED", now):
+                        hold(item)
 
         # 3. The summary log: rotate the live file by one rename, compact only rotated copies.
         if log_ok:
