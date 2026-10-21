@@ -67,7 +67,7 @@ you checked and what changed.
 
 ## In progress
 
-Not ready yet, so not listed above: SIMBA invoice intake (waiting on a live test while its account matching is redesigned), AutoCount member sync from Shopify, and the AutoCount stock and buying-data exports (#245, #246). Progress for all of them is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117).
+Not ready yet, so not listed above: SIMBA invoice intake (waiting on its live test with a real bill), AutoCount member sync from Shopify, and the AutoCount stock and buying-data exports (#245, #246). Progress for all of them is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117).
 
 ## Developers and CI
 
