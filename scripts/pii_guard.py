@@ -21,11 +21,15 @@ Diffs are forced to text (``--text``), so a ``-diff`` or ``binary`` attribute ca
 hide added lines. No blob git cannot diff as text is skipped whole: printable
 ASCII, UTF-16LE and UTF-16BE runs of its raw bytes are always scanned;
 BOM-marked Unicode text (UTF-8, UTF-16 or UTF-32) is also decoded line by line;
-zip containers (``ZIP_EXTENSIONS``, such as .xlsx) have every member expanded and
-scanned, and a corrupt or encrypted one fails closed. Any other NUL-bearing blob
-fails closed unless its extension is on the reviewed ``BINARY_EXTENSIONS`` list.
-Known limit: compressed streams inside a non-zip binary (for example a PDF's
-deflated content streams) are not decompressed. Hits inside binary content are
+any zip, recognised by its signature or by ``ZIP_EXTENSIONS`` (such as .xlsx), has
+every member expanded and scanned, nested zips included up to ``ZIP_MAX_DEPTH``
+levels within one shared ``ZIP_MAX_BYTES`` budget; a corrupt, encrypted,
+over-budget or too deeply nested one fails closed. A reviewed binary extension
+must match its file signature. gzip, 7z, RAR and tar archives fail closed at any
+depth. Any other NUL-bearing blob fails closed unless its extension is on the
+reviewed ``BINARY_EXTENSIONS`` list. Known limits: compressed streams inside a
+non-zip binary (for example a PDF's deflated content streams) are not
+decompressed, and packages embedded in OLE2 files are scanned by text runs only. Hits inside binary content are
 reported as ``path (text runs):N`` or ``container!member:N``.
 
 Exit codes: 0 clean, 1 likely personal data found, 2 error. Every error fails
@@ -128,8 +132,30 @@ _DIFF_OPTS = [
 # BOM-marked Unicode text or a reviewed binary type, or they fail closed. The binary
 # list only means "expected to be binary"; it never means "not scanned".
 ZIP_EXTENSIONS = frozenset({".zip", ".xlsx", ".docx", ".pptx"})
-BINARY_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".xls", ".doc"})
+# A reviewed binary extension must start with its file signature, so a renamed
+# archive (zip, gzip, 7z and so on) cannot pass as an image, PDF or OLE2 file.
+BINARY_MAGIC = {
+    ".png": b"\x89PNG",
+    ".jpg": b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+    ".gif": b"GIF8",
+    ".ico": b"\x00\x00\x01\x00",
+    ".webp": b"RIFF",
+    ".pdf": b"%PDF",
+    ".xls": b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
+    ".doc": b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
+}
+BINARY_EXTENSIONS = frozenset(BINARY_MAGIC)
 ZIP_MAX_BYTES = 64 * 1024 * 1024
+ZIP_MAX_DEPTH = 3
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06")
+# (signature, offset, label) for archives the scanner cannot open; they fail closed.
+_OTHER_ARCHIVES = (
+    (b"\x1f\x8b", 0, "gzip"),
+    (b"7z\xbc\xaf\x27\x1c", 0, "7z"),
+    (b"Rar!\x1a\x07", 0, "RAR"),
+    (b"ustar", 257, "tar"),
+)
 RUNS_SUFFIX = " (text runs)"
 _ASCII_RUN = re.compile(rb"[\x20-\x7e\t]{6,}")
 _UTF16LE_RUN = re.compile(rb"(?:[\x20-\x7e]\x00){6,}")
@@ -368,29 +394,55 @@ def _bom_text(data):
     return None
 
 
-def _zip_documents(path, data):
-    """Text documents for every member of a zip container; corrupt or encrypted fails closed."""
-    docs, remaining = [], ZIP_MAX_BYTES
+def _is_zip(data):
+    return data.startswith(_ZIP_SIGNATURES)
+
+
+def _refuse_other_archives(path, data):
+    """Compressed archives the scanner cannot open fail closed at any depth."""
+    for signature, offset, label in _OTHER_ARCHIVES:
+        if data[offset : offset + len(signature)] == signature:
+            raise GuardError("%s is a %s archive, which the scanner cannot open" % (path, label))
+
+
+def _member_documents(name, data, budget, depth):
+    """Documents for one archive member: nested zips recurse, other bytes are scanned in place."""
+    if _is_zip(data):
+        return _zip_documents(name, data, budget, depth + 1) + [(name + RUNS_SUFFIX, _printable_runs(data))]
+    _refuse_other_archives(name, data)
+    if b"\0" not in data:
+        return [(name, _text(data).splitlines())]
+    docs = []
+    text = _bom_text(data)
+    if text is not None:
+        docs.append((name, text.splitlines()))
+    docs.append((name + RUNS_SUFFIX, _printable_runs(data)))
+    return docs
+
+
+def _zip_documents(path, data, budget, depth):
+    """Text documents for every member of a zip container, recursing into nested zips.
+
+    ``budget`` is a one-item list holding the bytes still allowed across the whole
+    blob, nested containers included. A corrupt, encrypted, over-budget or too
+    deeply nested container fails closed.
+    """
+    if depth > ZIP_MAX_DEPTH:
+        raise GuardError("%s nests zip containers deeper than %d levels" % (path, ZIP_MAX_DEPTH))
+    docs = []
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             for info in archive.infolist():
                 if info.is_dir():
                     continue
                 if info.flag_bits & 0x1:
-                    raise GuardError("%s member %s is encrypted and cannot be scanned" % (path, info.filename))
+                    raise GuardError("%s member %s is encrypted and cannot be scanned" % (path, _safe_name(info.filename)))
                 with archive.open(info) as handle:
-                    member = handle.read(remaining + 1)
-                if len(member) > remaining:
+                    member = handle.read(budget[0] + 1)
+                if len(member) > budget[0]:
                     raise GuardError("%s expands beyond %d bytes and cannot be scanned" % (path, ZIP_MAX_BYTES))
-                remaining -= len(member)
-                name = "%s!%s" % (path, info.filename)
-                if b"\0" in member:
-                    text = _bom_text(member)
-                    if text is not None:
-                        docs.append((name, text.splitlines()))
-                    docs.append((name + RUNS_SUFFIX, _printable_runs(member)))
-                else:
-                    docs.append((name, _text(member).splitlines()))
+                budget[0] -= len(member)
+                docs.extend(_member_documents("%s!%s" % (path, _safe_name(info.filename)), member, budget, depth))
     except GuardError:
         raise
     except (zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError, NotImplementedError, EOFError, OSError, ValueError, zlib.error) as exc:
@@ -398,25 +450,36 @@ def _zip_documents(path, data):
     return docs
 
 
+def _safe_name(name):
+    """Member names are display-only; control characters must not forge log lines."""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", name)
+
+
 def needs_blob_scan(path, data):
-    return b"\0" in data or Path(path).suffix.lower() in ZIP_EXTENSIONS
+    return b"\0" in data or _is_zip(data) or Path(path).suffix.lower() in ZIP_EXTENSIONS
 
 
 def blob_documents(path, data):
     """Return [(display_path, lines)] to scan for a blob git cannot diff as text.
 
-    No such blob is skipped whole. Printable ASCII and UTF-16 runs of the raw bytes
-    are always scanned; BOM-marked Unicode text is also decoded line by line; zip
-    containers have every member expanded and scanned. A NUL-bearing blob that is
-    neither BOM-marked, a zip container nor a reviewed binary type fails closed.
+    No such blob is skipped whole. A reviewed binary extension must match its magic
+    bytes. Printable ASCII and UTF-16 runs of the raw bytes are always scanned;
+    BOM-marked Unicode text is also decoded line by line; any zip (by signature or
+    by extension) has every member expanded and scanned, nested zips included up to
+    ``ZIP_MAX_DEPTH`` levels within one shared ``ZIP_MAX_BYTES`` budget. gzip, 7z,
+    RAR and tar archives, and any other NUL-bearing blob that is neither BOM-marked
+    text nor a reviewed binary type, fail closed.
     """
     suffix = Path(path).suffix.lower()
+    if suffix in BINARY_EXTENSIONS and not data.startswith(BINARY_MAGIC[suffix]):
+        raise GuardError("%s does not start with the %s file signature" % (path, suffix))
+    _refuse_other_archives(path, data)
     docs = []
     text = _bom_text(data)
     if text is not None:
         docs.append((path, text.splitlines()))
-    if suffix in ZIP_EXTENSIONS:
-        docs.extend(_zip_documents(path, data))
+    if suffix in ZIP_EXTENSIONS or _is_zip(data):
+        docs.extend(_zip_documents(path, data, [ZIP_MAX_BYTES], 1))
     elif text is None and suffix not in BINARY_EXTENSIONS:
         raise GuardError("%s contains NUL bytes but is neither BOM-marked Unicode text nor a reviewed binary type" % path)
     docs.append((path + RUNS_SUFFIX, _printable_runs(data)))

@@ -86,15 +86,22 @@ lines. No binary file is skipped whole:
   strings are covered.
 - BOM-marked UTF-8, UTF-16 or UTF-32 text is also decoded line by line (Windows
   PowerShell 5.1 `Out-File` writes UTF-16).
-- Zip containers (`.zip`, `.xlsx`, `.docx`, `.pptx`) have every member
-  expanded and scanned, deflated members included; a corrupt, encrypted or
-  oversized container fails the scan.
-- Any other file containing NUL bytes fails the scan unless it is a reviewed
-  binary type (images, `.pdf`, `.xls`, `.doc`).
+- Zip containers, recognised by their signature whatever the file is called
+  (so `.zip`, `.xlsx`, `.docx`, `.pptx` and renamed zips), have every member
+  expanded and scanned, deflated members and nested zips included, up to three
+  levels deep within one 64 MiB budget. A corrupt, encrypted, oversized or
+  too deeply nested container fails the scan.
+- gzip, 7z, RAR and tar archives fail the scan at any depth, because the
+  scanner cannot open them.
+- A reviewed binary type (images, `.pdf`, `.xls`, `.doc`) must start with its
+  file signature, so a renamed archive fails the scan. Any other file
+  containing NUL bytes fails the scan.
 
-Known limit: compressed streams inside a non-zip binary, such as a PDF's
-deflated page content, are not decompressed. Hits inside binary content are
-reported as `file (text runs):N` or `container!member:N`.
+Known limits: compressed streams inside a non-zip binary, such as a PDF's
+deflated page content, are not decompressed; packages embedded inside OLE2
+files (legacy `.xls` or `.doc` objects) are scanned by text runs only; and CI
+runs the scanner and allowlist from the pull request itself. Hits inside binary
+content are reported as `file (text runs):N` or `container!member:N`.
 
 If the guard flags a value on a branch, remove it from the commit that added it
 (amend or rebase the branch before merge); a follow-up commit that deletes it

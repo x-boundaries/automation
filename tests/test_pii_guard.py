@@ -6,6 +6,7 @@ value and the guard does not flag its own tests (proved by the self-scan test).
 """
 
 import contextlib
+import gzip
 import importlib.util
 import io
 import os
@@ -13,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -58,6 +60,9 @@ def _intl():
     return "+" + "44" + " " + "20" + " " + "7946" + " " + "00" + "11"
 
 
+OLE2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
 def _zip_bytes(members, compression):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
@@ -75,6 +80,16 @@ def _xlsx(cell, compression=zipfile.ZIP_DEFLATED):
         },
         compression,
     )
+
+
+def _tar_bytes(name, body):
+    buffer = io.BytesIO()
+    payload = body.encode("utf-8")
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
 
 
 def _load_scanner():
@@ -523,7 +538,7 @@ class GitScanTests(unittest.TestCase):
             ("b3be.pdf", b"%PDF-1.7\n\x00\x00 << /Title (\xfe\xff" + ("call " + _sg_prefixed()).encode("utf-16-be") + b") >>\n"),
             ("b6.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00tEXtAuthor\x00" + email + b"\x00\x00IEND"),
             ("c1.txt", b"\xff\xfe" + b"plain ascii mail " + email + b"\n\x00tail"),
-            ("utf16.doc", b"\xd0\xcf\x11\xe0\x00\x00" + ("owner " + _email() + " ").encode("utf-16-le") + b"\x00\x00"),
+            ("utf16.doc", OLE2 + b"\x00\x00" + ("owner " + _email() + " ").encode("utf-16-le") + b"\x00\x00"),
         )
         for name, data in cases:
             with self.subTest(name=name):
@@ -586,6 +601,86 @@ class GitScanTests(unittest.TestCase):
         self.commit_bytes("big.xlsx", good)
         with mock.patch.object(self.g, "ZIP_MAX_BYTES", 16):
             self.assertEqual(self.range_code(start)[0], 2)
+
+
+    # R3-1: zips are found by signature at every depth and expanded recursively.
+
+    def test_nested_and_signature_detected_zips_are_expanded(self):
+        deflated = zipfile.ZIP_DEFLATED
+        inner_xlsx = _xlsx(_email())
+        cases = (
+            ("bundle.zip", _zip_bytes({"reports/report.xlsx": inner_xlsx}, deflated), "bundle.zip!reports/report.xlsx!xl/sharedStrings.xml:1 email"),
+            (
+                "outer.zip",
+                _zip_bytes({"inner.zip": _zip_bytes({"notes.txt": "mail " + _email()}, deflated)}, deflated),
+                "outer.zip!inner.zip!notes.txt:1 email",
+            ),
+            ("export.dat", _zip_bytes({"rows.csv": "name,phone\nA," + _sg_local() + "\n"}, deflated), "export.dat!rows.csv:2 sg_phone_local"),
+            (
+                "embed.xlsx",
+                _zip_bytes({"xl/embeddings/Microsoft_Excel_Worksheet.xlsx": inner_xlsx}, deflated),
+                "embed.xlsx!xl/embeddings/Microsoft_Excel_Worksheet.xlsx!xl/sharedStrings.xml:1 email",
+            ),
+        )
+        for name, data, expected in cases:
+            with self.subTest(name=name):
+                start = self.rev("HEAD")
+                self.commit_bytes(name, data)
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 1, (name, out, err))
+                self.assertIn(expected + " [redacted]", out)
+                self.assertNotIn(_email(), out + err)
+        self.assertEqual(self.run_main("--tree", "HEAD", "--report-only")[0], 0)
+
+    def test_zip_nesting_depth_is_capped(self):
+        def nested(levels):
+            data, name = "mail " + _email(), "notes.txt"
+            for level in range(levels):
+                data, name = _zip_bytes({name: data}, zipfile.ZIP_DEFLATED), "level%d.zip" % level
+            return data
+
+        start = self.rev("HEAD")
+        self.commit_bytes("three.zip", nested(3))
+        code, out, err = self.range_code(start)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("three.zip!level1.zip!level0.zip!notes.txt:1 email", out)
+        start = self.rev("HEAD")
+        self.commit_bytes("four.zip", nested(4))
+        self.assertEqual(self.range_code(start)[0], 2)
+
+    # R3-2: disguised containers and archives the scanner cannot open fail closed.
+
+    def test_disguised_and_unsupported_archives_fail_closed(self):
+        clean_zip = _zip_bytes({"a.txt": "nothing personal"}, zipfile.ZIP_DEFLATED)
+        packed = gzip.compress(("mail " + _email()).encode("ascii"), mtime=0)
+        for name, data in (
+            ("image.png", clean_zip),
+            ("doc.pdf", clean_zip),
+            ("sheet.xls", clean_zip),
+            ("photo.png", packed),
+            ("logs.gz", packed),
+            ("backup.tar", _tar_bytes("notes.txt", "mail " + _email())),
+            ("archive.7z", b"7z\xbc\xaf\x27\x1c\x00\x04" + bytes(32)),
+            ("archive.rar", b"Rar!\x1a\x07\x00" + bytes(32)),
+            ("inner.zip", _zip_bytes({"logs.gz": packed}, zipfile.ZIP_DEFLATED)),
+            ("sheet2.xls", b"\xd0\xcf\x11\xe0" + b"\x00" * 16),
+        ):
+            with self.subTest(name=name):
+                start = self.rev("HEAD")
+                self.commit_bytes(name, data)
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 2, (name, out, err))
+                self.assertNotIn(_email(), out + err)
+                self.git("rm", "-q", name)
+                self.git("commit", "-q", "-m", "drop")
+
+    def test_member_names_cannot_forge_log_lines(self):
+        start = self.rev("HEAD")
+        self.commit_bytes("names.zip", _zip_bytes({"a\nb.txt": "mail " + _email()}, zipfile.ZIP_DEFLATED))
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1)
+        self.assertIn("names.zip!a?b.txt:1 email", out)
+        self.assertTrue(all(line.startswith("pii-guard: ") for line in out.splitlines()), out)
 
     def test_staged_and_tree_modes_scan_binary_content(self):
         (self.repo / "s.xlsx").write_bytes(_xlsx(_email()))
