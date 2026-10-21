@@ -25,17 +25,17 @@ WORKFLOW = REPO_ROOT / "n8n-workflows" / "simba_invoice_intake.workflow.json"
 ALLOWED_TYPES = {
     "n8n-nodes-base.gmailTrigger", "n8n-nodes-base.set", "n8n-nodes-base.splitInBatches", "n8n-nodes-base.noOp",
     "n8n-nodes-base.httpRequest", "n8n-nodes-base.code", "n8n-nodes-base.if", "n8n-nodes-base.crypto",
-    "n8n-nodes-base.stickyNote",
+    "n8n-nodes-base.stickyNote", "n8n-nodes-base.gmail",
 }
 LOOP = "One Email At A Time"
 
-BROADBAND_ADDR = "personal-billing@example.com"
-MOBILE_ADDR = "company-billing@example.com"
+INTAKE_ADDR = "intake@example.com"
 SETTINGS = {
-    "broadband_folder_id": "FOLDER_BROADBAND",
-    "mobile_folder_id": "FOLDER_MOBILE",
+    "invoice_folder_id": "FOLDER_INVOICES",
     "review_folder_id": "FOLDER_REVIEW",
-    "billing_addresses": f"{BROADBAND_ADDR} = BROADBAND;\n{MOBILE_ADDR}=mobile",
+    "intake_recipients": INTAKE_ADDR,
+    "filed_label_id": "Label_FILED",
+    "review_label_id": "Label_REVIEW",
 }
 INVOICE = "S0000012345"
 PDF_URL = "https://billing-invoice-pdf.amdocs-dbs.com/v1/invoices/SYNTHETICTOKEN123/pdf"
@@ -64,6 +64,16 @@ const byName = Object.fromEntries(wf.nodes.map((node) => [node.name, node]));
       return { first: () => refs[name] };
     };
     const input = testCase.input || [];
+    if (testCase.param) {
+      // A single-expression parameter "={{ ... }}", evaluated with $json and $ as n8n does.
+      const body = node.parameters[testCase.param].replace(/^=\{\{\s*/, '').replace(/\s*\}\}$/, '');
+      try {
+        results.push({ ok: true, output: new Function('$json', '$', 'return (' + body + ');')(input[0].json, lookup) });
+      } catch (error) {
+        results.push({ ok: false, error: String(error && error.message || error) });
+      }
+      continue;
+    }
     const context = { helpers: { getBinaryDataBuffer: async (index, key) => Buffer.from(input[index].binary[key].data, 'base64') } };
     const fn = new (Object.getPrototypeOf(async function () {}).constructor)('$input', '$', node.parameters.jsCode);
     try {
@@ -130,25 +140,26 @@ def message(headers: list[tuple[str, str]], plain: str | None = None, html: str 
         "headers": [{"name": name, "value": value} for name, value in headers]}}
 
 
-def direct(to: str = BROADBAND_ADDR, auth: str | list[str] = GOOD_AUTH,
-           sender: str = "Simba Mobile <bills@my.simba.sg>", extra: list[tuple[str, str]] | None = None, **body) -> dict:
+def direct(to: str = INTAKE_ADDR, auth: str | list[str] = GOOD_AUTH,
+           sender: str = "Simba Mobile <bills@my.simba.sg>", extra: list[tuple[str, str]] | None = None,
+           subject: str = "Your SIMBA Invoice", **body) -> dict:
     auths = auth if isinstance(auth, list) else [auth]
-    headers = [("Delivered-To", "intake@example.com")]
+    headers = [("Delivered-To", INTAKE_ADDR)]
     headers += [("Authentication-Results", value) for value in auths]
-    headers += [("From", sender), ("To", to), ("Subject", "Your SIMBA Invoice"),
+    headers += [("From", sender), ("To", to), ("Subject", subject),
                 ("Message-ID", "<0100018f-synthetic@ap-southeast-1.amazonses.com>")]
     headers += extra or []
     html_body = {key: value for key, value in body.items() if key != "amount"}
     return message(headers, plain=body_text(**body), html=body_html(**html_body))
 
 
-def forwarded(quoted_to: str, prefix: str = "Fwd:") -> dict:
+def forwarded(quoted_to: str = "customer@example.com", prefix: str = "Fwd:") -> dict:
     plain = ("This is another invoice from SIMBA.\n\nBegin forwarded message:\n\n"
              "> From: Simba Mobile <bills@my.simba.sg>\n> Subject: Your SIMBA Invoice\n"
              f"> To: CUSTOMER NAME <{quoted_to}>\n>\n> " + body_text().replace("\n", "\n> "))
     auth = "mx.google.com;\r\n dkim=pass header.i=@example.com; spf=pass smtp.mailfrom=forwarder@example.com; dmarc=pass header.from=example.com"
     return message([("Authentication-Results", auth), ("From", "Forwarder <forwarder@example.com>"),
-                    ("To", "intake@example.com"), ("Subject", prefix + " Your SIMBA Invoice")], plain=plain)
+                    ("To", INTAKE_ADDR), ("Subject", prefix + " Your SIMBA Invoice")], plain=plain)
 
 
 def classify(msg: dict, settings: dict | None = None) -> dict:
@@ -259,11 +270,9 @@ class StaticContractTests(unittest.TestCase):
 
     def test_every_path_returns_to_the_loop_and_pdf_failures_reach_review(self) -> None:
         connections = self.workflow["connections"]
-        self.assertEqual("All New Emails Handled", connections[LOOP]["main"][0][0]["node"])
+        self.assertEqual("Report Label Failures", connections[LOOP]["main"][0][0]["node"])
         self.assertEqual("Fetch Full Email", connections[LOOP]["main"][1][0]["node"])
-        for name in ("Is SIMBA Invoice Email", "Needs Storing"):
-            self.assertEqual(LOOP, connections[name]["main"][1][0]["node"], name)
-        self.assertEqual(LOOP, connections["Verify Stored File"]["main"][0][0]["node"])
+        self.assertEqual(LOOP, connections["Is SIMBA Invoice Email"]["main"][1][0]["node"])
         for name in ("Download Invoice PDF", "Fingerprint PDF"):
             self.assertEqual("continueErrorOutput", self.nodes[name]["onError"], name)
             self.assertEqual("Prepare Drive File", connections[name]["main"][1][0]["node"], name)
@@ -272,89 +281,104 @@ class StaticContractTests(unittest.TestCase):
         self.assertNotIn("Start Drive Upload", downstream(self.workflow, "Needs Storing", 1))
         self.assertEqual("Something To Store", connections["Prepare Drive File"]["main"][0][0]["node"])
         self.assertEqual("Start Drive Upload", connections["Something To Store"]["main"][0][0]["node"])
-        self.assertEqual(LOOP, connections["Something To Store"]["main"][1][0]["node"])
+
+    def test_label_comes_after_drive_and_never_blocks_filing(self) -> None:
+        connections = self.workflow["connections"]
+        label = self.nodes["Label SIMBA Email"]
+        # The only Gmail write: add one label to one message. No send, reply, delete, read-mark or label removal.
+        self.assertEqual([label], [n for n in self.workflow["nodes"] if n["type"] == "n8n-nodes-base.gmail"])
+        self.assertEqual(("message", "addLabels"), (label["parameters"]["resource"], label["parameters"]["operation"]))
+        self.assertEqual({"resource", "operation", "messageId", "labelIds"}, set(label["parameters"]))
+        self.assertEqual((True, 3, 5000), (label["retryOnFail"], label["maxTries"], label["waitBetweenTries"]))
+        # Labelling happens only once Drive holds the file: after the verified upload, or for a copy already stored.
+        feeders = sorted((name, index) for name, node in connections.items()
+                         for index, links in enumerate(node["main"]) for link in links if link["node"] == "Label SIMBA Email")
+        self.assertEqual([("Needs Storing", 1), ("Something To Store", 1), ("Verify Stored File", 0)], feeders)
+        self.assertNotIn("Label SIMBA Email", downstream(self.workflow, "Is SIMBA Invoice Email", 1))
+        # A failed label is noted and the loop carries on; the end-of-run report fails the run.
+        self.assertEqual("continueErrorOutput", label["onError"])
+        self.assertEqual(LOOP, connections["Label SIMBA Email"]["main"][0][0]["node"])
+        self.assertEqual("Note Label Failure", connections["Label SIMBA Email"]["main"][1][0]["node"])
+        self.assertEqual(LOOP, connections["Note Label Failure"]["main"][0][0]["node"])
+        self.assertNotIn("Report Label Failures", connections)
 
     def test_canvas_documents_purpose_and_required_settings(self) -> None:
         note = self.nodes["Overview"]["parameters"]["content"]
         self.assertTrue(note.startswith("# SIMBA invoices: email to Google Drive"))
         self.assertIn("## Required manual configuration:", note)
-        for key in ("broadband_folder_id", "mobile_folder_id", "review_folder_id", "billing_addresses"):
+        for key in SETTINGS:
             self.assertIn("`" + key + "`", note)
         self.assertTrue(all(ord(ch) < 128 for ch in self.raw))
 
 
 class ClassifyTests(unittest.TestCase):
-    def test_genuine_broadband_invoice_is_filed(self) -> None:
+    def test_genuine_invoice_to_the_intake_mailbox_is_filed(self) -> None:
         decision = decision_for(direct())
-        self.assertEqual(("FILE", "DIRECT_VERIFIED", "BROADBAND", []),
-                         (decision["route"], decision["kind"], decision["service"], decision["review_reasons"]))
+        self.assertEqual(("FILE", "DIRECT_VERIFIED", []), (decision["route"], decision["kind"], decision["review_reasons"]))
         self.assertEqual((INVOICE, "2026-10-15", PDF_URL, INVOICE),
                          (decision["invoice_number"], decision["issue_date"], decision["pdf_url"], decision["intake_key"]))
+        self.assertNotIn("service", decision)
         self.assertNotIn("amount", json.dumps(decision).lower())
+        named = decision_for(direct(to="Accounts <" + INTAKE_ADDR.upper() + ">, colleague@example.com"))
+        self.assertEqual("FILE", named["route"])
 
-    def test_mobile_account_recognised_from_to(self) -> None:
-        decision = decision_for(direct(to="Customer <" + MOBILE_ADDR.upper() + ">"))
-        self.assertEqual(("FILE", "MOBILE"), (decision["route"], decision["service"]))
-
-    def test_added_recipient_headers_never_choose_the_account(self) -> None:
-        # A genuine SIMBA email to someone else, resent to us with an extra unsigned header, must not be filed.
+    def test_bill_addressed_to_someone_else_goes_to_review(self) -> None:
+        # A genuine SIMBA bill for another customer, resent to us, must never be filed among our invoices.
         stranger = "Customer <someone@example.com>"
         probes = {
-            "X-Original-To": (direct(to=stranger, extra=[("X-Original-To", BROADBAND_ADDR)]), "ACCOUNT_NOT_RECOGNISED"),
-            "Delivered-To": (direct(to=stranger, extra=[("Delivered-To", MOBILE_ADDR)]), "ACCOUNT_NOT_RECOGNISED"),
-            "second To": (direct(to=stranger, extra=[("To", BROADBAND_ADDR)]), "RECIPIENT_HEADERS_UNCLEAR"),
-            "Cc": (direct(to=stranger, extra=[("Cc", MOBILE_ADDR)]), "ACCOUNT_NOT_RECOGNISED"),
+            "To someone else": (direct(to=stranger), "NOT_SENT_TO_INTAKE"),
+            "X-Original-To added": (direct(to=stranger, extra=[("X-Original-To", INTAKE_ADDR)]), "NOT_SENT_TO_INTAKE"),
+            "Delivered-To added": (direct(to=stranger, extra=[("Delivered-To", INTAKE_ADDR)]), "NOT_SENT_TO_INTAKE"),
+            "Cc added": (direct(to=stranger, extra=[("Cc", INTAKE_ADDR)]), "NOT_SENT_TO_INTAKE"),
+            "second To": (direct(to=stranger, extra=[("To", INTAKE_ADDR)]), "RECIPIENT_HEADERS_UNCLEAR"),
             "two Cc": (direct(extra=[("Cc", "a@example.com"), ("Cc", "b@example.com")]), "RECIPIENT_HEADERS_UNCLEAR"),
+            "plus alias not listed": (direct(to="intake+simba@example.com"), "NOT_SENT_TO_INTAKE"),
         }
         for label, (msg, reason) in probes.items():
             with self.subTest(label):
                 decision = decision_for(msg)
-                self.assertEqual(("REVIEW", None, [reason]),
-                                 (decision["route"], decision["service"], decision["review_reasons"]))
+                self.assertEqual(("REVIEW", [reason]), (decision["route"], decision["review_reasons"]))
+                self.assertEqual(PDF_URL, decision["pdf_url"])
 
-    def test_unknown_or_ambiguous_account_goes_to_review(self) -> None:
-        unknown = decision_for(direct(to="other@example.com"))
-        self.assertEqual(("REVIEW", None, ["ACCOUNT_NOT_RECOGNISED"]),
-                         (unknown["route"], unknown["service"], unknown["review_reasons"]))
-        self.assertEqual(PDF_URL, unknown["pdf_url"])
-        both = decision_for(direct(to=BROADBAND_ADDR + ", " + MOBILE_ADDR))
-        self.assertEqual(["ACCOUNT_AMBIGUOUS"], both["review_reasons"])
-
-    def test_unconfigured_billing_addresses_never_match(self) -> None:
-        settings = dict(SETTINGS, billing_addresses="REPLACE_WITH_BILLING_ADDRESSES")
-        result = classify(direct(), settings)
-        self.assertEqual(["ACCOUNT_NOT_RECOGNISED"], result["output"][0]["json"]["review_reasons"])
-
-    def test_billing_address_change_is_a_settings_edit_only(self) -> None:
-        alias = "intake+new-mobile@example.com"
-        settings = dict(SETTINGS, billing_addresses=f"{BROADBAND_ADDR} = BROADBAND, {MOBILE_ADDR} = MOBILE, {alias} = MOBILE")
-        for to in (MOBILE_ADDR, alias):
+    def test_extra_intake_address_is_a_settings_edit_only(self) -> None:
+        # For example the forwarder's own address, if SIMBA mail reaches us by Gmail auto-forwarding.
+        settings = dict(SETTINGS, intake_recipients=f"{INTAKE_ADDR},\n forwarder@example.com; ")
+        for to in (INTAKE_ADDR, "forwarder@example.com"):
             with self.subTest(to=to):
-                result = classify(direct(to=to), settings)
-                self.assertEqual(("FILE", "MOBILE"), (result["output"][0]["json"]["route"], result["output"][0]["json"]["service"]))
-        moved = classify(direct(to=MOBILE_ADDR), dict(SETTINGS, billing_addresses=f"{alias} = MOBILE"))
-        self.assertEqual(["ACCOUNT_NOT_RECOGNISED"], moved["output"][0]["json"]["review_reasons"])
+                self.assertEqual("FILE", classify(direct(to=to), settings)["output"][0]["json"]["route"])
 
-    def test_bad_billing_address_list_stops_the_run(self) -> None:
-        for value in ("someone@example.com", "someone@example.com = TV", f"{MOBILE_ADDR} = MOBILE; {MOBILE_ADDR} = BROADBAND"):
+    def test_subject_must_name_a_simba_invoice(self) -> None:
+        cases = {
+            "other subject": direct(subject="Your SIMBA payment receipt"),
+            "two subjects": direct(extra=[("Subject", "Something else")]),
+        }
+        for label, msg in cases.items():
+            with self.subTest(label):
+                decision = decision_for(msg)
+                self.assertEqual(("REVIEW", ["NOT_AN_INVOICE_SUBJECT"]), (decision["route"], decision["review_reasons"]))
+        self.assertEqual("FILE", decision_for(direct(subject="Your simba invoice for October"))["route"])
+
+    def test_bad_intake_recipients_stop_the_run(self) -> None:
+        for value in ("not an address", "intake@example.com = BROADBAND", ",;"):
             with self.subTest(value=value):
-                result = classify(direct(), dict(SETTINGS, billing_addresses=value))
+                result = classify(direct(), dict(SETTINGS, intake_recipients=value))
                 self.assertFalse(result["ok"])
-                self.assertIn("billing_addresses", result["error"])
+                self.assertIn("intake_recipients", result["error"])
 
-    def test_missing_folder_settings_stop_the_run(self) -> None:
-        result = classify(direct(), dict(SETTINGS, review_folder_id="REPLACE_WITH_REVIEW_FOLDER_ID"))
-        self.assertFalse(result["ok"])
-        self.assertIn("review_folder_id", result["error"])
-
-    def test_review_folder_must_differ_from_invoice_folders(self) -> None:
-        shared = dict(SETTINGS, broadband_folder_id="FOLDER_SHARED", mobile_folder_id="FOLDER_SHARED")
-        self.assertTrue(classify(direct(), shared)["ok"])
-        for key in ("broadband_folder_id", "mobile_folder_id"):
+    def test_missing_settings_stop_the_run(self) -> None:
+        for key in SETTINGS:
             with self.subTest(key=key):
-                result = classify(direct(), dict(SETTINGS, review_folder_id=SETTINGS[key]))
+                result = classify(direct(), dict(SETTINGS, **{key: "REPLACE_WITH_" + key.upper()}))
                 self.assertFalse(result["ok"])
-                self.assertIn("review_folder_id", result["error"])
+                self.assertIn(key, result["error"])
+
+    def test_review_folder_and_labels_must_differ(self) -> None:
+        folder = classify(direct(), dict(SETTINGS, review_folder_id=SETTINGS["invoice_folder_id"]))
+        self.assertFalse(folder["ok"])
+        self.assertIn("review_folder_id", folder["error"])
+        labels = classify(direct(), dict(SETTINGS, review_label_id=SETTINGS["filed_label_id"]))
+        self.assertFalse(labels["ok"])
+        self.assertIn("review_label_id", labels["error"])
 
     def test_sender_must_be_proven_by_gmails_own_top_header(self) -> None:
         failing = "mx.google.com; dkim=none; spf=softfail smtp.mailfrom=bills@my.simba.sg; dmarc=fail header.from=my.simba.sg"
@@ -384,16 +408,13 @@ class ClassifyTests(unittest.TestCase):
                 " dmarc=pass header.from=my.simba.sg")
         self.assertEqual("FILE", decision_for(direct(auth=auth))["route"])
 
-    def test_forwards_go_to_review_with_a_hint_only(self) -> None:
-        apple = decision_for(forwarded(BROADBAND_ADDR))
-        self.assertEqual(("REVIEW", "FORWARDED_COPY", None, "BROADBAND"),
-                         (apple["route"], apple["kind"], apple["service"], apple["service_hint"]))
-        self.assertEqual(INVOICE, apple["invoice_number"])
-        self.assertEqual(PDF_URL, apple["pdf_url"])
-        outlook = decision_for(forwarded(MOBILE_ADDR, prefix="FW:"))
-        self.assertEqual(("REVIEW", "MOBILE"), (outlook["route"], outlook["service_hint"]))
-        unknown = decision_for(forwarded("someone@example.com"))
-        self.assertIsNone(unknown["service_hint"])
+    def test_forwards_always_go_to_review(self) -> None:
+        for prefix, quoted_to in (("Fwd:", INTAKE_ADDR), ("FW:", "someone@example.com")):
+            with self.subTest(prefix=prefix):
+                decision = decision_for(forwarded(quoted_to, prefix=prefix))
+                self.assertEqual(("REVIEW", "FORWARDED_COPY", ["FORWARDED_COPY"]),
+                                 (decision["route"], decision["kind"], decision["review_reasons"]))
+                self.assertEqual((INVOICE, PDF_URL), (decision["invoice_number"], decision["pdf_url"]))
 
     def test_unrelated_internal_reply_is_ignored(self) -> None:
         msg = message([("From", "Colleague <colleague@example.com>"), ("Subject", "RE: FW: Your SIMBA Invoice")],
@@ -462,19 +483,20 @@ class DecideTests(unittest.TestCase):
         file_route = decision_for(direct())
         review_route = decision_for(direct(to="other@example.com"))
         cases = [
-            (file_route, [], True),
-            (file_route, [existing("REVIEW")], True),
-            (file_route, [existing("FILED")], False),
-            (file_route, [existing("FILED", key="S0000000001")], True),
-            (review_route, [], True),
-            (review_route, [existing("REVIEW")], False),
-            (review_route, [existing("FILED")], False),
+            (file_route, [], True, False),
+            (file_route, [existing("REVIEW")], True, False),
+            (file_route, [existing("FILED")], False, True),
+            (file_route, [existing("FILED", key="S0000000001")], True, False),
+            (review_route, [], True, False),
+            (review_route, [existing("REVIEW")], False, False),
+            (review_route, [existing("FILED")], False, True),
         ]
-        for decision, files, store in cases:
+        for decision, files, store, already_filed in cases:
             with self.subTest(route=decision["route"], files=files):
                 result = self.decide(decision, drive_search(files))
                 self.assertTrue(result["ok"], result)
-                self.assertIs(store, result["output"][0]["json"]["store"])
+                self.assertEqual((store, already_filed), (result["output"][0]["json"]["store"],
+                                                          result["output"][0]["json"]["already_filed"]))
 
     def test_drive_problems_stop_the_run(self) -> None:
         decision = decision_for(direct())
@@ -511,20 +533,37 @@ class PdfAndUploadTests(unittest.TestCase):
         out = self.prepare(decision_for(direct()), self.pdf_item())
         upload = out["json"]["upload"]
         self.assertEqual("FILE", out["json"]["route"])
-        self.assertEqual("Oct 2026 - SIMBA Broadband Invoice " + INVOICE + ".pdf", upload["name"])
-        self.assertEqual(("FOLDER_BROADBAND", "application/pdf", len(PDF_BYTES)),
+        self.assertEqual("Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", upload["name"])
+        self.assertEqual(("FOLDER_INVOICES", "application/pdf", len(PDF_BYTES)),
                          (upload["folder_id"], upload["mime_type"], upload["size"]))
         self.assertEqual({"simbaIntakeKey": INVOICE, "simbaStatus": "FILED", "simbaGmailId": "18f0a1b2c3d4e5f6",
-                          "simbaAccount": "BROADBAND", "simbaSha256": hashlib.sha256(PDF_BYTES).hexdigest()},
+                          "simbaSha256": hashlib.sha256(PDF_BYTES).hexdigest()},
                          upload["properties"])
         self.assertIn("file", out["binary"])
 
-    def test_review_pdf_keeps_hint_in_name(self) -> None:
-        out = self.prepare(decision_for(forwarded(MOBILE_ADDR)), self.pdf_item())
+    def test_two_bills_in_one_month_both_file_to_the_one_folder(self) -> None:
+        # Broadband and mobile bills look the same; the invoice number keeps their names and keys apart.
+        first = self.prepare(decision_for(direct()), self.pdf_item())["json"]["upload"]
+        second = self.prepare(decision_for(direct(invoice="S0000054321")), self.pdf_item())["json"]["upload"]
+        self.assertEqual(("FOLDER_INVOICES", "FOLDER_INVOICES"), (first["folder_id"], second["folder_id"]))
+        self.assertEqual(("Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", "Oct 2026 - SIMBA Invoice S0000054321.pdf"),
+                         (first["name"], second["name"]))
+        self.assertNotEqual(first["properties"]["simbaIntakeKey"], second["properties"]["simbaIntakeKey"])
+
+    def test_bill_type_is_a_small_switch_for_later(self) -> None:
+        # Nothing sets decision.service today. A later step that learns the bill type only has to set it.
+        decision = decision_for(direct())
+        named = self.prepare(dict(decision, service="MOBILE"), self.pdf_item())["json"]["upload"]["name"]
+        self.assertEqual("Oct 2026 - SIMBA Mobile Invoice " + INVOICE + ".pdf", named)
+        unknown = self.prepare(dict(decision, service="TV"), self.pdf_item())["json"]["upload"]["name"]
+        self.assertEqual("Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", unknown)
+
+    def test_review_pdf_name_and_properties(self) -> None:
+        out = self.prepare(decision_for(forwarded()), self.pdf_item())
         upload = out["json"]["upload"]
-        self.assertEqual("Needs review - Oct 2026 - SIMBA probably Mobile Invoice " + INVOICE + ".pdf", upload["name"])
-        self.assertEqual(("FOLDER_REVIEW", "REVIEW", "HINT_MOBILE"),
-                         (upload["folder_id"], upload["properties"]["simbaStatus"], upload["properties"]["simbaAccount"]))
+        self.assertEqual("Needs review - Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", upload["name"])
+        self.assertEqual(("FOLDER_REVIEW", "REVIEW"), (upload["folder_id"], upload["properties"]["simbaStatus"]))
+        self.assertNotIn("simbaAccount", upload["properties"])
 
     def test_failed_download_turns_a_filing_into_a_review_note(self) -> None:
         decision = decision_for(direct())
@@ -543,6 +582,8 @@ class PdfAndUploadTests(unittest.TestCase):
                 self.assertNotIn("SYNTHETICTOKEN", note)
                 self.assertNotIn("http", note)
                 self.assertNotIn("12.34", note)
+                self.assertIn("Needs review label", note)
+                self.assertNotIn("Account:", note)
 
     def test_failed_filing_adds_no_second_review_copy(self) -> None:
         out = self.prepare(decision_for(direct()), {"json": {"error": "403 Forbidden"}}, existing_copies=1)
@@ -588,6 +629,46 @@ class PdfAndUploadTests(unittest.TestCase):
         failed_put = run_one("Verify Stored File", [{"json": {"statusCode": 404, "body": {}}}],
                              {"Prepare Drive File": prepared, "Upload File Bytes": {"json": {"statusCode": 500, "body": {}}}})
         self.assertFalse(failed_put["ok"])
+
+
+class LabelTests(unittest.TestCase):
+    REFS = {"Intake Settings": {"json": SETTINGS},
+            "Read And Classify Invoice Email": {"json": {"gmail_message_id": "18f0a1b2c3d4e5f6"}}}
+
+    def label_for(self, item_json: dict) -> list:
+        result = run_nodes([{"node": "Label SIMBA Email", "param": "labelIds", "input": [{"json": item_json}],
+                             "refs": self.REFS}])[0]
+        self.assertTrue(result["ok"], result)
+        return result["output"]
+
+    def test_label_matches_what_happened(self) -> None:
+        cases = {
+            "filed and verified": ({"stored": True, "route": "FILE"}, "Label_FILED"),
+            "review copy stored": ({"stored": True, "route": "REVIEW"}, "Label_REVIEW"),
+            "already filed by an earlier run": ({"route": "FILE", "store": False, "already_filed": True}, "Label_FILED"),
+            "forward of an invoice already filed": ({"route": "REVIEW", "store": False, "already_filed": True}, "Label_FILED"),
+            "review copy already stored": ({"route": "REVIEW", "store": False, "already_filed": False}, "Label_REVIEW"),
+            "filing fell back, review copy exists": ({"store": False, "skip_reason": "REVIEW_COPY_EXISTS", "route": "REVIEW"},
+                                                     "Label_REVIEW"),
+        }
+        for label, (item_json, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual([expected], self.label_for(item_json))
+        message_id = run_nodes([{"node": "Label SIMBA Email", "param": "messageId", "input": [{"json": {}}],
+                                 "refs": self.REFS}])[0]
+        self.assertEqual("18f0a1b2c3d4e5f6", message_id["output"])
+
+    def test_label_failure_is_noted_then_fails_the_run_at_the_end(self) -> None:
+        noted = run_one("Note Label Failure", [{"json": {"error": "Request failed with status code 403"}}], self.REFS)
+        self.assertEqual({"label_failed": True, "gmail_message_id": "18f0a1b2c3d4e5f6",
+                          "label_error": "Request failed with status code 403"}, noted["output"][0]["json"])
+        handled = [{"json": {"id": "18f0a1b2c3d4e5f7", "labelIds": ["Label_FILED"]}}, {"json": {"route": "IGNORE"}}]
+        clean = run_one("Report Label Failures", handled)
+        self.assertEqual({"emails_handled": 2, "label_failures": 0}, clean["output"][0]["json"])
+        failed = run_one("Report Label Failures", handled + [noted["output"][0]])
+        self.assertFalse(failed["ok"])
+        self.assertIn("1 SIMBA email(s) are stored in Google Drive", failed["error"])
+        self.assertIn("18f0a1b2c3d4e5f6", failed["error"])
 
 
 if __name__ == "__main__":
