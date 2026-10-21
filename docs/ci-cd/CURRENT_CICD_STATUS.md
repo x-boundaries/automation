@@ -28,6 +28,11 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   jobs stay in the Windows full suite. `tests/test_member_gateway_ci.py` proves
   the skip list equals those jobs' module lists and that the targeted shard
   plus the remainder equals the accepted test set.
+- `tests/_run_ci_full_suite.py` is in both member-gateway path filters, so a
+  runner change triggers the workflow (#211). The workflow also runs every job
+  weekly on main (`cron: "17 14 * * 0"`, Sunday 22:17 SGT) and on manual
+  dispatch, so modules outside the path filters still get a full run.
+  `tests/test_member_gateway_ci.py` pins the path entries and the single cron.
 - The member-create-uat workflow's `windows-full-suite` job is a four-leg
   `fail-fast: false` matrix (#211): `focused`, `mg-deployment`,
   `bounded-import` and `rest`, each running

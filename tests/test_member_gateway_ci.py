@@ -101,6 +101,15 @@ class MemberGatewayCiTests(unittest.TestCase):
         ):
             self.assertEqual(self.text.count(required_path), 2, required_path)
 
+    def test_full_suite_runner_triggers_ci_and_runs_weekly(self):
+        self.assertEqual(self.text.count('      - "tests/_run_ci_full_suite.py"\n'), 2)
+        on_block = self.text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        # Sunday 14:17 UTC is Sunday 22:17 SGT; one schedule only, alongside manual dispatch.
+        self.assertEqual(re.findall(r"(?m)^    - cron: (.+)$", on_block), ['"17 14 * * 0"'])
+        self.assertEqual(self.text.count("cron:"), 1)
+        self.assertIn("\n  schedule:\n    - cron:", on_block)
+        self.assertIn("\n  workflow_dispatch: {}\n", on_block)
+
     def test_every_checkout_binds_to_literal_event_head(self):
         head_ref = chr(36) + "{{ github.event.pull_request.head.sha || github.sha }}"
         self.assertGreaterEqual(self.text.count("ref: " + head_ref), 4)

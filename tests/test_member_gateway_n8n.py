@@ -160,7 +160,11 @@ class MemberGatewayN8nTests(unittest.TestCase):
                 self.assertEqual((action["kind"], action["body"]["error_code"]), ("rejection", expected))
                 body = action["body"]
                 self.assertEqual(set(body), {"schema_version", "source_system", "form_alias", "response_id", "create_time", "mapping_version", "request_id", "payload_hash", "error_code", "operation"})
-                serialized = json.dumps(body, ensure_ascii=False)
+                # request_id is a fresh random UUID per run and payload_hash is hex, so either can
+                # contain "8123" by chance. Pin their opaque shapes, then scan the remaining fields.
+                self.assertRegex(body["request_id"], r"^n8n-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+                self.assertRegex(body["payload_hash"], r"^sha256:[0-9a-f]{64}$")
+                serialized = json.dumps({key: value for key, value in body.items() if key not in ("request_id", "payload_hash")}, ensure_ascii=False)
                 for private in ("Synthetic Alpha", "alpha@example.test", "8123"):
                     self.assertNotIn(private, serialized)
                 self.assertEqual(output["open"]["items"], [{"response_id": body["response_id"], "create_time": body["create_time"], "payload_hash": body["payload_hash"]}])
