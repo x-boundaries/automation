@@ -24,7 +24,8 @@ SIMBA sends each invoice as an email with a link, not an attachment. The workflo
 | A forwarded copy (Apple Mail "Fwd:" or Outlook "FW:") | Review folder | `SIMBA/Needs review` |
 | Missing or repeated invoice number, date or PDF link, or an attached file | Review folder | `SIMBA/Needs review` |
 | PDF cannot be downloaded, or the download is not a real PDF | Review folder, as a text note | `SIMBA/Needs review` |
-| Invoice already filed by an earlier run (including a forwarded copy of it) | Nothing new stored | `SIMBA/Filed` |
+| Invoice already filed by an earlier run, and this is SIMBA's own email or a forwarded copy of it | Nothing new stored | `SIMBA/Filed` |
+| Invoice already filed, but this email only claims to be from SIMBA | Nothing new stored | `SIMBA/Needs review` |
 | Not a SIMBA invoice (for example an internal reply that quotes nothing) | Ignored | none |
 
 Broadband and mobile bills are handled the same way and file into the same folder. SIMBA's emails do not say which service a bill is for, so the file name carries no bill type; the invoice number keeps names unique.
@@ -46,7 +47,7 @@ The `From` header must be exactly `bills@my.simba.sg`, and there must be exactly
 
 A genuine SIMBA bill is filed only when SIMBA addressed it to us. The `intake_recipients` setting in **Intake Settings** lists the address or addresses SIMBA sends our bills to, separated by new lines, commas or semicolons. Normally that is just the intake mailbox. Plus-addresses are not matched automatically; list each exact address.
 
-The check reads only the `To` header of a genuine SIMBA email. The email must have exactly one `To` line, containing a listed address, and at most one `Cc` line. `Cc`, `Delivered-To` and `X-Original-To` are never used, because anyone who receives a genuine SIMBA bill could resend it to the intake mailbox with one of those headers added. SIMBA's DKIM signature normally covers `To`. This stops someone else's genuine SIMBA bill being filed among our invoices.
+The check reads only the `To` header of a genuine SIMBA email. The email must have exactly one `To` line, containing a listed address, and at most one `Cc` line. Only the mailbox address counts, never a display name: in `"intake@example.com" <someone@example.com>` the address is `someone@example.com`. `Cc`, `Delivered-To` and `X-Original-To` are never used, because anyone who receives a genuine SIMBA bill could resend it to the intake mailbox with one of those headers added. SIMBA's DKIM signature normally covers `To`. This stops someone else's genuine SIMBA bill being filed among our invoices.
 
 If SIMBA mail reaches the intake mailbox by Gmail auto-forwarding from another mailbox instead of being sent to it directly, `To` shows that other mailbox's address; add it to `intake_recipients` (in n8n only, never in this repository). An entry that is not an email address stops the run until the setting is fixed.
 
@@ -68,7 +69,7 @@ Each stored file carries Drive properties: `simbaIntakeKey` (the invoice number,
 - a review copy is never stored twice, so a long reply thread that keeps quoting one invoice produces one review item;
 - a genuine SIMBA email still gets filed when only a review copy of that invoice exists. Delete the review copy by hand. If that filing then falls back to review (for example the PDF download fails), no second review copy is stored.
 
-An email whose invoice is already in Drive is still labelled. Adding a label the email already has changes nothing.
+An email whose invoice is already in Drive is still labelled: `SIMBA/Filed` when the invoice is filed and the email is SIMBA's own (or a forward of it), otherwise `SIMBA/Needs review`. Adding a label the email already has changes nothing.
 
 Emails are handled one at a time, so two emails for the same invoice in the same minute cannot both be stored.
 
@@ -88,7 +89,7 @@ The Gmail Trigger does not offer an email again after a failed run. When a run f
 2. Fix the cause (for example reconnect the Google credential).
 3. Handle the affected email by hand: find it in Gmail, download the invoice PDF from SIMBA, save it in the right folder with the naming above, and add the label.
 
-A Gmail read or Drive failure on one email also stops the rest of that minute's batch; handle those by hand too.
+A Gmail read or Drive failure on one email also stops the rest of that minute's batch; handle those by hand too. Such a failure also ends the run before **Report Label Failures**, so check that the emails handled earlier in that batch have their SIMBA label.
 
 ## Setup (owner, each step separately approved)
 

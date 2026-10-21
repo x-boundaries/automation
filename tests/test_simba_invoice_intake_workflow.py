@@ -319,8 +319,10 @@ class ClassifyTests(unittest.TestCase):
                          (decision["invoice_number"], decision["issue_date"], decision["pdf_url"], decision["intake_key"]))
         self.assertNotIn("service", decision)
         self.assertNotIn("amount", json.dumps(decision).lower())
-        named = decision_for(direct(to="Accounts <" + INTAKE_ADDR.upper() + ">, colleague@example.com"))
-        self.assertEqual("FILE", named["route"])
+        for to in ("Accounts <" + INTAKE_ADDR.upper() + ">, colleague@example.com",
+                   '"Doe, Jane" <someone@example.com>, ' + INTAKE_ADDR, '"Accounts (SG)" <' + INTAKE_ADDR + ">"):
+            with self.subTest(to=to):
+                self.assertEqual("FILE", decision_for(direct(to=to))["route"])
 
     def test_bill_addressed_to_someone_else_goes_to_review(self) -> None:
         # A genuine SIMBA bill for another customer, resent to us, must never be filed among our invoices.
@@ -333,6 +335,10 @@ class ClassifyTests(unittest.TestCase):
             "second To": (direct(to=stranger, extra=[("To", INTAKE_ADDR)]), "RECIPIENT_HEADERS_UNCLEAR"),
             "two Cc": (direct(extra=[("Cc", "a@example.com"), ("Cc", "b@example.com")]), "RECIPIENT_HEADERS_UNCLEAR"),
             "plus alias not listed": (direct(to="intake+simba@example.com"), "NOT_SENT_TO_INTAKE"),
+            # Only the mailbox address counts, never a display name that looks like our address.
+            "quoted display name": (direct(to=f'"{INTAKE_ADDR}" <someone@example.com>'), "NOT_SENT_TO_INTAKE"),
+            "bare display name": (direct(to=f"{INTAKE_ADDR} <someone@example.com>"), "NOT_SENT_TO_INTAKE"),
+            "comment": (direct(to=f"someone@example.com ({INTAKE_ADDR})"), "NOT_SENT_TO_INTAKE"),
         }
         for label, (msg, reason) in probes.items():
             with self.subTest(label):
@@ -645,9 +651,15 @@ class LabelTests(unittest.TestCase):
         cases = {
             "filed and verified": ({"stored": True, "route": "FILE"}, "Label_FILED"),
             "review copy stored": ({"stored": True, "route": "REVIEW"}, "Label_REVIEW"),
-            "already filed by an earlier run": ({"route": "FILE", "store": False, "already_filed": True}, "Label_FILED"),
-            "forward of an invoice already filed": ({"route": "REVIEW", "store": False, "already_filed": True}, "Label_FILED"),
-            "review copy already stored": ({"route": "REVIEW", "store": False, "already_filed": False}, "Label_REVIEW"),
+            "already filed by an earlier run": ({"route": "FILE", "kind": "DIRECT_VERIFIED", "store": False,
+                                                 "already_filed": True}, "Label_FILED"),
+            "forward of an invoice already filed": ({"route": "REVIEW", "kind": "FORWARDED_COPY", "store": False,
+                                                     "already_filed": True}, "Label_FILED"),
+            # A spoof quoting a filed invoice number must not get the reassuring label.
+            "unverified email quoting a filed invoice": ({"route": "REVIEW", "kind": "DIRECT_UNVERIFIED", "store": False,
+                                                          "already_filed": True}, "Label_REVIEW"),
+            "review copy already stored": ({"route": "REVIEW", "kind": "FORWARDED_COPY", "store": False,
+                                            "already_filed": False}, "Label_REVIEW"),
             "filing fell back, review copy exists": ({"store": False, "skip_reason": "REVIEW_COPY_EXISTS", "route": "REVIEW"},
                                                      "Label_REVIEW"),
         }
