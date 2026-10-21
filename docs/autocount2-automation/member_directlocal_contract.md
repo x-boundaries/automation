@@ -5,9 +5,11 @@ Status (2026-10-15): real-operation Core source for the development book
 #155:6195382795 / 6195468717 / 6195563312. This document authorises no live
 effect. Shopify is read-only, with one exception (#155 phase 1 member sync,
 2026-10-21): the only allowed automation-originated Shopify write is
-`customerCreate` (with tags on create) from `directlocal/xb_member_sync.py`,
-refused unless `shopify_create_enabled` is true; no update, delete, tag change
-or any other mutation is allowed. See [member sync phase 1](member_sync_phase1.md). Every AutoCount login, `GetNextMemberNo`, `GetMember` or
+`customerCreate` from `directlocal/xb_member_sync.py`, sent with the
+configured tags and the `custom.ac2_member_no` metafield (plus
+`custom.birthday_month` when AC2 has a DOB) on create only, and refused unless
+`shopify_create_enabled` is true; no update, delete, tag change, metafield
+change or any other mutation is allowed. See [member sync phase 1](member_sync_phase1.md). Every AutoCount login, `GetNextMemberNo`, `GetMember` or
 `SaveMember` on any book, any production access and any scheduling still needs
 its own scoped Owner approval. The previous gateway/n8n/PostgreSQL path is not
 used and its files are unchanged. Operating steps: [UAT runbook](member_directlocal_uat_runbook.md).
