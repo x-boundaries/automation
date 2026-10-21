@@ -96,11 +96,12 @@ class ScanLineTests(unittest.TestCase):
             _email("0100018f2a3b4c5d-synthetic", "ap-southeast-1.amazonses", "com"),
             _email("x", "eu-west-1.amazonses", "com"),
             _email("pass", "reviewed.gateway", "internal"),
+            _email("noreply", "anthropic", "com"),
         ):
             self.assertEqual(self.kinds("x " + address + " y"), [], address)
 
     def test_company_personal_mailbox_is_not_allowed(self):
-        self.assertEqual(self.kinds(_email("alex.tan", "x-boundaries", "com")), ["email"])
+        self.assertEqual(self.kinds(_email("synthetic.person", "x-boundaries", "com")), ["email"])
         self.assertEqual(self.kinds(_email("name", "notexample", "com")), ["email"])
         self.assertEqual(self.kinds(_email("name", "example.com.evil", "sg")), ["email"])
         self.assertEqual(self.kinds(_email("someone", "my.simba", "sg")), ["email"])
@@ -172,6 +173,7 @@ class AllowlistTests(unittest.TestCase):
         "*" + AT + "ap-southeast-1.amazonses.com",
         "*" + AT + "eu-west-1.amazonses.com",
         "*" + AT + "reviewed.gateway.internal",
+        "noreply" + AT + "anthropic.com",
     ]
 
     def setUp(self):
@@ -236,10 +238,6 @@ class DiffParserTests(unittest.TestCase):
             "+++ /dev/null\n"
             "@@ -1 +0,0 @@\n"
             "-bye\n"
-            "diff --git a/img.png b/img.png\n"
-            "new file mode 100644\n"
-            "index 0000000..4444444\n"
-            "Binary files /dev/null and b/img.png differ\n"
         )
         self.assertEqual(self.added(patch), [("x.txt", 3, "new one"), ("x.txt", 4, "+++ looks like a header"), ("x.txt", 12, "tail")])
 
@@ -267,6 +265,8 @@ class DiffParserTests(unittest.TestCase):
             "diff --git a/x b/x\n+++ b/x\n@@ -1 +1 @@\n*v\n",
             "diff --git a/x b/x\n@@ -1 +1 @@\n+v\n",
             "diff --git a/x b/x\n+++ x\n@@ -1 +1 @@\n+v\n",
+            # --text is always passed, so a binary summary means the diff was not scanned.
+            "diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0000000..4444444\nBinary files /dev/null and b/img.png differ\n",
         ):
             with self.assertRaises(self.g.GuardError, msg=patch):
                 self.added(patch)
@@ -311,10 +311,21 @@ class GitScanTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(text.encode("utf-8"))
 
-    def commit(self, name, text, message="change"):
+    def commit(self, name, text, message="change", author=None):
         self.write(name, text)
         self.git("add", "--", name)
+        self.git("commit", "-q", "-m", message, *(["--author", author] if author else []))
+
+    def commit_bytes(self, name, data, message="change"):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        self.git("add", "--", name)
         self.git("commit", "-q", "-m", message)
+
+    def range_code(self, start):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return self.run_main("--range", start + "..HEAD")
 
     def run_main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -436,6 +447,113 @@ class GitScanTests(unittest.TestCase):
                 code, out, err = self.run_main(*argv)
             self.assertEqual(code, 2, (argv, out, err))
 
+
+    # F1: attributes and encodings cannot hide added lines.
+
+    def test_diff_attribute_cannot_hide_added_lines(self):
+        for attributes, name in (("*.json -diff\n", "data.json"), ("*.csv binary\n", "rows.csv")):
+            with self.subTest(attributes=attributes):
+                start = self.rev("HEAD")
+                self.commit(".gitattributes", attributes)
+                self.commit(name, "header\nrow " + _email() + "\n")
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(name + ":2 email [redacted]", out)
+
+    def test_nul_bytes_without_a_bom_fail_closed(self):
+        start = self.rev("HEAD")
+        self.commit_bytes("notes.txt", b"head\x00er\nmail " + _email().encode("ascii") + b"\n")
+        code, out, err = self.range_code(start)
+        self.assertEqual(code, 2, out + err)
+        self.assertNotIn(_email(), out + err)
+        start = self.rev("HEAD")
+        self.commit_bytes("raw16.txt", ("mail " + _email() + "\n").encode("utf-16-le"))
+        self.assertEqual(self.range_code(start)[0], 2)
+
+    def test_reviewed_binary_types_are_skipped(self):
+        start = self.rev("HEAD")
+        self.commit_bytes("logo.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(256)))
+        code, out, err = self.range_code(start)
+        self.assertEqual(code, 0, out + err)
+
+    def test_utf16_text_is_decoded_and_only_added_lines_count(self):
+        for encoding in ("utf-16-le", "utf-16-be", "utf-32-le"):
+            with self.subTest(encoding=encoding):
+                bom = {"utf-16-le": b"\xff\xfe", "utf-16-be": b"\xfe\xff", "utf-32-le": b"\xff\xfe\x00\x00"}[encoding]
+                name = "log-%s.txt" % encoding
+                start = self.rev("HEAD")
+                self.commit_bytes(name, bom + ("first\r\nmail " + _email() + "\r\n").encode(encoding))
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(name + ":2 email [redacted]", out)
+                # Editing the file elsewhere does not re-flag the existing line; a new one is caught.
+                start = self.rev("HEAD")
+                self.commit_bytes(name, bom + ("first\r\nmail " + _email() + "\r\nclean\r\n").encode(encoding))
+                self.assertEqual(self.range_code(start)[0], 0)
+                start = self.rev("HEAD")
+                body = "first\r\nmail " + _email() + "\r\nclean\r\ntel " + _sg_local() + "\r\n"
+                self.commit_bytes(name, bom + body.encode(encoding))
+                code, out, _ = self.range_code(start)
+                self.assertEqual(code, 1)
+                self.assertEqual(out.count("pii-guard: "), 1)
+                self.assertIn(name + ":4 sg_phone_local", out)
+
+    def test_utf16_text_from_a_merged_parent_is_not_new(self):
+        self.git("checkout", "-q", "-b", "feature")
+        self.commit("feature.md", "clean feature\n")
+        self.git("checkout", "-q", "main")
+        self.commit_bytes("export.txt", b"\xff\xfe" + ("mail " + _email() + "\r\n").encode("utf-16-le"))
+        main_tip = self.rev("HEAD")
+        self.git("checkout", "-q", "feature")
+        self.git("merge", "-q", "--no-edit", "main")
+        code, out, err = self.range_code(main_tip)
+        self.assertEqual(code, 0, out + err)
+
+    def test_staged_and_tree_modes_decode_utf16(self):
+        self.write("s.txt", "")
+        (self.repo / "s.txt").write_bytes(b"\xff\xfe" + ("mail " + _email() + "\r\n").encode("utf-16-le"))
+        self.git("add", "s.txt")
+        code, out, _ = self.run_main("--staged")
+        self.assertEqual(code, 1)
+        self.assertIn("staged s.txt:1 email", out)
+        self.git("commit", "-q", "-m", "utf16")
+        code, out, _ = self.run_main("--tree", "HEAD", "--report-only")
+        self.assertEqual(code, 0)
+        self.assertIn("  1 s.txt", out)
+        self.commit_bytes("bad.txt", b"x\x00y\n")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_main("--tree", "HEAD", "--report-only")[0], 2)
+        self.write("bad2.txt", "")
+        (self.repo / "bad2.txt").write_bytes(b"x\x00y\n")
+        self.git("add", "bad2.txt")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_main("--staged")[0], 2)
+
+    # F2: commit identity and message.
+
+    def test_commit_identity_and_message_are_scanned(self):
+        start = self.rev("HEAD")
+        self.commit("a.md", "clean\n", author="Synthetic Person <" + _email("synthetic.person") + ">")
+        code, out, err = self.range_code(start)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("(commit author, committer and message):1 email [redacted]", out)
+        self.assertNotIn(_email("synthetic.person"), out + err)
+        start = self.rev("HEAD")
+        with mock.patch.dict(os.environ, {"GIT_COMMITTER_EMAIL": _email("synthetic.committer")}):
+            self.commit("b.md", "clean\n")
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1)
+        self.assertIn("(commit author, committer and message):2 email", out)
+        start = self.rev("HEAD")
+        self.commit("c.md", "clean\n", message="Fix intake\n\nReported by " + _email() + " on " + _sg_prefixed())
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1)
+        self.assertIn("(commit author, committer and message):5 email", out)
+        self.assertIn("(commit author, committer and message):5 sg_phone", out)
+        start = self.rev("HEAD")
+        self.commit("d.md", "clean\n", message="Clean change\n\nCo-Authored-By: Bot <noreply" + AT + "anthropic.com>")
+        self.assertEqual(self.range_code(start)[0], 0)
+
     def test_not_a_repository_fails_closed(self):
         outside = Path(self.tmp.name, "plain")
         outside.mkdir()
@@ -455,6 +573,10 @@ class SelfScanTests(unittest.TestCase):
 
 # --------------------------------------------------------------------------- hook
 
+GITATTRIBUTES_TEXT = (
+    "# The tracked pre-commit hook is a POSIX shell script; CRLF would break it on Windows checkouts.\n"
+    "/.githooks/** text eol=lf\n"
+)
 HOOK_EXEC = '    exec "$candidate" "$scanner" --staged --show-values\n'
 
 
@@ -478,7 +600,7 @@ class HookTests(unittest.TestCase):
 
     def test_hook_is_pinned(self):
         _assert_hook(self, self.text)
-        self.assertEqual(GITATTRIBUTES.read_text(encoding="utf-8").splitlines()[-1], "/.githooks/** text eol=lf")
+        self.assertEqual(GITATTRIBUTES.read_bytes().decode("utf-8").replace("\r\n", "\n"), GITATTRIBUTES_TEXT)
 
     def test_hook_guard_rejects_drift(self):
         for mutated in (

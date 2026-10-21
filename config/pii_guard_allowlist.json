@@ -18,7 +18,8 @@
     {"pattern": "bills@my.simba.sg", "reason": "SIMBA vendor billing mailbox (SIMBA invoice intake)"},
     {"pattern": "*@ap-southeast-1.amazonses.com", "reason": "AWS SES message-id host, not a person"},
     {"pattern": "*@eu-west-1.amazonses.com", "reason": "AWS SES message-id host, not a person"},
-    {"pattern": "*@reviewed.gateway.internal", "reason": "Synthetic .internal test host"}
+    {"pattern": "*@reviewed.gateway.internal", "reason": "Synthetic .internal test host"},
+    {"pattern": "noreply@anthropic.com", "reason": "Claude Code co-author trailer in commit messages, vendor no-reply"}
   ],
   "phones": []
 }

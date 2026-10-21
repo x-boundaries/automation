@@ -50,10 +50,12 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   It runs on every pull request with no path filter, checks out the literal
   head with full history and runs `scripts/pii_guard.py --range
   "${BASE_SHA}..${HEAD_SHA}"`, scanning each commit in the range (merge commits
-  contribute only lines new to every parent) for likely email addresses and
-  phone numbers outside `config/pii_guard_allowlist.json`. It fails closed on a
-  hit, a missing or empty range, an unknown commit or a parse error, and it
-  redacts matched values in the log. `tests/test_pii_guard.py` pins the trigger,
+  contribute only lines new to every parent), plus each commit's author,
+  committer and message, for likely email addresses and phone numbers outside
+  `config/pii_guard_allowlist.json`. Diffs are forced to text; NUL-bearing files
+  are decoded by BOM or fail closed unless on the reviewed binary list. It fails
+  closed on a hit, a missing or empty range, an unknown commit or a parse error,
+  and it redacts matched values in the log. `tests/test_pii_guard.py` pins the trigger,
   checkout, exact run lines and allowlist, and rejects `continue-on-error`,
   `|| true`, `if:` conditions, path filters, a dropped or narrowed range and
   report-only or value-printing flags. The tracked `.githooks/pre-commit` hook

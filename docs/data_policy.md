@@ -45,7 +45,8 @@ line a change adds.
   (`example.com`, `example.org`, `example.net`, `.example`, `.test`, `.invalid`,
   `.localhost`), GitHub noreply identities, named X-Boundaries role mailboxes
   and named vendor or system addresses (a vendor billing mailbox, AWS SES
-  message-id hosts, a synthetic `.internal` test host).
+  message-id hosts, a synthetic `.internal` test host, the Claude Code
+  co-author no-reply address).
   Every entry needs a reason, and `tests/test_pii_guard.py` pins the exact set, so
   widening it is a reviewed change.
 - Opt-out marker for a justified line: put `pii-guard: allow (<reason>)` on the
@@ -73,8 +74,16 @@ Exit codes are 0 (clean), 1 (hit) and 2 (error). Output is redacted unless
 `--show-values` is passed, which is for local use only.
 
 CI: `.github/workflows/pii-guard.yml` runs on every pull request and scans each
-commit in the pull-request range, not just the final diff. A hit, a missing or
-empty range, an unknown commit or a parse error fails the job.
+commit in the pull-request range, not just the final diff, including each
+commit's author and committer name and email and its message. A hit, a missing
+or empty range, an unknown commit or a parse error fails the job.
+
+Diffs are forced to text, so a `-diff` or `binary` attribute cannot hide added
+lines. A file containing NUL bytes is decoded when it is BOM-marked UTF-8,
+UTF-16 or UTF-32 text (Windows PowerShell 5.1 `Out-File` writes UTF-16); any
+other NUL-bearing file fails the scan unless its extension is on the reviewed
+binary list in `scripts/pii_guard.py` (images, PDF, ZIP and Office files, which
+are not scanned).
 
 If the guard flags a value on a branch, remove it from the commit that added it
 (amend or rebase the branch before merge); a follow-up commit that deletes it

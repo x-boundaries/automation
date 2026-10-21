@@ -12,13 +12,20 @@ Modes (exactly one):
   pre-commit hook in ``.githooks/pre-commit``; also runnable by hand).
 * ``--range BASE..HEAD`` - every commit in the range, one commit at a time, so a
   value added and later removed inside a pull request is still caught. Merge
-  commits contribute only the lines that are new relative to every parent.
+  commits contribute only the lines that are new relative to every parent. Each
+  commit's author and committer name and email and its message are scanned too.
 * ``--tree REV`` - every line of every text file at a revision (an audit of
   existing content, normally with ``--report-only``).
 
+Diffs are forced to text (``--text``), so a ``-diff`` or ``binary`` attribute cannot
+hide added lines. A blob containing NUL bytes is decoded when it is BOM-marked
+Unicode text (UTF-8, UTF-16 or UTF-32); otherwise it fails closed unless its
+extension is on the reviewed ``BINARY_EXTENSIONS`` list.
+
 Exit codes: 0 clean, 1 likely personal data found, 2 error. Every error fails
 closed: an unreadable allowlist, a missing or empty range, an unknown revision,
-a failed git command or an unparseable diff all exit 2, never 0.
+a failed git command, an unparseable diff or an undecodable NUL-bearing file all
+exit 2, never 0.
 
 Matched values are redacted in the output unless ``--show-values`` is given, so
 a CI log never republishes the value it caught. ``--report-only`` prints counts
@@ -32,7 +39,9 @@ The scanner uses the Python standard library only and performs no network action
 """
 
 import argparse
+import codecs
 import collections
+import difflib
 import fnmatch
 import json
 import re
@@ -79,7 +88,6 @@ _HEADER_PREFIXES = (
     "rename to ",
     "copy from ",
     "copy to ",
-    "Binary files ",
     "--- ",
     "+++ ",
 )
@@ -96,6 +104,7 @@ _GIT_BASE = [
 ]
 _DIFF_OPTS = [
     "-U0",
+    "--text",
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
@@ -103,6 +112,21 @@ _DIFF_OPTS = [
     "--src-prefix=a/",
     "--dst-prefix=b/",
 ]
+
+# A blob with NUL bytes is scanned only when it is BOM-marked Unicode text; otherwise
+# it fails closed unless its extension is on this reviewed binary list.
+BINARY_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip", ".xlsx", ".xls", ".docx", ".doc", ".pptx"}
+)
+# Longest BOM first: the UTF-32-LE BOM starts with the UTF-16-LE BOM.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+METADATA_PATH = "(commit author, committer and message)"
 
 
 class GuardError(Exception):
@@ -278,17 +302,124 @@ def _text(data):
     return data.decode("utf-8", "replace")
 
 
-def _scan_patch(diff_text, commit, allowlist):
+def _scan_patch(diff_text, commit, allowlist, skip_paths=()):
     findings = []
     for path, line_no, text in iter_added_lines(diff_text):
+        if path in skip_paths:
+            continue
         for kind, value in scan_line(text, allowlist):
             findings.append(Finding(commit, path, line_no, kind, value))
     return findings
 
 
+def _read_blobs(shas, cwd):
+    """Return {sha: bytes} for the given blob ids via one ``git cat-file --batch``."""
+    wanted = sorted(set(shas))
+    if not wanted:
+        return {}
+    out = _git(["cat-file", "--batch"], cwd, "".join(sha + "\n" for sha in wanted).encode("ascii"))
+    blobs, offset = {}, 0
+    for sha in wanted:
+        header_end = out.index(b"\n", offset)
+        parts = out[offset:header_end].decode("ascii", "replace").split(" ")
+        if len(parts) != 3 or parts[0] != sha or parts[1] != "blob":
+            raise GuardError("unexpected cat-file record for %s" % sha)
+        size = int(parts[2])
+        blobs[sha] = out[header_end + 1 : header_end + 1 + size]
+        offset = header_end + 1 + size + 1
+    return blobs
+
+
+def decode_nul_blob(path, data):
+    """Decode a blob that contains NUL bytes, or return None for a reviewed binary type.
+
+    Text in a BOM-marked Unicode encoding (UTF-8, UTF-16 or UTF-32, as PowerShell 5.1
+    ``Out-File`` writes) is decoded and scanned. Anything else with NUL bytes fails
+    closed unless its extension is on the reviewed binary list.
+    """
+    for bom, encoding in _BOMS:
+        if data.startswith(bom):
+            return data.decode(encoding, "replace")
+    if Path(path).suffix.lower() in BINARY_EXTENSIONS:
+        return None
+    raise GuardError("%s contains NUL bytes but is neither BOM-marked Unicode text nor a reviewed binary type" % path)
+
+
+def _lenient_lines(data):
+    if b"\0" in data:
+        for bom, encoding in _BOMS:
+            if data.startswith(bom):
+                return data.decode(encoding, "replace").splitlines()
+        return []
+    return _text(data).splitlines()
+
+
+def _is_null_sha(sha):
+    return set(sha) == {"0"}
+
+
+def _raw_changes(raw):
+    """Parse ``--raw -z`` output (plain or combined) into (path, new_sha, parent_shas)."""
+    tokens = raw.decode("utf-8", "surrogateescape").split("\0")
+    changes, index = [], 0
+    while index < len(tokens):
+        meta = tokens[index]
+        if meta == "":
+            index += 1
+            continue
+        colons = len(meta) - len(meta.lstrip(":"))
+        fields = meta[colons:].split(" ")
+        if colons < 1 or len(fields) != 2 * colons + 3:
+            raise GuardError("unparseable raw diff record %r" % meta[:80])
+        modes, shas, status = fields[: colons + 1], fields[colons + 1 : 2 * colons + 2], fields[-1]
+        step = 3 if colons == 1 and status[:1] in ("R", "C") else 2
+        path = tokens[index + step - 1] if index + step - 1 < len(tokens) else ""
+        index += step
+        if not path:
+            raise GuardError("raw diff record without a path")
+        if modes[-1] in ("000000", "120000", "160000") or _is_null_sha(shas[-1]):
+            continue
+        changes.append((path, shas[-1], shas[:-1]))
+    return changes
+
+
+def _encoded_text_findings(changes, label, cwd, allowlist):
+    """Scan changed blobs that contain NUL bytes; return (handled_paths, findings).
+
+    git's line diff cannot represent these blobs reliably, so their added lines are
+    recomputed here: lines of the decoded new blob absent from every parent's blob.
+    """
+    new_blobs = _read_blobs([sha for _, sha, _ in changes], cwd)
+    flagged = [(path, sha, parents) for path, sha, parents in changes if b"\0" in new_blobs[sha]]
+    if not flagged:
+        return set(), []
+    old_blobs = _read_blobs([sha for _, _, parents in flagged for sha in parents if not _is_null_sha(sha)], cwd)
+    handled, findings = set(), []
+    for path, sha, parents in flagged:
+        handled.add(path)
+        text = decode_nul_blob(path, new_blobs[sha])
+        if text is None:
+            continue
+        new_lines = text.splitlines()
+        added = set(range(len(new_lines)))
+        for parent in parents or ["0"]:
+            old_lines = [] if _is_null_sha(parent) else _lenient_lines(old_blobs[parent])
+            fresh = set()
+            for tag, _, _, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
+                if tag in ("insert", "replace"):
+                    fresh.update(range(j1, j2))
+            added &= fresh
+        for index in sorted(added):
+            for kind, value in scan_line(new_lines[index], allowlist):
+                findings.append(Finding(label, path, index + 1, kind, value))
+    return handled, findings
+
+
 def scan_staged(cwd, allowlist):
+    raw = _git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--find-renames"], cwd)
+    handled, encoded = _encoded_text_findings(_raw_changes(raw), "staged", cwd, allowlist)
     diff = _git(["diff", "--cached"] + _DIFF_OPTS, cwd)
-    return _scan_patch(_text(diff), "staged", allowlist)
+    return _scan_patch(_text(diff), "staged", allowlist, handled) + encoded
 
 
 def _resolve_commit(rev, cwd):
@@ -311,11 +442,25 @@ def resolve_range(spec, cwd):
     return commits
 
 
+def scan_commit_metadata(commit, cwd, allowlist):
+    """Scan a commit's author and committer name and email and its full message."""
+    meta = _text(_git(["show", "-s", "--no-notes", "--format=%an <%ae>%n%cn <%ce>%n%B", commit], cwd))
+    findings = []
+    for line_no, text in enumerate(meta.splitlines(), 1):
+        for kind, value in scan_line(text, allowlist):
+            findings.append(Finding(commit, METADATA_PATH, line_no, kind, value))
+    return findings
+
+
 def scan_range(spec, cwd, allowlist):
     findings = []
     for commit in resolve_range(spec, cwd):
+        findings.extend(scan_commit_metadata(commit, cwd, allowlist))
+        raw = _git(["diff-tree", "-r", "-z", "-c", "--raw", "--no-abbrev", "--no-commit-id", "--find-renames", "--root", commit], cwd)
+        handled, encoded = _encoded_text_findings(_raw_changes(raw), commit, cwd, allowlist)
         diff = _git(["show", "--format=", "--cc"] + _DIFF_OPTS + [commit], cwd)
-        findings.extend(_scan_patch(_text(diff), commit, allowlist))
+        findings.extend(_scan_patch(_text(diff), commit, allowlist, handled))
+        findings.extend(encoded)
     return findings
 
 
@@ -331,21 +476,18 @@ def scan_tree(rev, cwd, allowlist):
         mode, kind, sha = meta.split(" ")
         if kind == "blob" and mode != "120000":
             entries.append((path, sha))
-    if not entries:
-        return []
-    out = _git(["cat-file", "--batch"], cwd, "".join(sha + "\n" for _, sha in entries).encode("ascii"))
-    findings, offset = [], 0
+    blobs = _read_blobs([sha for _, sha in entries], cwd)
+    findings = []
     for path, sha in entries:
-        header_end = out.index(b"\n", offset)
-        got_sha, got_type, size = out[offset:header_end].decode("ascii").split(" ")
-        if got_sha != sha or got_type != "blob":
-            raise GuardError("unexpected cat-file record for %s" % path)
-        body = out[header_end + 1 : header_end + 1 + int(size)]
-        offset = header_end + 1 + int(size) + 1
-        if b"\0" in body[:8000]:
-            continue
-        for line_no, text in enumerate(_text(body).splitlines(), 1):
-            for hit_kind, value in scan_line(text, allowlist):
+        body = blobs[sha]
+        if b"\0" in body:
+            text = decode_nul_blob(path, body)
+            if text is None:
+                continue
+        else:
+            text = _text(body)
+        for line_no, line in enumerate(text.splitlines(), 1):
+            for hit_kind, value in scan_line(line, allowlist):
                 findings.append(Finding(tree, path, line_no, hit_kind, value))
     return findings
 
