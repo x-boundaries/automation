@@ -8,8 +8,8 @@ All three run together on one Windows PC that also runs a local n8n. Set them up
 
 ### 1. EnergyGrid daily bills
 
-- **What it does:** every day at 11:30 SGT it downloads the newest EnergyGrid EB Bill and Tenant Bill, saves each PDF to Google Drive, checks Google's copy, and emails the owner. No AI model runs.
-- **Where it runs:** Windows Task Scheduler on the owner PC, with Google Drive for desktop signed in and two local n8n workflows (Drive Verify and Owner Email).
+- **What it does:** every day at 11:30 SGT it downloads the newest EnergyGrid EB Bill and Tenant Bill, saves each PDF to Google Drive, checks Google's copy, and emails the owner when a new bill arrives or something fails. No AI model runs.
+- **Where it runs:** Windows Task Scheduler on the owner PC (the user must be signed in), with Google Drive for desktop and two local n8n workflows (Drive Verify and Owner Email).
 - **Runbook:** [Claude-free daily run](energygrid-bill-downloader/docs/native_daily_claude_free.md) and [EnergyGrid runbook](energygrid-bill-downloader/docs/runbook.md).
 
 <details>
@@ -25,18 +25,26 @@ I will give you the private values when you ask: the EnergyGrid portal sign-in, 
 folder and the Google account that owns it, the owner email address, and the n8n header
 token file. Never write them into the repo, a commit, or a log.
 
-Do these steps in order, and stop for my approval before each one:
+Ask me separately before each live action: installing, importing into n8n, binding credentials,
+creating the Data Table, activating a workflow, daily-preflight, any live run, registering the
+task, and enabling it.
+
+Before any live run, confirm no other EnergyGrid daily task or Claude routine is enabled on any
+PC, so bills are never filed or emailed twice.
+
+Do these steps in order:
 1. Install into one admin-owned EG_HOME (for example C:\Program Files\EnergyGrid) as section 7
    says: its own Python, a hash-locked venv, Playwright Chromium, and the monitor folder. Only
    EG_HOME\data may be writable by the task user.
-2. Write the private native.daily.json from config/energygrid.native_daily.example.json.
+2. Write the private native.daily.json from
+   energygrid-bill-downloader/config/energygrid.native_daily.example.json.
 3. Import n8n-workflows/energygrid_drive_verify.workflow.json and
    n8n-workflows/energygrid_owner_email.workflow.json into the local n8n as inactive, bind the
    credentials there, and create the email claim Data Table. Prove the two webhooks are not
    reachable from the internet (section 6) before activating them.
 4. Run daily-preflight, then one attended daily run, and show me the result.
-5. Register task-scheduler/energygrid_daily_native.task.example.xml for the same signed-in user,
-   read it back, then enable it.
+5. Register energygrid-bill-downloader/task-scheduler/energygrid_daily_native.task.example.xml
+   for the same signed-in user, read it back, then enable it.
 
 After each step, tell me what you checked and what changed.
 ```
@@ -46,7 +54,7 @@ After each step, tell me what you checked and what changed.
 ### 2. EnergyGrid run monitor
 
 - **What it does:** sends the owner a Telegram alert if the daily run has not reported by 14:00 SGT, or if a bill is still pending after a run. It stays quiet on failures the daily run already emails.
-- **Where it runs:** the local n8n workflow `EnergyGrid - Local Run Monitor`, fed by the `egmonitor.cmd` reporter after each daily run.
+- **Where it runs:** the local n8n workflow `EnergyGrid - Local Run Monitor`, fed by the `egmonitor.cmd` reporter after each daily run, on the same PC.
 - **Runbook:** [n8n local run monitor](n8n-workflows/energygrid_local_failure_monitor/README.md).
 
 <details>
@@ -62,9 +70,13 @@ n8n-workflows/README.md (energygrid_local_failure_monitor.workflow.json).
 I will give you the private values when you ask: the Telegram bot credential, the Telegram chat,
 and the webhook header token. Never write them into the repo, a commit, or a log.
 
-Do these steps in order, and stop for my approval before each one:
-1. Copy egmonitor.cmd and energygrid_monitor_report.py into EG_HOME\monitor and store the token
-   file privately.
+Ask me separately before each live action: copying files, importing into n8n, binding
+credentials, activating the workflow, and sending a test report.
+
+Do these steps in order:
+1. As administrator, copy egmonitor.cmd and energygrid_monitor_report.py into EG_HOME\monitor
+   (skip if the daily bills install already did), keep EG_HOME locked, and store the token file
+   privately.
 2. Import n8n-workflows/energygrid_local_failure_monitor.workflow.json into the local n8n as
    inactive. Bind the Header Auth and Telegram credentials and set ENABLE_OWNER_ALERTS to true
    in the live copy only.
@@ -78,7 +90,7 @@ Never re-run a bill download or email to test the monitor. To roll back, deactiv
 ### 3. EnergyGrid run-log cleanup
 
 - **What it does:** every day at 19:30 SGT it keeps 90 days of clean run logs, removes older clean ones, and archives every run that had a problem. It never touches bills or billing state.
-- **Where it runs:** Windows Task Scheduler on the same PC.
+- **Where it runs:** Windows Task Scheduler on the same PC (the user must be signed in).
 - **Runbook:** [Run-evidence retention](energygrid-bill-downloader/docs/run_log_retention.md).
 
 <details>
@@ -90,13 +102,17 @@ as the EnergyGrid daily bills.
 
 Read first: energygrid-bill-downloader/docs/run_log_retention.md (sections 1 to 6).
 
-Do these steps in order, and stop for my approval before each one:
-1. As administrator, copy runtime/maintenance/energygrid_retention.py and render
-   runtime/maintenance/egretention.ps1.template into EG_HOME\maintenance, then lock both and
-   create EG_HOME\data\retention with the ACLs in section 6.
+Ask me separately before each live action: copying files, changing ACLs, the dry run,
+registering the task, turning on -Apply, and enabling it.
+
+Do these steps in order:
+1. As administrator, copy energygrid-bill-downloader/runtime/maintenance/energygrid_retention.py
+   and render energygrid-bill-downloader/runtime/maintenance/egretention.ps1.template into
+   EG_HOME\maintenance. Lock both, and create EG_HOME\data\retention with the ACLs in section 6.
 2. Run it once without -Apply (dry run) and show me the report.
-3. Register task-scheduler/energygrid_retention.task.example.xml for the evening run, read it
-   back, and only then add -Apply and enable it.
+3. Register energygrid-bill-downloader/task-scheduler/energygrid_retention.task.example.xml,
+   set the trigger to 19:30 SGT as on the live PC (the file ships 19:00), read it back, and
+   only then add -Apply and enable it.
 
 After each step, tell me what you checked and what changed.
 ```
@@ -105,7 +121,7 @@ After each step, tell me what you checked and what changed.
 
 ## In progress
 
-Not ready yet, so not listed above: SIMBA invoice intake (waiting on a live test while its account matching is redesigned), AutoCount member sync from Shopify, and AutoCount stock exports. Progress for all of them is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117).
+Not ready yet, so not listed above: SIMBA invoice intake (waiting on a live test while its account matching is redesigned), AutoCount member sync from Shopify, and the AutoCount stock and buying-data exports (#245, #246). Progress for all of them is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117).
 
 ## Developers and CI
 
