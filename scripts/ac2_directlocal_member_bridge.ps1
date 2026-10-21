@@ -208,7 +208,7 @@ function Invoke-XbDirectLocalSyncChangeLog {
         "WHERE TableName = 'Member' AND ChangeType = 'I' AND ID > ? ORDER BY ID FOR JSON PATH)"
     try {
         $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params @([long]$afterId))
-        $maxId = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog")
+        $maxId = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.changelog_max_id)
     }
     catch { throw "sync_changelog_failed" }
     return [ordered]@{ rows = (ConvertFrom-XbDirectLocalJsonRows -Json $json); max_id = $maxId }

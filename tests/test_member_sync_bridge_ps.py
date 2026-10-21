@@ -117,6 +117,182 @@ class SqlPlaceholderStaticTests(unittest.TestCase):
         self.assertNotRegex(source, r"(?i)\bFROM\s+(dbo\.)?(Member|ChangeLog)\b")
 
 
+GUARD = ROOT / "scripts" / "ac2_directlocal_book_guard.ps1"
+
+# G2 H1: the exact SQL texts Get-XbDlScalar may send (every AutoCount session
+# runs as SQL login sa, so the guard is the only database-side limit). Pins
+# $script:XbDlSqlText in the book guard.
+ALLOWED_SQL_TEXTS = {
+    "db_name": "SELECT DB_NAME()",
+    "machine_name": "SELECT CAST(SERVERPROPERTY('MachineName') AS nvarchar(128))",
+    "user_script_rows": "SELECT COUNT_BIG(*) FROM UserScript",
+    "mail_queue_rows": "SELECT COUNT_BIG(*) FROM MailQueue",
+    "einvoice_queue_rows": "SELECT COUNT_BIG(*) FROM EInvoiceQueue",
+    "pos_sync_registrations": (
+        "SELECT (SELECT Location AS location, SyncName AS sync_name, "
+        "CONVERT(varchar(19), LastFinishSyncTime, 126) AS last_finish_sync_local, CONVERT(varchar(19), LastAliveTime, 126) AS last_alive_local "
+        "FROM SyncRegistration ORDER BY Location, SyncName FOR JSON PATH, INCLUDE_NULL_VALUES)"
+    ),
+    "server_now_local": "SELECT CONVERT(varchar(19), GETDATE(), 126)",
+    "member_change_counter": "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'",
+    "changelog_max_id": "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog",
+}
+
+
+def changelog_sql(limit, column: str = "Content") -> str:
+    return (f"SELECT (SELECT TOP ({limit}) ID AS id, CAST([{column}] AS nvarchar(max)) AS xml FROM ChangeLog "
+            "WHERE TableName = 'Member' AND ChangeType = 'I' AND ID > ? ORDER BY ID FOR JSON PATH)")
+
+
+LOOKUP_KEY = "UPPER(LTRIM(RTRIM(MemberNo))) = ?"
+LOOKUP_MOBILE = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '') = ?"
+LOOKUP_EMBEDDED = "CHARINDEX(?, MemberNo) > 0"
+LOOKUP_NUMBER = "UPPER(LTRIM(RTRIM(MemberNo))) = UPPER(LTRIM(RTRIM(?)))"
+
+
+def lookup_sql(conditions) -> str:
+    return ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
+            "CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE " + " OR ".join(conditions) + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)")
+
+
+DENIED_WORDS = ("EXEC", "EXECUTE", "TRUNCATE", "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "GRANT", "REVOKE", "DENY",
+                "INTO", "DBCC", "SHUTDOWN", "KILL", "BACKUP", "RESTORE", "BULK", "OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "WAITFOR",
+                "DECLARE", "SET", "USE")
+
+SQL_GUARD_HARNESS = r"""
+$ErrorActionPreference = "Stop"
+. $args[0]
+$doc = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $args[1] -Raw -Encoding UTF8)
+$db = [pscustomobject]@{ Calls = 0 }
+$db | Add-Member -MemberType ScriptMethod -Name ExecuteScalar -Value { param([string]$Sql, [object[]]$Params) $this.Calls++; return "x" }
+$results = @()
+foreach ($case in $doc.cases) {
+    $params = @()
+    foreach ($value in @($case.params)) { if ($null -ne $value) { $params += [string]$value } }
+    $before = $db.Calls
+    try { [void](Get-XbDlScalar -DBSetting $db -Sql ([string]$case.sql) -Params $params); $code = "ok" } catch { $code = [string]$_.Exception.Message }
+    $results += [ordered]@{ code = $code; executed = ($db.Calls -gt $before) }
+}
+$texts = Get-Variable -Name XbDlSqlText -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject ([ordered]@{ results = $results; texts = $texts }) -Compress -Depth 4))
+"""
+
+
+class SqlAllowlistStaticTests(unittest.TestCase):
+    """G2 H1: no PowerShell needed. Every Get-XbDlScalar call in the scripts
+    sends a named allowlisted text, or (only in the two sync reads) the
+    template the guard pins; Python builds no AutoCount SQL (see
+    SqlPlaceholderStaticTests)."""
+
+    def test_every_call_sends_an_allowlisted_text(self):
+        calls = []
+        for path in sorted((ROOT / "scripts").glob("*.ps1")):
+            function = None
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                found = re.match(r"^function ([A-Za-z-]+)", line)
+                function = found.group(1) if found else function
+                if "Get-XbDlScalar" in line and not line.lstrip().startswith(("function ", "#")):
+                    calls.append((path.name, number, function, line))
+        self.assertGreaterEqual(len(calls), 12)
+        for name, number, function, line in calls:
+            with self.subTest(at=f"{name}:{number}"):
+                self.assertIn(name, ("ac2_directlocal_book_guard.ps1", "ac2_directlocal_member_bridge.ps1"))
+                argument = re.search(r"-Sql\s+(\S+)", line).group(1)
+                if argument == "$sql":
+                    self.assertIn(function, ("Invoke-XbDirectLocalSyncLookup", "Invoke-XbDirectLocalSyncChangeLog"))
+                else:
+                    self.assertRegex(argument, r"^\$script:XbDlSqlText\.[a-z_]+\)*$")
+                    self.assertIn(argument.split(".", 1)[1].rstrip(")"), ALLOWED_SQL_TEXTS)
+
+
+@unittest.skipUnless(powershell(), "no PowerShell executable available")
+class SqlAllowlistGuardTests(unittest.TestCase):
+    """G2 H1 under real PowerShell: Get-XbDlScalar refuses every text that is
+    not pinned, after a deny check on every text. Refused texts never reach
+    ExecuteScalar."""
+
+    def run_guard(self, cases):
+        temp = Path(tempfile.mkdtemp(prefix="xb-sql-guard-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        (temp / "harness.ps1").write_text(SQL_GUARD_HARNESS, encoding="utf-8")
+        (temp / "cases.json").write_text(json.dumps({"cases": [{"sql": sql, "params": list(params)} for sql, params in cases]}), encoding="utf-8")
+        proc = subprocess.run([powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(temp / "harness.ps1"), str(GUARD), str(temp / "cases.json")],
+                              capture_output=True, timeout=120, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+        out = json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
+        self.assertEqual(len(out["results"]), len(cases))
+        return out
+
+    def assert_refused(self, cases, code):
+        out = self.run_guard(cases)
+        for (sql, _params), result in zip(cases, out["results"]):
+            with self.subTest(sql=sql[:90]):
+                self.assertEqual(result, {"code": code, "executed": False})
+
+    def test_g2_probe_strings_are_refused(self):
+        self.assert_refused([
+            ("SELECT 1; EXECUTE sp_who", ()),
+            ("SELECT 1; TRUNCATE TABLE Member", ()),
+            ("SELECT 1; GRANT CONTROL TO public", ()),
+            ("SELECT * FROM AED_XBOUNDARIES.dbo.Member", ()),
+        ], "vendor_query_not_read_only")
+
+    def test_denied_words_and_tokens(self):
+        cases = [(f"SELECT {word} FROM Member", ()) for word in DENIED_WORDS]
+        cases += [(f"select 1 {word.lower()} x", ()) for word in DENIED_WORDS]
+        cases += [(text, ()) for text in (
+            "SELECT 1;", "SELECT 1 -- x", "SELECT 1 /* x", "SELECT 1 */", "SELECT * FROM sp_helpdb", "SELECT xp_cmdshell",
+            "SELECT COUNT_BIG(*) FROM aed_xboundaries", ALLOWED_SQL_TEXTS["db_name"] + ";",
+        )]
+        self.assert_refused(cases, "vendor_query_not_read_only")
+
+    def test_three_and_four_part_names(self):
+        self.assert_refused([(f"SELECT COUNT_BIG(*) FROM {name}", ()) for name in (
+            "a.b.c", "[a].[b].[c]", "a..c", "srv.db.dbo.t", '"a"."b"."c"', "a . b . c", "[srv].[db]..[t]",
+        )], "vendor_query_not_read_only")
+
+    def test_unknown_or_altered_texts(self):
+        db_name, max_id = ALLOWED_SQL_TEXTS["db_name"], ALLOWED_SQL_TEXTS["changelog_max_id"]
+        self.assert_refused([
+            ("SELECT 1", ()),
+            ("SELECT  DB_NAME()", ()),
+            (db_name + " ", ()),
+            (" " + db_name, ()),
+            (db_name + "\n", ()),
+            ("select DB_NAME()", ()),
+            (max_id + " WHERE ID > 0", ()),
+            ("SELECT COUNT_BIG(*) FROM Member", ()),
+            (db_name, ("x",)),  # a parameter the text has no placeholder for
+            (changelog_sql(200), ()),  # its placeholder without the parameter
+            (changelog_sql(0), ("1",)),
+            (changelog_sql(1001), ("1",)),
+            (changelog_sql("01"), ("1",)),
+            (changelog_sql(200, "Con tent"), ("1",)),
+            (changelog_sql(200, "1Content"), ("1",)),
+            (changelog_sql(200) + " ", ("1",)),
+            (lookup_sql([]), ()),
+            (lookup_sql(["1 = 1"]), ()),
+            (lookup_sql([LOOKUP_MOBILE, LOOKUP_KEY]), ("1", "2")),
+            (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE] * 3), ("1",) * 6),
+            (lookup_sql([LOOKUP_EMBEDDED]), ("1",)),
+            (lookup_sql([LOOKUP_NUMBER] * 21), ("1",) * 21),
+            (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE]).replace(" OR ", "  OR "), ("1", "2")),
+        ], "vendor_query_not_allowlisted")
+
+    def test_every_allowlisted_text_runs(self):
+        phone, sg_local = [LOOKUP_KEY, LOOKUP_MOBILE], [LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_EMBEDDED]
+        cases = [(text, ()) for text in ALLOWED_SQL_TEXTS.values()]
+        cases += [(changelog_sql(limit, column), ("1",)) for limit in (1, 200, 1000) for column in ("Content", "XmlData")]
+        cases += [(lookup_sql(conditions), ("1",) * sum(c.count("?") for c in conditions)) for conditions in (
+            phone, sg_local, phone + sg_local, [LOOKUP_NUMBER], [LOOKUP_NUMBER] * 20, phone + sg_local + [LOOKUP_NUMBER] * 20,
+        )]
+        out = self.run_guard(cases)
+        for (sql, _params), result in zip(cases, out["results"]):
+            with self.subTest(sql=sql[:90]):
+                self.assertEqual(result, {"code": "ok", "executed": True})
+        self.assertEqual(out["texts"], ALLOWED_SQL_TEXTS)  # the guard's table is exactly the pin
+
+
 @unittest.skipUnless(powershell(), "no PowerShell executable available")
 class SyncBridgeTests(unittest.TestCase):
     def setUp(self):
