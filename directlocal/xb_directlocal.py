@@ -1215,6 +1215,7 @@ BRIDGE_CHILD_ERROR_CODES = frozenset({
     "outbound_queue_not_empty", "payload_digest_mismatch", "phone_keys_invalid", "pos_sync_state_unreadable",
     "pos_sync_status_requires_real_session", "production_book_not_authorised", "production_book_refused",
     "real_autocount_object_refused", "resolve_guard_unavailable", "save_member_invocation_count_invalid", "session_factory_env_refused",
+    "sync_changelog_failed", "sync_changelog_request_invalid", "sync_lookup_failed",
     "synthetic_session_binding_invalid", "synthetic_session_marker_missing", "synthetic_session_with_target_book",
     "target_book_not_authorised", "user_script_present", "vendor_error_telemetry_enabled",
     "vendor_query_not_read_only", "writer_deadline_expired", "writer_deadline_invalid",

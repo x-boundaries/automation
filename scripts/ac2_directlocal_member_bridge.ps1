@@ -16,6 +16,11 @@
 # With neither, the bridge refuses (autocount_real_bridge_disabled) before
 # stdin is read, whatever flags, fence ids or AutoCount environment exist.
 #
+# #155 phase 1 sync adds two read-only operations, sync-lookup and
+# sync-changelog (parameterised SELECTs through the guarded DBSetting), and
+# a sync_p1 payload profile for write-once. Their stdout carries member rows
+# for the parent process only; the parent never prints them.
+#
 # write-once is the only path that reaches SaveMember. It additionally needs a
 # fence id bound to the stdin payload, a payload digest match, an unexpired
 # deadline (self-terminating watchdog) and an exclusive CreateNew claim file
@@ -23,7 +28,7 @@
 # without SaveMember. Claim and outcome files are never deleted here.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once")][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog")][string]$Operation,
     [switch]$EnableProductionAdapter,
     [string]$FenceId,
     [string]$ClaimDirectory,
@@ -136,6 +141,74 @@ function Invoke-XbDirectLocalLegacyPrecheck {
     return [ordered]@{ outcome = $outcome; phone_member_no_hit = $phoneMemberNo; mobile_phone_hit = $mobile; email_hit = $emailHit; lookups = $results.Count }
 }
 
+function ConvertFrom-XbDirectLocalJsonRows {
+    # FOR JSON PATH text -> array of rows (ConvertFrom-Json in Windows
+    # PowerShell 5.1 emits a JSON array as one object; foreach enumerates it).
+    param([AllowNull()][string]$Json)
+    $rows = @()
+    if ([string]::IsNullOrWhiteSpace($Json)) { return ,$rows }
+    foreach ($row in (ConvertFrom-Json -InputObject $Json)) { $rows += $row }
+    return ,$rows
+}
+
+function Invoke-XbDirectLocalSyncLookup {
+    # Read-only: members whose MemberNo or MobilePhone is the phone, whose
+    # MemberNo embeds the Singapore 8 digits, or whose MemberNo equals one of
+    # the given numbers (trimmed, case-insensitive). Email is never searched.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
+    $phone = $Request.phone_digits
+    $local = $Request.sg_local
+    $numbers = @($Request.member_nos | Where-Object { $null -ne $_ })
+    if ($null -ne $phone -and [string]$phone -cnotmatch '^[0-9]{8,15}$') { throw "phone_keys_invalid" }
+    if ($null -ne $local -and [string]$local -cnotmatch '^[0-9]{8}$') { throw "phone_keys_invalid" }
+    if ($numbers.Count -gt 20) { throw "member_no_invalid" }
+    foreach ($number in $numbers) {
+        if ([string]::IsNullOrWhiteSpace([string]$number) -or ([string]$number).Length -gt 40) { throw "member_no_invalid" }
+    }
+    $keyExpr = "UPPER(LTRIM(RTRIM(MemberNo)))"
+    $mobileExpr = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '')"
+    $conditions = @()
+    $params = @()
+    if ($null -ne $phone) {
+        $conditions += "$keyExpr = ?"; $params += [string]$phone
+        $conditions += "$mobileExpr = ?"; $params += [string]$phone
+    }
+    if ($null -ne $local) {
+        $conditions += "$keyExpr = ?"; $params += [string]$local
+        $conditions += "$mobileExpr = ?"; $params += [string]$local
+        $conditions += "CHARINDEX(?, MemberNo) > 0"; $params += [string]$local
+    }
+    foreach ($number in $numbers) {
+        $conditions += "$keyExpr = UPPER(LTRIM(RTRIM(?)))"; $params += [string]$number
+    }
+    if ($conditions.Count -eq 0) { return [ordered]@{ members = @() } }
+    $sql = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, " +
+        "CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE " + ($conditions -join " OR ") + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
+    try { $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params $params) } catch { throw "sync_lookup_failed" }
+    return [ordered]@{ members = (ConvertFrom-XbDirectLocalJsonRows -Json $json) }
+}
+
+function Invoke-XbDirectLocalSyncChangeLog {
+    # Read-only: Member insert rows of HQ ChangeLog after an Id watermark
+    # (inserts carry the full row as XML; ids have gaps), plus the current
+    # highest Id. The XML column name is configuration (a VM fact).
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
+    $column = [string]$Request.xml_column
+    if ($column -cnotmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$') { throw "sync_changelog_request_invalid" }
+    $afterId = $Request.after_id
+    $limit = $Request.limit
+    if ($afterId -isnot [int] -and $afterId -isnot [long]) { throw "sync_changelog_request_invalid" }
+    if ($limit -isnot [int] -or $limit -lt 1 -or $limit -gt 500 -or $afterId -lt -1) { throw "sync_changelog_request_invalid" }
+    $sql = "SELECT (SELECT TOP ($limit) Id AS id, CAST([$column] AS nvarchar(max)) AS xml FROM ChangeLog " +
+        "WHERE TableName = 'Member' AND ChangeType = 'I' AND Id > ? ORDER BY Id FOR JSON PATH)"
+    try {
+        $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params @([long]$afterId))
+        $maxId = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(Id), 0) FROM ChangeLog")
+    }
+    catch { throw "sync_changelog_failed" }
+    return [ordered]@{ rows = (ConvertFrom-XbDirectLocalJsonRows -Json $json); max_id = $maxId }
+}
+
 function Invoke-XbDirectLocalWriteOnce {
     param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ClaimPath)
     if ([string]$Request.fence_id -cne $FenceId) { throw "fence_binding_mismatch" }
@@ -145,12 +218,25 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     Assert-XbDirectLocalMemberNo -MemberNo ([string]$Request.member_no)
     $payload = $payloadText | ConvertFrom-Json
-    $member = @{
-        MemberNo = [string]$Request.member_no
-        Name = [string]$payload.name
-        RegisterDate = [string]$payload.register_date
-        ExpiryDate = [string]$payload.expiry_date
+    # A payload without "profile" is the original Shopify M1 create.
+    $profile = if ($null -ne $payload.PSObject.Properties["profile"]) { [string]$payload.profile } else { "shopify_m1" }
+    if ($profile -ceq "sync_p1") {
+        $member = @{
+            MemberNo = [string]$Request.member_no
+            Name = [string]$payload.name
+            RegisterDate = [string]$payload.register_date
+        }
+        if ($null -ne $payload.dob) { $member.DOB = [string]$payload.dob }
     }
+    elseif ($profile -ceq "shopify_m1") {
+        $member = @{
+            MemberNo = [string]$Request.member_no
+            Name = [string]$payload.name
+            RegisterDate = [string]$payload.register_date
+            ExpiryDate = [string]$payload.expiry_date
+        }
+    }
+    else { throw "member_field_not_allowed" }
     if ($null -ne $payload.mobile_phone) { $member.MobilePhone = [string]$payload.mobile_phone }
     if ($null -ne $payload.email_address) { $member.EmailAddress = [string]$payload.email_address }
     # A login, identity or outbound-queue failure here stops before the claim.
@@ -171,8 +257,8 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     finally { $stream.Dispose() }
 
-    $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile "shopify_m1"
-    $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile "shopify_m1"
+    $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile $profile
+    $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile $profile
     $outboundChanged = if ($null -ne $SessionFactory) { $false } else { Test-XbDlOutboundChanged -DBSetting $session.DBSetting }
     $result = [ordered]@{
         save_invocation_count = [int]$created.SaveInvocationCount
@@ -230,6 +316,8 @@ try {
                 try { $result = Get-XbDlPosSyncState -DBSetting $session.DBSetting } catch { throw "pos_sync_state_unreadable" }
             }
             "legacy-precheck" { $result = Invoke-XbDirectLocalLegacyPrecheck -Session $session -Request $request }
+            "sync-lookup" { $result = Invoke-XbDirectLocalSyncLookup -DBSetting $session.DBSetting -Request $request }
+            "sync-changelog" { $result = Invoke-XbDirectLocalSyncChangeLog -DBSetting $session.DBSetting -Request $request }
             "next-member-no" { $result = [ordered]@{ member_no = (Get-XbAutoCountNextMemberNo -Session $session) } }
             "probe" {
                 Assert-XbDirectLocalMemberNo -MemberNo ([string]$request.member_no)
