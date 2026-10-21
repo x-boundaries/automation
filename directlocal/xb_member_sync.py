@@ -12,9 +12,12 @@ Scope (Owner decisions, #155 build step 2)
   ``T``. The Shopify expiry metafield is ignored.
 * AC2 -> Shopify: a member created in AutoCount (for example at the till)
   reaches HQ ``dbo.ChangeLog`` as an insert (``TableName = 'Member'``,
-  ``ChangeType = 'I'``). Rows are read by an ``Id`` watermark kept in the
-  sync ledger (gaps tolerated; a replay is a no-op). Before creating, the
-  Shopify customer is looked up by phone: found -> link, never a duplicate.
+  ``ChangeType = 'I'``, XML in ``Content``). Rows are read by an ``ID``
+  watermark kept in the sync ledger, re-reading a small overlap below it
+  (gaps tolerated; a replay is a no-op; an unparseable row or a numbering
+  reset stops with an alert). Before creating, the Shopify customer is looked
+  up by phone, and only customers whose own phone matches count: found ->
+  link, never a duplicate.
   ``customerCreate`` is sent only when ``shopify_create_enabled`` is true.
 * No review queue. Same phone + same first name links; same phone + another
   first name creates ``phone + name letters`` (fits nvarchar(20), a digit 2-9
@@ -73,7 +76,9 @@ import xb_shopify_direct as direct  # noqa: E402
 CONFIG_SCHEMA = "xb.directlocal.member_sync.config.v1"
 SUMMARY_SCHEMA = "xb.directlocal.member_sync.run.v1"
 LEDGER_FILE = "member_sync.sqlite3"
-SCHEMA_VERSION = 1
+# v2 (2026-10-22, G2 B2 and fact 7): writes.intent_digest and changelog_seen,
+# added to a v1 ledger in one transaction (additive; nothing else changes).
+SCHEMA_VERSION = 2
 
 AUTHORISED_BOOKS = frozenset({"AED_TESTINGAPI"})
 FORBIDDEN_BOOKS = frozenset({"AED_XBOUNDARIES"})
@@ -108,7 +113,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "ac2_create_enabled": False,
     "shopify_create_enabled": False,
     "max_writes_per_run": MAX_WRITES_PER_RUN_LIMIT,
-    # Open question for the Owner: the real birthday-month metafield.
+    # Owner: placeholder until Shopify's developer confirms it.
     "birthday_month_metafield": {"namespace": "custom", "key": "birthday_month", "type": "number_integer"},
     # Owner (2026-10-21): tags on a customer created from AC2.
     "shopify_create_tags": ["ac2-member"],
@@ -117,9 +122,14 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # Name of the generic Windows Credential Manager entry of the AC2
     # automation user; null keeps the attended owner-console credential path.
     "ac2_credential_target": None,
-    # VM fact still to confirm: the ChangeLog column holding the row XML.
-    "changelog_xml_column": None,
+    # VM fact r5 (2026-10-21): dbo.ChangeLog.Content nvarchar(max) holds the
+    # insert XML. Setting it (the default) turns on AC2 -> Shopify reads and
+    # ledger links; Shopify creates still need shopify_create_enabled.
+    "changelog_xml_column": "Content",
     "changelog_batch": 200,
+    # IDs below the watermark re-read on every run, so an insert that
+    # committed after a higher ID was read is still seen (fact 7).
+    "changelog_overlap": 50,
     "max_shopify_customers_per_run": 20,
     "shopify_max_pages": 10,
     "http_timeout_seconds": 30,
@@ -129,6 +139,7 @@ _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
 _BOUNDS = {
     "max_writes_per_run": (0, MAX_WRITES_PER_RUN_LIMIT),
     "changelog_batch": (1, 500),
+    "changelog_overlap": (0, 200),
     "max_shopify_customers_per_run": (1, 100),
     "shopify_max_pages": (1, 40),
     "http_timeout_seconds": (5, 60),
@@ -164,6 +175,7 @@ class SyncConfig:
     ac2_credential_target: str | None
     changelog_xml_column: str | None
     changelog_batch: int
+    changelog_overlap: int
     max_shopify_customers_per_run: int
     shopify_max_pages: int
     http_timeout_seconds: int
@@ -236,6 +248,8 @@ def parse_config(value: Any) -> SyncConfig:
     target = merged["ac2_credential_target"]
     if target is not None and (not isinstance(target, str) or not CREDENTIAL_TARGET_RE.fullmatch(target)):
         raise dl.DirectLocalError("sync_config_ac2_credential_target_invalid")
+    if numbers["changelog_overlap"] >= numbers["changelog_batch"]:
+        raise dl.DirectLocalError("sync_config_changelog_overlap_invalid")
     column = merged["changelog_xml_column"]
     if column is not None and (not isinstance(column, str) or not IDENTIFIER_RE.fullmatch(column)):
         raise dl.DirectLocalError("sync_config_changelog_xml_column_invalid")
@@ -496,7 +510,8 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
         return Decision("CREATE", "new_member_phone", phone_digits)
     member_no = fallback_member_no(phone_digits, customer.first_name, customer.last_name)
     if member_no is None:
-        return Decision("SKIP", "shared_phone_no_name_letters")
+        # Owner round 2, Q1: no Latin letters -> phone + first free digit 2-9.
+        return Decision("CREATE", "shared_phone_digit_fallback", phone_digits)
     return Decision("CREATE", "shared_phone_name_fallback", member_no)
 
 
@@ -556,7 +571,8 @@ CREATE TABLE writes(
   write_id TEXT PRIMARY KEY, direction TEXT NOT NULL CHECK (direction IN ('shopify_to_ac2', 'ac2_to_shopify')),
   customer_gid TEXT, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('INTENT', 'DONE', 'NOT_WRITTEN', 'REJECTED', 'UNCERTAIN', 'RESOLVED')),
-  code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, intent_digest TEXT);
+CREATE TABLE changelog_seen(id INTEGER PRIMARY KEY, seen_at TEXT NOT NULL);
 CREATE TABLE watermarks(name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE member_snapshots(
   member_no_key TEXT PRIMARY KEY, changelog_id INTEGER NOT NULL, digest TEXT NOT NULL, first_seen_at TEXT NOT NULL);
@@ -572,7 +588,7 @@ CREATE TRIGGER meta_no_delete BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'm
 CREATE TRIGGER links_immutable BEFORE UPDATE ON links BEGIN SELECT RAISE(ABORT, 'link_immutable'); END;
 CREATE TRIGGER links_no_delete BEFORE DELETE ON links BEGIN SELECT RAISE(ABORT, 'link_immutable'); END;
 CREATE TRIGGER writes_no_delete BEFORE DELETE ON writes BEGIN SELECT RAISE(ABORT, 'write_immutable'); END;
-CREATE TRIGGER writes_binding_immutable BEFORE UPDATE OF write_id, direction, member_no, member_no_key, created_at ON writes
+CREATE TRIGGER writes_binding_immutable BEFORE UPDATE OF write_id, direction, member_no, member_no_key, created_at, intent_digest ON writes
   BEGIN SELECT RAISE(ABORT, 'write_immutable'); END;
 CREATE TRIGGER writes_transition BEFORE UPDATE OF state ON writes
   WHEN NOT ((OLD.state = 'INTENT' AND NEW.state IN ('DONE', 'NOT_WRITTEN', 'REJECTED', 'UNCERTAIN'))
@@ -580,6 +596,22 @@ CREATE TRIGGER writes_transition BEFORE UPDATE OF state ON writes
   BEGIN SELECT RAISE(ABORT, 'write_transition_invalid'); END;
 CREATE TRIGGER snapshots_no_delete BEFORE DELETE ON member_snapshots BEGIN SELECT RAISE(ABORT, 'snapshot_immutable'); END;
 """
+# v1 -> v2, additive only: the nullable intent digest (older rows keep NULL
+# and are never linked on resolution), the seen-ID table, and the digest in
+# the binding trigger.
+_LEDGER_V2_MIGRATION = (
+    "ALTER TABLE writes ADD COLUMN intent_digest TEXT",
+    "CREATE TABLE changelog_seen(id INTEGER PRIMARY KEY, seen_at TEXT NOT NULL)",
+    "DROP TRIGGER writes_binding_immutable",
+    "CREATE TRIGGER writes_binding_immutable BEFORE UPDATE OF write_id, direction, member_no, member_no_key, created_at, intent_digest ON writes "
+    "BEGIN SELECT RAISE(ABORT, 'write_immutable'); END",
+)
+
+
+def normalised_name(value: Any) -> str:
+    """Case-folded, NFKC, single-spaced (for the identity digest only)."""
+
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split()) if isinstance(value, str) else ""
 
 
 class SyncLedger:
@@ -601,6 +633,16 @@ class SyncLedger:
                 self.conn.execute("BEGIN IMMEDIATE")
                 try:
                     for statement in dl._split_sql(LEDGER_SCHEMA):
+                        self.conn.execute(statement)
+                    self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+            elif version == 1:
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _LEDGER_V2_MIGRATION:
                         self.conn.execute(statement)
                     self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     self.conn.execute("COMMIT")
@@ -663,6 +705,13 @@ class SyncLedger:
         body = json.dumps([member.name, member.mobile_phone, member.email_address, member.dob], ensure_ascii=True)
         return "sha256:" + hmac.new(bytes.fromhex(self.meta()["ref_key"]), body.encode("ascii"), hashlib.sha256).hexdigest()
 
+    def identity_digest(self, name: Any, mobile_phone: Any) -> str:
+        """Salted digest (the ledger's ref key) of the normalised name and
+        phone of the person a write is for. Only the digest is stored."""
+
+        body = json.dumps(["identity", normalised_name(name), phone_member_no(mobile_phone)[0]], ensure_ascii=True)
+        return "sha256:" + hmac.new(bytes.fromhex(self.meta()["ref_key"]), body.encode("ascii"), hashlib.sha256).hexdigest()
+
     # -- mapping ------------------------------------------------------------
     def link_for_gid(self, gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM links WHERE customer_gid = ?", (gid,)).fetchone()
@@ -705,7 +754,15 @@ class WriteRefused(dl.DirectLocalError):
 class RunSummary:
     counts: dict[str, int] = field(default_factory=dict)
     refs: list[dict[str, str]] = field(default_factory=list)
+    alerts: list[str] = field(default_factory=list)
     writes: int = 0
+
+    def alert(self, code: str) -> None:
+        """Needs an operator; the run summary status says so."""
+
+        self.count(code)
+        if code not in self.alerts:
+            self.alerts.append(code)
 
     def count(self, code: str, ref: str | None = None, action: str | None = None) -> None:
         self.counts[code] = self.counts.get(code, 0) + 1
@@ -740,13 +797,14 @@ class SyncEngine:
             raise WriteRefused("max_writes_per_run_reached")
         self.summary.writes += 1
 
-    def _intent(self, direction: str, member_no: str, gid: str | None) -> str:
+    def _intent(self, direction: str, member_no: str, gid: str | None, identity_digest: str | None = None) -> str:
         write_id = f"write-{uuid.uuid4().hex}"
         now = dl.ts(self.ledger.now())
         with self.ledger.tx() as conn:
             conn.execute(
-                "INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'INTENT', ?, ?)",
-                (write_id, direction, gid, member_no, member_no_key(member_no), now, now),
+                "INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, created_at, updated_at, intent_digest) "
+                "VALUES (?, ?, ?, ?, ?, 'INTENT', ?, ?, ?)",
+                (write_id, direction, gid, member_no, member_no_key(member_no), now, now, identity_digest),
             )
         return write_id
 
@@ -772,7 +830,8 @@ class SyncEngine:
             self._resolve_uncertain("ac2_to_shopify")
             self.ac2_to_shopify()
         result = {
-            "schema": SUMMARY_SCHEMA, "status": "completed", "direction": direction,
+            "schema": SUMMARY_SCHEMA, "status": "completed_with_alerts" if self.summary.alerts else "completed", "direction": direction,
+            "alerts": list(self.summary.alerts),
             "autocount_book": self.config.autocount_book, "writes": self.summary.writes,
             "ac2_create_enabled": self.config.ac2_create_enabled, "shopify_create_enabled": self.config.shopify_create_enabled,
             "counts": dict(sorted(self.summary.counts.items())), "refs": self.summary.refs,
@@ -800,7 +859,14 @@ class SyncEngine:
             if direction == "shopify_to_ac2":
                 found = [m for m in self.ac2.lookup(None, [row["member_no"]]) if member_no_key(m.member_no) == row["member_no_key"]]
                 gid = row["customer_gid"]
-                if len(found) == 1 and gid and self.ledger.link_for_gid(gid) is None:
+                ref = self.ledger.ref("m", row["member_no_key"])
+                if len(found) == 1 and row["intent_digest"] is None:
+                    # G2 B2: a row without the intended identity is never linked.
+                    self.summary.count("uncertain_write_identity_unverifiable", ref)
+                elif len(found) == 1 and not hmac.compare_digest(self.ledger.identity_digest(found[0].name, found[0].mobile_phone), row["intent_digest"]):
+                    # Someone else holds the number: never linked; stays UNCERTAIN.
+                    self.summary.count("uncertain_write_identity_mismatch", ref)
+                elif len(found) == 1 and gid and self.ledger.link_for_gid(gid) is None:
                     with self.ledger.tx() as conn:
                         self.ledger.add_link(conn, gid, found[0].member_no, "created_in_ac2", "uncertain_write_found")
                         self._close_write(conn, row["write_id"], "RESOLVED", "uncertain_write_found")
@@ -897,13 +963,13 @@ class SyncEngine:
         if member_no is None:
             self._create_in_ac2(customer, digits, decision, ref)  # GetNextMemberNo at write time
             return
-        if decision.code == "shared_phone_name_fallback":
-            member_no = self._free_suffix(member_no)
+        if decision.code in ("shared_phone_name_fallback", "shared_phone_digit_fallback"):
+            member_no = self._free_suffix(member_no, include_base=decision.code == "shared_phone_name_fallback")
             if member_no is None:
                 self._shopify_pending(gid, "SKIPPED", "shared_phone_member_no_exhausted")
                 self.summary.count("shared_phone_member_no_exhausted", ref)
                 return
-            if member_no != decision.member_no:
+            if member_no != decision.member_no and decision.code == "shared_phone_name_fallback":
                 self.summary.count("shared_phone_suffix_digit")
             decision = Decision(decision.action, decision.code, member_no)
         member_ref = self.ledger.ref("m", member_no_key(member_no))
@@ -935,8 +1001,8 @@ class SyncEngine:
                 taken.add(member_no_key(number))
         return taken
 
-    def _free_suffix(self, base: str) -> str | None:
-        candidates = suffix_candidates(base)
+    def _free_suffix(self, base: str, *, include_base: bool = True) -> str | None:
+        candidates = suffix_candidates(base) if include_base else suffix_candidates(base)[1:]
         taken = self._member_no_taken(candidates)
         return next((c for c in candidates if member_no_key(c) not in taken), None)
 
@@ -1008,7 +1074,7 @@ class SyncEngine:
                 self._shopify_pending(gid, "PENDING", "member_no_held_by_open_write")
                 self.summary.count("member_no_held_by_open_write", member_ref)
                 return
-        write_id = self._intent("shopify_to_ac2", member_no, gid)
+        write_id = self._intent("shopify_to_ac2", member_no, gid, self.ledger.identity_digest(name, digits))
         state, code = self.ac2.create_member(member_no, payload, write_id=write_id)
         with self.ledger.tx() as conn:
             if state == "CREATED_VERIFIED":
@@ -1035,41 +1101,70 @@ class SyncEngine:
         if column is None:
             self.summary.count("changelog_column_unconfigured")
             return
+        overlap = self.config.changelog_overlap
         watermark = self.ledger.watermark("ac2_changelog_id")
-        rows, max_id = self.ac2.changelog_inserts(int(watermark) if watermark is not None else None, self.config.changelog_batch, column)
         if watermark is None:
-            # First run: start from now, never replay history (the backfill is
-            # a later, separate phase).
-            with self.ledger.tx() as conn:
-                self.ledger.set_watermark(conn, "ac2_changelog_id", str(int(max_id)))
-            self.summary.count("changelog_watermark_initialised")
+            self._initialise_changelog(column, overlap)
             return
         current = int(watermark)
+        after = max(current - overlap, 0) if overlap else current
+        rows, max_id = self.ac2.changelog_inserts(after, self.config.changelog_batch + overlap, column)
+        if max_id < current:
+            # ChangeLog numbering went backwards (reseed or restore): refuse,
+            # never reset the watermark automatically.
+            self.summary.alert("changelog_id_reset_detected")
+            return
         for row_id, xml_text in sorted(rows, key=lambda item: item[0]):
-            if row_id <= current:
-                self.summary.count("changelog_row_replayed")  # a replay is a no-op
-                continue
+            if self.ledger.conn.execute("SELECT 1 FROM changelog_seen WHERE id = ?", (row_id,)).fetchone() is not None:
+                if row_id > current:
+                    self.summary.count("changelog_row_replayed")  # a replay is a no-op
+                continue  # an overlap re-read of a processed row: nothing to do
             member = parse_changelog_member(xml_text)
+            if member is None:
+                # Stop here: the watermark stays at the last good ID, so this
+                # row and everything after it are read again next run.
+                self.summary.alert("changelog_row_unparsed")
+                break
             with self.ledger.tx() as conn:
-                if member is None:
-                    self.summary.count("changelog_row_unparsed")
+                key = member_no_key(member.member_no)
+                conn.execute(
+                    "INSERT OR IGNORE INTO member_snapshots(member_no_key, changelog_id, digest, first_seen_at) VALUES (?, ?, ?, ?)",
+                    (key, row_id, self.ledger.digest(member), dl.ts(self.ledger.now())),
+                )
+                if self.ledger.link_for_member(member.member_no) is not None or self.ledger.open_write_for_member(member.member_no) is not None:
+                    self.summary.count("ac2_insert_own_or_linked")  # loop prevention
                 else:
-                    key = member_no_key(member.member_no)
-                    conn.execute(
-                        "INSERT OR IGNORE INTO member_snapshots(member_no_key, changelog_id, digest, first_seen_at) VALUES (?, ?, ?, ?)",
-                        (key, row_id, self.ledger.digest(member), dl.ts(self.ledger.now())),
-                    )
-                    if self.ledger.link_for_member(member.member_no) is not None or self.ledger.open_write_for_member(member.member_no) is not None:
-                        self.summary.count("ac2_insert_own_or_linked")  # loop prevention
-                    else:
-                        inserted = conn.execute(
-                            "INSERT OR IGNORE INTO ac2_pending(member_no_key, member_no, changelog_id, state, updated_at) VALUES (?, ?, ?, 'PENDING', ?)",
-                            (key, member.member_no, row_id, dl.ts(self.ledger.now())),
-                        ).rowcount
-                        self.summary.count("ac2_insert_queued" if inserted else "ac2_insert_already_seen")
-                self.ledger.set_watermark(conn, "ac2_changelog_id", str(row_id))
-                current = row_id
+                    inserted = conn.execute(
+                        "INSERT OR IGNORE INTO ac2_pending(member_no_key, member_no, changelog_id, state, updated_at) VALUES (?, ?, ?, 'PENDING', ?)",
+                        (key, member.member_no, row_id, dl.ts(self.ledger.now())),
+                    ).rowcount
+                    self.summary.count("ac2_insert_queued" if inserted else "ac2_insert_already_seen")
+                if row_id <= current:
+                    self.summary.count("changelog_late_row_processed")
+                conn.execute("INSERT INTO changelog_seen(id, seen_at) VALUES (?, ?)", (row_id, dl.ts(self.ledger.now())))
+                if row_id > current:
+                    self.ledger.set_watermark(conn, "ac2_changelog_id", str(row_id))
+                    current = row_id
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM changelog_seen WHERE id <= ?", (current - overlap,))  # never re-read again
         self._process_ac2_pending()
+
+    def _initialise_changelog(self, column: str, overlap: int) -> None:
+        """First run: start from the current highest ID (history is the
+        phase-2 backfill). Rows already visible inside the overlap window
+        are history too, so they are marked seen; an insert that commits
+        later below the watermark is then still processed."""
+
+        _, max_id = self.ac2.changelog_inserts(None, 1, column)
+        visible: list = []
+        if overlap and max_id > 0:
+            visible, _ = self.ac2.changelog_inserts(max(max_id - overlap, 0), overlap, column)
+        with self.ledger.tx() as conn:
+            for row_id, _xml in visible:
+                if row_id <= max_id:
+                    conn.execute("INSERT OR IGNORE INTO changelog_seen(id, seen_at) VALUES (?, ?)", (row_id, dl.ts(self.ledger.now())))
+            self.ledger.set_watermark(conn, "ac2_changelog_id", str(int(max_id)))
+        self.summary.count("changelog_watermark_initialised")
 
     def _ac2_done(self, key: str, state: str, code: str, *, count_check: bool = False) -> None:
         with self.ledger.tx() as conn:
@@ -1207,7 +1302,7 @@ CUSTOMER_QUERY = """query XbMemberSyncCustomer($id: ID!, $birthdayNamespace: Str
   customer(id: $id) { """ + _CUSTOMER_FIELDS + """ }
 }"""
 PHONE_LOOKUP_QUERY = """query XbMemberSyncPhoneLookup($search: String!) {
-  customers(first: 5, query: $search) { nodes { id firstName lastName } }
+  customers(first: 5, query: $search) { nodes { id firstName lastName defaultPhoneNumber { phoneNumber } } }
 }"""
 CUSTOMER_CREATE_MUTATION = """mutation XbMemberSyncCustomerCreate($input: CustomerInput!) {
   customerCreate(input: $input) { customer { id } userErrors { field message } }
@@ -1289,12 +1384,21 @@ class SyncShopifyClient(direct.ShopifyDirectClient):
         return None if node is None else _customer_from_node(node)
 
     def find_by_phone(self, phone_e164: str) -> list[ShopifyCustomer]:
+        """Customers whose own phone is this phone. The search is only a
+        candidate list (its matching may be loose): every node's phone goes
+        through the same ``phone_member_no`` normalisation as ours, and a node
+        with no phone or another phone is dropped before any decision (G2 B1)."""
+
+        digits, status = phone_member_no(phone_e164)
+        if status != "ok":
+            raise dl.DirectLocalError("phone_lookup_input_invalid")
         # Open item for live UAT: Shopify's customer search syntax for phone.
         data = self.execute(PHONE_LOOKUP_QUERY, {"search": f"phone:{phone_e164}"})
         page = data.get("customers")
         if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
             raise direct.ShopifyDirectError("shopify_response_shape_invalid")
-        return [_customer_from_node({**node, "tags": []}) for node in page["nodes"]]
+        customers = [_customer_from_node({**node, "tags": []}) for node in page["nodes"]]
+        return [c for c in customers if phone_member_no(c.phone)[0] == digits]
 
     def create_customer(self, customer_input: Mapping[str, Any]) -> str:
         if not self.create_enabled:
@@ -1514,7 +1618,10 @@ def main(argv: list[str] | None = None) -> int:
                 counts = {name: ledger.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in ("links", "writes", "ac2_pending", "shopify_pending")}
                 _emit({"status": "ok", "counts": counts, "uncertain_writes": ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'UNCERTAIN'").fetchone()[0]})
             else:
-                _emit(build_real_engine(config, ledger, environ=os.environ).run(direction=args.direction))
+                result = build_real_engine(config, ledger, environ=os.environ).run(direction=args.direction)
+                _emit(result)
+                if result["alerts"]:
+                    return 3  # completed, but an operator must look (summary.alerts)
         finally:
             ledger.close()
         return 0

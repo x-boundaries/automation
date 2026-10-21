@@ -63,7 +63,7 @@ def config_value(**overrides) -> dict:
     value = {
         "schema": sync.CONFIG_SCHEMA, "state_root": "C:\\XB\\xb155-member-sync", "autocount_book": TEST_BOOK,
         "shopify": {"store_gid": STORE, "shop_domain": DOMAIN, "api_version": "2026-07", "auth": {"method": "admin_api_access_token", "token_env": "XB_SHOPIFY_SYNC_TOKEN"}},
-        "shopify_cutover_utc": dl.ts(CUTOVER), "changelog_xml_column": "XmlData",
+        "shopify_cutover_utc": dl.ts(CUTOVER),
     }
     value.update(overrides)
     return value
@@ -83,14 +83,13 @@ def customer(n: int, *, first="Alpha", last="Tester", phone="sg", email=None, re
 
 
 def changelog_xml(member_no: str, name: str, mobile: str | None = None, email: str | None = None, dob: str | None = None) -> str:
-    parts = [f"<MemberNo>{member_no}</MemberNo>", f"<Name>{name}</Name>"]
-    if mobile is not None:
-        parts.append(f"<MobilePhone>{mobile}</MobilePhone>")
-    if email is not None:
-        parts.append(f"<EmailAddress>{email}</EmailAddress>")
-    if dob is not None:
-        parts.append(f"<DOB>{dob}T00:00:00</DOB>")
-    return "<Member>" + "".join(parts) + "</Member>"
+    """The VM-observed insert shape (fact r5-2): one root ``<Member .../>``
+    with attributes only; a NULL column is omitted; DOB as YYYY-MM-DDTHH:MM:SS."""
+
+    from xml.sax.saxutils import quoteattr
+
+    values = {"MemberNo": member_no, "Name": name, "MobilePhone": mobile, "EmailAddress": email, "DOB": None if dob is None else dob + "T00:00:00"}
+    return "<Member " + " ".join(f"{key}={quoteattr(value)}" for key, value in values.items() if value is not None) + "/>"
 
 
 class FakeShopify:
@@ -171,8 +170,8 @@ class FakeAc2:
         return found
 
     def changelog_inserts(self, after_id, limit, column):
-        assert column == "XmlData"
-        rows = [row for row in self.changelog if after_id is None or row[0] > after_id][:limit]
+        assert column == "Content"
+        rows = sorted(row for row in self.changelog if after_id is None or row[0] > after_id)[:limit]
         return rows, max([row[0] for row in self.changelog], default=0)
 
     def create_member(self, member_no, payload, *, write_id):
@@ -660,8 +659,15 @@ class Ac2ToShopifyTests(SyncTestCase):
             self.ledger.set_watermark(conn, "ac2_changelog_id", str(ids[0] - 1))
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual(len(self.shopify.created), 3)
-        self.assertEqual(result["counts"]["ac2_insert_own_or_linked"], 3)
+        self.assertEqual(result["counts"]["changelog_row_replayed"], 3)  # seen IDs
         self.assertNotIn("shopify_customer_created", result["counts"])
+        # Even without the seen IDs, the ledger links stop any second create.
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM changelog_seen")
+            self.ledger.set_watermark(conn, "ac2_changelog_id", str(ids[0] - 1))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(len(self.shopify.created), 3)
+        self.assertEqual(result["counts"]["ac2_insert_own_or_linked"], 3)
 
     def test_shopify_create_disabled_refuses_and_keeps_member_pending(self):
         self.initialise()
@@ -814,7 +820,7 @@ class SyncShopifyClientTests(unittest.TestCase):
     def test_reads_are_retried_and_create_returns_gid(self):
         responses = [
             direct.HttpResponse(503, {}, b""),
-            _graphql({"customers": {"nodes": [{"id": gid(71), "firstName": "Alpha", "lastName": None}]}}),
+            _graphql({"customers": {"nodes": [{"id": gid(71), "firstName": "Alpha", "lastName": None, "defaultPhoneNumber": {"phoneNumber": plus(sg(71))}}]}}),
             _graphql({"customerCreate": {"customer": {"id": gid(72)}, "userErrors": []}}),
             _graphql({"customerCreate": {"customer": None, "userErrors": [{"field": ["phone"], "message": "taken"}]}}),
         ]
@@ -870,6 +876,405 @@ class BridgeClientTests(unittest.TestCase):
         self.assertNotIn(b"fake-secret", captured["stdin"])
         self.assertEqual(captured["args"][-2:], ["-TargetBook", TEST_BOOK])
         self.assertEqual(json.loads(captured["stdin"]), {"phone_digits": sg(80), "sg_local": local(80), "member_nos": []})
+
+
+# A fake 9-digit number without "+" that is not a Singapore number (L1).
+NINE_DIGITS = "9" + "123" + "45" + "678"
+
+
+class ScriptedPhoneSearch:
+    """Shopify's ``phone:`` search answered by a scripted transport that
+    returns raw nodes unfiltered, through the real ``SyncShopifyClient``."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.searches = []
+
+        def transport(url, body, headers, timeout):
+            self.searches.append(json.loads(body)["variables"]["search"])
+            return _graphql({"customers": {"nodes": list(self.nodes)}})
+
+        self.client = sync.SyncShopifyClient(
+            create_enabled=False, shop_domain=DOMAIN, api_version="2026-07",
+            token_provider=direct.StaticTokenProvider("shpat_synthetic_token_value_0001"), transport=transport, sleep=lambda s: None,
+        )
+
+
+def phone_node(n: int, phone: str | None, first: str = "Alpha", last: str | None = "Tester") -> dict:
+    return {"id": gid(n), "firstName": first, "lastName": last, "defaultPhoneNumber": None if phone is None else {"phoneNumber": phone}}
+
+
+class B1PhoneLookupVerifiesPhoneTests(SyncTestCase):
+    """B1: a loose ``phone:`` search must never decide a link by itself."""
+
+    def use_search(self, nodes):
+        search = ScriptedPhoneSearch(nodes)
+        self.shopify.find_by_phone = search.client.find_by_phone
+        self.run_sync("ac2_to_shopify")  # watermark
+        return search
+
+    def test_node_with_other_phone_never_links_and_phone_counts_as_free(self):
+        self.use_search([phone_node(90, plus(sg(91)))])
+        self.ac2.add(sync.Ac2Member(sg(90), "Alpha Tester", sg(90)), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertNotIn(gid(90), self.links())
+        self.assertEqual(self.shopify.created[0]["phone"], plus(sg(90)))  # phone free: created with it
+        self.assertEqual(result["counts"]["shopify_customer_created"], 1)
+
+    def test_one_match_plus_one_other_phone_is_single(self):
+        self.use_search([phone_node(92, plus(sg(92))), phone_node(93, plus(sg(93)))])
+        self.ac2.add(sync.Ac2Member(sg(92), "Alpha Tester", sg(92)), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.links(), {gid(92): sg(92)})
+        self.assertNotIn("shopify_phone_on_multiple_customers", result["counts"])
+        self.assertEqual(self.shopify.created, [])
+
+    def test_node_without_phone_is_ignored(self):
+        self.use_search([phone_node(94, None)])
+        self.ac2.add(sync.Ac2Member(sg(94), "Alpha Tester", sg(94)), log=True)
+        self.run_sync("ac2_to_shopify")
+        self.assertNotIn(gid(94), self.links())
+        self.assertEqual(self.shopify.created[0]["phone"], plus(sg(94)))
+
+    def test_non_sg_number_without_plus_compares_as_typed(self):
+        search = self.use_search([phone_node(95, "+" + NINE_DIGITS), phone_node(96, "+" + "65" + NINE_DIGITS)])
+        self.ac2.add(sync.Ac2Member("TILL95", "Alpha Tester", NINE_DIGITS), log=True)
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.links(), {gid(95): "TILL95"})
+        self.assertEqual(search.searches[-1], "phone:+" + NINE_DIGITS)
+
+
+class B2UncertainCreateIdentityTests(SyncTestCase):
+    """B2: an unclear AC2 create links only when the member found under that
+    MemberNo is the person the write was for."""
+
+    def uncertain_create(self, n: int, *, found_name: str | None) -> None:
+        self.ac2.create_result = ("WRITE_OUTCOME_UNCERTAIN", "writer_failed_after_claim")
+        original = self.ac2.create_member
+
+        def taken_by(member_no, payload, *, write_id):
+            self.ac2.creates.append((member_no, dict(payload)))
+            if found_name is not None:  # who holds the number afterwards
+                self.ac2.add(sync.Ac2Member(member_no, found_name, payload["mobile_phone"] if found_name == payload["name"] else None))
+            return self.ac2.create_result
+
+        self.ac2.create_member = taken_by
+        self.shopify.add(customer(n))
+        self.run_sync("shopify_to_ac2")
+        self.ac2.create_member = original
+        self.ac2.create_result = ("CREATED_VERIFIED", None)
+
+    def test_number_held_by_another_person_is_never_linked(self):
+        self.uncertain_create(36, found_name="Kilo Other")
+        result = self.run_sync("shopify_to_ac2")
+        self.assertNotIn(gid(36), self.links())
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.assertEqual(result["counts"]["uncertain_write_identity_mismatch"], 1)
+        self.assertEqual(len(self.ac2.creates), 1)
+
+    def test_same_person_found_links(self):
+        self.uncertain_create(37, found_name="Alpha Tester")
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.links(), {gid(37): sg(37)})
+        self.assertEqual(result["counts"]["uncertain_write_resolved_linked"], 1)
+
+    def test_old_intent_without_digest_is_never_linked(self):
+        self.ac2.add(sync.Ac2Member(sg(38), "Alpha Tester", sg(38)))
+        now = dl.ts(self.now)
+        with self.ledger.tx() as conn:
+            conn.execute(
+                "INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, code, created_at, updated_at) VALUES (?, 'shopify_to_ac2', ?, ?, ?, 'UNCERTAIN', 'old', ?, ?)",
+                ("write-" + "f" * 32, gid(38), sg(38), sync.member_no_key(sg(38)), now, now),
+            )
+        result = self.run_sync("shopify_to_ac2")
+        self.assertNotIn(gid(38), self.links())
+        self.assertEqual(result["counts"]["uncertain_write_identity_unverifiable"], 1)
+
+    def test_ledger_holds_only_the_digest(self):
+        self.uncertain_create(39, found_name=None)
+        dump = "\n".join(self.ledger.conn.iterdump())
+        self.assertNotIn("Alpha", dump)
+        self.assertNotIn("alpha tester", dump)
+        self.assertNotIn(local(39), dump.replace(sg(39), ""))  # only the MemberNo itself carries the digits
+        self.assertRegex(self.ledger.conn.execute("SELECT intent_digest FROM writes").fetchone()[0], r"^sha256:[0-9a-f]{64}$")
+
+
+def split_name(full: str) -> tuple[str, str | None]:
+    words = full.split()
+    return (" ".join(words[:-1]), words[-1]) if len(words) > 1 else (full, None)
+
+
+class NameRuleTests(unittest.TestCase):
+    """Owner decision 2026-10-21 14:35Z examples, locked where the current
+    rule (``first_name_matches``) already gives the stated result. Not
+    included because the current code differs (reported to the Owner, no
+    logic change): Shopify -> AC2 "Mary Tan" links to "MARY ANN LEE";
+    AC2 -> Shopify "Ann Lee" and "Mary Lee" do not link to "MARY ANN LEE"."""
+
+    LINK = ("Ann Lee", "Mary Lee", "Mary Ann Lee")
+    SEPARATE = ("John Lim",)
+    AC2_LINK = ("Mary Ann Lee",)
+    AC2_SEPARATE = ("Mary Tan", "John Lim")
+
+    def fresh(self):
+        case = SyncTestCase("run_sync")
+        case.setUp()
+        self.addCleanup(case.tearDown)
+        return case
+
+    def shopify_to_ac2(self, ac2_name: str, shopify_name: str) -> tuple[dict, list]:
+        case = self.fresh()
+        case.ac2.add(sync.Ac2Member(sg(81), ac2_name, None))
+        first, last = split_name(shopify_name)
+        case.shopify.add(customer(81, first=first, last=last))
+        case.run_sync("shopify_to_ac2")
+        return case.links(), case.ac2.creates
+
+    def ac2_to_shopify(self, shopify_first: str, shopify_last: str | None, ac2_name: str) -> tuple[dict, list]:
+        case = self.fresh()
+        case.run_sync("ac2_to_shopify")
+        case.shopify.add(customer(82, first=shopify_first, last=shopify_last, tags=()))
+        case.ac2.add(sync.Ac2Member("TILL82", ac2_name, sg(82)), log=True)
+        case.run_sync("ac2_to_shopify")
+        return case.links(), case.shopify.created
+
+    def test_shopify_to_ac2_examples(self):
+        for name in self.LINK:
+            with self.subTest(link=name):
+                links, creates = self.shopify_to_ac2("MARY ANN LEE", name)
+                self.assertEqual((links, creates), ({gid(81): sg(81)}, []))
+        for name in self.SEPARATE + ("Anne Lee",):
+            with self.subTest(separate=name):
+                ac2 = "ANN LEE" if name == "Anne Lee" else "MARY ANN LEE"
+                links, creates = self.shopify_to_ac2(ac2, name)
+                first, last = split_name(name)
+                self.assertEqual([m for m, _ in creates], [sync.fallback_member_no(sg(81), first, last)])
+
+    def test_ac2_to_shopify_examples(self):
+        for shopify_first, shopify_last in (("MARY ANN", "LEE"), ("MARY ANN LEE", None)):  # split, or the whole name in firstName
+            for name in self.AC2_LINK:
+                with self.subTest(shopify=shopify_first, link=name):
+                    links, created = self.ac2_to_shopify(shopify_first, shopify_last, name)
+                    self.assertEqual((links, created), ({gid(82): "TILL82"}, []))
+            for name in self.AC2_SEPARATE:
+                with self.subTest(shopify=shopify_first, separate=name):
+                    links, created = self.ac2_to_shopify(shopify_first, shopify_last, name)
+                    self.assertNotIn(gid(82), links)
+                    self.assertNotIn("phone", created[0])
+        links, created = self.ac2_to_shopify("ANN", "LEE", "Anne Lee")
+        self.assertNotIn(gid(82), links)
+        self.assertNotIn("phone", created[0])
+
+
+class Q1NonLatinSharedPhoneTests(SyncTestCase):
+    """Owner round 2 Q1: shared phone, no Latin letters -> phone + 2-9."""
+
+    def register(self, n: int) -> dict:
+        self.ac2.add(sync.Ac2Member(sg(n), "Charlie Holder", None))
+        self.shopify.add(customer(n, first="陈", last="美玲"))
+        return self.run_sync("shopify_to_ac2")
+
+    def test_non_latin_name_gets_phone_plus_two(self):
+        result = self.register(53)
+        self.assertEqual([m for m, _ in self.ac2.creates], [sg(53) + "2"])
+        self.assertEqual(result["counts"]["shared_phone_digit_fallback"], 1)
+
+    def test_two_taken_in_ac2_gives_three(self):
+        self.ac2.add(sync.Ac2Member(sg(54) + "2", "Delta Other", None))
+        self.register(54)
+        self.assertEqual([m for m, _ in self.ac2.creates], [sg(54) + "3"])
+
+    def test_three_taken_in_the_ledger_gives_the_next_free_digit(self):
+        self.ac2.add(sync.Ac2Member(sg(55) + "2", "Delta Other", None))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(98), sg(55) + "3", "matched", "test")
+        self.register(55)
+        self.assertEqual([m for m, _ in self.ac2.creates], [sg(55) + "4"])
+
+    def test_two_to_nine_all_taken_skips_and_counts(self):
+        for digit in range(2, 10):
+            self.ac2.add(sync.Ac2Member(sg(56) + str(digit), "Delta Other", None))
+        result = self.register(56)
+        self.assertEqual(self.ac2.creates, [])
+        self.assertEqual(result["counts"]["shared_phone_member_no_exhausted"], 1)
+
+
+class ChangeLogCursorTests(SyncTestCase):
+    def initialise(self):
+        self.run_sync("ac2_to_shopify")
+
+    def member_xml(self, n: int) -> str:
+        return changelog_xml(sg(n), f"Member {n}", sg(n))
+
+    def pending_numbers(self) -> list[str]:
+        return [row[0] for row in self.ledger.conn.execute("SELECT member_no FROM ac2_pending ORDER BY changelog_id")]
+
+    def test_unparseable_row_stops_and_keeps_the_watermark(self):
+        self.initialise()  # empty ChangeLog: watermark 0
+        self.ac2.changelog += [(1, self.member_xml(57)), (2, "<Member Name=" + chr(34) + "x"), (3, self.member_xml(58))]
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), "1")
+        self.assertEqual(self.pending_numbers(), [sg(57)])  # row 3 not processed in this run
+        self.assertEqual((result["status"], result["alerts"]), ("completed_with_alerts", ["changelog_row_unparsed"]))
+        self.assertEqual(result["counts"]["changelog_row_unparsed"], 1)
+
+    def test_numbering_reset_is_refused_with_an_alert(self):
+        self.ac2.add(sync.Ac2Member(sg(59), "Member", sg(59)), log=True)
+        self.initialise()
+        watermark = self.ledger.watermark("ac2_changelog_id")
+        self.ac2.changelog = [(5, self.member_xml(60))]  # IDs went backwards
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["alerts"], ["changelog_id_reset_detected"])
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), watermark)
+        self.assertEqual(self.pending_numbers(), [])
+
+    def test_overlap_reread_of_processed_rows_is_a_no_op(self):
+        self.initialise()
+        self.ac2.add(sync.Ac2Member(sg(61), "Member", sg(61)), log=True)
+        self.run_sync("ac2_to_shopify")
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["counts"], {})
+        self.assertEqual(len(self.shopify.created), 1)
+
+    def test_late_lower_id_inside_the_overlap_is_processed(self):
+        self.initialise()
+        self.ac2.add(sync.Ac2Member(sg(62), "Member", sg(62)), log=True)
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        watermark = int(self.ledger.watermark("ac2_changelog_id"))
+        self.ac2.changelog.append((watermark - 3, self.member_xml(63)))  # committed late
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(result["counts"]["changelog_late_row_processed"], 1)
+        self.assertEqual(self.pending_numbers(), [sg(63), sg(62)])
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(watermark))
+
+    def test_overlap_zero_behaves_as_before(self):
+        self.run_sync("ac2_to_shopify", changelog_overlap=0)
+        self.ac2.add(sync.Ac2Member(sg(64), "Member", sg(64)), log=True)
+        self.run_sync("ac2_to_shopify", changelog_overlap=0, shopify_create_enabled=False)
+        watermark = int(self.ledger.watermark("ac2_changelog_id"))
+        self.ac2.changelog.append((watermark - 3, self.member_xml(65)))
+        result = self.run_sync("ac2_to_shopify", changelog_overlap=0, shopify_create_enabled=False)
+        self.assertNotIn("changelog_late_row_processed", result["counts"])
+        self.assertEqual(self.pending_numbers(), [sg(64)])
+
+    def test_rows_visible_at_first_run_are_history(self):
+        for n in (66, 67):
+            self.ac2.add(sync.Ac2Member(sg(n), "Member", sg(n)), log=True)
+        self.initialise()
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM changelog_seen").fetchone()[0], 2)
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.pending_numbers(), self.shopify.created), ([], []))
+
+
+class InsertXmlShapeTests(unittest.TestCase):
+    """VM fact r5-2: attribute-only ``<Member .../>``; NULL columns omitted."""
+
+    def test_all_five_attributes(self):
+        member = sync.parse_changelog_member(changelog_xml(sg(68), "Alpha Tester", sg(68), "alpha@example.com", "2000-05-01"))
+        self.assertEqual((member.member_no, member.name, member.mobile_phone, member.email_address, member.dob), (sg(68), "Alpha Tester", sg(68), "alpha@example.com", "2000-05-01"))
+
+    def test_missing_attributes_are_null(self):
+        for missing in ("MobilePhone", "EmailAddress", "DOB"):
+            with self.subTest(missing=missing):
+                fields = {"mobile": sg(69), "email": "alpha@example.com", "dob": "2000-05-01"}
+                fields[{"MobilePhone": "mobile", "EmailAddress": "email", "DOB": "dob"}[missing]] = None
+                member = sync.parse_changelog_member(changelog_xml(sg(69), "Alpha Tester", **fields))
+                values = {"MobilePhone": member.mobile_phone, "EmailAddress": member.email_address, "DOB": member.dob}
+                self.assertIsNone(values[missing])
+                self.assertEqual(sum(v is not None for v in values.values()), 2)
+
+    def test_dob_datetime_form(self):
+        xml = '<Member MemberNo="TILL1" Name="Alpha" DOB="2000-11-01T00:00:00"/>'
+        self.assertEqual(sync.parse_changelog_member(xml).dob, "2000-11-01")
+
+
+class Ac2PhoneSourceTests(SyncTestCase):
+    """VM fact r5-3: MobilePhone is usually missing; the MemberNo is then the
+    phone when it is one under ``phone_member_no``."""
+
+    def test_phone_source_shapes(self):
+        cases = [
+            (sync.Ac2Member(sg(70), "Alpha", None), sg(70)),  # SG phone MemberNo
+            (sync.Ac2Member((sg(70) + "ALPHATESTER")[:20], "Alpha", None), None),  # phone + initials
+            (sync.Ac2Member(sg(70) + "2", "Alpha", None), None),  # phone + digit (11 digits, 65...)
+            (sync.Ac2Member("M000201", "Alpha", None), None),  # generator number
+            (sync.Ac2Member("TILL70", "Alpha", local(71)), sg(71)),  # MobilePhone present
+            (sync.Ac2Member(sg(72), "Alpha", local(73)), sg(73)),  # MobilePhone wins
+        ]
+        for member, expected in cases:
+            with self.subTest(case=cases.index((member, expected))):
+                self.assertEqual(sync._ac2_phone(member), expected)
+
+    def test_member_no_phone_used_when_mobile_missing(self):
+        self.run_sync("ac2_to_shopify")
+        self.ac2.add(sync.Ac2Member(sg(74), "Alpha Tester", None), log=True)
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.shopify.created[0]["phone"], plus(sg(74)))
+
+
+class Q4PhonelessUncertainTests(SyncTestCase):
+    def test_lost_reply_on_phoneless_create_is_never_resent(self):
+        self.run_sync("ac2_to_shopify")
+        self.shopify.add(customer(75, first="Bravo", tags=()))
+        self.ac2.add(sync.Ac2Member("TILL75", "Alpha Tester", local(75)), log=True)
+        self.shopify.create_mode = "uncertain"
+        self.run_sync("ac2_to_shopify")
+        self.shopify.create_mode = "ok"
+        for _ in range(2):
+            result = self.run_sync("ac2_to_shopify")
+            self.assertEqual(result["counts"].get("uncertain_write_unresolved"), 1)
+        self.assertEqual(self.shopify.created, [])
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM ac2_pending").fetchone()[:], ("SKIPPED", "shopify_create_uncertain"))
+
+
+class LedgerMigrationTests(unittest.TestCase):
+    def test_v1_ledger_gets_the_additive_v2_columns(self):
+        import sqlite3
+
+        temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-v1-"))
+        try:
+            v1 = sync.LEDGER_SCHEMA.replace(", intent_digest TEXT", "").replace("CREATE TABLE changelog_seen(id INTEGER PRIMARY KEY, seen_at TEXT NOT NULL);\n", "")
+            v1 = v1.replace("created_at, intent_digest ON writes", "created_at ON writes")
+            conn = sqlite3.connect(temp / sync.LEDGER_FILE)
+            conn.executescript(v1)
+            conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) VALUES ('write-1', 'shopify_to_ac2', 'M1', 'm1', 'UNCERTAIN', 't', 't')")
+            conn.execute("PRAGMA user_version=1")
+            conn.commit()
+            conn.close()
+            ledger = sync.SyncLedger(temp, check_custody=False)
+            try:
+                self.assertEqual(ledger.conn.execute("PRAGMA user_version").fetchone()[0], sync.SCHEMA_VERSION)
+                self.assertIsNone(ledger.conn.execute("SELECT intent_digest FROM writes").fetchone()[0])
+                ledger.conn.execute("SELECT COUNT(*) FROM changelog_seen").fetchone()
+                with self.assertRaises(sqlite3.IntegrityError):
+                    ledger.conn.execute("UPDATE writes SET intent_digest = 'x'")
+            finally:
+                ledger.close()
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+class ChangeLogConfigTests(unittest.TestCase):
+    def test_content_column_and_overlap_defaults(self):
+        value = config_value()
+        self.assertNotIn("changelog_xml_column", value)
+        config = sync.parse_config(value)
+        self.assertEqual((config.changelog_xml_column, config.changelog_overlap), ("Content", 50))
+        with self.assertRaises(dl.DirectLocalError):
+            sync.parse_config(config_value(changelog_overlap=200, changelog_batch=200))
+
+
+class L1PhoneWithoutPlusTests(unittest.TestCase):
+    def test_member_no_is_the_digits_as_typed(self):
+        self.assertEqual(sync.phone_member_no(NINE_DIGITS), (NINE_DIGITS, "ok"))
+        self.assertEqual(sync.phone_member_no(sg(83)), (sg(83), "ok"))  # 10 digits starting 65
+        self.assertEqual(sync.phone_member_no(local(84)), (sg(84), "ok"))  # SG 8 digits still get 65
+        self.assertEqual(sync.phone_member_no("+" + NINE_DIGITS), (NINE_DIGITS, "ok"))  # "+" unchanged
+
+    def test_invalid_without_plus_is_unchanged(self):
+        for raw in ("0" + NINE_DIGITS[1:], "65" + "1" + "2345678", "1" + "2345678", "12" + "34567", "1" * 16):
+            with self.subTest(length=len(raw)):
+                self.assertEqual(sync.phone_member_no(raw), (None, "invalid"))
 
 
 if __name__ == "__main__":
