@@ -6,8 +6,8 @@ Scope (Owner decisions, #155 build step 2)
   ``member-mg``, registration instant at or after ``shopify_cutover_utc``)
   becomes an AutoCount member. MemberNo is the phone number in digits
   (Singapore ``65`` + 8 digits; a foreign number keeps its country code; a
-  Singapore 8-digit number starting 3/6/8/9 gets ``65``). ``GetNextMemberNo``
-  is not used. MemberType ``REGISTERED``, ExpiryDate NULL, DOB ``2000-MM-01``
+  Singapore 8-digit number starting 3/6/8/9 gets ``65``). Without a usable
+  phone the member gets AutoCount's own ``GetNextMemberNo`` number. MemberType ``REGISTERED``, ExpiryDate NULL, DOB ``2000-MM-01``
   from the configured birthday-month metafield (NULL when absent), IsActive
   ``T``. The Shopify expiry metafield is ignored.
 * AC2 -> Shopify: a member created in AutoCount (for example at the till)
@@ -17,8 +17,10 @@ Scope (Owner decisions, #155 build step 2)
   Shopify customer is looked up by phone: found -> link, never a duplicate.
   ``customerCreate`` is sent only when ``shopify_create_enabled`` is true.
 * No review queue. Same phone + same first name links; same phone + another
-  first name creates ``phone + name letters`` (fits nvarchar(20)); no phone
-  uses the name letters alone; email never links. Every link, skip and
+  first name creates ``phone + name letters`` (fits nvarchar(20), a digit 2-9
+  when taken); no phone uses ``GetNextMemberNo``; email never links. In AC2
+  -> Shopify, a Shopify customer holding the phone under another first name
+  is a different person: a separate customer is created without the phone. Every link, skip and
   fallback is counted in the run summary (counts and keyed refs only).
 * Loop prevention both ways through the ledger mapping (customer GID <->
   MemberNo, both unique): a member this sync created in AC2 never comes back
@@ -108,8 +110,10 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "max_writes_per_run": MAX_WRITES_PER_RUN_LIMIT,
     # Open question for the Owner: the real birthday-month metafield.
     "birthday_month_metafield": {"namespace": "custom", "key": "birthday_month", "type": "number_integer"},
-    # Open question for the Owner: tags on a customer created from AC2.
+    # Owner (2026-10-21): tags on a customer created from AC2.
     "shopify_create_tags": ["ac2-member"],
+    # The AC2 MemberNo on a customer created from AC2 (maps it back).
+    "ac2_member_no_metafield": {"namespace": "custom", "key": "ac2_member_no", "type": "single_line_text_field"},
     # Name of the generic Windows Credential Manager entry of the AC2
     # automation user; null keeps the attended owner-console credential path.
     "ac2_credential_target": None,
@@ -155,6 +159,7 @@ class SyncConfig:
     shopify_create_enabled: bool
     max_writes_per_run: int
     birthday_month_metafield: Mapping[str, str]
+    ac2_member_no_metafield: Mapping[str, str]
     shopify_create_tags: tuple[str, ...]
     ac2_credential_target: str | None
     changelog_xml_column: str | None
@@ -219,6 +224,11 @@ def parse_config(value: Any) -> SyncConfig:
         isinstance(birthday[k], str) and METAFIELD_PART_RE.fullmatch(birthday[k]) for k in ("namespace", "key")
     ) or birthday["type"] not in METAFIELD_TYPES:
         raise dl.DirectLocalError("sync_config_birthday_month_metafield_invalid")
+    member_no_field = merged["ac2_member_no_metafield"]
+    if not isinstance(member_no_field, dict) or set(member_no_field) != {"namespace", "key", "type"} or not all(
+        isinstance(member_no_field[k], str) and METAFIELD_PART_RE.fullmatch(member_no_field[k]) for k in ("namespace", "key")
+    ) or member_no_field["type"] != "single_line_text_field" or (member_no_field["namespace"], member_no_field["key"]) == (birthday["namespace"], birthday["key"]):
+        raise dl.DirectLocalError("sync_config_ac2_member_no_metafield_invalid")
     tags = merged["shopify_create_tags"]
     if not isinstance(tags, list) or len(tags) > 10 or any(not isinstance(t, str) or not TAG_RE.fullmatch(t) for t in tags) or REGISTRATION_TAG in tags:
         # The registration tag would send the customer straight back to AC2.
@@ -233,7 +243,7 @@ def parse_config(value: Any) -> SyncConfig:
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
         shopify_create_enabled=_bool(merged["shopify_create_enabled"], "shopify_create_enabled"),
-        birthday_month_metafield=dict(birthday), shopify_create_tags=tuple(tags), ac2_credential_target=target,
+        birthday_month_metafield=dict(birthday), ac2_member_no_metafield=dict(member_no_field), shopify_create_tags=tuple(tags), ac2_credential_target=target,
         changelog_xml_column=column, **numbers,
     )
 
@@ -366,15 +376,21 @@ def name_letters(*parts: Any) -> str:
     return re.sub(r"[^A-Z]", "", folded.upper())
 
 
-def fallback_member_no(phone_digits: str | None, first_name: Any, last_name: Any) -> str | None:
-    """Proposed format (Owner question): ``<phone digits><FIRST+LAST letters>``
-    truncated to 20 characters; without a phone, the letters alone. None
-    when no letter is left (for example a name with no Latin letters)."""
+def fallback_member_no(phone_digits: str, first_name: Any, last_name: Any) -> str | None:
+    """Shared-phone MemberNo (Owner, 2026-10-21): ``<phone digits><FIRST+LAST
+    letters>`` truncated to 20 characters. None when no Latin letter is left."""
 
     letters = name_letters(first_name, last_name)
     if not letters:
         return None
-    return ((phone_digits or "") + letters)[:MEMBER_NO_WIDTH]
+    return (phone_digits + letters)[:MEMBER_NO_WIDTH]
+
+
+def suffix_candidates(base: str) -> list[str]:
+    """``base``, then ``base`` with a digit 2-9 appended, letters trimmed so
+    the MemberNo stays within 20 characters."""
+
+    return [base] + [base[:MEMBER_NO_WIDTH - 1] + str(digit) for digit in range(2, 10)]
 
 
 def birthday_month(value: Any) -> int | None:
@@ -456,17 +472,15 @@ def _phone_hit(member: Ac2Member, digits: str) -> bool:
 
 def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member]) -> Decision:
     """The no-review-queue rules for one Shopify registration. ``candidates``
-    are AC2 rows found by phone (or, without a phone, by the fallback
-    MemberNo). Email is never consulted."""
+    are AC2 rows found by phone. Email is never consulted.
+
+    A CREATE without ``member_no`` takes AutoCount's own next number; a
+    shared-phone CREATE carries the base MemberNo, whose free 2-9 variant the
+    engine picks."""
 
     rows = list(candidates)
     if phone_digits is None:
-        member_no = fallback_member_no(None, customer.first_name, customer.last_name)
-        if member_no is None:
-            return Decision("SKIP", "no_phone_no_name_letters")
-        if any(member_no_key(r.member_no) == member_no_key(member_no) for r in rows):
-            return Decision("SKIP", "no_phone_member_no_taken")
-        return Decision("CREATE", "no_phone_name_fallback", member_no)
+        return Decision("CREATE", "no_phone_generator_member_no")
     hits = [r for r in rows if _phone_hit(r, phone_digits)]
     same = [r for r in hits if first_name_matches(customer.first_name, r.name)]
     if len(same) == 1:
@@ -483,8 +497,6 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
     member_no = fallback_member_no(phone_digits, customer.first_name, customer.last_name)
     if member_no is None:
         return Decision("SKIP", "shared_phone_no_name_letters")
-    if any(member_no_key(r.member_no) == member_no_key(member_no) for r in rows):
-        return Decision("SKIP", "shared_phone_member_no_taken")
     return Decision("CREATE", "shared_phone_name_fallback", member_no)
 
 
@@ -875,18 +887,25 @@ class SyncEngine:
         digits, phone_status = phone_member_no(customer.phone)
         if phone_status == "invalid":
             self.summary.count("shopify_phone_invalid_treated_as_absent", ref)
-        if digits is None:
-            fallback = fallback_member_no(None, customer.first_name, customer.last_name)
-            candidates = self.ac2.lookup(None, [fallback]) if fallback else []
-        else:
-            candidates = self.ac2.lookup(digits, [])
+        candidates = self.ac2.lookup(digits, []) if digits is not None else []
         decision = decide_shopify_to_ac2(customer, digits, candidates)
         if decision.action == "SKIP":
             self._shopify_pending(gid, "SKIPPED", decision.code)
             self.summary.count(decision.code, ref)
             return
         member_no = decision.member_no
-        assert member_no is not None
+        if member_no is None:
+            self._create_in_ac2(customer, digits, decision, ref)  # GetNextMemberNo at write time
+            return
+        if decision.code == "shared_phone_name_fallback":
+            member_no = self._free_suffix(member_no)
+            if member_no is None:
+                self._shopify_pending(gid, "SKIPPED", "shared_phone_member_no_exhausted")
+                self.summary.count("shared_phone_member_no_exhausted", ref)
+                return
+            if member_no != decision.member_no:
+                self.summary.count("shared_phone_suffix_digit")
+            decision = Decision(decision.action, decision.code, member_no)
         member_ref = self.ledger.ref("m", member_no_key(member_no))
         linked = self.ledger.link_for_member(member_no)
         if linked is not None:
@@ -906,10 +925,48 @@ class SyncEngine:
             return
         self._create_in_ac2(customer, digits, decision, member_ref)
 
+    def _member_no_taken(self, numbers: list[str]) -> set[str]:
+        """Keys of the numbers held in AC2 (trimmed, case-insensitive) or by
+        this ledger (a link or an open write)."""
+
+        taken = {member_no_key(m.member_no) for m in self.ac2.lookup(None, numbers)}
+        for number in numbers:
+            if self.ledger.link_for_member(number) is not None or self.ledger.open_write_for_member(number) is not None:
+                taken.add(member_no_key(number))
+        return taken
+
+    def _free_suffix(self, base: str) -> str | None:
+        candidates = suffix_candidates(base)
+        taken = self._member_no_taken(candidates)
+        return next((c for c in candidates if member_no_key(c) not in taken), None)
+
+    def _allocate_generator(self) -> tuple[str | None, str]:
+        """AutoCount's own number (``GetNextMemberNo``, a preview that saving
+        does not advance, observed 16 Oct 2026). A taken preview continues in
+        the generator's format (``member_no_successor``), at most three
+        candidates, each checked against AC2 and this ledger."""
+
+        try:
+            candidate = self.ac2.next_member_no()
+        except dl.DirectLocalError:
+            return None, "member_no_generator_failed"
+        # Numbers this ledger already used: the preview does not advance after
+        # a save, so continue above them instead of spending candidates.
+        tried: set[str] = {row[0] for row in self.ledger.conn.execute("SELECT member_no FROM links UNION SELECT member_no FROM writes")}
+        for _ in range(dl.MAX_MEMBER_NO_CANDIDATES):
+            if not isinstance(candidate, str) or not dl.MEMBER_NO_RE.fullmatch(candidate):
+                return None, "member_no_generator_invalid"
+            if member_no_key(candidate) not in self._member_no_taken([candidate]):
+                return candidate, "no_phone_generator_member_no"
+            tried.add(candidate)
+            candidate = dl.member_no_successor(candidate, tried)
+            if candidate is None:
+                return None, "member_no_generator_not_advancing"
+        return None, "member_no_candidates_exhausted"
+
     def _create_in_ac2(self, customer: ShopifyCustomer, digits: str | None, decision: Decision, member_ref: str) -> None:
         gid = customer.gid
         member_no = decision.member_no
-        assert member_no is not None
         name = " ".join(part.strip() for part in (customer.first_name, customer.last_name) if isinstance(part, str) and part.strip())
         if not name:
             self._shopify_pending(gid, "SKIPPED", "name_missing")
@@ -927,7 +984,7 @@ class SyncEngine:
             "register_date": registered, "dob": dob_from_month(month),
         }
         issue = dl.autocount_text_issue(payload)
-        if issue or not dl.MEMBER_NO_RE.fullmatch(member_no):
+        if issue or (member_no is not None and not dl.MEMBER_NO_RE.fullmatch(member_no)):
             self._shopify_pending(gid, "SKIPPED", issue or "member_no_invalid")
             self.summary.count(issue or "member_no_invalid", member_ref)
             return
@@ -937,6 +994,20 @@ class SyncEngine:
             self._shopify_pending(gid, "PENDING", refused.code)
             self.summary.count(refused.code, member_ref, "would_create")
             return
+        if member_no is None:
+            # Allocated only when the write will really start.
+            member_no, code = self._allocate_generator()
+            if member_no is None:
+                self.summary.writes -= 1  # nothing was written
+                self._shopify_pending(gid, "PENDING", code)
+                self.summary.count(code, member_ref)
+                return
+            member_ref = self.ledger.ref("m", member_no_key(member_no))
+            if self.ledger.link_for_member(member_no) is not None or self.ledger.open_write_for_member(member_no) is not None:
+                self.summary.writes -= 1
+                self._shopify_pending(gid, "PENDING", "member_no_held_by_open_write")
+                self.summary.count("member_no_held_by_open_write", member_ref)
+                return
         write_id = self._intent("shopify_to_ac2", member_no, gid)
         state, code = self.ac2.create_member(member_no, payload, write_id=write_id)
         with self.ledger.tx() as conn:
@@ -1036,23 +1107,28 @@ class SyncEngine:
                 continue
             if len(customers) == 1:
                 customer = customers[0]
-                if self.ledger.link_for_gid(customer.gid) is not None:
+                if not first_name_matches(customer.first_name, member.name):
+                    # Owner (2026-10-21): another first name is another
+                    # person. Shopify phones are unique, so the separate
+                    # customer is created without the phone; never linked.
+                    self.summary.count("shopify_phone_owned_by_other_name")
+                    self._create_in_shopify(member, None, key, ref)
+                elif self.ledger.link_for_gid(customer.gid) is not None:
                     self._ac2_done(key, "SKIPPED", "shopify_customer_linked_to_other_member")
                     self.summary.count("shopify_customer_linked_to_other_member", ref)
-                elif first_name_matches(customer.first_name, member.name):
+                else:
                     with self.ledger.tx() as conn:
                         self.ledger.add_link(conn, customer.gid, member.member_no, "matched", "shopify_phone_and_first_name_match")
                     self._ac2_done(key, "DONE", "linked_existing_shopify_customer")
                     self.summary.count("linked_existing_shopify_customer", ref, "link")
-                else:
-                    # Shopify phones are unique: creating would fail, linking
-                    # would join two people. Counted, never merged.
-                    self._ac2_done(key, "SKIPPED", "shopify_phone_owned_by_other_name")
-                    self.summary.count("shopify_phone_owned_by_other_name", ref)
                 continue
             self._create_in_shopify(member, digits, key, ref)
 
-    def _create_in_shopify(self, member: Ac2Member, digits: str, key: str, ref: str) -> None:
+    def _create_in_shopify(self, member: Ac2Member, digits: str | None, key: str, ref: str) -> None:
+        """``digits`` None: a separate customer without the phone (it belongs
+        to another Shopify customer). Shopify requires a name, phone or email
+        (customerCreate, API 2026-10); the AC2 Name is always present here."""
+
         name = (member.name or "").strip()
         if not name:
             self._ac2_done(key, "SKIPPED", "ac2_member_without_name")
@@ -1063,14 +1139,19 @@ class SyncEngine:
         except WriteRefused as refused:
             self.summary.count(refused.code, ref, "would_create")  # stays PENDING
             return
-        customer_input: dict[str, Any] = {"firstName": name, "phone": e164(digits), "tags": list(self.config.shopify_create_tags)}
+        customer_input: dict[str, Any] = {"firstName": name, "tags": list(self.config.shopify_create_tags)}
+        if digits is not None:
+            customer_input["phone"] = e164(digits)
         email = (member.email_address or "").strip()
         if email:
             customer_input["email"] = email
+        number_field = self.config.ac2_member_no_metafield
+        metafields = [{"namespace": number_field["namespace"], "key": number_field["key"], "type": number_field["type"], "value": member.member_no.strip()}]
         month = int(member.dob[5:7]) if isinstance(member.dob, str) and DATE_RE.fullmatch(member.dob[:10]) else None
         if month:
             meta = self.config.birthday_month_metafield
-            customer_input["metafields"] = [{"namespace": meta["namespace"], "key": meta["key"], "type": meta["type"], "value": str(month)}]
+            metafields.append({"namespace": meta["namespace"], "key": meta["key"], "type": meta["type"], "value": str(month)})
+        customer_input["metafields"] = metafields
         write_id = self._intent("ac2_to_shopify", member.member_no, None)
         try:
             gid = self.shopify.create_customer(customer_input)
@@ -1089,8 +1170,8 @@ class SyncEngine:
         with self.ledger.tx() as conn:
             self._close_write(conn, write_id, "DONE", "created", gid)
             self.ledger.add_link(conn, gid, member.member_no, "created_in_shopify", "created_from_ac2")
-        self._ac2_done(key, "DONE", "shopify_customer_created")
-        self.summary.count("shopify_customer_created", ref, "create")
+        self._ac2_done(key, "DONE", "shopify_customer_created" if digits is not None else "shopify_separate_customer_created")
+        self.summary.count("shopify_customer_created" if digits is not None else "shopify_separate_customer_created_without_phone", ref, "create")
 
 
 def _ac2_phone(member: Ac2Member) -> str | None:

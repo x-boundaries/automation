@@ -30,7 +30,7 @@ sent to Shopify; a mapped customer is never sent to AC2.
 
 | AC2 field | Value |
 |---|---|
-| MemberNo | The phone in digits: `65` + 8 digits for Singapore; a foreign number keeps its country code; 8 Singapore digits starting 3/6/8/9 without `65` get `65`. `GetNextMemberNo` is not used. |
+| MemberNo | The phone in digits: `65` + 8 digits for Singapore; a foreign number keeps its country code; 8 Singapore digits starting 3/6/8/9 without `65` get `65`. Without a usable phone: AutoCount's own `GetNextMemberNo` number (see below). |
 | MemberType | `REGISTERED` (test book type, upper case) |
 | Name | Shopify first name + last name |
 | MobilePhone | The same digits, or NULL |
@@ -47,9 +47,21 @@ sent to Shopify; a mapped customer is never sent to AC2.
 | Phone already in AC2 (MemberNo equals the phone or its 8 digits, MobilePhone normalises to it, or the 8 digits are embedded in a MemberNo) and the first name matches | Link, no create | `phone_and_first_name_match` |
 | Same phone on several matching records | Link to the record whose MemberNo is the phone; otherwise skip (never merge) | `phone_duplicate_member_no_exact` / `phone_on_multiple_records` |
 | Phone matches, first name differs (people sharing a phone) | Create with `<phone digits><FIRST+LAST letters A-Z>` truncated to 20 characters | `shared_phone_name_fallback` |
-| No phone (or an unusable one) | Create with the name letters alone | `no_phone_name_fallback` |
-| Fallback MemberNo already exists (trimmed, case-insensitive) | Skip | `shared_phone_member_no_taken` / `no_phone_member_no_taken` |
+| That MemberNo is already held (in AC2, trimmed and case-insensitive, or by another customer's link or open write in the ledger) | Use the first free of the same value with a digit 2-9 appended (letters trimmed to stay within 20) | `shared_phone_suffix_digit` |
+| Digits 2-9 all taken too | Skip | `shared_phone_member_no_exhausted` |
+| Shared phone but the name has no Latin letters | Skip | `shared_phone_no_name_letters` |
+| No phone, or an unusable one | Create with AutoCount's next member number (`GetNextMemberNo`) | `no_phone_generator_member_no` (+ `shopify_phone_invalid_treated_as_absent`) |
 | Email matches only | Ignored: email never links | - |
+
+`GetNextMemberNo` (no phone): the number is taken only when the write will
+really start (never while `ac2_create_enabled` is off). On the test book the
+preview does not advance after a save (observed 16 October 2026), so a taken
+preview continues in the generator's own format above every number this
+ledger has used and every number found taken in AC2, at most three candidates
+per member (`member_no_successor`, as in the Core). A generator failure writes
+nothing and the customer is retried on a later run. As in the Core, numbers
+derived this way run ahead of AutoCount's own counter: production numbering
+stays an E9 decision.
 
 First-name match: case- and space-insensitive; the Shopify first name must
 equal a run of consecutive words of the AC2 `Name` (so a surname-first AC2
@@ -68,10 +80,26 @@ name still matches).
 4. Queued members are re-read from AC2 by MemberNo (so the ledger holds no
    names or phones), then looked up in Shopify by phone:
    - one customer with a matching first name: link;
-   - one customer with another first name: skip (`shopify_phone_owned_by_other_name`);
+   - one customer with another first name: a different person (Owner,
+     21 October 2026). Never linked. A separate customer is created
+     **without the phone** (Shopify phones are unique), with the AC2 `Name`,
+     email if AC2 has one, the tags and the metafields below
+     (`shopify_phone_owned_by_other_name`,
+     `shopify_separate_customer_created_without_phone`);
    - several customers: skip;
    - none: `customerCreate` with first name = the AC2 `Name`, phone in E.164,
-     email if present, the configured tags and the birthday-month metafield.
+     email if present, the configured tags and the metafields below.
+
+   Every customer created from AC2 carries the AC2 MemberNo in the
+   `ac2_member_no_metafield` (default `custom.ac2_member_no`,
+   `single_line_text_field`) so it maps back, plus the birthday-month
+   metafield when AC2 has a DOB. Shopify requires a name, phone number or
+   email address on `customerCreate` (shopify.dev, `customerCreate`, API
+   2026-10, read 21 October 2026); the AC2 `Name` is always present (a member
+   without a name is skipped and counted), so a separate customer with no
+   email is still valid. Whether a first name alone satisfies the rule is to
+   be confirmed in the test-book UAT. All of this stays behind
+   `shopify_create_enabled` (off).
 5. A member without a phone is skipped and counted (there is no safe
    duplicate key; email never links).
 
@@ -91,8 +119,9 @@ Unknown keys, at the top level or nested, are refused.
 | `ac2_create_enabled` | `false` | Shopify -> AC2 SaveMember |
 | `shopify_create_enabled` | `false` | AC2 -> Shopify `customerCreate`; the app also needs `write_customers` (the session check requires exactly `read_customers` while off, and `read_customers` + `write_customers` while on) |
 | `max_writes_per_run` | `5` | 0-5, both directions together |
-| `birthday_month_metafield` | `custom.birthday_month`, `number_integer` | Open question: the real metafield |
-| `shopify_create_tags` | `["ac2-member"]` | Open question; `member-mg` is refused (it would loop) |
+| `birthday_month_metafield` | `custom.birthday_month`, `number_integer` | Owner: placeholder until Shopify's developer confirms it |
+| `ac2_member_no_metafield` | `custom.ac2_member_no`, `single_line_text_field` | AC2 MemberNo on customers created from AC2 |
+| `shopify_create_tags` | `["ac2-member"]` | Owner-confirmed; `member-mg` is refused (it would loop) |
 | `ac2_credential_target` | `null` | Credential Manager target of the AC2 automation user; `null` keeps the attended owner-console path |
 | `changelog_xml_column` | `null` | VM fact still to confirm; `null` disables AC2 -> Shopify |
 | `changelog_batch` | `200` | 1-500 |
@@ -115,7 +144,9 @@ Unknown keys, at the top level or nested, are refused.
 - `NOT_WRITTEN` (proven) is retried on a later run. An uncertain outcome
   (timeout, crash, Shopify transport or 5xx error) is never re-sent: later
   runs only look the record up (AC2 by MemberNo, Shopify by phone) and link
-  it when found. `customerCreate` is retried only after a GraphQL throttle
+  it when found. A separate customer created without a phone cannot be found
+  by phone, so an uncertain create of that kind stays counted as
+  `uncertain_write_unresolved` and is never re-sent. `customerCreate` is retried only after a GraphQL throttle
   answer (not executed).
 - The run summary carries counts and keyed references (`c-`/`m-`) only.
 
@@ -181,19 +212,35 @@ writes enabled. The sync ledger is separate from the Core ledger.
   POS behaviour; the test book has no POS sync, so till behaviour is never in
   UAT.
 
+## Owner decisions (21 October 2026)
+
+1. No phone or an invalid phone: AutoCount's `GetNextMemberNo` number,
+   counted. Same phone, different first name: `<phone digits><FIRST+LAST
+   letters>` cut to 20; when taken by a member not linked to this customer,
+   a digit 2-9 (letters trimmed); skip and count only when 2-9 are all taken.
+2. Birthday month: placeholder `custom.birthday_month` (`number_integer`)
+   until Shopify's developer confirms it.
+3. Tag on customers created from AC2: `ac2-member` (`member-mg` refused).
+4. The AC2 `Name` goes whole into Shopify `firstName`.
+5. One Shopify customer with the same phone but another first name is a
+   separate person: a separate customer without the phone, with email if
+   any, name, tags and the AC2 MemberNo metafield; behind
+   `shopify_create_enabled`.
+6. VM facts are checked separately; placeholders stay.
+
 ## Open questions
 
-1. Fallback MemberNo format: `<phone digits><FIRST+LAST letters A-Z>`,
-   truncated to 20 characters (letters only without a phone)? What does the
-   shop do today exactly (first name only, separator)?
-2. The birthday-month metafield: namespace, key, type and value format
-   (number, month name or date).
-3. Tags for a customer created from AC2 (default `ac2-member`).
-4. AC2 -> Shopify name: the AC2 `Name` goes into Shopify `firstName` whole
-   (no split). Acceptable?
-5. A Shopify customer found by phone with a different first name is skipped,
-   not linked (linking would join two people). Confirm.
-6. VM facts: the ChangeLog column holding the insert XML and the XML shape;
-   that `DBSetting.ExecuteScalar` accepts `?` parameters; the automation
-   user's rights; and Shopify's customer search syntax for a phone
-   (`phone:+65...`).
+1. Shared phone but a name with no Latin letters (for example a Chinese
+   name): currently skipped and counted (`shared_phone_no_name_letters`).
+   Recommendation: phone digits plus the first free digit 2-9.
+2. The `custom.ac2_member_no` metafield: confirm the key, and create it as a
+   customer metafield definition in Shopify admin so staff can see it.
+3. Whether a Shopify customer with a first name only (no last name, phone or
+   email) is accepted: confirm in the test-store UAT before enabling
+   `shopify_create_enabled`.
+4. An uncertain create of a separate (phoneless) Shopify customer cannot be
+   found by phone and stays counted as unresolved. Recommendation: accept for
+   phase 1; phase 2 can look it up by the MemberNo metafield.
+5. VM facts (unchanged): the ChangeLog XML column and XML shape; `?`
+   parameters in `DBSetting.ExecuteScalar`; the automation user's rights;
+   Shopify's phone search syntax.

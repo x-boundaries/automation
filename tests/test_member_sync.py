@@ -123,7 +123,7 @@ class FakeShopify:
             raise sync.ShopifyCreateRejected("shopify_create_rejected")
         self.created.append(dict(customer_input))
         self.next_gid += 1
-        created = sync.ShopifyCustomer(gid(self.next_gid), customer_input["firstName"], None, customer_input["phone"], customer_input.get("email"), T0, T0, tuple(customer_input["tags"]), None, None, None)
+        created = sync.ShopifyCustomer(gid(self.next_gid), customer_input["firstName"], None, customer_input.get("phone"), customer_input.get("email"), T0, T0, tuple(customer_input["tags"]), None, None, None)
         self.customers[created.gid] = created
         return created.gid
 
@@ -138,6 +138,16 @@ class FakeAc2:
         self.creates: list[tuple[str, dict]] = []
         self.create_result = ("CREATED_VERIFIED", None)
         self.lookups = 0
+        # GetNextMemberNo previews; like the test book, saving does not advance it.
+        self.next_previews: list = ["M000201"]
+        self.generator_calls = 0
+
+    def next_member_no(self):
+        self.generator_calls += 1
+        value = self.next_previews[min(self.generator_calls, len(self.next_previews)) - 1]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def add(self, member: sync.Ac2Member, *, log: bool = False) -> None:
         self.members.append(member)
@@ -246,9 +256,18 @@ class PhoneRuleTests(unittest.TestCase):
         self.assertEqual(len(value), 20)
         self.assertTrue(value.startswith(sg(9)))
         self.assertRegex(value[10:], r"^[A-Z]+$")
-        self.assertEqual(sync.fallback_member_no(None, "Bravo", "Tester"), "BRAVOTESTER")
+        self.assertEqual(sync.fallback_member_no(sg(9), "Bravo", "Tester"), sg(9) + "BRAVOTESTE")
         self.assertIsNone(sync.fallback_member_no(sg(9), "陈", "美玲"))
         self.assertTrue(dl.MEMBER_NO_RE.fullmatch(value))
+
+    def test_suffix_candidates_trim_letters_for_the_digit(self):
+        base = sync.fallback_member_no(sg(9), "Bravo", "Tester")
+        candidates = sync.suffix_candidates(base)
+        self.assertEqual(candidates[0], base)
+        self.assertEqual(candidates[1:], [base[:19] + str(d) for d in range(2, 10)])
+        self.assertTrue(all(len(c) <= 20 for c in candidates))
+        short = sync.suffix_candidates(FOREIGN_DIGITS + "AB")
+        self.assertEqual(short[1], FOREIGN_DIGITS + "AB2")
 
     def test_birthday_month_and_dob(self):
         for raw, month in ((3, 3), ("03", 3), ("March", 3), ("sep", 9), ("1990-07-15", 7), ("--12-01", 12), ("2001-02", 2), ("13", None), ("", None), (True, None), ("Smarch", None)):
@@ -295,6 +314,15 @@ class ConfigTests(unittest.TestCase):
         for bad in (6, -1, True, "5"):
             with self.assertRaises(dl.DirectLocalError):
                 sync.parse_config(config_value(max_writes_per_run=bad))
+
+    def test_member_no_metafield_is_validated(self):
+        for bad in (
+            {"namespace": "custom", "key": "ac2_member_no", "type": "number_integer"},
+            {"namespace": "custom", "key": "birthday_month", "type": "single_line_text_field"},
+            {"namespace": "custom", "key": "ac2_member_no", "type": "single_line_text_field", "x": 1},
+        ):
+            with self.assertRaises(dl.DirectLocalError):
+                sync.parse_config(config_value(ac2_member_no_metafield=bad))
 
     def test_registration_tag_cannot_be_a_create_tag(self):
         with self.assertRaises(dl.DirectLocalError):
@@ -374,27 +402,78 @@ class ShopifyToAc2Tests(SyncTestCase):
         self.assertEqual(result["counts"]["shared_phone_name_fallback"], 1)
         self.assertEqual(self.links(), {gid(5): member_no})
 
-    def test_suffix_member_no_already_taken_is_skipped(self):
+    def test_suffix_member_no_taken_adds_a_digit(self):
+        base = (sg(6) + "BRAVOTESTER")[:20]
         self.ac2.add(sync.Ac2Member(sg(6), "Charlie Holder", None))
-        self.ac2.add(sync.Ac2Member((sg(6) + "BRAVOTESTER")[:20], "Delta Other", None))
+        # Taken in a different case and with spaces: still taken.
+        self.ac2.add(sync.Ac2Member(" " + base.lower() + " ", "Delta Other", None))
         self.shopify.add(customer(6, first="Bravo", last="Tester"))
         result = self.run_sync("shopify_to_ac2")
-        self.assertEqual(self.ac2.creates, [])
-        self.assertEqual(result["counts"]["shared_phone_member_no_taken"], 1)
+        self.assertEqual([m for m, _ in self.ac2.creates], [base[:19] + "2"])
+        self.assertEqual(result["counts"]["shared_phone_suffix_digit"], 1)
+        self.assertEqual(self.links(), {gid(6): base[:19] + "2"})
 
-    def test_no_phone_uses_name_fallback_and_is_counted(self):
+    def test_suffix_digits_two_to_nine_all_taken_skips(self):
+        base = (sg(17) + "BRAVOTESTER")[:20]
+        self.ac2.add(sync.Ac2Member(sg(17), "Charlie Holder", None))
+        for candidate in sync.suffix_candidates(base):
+            self.ac2.add(sync.Ac2Member(candidate, "Delta Other", None))
+        self.shopify.add(customer(17, first="Bravo", last="Tester"))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.ac2.creates, [])
+        self.assertEqual(result["counts"]["shared_phone_member_no_exhausted"], 1)
+
+    def test_suffix_taken_by_our_own_link_adds_a_digit(self):
+        base = (sg(18) + "BRAVOTESTER")[:20]
+        self.ac2.add(sync.Ac2Member(sg(18), "Charlie Holder", None))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(99), base, "matched", "test")
+        self.shopify.add(customer(18, first="Bravo", last="Tester"))
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual([m for m, _ in self.ac2.creates], [base[:19] + "2"])
+
+    def test_no_phone_uses_autocount_next_member_no(self):
         self.shopify.add(customer(7, phone=None, first="Echo", last="Tester"))
         result = self.run_sync("shopify_to_ac2")
-        self.assertEqual(self.ac2.creates[0][0], "ECHOTESTER")
+        self.assertEqual(self.ac2.creates[0][0], "M000201")
         self.assertIsNone(self.ac2.creates[0][1]["mobile_phone"])
-        self.assertEqual(result["counts"]["no_phone_name_fallback"], 1)
+        self.assertEqual(result["counts"]["no_phone_generator_member_no"], 1)
+        self.assertEqual(self.links(), {gid(7): "M000201"})
 
-    def test_no_phone_member_no_case_and_space_duplicate_is_skipped(self):
-        self.ac2.add(sync.Ac2Member(" echotester  ", "Someone Else", None))
-        self.shopify.add(customer(8, phone=None, first="Echo", last="Tester"))
+    def test_invalid_phone_uses_autocount_next_member_no(self):
+        self.shopify.add(customer(8, phone="12345", first="Echo", last="Tester"))
         result = self.run_sync("shopify_to_ac2")
-        self.assertEqual(self.ac2.creates, [])
-        self.assertEqual(result["counts"]["no_phone_member_no_taken"], 1)
+        self.assertEqual(self.ac2.creates[0][0], "M000201")
+        self.assertEqual(result["counts"]["shopify_phone_invalid_treated_as_absent"], 1)
+        self.assertEqual(result["counts"]["no_phone_generator_member_no"], 1)
+
+    def test_repeated_generator_preview_continues_its_format(self):
+        # The preview repeats after a save (test-book behaviour, 16 Oct 2026).
+        self.shopify.add(customer(19, phone=None, first="Echo", last="Tester"))
+        self.shopify.add(customer(28, phone=None, first="Foxtrot", last="Tester"))
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual(sorted(m for m, _ in self.ac2.creates), ["M000201", "M000202"])
+        self.ac2.add(sync.Ac2Member(" m000203 ", "Golf Other", None))
+        self.shopify.add(customer(29, phone=None, first="Hotel", last="Tester"))
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.ac2.creates[-1][0], "M000204")
+
+    def test_generator_failure_writes_nothing_and_retries_later(self):
+        self.ac2.next_previews = [dl.BridgeError("bridge_read_failed")]
+        self.shopify.add(customer(34, phone=None))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.ac2.creates, result["writes"]), ([], 0))
+        self.assertEqual(result["counts"]["member_no_generator_failed"], 1)
+        self.ac2.next_previews = ["M000301"]
+        self.ac2.generator_calls = 0
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual([m for m, _ in self.ac2.creates], ["M000301"])
+
+    def test_generator_not_called_while_writes_are_off(self):
+        self.shopify.add(customer(35, phone=None))
+        result = self.run_sync("shopify_to_ac2", ac2_create_enabled=False)
+        self.assertEqual(self.ac2.generator_calls, 0)
+        self.assertEqual(result["counts"]["ac2_create_disabled"], 1)
 
     def test_member_no_with_spaces_and_case_still_links(self):
         self.ac2.add(sync.Ac2Member(" " + sg(9) + "  ", "alpha", None))
@@ -513,7 +592,10 @@ class Ac2ToShopifyTests(SyncTestCase):
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual(self.shopify.created, [{
             "firstName": "Alpha Tester", "phone": plus(sg(41)), "email": "alpha@example.com", "tags": ["ac2-member"],
-            "metafields": [{"namespace": "custom", "key": "birthday_month", "type": "number_integer", "value": "9"}],
+            "metafields": [
+                {"namespace": "custom", "key": "ac2_member_no", "type": "single_line_text_field", "value": sg(41)},
+                {"namespace": "custom", "key": "birthday_month", "type": "number_integer", "value": "9"},
+            ],
         }])
         self.assertEqual(list(self.links().values()), [sg(41)])
         self.assertEqual(result["counts"]["shopify_customer_created"], 1)
@@ -528,13 +610,41 @@ class Ac2ToShopifyTests(SyncTestCase):
         self.assertEqual(self.links(), {gid(42): "TILL42"})
         self.assertEqual(result["counts"]["linked_existing_shopify_customer"], 1)
 
-    def test_shopify_phone_with_other_name_is_counted_not_linked(self):
+    def test_shopify_phone_with_other_name_creates_separate_customer_without_phone(self):
         self.initialise()
         self.shopify.add(customer(43, first="Bravo", tags=()))
-        self.ac2.add(sync.Ac2Member("TILL43", "Alpha Tester", local(43)), log=True)
+        self.ac2.add(sync.Ac2Member("TILL43", "Alpha Tester", local(43), "alpha@example.com"), log=True)
         result = self.run_sync("ac2_to_shopify")
-        self.assertEqual((self.shopify.created, self.links()), ([], {}))
+        self.assertEqual(self.shopify.created, [{
+            "firstName": "Alpha Tester", "email": "alpha@example.com", "tags": ["ac2-member"],
+            "metafields": [{"namespace": "custom", "key": "ac2_member_no", "type": "single_line_text_field", "value": "TILL43"}],
+        }])
+        new_gid = next(g for g in self.links())
+        self.assertNotEqual(new_gid, gid(43))  # never linked to the phone's owner
+        self.assertEqual(self.links(), {new_gid: "TILL43"})
         self.assertEqual(result["counts"]["shopify_phone_owned_by_other_name"], 1)
+        self.assertEqual(result["counts"]["shopify_separate_customer_created_without_phone"], 1)
+        self.assert_no_pii(result)
+        self.assertEqual(self.run_sync("ac2_to_shopify")["counts"], {})  # done; nothing repeats
+
+    def test_separate_customer_without_email_uses_name_only(self):
+        self.initialise()
+        self.shopify.add(customer(51, first="Bravo", tags=()))
+        self.ac2.add(sync.Ac2Member(sg(51), "Alpha Tester", sg(51)), log=True)
+        self.run_sync("ac2_to_shopify")
+        created = self.shopify.created[0]
+        self.assertNotIn("phone", created)
+        self.assertNotIn("email", created)
+        self.assertEqual(created["firstName"], "Alpha Tester")
+
+    def test_separate_customer_waits_while_shopify_create_is_off(self):
+        self.initialise()
+        self.shopify.add(customer(52, first="Bravo", tags=()))
+        self.ac2.add(sync.Ac2Member(sg(52), "Alpha Tester", sg(52)), log=True)
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((self.shopify.created, self.links()), ([], {}))
+        self.assertEqual(result["counts"]["shopify_create_disabled"], 1)
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM ac2_pending").fetchone()[0], "PENDING")
 
     def test_watermark_with_gaps_and_replay_is_a_no_op(self):
         self.initialise()
