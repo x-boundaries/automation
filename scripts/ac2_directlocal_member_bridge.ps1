@@ -18,8 +18,9 @@
 #
 # #155 phase 1 sync adds two read-only operations, sync-lookup and
 # sync-changelog (parameterised SELECTs through the guarded DBSetting), and
-# a sync_p1 payload profile for write-once. Their stdout carries member rows
-# for the parent process only; the parent never prints them.
+# a sync_p1 payload profile for write-once (ac2_member_sync_member.ps1; the
+# pinned gateway adapter is unchanged). Their stdout carries member rows for
+# the parent process only; the parent never prints them.
 #
 # write-once is the only path that reaches SaveMember. It additionally needs a
 # fence id bound to the stdin payload, a payload digest match, an unexpired
@@ -42,6 +43,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "ac2_member_gateway_autocount_adapter.ps1")
 . (Join-Path $PSScriptRoot "ac2_directlocal_book_guard.ps1")
+. (Join-Path $PSScriptRoot "ac2_member_sync_member.ps1")
 
 $script:XbDirectLocalMemberNoPattern = '^[A-Za-z0-9][A-Za-z0-9._/-]{0,19}$'
 
@@ -257,8 +259,14 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     finally { $stream.Dispose() }
 
-    $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile $profile
-    $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile $profile
+    if ($profile -ceq "sync_p1") {
+        $created = New-XbSyncAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter
+        $check = Compare-XbSyncMemberReadBack -Expected $created.Expected -Actual $created.ReadBack
+    }
+    else {
+        $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile "shopify_m1"
+        $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile "shopify_m1"
+    }
     $outboundChanged = if ($null -ne $SessionFactory) { $false } else { Test-XbDlOutboundChanged -DBSetting $session.DBSetting }
     $result = [ordered]@{
         save_invocation_count = [int]$created.SaveInvocationCount

@@ -9,7 +9,9 @@ their own Owner approval. Only the test book `AED_TESTINGAPI` is authorised;
 Code: `directlocal/xb_member_sync.py` (engine, ledger, Shopify client,
 credential loader, CLI), the `sync-lookup` / `sync-changelog` operations and
 the `sync_p1` write-once profile in `scripts/ac2_directlocal_member_bridge.ps1`,
-and the `sync_p1` field profile in `scripts/ac2_member_gateway_autocount_adapter.ps1`.
+and the `sync_p1` member create in `scripts/ac2_member_sync_member.ps1` (the
+pinned gateway adapter `scripts/ac2_member_gateway_autocount_adapter.ps1` is
+unchanged; the new script reuses its helpers).
 Tests: `tests/test_member_sync.py`, `tests/test_member_sync_bridge_ps.py`.
 
 ## What phase 1 does

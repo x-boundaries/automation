@@ -13,12 +13,6 @@ $script:XbAutoCountAdapterManagedFields = @("IsActive", "Individual")
 # assigned; absent MobilePhone/EmailAddress stay DBNull, never "".
 $script:XbShopifyCallerFields = @("MemberNo", "Name", "RegisterDate", "ExpiryDate", "MobilePhone", "EmailAddress")
 $script:XbShopifyAdapterOwnedFields = @("MemberType", "OpeningPoints", "IsActive", "Individual")
-# #155 phase 1 sync (sync_p1): MemberNo is the phone number (or its name
-# fallback), MemberType REGISTERED, ExpiryDate NULL, DOB 2000-MM-01 or NULL.
-# MemberType, ExpiryDate, OpeningPoints, IsActive and Individual are adapter-owned.
-$script:XbSyncCallerFields = @("MemberNo", "Name", "RegisterDate", "MobilePhone", "EmailAddress", "DOB")
-$script:XbSyncAdapterOwnedFields = @("MemberType", "ExpiryDate", "OpeningPoints", "IsActive", "Individual")
-$script:XbSyncMemberType = "REGISTERED"
 
 function Get-XbAutoCountRuntimeValue {
     param(
@@ -357,13 +351,13 @@ function Convert-XbAutoCountNullableValue {
 function Convert-XbAutoCountMemberRecord {
     param(
         [AllowNull()][object]$Entity,
-        [ValidateSet("forms_v1", "shopify_m1", "sync_p1")][string]$FieldProfile = "forms_v1"
+        [ValidateSet("forms_v1", "shopify_m1")][string]$FieldProfile = "forms_v1"
     )
     if ($null -eq $Entity) { return $null }
     $record = [ordered]@{}
     foreach ($field in $script:XbAutoCountAssignedFields) {
         $raw = Get-XbAutoCountEntityValue -Entity $Entity -Field $field
-        if ($FieldProfile -in @("shopify_m1", "sync_p1")) {
+        if ($FieldProfile -eq "shopify_m1") {
             $record[$field] = Convert-XbAutoCountNullableValue -Value $raw -Field $field
         } else {
             $record[$field] = Convert-XbAutoCountNormalizedValue -Value $raw -Field $field
@@ -399,36 +393,6 @@ function Assert-XbAutoCountShopifyMemberInput {
         }
     }
     if ([string]::CompareOrdinal([string]$Member.ExpiryDate, [string]$Member.RegisterDate) -lt 0) { throw "member_expiry_before_register" }
-}
-
-function Assert-XbAutoCountSyncMemberInput {
-    param([Parameter(Mandatory)][hashtable]$Member)
-    foreach ($field in @($Member.Keys)) {
-        if ($script:XbSyncAdapterOwnedFields -contains $field) {
-            throw "adapter_managed_defaults_are_not_caller_inputs"
-        }
-        if ($script:XbSyncCallerFields -cnotcontains $field) { throw "member_field_not_allowed" }
-    }
-    foreach ($field in @("MemberNo", "Name", "RegisterDate")) {
-        if (-not $Member.Contains($field) -or $Member[$field] -isnot [string] -or [string]::IsNullOrWhiteSpace($Member[$field])) {
-            throw "member_field_required"
-        }
-    }
-    foreach ($field in @("MobilePhone", "EmailAddress", "DOB")) {
-        if ($Member.Contains($field) -and $null -ne $Member[$field]) {
-            if ($Member[$field] -isnot [string] -or [string]::IsNullOrWhiteSpace($Member[$field])) {
-                throw "empty_string_not_null_equivalent"
-            }
-        }
-    }
-    [datetime]$parsed = [datetime]::MinValue
-    if (-not [datetime]::TryParseExact([string]$Member.RegisterDate, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
-        throw "member_date_invalid"
-    }
-    # DOB carries only the birthday month: 2000-MM-01.
-    if ($Member.Contains("DOB") -and $null -ne $Member.DOB -and [string]$Member.DOB -cnotmatch '^2000-(0[1-9]|1[0-2])-01$') {
-        throw "member_date_invalid"
-    }
 }
 
 function New-XbAutoCountShopifyExpectedRecord {
@@ -564,15 +528,14 @@ function New-XbAutoCountMember {
         [Parameter(Mandatory)][hashtable]$Member,
         [Parameter(Mandatory)][switch]$EnableProductionAdapter,
         [scriptblock]$MemberCommandFactory,
-        [ValidateSet("forms_v1", "shopify_m1", "sync_p1")][string]$FieldProfile = "forms_v1"
+        [ValidateSet("forms_v1", "shopify_m1")][string]$FieldProfile = "forms_v1"
     )
     Assert-XbAutoCountAdapterEnabled -EnableProductionAdapter:$EnableProductionAdapter
     if ([string]::IsNullOrWhiteSpace([string]$Member.MemberNo)) { throw "member_no_required" }
 
     if ($FieldProfile -eq "shopify_m1") { Assert-XbAutoCountShopifyMemberInput -Member $Member }
-    if ($FieldProfile -eq "sync_p1") { Assert-XbAutoCountSyncMemberInput -Member $Member }
     foreach ($field in $Member.Keys) {
-        if ($FieldProfile -in @("shopify_m1", "sync_p1")) { continue }
+        if ($FieldProfile -eq "shopify_m1") { continue }
         if ($script:XbAutoCountAdapterManagedFields -contains $field) {
             throw "adapter_managed_defaults_are_not_caller_inputs"
         }
@@ -611,30 +574,6 @@ function New-XbAutoCountMember {
         $effectiveExpected = [ordered]@{}
         foreach ($field in $script:XbAutoCountAssignedFields) {
             $effectiveExpected[$field] = if ($assignments.Contains($field)) { Convert-XbAutoCountNullableValue -Value $assignments[$field] -Field $field } else { $null }
-        }
-    } elseif ($FieldProfile -eq "sync_p1") {
-        # ExpiryDate is NULL (no expiry in phase 1); DOB only when a birthday
-        # month is known. Absent contact fields are DBNull.
-        $assignments = [ordered]@{
-            MemberNo      = [string]$Member.MemberNo
-            MemberType    = $script:XbSyncMemberType
-            Name          = [string]$Member.Name
-            MobilePhone   = if ($Member.Contains("MobilePhone") -and $null -ne $Member.MobilePhone) { [string]$Member.MobilePhone } else { [System.DBNull]::Value }
-            EmailAddress  = if ($Member.Contains("EmailAddress") -and $null -ne $Member.EmailAddress) { [string]$Member.EmailAddress } else { [System.DBNull]::Value }
-            DOB           = if ($Member.Contains("DOB") -and $null -ne $Member.DOB) {
-                [datetime]::ParseExact([string]$Member.DOB, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
-            } else { [System.DBNull]::Value }
-            RegisterDate  = [datetime]::ParseExact(
-                [string]$Member.RegisterDate, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture
-            )
-            ExpiryDate    = [System.DBNull]::Value
-            OpeningPoints = [decimal]0
-            IsActive      = "T"
-            Individual    = "T"
-        }
-        $effectiveExpected = [ordered]@{}
-        foreach ($field in $script:XbAutoCountAssignedFields) {
-            $effectiveExpected[$field] = Convert-XbAutoCountNullableValue -Value $assignments[$field] -Field $field
         }
     } else {
         # These values are adapter-owned effective defaults, not source/customer inputs.
@@ -692,7 +631,7 @@ function Compare-XbAutoCountMemberReadBack {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Expected,
         [AllowNull()][object]$Actual,
-        [ValidateSet("forms_v1", "shopify_m1", "sync_p1")][string]$FieldProfile = "forms_v1"
+        [ValidateSet("forms_v1", "shopify_m1")][string]$FieldProfile = "forms_v1"
     )
     if ($null -eq $Actual) {
         return [pscustomobject]@{
@@ -709,7 +648,7 @@ function Compare-XbAutoCountMemberReadBack {
             $mismatches += $field
             continue
         }
-        if ($FieldProfile -in @("shopify_m1", "sync_p1")) {
+        if ($FieldProfile -eq "shopify_m1") {
             $expectedValue = Convert-XbAutoCountNullableValue -Value $Expected[$field] -Field $field
             $actualValue = $actualValues[$field]
             # NULL equals only NULL; "" is a different value.

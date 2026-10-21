@@ -47,6 +47,17 @@ def sg(n: int) -> str:
     return "65" + "8000" + f"{n:04d}"
 
 
+class SyncScriptStaticTests(unittest.TestCase):
+    def test_sync_create_is_separate_from_the_pinned_adapter(self):
+        sync_script = (ROOT / "scripts" / "ac2_member_sync_member.ps1").read_text(encoding="utf-8")
+        adapter = (ROOT / "scripts" / "ac2_member_gateway_autocount_adapter.ps1").read_text(encoding="utf-8")
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        self.assertEqual(sync_script.count(".SaveMember("), 1)
+        self.assertNotIn("sync_p1", adapter)
+        self.assertNotIn("REGISTERED", adapter)
+        self.assertIn('. (Join-Path $PSScriptRoot "ac2_member_sync_member.ps1")', bridge)
+
+
 @unittest.skipUnless(powershell(), "no PowerShell executable available")
 class SyncBridgeTests(unittest.TestCase):
     def setUp(self):
