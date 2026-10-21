@@ -1,9 +1,10 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
 Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-fix round 1). Nothing here has run against AutoCount or Shopify. Every write
-switch is off by default; turning one on, any AutoCount login and any
-scheduling each need their own Owner approval. Only the test book
+fix round 3). Nothing here has run against AutoCount or Shopify. Every write
+switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
+null); turning one on, any AutoCount login and any scheduling each need their
+own Owner approval. Only the test book
 `AED_TESTINGAPI` is authorised; `AED_XBOUNDARIES` is refused in Python and
 PowerShell.
 
@@ -54,14 +55,19 @@ sent to Shopify; a mapped customer is never sent to AC2.
   8 or more than 15 digits; 8 digits not starting 3/6/8/9; a `65`-prefixed
   number that is not `65` + a Singapore 8-digit number; any letter.
 - The Shopify phone lookup normalises both sides with this same function.
+- Sent to Shopify (Owner Q2, 2026-10-21: keep today's behaviour): the number
+  in E.164, `+` and the digits above. A number without `+` that is not a
+  recognised Singapore number is therefore sent as `+` + its digits as typed,
+  and Shopify reads its leading digits as a country code. This is the Owner's
+  accepted choice.
 
 ### Matching rules (no review queue)
 
 | Situation | Action | Counted as |
 |---|---|---|
-| Phone already in AC2 (MemberNo equals the phone or its 8 digits, MobilePhone normalises to it, or the 8 digits are embedded in a MemberNo) and the name rule matches | Link, no create | `phone_and_first_name_match` |
+| Phone already in AC2 (MemberNo equals the phone or its 8 digits, MobilePhone normalises to it, or the 8 digits are embedded in a MemberNo) and the name rule below matches | Link, no create | `phone_and_name_match` |
 | Same phone on several matching records | Link to the record whose MemberNo is the phone; otherwise skip (never merge) | `phone_duplicate_member_no_exact` / `phone_on_multiple_records` |
-| Phone matches, name differs (people sharing a phone) | Create with `<phone digits><FIRST+LAST letters A-Z>` truncated to 20 characters | `shared_phone_name_fallback` |
+| Phone matches, the name rule does not match (people sharing a phone) | Create with `<phone digits><FIRST+LAST letters A-Z>` truncated to 20 characters | `shared_phone_name_fallback` |
 | That MemberNo is already held (in AC2, trimmed and case-insensitive, or by another customer's link or open write in the ledger) | The first free of the same value with a digit 2-9 appended (letters trimmed to stay within 20) | `shared_phone_suffix_digit` |
 | Shared phone but the name has no Latin letters (Owner round 2, Q1) | `<phone digits>` + the first digit 2-9 free in both AC2 and the ledger | `shared_phone_digit_fallback` |
 | Digits 2-9 all taken | Skip | `shared_phone_member_no_exhausted` |
@@ -78,34 +84,81 @@ nothing and the customer is retried on a later run. As in the Core, numbers
 derived this way run ahead of AutoCount's own counter: production numbering
 stays an E9 decision.
 
-### Name rule (Owner decision 2026-10-21 14:35Z)
+### Name rule (Owner decisions Q1 and r3a, 2026-10-21)
 
-Stated rule: on the same phone, link when every word of the shorter name
-appears in the longer one; any differing word means a separate member (the
-phone + initials rule); typos count as different ("Anne" is not "Ann"); no
-fuzzy matching.
+The rule (`full_name_matches`, both directions): on the same phone, the names
+match when the **shorter name has at least 2 words** and **every one of them
+is a word of the longer name** (2 to 2, or 2 to 3 and more). Any other case
+is a different person and takes the no-link path of that direction:
 
-Implemented rule (unchanged, `first_name_matches`): case- and
-space-insensitive, the **Shopify first name** must equal a run of consecutive
-words of the AC2 `Name` (Shopify -> AC2 and AC2 -> Shopify alike; Shopify's
-last name is not compared).
+- Shopify -> AC2: the shared-phone MemberNo (phone + name letters, a digit
+  2-9 when taken; phone + digit 2-9 when the name has no Latin letters).
+- AC2 -> Shopify: a separate customer without the phone, created only while
+  `shopify_create_enabled` is on (counted and kept pending while it is off).
 
-Examples, checked against the code on one shared fake phone
-(`NameRuleTests`):
+Details:
 
-| Example | Stated | Code | Locked by a test |
-|---|---|---|---|
-| Shopify "Ann Lee" / "Mary Lee" / "Mary Ann Lee" -> AC2 "MARY ANN LEE" | link | link | yes |
-| Shopify "John Lim" -> AC2 "MARY ANN LEE" | separate | separate | yes |
-| Shopify "Anne Lee" -> AC2 "ANN LEE" | separate | separate | yes |
-| Shopify "Mary Tan" -> AC2 "MARY ANN LEE" | separate | **link** (first name "Mary" is a word of the AC2 name; the last name is not compared) | no: Owner decision pending |
-| AC2 "Mary Ann Lee" -> Shopify "MARY ANN" + "LEE", or "MARY ANN LEE" whole in firstName | link | link | yes |
-| AC2 "Mary Tan" / "John Lim" -> the same Shopify customer | separate | separate | yes |
-| AC2 "Anne Lee" -> Shopify "ANN" + "LEE" | separate | separate | yes |
-| AC2 "Ann Lee" / "Mary Lee" -> Shopify "MARY ANN" + "LEE", or "MARY ANN LEE" whole | link | **separate** (the Shopify first name "MARY ANN" / "MARY ANN LEE" is not a run of words of "Ann Lee" / "Mary Lee") | no: Owner decision pending |
+- The Shopify name is the full name, `firstName` + " " + `lastName` (either
+  may be empty). The AC2 name is `Name`.
+- Both sides go through one shared helper (`name_words`): Unicode NFKC, then
+  case folding, then every character that is not a Unicode letter, mark or
+  digit (punctuation, hyphens, apostrophes, dots, commas, any whitespace)
+  becomes a space, then the text is split into words. A name is a set of
+  words: word order and repeated words do not matter.
+- Exact words only: no prefixes, initials, edit distance or fuzzy matching
+  ("Anne" is not "Ann"; "T" is not "Tester").
+- A name of 0 or 1 words never links, even when both names are identical
+  ("Mary" and "MARY"). A blank or punctuation-only name has 0 words; the
+  existing rule still skips a Shopify -> AC2 create without a name
+  (`shopify_name_missing`).
+- Any script: the helper is script-agnostic and identical normalised words
+  match. A name written without spaces (common in CJK) is **one word**, so it
+  never links, even when identical; the same name written with a space (2
+  words) links when identical. A Latin and a non-Latin name share no words.
+  The non-Latin shared-phone path is unchanged (MemberNo = phone + the first
+  free digit 2-9, checked in AC2 and the ledger; skipped and counted when all
+  are taken).
+- B2 (unclear AC2 create) uses the same normalisation but stays an exact
+  check of our own write: the found member's words, in order, must equal the
+  intended name's (never a subset; see Write safety).
+
+Examples, all on one shared fake phone (`FullNameRuleTests`, one test per
+example and direction). "Split" means Shopify `firstName` "MARY ANN" +
+`lastName` "LEE"; "whole" means `firstName` "MARY ANN LEE" and an empty
+`lastName`, as AC2 -> Shopify creates write it.
+
+| Example | Shopify -> AC2 (Shopify name -> AC2 `Name`) | AC2 -> Shopify (AC2 `Name` -> Shopify split / whole) |
+|---|---|---|
+| "Ann Lee" vs "MARY ANN LEE" | link | link / link |
+| "Mary Lee" vs "MARY ANN LEE" | link | link / link |
+| "Mary Ann Lee" vs "MARY ANN LEE" | link | link / link |
+| "Mary Tan" vs "MARY ANN LEE" | separate (phone + `MARYTAN`) | separate / separate |
+| "John Lim" vs "MARY ANN LEE" | separate (phone + `JOHNLIM`) | separate / separate |
+| "Anne Lee" vs "ANN LEE" | separate (phone + `ANNELEE`) | separate / separate (Shopify "ANN" + "LEE", or "ANN LEE" whole) |
+| Word order: "Lee Mary Ann" vs "MARY ANN LEE" | link | link / link |
+| Punctuation and spacing: "Mary-Ann  Lee." vs "MARY ANN LEE" | link | link / link |
+| One word: "Lee" vs "MARY ANN LEE" | separate | separate (Shopify "Lee" alone) |
+| One word: "Mary" vs "MARY ANN LEE" | separate | separate (Shopify "Mary" alone) |
+| One word, identical: "Mary" vs "MARY" | separate | separate |
+| One word on the AC2 side: Shopify "Mary Lee" vs AC2 "LEE"; AC2 "Lee" vs Shopify split | separate | separate |
+| Empty or punctuation only ("" or ".." on both sides) | never links (an empty Shopify name is skipped) | never links |
+| Non-Latin, identical, written without spaces (1 word) | separate (phone + digit 2-9) | separate |
+| Non-Latin, identical, 2 words | link | link |
+| Non-Latin, the same characters split into 2 words vs written as 1 word | separate (phone + digit 2-9) | - |
+| Non-Latin Shopify name vs Latin AC2 name | separate (phone + digit 2-9) | separate |
+| Latin Shopify name vs non-Latin AC2 name | separate (phone + letters) | - |
+
+Before this round the code compared only the Shopify first name with a run
+of words of the AC2 `Name`. Re-added as tests (each failed on `3562a21`):
+Shopify "Mary Tan" (linked through "Mary"), and AC2 "Ann Lee" and "Mary Lee"
+against Shopify split and whole (stayed separate).
 
 ### AC2 -> Shopify create
 
+0. Off by default (Owner Q4, 2026-10-21): with `changelog_xml_column` null
+   the run reads no ChangeLog, queues nothing and makes no ledger links
+   (`changelog_column_unconfigured`). The operator sets it to `"Content"` at
+   UAT, deliberately, after confirming the name rule above.
 1. First run: the watermark is set to the current highest ChangeLog `ID`
    (history is not replayed; the backfill is phase 2). Inserts already
    visible within the overlap window below it are recorded as seen
@@ -116,7 +169,22 @@ Examples, checked against the code on one shared fake phone
    VM fact 7) is processed (`changelog_late_row_processed`). Gaps are normal
    (26 vendor procedures, including `bsp_ChangeMemberNo`, delete their own
    rows by ID). The watermark advances row by row in the same transaction as
-   the queueing.
+   the queueing. The overlap the run used is stored in the ledger
+   (`watermarks` key `ac2_changelog_overlap`).
+
+   Overlap baseline (G2 H3, Option A): the seen IDs cover the overlap window
+   only when the last run used at least this overlap. When a watermark exists
+   and either no overlap is stored (a ledger upgraded from v1, or written
+   before this rule) or the configured overlap is larger than the stored one,
+   every insert already in the window below the watermark is marked seen as
+   history, without processing (alert `changelog_overlap_baselined`, count
+   `changelog_overlap_baselined_rows`), and the new overlap is stored. This
+   is what the first run already does for a fresh ledger, so it reuses that
+   rule; the cost is the same accepted risk: an insert that commits late
+   inside the window on that one run is treated as history. Option B
+   (refuse until the operator confirms) was not chosen: A needs no new CLI
+   flag or schema change and leaves no stalled direction. A smaller overlap
+   is stored without a baseline (pruning follows it).
 3. A row that cannot be parsed stops the run's ChangeLog read: the watermark
    stays at the last good ID, the run status is `completed_with_alerts`
    (alert and count `changelog_row_unparsed`) and the CLI exits 3. Later rows
@@ -127,15 +195,17 @@ Examples, checked against the code on one shared fake phone
 5. A snapshot (MemberNo, first ChangeLog ID, salted digest) is kept in the
    ledger; the member's Guid is never used as a key (it can change).
 6. Queued members are re-read from AC2 by MemberNo (so the ledger holds no
-   names or phones). Their phone is `MobilePhone`; when that is missing
-   (VM fact 3: present on 198 of 2,758 production inserts), a MemberNo made
-   only of digits that is itself a phone under the numbering rules (for
-   example `65` + 8 digits, the phase-1 numbering). A phone + initials,
-   phone + digit (`65`...) or `GetNextMemberNo` MemberNo gives no phone.
+   names or phones). Their phone is `MobilePhone` (through
+   `phone_member_no`, unchanged, including L1). When MobilePhone gives no
+   phone (VM fact 3: present on 198 of 2,758 production inserts), the
+   MemberNo gives one **only when it is a Singapore number** (Owner Q3,
+   2026-10-21): `65` + 8 digits starting 3/6/8/9 (used as is), or those 8
+   digits alone (`65` added). Any other MemberNo gives no phone (see Known
+   limits for the shapes).
 7. The member is looked up in Shopify by phone. The search result is only a
    candidate list: a node whose own phone does not normalise to the same
    digits, or has no phone, is dropped before any decision (G2 B1). Then:
-   - one customer, name rule matches: link;
+   - one customer, name rule matches: link (`shopify_phone_and_name_match`);
    - one customer, name rule does not match: a different person (Owner,
      21 October 2026). Never linked. A separate customer is created
      **without the phone** (Shopify phones are unique), with the AC2 `Name`,
@@ -161,10 +231,13 @@ Till-created members reach the HQ ChangeLog about 15 minutes after creation
 
 ## Go-live gate: Shopify create (Owner round 2, Q3)
 
-`shopify_create_enabled` stays `false` until a customer with a first name
-only (no last name, phone or email) is proven to be accepted by
-`customerCreate` in the Shopify **test** store. This is not tested by this
-source or its CI.
+A first-name-only customer must be proven accepted before
+`shopify_create_enabled` is enabled. There is no Shopify test store: the only
+store this source qualifies is the live one (G2). Owner's chosen method
+(2026-10-21): at UAT, one fake customer on the live store, created only with
+the Owner's OK at that moment and deleted straight after. The code stays off
+(`shopify_create_enabled` default `false`); this source and its CI never test
+it.
 
 ## Settings (`config/member_sync.example.json`)
 
@@ -182,8 +255,8 @@ Unknown keys, at the top level or nested, are refused.
 | `birthday_month_metafield` | `custom.birthday_month`, `number_integer` | Owner: placeholder until Shopify's developer confirms it |
 | `ac2_member_no_metafield` | `custom.ac2_member_no`, `single_line_text_field` | Sent on every create from AC2 (Owner round 2, Q2) |
 | `shopify_create_tags` | `["ac2-member"]` | Owner-confirmed; `member-mg` is refused (it would loop) |
-| `ac2_credential_target` | `null` | Credential Manager target of the AC2 automation user; `null` keeps the attended owner-console path |
-| `changelog_xml_column` | `"Content"` | VM fact r5-1. Set (the default), AC2 -> Shopify reads ChangeLog and writes ledger links on every run; `null` turns that direction off. Shopify creates still need `shopify_create_enabled` |
+| `ac2_credential_target` | `null` | Credential Manager target holding the AutoCount account the sync logs in with (the Owner's own account; example `XB-AC2-MemberSync`); `null` keeps the attended owner-console path |
+| `changelog_xml_column` | `null` | Owner Q4: off. AC2 -> Shopify then reads no ChangeLog and makes no links. Set to `"Content"` (VM fact r5-1) at UAT, deliberately, after the name rule is confirmed; Shopify creates still need `shopify_create_enabled` |
 | `changelog_batch` | `200` | 1-500 new rows per run |
 | `changelog_overlap` | `50` | 0-200 (below `changelog_batch`); IDs re-read below the watermark; 0 = no overlap |
 | `max_shopify_customers_per_run` | `20` | 1-100 |
@@ -193,12 +266,38 @@ Unknown keys, at the top level or nested, are refused.
 ## What stays switched off
 
 - Both create switches (`ac2_create_enabled`, `shopify_create_enabled`).
+- ChangeLog reads (`changelog_xml_column` null), so no AC2 -> Shopify links.
 - The Shopify app has no write scope; `customerCreate` is refused by the
   client unless the switch is on and the token carries `write_customers`.
 - No scheduled task, no production book, no n8n.
 
 ## Write safety
 
+- SQL login (fact, closes open item 2): every AutoCount API session runs as
+  SQL login `sa` (sysadmin, `db_owner`). This is hard-coded in AutoCount.dll,
+  whichever AutoCount user logs in. Every limit is therefore in this code: the
+  book guard, the SQL allowlist below, the one-write guards and the write
+  switches. `ac2_credential_sa_refused` refuses only an AutoCount **user ID**
+  of `sa`; it does not change the SQL login.
+- SQL allowlist (G2 H1): `Get-XbDlScalar` in
+  `scripts/ac2_directlocal_book_guard.ps1` (not a pinned worker script, so
+  hardened in place for every caller, main's included) sends only pinned
+  texts. First a deny check on every text, case-insensitive: `;`, `--`, `/*`,
+  `*/`, `EXEC`, `EXECUTE`, `TRUNCATE`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+  `DROP`, `ALTER`, `CREATE`, `GRANT`, `REVOKE`, `DENY`, `INTO`, `DBCC`,
+  `SHUTDOWN`, `KILL`, `BACKUP`, `RESTORE`, `BULK`, `OPENROWSET`,
+  `OPENDATASOURCE`, `OPENQUERY`, `WAITFOR`, `DECLARE`, `SET`, `USE`, any
+  `xp_`/`sp_` name, `AED_XBOUNDARIES` and any 3- or 4-part object name
+  (`vendor_query_not_read_only`). Then the text must be one of the named
+  texts in `$script:XbDlSqlText` (`db_name`, `machine_name`,
+  `user_script_rows`, `mail_queue_rows`, `einvoice_queue_rows`,
+  `pos_sync_registrations`, `server_now_local`, `member_change_counter`,
+  `changelog_max_id`), the `sync-changelog` template (only `TOP (1-1000)` and
+  the checked `[column]` vary) or the `sync-lookup` template (only the
+  condition list varies: phone block, Singapore block, up to 20 MemberNo
+  conditions, at most 25 parameters), with exactly one parameter per `?`
+  (`vendor_query_not_allowlisted` otherwise). Python builds no AutoCount SQL
+  (`SqlPlaceholderStaticTests`).
 - AutoCount access rights (`GM_MEMBER_SHOW/OPEN/VIEW/NEW`) are checked only
   in the AutoCount screens; `SaveMember` and the member API check none (VM
   fact r5-6). Every write limit therefore comes from this code: the book
@@ -209,13 +308,25 @@ Unknown keys, at the top level or nested, are refused.
 - Each write is recorded as `INTENT` before it starts. For a Shopify -> AC2
   create, the intent row also stores a salted digest (the ledger's ref key)
   of the intended person's normalised name and phone; no name or phone is
-  stored in plain text.
+  stored in plain text. The name is normalised by the name rule's helper
+  (case, spacing, punctuation), keeping the words in order.
+- One customer, one open write (G2 H2): a Shopify -> AC2 create is refused
+  while a write for the same customer is `INTENT` or `UNCERTAIN` (alert and
+  count `customer_held_by_open_write`; the pending row becomes `SKIPPED` and
+  is never re-sent blindly). Crash recovery (a left `INTENT` becomes
+  `UNCERTAIN`) holds that customer the same way, because the write-once child
+  of a killed parent may still save (deadline 120 s): a re-run can no longer
+  register the person again under the next generator number. The phone path
+  keeps its `open_write_for_member` guard. A write that is `DONE`, proven
+  `NOT_WRITTEN`, `REJECTED` or `RESOLVED` does not hold the customer.
 - `NOT_WRITTEN` (proven) is retried on a later run. An uncertain outcome
   (timeout, crash, Shopify transport or 5xx error) is never re-sent. A later
   run only looks it up:
   - AC2 create: the member found under that MemberNo is linked only when
     the digest of its Name and MobilePhone, normalised the same way, equals
-    the intent digest (G2 B2). A different person holding the number
+    the intent digest (G2 B2, exact; a digest stored before fix round 3 for
+    a name with punctuation no longer matches, so that write stays
+    `UNCERTAIN` and counted, which is safe). A different person holding the number
     (`uncertain_write_identity_mismatch`) or an older intent row without a
     digest (`uncertain_write_identity_unverifiable`) is never linked; the
     write stays `UNCERTAIN`.
@@ -261,31 +372,66 @@ Unknown keys, at the top level or nested, are refused.
   recording new registrations once `max_shopify_customers_per_run` (20)
   are pending, and AC2 -> Shopify re-reads the same first 20 pending
   members each run. Dry-run and UAT counts therefore under-report.
-- A purely numeric MemberNo of 9-15 digits that is not a phone (and does not
-  start with `0` or `65`) is read as a phone when MobilePhone is missing.
+- MemberNo as the phone (AC2 -> Shopify, only when MobilePhone gives none;
+  Owner Q3):
+
+  | MemberNo shape | Phone |
+  |---|---|
+  | `65` + 8 digits starting 3/6/8/9 | itself |
+  | 8 digits starting 3/6/8/9 | `65` + the 8 digits |
+  | A generator number (letters, or all digits such as 9 digits) | none |
+  | A foreign number, with or without a suffix digit | none |
+  | A Singapore phone + a suffix digit 2-9 | none |
+  | `65` + 8 digits starting with another digit | none |
+  | A leading `0`, or a phone + initials | none |
+
+  A member with no phone is skipped and counted (`ac2_member_without_phone`).
 - A number without `+` that is not a Singapore number is sent to Shopify as
-  `+` and its digits, which Shopify reads as a country code (Owner to
-  decide; `shopify_create_enabled` stays off under the Q3 gate).
+  `+` and its digits, which Shopify reads as a country code. Owner Q2
+  (2026-10-21): accepted, no change.
 
-## AC2 automation user and credential (runbook; not yet done)
+## Runbook: pre-flight, AutoCount login and credential (not yet done)
 
-Creating the user is a later, Owner-approved VM step.
+Each step is a later, Owner-approved VM step.
 
-1. In AutoCount (test book first), create a dedicated user, for example
-   `xbsync01`, with only the rights to view and create members. Never use
-   `sa` (the loader refuses it), never reuse the read-only SQL login, never
-   rotate an existing credential. AutoCount rights do not limit the member
-   API (VM fact r5-6); they only keep the user out of other screens.
+### Pre-flight before the first VM run
+
+1. Ledger: confirm there is no old ledger, in particular none with an
+   `ac2_changelog_id` watermark or with links made under the old first-name
+   rule. Check (read-only; nothing is written; it prints nothing if the file
+   is absent):
+
+   ```powershell
+   $ledger = "<state_root>\member_sync.sqlite3"
+   if (Test-Path -LiteralPath $ledger) { python -c "import sqlite3, sys, pathlib; c = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro', uri=True); print(c.execute('SELECT name, value FROM watermarks ORDER BY name').fetchall(), c.execute('SELECT COUNT(*) FROM links').fetchone()[0])" $ledger }
+   ```
+
+   If a ledger exists, delete it (and its `-wal`/`-shm` files) and run
+   `init` for a new one. If any ledger made links under the old first-name
+   rule, wipe it before relying on its counts. Nothing was written to
+   AutoCount or Shopify by deleting it. (The `status` command is not used
+   here: opening a v1 ledger migrates it.)
+2. Keep `changelog_xml_column` null until the name rule is confirmed at UAT;
+   then set it to `"Content"` deliberately.
+
+### AutoCount login and credential
+
+1. The sync logs in with the Owner's own AutoCount account (Owner,
+   2026-10-21). Its user ID is not written in this repository. No separate
+   AutoCount user is created. AutoCount rights do not limit the member API
+   (VM fact r5-6) and the SQL login is always `sa` (see Write safety), so
+   the limits are this source's guards.
 2. Signed in as the Windows account that will run the sync (the same account
    that owns the state root), store the credential in Windows Credential
-   Manager as a generic credential:
+   Manager as a generic credential. The password lives only there, never in
+   the repository or the config:
 
    ```bat
-   cmdkey /generic:XB-AC2-Automation /user:xbsync01 /pass
+   cmdkey /generic:XB-AC2-MemberSync /user:<the Owner's AutoCount user ID> /pass
    ```
 
    `cmdkey` prompts for the password, so it is not in the command history.
-3. Set `ac2_credential_target` to `XB-AC2-Automation` and check it:
+3. Set `ac2_credential_target` to `XB-AC2-MemberSync` and check it:
 
    ```powershell
    python directlocal\xb_member_sync.py check-credential --config <config>
@@ -293,9 +439,13 @@ Creating the user is a later, Owner-approved VM step.
 
    The output shows only the last three characters of the user ID and
    `secret_present: true`.
+4. When the Owner changes that AutoCount password, update the Credential
+   Manager entry to match (step 2 again), or the sync fails to log in
+   (nothing is written; the run is refused with a login code).
 
 How it is read: the loader (`load_ac2_credential`) calls `CredReadW` in
-memory, refuses `sa`, and passes the user ID and password only in the bridge
+memory, refuses an AutoCount user ID of `sa` (`ac2_credential_sa_refused`;
+the SQL login is `sa` regardless), and passes the user ID and password only in the bridge
 child's environment (`XB_AC2_USER_ID`, `XB_AC2_PASSWORD_ENV_VAR` ->
 `XB_AC2_SYNC_PASSWORD`). This follows the EnergyGrid pattern (secret read in
 memory, injected only into the child, never printed), but from Credential
@@ -319,7 +469,9 @@ summary's `alerts`), 2 when refused.
 Schema v2 (2026-10-22): `writes.intent_digest` and the `changelog_seen`
 table were added. A v1 ledger is migrated on open in one transaction
 (additive only; existing rows keep a NULL digest and are never linked on
-resolution).
+resolution). Fix round 3 adds no schema change: the overlap of the last run
+is a `watermarks` row (`ac2_changelog_overlap`), and a ledger without it is
+baselined once (G2 H3 above).
 
 ## Relation to the DirectLocal Core
 
@@ -363,15 +515,27 @@ Round 2 (21-22 October 2026): Q1 non-Latin shared-phone names use phone +
 above; Q4 phoneless uncertain creates stay unresolved until phase 2; the
 name rule examples above; L1 option B (digits as typed); VM facts r5 applied.
 
+Round 3 (21 October 2026, fix round 3):
+
+- Q1: the full-name word rule above replaces the first-name rule; r3a: the
+  shorter name needs at least 2 words (a name of 0 or 1 words never links,
+  even identical).
+- Q2: a no-`+` non-Singapore number keeps going to Shopify as `+` + digits.
+- Q3: the MemberNo gives a phone only when it is a Singapore number.
+- Q4: `changelog_xml_column` defaults to null; set at UAT.
+- Shopify gate: one fake customer on the live store at UAT, with the Owner's
+  OK at that moment, deleted straight after.
+- AutoCount login: the Owner's own account, password in Credential Manager.
+
 ## Open items
 
-1. Name rule: the stated subset rule and the implemented first-name rule
-   differ on "Mary Tan" (links today) and on AC2 "Ann Lee" / "Mary Lee"
-   against Shopify "MARY ANN LEE" (separate today). Owner to decide; no
-   logic change was made.
-2. SQL login of an AutoCount API session: unknown (the book registry stores
-   `sa`). Needs an Owner-attended check on the test book.
-3. The `custom.ac2_member_no` metafield as a customer metafield definition in
+Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
+`sa`, see Write safety).
+
+1. Follow-up: the attended E7 test-book script
+   (`scripts/ac2_directlocal_e7_testbook_create.ps1`, unchanged) keeps its own
+   SELECT-only check (`Get-E7Scalar`) without the H1 allowlist.
+2. The `custom.ac2_member_no` metafield as a customer metafield definition in
    Shopify admin, so staff can see it.
-4. Shopify's customer search syntax for a phone (`phone:+<digits>`), checked
-   in the test-store UAT (results are verified by B1 either way).
+3. Shopify's customer search syntax for a phone (`phone:+<digits>`), checked
+   at UAT (results are verified by B1 either way).

@@ -37,12 +37,17 @@ qualification, book pinned for the process, vendor login, telemetry off,
 `UserScript`/`MailQueue`/`EInvoiceQueue`. A failure before the claim leaves no
 claim, so the parent proves `NOT_WRITTEN`. After `SaveMember` the queues are
 re-read; any row (or an unreadable queue) makes the fence
-`CREATED_OUTBOUND_QUEUE_CHANGED` (manual review).
+`CREATED_OUTBOUND_QUEUE_CHANGED` (manual review). Every AutoCount API session
+runs as SQL login `sa` whatever the AutoCount user, so every vendor query goes
+through `Get-XbDlScalar`, which sends only pinned SQL texts after a deny check
+(#155 phase 1 fix round 3, G2 H1; see [member sync phase 1](member_sync_phase1.md)).
 
 Credentials reach the bridge only from `scripts/ac2_directlocal_owner_console.ps1`
 (interactive, elevated, fresh `ISOLATED` evidence in `<state_root>\evidence`,
 exact source head, credentials typed into a `SecureString` and passed only to
-the child process environment).
+the child process environment), or, for the #155 phase 1 sync, from the
+Windows Credential Manager entry `xb_member_sync.py` reads in memory and
+passes only to the child process environment.
 
 ## Data path
 
