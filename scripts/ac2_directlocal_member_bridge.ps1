@@ -191,21 +191,24 @@ function Invoke-XbDirectLocalSyncLookup {
 }
 
 function Invoke-XbDirectLocalSyncChangeLog {
-    # Read-only: Member insert rows of HQ ChangeLog after an Id watermark
-    # (inserts carry the full row as XML; ids have gaps), plus the current
-    # highest Id. The XML column name is configuration (a VM fact).
+    # Read-only: Member insert rows of HQ ChangeLog after an ID watermark
+    # (inserts carry the full row as XML; IDs have gaps), plus the current
+    # highest ID. VM facts r5 (2026-10-21): ID bigint IDENTITY(1,1),
+    # TableName 'Member', insert ChangeType 'I', XML in Content (configured).
+    # AutoCount rewrites every "?" in the text into a parameter, so the SQL
+    # text holds no literal "?" other than the one placeholder.
     param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
     $column = [string]$Request.xml_column
     if ($column -cnotmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$') { throw "sync_changelog_request_invalid" }
     $afterId = $Request.after_id
     $limit = $Request.limit
     if ($afterId -isnot [int] -and $afterId -isnot [long]) { throw "sync_changelog_request_invalid" }
-    if ($limit -isnot [int] -or $limit -lt 1 -or $limit -gt 500 -or $afterId -lt -1) { throw "sync_changelog_request_invalid" }
-    $sql = "SELECT (SELECT TOP ($limit) Id AS id, CAST([$column] AS nvarchar(max)) AS xml FROM ChangeLog " +
-        "WHERE TableName = 'Member' AND ChangeType = 'I' AND Id > ? ORDER BY Id FOR JSON PATH)"
+    if ($limit -isnot [int] -or $limit -lt 1 -or $limit -gt 1000 -or $afterId -lt -1) { throw "sync_changelog_request_invalid" }
+    $sql = "SELECT (SELECT TOP ($limit) ID AS id, CAST([$column] AS nvarchar(max)) AS xml FROM ChangeLog " +
+        "WHERE TableName = 'Member' AND ChangeType = 'I' AND ID > ? ORDER BY ID FOR JSON PATH)"
     try {
         $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params @([long]$afterId))
-        $maxId = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(Id), 0) FROM ChangeLog")
+        $maxId = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog")
     }
     catch { throw "sync_changelog_failed" }
     return [ordered]@{ rows = (ConvertFrom-XbDirectLocalJsonRows -Json $json); max_id = $maxId }
@@ -243,6 +246,12 @@ function Invoke-XbDirectLocalWriteOnce {
     if ($null -ne $payload.email_address) { $member.EmailAddress = [string]$payload.email_address }
     # A login, identity or outbound-queue failure here stops before the claim.
     $session = New-XbDirectLocalSession
+    if ($profile -ceq "sync_p1") {
+        # VM fact r5-6: SaveMember and the member API check no access right,
+        # so the write limits are ours. A number already held is refused
+        # here, before the claim (proven not written), never left to SaveMember.
+        if ($null -ne (Get-XbAutoCountMember -Session $session -MemberNo $member.MemberNo)) { throw "member_no_taken" }
+    }
 
     # Exclusive claim immediately before the sole SaveMember path.
     try {

@@ -9,6 +9,7 @@ network is used. Phones are built at runtime from fragments.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,64 @@ class SyncScriptStaticTests(unittest.TestCase):
         self.assertNotIn("sync_p1", adapter)
         self.assertNotIn("REGISTERED", adapter)
         self.assertIn('. (Join-Path $PSScriptRoot "ac2_member_sync_member.ps1")', bridge)
+
+
+SQL_SCRIPTS = ("ac2_directlocal_member_bridge.ps1", "ac2_directlocal_book_guard.ps1", "ac2_member_sync_member.ps1")
+_PS_STRING_RE = re.compile(r'"(?:[^"\n`]|`.)*"')
+_SQL_HINT_RE = re.compile(r"\b(SELECT|FROM|WHERE|CHARINDEX|COUNT_BIG|ISNULL)\b|\$keyExpr|\$mobileExpr|= \?")
+_PLACEHOLDER_RE = re.compile(r"(?<=[\s(,])\?(?=[\s),]|$)")
+
+
+class SqlPlaceholderStaticTests(unittest.TestCase):
+    """VM fact r5-5: AutoCount's ExecuteScalar rewrites every "?" in the SQL
+    text into a parameter, so a "?" may appear only as a placeholder."""
+
+    def sql_literals(self):
+        for name in SQL_SCRIPTS:
+            for number, line in enumerate((ROOT / "scripts" / name).read_text(encoding="utf-8").splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                for literal in _PS_STRING_RE.findall(line):
+                    if _SQL_HINT_RE.search(literal):
+                        yield name, number, line, literal[1:-1]
+
+    def test_question_marks_are_placeholders_only(self):
+        literals = list(self.sql_literals())
+        self.assertGreater(len(literals), 10)
+        for name, number, _line, text in literals:
+            with self.subTest(at=f"{name}:{number}"):
+                for quoted in re.findall(r"'[^']*'", text):
+                    self.assertNotIn("?", quoted)  # inside an SQL string literal
+                self.assertNotIn("--", text)  # no SQL comment at all
+                outside = re.sub(r"'[^']*'", "''", text)
+                self.assertEqual(outside.count("?"), len(_PLACEHOLDER_RE.findall(outside)))
+
+    def test_placeholder_count_matches_parameters(self):
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        # sync-lookup: each condition adds exactly as many parameters as "?".
+        lines = [line for line in bridge.splitlines() if "$conditions +=" in line]
+        self.assertEqual(len(lines), 6)
+        for line in lines:
+            with self.subTest(line=line.strip()):
+                literal = _PS_STRING_RE.search(line).group(0)
+                self.assertEqual(literal.count("?"), line.count("$params +="))
+        # sync-changelog: one "?" and one parameter.
+        body = bridge.split("function Invoke-XbDirectLocalSyncChangeLog", 1)[1].split("\nfunction ", 1)[0]
+        query = "".join(literal for literal in _PS_STRING_RE.findall(body) if "ChangeLog " in literal or "ORDER BY ID" in literal)
+        self.assertEqual(query.count("?"), 1)
+        self.assertEqual(body.count("-Params @([long]$afterId)"), 1)
+        # Every call without -Params passes no "?".
+        for name in SQL_SCRIPTS:
+            for line in (ROOT / "scripts" / name).read_text(encoding="utf-8").splitlines():
+                if "Get-XbDlScalar" in line and "-Sql" in line and "-Params" not in line and "function " not in line:
+                    with self.subTest(line=line.strip()):
+                        self.assertNotIn("?", "".join(_PS_STRING_RE.findall(line)))
+
+    def test_python_builds_no_sql_for_execute_scalar(self):
+        source = (ROOT / "directlocal" / "xb_member_sync.py").read_text(encoding="utf-8")
+        self.assertNotIn("ExecuteScalar", source)
+        # Its own SQL is SQLite on the private ledger; no AutoCount table is named.
+        self.assertNotRegex(source, r"(?i)\bFROM\s+(dbo\.)?(Member|ChangeLog)\b")
 
 
 @unittest.skipUnless(powershell(), "no PowerShell executable available")
@@ -134,7 +193,7 @@ class SyncBridgeTests(unittest.TestCase):
         sql = self.fake()["sql"][0]
         self.assertIn("TOP (200)", sql)
         self.assertIn("CAST([XmlData] AS nvarchar(max))", sql)
-        self.assertIn("TableName = 'Member' AND ChangeType = 'I' AND Id > ?", sql)
+        self.assertIn("FROM ChangeLog WHERE TableName = 'Member' AND ChangeType = 'I' AND ID > ? ORDER BY ID", sql)
         params = self.fake()["params"][0]  # the fake's JSON flattens a one-item array
         self.assertEqual(params if isinstance(params, list) else [params], ["1000"])
 
@@ -142,7 +201,7 @@ class SyncBridgeTests(unittest.TestCase):
         for request in (
             {"after_id": 0, "limit": 200, "xml_column": "Xml;DROP"},
             {"after_id": 0, "limit": 0, "xml_column": "XmlData"},
-            {"after_id": 0, "limit": 501, "xml_column": "XmlData"},
+            {"after_id": 0, "limit": 1001, "xml_column": "XmlData"},
             {"after_id": -2, "limit": 10, "xml_column": "XmlData"},
             {"after_id": "1", "limit": 10, "xml_column": "XmlData"},
         ):
@@ -179,6 +238,15 @@ class SyncBridgeTests(unittest.TestCase):
         self.assertTrue(out["readback_match"])
         member = self.fake()["members"][0]
         self.assertEqual((member["DOB"], member["ExpiryDate"], member["MobilePhone"], member["EmailAddress"]), (None, None, None, None))
+
+    def test_sync_p1_refuses_a_held_number_before_the_claim(self):
+        self.set_state(members=[{"MemberNo": sg(8), "Name": "Kilo Other"}])
+        fence = "fence-" + "e" * 32
+        payload = {"profile": "sync_p1", "name": "Alpha Tester", "mobile_phone": sg(8), "email_address": None, "register_date": "2026-10-21", "dob": None}
+        code, out, _ = self.run_bridge("write-once", self.write_request(fence, payload, sg(8)), *self.write_args(fence))
+        self.assertEqual((code, out), (1, {"error": "member_no_taken"}))
+        self.assertEqual(self.fake()["saves"], 0)
+        self.assertFalse((self.claims / f"{fence}.claim").exists())  # parent proves NOT_WRITTEN
 
     def test_sync_p1_refuses_a_full_birth_date_and_unknown_profile(self):
         for letter, payload, error in (
