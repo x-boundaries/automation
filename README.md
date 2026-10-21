@@ -1,4 +1,118 @@
-# X-Boundaries AutoCount 2 Automation
+# X-Boundaries Automation
+
+This page lists only the automations that are finished and ready to deploy, with a Claude prompt to set each one up. Work that is not ready yet is named under [In progress](#in-progress).
+
+## Ready to deploy
+
+All three run together on one Windows PC that also runs a local n8n. Set them up in this order.
+
+### 1. EnergyGrid daily bills
+
+- **What it does:** every day at 11:30 SGT it downloads the newest EnergyGrid EB Bill and Tenant Bill, saves each PDF to Google Drive, checks Google's copy, and emails the owner. No AI model runs.
+- **Where it runs:** Windows Task Scheduler on the owner PC, with Google Drive for desktop signed in and two local n8n workflows (Drive Verify and Owner Email).
+- **Runbook:** [Claude-free daily run](energygrid-bill-downloader/docs/native_daily_claude_free.md) and [EnergyGrid runbook](energygrid-bill-downloader/docs/runbook.md).
+
+<details>
+<summary>Claude setup prompt</summary>
+
+```text
+Set up the EnergyGrid daily bill automation from the x-boundaries/automation repo on this Windows PC.
+
+Read first: energygrid-bill-downloader/docs/native_daily_claude_free.md (sections 2, 6, 7, 9)
+and energygrid-bill-downloader/docs/runbook.md.
+
+I will give you the private values when you ask: the EnergyGrid portal sign-in, the Google Drive
+folder and the Google account that owns it, the owner email address, and the n8n header
+token file. Never write them into the repo, a commit, or a log.
+
+Do these steps in order, and stop for my approval before each one:
+1. Install into one admin-owned EG_HOME (for example C:\Program Files\EnergyGrid) as section 7
+   says: its own Python, a hash-locked venv, Playwright Chromium, and the monitor folder. Only
+   EG_HOME\data may be writable by the task user.
+2. Write the private native.daily.json from config/energygrid.native_daily.example.json.
+3. Import n8n-workflows/energygrid_drive_verify.workflow.json and
+   n8n-workflows/energygrid_owner_email.workflow.json into the local n8n as inactive, bind the
+   credentials there, and create the email claim Data Table. Prove the two webhooks are not
+   reachable from the internet (section 6) before activating them.
+4. Run daily-preflight, then one attended daily run, and show me the result.
+5. Register task-scheduler/energygrid_daily_native.task.example.xml for the same signed-in user,
+   read it back, then enable it.
+
+After each step, tell me what you checked and what changed.
+```
+
+</details>
+
+### 2. EnergyGrid run monitor
+
+- **What it does:** sends the owner a Telegram alert if the daily run has not reported by 14:00 SGT, or if a bill is still pending after a run. It stays quiet on failures the daily run already emails.
+- **Where it runs:** the local n8n workflow `EnergyGrid - Local Run Monitor`, fed by the `egmonitor.cmd` reporter after each daily run.
+- **Runbook:** [n8n local run monitor](n8n-workflows/energygrid_local_failure_monitor/README.md).
+
+<details>
+<summary>Claude setup prompt</summary>
+
+```text
+Set up the EnergyGrid run monitor from the x-boundaries/automation repo on the same Windows PC
+as the EnergyGrid daily bills.
+
+Read first: n8n-workflows/energygrid_local_failure_monitor/README.md and
+n8n-workflows/README.md (energygrid_local_failure_monitor.workflow.json).
+
+I will give you the private values when you ask: the Telegram bot credential, the Telegram chat,
+and the webhook header token. Never write them into the repo, a commit, or a log.
+
+Do these steps in order, and stop for my approval before each one:
+1. Copy egmonitor.cmd and energygrid_monitor_report.py into EG_HOME\monitor and store the token
+   file privately.
+2. Import n8n-workflows/energygrid_local_failure_monitor.workflow.json into the local n8n as
+   inactive. Bind the Header Auth and Telegram credentials and set ENABLE_OWNER_ALERTS to true
+   in the live copy only.
+3. Activate it, then send one synthetic healthy report and confirm it stays silent.
+
+Never re-run a bill download or email to test the monitor. To roll back, deactivate the workflow.
+```
+
+</details>
+
+### 3. EnergyGrid run-log cleanup
+
+- **What it does:** every day at 19:30 SGT it keeps 90 days of clean run logs, removes older clean ones, and archives every run that had a problem. It never touches bills or billing state.
+- **Where it runs:** Windows Task Scheduler on the same PC.
+- **Runbook:** [Run-evidence retention](energygrid-bill-downloader/docs/run_log_retention.md).
+
+<details>
+<summary>Claude setup prompt</summary>
+
+```text
+Set up EnergyGrid run-log cleanup from the x-boundaries/automation repo on the same Windows PC
+as the EnergyGrid daily bills.
+
+Read first: energygrid-bill-downloader/docs/run_log_retention.md (sections 1 to 6).
+
+Do these steps in order, and stop for my approval before each one:
+1. As administrator, copy runtime/maintenance/energygrid_retention.py and render
+   runtime/maintenance/egretention.ps1.template into EG_HOME\maintenance, then lock both and
+   create EG_HOME\data\retention with the ACLs in section 6.
+2. Run it once without -Apply (dry run) and show me the report.
+3. Register task-scheduler/energygrid_retention.task.example.xml for the evening run, read it
+   back, and only then add -Apply and enable it.
+
+After each step, tell me what you checked and what changed.
+```
+
+</details>
+
+## In progress
+
+Not ready yet, so not listed above: SIMBA invoice intake (waiting on a live test while its account matching is redesigned), AutoCount member sync from Shopify, and AutoCount stock exports. Progress for all of them is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117).
+
+## Developers and CI
+
+The full repository reference (scripts, config templates, output folders, runbooks, and data rules) is in the section below. CI workflows are in [.github/workflows/](.github/workflows/) and run offline tests only.
+
+<details>
+<summary>Repository reference</summary>
 
 This repository contains AutoCount 2 automation work: local extraction scripts, SQL/API investigation notes, configuration templates, and runbooks for safe read-only automation around the AutoCount 2 environment. It also contains the isolated Energy@Grid bill downloader documented below.
 
@@ -186,3 +300,5 @@ This repository must not store:
 - Passwords, API keys, or `.env` files.
 
 Real data should stay in approved secure storage outside GitHub. AutoCount workflow outputs should go under `C:\XB\autocount_outputs` on the VM; generic local test outputs should go into ignored folders such as `data/`, `exports/`, `outputs/`, or `exceptions/`.
+
+</details>
