@@ -3,8 +3,11 @@
 Status (2026-10-15): real-operation Core source for the development book
 (`AED_TESTINGAPI`), built under #155:6195037656 and the scope delta
 #155:6195382795 / 6195468717 / 6195563312. This document authorises no live
-effect. Shopify is read-only (automation-originated Shopify writes are
-forbidden). Every AutoCount login, `GetNextMemberNo`, `GetMember` or
+effect. Shopify is read-only, with one exception (#155 phase 1 member sync,
+2026-10-21): the only allowed automation-originated Shopify write is
+`customerCreate` (with tags on create) from `directlocal/xb_member_sync.py`,
+refused unless `shopify_create_enabled` is true; no update, delete, tag change
+or any other mutation is allowed. See [member sync phase 1](member_sync_phase1.md). Every AutoCount login, `GetNextMemberNo`, `GetMember` or
 `SaveMember` on any book, any production access and any scheduling still needs
 its own scoped Owner approval. The previous gateway/n8n/PostgreSQL path is not
 used and its files are unchanged. Operating steps: [UAT runbook](member_directlocal_uat_runbook.md).
@@ -57,13 +60,14 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
 | File | Role |
 |---|---|
 | `directlocal/xb_directlocal.py` | Capture parsing, ledger, custody, baseline/discovery, registration events, admission, standing policy, allocation, fence, recovery, reconcile, retention, UAT evidence, CLI |
-| `scripts/ac2_directlocal_member_bridge.ps1` | Child bridge: `book-check`, `pos-sync-status`, `legacy-precheck`, `next-member-no`, `probe`, `reconcile`, `write-once` |
+| `scripts/ac2_directlocal_member_bridge.ps1` | Child bridge: `book-check`, `pos-sync-status`, `legacy-precheck`, `next-member-no`, `probe`, `reconcile`, `write-once` (profiles `shopify_m1`, `sync_p1`), `sync-lookup`, `sync-changelog` |
 | `scripts/ac2_directlocal_book_guard.ps1` | Real-session guard (above) and the read-only POS sync state |
 | `scripts/ac2_directlocal_owner_console.ps1` | Owner console for `BookCheck`, `PosSyncStatus`, `Process`, `Reconcile` |
 | `scripts/directlocal_connector_hook.py` | `guard` (PreToolUse default-deny for MCP) and `capture` (PostToolUse inbox writer) |
 | `config/directlocal_claude_settings.template.json` | Dedicated-session settings template (deny list + hooks) |
 | `directlocal/xb_shopify_direct.py`, `directlocal/xb_shopify_poller.py` | Claude-free read-only Shopify poller (E8 source; no AutoCount route): [poller contract](member_directlocal_shopify_poller.md) |
-| `tests/test_member_directlocal*.py`, `tests/test_directlocal_*_ps.py` | Offline tests |
+| `directlocal/xb_member_sync.py` | #155 phase 1 two-way member create sync (own ledger; bridge `sync-lookup`, `sync-changelog`, write-once profile `sync_p1`): [member sync phase 1](member_sync_phase1.md) |
+| `tests/test_member_directlocal*.py`, `tests/test_directlocal_*_ps.py`, `tests/test_member_sync*.py` | Offline tests |
 
 ## Capture provenance and shapes
 
