@@ -19,12 +19,15 @@ Scope (Owner decisions, #155 build step 2)
   up by phone, and only customers whose own phone matches count: found ->
   link, never a duplicate.
   ``customerCreate`` is sent only when ``shopify_create_enabled`` is true.
-* No review queue. Same phone + same first name links; same phone + another
-  first name creates ``phone + name letters`` (fits nvarchar(20), a digit 2-9
-  when taken); no phone uses ``GetNextMemberNo``; email never links. In AC2
-  -> Shopify, a Shopify customer holding the phone under another first name
-  is a different person: a separate customer is created without the phone. Every link, skip and
-  fallback is counted in the run summary (counts and keyed refs only).
+  ChangeLog reads are off until ``changelog_xml_column`` is set (Owner Q4).
+* No review queue. Same phone + the same name links, where the same name
+  means every word of the shorter full name is a word of the longer one
+  (Owner Q1, ``full_name_matches``); same phone + another name creates
+  ``phone + name letters`` (fits nvarchar(20), a digit 2-9 when taken); no
+  phone uses ``GetNextMemberNo``; email never links. In AC2 -> Shopify, a
+  Shopify customer holding the phone under another name is a different
+  person: a separate customer is created without the phone. Every link, skip
+  and fallback is counted in the run summary (counts and keyed refs only).
 * Loop prevention both ways through the ledger mapping (customer GID <->
   MemberNo, both unique): a member this sync created in AC2 never comes back
   to Shopify as new, and a customer it created in Shopify never goes back to
@@ -91,6 +94,8 @@ SHOPIFY_WATERMARK_MARGIN_SECONDS = 900  # search-index lag overlap, as in the Co
 REGISTRATION_WAIT_MAX_CHECKS = 5  # Forms writes start_date ~3 s after the tag
 LOOKUP_MAX_ROWS = 50
 PENDING_LOOKUP_BATCH = 20
+# Watermarks-table key of the ChangeLog overlap the last run used (G2 H3).
+OVERLAP_MARK = "ac2_changelog_overlap"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _:-]{0,39}$")
 METAFIELD_PART_RE = re.compile(r"^[a-z0-9_]{1,64}$")
@@ -119,13 +124,18 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "shopify_create_tags": ["ac2-member"],
     # The AC2 MemberNo on a customer created from AC2 (maps it back).
     "ac2_member_no_metafield": {"namespace": "custom", "key": "ac2_member_no", "type": "single_line_text_field"},
-    # Name of the generic Windows Credential Manager entry of the AC2
-    # automation user; null keeps the attended owner-console credential path.
+    # Name of the generic Windows Credential Manager entry holding the
+    # AutoCount account the sync logs in with (the Owner's own account,
+    # 2026-10-21); null keeps the attended owner-console credential path.
+    # Every AutoCount API session runs as SQL login sa whatever the account,
+    # so the limits are this source's guards, not the account's rights.
     "ac2_credential_target": None,
     # VM fact r5 (2026-10-21): dbo.ChangeLog.Content nvarchar(max) holds the
-    # insert XML. Setting it (the default) turns on AC2 -> Shopify reads and
-    # ledger links; Shopify creates still need shopify_create_enabled.
-    "changelog_xml_column": "Content",
+    # insert XML. Owner Q4 (2026-10-21): null (off) by default, so AC2 ->
+    # Shopify reads no ChangeLog and makes no links; the operator sets
+    # "Content" at UAT, after confirming the name rule. Shopify creates still
+    # need shopify_create_enabled.
+    "changelog_xml_column": None,
     "changelog_batch": 200,
     # IDs below the watermark re-read on every run, so an insert that
     # committed after a higher ID was read is still seen (fact 7).
@@ -356,30 +366,44 @@ def member_no_key(value: str) -> str:
     return value.strip().casefold()
 
 
-def _name_key(text: str) -> str:
-    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
+def _name_tokens(text: Any) -> tuple[str, ...]:
+    """The words of a name, in order: NFKC, case-folded, and every character
+    that is not a Unicode letter, mark or decimal digit (punctuation, hyphens,
+    apostrophes, dots, commas, any whitespace) read as a space. Any script: a
+    name written without spaces (common in CJK) is one word."""
+
+    if not isinstance(text, str):
+        return ()
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return tuple("".join(ch if unicodedata.category(ch)[0] in "LM" or unicodedata.category(ch) == "Nd" else " " for ch in folded).split())
 
 
-def first_name_matches(first_name: Any, full_name: Any) -> bool:
-    """Case- and space-insensitive: the first name equals a run of
-    consecutive words of the full name ("Mei Ling" matches "TAN MEI LING"
-    and "MeiLing Tan"). An empty first name never matches."""
+def name_words(text: Any) -> frozenset[str]:
+    """The name as a set of words (order and repeats do not matter)."""
 
-    if not isinstance(first_name, str) or not isinstance(full_name, str):
-        return False
-    target = _name_key(first_name)
-    words = [_name_key(word) for word in unicodedata.normalize("NFKC", full_name).split()]
-    if not target:
-        return False
-    for start in range(len(words)):
-        joined = ""
-        for word in words[start:]:
-            joined += word
-            if joined == target:
-                return True
-            if len(joined) >= len(target):
-                break
-    return False
+    return frozenset(_name_tokens(text))
+
+
+def shopify_full_name(first_name: Any, last_name: Any) -> str:
+    """Shopify's full name: ``firstName`` + " " + ``lastName`` (either may be
+    empty; AC2 -> Shopify creates put the whole name in ``firstName``)."""
+
+    return " ".join(part for part in (first_name, last_name) if isinstance(part, str))
+
+
+MIN_NAME_WORDS = 2
+
+
+def full_name_matches(name_a: Any, name_b: Any) -> bool:
+    """Owner Q1 (2026-10-21, addendum r3a): on the same phone, the names
+    match when the shorter name has at least two words and every one of them
+    is a word of the longer one ("Ann Lee" and "MARY ANN LEE"). Exact words
+    only: no prefixes, no fuzzy matching ("Anne" is not "Ann"). A name of 0
+    or 1 words (blank, only punctuation, "Lee", or a name written without
+    spaces) never matches, even an identical one."""
+
+    shorter, longer = sorted((name_words(name_a), name_words(name_b)), key=len)
+    return len(shorter) >= MIN_NAME_WORDS and shorter <= longer
 
 
 def name_letters(*parts: Any) -> str:
@@ -496,9 +520,10 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
     if phone_digits is None:
         return Decision("CREATE", "no_phone_generator_member_no")
     hits = [r for r in rows if _phone_hit(r, phone_digits)]
-    same = [r for r in hits if first_name_matches(customer.first_name, r.name)]
+    full_name = shopify_full_name(customer.first_name, customer.last_name)
+    same = [r for r in hits if full_name_matches(full_name, r.name)]
     if len(same) == 1:
-        return Decision("LINK", "phone_and_first_name_match", same[0].member_no)
+        return Decision("LINK", "phone_and_name_match", same[0].member_no)
     if len(same) > 1:
         # The 15 shared-phone records: link only to the record whose MemberNo
         # is the phone itself; otherwise skip. Records are never merged.
@@ -609,9 +634,10 @@ _LEDGER_V2_MIGRATION = (
 
 
 def normalised_name(value: Any) -> str:
-    """Case-folded, NFKC, single-spaced (for the identity digest only)."""
+    """The name's words in order, from the same normalisation as the name rule
+    (for the identity digest only). Exact: "Ann Lee" is not "Mary Ann Lee"."""
 
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split()) if isinstance(value, str) else ""
+    return " ".join(_name_tokens(value))
 
 
 class SyncLedger:
@@ -725,6 +751,14 @@ class SyncLedger:
             (member_no_key(member_no),),
         ).fetchone()
 
+    def open_write_for_customer(self, gid: str) -> sqlite3.Row | None:
+        """A Shopify -> AC2 write for this customer that may still land."""
+
+        return self.conn.execute(
+            "SELECT * FROM writes WHERE customer_gid = ? AND direction = 'shopify_to_ac2' AND state IN ('INTENT', 'UNCERTAIN') LIMIT 1",
+            (gid,),
+        ).fetchone()
+
     def add_link(self, conn: sqlite3.Connection, gid: str, member_no: str, origin: str, code: str) -> None:
         conn.execute(
             "INSERT INTO links(customer_gid, member_no, member_no_key, origin, code, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -757,10 +791,10 @@ class RunSummary:
     alerts: list[str] = field(default_factory=list)
     writes: int = 0
 
-    def alert(self, code: str) -> None:
+    def alert(self, code: str, ref: str | None = None) -> None:
         """Needs an operator; the run summary status says so."""
 
-        self.count(code)
+        self.count(code, ref)
         if code not in self.alerts:
             self.alerts.append(code)
 
@@ -842,12 +876,20 @@ class SyncEngine:
 
     def _recover_crashed_intents(self) -> None:
         """An INTENT left by a crashed run may or may not have been written:
-        it becomes UNCERTAIN and is only ever looked up, never re-sent."""
+        it becomes UNCERTAIN and is only ever looked up, never re-sent. Its
+        customer is held (G2 H2): the write-once child of a killed parent may
+        still save, so the customer is never registered again."""
 
+        held = []
         with self.ledger.tx() as conn:
-            for row in conn.execute("SELECT write_id FROM writes WHERE state = 'INTENT'").fetchall():
+            for row in conn.execute("SELECT write_id, direction, customer_gid FROM writes WHERE state = 'INTENT'").fetchall():
                 self._close_write(conn, row["write_id"], "UNCERTAIN", "crashed_intent")
                 self.summary.count("crashed_intent_uncertain")
+                if row["direction"] == "shopify_to_ac2" and row["customer_gid"]:
+                    self._set_shopify_pending(conn, row["customer_gid"], "SKIPPED", "customer_held_by_open_write")
+                    held.append(row["customer_gid"])
+        for gid in held:
+            self.summary.alert("customer_held_by_open_write", self.ledger.ref("c", gid))
 
     def _resolve_uncertain(self, direction: str) -> None:
         rows = self.ledger.conn.execute("SELECT * FROM writes WHERE state = 'UNCERTAIN' AND direction = ?", (direction,)).fetchall()
@@ -877,7 +919,8 @@ class SyncEngine:
                 members = [m for m in self.ac2.lookup(None, [row["member_no"]]) if member_no_key(m.member_no) == row["member_no_key"]]
                 digits = _ac2_phone(members[0]) if len(members) == 1 else None
                 customers = self.shopify.find_by_phone(e164(digits)) if digits else []
-                if len(members) == 1 and len(customers) == 1 and first_name_matches(customers[0].first_name, members[0].name) and self.ledger.link_for_gid(customers[0].gid) is None:
+                if (len(members) == 1 and len(customers) == 1 and self.ledger.link_for_gid(customers[0].gid) is None
+                        and full_name_matches(shopify_full_name(customers[0].first_name, customers[0].last_name), members[0].name)):
                     with self.ledger.tx() as conn:
                         self.ledger.add_link(conn, customers[0].gid, members[0].member_no, "created_in_shopify", "uncertain_write_found")
                         self._close_write(conn, row["write_id"], "RESOLVED", "uncertain_write_found", customers[0].gid)
@@ -921,11 +964,14 @@ class SyncEngine:
 
     def _shopify_pending(self, gid: str, state: str, code: str, *, count_check: bool = False) -> None:
         with self.ledger.tx() as conn:
-            conn.execute(
-                "INSERT INTO shopify_pending(customer_gid, state, code, checks, updated_at) VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(customer_gid) DO UPDATE SET state = excluded.state, code = excluded.code, checks = shopify_pending.checks + ?, updated_at = excluded.updated_at",
-                (gid, state, code, 1 if count_check else 0, dl.ts(self.ledger.now()), 1 if count_check else 0),
-            )
+            self._set_shopify_pending(conn, gid, state, code, count_check=count_check)
+
+    def _set_shopify_pending(self, conn: sqlite3.Connection, gid: str, state: str, code: str, *, count_check: bool = False) -> None:
+        conn.execute(
+            "INSERT INTO shopify_pending(customer_gid, state, code, checks, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(customer_gid) DO UPDATE SET state = excluded.state, code = excluded.code, checks = shopify_pending.checks + ?, updated_at = excluded.updated_at",
+            (gid, state, code, 1 if count_check else 0, dl.ts(self.ledger.now()), 1 if count_check else 0),
+        )
 
     def _register(self, customer: ShopifyCustomer) -> None:
         gid = customer.gid
@@ -1033,6 +1079,13 @@ class SyncEngine:
     def _create_in_ac2(self, customer: ShopifyCustomer, digits: str | None, decision: Decision, member_ref: str) -> None:
         gid = customer.gid
         member_no = decision.member_no
+        if self.ledger.open_write_for_customer(gid) is not None:
+            # G2 H2: an earlier write for this customer may still land (a
+            # killed run's child); another create would be a second member.
+            # Never re-sent blindly, like any unclear result.
+            self._shopify_pending(gid, "SKIPPED", "customer_held_by_open_write")
+            self.summary.alert("customer_held_by_open_write", member_ref)
+            return
         name = " ".join(part.strip() for part in (customer.first_name, customer.last_name) if isinstance(part, str) and part.strip())
         if not name:
             self._shopify_pending(gid, "SKIPPED", "name_missing")
@@ -1107,6 +1160,7 @@ class SyncEngine:
             self._initialise_changelog(column, overlap)
             return
         current = int(watermark)
+        self._baseline_overlap(column, current, overlap)
         after = max(current - overlap, 0) if overlap else current
         rows, max_id = self.ac2.changelog_inserts(after, self.config.changelog_batch + overlap, column)
         if max_id < current:
@@ -1164,7 +1218,40 @@ class SyncEngine:
                 if row_id <= max_id:
                     conn.execute("INSERT OR IGNORE INTO changelog_seen(id, seen_at) VALUES (?, ?)", (row_id, dl.ts(self.ledger.now())))
             self.ledger.set_watermark(conn, "ac2_changelog_id", str(int(max_id)))
+            self.ledger.set_watermark(conn, OVERLAP_MARK, str(overlap))
         self.summary.count("changelog_watermark_initialised")
+
+    def _baseline_overlap(self, column: str, current: int, overlap: int) -> None:
+        """G2 H3 (Option A): the seen IDs cover the overlap window only when
+        the last run used at least this overlap. A ledger without the stored
+        overlap (upgraded from v1, or written before this rule) or a larger
+        overlap than stored would re-read rows that were never recorded or
+        were already pruned, and queue history as new. Those rows are marked
+        seen without processing, as on the first run (the same accepted risk:
+        an insert committing late inside the window on that one run is
+        treated as history). A numbering reset is left to the main read."""
+
+        stored = self.ledger.watermark(OVERLAP_MARK)
+        if stored is not None and int(stored) >= overlap:
+            if int(stored) != overlap:
+                with self.ledger.tx() as conn:  # smaller now: pruning follows it
+                    self.ledger.set_watermark(conn, OVERLAP_MARK, str(overlap))
+            return
+        rows: list = []
+        if overlap and current > 0:
+            rows, max_id = self.ac2.changelog_inserts(max(current - overlap, 0), overlap, column)
+            if max_id < current:
+                return
+        marked = 0
+        with self.ledger.tx() as conn:
+            for row_id, _xml in rows:
+                if row_id <= current:
+                    marked += conn.execute("INSERT OR IGNORE INTO changelog_seen(id, seen_at) VALUES (?, ?)", (row_id, dl.ts(self.ledger.now()))).rowcount
+            self.ledger.set_watermark(conn, OVERLAP_MARK, str(overlap))
+        if overlap:
+            self.summary.alert("changelog_overlap_baselined")
+            for _ in range(marked):
+                self.summary.count("changelog_overlap_baselined_rows")
 
     def _ac2_done(self, key: str, state: str, code: str, *, count_check: bool = False) -> None:
         with self.ledger.tx() as conn:
@@ -1202,10 +1289,10 @@ class SyncEngine:
                 continue
             if len(customers) == 1:
                 customer = customers[0]
-                if not first_name_matches(customer.first_name, member.name):
-                    # Owner (2026-10-21): another first name is another
-                    # person. Shopify phones are unique, so the separate
-                    # customer is created without the phone; never linked.
+                if not full_name_matches(shopify_full_name(customer.first_name, customer.last_name), member.name):
+                    # Owner (2026-10-21): another name (Q1 word rule) is
+                    # another person. Shopify phones are unique, so the
+                    # separate customer is created without the phone; never linked.
                     self.summary.count("shopify_phone_owned_by_other_name")
                     self._create_in_shopify(member, None, key, ref)
                 elif self.ledger.link_for_gid(customer.gid) is not None:
@@ -1213,7 +1300,7 @@ class SyncEngine:
                     self.summary.count("shopify_customer_linked_to_other_member", ref)
                 else:
                     with self.ledger.tx() as conn:
-                        self.ledger.add_link(conn, customer.gid, member.member_no, "matched", "shopify_phone_and_first_name_match")
+                        self.ledger.add_link(conn, customer.gid, member.member_no, "matched", "shopify_phone_and_name_match")
                     self._ac2_done(key, "DONE", "linked_existing_shopify_customer")
                     self.summary.count("linked_existing_shopify_customer", ref, "link")
                 continue
@@ -1269,13 +1356,21 @@ class SyncEngine:
         self.summary.count("shopify_customer_created" if digits is not None else "shopify_separate_customer_created_without_phone", ref, "create")
 
 
+_SG_MEMBER_NO_RE = re.compile(r"65[3689][0-9]{7}|[3689][0-9]{7}")
+
+
 def _ac2_phone(member: Ac2Member) -> str | None:
-    """The member's phone: MobilePhone, else a MemberNo that is itself a
-    phone number (the phase-1 numbering)."""
+    """The member's phone: MobilePhone (``phone_member_no``, unchanged), else
+    a MemberNo that is a Singapore number (Owner Q3, 2026-10-21): ``65`` + 8
+    digits starting 3/6/8/9 as is, or those 8 digits alone with ``65``. Any
+    other MemberNo (a generator number, a foreign number, a phone + suffix
+    digit, a leading 0, 9 digits) gives no phone."""
 
     digits, _ = phone_member_no(member.mobile_phone)
-    if digits is None and member.member_no.strip().isdigit():
-        digits, _ = phone_member_no(member.member_no.strip())
+    if digits is None:
+        number = member.member_no.strip()
+        if _SG_MEMBER_NO_RE.fullmatch(number):
+            digits = number if len(number) == 10 else "65" + number
     return digits
 
 
@@ -1480,8 +1575,10 @@ def _win_cred_read(target: str) -> tuple[str, str] | None:
 
 
 def load_ac2_credential(target: str, *, cred_read: Callable[[str], tuple[str, str] | None] | None = None) -> Ac2Credential:
-    """Load the AC2 automation user's credential. Never prints, logs or
-    returns the secret in an error; failures are fixed codes."""
+    """Load the credential of the AutoCount account the sync logs in with.
+    Never prints, logs or returns the secret in an error; failures are fixed
+    codes. ``ac2_credential_sa_refused`` refuses an AutoCount user ID of
+    ``sa`` only; it does not change the SQL login (always ``sa``)."""
 
     if not isinstance(target, str) or not CREDENTIAL_TARGET_RE.fullmatch(target):
         raise dl.DirectLocalError("ac2_credential_target_invalid")

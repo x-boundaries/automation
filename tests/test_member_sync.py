@@ -197,7 +197,8 @@ class SyncTestCase(unittest.TestCase):
         shutil.rmtree(self.temp, ignore_errors=True)
 
     def engine(self, **overrides) -> sync.SyncEngine:
-        settings = {"ac2_create_enabled": True, "shopify_create_enabled": True}
+        # ChangeLog reads are off by default (Owner Q4); these tests turn them on.
+        settings = {"ac2_create_enabled": True, "shopify_create_enabled": True, "changelog_xml_column": "Content"}
         settings.update(overrides)
         return sync.SyncEngine(self.ledger, make_config(**settings), shopify=self.shopify, ac2=self.ac2)
 
@@ -241,14 +242,28 @@ class PhoneRuleTests(unittest.TestCase):
         self.assertEqual(sync.member_no_key(" abC1  "), sync.member_no_key("ABC1"))
         self.assertNotEqual(sync.member_no_key("AB-C1"), sync.member_no_key("ABC1"))  # hyphens stay significant
 
-    def test_first_name_matching(self):
-        self.assertTrue(sync.first_name_matches("Mei Ling", "TAN MEI LING"))
-        self.assertTrue(sync.first_name_matches("meiling", "Mei Ling Tan"))
-        self.assertTrue(sync.first_name_matches(" ALPHA ", "alpha tester"))
-        self.assertFalse(sync.first_name_matches("Al", "Alpha Tester"))
-        self.assertFalse(sync.first_name_matches("", "Alpha"))
-        self.assertFalse(sync.first_name_matches(None, "Alpha"))
-        self.assertFalse(sync.first_name_matches("Bravo", "Alpha Tester"))
+    def test_full_name_word_rule(self):
+        self.assertEqual(sync.name_words("  Mary-Ann  LEE. "), frozenset({"mary", "ann", "lee"}))
+        self.assertEqual(sync.name_words("Ｍａｒｙ"), frozenset({"mary"}))  # NFKC folds full-width letters
+        self.assertEqual(sync.name_words("O'Brien, J."), frozenset({"o", "brien", "j"}))
+        self.assertEqual(sync.name_words("Lee Lee"), frozenset({"lee"}))
+        for empty in (None, "", "  ", "...", "-'.,"):
+            self.assertEqual(sync.name_words(empty), frozenset())
+        self.assertTrue(sync.full_name_matches("Ann Lee", "MARY ANN LEE"))
+        self.assertTrue(sync.full_name_matches("MARY ANN LEE", "Ann Lee"))  # either side may be the shorter
+        self.assertTrue(sync.full_name_matches("Lee Mary Ann", "MARY ANN LEE"))
+        self.assertFalse(sync.full_name_matches("Mary Tan", "MARY ANN LEE"))
+        self.assertFalse(sync.full_name_matches("Anne Lee", "ANN LEE"))  # exact words only
+        self.assertFalse(sync.full_name_matches("Al", "Alpha Tester"))  # no prefixes
+        self.assertFalse(sync.full_name_matches("..", ".."))
+        self.assertTrue(sync.full_name_matches("Ann Lee", "ANN LEE"))  # 2 to 2
+        for one_word in (("Lee", "MARY ANN LEE"), ("Mary", "MARY"), ("MARY ANN LEE", "Lee"), ("Mary.", "Mary")):
+            self.assertFalse(sync.full_name_matches(*one_word))  # r3a: one word never links
+        self.assertFalse(sync.full_name_matches("", "Alpha"))
+        self.assertFalse(sync.full_name_matches(None, "Alpha"))
+        self.assertEqual(sync.shopify_full_name("MARY ANN", "LEE"), "MARY ANN LEE")
+        self.assertEqual(sync.shopify_full_name("MARY ANN LEE", None), "MARY ANN LEE")
+        self.assertFalse(hasattr(sync, "first_name_matches"))
 
     def test_fallback_member_no_fits_twenty_characters(self):
         value = sync.fallback_member_no(sync.phone_member_no(plus(sg(9)))[0], "Bravo-Zoë", "Very Long Family Name")
@@ -372,20 +387,21 @@ class ShopifyToAc2Tests(SyncTestCase):
         self.assertEqual(result["counts"]["ac2_member_created"], 1)
         self.assert_no_pii(result)
 
-    def test_same_phone_same_first_name_links(self):
+    def test_same_phone_same_name_links(self):
         self.ac2.add(sync.Ac2Member(sg(2), "TESTER ALPHA", None))
         self.shopify.add(customer(2))
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual(self.ac2.creates, [])
         self.assertEqual(self.links(), {gid(2): sg(2)})
-        self.assertEqual(result["counts"]["phone_and_first_name_match"], 1)
+        self.assertEqual(result["counts"]["phone_and_name_match"], 1)
 
     def test_mobile_phone_and_embedded_digits_count_as_same_phone(self):
-        self.ac2.add(sync.Ac2Member("OLD-17", "Alpha T", local(3)[:4] + " " + local(3)[4:]))
+        # Q1: exact words only, so the full name (an initial "T" is not "Tester").
+        self.ac2.add(sync.Ac2Member("OLD-17", "Alpha Tester", local(3)[:4] + " " + local(3)[4:]))
         self.shopify.add(customer(3))
         self.run_sync("shopify_to_ac2")
         self.assertEqual(self.links(), {gid(3): "OLD-17"})
-        self.ac2.add(sync.Ac2Member("X" + local(4), "Alpha", None))
+        self.ac2.add(sync.Ac2Member("X" + local(4), "Alpha Tester", None))
         self.shopify.add(customer(4))
         self.run_sync("shopify_to_ac2")
         self.assertEqual(self.links()[gid(4)], "X" + local(4))
@@ -475,7 +491,7 @@ class ShopifyToAc2Tests(SyncTestCase):
         self.assertEqual(result["counts"]["ac2_create_disabled"], 1)
 
     def test_member_no_with_spaces_and_case_still_links(self):
-        self.ac2.add(sync.Ac2Member(" " + sg(9) + "  ", "alpha", None))
+        self.ac2.add(sync.Ac2Member(" " + sg(9) + "  ", "alpha tester", None))
         self.shopify.add(customer(9))
         self.run_sync("shopify_to_ac2")
         self.assertEqual(self.ac2.creates, [])
@@ -739,10 +755,10 @@ class CredentialTests(unittest.TestCase):
     SECRET = "fake-secret-value-9f2c"
 
     def test_loader_never_reveals_the_secret(self):
-        credential = sync.load_ac2_credential("XB-AC2-Automation", cred_read=lambda target: ("xbsync01", self.SECRET))
+        credential = sync.load_ac2_credential("XB-AC2-MemberSync", cred_read=lambda target: ("fakeuser01", self.SECRET))
         self.assertNotIn(self.SECRET, repr(credential))
-        self.assertNotIn("xbsync01", repr(credential))
-        self.assertIn("c01", repr(credential))
+        self.assertNotIn("fakeuser01", repr(credential))
+        self.assertIn("r01", repr(credential))
         env = credential.child_environment({"PATH": "x", "AC2_PROBE_PASSWORD": "stale"})
         self.assertEqual(env["XB_AC2_PASSWORD_ENV_VAR"], sync.AC2_PASSWORD_ENV)
         self.assertEqual(env[sync.AC2_PASSWORD_ENV], self.SECRET)
@@ -754,11 +770,11 @@ class CredentialTests(unittest.TestCase):
             (lambda target: (_ for _ in ()).throw(OSError(self.SECRET)), "ac2_credential_unreadable"),
             (lambda target: ("sa", self.SECRET), "ac2_credential_sa_refused"),
             (lambda target: ("SA", self.SECRET), "ac2_credential_sa_refused"),
-            (lambda target: ("xbsync01", ""), "ac2_credential_secret_invalid"),
+            (lambda target: ("fakeuser01", ""), "ac2_credential_secret_invalid"),
         ]
         for reader, code in cases:
             with self.assertRaises(dl.DirectLocalError) as caught:
-                sync.load_ac2_credential("XB-AC2-Automation", cred_read=reader)
+                sync.load_ac2_credential("XB-AC2-MemberSync", cred_read=reader)
             self.assertEqual(caught.exception.code, code)
             self.assertNotIn(self.SECRET, str(caught.exception))
 
@@ -766,20 +782,20 @@ class CredentialTests(unittest.TestCase):
         temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-cli-"))
         try:
             path = temp / "config.json"
-            path.write_text(json.dumps(config_value(ac2_credential_target="XB-AC2-Automation")), encoding="utf-8")
+            path.write_text(json.dumps(config_value(ac2_credential_target="XB-AC2-MemberSync")), encoding="utf-8")
             out = io.StringIO()
-            with mock.patch.object(sync, "_win_cred_read", return_value=("xbsync01", self.SECRET)), redirect_stdout(out):
+            with mock.patch.object(sync, "_win_cred_read", return_value=("fakeuser01", self.SECRET)), redirect_stdout(out):
                 code = sync.main(["check-credential", "--config", str(path)])
             self.assertEqual(code, 0)
             self.assertNotIn(self.SECRET, out.getvalue())
-            self.assertNotIn("xbsync01", out.getvalue())
-            self.assertEqual(json.loads(out.getvalue())["user_id"], "*****c01")
+            self.assertNotIn("fakeuser01", out.getvalue())
+            self.assertEqual(json.loads(out.getvalue())["user_id"], "*******r01")
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
     def test_mask_last3(self):
         self.assertEqual(sync.mask_last3(sg(1)), "*******" + sg(1)[-3:])
-        self.assertEqual(sync.mask_last3("xbsync01"), "*****c01")
+        self.assertEqual(sync.mask_last3("fakeuser01"), "*******r01")
         self.assertNotIn(local(1), sync.mask_last3(sg(1)))
 
 
@@ -867,7 +883,7 @@ class BridgeClientTests(unittest.TestCase):
             captured["env"] = kwargs.get("env")
             return Process()
 
-        env = sync.Ac2Credential("xbsync01", "fake-secret-value-9f2c").child_environment({"PATH": "x"})
+        env = sync.Ac2Credential("fakeuser01", "fake-secret-value-9f2c").child_environment({"PATH": "x"})
         client = sync.SyncBridgeClient(["powershell.exe"], autocount_book=TEST_BOOK, claims=Path("."), env=env, popen=popen)
         members = client.lookup(sg(80), [])
         self.assertEqual(members[0].member_no, sg(80))
@@ -999,22 +1015,73 @@ class B2UncertainCreateIdentityTests(SyncTestCase):
         self.assertRegex(self.ledger.conn.execute("SELECT intent_digest FROM writes").fetchone()[0], r"^sha256:[0-9a-f]{64}$")
 
 
-def split_name(full: str) -> tuple[str, str | None]:
-    words = full.split()
-    return (" ".join(words[:-1]), words[-1]) if len(words) > 1 else (full, None)
+# Owner decision Q1 (2026-10-21, with addendum r3a): on the same phone, link
+# when the shorter full name has at least 2 words and every one of them is a
+# word of the longer one; a name of 0 or 1 words never links, even when
+# identical. Every example runs on one shared fake phone. Non-Latin names are
+# built from escapes (ASCII source).
+NAME_PHONE = 81
+NAME_TILL = "TILL81"
+CJK_NAME = "陈美玲"  # written without spaces: one word
+CJK_TWO_WORDS = "陈 美玲"  # the same name written with a space: two words
+
+# (label, Shopify firstName, Shopify lastName, AC2 Name, links)
+SHOPIFY_TO_AC2_NAMES = (
+    ("ann_lee", "Ann", "Lee", "MARY ANN LEE", True),
+    ("mary_lee", "Mary", "Lee", "MARY ANN LEE", True),
+    ("mary_ann_lee", "Mary Ann", "Lee", "MARY ANN LEE", True),
+    ("mary_tan", "Mary", "Tan", "MARY ANN LEE", False),  # re-added: first name only linked it
+    ("john_lim", "John", "Lim", "MARY ANN LEE", False),
+    ("anne_lee", "Anne", "Lee", "ANN LEE", False),
+    ("word_order", "Lee", "Mary Ann", "MARY ANN LEE", True),
+    ("punctuation_and_spacing", "Mary-Ann ", " Lee.", "MARY ANN LEE", True),
+    ("one_word_surname", "Lee", None, "MARY ANN LEE", False),  # r3a: one word never links
+    ("one_word_first_name", "Mary", None, "MARY ANN LEE", False),
+    ("one_word_identical", "Mary", None, "MARY", False),
+    ("one_word_ac2_side", "Mary", "Lee", "LEE", False),
+    ("punctuation_only_both_sides", "..", None, "..", False),
+    ("non_latin_identical_one_word", CJK_NAME, None, CJK_NAME, False),
+    ("non_latin_identical_two_words", CJK_TWO_WORDS, None, CJK_TWO_WORDS, True),
+    ("non_latin_spaced_vs_unspaced", CJK_NAME[0], CJK_NAME[1:], CJK_NAME, False),
+    ("non_latin_vs_latin", CJK_NAME, None, "MARY ANN LEE", False),
+    ("latin_vs_non_latin", "Mary", "Lee", CJK_NAME, False),
+)
+
+# (label, AC2 Name, Shopify firstName, Shopify lastName, links). Shopify holds
+# the name split, or whole in firstName as AC2 -> Shopify creates write it.
+AC2_TO_SHOPIFY_NAMES = (
+    ("ann_lee_split", "Ann Lee", "MARY ANN", "LEE", True),  # re-added
+    ("ann_lee_whole", "Ann Lee", "MARY ANN LEE", None, True),  # re-added
+    ("mary_lee_split", "Mary Lee", "MARY ANN", "LEE", True),  # re-added
+    ("mary_lee_whole", "Mary Lee", "MARY ANN LEE", None, True),  # re-added
+    ("mary_ann_lee_split", "Mary Ann Lee", "MARY ANN", "LEE", True),
+    ("mary_ann_lee_whole", "Mary Ann Lee", "MARY ANN LEE", None, True),
+    ("mary_tan_split", "Mary Tan", "MARY ANN", "LEE", False),
+    ("mary_tan_whole", "Mary Tan", "MARY ANN LEE", None, False),
+    ("john_lim_split", "John Lim", "MARY ANN", "LEE", False),
+    ("john_lim_whole", "John Lim", "MARY ANN LEE", None, False),
+    ("anne_lee_split", "Anne Lee", "ANN", "LEE", False),
+    ("anne_lee_whole", "Anne Lee", "ANN LEE", None, False),
+    ("word_order_split", "Lee Mary Ann", "MARY ANN", "LEE", True),
+    ("word_order_whole", "Lee Mary Ann", "MARY ANN LEE", None, True),
+    ("punctuation_and_spacing_split", "Mary-Ann  Lee.", "MARY ANN", "LEE", True),
+    ("punctuation_and_spacing_whole", "Mary-Ann  Lee.", "MARY ANN LEE", None, True),
+    ("one_word_surname", "MARY ANN LEE", "Lee", None, False),  # r3a: one word never links
+    ("one_word_first_name", "MARY ANN LEE", "Mary", None, False),
+    ("one_word_identical", "MARY", "Mary", None, False),
+    ("one_word_ac2_side", "Lee", "MARY ANN", "LEE", False),
+    ("punctuation_only_both_sides", "..", "..", None, False),
+    ("non_latin_identical_one_word", CJK_NAME, CJK_NAME, None, False),
+    ("non_latin_identical_two_words", CJK_TWO_WORDS, CJK_TWO_WORDS, None, True),
+    ("non_latin_vs_latin", CJK_NAME, "MARY ANN", "LEE", False),
+)
 
 
-class NameRuleTests(unittest.TestCase):
-    """Owner decision 2026-10-21 14:35Z examples, locked where the current
-    rule (``first_name_matches``) already gives the stated result. Not
-    included because the current code differs (reported to the Owner, no
-    logic change): Shopify -> AC2 "Mary Tan" links to "MARY ANN LEE";
-    AC2 -> Shopify "Ann Lee" and "Mary Lee" do not link to "MARY ANN LEE"."""
-
-    LINK = ("Ann Lee", "Mary Lee", "Mary Ann Lee")
-    SEPARATE = ("John Lim",)
-    AC2_LINK = ("Mary Ann Lee",)
-    AC2_SEPARATE = ("Mary Tan", "John Lim")
+class FullNameRuleTests(unittest.TestCase):
+    """Q1 examples in both directions. A non-link must take that direction's
+    existing no-link path: Shopify -> AC2 the shared-phone MemberNo (phone +
+    letters, or phone + digit 2-9 without Latin letters); AC2 -> Shopify a
+    separate customer without the phone."""
 
     def fresh(self):
         case = SyncTestCase("run_sync")
@@ -1022,48 +1089,122 @@ class NameRuleTests(unittest.TestCase):
         self.addCleanup(case.tearDown)
         return case
 
-    def shopify_to_ac2(self, ac2_name: str, shopify_name: str) -> tuple[dict, list]:
+    def check_shopify_to_ac2(self, first, last, ac2_name, links):
         case = self.fresh()
-        case.ac2.add(sync.Ac2Member(sg(81), ac2_name, None))
-        first, last = split_name(shopify_name)
-        case.shopify.add(customer(81, first=first, last=last))
-        case.run_sync("shopify_to_ac2")
-        return case.links(), case.ac2.creates
+        phone = sg(NAME_PHONE)
+        case.ac2.add(sync.Ac2Member(phone, ac2_name, None))
+        case.shopify.add(customer(NAME_PHONE, first=first, last=last))
+        result = case.run_sync("shopify_to_ac2")
+        if links:
+            self.assertEqual((case.links(), case.ac2.creates), ({gid(NAME_PHONE): phone}, []))
+            return
+        letters = sync.fallback_member_no(phone, first, last)
+        expected, code = (letters, "shared_phone_name_fallback") if letters else (phone + "2", "shared_phone_digit_fallback")
+        self.assertEqual([m for m, _ in case.ac2.creates], [expected])
+        self.assertEqual(case.links(), {gid(NAME_PHONE): expected})  # the new member, never the phone's holder
+        self.assertEqual(result["counts"][code], 1)
 
-    def ac2_to_shopify(self, shopify_first: str, shopify_last: str | None, ac2_name: str) -> tuple[dict, list]:
+    def check_ac2_to_shopify(self, ac2_name, first, last, links):
+        case = self.fresh()
+        case.run_sync("ac2_to_shopify")  # watermark
+        case.shopify.add(customer(NAME_PHONE, first=first, last=last, tags=()))
+        case.ac2.add(sync.Ac2Member(NAME_TILL, ac2_name, sg(NAME_PHONE)), log=True)
+        result = case.run_sync("ac2_to_shopify")
+        if links:
+            self.assertEqual((case.links(), case.shopify.created), ({gid(NAME_PHONE): NAME_TILL}, []))
+            return
+        self.assertNotIn(gid(NAME_PHONE), case.links())
+        self.assertEqual(len(case.shopify.created), 1)
+        self.assertNotIn("phone", case.shopify.created[0])
+        self.assertEqual(result["counts"]["shopify_phone_owned_by_other_name"], 1)
+        self.assertEqual(result["counts"]["shopify_separate_customer_created_without_phone"], 1)
+
+    def test_ac2_to_shopify_no_link_only_counts_while_shopify_create_is_off(self):
         case = self.fresh()
         case.run_sync("ac2_to_shopify")
-        case.shopify.add(customer(82, first=shopify_first, last=shopify_last, tags=()))
-        case.ac2.add(sync.Ac2Member("TILL82", ac2_name, sg(82)), log=True)
+        case.shopify.add(customer(NAME_PHONE, first="MARY ANN", last="LEE", tags=()))
+        case.ac2.add(sync.Ac2Member(NAME_TILL, "Mary Tan", sg(NAME_PHONE)), log=True)
+        result = case.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((case.links(), case.shopify.created), ({}, []))
+        self.assertEqual((result["counts"]["shopify_phone_owned_by_other_name"], result["counts"]["shopify_create_disabled"]), (1, 1))
+        self.assertEqual(case.ledger.conn.execute("SELECT state FROM ac2_pending").fetchone()[0], "PENDING")
+
+    def test_empty_shopify_name_never_links_and_is_still_skipped(self):
+        case = self.fresh()
+        case.ac2.add(sync.Ac2Member(sg(NAME_PHONE), "MARY ANN LEE", None))
+        case.shopify.add(customer(NAME_PHONE, first="", last=" "))
+        result = case.run_sync("shopify_to_ac2")
+        self.assertEqual((case.links(), case.ac2.creates), ({}, []))
+        self.assertEqual(result["counts"]["shopify_name_missing"], 1)
+
+    def test_empty_ac2_name_never_links(self):
+        case = self.fresh()
         case.run_sync("ac2_to_shopify")
-        return case.links(), case.shopify.created
+        case.shopify.add(customer(NAME_PHONE, first="MARY ANN", last="LEE", tags=()))
+        case.ac2.add(sync.Ac2Member(NAME_TILL, "", sg(NAME_PHONE)), log=True)
+        result = case.run_sync("ac2_to_shopify")
+        self.assertEqual((case.links(), case.shopify.created), ({}, []))
+        self.assertEqual(result["counts"]["ac2_member_without_name"], 1)
 
-    def test_shopify_to_ac2_examples(self):
-        for name in self.LINK:
-            with self.subTest(link=name):
-                links, creates = self.shopify_to_ac2("MARY ANN LEE", name)
-                self.assertEqual((links, creates), ({gid(81): sg(81)}, []))
-        for name in self.SEPARATE + ("Anne Lee",):
-            with self.subTest(separate=name):
-                ac2 = "ANN LEE" if name == "Anne Lee" else "MARY ANN LEE"
-                links, creates = self.shopify_to_ac2(ac2, name)
-                first, last = split_name(name)
-                self.assertEqual([m for m, _ in creates], [sync.fallback_member_no(sg(81), first, last)])
+    def test_uncertain_shopify_create_resolves_with_the_word_rule(self):
+        case = self.fresh()
+        case.run_sync("ac2_to_shopify")
+        case.ac2.add(sync.Ac2Member(sg(NAME_PHONE), "Mary Ann Lee", sg(NAME_PHONE)), log=True)
+        case.shopify.create_mode = "uncertain"
+        case.run_sync("ac2_to_shopify")
+        case.shopify.create_mode = "ok"
+        case.shopify.add(customer(NAME_PHONE, first="Mary-Ann", last="Lee", tags=()))  # it had been created after all
+        result = case.run_sync("ac2_to_shopify")
+        self.assertEqual((case.links(), case.shopify.created), ({gid(NAME_PHONE): sg(NAME_PHONE)}, []))
+        self.assertEqual(result["counts"]["uncertain_write_resolved_linked"], 1)
 
-    def test_ac2_to_shopify_examples(self):
-        for shopify_first, shopify_last in (("MARY ANN", "LEE"), ("MARY ANN LEE", None)):  # split, or the whole name in firstName
-            for name in self.AC2_LINK:
-                with self.subTest(shopify=shopify_first, link=name):
-                    links, created = self.ac2_to_shopify(shopify_first, shopify_last, name)
-                    self.assertEqual((links, created), ({gid(82): "TILL82"}, []))
-            for name in self.AC2_SEPARATE:
-                with self.subTest(shopify=shopify_first, separate=name):
-                    links, created = self.ac2_to_shopify(shopify_first, shopify_last, name)
-                    self.assertNotIn(gid(82), links)
-                    self.assertNotIn("phone", created[0])
-        links, created = self.ac2_to_shopify("ANN", "LEE", "Anne Lee")
-        self.assertNotIn(gid(82), links)
-        self.assertNotIn("phone", created[0])
+
+def _name_test(method, args):
+    return lambda self: getattr(self, method)(*args)
+
+
+# One test per example and direction, so each result is reported by name.
+for _label, _first, _last, _ac2_name, _links in SHOPIFY_TO_AC2_NAMES:
+    setattr(FullNameRuleTests, f"test_shopify_to_ac2_{_label}", _name_test("check_shopify_to_ac2", (_first, _last, _ac2_name, _links)))
+for _label, _ac2_name, _first, _last, _links in AC2_TO_SHOPIFY_NAMES:
+    setattr(FullNameRuleTests, f"test_ac2_to_shopify_{_label}", _name_test("check_ac2_to_shopify", (_ac2_name, _first, _last, _links)))
+
+
+class B2IdentityNormalisationTests(SyncTestCase):
+    """B2 stays an exact identity check, with the name normalised by the same
+    helper as the word rule (case, spacing and punctuation)."""
+
+    def test_identity_digest_uses_the_shared_normalisation_exactly(self):
+        digest = self.ledger.identity_digest
+        self.assertEqual(digest("Mary-Ann  Lee.", sg(85)), digest("MARY ANN LEE", sg(85)))
+        self.assertNotEqual(digest("Ann Lee", sg(85)), digest("Mary Ann Lee", sg(85)))  # never a subset
+        self.assertNotEqual(digest("Lee Mary Ann", sg(85)), digest("Mary Ann Lee", sg(85)))  # the exact word sequence
+        self.assertNotEqual(digest("Mary Ann Lee", sg(85)), digest("Mary Ann Lee", sg(86)))
+
+    def uncertain_create(self, holder_name: str) -> dict:
+        self.ac2.create_result = ("WRITE_OUTCOME_UNCERTAIN", "writer_failed_after_claim")
+        original = self.ac2.create_member
+
+        def lands_as(member_no, payload, *, write_id):
+            self.ac2.creates.append((member_no, dict(payload)))
+            self.ac2.add(sync.Ac2Member(member_no, holder_name, payload["mobile_phone"]))
+            return self.ac2.create_result
+
+        self.ac2.create_member = lands_as
+        self.shopify.add(customer(85, first="Mary-Ann", last="Lee"))
+        self.run_sync("shopify_to_ac2")
+        self.ac2.create_member = original
+        return self.run_sync("shopify_to_ac2")
+
+    def test_same_words_link(self):
+        result = self.uncertain_create("MARY ANN LEE")
+        self.assertEqual(self.links(), {gid(85): sg(85)})
+        self.assertEqual(result["counts"]["uncertain_write_resolved_linked"], 1)
+
+    def test_a_subset_name_is_not_the_written_identity(self):
+        result = self.uncertain_create("Ann Lee")
+        self.assertEqual(self.links(), {})
+        self.assertEqual(result["counts"]["uncertain_write_identity_mismatch"], 1)
 
 
 class Q1NonLatinSharedPhoneTests(SyncTestCase):
@@ -1255,11 +1396,12 @@ class LedgerMigrationTests(unittest.TestCase):
 
 
 class ChangeLogConfigTests(unittest.TestCase):
-    def test_content_column_and_overlap_defaults(self):
+    def test_content_column_off_by_default_and_overlap_default(self):
         value = config_value()
         self.assertNotIn("changelog_xml_column", value)
         config = sync.parse_config(value)
-        self.assertEqual((config.changelog_xml_column, config.changelog_overlap), ("Content", 50))
+        self.assertEqual((config.changelog_xml_column, config.changelog_overlap), (None, 50))  # Owner Q4: null
+        self.assertEqual(sync.parse_config(config_value(changelog_xml_column="Content")).changelog_xml_column, "Content")
         with self.assertRaises(dl.DirectLocalError):
             sync.parse_config(config_value(changelog_overlap=200, changelog_batch=200))
 
@@ -1275,6 +1417,243 @@ class L1PhoneWithoutPlusTests(unittest.TestCase):
         for raw in ("0" + NINE_DIGITS[1:], "65" + "1" + "2345678", "1" + "2345678", "12" + "34567", "1" * 16):
             with self.subTest(length=len(raw)):
                 self.assertEqual(sync.phone_member_no(raw), (None, "invalid"))
+
+
+# A 9-digit all-digit MemberNo shaped like a generator number (not a phone).
+GENERATOR_LIKE = "1" + "0000" + "0123"
+
+
+class Q3MemberNoPhoneFallbackTests(SyncTestCase):
+    """Owner Q3: without MobilePhone, the MemberNo gives a phone only when it
+    is a Singapore number (65 + 8 digits starting 3/6/8/9, or those 8 digits)."""
+
+    def test_member_no_shapes(self):
+        cases = [
+            ("sg_65_plus_8", sync.Ac2Member(sg(86), "Alpha", None), sg(86)),
+            ("sg_bare_8", sync.Ac2Member(local(86), "Alpha", None), sg(86)),
+            ("sg_with_spaces_around", sync.Ac2Member(" " + sg(86) + " ", "Alpha", None), sg(86)),
+            ("nine_digits_generator_like", sync.Ac2Member(GENERATOR_LIKE, "Alpha", None), None),
+            ("foreign_plus_suffix_digit", sync.Ac2Member(FOREIGN_DIGITS + "2", "Alpha", None), None),
+            ("foreign_digits", sync.Ac2Member(FOREIGN_DIGITS, "Alpha", None), None),
+            ("nine_digits_phone_like", sync.Ac2Member(NINE_DIGITS, "Alpha", None), None),
+            ("sg_plus_suffix_digit", sync.Ac2Member(sg(86) + "2", "Alpha", None), None),
+            ("65_then_8_starting_1", sync.Ac2Member("65" + "1" + local(86)[1:], "Alpha", None), None),
+            ("bare_8_starting_1", sync.Ac2Member("1" + local(86)[1:], "Alpha", None), None),
+            ("leading_zero", sync.Ac2Member("0" + local(86), "Alpha", None), None),
+            ("phone_plus_initials", sync.Ac2Member(sg(86) + "AT", "Alpha", None), None),
+            ("generator_letters", sync.Ac2Member("M000201", "Alpha", None), None),
+            ("mobile_present_sg", sync.Ac2Member(GENERATOR_LIKE, "Alpha", local(87)), sg(87)),
+            ("mobile_present_foreign", sync.Ac2Member("TILL87", "Alpha", FOREIGN_DIGITS), FOREIGN_DIGITS),
+            ("mobile_present_wins_over_member_no", sync.Ac2Member(sg(88), "Alpha", local(87)), sg(87)),
+        ]
+        for label, member, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(sync._ac2_phone(member), expected)
+
+    def check_no_phone(self, member_no: str) -> None:
+        self.run_sync("ac2_to_shopify")
+        self.shopify.add(customer(89, phone="+" + member_no, tags=()))  # someone holds those digits in Shopify
+        self.ac2.add(sync.Ac2Member(member_no, "Alpha Tester", None), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["counts"]["ac2_member_without_phone"], 1)
+        self.assertEqual((self.links(), self.shopify.created), ({}, []))
+
+    def test_generator_like_member_no_is_not_a_phone(self):
+        self.check_no_phone(GENERATOR_LIKE)
+
+    def test_foreign_member_no_with_suffix_is_not_a_phone(self):
+        self.check_no_phone(FOREIGN_DIGITS + "2")
+
+    def test_bare_sg_member_no_gets_65(self):
+        self.run_sync("ac2_to_shopify")
+        self.ac2.add(sync.Ac2Member(local(90), "Alpha Tester", None), log=True)
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.shopify.created[0]["phone"], plus(sg(90)))
+
+
+class Q4ChangeLogDefaultOffTests(SyncTestCase):
+    """Owner Q4: with the default config (every write switch off, the
+    ChangeLog column null) AC2 -> Shopify reads no ChangeLog and links nothing."""
+
+    def test_default_config_makes_no_links_and_sends_nothing(self):
+        reads = []
+        original = self.ac2.changelog_inserts
+        self.ac2.changelog_inserts = lambda *args: reads.append(args) or original(*args)
+        # G2 O1 shape: the AC2 insert has MemberNo = phone and no MobilePhone;
+        # a Shopify customer already holds that phone.
+        self.shopify.add(customer(91, first="MARY ANN", last="LEE", tags=()))
+        config = make_config()
+        self.assertEqual((config.ac2_create_enabled, config.shopify_create_enabled, config.changelog_xml_column), (False, False, None))
+        results = [sync.SyncEngine(self.ledger, config, shopify=self.shopify, ac2=self.ac2).run(direction="ac2_to_shopify")]
+        self.ac2.add(sync.Ac2Member(sg(91), "MARY ANN LEE", None), log=True)
+        results.append(sync.SyncEngine(self.ledger, config, shopify=self.shopify, ac2=self.ac2).run(direction="ac2_to_shopify"))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM links").fetchone()[0], 0)
+        self.assertEqual(self.shopify.created, [])
+        self.assertEqual(reads, [])
+        for result in results:
+            self.assertEqual(result["counts"], {"changelog_column_unconfigured": 1})
+            self.assertEqual([c for c in result["counts"] if "link" in c], [])
+            self.assertEqual([r for r in result["refs"] if r["action"] == "link"], [])
+
+
+class SimulatedParentDeath(BaseException):
+    """The parent process dies after INTENT; the write-once child may still save."""
+
+
+class H2OpenWriteRefusalTests(SyncTestCase):
+    """G2 H2: a customer whose earlier write is open (INTENT or UNCERTAIN) is
+    never registered again, so a killed run cannot leave two AC2 members."""
+
+    def killed_after_intent(self, n: int) -> sync.Ac2Member:
+        landed = []
+
+        def die(member_no, payload, *, write_id):
+            self.ac2.creates.append((member_no, dict(payload)))
+            landed.append(sync.Ac2Member(member_no, payload["name"], payload["mobile_phone"]))
+            raise SimulatedParentDeath()
+
+        self.ac2.create_member = die
+        self.shopify.add(customer(n, phone=None))  # no phone: a generator number
+        with self.assertRaises(SimulatedParentDeath):
+            self.run_sync("shopify_to_ac2")
+        del self.ac2.create_member
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "INTENT")
+        return landed[0]
+
+    def pending_state(self, n: int) -> tuple:
+        return tuple(self.ledger.conn.execute("SELECT state, code FROM shopify_pending WHERE customer_gid = ?", (gid(n),)).fetchone())
+
+    def test_rerun_after_a_killed_run_creates_nothing_for_that_customer(self):
+        orphan = self.killed_after_intent(92)
+        result = self.run_sync("shopify_to_ac2")  # the orphaned child has not saved yet
+        self.assertEqual(len(self.ac2.creates), 1)
+        self.assertEqual(result["counts"].get("ac2_member_created", 0), 0)
+        self.assertEqual(result["counts"]["customer_held_by_open_write"], 1)
+        self.assertIn("customer_held_by_open_write", result["alerts"])
+        self.assertEqual(self.pending_state(92), ("SKIPPED", "customer_held_by_open_write"))
+        self.assertEqual(self.run_sync("shopify_to_ac2")["counts"].get("ac2_member_created", 0), 0)
+        # The orphaned save lands: it is found, verified and linked. Still one member.
+        self.ac2.add(orphan)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.links(), {gid(92): orphan.member_no})
+        self.assertEqual(result["counts"]["uncertain_write_resolved_linked"], 1)
+        self.assertEqual(len(self.ac2.creates), 1)
+
+    def test_another_customer_is_still_created(self):
+        self.killed_after_intent(93)
+        self.shopify.add(customer(94))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual([m for m, _ in self.ac2.creates[1:]], [sg(94)])
+        self.assertEqual(result["counts"]["ac2_member_created"], 1)
+
+    def add_write(self, n: int, state: str, member_no: str) -> None:
+        now = dl.ts(self.now)
+        with self.ledger.tx() as conn:
+            conn.execute(
+                "INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, code, created_at, updated_at) VALUES (?, 'shopify_to_ac2', ?, ?, ?, ?, 'test', ?, ?)",
+                (f"write-{n:032d}", gid(n), member_no, sync.member_no_key(member_no), state, now, now),
+            )
+
+    def test_open_write_for_the_customer_refuses_any_create(self):
+        self.add_write(95, "UNCERTAIN", "M000150")
+        self.shopify.add(customer(95))  # the phone path too
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.ac2.creates, [])
+        self.assertEqual(result["counts"]["customer_held_by_open_write"], 1)
+        self.assertIn("customer_held_by_open_write", result["alerts"])
+        self.assertEqual(self.pending_state(95), ("SKIPPED", "customer_held_by_open_write"))
+
+    def test_closed_writes_do_not_block(self):
+        for n, state in ((96, "NOT_WRITTEN"), (97, "RESOLVED"), (98, "DONE"), (99, "REJECTED")):
+            self.add_write(n, state, f"M0001{n}")
+            self.shopify.add(customer(n))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertNotIn("customer_held_by_open_write", result["counts"])
+        self.assertEqual(sorted(m for m, _ in self.ac2.creates), sorted(sg(n) for n in (96, 97, 98, 99)))
+
+
+class H3ChangeLogOverlapBaselineTests(SyncTestCase):
+    """G2 H3 (Option A): when the overlap window cannot be trusted (a ledger
+    upgraded from v1, or a larger overlap than the last run used), the rows
+    already in it are history: marked seen, never queued."""
+
+    def log_history(self, numbers) -> None:
+        for n in numbers:
+            self.ac2.add(sync.Ac2Member(sg(n), f"Member {n}", sg(n)), log=True)
+
+    def pending(self, ledger=None) -> int:
+        return (ledger or self.ledger).conn.execute("SELECT COUNT(*) FROM ac2_pending").fetchone()[0]
+
+    def test_upgraded_v1_ledger_with_a_watermark_queues_no_history(self):
+        import sqlite3
+
+        self.log_history((11, 12, 13, 14))
+        watermark = self.ac2.changelog[-1][0]
+        temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-v1wm-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        v1 = sync.LEDGER_SCHEMA.replace(", intent_digest TEXT", "").replace("CREATE TABLE changelog_seen(id INTEGER PRIMARY KEY, seen_at TEXT NOT NULL);\n", "")
+        conn = sqlite3.connect(temp / sync.LEDGER_FILE)
+        conn.executescript(v1.replace("created_at, intent_digest ON writes", "created_at ON writes"))
+        conn.execute("INSERT INTO meta(id, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, 'sync-v1', ?, ?, ?, ?, 't')", (TEST_BOOK, STORE, DOMAIN, "ab" * 32))
+        conn.execute("INSERT INTO watermarks(name, value, updated_at) VALUES ('ac2_changelog_id', ?, 't')", (str(watermark),))
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+        ledger = sync.SyncLedger(temp, clock=lambda: self.now, check_custody=False)
+        self.addCleanup(ledger.close)
+        engine = lambda: sync.SyncEngine(ledger, make_config(changelog_xml_column="Content"), shopify=self.shopify, ac2=self.ac2)
+        result = engine().run(direction="ac2_to_shopify")
+        self.assertEqual(self.pending(ledger), 0)
+        self.assertNotIn("ac2_insert_queued", result["counts"])
+        self.assertEqual(result["counts"]["changelog_overlap_baselined"], 1)
+        self.assertEqual(result["counts"]["changelog_overlap_baselined_rows"], 4)
+        self.assertIn("changelog_overlap_baselined", result["alerts"])
+        # Afterwards a new insert is processed as usual, and no second baseline runs.
+        self.log_history((15,))
+        result = engine().run(direction="ac2_to_shopify")
+        self.assertEqual((self.pending(ledger), result["counts"]["ac2_insert_queued"]), (1, 1))
+        self.assertNotIn("changelog_overlap_baselined", result["counts"])
+
+    def test_raising_the_overlap_queues_no_pruned_history(self):
+        self.log_history(range(11, 23))
+        self.run_sync("ac2_to_shopify", changelog_overlap=10)  # first run: watermark at the end
+        self.log_history((23,))
+        self.run_sync("ac2_to_shopify", changelog_overlap=10, shopify_create_enabled=False)
+        self.assertEqual(self.pending(), 1)
+        result = self.run_sync("ac2_to_shopify", changelog_overlap=100, shopify_create_enabled=False)
+        self.assertEqual(self.pending(), 1)
+        self.assertNotIn("ac2_insert_queued", result["counts"])
+        self.assertIn("changelog_overlap_baselined", result["alerts"])
+        # The larger overlap is now the stored one: the next run is a normal run.
+        result = self.run_sync("ac2_to_shopify", changelog_overlap=100, shopify_create_enabled=False)
+        self.assertNotIn("changelog_overlap_baselined", result["counts"])
+
+    def test_unchanged_overlap_still_processes_a_late_row_once(self):
+        self.run_sync("ac2_to_shopify")
+        self.log_history((24,))
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        watermark = int(self.ledger.watermark("ac2_changelog_id"))
+        self.ac2.changelog.append((watermark - 3, changelog_xml(sg(25), "Member", sg(25))))
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(result["counts"]["changelog_late_row_processed"], 1)
+        self.assertNotIn("changelog_overlap_baselined", result["counts"])
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertNotIn("changelog_late_row_processed", result["counts"])
+        self.assertEqual(self.pending(), 2)
+
+    def test_fresh_ledger_first_run_is_unchanged(self):
+        self.log_history((26, 27))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["counts"], {"changelog_watermark_initialised": 1})
+        self.assertEqual(self.ledger.watermark("ac2_changelog_overlap"), "50")
+        self.assertEqual(self.run_sync("ac2_to_shopify")["counts"], {})
+
+    def test_overlap_zero_never_baselines(self):
+        self.run_sync("ac2_to_shopify", changelog_overlap=0)
+        self.log_history((28,))
+        result = self.run_sync("ac2_to_shopify", changelog_overlap=0, shopify_create_enabled=False)
+        self.assertEqual(result["counts"].get("ac2_insert_queued"), 1)
+        self.assertNotIn("changelog_overlap_baselined", result["counts"])
 
 
 if __name__ == "__main__":
