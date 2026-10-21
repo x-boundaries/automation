@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -54,6 +56,25 @@ def _sg_prefixed(sep=" "):
 
 def _intl():
     return "+" + "44" + " " + "20" + " " + "7946" + " " + "00" + "11"
+
+
+def _zip_bytes(members, compression):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
+        for name, body in members.items():
+            archive.writestr(name, body)
+    return buffer.getvalue()
+
+
+def _xlsx(cell, compression=zipfile.ZIP_DEFLATED):
+    return _zip_bytes(
+        {
+            "[Content_Types].xml": '<?xml version="1.0"?><Types/>',
+            "xl/workbook.xml": '<?xml version="1.0"?><workbook><sheets/></workbook>',
+            "xl/sharedStrings.xml": '<?xml version="1.0"?><sst><si><t>Name</t></si><si><t>' + cell + "</t></si></sst>",
+        },
+        compression,
+    )
 
 
 def _load_scanner():
@@ -255,6 +276,16 @@ class DiffParserTests(unittest.TestCase):
             "  context\n"
         )
         self.assertEqual(self.added(patch), [("m.txt", 3, "evil merge line")])
+
+    def test_combined_binary_summary_needs_a_blob_scanned_path(self):
+        patch = "diff --cc data.bin\nindex 1111111,2222222..3333333\nBinary files differ\n"
+        self.assertEqual(list(self.g.iter_added_lines(patch, {"data.bin"})), [])
+        for scanned in ((), {"other.bin"}):
+            with self.assertRaises(self.g.GuardError):
+                list(self.g.iter_added_lines(patch, scanned))
+        plain = "diff --git a/data.bin b/data.bin\nindex 1111111..2222222 100644\nBinary files a/data.bin and b/data.bin differ\n"
+        with self.assertRaises(self.g.GuardError):
+            list(self.g.iter_added_lines(plain, {"data.bin"}))
 
     def test_unrecognised_output_fails_closed(self):
         for patch in (
@@ -470,11 +501,134 @@ class GitScanTests(unittest.TestCase):
         self.commit_bytes("raw16.txt", ("mail " + _email() + "\n").encode("utf-16-le"))
         self.assertEqual(self.range_code(start)[0], 2)
 
-    def test_reviewed_binary_types_are_skipped(self):
+    def test_clean_binary_types_pass(self):
         start = self.rev("HEAD")
         self.commit_bytes("logo.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(256)))
+        self.commit_bytes("book.xlsx", _xlsx("Synthetic Member"))
         code, out, err = self.range_code(start)
         self.assertEqual(code, 0, out + err)
+
+    # R2-1: no NUL-bearing blob is skipped whole.
+
+    def test_binary_content_is_scanned_by_text_runs(self):
+        email = _email().encode("ascii")
+        cases = (
+            ("b1.pdf", b"%PDF-1.4\n\x00\x01\x02contact " + email + b"\n"),
+            (
+                "b3.pdf",
+                b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Author (" + email + b") /Producer (Synthetic) >>\nendobj\n"
+                b"2 0 obj\n<< /Length 24 /Filter /FlateDecode >>\nstream\n" + zlib.compress(b"q 1 0 0 1 0 0 cm Q") + b"\x00\x00"
+                b"\nendstream\nendobj\n%%EOF\n",
+            ),
+            ("b3be.pdf", b"%PDF-1.7\n\x00\x00 << /Title (\xfe\xff" + ("call " + _sg_prefixed()).encode("utf-16-be") + b") >>\n"),
+            ("b6.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00tEXtAuthor\x00" + email + b"\x00\x00IEND"),
+            ("c1.txt", b"\xff\xfe" + b"plain ascii mail " + email + b"\n\x00tail"),
+            ("utf16.doc", b"\xd0\xcf\x11\xe0\x00\x00" + ("owner " + _email() + " ").encode("utf-16-le") + b"\x00\x00"),
+        )
+        for name, data in cases:
+            with self.subTest(name=name):
+                start = self.rev("HEAD")
+                self.commit_bytes(name, data)
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 1, (name, out, err))
+                self.assertIn(name + " (text runs):", out)
+                self.assertNotIn(_email(), out + err)
+        # Editing a binary elsewhere does not re-flag its existing text.
+        start = self.rev("HEAD")
+        self.commit_bytes("b6.png", cases[3][1] + b"\x00\x01\x02\x03")
+        self.assertEqual(self.range_code(start)[0], 0)
+
+    def test_zip_containers_are_expanded(self):
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=compression):
+                start = self.rev("HEAD")
+                name = "book-%d.xlsx" % compression
+                self.commit_bytes(name, _xlsx(_email(), compression))
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(name + "!xl/sharedStrings.xml:1 email [redacted]", out)
+                self.assertNotIn(_email(), out + err)
+        start = self.rev("HEAD")
+        document = _zip_bytes({"word/document.xml": "<w:t>tel " + _sg_local() + "</w:t>"}, zipfile.ZIP_DEFLATED)
+        self.commit_bytes("letter.docx", document)
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1)
+        self.assertIn("letter.docx!word/document.xml:1 sg_phone_local", out)
+        # Rewriting the container with the same member text is not a new addition.
+        start = self.rev("HEAD")
+        self.commit_bytes("letter.docx", _zip_bytes({"word/document.xml": "<w:t>tel " + _sg_local() + "</w:t>", "docProps/app.xml": "<x/>"}, zipfile.ZIP_DEFLATED))
+        self.assertEqual(self.range_code(start)[0], 0)
+
+    def test_unreadable_zip_containers_fail_closed(self):
+        good = _xlsx("Synthetic Member")
+        encrypted = bytearray(good)
+        for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+            at = 0
+            while True:
+                at = encrypted.find(signature, at)
+                if at < 0:
+                    break
+                encrypted[at + offset] |= 0x01
+                at += 4
+        for name, data in (
+            ("corrupt.xlsx", b"PK\x03\x04" + b"\x00\x01" * 40),
+            ("truncated.xlsx", good[: len(good) // 2]),
+            ("encrypted.xlsx", bytes(encrypted)),
+            ("notzip.zip", b"plain text only\n"),
+        ):
+            with self.subTest(name=name):
+                start = self.rev("HEAD")
+                self.commit_bytes(name, data)
+                self.assertEqual(self.range_code(start)[0], 2, name)
+                self.git("rm", "-q", name)
+                self.git("commit", "-q", "-m", "drop")
+        start = self.rev("HEAD")
+        self.commit_bytes("big.xlsx", good)
+        with mock.patch.object(self.g, "ZIP_MAX_BYTES", 16):
+            self.assertEqual(self.range_code(start)[0], 2)
+
+    def test_staged_and_tree_modes_scan_binary_content(self):
+        (self.repo / "s.xlsx").write_bytes(_xlsx(_email()))
+        (self.repo / "s.pdf").write_bytes(b"%PDF-1.4\n\x00 /Author (" + _email("other.person").encode("ascii") + b")\n")
+        self.git("add", "s.xlsx", "s.pdf")
+        code, out, _ = self.run_main("--staged")
+        self.assertEqual(code, 1)
+        self.assertIn("staged s.xlsx!xl/sharedStrings.xml:1 email", out)
+        self.assertIn("staged s.pdf (text runs):", out)
+        self.git("commit", "-q", "-m", "binaries")
+        code, out, _ = self.run_main("--tree", "HEAD", "--report-only")
+        self.assertEqual(code, 0)
+        self.assertIn("pii-guard report: 2 hit(s) in 2 file(s)", out)
+
+    # R2-2: evil merges that touch NUL-bearing files are scanned, not errors.
+
+    def test_evil_merge_touching_binary_files(self):
+        self.commit_bytes("export.txt", b"\xff\xfe" + "first\r\n".encode("utf-16-le"))
+        self.commit_bytes("logo.png", b"\x89PNG\x00\x00base")
+        self.git("checkout", "-q", "-b", "feature")
+        self.commit("feature.md", "clean feature\n")
+        self.git("checkout", "-q", "main")
+        self.commit("other.md", "main moves on\n")
+        main_tip = self.rev("HEAD")
+        self.git("checkout", "-q", "feature")
+        self.git("merge", "-q", "--no-commit", "--no-ff", "main")
+        (self.repo / "logo.png").write_bytes(b"\x89PNG\x00\x00base\x00changed in merge")
+        self.git("add", "logo.png")
+        self.git("commit", "-q", "--no-edit")
+        code, out, err = self.range_code(main_tip)
+        self.assertEqual(code, 0, out + err)
+        self.git("checkout", "-q", "main")
+        self.commit("other.md", "main moves again\n")
+        main_tip = self.rev("HEAD")
+        self.git("checkout", "-q", "feature")
+        self.git("merge", "-q", "--no-commit", "--no-ff", "main")
+        (self.repo / "export.txt").write_bytes(b"\xff\xfe" + ("first\r\nmail " + _email() + "\r\n").encode("utf-16-le"))
+        self.git("add", "export.txt")
+        self.git("commit", "-q", "--no-edit")
+        code, out, err = self.range_code(main_tip)
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(out.count("pii-guard: "), 1)
+        self.assertIn("export.txt:2 email", out)
 
     def test_utf16_text_is_decoded_and_only_added_lines_count(self):
         for encoding in ("utf-16-le", "utf-16-be", "utf-32-le"):

@@ -18,9 +18,15 @@ Modes (exactly one):
   existing content, normally with ``--report-only``).
 
 Diffs are forced to text (``--text``), so a ``-diff`` or ``binary`` attribute cannot
-hide added lines. A blob containing NUL bytes is decoded when it is BOM-marked
-Unicode text (UTF-8, UTF-16 or UTF-32); otherwise it fails closed unless its
-extension is on the reviewed ``BINARY_EXTENSIONS`` list.
+hide added lines. No blob git cannot diff as text is skipped whole: printable
+ASCII, UTF-16LE and UTF-16BE runs of its raw bytes are always scanned;
+BOM-marked Unicode text (UTF-8, UTF-16 or UTF-32) is also decoded line by line;
+zip containers (``ZIP_EXTENSIONS``, such as .xlsx) have every member expanded and
+scanned, and a corrupt or encrypted one fails closed. Any other NUL-bearing blob
+fails closed unless its extension is on the reviewed ``BINARY_EXTENSIONS`` list.
+Known limit: compressed streams inside a non-zip binary (for example a PDF's
+deflated content streams) are not decompressed. Hits inside binary content are
+reported as ``path (text runs):N`` or ``container!member:N``.
 
 Exit codes: 0 clean, 1 likely personal data found, 2 error. Every error fails
 closed: an unreadable allowlist, a missing or empty range, an unknown revision,
@@ -43,10 +49,13 @@ import codecs
 import collections
 import difflib
 import fnmatch
+import io
 import json
 import re
 import subprocess
 import sys
+import zipfile
+import zlib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -113,11 +122,18 @@ _DIFF_OPTS = [
     "--dst-prefix=b/",
 ]
 
-# A blob with NUL bytes is scanned only when it is BOM-marked Unicode text; otherwise
-# it fails closed unless its extension is on this reviewed binary list.
-BINARY_EXTENSIONS = frozenset(
-    {".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip", ".xlsx", ".xls", ".docx", ".doc", ".pptx"}
-)
+# Blobs git cannot diff as text are never skipped whole: their printable ASCII and
+# UTF-16 runs are always scanned. Zip containers also have every member expanded and
+# scanned (corrupt or encrypted fails closed). Other NUL-bearing blobs must be
+# BOM-marked Unicode text or a reviewed binary type, or they fail closed. The binary
+# list only means "expected to be binary"; it never means "not scanned".
+ZIP_EXTENSIONS = frozenset({".zip", ".xlsx", ".docx", ".pptx"})
+BINARY_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".xls", ".doc"})
+ZIP_MAX_BYTES = 64 * 1024 * 1024
+RUNS_SUFFIX = " (text runs)"
+_ASCII_RUN = re.compile(rb"[\x20-\x7e\t]{6,}")
+_UTF16LE_RUN = re.compile(rb"(?:[\x20-\x7e]\x00){6,}")
+_UTF16BE_RUN = re.compile(rb"(?:\x00[\x20-\x7e]){6,}")
 # Longest BOM first: the UTF-32-LE BOM starts with the UTF-16-LE BOM.
 _BOMS = (
     (codecs.BOM_UTF32_LE, "utf-32"),
@@ -226,20 +242,25 @@ def _strip_path(raw):
     raise GuardError("unexpected diff target path %r" % raw)
 
 
-def iter_added_lines(diff_text):
+def iter_added_lines(diff_text, blob_scanned=()):
     """Yield (path, new_line_number, text) for every added line of a git patch.
 
     Handles ordinary patches and combined (``--cc``) merge diffs. For a merge, a
     line counts as added only when it is new relative to every parent. Anything
     the parser does not recognise raises GuardError so the guard fails closed.
+    ``git show --cc`` ignores ``--text``, so a combined section may summarise a
+    blob as "Binary files ... differ"; that is accepted only for a path in
+    ``blob_scanned``, whose content the blob scanner has already covered.
     """
     path = None
+    cc_path = None
     in_section = False
     hunk_parents = 0
     line_no = 0
     for raw in diff_text.split("\n"):
         if raw.startswith("diff --git ") or raw.startswith("diff --cc ") or raw.startswith("diff --combined "):
             in_section, hunk_parents, path = True, 0, None
+            cc_path = raw.split(" ", 2)[2] if raw.startswith("diff --cc ") else None
             continue
         if raw.startswith("@@"):
             match = _HUNK_RE.match(raw)
@@ -274,6 +295,8 @@ def iter_added_lines(diff_text):
             continue
         if raw.startswith(_HEADER_PREFIXES):
             continue
+        if raw.startswith("Binary files ") and cc_path is not None and cc_path in blob_scanned:
+            continue
         raise GuardError("unexpected diff header %r" % raw[:80])
 
 
@@ -304,7 +327,7 @@ def _text(data):
 
 def _scan_patch(diff_text, commit, allowlist, skip_paths=()):
     findings = []
-    for path, line_no, text in iter_added_lines(diff_text):
+    for path, line_no, text in iter_added_lines(diff_text, skip_paths):
         if path in skip_paths:
             continue
         for kind, value in scan_line(text, allowlist):
@@ -330,28 +353,128 @@ def _read_blobs(shas, cwd):
     return blobs
 
 
-def decode_nul_blob(path, data):
-    """Decode a blob that contains NUL bytes, or return None for a reviewed binary type.
+def _printable_runs(data):
+    """Printable ASCII, UTF-16LE and UTF-16BE runs of 6+ characters in raw bytes."""
+    runs = [match.group(0).decode("ascii") for match in _ASCII_RUN.finditer(data)]
+    runs.extend(match.group(0).decode("utf-16-le") for match in _UTF16LE_RUN.finditer(data))
+    runs.extend(match.group(0).decode("utf-16-be") for match in _UTF16BE_RUN.finditer(data))
+    return runs
 
-    Text in a BOM-marked Unicode encoding (UTF-8, UTF-16 or UTF-32, as PowerShell 5.1
-    ``Out-File`` writes) is decoded and scanned. Anything else with NUL bytes fails
-    closed unless its extension is on the reviewed binary list.
-    """
+
+def _bom_text(data):
     for bom, encoding in _BOMS:
         if data.startswith(bom):
             return data.decode(encoding, "replace")
-    if Path(path).suffix.lower() in BINARY_EXTENSIONS:
-        return None
-    raise GuardError("%s contains NUL bytes but is neither BOM-marked Unicode text nor a reviewed binary type" % path)
+    return None
 
 
-def _lenient_lines(data):
-    if b"\0" in data:
-        for bom, encoding in _BOMS:
-            if data.startswith(bom):
-                return data.decode(encoding, "replace").splitlines()
-        return []
-    return _text(data).splitlines()
+def _zip_documents(path, data):
+    """Text documents for every member of a zip container; corrupt or encrypted fails closed."""
+    docs, remaining = [], ZIP_MAX_BYTES
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                if info.flag_bits & 0x1:
+                    raise GuardError("%s member %s is encrypted and cannot be scanned" % (path, info.filename))
+                with archive.open(info) as handle:
+                    member = handle.read(remaining + 1)
+                if len(member) > remaining:
+                    raise GuardError("%s expands beyond %d bytes and cannot be scanned" % (path, ZIP_MAX_BYTES))
+                remaining -= len(member)
+                name = "%s!%s" % (path, info.filename)
+                if b"\0" in member:
+                    text = _bom_text(member)
+                    if text is not None:
+                        docs.append((name, text.splitlines()))
+                    docs.append((name + RUNS_SUFFIX, _printable_runs(member)))
+                else:
+                    docs.append((name, _text(member).splitlines()))
+    except GuardError:
+        raise
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError, NotImplementedError, EOFError, OSError, ValueError, zlib.error) as exc:
+        raise GuardError("%s is not a readable zip container: %s" % (path, exc.__class__.__name__))
+    return docs
+
+
+def needs_blob_scan(path, data):
+    return b"\0" in data or Path(path).suffix.lower() in ZIP_EXTENSIONS
+
+
+def blob_documents(path, data):
+    """Return [(display_path, lines)] to scan for a blob git cannot diff as text.
+
+    No such blob is skipped whole. Printable ASCII and UTF-16 runs of the raw bytes
+    are always scanned; BOM-marked Unicode text is also decoded line by line; zip
+    containers have every member expanded and scanned. A NUL-bearing blob that is
+    neither BOM-marked, a zip container nor a reviewed binary type fails closed.
+    """
+    suffix = Path(path).suffix.lower()
+    docs = []
+    text = _bom_text(data)
+    if text is not None:
+        docs.append((path, text.splitlines()))
+    if suffix in ZIP_EXTENSIONS:
+        docs.extend(_zip_documents(path, data))
+    elif text is None and suffix not in BINARY_EXTENSIONS:
+        raise GuardError("%s contains NUL bytes but is neither BOM-marked Unicode text nor a reviewed binary type" % path)
+    docs.append((path + RUNS_SUFFIX, _printable_runs(data)))
+    return docs
+
+
+def _parent_documents(path, data):
+    if not needs_blob_scan(path, data):
+        return {path: _text(data).splitlines()}
+    try:
+        return dict(blob_documents(path, data))
+    except GuardError:
+        return {}
+
+
+def _scan_documents(label, docs, allowlist, keep=None):
+    """Scan documents, reporting each (kind, value) once per blob; run hits come last."""
+    findings, seen = [], set()
+    for name, lines in docs:
+        indices = range(len(lines)) if keep is None else sorted(keep.get(name, ()))
+        for index in indices:
+            for kind, value in scan_line(lines[index], allowlist):
+                if (kind, value) in seen:
+                    continue
+                seen.add((kind, value))
+                findings.append(Finding(label, name, index + 1, kind, value))
+    return findings
+
+
+def _blob_findings(changes, label, cwd, allowlist):
+    """Scan changed blobs git cannot diff as text; return (handled_paths, findings).
+
+    Their added lines are recomputed here, per document: lines of the new blob's
+    document absent from the same document of every parent blob.
+    """
+    new_blobs = _read_blobs([sha for _, sha, _ in changes], cwd)
+    flagged = [(path, sha, parents) for path, sha, parents in changes if needs_blob_scan(path, new_blobs[sha])]
+    if not flagged:
+        return set(), []
+    old_blobs = _read_blobs([sha for _, _, parents in flagged for sha in parents if not _is_null_sha(sha)], cwd)
+    handled, findings = set(), []
+    for path, sha, parents in flagged:
+        handled.add(path)
+        docs = blob_documents(path, new_blobs[sha])
+        parent_docs = [{} if _is_null_sha(parent) else _parent_documents(path, old_blobs[parent]) for parent in parents or ["0"]]
+        keep = {}
+        for name, lines in docs:
+            added = set(range(len(lines)))
+            for old in parent_docs:
+                fresh = set()
+                matcher = difflib.SequenceMatcher(None, old.get(name, []), lines, autojunk=False)
+                for tag, _, _, j1, j2 in matcher.get_opcodes():
+                    if tag in ("insert", "replace"):
+                        fresh.update(range(j1, j2))
+                added &= fresh
+            keep[name] = added
+        findings.extend(_scan_documents(label, docs, allowlist, keep))
+    return handled, findings
 
 
 def _is_null_sha(sha):
@@ -383,41 +506,9 @@ def _raw_changes(raw):
     return changes
 
 
-def _encoded_text_findings(changes, label, cwd, allowlist):
-    """Scan changed blobs that contain NUL bytes; return (handled_paths, findings).
-
-    git's line diff cannot represent these blobs reliably, so their added lines are
-    recomputed here: lines of the decoded new blob absent from every parent's blob.
-    """
-    new_blobs = _read_blobs([sha for _, sha, _ in changes], cwd)
-    flagged = [(path, sha, parents) for path, sha, parents in changes if b"\0" in new_blobs[sha]]
-    if not flagged:
-        return set(), []
-    old_blobs = _read_blobs([sha for _, _, parents in flagged for sha in parents if not _is_null_sha(sha)], cwd)
-    handled, findings = set(), []
-    for path, sha, parents in flagged:
-        handled.add(path)
-        text = decode_nul_blob(path, new_blobs[sha])
-        if text is None:
-            continue
-        new_lines = text.splitlines()
-        added = set(range(len(new_lines)))
-        for parent in parents or ["0"]:
-            old_lines = [] if _is_null_sha(parent) else _lenient_lines(old_blobs[parent])
-            fresh = set()
-            for tag, _, _, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
-                if tag in ("insert", "replace"):
-                    fresh.update(range(j1, j2))
-            added &= fresh
-        for index in sorted(added):
-            for kind, value in scan_line(new_lines[index], allowlist):
-                findings.append(Finding(label, path, index + 1, kind, value))
-    return handled, findings
-
-
 def scan_staged(cwd, allowlist):
     raw = _git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--find-renames"], cwd)
-    handled, encoded = _encoded_text_findings(_raw_changes(raw), "staged", cwd, allowlist)
+    handled, encoded = _blob_findings(_raw_changes(raw), "staged", cwd, allowlist)
     diff = _git(["diff", "--cached"] + _DIFF_OPTS, cwd)
     return _scan_patch(_text(diff), "staged", allowlist, handled) + encoded
 
@@ -457,7 +548,7 @@ def scan_range(spec, cwd, allowlist):
     for commit in resolve_range(spec, cwd):
         findings.extend(scan_commit_metadata(commit, cwd, allowlist))
         raw = _git(["diff-tree", "-r", "-z", "-c", "--raw", "--no-abbrev", "--no-commit-id", "--find-renames", "--root", commit], cwd)
-        handled, encoded = _encoded_text_findings(_raw_changes(raw), commit, cwd, allowlist)
+        handled, encoded = _blob_findings(_raw_changes(raw), commit, cwd, allowlist)
         diff = _git(["show", "--format=", "--cc"] + _DIFF_OPTS + [commit], cwd)
         findings.extend(_scan_patch(_text(diff), commit, allowlist, handled))
         findings.extend(encoded)
@@ -480,13 +571,10 @@ def scan_tree(rev, cwd, allowlist):
     findings = []
     for path, sha in entries:
         body = blobs[sha]
-        if b"\0" in body:
-            text = decode_nul_blob(path, body)
-            if text is None:
-                continue
-        else:
-            text = _text(body)
-        for line_no, line in enumerate(text.splitlines(), 1):
+        if needs_blob_scan(path, body):
+            findings.extend(_scan_documents(tree, blob_documents(path, body), allowlist))
+            continue
+        for line_no, line in enumerate(_text(body).splitlines(), 1):
             for hit_kind, value in scan_line(line, allowlist):
                 findings.append(Finding(tree, path, line_no, hit_kind, value))
     return findings

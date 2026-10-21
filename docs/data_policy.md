@@ -79,11 +79,22 @@ commit's author and committer name and email and its message. A hit, a missing
 or empty range, an unknown commit or a parse error fails the job.
 
 Diffs are forced to text, so a `-diff` or `binary` attribute cannot hide added
-lines. A file containing NUL bytes is decoded when it is BOM-marked UTF-8,
-UTF-16 or UTF-32 text (Windows PowerShell 5.1 `Out-File` writes UTF-16); any
-other NUL-bearing file fails the scan unless its extension is on the reviewed
-binary list in `scripts/pii_guard.py` (images, PDF, ZIP and Office files, which
-are not scanned).
+lines. No binary file is skipped whole:
+
+- Printable ASCII, UTF-16LE and UTF-16BE runs of six or more characters are
+  always scanned, so PDF metadata, image text chunks and legacy `.xls` or `.doc`
+  strings are covered.
+- BOM-marked UTF-8, UTF-16 or UTF-32 text is also decoded line by line (Windows
+  PowerShell 5.1 `Out-File` writes UTF-16).
+- Zip containers (`.zip`, `.xlsx`, `.docx`, `.pptx`) have every member
+  expanded and scanned, deflated members included; a corrupt, encrypted or
+  oversized container fails the scan.
+- Any other file containing NUL bytes fails the scan unless it is a reviewed
+  binary type (images, `.pdf`, `.xls`, `.doc`).
+
+Known limit: compressed streams inside a non-zip binary, such as a PDF's
+deflated page content, are not decompressed. Hits inside binary content are
+reported as `file (text runs):N` or `container!member:N`.
 
 If the guard flags a value on a branch, remove it from the commit that added it
 (amend or rebase the branch before merge); a follow-up commit that deletes it

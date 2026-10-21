@@ -52,8 +52,9 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   "${BASE_SHA}..${HEAD_SHA}"`, scanning each commit in the range (merge commits
   contribute only lines new to every parent), plus each commit's author,
   committer and message, for likely email addresses and phone numbers outside
-  `config/pii_guard_allowlist.json`. Diffs are forced to text; NUL-bearing files
-  are decoded by BOM or fail closed unless on the reviewed binary list. It fails
+  `config/pii_guard_allowlist.json`. Diffs are forced to text; binary files are
+  never skipped whole (printable text runs always, BOM text decoded, zip
+  containers expanded, anything unrecognised fails closed). It fails
   closed on a hit, a missing or empty range, an unknown commit or a parse error,
   and it redacts matched values in the log. `tests/test_pii_guard.py` pins the trigger,
   checkout, exact run lines and allowlist, and rejects `continue-on-error`,
