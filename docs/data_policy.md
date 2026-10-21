@@ -38,9 +38,12 @@ This repository is public. A personal email address or phone number in any pushe
 commit is published, even if a later commit removes it, so the guard checks every
 line a change adds.
 
+- Scope: email addresses and phone numbers only. It does not look for names,
+  street addresses, identity numbers or account numbers.
 - Scanner: `scripts/pii_guard.py` (Python standard library only). It flags email
-  addresses, Singapore numbers (`+65`, and bare 8-digit numbers starting with 6, 8
-  or 9) and other `+`-prefixed international numbers.
+  addresses, Singapore numbers (`+65`, the `65XXXXXXXX` storage form used by
+  member intake, including inside `wa.me` links, and bare 8-digit numbers
+  starting with 6, 8 or 9) and other `+`-prefixed international numbers.
 - Allowlist: `config/pii_guard_allowlist.json` covers reserved domains
   (`example.com`, `example.org`, `example.net`, `.example`, `.test`, `.invalid`,
   `.localhost`), GitHub noreply identities, named X-Boundaries role mailboxes
@@ -75,8 +78,9 @@ Exit codes are 0 (clean), 1 (hit) and 2 (error). Output is redacted unless
 
 CI: `.github/workflows/pii-guard.yml` runs on every pull request and scans each
 commit in the pull-request range, not just the final diff, including each
-commit's author and committer name and email and its message. A hit, a missing
-or empty range, an unknown commit or a parse error fails the job.
+commit's message. Author and committer emails are not scanned (owner decision).
+A hit, a missing or empty range, an unknown commit or a parse error fails the
+job.
 
 Diffs are forced to text, so a `-diff` or `binary` attribute cannot hide added
 lines. No binary file is skipped whole:
@@ -103,7 +107,19 @@ files (legacy `.xls` or `.doc` objects) are scanned by text runs only; and CI
 runs the scanner and allowlist from the pull request itself. Hits inside binary
 content are reported as `file (text runs):N` or `container!member:N`.
 
-If the guard flags a value on a branch, remove it from the commit that added it
-(amend or rebase the branch before merge); a follow-up commit that deletes it
-still leaves it in the published history. If a value has already reached `main`,
-tell the owner; do not rewrite shared history without their approval.
+If the guard flags a value, two things are needed:
+
+1. Report it to the repository owner. A value CI flags on a pushed pull request
+   is already public, so fixing it does not undo the exposure; the owner decides
+   whether anything else (for example telling the person) is needed.
+2. Remove it from the commit that added it (amend or rebase the branch before
+   merge); a follow-up commit that deletes it still leaves it in the published
+   history. If a value has already reached `main`, do not rewrite shared history
+   without the owner's approval.
+
+A pre-commit hook hit is caught before anything is published; just fix it.
+
+Not scanned: commits created at merge time on GitHub (web merges and squash
+merges land on `main`, outside any pull-request range), commit author and
+committer identities (owner decision, 2026-10-21), pull-request titles, bodies
+and comments, and branches pushed without a pull request.

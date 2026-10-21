@@ -154,6 +154,20 @@ class ScanLineTests(unittest.TestCase):
         for text in (_sg_prefixed(), _sg_prefixed(""), _sg_prefixed("-"), "(" + "65) " + "6" + "000 0042", "(+" + "65)" + "3" + "000" + "0042"):
             self.assertEqual(self.kinds("tel " + text), ["sg_phone"], text)
 
+    def test_flags_country_code_storage_form(self):
+        stored = "65" + "9" + "000" + "0017"
+        for text in (stored, "65 " + "9" + "000 " + "0017", "65-" + "8" + "000-" + "0042", "https://wa.me/" + stored, "wa.me/" + stored + "?text=hi"):
+            self.assertEqual(self.kinds("tel " + text), ["sg_phone"], text)
+        for text in (
+            stored + "1",  # 11 digits
+            "1" + stored,  # longer number
+            "a" + stored,  # inside an identifier
+            "1." + stored,  # decimal
+            "65" + "1" + "000" + "0017",  # not a 3/6/8/9 subscriber number
+            "65" + "9" + "000" + "001",  # too short
+        ):
+            self.assertEqual(self.kinds(text), [], text)
+
     def test_flags_international_numbers(self):
         self.assertEqual(self.kinds("call " + _intl()), ["phone"])
 
@@ -778,27 +792,28 @@ class GitScanTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.run_main("--staged")[0], 2)
 
-    # F2: commit identity and message.
+    # F2 (owner decision 2026-10-21): commit messages are scanned, identities are not.
 
-    def test_commit_identity_and_message_are_scanned(self):
+    def test_commit_message_is_scanned_but_identity_is_not(self):
         start = self.rev("HEAD")
         self.commit("a.md", "clean\n", author="Synthetic Person <" + _email("synthetic.person") + ">")
-        code, out, err = self.range_code(start)
-        self.assertEqual(code, 1, out + err)
-        self.assertIn("(commit author, committer and message):1 email [redacted]", out)
-        self.assertNotIn(_email("synthetic.person"), out + err)
-        start = self.rev("HEAD")
         with mock.patch.dict(os.environ, {"GIT_COMMITTER_EMAIL": _email("synthetic.committer")}):
             self.commit("b.md", "clean\n")
-        code, out, _ = self.range_code(start)
-        self.assertEqual(code, 1)
-        self.assertIn("(commit author, committer and message):2 email", out)
+        code, out, err = self.range_code(start)
+        self.assertEqual(code, 0, out + err)
         start = self.rev("HEAD")
         self.commit("c.md", "clean\n", message="Fix intake\n\nReported by " + _email() + " on " + _sg_prefixed())
+        code, out, err = self.range_code(start)
+        self.assertEqual(code, 1)
+        self.assertIn("(commit message):3 email [redacted]", out)
+        self.assertIn("(commit message):3 sg_phone", out)
+        self.assertNotIn(_email(), out + err)
+        # The same identity address used in content is still flagged.
+        start = self.rev("HEAD")
+        self.commit("e.md", "contact " + _email("synthetic.person") + "\n", author="Synthetic Person <" + _email("synthetic.person") + ">")
         code, out, _ = self.range_code(start)
         self.assertEqual(code, 1)
-        self.assertIn("(commit author, committer and message):5 email", out)
-        self.assertIn("(commit author, committer and message):5 sg_phone", out)
+        self.assertIn("e.md:1 email", out)
         start = self.rev("HEAD")
         self.commit("d.md", "clean\n", message="Clean change\n\nCo-Authored-By: Bot <noreply" + AT + "anthropic.com>")
         self.assertEqual(self.range_code(start)[0], 0)

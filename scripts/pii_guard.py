@@ -13,7 +13,7 @@ Modes (exactly one):
 * ``--range BASE..HEAD`` - every commit in the range, one commit at a time, so a
   value added and later removed inside a pull request is still caught. Merge
   commits contribute only the lines that are new relative to every parent. Each
-  commit's author and committer name and email and its message are scanned too.
+  commit's message is scanned too; author and committer identities are not.
 * ``--tree REV`` - every line of every text file at a revision (an audit of
   existing content, normally with ``--report-only``).
 
@@ -78,6 +78,9 @@ EMAIL_RE = re.compile(
 )
 # Singapore numbers with the +65 (or (65)/(+65)) prefix: 8 digits starting 3, 6, 8 or 9.
 SG_PREFIXED_RE = re.compile(r"(?<![\w+])(?:\+65|\(\+?65\))[ .-]?[3689]\d{3}[ .-]?\d{4}(?!\d)")
+# Singapore numbers with the country code but no "+", the member-intake storage form
+# (65XXXXXXXX), including inside wa.me links.
+SG_COUNTRY_CODE_RE = re.compile(r"(?<![\w.+])65[ -]?[3689]\d{3}[ -]?\d{4}(?!\d|\.\d)")
 # Bare Singapore-style 8-digit numbers starting 6, 8 or 9, optionally split 4-4.
 SG_LOCAL_RE = re.compile(r"(?<![\w.])[689]\d{3}[ -]?\d{4}(?!\d|\.\d)")
 # Other international numbers written with a leading +: 8 to 15 digits in total.
@@ -168,7 +171,7 @@ _BOMS = (
     (codecs.BOM_UTF16_LE, "utf-16"),
     (codecs.BOM_UTF16_BE, "utf-16"),
 )
-METADATA_PATH = "(commit author, committer and message)"
+METADATA_PATH = "(commit message)"
 
 
 class GuardError(Exception):
@@ -232,7 +235,12 @@ def scan_line(text, allowlist):
     spans = []
     for match in EMAIL_RE.finditer(text):
         spans.append((match.start(), match.end(), "email", match.group(0)))
-    for kind, regex in (("sg_phone", SG_PREFIXED_RE), ("sg_phone_local", SG_LOCAL_RE), ("phone", INTL_RE)):
+    for kind, regex in (
+        ("sg_phone", SG_PREFIXED_RE),
+        ("sg_phone", SG_COUNTRY_CODE_RE),
+        ("sg_phone_local", SG_LOCAL_RE),
+        ("phone", INTL_RE),
+    ):
         for match in regex.finditer(text):
             value = match.group(0)
             if kind == "phone" and not 8 <= len(re.sub(r"\D", "", value)) <= 15:
@@ -597,8 +605,13 @@ def resolve_range(spec, cwd):
 
 
 def scan_commit_metadata(commit, cwd, allowlist):
-    """Scan a commit's author and committer name and email and its full message."""
-    meta = _text(_git(["show", "-s", "--no-notes", "--format=%an <%ae>%n%cn <%ce>%n%B", commit], cwd))
+    """Scan a commit's full message.
+
+    Author and committer identities are deliberately not scanned: the owner
+    accepts their own addresses on commits (decision of 2026-10-21), and a git
+    identity is configured outside the change under review.
+    """
+    meta = _text(_git(["show", "-s", "--no-notes", "--format=%B", commit], cwd))
     findings = []
     for line_no, text in enumerate(meta.splitlines(), 1):
         for kind, value in scan_line(text, allowlist):
@@ -701,7 +714,8 @@ def main(argv=None, cwd=None, out=None, err=None):
     err.write(
         "pii-guard: %d likely personal-data hit(s). Remove the value, use a reserved example "
         "(name@example.com), or add 'pii-guard: allow (<reason>)' on the line if it is justified. "
-        "A hit in an earlier commit of a pull request needs that commit rewritten, not a follow-up fix.\n"
+        "A hit in an earlier commit of a pull request needs that commit rewritten, not a follow-up fix, "
+        "and a hit on a pushed branch is already public: report it to the repository owner as well.\n"
         % len(findings)
     )
     return EXIT_FOUND
