@@ -1,0 +1,25 @@
+{
+  "emails": [
+    {"pattern": "*@example.com", "reason": "RFC 2606 reserved example domain"},
+    {"pattern": "*@*.example.com", "reason": "RFC 2606 reserved example domain"},
+    {"pattern": "*@example.org", "reason": "RFC 2606 reserved example domain"},
+    {"pattern": "*@*.example.org", "reason": "RFC 2606 reserved example domain"},
+    {"pattern": "*@example.net", "reason": "RFC 2606 reserved example domain"},
+    {"pattern": "*@*.example.net", "reason": "RFC 2606 reserved example domain"},
+    {"pattern": "*@*.example", "reason": "RFC 2606 reserved top-level domain"},
+    {"pattern": "*@*.test", "reason": "RFC 2606 reserved top-level domain"},
+    {"pattern": "*@*.invalid", "reason": "RFC 2606 reserved top-level domain"},
+    {"pattern": "*@*.localhost", "reason": "RFC 2606 reserved top-level domain"},
+    {"pattern": "*@users.noreply.github.com", "reason": "GitHub noreply commit identity"},
+    {"pattern": "noreply@github.com", "reason": "GitHub noreply sender"},
+    {"pattern": "git@github.com", "reason": "GitHub SSH transport user, not a person"},
+    {"pattern": "digital@x-boundaries.com", "reason": "X-Boundaries company role mailbox"},
+    {"pattern": "noreply@x-boundaries.com", "reason": "X-Boundaries company no-reply sender"},
+    {"pattern": "bills@my.simba.sg", "reason": "SIMBA vendor billing mailbox (SIMBA invoice intake)"},
+    {"pattern": "*@ap-southeast-1.amazonses.com", "reason": "AWS SES message-id host, not a person"},
+    {"pattern": "*@eu-west-1.amazonses.com", "reason": "AWS SES message-id host, not a person"},
+    {"pattern": "*@reviewed.gateway.internal", "reason": "Synthetic .internal test host"},
+    {"pattern": "noreply@anthropic.com", "reason": "Claude Code co-author trailer in commit messages, vendor no-reply"}
+  ],
+  "phones": []
+}
