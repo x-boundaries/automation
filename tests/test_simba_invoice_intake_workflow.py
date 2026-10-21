@@ -27,6 +27,7 @@ ALLOWED_TYPES = {
     "n8n-nodes-base.gmailTrigger", "n8n-nodes-base.set", "n8n-nodes-base.splitInBatches", "n8n-nodes-base.noOp",
     "n8n-nodes-base.httpRequest", "n8n-nodes-base.code", "n8n-nodes-base.if", "n8n-nodes-base.crypto",
     "n8n-nodes-base.stickyNote", "n8n-nodes-base.gmail", "n8n-nodes-base.extractFromFile", "n8n-nodes-base.telegram",
+    "n8n-nodes-base.scheduleTrigger",
 }
 LOOP = "One Email At A Time"
 
@@ -248,11 +249,14 @@ class StaticContractTests(unittest.TestCase):
         query = trigger["parameters"]["filters"]["q"]
         self.assertIn("from:bills@my.simba.sg", query)
         self.assertIn('subject:"SIMBA Invoice"', query)
+        # Gmail Trigger v1.2 also lists sent mail; the mailbox's own replies are skipped.
+        self.assertTrue(query.endswith(" -in:sent"), query)
 
     def test_http_nodes_are_bounded_and_never_call_the_tracker(self) -> None:
         http = {name: node for name, node in self.nodes.items() if node["type"] == "n8n-nodes-base.httpRequest"}
         self.assertEqual({"Fetch Full Email", "Look For Existing Copy In Drive", "Download Invoice PDF",
-                          "Start Drive Upload", "Upload File Bytes", "Read Back Stored File"}, set(http))
+                          "Start Drive Upload", "Upload File Bytes", "Read Back Stored File", "Check Mailbox Access"},
+                         set(http))
         for name, node in http.items():
             params = node["parameters"]
             self.assertIs(False, params["options"]["redirect"]["redirect"]["followRedirects"], name)
@@ -266,7 +270,8 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual("={{ $json.pdf_url }}", download["url"])
         self.assertNotIn("authentication", download)
         self.assertEqual("file", download["options"]["response"]["response"]["responseFormat"])
-        self.assertEqual("gmailOAuth2", http["Fetch Full Email"]["parameters"]["nodeCredentialType"])
+        for name in ("Fetch Full Email", "Check Mailbox Access"):
+            self.assertEqual("gmailOAuth2", http[name]["parameters"]["nodeCredentialType"], name)
         for name in ("Look For Existing Copy In Drive", "Start Drive Upload", "Upload File Bytes", "Read Back Stored File"):
             self.assertEqual("googleDriveOAuth2Api", http[name]["parameters"]["nodeCredentialType"], name)
         for name in ("Start Drive Upload", "Upload File Bytes"):
@@ -308,6 +313,33 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual("Prepare Drive File", connections["Check Invoice PDF"]["main"][0][0]["node"])
         # Nothing reads the email or PDF with a model: no AI, LangChain or OpenAI node types at all.
         self.assertFalse([n["type"] for n in self.workflow["nodes"] if re.search(r"langchain|openAi|anthropic", n["type"], re.I)])
+
+    def test_daily_mailbox_check_fails_loudly_into_the_error_workflow(self) -> None:
+        # The Gmail Trigger only logs its own poll errors, so a separate daily read with the same Gmail
+        # credential type must fail its run (no error output) for the error workflow to alert.
+        schedule = self.nodes["Daily Mailbox Check"]
+        self.assertEqual("n8n-nodes-base.scheduleTrigger", schedule["type"])
+        self.assertEqual([{"field": "days", "daysInterval": 1, "triggerAtHour": 8, "triggerAtMinute": 0}],
+                         schedule["parameters"]["rule"]["interval"])
+        check = self.nodes["Check Mailbox Access"]
+        self.assertEqual({"Daily Mailbox Check": ["Check Mailbox Access"]},
+                         {name: [link["node"] for links in self.workflow["connections"][name]["main"] for link in links]
+                          for name in ("Daily Mailbox Check",)})
+        self.assertNotIn("Check Mailbox Access", self.workflow["connections"])
+        self.assertNotIn("onError", check)
+        self.assertNotIn("continueOnFail", check)
+        self.assertNotIn("alwaysOutputData", check)
+        params = check["parameters"]
+        self.assertEqual(("GET", "https://gmail.googleapis.com/gmail/v1/users/me/profile", "predefinedCredentialType",
+                          "gmailOAuth2"),
+                         (params["method"], params["url"], params["authentication"], params["nodeCredentialType"]))
+        self.assertEqual([{"name": "fields", "value": "messagesTotal"}], params["queryParameters"]["parameters"])
+        self.assertNotIn("response", params["options"])
+        self.assertEqual("gmailTrigger", self.nodes["Watch Mailbox For SIMBA Emails"]["type"].split(".")[-1])
+        runbook = (REPO_ROOT / "docs" / "simba_invoice_intake.md").read_text(encoding="utf-8")
+        self.assertIn("A failed Gmail Trigger poll creates no execution and no alert", runbook)
+        self.assertIn("**Daily mailbox check**", runbook)
+        self.assertNotIn("Any Gmail read or Drive failure (credential expired", runbook)
 
     def test_label_and_alert_come_after_drive_and_never_block_filing(self) -> None:
         connections = self.workflow["connections"]
@@ -524,6 +556,18 @@ class ClassifyTests(unittest.TestCase):
         msg["payload"]["parts"].append({"mimeType": "application/pdf", "filename": "invoice.pdf",
                                         "body": {"attachmentId": "A1", "size": 10}})
         self.assertIn("UNEXPECTED_ATTACHMENT", decision_for(msg)["review_reasons"])
+
+    def test_crafted_entity_never_stops_the_batch(self) -> None:
+        for entity in ("&#x110000;", "&#99999999999;", "&#1114112;"):
+            with self.subTest(entity=entity):
+                msg = message([("From", "Someone <someone@example.com>"), ("Subject", "Re: SIMBA Invoice")],
+                              html="<p>hello " + entity + " world</p>")
+                result = classify(msg)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual("IGNORE", result["output"][0]["json"]["route"])
+        genuine = direct()
+        genuine["payload"]["parts"][1]["body"]["data"] = b64url(body_html() + "<p>&#x110000;</p>")
+        self.assertEqual("FILE", decision_for(genuine)["route"])
 
     def test_unreadable_message_stops_the_run(self) -> None:
         self.assertFalse(classify({"id": "not hex!", "payload": {}})["ok"])
@@ -891,8 +935,12 @@ class ErrorAlertWorkflowTests(unittest.TestCase):
         self.assertNotRegex(runbook, r"(?i)(does not|doesn't|need not|needn't)\s+(need\s+to\s+)?be\s+(active|published)")
         self.assertIn("**The error workflow must be published (active):**", runbook)
         setup = runbook[runbook.index("## Setup"):runbook.index("## Acceptance checks")]
-        self.assertIn("publish `SIMBA Invoices - Error Alert` first (or together with the main workflow), "
-                      "then publish `SIMBA Invoices - Email To Drive`", setup)
+        # Publish the error workflow first, select it in the main workflow's settings, then publish the main one.
+        published = setup.index("publish `SIMBA Invoices - Error Alert` first (or together with the main workflow)")
+        selected = setup.index("set **Error workflow** to `SIMBA Invoices - Error Alert`")
+        self.assertLess(published, selected)
+        self.assertLess(selected, setup.index("publish `SIMBA Invoices - Email To Drive`"))
+        self.assertEqual(1, setup.count("set **Error workflow** to `SIMBA Invoices - Error Alert`, and publish"))
         self.assertIn("until one Telegram failure alert arrives", setup)
         note = self.nodes["Overview"]["parameters"]["content"]
         self.assertIn("Must be published (active)", note)
