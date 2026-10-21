@@ -14,7 +14,11 @@
     {"pattern": "noreply@github.com", "reason": "GitHub noreply sender"},
     {"pattern": "git@github.com", "reason": "GitHub SSH transport user, not a person"},
     {"pattern": "digital@x-boundaries.com", "reason": "X-Boundaries company role mailbox"},
-    {"pattern": "noreply@x-boundaries.com", "reason": "X-Boundaries company no-reply sender"}
+    {"pattern": "noreply@x-boundaries.com", "reason": "X-Boundaries company no-reply sender"},
+    {"pattern": "bills@my.simba.sg", "reason": "SIMBA vendor billing mailbox (SIMBA invoice intake)"},
+    {"pattern": "*@ap-southeast-1.amazonses.com", "reason": "AWS SES message-id host, not a person"},
+    {"pattern": "*@eu-west-1.amazonses.com", "reason": "AWS SES message-id host, not a person"},
+    {"pattern": "*@reviewed.gateway.internal", "reason": "Synthetic .internal test host"}
   ],
   "phones": []
 }

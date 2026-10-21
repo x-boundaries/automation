@@ -92,6 +92,10 @@ class ScanLineTests(unittest.TestCase):
             _email("digital", "x-boundaries", "com"),
             _email("DIGITAL", "X-Boundaries", "COM"),
             _email("noreply", "x-boundaries", "com"),
+            _email("bills", "my.simba", "sg"),
+            _email("0100018f2a3b4c5d-synthetic", "ap-southeast-1.amazonses", "com"),
+            _email("x", "eu-west-1.amazonses", "com"),
+            _email("pass", "reviewed.gateway", "internal"),
         ):
             self.assertEqual(self.kinds("x " + address + " y"), [], address)
 
@@ -99,6 +103,9 @@ class ScanLineTests(unittest.TestCase):
         self.assertEqual(self.kinds(_email("alex.tan", "x-boundaries", "com")), ["email"])
         self.assertEqual(self.kinds(_email("name", "notexample", "com")), ["email"])
         self.assertEqual(self.kinds(_email("name", "example.com.evil", "sg")), ["email"])
+        self.assertEqual(self.kinds(_email("someone", "my.simba", "sg")), ["email"])
+        self.assertEqual(self.kinds(_email("x", "us-east-1.amazonses", "com")), ["email"])
+        self.assertEqual(self.kinds(_email("x", "other.gateway", "internal")), ["email"])
 
     def test_not_emails(self):
         for text in ("uses: actions/checkout" + AT + "v4", "react" + AT + "18.3.1", AT + "decorator", "a " + AT + " b.com"):
@@ -161,6 +168,10 @@ class AllowlistTests(unittest.TestCase):
         "git" + AT + "github.com",
         "digital" + AT + "x-boundaries.com",
         "noreply" + AT + "x-boundaries.com",
+        "bills" + AT + "my.simba.sg",
+        "*" + AT + "ap-southeast-1.amazonses.com",
+        "*" + AT + "eu-west-1.amazonses.com",
+        "*" + AT + "reviewed.gateway.internal",
     ]
 
     def setUp(self):

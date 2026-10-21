@@ -43,7 +43,9 @@ line a change adds.
   or 9) and other `+`-prefixed international numbers.
 - Allowlist: `config/pii_guard_allowlist.json` covers reserved domains
   (`example.com`, `example.org`, `example.net`, `.example`, `.test`, `.invalid`,
-  `.localhost`), GitHub noreply identities and named X-Boundaries role mailboxes.
+  `.localhost`), GitHub noreply identities, named X-Boundaries role mailboxes
+  and named vendor or system addresses (a vendor billing mailbox, AWS SES
+  message-id hosts, a synthetic `.internal` test host).
   Every entry needs a reason, and `tests/test_pii_guard.py` pins the exact set, so
   widening it is a reviewed change.
 - Opt-out marker for a justified line: put `pii-guard: allow (<reason>)` on the
