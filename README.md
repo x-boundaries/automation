@@ -47,13 +47,14 @@ Do these steps in order:
    n8n-workflows/energygrid_local_failure_monitor.workflow.json (set ENABLE_OWNER_ALERTS to true
    in the live copy only). Create the email claim Data Table.
 4. Prove the Drive Verify and Owner Email webhooks are not reachable from the internet
-   (section 6), then activate the three workflows.
-5. Run daily-preflight, then one attended daily run, and show me the result.
+   (section 6), activate the three workflows, then prove it again.
+5. Run daily-preflight as the signed-in task user.
 6. Register energygrid-bill-downloader/task-scheduler/energygrid_daily_native.task.example.xml
-   for the same signed-in user, read it back, then enable it.
+   disabled for that user, read it back, run it once by hand, show me the result, then enable it.
 7. Copy energygrid-bill-downloader/runtime/maintenance/energygrid_retention.py and render
    egretention.ps1.template from the same folder into EG_HOME\maintenance. Lock both, and
-   create EG_HOME\data\retention with the ACLs in its section 6. Run one dry run (no -Apply).
+   create EG_HOME\data\retention with the ACLs in its section 6. Show the negative ACL proof,
+   then one dry run (no -Apply) as the task user after 14:00 SGT.
 8. Register energygrid-bill-downloader/task-scheduler/energygrid_retention.task.example.xml,
    set the trigger to 19:30 SGT (the file ships 19:00), read it back, and only then add -Apply
    and enable it.
