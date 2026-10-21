@@ -591,6 +591,13 @@ class PdfAndUploadTests(unittest.TestCase):
             "open action": b"<< /OpenAction 7 0 R >>",
             "open action dictionary": b"<< /OpenAction << /S /GoTo >> >>",
             "hex-escaped name": b"<< /S /J#61vaScript >>",
+            "XFA form": b"<< /AcroForm << /XFA 5 0 R >> >>",
+            "rich media": b"<< /Subtype /RichMedia >>",
+            "remote go-to": b"<< /S /GoToR /F (other.pdf) >>",
+            "embedded go-to": b"<< /S /GoToE >>",
+            "submit form": b"<< /S /SubmitForm >>",
+            "import data": b"<< /S /ImportData >>",
+            "key outside a stream": b"4 0 obj << /Length 4 >>\nstream\nabcd\nendstream\nendobj\n<< /S /JavaScript >>",
         }
         for label, fragment in risky.items():
             with self.subTest(label):
@@ -600,6 +607,9 @@ class PdfAndUploadTests(unittest.TestCase):
         benign = {
             "open view only": b"<< /OpenAction [3 0 R /Fit] >>",
             "longer name": b"<< /JSONData 1 /AAPL 2 /JBIG2Decode 3 >>",
+            # Stream data (page content, images) is skipped: its bytes can look like a key by chance.
+            "key-like bytes inside a stream": b"4 0 obj << /Length 20 >>\nstream\nx\x9c/JS /Launch\x00\xff\nendstream\nendobj",
+            "key-like bytes inside a CRLF stream": b"4 0 obj << /Length 8 >>\nstream\r\n/AA /JS \r\nendstream\nendobj",
         }
         for label, fragment in benign.items():
             with self.subTest(label):
@@ -874,6 +884,18 @@ class ErrorAlertWorkflowTests(unittest.TestCase):
                          (send["parameters"]["chatId"], send["parameters"]["text"],
                           send["parameters"]["additionalFields"]["appendAttribution"]))
         self.assertTrue(all(ord(ch) < 128 for ch in self.raw))
+
+    def test_runbook_and_note_require_the_error_workflow_to_be_published(self) -> None:
+        # n8n runs only the published version of an error workflow; an unpublished one sends no alert.
+        runbook = (REPO_ROOT / "docs" / "simba_invoice_intake.md").read_text(encoding="utf-8")
+        self.assertNotRegex(runbook, r"(?i)(does not|doesn't|need not|needn't)\s+(need\s+to\s+)?be\s+(active|published)")
+        self.assertIn("**The error workflow must be published (active):**", runbook)
+        setup = runbook[runbook.index("## Setup"):runbook.index("## Acceptance checks")]
+        self.assertIn("publish `SIMBA Invoices - Error Alert` first (or together with the main workflow), "
+                      "then publish `SIMBA Invoices - Email To Drive`", setup)
+        self.assertIn("until one Telegram failure alert arrives", setup)
+        note = self.nodes["Overview"]["parameters"]["content"]
+        self.assertIn("Must be published (active)", note)
 
     def test_alert_text_carries_no_error_message_or_email_content(self) -> None:
         payload = {"execution": {"id": "1234", "url": "https://n8n.example.com/workflow/abc/executions/1234",

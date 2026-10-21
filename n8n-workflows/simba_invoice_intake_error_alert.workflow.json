@@ -60,8 +60,8 @@
       ],
       "parameters": {
         "width": 760,
-        "height": 300,
-        "content": "# SIMBA invoices: error alert\n\n- Runs when \"SIMBA Invoices - Email To Drive\" fails on its own (not on manual editor runs).\n- Sends one Telegram message: workflow, the step it stopped at, execution number and link, and time. No email, PDF or error text is copied.\n- A failed Telegram send fails this workflow too, so it stays visible in n8n Executions.\n\n## Required manual configuration:\n\n- **Send Error Alert**\n  - `Chat ID`: the Telegram chat for alerts (the same one EnergyGrid alerts use).\n- **SIMBA Invoices - Email To Drive, Workflow settings**\n  - `Error workflow`: this workflow.\n"
+        "height": 340,
+        "content": "# SIMBA invoices: error alert\n\n- Runs when \"SIMBA Invoices - Email To Drive\" fails on its own (not on manual editor runs).\n- Must be published (active): n8n runs only the published version of an error workflow, so publish it with or before the main workflow.\n- Sends one Telegram message: workflow, the step it stopped at, execution number and link, and time. No email, PDF or error text is copied.\n- A failed Telegram send fails this workflow too, so it stays visible in n8n Executions.\n\n## Required manual configuration:\n\n- **Send Error Alert**\n  - `Chat ID`: the Telegram chat for alerts (the same one EnergyGrid alerts use).\n- **SIMBA Invoices - Email To Drive, Workflow settings**\n  - `Error workflow`: this workflow.\n"
       }
     }
   ],

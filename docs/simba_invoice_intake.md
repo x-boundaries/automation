@@ -67,7 +67,7 @@ The invoice link goes through Amazon SES click tracking (`*.awstrack.me`). The r
 
 - **Host allowlist:** only that exact host over HTTPS on the default port, with a path ending in `/pdf`, is accepted. Any other link is ignored and the email goes to review with `NO_PDF_LINK`. Redirects are never followed, so a redirect to any other host (or the same host) fails the download and goes to review.
 - **Size and type:** the download must start with `%PDF-` and be at most 10 MB.
-- **Active content:** a PDF containing `/JavaScript`, `/JS`, `/Launch`, `/EmbeddedFile(s)`, `/AA` (automatic actions) or an `/OpenAction` that is not just a page view (`/OpenAction [ ... ]`) is refused. Names hidden with `#xx` escapes are decoded first. A refused PDF is not stored, not read and not opened; the invoice goes to review as a note (`PDF_ACTIVE_CONTENT`) with an alert. Limit: keys inside compressed object streams are not scanned. The PDF is still never executed; n8n only extracts its text, so keep n8n updated for its PDF library's security fixes.
+- **Active content:** a PDF containing `/JavaScript`, `/JS`, `/Launch`, `/EmbeddedFile(s)`, `/AA` (automatic actions), `/XFA`, `/RichMedia`, `/GoToR`, `/GoToE`, `/SubmitForm`, `/ImportData` or an `/OpenAction` that is not just a page view (`/OpenAction [ ... ]`) is refused. Names hidden with `#xx` escapes are decoded first. Stream data (`stream ... endstream`) is skipped, because page content or image bytes can look like a key by chance. A refused PDF is not stored, not read and not opened; the invoice goes to review as a note (`PDF_ACTIVE_CONTENT`) with an alert. Limit: keys inside compressed object streams (`/ObjStm`) are not scanned. The PDF is still never executed; n8n only extracts its text, so keep n8n updated for its PDF library's security fixes.
 - **Prompt injection:** nothing in the email, link or PDF is given to an AI model, so hidden text cannot instruct anything.
 
 Whether the PDF address works without a SIMBA login, and for how long, is **not yet verified**. If it does not, every invoice lands in review as a note and a person downloads the PDF from SIMBA.
@@ -91,7 +91,7 @@ After each upload the workflow reads the file back from Drive and checks its nam
 ## Alerts on Telegram
 
 - **Review alert** (from the main workflow): every email labelled `SIMBA/Needs review` sends one message to `telegram_chat_id` with the reason codes, the invoice number and issue date if known, and whether a review copy was stored. It never includes an address, link, amount, account number or email text.
-- **Failure alert** (from `SIMBA Invoices - Error Alert`): when the main workflow fails on its own, n8n runs the error workflow, which sends the workflow name, the step it stopped at, the execution number and link, and the time. The error message is left out because it can quote data; open the execution in n8n to read it. The error workflow does not need to be active, and it does not run for manual editor runs.
+- **Failure alert** (from `SIMBA Invoices - Error Alert`): when the main workflow fails on its own, n8n runs the error workflow, which sends the workflow name, the step it stopped at, the execution number and link, and the time. The error message is left out because it can quote data; open the execution in n8n to read it. **The error workflow must be published (active):** n8n runs only the published version of an error workflow, and an unpublished one sends nothing. It does not run for manual editor runs.
 - The error workflow must be selected in the main workflow's **Settings > Error workflow** after both are imported. Its n8n ID only exists after import, so it is set in n8n, never in this repository.
 
 ## Failures
@@ -116,7 +116,8 @@ A Gmail read or Drive failure on one email also stops the rest of that minute's 
 4. In n8n, create a Gmail OAuth2 credential on the intake mailbox and a Google Drive OAuth2 credential, and reuse the Telegram credential the EnergyGrid alerts use. Bind them in a local import copy: Gmail to `Watch Mailbox For SIMBA Emails`, `Fetch Full Email` and `Label SIMBA Email`; Drive to the four Drive nodes; Telegram to `Send Review Alert` and, in the error workflow, `Send Error Alert`. n8n's Gmail credential already includes label permission. Never commit the bound copies.
 5. In the local import copy, fill **Intake Settings**: `invoice_folder_id`, `review_folder_id`, `intake_recipients` (the intake mailbox address), `filed_label_id`, `review_label_id`, `broadband_account_numbers`, `mobile_account_numbers` (from a real bill or SIMBA My Account) and `telegram_chat_id`. In the error workflow, set the `Send Error Alert` chat ID. The workflow refuses to run while any setting is still a `REPLACE_WITH_...` placeholder, if the two label IDs are the same, or if an account number is malformed or in both lists.
 6. Import both inactive. In the main workflow's **Settings**, set **Error workflow** to `SIMBA Invoices - Error Alert`.
-7. Run the real-mail checks below, then activate the main workflow only after the owner approves.
+7. Run the real-mail checks below.
+8. Activation, only after the owner approves: publish `SIMBA Invoices - Error Alert` first (or together with the main workflow), then publish `SIMBA Invoices - Email To Drive`. Confirm one real failure alert: create a throwaway workflow with a Schedule Trigger and a Stop and Error node, set its **Error workflow** to `SIMBA Invoices - Error Alert`, publish it until one Telegram failure alert arrives, then unpublish and delete it.
 
 ## Acceptance checks still to do with real mail
 
@@ -134,7 +135,7 @@ These cannot be proven offline:
 - A poll with two or more SIMBA emails stores each one once (the one-at-a-time loop).
 - Drive returns `sha256Checksum` on read-back for the uploaded PDF.
 - The filed email carries `SIMBA/Filed` (or `SIMBA/Needs review`) and nothing else about it changed: still in the Inbox, read state unchanged, no other label added or removed. A second run on the same email stores nothing and leaves one SIMBA label.
-- A review outcome sends one Telegram review alert with no address or account number, and the error workflow's Telegram message arrives (run it once from the editor; its Error Trigger supplies sample data).
+- A review outcome sends one Telegram review alert with no address or account number, and the error workflow's Telegram message arrives (run it once from the editor; its Error Trigger supplies sample data). A real failure alert needs the error workflow published, so it is confirmed at activation (Setup step 8).
 
 The malicious-PDF refusal is proven with synthetic PDFs in the offline tests only; never test it with a real malicious file.
 
