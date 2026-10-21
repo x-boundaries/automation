@@ -37,7 +37,7 @@ BROADBAND_ACCT = "BB0000000001"
 MOBILE_ACCT = "MB0000000002"
 SETTINGS = {
     "invoice_folder_id": "FOLDER_INVOICES",
-    "review_folder_id": "FOLDER_REVIEW",
+    "review_folder_name": "SIMBA Needs Review",
     "intake_recipients": INTAKE_ADDR,
     "filed_label_id": "Label_FILED",
     "review_label_id": "Label_REVIEW",
@@ -237,7 +237,10 @@ class StaticContractTests(unittest.TestCase):
         settings = self.nodes["Intake Settings"]["parameters"]["assignments"]["assignments"]
         self.assertEqual(set(SETTINGS), {item["name"] for item in settings})
         for item in settings:
-            self.assertRegex(item["value"], r"^REPLACE_WITH_[A-Z_]+$")
+            if item["name"] == "review_folder_name":
+                self.assertEqual("SIMBA Needs Review", item["value"])  # a non-private default
+            else:
+                self.assertRegex(item["value"], r"^REPLACE_WITH_[A-Z_]+$")
         self.assertNotIn(BROADBAND_ACCT, self.raw)
         emails = set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", self.raw))
         self.assertEqual({"bills@my.simba.sg"}, {email for email in emails if not email.endswith("@example.com")})
@@ -255,15 +258,15 @@ class StaticContractTests(unittest.TestCase):
     def test_http_nodes_are_bounded_and_never_call_the_tracker(self) -> None:
         http = {name: node for name, node in self.nodes.items() if node["type"] == "n8n-nodes-base.httpRequest"}
         self.assertEqual({"Fetch Full Email", "Look For Existing Copy In Drive", "Download Invoice PDF",
-                          "Start Drive Upload", "Upload File Bytes", "Read Back Stored File", "Check Mailbox Access"},
-                         set(http))
+                          "Start Drive Upload", "Upload File Bytes", "Read Back Stored File", "Check Mailbox Access",
+                          "Find Review Folder", "Create Review Folder"}, set(http))
         for name, node in http.items():
             params = node["parameters"]
             self.assertIs(False, params["options"]["redirect"]["redirect"]["followRedirects"], name)
             self.assertGreater(params["options"]["timeout"], 0, name)
             self.assertNotIn("awstrack", json.dumps(params), name)
             self.assertNotIn("amdocs", json.dumps(params), name)
-        self.assertEqual({"Start Drive Upload": "POST", "Upload File Bytes": "PUT"},
+        self.assertEqual({"Start Drive Upload": "POST", "Upload File Bytes": "PUT", "Create Review Folder": "POST"},
                          {name: node["parameters"]["method"] for name, node in http.items()
                           if node["parameters"]["method"] != "GET"})
         download = http["Download Invoice PDF"]["parameters"]
@@ -272,9 +275,10 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual("file", download["options"]["response"]["response"]["responseFormat"])
         for name in ("Fetch Full Email", "Check Mailbox Access"):
             self.assertEqual("gmailOAuth2", http[name]["parameters"]["nodeCredentialType"], name)
-        for name in ("Look For Existing Copy In Drive", "Start Drive Upload", "Upload File Bytes", "Read Back Stored File"):
+        for name in ("Look For Existing Copy In Drive", "Start Drive Upload", "Upload File Bytes", "Read Back Stored File",
+                     "Find Review Folder", "Create Review Folder"):
             self.assertEqual("googleDriveOAuth2Api", http[name]["parameters"]["nodeCredentialType"], name)
-        for name in ("Start Drive Upload", "Upload File Bytes"):
+        for name in ("Start Drive Upload", "Upload File Bytes", "Create Review Folder"):
             self.assertIs(False, http[name]["retryOnFail"], name)
 
     def test_tracker_host_appears_only_as_a_pattern_in_the_classifier(self) -> None:
@@ -293,7 +297,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertNotIn("Start Drive Upload", downstream(self.workflow, "Is SIMBA Invoice Email", 1))
         self.assertNotIn("Start Drive Upload", downstream(self.workflow, "Needs Storing", 1))
         self.assertEqual("Something To Store", connections["Prepare Drive File"]["main"][0][0]["node"])
-        self.assertEqual("Start Drive Upload", connections["Something To Store"]["main"][0][0]["node"])
+        self.assertEqual("Is Review Upload", connections["Something To Store"]["main"][0][0]["node"])
 
     def test_pdf_text_is_read_only_from_a_safe_pdf(self) -> None:
         connections = self.workflow["connections"]
@@ -458,10 +462,18 @@ class ClassifyTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn(key, result["error"])
 
-    def test_review_folder_and_labels_must_differ(self) -> None:
-        folder = classify(direct(), dict(SETTINGS, review_folder_id=SETTINGS["invoice_folder_id"]))
-        self.assertFalse(folder["ok"])
-        self.assertIn("review_folder_id", folder["error"])
+    def test_folder_settings_and_labels_are_checked(self) -> None:
+        for value in ("a/b", 'quote"d', " padded ", "x" * 101, "line\nbreak"):
+            with self.subTest(review_folder_name=value):
+                result = classify(direct(), dict(SETTINGS, review_folder_name=value))
+                self.assertFalse(result["ok"])
+                self.assertIn("review_folder_name", result["error"])
+        self.assertTrue(classify(direct(), dict(SETTINGS, review_folder_name="SIMBA - to check (Oct)"))["ok"])
+        for value in ("short", "abc' or '1'='1", "folder id with spaces"):
+            with self.subTest(invoice_folder_id=value):
+                result = classify(direct(), dict(SETTINGS, invoice_folder_id=value))
+                self.assertFalse(result["ok"])
+                self.assertIn("invoice_folder_id", result["error"])
         labels = classify(direct(), dict(SETTINGS, review_label_id=SETTINGS["filed_label_id"]))
         self.assertFalse(labels["ok"])
         self.assertIn("review_label_id", labels["error"])
@@ -488,6 +500,20 @@ class ClassifyTests(unittest.TestCase):
                 decision = decision_for(msg)
                 self.assertEqual(("REVIEW", "DIRECT_UNVERIFIED"), (decision["route"], decision["kind"]))
                 self.assertIn("SENDER_NOT_VERIFIED", decision["review_reasons"])
+
+    def test_gmail_auto_forwarded_bill_still_files(self) -> None:
+        # A Gmail server-side forward from another of our mailboxes keeps the message and SIMBA's DKIM signatures,
+        # but SPF now fails for SES. DMARC passes on the aligned my.simba.sg DKIM, and To still names our address.
+        forwarded_auth = ("mx.google.com; dkim=pass header.i=@my.simba.sg header.s=s1; dkim=pass header.i=@amazonses.com;"
+                          " spf=pass smtp.mailfrom=accounts+caf_=intake=example.com@example.com;"
+                          " dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=my.simba.sg")
+        settings = dict(SETTINGS, intake_recipients="accounts@example.com, " + INTAKE_ADDR)
+        result = classify(direct(to="accounts@example.com", auth=[forwarded_auth, GOOD_AUTH]), settings)
+        self.assertEqual(("FILE", "DIRECT_VERIFIED"), (result["output"][0]["json"]["route"], result["output"][0]["json"]["kind"]))
+        # If the forward broke SIMBA's DKIM, DMARC fails and the bill goes to review instead.
+        broken = forwarded_auth.replace("dkim=pass header.i=@my.simba.sg", "dkim=fail header.i=@my.simba.sg").replace(
+            "dkim=pass header.i=@amazonses.com", "dkim=fail header.i=@amazonses.com").replace("dmarc=pass", "dmarc=fail")
+        self.assertEqual(["SENDER_NOT_VERIFIED"], classify(direct(to="accounts@example.com", auth=broken), settings)["output"][0]["json"]["review_reasons"])
 
     def test_ses_proof_by_spf_alone_is_enough(self) -> None:
         auth = ("mx.google.com; dkim=pass header.d=my.simba.sg; spf=pass smtp.mailfrom=x@ap-southeast-1.amazonses.com;"
@@ -737,7 +763,7 @@ class PdfAndUploadTests(unittest.TestCase):
         upload = out["json"]["upload"]
         self.assertEqual(("REVIEW", ["PDF_ACCOUNT_NOT_OURS"]), (out["json"]["route"], out["json"]["review_reasons"]))
         self.assertEqual("Needs review - Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", upload["name"])
-        self.assertEqual(("FOLDER_REVIEW", "application/pdf", "REVIEW"),
+        self.assertEqual((None, "application/pdf", "REVIEW"),
                          (upload["folder_id"], upload["mime_type"], upload["properties"]["simbaStatus"]))
         self.assertNotIn("simbaBillType", upload["properties"])
 
@@ -755,7 +781,7 @@ class PdfAndUploadTests(unittest.TestCase):
         out = self.prepare(decision, self.pdf_item(decision=decision))
         upload = out["json"]["upload"]
         self.assertEqual("Needs review - Oct 2026 - SIMBA Broadband Invoice " + INVOICE + ".pdf", upload["name"])
-        self.assertEqual(("FOLDER_REVIEW", "REVIEW", ["FORWARDED_COPY"]),
+        self.assertEqual((None, "REVIEW", ["FORWARDED_COPY"]),
                          (upload["folder_id"], upload["properties"]["simbaStatus"], out["json"]["review_reasons"]))
 
     def test_failed_download_turns_a_filing_into_a_review_note(self) -> None:
@@ -766,7 +792,7 @@ class PdfAndUploadTests(unittest.TestCase):
                 upload = out["json"]["upload"]
                 self.assertEqual(("REVIEW", ["PDF_NOT_AVAILABLE"]), (out["json"]["route"], out["json"]["review_reasons"]))
                 self.assertEqual("Needs review - Oct 2026 - SIMBA Invoice " + INVOICE + ".txt", upload["name"])
-                self.assertEqual(("FOLDER_REVIEW", "text/plain", "REVIEW"),
+                self.assertEqual((None, "text/plain", "REVIEW"),
                                  (upload["folder_id"], upload["mime_type"], upload["properties"]["simbaStatus"]))
                 note = base64.b64decode(out["binary"]["file"]["data"]).decode("utf-8")
                 self.assertEqual(upload["size"], len(note.encode("utf-8")))
@@ -806,12 +832,16 @@ class PdfAndUploadTests(unittest.TestCase):
                           {"Prepare Drive File": prepared})
         self.assertFalse(refused["ok"])
 
-        upload = prepared["json"]["upload"]
+        ready = run_one("Ready To Upload", [prepared], {"Intake Settings": {"json": SETTINGS}, "Prepare Drive File": prepared})
+        self.assertTrue(ready["ok"], ready)
+        ready = ready["output"][0]
+        upload = ready["json"]["upload"]
+        self.assertEqual("FOLDER_INVOICES", upload["folder_id"])
         put = {"json": {"statusCode": 200, "body": {"id": "DRIVEFILE1"}}}
         stored = {"id": "DRIVEFILE1", "name": upload["name"], "parents": [upload["folder_id"]],
                   "size": str(upload["size"]), "sha256Checksum": upload["sha256"], "trashed": False,
                   "properties": dict(upload["properties"])}
-        refs = {"Prepare Drive File": prepared, "Upload File Bytes": put}
+        refs = {"Ready To Upload": ready, "Upload File Bytes": put}
         ok = run_one("Verify Stored File", [{"json": {"statusCode": 200, "body": stored}}], refs)
         self.assertEqual({"stored": True, "route": "FILE", "review_reasons": [], "drive_file_id": "DRIVEFILE1",
                           "name": upload["name"]}, ok["output"][0]["json"])
@@ -821,8 +851,111 @@ class PdfAndUploadTests(unittest.TestCase):
                 bad = run_one("Verify Stored File", [{"json": {"statusCode": 200, "body": dict(stored, **change)}}], refs)
                 self.assertFalse(bad["ok"])
         failed_put = run_one("Verify Stored File", [{"json": {"statusCode": 404, "body": {}}}],
-                             {"Prepare Drive File": prepared, "Upload File Bytes": {"json": {"statusCode": 500, "body": {}}}})
+                             {"Ready To Upload": ready, "Upload File Bytes": {"json": {"statusCode": 500, "body": {}}}})
         self.assertFalse(failed_put["ok"])
+
+
+class ReviewFolderTests(unittest.TestCase):
+    """The review folder sits inside the invoice folder and is found or created, so it can be deleted after review."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        cls.nodes = {node["name"]: node for node in cls.workflow["nodes"]}
+
+    def review_prepared(self) -> dict:
+        decision = dict(decision_for(forwarded()), store=True, skip_reason=None, existing_copies=0)
+        result = run_one("Prepare Drive File", [{"json": {"error": "403 Forbidden"}}],
+                         {"Intake Settings": {"json": SETTINGS}, "Decide Whether To Store": {"json": decision}})
+        self.assertTrue(result["ok"], result)
+        return result["output"][0]
+
+    def pick(self, files: list[dict], status: int = 200, incomplete: bool = False) -> dict:
+        return run_one("Pick Review Folder",
+                       [{"json": {"statusCode": status, "body": {"files": files, "incompleteSearch": incomplete}}}],
+                       {"Intake Settings": {"json": SETTINGS}})
+
+    def ready(self, prepared: dict, input_json: dict) -> dict:
+        return run_one("Ready To Upload", [{"json": input_json}],
+                       {"Intake Settings": {"json": SETTINGS}, "Prepare Drive File": prepared})
+
+    @staticmethod
+    def folder(folder_id: str, created: str, parent: str = "FOLDER_INVOICES") -> dict:
+        return {"id": folder_id, "name": "SIMBA Needs Review", "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent], "trashed": False, "createdTime": created}
+
+    def test_wiring_only_review_items_look_for_the_folder(self) -> None:
+        connections = self.workflow["connections"]
+        self.assertEqual("Is Review Upload", connections["Something To Store"]["main"][0][0]["node"])
+        self.assertEqual("={{ $json.route === 'REVIEW' }}",
+                         self.nodes["Is Review Upload"]["parameters"]["conditions"]["conditions"][0]["leftValue"])
+        self.assertEqual(["Find Review Folder", "Ready To Upload"],
+                         [links[0]["node"] for links in connections["Is Review Upload"]["main"]])
+        # A filed invoice never searches for or creates the review folder.
+        filed_path = downstream(self.workflow, "Is Review Upload", 1)
+        self.assertNotIn("Find Review Folder", filed_path)
+        self.assertNotIn("Create Review Folder", filed_path)
+        self.assertEqual(["Ready To Upload", "Create Review Folder"],
+                         [links[0]["node"] for links in connections["Review Folder Exists"]["main"]])
+        self.assertEqual("Ready To Upload", connections["Create Review Folder"]["main"][0][0]["node"])
+        self.assertEqual("Start Drive Upload", connections["Ready To Upload"]["main"][0][0]["node"])
+        for name in ("Find Review Folder", "Create Review Folder"):
+            self.assertNotIn("onError", self.nodes[name], name)
+
+    def test_search_and_create_requests(self) -> None:
+        find = self.nodes["Find Review Folder"]["parameters"]
+        query = {item["name"]: item["value"] for item in find["queryParameters"]["parameters"]}
+        self.assertIn("in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+                      "and appProperties has { key='simbaReviewFolder' and value='1' }", query["q"])
+        self.assertIn("$('Intake Settings').first().json.invoice_folder_id", query["q"])
+        self.assertEqual(("createdTime", "false", "false", "user"),
+                         (query["orderBy"], query["supportsAllDrives"], query["includeItemsFromAllDrives"], query["corpora"]))
+        create = self.nodes["Create Review Folder"]["parameters"]
+        self.assertEqual(("POST", "https://www.googleapis.com/drive/v3/files"), (create["method"], create["url"]))
+        body = run_nodes([{"node": "Create Review Folder", "param": "jsonBody", "input": [{"json": {}}],
+                           "refs": {"Intake Settings": {"json": SETTINGS}}}])[0]
+        self.assertTrue(body["ok"], body)
+        self.assertEqual({"name": "SIMBA Needs Review", "mimeType": "application/vnd.google-apps.folder",
+                          "parents": ["FOLDER_INVOICES"], "appProperties": {"simbaReviewFolder": "1"}},
+                         json.loads(body["output"]))
+
+    def test_pick_uses_the_oldest_of_ours(self) -> None:
+        none = self.pick([])
+        self.assertEqual({"review_folder_found": False, "review_folder_id": None}, none["output"][0]["json"])
+        several = self.pick([self.folder("NEWER", "2026-10-21T00:00:00.000Z"), self.folder("OLDEST", "2026-10-01T00:00:00.000Z"),
+                             self.folder("ELSEWHERE", "2026-01-01T00:00:00.000Z", parent="OTHER_FOLDER")])
+        self.assertEqual({"review_folder_found": True, "review_folder_id": "OLDEST"}, several["output"][0]["json"])
+        for bad in (self.pick([], status=403), self.pick([], incomplete=True)):
+            self.assertFalse(bad["ok"])
+            self.assertIn("review folder", bad["error"])
+
+    def test_ready_puts_review_items_in_the_found_or_created_folder(self) -> None:
+        prepared = self.review_prepared()
+        found = self.ready(prepared, {"review_folder_found": True, "review_folder_id": "REVIEWFOLDER1"})
+        self.assertEqual("REVIEWFOLDER1", found["output"][0]["json"]["upload"]["folder_id"])
+        self.assertIn("file", found["output"][0]["binary"])
+        created_body = {"id": "REVIEWFOLDER2", "name": "SIMBA Needs Review", "mimeType": "application/vnd.google-apps.folder",
+                        "parents": ["FOLDER_INVOICES"], "appProperties": {"simbaReviewFolder": "1"}}
+        created = self.ready(prepared, {"statusCode": 200, "body": created_body})
+        self.assertEqual("REVIEWFOLDER2", created["output"][0]["json"]["upload"]["folder_id"])
+        for label, response in {
+            "refused": {"statusCode": 403, "body": {"error": {"message": "insufficientFilePermissions"}}},
+            "not a folder": {"statusCode": 200, "body": dict(created_body, mimeType="application/pdf")},
+            "wrong parent": {"statusCode": 200, "body": dict(created_body, parents=["OTHER_FOLDER"])},
+            "unmarked": {"statusCode": 200, "body": dict(created_body, appProperties={})},
+        }.items():
+            with self.subTest(label):
+                failed = self.ready(prepared, response)
+                self.assertFalse(failed["ok"])
+                self.assertIn("could not create the SIMBA review folder", failed["error"])
+
+    def test_filed_invoice_goes_to_the_invoice_folder(self) -> None:
+        helper = PdfAndUploadTests()
+        prepared = helper.prepare(decision_for(direct()), helper.pdf_item())
+        result = self.ready(prepared, prepared["json"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(("FILE", "FOLDER_INVOICES"), (result["output"][0]["json"]["route"],
+                                                       result["output"][0]["json"]["upload"]["folder_id"]))
 
 
 class LabelAndAlertTests(unittest.TestCase):

@@ -47,8 +47,8 @@
             },
             {
               "id": "00000000-0000-4244-8000-000000000005",
-              "name": "review_folder_id",
-              "value": "REPLACE_WITH_REVIEW_FOLDER_ID",
+              "name": "review_folder_name",
+              "value": "SIMBA Needs Review",
               "type": "string"
             },
             {
@@ -93,7 +93,7 @@
         "options": {}
       },
       "notesInFlow": true,
-      "notes": "Folder IDs, the intake address, Gmail label IDs, SIMBA account numbers and the Telegram chat ID go here, in your own n8n copy only. Never commit real values."
+      "notes": "The invoice folder ID, the intake address, Gmail label IDs, SIMBA account numbers and the Telegram chat ID go here, in your own n8n copy only. Never commit real values."
     },
     {
       "id": "00000000-0000-4244-8000-000000000007",
@@ -170,7 +170,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "\n// Reads one full Gmail message and decides what happens to it. Pure logic: no network calls.\n// FILE   = genuine SIMBA invoice email addressed to the intake mailbox, PDF link found -> invoice folder.\n// REVIEW = looks like a SIMBA invoice but something is unproven -> review folder for a person.\n// IGNORE = not a SIMBA invoice email (for example an internal reply that does not quote one).\n// The amount on the invoice is never read or used.\nconst SIMBA_SENDER = 'bills@my.simba.sg';\nconst SIMBA_DOMAIN = 'my.simba.sg';\nconst SES_DOMAIN = 'amazonses.com';\nconst GMAIL_AUTH_SERVER = 'mx.google.com';\nconst PDF_HOST = 'billing-invoice-pdf.amdocs-dbs.com';\nconst TRACKER_HOST_SUFFIX = '.awstrack.me';\nconst MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };\n\nconst settings = $('Intake Settings').first().json;\nconst message = $input.first().json;\n\nfunction configured(value) {\n  return typeof value === 'string' && value.trim() !== '' && !value.startsWith('REPLACE_WITH_');\n}\nfor (const key of ['invoice_folder_id', 'review_folder_id', 'intake_recipients', 'filed_label_id', 'review_label_id',\n  'broadband_account_numbers', 'mobile_account_numbers', 'telegram_chat_id']) {\n  if (!configured(settings[key])) {\n    throw new Error('SIMBA intake settings are incomplete: set ' + key + ' in the Intake Settings node before activating.');\n  }\n}\nif (settings.review_folder_id === settings.invoice_folder_id) {\n  throw new Error('SIMBA intake settings: review_folder_id must be a different folder from invoice_folder_id, so review notes never land among filed invoices.');\n}\nif (settings.filed_label_id === settings.review_label_id) {\n  throw new Error('SIMBA intake settings: filed_label_id and review_label_id must be two different Gmail labels.');\n}\n// intake_recipients: the address(es) SIMBA sends our bills to, separated by new lines, commas or semicolons.\n// A genuine SIMBA bill addressed to anyone else is someone else's bill and is never filed.\nconst INTAKE = new Set();\nfor (const entry of settings.intake_recipients.split(/[\\n,;]+/).map((s) => s.trim()).filter(Boolean)) {\n  if (!/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$/i.test(entry)) {\n    throw new Error('SIMBA intake settings: intake_recipients entry \"' + entry.slice(0, 80) + '\" is not an email address.');\n  }\n  INTAKE.add(entry.toLowerCase());\n}\nif (INTAKE.size === 0) {\n  throw new Error('SIMBA intake settings: intake_recipients lists no email address.');\n}\n// broadband_account_numbers / mobile_account_numbers: our SIMBA account numbers, as printed on the bill\n// PDF, separated by new lines, commas or semicolons. Spaces and dashes are ignored. Checked in \"Check Invoice PDF\".\nconst ACCOUNTS = {};\nfor (const key of ['broadband_account_numbers', 'mobile_account_numbers']) {\n  ACCOUNTS[key] = settings[key].split(/[\\n,;]+/).map((s) => s.toUpperCase().replace(/[\\s-]+/g, '')).filter(Boolean);\n  if (ACCOUNTS[key].length === 0 || ACCOUNTS[key].some((a) => !/^[A-Z0-9]{5,30}$/.test(a))) {\n    throw new Error('SIMBA intake settings: ' + key + ' must list account numbers of 5 to 30 letters or digits.');\n  }\n}\nif (ACCOUNTS.broadband_account_numbers.some((a) => ACCOUNTS.mobile_account_numbers.includes(a))) {\n  throw new Error('SIMBA intake settings: an account number is listed as both broadband and mobile.');\n}\n\nif (!message || typeof message.id !== 'string' || !/^[0-9a-f]{6,32}$/i.test(message.id) || !message.payload) {\n  throw new Error('Gmail did not return a readable message; the SIMBA intake stopped so the email is not lost silently.');\n}\n\nconst headers = Array.isArray(message.payload.headers) ? message.payload.headers : [];\nfunction headerValues(name) {\n  const lower = name.toLowerCase();\n  return headers.filter((h) => h && typeof h.name === 'string' && h.name.toLowerCase() === lower).map((h) => String(h.value || ''));\n}\nfunction addressesIn(text) {\n  return (String(text || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi) || []).map((a) => a.toLowerCase());\n}\n// The mailbox addresses in an address header, never a display name: in \"a@example.com\" <b@example.com>\n// only b@example.com counts. Quoted names and comments are dropped first, then each comma-separated\n// mailbox gives its <...> address or, without brackets, the bare address.\nfunction mailboxAddresses(text) {\n  const cleaned = String(text || '').replace(/\"(?:[^\"\\\\]|\\\\.)*\"/g, ' ').replace(/\\([^()]*\\)/g, ' ');\n  const found = [];\n  for (const mailbox of cleaned.split(',')) {\n    const bracket = mailbox.match(/<([^<>]*)>/);\n    const candidate = (bracket ? bracket[1] : mailbox).trim();\n    if (/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$/i.test(candidate)) found.push(candidate.toLowerCase());\n  }\n  return found;\n}\nfunction decodeBase64Url(data) {\n  if (typeof data !== 'string' || data === '') return '';\n  return Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');\n}\n\n// Collect the plain-text and HTML bodies, and note any attached files.\nconst plainParts = [];\nconst htmlParts = [];\nconst attachments = [];\n(function walk(part, depth) {\n  if (!part || depth > 12) return;\n  const type = String(part.mimeType || '').toLowerCase();\n  const filename = typeof part.filename === 'string' ? part.filename : '';\n  if (filename !== '' || (part.body && part.body.attachmentId)) {\n    attachments.push(type || 'unknown');\n  } else if (type === 'text/plain') {\n    plainParts.push(decodeBase64Url(part.body && part.body.data));\n  } else if (type === 'text/html') {\n    htmlParts.push(decodeBase64Url(part.body && part.body.data));\n  }\n  if (Array.isArray(part.parts)) part.parts.forEach((child) => walk(child, depth + 1));\n})(message.payload, 0);\n\n// A numeric entity outside Unicode (for example &#x110000;) becomes a replacement character instead of\n// throwing, so one crafted email can never stop the rest of the batch.\nfunction codePoint(n) {\n  return Number.isInteger(n) && n >= 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : '\\uFFFD';\n}\nfunction decodeEntities(text) {\n  return text\n    .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '\"')\n    .replace(/&#39;|&apos;/gi, \"'\")\n    .replace(/&#(\\d+);/g, (_, n) => codePoint(Number(n)))\n    .replace(/&#x([0-9a-f]+);/gi, (_, n) => codePoint(parseInt(n, 16)))\n    .replace(/&amp;/gi, '&');\n}\nfunction htmlToText(html) {\n  return decodeEntities(html\n    .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, ' ')\n    .replace(/<br\\s*\\/?>|<\\/(p|div|tr|li|h\\d)>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' '));\n}\nfunction normaliseSpaces(text) {\n  return text.replace(/[\u00a0\u202f\u2007]/g, ' ').replace(/\\r\\n?/g, '\\n');\n}\n\nconst htmlText = htmlParts.map(htmlToText).join('\\n');\nconst bodyText = normaliseSpaces([plainParts.join('\\n'), htmlText].join('\\n'));\nconst textWithoutLinks = bodyText.replace(/https?:\\/\\/[^\\s<>\"']+/gi, ' ');\n\n// Links: from HTML href attributes and from the plain text.\nconst rawLinks = new Set();\nfor (const html of htmlParts) {\n  for (const m of html.matchAll(/href\\s*=\\s*(\"([^\"]*)\"|'([^']*)')/gi)) rawLinks.add(decodeEntities(m[2] !== undefined ? m[2] : m[3]).trim());\n}\nfor (const m of bodyText.matchAll(/https?:\\/\\/[^\\s<>\"'\\])]+/gi)) rawLinks.add(m[0]);\n\nfunction directPdfLink(raw) {\n  let url;\n  try { url = new URL(raw); } catch (error) { return null; }\n  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== PDF_HOST) return null;\n  if (url.username || url.password || (url.port !== '' && url.port !== '443')) return null;\n  if (!/\\/pdf$/i.test(url.pathname)) return null;\n  url.hash = '';\n  return url.toString();\n}\n// SIMBA links go through Amazon SES click tracking. The real PDF address sits URL-encoded in the\n// tracking path (/L0/<encoded address>/...). It is read from there; the tracker is never called.\nfunction pdfLinkFrom(raw) {\n  let url;\n  try { url = new URL(raw); } catch (error) { return null; }\n  if (url.protocol === 'https:' && url.hostname.toLowerCase().endsWith(TRACKER_HOST_SUFFIX)) {\n    const match = url.pathname.match(/^\\/L\\d+\\/([^/]+)\\//);\n    if (!match) return null;\n    let inner;\n    try { inner = decodeURIComponent(match[1]); } catch (error) { return null; }\n    return directPdfLink(inner);\n  }\n  return directPdfLink(raw);\n}\nconst pdfLinks = [...new Set([...rawLinks].map(pdfLinkFrom).filter(Boolean))];\n\nconst invoiceNumbers = [...new Set([...textWithoutLinks.matchAll(/(?:^|[^A-Za-z0-9])(S\\d{10})(?![0-9])/g)].map((m) => m[1]))];\n\nfunction isoDate(day, monthName, year) {\n  const month = MONTHS[String(monthName).toLowerCase()];\n  const d = Number(day);\n  const y = Number(year);\n  if (!month || y < 2000 || y > 2100) return null;\n  const check = new Date(Date.UTC(y, month - 1, d));\n  if (check.getUTCFullYear() !== y || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== d) return null;\n  return String(y) + '-' + String(month).padStart(2, '0') + '-' + String(d).padStart(2, '0');\n}\nconst issueDateMatches = [...textWithoutLinks.matchAll(/Issued\\s+On\\s*:\\s*(\\d{1,2})-([A-Za-z]{3})-(\\d{4})/gi)];\nconst issueDates = [...new Set(issueDateMatches.map((m) => isoDate(m[1], m[2], m[3]) || 'INVALID'))];\n\n// Sender trust: only Gmail's own top Authentication-Results header counts. Anything lower down could\n// have been written by the sender. It must show SIMBA's domain passing (DMARC, or DKIM signed by\n// SIMBA's domain) and delivery through Amazon SES.\nfunction parseAuthResults(value) {\n  const cleaned = String(value || '').replace(/\\([^()]*\\)/g, ' ');\n  const parts = cleaned.split(';').map((s) => s.trim()).filter(Boolean);\n  const server = (parts.shift() || '').split(/\\s+/)[0].toLowerCase();\n  const results = [];\n  for (const part of parts) {\n    const head = part.match(/^([a-z0-9_-]+)\\s*=\\s*([a-z]+)/i);\n    if (!head) continue;\n    const props = {};\n    for (const p of part.matchAll(/([a-z]+\\.[a-z0-9_-]+)\\s*=\\s*\"?([^\\s\";]+)\"?/gi)) props[p[1].toLowerCase()] = p[2].toLowerCase();\n    results.push({ method: head[1].toLowerCase(), result: head[2].toLowerCase(), props });\n  }\n  return { server, results };\n}\nfunction domainOf(value) {\n  const text = String(value || '').toLowerCase();\n  return text.includes('@') ? text.slice(text.lastIndexOf('@') + 1) : text;\n}\nfunction sameOrSubdomain(domain, base) {\n  return domain === base || domain.endsWith('.' + base);\n}\n\nconst fromHeaders = headerValues('From');\nconst fromAddresses = fromHeaders.length === 1 ? addressesIn(fromHeaders[0]) : [];\nconst fromIsSimba = fromAddresses.length === 1 && fromAddresses[0] === SIMBA_SENDER;\nconst claimsSimba = fromHeaders.some((value) => addressesIn(value).includes(SIMBA_SENDER));\nconst topAuth = parseAuthResults(headerValues('Authentication-Results')[0]);\nconst passed = (method) => topAuth.results.filter((r) => r.method === method && r.result === 'pass');\n// Exactly one DMARC result, and it must pass for SIMBA's domain; a failing result is never outvoted.\nconst dmarcResults = topAuth.results.filter((r) => r.method === 'dmarc');\nconst simbaDomainPassed = topAuth.server === GMAIL_AUTH_SERVER && dmarcResults.length === 1\n  && dmarcResults[0].result === 'pass' && dmarcResults[0].props['header.from'] === SIMBA_DOMAIN;\nconst sentThroughSes = topAuth.server === GMAIL_AUTH_SERVER && (\n  passed('dkim').some((r) => sameOrSubdomain(domainOf(r.props['header.d'] || r.props['header.i']), SES_DOMAIN)) ||\n  passed('spf').some((r) => sameOrSubdomain(domainOf(r.props['smtp.mailfrom']), SES_DOMAIN)));\n\nlet kind;\nif (fromIsSimba && simbaDomainPassed && sentThroughSes) kind = 'DIRECT_VERIFIED';\nelse if (claimsSimba) kind = 'DIRECT_UNVERIFIED';\nelse if (bodyText.toLowerCase().includes(SIMBA_SENDER)) kind = 'FORWARDED_COPY';\nelse kind = 'NOT_SIMBA';\n\nconst reasons = [];\nif (kind === 'DIRECT_VERIFIED') {\n  // The bill is ours only when SIMBA addressed it to the intake mailbox. Only the To header counts, which\n  // SIMBA's DKIM signature normally covers. Delivered-To, X-Original-To and Cc are not used: anyone who\n  // receives a genuine SIMBA bill could resend it to us with those headers added.\n  const toHeaders = headerValues('To');\n  if (toHeaders.length !== 1 || headerValues('Cc').length > 1) {\n    reasons.push('RECIPIENT_HEADERS_UNCLEAR');\n  } else if (!mailboxAddresses(toHeaders[0]).some((address) => INTAKE.has(address))) {\n    reasons.push('NOT_SENT_TO_INTAKE');\n  }\n  const subjects = headerValues('Subject');\n  if (subjects.length !== 1 || !/SIMBA Invoice/i.test(subjects[0])) reasons.push('NOT_AN_INVOICE_SUBJECT');\n} else if (kind === 'DIRECT_UNVERIFIED') {\n  reasons.push('SENDER_NOT_VERIFIED');\n} else if (kind === 'FORWARDED_COPY') {\n  reasons.push('FORWARDED_COPY');\n}\n\nif (kind !== 'NOT_SIMBA') {\n  if (invoiceNumbers.length === 0) reasons.push('NO_INVOICE_NUMBER');\n  if (invoiceNumbers.length > 1) reasons.push('SEVERAL_INVOICE_NUMBERS');\n  if (issueDates.length === 0) reasons.push('NO_ISSUE_DATE');\n  if (issueDates.length > 1 || issueDates.includes('INVALID')) reasons.push('ISSUE_DATE_UNCLEAR');\n  if (pdfLinks.length === 0) reasons.push('NO_PDF_LINK');\n  if (pdfLinks.length > 1) reasons.push('SEVERAL_PDF_LINKS');\n  if (attachments.length > 0) reasons.push('UNEXPECTED_ATTACHMENT');\n}\n\nconst invoiceNumber = invoiceNumbers.length === 1 ? invoiceNumbers[0] : null;\nconst issueDate = issueDates.length === 1 && issueDates[0] !== 'INVALID' ? issueDates[0] : null;\nconst route = kind === 'NOT_SIMBA' ? 'IGNORE' : (kind === 'DIRECT_VERIFIED' && reasons.length === 0 ? 'FILE' : 'REVIEW');\nconst receivedAt = /^\\d{1,15}$/.test(String(message.internalDate || ''))\n  ? new Date(Number(message.internalDate)).toISOString() : null;\n\nreturn [{\n  json: {\n    schema: 'simba.invoice_intake.decision.v2',\n    route,\n    kind,\n    review_reasons: reasons,\n    invoice_number: invoiceNumber,\n    issue_date: issueDate,\n    pdf_url: pdfLinks.length === 1 && route !== 'IGNORE' ? pdfLinks[0] : '',\n    intake_key: invoiceNumber || ('gmail-' + message.id.toLowerCase()),\n    gmail_message_id: message.id,\n    internet_message_id: (headerValues('Message-ID')[0] || '').trim().slice(0, 300),\n    received_at: receivedAt,\n  },\n}];\n"
+        "jsCode": "\n// Reads one full Gmail message and decides what happens to it. Pure logic: no network calls.\n// FILE   = genuine SIMBA invoice email addressed to the intake mailbox, PDF link found -> invoice folder.\n// REVIEW = looks like a SIMBA invoice but something is unproven -> review folder for a person.\n// IGNORE = not a SIMBA invoice email (for example an internal reply that does not quote one).\n// The amount on the invoice is never read or used.\nconst SIMBA_SENDER = 'bills@my.simba.sg';\nconst SIMBA_DOMAIN = 'my.simba.sg';\nconst SES_DOMAIN = 'amazonses.com';\nconst GMAIL_AUTH_SERVER = 'mx.google.com';\nconst PDF_HOST = 'billing-invoice-pdf.amdocs-dbs.com';\nconst TRACKER_HOST_SUFFIX = '.awstrack.me';\nconst MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };\n\nconst settings = $('Intake Settings').first().json;\nconst message = $input.first().json;\n\nfunction configured(value) {\n  return typeof value === 'string' && value.trim() !== '' && !value.startsWith('REPLACE_WITH_');\n}\nfor (const key of ['invoice_folder_id', 'review_folder_name', 'intake_recipients', 'filed_label_id', 'review_label_id',\n  'broadband_account_numbers', 'mobile_account_numbers', 'telegram_chat_id']) {\n  if (!configured(settings[key])) {\n    throw new Error('SIMBA intake settings are incomplete: set ' + key + ' in the Intake Settings node before activating.');\n  }\n}\n// The invoice folder ID goes into a Drive search, so it must look like a Drive ID.\nif (!/^[A-Za-z0-9_-]{10,200}$/.test(settings.invoice_folder_id)) {\n  throw new Error('SIMBA intake settings: invoice_folder_id is not a Google Drive folder ID.');\n}\n// review_folder_name: the folder created inside the invoice folder for review items when none exists.\nif (!/^[^\\\\/\"'<>\\u0000-\\u001f]{1,100}$/.test(settings.review_folder_name) || settings.review_folder_name.trim() !== settings.review_folder_name) {\n  throw new Error('SIMBA intake settings: review_folder_name must be 1 to 100 characters, with no slashes, quotes, angle brackets or leading or trailing spaces.');\n}\nif (settings.filed_label_id === settings.review_label_id) {\n  throw new Error('SIMBA intake settings: filed_label_id and review_label_id must be two different Gmail labels.');\n}\n// intake_recipients: the address(es) SIMBA sends our bills to, separated by new lines, commas or semicolons.\n// A genuine SIMBA bill addressed to anyone else is someone else's bill and is never filed.\nconst INTAKE = new Set();\nfor (const entry of settings.intake_recipients.split(/[\\n,;]+/).map((s) => s.trim()).filter(Boolean)) {\n  if (!/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$/i.test(entry)) {\n    throw new Error('SIMBA intake settings: intake_recipients entry \"' + entry.slice(0, 80) + '\" is not an email address.');\n  }\n  INTAKE.add(entry.toLowerCase());\n}\nif (INTAKE.size === 0) {\n  throw new Error('SIMBA intake settings: intake_recipients lists no email address.');\n}\n// broadband_account_numbers / mobile_account_numbers: our SIMBA account numbers, as printed on the bill\n// PDF, separated by new lines, commas or semicolons. Spaces and dashes are ignored. Checked in \"Check Invoice PDF\".\nconst ACCOUNTS = {};\nfor (const key of ['broadband_account_numbers', 'mobile_account_numbers']) {\n  ACCOUNTS[key] = settings[key].split(/[\\n,;]+/).map((s) => s.toUpperCase().replace(/[\\s-]+/g, '')).filter(Boolean);\n  if (ACCOUNTS[key].length === 0 || ACCOUNTS[key].some((a) => !/^[A-Z0-9]{5,30}$/.test(a))) {\n    throw new Error('SIMBA intake settings: ' + key + ' must list account numbers of 5 to 30 letters or digits.');\n  }\n}\nif (ACCOUNTS.broadband_account_numbers.some((a) => ACCOUNTS.mobile_account_numbers.includes(a))) {\n  throw new Error('SIMBA intake settings: an account number is listed as both broadband and mobile.');\n}\n\nif (!message || typeof message.id !== 'string' || !/^[0-9a-f]{6,32}$/i.test(message.id) || !message.payload) {\n  throw new Error('Gmail did not return a readable message; the SIMBA intake stopped so the email is not lost silently.');\n}\n\nconst headers = Array.isArray(message.payload.headers) ? message.payload.headers : [];\nfunction headerValues(name) {\n  const lower = name.toLowerCase();\n  return headers.filter((h) => h && typeof h.name === 'string' && h.name.toLowerCase() === lower).map((h) => String(h.value || ''));\n}\nfunction addressesIn(text) {\n  return (String(text || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi) || []).map((a) => a.toLowerCase());\n}\n// The mailbox addresses in an address header, never a display name: in \"a@example.com\" <b@example.com>\n// only b@example.com counts. Quoted names and comments are dropped first, then each comma-separated\n// mailbox gives its <...> address or, without brackets, the bare address.\nfunction mailboxAddresses(text) {\n  const cleaned = String(text || '').replace(/\"(?:[^\"\\\\]|\\\\.)*\"/g, ' ').replace(/\\([^()]*\\)/g, ' ');\n  const found = [];\n  for (const mailbox of cleaned.split(',')) {\n    const bracket = mailbox.match(/<([^<>]*)>/);\n    const candidate = (bracket ? bracket[1] : mailbox).trim();\n    if (/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$/i.test(candidate)) found.push(candidate.toLowerCase());\n  }\n  return found;\n}\nfunction decodeBase64Url(data) {\n  if (typeof data !== 'string' || data === '') return '';\n  return Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');\n}\n\n// Collect the plain-text and HTML bodies, and note any attached files.\nconst plainParts = [];\nconst htmlParts = [];\nconst attachments = [];\n(function walk(part, depth) {\n  if (!part || depth > 12) return;\n  const type = String(part.mimeType || '').toLowerCase();\n  const filename = typeof part.filename === 'string' ? part.filename : '';\n  if (filename !== '' || (part.body && part.body.attachmentId)) {\n    attachments.push(type || 'unknown');\n  } else if (type === 'text/plain') {\n    plainParts.push(decodeBase64Url(part.body && part.body.data));\n  } else if (type === 'text/html') {\n    htmlParts.push(decodeBase64Url(part.body && part.body.data));\n  }\n  if (Array.isArray(part.parts)) part.parts.forEach((child) => walk(child, depth + 1));\n})(message.payload, 0);\n\n// A numeric entity outside Unicode (for example &#x110000;) becomes a replacement character instead of\n// throwing, so one crafted email can never stop the rest of the batch.\nfunction codePoint(n) {\n  return Number.isInteger(n) && n >= 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : '\\uFFFD';\n}\nfunction decodeEntities(text) {\n  return text\n    .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '\"')\n    .replace(/&#39;|&apos;/gi, \"'\")\n    .replace(/&#(\\d+);/g, (_, n) => codePoint(Number(n)))\n    .replace(/&#x([0-9a-f]+);/gi, (_, n) => codePoint(parseInt(n, 16)))\n    .replace(/&amp;/gi, '&');\n}\nfunction htmlToText(html) {\n  return decodeEntities(html\n    .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, ' ')\n    .replace(/<br\\s*\\/?>|<\\/(p|div|tr|li|h\\d)>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' '));\n}\nfunction normaliseSpaces(text) {\n  return text.replace(/[\u00a0\u202f\u2007]/g, ' ').replace(/\\r\\n?/g, '\\n');\n}\n\nconst htmlText = htmlParts.map(htmlToText).join('\\n');\nconst bodyText = normaliseSpaces([plainParts.join('\\n'), htmlText].join('\\n'));\nconst textWithoutLinks = bodyText.replace(/https?:\\/\\/[^\\s<>\"']+/gi, ' ');\n\n// Links: from HTML href attributes and from the plain text.\nconst rawLinks = new Set();\nfor (const html of htmlParts) {\n  for (const m of html.matchAll(/href\\s*=\\s*(\"([^\"]*)\"|'([^']*)')/gi)) rawLinks.add(decodeEntities(m[2] !== undefined ? m[2] : m[3]).trim());\n}\nfor (const m of bodyText.matchAll(/https?:\\/\\/[^\\s<>\"'\\])]+/gi)) rawLinks.add(m[0]);\n\nfunction directPdfLink(raw) {\n  let url;\n  try { url = new URL(raw); } catch (error) { return null; }\n  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== PDF_HOST) return null;\n  if (url.username || url.password || (url.port !== '' && url.port !== '443')) return null;\n  if (!/\\/pdf$/i.test(url.pathname)) return null;\n  url.hash = '';\n  return url.toString();\n}\n// SIMBA links go through Amazon SES click tracking. The real PDF address sits URL-encoded in the\n// tracking path (/L0/<encoded address>/...). It is read from there; the tracker is never called.\nfunction pdfLinkFrom(raw) {\n  let url;\n  try { url = new URL(raw); } catch (error) { return null; }\n  if (url.protocol === 'https:' && url.hostname.toLowerCase().endsWith(TRACKER_HOST_SUFFIX)) {\n    const match = url.pathname.match(/^\\/L\\d+\\/([^/]+)\\//);\n    if (!match) return null;\n    let inner;\n    try { inner = decodeURIComponent(match[1]); } catch (error) { return null; }\n    return directPdfLink(inner);\n  }\n  return directPdfLink(raw);\n}\nconst pdfLinks = [...new Set([...rawLinks].map(pdfLinkFrom).filter(Boolean))];\n\nconst invoiceNumbers = [...new Set([...textWithoutLinks.matchAll(/(?:^|[^A-Za-z0-9])(S\\d{10})(?![0-9])/g)].map((m) => m[1]))];\n\nfunction isoDate(day, monthName, year) {\n  const month = MONTHS[String(monthName).toLowerCase()];\n  const d = Number(day);\n  const y = Number(year);\n  if (!month || y < 2000 || y > 2100) return null;\n  const check = new Date(Date.UTC(y, month - 1, d));\n  if (check.getUTCFullYear() !== y || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== d) return null;\n  return String(y) + '-' + String(month).padStart(2, '0') + '-' + String(d).padStart(2, '0');\n}\nconst issueDateMatches = [...textWithoutLinks.matchAll(/Issued\\s+On\\s*:\\s*(\\d{1,2})-([A-Za-z]{3})-(\\d{4})/gi)];\nconst issueDates = [...new Set(issueDateMatches.map((m) => isoDate(m[1], m[2], m[3]) || 'INVALID'))];\n\n// Sender trust: only Gmail's own top Authentication-Results header counts. Anything lower down could\n// have been written by the sender. It must show SIMBA's domain passing (DMARC, or DKIM signed by\n// SIMBA's domain) and delivery through Amazon SES.\nfunction parseAuthResults(value) {\n  const cleaned = String(value || '').replace(/\\([^()]*\\)/g, ' ');\n  const parts = cleaned.split(';').map((s) => s.trim()).filter(Boolean);\n  const server = (parts.shift() || '').split(/\\s+/)[0].toLowerCase();\n  const results = [];\n  for (const part of parts) {\n    const head = part.match(/^([a-z0-9_-]+)\\s*=\\s*([a-z]+)/i);\n    if (!head) continue;\n    const props = {};\n    for (const p of part.matchAll(/([a-z]+\\.[a-z0-9_-]+)\\s*=\\s*\"?([^\\s\";]+)\"?/gi)) props[p[1].toLowerCase()] = p[2].toLowerCase();\n    results.push({ method: head[1].toLowerCase(), result: head[2].toLowerCase(), props });\n  }\n  return { server, results };\n}\nfunction domainOf(value) {\n  const text = String(value || '').toLowerCase();\n  return text.includes('@') ? text.slice(text.lastIndexOf('@') + 1) : text;\n}\nfunction sameOrSubdomain(domain, base) {\n  return domain === base || domain.endsWith('.' + base);\n}\n\nconst fromHeaders = headerValues('From');\nconst fromAddresses = fromHeaders.length === 1 ? addressesIn(fromHeaders[0]) : [];\nconst fromIsSimba = fromAddresses.length === 1 && fromAddresses[0] === SIMBA_SENDER;\nconst claimsSimba = fromHeaders.some((value) => addressesIn(value).includes(SIMBA_SENDER));\nconst topAuth = parseAuthResults(headerValues('Authentication-Results')[0]);\nconst passed = (method) => topAuth.results.filter((r) => r.method === method && r.result === 'pass');\n// Exactly one DMARC result, and it must pass for SIMBA's domain; a failing result is never outvoted.\nconst dmarcResults = topAuth.results.filter((r) => r.method === 'dmarc');\nconst simbaDomainPassed = topAuth.server === GMAIL_AUTH_SERVER && dmarcResults.length === 1\n  && dmarcResults[0].result === 'pass' && dmarcResults[0].props['header.from'] === SIMBA_DOMAIN;\nconst sentThroughSes = topAuth.server === GMAIL_AUTH_SERVER && (\n  passed('dkim').some((r) => sameOrSubdomain(domainOf(r.props['header.d'] || r.props['header.i']), SES_DOMAIN)) ||\n  passed('spf').some((r) => sameOrSubdomain(domainOf(r.props['smtp.mailfrom']), SES_DOMAIN)));\n\nlet kind;\nif (fromIsSimba && simbaDomainPassed && sentThroughSes) kind = 'DIRECT_VERIFIED';\nelse if (claimsSimba) kind = 'DIRECT_UNVERIFIED';\nelse if (bodyText.toLowerCase().includes(SIMBA_SENDER)) kind = 'FORWARDED_COPY';\nelse kind = 'NOT_SIMBA';\n\nconst reasons = [];\nif (kind === 'DIRECT_VERIFIED') {\n  // The bill is ours only when SIMBA addressed it to the intake mailbox. Only the To header counts, which\n  // SIMBA's DKIM signature normally covers. Delivered-To, X-Original-To and Cc are not used: anyone who\n  // receives a genuine SIMBA bill could resend it to us with those headers added.\n  const toHeaders = headerValues('To');\n  if (toHeaders.length !== 1 || headerValues('Cc').length > 1) {\n    reasons.push('RECIPIENT_HEADERS_UNCLEAR');\n  } else if (!mailboxAddresses(toHeaders[0]).some((address) => INTAKE.has(address))) {\n    reasons.push('NOT_SENT_TO_INTAKE');\n  }\n  const subjects = headerValues('Subject');\n  if (subjects.length !== 1 || !/SIMBA Invoice/i.test(subjects[0])) reasons.push('NOT_AN_INVOICE_SUBJECT');\n} else if (kind === 'DIRECT_UNVERIFIED') {\n  reasons.push('SENDER_NOT_VERIFIED');\n} else if (kind === 'FORWARDED_COPY') {\n  reasons.push('FORWARDED_COPY');\n}\n\nif (kind !== 'NOT_SIMBA') {\n  if (invoiceNumbers.length === 0) reasons.push('NO_INVOICE_NUMBER');\n  if (invoiceNumbers.length > 1) reasons.push('SEVERAL_INVOICE_NUMBERS');\n  if (issueDates.length === 0) reasons.push('NO_ISSUE_DATE');\n  if (issueDates.length > 1 || issueDates.includes('INVALID')) reasons.push('ISSUE_DATE_UNCLEAR');\n  if (pdfLinks.length === 0) reasons.push('NO_PDF_LINK');\n  if (pdfLinks.length > 1) reasons.push('SEVERAL_PDF_LINKS');\n  if (attachments.length > 0) reasons.push('UNEXPECTED_ATTACHMENT');\n}\n\nconst invoiceNumber = invoiceNumbers.length === 1 ? invoiceNumbers[0] : null;\nconst issueDate = issueDates.length === 1 && issueDates[0] !== 'INVALID' ? issueDates[0] : null;\nconst route = kind === 'NOT_SIMBA' ? 'IGNORE' : (kind === 'DIRECT_VERIFIED' && reasons.length === 0 ? 'FILE' : 'REVIEW');\nconst receivedAt = /^\\d{1,15}$/.test(String(message.internalDate || ''))\n  ? new Date(Number(message.internalDate)).toISOString() : null;\n\nreturn [{\n  json: {\n    schema: 'simba.invoice_intake.decision.v2',\n    route,\n    kind,\n    review_reasons: reasons,\n    invoice_number: invoiceNumber,\n    issue_date: issueDate,\n    pdf_url: pdfLinks.length === 1 && route !== 'IGNORE' ? pdfLinks[0] : '',\n    intake_key: invoiceNumber || ('gmail-' + message.id.toLowerCase()),\n    gmail_message_id: message.id,\n    internet_message_id: (headerValues('Message-ID')[0] || '').trim().slice(0, 300),\n    received_at: receivedAt,\n  },\n}];\n"
       }
     },
     {
@@ -496,7 +496,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "\n// Builds the one file to store. A filed invoice keeps its PDF. Anything needing review goes to the\n// review folder: its PDF when one was downloaded, otherwise a short text note saying what to check.\n// The note never copies the PDF link, the amount or the email body.\nconst settings = $('Intake Settings').first().json;\nconst decision = $('Decide Whether To Store').first().json;\nconst input = $input.first();\nconst REASON_TEXT = {\n  NOT_SENT_TO_INTAKE: 'The email was not addressed to the intake mailbox (intake_recipients in Intake Settings), so it may be someone else\\'s SIMBA bill.',\n  RECIPIENT_HEADERS_UNCLEAR: 'The email has no single To line, or more than one Cc line, so where SIMBA sent it is unclear.',\n  NOT_AN_INVOICE_SUBJECT: 'The subject does not say \"SIMBA Invoice\", so this may not be a bill.',\n  SENDER_NOT_VERIFIED: 'The email says it is from SIMBA, but Gmail could not confirm it really came from SIMBA. It may be fake.',\n  FORWARDED_COPY: 'This is a forwarded copy, not the original SIMBA email, so the sender cannot be checked.',\n  NO_INVOICE_NUMBER: 'No SIMBA invoice number (S followed by 10 digits) was found.',\n  SEVERAL_INVOICE_NUMBERS: 'More than one invoice number was found.',\n  NO_ISSUE_DATE: 'No \"Issued On\" date was found.',\n  ISSUE_DATE_UNCLEAR: 'The \"Issued On\" date is repeated with different values or is not a real date.',\n  NO_PDF_LINK: 'No link to the invoice PDF was found.',\n  SEVERAL_PDF_LINKS: 'More than one invoice PDF link was found.',\n  UNEXPECTED_ATTACHMENT: 'The email has an attached file. SIMBA invoices normally have only a link.',\n  PDF_NOT_AVAILABLE: 'The invoice PDF could not be downloaded, or the download was not a valid PDF. The link may need a SIMBA login or may have expired.',\n  PDF_ACTIVE_CONTENT: 'The downloaded PDF contains active content (a script, launch action, embedded file or automatic action). It was not stored or opened; get the bill from SIMBA directly.',\n  PDF_TEXT_UNREADABLE: 'The text of the invoice PDF could not be read, so it could not be checked.',\n  PDF_INVOICE_NUMBER_MISMATCH: 'The invoice PDF does not show the invoice number from the email.',\n  PDF_ACCOUNT_NOT_OURS: 'The invoice PDF does not show any of our SIMBA account numbers (Intake Settings). It may be someone else\\'s bill.',\n  PDF_ACCOUNT_UNCLEAR: 'The invoice PDF shows both a broadband and a mobile account number, so the bill type is unclear.',\n};\nconst MONTH = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n\nconst reasons = decision.review_reasons.slice();\nlet route = decision.route;\n// pdf: safe PDF bytes (a real PDF without active content). It is filed only when its content check passed.\nconst pdf = input.json.pdf_check === 'OK' && input.binary && input.binary.data ? input.binary.data : null;\nconst contentOk = pdf !== null && input.json.invoice_check === 'OK';\nif (decision.pdf_url && !contentOk) {\n  const problem = String(input.json.pdf_problem || '');\n  reasons.push(problem.startsWith('PDF_') ? problem : (problem === 'ACTIVE_CONTENT' ? 'PDF_ACTIVE_CONTENT' : 'PDF_NOT_AVAILABLE'));\n  route = 'REVIEW';\n}\n// A filing that fell back to review must not add a second review copy of the same invoice.\nif (route === 'REVIEW' && decision.route === 'FILE' && decision.existing_copies > 0) {\n  return [{ json: { store: false, skip_reason: 'REVIEW_COPY_EXISTS', route, review_reasons: [...new Set(reasons)] } }];\n}\nconst period = decision.issue_date\n  ? MONTH[Number(decision.issue_date.slice(5, 7)) - 1] + ' ' + decision.issue_date.slice(0, 4) : null;\n\n// The bill type comes from the account number on the PDF (\"Check Invoice PDF\"), never from the email.\nconst service = contentOk ? input.json.service : null;\nconst BILL_TYPE = { BROADBAND: 'Broadband ', MOBILE: 'Mobile ' }[service] || '';\nconst title = 'SIMBA ' + BILL_TYPE + 'Invoice ';\nlet name;\nlet folderId;\nif (route === 'FILE') {\n  folderId = settings.invoice_folder_id;\n  name = period + ' - ' + title + decision.invoice_number + '.pdf';\n} else {\n  folderId = settings.review_folder_id;\n  name = 'Needs review - ' + (period ? period + ' - ' : '') + title\n    + (decision.invoice_number || 'without number') + (pdf ? '.pdf' : '.txt');\n}\n\nconst properties = {\n  simbaIntakeKey: decision.intake_key,\n  simbaStatus: route === 'FILE' ? 'FILED' : 'REVIEW',\n  simbaGmailId: decision.gmail_message_id,\n};\nif (BILL_TYPE) properties.simbaBillType = service;\nif (pdf) properties.simbaSha256 = input.json.pdf_sha256;\n\nif (pdf) {\n  return [{\n    json: { store: true, route, review_reasons: [...new Set(reasons)], upload: { name, folder_id: folderId, mime_type: 'application/pdf', size: input.json.pdf_size, sha256: input.json.pdf_sha256, properties } },\n    binary: { file: pdf },\n  }];\n}\n\nconst lines = [\n  'A SIMBA invoice email needs a person to check it.',\n  '',\n  'Why it was not filed automatically:',\n  ...[...new Set(reasons)].map((code) => '- ' + (REASON_TEXT[code] || code)),\n  '',\n  'What was found:',\n  '- Invoice number: ' + (decision.invoice_number || 'not found'),\n  '- Issued on: ' + (decision.issue_date || 'not found'),\n  '- Invoice PDF link in the email: ' + (decision.pdf_url ? 'yes (not copied here)' : 'no'),\n  '- Email received: ' + (decision.received_at || 'unknown'),\n  '- Gmail message id: ' + decision.gmail_message_id,\n  '- To find it in Gmail, search for: rfc822msgid:' + (decision.internet_message_id || 'unknown').replace(/^<|>$/g, ''),\n  '',\n  'What to do: open the email (it has the Needs review label in Gmail), check it is a genuine SIMBA bill',\n  'for us, save the invoice PDF in the invoice folder, then delete this note.',\n  '',\n];\nconst text = lines.join('\\n');\nreturn [{\n  json: { store: true, route: 'REVIEW', review_reasons: [...new Set(reasons)], upload: { name, folder_id: folderId, mime_type: 'text/plain', size: Buffer.byteLength(text, 'utf8'), sha256: null, properties } },\n  binary: { file: { data: Buffer.from(text, 'utf8').toString('base64'), mimeType: 'text/plain', fileName: name, fileExtension: 'txt' } },\n}];\n"
+        "jsCode": "\n// Builds the one file to store. A filed invoice keeps its PDF. Anything needing review goes to the\n// review folder: its PDF when one was downloaded, otherwise a short text note saying what to check.\n// The note never copies the PDF link, the amount or the email body.\nconst settings = $('Intake Settings').first().json;\nconst decision = $('Decide Whether To Store').first().json;\nconst input = $input.first();\nconst REASON_TEXT = {\n  NOT_SENT_TO_INTAKE: 'The email was not addressed to the intake mailbox (intake_recipients in Intake Settings), so it may be someone else\\'s SIMBA bill.',\n  RECIPIENT_HEADERS_UNCLEAR: 'The email has no single To line, or more than one Cc line, so where SIMBA sent it is unclear.',\n  NOT_AN_INVOICE_SUBJECT: 'The subject does not say \"SIMBA Invoice\", so this may not be a bill.',\n  SENDER_NOT_VERIFIED: 'The email says it is from SIMBA, but Gmail could not confirm it really came from SIMBA. It may be fake.',\n  FORWARDED_COPY: 'This is a forwarded copy, not the original SIMBA email, so the sender cannot be checked.',\n  NO_INVOICE_NUMBER: 'No SIMBA invoice number (S followed by 10 digits) was found.',\n  SEVERAL_INVOICE_NUMBERS: 'More than one invoice number was found.',\n  NO_ISSUE_DATE: 'No \"Issued On\" date was found.',\n  ISSUE_DATE_UNCLEAR: 'The \"Issued On\" date is repeated with different values or is not a real date.',\n  NO_PDF_LINK: 'No link to the invoice PDF was found.',\n  SEVERAL_PDF_LINKS: 'More than one invoice PDF link was found.',\n  UNEXPECTED_ATTACHMENT: 'The email has an attached file. SIMBA invoices normally have only a link.',\n  PDF_NOT_AVAILABLE: 'The invoice PDF could not be downloaded, or the download was not a valid PDF. The link may need a SIMBA login or may have expired.',\n  PDF_ACTIVE_CONTENT: 'The downloaded PDF contains active content (a script, launch action, embedded file or automatic action). It was not stored or opened; get the bill from SIMBA directly.',\n  PDF_TEXT_UNREADABLE: 'The text of the invoice PDF could not be read, so it could not be checked.',\n  PDF_INVOICE_NUMBER_MISMATCH: 'The invoice PDF does not show the invoice number from the email.',\n  PDF_ACCOUNT_NOT_OURS: 'The invoice PDF does not show any of our SIMBA account numbers (Intake Settings). It may be someone else\\'s bill.',\n  PDF_ACCOUNT_UNCLEAR: 'The invoice PDF shows both a broadband and a mobile account number, so the bill type is unclear.',\n};\nconst MONTH = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n\nconst reasons = decision.review_reasons.slice();\nlet route = decision.route;\n// pdf: safe PDF bytes (a real PDF without active content). It is filed only when its content check passed.\nconst pdf = input.json.pdf_check === 'OK' && input.binary && input.binary.data ? input.binary.data : null;\nconst contentOk = pdf !== null && input.json.invoice_check === 'OK';\nif (decision.pdf_url && !contentOk) {\n  const problem = String(input.json.pdf_problem || '');\n  reasons.push(problem.startsWith('PDF_') ? problem : (problem === 'ACTIVE_CONTENT' ? 'PDF_ACTIVE_CONTENT' : 'PDF_NOT_AVAILABLE'));\n  route = 'REVIEW';\n}\n// A filing that fell back to review must not add a second review copy of the same invoice.\nif (route === 'REVIEW' && decision.route === 'FILE' && decision.existing_copies > 0) {\n  return [{ json: { store: false, skip_reason: 'REVIEW_COPY_EXISTS', route, review_reasons: [...new Set(reasons)] } }];\n}\nconst period = decision.issue_date\n  ? MONTH[Number(decision.issue_date.slice(5, 7)) - 1] + ' ' + decision.issue_date.slice(0, 4) : null;\n\n// The bill type comes from the account number on the PDF (\"Check Invoice PDF\"), never from the email.\nconst service = contentOk ? input.json.service : null;\nconst BILL_TYPE = { BROADBAND: 'Broadband ', MOBILE: 'Mobile ' }[service] || '';\nconst title = 'SIMBA ' + BILL_TYPE + 'Invoice ';\nlet name;\nlet folderId;\nif (route === 'FILE') {\n  folderId = settings.invoice_folder_id;\n  name = period + ' - ' + title + decision.invoice_number + '.pdf';\n} else {\n  // Review items go to the review folder inside the invoice folder; \"Ready To Upload\" finds or creates it.\n  folderId = null;\n  name = 'Needs review - ' + (period ? period + ' - ' : '') + title\n    + (decision.invoice_number || 'without number') + (pdf ? '.pdf' : '.txt');\n}\n\nconst properties = {\n  simbaIntakeKey: decision.intake_key,\n  simbaStatus: route === 'FILE' ? 'FILED' : 'REVIEW',\n  simbaGmailId: decision.gmail_message_id,\n};\nif (BILL_TYPE) properties.simbaBillType = service;\nif (pdf) properties.simbaSha256 = input.json.pdf_sha256;\n\nif (pdf) {\n  return [{\n    json: { store: true, route, review_reasons: [...new Set(reasons)], upload: { name, folder_id: folderId, mime_type: 'application/pdf', size: input.json.pdf_size, sha256: input.json.pdf_sha256, properties } },\n    binary: { file: pdf },\n  }];\n}\n\nconst lines = [\n  'A SIMBA invoice email needs a person to check it.',\n  '',\n  'Why it was not filed automatically:',\n  ...[...new Set(reasons)].map((code) => '- ' + (REASON_TEXT[code] || code)),\n  '',\n  'What was found:',\n  '- Invoice number: ' + (decision.invoice_number || 'not found'),\n  '- Issued on: ' + (decision.issue_date || 'not found'),\n  '- Invoice PDF link in the email: ' + (decision.pdf_url ? 'yes (not copied here)' : 'no'),\n  '- Email received: ' + (decision.received_at || 'unknown'),\n  '- Gmail message id: ' + decision.gmail_message_id,\n  '- To find it in Gmail, search for: rfc822msgid:' + (decision.internet_message_id || 'unknown').replace(/^<|>$/g, ''),\n  '',\n  'What to do: open the email (it has the Needs review label in Gmail), check it is a genuine SIMBA bill',\n  'for us, save the invoice PDF in the invoice folder, then delete this note.',\n  '',\n];\nconst text = lines.join('\\n');\nreturn [{\n  json: { store: true, route: 'REVIEW', review_reasons: [...new Set(reasons)], upload: { name, folder_id: folderId, mime_type: 'text/plain', size: Buffer.byteLength(text, 'utf8'), sha256: null, properties } },\n  binary: { file: { data: Buffer.from(text, 'utf8').toString('base64'), mimeType: 'text/plain', fileName: name, fileExtension: 'txt' } },\n}];\n"
       }
     },
     {
@@ -533,12 +533,226 @@
       }
     },
     {
+      "id": "00000000-0000-4244-8000-000000000053",
+      "name": "Is Review Upload",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3960,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4244-8000-000000000054",
+              "leftValue": "={{ $json.route === 'REVIEW' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4244-8000-000000000055",
+      "name": "Find Review Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4180,
+        600
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $('Intake Settings').first().json.invoice_folder_id + \"' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false and appProperties has { key='simbaReviewFolder' and value='1' }\" }}"
+            },
+            {
+              "name": "corpora",
+              "value": "user"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "orderBy",
+              "value": "createdTime"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "fields",
+              "value": "nextPageToken,incompleteSearch,files(id,name,mimeType,parents,trashed,createdTime)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "00000000-0000-4244-8000-000000000056",
+      "name": "Pick Review Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4400,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Uses the review folder this workflow made earlier inside the invoice folder (marked with the private\n// Drive app property simbaReviewFolder=1, so a same-named folder someone else made is never used).\n// Several matches: the oldest. None: \"Create Review Folder\" makes one. A failed search stops the run.\nconst settings = $('Intake Settings').first().json;\nconst search = $input.first().json;\nif (!search || search.statusCode !== 200 || !search.body || !Array.isArray(search.body.files) || search.body.incompleteSearch === true) {\n  throw new Error('Google Drive could not search for the SIMBA review folder (HTTP ' + (search && search.statusCode) + '). Nothing was stored; check the Google Drive credential and the invoice folder.');\n}\nconst folders = search.body.files.filter((file) => file && typeof file.id === 'string' && file.trashed !== true\n  && file.mimeType === 'application/vnd.google-apps.folder' && Array.isArray(file.parents)\n  && file.parents.includes(settings.invoice_folder_id));\nfolders.sort((a, b) => String(a.createdTime || '').localeCompare(String(b.createdTime || '')));\nreturn [{ json: { review_folder_found: folders.length > 0, review_folder_id: folders.length > 0 ? folders[0].id : null } }];\n"
+      }
+    },
+    {
+      "id": "00000000-0000-4244-8000-000000000057",
+      "name": "Review Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4620,
+        600
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4244-8000-000000000058",
+              "leftValue": "={{ $json.review_folder_found === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4244-8000-000000000059",
+      "name": "Create Review Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4840,
+        760
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "supportsAllDrives",
+              "value": "false"
+            },
+            {
+              "name": "fields",
+              "value": "id,name,mimeType,parents,appProperties"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: $('Intake Settings').first().json.review_folder_name, mimeType: 'application/vnd.google-apps.folder', parents: [$('Intake Settings').first().json.invoice_folder_id], appProperties: { simbaReviewFolder: '1' } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": false
+    },
+    {
+      "id": "00000000-0000-4244-8000-000000000060",
+      "name": "Ready To Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5060,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The one file to upload, with its final folder: the invoice folder for a filed invoice, or the review\n// folder that \"Pick Review Folder\" found or \"Create Review Folder\" just made. Anything else stops the run.\nconst settings = $('Intake Settings').first().json;\nconst prepared = $('Prepare Drive File').first();\nconst upload = Object.assign({}, prepared.json.upload);\nif (prepared.json.route === 'REVIEW') {\n  const input = $input.first().json || {};\n  let folderId = null;\n  if (input.review_folder_found === true && typeof input.review_folder_id === 'string') {\n    folderId = input.review_folder_id;\n  } else if (input.statusCode === 200 && input.body && typeof input.body.id === 'string'\n    && input.body.mimeType === 'application/vnd.google-apps.folder'\n    && Array.isArray(input.body.parents) && input.body.parents.includes(settings.invoice_folder_id)\n    && input.body.appProperties && input.body.appProperties.simbaReviewFolder === '1') {\n    folderId = input.body.id;\n  }\n  if (!folderId) {\n    throw new Error('Google Drive could not create the SIMBA review folder (HTTP ' + input.statusCode + '). Nothing was stored; check that the Google Drive credential can add folders to the invoice folder.');\n  }\n  upload.folder_id = folderId;\n} else {\n  upload.folder_id = settings.invoice_folder_id;\n}\nreturn [{ json: Object.assign({}, prepared.json, { upload }), binary: prepared.binary }];\n"
+      }
+    },
+    {
       "id": "00000000-0000-4244-8000-000000000025",
       "name": "Start Drive Upload",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        3960,
+        5280,
         400
       ],
       "parameters": {
@@ -605,7 +819,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4180,
+        5500,
         400
       ],
       "parameters": {
@@ -619,7 +833,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        4400,
+        5720,
         400
       ],
       "parameters": {
@@ -663,7 +877,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        4620,
+        5940,
         400
       ],
       "parameters": {
@@ -710,12 +924,12 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4840,
+        6160,
         400
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "\n// Reads the stored file back from Drive and checks it is exactly what was meant to be stored.\n// Any difference stops the run so it shows as failed in n8n instead of passing silently.\nconst prepared = $('Prepare Drive File').first().json;\nconst upload = prepared.upload;\nconst put = $('Upload File Bytes').first().json;\nconst stored = $input.first().json;\nif (!put || (put.statusCode !== 200 && put.statusCode !== 201) || !put.body || typeof put.body.id !== 'string') {\n  throw new Error('Google Drive did not confirm the upload (HTTP ' + (put && put.statusCode) + '). Check the SIMBA folders in Drive before re-running.');\n}\nconst file = stored && stored.statusCode === 200 ? stored.body : null;\nconst problems = [];\nif (!file) {\n  problems.push('read-back failed');\n} else {\n  if (file.id !== put.body.id) problems.push('different file id');\n  if (file.name !== upload.name) problems.push('name');\n  if (!Array.isArray(file.parents) || !file.parents.includes(upload.folder_id)) problems.push('folder');\n  if (String(file.size) !== String(upload.size)) problems.push('size');\n  if (file.trashed === true) problems.push('trashed');\n  if (upload.sha256 && String(file.sha256Checksum || '').toLowerCase() !== upload.sha256) problems.push('checksum');\n  const props = file.properties || {};\n  for (const [key, value] of Object.entries(upload.properties)) {\n    if (props[key] !== value) problems.push('property ' + key);\n  }\n}\nif (problems.length > 0) {\n  throw new Error('The file stored in Google Drive does not match (' + problems.join(', ') + '). Check the SIMBA folders in Drive.');\n}\nreturn [{ json: { stored: true, route: prepared.route, review_reasons: prepared.review_reasons, drive_file_id: file.id, name: file.name } }];\n"
+        "jsCode": "\n// Reads the stored file back from Drive and checks it is exactly what was meant to be stored.\n// Any difference stops the run so it shows as failed in n8n instead of passing silently.\nconst prepared = $('Ready To Upload').first().json;\nconst upload = prepared.upload;\nconst put = $('Upload File Bytes').first().json;\nconst stored = $input.first().json;\nif (!put || (put.statusCode !== 200 && put.statusCode !== 201) || !put.body || typeof put.body.id !== 'string') {\n  throw new Error('Google Drive did not confirm the upload (HTTP ' + (put && put.statusCode) + '). Check the SIMBA folders in Drive before re-running.');\n}\nconst file = stored && stored.statusCode === 200 ? stored.body : null;\nconst problems = [];\nif (!file) {\n  problems.push('read-back failed');\n} else {\n  if (file.id !== put.body.id) problems.push('different file id');\n  if (file.name !== upload.name) problems.push('name');\n  if (!Array.isArray(file.parents) || !file.parents.includes(upload.folder_id)) problems.push('folder');\n  if (String(file.size) !== String(upload.size)) problems.push('size');\n  if (file.trashed === true) problems.push('trashed');\n  if (upload.sha256 && String(file.sha256Checksum || '').toLowerCase() !== upload.sha256) problems.push('checksum');\n  const props = file.properties || {};\n  for (const [key, value] of Object.entries(upload.properties)) {\n    if (props[key] !== value) problems.push('property ' + key);\n  }\n}\nif (problems.length > 0) {\n  throw new Error('The file stored in Google Drive does not match (' + problems.join(', ') + '). Check the SIMBA folders in Drive.');\n}\nreturn [{ json: { stored: true, route: prepared.route, review_reasons: prepared.review_reasons, drive_file_id: file.id, name: file.name } }];\n"
       }
     },
     {
@@ -724,7 +938,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        5060,
+        6380,
         400
       ],
       "parameters": {
@@ -738,7 +952,7 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.1,
       "position": [
-        5280,
+        6600,
         400
       ],
       "parameters": {
@@ -758,7 +972,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        5500,
+        6820,
         560
       ],
       "parameters": {
@@ -772,7 +986,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        5720,
+        7040,
         400
       ],
       "parameters": {
@@ -805,7 +1019,7 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        5940,
+        7260,
         320
       ],
       "parameters": {
@@ -827,7 +1041,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        6160,
+        7480,
         240
       ],
       "parameters": {
@@ -841,7 +1055,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        6160,
+        7480,
         480
       ],
       "parameters": {
@@ -859,7 +1073,7 @@
         -360
       ],
       "parameters": {
-        "content": "# SIMBA invoices: email to Google Drive\n\n- Checks the intake mailbox every minute for SIMBA invoice emails and forwarded copies, one email at a time.\n- Files the invoice PDF in the invoice folder only when Gmail confirms the email really came from SIMBA (its domain and Amazon SES), the subject says \"SIMBA Invoice\", it was addressed to the intake mailbox, and the PDF shows the invoice number and one of our account numbers. The account number says Broadband or Mobile, which goes in the file name.\n- Everything uncertain goes to the review folder and sends a Telegram alert: forwarded copies, mail addressed to someone else, missing details, another customer's account, an unreadable or unsafe PDF, or a PDF that cannot be downloaded.\n- After the file is stored, the email gets the Filed or Needs review label in Gmail. A label or alert failure never undoes filing; it fails the run at the end so it is seen.\n- No AI reads the email or PDF. The PDF is only downloaded from SIMBA's PDF host, checked for active content, and its text is read; it is never opened or run.\n- Drive file properties are the duplicate record, so the same invoice is never filed twice.\n- Any other failure in a run stops it; the error workflow sends a Telegram alert. It must be published (active) for that.\n- A failed Gmail Trigger poll (for example an expired Gmail credential) creates no run and no alert; n8n only logs it. The daily mailbox check below catches it within a day.\n\n## Required manual configuration:\n\n- **Intake Settings**\n  - `invoice_folder_id`: Drive folder for filed SIMBA invoices.\n  - `review_folder_id`: a different Drive folder for emails a person must check.\n  - `intake_recipients`: the address SIMBA sends our bills to (more than one allowed, comma separated).\n  - `filed_label_id`: Gmail label ID for SIMBA/Filed.\n  - `review_label_id`: Gmail label ID for SIMBA/Needs review.\n  - `broadband_account_numbers`: our SIMBA broadband account number(s), as printed on the bill.\n  - `mobile_account_numbers`: our SIMBA mobile account number(s), as printed on the bill.\n  - `telegram_chat_id`: Telegram chat for review alerts.\n- **Workflow settings**\n  - `Error workflow`: SIMBA Invoices - Error Alert.\n",
+        "content": "# SIMBA invoices: email to Google Drive\n\n- Checks the intake mailbox every minute for SIMBA invoice emails and forwarded copies, one email at a time.\n- Files the invoice PDF in the invoice folder only when Gmail confirms the email really came from SIMBA (its domain and Amazon SES), the subject says \"SIMBA Invoice\", it was addressed to the intake mailbox, and the PDF shows the invoice number and one of our account numbers. The account number says Broadband or Mobile, which goes in the file name.\n- Everything uncertain goes to the review folder (inside the invoice folder, created when missing) and sends a Telegram alert: forwarded copies, mail addressed to someone else, missing details, another customer's account, an unreadable or unsafe PDF, or a PDF that cannot be downloaded.\n- After the file is stored, the email gets the Filed or Needs review label in Gmail. A label or alert failure never undoes filing; it fails the run at the end so it is seen.\n- No AI reads the email or PDF. The PDF is only downloaded from SIMBA's PDF host, checked for active content, and its text is read; it is never opened or run.\n- Drive file properties are the duplicate record, so the same invoice is never filed twice.\n- Any other failure in a run stops it; the error workflow sends a Telegram alert. It must be published (active) for that.\n- A failed Gmail Trigger poll (for example an expired Gmail credential) creates no run and no alert; n8n only logs it. The daily mailbox check below catches it within a day.\n\n## Required manual configuration:\n\n- **Intake Settings**\n  - `invoice_folder_id`: Drive folder for filed SIMBA invoices.\n  - `review_folder_name`: name of the review folder inside the invoice folder (default SIMBA Needs Review). It is created when missing, so it can be deleted after each review.\n  - `intake_recipients`: the address SIMBA sends our bills to (more than one allowed, comma separated).\n  - `filed_label_id`: Gmail label ID for SIMBA/Filed.\n  - `review_label_id`: Gmail label ID for SIMBA/Needs review.\n  - `broadband_account_numbers`: our SIMBA broadband account number(s), as printed on the bill.\n  - `mobile_account_numbers`: our SIMBA mobile account number(s), as printed on the bill.\n  - `telegram_chat_id`: Telegram chat for review alerts.\n- **Workflow settings**\n  - `Error workflow`: SIMBA Invoices - Error Alert.\n",
         "height": 760,
         "width": 980
       }
@@ -874,8 +1088,8 @@
         -120
       ],
       "parameters": {
-        "content": "# Check the PDF, store one file, label and alert\n\n- Downloads the PDF straight from SIMBA's PDF host, with no login and no redirects. Files over 10 MB are refused after the download.\n- A download that is not a real PDF, or that carries scripts, launch or remote actions, embedded files or media, submitting forms or automatic actions, is not stored; the invoice goes to review with a note.\n- Reads the PDF text (no AI) and checks the invoice number and our account number, which gives Broadband or Mobile. A failed check files the PDF in the review folder instead.\n- Uploads one file, then reads it back and checks name, folder, size, checksum and properties.\n- Only then adds the Gmail label, and sends a Telegram alert for anything needing review. An email already stored by an earlier run is labelled too.\n- A failed label or alert is noted and the loop moves on; the run is marked failed at the end.\n",
-        "height": 400,
+        "content": "# Check the PDF, store one file, label and alert\n\n- Downloads the PDF straight from SIMBA's PDF host, with no login and no redirects. Files over 10 MB are refused after the download.\n- A download that is not a real PDF, or that carries scripts, launch or remote actions, embedded files or media, submitting forms or automatic actions, is not stored; the invoice goes to review with a note.\n- Reads the PDF text (no AI) and checks the invoice number and our account number, which gives Broadband or Mobile. A failed check files the PDF in the review folder instead.\n- A review item goes to the review folder inside the invoice folder: the oldest one this workflow made, or a new one when it was deleted.\n- Uploads one file, then reads it back and checks name, folder, size, checksum and properties.\n- Only then adds the Gmail label, and sends a Telegram alert for anything needing review. An email already stored by an earlier run is labelled too.\n- A failed label or alert is noted and the loop moves on; the run is marked failed at the end.\n",
+        "height": 440,
         "width": 1100
       }
     },
@@ -1156,7 +1370,7 @@
       "main": [
         [
           {
-            "node": "Start Drive Upload",
+            "node": "Is Review Upload",
             "type": "main",
             "index": 0
           }
@@ -1375,6 +1589,86 @@
         [
           {
             "node": "Check Mailbox Access",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Review Upload": {
+      "main": [
+        [
+          {
+            "node": "Find Review Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ready To Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Review Folder": {
+      "main": [
+        [
+          {
+            "node": "Pick Review Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Review Folder": {
+      "main": [
+        [
+          {
+            "node": "Review Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Ready To Upload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Review Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Review Folder": {
+      "main": [
+        [
+          {
+            "node": "Ready To Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ready To Upload": {
+      "main": [
+        [
+          {
+            "node": "Start Drive Upload",
             "type": "main",
             "index": 0
           }
