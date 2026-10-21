@@ -21,21 +21,28 @@ from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / "n8n-workflows" / "simba_invoice_intake.workflow.json"
+ERROR_WORKFLOW = REPO_ROOT / "n8n-workflows" / "simba_invoice_intake_error_alert.workflow.json"
 
 ALLOWED_TYPES = {
     "n8n-nodes-base.gmailTrigger", "n8n-nodes-base.set", "n8n-nodes-base.splitInBatches", "n8n-nodes-base.noOp",
     "n8n-nodes-base.httpRequest", "n8n-nodes-base.code", "n8n-nodes-base.if", "n8n-nodes-base.crypto",
-    "n8n-nodes-base.stickyNote", "n8n-nodes-base.gmail",
+    "n8n-nodes-base.stickyNote", "n8n-nodes-base.gmail", "n8n-nodes-base.extractFromFile", "n8n-nodes-base.telegram",
 }
 LOOP = "One Email At A Time"
 
 INTAKE_ADDR = "intake@example.com"
+# Invented account numbers in an invented format; real ones live only in n8n.
+BROADBAND_ACCT = "BB0000000001"
+MOBILE_ACCT = "MB0000000002"
 SETTINGS = {
     "invoice_folder_id": "FOLDER_INVOICES",
     "review_folder_id": "FOLDER_REVIEW",
     "intake_recipients": INTAKE_ADDR,
     "filed_label_id": "Label_FILED",
     "review_label_id": "Label_REVIEW",
+    "broadband_account_numbers": BROADBAND_ACCT,
+    "mobile_account_numbers": "MB-000-000-0002, MB0000000099",
+    "telegram_chat_id": "-1000000000000",
 }
 INVOICE = "S0000012345"
 PDF_URL = "https://billing-invoice-pdf.amdocs-dbs.com/v1/invoices/SYNTHETICTOKEN123/pdf"
@@ -88,7 +95,7 @@ const byName = Object.fromEntries(wf.nodes.map((node) => [node.name, node]));
 """
 
 
-def run_nodes(cases: list[dict]) -> list[dict]:
+def run_nodes(cases: list[dict], workflow: Path = WORKFLOW) -> list[dict]:
     node = shutil.which("node")
     if node is None:
         raise unittest.SkipTest("Node is required to execute the committed Code-node JavaScript")
@@ -97,15 +104,15 @@ def run_nodes(cases: list[dict]) -> list[dict]:
         script.write_text(HARNESS, encoding="utf-8")
         cases_path = Path(temp) / "cases.json"
         cases_path.write_text(json.dumps(cases), encoding="utf-8")
-        completed = subprocess.run([node, str(script), str(WORKFLOW), str(cases_path)], capture_output=True, text=True,
+        completed = subprocess.run([node, str(script), str(workflow), str(cases_path)], capture_output=True, text=True,
                                    timeout=60, check=False)
     if completed.returncode != 0:
         raise AssertionError(completed.stderr[-2000:])
     return json.loads(completed.stdout)
 
 
-def run_one(node: str, input_items: list[dict], refs: dict | None = None) -> dict:
-    return run_nodes([{"node": node, "input": input_items, "refs": refs or {}}])[0]
+def run_one(node: str, input_items: list[dict], refs: dict | None = None, workflow: Path = WORKFLOW) -> dict:
+    return run_nodes([{"node": node, "input": input_items, "refs": refs or {}}], workflow)[0]
 
 
 def b64url(text: str) -> str:
@@ -230,6 +237,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual(set(SETTINGS), {item["name"] for item in settings})
         for item in settings:
             self.assertRegex(item["value"], r"^REPLACE_WITH_[A-Z_]+$")
+        self.assertNotIn(BROADBAND_ACCT, self.raw)
         emails = set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", self.raw))
         self.assertEqual({"bills@my.simba.sg"}, {email for email in emails if not email.endswith("@example.com")})
 
@@ -270,7 +278,7 @@ class StaticContractTests(unittest.TestCase):
 
     def test_every_path_returns_to_the_loop_and_pdf_failures_reach_review(self) -> None:
         connections = self.workflow["connections"]
-        self.assertEqual("Report Label Failures", connections[LOOP]["main"][0][0]["node"])
+        self.assertEqual("Report Failures", connections[LOOP]["main"][0][0]["node"])
         self.assertEqual("Fetch Full Email", connections[LOOP]["main"][1][0]["node"])
         self.assertEqual(LOOP, connections["Is SIMBA Invoice Email"]["main"][1][0]["node"])
         for name in ("Download Invoice PDF", "Fingerprint PDF"):
@@ -282,25 +290,56 @@ class StaticContractTests(unittest.TestCase):
         self.assertEqual("Something To Store", connections["Prepare Drive File"]["main"][0][0]["node"])
         self.assertEqual("Start Drive Upload", connections["Something To Store"]["main"][0][0]["node"])
 
-    def test_label_comes_after_drive_and_never_blocks_filing(self) -> None:
+    def test_pdf_text_is_read_only_from_a_safe_pdf(self) -> None:
+        connections = self.workflow["connections"]
+        self.assertEqual("PDF Safe To Read", connections["Check Downloaded PDF"]["main"][0][0]["node"])
+        self.assertEqual("={{ $json.pdf_check === 'OK' }}",
+                         self.nodes["PDF Safe To Read"]["parameters"]["conditions"]["conditions"][0]["leftValue"])
+        self.assertEqual(["Read PDF Text", "Prepare Drive File"],
+                         [links[0]["node"] for links in connections["PDF Safe To Read"]["main"]])
+        reader = self.nodes["Read PDF Text"]
+        self.assertEqual(("n8n-nodes-base.extractFromFile", "pdf", "data", "continueErrorOutput"),
+                         (reader["type"], reader["parameters"]["operation"], reader["parameters"]["binaryPropertyName"],
+                          reader["onError"]))
+        self.assertNotIn("password", reader["parameters"]["options"])
+        # Both the text and an extraction error go to the content check, which sends failures to review.
+        self.assertEqual(["Check Invoice PDF", "Check Invoice PDF"],
+                         [links[0]["node"] for links in connections["Read PDF Text"]["main"]])
+        self.assertEqual("Prepare Drive File", connections["Check Invoice PDF"]["main"][0][0]["node"])
+        # Nothing reads the email or PDF with a model: no AI, LangChain or OpenAI node types at all.
+        self.assertFalse([n["type"] for n in self.workflow["nodes"] if re.search(r"langchain|openAi|anthropic", n["type"], re.I)])
+
+    def test_label_and_alert_come_after_drive_and_never_block_filing(self) -> None:
         connections = self.workflow["connections"]
         label = self.nodes["Label SIMBA Email"]
         # The only Gmail write: add one label to one message. No send, reply, delete, read-mark or label removal.
         self.assertEqual([label], [n for n in self.workflow["nodes"] if n["type"] == "n8n-nodes-base.gmail"])
         self.assertEqual(("message", "addLabels"), (label["parameters"]["resource"], label["parameters"]["operation"]))
         self.assertEqual({"resource", "operation", "messageId", "labelIds"}, set(label["parameters"]))
+        self.assertEqual("={{ [$('Choose Label').first().json.label_id] }}", label["parameters"]["labelIds"])
         self.assertEqual((True, 3, 5000), (label["retryOnFail"], label["maxTries"], label["waitBetweenTries"]))
         # Labelling happens only once Drive holds the file: after the verified upload, or for a copy already stored.
         feeders = sorted((name, index) for name, node in connections.items()
-                         for index, links in enumerate(node["main"]) for link in links if link["node"] == "Label SIMBA Email")
+                         for index, links in enumerate(node["main"]) for link in links if link["node"] == "Choose Label")
         self.assertEqual([("Needs Storing", 1), ("Something To Store", 1), ("Verify Stored File", 0)], feeders)
-        self.assertNotIn("Label SIMBA Email", downstream(self.workflow, "Is SIMBA Invoice Email", 1))
-        # A failed label is noted and the loop carries on; the end-of-run report fails the run.
+        self.assertEqual("Label SIMBA Email", connections["Choose Label"]["main"][0][0]["node"])
+        self.assertNotIn("Choose Label", downstream(self.workflow, "Is SIMBA Invoice Email", 1))
+        # A failed label is noted and the alert step still runs; the end-of-run report fails the run.
         self.assertEqual("continueErrorOutput", label["onError"])
-        self.assertEqual(LOOP, connections["Label SIMBA Email"]["main"][0][0]["node"])
-        self.assertEqual("Note Label Failure", connections["Label SIMBA Email"]["main"][1][0]["node"])
-        self.assertEqual(LOOP, connections["Note Label Failure"]["main"][0][0]["node"])
-        self.assertNotIn("Report Label Failures", connections)
+        self.assertEqual(["Alert Needed", "Note Label Failure"],
+                         [links[0]["node"] for links in connections["Label SIMBA Email"]["main"]])
+        self.assertEqual("Alert Needed", connections["Note Label Failure"]["main"][0][0]["node"])
+        self.assertEqual(["Send Review Alert", LOOP], [links[0]["node"] for links in connections["Alert Needed"]["main"]])
+        alert = self.nodes["Send Review Alert"]
+        self.assertEqual(("continueErrorOutput", True, False),
+                         (alert["onError"], alert["retryOnFail"], alert["parameters"]["additionalFields"]["appendAttribution"]))
+        self.assertEqual("={{ $('Intake Settings').first().json.telegram_chat_id }}", alert["parameters"]["chatId"])
+        self.assertEqual("={{ $('Choose Label').first().json.alert_text }}", alert["parameters"]["text"])
+        self.assertEqual(["Alert Sent", "Note Alert Failure"],
+                         [links[0]["node"] for links in connections["Send Review Alert"]["main"]])
+        for name in ("Alert Sent", "Note Alert Failure"):
+            self.assertEqual(LOOP, connections[name]["main"][0][0]["node"], name)
+        self.assertNotIn("Report Failures", connections)
 
     def test_canvas_documents_purpose_and_required_settings(self) -> None:
         note = self.nodes["Overview"]["parameters"]["content"]
@@ -308,6 +347,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("## Required manual configuration:", note)
         for key in SETTINGS:
             self.assertIn("`" + key + "`", note)
+        self.assertIn("`Error workflow`: SIMBA Invoices - Error Alert", note)
         self.assertTrue(all(ord(ch) < 128 for ch in self.raw))
 
 
@@ -370,6 +410,14 @@ class ClassifyTests(unittest.TestCase):
                 result = classify(direct(), dict(SETTINGS, intake_recipients=value))
                 self.assertFalse(result["ok"])
                 self.assertIn("intake_recipients", result["error"])
+
+    def test_bad_account_numbers_stop_the_run(self) -> None:
+        for key, value in (("broadband_account_numbers", "1234"), ("mobile_account_numbers", "MB 000/1"),
+                           ("mobile_account_numbers", ",;"), ("mobile_account_numbers", "bb-0000000001")):
+            with self.subTest(key=key, value=value):
+                result = classify(direct(), dict(SETTINGS, **{key: value}))
+                self.assertFalse(result["ok"])
+                self.assertIn("account number", result["error"])
 
     def test_missing_settings_stop_the_run(self) -> None:
         for key in SETTINGS:
@@ -510,6 +558,11 @@ class DecideTests(unittest.TestCase):
             self.assertFalse(self.decide(decision, search)["ok"])
 
 
+def pdf_text(invoice: str = INVOICE, account: str = BROADBAND_ACCT) -> str:
+    return ("SIMBA Telecom Pte Ltd\nTax Invoice\nInvoice No: " + invoice + "\nAccount No: " + account
+            + "\nIssued On: 15-Oct-2026\nTotal Due: S$ 12.34\n")
+
+
 class PdfAndUploadTests(unittest.TestCase):
     def check(self, data: bytes | None) -> dict:
         item = {"json": {"pdf_sha256": hashlib.sha256(data or b"").hexdigest()}}
@@ -523,6 +576,73 @@ class PdfAndUploadTests(unittest.TestCase):
         self.assertIn("data", good["binary"])
         self.assertEqual("NOT_A_PDF", self.check(b"<html>Please log in</html>")["output"][0]["json"]["pdf_problem"])
         self.assertEqual("NO_FILE_RETURNED", self.check(None)["output"][0]["json"]["pdf_problem"])
+        big = b"%PDF-1.7\n" + b"0" * (10 * 1024 * 1024)
+        self.assertEqual("TOO_LARGE", self.check(big)["output"][0]["json"]["pdf_problem"])
+
+    def test_active_content_is_refused(self) -> None:
+        # Synthetic fragments only; nothing here is a working exploit.
+        risky = {
+            "JavaScript": b"<< /S /JavaScript /JS (app.alert(1)) >>",
+            "JS only": b"<< /JS 12 0 R >>",
+            "Launch": b"<< /S /Launch /F (calc) >>",
+            "embedded file": b"<< /Type /EmbeddedFile >>",
+            "embedded files tree": b"<< /EmbeddedFiles 9 0 R >>",
+            "automatic action": b"<< /AA << /O 7 0 R >> >>",
+            "open action": b"<< /OpenAction 7 0 R >>",
+            "open action dictionary": b"<< /OpenAction << /S /GoTo >> >>",
+            "hex-escaped name": b"<< /S /J#61vaScript >>",
+        }
+        for label, fragment in risky.items():
+            with self.subTest(label):
+                out = self.check(PDF_BYTES[:-6] + fragment + b"\n%%EOF\n")["output"][0]
+                self.assertEqual(("FAILED", "ACTIVE_CONTENT"), (out["json"]["pdf_check"], out["json"]["pdf_problem"]))
+                self.assertNotIn("binary", out)
+        benign = {
+            "open view only": b"<< /OpenAction [3 0 R /Fit] >>",
+            "longer name": b"<< /JSONData 1 /AAPL 2 /JBIG2Decode 3 >>",
+        }
+        for label, fragment in benign.items():
+            with self.subTest(label):
+                self.assertEqual("OK", self.check(PDF_BYTES[:-6] + fragment + b"\n%%EOF\n")["output"][0]["json"]["pdf_check"])
+
+    def content(self, text: str | None, decision: dict | None = None, settings: dict | None = None,
+                error: str | None = None) -> dict:
+        checked = self.check(PDF_BYTES)["output"][0]
+        extracted = {"error": error} if error else {"numpages": 1, "text": text}
+        result = run_one("Check Invoice PDF", [{"json": extracted}], {
+            "Intake Settings": {"json": settings or SETTINGS},
+            "Decide Whether To Store": {"json": decision or decision_for(direct())},
+            "Check Downloaded PDF": checked,
+        })
+        self.assertTrue(result["ok"], result)
+        return result["output"][0]
+
+    def test_pdf_content_check_finds_our_account_and_bill_type(self) -> None:
+        broadband = self.content(pdf_text())
+        self.assertEqual(("OK", "BROADBAND", None), (broadband["json"]["invoice_check"], broadband["json"]["service"],
+                                                     broadband["json"]["pdf_problem"]))
+        self.assertIn("data", broadband["binary"])
+        # Spaces and dashes are ignored, and any listed number counts.
+        mobile = self.content(pdf_text(account="MB 0000 0000 02"))
+        self.assertEqual(("OK", "MOBILE"), (mobile["json"]["invoice_check"], mobile["json"]["service"]))
+        spaced = self.content(pdf_text(invoice="S 00000 12345", account="MB0000000099"))
+        self.assertEqual("MOBILE", spaced["json"]["service"])
+
+    def test_pdf_content_problems_go_to_review(self) -> None:
+        cases = {
+            "PDF_ACCOUNT_NOT_OURS": self.content(pdf_text(account="ZZ0000000003")),
+            "PDF_ACCOUNT_UNCLEAR": self.content(pdf_text(account=BROADBAND_ACCT + " / " + MOBILE_ACCT)),
+            "PDF_INVOICE_NUMBER_MISMATCH": self.content(pdf_text(invoice="S0000099999")),
+            "PDF_TEXT_UNREADABLE": self.content(""),
+            "PDF_TEXT_UNREADABLE (extraction error)": self.content(None, error="Invalid PDF structure"),
+        }
+        # A longer number that merely contains our account number is not our account.
+        cases["PDF_ACCOUNT_NOT_OURS (longer number)"] = self.content(pdf_text(account="9" + BROADBAND_ACCT + "9"))
+        for label, out in cases.items():
+            with self.subTest(label):
+                self.assertEqual(("FAILED", label.split(" ")[0], None),
+                                 (out["json"]["invoice_check"], out["json"]["pdf_problem"], out["json"]["service"]))
+                self.assertIn("data", out["binary"])
 
     def prepare(self, decision: dict, input_item: dict, existing_copies: int = 0) -> dict:
         decided = dict(decision, store=True, skip_reason=None, existing_copies=existing_copies)
@@ -531,45 +651,58 @@ class PdfAndUploadTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         return result["output"][0]
 
-    def pdf_item(self) -> dict:
-        checked = self.check(PDF_BYTES)["output"][0]
+    def pdf_item(self, text: str | None = None, decision: dict | None = None) -> dict:
+        checked = self.content(pdf_text() if text is None else text, decision)
         return {"json": checked["json"], "binary": checked["binary"]}
 
     def test_filed_invoice_name_folder_and_properties(self) -> None:
         out = self.prepare(decision_for(direct()), self.pdf_item())
         upload = out["json"]["upload"]
         self.assertEqual("FILE", out["json"]["route"])
-        self.assertEqual("Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", upload["name"])
+        self.assertEqual("Oct 2026 - SIMBA Broadband Invoice " + INVOICE + ".pdf", upload["name"])
         self.assertEqual(("FOLDER_INVOICES", "application/pdf", len(PDF_BYTES)),
                          (upload["folder_id"], upload["mime_type"], upload["size"]))
         self.assertEqual({"simbaIntakeKey": INVOICE, "simbaStatus": "FILED", "simbaGmailId": "18f0a1b2c3d4e5f6",
-                          "simbaSha256": hashlib.sha256(PDF_BYTES).hexdigest()},
+                          "simbaBillType": "BROADBAND", "simbaSha256": hashlib.sha256(PDF_BYTES).hexdigest()},
                          upload["properties"])
         self.assertIn("file", out["binary"])
+        self.assertNotIn(BROADBAND_ACCT, json.dumps(out["json"]))
 
     def test_two_bills_in_one_month_both_file_to_the_one_folder(self) -> None:
-        # Broadband and mobile bills look the same; the invoice number keeps their names and keys apart.
+        second_decision = decision_for(direct(invoice="S0000054321"))
         first = self.prepare(decision_for(direct()), self.pdf_item())["json"]["upload"]
-        second = self.prepare(decision_for(direct(invoice="S0000054321")), self.pdf_item())["json"]["upload"]
+        second = self.prepare(second_decision, self.pdf_item(pdf_text("S0000054321", MOBILE_ACCT), second_decision))
+        second = second["json"]["upload"]
         self.assertEqual(("FOLDER_INVOICES", "FOLDER_INVOICES"), (first["folder_id"], second["folder_id"]))
-        self.assertEqual(("Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", "Oct 2026 - SIMBA Invoice S0000054321.pdf"),
-                         (first["name"], second["name"]))
+        self.assertEqual(("Oct 2026 - SIMBA Broadband Invoice " + INVOICE + ".pdf",
+                          "Oct 2026 - SIMBA Mobile Invoice S0000054321.pdf"), (first["name"], second["name"]))
         self.assertNotEqual(first["properties"]["simbaIntakeKey"], second["properties"]["simbaIntakeKey"])
 
-    def test_bill_type_is_a_small_switch_for_later(self) -> None:
-        # Nothing sets decision.service today. A later step that learns the bill type only has to set it.
-        decision = decision_for(direct())
-        named = self.prepare(dict(decision, service="MOBILE"), self.pdf_item())["json"]["upload"]["name"]
-        self.assertEqual("Oct 2026 - SIMBA Mobile Invoice " + INVOICE + ".pdf", named)
-        unknown = self.prepare(dict(decision, service="TV"), self.pdf_item())["json"]["upload"]["name"]
-        self.assertEqual("Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", unknown)
+    def test_failed_content_check_files_the_pdf_in_review(self) -> None:
+        out = self.prepare(decision_for(direct()), self.pdf_item(pdf_text(account="ZZ0000000003")))
+        upload = out["json"]["upload"]
+        self.assertEqual(("REVIEW", ["PDF_ACCOUNT_NOT_OURS"]), (out["json"]["route"], out["json"]["review_reasons"]))
+        self.assertEqual("Needs review - Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", upload["name"])
+        self.assertEqual(("FOLDER_REVIEW", "application/pdf", "REVIEW"),
+                         (upload["folder_id"], upload["mime_type"], upload["properties"]["simbaStatus"]))
+        self.assertNotIn("simbaBillType", upload["properties"])
+
+    def test_unsafe_pdf_becomes_a_note_never_an_upload(self) -> None:
+        unsafe = self.check(PDF_BYTES[:-6] + b"<< /S /JavaScript >>\n%%EOF\n")["output"][0]
+        out = self.prepare(decision_for(direct()), {"json": unsafe["json"]})
+        upload = out["json"]["upload"]
+        self.assertEqual(("REVIEW", "text/plain", ["PDF_ACTIVE_CONTENT"]),
+                         (out["json"]["route"], upload["mime_type"], out["json"]["review_reasons"]))
+        note = base64.b64decode(out["binary"]["file"]["data"]).decode("utf-8")
+        self.assertIn("active content", note)
 
     def test_review_pdf_name_and_properties(self) -> None:
-        out = self.prepare(decision_for(forwarded()), self.pdf_item())
+        decision = decision_for(forwarded())
+        out = self.prepare(decision, self.pdf_item(decision=decision))
         upload = out["json"]["upload"]
-        self.assertEqual("Needs review - Oct 2026 - SIMBA Invoice " + INVOICE + ".pdf", upload["name"])
-        self.assertEqual(("FOLDER_REVIEW", "REVIEW"), (upload["folder_id"], upload["properties"]["simbaStatus"]))
-        self.assertNotIn("simbaAccount", upload["properties"])
+        self.assertEqual("Needs review - Oct 2026 - SIMBA Broadband Invoice " + INVOICE + ".pdf", upload["name"])
+        self.assertEqual(("FOLDER_REVIEW", "REVIEW", ["FORWARDED_COPY"]),
+                         (upload["folder_id"], upload["properties"]["simbaStatus"], out["json"]["review_reasons"]))
 
     def test_failed_download_turns_a_filing_into_a_review_note(self) -> None:
         decision = decision_for(direct())
@@ -577,7 +710,7 @@ class PdfAndUploadTests(unittest.TestCase):
             with self.subTest(input_item=input_item):
                 out = self.prepare(decision, input_item)
                 upload = out["json"]["upload"]
-                self.assertEqual("REVIEW", out["json"]["route"])
+                self.assertEqual(("REVIEW", ["PDF_NOT_AVAILABLE"]), (out["json"]["route"], out["json"]["review_reasons"]))
                 self.assertEqual("Needs review - Oct 2026 - SIMBA Invoice " + INVOICE + ".txt", upload["name"])
                 self.assertEqual(("FOLDER_REVIEW", "text/plain", "REVIEW"),
                                  (upload["folder_id"], upload["mime_type"], upload["properties"]["simbaStatus"]))
@@ -593,7 +726,8 @@ class PdfAndUploadTests(unittest.TestCase):
 
     def test_failed_filing_adds_no_second_review_copy(self) -> None:
         out = self.prepare(decision_for(direct()), {"json": {"error": "403 Forbidden"}}, existing_copies=1)
-        self.assertEqual({"store": False, "skip_reason": "REVIEW_COPY_EXISTS", "route": "REVIEW"}, out["json"])
+        self.assertEqual({"store": False, "skip_reason": "REVIEW_COPY_EXISTS", "route": "REVIEW",
+                          "review_reasons": ["PDF_NOT_AVAILABLE"]}, out["json"])
         self.assertNotIn("binary", out)
         stored = self.prepare(decision_for(direct()), self.pdf_item(), existing_copies=1)
         self.assertEqual((True, "FILE"), (stored["json"]["store"], stored["json"]["route"]))
@@ -625,8 +759,8 @@ class PdfAndUploadTests(unittest.TestCase):
                   "properties": dict(upload["properties"])}
         refs = {"Prepare Drive File": prepared, "Upload File Bytes": put}
         ok = run_one("Verify Stored File", [{"json": {"statusCode": 200, "body": stored}}], refs)
-        self.assertEqual({"stored": True, "route": "FILE", "drive_file_id": "DRIVEFILE1", "name": upload["name"]},
-                         ok["output"][0]["json"])
+        self.assertEqual({"stored": True, "route": "FILE", "review_reasons": [], "drive_file_id": "DRIVEFILE1",
+                          "name": upload["name"]}, ok["output"][0]["json"])
         for change in ({"sha256Checksum": "0" * 64}, {"parents": ["OTHER"]}, {"size": "1"},
                        {"properties": {"simbaIntakeKey": INVOICE}}):
             with self.subTest(change=change):
@@ -637,50 +771,126 @@ class PdfAndUploadTests(unittest.TestCase):
         self.assertFalse(failed_put["ok"])
 
 
-class LabelTests(unittest.TestCase):
-    REFS = {"Intake Settings": {"json": SETTINGS},
-            "Read And Classify Invoice Email": {"json": {"gmail_message_id": "18f0a1b2c3d4e5f6"}}}
+class LabelAndAlertTests(unittest.TestCase):
+    DECISION = {"gmail_message_id": "18f0a1b2c3d4e5f6", "kind": "DIRECT_VERIFIED", "invoice_number": INVOICE,
+                "issue_date": "2026-10-15"}
 
-    def label_for(self, item_json: dict) -> list:
-        result = run_nodes([{"node": "Label SIMBA Email", "param": "labelIds", "input": [{"json": item_json}],
-                             "refs": self.REFS}])[0]
+    def choose(self, item_json: dict, kind: str = "DIRECT_VERIFIED", invoice: str | None = INVOICE) -> dict:
+        decision = dict(self.DECISION, kind=kind, invoice_number=invoice)
+        result = run_one("Choose Label", [{"json": item_json}],
+                         {"Intake Settings": {"json": SETTINGS}, "Read And Classify Invoice Email": {"json": decision}})
         self.assertTrue(result["ok"], result)
-        return result["output"]
+        return result["output"][0]["json"]
 
     def test_label_matches_what_happened(self) -> None:
         cases = {
-            "filed and verified": ({"stored": True, "route": "FILE"}, "Label_FILED"),
-            "review copy stored": ({"stored": True, "route": "REVIEW"}, "Label_REVIEW"),
-            "already filed by an earlier run": ({"route": "FILE", "kind": "DIRECT_VERIFIED", "store": False,
-                                                 "already_filed": True}, "Label_FILED"),
-            "forward of an invoice already filed": ({"route": "REVIEW", "kind": "FORWARDED_COPY", "store": False,
-                                                     "already_filed": True}, "Label_FILED"),
+            "filed and verified": ({"stored": True, "route": "FILE", "review_reasons": []}, "DIRECT_VERIFIED", "Label_FILED"),
+            "review copy stored": ({"stored": True, "route": "REVIEW", "review_reasons": ["PDF_ACCOUNT_NOT_OURS"]},
+                                   "DIRECT_VERIFIED", "Label_REVIEW"),
+            "already filed by an earlier run": ({"route": "FILE", "store": False, "already_filed": True, "review_reasons": []},
+                                                "DIRECT_VERIFIED", "Label_FILED"),
+            "forward of an invoice already filed": ({"route": "REVIEW", "store": False, "already_filed": True,
+                                                     "review_reasons": ["FORWARDED_COPY"]}, "FORWARDED_COPY", "Label_FILED"),
             # A spoof quoting a filed invoice number must not get the reassuring label.
-            "unverified email quoting a filed invoice": ({"route": "REVIEW", "kind": "DIRECT_UNVERIFIED", "store": False,
-                                                          "already_filed": True}, "Label_REVIEW"),
-            "review copy already stored": ({"route": "REVIEW", "kind": "FORWARDED_COPY", "store": False,
-                                            "already_filed": False}, "Label_REVIEW"),
-            "filing fell back, review copy exists": ({"store": False, "skip_reason": "REVIEW_COPY_EXISTS", "route": "REVIEW"},
-                                                     "Label_REVIEW"),
+            "unverified email quoting a filed invoice": ({"route": "REVIEW", "store": False, "already_filed": True,
+                                                          "review_reasons": ["SENDER_NOT_VERIFIED"]},
+                                                         "DIRECT_UNVERIFIED", "Label_REVIEW"),
+            "review copy already stored": ({"route": "REVIEW", "store": False, "already_filed": False,
+                                            "review_reasons": ["FORWARDED_COPY"]}, "FORWARDED_COPY", "Label_REVIEW"),
+            "filing fell back, review copy exists": ({"store": False, "skip_reason": "REVIEW_COPY_EXISTS", "route": "REVIEW",
+                                                      "review_reasons": ["PDF_NOT_AVAILABLE"]}, "DIRECT_VERIFIED", "Label_REVIEW"),
         }
-        for label, (item_json, expected) in cases.items():
+        for label, (item_json, kind, expected) in cases.items():
             with self.subTest(label):
-                self.assertEqual([expected], self.label_for(item_json))
-        message_id = run_nodes([{"node": "Label SIMBA Email", "param": "messageId", "input": [{"json": {}}],
-                                 "refs": self.REFS}])[0]
-        self.assertEqual("18f0a1b2c3d4e5f6", message_id["output"])
+                chosen = self.choose(item_json, kind)
+                self.assertEqual(expected, chosen["label_id"])
+                self.assertEqual(expected == "Label_REVIEW", chosen["alert_text"] != "")
+        evaluated = run_nodes([{"node": "Label SIMBA Email", "param": param, "input": [{"json": {}}],
+                                "refs": {"Choose Label": {"json": {"label_id": "Label_REVIEW"}},
+                                         "Read And Classify Invoice Email": {"json": self.DECISION}}}
+                               for param in ("labelIds", "messageId")])
+        self.assertEqual([["Label_REVIEW"], "18f0a1b2c3d4e5f6"], [result["output"] for result in evaluated])
 
-    def test_label_failure_is_noted_then_fails_the_run_at_the_end(self) -> None:
-        noted = run_one("Note Label Failure", [{"json": {"error": "Request failed with status code 403"}}], self.REFS)
+    def test_review_alert_is_bounded(self) -> None:
+        alert = self.choose({"stored": True, "route": "REVIEW", "review_reasons": ["NOT_SENT_TO_INTAKE", "PDF_NOT_AVAILABLE"]})
+        self.assertEqual("SIMBA bill needs review\nReason: NOT_SENT_TO_INTAKE, PDF_NOT_AVAILABLE\n"
+                         "Invoice: " + INVOICE + " (issued 2026-10-15)\nDrive: review copy stored in the review folder\n"
+                         "Find it in Gmail under the SIMBA/Needs review label.", alert["alert_text"])
+        unknown = self.choose({"route": "REVIEW", "store": False, "review_reasons": []}, "DIRECT_UNVERIFIED", None)
+        self.assertIn("Reason: ALREADY_IN_DRIVE\nInvoice: not found", unknown["alert_text"])
+        self.assertNotIn("@", alert["alert_text"] + unknown["alert_text"])
+        workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        alert_if = [n for n in workflow["nodes"] if n["name"] == "Alert Needed"][0]
+        self.assertEqual("={{ $('Choose Label').first().json.alert_text !== '' }}",
+                         alert_if["parameters"]["conditions"]["conditions"][0]["leftValue"])
+
+    def test_label_or_alert_failures_fail_the_run_at_the_end(self) -> None:
+        refs = {"Read And Classify Invoice Email": {"json": self.DECISION}}
+        noted = run_one("Note Label Failure", [{"json": {"error": "Request failed with status code 403"}}], refs)
         self.assertEqual({"label_failed": True, "gmail_message_id": "18f0a1b2c3d4e5f6",
                           "label_error": "Request failed with status code 403"}, noted["output"][0]["json"])
+        alert_refs = {"Alert Needed": noted["output"][0], "Choose Label": {"json": {"gmail_message_id": "18f0a1b2c3d4e5f6"}}}
+        sent = run_one("Alert Sent", [{"json": {"ok": True}}], alert_refs)
+        self.assertEqual((True, False), (sent["output"][0]["json"]["label_failed"], sent["output"][0]["json"]["alert_failed"]))
+        alert_failed = run_one("Note Alert Failure", [{"json": {"error": "Bad Request: chat not found"}}],
+                               {"Alert Needed": {"json": {"id": "18f0a1b2c3d4e5f6"}},
+                                "Choose Label": {"json": {"gmail_message_id": "18f0a1b2c3d4e5f6"}}})
+        self.assertEqual((True, "Bad Request: chat not found"), (alert_failed["output"][0]["json"]["alert_failed"],
+                                                                 alert_failed["output"][0]["json"]["alert_error"]))
         handled = [{"json": {"id": "18f0a1b2c3d4e5f7", "labelIds": ["Label_FILED"]}}, {"json": {"route": "IGNORE"}}]
-        clean = run_one("Report Label Failures", handled)
-        self.assertEqual({"emails_handled": 2, "label_failures": 0}, clean["output"][0]["json"])
-        failed = run_one("Report Label Failures", handled + [noted["output"][0]])
+        clean = run_one("Report Failures", handled)
+        self.assertEqual({"emails_handled": 2, "label_failures": 0, "alert_failures": 0}, clean["output"][0]["json"])
+        failed = run_one("Report Failures", handled + [sent["output"][0], alert_failed["output"][0]])
         self.assertFalse(failed["ok"])
-        self.assertIn("1 SIMBA email(s) are stored in Google Drive", failed["error"])
+        self.assertIn("1 SIMBA email(s) are stored in Google Drive, but the Gmail label could not be added", failed["error"])
+        self.assertIn("1 SIMBA review alert(s) could not be sent on Telegram", failed["error"])
         self.assertIn("18f0a1b2c3d4e5f6", failed["error"])
+
+
+class ErrorAlertWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = ERROR_WORKFLOW.read_text(encoding="utf-8")
+        cls.workflow = json.loads(cls.raw)
+        cls.nodes = {node["name"]: node for node in cls.workflow["nodes"]}
+
+    def test_error_trigger_to_one_bounded_telegram_alert(self) -> None:
+        workflow = self.workflow
+        self.assertEqual(("SIMBA Invoices - Error Alert", False, False, None, {}),
+                         (workflow["name"], workflow["active"], workflow["settings"]["availableInMCP"],
+                          workflow["staticData"], workflow["pinData"]))
+        self.assertNotIn("errorWorkflow", workflow["settings"])
+        self.assertEqual({"n8n-nodes-base.errorTrigger", "n8n-nodes-base.code", "n8n-nodes-base.telegram",
+                          "n8n-nodes-base.stickyNote"}, {node["type"] for node in workflow["nodes"]})
+        for node in workflow["nodes"]:
+            self.assertNotIn("credentials", node, node["name"])
+            self.assertNotIn("webhookId", node, node["name"])
+        self.assertEqual({"SIMBA Intake Failed": "Build Error Alert", "Build Error Alert": "Send Error Alert"},
+                         {name: links["main"][0][0]["node"] for name, links in workflow["connections"].items()})
+        send = self.nodes["Send Error Alert"]
+        # A failed alert must fail this workflow visibly, never be swallowed.
+        self.assertNotIn("onError", send)
+        self.assertEqual(("REPLACE_WITH_TELEGRAM_CHAT_ID", "={{ $json.alert_text }}", False),
+                         (send["parameters"]["chatId"], send["parameters"]["text"],
+                          send["parameters"]["additionalFields"]["appendAttribution"]))
+        self.assertTrue(all(ord(ch) < 128 for ch in self.raw))
+
+    def test_alert_text_carries_no_error_message_or_email_content(self) -> None:
+        payload = {"execution": {"id": "1234", "url": "https://n8n.example.com/workflow/abc/executions/1234",
+                                 "lastNodeExecuted": "Look For Existing Copy In Drive", "mode": "trigger",
+                                 "error": {"name": "NodeApiError", "message": "Invoice " + INVOICE + " for someone@example.com"}},
+                   "workflow": {"id": "abc", "name": "SIMBA Invoices - Email To Drive <b>"}}
+        result = run_one("Build Error Alert", [{"json": payload}], workflow=ERROR_WORKFLOW)
+        self.assertTrue(result["ok"], result)
+        text = result["output"][0]["json"]["alert_text"]
+        self.assertTrue(text.startswith("SIMBA invoice intake failed\nWorkflow: SIMBA Invoices - Email To Drive b\n"
+                                        "Stopped at: Look For Existing Copy In Drive\nExecution: 1234\n"
+                                        "Open: https://n8n.example.com/workflow/abc/executions/1234\nTime: "), text)
+        for leaked in (INVOICE, "someone@example.com", "NodeApiError", "<"):
+            self.assertNotIn(leaked, text)
+        bare = run_one("Build Error Alert", [{"json": {}}], workflow=ERROR_WORKFLOW)["output"][0]["json"]["alert_text"]
+        self.assertIn("Workflow: unknown\nStopped at: unknown\nExecution: unknown\nTime: ", bare)
+        self.assertNotIn("Open:", bare)
 
 
 if __name__ == "__main__":
