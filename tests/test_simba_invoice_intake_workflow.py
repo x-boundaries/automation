@@ -384,6 +384,8 @@ class StaticContractTests(unittest.TestCase):
         for key in SETTINGS:
             self.assertIn("`" + key + "`", note)
         self.assertIn("`Error workflow`: SIMBA Invoices - Error Alert", note)
+        # The optional review folder name is described, but not listed as required configuration.
+        self.assertNotIn("review_folder_name", note[note.index("## Required manual configuration:"):])
         self.assertTrue(all(ord(ch) < 128 for ch in self.raw))
 
 
@@ -928,6 +930,19 @@ class ReviewFolderTests(unittest.TestCase):
         for bad in (self.pick([], status=403), self.pick([], incomplete=True)):
             self.assertFalse(bad["ok"])
             self.assertIn("review folder", bad["error"])
+
+    def test_more_pages_without_a_match_never_creates_a_folder(self) -> None:
+        paged = run_one("Pick Review Folder",
+                        [{"json": {"statusCode": 200, "body": {"files": [], "nextPageToken": "NEXT"}}}],
+                        {"Intake Settings": {"json": SETTINGS}})
+        self.assertFalse(paged["ok"])
+        self.assertIn("more than one page", paged["error"])
+        # A match on the first page is the oldest (orderBy createdTime), so more pages don't matter then.
+        found = run_one("Pick Review Folder",
+                        [{"json": {"statusCode": 200, "body": {"files": [self.folder("OLDEST", "2026-10-01T00:00:00.000Z")],
+                                                              "nextPageToken": "NEXT"}}}],
+                        {"Intake Settings": {"json": SETTINGS}})
+        self.assertEqual({"review_folder_found": True, "review_folder_id": "OLDEST"}, found["output"][0]["json"])
 
     def test_ready_puts_review_items_in_the_found_or_created_folder(self) -> None:
         prepared = self.review_prepared()
