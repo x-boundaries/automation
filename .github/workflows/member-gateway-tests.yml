@@ -54,6 +54,7 @@ on:
       - "tests/test_directlocal_realbridge_ps.py"
       - "tests/directlocal_acl_ci_diagnostic.py"
       - "tests/_ci_annotated_unittest.py"
+      - "tests/_run_ci_full_suite.py"
       - "docs/autocount2-automation/member_directlocal_contract.md"
       - "docs/autocount2-automation/member_directlocal_uat_runbook.md"
       - "tests/test_member_gateway_worker_static.py"
@@ -135,6 +136,7 @@ on:
       - "tests/test_directlocal_realbridge_ps.py"
       - "tests/directlocal_acl_ci_diagnostic.py"
       - "tests/_ci_annotated_unittest.py"
+      - "tests/_run_ci_full_suite.py"
       - "docs/autocount2-automation/member_directlocal_contract.md"
       - "docs/autocount2-automation/member_directlocal_uat_runbook.md"
       - "tests/test_member_gateway_worker_static.py"
@@ -161,6 +163,11 @@ on:
       - "member_gateway/migrations/0005_member_vertical_slice.sql"
       - "member_gateway/migrations/0006_shopify_member_m1.sql"
       - ".github/workflows/member-gateway-tests.yml"
+  # Weekly run of every job on main, so tests outside the path filters cannot
+  # rot unnoticed. 14:17 UTC Sunday is 22:17 SGT Sunday; minute 17 avoids the
+  # top-of-hour peak when GitHub delays scheduled runs.
+  schedule:
+    - cron: "17 14 * * 0"
   workflow_dispatch: {}
 
 permissions:
