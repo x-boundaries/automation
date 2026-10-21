@@ -1,0 +1,28 @@
+{
+  "schema": "xb.directlocal.member_sync.config.v1",
+  "state_root": "C:\\XB\\xb155-member-sync",
+  "autocount_book": "AED_TESTINGAPI",
+  "shopify": {
+    "store_gid": "gid://shopify/Shop/48759472277",
+    "shop_domain": "xboundariessg.myshopify.com",
+    "api_version": "2026-07",
+    "auth": {
+      "method": "client_credentials",
+      "client_id_env": "XB_SHOPIFY_SYNC_CLIENT_ID",
+      "client_secret_env": "XB_SHOPIFY_SYNC_CLIENT_SECRET"
+    },
+    "token_cache": "dpapi_current_user"
+  },
+  "shopify_cutover_utc": "2026-11-01T00:00:00Z",
+  "ac2_create_enabled": false,
+  "shopify_create_enabled": false,
+  "max_writes_per_run": 5,
+  "birthday_month_metafield": {"namespace": "custom", "key": "birthday_month", "type": "number_integer"},
+  "shopify_create_tags": ["ac2-member"],
+  "ac2_credential_target": "XB-AC2-Automation",
+  "changelog_xml_column": null,
+  "changelog_batch": 200,
+  "max_shopify_customers_per_run": 20,
+  "shopify_max_pages": 10,
+  "http_timeout_seconds": 30
+}
