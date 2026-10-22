@@ -1,7 +1,7 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
 Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-round 7). Nothing here has run against AutoCount or Shopify. Every write
+round 7c). Nothing here has run against AutoCount or Shopify. Every write
 switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
 null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Only the test book
@@ -36,18 +36,32 @@ Online and in-shop customers use the same sign-up form, so the sync cannot
 tell them apart. Staff typing of names is unreliable, so the link does not
 use the name (round 7). Therefore:
 
+0. **Existing customers first (round 7c).** Before any of this, the
+   one-off initial link (below) links every Shopify customer made before the
+   cutover to the AC2 member whose MemberNo is their phone. Shopify -> AC2
+   reads and writes nothing (alert `initial_link_not_complete`) until an
+   applied initial link has completed a full pass.
 1. **Link first.** A new sign-up is not created in AC2 straight away. Every
    run looks it up again (it stays a pending customer); no link writes to
    AC2. Email never links.
-   - **MemberNo + created time (round 7).** The AC2 member whose MemberNo is
-     exactly the sign-up's phone MemberNo (`phone_member_no`: `65` + 8 digits
-     for a Singapore number; MemberNo trimmed, any case) is linked when its
-     `CreatedTime` and the Shopify `Customer.createdAt` are at most
+   - **MemberNo + created time (round 7, 7c).** The AC2 member whose
+     MemberNo is exactly the sign-up's phone (`phone_member_no`: `65` + 8
+     digits for a Singapore number, or round 7c the same 8 digits without
+     `65`; a foreign `+` number's full digits; MemberNo trimmed, any case) is
+     linked when its `CreatedTime` and the **sign-up time** are at most
      `memberno_link_window_minutes` (default 10) apart, either way, the
-     boundary included (`memberno_and_created_time_match`). The name is not
-     used. AC2 stores `CreatedTime` in Singapore local time with no offset
-     (VM fact G0, below); the sync reads it as Asia/Singapore (UTC+8), turns
-     it into UTC and compares it with `createdAt` (UTC). Only the two stored
+     boundary included (`memberno_and_created_time_match`). The sign-up time
+     (round 7c) is `ShopifyCustomer.registration_at`: the `createdAt` of the
+     `membership.start_date` customer metafield the sign-up form writes,
+     the same instant the sync uses for the cutover and the 06:00 cutoff
+     (after the bounded wait for that metafield, `Customer.createdAt` stands
+     in, as it already does for those). `Customer.createdAt` itself is not
+     compared, so an older Shopify account that signs up now still links.
+     Both forms of the number in AC2 at once (`65` + 8 digits and the 8
+     digits) is a conflict: alert `memberno_conflict`, no link, no create.
+     The name is not used. AC2 stores `CreatedTime` in Singapore local time
+     with no offset (VM fact G0, below); the sync reads it as Asia/Singapore
+     (UTC+8), turns it into UTC and compares it with the sign-up time (UTC). Only the two stored
      times are compared, never the run's own clock, so any run frequency
      works, including once a day, and a link found after the next-morning
      cutoff still wins over a create.
@@ -59,9 +73,8 @@ use the name (round 7). Therefore:
      A missing or unreadable time on either side is treated the same way
      (`created_time_missing`, alert).
    - **Name rule, only where still needed:** an AC2 record that holds the
-     phone in another way (MobilePhone, a MemberNo of the 8 Singapore digits
-     without `65`, or the 8 digits embedded in a MemberNo) and no record
-     whose MemberNo is exactly the phone: linked when the name rule below
+     phone in another way (MobilePhone, or the 8 digits embedded in a longer
+     MemberNo) and no record whose MemberNo is exactly the phone: linked when the name rule below
      matches (`phone_and_name_match`); otherwise the shared-phone fallback
      MemberNo after the cutoff, as before.
 2. **Wait.** Before the cutoff, an unmatched sign-up is only counted
@@ -132,10 +145,12 @@ instead; after it, every create also raises `created_after_wait`.
 
 | Situation | Action | Counted as |
 |---|---|---|
-| Round 7: an AC2 MemberNo is exactly the phone MemberNo, and its `CreatedTime` is within `memberno_link_window_minutes` of Shopify `createdAt` (either way) | Link, no create; name not used | `memberno_and_created_time_match` |
+| Round 7c: Shopify -> AC2 before an applied initial link has completed | Nothing read or written | `initial_link_not_complete` (alert) |
+| Round 7: an AC2 MemberNo is exactly the phone (round 7c: `65` + 8 digits or the 8 digits), and its `CreatedTime` is within `memberno_link_window_minutes` of the sign-up time (`registration_at`, either way) | Link, no create; name not used | `memberno_and_created_time_match` |
+| Round 7c: both forms of the number are MemberNos in AC2 | No link, no create (pending `SKIPPED`); alert | `memberno_conflict` |
 | Round 7: that MemberNo exists, outside the window | No link, no create (pending `SKIPPED`); alert with the MemberNo masked to its last 3 characters | `memberno_exists_outside_window` |
 | Round 7: that MemberNo exists, but a time is missing or unreadable | No link, no create (pending `SKIPPED`); alert | `created_time_missing` |
-| No MemberNo is the phone, but the phone is in AC2 otherwise (MemberNo of its 8 digits, MobilePhone normalises to it, or the 8 digits are embedded in a MemberNo) and the name rule below matches | Link, no create | `phone_and_name_match` |
+| No MemberNo is the phone, but the phone is in AC2 otherwise (MobilePhone normalises to it, or the 8 digits are embedded in a longer MemberNo) and the name rule below matches | Link, no create | `phone_and_name_match` |
 | Several such records match the name | Skip (never guessed, never merged) | `phone_on_multiple_records` |
 | Phone matches that way, the name rule does not match (people sharing a phone) | Create with `<phone digits><FIRST+LAST letters A-Z>` truncated to 20 characters | `shared_phone_name_fallback` |
 | That MemberNo is already held (in AC2, trimmed and case-insensitive, or by another customer's link or open write in the ledger) | The first free of the same value with a digit 2-9 appended (letters trimmed to stay within 20) | `shared_phone_suffix_digit` |
@@ -324,7 +339,7 @@ Unknown keys, at the top level or nested, are refused.
 | `autocount_book` | required | `AED_TESTINGAPI` only; `AED_XBOUNDARIES` refused |
 | `state_root` | required | Private root (same custody check as the Core); ledger `member_sync.sqlite3`, `claims\` |
 | `shopify` | required | Store, API version, auth env names, token cache (as the poller) |
-| `shopify_cutover_utc` | required | Registrations before it are skipped (historic members are phase 2) |
+| `shopify_cutover_utc` | required | Registrations before it are skipped by the regular sync; customers made before it are linked once by the initial link (round 7c); creating historic members is phase 2 |
 | `ac2_create_enabled` | `false` | Shopify -> AC2 SaveMember |
 | `shopify_create_enabled` | `false` | AC2 -> Shopify `customerCreate`; Q3 gate above. The app also needs `write_customers` (the session check requires exactly `read_customers` while off, and `read_customers` + `write_customers` while on) |
 | `max_writes_per_run` | `5` | 0-5, both directions together |
@@ -340,7 +355,8 @@ Unknown keys, at the top level or nested, are refused.
 | `http_timeout_seconds` | `30` | 5-60 |
 | `deferred_create_local_time` | `"06:00"` | Round 6: `HH:MM` (00:00-23:59) in Asia/Singapore on the day after sign-up; before it an unmatched sign-up waits for staff |
 | `ac2_create_member_type` | `"REGISTERED"` | Round 6: the AutoCount member type of a member the sync creates (1-20 of `A-Z a-z 0-9 _ -`, starting with a letter or digit). The test book type is `REGISTERED`; production uses other codes (a production change is E9) |
-| `memberno_link_window_minutes` | `10` | Round 7: 1-60. The largest gap, either way, between AC2 `CreatedTime` and Shopify `createdAt` for a MemberNo link |
+| `memberno_link_window_minutes` | `10` | Round 7: 1-60. The largest gap, either way, between AC2 `CreatedTime` and the sign-up time (round 7c: `registration_at`) for a MemberNo link |
+| `initial_link_enabled` | `false` | Round 7c: the Owner's gate for `initial-link --apply`; a dry run needs no gate |
 
 ## What stays switched off
 
@@ -480,16 +496,19 @@ Unknown keys, at the top level or nested, are refused.
   `max_shopify_customers_per_run` (20) at once delays recording new sign-ups
   until the list drains (the watermark does not advance while the budget is
   spent). Each waiting customer costs one AC2 lookup per run.
-- Round 7: Shopify `Customer.createdAt` is when the Shopify account was
-  made, not the sign-up. A customer who already had an account (for example
-  an earlier online order) and signs up later is outside the window even if
-  staff keyed the member at once: `memberno_exists_outside_window`, no link,
-  no create (`test_an_existing_shopify_account_uses_its_original_created_at`).
-- Round 7: the time link needs the MemberNo exactly as the sync normalises
-  the phone (`65` + 8 digits for Singapore). A member keyed with only the 8
-  digits, or with the phone in MobilePhone under another MemberNo, falls back
-  to the name rule and, without a name match, to a second member with the
-  shared-phone MemberNo after the cutoff.
+- Round 7c: the time link needs the MemberNo to be the phone (`65` + 8
+  digits or the 8 digits). A member keyed with the phone only in MobilePhone
+  under another MemberNo falls back to the name rule and, without a name
+  match, to a second member with the shared-phone MemberNo after the cutoff.
+- Round 7c: the initial link reads customers in Shopify `updatedAt` order
+  from a cursor; each run reads at most `shopify_max_pages` x 50 customers.
+  More customers sharing one `updatedAt` than one run reads stops the pass
+  (`initial_link_cursor_stuck`); raise `shopify_max_pages` (max 40) and run
+  again. Dry-run counts are per run, and the customer at the cursor is
+  counted again in the next run.
+- Round 7c: a customer made before the cutover with no phone, or whose
+  phone is no AC2 MemberNo, is not linked by the initial link; if they sign
+  up later, the regular rules apply to them.
 - A sign-up without a usable phone can never be linked to a staff member
   (email never links), so it is created after the cutoff even if staff made
   one, and that duplicate cannot be detected. Staff should not make members
@@ -590,15 +609,43 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
   after the sync's create while both records exist.
 - `memberno_exists_outside_window` (alert, round 7): AC2 already has a
   member with this sign-up's phone as its MemberNo, created more than
-  `memberno_link_window_minutes` before or after the Shopify customer. The
+  `memberno_link_window_minutes` before or after the sign-up (and the
+  initial link did not link it: the customer was made after the cutover).
+  `memberno_conflict` (round 7c): both `65` + 8 digits and the 8 digits are
+  MemberNos in AC2. The
   summary's `refs` show the customer ref and `member_no_masked` (last 3
   characters). Nothing was linked or created, and the customer is not read
   again. Check in AutoCount whether that member is the same person (for
-  example an existing Shopify account signing up late, or a member keyed
-  long after the sign-up); linking by hand is a later, separately approved
+  example a member keyed long after the sign-up); linking by hand is a later, separately approved
   step. `created_time_missing` is handled the same way.
 - The pending list is private ledger data; read it only on the VM (the
   read-only query style of the pre-flight step).
+
+### Initial link: existing customers first (round 7c, one-off)
+
+Run on the VM before the first Shopify -> AC2 run (that direction alerts
+`initial_link_not_complete` and does nothing until it is done):
+
+1. Dry run (the default; writes no link, only its own progress mark):
+   `python directlocal\xb_member_sync.py initial-link --config <config>`.
+   It reads the Shopify customers made before `shopify_cutover_utc` (any
+   tag; Customer.createdAt), looks their phone up in AC2 by MemberNo only
+   (`65` + 8 digits, or the 8 digits), and reports `initial_link_would_link`,
+   `initial_link_no_phone`, `initial_link_no_member`,
+   `initial_link_already_linked`, `initial_link_held_by_open_write` and the
+   alert `initial_link_member_no_conflict`, with `refs` holding each
+   customer ref and the MemberNo masked to its last 3 characters. `complete`
+   says whether the pass reached the end; run again until it does.
+2. The Owner reviews the counts and approves the apply step, then sets
+   `initial_link_enabled: true`.
+3. Apply: the same command with `--apply` (refused with
+   `initial_link_disabled` while the setting is off, before any login or
+   read). It writes only ledger links (origin `matched`, code
+   `initial_link_member_no`): no AC2 or Shopify write, no field change, no
+   time or name rule. A conflict (both forms of the number in AC2, or the
+   member already linked to another customer) alerts and is never merged.
+   Run until `complete` is true; that pass opens Shopify -> AC2.
+4. Set `initial_link_enabled` back to `false`.
 
 ### Releasing a customer held by an open write
 
@@ -680,8 +727,13 @@ Per UAT run, before any create switch goes on for good:
    no AC2 write, whatever name staff typed) and check one where the times
    are more than 10 minutes apart (it must alert, never create). Compare one
    member's `CreatedTime` with the Shopify customer's `createdAt` to confirm
-   the 8-hour conversion. Count sign-ups that already had a Shopify account
-   (outside the window by design).
+   the 8-hour conversion.
+6. Round 7c: run the initial link dry run and record its counts and
+   conflicts; after the Owner's approval, apply it and check one linked
+   customer (link only, nothing changed in AC2 or Shopify). Then check a
+   sign-up whose staff member was keyed with the 8 digits only (it must
+   link by time) and one sign-up from an older Shopify account (it must
+   link by its sign-up time).
 
 ## Commands
 
@@ -690,6 +742,7 @@ python directlocal\xb_member_sync.py check-config --config <config>
 python directlocal\xb_member_sync.py init --config <config>
 python directlocal\xb_member_sync.py run --config <config> [--direction shopify_to_ac2|ac2_to_shopify]
 python directlocal\xb_member_sync.py status --config <config>
+python directlocal\xb_member_sync.py initial-link --config <config> [--apply]
 ```
 
 `run` exits 0 when completed, 3 when completed with alerts (see the
@@ -717,7 +770,8 @@ writes enabled. The sync ledger is separate from the Core ledger.
 - Expiry downgrade.
 - Refund exceptions.
 - The fix list for existing data (including the 15 shared-phone pairs).
-- The 2,744-member rehearsal / historic backfill.
+- The 2,744-member rehearsal / historic backfill (creating members; the
+  round 7c initial link only links existing pairs).
 - The online-order path.
 - A lookup by the `custom.ac2_member_no` metafield for unresolved phoneless
   Shopify creates (Q4).
@@ -785,6 +839,15 @@ create. The Owner approved exactly one book-guard change: `CreatedTime` in
 the member lookup. The ChangeLog query is unchanged and ChangeLog reads stay
 off by default.
 
+Round 7c (22 October 2026, 12:41Z): the window compares `CreatedTime` with
+the sign-up time the sync already reads (`registration_at`), not
+Customer.createdAt; existing (pre-cutover) Shopify customers are linked
+first by exact MemberNo (including the 8-digit form) with no time rule, in a
+one-off initial link (dry run by default, link-only, its own gate
+`initial_link_enabled`; conflicts alert, never merge); the time link also
+accepts the 8 digits without `65`; foreign `+` numbers get the same
+10-minute rule.
+
 ## Open items
 
 Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
@@ -828,8 +891,4 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    no longer needed for a member keyed with MemberNo `65` + 8 digits (it
    links by time, without the name); still needed for records holding the
    phone in another way.
-6. Round 7: the window compares with Shopify `Customer.createdAt` (as
-   specified). A customer who had a Shopify account before signing up is
-   always outside the window (see Known limits). Owner to decide whether the
-   sign-up time (`membership.start_date` metafield `createdAt`, already read
-   for the cutover) should be used instead; that would be a one-line change.
+6. Closed in round 7c: the window uses the sign-up time (`registration_at`).
