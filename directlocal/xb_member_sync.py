@@ -634,7 +634,9 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
     forms = member_no_forms(phone_digits)
     exact = [r for r in hits if member_no_key(r.member_no) in forms]
     if len(exact) > 1:
-        return Decision("SKIP", "memberno_conflict")  # never guessed, never merged
+        # Never guessed, never merged. Round 9: the MemberNo rides along (the
+        # alert masks it; both forms end in the same 3 digits).
+        return Decision("SKIP", "memberno_conflict", exact[0].member_no)
     if exact:
         staff = exact[0].created_at
         if staff is None or signed_up is None:
@@ -1135,8 +1137,10 @@ class SyncEngine:
     # -- Shopify -> AC2 ----------------------------------------------------------
     def shopify_to_ac2(self, started: datetime) -> None:
         if self.ledger.watermark(INITIAL_LINK_DONE_MARK) is None:
-            # Round 7c (Owner): existing customers are linked first. Nothing
-            # is read or written until an applied initial link has completed.
+            # Round 7c (Owner): existing customers are linked first. Until an
+            # applied initial link has completed, no sign-up is read and no
+            # link or create is made (the start-up housekeeping above still
+            # runs; round 8, G2 L4).
             self.summary.alert("initial_link_not_complete")
             return
         # Round 8 (G2 M1): pending sign-ups are re-checked under their own
@@ -1551,15 +1555,28 @@ class SyncEngine:
                 self._ac2_done(key, "SKIPPED", "ac2_member_without_phone")
                 self.summary.count("ac2_member_without_phone", ref)
                 continue
-            phone_form = member_no_key(member.member_no) in member_no_forms(digits)
+            forms = member_no_forms(digits)
+            phone_form = member_no_key(member.member_no) in forms
+            if phone_form and len({member_no_key(r.member_no) for r in self.ac2.lookup(digits, []) if _phone_hit(r, digits) and member_no_key(r.member_no) in forms}) > 1:
+                # Round 9 (G2 M2): both forms of the phone are MemberNos: the
+                # Shopify -> AC2 conflict rule. Never linked, never created.
+                self._ac2_done(key, "SKIPPED", "memberno_conflict")
+                self.summary.alert("memberno_conflict", ref, member_no=member.member_no)
+                continue
             customers = self.shopify.find_by_phone(e164(digits))
             if phone_form and not customers:
                 # Round 8 (G2 H1): a sign-up the phone search does not show
                 # yet is still a sign-up: look in the pending list too.
                 customers, sure = self._pending_sign_ups_with_phone(digits)
                 if not customers and not sure:
-                    self._ac2_done(key, "PENDING", "held_for_sign_up", count_check=True)
-                    self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
+                    if row["checks"] + 1 < REGISTRATION_WAIT_MAX_CHECKS:
+                        self._ac2_done(key, "PENDING", "held_for_sign_up", count_check=True)
+                        self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
+                    else:
+                        # Round 9 (G2 L6): the same bounded wait as the sign-up
+                        # time hold; then an operator decides (never created).
+                        self._ac2_done(key, "SKIPPED", "ac2_member_hold_stuck", count_check=True)
+                        self.summary.alert("ac2_member_hold_stuck", ref, member_no=member.member_no)
                     continue
             if len(customers) > 1:
                 self._ac2_done(key, "SKIPPED", "shopify_phone_on_multiple_customers")
