@@ -4,7 +4,8 @@
 # whose bytes are pinned for the production worker and stay unchanged. This
 # file reuses the adapter's helpers (command binding, row access,
 # null-preserving normalisation) and adds only the sync_p1 field set:
-#   MemberNo (the phone number or its name fallback), MemberType REGISTERED,
+#   MemberNo (the phone number or its name fallback), MemberType (the
+#   configured ac2_create_member_type, validated here; round 6),
 #   Name, MobilePhone/EmailAddress (or NULL), DOB 2000-MM-01 (or NULL),
 #   RegisterDate, ExpiryDate NULL, OpeningPoints 0, IsActive T, Individual T.
 # It is reached only from the bridge's write-once path (fence, digest,
@@ -14,7 +15,8 @@ Set-StrictMode -Version Latest
 
 $script:XbSyncCallerFields = @("MemberNo", "Name", "RegisterDate", "MobilePhone", "EmailAddress", "DOB")
 $script:XbSyncAdapterOwnedFields = @("MemberType", "ExpiryDate", "OpeningPoints", "IsActive", "Individual")
-$script:XbSyncMemberType = "REGISTERED"
+# A member type code, never a caller field on the member (round 6).
+$script:XbSyncMemberTypePattern = '\A[A-Za-z0-9][A-Za-z0-9_-]{0,19}\z'
 
 function Assert-XbSyncMemberInput {
     param([Parameter(Mandatory)][hashtable]$Member)
@@ -42,14 +44,21 @@ function Assert-XbSyncMemberInput {
     }
 }
 
+function Assert-XbSyncMemberType {
+    param([AllowNull()][AllowEmptyString()][string]$MemberType)
+    if ([string]::IsNullOrEmpty($MemberType) -or $MemberType -cnotmatch $script:XbSyncMemberTypePattern) { throw "member_type_invalid" }
+}
+
 function New-XbSyncAutoCountMember {
     param(
         [Parameter(Mandatory)]$Session,
         [Parameter(Mandatory)][hashtable]$Member,
+        [Parameter(Mandatory)][string]$MemberType,
         [Parameter(Mandatory)][switch]$EnableProductionAdapter
     )
     Assert-XbAutoCountAdapterEnabled -EnableProductionAdapter:$EnableProductionAdapter
     Assert-XbSyncMemberInput -Member $Member
+    Assert-XbSyncMemberType -MemberType $MemberType
     $command = Get-XbAutoCountMemberCommand -Session $Session
     $entity = $command.NewMember($false)
     if ($null -eq $entity) { throw "autocount_new_member_failed" }
@@ -58,7 +67,7 @@ function New-XbSyncAutoCountMember {
 
     $assignments = [ordered]@{
         MemberNo      = [string]$Member.MemberNo
-        MemberType    = $script:XbSyncMemberType
+        MemberType    = $MemberType
         Name          = [string]$Member.Name
         MobilePhone   = if ($Member.Contains("MobilePhone") -and $null -ne $Member.MobilePhone) { [string]$Member.MobilePhone } else { [System.DBNull]::Value }
         EmailAddress  = if ($Member.Contains("EmailAddress") -and $null -ne $Member.EmailAddress) { [string]$Member.EmailAddress } else { [System.DBNull]::Value }

@@ -94,6 +94,12 @@ SHOPIFY_WATERMARK_MARGIN_SECONDS = 900  # search-index lag overlap, as in the Co
 REGISTRATION_WAIT_MAX_CHECKS = 5  # Forms writes start_date ~3 s after the tag
 LOOKUP_MAX_ROWS = 50
 PENDING_LOOKUP_BATCH = 20
+# Round 6: after a sync create, re-check for a later staff-made member of
+# the same person for this long (bounded lookups per run).
+DUPLICATE_WATCH_DAYS = 7
+DUPLICATE_WATCH_PER_RUN = 10
+LOCAL_TIME_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+MEMBER_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$")
 # Watermarks-table key of the ChangeLog overlap the last run used (G2 H3).
 OVERLAP_MARK = "ac2_changelog_overlap"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
@@ -143,6 +149,12 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "max_shopify_customers_per_run": 20,
     "shopify_max_pages": 10,
     "http_timeout_seconds": 30,
+    # Round 6 (Owner, 22 Oct 2026): staff create members by hand from the
+    # sign-up sheet. A sign-up still unmatched at this time (HH:MM,
+    # Asia/Singapore) on the day after sign-up is created by the sync, with
+    # this AutoCount member type (the test book's type; production differs).
+    "deferred_create_local_time": "06:00",
+    "ac2_create_member_type": "REGISTERED",
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -184,6 +196,8 @@ class SyncConfig:
     shopify_create_tags: tuple[str, ...]
     ac2_credential_target: str | None
     changelog_xml_column: str | None
+    deferred_create_local_time: str
+    ac2_create_member_type: str
     changelog_batch: int
     changelog_overlap: int
     max_shopify_customers_per_run: int
@@ -199,6 +213,7 @@ class SyncConfig:
             "shopify_cutover_utc": dl.ts(self.shopify_cutover_utc), "birthday_month_metafield": dict(self.birthday_month_metafield),
             "shopify_create_tags": list(self.shopify_create_tags), "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "changelog_configured": self.changelog_xml_column is not None,
+            "deferred_create_local_time": self.deferred_create_local_time, "ac2_create_member_type": self.ac2_create_member_type,
         }
 
 
@@ -263,12 +278,18 @@ def parse_config(value: Any) -> SyncConfig:
     column = merged["changelog_xml_column"]
     if column is not None and (not isinstance(column, str) or not IDENTIFIER_RE.fullmatch(column)):
         raise dl.DirectLocalError("sync_config_changelog_xml_column_invalid")
+    local_time = merged["deferred_create_local_time"]
+    if not isinstance(local_time, str) or not LOCAL_TIME_RE.fullmatch(local_time):
+        raise dl.DirectLocalError("sync_config_deferred_create_local_time_invalid")
+    member_type = merged["ac2_create_member_type"]
+    if not isinstance(member_type, str) or not MEMBER_TYPE_RE.fullmatch(member_type):
+        raise dl.DirectLocalError("sync_config_ac2_create_member_type_invalid")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
         shopify_create_enabled=_bool(merged["shopify_create_enabled"], "shopify_create_enabled"),
         birthday_month_metafield=dict(birthday), ac2_member_no_metafield=dict(member_no_field), shopify_create_tags=tuple(tags), ac2_credential_target=target,
-        changelog_xml_column=column, **numbers,
+        changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type, **numbers,
     )
 
 
@@ -429,6 +450,15 @@ def suffix_candidates(base: str) -> list[str]:
     the MemberNo stays within 20 characters."""
 
     return [base] + [base[:MEMBER_NO_WIDTH - 1] + str(digit) for digit in range(2, 10)]
+
+
+def deferred_create_cutoff(signed_up: datetime, local_time: str) -> datetime:
+    """Round 6: the next morning. ``local_time`` (HH:MM) in Asia/Singapore
+    (UTC+8 all year, no daylight saving, so a fixed offset is exact) on the
+    day after the sign-up's Singapore date; never the same morning."""
+
+    day = signed_up.astimezone(SGT).date() + timedelta(days=1)
+    return datetime(day.year, day.month, day.day, int(local_time[:2]), int(local_time[3:]), tzinfo=SGT)
 
 
 def birthday_month(value: Any) -> int | None:
@@ -979,6 +1009,32 @@ class SyncEngine:
             mark = started - timedelta(seconds=SHOPIFY_WATERMARK_MARGIN_SECONDS)
             with self.ledger.tx() as conn:
                 self.ledger.set_watermark(conn, "shopify_updated_at", dl.ts(max(mark, self.config.shopify_cutover_utc)))
+        self._watch_sync_created_members()
+
+    def _watch_sync_created_members(self) -> None:
+        """Round 6: a member staff make by hand AFTER the sync created one for
+        the same person (same phone, name rule) is a possible duplicate:
+        alert and count only, never merged, linked or written. Read-only, for
+        members this sync created in the last DUPLICATE_WATCH_DAYS days. A
+        member created without a phone cannot be checked."""
+
+        since = dl.ts(self.ledger.now() - timedelta(days=DUPLICATE_WATCH_DAYS))
+        rows = self.ledger.conn.execute(
+            "SELECT member_no, member_no_key FROM links WHERE origin = 'created_in_ac2' AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+            (since, DUPLICATE_WATCH_PER_RUN),
+        ).fetchall()
+        for row in rows:
+            ours = [m for m in self.ac2.lookup(None, [row["member_no"]]) if member_no_key(m.member_no) == row["member_no_key"]]
+            digits = phone_member_no(ours[0].mobile_phone)[0] if len(ours) == 1 else None
+            if digits is None:
+                continue
+            others = [
+                m for m in self.ac2.lookup(digits, [])
+                if member_no_key(m.member_no) != row["member_no_key"] and _phone_hit(m, digits)
+                and full_name_matches(ours[0].name, m.name) and self.ledger.link_for_member(m.member_no) is None
+            ]
+            if others:
+                self.summary.alert("possible_duplicate_member", self.ledger.ref("m", row["member_no_key"]))
 
     def _shopify_pending(self, gid: str, state: str, code: str, *, count_check: bool = False) -> None:
         with self.ledger.tx() as conn:
@@ -1022,6 +1078,14 @@ class SyncEngine:
         if decision.action == "SKIP":
             self._shopify_pending(gid, "SKIPPED", decision.code)
             self.summary.count(decision.code, ref)
+            return
+        if decision.action == "CREATE" and self.ledger.now() < deferred_create_cutoff(instant, self.config.deferred_create_local_time):
+            # Round 6 (Owner): staff create members by hand from the sign-up
+            # sheet. Until the next morning's cutoff the sync only looks for
+            # their member (each run re-reads this pending customer) and
+            # writes nothing.
+            self._shopify_pending(gid, "PENDING", "waiting_for_staff")
+            self.summary.count("waiting_for_staff", ref)
             return
         member_no = decision.member_no
         if member_no is None:
@@ -1117,7 +1181,7 @@ class SyncEngine:
             instant = customer.registration_at or customer.created_at
             registered = instant.astimezone(SGT).strftime("%Y-%m-%d") if instant else self.ledger.now().astimezone(SGT).strftime("%Y-%m-%d")
         payload = {
-            "profile": "sync_p1", "name": name, "mobile_phone": digits, "email_address": customer.email or None,
+            "profile": "sync_p1", "member_type": self.config.ac2_create_member_type, "name": name, "mobile_phone": digits, "email_address": customer.email or None,
             "register_date": registered, "dob": dob_from_month(month),
         }
         issue = dl.autocount_text_issue(payload)
@@ -1162,6 +1226,9 @@ class SyncEngine:
         if state == "CREATED_VERIFIED":
             self._shopify_pending(gid, "DONE", decision.code)
             self.summary.count("ac2_member_created", member_ref, "create")
+            # Round 6: every sync create comes after the staff wait; the
+            # operator checks staff did not make the member too.
+            self.summary.alert("created_after_wait")
             self._count_decision(decision)
         elif state == "NOT_WRITTEN_PROVEN":
             self._shopify_pending(gid, "PENDING", "ac2_not_written")
@@ -1324,9 +1391,15 @@ class SyncEngine:
                     for note in name_fallback_notes(member.name, [shopify_full_name(customer.first_name, customer.last_name)]):
                         self.summary.count(note)
                     self._create_in_shopify(member, None, key, ref)
-                elif self.ledger.link_for_gid(customer.gid) is not None:
-                    self._ac2_done(key, "SKIPPED", "shopify_customer_linked_to_other_member")
-                    self.summary.count("shopify_customer_linked_to_other_member", ref)
+                elif (link := self.ledger.link_for_gid(customer.gid)) is not None:
+                    if link["origin"] == "created_in_ac2":
+                        # Round 6: staff made a member for a person the sync
+                        # already created: possible duplicate, never merged.
+                        self._ac2_done(key, "SKIPPED", "possible_duplicate_member")
+                        self.summary.alert("possible_duplicate_member", ref)
+                    else:
+                        self._ac2_done(key, "SKIPPED", "shopify_customer_linked_to_other_member")
+                        self.summary.count("shopify_customer_linked_to_other_member", ref)
                 else:
                     with self.ledger.tx() as conn:
                         self.ledger.add_link(conn, customer.gid, member.member_no, "matched", "shopify_phone_and_name_match")

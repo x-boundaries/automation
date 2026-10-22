@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -186,7 +187,10 @@ class FakeAc2:
 class SyncTestCase(unittest.TestCase):
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-"))
-        self.now = T0 + timedelta(hours=1)
+        # A day after the default sign-up (T0, 10:00 Singapore time): past the
+        # next-morning cutoff, so a create is due. DeferredCreateTests set
+        # earlier times for the waiting period.
+        self.now = T0 + timedelta(days=1)
         self.ledger = sync.SyncLedger(self.temp, clock=lambda: self.now, check_custody=False)
         self.ledger.init_meta(autocount_book=TEST_BOOK, store_gid=STORE, shop_domain=DOMAIN)
         self.shopify = FakeShopify()
@@ -382,7 +386,7 @@ class ShopifyToAc2Tests(SyncTestCase):
         self.assertEqual(len(self.ac2.creates), 1)
         member_no, payload = self.ac2.creates[0]
         self.assertEqual(member_no, sg(1))
-        self.assertEqual(payload, {"profile": "sync_p1", "name": "Alpha Tester", "mobile_phone": sg(1), "email_address": "alpha@example.com", "register_date": "2026-10-21", "dob": "2000-07-01"})
+        self.assertEqual(payload, {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Alpha Tester", "mobile_phone": sg(1), "email_address": "alpha@example.com", "register_date": "2026-10-21", "dob": "2000-07-01"})
         self.assertEqual(self.links(), {gid(1): sg(1)})
         self.assertEqual(result["counts"]["ac2_member_created"], 1)
         self.assert_no_pii(result)
@@ -1712,6 +1716,176 @@ class DryRunFallbackCountTests(SyncTestCase):
         counts = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)["counts"]
         self.assertEqual((counts["shopify_phone_owned_by_other_name"], counts["name_fallback_one_word"], counts["shopify_create_disabled"]), (1, 1, 1))
         self.assertEqual(self.shopify.created, [])
+
+
+SGT = timezone(timedelta(hours=8))  # Asia/Singapore: UTC+8 all year
+
+
+def sgt(day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(2026, 10, day, hour, minute, tzinfo=SGT)
+
+
+class DeferredCreateTests(SyncTestCase):
+    """Round 6 (Owner, 22 Oct 2026): staff keep creating members by hand from
+    the sign-up sheet. A Shopify sign-up is first linked to the member staff
+    create (phone + name rule, no AC2 write); only one still unmatched at the
+    cutoff (06:00 Asia/Singapore the day after sign-up) is created by the sync,
+    with an alert. Before the cutoff nothing is written."""
+
+    def pending(self) -> dict:
+        return {row[0]: (row[1], row[2]) for row in self.ledger.conn.execute("SELECT customer_gid, state, code FROM shopify_pending")}
+
+    def test_before_the_cutoff_nothing_is_written(self):
+        self.now = T0 + timedelta(hours=1)
+        self.shopify.add(customer(40))
+        self.shopify.add(customer(41, phone=None))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.ac2.creates, self.ac2.generator_calls, self.links()), ([], 0, {}))
+        self.assertEqual(result["counts"]["waiting_for_staff"], 2)
+        self.assertEqual(self.pending(), {gid(40): ("PENDING", "waiting_for_staff"), gid(41): ("PENDING", "waiting_for_staff")})
+        self.assertEqual(result["alerts"], [])
+
+    def test_a_staff_member_made_before_the_cutoff_is_linked_without_a_write(self):
+        self.now = T0 + timedelta(hours=1)
+        self.shopify.add(customer(42, first="Mary Ann", last="Lee"))
+        self.run_sync("shopify_to_ac2")
+        self.ac2.add(sync.Ac2Member(sg(42), "MARY ANN LEE", None))  # staff, by hand from the sheet
+        self.now = T0 + timedelta(hours=3)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates), ({gid(42): sg(42)}, []))
+        self.assertEqual(result["counts"]["phone_and_name_match"], 1)
+        self.now = T0 + timedelta(days=2)  # nothing more after the cutoff
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.ac2.creates, result["alerts"]), ([], []))
+
+    def test_initials_never_link_so_the_sign_up_waits_then_is_created(self):
+        self.now = T0 + timedelta(hours=1)
+        self.ac2.add(sync.Ac2Member(sg(43), "Mary A Lee", None))  # staff typed an initial
+        self.shopify.add(customer(43, first="Mary Ann", last="Lee"))
+        self.assertEqual(self.run_sync("shopify_to_ac2")["counts"]["waiting_for_staff"], 1)
+        self.now = T0 + timedelta(days=1)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual([m for m, _ in self.ac2.creates], [sync.fallback_member_no(sg(43), "Mary Ann", "Lee")])
+        self.assertIn("created_after_wait", result["alerts"])
+
+    def test_email_never_links_while_waiting(self):
+        self.now = T0 + timedelta(hours=1)
+        self.ac2.add(sync.Ac2Member("STAFF44", "Alpha Tester", None, "alpha@example.com"))
+        self.shopify.add(customer(44, phone=None, email="alpha@example.com"))
+        self.run_sync("shopify_to_ac2")
+        self.now = T0 + timedelta(days=1)
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual(len(self.ac2.creates), 1)
+        self.assertNotEqual(self.links()[gid(44)], "STAFF44")
+
+    def test_unmatched_at_the_cutoff_is_created_with_the_member_type_and_an_alert(self):
+        self.shopify.add(customer(45))
+        result = self.run_sync("shopify_to_ac2", ac2_create_member_type="GUEST")
+        self.assertEqual([(m, p["member_type"]) for m, p in self.ac2.creates], [(sg(45), "GUEST")])
+        self.assertEqual((result["counts"]["ac2_member_created"], result["counts"]["created_after_wait"]), (1, 1))
+        self.assertIn("created_after_wait", result["alerts"])
+        self.assertNotIn("waiting_for_staff", result["counts"])
+
+    def test_default_member_type_and_cutoff_time(self):
+        config = make_config()
+        self.assertEqual((config.ac2_create_member_type, config.deferred_create_local_time), ("REGISTERED", "06:00"))
+        self.shopify.add(customer(46))
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.ac2.creates[0][1]["member_type"], "REGISTERED")
+
+    def test_cutoff_is_the_next_morning_in_singapore(self):
+        cutoff = sync.deferred_create_cutoff
+        self.assertEqual(cutoff(sgt(21, 23, 30), "06:00"), sgt(22, 6))
+        self.assertEqual(cutoff(sgt(21, 0, 10), "06:00"), sgt(22, 6))  # never the same morning
+        self.assertEqual(cutoff(datetime(2026, 10, 21, 17, 0, tzinfo=timezone.utc), "06:00"), sgt(23, 6))  # 01:00 on the 22nd in Singapore
+        self.assertEqual(cutoff(sgt(21, 10), "09:30"), sgt(22, 9, 30))
+
+    def check_cutoff(self, n: int, signed_up: datetime, before: datetime, at: datetime, **overrides) -> None:
+        self.shopify.add(customer(n, registered=signed_up.astimezone(timezone.utc)))
+        self.now = before
+        self.assertEqual(self.run_sync("shopify_to_ac2", **overrides)["counts"].get("waiting_for_staff"), 1)
+        self.assertEqual(self.ac2.creates, [])
+        self.now = at
+        self.run_sync("shopify_to_ac2", **overrides)
+        self.assertEqual([m for m, _ in self.ac2.creates], [sg(n)])
+
+    def test_late_evening_sign_up_waits_until_six(self):
+        self.check_cutoff(47, sgt(21, 23, 30), sgt(22, 5, 59), sgt(22, 6))
+
+    def test_configured_cutoff_time(self):
+        self.check_cutoff(48, sgt(21, 10), sgt(22, 9, 29), sgt(22, 9, 30), deferred_create_local_time="09:30")
+
+    def test_dry_run_after_the_cutoff_counts_what_would_be_created(self):
+        self.shopify.add(customer(49))
+        result = self.run_sync("shopify_to_ac2", ac2_create_enabled=False)
+        self.assertEqual((result["counts"]["ac2_create_disabled"], result["counts"]["new_member_phone"]), (1, 1))
+        self.assertNotIn("created_after_wait", result["counts"])
+        self.assertNotIn("waiting_for_staff", result["counts"])
+
+    def test_settings_are_validated(self):
+        for value in ("6:00", "24:00", "06:60", "06:00 ", 600, None):
+            with self.subTest(time=value), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(deferred_create_local_time=value)
+            self.assertEqual(caught.exception.code, "sync_config_deferred_create_local_time_invalid")
+        for value in ("", "A B", "X" * 21, "GUÉST", "-GUEST", None, 1):
+            with self.subTest(member_type=ascii(value)), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(ac2_create_member_type=value)
+            self.assertEqual(caught.exception.code, "sync_config_ac2_create_member_type_invalid")
+        self.assertEqual(make_config(ac2_create_member_type="Default").ac2_create_member_type, "Default")
+
+    def test_the_sync_has_no_way_to_change_an_existing_member(self):
+        # Owner: never change MemberType (or anything) on a member staff created.
+        bridge = (ROOT / "scripts" / "ac2_directlocal_member_bridge.ps1").read_text(encoding="utf-8")
+        operations = re.search(r'ValidateSet\(([^)]*)\)\]\[string\]\$Operation', bridge).group(1)
+        self.assertEqual(sorted(re.findall(r'"([a-z-]+)"', operations)),
+                         sorted(["book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog"]))
+        source = (ROOT / "directlocal" / "xb_member_sync.py").read_text(encoding="utf-8")
+        self.assertNotRegex(source, r"(?i)update_?member|edit_?member|change_?member_?type")
+        member_script = (ROOT / "scripts" / "ac2_member_sync_member.ps1").read_text(encoding="utf-8")
+        self.assertEqual((member_script.count(".SaveMember("), member_script.count(".NewMember(")), (1, 1))
+
+
+class PossibleDuplicateTests(SyncTestCase):
+    """Round 6: a staff-created member that appears after the sync created
+    one for the same person (same phone, name rule) raises an alert; nothing
+    is merged, linked or written."""
+
+    def created_by_sync(self, n: int) -> str:
+        self.shopify.add(customer(n, first="Mary Ann", last="Lee"))
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual(len(self.ac2.creates), 1)
+        return self.ac2.creates[0][0]
+
+    def test_a_later_staff_member_for_the_same_person_is_flagged(self):
+        member_no = self.created_by_sync(50)
+        self.ac2.add(sync.Ac2Member("STAFF50", "MARY ANN LEE", local(50)))
+        self.now += timedelta(hours=2)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertIn("possible_duplicate_member", result["alerts"])
+        self.assertEqual(result["counts"]["possible_duplicate_member"], 1)
+        self.assertEqual((len(self.ac2.creates), self.links()), (1, {gid(50): member_no}))
+
+    def test_another_name_on_the_phone_is_not_flagged(self):
+        self.created_by_sync(51)
+        self.ac2.add(sync.Ac2Member("STAFF51", "John Lim", local(51)))
+        self.now += timedelta(hours=2)
+        self.assertNotIn("possible_duplicate_member", self.run_sync("shopify_to_ac2")["counts"])
+
+    def test_the_watch_ends_after_seven_days(self):
+        self.created_by_sync(52)
+        self.ac2.add(sync.Ac2Member("STAFF52", "MARY ANN LEE", local(52)))
+        self.now += timedelta(days=8)
+        self.assertNotIn("possible_duplicate_member", self.run_sync("shopify_to_ac2")["counts"])
+
+    def test_a_changelog_insert_for_a_sync_created_customer_is_flagged(self):
+        self.run_sync("ac2_to_shopify")  # watermark
+        self.created_by_sync(53)
+        self.run_sync("ac2_to_shopify")  # our own insert: loop prevention
+        self.ac2.add(sync.Ac2Member("STAFF53", "MARY ANN LEE", local(53)), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertIn("possible_duplicate_member", result["alerts"])
+        self.assertEqual(self.shopify.created, [])
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM ac2_pending WHERE member_no = 'STAFF53'").fetchone()[:], ("SKIPPED", "possible_duplicate_member"))
 
 
 if __name__ == "__main__":

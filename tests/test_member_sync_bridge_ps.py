@@ -463,7 +463,7 @@ class SyncBridgeTests(unittest.TestCase):
 
     def test_sync_p1_create_registered_no_expiry_month_dob(self):
         fence = "fence-" + "a" * 32
-        payload = {"profile": "sync_p1", "name": "Alpha Tester", "mobile_phone": sg(4), "email_address": "alpha@example.com", "register_date": "2026-10-21", "dob": "2000-07-01"}
+        payload = {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Alpha Tester", "mobile_phone": sg(4), "email_address": "alpha@example.com", "register_date": "2026-10-21", "dob": "2000-07-01"}
         code, out, proc = self.run_bridge("write-once", self.write_request(fence, payload, sg(4)), *self.write_args(fence))
         self.assertEqual((code, out), (0, {"save_invocation_count": 1, "readback_found": True, "readback_match": True, "outbound_queue_changed": False}))
         member = self.fake()["members"][0]
@@ -475,7 +475,7 @@ class SyncBridgeTests(unittest.TestCase):
 
     def test_sync_p1_without_birthday_or_phone(self):
         fence = "fence-" + "b" * 32
-        payload = {"profile": "sync_p1", "name": "Echo Tester", "mobile_phone": None, "email_address": None, "register_date": "2026-10-21", "dob": None}
+        payload = {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Echo Tester", "mobile_phone": None, "email_address": None, "register_date": "2026-10-21", "dob": None}
         code, out, _ = self.run_bridge("write-once", self.write_request(fence, payload, "ECHOTESTER"), *self.write_args(fence))
         self.assertEqual(code, 0, out)
         self.assertTrue(out["readback_match"])
@@ -485,7 +485,7 @@ class SyncBridgeTests(unittest.TestCase):
     def test_sync_p1_refuses_a_held_number_before_the_claim(self):
         self.set_state(members=[{"MemberNo": sg(8), "Name": "Kilo Other"}])
         fence = "fence-" + "e" * 32
-        payload = {"profile": "sync_p1", "name": "Alpha Tester", "mobile_phone": sg(8), "email_address": None, "register_date": "2026-10-21", "dob": None}
+        payload = {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Alpha Tester", "mobile_phone": sg(8), "email_address": None, "register_date": "2026-10-21", "dob": None}
         code, out, _ = self.run_bridge("write-once", self.write_request(fence, payload, sg(8)), *self.write_args(fence))
         self.assertEqual((code, out), (1, {"error": "member_no_taken"}))
         self.assertEqual(self.fake()["saves"], 0)
@@ -493,13 +493,31 @@ class SyncBridgeTests(unittest.TestCase):
 
     def test_sync_p1_refuses_a_full_birth_date_and_unknown_profile(self):
         for letter, payload, error in (
-            ("c", {"profile": "sync_p1", "name": "Alpha", "mobile_phone": None, "email_address": None, "register_date": "2026-10-21", "dob": "1990-07-15"}, "member_date_invalid"),
+            ("c", {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Alpha", "mobile_phone": None, "email_address": None, "register_date": "2026-10-21", "dob": "1990-07-15"}, "member_date_invalid"),
             ("d", {"profile": "other", "name": "Alpha", "register_date": "2026-10-21"}, "member_field_not_allowed"),
         ):
             fence = "fence-" + letter * 32
             code, out, _ = self.run_bridge("write-once", self.write_request(fence, payload, "ALPHA"), *self.write_args(fence))
             self.assertEqual((code, out), (1, {"error": error}))
         self.assertEqual(self.fake()["saves"], 0)
+
+    def test_sync_p1_member_type_is_the_configured_code(self):
+        # Round 6: the sync's MemberType comes from ac2_create_member_type
+        # (validated here too); it is never a caller field on the member.
+        base = {"profile": "sync_p1", "name": "Alpha Tester", "mobile_phone": None, "email_address": None, "register_date": "2026-10-21", "dob": None}
+        for digit, member_type, error in (("1", "BAD TYPE", "member_type_invalid"), ("2", "GU" + chr(0xC9) + "ST", "member_type_invalid"), ("3", "X" * 21, "member_type_invalid"), ("4", None, "member_field_required")):
+            with self.subTest(member_type=ascii(member_type)):
+                fence = "fence-" + digit * 32
+                payload = dict(base) if member_type is None else {**base, "member_type": member_type}
+                code, out, _ = self.run_bridge("write-once", self.write_request(fence, payload, "ALPHA" + digit), *self.write_args(fence))
+                self.assertEqual((code, out), (1, {"error": error}))
+                self.assertFalse((self.claims / f"{fence}.claim").exists())  # refused before the claim
+        self.assertEqual(self.fake()["saves"], 0)
+        fence = "fence-" + "5" * 32
+        code, out, _ = self.run_bridge("write-once", self.write_request(fence, {**base, "member_type": "GUEST"}, "ALPHA5"), *self.write_args(fence))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["readback_match"])
+        self.assertEqual(self.fake()["members"][0]["MemberType"], "GUEST")
 
     def test_production_book_refused_by_entrypoint(self):
         direct = [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(BRIDGE)]
@@ -515,7 +533,7 @@ class SyncBridgeTests(unittest.TestCase):
         client.autocount_book = None  # the marked fake host takes no -TargetBook (test-only)
         self.assertEqual([m.member_no for m in client.lookup(sg(6), [])], [sg(6)])
         self.assertEqual(client.changelog_inserts(None, 10, "XmlData"), ([(5, "<Member/>")], 9))
-        payload = {"profile": "sync_p1", "name": "Bravo Tester", "mobile_phone": sg(7), "email_address": None, "register_date": "2026-10-21", "dob": "2000-01-01"}
+        payload = {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Bravo Tester", "mobile_phone": sg(7), "email_address": None, "register_date": "2026-10-21", "dob": "2000-01-01"}
         self.assertEqual(client.create_member(sg(7), payload, write_id="write-" + "e" * 32), ("CREATED_VERIFIED", None))
         self.assertEqual(self.fake()["saves"], 1)
 

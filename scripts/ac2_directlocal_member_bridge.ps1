@@ -232,6 +232,10 @@ function Invoke-XbDirectLocalWriteOnce {
             RegisterDate = [string]$payload.register_date
         }
         if ($null -ne $payload.dob) { $member.DOB = [string]$payload.dob }
+        # Round 6: the configured member type, checked before any session.
+        if ($null -eq $payload.PSObject.Properties["member_type"] -or $null -eq $payload.member_type) { throw "member_field_required" }
+        $memberType = [string]$payload.member_type
+        Assert-XbSyncMemberType -MemberType $memberType
     }
     elseif ($profile -ceq "shopify_m1") {
         $member = @{
@@ -269,7 +273,7 @@ function Invoke-XbDirectLocalWriteOnce {
     finally { $stream.Dispose() }
 
     if ($profile -ceq "sync_p1") {
-        $created = New-XbSyncAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter
+        $created = New-XbSyncAutoCountMember -Session $session -Member $member -MemberType $memberType -EnableProductionAdapter:$EnableProductionAdapter
         $check = Compare-XbSyncMemberReadBack -Expected $created.Expected -Actual $created.ReadBack
     }
     else {

@@ -26,5 +26,7 @@
   "changelog_overlap": 50,
   "max_shopify_customers_per_run": 20,
   "shopify_max_pages": 10,
-  "http_timeout_seconds": 30
+  "http_timeout_seconds": 30,
+  "deferred_create_local_time": "06:00",
+  "ac2_create_member_type": "REGISTERED"
 }
