@@ -282,7 +282,14 @@ Unknown keys, at the top level or nested, are refused.
 - SQL allowlist (G2 H1): `Get-XbDlScalar` in
   `scripts/ac2_directlocal_book_guard.ps1` (not a pinned worker script, so
   hardened in place for every caller, main's included) sends only pinned
-  texts. First a deny check on every text, case-insensitive: `;`, `--`, `/*`,
+  texts. First an ASCII gate (G2 LOW-1): every pinned text and both
+  templates are one line of printable ASCII (U+0020-U+007E; U+0020 is the
+  only whitespace, no tab, CR or LF), so a text with any other character
+  (for example U+00AD, NUL, U+200B, U+200D, U+FEFF, U+00A0 or a line break)
+  is refused before any other check (`vendor_query_not_ascii`). Every exact
+  comparison is ordinal (`[string]::Equals(..., Ordinal)`), because
+  PowerShell's `-ccontains` and `-ceq` are culture-aware and ignore
+  characters such as U+00AD. Then a deny check on every text, case-insensitive: `;`, `--`, `/*`,
   `*/`, `EXEC`, `EXECUTE`, `TRUNCATE`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
   `DROP`, `ALTER`, `CREATE`, `GRANT`, `REVOKE`, `DENY`, `INTO`, `DBCC`,
   `SHUTDOWN`, `KILL`, `BACKUP`, `RESTORE`, `BULK`, `OPENROWSET`,
@@ -452,6 +459,64 @@ memory, injected only into the child, never printed), but from Credential
 Manager as the Owner decided; EnergyGrid itself uses a DPAPI CLIXML file.
 The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
 
+### Releasing a customer held by an open write
+
+There is no release command (checked at `017ec98`): the CLI has only
+`check-config`, `init`, `run`, `status` and `check-credential`; the ledger
+triggers forbid deleting a `writes` row and allow `UNCERTAIN` to become only
+`RESOLVED`, which only a run sets (`_resolve_uncertain`) when the member
+found under that MemberNo has the intended identity (G2 B2). Crash recovery
+(`_recover_crashed_intents`) and `_create_in_ac2` hold the customer while
+the write is `INTENT` or `UNCERTAIN`. A held customer is released only by
+that lookup succeeding:
+
+1. Signs: the alert `customer_held_by_open_write` (or the count
+   `ac2_create_uncertain`); later runs count `uncertain_write_unresolved`;
+   `status` shows `uncertain_writes` above 0.
+2. Wait past the 120-second write-once deadline, with no sync run and no
+   bridge child (`powershell.exe` running the bridge) alive, then run one
+   normal `run --config <config> --direction shopify_to_ac2`. If the save
+   landed, B2 links it (`uncertain_write_resolved_linked`): done.
+3. Still unresolved: list the open writes read-only, in the pre-flight
+   style. The output is private (MemberNos and customer GIDs): keep it on
+   the VM, never paste it into a ticket, PR or chat.
+
+   ```powershell
+   $ledger = "<state_root>\member_sync.sqlite3"
+   python -c "import sqlite3, sys, pathlib; c = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro', uri=True); print(c.execute('SELECT write_id, member_no, customer_gid, created_at, code FROM writes WHERE state = ? AND direction = ?', ('UNCERTAIN', 'shopify_to_ac2')).fetchall())" $ledger
+   ```
+
+4. Check that MemberNo in the AutoCount screens.
+   - Absent: the Owner may (an approved live step) create it by hand under
+     exactly that MemberNo, with the customer's first + last name (the same
+     words in the same order) and phone (none when the customer had no valid
+     phone). The next run links it through B2.
+   - `uncertain_write_identity_mismatch` on the next run means the typed
+     name or phone differs (the Owner corrects it and runs again) or another
+     person holds the number: then never link by hand.
+5. Never edit ledger rows. The pending row stays `SKIPPED`; the link is the
+   record. A customer that stays held is safe: the sync fails closed and
+   never creates a second member.
+
+### UAT checklist
+
+Per UAT run, before any create switch goes on for good:
+
+1. Record `shared_phone_name_fallback` and `shopify_phone_owned_by_other_name`
+   from the run summary's `counts`. `shopify_phone_owned_by_other_name` is
+   counted even while `shopify_create_enabled` is off.
+   `shared_phone_name_fallback` is counted only for an AC2 member actually
+   created (the decision code is added after a verified create); while
+   `ac2_create_enabled` is off the same decision shows only as
+   `ac2_create_disabled` with action `would_create` in `refs`.
+2. Check in AutoCount which of those fallbacks came from a one-word name or
+   initials on either side (for example a Shopify customer with only "Lee",
+   or an AC2 `Name` with an initial), since those never link under the name
+   rule.
+3. Report to the Owner how many second AC2 member records a one-word name
+   created (or, for AC2 -> Shopify, how many separate Shopify customers),
+   before any create switch goes on.
+
 ## Commands
 
 ```powershell
@@ -527,14 +592,25 @@ Round 3 (21 October 2026, fix round 3):
   OK at that moment, deleted straight after.
 - AutoCount login: the Owner's own account, password in Credential Manager.
 
+Round 4 (G2 delta review of `017ec98`), decisions accepted by the Owner:
+
+- (a) The attended E7 test-book script keeps its own SELECT check
+  (`Get-E7Scalar`) for now. A follow-up is **required** before it runs
+  again: the same exact-text set and ASCII gate as `Get-XbDlScalar`.
+- (b) Initials never count toward a name match (exact words only).
+- (c) The H3 trigger "no overlap stored" is kept (not "`changelog_seen`
+  empty", which could treat a real late row as history on a quiet
+  ChangeLog).
+
 ## Open items
 
 Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
 `sa`, see Write safety).
 
-1. Follow-up: the attended E7 test-book script
-   (`scripts/ac2_directlocal_e7_testbook_create.ps1`, unchanged) keeps its own
-   SELECT-only check (`Get-E7Scalar`) without the H1 allowlist.
+1. Required follow-up before the attended E7 test-book script
+   (`scripts/ac2_directlocal_e7_testbook_create.ps1`, unchanged) runs again:
+   give `Get-E7Scalar` the exact-text set and ASCII gate (round 4 decision
+   (a) above).
 2. The `custom.ac2_member_no` metafield as a customer metafield definition in
    Shopify admin, so staff can see it.
 3. Shopify's customer search syntax for a phone (`phone:+<digits>`), checked
