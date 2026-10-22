@@ -1,7 +1,7 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
 Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-fix round 3). Nothing here has run against AutoCount or Shopify. Every write
+round 6). Nothing here has run against AutoCount or Shopify. Every write
 switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
 null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Only the test book
@@ -20,7 +20,7 @@ Tests: `tests/test_member_sync.py`, `tests/test_member_sync_bridge_ps.py`.
 
 | Direction | Trigger | Result |
 |---|---|---|
-| Shopify -> AC2 | A customer tagged `member-mg` whose registration instant (`membership.start_date` metafield `createdAt`) is at or after `shopify_cutover_utc` | An AC2 member, or a link to an existing one |
+| Shopify -> AC2 | A customer tagged `member-mg` whose registration instant (`membership.start_date` metafield `createdAt`) is at or after `shopify_cutover_utc` | A link to the member staff create by hand; only if none matches by the next-morning cutoff, an AC2 member created by the sync (with an alert) |
 | AC2 -> Shopify | A `dbo.ChangeLog` insert (`TableName = 'Member'`, `ChangeType = 'I'`) after the stored `ID` watermark, for example a member created at the till | A Shopify customer, or a link to an existing one |
 
 Both directions write the mapping (Shopify customer GID <-> MemberNo, each
@@ -28,12 +28,51 @@ unique) to the sync ledger. That mapping is the loop prevention: an AC2
 insert for a mapped MemberNo, or for a MemberNo with an open write, is never
 sent to Shopify; a mapped customer is never sent to AC2.
 
+### Shopify -> AC2: staff first, deferred create (Owner, 22 Oct 2026)
+
+Shop staff keep creating members by hand in AC2 from the existing Google
+Sheet that the sign-up form fills, and choose Member or Guest themselves.
+Online and in-shop customers use the same sign-up form, so the sync cannot
+tell them apart. Therefore:
+
+1. **Link first.** A new sign-up is not created in AC2 straight away. Every
+   run looks it up again (it stays a pending customer) for an AC2 member with
+   the same phone and the name rule below (at least 2 matching words;
+   initials never count) and links it: no AC2 write (`phone_and_name_match`).
+   Email never links.
+2. **Wait.** Before the cutoff, an unmatched sign-up is only counted
+   (`waiting_for_staff`, pending code `waiting_for_staff`); nothing is
+   written and `GetNextMemberNo` is not called.
+3. **Deferred create.** The cutoff is `deferred_create_local_time` (default
+   `06:00`, Asia/Singapore, which is UTC+8 all year) on the day after the
+   sign-up's Singapore date, never the same morning (a sign-up at 00:10 waits
+   until 06:00 the next day). A sign-up still unmatched at the cutoff is
+   created by the sync with the member type `ac2_create_member_type`
+   (default `REGISTERED`, the test book's type), under the numbering and
+   matching rules below, and raises the alert `created_after_wait` (the run
+   exits 3). With `ac2_create_enabled` off it is counted only
+   (`ac2_create_disabled` plus the decision code).
+4. **Never change a staff member.** The sync has no update path at all: it
+   only links to a member staff made, and never changes its MemberType or any
+   other field (the bridge has no update operation; static test).
+5. **Possible duplicates.** All duplicate guards stay. When a member staff
+   make appears AFTER the sync already created one for the same person (same
+   phone, name rule), the sync raises the alert `possible_duplicate_member`
+   and merges, links or writes nothing:
+   - Shopify -> AC2 runs re-check the members this sync created in the last
+     7 days (at most 10 per run; read-only lookups by MemberNo and phone);
+   - AC2 -> Shopify (when ChangeLog reads are on) flags the staff insert
+     whose Shopify customer is already linked to a sync-created member
+     (pending code `possible_duplicate_member`).
+   A member created without a phone cannot be checked (phone is the only
+   key; email never links).
+
 ### Shopify -> AC2 create
 
 | AC2 field | Value |
 |---|---|
 | MemberNo | The phone in digits (numbering rules below). Without a usable phone: AutoCount's own `GetNextMemberNo` number. |
-| MemberType | `REGISTERED` (test book type, upper case) |
+| MemberType | `ac2_create_member_type` (default `REGISTERED`, the test book's type); validated in Python and in the bridge (`member_type_invalid`) |
 | Name | Shopify first name + last name |
 | MobilePhone | The same digits, or NULL |
 | EmailAddress | Shopify default email, or NULL |
@@ -62,6 +101,9 @@ sent to Shopify; a mapped customer is never sent to AC2.
   accepted choice.
 
 ### Matching rules (no review queue)
+
+Before the cutoff (above) every CREATE row below is `waiting_for_staff`
+instead; after it, every create also raises `created_after_wait`.
 
 | Situation | Action | Counted as |
 |---|---|---|
@@ -262,6 +304,8 @@ Unknown keys, at the top level or nested, are refused.
 | `max_shopify_customers_per_run` | `20` | 1-100 |
 | `shopify_max_pages` | `10` | 1-40 |
 | `http_timeout_seconds` | `30` | 5-60 |
+| `deferred_create_local_time` | `"06:00"` | Round 6: `HH:MM` (00:00-23:59) in Asia/Singapore on the day after sign-up; before it an unmatched sign-up waits for staff |
+| `ac2_create_member_type` | `"REGISTERED"` | Round 6: the AutoCount member type of a member the sync creates (1-20 of `A-Z a-z 0-9 _ -`, starting with a letter or digit). The test book type is `REGISTERED`; production uses other codes (a production change is E9) |
 
 ## What stays switched off
 
@@ -317,6 +361,11 @@ Unknown keys, at the top level or nested, are refused.
   of the intended person's normalised name and phone; no name or phone is
   stored in plain text. The name is normalised by the name rule's helper
   (case, spacing, punctuation), keeping the words in order.
+- Round 6: the sync never changes an existing AC2 member (no update
+  operation exists); a member staff made is only linked. A sync create comes
+  only after the staff wait and raises `created_after_wait`; a later staff
+  member for the same person raises `possible_duplicate_member` and is never
+  merged.
 - One customer, one open write (G2 H2): a Shopify -> AC2 create is refused
   while a write for the same customer is `INTENT` or `UNCERTAIN` (alert and
   count `customer_held_by_open_write`; the pending row becomes `SKIPPED` and
@@ -379,6 +428,15 @@ Unknown keys, at the top level or nested, are refused.
   recording new registrations once `max_shopify_customers_per_run` (20)
   are pending, and AC2 -> Shopify re-reads the same first 20 pending
   members each run. Dry-run and UAT counts therefore under-report.
+- Waiting customers (round 6) stay in the Shopify -> AC2 pending list until
+  they are linked or created (about a day). More than
+  `max_shopify_customers_per_run` (20) at once delays recording new sign-ups
+  until the list drains (the watermark does not advance while the budget is
+  spent). Each waiting customer costs one AC2 lookup per run.
+- A sign-up without a usable phone can never be linked to a staff member
+  (email never links), so it is created after the cutoff even if staff made
+  one, and that duplicate cannot be detected. Staff should not make members
+  for sign-ups without a phone, or the Owner accepts these duplicates.
 - MemberNo as the phone (AC2 -> Shopify, only when MobilePhone gives none;
   Owner Q3):
 
@@ -459,6 +517,21 @@ memory, injected only into the child, never printed), but from Credential
 Manager as the Owner decided; EnergyGrid itself uses a DPAPI CLIXML file.
 The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
 
+### Waiting customers, deferred creates and possible duplicates (round 6)
+
+- `waiting_for_staff` in a run's counts is normal: a sign-up not yet matched
+  to a staff-made member. It is linked as soon as staff make the member with
+  the same phone and the same name (at least 2 matching words, no initials).
+- `created_after_wait` (alert): the sync created a member after the cutoff.
+  Tell staff not to make that customer by hand any more.
+- `possible_duplicate_member` (alert): staff made a member after the sync
+  created one for the same person. Nothing was merged. The Owner decides in
+  the AutoCount screens which record to keep; the sync never deletes or
+  merges. The Shopify -> AC2 alert repeats on every run for up to 7 days
+  after the sync's create while both records exist.
+- The pending list is private ledger data; read it only on the VM (the
+  read-only query style of the pre-flight step).
+
 ### Releasing a customer held by an open write
 
 There is no release command (checked at `017ec98`): the CLI has only
@@ -527,6 +600,12 @@ Per UAT run, before any create switch goes on for good:
 3. Report to the Owner how many second AC2 member records a one-word name
    created (or, for AC2 -> Shopify, how many separate Shopify customers),
    before any create switch goes on.
+4. Round 6: record `waiting_for_staff`, `phone_and_name_match`,
+   `created_after_wait` and `possible_duplicate_member`. Check at least one
+   sign-up that staff made by hand before the cutoff (it must be linked, with
+   no AC2 write and its MemberType unchanged) and one left unmatched (it must
+   wait until the cutoff, then be created with `ac2_create_member_type`).
+   Report how many sign-ups staff did not make by the cutoff.
 
 ## Commands
 
@@ -613,6 +692,14 @@ Round 4 (G2 delta review of `017ec98`), decisions accepted by the Owner:
   empty", which could treat a real late row as history on a quiet
   ChangeLog).
 
+Round 6 (22 October 2026): shop staff keep creating members by hand in AC2
+from the Google Sheet the sign-up form fills, choosing Member or Guest; the
+sync links first, waits until the next morning (06:00 Asia/Singapore,
+configurable) and only then creates an unmatched sign-up with a configurable
+member type and the alert `created_after_wait`; it never changes a member
+staff made, never links on email, and alerts `possible_duplicate_member`
+when staff make a member after the sync created one.
+
 ## Open items
 
 Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
@@ -641,3 +728,15 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    SQL texts the guard sends are ASCII-gated and ordinal
    (round 4). The fix (ordinal compares) stays a later, separately approved
    change.
+5. Staff sign-up Sheet (round 6, from issue #225; read-only, no live check):
+   sign-ups reach the staff Google Sheet through Shopify Flow (Shopify
+   member form -> Shopify Flow -> tab `Members (from Shopify)`), with the
+   headers `Phone`, `First name`, `Email`, `Start date`, `Expiry date`,
+   `Birthday month`, `Email consent`. The Phone column's format (for example
+   whether it shows `65` + 8 digits like the AC2 MemberNo) is not recorded
+   anywhere in the repository or the issue: check the Flow's Sheets action
+   and one row on the VM. The Sheet shows only `First name`: if staff type
+   only that one word as the AC2 `Name`, the name rule (at least 2 words)
+   can never link it and the sync creates a second member at the cutoff
+   (`possible_duplicate_member` then needs both names to match, so it may not
+   fire). Owner to confirm what staff type as `Name` before UAT.
