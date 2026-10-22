@@ -1656,5 +1656,63 @@ class H3ChangeLogOverlapBaselineTests(SyncTestCase):
         self.assertNotIn("changelog_overlap_baselined", result["counts"])
 
 
+class DryRunFallbackCountTests(SyncTestCase):
+    """Round 5 (Owner-approved): with ac2_create_enabled off, the summary
+    counts show how many creates WOULD use a fallback MemberNo, and how many
+    of those come from a one-word name or an initial (UAT checklist)."""
+
+    def register(self, ac2_name: str, first: str, last: str | None, **overrides) -> dict:
+        self.ac2.add(sync.Ac2Member(sg(30), ac2_name, None))
+        self.shopify.add(customer(30, first=first, last=last))
+        return self.run_sync("shopify_to_ac2", **overrides)
+
+    def test_dry_run_counts_the_name_fallback(self):
+        counts = self.register("MARY ANN LEE", "Mary", "Tan", ac2_create_enabled=False)["counts"]
+        self.assertEqual((counts["shared_phone_name_fallback"], counts["ac2_create_disabled"]), (1, 1))
+        self.assertNotIn("name_fallback_one_word", counts)
+        self.assertNotIn("name_fallback_initial", counts)
+        self.assertEqual(self.ac2.creates, [])
+
+    def test_dry_run_counts_a_one_word_name_fallback(self):
+        counts = self.register("MARY ANN LEE", "Lee", None, ac2_create_enabled=False)["counts"]
+        self.assertEqual((counts["shared_phone_name_fallback"], counts["name_fallback_one_word"]), (1, 1))
+        self.assertEqual(self.ac2.creates, [])
+
+    def test_dry_run_counts_an_initial_fallback(self):
+        counts = self.register("Alpha T", "Alpha", "Tester", ac2_create_enabled=False)["counts"]
+        self.assertEqual((counts["shared_phone_name_fallback"], counts["name_fallback_initial"]), (1, 1))
+        self.assertNotIn("name_fallback_one_word", counts)
+
+    def test_dry_run_counts_the_digit_fallback(self):
+        counts = self.register("Charlie Holder", CJK_NAME, None, ac2_create_enabled=False)["counts"]
+        self.assertEqual((counts["shared_phone_digit_fallback"], counts["name_fallback_one_word"]), (1, 1))
+
+    def test_dry_run_counts_new_phone_and_generator_creates(self):
+        self.shopify.add(customer(31))
+        self.shopify.add(customer(32, phone=None))
+        counts = self.run_sync("shopify_to_ac2", ac2_create_enabled=False)["counts"]
+        self.assertEqual((counts["new_member_phone"], counts["no_phone_generator_member_no"], counts["ac2_create_disabled"]), (1, 1, 2))
+        self.assertEqual(self.ac2.generator_calls, 0)  # still never called while writes are off
+
+    def test_switch_on_counts_are_unchanged_apart_from_the_reason(self):
+        counts = self.register("MARY ANN LEE", "Lee", None)["counts"]
+        self.assertEqual((counts["ac2_member_created"], counts["shared_phone_name_fallback"], counts["name_fallback_one_word"]), (1, 1, 1))
+        self.assertNotIn("ac2_create_disabled", counts)
+
+    def test_write_cap_refusal_with_the_switch_on_counts_no_decision(self):
+        counts = self.register("MARY ANN LEE", "Lee", None, max_writes_per_run=0)["counts"]
+        self.assertEqual(counts["max_writes_per_run_reached"], 1)
+        self.assertNotIn("shared_phone_name_fallback", counts)
+        self.assertNotIn("name_fallback_one_word", counts)
+
+    def test_ac2_to_shopify_counts_a_one_word_name_while_create_is_off(self):
+        self.run_sync("ac2_to_shopify")
+        self.shopify.add(customer(33, first="Lee", last=None, tags=()))
+        self.ac2.add(sync.Ac2Member("TILL33", "MARY ANN LEE", sg(33)), log=True)
+        counts = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)["counts"]
+        self.assertEqual((counts["shopify_phone_owned_by_other_name"], counts["name_fallback_one_word"], counts["shopify_create_disabled"]), (1, 1, 1))
+        self.assertEqual(self.shopify.created, [])
+
+
 if __name__ == "__main__":
     unittest.main()

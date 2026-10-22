@@ -62,7 +62,7 @@ import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
@@ -492,6 +492,23 @@ class Decision:
     action: str  # LINK | CREATE | SKIP
     code: str
     member_no: str | None = None
+    notes: tuple[str, ...] = ()  # counted with the code (UAT visibility only)
+
+
+def name_fallback_notes(name: Any, others: Iterable[Any]) -> tuple[str, ...]:
+    """Counters for a same-phone pair that did not link, so UAT can see the
+    fallbacks a short name caused (round 5): ``name_fallback_one_word`` when
+    either side has fewer than 2 words (it can never link, r3a), and
+    ``name_fallback_initial`` when either side has a one-character word (an
+    initial never matches a full word). Counts only; no decision changes."""
+
+    word_sets = [name_words(value) for value in (name, *others)]
+    notes = []
+    if any(len(words) < MIN_NAME_WORDS for words in word_sets):
+        notes.append("name_fallback_one_word")
+    if any(len(word) == 1 for words in word_sets for word in words):
+        notes.append("name_fallback_initial")
+    return tuple(notes)
 
 
 def _phone_hit(member: Ac2Member, digits: str) -> bool:
@@ -533,11 +550,12 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
         return Decision("SKIP", "phone_on_multiple_records")
     if not hits:
         return Decision("CREATE", "new_member_phone", phone_digits)
+    notes = name_fallback_notes(full_name, [r.name for r in hits])
     member_no = fallback_member_no(phone_digits, customer.first_name, customer.last_name)
     if member_no is None:
         # Owner round 2, Q1: no Latin letters -> phone + first free digit 2-9.
-        return Decision("CREATE", "shared_phone_digit_fallback", phone_digits)
-    return Decision("CREATE", "shared_phone_name_fallback", member_no)
+        return Decision("CREATE", "shared_phone_digit_fallback", phone_digits, notes)
+    return Decision("CREATE", "shared_phone_name_fallback", member_no, notes)
 
 
 # --------------------------------------------------------------------------
@@ -1017,7 +1035,7 @@ class SyncEngine:
                 return
             if member_no != decision.member_no and decision.code == "shared_phone_name_fallback":
                 self.summary.count("shared_phone_suffix_digit")
-            decision = Decision(decision.action, decision.code, member_no)
+            decision = replace(decision, member_no=member_no)
         member_ref = self.ledger.ref("m", member_no_key(member_no))
         linked = self.ledger.link_for_member(member_no)
         if linked is not None:
@@ -1112,6 +1130,10 @@ class SyncEngine:
         except WriteRefused as refused:
             self._shopify_pending(gid, "PENDING", refused.code)
             self.summary.count(refused.code, member_ref, "would_create")
+            if refused.code == "ac2_create_disabled":
+                # Dry run (round 5): count the MemberNo rule this create would
+                # use, as a real create counts it; nothing else changes.
+                self._count_decision(decision)
             return
         if member_no is None:
             # Allocated only when the write will really start.
@@ -1140,13 +1162,18 @@ class SyncEngine:
         if state == "CREATED_VERIFIED":
             self._shopify_pending(gid, "DONE", decision.code)
             self.summary.count("ac2_member_created", member_ref, "create")
-            self.summary.count(decision.code)
+            self._count_decision(decision)
         elif state == "NOT_WRITTEN_PROVEN":
             self._shopify_pending(gid, "PENDING", "ac2_not_written")
             self.summary.count("ac2_create_not_written", member_ref)
         else:
             self._shopify_pending(gid, "SKIPPED", "ac2_write_uncertain")
             self.summary.count("ac2_create_uncertain", member_ref)
+
+    def _count_decision(self, decision: Decision) -> None:
+        self.summary.count(decision.code)
+        for note in decision.notes:
+            self.summary.count(note)
 
     # -- AC2 -> Shopify ----------------------------------------------------------
     def ac2_to_shopify(self) -> None:
@@ -1294,6 +1321,8 @@ class SyncEngine:
                     # another person. Shopify phones are unique, so the
                     # separate customer is created without the phone; never linked.
                     self.summary.count("shopify_phone_owned_by_other_name")
+                    for note in name_fallback_notes(member.name, [shopify_full_name(customer.first_name, customer.last_name)]):
+                        self.summary.count(note)
                     self._create_in_shopify(member, None, key, ref)
                 elif self.ledger.link_for_gid(customer.gid) is not None:
                     self._ac2_done(key, "SKIPPED", "shopify_customer_linked_to_other_member")
