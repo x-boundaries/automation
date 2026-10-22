@@ -1,7 +1,7 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
 Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-round 7c). Nothing here has run against AutoCount or Shopify. Every write
+round 8). Nothing here has run against AutoCount or Shopify. Every write
 switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
 null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Only the test book
@@ -38,9 +38,12 @@ use the name (round 7). Therefore:
 
 0. **Existing customers first (round 7c).** Before any of this, the
    one-off initial link (below) links every Shopify customer made before the
-   cutover to the AC2 member whose MemberNo is their phone. Shopify -> AC2
-   reads and writes nothing (alert `initial_link_not_complete`) until an
-   applied initial link has completed a full pass.
+   cutover to the AC2 member whose MemberNo is their phone. Until an applied
+   initial link has completed a full pass, Shopify -> AC2 reads no sign-ups
+   and makes no link or create (alert `initial_link_not_complete`). The run's
+   start-up housekeeping still runs before that check: crashed `INTENT` rows
+   become `UNCERTAIN` and earlier unclear writes are looked up (none can
+   exist on a fresh ledger before the hold opens).
 1. **Link first.** A new sign-up is not created in AC2 straight away. Every
    run looks it up again (it stays a pending customer); no link writes to
    AC2. Email never links.
@@ -145,7 +148,7 @@ instead; after it, every create also raises `created_after_wait`.
 
 | Situation | Action | Counted as |
 |---|---|---|
-| Round 7c: Shopify -> AC2 before an applied initial link has completed | Nothing read or written | `initial_link_not_complete` (alert) |
+| Round 7c: Shopify -> AC2 before an applied initial link has completed | No sign-up read, no link, no create (start-up housekeeping of earlier writes still runs) | `initial_link_not_complete` (alert) |
 | Round 7: an AC2 MemberNo is exactly the phone (round 7c: `65` + 8 digits or the 8 digits), and its `CreatedTime` is within `memberno_link_window_minutes` of the sign-up time (`registration_at`, either way) | Link, no create; name not used | `memberno_and_created_time_match` |
 | Round 7c: both forms of the number are MemberNos in AC2 | No link, no create (pending `SKIPPED`); alert | `memberno_conflict` |
 | Round 7: that MemberNo exists, outside the window | No link, no create (pending `SKIPPED`); alert with the MemberNo masked to its last 3 characters | `memberno_exists_outside_window` |
@@ -295,7 +298,33 @@ against Shopify split and whole (stayed separate).
    limits for the shapes).
 7. The member is looked up in Shopify by phone. The search result is only a
    candidate list: a node whose own phone does not normalise to the same
-   digits, or has no phone, is dropped before any decision (G2 B1). Then:
+   digits, or has no phone, is dropped before any decision (G2 B1).
+
+   **Round 8 (G2 H1): a staff-keyed member is never a second Shopify
+   customer.** When the member's MemberNo is exactly that phone (`65` + 8
+   digits or the 8 digits, as Shopify -> AC2 uses), AC2 -> Shopify never
+   creates a Shopify customer for it and never judges it by name:
+   - the Shopify customer is found by the phone search or, if the search
+     does not show it yet, among the pending sign-ups of this ledger (read
+     once per run, at most `max_pending_rechecks_per_run`; more pending than
+     that and no match: held, alert `ac2_member_held_for_sign_up`);
+   - already linked to another member: alert
+     `shopify_customer_linked_to_other_member` (or `possible_duplicate_member`
+     when the sync created that member), never merged;
+   - otherwise the Shopify -> AC2 rule decides: `CreatedTime` within
+     `memberno_link_window_minutes` of the customer's sign-up time
+     (`registration_at`) links (`memberno_and_created_time_match`); farther
+     apart: alert `memberno_exists_outside_window`, no link, no create; a
+     missing time: alert `created_time_missing`;
+   - a sign-up whose `start_date` metafield is not readable yet is held
+     (pending `held_for_sign_up`, alert `ac2_member_held_for_sign_up`) for
+     the same bounded wait as Shopify -> AC2 (`REGISTRATION_WAIT_MAX_CHECKS`,
+     5 runs); after that `Customer.createdAt` stands in, as it does there. A
+     Shopify -> AC2 run in between usually links it first, and AC2 ->
+     Shopify then finds the member linked (`ac2_already_linked`).
+
+   Otherwise (a MemberNo that is not the phone, for example a till number
+   with the phone in MobilePhone), unchanged:
    - one customer, name rule matches: link (`shopify_phone_and_name_match`);
    - one customer, name rule does not match: a different person (Owner,
      21 October 2026). Never linked. A separate customer is created
@@ -350,7 +379,8 @@ Unknown keys, at the top level or nested, are refused.
 | `changelog_xml_column` | `null` | Owner Q4: off. AC2 -> Shopify then reads no ChangeLog and makes no links. Set to `"Content"` (VM fact r5-1) at UAT, deliberately, after the name rule is confirmed; Shopify creates still need `shopify_create_enabled` |
 | `changelog_batch` | `200` | 1-500 new rows per run |
 | `changelog_overlap` | `50` | 0-200 (below `changelog_batch`); IDs re-read below the watermark; 0 = no overlap |
-| `max_shopify_customers_per_run` | `20` | 1-100 |
+| `max_shopify_customers_per_run` | `20` | 1-100. Round 8: new sign-ups only; pending ones never use it |
+| `max_pending_rechecks_per_run` | `100` | Round 8 (G2 M1): 1-500 pending sign-ups re-checked per run, oldest first, outside the budget above; more pending than this: alert `shopify_pending_backlog` (the rest wait for the next run) |
 | `shopify_max_pages` | `10` | 1-40 |
 | `http_timeout_seconds` | `30` | 5-60 |
 | `deferred_create_local_time` | `"06:00"` | Round 6: `HH:MM` (00:00-23:59) in Asia/Singapore on the day after sign-up; before it an unmatched sign-up waits for staff |
@@ -487,15 +517,19 @@ Unknown keys, at the top level or nested, are refused.
 - L4: a MemberNo that merely contains the 8 Singapore digits counts as the
   same phone (the embedded-digits rule, Python `_phone_hit` and the bridge
   `CHARINDEX` condition). Rare, and safe only where that is intended.
-- L5: while writes are off, the pending queues stall: Shopify -> AC2 stops
-  recording new registrations once `max_shopify_customers_per_run` (20)
-  are pending, and AC2 -> Shopify re-reads the same first 20 pending
-  members each run. Dry-run and UAT counts therefore under-report.
+- L5 (round 8, G2 M1): pending Shopify sign-ups (waiting for staff, or
+  past the cutoff while `ac2_create_enabled` is off) are re-checked under
+  their own bound, `max_pending_rechecks_per_run` (100), oldest first, and
+  never use `max_shopify_customers_per_run`, so new sign-ups are always read.
+  More pending than the bound raises `shopify_pending_backlog`; the rest are
+  re-checked in later runs. Each pending sign-up costs one Shopify read and
+  one AC2 lookup per run. A sign-up past the cutoff while creates are off
+  stays pending for good and raises `sign_up_past_cutoff_create_disabled`
+  on every run (with the MemberNo it would get, masked to the last 3
+  characters). AC2 -> Shopify still re-reads the same first 20 pending
+  members each run while its writes are off.
 - Waiting customers (round 6) stay in the Shopify -> AC2 pending list until
-  they are linked or created (about a day). More than
-  `max_shopify_customers_per_run` (20) at once delays recording new sign-ups
-  until the list drains (the watermark does not advance while the budget is
-  spent). Each waiting customer costs one AC2 lookup per run.
+  they are linked or created (about a day).
 - Round 7c: the time link needs the MemberNo to be the phone (`65` + 8
   digits or the 8 digits). A member keyed with the phone only in MobilePhone
   under another MemberNo falls back to the name rule and, without a name
@@ -597,7 +631,8 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
 
 - `waiting_for_staff` in a run's counts is normal: a sign-up not yet matched
   to a staff-made member. It is linked as soon as staff key the member with
-  MemberNo `65` + 8 digits within 10 minutes of the sign-up (round 7), or
+  MemberNo `65` + 8 digits or the 8 digits (round 7c) within 10 minutes of
+  the sign-up (round 7), or
   hold the phone otherwise with the same name (at least 2 matching words, no
   initials).
 - `created_after_wait` (alert): the sync created a member after the cutoff.
@@ -618,6 +653,15 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
   again. Check in AutoCount whether that member is the same person (for
   example a member keyed long after the sign-up); linking by hand is a later, separately approved
   step. `created_time_missing` is handled the same way.
+- Round 8: `ac2_member_held_for_sign_up` (alert): staff keyed a member whose
+  MemberNo is a sign-up's phone, but the sign-up time is not readable yet;
+  usually the next run links it. `shopify_customer_linked_to_other_member`
+  and `member_linked_to_other_customer` (alerts): the customer or the
+  member is already linked to someone else; nothing was merged.
+  `sign_up_past_cutoff_create_disabled` (alert): a sign-up is past the
+  cutoff while AC2 creates are off; it stays pending.
+  `shopify_pending_backlog` (alert): more sign-ups are pending than one run
+  re-checks; raise `max_pending_rechecks_per_run` or let later runs catch up.
 - The pending list is private ledger data; read it only on the VM (the
   read-only query style of the pre-flight step).
 
@@ -726,8 +770,10 @@ Per UAT run, before any create switch goes on for good:
    one member on the spot with MemberNo `65` + 8 digits (it must link, with
    no AC2 write, whatever name staff typed) and check one where the times
    are more than 10 minutes apart (it must alert, never create). Compare one
-   member's `CreatedTime` with the Shopify customer's `createdAt` to confirm
-   the 8-hour conversion.
+   member's `CreatedTime` with that customer's sign-up time
+   (`registration_at`: the `createdAt` of the `membership.start_date`
+   metafield, UTC; round 7c, not `Customer.createdAt`) to confirm the
+   8-hour conversion.
 6. Round 7c: run the initial link dry run and record its counts and
    conflicts; after the Owner's approval, apply it and check one linked
    customer (link only, nothing changed in AC2 or Shopify). Then check a
@@ -848,6 +894,13 @@ one-off initial link (dry run by default, link-only, its own gate
 accepts the 8 digits without `65`; foreign `+` numbers get the same
 10-minute rule.
 
+Round 8 (22 October 2026, 13:52Z, G2 review of `b91d2b2`): fix H1 (AC2 ->
+Shopify never creates a Shopify customer for a staff member whose MemberNo
+is a sign-up's phone; the Shopify -> AC2 time rule decides, otherwise hold
+and alert; linked-elsewhere cases alert), M1 (pending sign-ups never block
+new ones; alert past the cutoff while creates are off), L4 and L5 (wording);
+L1-L3 recorded as open items.
+
 ## Open items
 
 Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
@@ -892,3 +945,16 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    links by time, without the name); still needed for records holding the
    phone in another way.
 6. Closed in round 7c: the window uses the sign-up time (`registration_at`).
+7. G2 L1 (round 8, Owner to confirm): when no MemberNo is exactly the phone
+   but MobilePhone or an embedded 8-digit MemberNo holds it, the 2-word name
+   rule still **links** without the time rule (`phone_and_name_match`) and
+   still drives the shared-phone fallback creates. This affects legacy
+   records only.
+8. G2 L2 (round 8, no change): the `possible_duplicate_member` watch still
+   needs a name match, so a later staff member with a mistyped name is not
+   flagged. Not silent: every sync create already alerts
+   `created_after_wait`.
+9. G2 L3 (round 8, no change): the initial-link hold ends only when an
+   applied pass completes. `initial_link_cursor_stuck` (more than
+   `shopify_max_pages` x 50 customers sharing one `updatedAt`) is remedied
+   only by raising `shopify_max_pages` (max 40). The UAT dry run shows it.
