@@ -516,12 +516,24 @@ class ShopifyDirectClient:
             return min(max(math.ceil(deficit / throttle.restore_rate), 1), RETRY_MAX_SINGLE_WAIT_SECONDS)
         return min(2 ** (attempt - 1), RETRY_MAX_SINGLE_WAIT_SECONDS)
 
+    def _query_allowed(self, query: str) -> bool:
+        """The poller's allowlist: the Core's pinned queries and the session
+        check. A subclass with its own pinned set overrides this."""
+
+        return query == SESSION_QUERY or dl.PINNED_QUERIES.get(dl._sha256(query)) is not None
+
+    def _retry_allowed(self, query: str, error: ShopifyDirectError) -> bool:
+        """Every pinned read may be retried. A subclass sending a write
+        overrides this so an uncertain write is never repeated."""
+
+        return True
+
     def execute(self, query: str, variables: Mapping[str, Any]) -> dict[str, Any]:
         """``data`` of one pinned query (or the session check), with bounded
         retries for throttling, 5xx and transport failures, and one token
         refresh after a 401 when the provider can refresh."""
 
-        if query != SESSION_QUERY and dl.PINNED_QUERIES.get(dl._sha256(query)) is None:
+        if not self._query_allowed(query):
             raise ShopifyDirectError("shopify_query_not_pinned")
         body = json.dumps({"query": query, "variables": dict(variables)}, separators=(",", ":")).encode("utf-8")
         attempt = 0
@@ -545,7 +557,7 @@ class ShopifyDirectClient:
                     continue
                 if exc.throttle is not None:
                     self._throttle = exc.throttle
-                if not exc.retryable:
+                if not exc.retryable or not self._retry_allowed(query, exc):
                     raise
                 if attempt >= RETRY_MAX_ATTEMPTS_PER_REQUEST or self.stats.retries >= RETRY_MAX_TOTAL:
                     raise ShopifyDirectError("shopify_retry_budget_exhausted") from None

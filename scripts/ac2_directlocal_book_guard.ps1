@@ -13,6 +13,9 @@
 #     DBSetting.DBName, vendor DB_NAME() and vendor MachineName all match;
 #   - vendor error telemetry is off;
 #   - UserScript, MailQueue and EInvoiceQueue are empty.
+# Every vendor query goes through Get-XbDlScalar, which sends only the pinned
+# read-only SQL texts (G2 H1; the SQL login is always sa): printable ASCII
+# only, compared ordinally (G2 LOW-1).
 # Credentials are never read here: the adapter reads them from the process
 # environment, which only the Owner console procedure provides.
 
@@ -48,10 +51,75 @@ function Assert-XbDlQualifiedAssemblies {
     }
 }
 
+# G2 H1: every AutoCount API session runs as SQL login sa (hard-coded in
+# AutoCount.dll, whichever AutoCount user logs in), so Get-XbDlScalar is the
+# only database-side limit. It sends only these exact texts, or the two sync
+# read templates below whose only variable parts are validated, and only after
+# the deny check on every text. Every pinned text and template is one line of
+# printable ASCII (U+0020-U+007E; U+0020 is the only whitespace), so any other
+# character is refused first (G2 LOW-1: PowerShell's -ccontains and -ceq are
+# culture-aware and ignore characters such as U+00AD); every exact match is
+# ordinal. Pinned by tests/test_member_sync_bridge_ps.py.
+$script:XbDlSqlText = [ordered]@{
+    db_name = "SELECT DB_NAME()"
+    machine_name = "SELECT CAST(SERVERPROPERTY('MachineName') AS nvarchar(128))"
+    user_script_rows = "SELECT COUNT_BIG(*) FROM UserScript"
+    mail_queue_rows = "SELECT COUNT_BIG(*) FROM MailQueue"
+    einvoice_queue_rows = "SELECT COUNT_BIG(*) FROM EInvoiceQueue"
+    pos_sync_registrations = ("SELECT (SELECT Location AS location, SyncName AS sync_name, " +
+        "CONVERT(varchar(19), LastFinishSyncTime, 126) AS last_finish_sync_local, CONVERT(varchar(19), LastAliveTime, 126) AS last_alive_local " +
+        "FROM SyncRegistration ORDER BY Location, SyncName FOR JSON PATH, INCLUDE_NULL_VALUES)")
+    server_now_local = "SELECT CONVERT(varchar(19), GETDATE(), 126)"
+    member_change_counter = "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'"
+    changelog_max_id = "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog"
+}
+# Refused in any text: statement separators, comments, every non-read verb,
+# xp_/sp_ procedures, the production book, and 3- or 4-part object names
+# (two dots between identifiers: a.b.c, [a].[b].[c], a..c, srv.db.dbo.t).
+$script:XbDlDeniedSqlPattern = '(?i);|--|/\*|\*/|\b(?:EXEC|EXECUTE|TRUNCATE|INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|GRANT|REVOKE|DENY|INTO|DBCC|SHUTDOWN|KILL|BACKUP|RESTORE|BULK|OPENROWSET|OPENDATASOURCE|OPENQUERY|WAITFOR|DECLARE|SET|USE)\b|\b(?:xp|sp)_|AED_XBOUNDARIES|\.\s*(?:\[[^\]]*\]|"[^"]*"|[A-Za-z_@#][A-Za-z0-9_@#$]*)?\s*\.'
+# sync-changelog: only TOP (1-1000) and the regex-checked column vary.
+$script:XbDlChangeLogSqlPattern = '^SELECT \(SELECT TOP \(([1-9][0-9]{0,3})\) ID AS id, CAST\(\[[A-Za-z][A-Za-z0-9_]{0,63}\] AS nvarchar\(max\)\) AS xml FROM ChangeLog WHERE TableName = ''Member'' AND ChangeType = ''I'' AND ID > \? ORDER BY ID FOR JSON PATH\)\z'
+# sync-lookup: only the condition list varies (phone block, Singapore block,
+# then up to 20 MemberNo conditions; at most 25 parameters).
+$script:XbDlLookupSqlPrefix = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE "
+$script:XbDlLookupSqlSuffix = " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
+$script:XbDlLookupKey = "UPPER(LTRIM(RTRIM(MemberNo))) = ?"
+$script:XbDlLookupMobile = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '') = ?"
+$script:XbDlLookupEmbedded = "CHARINDEX(?, MemberNo) > 0"
+$script:XbDlLookupNumber = "UPPER(LTRIM(RTRIM(MemberNo))) = UPPER(LTRIM(RTRIM(?)))"
+
+function Test-XbDlLookupSql {
+    param([Parameter(Mandatory)][string]$Sql)
+    $prefix = $script:XbDlLookupSqlPrefix
+    $suffix = $script:XbDlLookupSqlSuffix
+    if ($Sql.Length -le ($prefix.Length + $suffix.Length) -or -not $Sql.StartsWith($prefix, [StringComparison]::Ordinal) -or -not $Sql.EndsWith($suffix, [StringComparison]::Ordinal)) { return $false }
+    $parts = @($Sql.Substring($prefix.Length, $Sql.Length - $prefix.Length - $suffix.Length) -csplit " OR ", 0, "SimpleMatch")
+    $end = $parts.Count
+    $numbers = 0
+    while ($end -gt 0 -and [string]::Equals($parts[$end - 1], $script:XbDlLookupNumber, [StringComparison]::Ordinal)) { $end--; $numbers++ }
+    $key = $script:XbDlLookupKey; $mobile = $script:XbDlLookupMobile
+    $heads = @{ 0 = ""; 2 = "$key|$mobile"; 3 = "$key|$mobile|$($script:XbDlLookupEmbedded)"; 5 = "$key|$mobile|$key|$mobile|$($script:XbDlLookupEmbedded)" }
+    $head = if ($end -gt 0) { @($parts[0..($end - 1)]) -join "|" } else { "" }
+    return ($numbers -le 20 -and ($end + $numbers) -ge 1 -and $heads.ContainsKey($end) -and [string]::Equals($head, [string]$heads[$end], [StringComparison]::Ordinal))
+}
+
+function Assert-XbDlSqlAllowed {
+    param([Parameter(Mandatory)][string]$Sql, [object[]]$Params = @())
+    if ($Sql -cnotmatch '\A[\x20-\x7E]+\z') { throw "vendor_query_not_ascii" }
+    if ($Sql -match $script:XbDlDeniedSqlPattern) { throw "vendor_query_not_read_only" }
+    if ([regex]::Matches($Sql, '\?').Count -ne @($Params).Count) { throw "vendor_query_not_allowlisted" }
+    foreach ($text in $script:XbDlSqlText.Values) {
+        if ([string]::Equals($Sql, [string]$text, [StringComparison]::Ordinal)) { return }
+    }
+    if ($Sql -cmatch $script:XbDlChangeLogSqlPattern -and [int]$Matches[1] -le 1000) { return }
+    if (Test-XbDlLookupSql -Sql $Sql) { return }
+    throw "vendor_query_not_allowlisted"
+}
+
 function Get-XbDlScalar {
     # Read-only vendor query through the authenticated DBSetting; "?" parameters.
     param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)][string]$Sql, [object[]]$Params = @())
-    if ($Sql -notmatch '^\s*SELECT\b' -or $Sql -match '(?i)\b(insert|update|delete|merge|drop|alter|create|exec|into)\b') { throw "vendor_query_not_read_only" }
+    Assert-XbDlSqlAllowed -Sql $Sql -Params $Params
     return $DBSetting.ExecuteScalar($Sql, [object[]]$Params)
 }
 
@@ -60,8 +128,8 @@ function Assert-XbDlBookIdentity {
     try {
         $db = $Session.DBSetting
         $declared = [string]$db.DBName
-        $vendorDb = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT DB_NAME()")
-        $vendorHost = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT CAST(SERVERPROPERTY('MachineName') AS nvarchar(128))")
+        $vendorDb = [string](Get-XbDlScalar -DBSetting $db -Sql $script:XbDlSqlText.db_name)
+        $vendorHost = [string](Get-XbDlScalar -DBSetting $db -Sql $script:XbDlSqlText.machine_name)
     }
     catch { throw "book_identity_unverifiable" }
     foreach ($name in @($declared, $vendorDb)) {
@@ -76,9 +144,9 @@ function Assert-XbDlBookIdentity {
 function Get-XbDlOutboundCounts {
     param([Parameter(Mandatory)]$DBSetting)
     [ordered]@{
-        user_script_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT COUNT_BIG(*) FROM UserScript")
-        mail_queue_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT COUNT_BIG(*) FROM MailQueue")
-        einvoice_queue_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT COUNT_BIG(*) FROM EInvoiceQueue")
+        user_script_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.user_script_rows)
+        mail_queue_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.mail_queue_rows)
+        einvoice_queue_rows = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.einvoice_queue_rows)
     }
 }
 
@@ -106,13 +174,11 @@ function Get-XbDlPosSyncState {
     # Member change counter the incremental sync reads. No member data. Uses
     # only the qualified DBSetting.ExecuteScalar path (one FOR JSON value).
     param([Parameter(Mandatory)]$DBSetting)
-    $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql ("SELECT (SELECT Location AS location, SyncName AS sync_name, " +
-        "CONVERT(varchar(19), LastFinishSyncTime, 126) AS last_finish_sync_local, CONVERT(varchar(19), LastAliveTime, 126) AS last_alive_local " +
-        "FROM SyncRegistration ORDER BY Location, SyncName FOR JSON PATH, INCLUDE_NULL_VALUES)"))
+    $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.pos_sync_registrations)
     $outlets = if ([string]::IsNullOrWhiteSpace($json)) { @() } else { @($json | ConvertFrom-Json) }
     return [ordered]@{
-        server_now_local = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT CONVERT(varchar(19), GETDATE(), 126)")
-        member_change_counter = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'")
+        server_now_local = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.server_now_local)
+        member_change_counter = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.member_change_counter)
         outlets = $outlets
     }
 }
@@ -133,7 +199,7 @@ function Get-XbDlSessionFailureStage {
     try {
         $factory = Find-XbAutoCountPublicStaticMethod -Type $dbSettingType -Name "CreateAutoCountDefaultDBSetting" -ParameterCount 2
         $db = $factory.Invoke($null, @($server, $Book))
-        $name = [string](Get-XbDlScalar -DBSetting $db -Sql "SELECT DB_NAME()")
+        $name = [string](Get-XbDlScalar -DBSetting $db -Sql $script:XbDlSqlText.db_name)
     }
     catch { return "autocount_sql_connection_failed" }
     if ($name -cne $Book) { return "autocount_sql_book_mismatch" }
