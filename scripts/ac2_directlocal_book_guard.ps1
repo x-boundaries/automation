@@ -81,7 +81,7 @@ $script:XbDlDeniedSqlPattern = '(?i);|--|/\*|\*/|\b(?:EXEC|EXECUTE|TRUNCATE|INSE
 $script:XbDlChangeLogSqlPattern = '^SELECT \(SELECT TOP \(([1-9][0-9]{0,3})\) ID AS id, CAST\(\[[A-Za-z][A-Za-z0-9_]{0,63}\] AS nvarchar\(max\)\) AS xml FROM ChangeLog WHERE TableName = ''Member'' AND ChangeType = ''I'' AND ID > \? ORDER BY ID FOR JSON PATH\)\z'
 # sync-lookup: only the condition list varies (phone block, Singapore block,
 # then up to 20 MemberNo conditions; at most 25 parameters).
-$script:XbDlLookupSqlPrefix = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE "
+$script:XbDlLookupSqlPrefix = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE "
 $script:XbDlLookupSqlSuffix = " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
 $script:XbDlLookupKey = "UPPER(LTRIM(RTRIM(MemberNo))) = ?"
 $script:XbDlLookupMobile = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '') = ?"

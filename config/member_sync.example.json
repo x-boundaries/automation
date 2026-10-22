@@ -28,5 +28,6 @@
   "shopify_max_pages": 10,
   "http_timeout_seconds": 30,
   "deferred_create_local_time": "06:00",
-  "ac2_create_member_type": "REGISTERED"
+  "ac2_create_member_type": "REGISTERED",
+  "memberno_link_window_minutes": 10
 }

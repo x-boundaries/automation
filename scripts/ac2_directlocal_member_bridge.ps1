@@ -185,7 +185,7 @@ function Invoke-XbDirectLocalSyncLookup {
     }
     if ($conditions.Count -eq 0) { return [ordered]@{ members = @() } }
     $sql = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, " +
-        "CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE " + ($conditions -join " OR ") + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
+        "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE " + ($conditions -join " OR ") + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
     try { $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params $params) } catch { throw "sync_lookup_failed" }
     return [ordered]@{ members = (ConvertFrom-XbDirectLocalJsonRows -Json $json) }
 }

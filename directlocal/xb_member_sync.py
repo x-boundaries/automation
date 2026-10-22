@@ -100,6 +100,9 @@ DUPLICATE_WATCH_DAYS = 7
 DUPLICATE_WATCH_PER_RUN = 10
 LOCAL_TIME_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 MEMBER_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$")
+# Round 7: AC2 Member.CreatedTime as the bridge sends it
+# (CONVERT(varchar(23), CreatedTime, 126); style 126 drops a zero fraction).
+AC2_CREATED_TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?$")
 # Watermarks-table key of the ChangeLog overlap the last run used (G2 H3).
 OVERLAP_MARK = "ac2_changelog_overlap"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
@@ -155,6 +158,11 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # this AutoCount member type (the test book's type; production differs).
     "deferred_create_local_time": "06:00",
     "ac2_create_member_type": "REGISTERED",
+    # Round 7 (Owner, 22 Oct 2026): staff key the member in AC2 on the spot.
+    # The AC2 member whose MemberNo is the sign-up's phone MemberNo links when
+    # its CreatedTime and Shopify Customer.createdAt are at most this many
+    # minutes apart (either way).
+    "memberno_link_window_minutes": 10,
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -165,6 +173,7 @@ _BOUNDS = {
     "max_shopify_customers_per_run": (1, 100),
     "shopify_max_pages": (1, 40),
     "http_timeout_seconds": (5, 60),
+    "memberno_link_window_minutes": (1, 60),
 }
 
 
@@ -203,6 +212,7 @@ class SyncConfig:
     max_shopify_customers_per_run: int
     shopify_max_pages: int
     http_timeout_seconds: int
+    memberno_link_window_minutes: int
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -214,6 +224,7 @@ class SyncConfig:
             "shopify_create_tags": list(self.shopify_create_tags), "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "changelog_configured": self.changelog_xml_column is not None,
             "deferred_create_local_time": self.deferred_create_local_time, "ac2_create_member_type": self.ac2_create_member_type,
+            "memberno_link_window_minutes": self.memberno_link_window_minutes,
         }
 
 
@@ -494,9 +505,25 @@ class Ac2Member:
     mobile_phone: str | None = None
     email_address: str | None = None
     dob: str | None = None
+    created_at: datetime | None = None  # round 7: CreatedTime, in UTC
 
     def __repr__(self) -> str:  # never render member data
         return "Ac2Member()"
+
+
+def ac2_created_time(value: Any) -> datetime | None:
+    """Round 7: AC2 ``Member.CreatedTime`` as UTC. AC2 stores Singapore local
+    time with no offset (VM fact G0, 22 Oct 2026), so the text is read as
+    Asia/Singapore (UTC+8 all year). None when absent or not in the bridge's
+    exact shape; a missing time never links."""
+
+    if not isinstance(value, str) or not AC2_CREATED_TIME_RE.fullmatch(value):
+        return None
+    try:
+        local = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return local.replace(tzinfo=SGT).astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -555,9 +582,17 @@ def _phone_hit(member: Ac2Member, digits: str) -> bool:
     return bool(local and local in member.member_no)
 
 
-def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member]) -> Decision:
+def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member], window: timedelta = timedelta(minutes=10)) -> Decision:
     """The no-review-queue rules for one Shopify registration. ``candidates``
     are AC2 rows found by phone. Email is never consulted.
+
+    Round 7 (Owner): the record whose MemberNo is exactly the phone MemberNo
+    decides by time alone: linked when its CreatedTime and
+    ``Customer.createdAt`` are at most ``window`` apart (either way), else
+    neither linked nor created. Name is not used there. The 2-word name rule
+    is left only for records that hold the phone otherwise (MobilePhone, the
+    8 Singapore digits), where it chooses between a link and the shared-phone
+    fallback MemberNo.
 
     A CREATE without ``member_no`` takes AutoCount's own next number; a
     shared-phone CREATE carries the base MemberNo, whose free 2-9 variant the
@@ -567,16 +602,22 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
     if phone_digits is None:
         return Decision("CREATE", "no_phone_generator_member_no")
     hits = [r for r in rows if _phone_hit(r, phone_digits)]
+    exact = [r for r in hits if member_no_key(r.member_no) == phone_digits]
+    if len(exact) > 1:
+        return Decision("SKIP", "phone_on_multiple_records")
+    if exact:
+        staff, signed_up = exact[0].created_at, customer.created_at
+        if staff is None or signed_up is None:
+            return Decision("SKIP", "created_time_missing", exact[0].member_no)
+        if abs(staff - signed_up) <= window:
+            return Decision("LINK", "memberno_and_created_time_match", exact[0].member_no)
+        return Decision("SKIP", "memberno_exists_outside_window", exact[0].member_no)
     full_name = shopify_full_name(customer.first_name, customer.last_name)
     same = [r for r in hits if full_name_matches(full_name, r.name)]
     if len(same) == 1:
         return Decision("LINK", "phone_and_name_match", same[0].member_no)
     if len(same) > 1:
-        # The 15 shared-phone records: link only to the record whose MemberNo
-        # is the phone itself; otherwise skip. Records are never merged.
-        exact = [r for r in same if member_no_key(r.member_no) == phone_digits]
-        if len(exact) == 1:
-            return Decision("LINK", "phone_duplicate_member_no_exact", exact[0].member_no)
+        # Shared-phone records: never guessed, never merged.
         return Decision("SKIP", "phone_on_multiple_records")
     if not hits:
         return Decision("CREATE", "new_member_phone", phone_digits)
@@ -839,17 +880,21 @@ class RunSummary:
     alerts: list[str] = field(default_factory=list)
     writes: int = 0
 
-    def alert(self, code: str, ref: str | None = None) -> None:
+    def alert(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
         """Needs an operator; the run summary status says so."""
 
-        self.count(code, ref)
+        self.count(code, ref, member_no=member_no)
         if code not in self.alerts:
             self.alerts.append(code)
 
-    def count(self, code: str, ref: str | None = None, action: str | None = None) -> None:
+    def count(self, code: str, ref: str | None = None, action: str | None = None, member_no: str | None = None) -> None:
         self.counts[code] = self.counts.get(code, 0) + 1
         if ref is not None:
-            self.refs.append({"ref": ref, "action": action or "skip", "code": code})
+            entry = {"ref": ref, "action": action or "skip", "code": code}
+            if member_no is not None:
+                # Round 7: so staff can find the record; last 3 characters only.
+                entry["member_no_masked"] = mask_last3(member_no)
+            self.refs.append(entry)
 
 
 class SyncEngine:
@@ -1074,10 +1119,15 @@ class SyncEngine:
         if phone_status == "invalid":
             self.summary.count("shopify_phone_invalid_treated_as_absent", ref)
         candidates = self.ac2.lookup(digits, []) if digits is not None else []
-        decision = decide_shopify_to_ac2(customer, digits, candidates)
+        decision = decide_shopify_to_ac2(customer, digits, candidates, timedelta(minutes=self.config.memberno_link_window_minutes))
         if decision.action == "SKIP":
             self._shopify_pending(gid, "SKIPPED", decision.code)
-            self.summary.count(decision.code, ref)
+            if decision.code in ("memberno_exists_outside_window", "created_time_missing"):
+                # Round 7: the phone MemberNo is in AC2 but cannot be linked
+                # by time; never created again. An operator decides.
+                self.summary.alert(decision.code, ref, member_no=decision.member_no)
+            else:
+                self.summary.count(decision.code, ref)
             return
         if decision.action == "CREATE" and self.ledger.now() < deferred_create_cutoff(instant, self.config.deferred_create_local_time):
             # Round 6 (Owner): staff create members by hand from the sign-up
@@ -1730,7 +1780,7 @@ class SyncBridgeClient(dl.BridgeClient):
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("member_no"), str):
                 raise dl.BridgeError("bridge_output_invalid")
-            members.append(Ac2Member(row["member_no"], row.get("name"), row.get("mobile_phone"), row.get("email_address"), row.get("dob")))
+            members.append(Ac2Member(row["member_no"], row.get("name"), row.get("mobile_phone"), row.get("email_address"), row.get("dob"), ac2_created_time(row.get("created_time"))))
         return members
 
     def changelog_inserts(self, after_id: int | None, limit: int, column: str) -> tuple[list[tuple[int, str]], int]:

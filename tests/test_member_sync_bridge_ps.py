@@ -150,9 +150,16 @@ LOOKUP_EMBEDDED = "CHARINDEX(?, MemberNo) > 0"
 LOOKUP_NUMBER = "UPPER(LTRIM(RTRIM(MemberNo))) = UPPER(LTRIM(RTRIM(?)))"
 
 
-def lookup_sql(conditions) -> str:
-    return ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
-            "CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE " + " OR ".join(conditions) + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)")
+# Round 7 (Owner-approved, 22 Oct 2026): the one change to the book guard is
+# CreatedTime in this lookup (Singapore local time, no offset, VM fact G0).
+LOOKUP_PREFIX = ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
+                 "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE ")
+LOOKUP_PREFIX_BEFORE_R7 = ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
+                           "CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE ")
+
+
+def lookup_sql(conditions, prefix: str = LOOKUP_PREFIX) -> str:
+    return prefix + " OR ".join(conditions) + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
 
 
 DENIED_WORDS = ("EXEC", "EXECUTE", "TRUNCATE", "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "GRANT", "REVOKE", "DENY",
@@ -278,6 +285,9 @@ class SqlAllowlistGuardTests(unittest.TestCase):
             (lookup_sql([LOOKUP_EMBEDDED]), ("1",)),
             (lookup_sql([LOOKUP_NUMBER] * 21), ("1",) * 21),
             (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE]).replace(" OR ", "  OR "), ("1", "2")),
+            # Round 7: the lookup without CreatedTime is no longer allowlisted.
+            (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE], LOOKUP_PREFIX_BEFORE_R7), ("1", "2")),
+            (lookup_sql([LOOKUP_NUMBER], LOOKUP_PREFIX_BEFORE_R7), ("1",)),
         ], "vendor_query_not_allowlisted")
 
     def test_every_allowlisted_text_runs(self):
@@ -345,6 +355,25 @@ def powershell_engines() -> list[str]:
     return found
 
 
+# The guard's ChangeLog template line, unchanged since round 3.
+CHANGELOG_PATTERN_LINE = "$script:XbDlChangeLogSqlPattern = '^SELECT \\(SELECT TOP \\(([1-9][0-9]{0,3})\\) ID AS id, CAST\\(\\[[A-Za-z][A-Za-z0-9_]{0,63}\\] AS nvarchar\\(max\\)\\) AS xml FROM ChangeLog WHERE TableName = ''Member'' AND ChangeType = ''I'' AND ID > \\? ORDER BY ID FOR JSON PATH\\)\\z'"
+
+
+class LookupCreatedTimeStaticTests(unittest.TestCase):
+    """Round 7: the guard's lookup prefix and the bridge's lookup text both
+    read CreatedTime; nothing else in the guard's SQL changed."""
+
+    def test_guard_and_bridge_pin_the_lookup_with_created_time(self):
+        guard = GUARD.read_text(encoding="utf-8")
+        self.assertEqual(guard.count('$script:XbDlLookupSqlPrefix = "' + LOOKUP_PREFIX + '"'), 1)
+        self.assertNotIn(LOOKUP_PREFIX_BEFORE_R7, guard)
+        bridge = BRIDGE.read_text(encoding="utf-8")
+        body = bridge.split("function Invoke-XbDirectLocalSyncLookup", 1)[1].split("\nfunction ", 1)[0]
+        self.assertEqual("".join(literal[1:-1] for literal in _PS_STRING_RE.findall(body) if "AS member_no" in literal or "AS dob" in literal), LOOKUP_PREFIX)
+        self.assertEqual(guard.count("CreatedTime"), 1)
+        self.assertEqual(guard.count(CHANGELOG_PATTERN_LINE + "\n"), 1)  # the ChangeLog read is unchanged
+
+
 class SqlAllowlistAsciiStaticTests(unittest.TestCase):
     def test_allowlisted_texts_are_single_line_printable_ascii(self):
         # Fact behind the ASCII gate: every pinned text and both templates use
@@ -394,7 +423,7 @@ class SyncBridgeTests(unittest.TestCase):
         return proc.returncode, (json.loads(out[-1]) if out else None), proc
 
     def test_lookup_is_parameterised_and_returns_rows(self):
-        rows = [{"member_no": sg(1), "name": "Alpha Tester", "mobile_phone": None, "email_address": None, "dob": None}]
+        rows = [{"member_no": sg(1), "name": "Alpha Tester", "mobile_phone": None, "email_address": None, "dob": None, "created_time": "2026-10-21T10:02:00.123"}]
         self.set_state(lookup_json=json.dumps(rows))
         code, out, _ = self.run_bridge("sync-lookup", {"phone_digits": sg(1), "sg_local": sg(1)[2:], "member_nos": ["ECHOTESTER"]})
         self.assertEqual((code, out), (0, {"members": rows}))
@@ -404,7 +433,7 @@ class SyncBridgeTests(unittest.TestCase):
         self.assertEqual(params, [sg(1), sg(1), sg(1)[2:], sg(1)[2:], sg(1)[2:], "ECHOTESTER"])
         self.assertNotIn(sg(1)[2:], sql)
         self.assertNotIn("EmailAddress =", sql)
-        self.assertTrue(sql.startswith("SELECT (SELECT TOP 50 "))
+        self.assertTrue(sql.startswith(LOOKUP_PREFIX))
 
     def test_lookup_single_row_and_empty(self):
         row = {"member_no": sg(2), "name": "Bravo", "mobile_phone": None, "email_address": None, "dob": "2000-03-01"}
