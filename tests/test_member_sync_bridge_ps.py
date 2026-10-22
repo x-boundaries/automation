@@ -174,7 +174,8 @@ foreach ($case in $doc.cases) {
     $results += [ordered]@{ code = $code; executed = ($db.Calls -gt $before) }
 }
 $texts = Get-Variable -Name XbDlSqlText -Scope Script -ValueOnly -ErrorAction SilentlyContinue
-[Console]::Out.WriteLine((ConvertTo-Json -InputObject ([ordered]@{ results = $results; texts = $texts }) -Compress -Depth 4))
+$engine = "$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)"
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject ([ordered]@{ results = $results; texts = $texts; engine = $engine }) -Compress -Depth 4))
 """
 
 
@@ -316,12 +317,16 @@ class SqlAllowlistGuardTests(unittest.TestCase):
         ]
         engines = powershell_engines()
         self.assertTrue(engines)
+        ran = []
         for engine in engines:
             with self.subTest(engine=Path(engine).name):
                 out = self.run_guard(cases, engine)
+                ran.append(f"{Path(engine).name} ({out['engine']})")
                 for (sql, _params), result in zip(cases, out["results"]):
                     with self.subTest(engine=Path(engine).name, sql=ascii(sql[:60])):
                         self.assertEqual(result, {"code": "vendor_query_not_ascii", "executed": False})
+        # G2 round 5 NOTE-1: the CI log shows which engines this test ran.
+        sys.stderr.write("\n[sql-allowlist non-ASCII] engines run: " + "; ".join(ran) + "\n")
 
 
 # U+00AD soft hyphen, NUL, U+200B zero-width space, U+200D zero-width joiner,

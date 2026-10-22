@@ -502,13 +502,24 @@ that lookup succeeding:
 
 Per UAT run, before any create switch goes on for good:
 
-1. Record `shared_phone_name_fallback` and `shopify_phone_owned_by_other_name`
-   from the run summary's `counts`. `shopify_phone_owned_by_other_name` is
-   counted even while `shopify_create_enabled` is off.
-   `shared_phone_name_fallback` is counted only for an AC2 member actually
-   created (the decision code is added after a verified create); while
-   `ac2_create_enabled` is off the same decision shows only as
-   `ac2_create_disabled` with action `would_create` in `refs`.
+1. Record `shared_phone_name_fallback`, `shared_phone_digit_fallback`,
+   `shopify_phone_owned_by_other_name`, `name_fallback_one_word` and
+   `name_fallback_initial` from the run summary's `counts`. All of them are
+   counted in dry runs too (round 5): while `ac2_create_enabled` is off, a
+   Shopify -> AC2 create refused only by that switch still counts the
+   MemberNo rule it **would** use (`new_member_phone`,
+   `shared_phone_name_fallback`, `shared_phone_digit_fallback`,
+   `no_phone_generator_member_no`) next to `ac2_create_disabled`, plus the
+   name reason; a create refused for another reason (for example
+   `max_writes_per_run_reached` with the switch on) counts no decision,
+   as before. `shopify_phone_owned_by_other_name` is counted whether or not
+   `shopify_create_enabled` is on. With the switches on, the counts are those
+   of the creates actually made. `name_fallback_one_word` counts a same-phone
+   pair that did not link where either name has fewer than 2 words (it can
+   never link); `name_fallback_initial` one where either name has a
+   one-character word (an initial, or a one-character non-Latin word).
+   Pending customers are re-read on every dry run, so the same customer is
+   counted again in each run (L5).
 2. Check in AutoCount which of those fallbacks came from a one-word name or
    initials on either side (for example a Shopify customer with only "Lee",
    or an AC2 `Name` with an initial), since those never link under the name
@@ -615,3 +626,18 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    Shopify admin, so staff can see it.
 3. Shopify's customer search syntax for a phone (`phone:+<digits>`), checked
    at UAT (results are verified by B1 either way).
+4. Ordinal book-name checks, deferred to a later separate change (G2 round 5
+   NOTE-2). The book checks in `scripts/ac2_directlocal_book_guard.ps1`
+   (`Assert-XbDlAuthorisedBook`, `Assert-XbDlBookIdentity`,
+   `Get-XbDlSessionFailureStage`) still compare with the culture-aware
+   `-ccontains` / `-cnotcontains` / `-cne`. On Windows PowerShell 5.1 a
+   lookalike of the test-book name (for example `AED_TESTINGAPI` with a U+00AD
+   soft hyphen inside) is therefore **accepted** by the authorised-book check
+   and by the `DB_NAME()` identity check (checked offline, 2026-10-22). It
+   cannot reach production: Python's `check_book` compares the configured
+   book name exactly (`AUTHORISED_BOOKS`, ordinal string equality) before any
+   bridge child starts and passes exactly that name as `-TargetBook`; any
+   other name, the production name included, is refused there first; and the
+   SQL texts the guard sends are ASCII-gated and ordinal
+   (round 4). The fix (ordinal compares) stays a later, separately approved
+   change.
