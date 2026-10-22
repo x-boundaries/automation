@@ -1,7 +1,7 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
 Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-round 6). Nothing here has run against AutoCount or Shopify. Every write
+round 7). Nothing here has run against AutoCount or Shopify. Every write
 switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
 null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Only the test book
@@ -30,16 +30,40 @@ sent to Shopify; a mapped customer is never sent to AC2.
 
 ### Shopify -> AC2: staff first, deferred create (Owner, 22 Oct 2026)
 
-Shop staff keep creating members by hand in AC2 from the existing Google
-Sheet that the sign-up form fills, and choose Member or Guest themselves.
+Shop staff key members in AC2 by hand, on the spot (round 7: the till picks
+them up after about 15 minutes), and choose Member or Guest themselves.
 Online and in-shop customers use the same sign-up form, so the sync cannot
-tell them apart. Therefore:
+tell them apart. Staff typing of names is unreliable, so the link does not
+use the name (round 7). Therefore:
 
 1. **Link first.** A new sign-up is not created in AC2 straight away. Every
-   run looks it up again (it stays a pending customer) for an AC2 member with
-   the same phone and the name rule below (at least 2 matching words;
-   initials never count) and links it: no AC2 write (`phone_and_name_match`).
-   Email never links.
+   run looks it up again (it stays a pending customer); no link writes to
+   AC2. Email never links.
+   - **MemberNo + created time (round 7).** The AC2 member whose MemberNo is
+     exactly the sign-up's phone MemberNo (`phone_member_no`: `65` + 8 digits
+     for a Singapore number; MemberNo trimmed, any case) is linked when its
+     `CreatedTime` and the Shopify `Customer.createdAt` are at most
+     `memberno_link_window_minutes` (default 10) apart, either way, the
+     boundary included (`memberno_and_created_time_match`). The name is not
+     used. AC2 stores `CreatedTime` in Singapore local time with no offset
+     (VM fact G0, below); the sync reads it as Asia/Singapore (UTC+8), turns
+     it into UTC and compares it with `createdAt` (UTC). Only the two stored
+     times are compared, never the run's own clock, so any run frequency
+     works, including once a day, and a link found after the next-morning
+     cutoff still wins over a create.
+   - **Same MemberNo, outside the window:** no link and no create, ever.
+     The alert `memberno_exists_outside_window` names the customer's ref
+     and the MemberNo masked to its last 3 characters (`member_no_masked`);
+     the pending row becomes `SKIPPED` with that code, so the alert is
+     raised once and the customer is not read again. An operator decides.
+     A missing or unreadable time on either side is treated the same way
+     (`created_time_missing`, alert).
+   - **Name rule, only where still needed:** an AC2 record that holds the
+     phone in another way (MobilePhone, a MemberNo of the 8 Singapore digits
+     without `65`, or the 8 digits embedded in a MemberNo) and no record
+     whose MemberNo is exactly the phone: linked when the name rule below
+     matches (`phone_and_name_match`); otherwise the shared-phone fallback
+     MemberNo after the cutoff, as before.
 2. **Wait.** Before the cutoff, an unmatched sign-up is only counted
    (`waiting_for_staff`, pending code `waiting_for_staff`); nothing is
    written and `GetNextMemberNo` is not called.
@@ -57,8 +81,9 @@ tell them apart. Therefore:
    other field (the bridge has no update operation; static test).
 5. **Possible duplicates.** All duplicate guards stay. When a member staff
    make appears AFTER the sync already created one for the same person (same
-   phone, name rule), the sync raises the alert `possible_duplicate_member`
-   and merges, links or writes nothing:
+   phone, name rule; round 7 keeps the name rule here, alert only), the sync
+   raises the alert `possible_duplicate_member` and merges, links or writes
+   nothing:
    - Shopify -> AC2 runs re-check the members this sync created in the last
      7 days (at most 10 per run; read-only lookups by MemberNo and phone);
    - AC2 -> Shopify (when ChangeLog reads are on) flags the staff insert
@@ -107,9 +132,12 @@ instead; after it, every create also raises `created_after_wait`.
 
 | Situation | Action | Counted as |
 |---|---|---|
-| Phone already in AC2 (MemberNo equals the phone or its 8 digits, MobilePhone normalises to it, or the 8 digits are embedded in a MemberNo) and the name rule below matches | Link, no create | `phone_and_name_match` |
-| Same phone on several matching records | Link to the record whose MemberNo is the phone; otherwise skip (never merge) | `phone_duplicate_member_no_exact` / `phone_on_multiple_records` |
-| Phone matches, the name rule does not match (people sharing a phone) | Create with `<phone digits><FIRST+LAST letters A-Z>` truncated to 20 characters | `shared_phone_name_fallback` |
+| Round 7: an AC2 MemberNo is exactly the phone MemberNo, and its `CreatedTime` is within `memberno_link_window_minutes` of Shopify `createdAt` (either way) | Link, no create; name not used | `memberno_and_created_time_match` |
+| Round 7: that MemberNo exists, outside the window | No link, no create (pending `SKIPPED`); alert with the MemberNo masked to its last 3 characters | `memberno_exists_outside_window` |
+| Round 7: that MemberNo exists, but a time is missing or unreadable | No link, no create (pending `SKIPPED`); alert | `created_time_missing` |
+| No MemberNo is the phone, but the phone is in AC2 otherwise (MemberNo of its 8 digits, MobilePhone normalises to it, or the 8 digits are embedded in a MemberNo) and the name rule below matches | Link, no create | `phone_and_name_match` |
+| Several such records match the name | Skip (never guessed, never merged) | `phone_on_multiple_records` |
+| Phone matches that way, the name rule does not match (people sharing a phone) | Create with `<phone digits><FIRST+LAST letters A-Z>` truncated to 20 characters | `shared_phone_name_fallback` |
 | That MemberNo is already held (in AC2, trimmed and case-insensitive, or by another customer's link or open write in the ledger) | The first free of the same value with a digit 2-9 appended (letters trimmed to stay within 20) | `shared_phone_suffix_digit` |
 | Shared phone but the name has no Latin letters (Owner round 2, Q1) | `<phone digits>` + the first digit 2-9 free in both AC2 and the ledger | `shared_phone_digit_fallback` |
 | Digits 2-9 all taken | Skip | `shared_phone_member_no_exhausted` |
@@ -127,6 +155,12 @@ derived this way run ahead of AutoCount's own counter: production numbering
 stays an E9 decision.
 
 ### Name rule (Owner decisions Q1 and r3a, 2026-10-21)
+
+Round 7: Shopify -> AC2 no longer uses this rule for a record whose
+MemberNo is exactly the phone (that record links by created time, above). It
+is left only for records holding the phone in another way, where it chooses
+between a link and the shared-phone fallback MemberNo, and for the
+`possible_duplicate_member` alert. AC2 -> Shopify is unchanged.
 
 The rule (`full_name_matches`, both directions): on the same phone, the names
 match when the **shorter name has at least 2 words** and **every one of them
@@ -306,6 +340,7 @@ Unknown keys, at the top level or nested, are refused.
 | `http_timeout_seconds` | `30` | 5-60 |
 | `deferred_create_local_time` | `"06:00"` | Round 6: `HH:MM` (00:00-23:59) in Asia/Singapore on the day after sign-up; before it an unmatched sign-up waits for staff |
 | `ac2_create_member_type` | `"REGISTERED"` | Round 6: the AutoCount member type of a member the sync creates (1-20 of `A-Z a-z 0-9 _ -`, starting with a letter or digit). The test book type is `REGISTERED`; production uses other codes (a production change is E9) |
+| `memberno_link_window_minutes` | `10` | Round 7: 1-60. The largest gap, either way, between AC2 `CreatedTime` and Shopify `createdAt` for a MemberNo link |
 
 ## What stays switched off
 
@@ -346,7 +381,9 @@ Unknown keys, at the top level or nested, are refused.
   `changelog_max_id`), the `sync-changelog` template (only `TOP (1-1000)` and
   the checked `[column]` vary) or the `sync-lookup` template (only the
   condition list varies: phone block, Singapore block, up to 20 MemberNo
-  conditions, at most 25 parameters), with exactly one parameter per `?`
+  conditions, at most 25 parameters; round 7, Owner-approved: the template
+  also reads `CONVERT(varchar(23), CreatedTime, 126) AS created_time`, the
+  one change to the book guard, so the lookup without it is refused), with exactly one parameter per `?`
   (`vendor_query_not_allowlisted` otherwise). Python builds no AutoCount SQL
   (`SqlPlaceholderStaticTests`).
 - AutoCount access rights (`GM_MEMBER_SHOW/OPEN/VIEW/NEW`) are checked only
@@ -397,6 +434,16 @@ Unknown keys, at the top level or nested, are refused.
 - The run summary carries counts, alerts and keyed references (`c-`/`m-`)
   only.
 
+## Member.CreatedTime fact (VM read-only check G0, 2026-10-22)
+
+- `dbo.Member.CreatedTime` is `datetime`, always filled, with millisecond
+  precision, stored in Singapore local time with no offset (the SQL server's
+  clock is +08:00), on the test book.
+- The bridge sends it as `CONVERT(varchar(23), CreatedTime, 126)`
+  (`YYYY-MM-DDTHH:MM:SS.mmm`; style 126 drops a zero fraction). The sync
+  accepts only that shape (`ac2_created_time`), reads it as Asia/Singapore
+  and compares in UTC. Anything else is unreadable and never links.
+
 ## ChangeLog facts (VM read-only check r5, 2026-10-21)
 
 - Columns: `ID` bigint IDENTITY(1,1) primary key, `TableName` nvarchar(50),
@@ -433,6 +480,16 @@ Unknown keys, at the top level or nested, are refused.
   `max_shopify_customers_per_run` (20) at once delays recording new sign-ups
   until the list drains (the watermark does not advance while the budget is
   spent). Each waiting customer costs one AC2 lookup per run.
+- Round 7: Shopify `Customer.createdAt` is when the Shopify account was
+  made, not the sign-up. A customer who already had an account (for example
+  an earlier online order) and signs up later is outside the window even if
+  staff keyed the member at once: `memberno_exists_outside_window`, no link,
+  no create (`test_an_existing_shopify_account_uses_its_original_created_at`).
+- Round 7: the time link needs the MemberNo exactly as the sync normalises
+  the phone (`65` + 8 digits for Singapore). A member keyed with only the 8
+  digits, or with the phone in MobilePhone under another MemberNo, falls back
+  to the name rule and, without a name match, to a second member with the
+  shared-phone MemberNo after the cutoff.
 - A sign-up without a usable phone can never be linked to a staff member
   (email never links), so it is created after the cutoff even if staff made
   one, and that duplicate cannot be detected. Staff should not make members
@@ -520,8 +577,10 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
 ### Waiting customers, deferred creates and possible duplicates (round 6)
 
 - `waiting_for_staff` in a run's counts is normal: a sign-up not yet matched
-  to a staff-made member. It is linked as soon as staff make the member with
-  the same phone and the same name (at least 2 matching words, no initials).
+  to a staff-made member. It is linked as soon as staff key the member with
+  MemberNo `65` + 8 digits within 10 minutes of the sign-up (round 7), or
+  hold the phone otherwise with the same name (at least 2 matching words, no
+  initials).
 - `created_after_wait` (alert): the sync created a member after the cutoff.
   Tell staff not to make that customer by hand any more.
 - `possible_duplicate_member` (alert): staff made a member after the sync
@@ -529,6 +588,15 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
   the AutoCount screens which record to keep; the sync never deletes or
   merges. The Shopify -> AC2 alert repeats on every run for up to 7 days
   after the sync's create while both records exist.
+- `memberno_exists_outside_window` (alert, round 7): AC2 already has a
+  member with this sign-up's phone as its MemberNo, created more than
+  `memberno_link_window_minutes` before or after the Shopify customer. The
+  summary's `refs` show the customer ref and `member_no_masked` (last 3
+  characters). Nothing was linked or created, and the customer is not read
+  again. Check in AutoCount whether that member is the same person (for
+  example an existing Shopify account signing up late, or a member keyed
+  long after the sign-up); linking by hand is a later, separately approved
+  step. `created_time_missing` is handled the same way.
 - The pending list is private ledger data; read it only on the VM (the
   read-only query style of the pre-flight step).
 
@@ -606,6 +674,14 @@ Per UAT run, before any create switch goes on for good:
    no AC2 write and its MemberType unchanged) and one left unmatched (it must
    wait until the cutoff, then be created with `ac2_create_member_type`).
    Report how many sign-ups staff did not make by the cutoff.
+5. Round 7: record `memberno_and_created_time_match`,
+   `memberno_exists_outside_window` and `created_time_missing`. Key at least
+   one member on the spot with MemberNo `65` + 8 digits (it must link, with
+   no AC2 write, whatever name staff typed) and check one where the times
+   are more than 10 minutes apart (it must alert, never create). Compare one
+   member's `CreatedTime` with the Shopify customer's `createdAt` to confirm
+   the 8-hour conversion. Count sign-ups that already had a Shopify account
+   (outside the window by design).
 
 ## Commands
 
@@ -700,6 +776,15 @@ member type and the alert `created_after_wait`; it never changes a member
 staff made, never links on email, and alerts `possible_duplicate_member`
 when staff make a member after the sync created one.
 
+Round 7 (22 October 2026, 10:49Z and 11:20Z): staff key members in AC2 on
+the spot and their name typing is unreliable, so Shopify -> AC2 links on the
+exact phone MemberNo plus `CreatedTime` within 10 minutes (configurable) of
+Shopify `createdAt`, with no name; the same MemberNo outside the window
+alerts and is never created; no MemberNo match keeps the round 6 wait and
+create. The Owner approved exactly one book-guard change: `CreatedTime` in
+the member lookup. The ChangeLog query is unchanged and ChangeLog reads stay
+off by default.
+
 ## Open items
 
 Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
@@ -739,4 +824,12 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    only that one word as the AC2 `Name`, the name rule (at least 2 words)
    can never link it and the sync creates a second member at the cutoff
    (`possible_duplicate_member` then needs both names to match, so it may not
-   fire). Owner to confirm what staff type as `Name` before UAT.
+   fire). Owner to confirm what staff type as `Name` before UAT. Round 7:
+   no longer needed for a member keyed with MemberNo `65` + 8 digits (it
+   links by time, without the name); still needed for records holding the
+   phone in another way.
+6. Round 7: the window compares with Shopify `Customer.createdAt` (as
+   specified). A customer who had a Shopify account before signing up is
+   always outside the window (see Known limits). Owner to decide whether the
+   sign-up time (`membership.start_date` metafield `createdAt`, already read
+   for the cutover) should be used instead; that would be a one-line change.
