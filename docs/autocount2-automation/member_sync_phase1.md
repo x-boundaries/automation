@@ -1,7 +1,7 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
 Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-round 8). Nothing here has run against AutoCount or Shopify. Every write
+round 9). Nothing here has run against AutoCount or Shopify. Every write
 switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
 null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Only the test book
@@ -150,7 +150,7 @@ instead; after it, every create also raises `created_after_wait`.
 |---|---|---|
 | Round 7c: Shopify -> AC2 before an applied initial link has completed | No sign-up read, no link, no create (start-up housekeeping of earlier writes still runs) | `initial_link_not_complete` (alert) |
 | Round 7: an AC2 MemberNo is exactly the phone (round 7c: `65` + 8 digits or the 8 digits), and its `CreatedTime` is within `memberno_link_window_minutes` of the sign-up time (`registration_at`, either way) | Link, no create; name not used | `memberno_and_created_time_match` |
-| Round 7c: both forms of the number are MemberNos in AC2 | No link, no create (pending `SKIPPED`); alert | `memberno_conflict` |
+| Round 7c: both forms of the number are MemberNos in AC2 | No link, no create (pending `SKIPPED`); alert with the masked MemberNo. Round 9 (G2 M2): AC2 -> Shopify applies the same rule | `memberno_conflict` |
 | Round 7: that MemberNo exists, outside the window | No link, no create (pending `SKIPPED`); alert with the MemberNo masked to its last 3 characters | `memberno_exists_outside_window` |
 | Round 7: that MemberNo exists, but a time is missing or unreadable | No link, no create (pending `SKIPPED`); alert | `created_time_missing` |
 | No MemberNo is the phone, but the phone is in AC2 otherwise (MobilePhone normalises to it, or the 8 digits are embedded in a longer MemberNo) and the name rule below matches | Link, no create | `phone_and_name_match` |
@@ -304,16 +304,32 @@ against Shopify split and whole (stayed separate).
    customer.** When the member's MemberNo is exactly that phone (`65` + 8
    digits or the 8 digits, as Shopify -> AC2 uses), AC2 -> Shopify never
    creates a Shopify customer for it and never judges it by name:
+   - round 9 (G2 M2): when both forms of the phone (`65` + 8 digits and the
+     8 digits) are MemberNos in AC2, the Shopify -> AC2 conflict rule
+     applies: never linked, never created (with or without a Shopify
+     customer), pending `SKIPPED`, alert `memberno_conflict` with the
+     MemberNo masked to its last 3 characters. The check is one AC2 lookup
+     by phone per such member (the batched lookup by MemberNo is capped at
+     20 numbers by the unchanged bridge);
    - the Shopify customer is found by the phone search or, if the search
      does not show it yet, among the pending sign-ups of this ledger (read
      once per run, at most `max_pending_rechecks_per_run`; more pending than
-     that and no match: held, alert `ac2_member_held_for_sign_up`);
+     that and no match: held, alert `ac2_member_held_for_sign_up`). Round 9
+     (G2 L6): this hold has the same bound as the sign-up-time hold below
+     (`REGISTRATION_WAIT_MAX_CHECKS`, 5 runs: at most 4 holds); on the 5th
+     run the member is `SKIPPED` with the alert `ac2_member_hold_stuck`
+     (masked MemberNo) and is never created. Shopify -> AC2 still links the
+     sign-up by time on its own when it reads it. Both holds share the
+     member's one `checks` counter, so a member is held at most 4 runs in
+     all;
    - already linked to another member: alert
      `shopify_customer_linked_to_other_member` (or `possible_duplicate_member`
      when the sync created that member), never merged;
    - otherwise the Shopify -> AC2 rule decides: `CreatedTime` within
      `memberno_link_window_minutes` of the customer's sign-up time
-     (`registration_at`) links (`memberno_and_created_time_match`); farther
+     (`registration_at`) links (`memberno_and_created_time_match`; inclusive:
+     exactly 10:00 apart links and 10:00.001 does not, pinned by tests on
+     both sides, round 9 G2 L7); farther
      apart: alert `memberno_exists_outside_window`, no link, no create; a
      missing time: alert `created_time_missing`;
    - a sign-up whose `start_date` metafield is not readable yet is held
@@ -662,6 +678,13 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
   cutoff while AC2 creates are off; it stays pending.
   `shopify_pending_backlog` (alert): more sign-ups are pending than one run
   re-checks; raise `max_pending_rechecks_per_run` or let later runs catch up.
+- Round 9: `memberno_conflict` can also come from AC2 -> Shopify (the
+  ChangeLog member's ref): both forms of one phone are MemberNos; nothing
+  was linked or created on either side. `ac2_member_hold_stuck` (alert):
+  the member above was held 4 runs because more sign-ups were pending than
+  one run reads, and is now left to an operator (never created). Check
+  whether a pending sign-up has that phone; Shopify -> AC2 links it by time
+  when it reads it.
 - The pending list is private ledger data; read it only on the VM (the
   read-only query style of the pre-flight step).
 
@@ -901,6 +924,17 @@ and alert; linked-elsewhere cases alert), M1 (pending sign-ups never block
 new ones; alert past the cutoff while creates are off), L4 and L5 (wording);
 L1-L3 recorded as open items.
 
+Round 9 (22 October 2026, 16:37Z, G2 review of `938f7cf`): fix M2 (AC2 ->
+Shopify applies the both-forms conflict rule: never link, alert
+`memberno_conflict` with the masked MemberNo, both directions agree), L6
+(the "more pending than read" hold gets a test and the same 5-run bound,
+then `ac2_member_hold_stuck`) and L7 (the AC2-side 10-minute boundary is
+pinned by tests). Recorded with no code change:
+- L1: keep the 2-word name rule for legacy records that hold the phone only
+  in MobilePhone (or an embedded 8-digit MemberNo) in phase 1.
+- The hold alert (`ac2_member_held_for_sign_up`, including the few-second
+  `start_date` race) stays an alert until UAT shows how often it fires.
+
 ## Open items
 
 Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
@@ -945,11 +979,11 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    links by time, without the name); still needed for records holding the
    phone in another way.
 6. Closed in round 7c: the window uses the sign-up time (`registration_at`).
-7. G2 L1 (round 8, Owner to confirm): when no MemberNo is exactly the phone
-   but MobilePhone or an embedded 8-digit MemberNo holds it, the 2-word name
-   rule still **links** without the time rule (`phone_and_name_match`) and
-   still drives the shared-phone fallback creates. This affects legacy
-   records only.
+7. Closed in round 9 (Owner: keep for phase 1): G2 L1, when no MemberNo is
+   exactly the phone but MobilePhone or an embedded 8-digit MemberNo holds
+   it, the 2-word name rule still **links** without the time rule
+   (`phone_and_name_match`) and still drives the shared-phone fallback
+   creates. This affects legacy records only.
 8. G2 L2 (round 8, no change): the `possible_duplicate_member` watch still
    needs a name match, so a later staff member with a mistyped name is not
    flagged. Not silent: every sync create already alerts
