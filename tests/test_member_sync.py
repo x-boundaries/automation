@@ -101,6 +101,7 @@ class FakeShopify:
         self.create_mode = "ok"
         self.next_gid = 900
         self.page_limit = None  # round 7c: initial-link pages
+        self.unindexed: set[str] = set()  # round 8: not yet in the phone search
 
     def add(self, item: sync.ShopifyCustomer) -> sync.ShopifyCustomer:
         self.customers[item.gid] = item
@@ -126,7 +127,7 @@ class FakeShopify:
 
     def find_by_phone(self, phone_e164):
         digits = phone_e164[1:]
-        return [c for c in self.customers.values() if sync.phone_member_no(c.phone)[0] == digits]
+        return [c for c in self.customers.values() if sync.phone_member_no(c.phone)[0] == digits and c.gid not in self.unindexed]
 
     def create_customer(self, customer_input):
         if self.create_mode == "uncertain":
@@ -666,7 +667,7 @@ class Ac2ToShopifyTests(SyncTestCase):
     def test_separate_customer_without_email_uses_name_only(self):
         self.initialise()
         self.shopify.add(customer(51, first="Bravo", tags=()))
-        self.ac2.add(sync.Ac2Member(sg(51), "Alpha Tester", sg(51)), log=True)
+        self.ac2.add(sync.Ac2Member("TILL51", "Alpha Tester", sg(51)), log=True)  # round 8: a till number, so the name rule decides
         self.run_sync("ac2_to_shopify")
         created = self.shopify.created[0]
         self.assertNotIn("phone", created)
@@ -676,7 +677,7 @@ class Ac2ToShopifyTests(SyncTestCase):
     def test_separate_customer_waits_while_shopify_create_is_off(self):
         self.initialise()
         self.shopify.add(customer(52, first="Bravo", tags=()))
-        self.ac2.add(sync.Ac2Member(sg(52), "Alpha Tester", sg(52)), log=True)
+        self.ac2.add(sync.Ac2Member("TILL52", "Alpha Tester", sg(52)), log=True)  # round 8: a till number, so the name rule decides
         result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
         self.assertEqual((self.shopify.created, self.links()), ([], {}))
         self.assertEqual(result["counts"]["shopify_create_disabled"], 1)
@@ -960,9 +961,9 @@ class B1PhoneLookupVerifiesPhoneTests(SyncTestCase):
 
     def test_one_match_plus_one_other_phone_is_single(self):
         self.use_search([phone_node(92, plus(sg(92))), phone_node(93, plus(sg(93)))])
-        self.ac2.add(sync.Ac2Member(sg(92), "Alpha Tester", sg(92)), log=True)
+        self.ac2.add(sync.Ac2Member("TILL92", "Alpha Tester", sg(92)), log=True)  # round 8: a till number, so the name rule decides
         result = self.run_sync("ac2_to_shopify")
-        self.assertEqual(self.links(), {gid(92): sg(92)})
+        self.assertEqual(self.links(), {gid(92): "TILL92"})
         self.assertNotIn("shopify_phone_on_multiple_customers", result["counts"])
         self.assertEqual(self.shopify.created, [])
 
@@ -2319,6 +2320,183 @@ class InitialLinkTests(SyncTestCase):
                 self.assertEqual(sync.main(["initial-link", "--apply", "--config", str(path)]), 2)
             self.assertEqual(json.loads(out.getvalue()), {"status": "refused", "code": "initial_link_disabled"})
             self.assertEqual(engine.initial_link.call_count, 1)  # refused before any engine call
+
+
+class StaffMemberBeforeSignUpLinkTests(SyncTestCase):
+    """Round 8, G2 H1: with ChangeLog reads and Shopify creates on, AC2 ->
+    Shopify must never turn a staff-keyed member into a second Shopify
+    customer. When the member's MemberNo is exactly a phone form (65 + 8
+    digits or the 8 digits) and a Shopify customer or a pending sign-up has
+    that phone, AC2 -> Shopify creates nothing: it links by the Shopify ->
+    AC2 rule (exact MemberNo + CreatedTime within the window of the sign-up
+    time), otherwise it holds the member and alerts."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = T0 + timedelta(hours=1)
+        self.run_sync("ac2_to_shopify")  # ChangeLog watermark
+
+    def sign_up(self, n: int, *, pending_metafield=False, tags=("member-mg",)) -> sync.ShopifyCustomer:
+        item = replace(customer(n, tags=tags), created_at=T0)
+        if pending_metafield:
+            item = replace(item, registration_at=None, registration_value=None)
+        return self.shopify.add(item)
+
+    def staff(self, member_no: str, at: datetime) -> None:
+        # Staff key the member at the till with a name typed differently.
+        self.ac2.add(sync.Ac2Member(member_no, "SOMEONE ELSE", None, created_at=at), log=True)
+
+    def ac2_pending(self, member_no: str):
+        row = self.ledger.conn.execute("SELECT state, code FROM ac2_pending WHERE member_no = ?", (member_no,)).fetchone()
+        return None if row is None else row[:]
+
+    def test_g2_repro_metafield_pending_never_creates_a_duplicate(self):
+        self.sign_up(90, pending_metafield=True)
+        self.staff(sg(90), T0 + timedelta(minutes=2))
+        first = self.run_sync("both")
+        self.assertEqual((self.shopify.created, self.links()), ([], {}))
+        self.assertIn("ac2_member_held_for_sign_up", first["alerts"])
+        self.assertEqual(self.ac2_pending(sg(90)), ("PENDING", "held_for_sign_up"))
+        # The start_date metafield appears: Shopify -> AC2 links by time and
+        # AC2 -> Shopify then finds the member linked.
+        self.shopify.add(replace(self.shopify.customers[gid(90)], registration_at=T0, registration_value="2026-10-21"))
+        self.now += timedelta(hours=1)
+        second = self.run_sync("both")
+        self.assertEqual((self.links(), self.shopify.created, self.ac2.creates), ({gid(90): sg(90)}, [], []))
+        self.assertEqual(second["counts"]["memberno_and_created_time_match"], 1)
+        self.assertEqual(self.ac2_pending(sg(90)), ("DONE", "already_linked"))
+        self.assertEqual(second["alerts"], [])
+
+    def test_ac2_side_links_by_time_when_it_runs_first(self):
+        self.sign_up(91)
+        self.staff(sg(91), T0 + timedelta(minutes=3))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.links(), self.shopify.created), ({gid(91): sg(91)}, []))
+        self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
+        self.assertEqual(self.ac2_pending(sg(91)), ("DONE", "memberno_and_created_time_match"))
+        self.assertEqual(self.run_sync("shopify_to_ac2")["counts"]["shopify_already_linked"], 1)
+
+    def test_eight_digit_member_no_links_by_time_too(self):
+        self.sign_up(92)
+        self.staff(local(92), T0 - timedelta(minutes=4))
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.links(), self.shopify.created), ({gid(92): local(92)}, []))
+
+    def test_outside_the_window_alerts_and_never_creates(self):
+        self.sign_up(93)
+        self.staff(sg(93), T0 + timedelta(minutes=30))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.links(), self.shopify.created), ({}, []))
+        self.assertIn("memberno_exists_outside_window", result["alerts"])
+        self.assertEqual(self.ac2_pending(sg(93)), ("SKIPPED", "memberno_exists_outside_window"))
+        self.assert_no_pii(result)
+
+    def test_a_pending_sign_up_missing_from_the_phone_search_is_not_duplicated(self):
+        self.sign_up(94)
+        self.run_sync("shopify_to_ac2")  # the sign-up is now a pending (waiting) customer
+        self.shopify.unindexed.add(gid(94))  # Shopify's phone search does not show it yet
+        self.staff(sg(94), T0 + timedelta(minutes=1))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.links(), self.shopify.created), ({gid(94): sg(94)}, []))
+        self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
+
+    def test_an_existing_customer_who_is_not_a_sign_up_is_held_with_an_alert(self):
+        # An older non-member Shopify account with the phone: no sign-up time
+        # within the window (its createdAt stands in), so no link and no create.
+        self.shopify.add(replace(customer(95, tags=()), created_at=T0 - timedelta(days=30), registration_at=None, registration_value=None))
+        self.staff(sg(95), T0)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.links(), self.shopify.created), ({}, []))
+        self.assertIn("memberno_exists_outside_window", result["alerts"])
+
+    def test_a_held_member_without_a_sign_up_time_ends_after_the_bounded_wait(self):
+        self.sign_up(96, pending_metafield=True)
+        self.shopify.customers[gid(96)] = replace(self.shopify.customers[gid(96)], created_at=T0 - timedelta(days=2))
+        self.staff(sg(96), T0)
+        for _ in range(sync.REGISTRATION_WAIT_MAX_CHECKS - 1):
+            self.assertIn("ac2_member_held_for_sign_up", self.run_sync("ac2_to_shopify")["alerts"])
+        result = self.run_sync("ac2_to_shopify")  # wait spent: createdAt decides, two days off
+        self.assertIn("memberno_exists_outside_window", result["alerts"])
+        self.assertEqual((self.links(), self.shopify.created), ({}, []))
+        self.assertEqual(self.ac2_pending(sg(96)), ("SKIPPED", "memberno_exists_outside_window"))
+
+    def test_customer_linked_to_another_member_alerts_on_both_sides(self):
+        self.sign_up(97)
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(97), "OTHER97", "matched", "test")
+        self.staff(sg(97), T0)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertIn("shopify_customer_linked_to_other_member", result["alerts"])
+        self.assertEqual(self.shopify.created, [])
+        # Shopify -> AC2: the exact MemberNo is already linked to another customer.
+        self.sign_up(98)
+        self.ac2.add(sync.Ac2Member(sg(98), "SOMEONE ELSE", None, created_at=T0))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(88), sg(98), "matched", "test")
+        result = self.run_sync("shopify_to_ac2")
+        self.assertIn("member_linked_to_other_customer", result["alerts"])
+
+    def test_name_rule_still_decides_when_the_member_no_is_not_a_phone_form(self):
+        # A till member with a generator number and the phone in MobilePhone:
+        # the round 7 name rule (unchanged): another name -> a separate customer.
+        self.sign_up(99)
+        self.ac2.add(sync.Ac2Member("M000999", "Charlie Holder", local(99)), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["counts"]["shopify_separate_customer_created_without_phone"], 1)
+
+
+class PendingBudgetTests(SyncTestCase):
+    """Round 8, G2 M1: pending sign-ups (waiting for staff, or past the
+    cutoff while AC2 creates are off) never use max_shopify_customers_per_run,
+    so new sign-ups are always read; their own bound is
+    max_pending_rechecks_per_run (alert when more are pending). A sign-up past
+    the cutoff while creates are off raises an alert with the MemberNo masked
+    to its last 3 characters."""
+
+    def pending_count(self) -> int:
+        return self.ledger.conn.execute("SELECT COUNT(*) FROM shopify_pending").fetchone()[0]
+
+    def test_twenty_five_waiting_sign_ups_never_block_a_new_one(self):
+        self.now = T0 + timedelta(hours=1)
+        for n in range(1, 26):
+            self.shopify.add(customer(n))
+        first = self.run_sync("shopify_to_ac2")
+        self.assertEqual((first["counts"]["waiting_for_staff"], first["counts"]["shopify_customer_budget_reached"]), (20, 1))
+        self.shopify.add(customer(26))
+        self.now += timedelta(minutes=5)
+        second = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.pending_count(), 26)  # the last 5 and the new one were read
+        self.assertNotIn("shopify_customer_budget_reached", second["counts"])
+        self.assertEqual(second["counts"]["waiting_for_staff"], 26)
+
+    def test_past_cutoff_with_creates_off_alerts_with_the_masked_member_no(self):
+        self.now = T0 + timedelta(days=1)
+        self.shopify.add(customer(40))
+        self.shopify.add(customer(41, phone=None))
+        result = self.run_sync("shopify_to_ac2", ac2_create_enabled=False)
+        self.assertIn("sign_up_past_cutoff_create_disabled", result["alerts"])
+        self.assertEqual(result["counts"]["sign_up_past_cutoff_create_disabled"], 2)
+        flagged = [r for r in result["refs"] if r["code"] == "sign_up_past_cutoff_create_disabled"]
+        self.assertEqual(sorted(r.get("member_no_masked", "") for r in flagged), ["", "*******" + sg(40)[-3:]])
+        self.assertEqual(self.ac2.creates, [])
+        self.assert_no_pii(result)
+        # Still pending, so it alerts again next run (and never blocks new ones).
+        self.now += timedelta(hours=1)
+        self.assertIn("sign_up_past_cutoff_create_disabled", self.run_sync("shopify_to_ac2", ac2_create_enabled=False)["alerts"])
+
+    def test_rechecks_have_their_own_bound_and_alert_beyond_it(self):
+        self.assertEqual(make_config().max_pending_rechecks_per_run, 100)
+        self.now = T0 + timedelta(hours=1)
+        for n in range(1, 6):
+            self.shopify.add(customer(n))
+        self.run_sync("shopify_to_ac2")
+        result = self.run_sync("shopify_to_ac2", max_pending_rechecks_per_run=3)
+        self.assertIn("shopify_pending_backlog", result["alerts"])
+        self.assertEqual(result["counts"]["waiting_for_staff"], 3)
+        for bad in (0, 501, "100", True):
+            with self.subTest(bad=bad), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(max_pending_rechecks_per_run=bad)
+            self.assertEqual(caught.exception.code, "sync_config_max_pending_rechecks_per_run_invalid")
 
 
 if __name__ == "__main__":

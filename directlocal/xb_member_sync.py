@@ -155,6 +155,9 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # committed after a higher ID was read is still seen (fact 7).
     "changelog_overlap": 50,
     "max_shopify_customers_per_run": 20,
+    # Round 8 (G2 M1): pending sign-ups re-checked per run, outside the
+    # budget above, so they never block new sign-ups.
+    "max_pending_rechecks_per_run": 100,
     "shopify_max_pages": 10,
     "http_timeout_seconds": 30,
     # Round 6 (Owner, 22 Oct 2026): staff create members by hand from the
@@ -180,6 +183,7 @@ _BOUNDS = {
     "changelog_batch": (1, 500),
     "changelog_overlap": (0, 200),
     "max_shopify_customers_per_run": (1, 100),
+    "max_pending_rechecks_per_run": (1, 500),
     "shopify_max_pages": (1, 40),
     "http_timeout_seconds": (5, 60),
     "memberno_link_window_minutes": (1, 60),
@@ -219,6 +223,7 @@ class SyncConfig:
     changelog_batch: int
     changelog_overlap: int
     max_shopify_customers_per_run: int
+    max_pending_rechecks_per_run: int
     shopify_max_pages: int
     http_timeout_seconds: int
     memberno_link_window_minutes: int
@@ -940,6 +945,7 @@ class SyncEngine:
         if (meta["autocount_book"], meta["store_gid"], meta["shop_domain"]) != (check_book(config.autocount_book), config.shopify.store_gid, config.shopify.shop_domain):
             raise dl.DirectLocalError("sync_ledger_binding_mismatch")
         self.summary = RunSummary()
+        self._pending_sign_ups: tuple[dict[str, list[ShopifyCustomer]], bool] | None = None  # round 8: per run
 
     # -- write budget ----------------------------------------------------------
     def _spend_write(self, switch: bool, disabled_code: str) -> None:
@@ -1133,11 +1139,17 @@ class SyncEngine:
             # is read or written until an applied initial link has completed.
             self.summary.alert("initial_link_not_complete")
             return
+        # Round 8 (G2 M1): pending sign-ups are re-checked under their own
+        # bound, oldest first (each re-check moves it to the back), so the
+        # budget below is only for new sign-ups and they are always read.
+        limit = self.config.max_pending_rechecks_per_run
+        pending = self.ledger.conn.execute("SELECT customer_gid FROM shopify_pending WHERE state = 'PENDING' ORDER BY updated_at LIMIT ?", (limit + 1,)).fetchall()
+        if len(pending) > limit:
+            self.summary.alert("shopify_pending_backlog")
+            pending = pending[:limit]
         budget = self.config.max_shopify_customers_per_run
-        pending = self.ledger.conn.execute("SELECT customer_gid FROM shopify_pending WHERE state = 'PENDING' ORDER BY updated_at LIMIT ?", (budget,)).fetchall()
         for row in pending:
             customer = self.shopify.customer(row["customer_gid"], self.config.birthday_month_metafield)
-            budget -= 1
             if customer is None:
                 self._shopify_pending(row["customer_gid"], "SKIPPED", "customer_not_found")
                 self.summary.count("shopify_customer_not_found", self.ledger.ref("c", row["customer_gid"]))
@@ -1262,9 +1274,10 @@ class SyncEngine:
         member_ref = self.ledger.ref("m", member_no_key(member_no))
         linked = self.ledger.link_for_member(member_no)
         if linked is not None:
-            # The AC2 member is already mapped to another Shopify customer.
+            # The AC2 member is already mapped to another Shopify customer
+            # (round 8, G2 H1: an alert, never silent).
             self._shopify_pending(gid, "SKIPPED", "member_linked_to_other_customer")
-            self.summary.count("member_linked_to_other_customer", ref)
+            self.summary.alert("member_linked_to_other_customer", ref, member_no=member_no)
             return
         if decision.action == "LINK":
             with self.ledger.tx() as conn:
@@ -1357,6 +1370,9 @@ class SyncEngine:
                 # Dry run (round 5): count the MemberNo rule this create would
                 # use, as a real create counts it; nothing else changes.
                 self._count_decision(decision)
+                # Round 8 (G2 M1): past the cutoff with creates off it stays
+                # pending for good: an operator must know.
+                self.summary.alert("sign_up_past_cutoff_create_disabled", self.ledger.ref("c", gid), member_no=member_no)
             return
         if member_no is None:
             # Allocated only when the write will really start.
@@ -1535,10 +1551,22 @@ class SyncEngine:
                 self._ac2_done(key, "SKIPPED", "ac2_member_without_phone")
                 self.summary.count("ac2_member_without_phone", ref)
                 continue
+            phone_form = member_no_key(member.member_no) in member_no_forms(digits)
             customers = self.shopify.find_by_phone(e164(digits))
+            if phone_form and not customers:
+                # Round 8 (G2 H1): a sign-up the phone search does not show
+                # yet is still a sign-up: look in the pending list too.
+                customers, sure = self._pending_sign_ups_with_phone(digits)
+                if not customers and not sure:
+                    self._ac2_done(key, "PENDING", "held_for_sign_up", count_check=True)
+                    self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
+                    continue
             if len(customers) > 1:
                 self._ac2_done(key, "SKIPPED", "shopify_phone_on_multiple_customers")
                 self.summary.count("shopify_phone_on_multiple_customers", ref)
+                continue
+            if len(customers) == 1 and phone_form:
+                self._ac2_member_by_time(row, member, customers[0], key, ref)
                 continue
             if len(customers) == 1:
                 customer = customers[0]
@@ -1558,7 +1586,7 @@ class SyncEngine:
                         self.summary.alert("possible_duplicate_member", ref)
                     else:
                         self._ac2_done(key, "SKIPPED", "shopify_customer_linked_to_other_member")
-                        self.summary.count("shopify_customer_linked_to_other_member", ref)
+                        self.summary.alert("shopify_customer_linked_to_other_member", ref, member_no=member.member_no)
                 else:
                     with self.ledger.tx() as conn:
                         self.ledger.add_link(conn, customer.gid, member.member_no, "matched", "shopify_phone_and_name_match")
@@ -1566,6 +1594,60 @@ class SyncEngine:
                     self.summary.count("linked_existing_shopify_customer", ref, "link")
                 continue
             self._create_in_shopify(member, digits, key, ref)
+
+    def _ac2_member_by_time(self, row: sqlite3.Row, member: Ac2Member, customer: ShopifyCustomer, key: str, ref: str) -> None:
+        """Round 8 (G2 H1): an AC2 member whose MemberNo is exactly the phone
+        of a Shopify customer is never created in Shopify and never judged by
+        name (staff typing is unreliable). The Shopify -> AC2 rule decides:
+        linked when CreatedTime and the customer's sign-up time are at most
+        the window apart; otherwise held with an alert. A sign-up whose
+        start_date metafield is not readable yet is held (alert) for the same
+        bounded wait as Shopify -> AC2, after which Customer.createdAt stands
+        in, as it does there."""
+
+        if (link := self.ledger.link_for_gid(customer.gid)) is not None:
+            code = "possible_duplicate_member" if link["origin"] == "created_in_ac2" else "shopify_customer_linked_to_other_member"
+            self._ac2_done(key, "SKIPPED", code)
+            self.summary.alert(code, ref, member_no=member.member_no)
+            return
+        # The phone search returns no sign-up fields: read the customer.
+        full = self.shopify.customer(customer.gid, self.config.birthday_month_metafield) or customer
+        signed_up = full.registration_at
+        if signed_up is None and REGISTRATION_TAG in full.tags and row["checks"] + 1 < REGISTRATION_WAIT_MAX_CHECKS:
+            self._ac2_done(key, "PENDING", "held_for_sign_up", count_check=True)
+            self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
+            return
+        signed_up = signed_up or full.created_at
+        if member.created_at is None or signed_up is None:
+            self._ac2_done(key, "SKIPPED", "created_time_missing")
+            self.summary.alert("created_time_missing", ref, member_no=member.member_no)
+            return
+        if abs(member.created_at - signed_up) > timedelta(minutes=self.config.memberno_link_window_minutes):
+            self._ac2_done(key, "SKIPPED", "memberno_exists_outside_window")
+            self.summary.alert("memberno_exists_outside_window", ref, member_no=member.member_no)
+            return
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, customer.gid, member.member_no, "matched", "memberno_and_created_time_match")
+        self._ac2_done(key, "DONE", "memberno_and_created_time_match")
+        self.summary.count("memberno_and_created_time_match", ref, "link")
+
+    def _pending_sign_ups_with_phone(self, digits: str) -> tuple[list[ShopifyCustomer], bool]:
+        """Round 8 (G2 H1): pending Shopify sign-ups (not linked yet) with this
+        phone, read once per run (bounded by max_pending_rechecks_per_run).
+        ``sure`` is False when more sign-ups are pending than were read."""
+
+        if self._pending_sign_ups is None:
+            limit = self.config.max_pending_rechecks_per_run
+            rows = self.ledger.conn.execute("SELECT customer_gid FROM shopify_pending WHERE state = 'PENDING' ORDER BY updated_at LIMIT ?", (limit + 1,)).fetchall()
+            found: dict[str, list[ShopifyCustomer]] = {}
+            for row in rows[:limit]:
+                item = self.shopify.customer(row["customer_gid"], self.config.birthday_month_metafield)
+                number = phone_member_no(item.phone)[0] if item is not None else None
+                if number is not None:
+                    found.setdefault(number, []).append(item)
+            self._pending_sign_ups = (found, len(rows) <= limit)
+        found, sure = self._pending_sign_ups
+        return list(found.get(digits, [])), sure
 
     def _create_in_shopify(self, member: Ac2Member, digits: str | None, key: str, ref: str) -> None:
         """``digits`` None: a separate customer without the phone (it belongs
