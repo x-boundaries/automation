@@ -103,6 +103,11 @@ MEMBER_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$")
 # Round 7: AC2 Member.CreatedTime as the bridge sends it
 # (CONVERT(varchar(23), CreatedTime, 126); style 126 drops a zero fraction).
 AC2_CREATED_TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?$")
+# Round 7c: watermarks of the one-off initial link. Shopify -> AC2 waits
+# until an applied pass has read every pre-cutover customer.
+INITIAL_LINK_DONE_MARK = "initial_link_completed_at"
+INITIAL_LINK_CURSORS = {True: "initial_link_updated_at", False: "initial_link_dry_run_updated_at"}
+INITIAL_LINK_BATCH = PENDING_LOOKUP_BATCH // 2  # two MemberNo forms per customer
 # Watermarks-table key of the ChangeLog overlap the last run used (G2 H3).
 OVERLAP_MARK = "ac2_changelog_overlap"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
@@ -160,9 +165,13 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "ac2_create_member_type": "REGISTERED",
     # Round 7 (Owner, 22 Oct 2026): staff key the member in AC2 on the spot.
     # The AC2 member whose MemberNo is the sign-up's phone MemberNo links when
-    # its CreatedTime and Shopify Customer.createdAt are at most this many
+    # its CreatedTime and the sign-up time (round 7c: registration_at, the
+    # membership.start_date metafield's createdAt) are at most this many
     # minutes apart (either way).
     "memberno_link_window_minutes": 10,
+    # Round 7c (Owner): the one-off initial link (CLI ``initial-link``) is a
+    # dry run unless ``--apply`` is given AND this is on.
+    "initial_link_enabled": False,
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -213,6 +222,7 @@ class SyncConfig:
     shopify_max_pages: int
     http_timeout_seconds: int
     memberno_link_window_minutes: int
+    initial_link_enabled: bool
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -224,7 +234,7 @@ class SyncConfig:
             "shopify_create_tags": list(self.shopify_create_tags), "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "changelog_configured": self.changelog_xml_column is not None,
             "deferred_create_local_time": self.deferred_create_local_time, "ac2_create_member_type": self.ac2_create_member_type,
-            "memberno_link_window_minutes": self.memberno_link_window_minutes,
+            "memberno_link_window_minutes": self.memberno_link_window_minutes, "initial_link_enabled": self.initial_link_enabled,
         }
 
 
@@ -299,6 +309,7 @@ def parse_config(value: Any) -> SyncConfig:
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
         shopify_create_enabled=_bool(merged["shopify_create_enabled"], "shopify_create_enabled"),
+        initial_link_enabled=_bool(merged["initial_link_enabled"], "initial_link_enabled"),
         birthday_month_metafield=dict(birthday), ac2_member_no_metafield=dict(member_no_field), shopify_create_tags=tuple(tags), ac2_credential_target=target,
         changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type, **numbers,
     )
@@ -582,17 +593,30 @@ def _phone_hit(member: Ac2Member, digits: str) -> bool:
     return bool(local and local in member.member_no)
 
 
-def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member], window: timedelta = timedelta(minutes=10)) -> Decision:
+def member_no_forms(phone_digits: str | None) -> set[str]:
+    """Round 7c: the MemberNo keys that are this phone exactly: the phone
+    MemberNo, plus the 8 digits without ``65`` for a Singapore number."""
+
+    if phone_digits is None:
+        return set()
+    local = sg_local(phone_digits)
+    return {phone_digits} | ({local} if local else set())
+
+
+def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member], window: timedelta = timedelta(minutes=10),
+                          signed_up: datetime | None = None) -> Decision:
     """The no-review-queue rules for one Shopify registration. ``candidates``
     are AC2 rows found by phone. Email is never consulted.
 
-    Round 7 (Owner): the record whose MemberNo is exactly the phone MemberNo
-    decides by time alone: linked when its CreatedTime and
-    ``Customer.createdAt`` are at most ``window`` apart (either way), else
-    neither linked nor created. Name is not used there. The 2-word name rule
-    is left only for records that hold the phone otherwise (MobilePhone, the
-    8 Singapore digits), where it chooses between a link and the shared-phone
-    fallback MemberNo.
+    Round 7 (Owner): the record whose MemberNo is exactly the phone (round
+    7c: the phone MemberNo or its 8 Singapore digits) decides by time alone:
+    linked when its CreatedTime and ``signed_up`` (round 7c: the sign-up
+    time, not Customer.createdAt) are at most ``window`` apart (either way),
+    else neither linked nor created; two such records are a conflict. Name
+    is not used there. The 2-word name rule is left only for records that
+    hold the phone otherwise (MobilePhone, the 8 digits embedded in a longer
+    MemberNo), where it chooses between a link and the shared-phone fallback
+    MemberNo.
 
     A CREATE without ``member_no`` takes AutoCount's own next number; a
     shared-phone CREATE carries the base MemberNo, whose free 2-9 variant the
@@ -602,11 +626,12 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
     if phone_digits is None:
         return Decision("CREATE", "no_phone_generator_member_no")
     hits = [r for r in rows if _phone_hit(r, phone_digits)]
-    exact = [r for r in hits if member_no_key(r.member_no) == phone_digits]
+    forms = member_no_forms(phone_digits)
+    exact = [r for r in hits if member_no_key(r.member_no) in forms]
     if len(exact) > 1:
-        return Decision("SKIP", "phone_on_multiple_records")
+        return Decision("SKIP", "memberno_conflict")  # never guessed, never merged
     if exact:
-        staff, signed_up = exact[0].created_at, customer.created_at
+        staff = exact[0].created_at
         if staff is None or signed_up is None:
             return Decision("SKIP", "created_time_missing", exact[0].member_no)
         if abs(staff - signed_up) <= window:
@@ -967,6 +992,85 @@ class SyncEngine:
             conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(result["counts"], sort_keys=True), run_id))
         return result
 
+    def initial_link(self, *, apply: bool) -> dict[str, Any]:
+        """Round 7c (Owner): link the Shopify customers made before the
+        cutover (Customer.createdAt < shopify_cutover_utc, any tag) to the AC2
+        member whose MemberNo is exactly their phone (``member_no_forms``),
+        with no time or name rule. A dry run (the default) writes no link;
+        ``apply`` needs ``initial_link_enabled``. Only ledger links are
+        written: no AC2 or Shopify write, no field change. A conflict (both
+        number forms in AC2, or the member already linked elsewhere) alerts
+        and is never merged. Resumable: a cursor on updatedAt per mode; an
+        applied pass that reaches the end opens Shopify -> AC2."""
+
+        if apply and not self.config.initial_link_enabled:
+            raise dl.DirectLocalError("initial_link_disabled")
+        cursor = INITIAL_LINK_CURSORS[apply]
+        floor = self.ledger.watermark(cursor)
+        cutover = dl.ts(self.config.shopify_cutover_utc)
+        search = f"created_at:<'{cutover}'" + (f" AND updated_at:>='{floor}'" if floor else "")
+        customers, complete = self.shopify.registrations(search, self.config.shopify_max_pages, self.config.birthday_month_metafield)
+        historical = []
+        for customer in customers:
+            if customer.created_at is None or customer.created_at >= self.config.shopify_cutover_utc:
+                continue  # defensive: the search already limits this
+            if self.ledger.link_for_gid(customer.gid) is not None:
+                self.summary.count("initial_link_already_linked")
+                continue
+            digits = phone_member_no(customer.phone)[0]
+            if digits is None:
+                self.summary.count("initial_link_no_phone")
+                continue
+            historical.append((customer, member_no_forms(digits)))
+        claimed: set[str] = set()
+        for start in range(0, len(historical), INITIAL_LINK_BATCH):
+            batch = historical[start:start + INITIAL_LINK_BATCH]
+            members = self.ac2.lookup(None, sorted({form for _, forms in batch for form in forms}))
+            for customer, forms in batch:
+                self._initial_link_one(customer, [m for m in members if member_no_key(m.member_no) in forms], claimed, apply)
+        if customers and not complete:
+            last = dl.ts(max(c.updated_at for c in customers if c.updated_at is not None))
+            if floor is not None and last <= floor:
+                # More customers share one updatedAt than one run reads.
+                self.summary.alert("initial_link_cursor_stuck")
+            else:
+                with self.ledger.tx() as conn:
+                    self.ledger.set_watermark(conn, cursor, last)
+        if complete:
+            with self.ledger.tx() as conn:
+                # A finished pass: the next one (dry run or a re-check) starts
+                # from the beginning again; an applied one opens Shopify -> AC2.
+                conn.execute("DELETE FROM watermarks WHERE name = ?", (cursor,))
+                if apply:
+                    self.ledger.set_watermark(conn, INITIAL_LINK_DONE_MARK, dl.ts(self.ledger.now()))
+        return {
+            "schema": SUMMARY_SCHEMA, "status": "completed_with_alerts" if self.summary.alerts else "completed", "direction": "initial_link",
+            "mode": "apply" if apply else "dry_run", "complete": complete, "alerts": list(self.summary.alerts),
+            "autocount_book": self.config.autocount_book, "writes": self.summary.writes,
+            "counts": dict(sorted(self.summary.counts.items())), "refs": self.summary.refs,
+        }
+
+    def _initial_link_one(self, customer: ShopifyCustomer, found: list[Ac2Member], claimed: set[str], apply: bool) -> None:
+        ref = self.ledger.ref("c", customer.gid)
+        if not found:
+            self.summary.count("initial_link_no_member")
+            return
+        member_no = found[0].member_no
+        key = member_no_key(member_no)
+        if len(found) > 1 or key in claimed or self.ledger.link_for_member(member_no) is not None:
+            self.summary.alert("initial_link_member_no_conflict", ref, member_no=member_no)
+            return
+        if self.ledger.open_write_for_member(member_no) is not None or self.ledger.open_write_for_customer(customer.gid) is not None:
+            self.summary.count("initial_link_held_by_open_write", ref, member_no=member_no)
+            return
+        claimed.add(key)
+        if not apply:
+            self.summary.count("initial_link_would_link", ref, "would_link", member_no=member_no)
+            return
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, customer.gid, member_no, "matched", "initial_link_member_no")
+        self.summary.count("initial_link_linked", ref, "link", member_no=member_no)
+
     def _recover_crashed_intents(self) -> None:
         """An INTENT left by a crashed run may or may not have been written:
         it becomes UNCERTAIN and is only ever looked up, never re-sent. Its
@@ -1024,6 +1128,11 @@ class SyncEngine:
 
     # -- Shopify -> AC2 ----------------------------------------------------------
     def shopify_to_ac2(self, started: datetime) -> None:
+        if self.ledger.watermark(INITIAL_LINK_DONE_MARK) is None:
+            # Round 7c (Owner): existing customers are linked first. Nothing
+            # is read or written until an applied initial link has completed.
+            self.summary.alert("initial_link_not_complete")
+            return
         budget = self.config.max_shopify_customers_per_run
         pending = self.ledger.conn.execute("SELECT customer_gid FROM shopify_pending WHERE state = 'PENDING' ORDER BY updated_at LIMIT ?", (budget,)).fetchall()
         for row in pending:
@@ -1119,10 +1228,10 @@ class SyncEngine:
         if phone_status == "invalid":
             self.summary.count("shopify_phone_invalid_treated_as_absent", ref)
         candidates = self.ac2.lookup(digits, []) if digits is not None else []
-        decision = decide_shopify_to_ac2(customer, digits, candidates, timedelta(minutes=self.config.memberno_link_window_minutes))
+        decision = decide_shopify_to_ac2(customer, digits, candidates, timedelta(minutes=self.config.memberno_link_window_minutes), signed_up=instant)
         if decision.action == "SKIP":
             self._shopify_pending(gid, "SKIPPED", decision.code)
-            if decision.code in ("memberno_exists_outside_window", "created_time_missing"):
+            if decision.code in ("memberno_exists_outside_window", "created_time_missing", "memberno_conflict"):
                 # Round 7: the phone MemberNo is in AC2 but cannot be linked
                 # by time; never created again. An operator decides.
                 self.summary.alert(decision.code, ref, member_no=decision.member_no)
@@ -1842,8 +1951,9 @@ def build_real_engine(config: SyncConfig, ledger: SyncLedger, *, environ: Mappin
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#155 phase 1 two-way member create sync")
-    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential"))
+    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link"))
     parser.add_argument("--config", required=True)
+    parser.add_argument("--apply", action="store_true", help="initial-link only: write the links (needs initial_link_enabled); default is a dry run")
     parser.add_argument("--direction", default="both", choices=("both", "shopify_to_ac2", "ac2_to_shopify"))
     args = parser.parse_args(argv)
     try:
@@ -1857,6 +1967,8 @@ def main(argv: list[str] | None = None) -> int:
             credential = load_ac2_credential(config.ac2_credential_target)
             _emit({"status": "ok", "user_id": mask_last3(credential.user_id), "secret_present": True})
             return 0
+        if args.command == "initial-link" and args.apply and not config.initial_link_enabled:
+            raise dl.DirectLocalError("initial_link_disabled")  # before any login or read
         root = _state_root(config)
         ledger = SyncLedger(root)
         try:
@@ -1866,6 +1978,11 @@ def main(argv: list[str] | None = None) -> int:
                 ledger.meta()
                 counts = {name: ledger.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in ("links", "writes", "ac2_pending", "shopify_pending")}
                 _emit({"status": "ok", "counts": counts, "uncertain_writes": ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'UNCERTAIN'").fetchone()[0]})
+            elif args.command == "initial-link":
+                result = build_real_engine(config, ledger, environ=os.environ).initial_link(apply=args.apply)
+                _emit(result)
+                if result["alerts"]:
+                    return 3
             else:
                 result = build_real_engine(config, ledger, environ=os.environ).run(direction=args.direction)
                 _emit(result)

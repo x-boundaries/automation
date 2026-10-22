@@ -100,6 +100,7 @@ class FakeShopify:
         self.searches: list[str] = []
         self.create_mode = "ok"
         self.next_gid = 900
+        self.page_limit = None  # round 7c: initial-link pages
 
     def add(self, item: sync.ShopifyCustomer) -> sync.ShopifyCustomer:
         self.customers[item.gid] = item
@@ -107,6 +108,17 @@ class FakeShopify:
 
     def registrations(self, search, max_pages, birthday):
         self.searches.append(search)
+        if search.startswith("created_at:<"):
+            # Round 7c initial link: customers made before the cutover, any
+            # tag, updated_at ascending from the cursor.
+            before = dl.parse_created_at(re.search(r"created_at:<'([^']+)'", search).group(1))
+            since = re.search(r"updated_at:>='([^']+)'", search)
+            floor = dl.parse_created_at(since.group(1)) if since else None
+            found = sorted((c for c in self.customers.values() if c.created_at is not None and c.created_at < before and (floor is None or c.updated_at >= floor)),
+                           key=lambda c: (c.updated_at, c.gid))
+            if self.page_limit is not None and len(found) > self.page_limit:
+                return found[:self.page_limit], False
+            return found, True
         return [c for c in self.customers.values() if "member-mg" in c.tags], True
 
     def customer(self, customer_gid, birthday):
@@ -195,6 +207,9 @@ class SyncTestCase(unittest.TestCase):
         self.ledger.init_meta(autocount_book=TEST_BOOK, store_gid=STORE, shop_domain=DOMAIN)
         self.shopify = FakeShopify()
         self.ac2 = FakeAc2()
+        # Round 7c: the one-off initial link has run (InitialLinkTests undo this).
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, "initial_link_completed_at", dl.ts(CUTOVER))
 
     def tearDown(self):
         self.ledger.close()
@@ -1896,7 +1911,8 @@ class MemberNoTimeWindowTests(SyncTestCase):
     """Round 7 (Owner, 22 Oct 2026): shop staff key the member in AC2 on the
     spot. A Shopify sign-up links to the AC2 member whose MemberNo is exactly
     the sign-up's phone MemberNo when AC2 CreatedTime (Singapore local time,
-    no offset) and Shopify Customer.createdAt are at most
+    no offset) and the sign-up time (round 7c: the start_date metafield's
+    createdAt; the ``signup`` helper sets both) are at most
     ``memberno_link_window_minutes`` (default 10) apart, either way. Name is
     not used. The same MemberNo outside the window: no link, no create, an
     alert. Only stored times are compared, so any run frequency works."""
@@ -2030,25 +2046,15 @@ class MemberNoTimeWindowTests(SyncTestCase):
         self.assertNotIn("memberno_and_created_time_match", result["counts"])
 
     def test_missing_created_time_never_links_or_creates(self):
+        # Round 7c: the Shopify side is the sign-up time, which a registered
+        # customer always has (no sign-up time never reaches this rule).
         self.now = T0 + timedelta(days=1)
         self.signup(74, T0)
         self.staff(74, None)
-        self.signup(75, T0)
-        self.shopify.add(replace(self.shopify.customers[gid(75)], created_at=None))
-        self.staff(75, T0)
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual((self.links(), self.ac2.creates), ({}, []))
-        self.assertEqual(result["counts"]["created_time_missing"], 2)
+        self.assertEqual(result["counts"]["created_time_missing"], 1)
         self.assertIn("created_time_missing", result["alerts"])
-
-    def test_an_existing_shopify_account_uses_its_original_created_at(self):
-        # Customer.createdAt is the account's creation, not the sign-up: a
-        # customer who had an account before signing up (400 days here) is
-        # outside the window even if staff keyed the member at sign-up.
-        self.now = T0 + timedelta(hours=1)
-        self.shopify.add(customer(76))
-        self.staff(76, T0)
-        self.assert_alerted(76, self.run_sync("shopify_to_ac2"))
 
     def test_name_rule_applies_only_when_no_member_no_is_the_phone(self):
         # A legacy record holding the phone in MobilePhone under another
@@ -2099,6 +2105,220 @@ class Ac2CreatedTimeTests(unittest.TestCase):
         client = sync.SyncBridgeClient(["powershell.exe"], autocount_book=TEST_BOOK, claims=Path("."), env={}, popen=lambda args, **kwargs: Process())
         members = client.lookup(sg(80), [])
         self.assertEqual([m.created_at for m in members], [datetime(2026, 10, 21, 2, 2, 0, 123000, tzinfo=timezone.utc), None])
+
+
+class SignUpTimeWindowTests(SyncTestCase):
+    """Round 7c (Owner, 22 Oct 2026): the window compares AC2 CreatedTime with
+    the sign-up time the sync already reads (``registration_at``, the
+    ``membership.start_date`` metafield's ``createdAt``), not
+    Customer.createdAt; a MemberNo of the 8 Singapore digits without ``65``
+    is the same number; a foreign ``+`` number gets the same rule."""
+
+    def staff(self, member_no: str, at: datetime) -> None:
+        self.ac2.add(sync.Ac2Member(member_no, "SOMEONE ELSE", None, created_at=at))
+
+    def test_an_older_shopify_account_links_by_its_sign_up_time(self):
+        # customer(): account made 400 days before the sign-up at T0.
+        self.now = T0 + timedelta(hours=1)
+        self.shopify.add(customer(80))
+        self.staff(sg(80), T0 + timedelta(minutes=2))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates), ({gid(80): sg(80)}, []))
+        self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
+
+    def test_customer_created_at_alone_never_links(self):
+        # Account made at T0, sign-up (start_date metafield) 30 minutes later:
+        # staff keyed the member at T0 + 1 min, 29 minutes before the sign-up.
+        self.now = T0 + timedelta(hours=2)
+        self.shopify.add(replace(customer(81, registered=T0 + timedelta(minutes=30)), created_at=T0))
+        self.staff(sg(81), T0 + timedelta(minutes=1))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates), ({}, []))
+        self.assertIn("memberno_exists_outside_window", result["alerts"])
+
+    def test_eight_digit_member_no_is_the_same_number(self):
+        self.now = T0 + timedelta(hours=1)
+        self.shopify.add(customer(82))
+        self.staff(local(82), T0 - timedelta(minutes=3))
+        self.shopify.add(customer(83))
+        self.staff(local(83), T0 + timedelta(minutes=11))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.links(), {gid(82): local(82)})
+        self.assertEqual(self.ac2.creates, [])
+        self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
+        flagged = [r for r in result["refs"] if r["code"] == "memberno_exists_outside_window"]
+        self.assertEqual([r["member_no_masked"] for r in flagged], ["*****" + local(83)[-3:]])
+        self.assert_no_pii(result)
+
+    def test_both_forms_of_the_number_alert_as_a_conflict(self):
+        self.now = T0 + timedelta(days=1)  # past the cutoff: still never created
+        self.shopify.add(customer(84))
+        self.staff(sg(84), T0)
+        self.staff(local(84), T0)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates), ({}, []))
+        self.assertIn("memberno_conflict", result["alerts"])
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM shopify_pending WHERE customer_gid = ?", (gid(84),)).fetchone()[:], ("SKIPPED", "memberno_conflict"))
+
+    def test_foreign_numbers_get_the_same_window(self):
+        other = "60" + "1" + "2000" + "0002"  # a second fake foreign number
+        self.now = T0 + timedelta(hours=1)
+        self.shopify.add(customer(85, phone=plus(FOREIGN_DIGITS)))
+        self.staff(FOREIGN_DIGITS, T0 + timedelta(minutes=10))
+        self.shopify.add(customer(86, phone=plus(other)))
+        self.staff(other, T0 - timedelta(minutes=10, seconds=1))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(self.links(), {gid(85): FOREIGN_DIGITS})
+        self.assertEqual(self.ac2.creates, [])
+        self.assertIn("memberno_exists_outside_window", result["alerts"])
+
+
+class InitialLinkTests(SyncTestCase):
+    """Round 7c (Owner, 22 Oct 2026): before the window rule applies, the
+    Shopify customers made before the cutover (Customer.createdAt <
+    shopify_cutover_utc, any tag) are linked once to the AC2 member whose
+    MemberNo is their phone (65 + 8 digits, or the 8 digits), with no time
+    or name rule. Dry run by default; applying needs initial_link_enabled.
+    Link-only: only ledger links are written. A conflict alerts, never
+    merges. Shopify -> AC2 waits until an applied pass has completed."""
+
+    def setUp(self):
+        super().setUp()
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = 'initial_link_completed_at'")
+        self.shopify.page_limit = None
+
+    def historical(self, n: int, *, phone="sg", updated=None) -> sync.ShopifyCustomer:
+        item = customer(n, phone=phone, tags=())
+        made = CUTOVER - timedelta(days=30)
+        return self.shopify.add(replace(item, created_at=made, updated_at=updated or made, registration_at=None, registration_value=None))
+
+    def member(self, member_no: str, name: str = "WHOEVER TYPED") -> None:
+        self.ac2.add(sync.Ac2Member(member_no, name, None, created_at=T0 - timedelta(days=900)))
+
+    def link_codes(self) -> dict:
+        return {row[0]: (row[1], row[2], row[3]) for row in self.ledger.conn.execute("SELECT customer_gid, member_no, origin, code FROM links")}
+
+    def initial_link(self, *, apply: bool, **overrides) -> dict:
+        return self.engine(**overrides).initial_link(apply=apply)
+
+    def test_shopify_to_ac2_waits_for_the_initial_link(self):
+        self.shopify.add(customer(1))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertIn("initial_link_not_complete", result["alerts"])
+        self.assertEqual((self.ac2.lookups, self.ac2.creates, self.links(), self.shopify.searches), (0, [], {}, []))
+
+    def test_dry_run_counts_and_lists_masked_and_writes_nothing(self):
+        self.historical(20)
+        self.member(sg(20))
+        self.historical(21)
+        self.member(local(21))  # the 8 digits without 65: the same number
+        self.historical(22, phone=None)
+        self.historical(23)  # no AC2 member
+        self.shopify.add(replace(customer(24), created_at=T0))  # made after the cutover: not historical
+        self.member(sg(24))
+        result = self.initial_link(apply=False)
+        self.assertEqual(result["mode"], "dry_run")
+        counts = result["counts"]
+        self.assertEqual((counts["initial_link_would_link"], counts["initial_link_no_phone"], counts["initial_link_no_member"]), (2, 1, 1))
+        self.assertEqual(sorted(r["member_no_masked"] for r in result["refs"] if r["action"] == "would_link"),
+                         sorted(["*******" + sg(20)[-3:], "*****" + local(21)[-3:]]))
+        self.assertEqual((self.links(), self.ac2.creates, self.shopify.created), ({}, [], []))
+        self.assertIsNone(self.ledger.watermark("initial_link_completed_at"))
+        self.assert_no_pii(result)
+
+    def test_apply_needs_its_own_owner_gate(self):
+        self.historical(25)
+        self.member(sg(25))
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            self.initial_link(apply=True)
+        self.assertEqual(caught.exception.code, "initial_link_disabled")
+        self.assertEqual(self.links(), {})
+        self.assertFalse(make_config().initial_link_enabled)
+
+    def test_apply_links_by_member_no_without_time_or_name_and_writes_nothing_else(self):
+        self.historical(26)
+        self.member(sg(26))
+        self.historical(27)
+        self.member(local(27))
+        result = self.initial_link(apply=True, initial_link_enabled=True)
+        self.assertEqual(result["mode"], "apply")
+        self.assertEqual(self.link_codes(), {gid(26): (sg(26), "matched", "initial_link_member_no"), gid(27): (local(27), "matched", "initial_link_member_no")})
+        self.assertEqual(result["counts"]["initial_link_linked"], 2)
+        self.assertEqual((self.ac2.creates, self.ac2.generator_calls, self.shopify.created, result["writes"]), ([], 0, [], 0))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+        self.assertIsNotNone(self.ledger.watermark("initial_link_completed_at"))
+        # Later the customer signs up: already linked, no window rule, no alert.
+        self.shopify.add(replace(self.shopify.customers[gid(26)], tags=("member-mg",), registration_at=T0, registration_value="2026-10-21"))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(result["alerts"], [])
+        self.assertEqual(self.ac2.creates, [])
+
+    def test_conflicts_alert_and_never_link(self):
+        self.historical(28)
+        self.member(sg(28))
+        self.member(local(28))  # both forms in AC2
+        self.historical(29)
+        self.member(sg(29))
+        with self.ledger.tx() as conn:  # that member is already linked to another customer
+            self.ledger.add_link(conn, gid(97), sg(29), "matched", "test")
+        result = self.initial_link(apply=True, initial_link_enabled=True)
+        self.assertEqual(result["counts"]["initial_link_member_no_conflict"], 2)
+        self.assertIn("initial_link_member_no_conflict", result["alerts"])
+        self.assertEqual(self.links(), {gid(97): sg(29)})
+        self.assert_no_pii(result)
+
+    def test_an_unfinished_pass_resumes_and_keeps_the_sync_waiting(self):
+        for n, minutes in ((30, 1), (31, 2), (32, 3)):
+            self.historical(n, updated=CUTOVER - timedelta(minutes=60 - minutes))
+            self.member(sg(n))
+        self.shopify.page_limit = 2
+        first = self.initial_link(apply=True, initial_link_enabled=True)
+        self.assertFalse(first["complete"])
+        self.assertIsNone(self.ledger.watermark("initial_link_completed_at"))
+        self.assertIn("initial_link_not_complete", self.run_sync("shopify_to_ac2")["alerts"])
+        second = self.initial_link(apply=True, initial_link_enabled=True)
+        self.assertTrue(second["complete"])
+        self.assertEqual(set(self.links()), {gid(30), gid(31), gid(32)})
+        self.assertIsNotNone(self.ledger.watermark("initial_link_completed_at"))
+        self.assertIsNone(self.ledger.watermark("initial_link_updated_at"))  # a later pass starts again
+
+    def test_dry_runs_resume_then_start_again_and_never_link(self):
+        for n, minutes in ((36, 1), (37, 2), (38, 3)):
+            self.historical(n, updated=CUTOVER - timedelta(minutes=60 - minutes))
+            self.member(sg(n))
+        self.shopify.page_limit = 2
+        counts = [self.initial_link(apply=False)["counts"].get("initial_link_would_link", 0) for _ in range(3)]
+        # Pages 1 (2 customers), 2 (the cursor customer again + the last), then a fresh pass.
+        self.assertEqual(counts, [2, 2, 2])
+        self.assertEqual((self.links(), self.ledger.watermark("initial_link_completed_at")), ({}, None))
+        self.assertIsNone(self.ledger.watermark("initial_link_updated_at"))
+
+    def test_a_stuck_cursor_alerts(self):
+        for n in (33, 34, 35):
+            self.historical(n)  # all updated at the same instant
+        self.shopify.page_limit = 2
+        self.initial_link(apply=True, initial_link_enabled=True)
+        result = self.initial_link(apply=True, initial_link_enabled=True)
+        self.assertIn("initial_link_cursor_stuck", result["alerts"])
+        self.assertIsNone(self.ledger.watermark("initial_link_completed_at"))
+
+    def test_cli_runs_a_dry_run_unless_apply_is_given(self):
+        temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-cli-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        path = temp / "config.json"
+        path.write_text(json.dumps(config_value()), encoding="utf-8")
+        engine = mock.Mock()
+        engine.initial_link.return_value = {"alerts": []}
+        with mock.patch.object(sync, "_state_root", return_value=temp), mock.patch.object(sync, "SyncLedger"), \
+                mock.patch.object(sync, "build_real_engine", return_value=engine), redirect_stdout(io.StringIO()):
+            self.assertEqual(sync.main(["initial-link", "--config", str(path)]), 0)
+            engine.initial_link.assert_called_once_with(apply=False)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(sync.main(["initial-link", "--apply", "--config", str(path)]), 2)
+            self.assertEqual(json.loads(out.getvalue()), {"status": "refused", "code": "initial_link_disabled"})
+            self.assertEqual(engine.initial_link.call_count, 1)  # refused before any engine call
 
 
 if __name__ == "__main__":
