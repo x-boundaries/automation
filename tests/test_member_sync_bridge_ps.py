@@ -211,12 +211,13 @@ class SqlAllowlistGuardTests(unittest.TestCase):
     not pinned, after a deny check on every text. Refused texts never reach
     ExecuteScalar."""
 
-    def run_guard(self, cases):
+    def run_guard(self, cases, engine=None):
         temp = Path(tempfile.mkdtemp(prefix="xb-sql-guard-"))
         self.addCleanup(shutil.rmtree, temp, True)
         (temp / "harness.ps1").write_text(SQL_GUARD_HARNESS, encoding="utf-8")
+        # ensure_ascii (the default): any non-ASCII or control character travels as a \u escape.
         (temp / "cases.json").write_text(json.dumps({"cases": [{"sql": sql, "params": list(params)} for sql, params in cases]}), encoding="utf-8")
-        proc = subprocess.run([powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(temp / "harness.ps1"), str(GUARD), str(temp / "cases.json")],
+        proc = subprocess.run([engine or powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(temp / "harness.ps1"), str(GUARD), str(temp / "cases.json")],
                               capture_output=True, timeout=120, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
         out = json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
@@ -258,7 +259,6 @@ class SqlAllowlistGuardTests(unittest.TestCase):
             ("SELECT  DB_NAME()", ()),
             (db_name + " ", ()),
             (" " + db_name, ()),
-            (db_name + "\n", ()),
             ("select DB_NAME()", ()),
             (max_id + " WHERE ID > 0", ()),
             ("SELECT COUNT_BIG(*) FROM Member", ()),
@@ -291,6 +291,68 @@ class SqlAllowlistGuardTests(unittest.TestCase):
             with self.subTest(sql=sql[:90]):
                 self.assertEqual(result, {"code": "ok", "executed": True})
         self.assertEqual(out["texts"], ALLOWED_SQL_TEXTS)  # the guard's table is exactly the pin
+
+    def test_non_ascii_texts_are_refused_on_every_engine(self):
+        # G2 LOW-1: an allowlisted text with an invisible or non-ASCII
+        # character (built at runtime; this file stays ASCII) is refused
+        # before any other check, on Windows PowerShell 5.1 and pwsh alike.
+        db_name = ALLOWED_SQL_TEXTS["db_name"]
+        counter = ALLOWED_SQL_TEXTS["member_change_counter"]
+        bases = [(text, ()) for text in ALLOWED_SQL_TEXTS.values()]
+        bases += [(changelog_sql(200), ("1",)), (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE]), ("1", "2"))]
+        cases = []
+        for code in NON_ASCII_CODE_POINTS:
+            for text, params in bases:
+                middle = len(text) // 2
+                cases += [(chr(code) + text, params), (text[:middle] + chr(code) + text[middle:], params), (text + chr(code), params)]
+        cases += [
+            ("SELECT DB_" + chr(0xAD) + "NAME()", ()),  # G2 probes
+            (db_name + chr(0x00), ()),
+            (db_name + chr(0x200D), ()),
+            (counter.replace("'Member'", "'Mem" + chr(0xAD) + "ber'"), ()),
+            (db_name + "\n", ()),  # moved here: a line break is outside the allowed set
+            (db_name + "\r", ()),
+            ("SELECT" + "\t" + "DB_NAME()", ()),
+        ]
+        engines = powershell_engines()
+        self.assertTrue(engines)
+        for engine in engines:
+            with self.subTest(engine=Path(engine).name):
+                out = self.run_guard(cases, engine)
+                for (sql, _params), result in zip(cases, out["results"]):
+                    with self.subTest(engine=Path(engine).name, sql=ascii(sql[:60])):
+                        self.assertEqual(result, {"code": "vendor_query_not_ascii", "executed": False})
+
+
+# U+00AD soft hyphen, NUL, U+200B zero-width space, U+200D zero-width joiner,
+# U+FEFF byte-order mark, U+00A0 no-break space.
+NON_ASCII_CODE_POINTS = (0xAD, 0x00, 0x200B, 0x200D, 0xFEFF, 0xA0)
+
+
+def powershell_engines() -> list[str]:
+    """Every PowerShell engine on this machine (Windows PowerShell 5.1 and/or pwsh)."""
+
+    found = []
+    for name in ("powershell", "pwsh"):
+        path = shutil.which(name)
+        if path and path not in found:
+            found.append(path)
+    return found
+
+
+class SqlAllowlistAsciiStaticTests(unittest.TestCase):
+    def test_allowlisted_texts_are_single_line_printable_ascii(self):
+        # Fact behind the ASCII gate: every pinned text and both templates use
+        # only U+0020-U+007E, so U+0020 is the only whitespace (no tab, CR or LF).
+        texts = list(ALLOWED_SQL_TEXTS.values()) + [changelog_sql(1000, "Content")]
+        texts.append(lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_EMBEDDED] + [LOOKUP_NUMBER] * 20))
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                self.assertRegex(text, r"\A[\x20-\x7E]+\Z")
+
+    def test_sources_stay_ascii(self):
+        for path in (Path(__file__), GUARD):
+            path.read_bytes().decode("ascii")
 
 
 @unittest.skipUnless(powershell(), "no PowerShell executable available")

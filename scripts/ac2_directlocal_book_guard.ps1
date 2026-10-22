@@ -14,7 +14,8 @@
 #   - vendor error telemetry is off;
 #   - UserScript, MailQueue and EInvoiceQueue are empty.
 # Every vendor query goes through Get-XbDlScalar, which sends only the pinned
-# read-only SQL texts (G2 H1; the SQL login is always sa).
+# read-only SQL texts (G2 H1; the SQL login is always sa): printable ASCII
+# only, compared ordinally (G2 LOW-1).
 # Credentials are never read here: the adapter reads them from the process
 # environment, which only the Owner console procedure provides.
 
@@ -54,7 +55,11 @@ function Assert-XbDlQualifiedAssemblies {
 # AutoCount.dll, whichever AutoCount user logs in), so Get-XbDlScalar is the
 # only database-side limit. It sends only these exact texts, or the two sync
 # read templates below whose only variable parts are validated, and only after
-# the deny check on every text. Pinned by tests/test_member_sync_bridge_ps.py.
+# the deny check on every text. Every pinned text and template is one line of
+# printable ASCII (U+0020-U+007E; U+0020 is the only whitespace), so any other
+# character is refused first (G2 LOW-1: PowerShell's -ccontains and -ceq are
+# culture-aware and ignore characters such as U+00AD); every exact match is
+# ordinal. Pinned by tests/test_member_sync_bridge_ps.py.
 $script:XbDlSqlText = [ordered]@{
     db_name = "SELECT DB_NAME()"
     machine_name = "SELECT CAST(SERVERPROPERTY('MachineName') AS nvarchar(128))"
@@ -91,18 +96,21 @@ function Test-XbDlLookupSql {
     $parts = @($Sql.Substring($prefix.Length, $Sql.Length - $prefix.Length - $suffix.Length) -csplit " OR ", 0, "SimpleMatch")
     $end = $parts.Count
     $numbers = 0
-    while ($end -gt 0 -and $parts[$end - 1] -ceq $script:XbDlLookupNumber) { $end--; $numbers++ }
+    while ($end -gt 0 -and [string]::Equals($parts[$end - 1], $script:XbDlLookupNumber, [StringComparison]::Ordinal)) { $end--; $numbers++ }
     $key = $script:XbDlLookupKey; $mobile = $script:XbDlLookupMobile
     $heads = @{ 0 = ""; 2 = "$key|$mobile"; 3 = "$key|$mobile|$($script:XbDlLookupEmbedded)"; 5 = "$key|$mobile|$key|$mobile|$($script:XbDlLookupEmbedded)" }
     $head = if ($end -gt 0) { @($parts[0..($end - 1)]) -join "|" } else { "" }
-    return ($numbers -le 20 -and ($end + $numbers) -ge 1 -and $heads.ContainsKey($end) -and $head -ceq $heads[$end])
+    return ($numbers -le 20 -and ($end + $numbers) -ge 1 -and $heads.ContainsKey($end) -and [string]::Equals($head, [string]$heads[$end], [StringComparison]::Ordinal))
 }
 
 function Assert-XbDlSqlAllowed {
     param([Parameter(Mandatory)][string]$Sql, [object[]]$Params = @())
+    if ($Sql -cnotmatch '\A[\x20-\x7E]+\z') { throw "vendor_query_not_ascii" }
     if ($Sql -match $script:XbDlDeniedSqlPattern) { throw "vendor_query_not_read_only" }
     if ([regex]::Matches($Sql, '\?').Count -ne @($Params).Count) { throw "vendor_query_not_allowlisted" }
-    if (@($script:XbDlSqlText.Values) -ccontains $Sql) { return }
+    foreach ($text in $script:XbDlSqlText.Values) {
+        if ([string]::Equals($Sql, [string]$text, [StringComparison]::Ordinal)) { return }
+    }
     if ($Sql -cmatch $script:XbDlChangeLogSqlPattern -and [int]$Matches[1] -le 1000) { return }
     if (Test-XbDlLookupSql -Sql $Sql) { return }
     throw "vendor_query_not_allowlisted"

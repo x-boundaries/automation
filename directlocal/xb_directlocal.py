@@ -1218,7 +1218,7 @@ BRIDGE_CHILD_ERROR_CODES = frozenset({
     "sync_changelog_failed", "sync_changelog_request_invalid", "sync_lookup_failed",
     "synthetic_session_binding_invalid", "synthetic_session_marker_missing", "synthetic_session_with_target_book",
     "target_book_not_authorised", "user_script_present", "vendor_error_telemetry_enabled",
-    "vendor_query_not_allowlisted", "vendor_query_not_read_only", "writer_deadline_expired", "writer_deadline_invalid",
+    "vendor_query_not_allowlisted", "vendor_query_not_ascii", "vendor_query_not_read_only", "writer_deadline_expired", "writer_deadline_invalid",
 })
 
 
