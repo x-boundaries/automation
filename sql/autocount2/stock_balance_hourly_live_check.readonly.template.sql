@@ -3,7 +3,7 @@
 
   NOT RUN BY THE BUILD. The owner runs it once, off-peak, after an explicit OK (runbook step V3),
   with sqlcmd variable mode, for example:
-      sqlcmd -S <instance> -E -v ExpectedDb="<book database>" -i stock_balance_hourly_live_check.readonly.template.sql
+      sqlcmd -S <instance> -E -d <book database> -v ExpectedDb="<book database>" -i stock_balance_hourly_live_check.readonly.template.sql
 
   SELECT and aggregates only. No item-level rows, no free-text columns, no cost columns, no
   writes, no database setting changes. dbo.ChangeLog is never read.

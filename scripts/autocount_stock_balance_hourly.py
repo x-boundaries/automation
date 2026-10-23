@@ -61,10 +61,16 @@ LATEST_MANIFEST_NAME = "latest_manifest.json"
 LAST_RUN_STATUS_NAME = "last_run_status.json"
 LOCK_NAME = ".ac2_stockbal.lock"
 HOURLY_DIR = "hourly"
-# A lock older than this cannot belong to a live run (the scheduled task stops a run after 15
-# minutes). It is still never removed automatically: the run fails loudly as "stale_lock" and
-# the runbook tells the owner how to check and clear it.
-LOCK_STALE_AFTER_MINUTES = 60
+# The scheduled task stops a run after this many minutes (installer ExecutionTimeLimit).
+TASK_EXECUTION_LIMIT_MINUTES = 15
+# A lock older than the execution limit plus this margin is cleared automatically, but only when
+# the process it records is no longer running (a run killed by the time limit or a reboot). A
+# lock whose process is still alive is always respected. The clearing run records a warning.
+LOCK_CLEAR_MARGIN_MINUTES = 15
+LOCK_STALE_AFTER_MINUTES = TASK_EXECUTION_LIMIT_MINUTES + LOCK_CLEAR_MARGIN_MINUTES
+# A process created more than this after the lock was written reused the PID; it is not the
+# lock owner. The tolerance only absorbs small clock adjustments.
+LOCK_PID_START_TOLERANCE_SECONDS = 60
 
 NO_BALANCE_ROW_LABEL = "(no balance row)"
 ROW_SOURCE_BALANCE = "balance"
@@ -73,6 +79,11 @@ ROW_SOURCE_NO_BALANCE_ROW = "no_balance_row"
 SYNC_TIME_COLUMNS = ("LastFinishSyncTime", "LastTransFinishSyncTime")
 ZERO_ROW_MODES = ("keep_rows_and_add_items_without_rows", "keep_rows", "drop_zero_rows")
 AUTH_MODES = ("windows_integrated", "sql_login")
+LOGON_TYPES = ("S4U", "Password")
+# The only supported auth mode / scheduled-task logon pairs (runbook "Scheduled identity"). An
+# S4U task stores no password and cannot read Credential Manager secrets, so a SQL login
+# password can only be read by a task registered with a Password logon.
+SUPPORTED_LOGON_PAIRS = {"windows_integrated": "S4U", "sql_login": "Password"}
 UOM_GUARD_MODES = ("fail",)
 SCHEDULE_FREQUENCIES = ("hourly",)
 AVAILABLE_COLUMNS = (
@@ -99,6 +110,7 @@ EXIT_MISSING = 3
 
 # Failure classes written to manifests and last_run_status.json.
 FAILURE_CONFIG = "config_invalid"
+FAILURE_TIMEZONE = "timezone_unavailable"
 FAILURE_ALREADY_RUNNING = "already_running"
 FAILURE_STALE_LOCK = "stale_lock"
 FAILURE_IDENTITY = "identity_refused"
@@ -189,6 +201,14 @@ def query_sha256(text):
 class ConfigError(ValueError):
     """Invalid settings. Messages name the setting, never its value."""
 
+    failure_class = FAILURE_CONFIG
+
+
+class TimezoneUnavailableError(ConfigError):
+    """No time zone database at all (Windows Python without tzdata), not just a bad zone name."""
+
+    failure_class = FAILURE_TIMEZONE
+
 
 class RunFailure(RuntimeError):
     """A classified, sanitized failure that ends the run."""
@@ -220,7 +240,7 @@ class CredentialUnavailableError(RuntimeError):
 
 DEFAULT_SETTINGS = {
     "timezone": "Asia/Singapore",
-    "schedule": {"frequency": "hourly", "run_minute": 0},
+    "schedule": {"frequency": "hourly", "run_minute": 0, "logon_type": "S4U"},
     "stale_after_minutes": 70,
     "source": {
         "server": None,
@@ -293,11 +313,14 @@ def validate_settings(raw):
     try:
         load_timezone(_require_str(settings, "timezone"))
     except RuntimeError as exc:
+        if not timezone_database_available():
+            raise TimezoneUnavailableError("time zone data is not installed (install tzdata)") from exc
         raise ConfigError("timezone is not available") from exc
 
     schedule = settings["schedule"]
     _require_enum(schedule["frequency"], SCHEDULE_FREQUENCIES, "schedule.frequency")
     _require_int(schedule["run_minute"], "schedule.run_minute", 0, 59)
+    _require_enum(schedule["logon_type"], LOGON_TYPES, "schedule.logon_type")
     _require_int(settings["stale_after_minutes"], "stale_after_minutes", 1, 24 * 60)
 
     source = settings["source"]
@@ -329,6 +352,12 @@ def validate_settings(raw):
         for key in ("sql_login", "credential_target"):
             if identity[key] not in (None, ""):
                 raise ConfigError("identity.%s is only used with auth_mode sql_login" % key)
+    required_logon = SUPPORTED_LOGON_PAIRS[identity["auth_mode"]]
+    if schedule["logon_type"] != required_logon:
+        raise ConfigError(
+            "identity.auth_mode %s is only supported with schedule.logon_type %s"
+            % (identity["auth_mode"], required_logon)
+        )
 
     read = settings["read"]
     _require_int(read["lock_timeout_ms"], "read.lock_timeout_ms", 1, 600000)
@@ -364,6 +393,15 @@ def validate_settings(raw):
     if missing:
         raise ConfigError("output.columns must include: " + ", ".join(missing))
     return settings
+
+
+def timezone_database_available():
+    """False when not even the default zone loads, i.e. no zone database is installed."""
+    try:
+        load_timezone(DEFAULT_SETTINGS["timezone"])
+    except RuntimeError:
+        return False
+    return True
 
 
 def settings_sha256(settings):
@@ -925,29 +963,113 @@ def git_commit():
 # ---------------------------------------------------------------------------------------------
 
 
-def acquire_lock(archive_root, run_id, now):
+def acquire_lock(archive_root, run_id, now, warnings):
+    """Take the lock, clearing one left by a killed run. Appends a warning when it clears one.
+
+    A lock younger than LOCK_STALE_AFTER_MINUTES, or one whose process is still running, gives
+    already_running. An unreadable lock gives stale_lock and is kept for the owner to check.
+    """
     path = Path(archive_root) / LOCK_NAME
     payload = json_bytes({"run_id": run_id, "pid": os.getpid(), "started_at": now.isoformat()})
     try:
         write_exclusive(path, payload)
+        return path
+    except FileExistsError:
+        pass
+    held = _read_lock(path)
+    if held is None:
+        raise RunFailure(FAILURE_STALE_LOCK, "The lock file is unreadable; check no run is active, then remove it")
+    age = now - held["started_at"]
+    if age <= timedelta(minutes=LOCK_STALE_AFTER_MINUTES) or _pid_running(held["pid"], held["started_at"]):
+        raise RunFailure(FAILURE_ALREADY_RUNNING, "Another run holds the lock")
+    try:
+        # Remove only the lock that was inspected, never one another run has just taken.
+        if path.read_bytes() != held["raw"]:
+            raise RunFailure(FAILURE_ALREADY_RUNNING, "Another run holds the lock")
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RunFailure(FAILURE_STALE_LOCK, "A lock left by a killed run could not be removed") from exc
+    try:
+        write_exclusive(path, payload)
     except FileExistsError as exc:
-        stale = _lock_is_stale(path, now)
-        raise RunFailure(
-            FAILURE_STALE_LOCK if stale else FAILURE_ALREADY_RUNNING,
-            "A lock older than %d minutes exists; check no run is active, then remove it" % LOCK_STALE_AFTER_MINUTES
-            if stale
-            else "Another run holds the lock",
-        ) from exc
+        raise RunFailure(FAILURE_ALREADY_RUNNING, "Another run holds the lock") from exc
+    warnings.append(
+        "Cleared a lock left by run %s, whose process is no longer running (lock age %d minutes)"
+        % (held["run_id"][:8], int(age.total_seconds() // 60))
+    )
     return path
 
 
-def _lock_is_stale(path, now):
+def _read_lock(path):
+    """The lock's run_id, pid, started_at and raw bytes, or None when it cannot be trusted."""
     try:
-        started = datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["started_at"])
-        return now - started > timedelta(minutes=LOCK_STALE_AFTER_MINUTES)
-    except (OSError, ValueError, KeyError, TypeError):
-        # Unreadable lock content: report it as stale so the owner looks at it.
+        raw = path.read_bytes()
+        content = json.loads(raw.decode("utf-8"))
+        started = datetime.fromisoformat(content["started_at"])
+        pid = content["pid"]
+        run_id = content["run_id"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if started.tzinfo is None or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(run_id, str):
+        return None
+    return {"run_id": run_id, "pid": pid, "started_at": started, "raw": raw}
+
+
+def _pid_running(pid, started_at):
+    """True when the lock's process may still be running. Any doubt counts as running."""
+    if os.name == "nt":
+        return _windows_pid_running(pid, started_at)
+    # POSIX only: signal 0 checks existence. Never used on Windows, where os.kill terminates.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
         return True
+    return True
+
+
+def _windows_pid_running(pid, started_at):
+    import ctypes
+    from ctypes import wintypes
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    process_query_limited_information = 0x1000
+    error_invalid_parameter = 87
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(FILETIME)] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        # Invalid parameter: no process has this PID. Anything else (for example access denied)
+        # means a process exists that cannot be inspected, so the lock is respected.
+        return ctypes.get_last_error() != error_invalid_parameter
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        if exit_code.value != still_active:
+            return False
+        times = [FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return True
+        ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        created = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+        return created <= started_at + timedelta(seconds=LOCK_PID_START_TOLERANCE_SECONDS)
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def release_lock(path, run_id):
@@ -1031,7 +1153,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     publish_failure = None
     try:
         archive_root.mkdir(parents=True, exist_ok=True)
-        lock_path = acquire_lock(archive_root, run_id, started)
+        lock_path = acquire_lock(archive_root, run_id, started, manifest["warnings"])
         source = source or SqlServerSource(settings)
         snapshot, attempts, identity = read_snapshot(source, settings, environ, sleep)
         manifest["attempts"] = attempts
@@ -1222,9 +1344,9 @@ def check_latest(settings, clock=None):
         if hashlib.sha256(data).hexdigest() != latest["csv"]["sha256"]:
             raise ValueError("latest CSV does not match latest manifest")
         as_of = datetime.fromisoformat(latest["as_of_local"])
+        age_minutes = int((now - as_of).total_seconds() // 60)
     except (KeyError, TypeError, ValueError):
         return EXIT_MISSING, {"status": "invalid"}
-    age_minutes = int((now - as_of).total_seconds() // 60)
     result = {"as_of_local": latest["as_of_local"], "age_minutes": age_minutes, "run_id": latest.get("run_id")}
     if age_minutes > settings["stale_after_minutes"]:
         return EXIT_STALE, dict(result, status="stale")
@@ -1236,17 +1358,28 @@ def check_latest(settings, clock=None):
 # ---------------------------------------------------------------------------------------------
 
 
-def config_failure_manifest(raw, message, clock=None):
-    """Best-effort FAILED manifest for an invalid config, when an archive root is readable."""
+def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=None):
+    """Best-effort FAILED manifest for an invalid config, when an archive root is readable.
+
+    Never raises. Without any zone database the times are stamped in UTC with a visible note,
+    and last_run_status.json also goes to delivery_root when one is readable, so a stale
+    success status is not left in Drive.
+    """
     output = raw.get("output") if isinstance(raw, dict) else None
     root = output.get("archive_root") if isinstance(output, dict) else None
     if not isinstance(root, str) or not root.strip():
         return None
-    tz_name = raw.get("timezone") if isinstance(raw.get("timezone"), str) else DEFAULT_SETTINGS["timezone"]
-    try:
-        tz = load_timezone(tz_name)
-    except RuntimeError:
-        tz = load_timezone(DEFAULT_SETTINGS["timezone"])
+    delivery = output.get("delivery_root")
+    tz_names = [DEFAULT_SETTINGS["timezone"]]
+    if isinstance(raw.get("timezone"), str):
+        tz_names.insert(0, raw["timezone"])
+    tz, tz_name, note = timezone.utc, "UTC", "Time zone data unavailable: times are UTC"
+    for name in tz_names:
+        try:
+            tz, tz_name, note = load_timezone(name), name, None
+            break
+        except RuntimeError:
+            continue
     run_id = uuid.uuid4().hex
     now = _now(tz, clock)
     relative = Path(HOURLY_DIR) / now.strftime("%Y-%m-%d") / run_folder_name(now, run_id)
@@ -1255,22 +1388,34 @@ def config_failure_manifest(raw, message, clock=None):
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "status": "failed",
-        "failure_class": FAILURE_CONFIG,
+        "failure_class": failure_class,
         "message": "%s (run %s)" % (message, run_id[:8]),
         "started_at": now.isoformat(),
         "finished_at": now.isoformat(),
         "as_of_local": None,
+        "timezone": tz_name,
+        "note": note,
         "hourly_folder": relative.as_posix(),
     }
+    status = {k: manifest[k] for k in ("job", "run_id", "status", "failure_class", "as_of_local", "started_at", "finished_at", "hourly_folder", "note")}
+    status["delivery_status"] = DELIVERY_SKIPPED
     try:
         run_dir = Path(root) / relative
         run_dir.mkdir(parents=True, exist_ok=False)
         write_exclusive(run_dir / MANIFEST_NAME, json_bytes(manifest))
-        status = {k: manifest[k] for k in ("job", "run_id", "status", "failure_class", "as_of_local", "started_at", "finished_at", "hourly_folder")}
-        status["delivery_status"] = DELIVERY_SKIPPED
-        replace_atomic(Path(root) / LAST_RUN_STATUS_NAME, json_bytes(status), run_id[:8])
-    except OSError:
-        return None
+    except (OSError, ValueError):
+        manifest = None
+    roots = [root]
+    if isinstance(delivery, str) and delivery.strip():
+        roots.append(delivery)
+    for index, status_root in enumerate(roots):
+        try:
+            if index and _same_path(status_root, root):
+                continue
+            Path(status_root).mkdir(parents=True, exist_ok=True)
+            replace_atomic(Path(status_root) / LAST_RUN_STATUS_NAME, json_bytes(status), run_id[:8])
+        except (OSError, ValueError):
+            pass
     return manifest
 
 
@@ -1280,7 +1425,14 @@ def main(argv=None, source=None, environ=None, clock=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-latest", action="store_true", help="Read-only stale check of the latest pair.")
     mode.add_argument("--dry-run-config", action="store_true", help="Validate the settings only.")
-    args = parser.parse_args(argv)
+    # --check-latest exits only 0, 2 or 3, so a usage error there is 3, never argparse's 2.
+    check_mode = "--check-latest" in (sys.argv[1:] if argv is None else argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        if check_mode and exc.code not in (0, None):
+            return EXIT_MISSING
+        raise
 
     raw = None
     try:
@@ -1288,16 +1440,30 @@ def main(argv=None, source=None, environ=None, clock=None):
         settings = validate_settings(raw)
     except ConfigError as exc:
         message = "Settings invalid: %s" % exc
-        if not args.dry_run_config and not args.check_latest and raw is not None:
-            config_failure_manifest(raw, message, clock)
-        _print({"status": "failed", "failure_class": FAILURE_CONFIG, "message": message})
+        if args.check_latest:
+            _print({"status": "invalid", "failure_class": exc.failure_class, "message": message})
+            return EXIT_MISSING
+        if not args.dry_run_config and raw is not None:
+            config_failure_manifest(raw, message, exc.failure_class, clock)
+        _print({"status": "failed", "failure_class": exc.failure_class, "message": message})
         return EXIT_FAILED
 
     if args.dry_run_config:
-        _print({"status": "valid", "settings_sha256": settings_sha256(settings)})
+        # The installer reads auth_mode and scheduled_logon_type to register the matching task.
+        _print(
+            {
+                "status": "valid",
+                "settings_sha256": settings_sha256(settings),
+                "auth_mode": settings["identity"]["auth_mode"],
+                "scheduled_logon_type": settings["schedule"]["logon_type"],
+            }
+        )
         return EXIT_OK
     if args.check_latest:
-        code, result = check_latest(settings, clock)
+        try:
+            code, result = check_latest(settings, clock)
+        except Exception:  # noqa: BLE001 - --check-latest exits only 0, 2 or 3; 3 means invalid.
+            code, result = EXIT_MISSING, {"status": "invalid", "failure_class": FAILURE_INTERNAL}
         _print(result)
         return code
 

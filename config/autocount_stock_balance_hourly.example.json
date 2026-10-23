@@ -2,7 +2,8 @@
   "timezone": "Asia/Singapore",
   "schedule": {
     "frequency": "hourly",
-    "run_minute": 0
+    "run_minute": 0,
+    "logon_type": "S4U"
   },
   "stale_after_minutes": 70,
   "source": {

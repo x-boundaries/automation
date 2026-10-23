@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -243,6 +243,7 @@ class ConfigValidationTests(TempDirTestCase):
         self.assertEqual(settings["source"]["expected_database"], FAKE_DB)
         self.assertEqual(settings["timezone"], "Asia/Singapore")
         self.assertEqual(settings["schedule"]["run_minute"], 0)
+        self.assertEqual(settings["schedule"]["logon_type"], "S4U")
         self.assertEqual(settings["stale_after_minutes"], 70)
         self.assertEqual(settings["rows"]["zero_row_mode"], "keep_rows_and_add_items_without_rows")
         self.assertFalse(settings["identity"]["allow_privileged_identity"])
@@ -316,6 +317,38 @@ class ConfigValidationTests(TempDirTestCase):
         self.assert_config_error(raw_settings(self.tmp, schedule={"run_minute": 60}), "schedule.run_minute")
         self.assert_config_error(raw_settings(self.tmp, read={"max_attempts": 0}), "read.max_attempts")
         self.assert_config_error(raw_settings(self.tmp, identity={"allow_privileged_identity": "yes"}), "allow_privileged_identity")
+        self.assert_config_error(raw_settings(self.tmp, schedule={"logon_type": "Interactive"}), "schedule.logon_type")
+
+    def test_only_the_two_documented_identity_logon_pairs_are_supported(self):
+        sql_identity = {"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET}
+        self.assertEqual(settings_for(self.tmp)["schedule"]["logon_type"], "S4U")
+        settings = settings_for(self.tmp, identity=sql_identity, schedule={"logon_type": "Password"})
+        self.assertEqual((settings["identity"]["auth_mode"], settings["schedule"]["logon_type"]), ("sql_login", "Password"))
+        # An S4U task cannot read Credential Manager, so sql_login under S4U is refused.
+        message = self.assert_config_error(
+            raw_settings(self.tmp, identity=sql_identity), "sql_login is only supported with schedule.logon_type Password"
+        )
+        self.assertNotIn(FAKE_SQL_LOGIN, message)
+        self.assertNotIn(FAKE_CRED_TARGET, message)
+        self.assert_config_error(
+            raw_settings(self.tmp, schedule={"logon_type": "Password"}),
+            "windows_integrated is only supported with schedule.logon_type S4U",
+        )
+
+    def test_dry_run_reports_auth_mode_and_scheduled_logon_type(self):
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw_settings(
+            self.tmp,
+            identity={"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
+            schedule={"logon_type": "Password"},
+        )), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path), "--dry-run-config"])
+        self.assertEqual(code, 0)
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["auth_mode"], printed["scheduled_logon_type"]), ("sql_login", "Password"))
+        for value in (FAKE_SQL_LOGIN, FAKE_CRED_TARGET, FAKE_SERVER):
+            self.assertNotIn(value, out.getvalue())
 
     def test_columns_validation(self):
         self.assert_config_error(raw_settings(self.tmp, output={"columns": ["ItemCode", "Cost"]}), "unsupported column")
@@ -359,6 +392,101 @@ class ConfigValidationTests(TempDirTestCase):
         self.assertEqual(list(self.archive.rglob("*.csv")), [])
         status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
         self.assertEqual(status["status"], "failed")
+
+
+@contextlib.contextmanager
+def no_zone_database():
+    """Simulate Windows Python without tzdata: every zone lookup fails, as ZoneInfo does there."""
+    def missing(key):
+        raise ZoneInfoNotFoundError("No time zone found with key %s" % key)
+
+    with mock.patch.dict(hourly.load_timezone.__globals__, {"ZoneInfo": missing}):
+        yield
+
+
+class TimezoneFailureTests(TempDirTestCase):
+    def write_settings(self, **overrides):
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw_settings(self.tmp, **overrides)), encoding="utf-8")
+        return path
+
+    def main(self, *args, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = hourly.main(list(args), **kwargs)
+        return code, out.getvalue()
+
+    def test_missing_zone_database_run_writes_utc_manifest_and_status(self):
+        path = self.write_settings(output={"delivery_root": str(self.delivery)})
+        code, _ = self.main("--config", str(path), source=FakeSource(), environ=ENV, clock=clock_at())
+        self.assertEqual(code, 0)
+        source = FakeSource()
+        with no_zone_database():
+            code, printed = self.main("--config", str(path), source=source, environ=ENV, clock=clock_at())
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed)["failure_class"], "timezone_unavailable")
+        self.assertEqual(source.sessions, 0)
+        manifests = [json.loads(p.read_text(encoding="utf-8")) for p in self.archive.rglob(hourly.MANIFEST_NAME)]
+        failed = [m for m in manifests if m["status"] == "failed"]
+        self.assertEqual(len(failed), 1)
+        manifest = failed[0]
+        self.assertEqual(manifest["failure_class"], "timezone_unavailable")
+        self.assertEqual(manifest["timezone"], "UTC")
+        self.assertIn("UTC", manifest["note"])
+        self.assertEqual(manifest["started_at"], "2026-10-23T06:00:05+00:00")
+        self.assertIn("+0000", manifest["hourly_folder"])
+        # The earlier success status is replaced in the archive AND in Drive, never left stale.
+        for root in (self.archive, self.delivery):
+            status = json.loads((root / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+            self.assertEqual((status["status"], status["failure_class"]), ("failed", "timezone_unavailable"))
+            self.assertIn("UTC", status["note"])
+            self.assertEqual(status["run_id"], manifest["run_id"])
+        self.assertEqual(len(list(self.archive.rglob(hourly.CSV_NAME))), 1, "only the earlier success wrote a CSV")
+
+    def test_bad_zone_name_with_zone_database_is_config_invalid(self):
+        path = self.write_settings(timezone="Mars/Olympus_Mons")
+        code, printed = self.main("--config", str(path), source=FakeSource(), environ=ENV, clock=clock_at())
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed)["failure_class"], "config_invalid")
+        manifest = json.loads(next(self.archive.rglob(hourly.MANIFEST_NAME)).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["failure_class"], "config_invalid")
+        self.assertEqual((manifest["timezone"], manifest["note"]), ("Asia/Singapore", None))
+        self.assertTrue(manifest["started_at"].endswith("+08:00"))
+
+    def test_config_failure_path_never_raises(self):
+        with no_zone_database():
+            self.assertIsNone(hourly.config_failure_manifest({"output": {"archive_root": "bad\0root"}}, "x"))
+            self.assertIsNone(hourly.config_failure_manifest({"output": "not an object"}, "x"))
+
+    def test_dry_run_without_zone_database_fails_cleanly(self):
+        path = self.write_settings()
+        with no_zone_database():
+            code, printed = self.main("--config", str(path), "--dry-run-config")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(printed)["failure_class"], "timezone_unavailable")
+        self.assertFalse(self.archive.exists(), "dry run must not create output")
+
+    def test_check_latest_only_exits_0_2_or_3(self):
+        path = self.write_settings()
+        run(settings_for(self.tmp))
+        code, printed = self.main("--config", str(path), "--check-latest", clock=clock_at(FIXED_NOW + timedelta(minutes=5)))
+        self.assertEqual((code, json.loads(printed)["status"]), (0, "fresh"))
+        with no_zone_database():
+            code, printed = self.main("--config", str(path), "--check-latest")
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(printed)["failure_class"], "timezone_unavailable")
+        bad = self.write_settings(rows={"zero_row_mode": "bad"})
+        self.assertEqual(self.main("--config", str(bad), "--check-latest")[0], 3)
+        bad.write_text("{not json", encoding="utf-8")
+        self.assertEqual(self.main("--config", str(bad), "--check-latest")[0], 3)
+        self.assertEqual(self.main("--check-latest")[0], 3, "a usage error is 3, never argparse's 2")
+        path = self.write_settings()
+        with mock.patch.object(hourly, "check_latest", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.main("--config", str(path), "--check-latest")[0], 3)
+        latest = self.archive / hourly.LATEST_MANIFEST_NAME
+        content = json.loads(latest.read_text(encoding="utf-8"))
+        content["as_of_local"] = "2026-10-23T14:00:06"  # no offset
+        latest.write_text(json.dumps(content), encoding="utf-8")
+        self.assertEqual(hourly.check_latest(settings_for(self.tmp), clock=clock_at())[0], 3)
 
 
 class IdentityTests(TempDirTestCase):
@@ -433,6 +561,7 @@ class IdentityTests(TempDirTestCase):
         settings = settings_for(
             self.tmp,
             identity={"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
+            schedule={"logon_type": "Password"},
         )
         calls = []
 
@@ -858,28 +987,91 @@ class StaleCheckTests(TempDirTestCase):
 
 
 class LockTests(TempDirTestCase):
-    def write_lock(self, started):
+    OTHER_RUN = "deadbeefcafe0001"
+    OTHER_PID = 4242
+
+    def write_lock(self, started, content=None):
         self.archive.mkdir(parents=True, exist_ok=True)
         lock = self.archive / hourly.LOCK_NAME
-        lock.write_text(json.dumps({"run_id": "other", "pid": 1, "started_at": started.isoformat()}), encoding="utf-8")
+        if content is None:
+            content = json.dumps({"run_id": self.OTHER_RUN, "pid": self.OTHER_PID, "started_at": started.isoformat()})
+        lock.write_text(content, encoding="utf-8")
         return lock
 
     def test_concurrent_run_writes_already_running_manifest(self):
         lock = self.write_lock(FIXED_NOW - timedelta(minutes=2))
         before = lock.read_bytes()
         source = FakeSource()
-        manifest = run(settings_for(self.tmp), source)
+        with mock.patch.object(hourly, "_pid_running", side_effect=AssertionError("young lock: PID not consulted")):
+            manifest = run(settings_for(self.tmp), source)
         self.assertEqual(manifest["failure_class"], "already_running")
         self.assertEqual(source.sessions, 0, "no SQL read while another run holds the lock")
         on_disk = json.loads((self.run_dir(manifest) / hourly.MANIFEST_NAME).read_text(encoding="utf-8"))
         self.assertEqual(on_disk["failure_class"], "already_running")
         self.assertEqual(lock.read_bytes(), before, "the other run's lock is never removed")
 
-    def test_old_lock_is_stale_lock_and_kept(self):
-        lock = self.write_lock(FIXED_NOW - timedelta(minutes=90))
-        manifest = run(settings_for(self.tmp))
-        self.assertEqual(manifest["failure_class"], "stale_lock")
+    def test_young_lock_of_dead_process_still_gives_already_running(self):
+        lock = self.write_lock(FIXED_NOW - timedelta(minutes=hourly.LOCK_STALE_AFTER_MINUTES))
+        with mock.patch.object(hourly, "_pid_running", return_value=False):
+            manifest = run(settings_for(self.tmp))
+        self.assertEqual(manifest["failure_class"], "already_running")
         self.assertTrue(lock.exists())
+
+    def test_killed_run_lock_is_cleared_and_run_succeeds_with_warning(self):
+        started = FIXED_NOW - timedelta(hours=2)
+        lock = self.write_lock(started)
+        with mock.patch.object(hourly, "_pid_running", return_value=False) as pid_running:
+            manifest = run(settings_for(self.tmp))
+        pid_running.assert_called_once_with(self.OTHER_PID, started)
+        self.assertEqual((manifest["status"], manifest["failure_class"]), ("success", None))
+        warning = "Cleared a lock left by run deadbeef, whose process is no longer running (lock age 120 minutes)"
+        self.assertIn(warning, manifest["warnings"])
+        on_disk = json.loads((self.run_dir(manifest) / hourly.MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertIn(warning, on_disk["warnings"])
+        latest = json.loads((self.archive / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertIn(warning, latest["warnings"])
+        self.assertFalse(lock.exists(), "this run's own lock is released at the end")
+        # The next hour runs normally, with no warning.
+        later = run(settings_for(self.tmp), clock=clock_at(FIXED_NOW + timedelta(hours=1)))
+        self.assertEqual((later["status"], later["warnings"]), ("success", []))
+
+    def test_old_lock_of_live_process_is_respected(self):
+        lock = self.write_lock(FIXED_NOW - timedelta(hours=2))
+        before = lock.read_bytes()
+        source = FakeSource()
+        with mock.patch.object(hourly, "_pid_running", return_value=True):
+            manifest = run(settings_for(self.tmp), source)
+        self.assertEqual(manifest["failure_class"], "already_running")
+        self.assertEqual(source.sessions, 0)
+        self.assertEqual(lock.read_bytes(), before)
+
+    def test_untrustworthy_lock_is_stale_lock_and_kept(self):
+        old = (FIXED_NOW - timedelta(hours=2)).isoformat()
+        contents = (
+            "{not json",
+            json.dumps({"run_id": self.OTHER_RUN, "started_at": old}),
+            json.dumps({"run_id": self.OTHER_RUN, "pid": True, "started_at": old}),
+            json.dumps({"run_id": self.OTHER_RUN, "pid": self.OTHER_PID, "started_at": "2026-10-23T12:00:05"}),
+        )
+        for content in contents:
+            with self.subTest(content=content):
+                lock = self.write_lock(None, content)
+                with mock.patch.object(hourly, "_pid_running", side_effect=AssertionError("not consulted")):
+                    manifest = run(settings_for(self.tmp))
+                self.assertEqual(manifest["failure_class"], "stale_lock")
+                self.assertEqual(lock.read_text(encoding="utf-8"), content)
+
+    def test_pid_running_on_real_processes(self):
+        now = datetime.now(SGT)
+        self.assertTrue(hourly._pid_running(os.getpid(), now))
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(timeout=60)
+        self.assertFalse(hourly._pid_running(child.pid, now - timedelta(hours=2)))
+
+    @unittest.skipUnless(os.name == "nt", "process creation time check is Windows-only")
+    def test_reused_pid_is_not_the_lock_owner_on_windows(self):
+        # This test process was created long after a lock written 2 hours ago.
+        self.assertFalse(hourly._pid_running(os.getpid(), datetime.now(SGT) - timedelta(hours=2)))
 
 
 class PrivacyTests(TempDirTestCase):
@@ -887,6 +1079,7 @@ class PrivacyTests(TempDirTestCase):
         return settings_for(
             self.tmp,
             identity={"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
+            schedule={"logon_type": "Password"},
             output={"delivery_root": str(self.delivery)},
         )
 
@@ -907,6 +1100,7 @@ class PrivacyTests(TempDirTestCase):
         path.write_text(json.dumps(raw_settings(
             self.tmp,
             identity={"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
+            schedule={"logon_type": "Password"},
             output={"delivery_root": str(self.delivery)},
         )), encoding="utf-8")
         env = dict(ENV, AUTOCOUNT_EXPECTED_SQL_LOGIN=FAKE_SQL_LOGIN)
@@ -1031,12 +1225,49 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("-Force", self.text)
         self.assertIn("-ExecutionTimeLimit (New-TimeSpan -Minutes 15)", self.text)
         self.assertIn("-RunLevel Limited", self.text)
-        self.assertIn('[string]$LogonType = "S4U"', self.text)
         self.assertIn("-RepetitionInterval (New-TimeSpan -Hours 1)", self.text)
         self.assertIn("Get-ScheduledTask -TaskName $TaskName", self.text)
         self.assertNotIn("GetCurrent()", self.text, "no default Windows user")
         self.assertRegex(self.text, r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$UserId")
         self.assertIn("separate owner OK", self.text)
+
+    def test_execution_limit_matches_the_lock_rules(self):
+        limit = re.search(r"-ExecutionTimeLimit \(New-TimeSpan -Minutes (\d+)\)", self.text)
+        self.assertEqual(int(limit.group(1)), hourly.TASK_EXECUTION_LIMIT_MINUTES)
+        self.assertGreater(hourly.LOCK_STALE_AFTER_MINUTES, hourly.TASK_EXECUTION_LIMIT_MINUTES)
+
+    def test_python_exe_is_a_mandatory_full_path(self):
+        self.assertRegex(self.text, r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$PythonExe\s*,")
+        self.assertNotIn('$PythonExe = "python.exe"', self.text)
+        self.assertIn("[System.IO.Path]::IsPathRooted($PythonExe)", self.text)
+        self.assertIn("Test-Path -LiteralPath $PythonExe -PathType Leaf", self.text)
+
+    def test_logon_type_comes_from_the_validated_settings(self):
+        self.assertNotIn("$LogonType =", self.text, "no free LogonType parameter")
+        self.assertIn("--dry-run-config", self.text)
+        self.assertIn("$validated.scheduled_logon_type", self.text)
+        self.assertIn('($authMode -ceq "windows_integrated") -and ($logonType -ceq "S4U")', self.text)
+        self.assertIn('($authMode -ceq "sql_login") -and ($logonType -ceq "Password")', self.text)
+        self.assertIn("-LogonType S4U", self.text)
+        self.assertEqual(sorted(hourly.SUPPORTED_LOGON_PAIRS.items()), [("sql_login", "Password"), ("windows_integrated", "S4U")])
+
+    def test_password_logon_prompts_and_never_echoes(self):
+        self.assertIn("Get-Credential -UserName $UserId", self.text)
+        self.assertIn("-User $UserId", self.text)
+        self.assertIn("-Password $credential.GetNetworkCredential().Password", self.text)
+        for forbidden in ("ConvertFrom-SecureString", "Out-File", "Set-Content", "Add-Content", "Export-Clixml",
+                          "Start-Transcript", "Write-Output", "-Verbose"):
+            self.assertNotIn(forbidden, self.text)
+        for line in self.text.splitlines():
+            if "Write-Host" in line:
+                self.assertNotIn("$credential", line)
+                self.assertNotIn("Password", line.replace("LogonType Password", ""))
+        self.assertEqual(self.text.count("GetNetworkCredential()"), 1)
+
+    def test_v7_supervised_run_is_named(self):
+        self.assertIn("Start-ScheduledTask", self.text)
+        self.assertIn("last_run_status.json", self.text)
+        self.assertIn("Disable-ScheduledTask", self.text)
 
     def test_powershell_parse_only(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
