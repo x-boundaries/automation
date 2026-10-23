@@ -100,6 +100,23 @@ SG_COUNTRY_CODE_RE = re.compile(r"(?<![\w.+])65" + _SEP + r"?[3689]\d{3}" + _SEP
 SG_LOCAL_RE = re.compile(r"(?<![\w.])[689]\d{3}" + _SEP + r"?\d{4}(?!\d|\.\d)")
 # Other international numbers written with a leading +: 8 to 15 digits in total.
 INTL_RE = re.compile(r"(?<![\w+])\+[1-9](?:" + _SEP_DOT + r"?\(?\d+\)?){2,7}")
+PHONE_PATTERNS = (
+    ("sg_phone", SG_PREFIXED_RE),
+    ("sg_phone", SG_COUNTRY_CODE_RE),
+    ("sg_phone_local", SG_LOCAL_RE),
+    ("phone", INTL_RE),
+)
+# Base floor (#270): the phone patterns as they were before #270 (space, hyphen and
+# dot separators only) run as a second pass, so a wider separator can never leave a
+# line weaker than before. Without it, a match the wider separators lengthen past 15
+# digits is dropped whole, and a new match the allowlist covers hides the overlapping
+# number the narrower patterns find.
+FLOOR_PHONE_PATTERNS = (
+    ("sg_phone", re.compile(r"(?<![\w+])(?:\+65|\(\+?65\))[ .-]?[3689]\d{3}[ .-]?\d{4}(?!\d)")),
+    ("sg_phone", re.compile(r"(?<![\w.+])65[ -]?[3689]\d{3}[ -]?\d{4}(?!\d|\.\d)")),
+    ("sg_phone_local", re.compile(r"(?<![\w.])[689]\d{3}[ -]?\d{4}(?!\d|\.\d)")),
+    ("phone", re.compile(r"(?<![\w+])\+[1-9](?:[ .-]?\(?\d+\)?){2,7}")),
+)
 ALLOW_MARKER_RE = re.compile(r"pii-guard:\s*allow\s*\(\s*[^)\s][^)]*\)")
 
 ALLOWLIST_KEYS = {"emails", "phones"}
@@ -189,11 +206,20 @@ JOINED_SUFFIX = " (joined text)"
 _ASCII_RUN = re.compile(rb"[\x20-\x7e\t\xa0]{6,}")
 _UTF16LE_RUN = re.compile(rb"(?:[\x20-\x7e\xa0]\x00|\x13\x20){6,}")
 _UTF16BE_RUN = re.compile(rb"(?:\x00[\x20-\x7e\xa0]|\x20\x13){6,}")
+# Base floor (#270): the runs as they were cut before #270 are kept too, so a wider run
+# cannot join a hit to an opt-out marker or lengthen a number past the digit limit.
+_FLOOR_RUNS = (
+    (re.compile(rb"[\x20-\x7e\t]{6,}"), "ascii"),
+    (re.compile(rb"(?:[\x20-\x7e]\x00){6,}"), "utf-16-le"),
+    (re.compile(rb"(?:\x00[\x20-\x7e]){6,}"), "utf-16-be"),
+)
 # PDF: a stream keyword, the object header before it, and a FlateDecode first filter.
 _PDF_STREAM = re.compile(rb"(?<![A-Za-z])stream(?:\r\n|\n)")
 _PDF_FLATE = re.compile(rb"/Filter\s*(?:\[\s*)?/FlateDecode(?![A-Za-z0-9])")
 # An encryption dictionary (named in the trailer) means every stream is ciphertext.
 _PDF_ENCRYPT = re.compile(rb"/Encrypt(?![A-Za-z0-9])")
+# A name may spell any byte as #xx (so /Encr#79pt is /Encrypt).
+_PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
 _INFLATE_CHUNK = 4096
 # OLE2 (compound file) layout constants and the BIFF records that hold numbers.
 _CFB_END = 0xFFFFFFFE
@@ -204,18 +230,21 @@ _BIFF_NUMBER = 0x0203
 _BIFF_RK = 0x027E
 _BIFF_MULRK = 0x00BD
 _BIFF_FORMULA = 0x0006
-# Office XML: run properties hold no text; joining runs (r, t, the markers Word
+# Office XML: run properties and the properties of the inline wrappers (content
+# controls, smart tags, custom XML) hold no text; joining runs (r, t, the markers Word
 # drops between them and the inline wrappers around runs) rebuilds text split across
-# runs. A no-break hyphen reads as a hyphen. Every other tag is a break. A tracked
-# property change (rPrChange, which holds its own rPr) is stripped first so the
-# outer rPr strip does not stop at the inner closing tag.
+# runs. A no-break hyphen reads as a hyphen and a soft hyphen as nothing. Every other
+# tag is a break. A tracked property change (rPrChange, which holds its own rPr) is
+# stripped first so the outer rPr strip does not stop at the inner closing tag.
 _XML_RUN_PROPS_CHANGE = re.compile(r"<((?:[\w.-]+:)?rPrChange)\b[^>]*?(?:/>|>.*?</\1>)", re.S)
-_XML_RUN_PROPS = re.compile(r"<((?:[\w.-]+:)?rPr)\b[^>]*?(?:/>|>.*?</\1>)", re.S)
+_XML_RUN_PROPS = re.compile(r"<((?:[\w.-]+:)?(?:rPr|sdtPr|sdtEndPr|smartTagPr|customXmlPr))\b[^>]*?(?:/>|>.*?</\1>)", re.S)
 _XML_TAG = re.compile(r"<(?:/?(?:[\w.-]+:)?([\w.-]+)[^>]*|[!?][^>]*)>")
 _XML_INLINE = frozenset(
     {
         "r", "t", "proofErr", "bookmarkStart", "bookmarkEnd", "lastRenderedPageBreak",
         "hyperlink", "ins", "smartTag", "sdt", "sdtContent", "fldSimple", "customXml",
+        "commentRangeStart", "commentRangeEnd", "moveTo", "moveToRangeStart", "moveToRangeEnd",
+        "softHyphen",
     }
 )
 _XML_INLINE_TEXT = {"noBreakHyphen": "-"}
@@ -285,18 +314,28 @@ def _phone_allowed(kind, value, allowlist):
 
 
 def scan_line(text, allowlist):
-    """Return [(kind, value)] for likely personal data on one added line."""
+    """Return [(kind, value)] for likely personal data on one added line.
+
+    The phone patterns run twice: ``PHONE_PATTERNS``, then ``FLOOR_PHONE_PATTERNS``.
+    A floor hit is added unless a reported hit of the first pass already covers it.
+    """
     if ALLOW_MARKER_RE.search(text):
         return []
+    hits = _line_hits(text, PHONE_PATTERNS, allowlist)
+    covered = [(start, end) for start, end, _, _ in hits]
+    for start, end, kind, value in _line_hits(text, FLOOR_PHONE_PATTERNS, allowlist):
+        if not any(left <= start and end <= right for left, right in covered):
+            hits.append((start, end, kind, value))
+    hits.sort(key=lambda hit: hit[0])
+    return [(kind, value) for _, _, kind, value in hits]
+
+
+def _line_hits(text, phone_patterns, allowlist):
+    """Return [(start, end, kind, value)] for one pass of the email and phone patterns."""
     spans = []
     for match in EMAIL_RE.finditer(text):
         spans.append((match.start(), match.end(), "email", match.group(0)))
-    for kind, regex in (
-        ("sg_phone", SG_PREFIXED_RE),
-        ("sg_phone", SG_COUNTRY_CODE_RE),
-        ("sg_phone_local", SG_LOCAL_RE),
-        ("phone", INTL_RE),
-    ):
+    for kind, regex in phone_patterns:
         for match in regex.finditer(text):
             value = match.group(0)
             if kind == "phone" and not 8 <= len(re.sub(r"\D", "", value)) <= 15:
@@ -314,7 +353,7 @@ def scan_line(text, allowlist):
                 continue
         elif _phone_allowed(kind, value, allowlist):
             continue
-        hits.append((kind, value))
+        hits.append((start, end, kind, value))
     return hits
 
 
@@ -444,10 +483,20 @@ def _read_blobs(shas, cwd):
 
 
 def _printable_runs(data):
-    """Printable ASCII (plus no-break space), UTF-16LE and UTF-16BE runs of 6+ characters in raw bytes."""
+    """Printable ASCII (plus no-break space), UTF-16LE and UTF-16BE runs of 6+ characters in raw bytes.
+
+    Floor runs (``_FLOOR_RUNS``) that differ from every wider run are appended.
+    """
     runs = [match.group(0).decode("latin-1") for match in _ASCII_RUN.finditer(data)]
     runs.extend(match.group(0).decode("utf-16-le") for match in _UTF16LE_RUN.finditer(data))
     runs.extend(match.group(0).decode("utf-16-be") for match in _UTF16BE_RUN.finditer(data))
+    seen = set(runs)
+    for regex, encoding in _FLOOR_RUNS:
+        for match in regex.finditer(data):
+            run = match.group(0).decode(encoding)
+            if run not in seen:
+                seen.add(run)
+                runs.append(run)
     return runs
 
 
@@ -481,37 +530,61 @@ def _pdf_stream_runs(path, data, budget):
     data starts with a zlib header is inflated until the zlib data ends (so a forged
     ``endstream`` inside it cannot cut it short), within the shared ``budget``.
     A stream whose object names FlateDecode as its first filter fails closed when
-    its data has no zlib header or will not decompress; other data that is not
-    zlib is skipped. Exceeding the budget fails closed.
+    its data has no zlib header or will not decompress; an undeclared one that will
+    not decompress (a bad checksum, say) is retried as raw deflate after its 2-byte
+    header and whatever that yields is scanned; other data that is not zlib is
+    skipped. Both name checks also try a copy with ``#xx`` name escapes decoded. Exceeding
+    the budget fails closed.
     """
-    if _PDF_ENCRYPT.search(data):
+    if _pdf_names_match(_PDF_ENCRYPT, data):
         raise GuardError("%s is an encrypted PDF and cannot be scanned" % path)
     runs, previous = [], 0
     for match in _PDF_STREAM.finditer(data):
-        # The window runs from the previous stream's data, so it always holds this
-        # object's header (over-inclusive, the safe direction).
+        # The window runs from the previous stream's data, so it normally holds this
+        # object's header (over-inclusive, the safe direction). A forged "stream"
+        # token inside the object's own dictionary can cut it short (Known limits L2).
         start, declared_from, previous = match.end(), previous, match.end()
-        declared = _PDF_FLATE.search(data, declared_from, match.start()) is not None
+        declared = _pdf_names_match(_PDF_FLATE, data[declared_from : match.start()])
         if not _zlib_header(data, start):
             if declared:
                 raise GuardError("%s has a FlateDecode stream that is not zlib data and cannot be scanned" % path)
             continue
-        inflater, pieces = zlib.decompressobj(), []
+        pieces = []
         try:
-            for at in range(start, len(data), _INFLATE_CHUNK):
-                piece = inflater.decompress(data[at : at + _INFLATE_CHUNK])
-                budget[0] -= len(piece)
-                if budget[0] < 0:
-                    raise GuardError("%s expands beyond %d bytes and cannot be scanned" % (path, ZIP_MAX_BYTES))
-                pieces.append(piece)
-                if inflater.eof:
-                    break
+            _inflate(path, data, start, zlib.MAX_WBITS, budget, pieces)
         except zlib.error:
             if declared:
                 raise GuardError("%s has a corrupt FlateDecode stream and cannot be scanned" % path)
-            continue
+            pieces = []
+            try:
+                _inflate(path, data, start + 2, -zlib.MAX_WBITS, budget, pieces)
+            except zlib.error:
+                pass  # best effort for undeclared data: scan what was recovered
         runs.extend(_printable_runs(b"".join(pieces)))
     return runs
+
+
+def _inflate(path, data, at, wbits, budget, pieces):
+    """Inflate ``data`` from ``at`` into ``pieces`` until the stream ends, within ``budget``.
+
+    ``zlib.error`` propagates; ``pieces`` keeps the output produced before it.
+    """
+    inflater = zlib.decompressobj(wbits)
+    for offset in range(at, len(data), _INFLATE_CHUNK):
+        piece = inflater.decompress(data[offset : offset + _INFLATE_CHUNK])
+        budget[0] -= len(piece)
+        if budget[0] < 0:
+            raise GuardError("%s expands beyond %d bytes and cannot be scanned" % (path, ZIP_MAX_BYTES))
+        pieces.append(piece)
+        if inflater.eof:
+            break
+
+
+def _pdf_names_match(regex, data):
+    """True when ``regex`` matches PDF bytes as written or with ``#xx`` name escapes decoded."""
+    if regex.search(data):
+        return True
+    return b"#" in data and regex.search(_PDF_NAME_ESCAPE.sub(lambda match: bytes([int(match.group(1), 16)]), data)) is not None
 
 
 def _cfb_streams(path, data, names):
@@ -667,7 +740,8 @@ def _xml_joined_lines(text):
 def _format_documents(name, data, budget):
     """Extra documents for formats whose raw bytes hide text: PDF streams and .xls numbers."""
     docs = []
-    if data.startswith(_PDF_MAGIC):
+    # PDF readers accept a header within the first 1024 bytes (#270 G2 L6).
+    if _PDF_MAGIC in data[:1024]:
         docs.append((name + DEFLATED_SUFFIX, _pdf_stream_runs(name, data, budget)))
     if data.startswith(_OLE2_MAGIC) and Path(name).suffix.lower() == ".xls":
         docs.append((name + CELLS_SUFFIX, _xls_numeric_cells(name, data)))
@@ -676,10 +750,12 @@ def _format_documents(name, data, budget):
 
 def _member_documents(name, data, budget, depth):
     """Documents for one archive member: nested or appended zips recurse, other bytes are scanned in place."""
+    # Refuse first, as blob_documents does, so an appended zip cannot take a gzip, 7z,
+    # RAR or tar member past the refusal (#270 G2 W1).
+    _refuse_other_archives(name, data)
     if _is_zip(data) or _ZIP_EOCD in data:
         docs = _zip_documents(name, data, budget, depth + 1) + _format_documents(name, data, budget)
         return docs + [(name + RUNS_SUFFIX, _printable_runs(data))]
-    _refuse_other_archives(name, data)
     docs = []
     if b"\0" not in data:
         text = _text(data)
@@ -847,8 +923,11 @@ def _blob_findings(changes, label, cwd, allowlist):
     old_blobs = _read_blobs([sha for _, _, parents in flagged for sha in parents if not _is_null_sha(sha)], cwd)
     handled, findings = set(), []
     for path, sha, parents in flagged:
-        handled.add(path)
         docs = blob_documents(path, new_blobs[sha])
+        if _diff_keeps_text(path, new_blobs[sha]):
+            docs = [doc for doc in docs if doc[0] != path]
+        else:
+            handled.add(path)
         parent_docs = [{} if _is_null_sha(parent) else _parent_documents(path, old_blobs[parent]) for parent in parents or ["0"]]
         keep = {}
         for name, lines in docs:
@@ -863,6 +942,15 @@ def _blob_findings(changes, label, cwd, allowlist):
             keep[name] = added
         findings.extend(_scan_documents(label, docs, allowlist, keep))
     return handled, findings
+
+
+def _diff_keeps_text(path, data):
+    """True for a blob only the #270 checks send to the blob scan (NUL-free, not a zip by name or signature).
+
+    git's diff still decides which of its text lines are added, as before #270: the
+    blob scan's line matching can treat a moved line as unchanged where git reports it.
+    """
+    return b"\0" not in data and not _is_zip(data) and Path(path).suffix.lower() not in ZIP_EXTENSIONS
 
 
 def _is_null_sha(sha):

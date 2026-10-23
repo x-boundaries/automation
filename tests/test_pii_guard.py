@@ -314,6 +314,40 @@ class ScanLineTests(unittest.TestCase):
         self.assertEqual(self.kinds(_sg_prefixed(), allow), [])
         self.assertEqual(self.kinds(_intl(), allow), ["phone"])
 
+    # #270 round 3: the pre-#270 patterns are a floor, so a wider separator never hides a number.
+
+    def test_wider_separators_never_drop_an_international_number(self):
+        # G2 W2: a number followed by more digit groups over a new separator went past 15 digits.
+        date = "2026" + " " + "10" + " " + "23"
+        for sep in (" ", "&nbsp;", "–"):
+            with self.subTest(sep=repr(sep)):
+                self.assertEqual(self.kinds("Tel " + _intl() + sep + date), ["phone"])
+                self.assertEqual(self.kinds("Tel " + _intl() + sep + "12" + sep + "34"), ["phone"])
+                self.assertEqual(self.kinds("Tel " + _intl() + sep + "1234" + "56789"), ["phone"])
+        # Still one hit when the wider match is itself a valid number.
+        self.assertEqual(self.kinds("Tel " + _intl() + "&nbsp;" + "12"), ["phone"])
+        # Plain space: base and head both read one 20-digit group and drop it (Known limits).
+        self.assertEqual(self.kinds("Tel " + _intl() + " " + date), [])
+
+    def test_allowlisted_wider_match_cannot_hide_a_number(self):
+        # A new match over a wider separator that the allowlist covers must not shadow the base match.
+        for sep, lead in ((" ", "9"), ("&nbsp;", "8"), ("–", "6")):
+            with self.subTest(sep=repr(sep)):
+                allow = {"emails": [], "phones": {"65" + lead + "000" + "9000"}}
+                self.assertEqual(self.kinds(lead + "000" + sep + _sg_local(), allow), ["sg_phone_local"])
+
+    def test_floor_patterns_are_the_pre_270_patterns(self):
+        self.assertEqual(
+            [regex.pattern for _, regex in self.g.FLOOR_PHONE_PATTERNS],
+            [
+                r"(?<![\w+])(?:\+65|\(\+?65\))[ .-]?[3689]\d{3}[ .-]?\d{4}(?!\d)",
+                r"(?<![\w.+])65[ -]?[3689]\d{3}[ -]?\d{4}(?!\d|\.\d)",
+                r"(?<![\w.])[689]\d{3}[ -]?\d{4}(?!\d|\.\d)",
+                r"(?<![\w+])\+[1-9](?:[ .-]?\(?\d+\)?){2,7}",
+            ],
+        )
+        self.assertEqual([kind for kind, _ in self.g.FLOOR_PHONE_PATTERNS], [kind for kind, _ in self.g.PHONE_PATTERNS])
+
 
 class AllowlistTests(unittest.TestCase):
     EXPECTED_PATTERNS = [
@@ -984,6 +1018,18 @@ class GitScanTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+    def test_nul_free_blob_keeps_git_added_lines(self):
+        # #270 round 3: a NUL-free text file starting %PDF is blob-scanned for its streams,
+        # but git still decides its added text lines, so a moved line is still caught.
+        line = "x " + _email()
+        self.commit("notes.txt", "%PDF-1.4\n" + line + "\ny\n")
+        start = self.rev("HEAD")
+        self.commit("notes.txt", "%PDF-1.4\ny\n" + line + "\n")
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1, out)
+        self.assertIn("notes.txt:3 email [redacted]", out)
+
+
 class BinaryFormatTests(unittest.TestCase):
     """#270: formats whose raw bytes hide text, checked through blob_documents."""
 
@@ -1183,6 +1229,21 @@ class BinaryFormatTests(unittest.TestCase):
             with self.subTest(name=name):
                 path = name + ".docx"
                 self.assertEqual(self.hits(path, _docx("<w:p>" + body + "</w:p>")), [(path + "!word/document.xml (joined text)", "sg_phone_local")])
+        # #270 G2 R2-H3: wrapper properties are stripped, so the split may fall on either edge.
+        sdt_open = '<w:sdt><w:sdtPr><w:alias w:val="Phone"/><w:rPr><w:b/></w:rPr></w:sdtPr><w:sdtEndPr/><w:sdtContent>'
+        cases = {
+            "sdtEntering": run(head) + sdt_open + run(tail) + "</w:sdtContent></w:sdt>",
+            "sdtEndPrOpen": run(head) + '<w:sdt><w:sdtEndPr><w:rPr><w:i/></w:rPr></w:sdtEndPr><w:sdtContent>' + run(tail) + "</w:sdtContent></w:sdt>",
+            "smartTagEntering": run(head) + '<w:smartTag w:element="phone"><w:smartTagPr><w:attr w:name="kind" w:val="tel"/></w:smartTagPr>' + run(tail) + "</w:smartTag>",
+            "customXmlEntering": run(head) + '<w:customXml w:element="contact"><w:customXmlPr><w:attr w:name="kind" w:val="tel"/></w:customXmlPr>' + run(tail) + "</w:customXml>",
+            "commentRange": run(head) + '<w:commentRangeStart w:id="3"/>' + run(tail) + '<w:commentRangeEnd w:id="3"/>',
+            "moveTo": run(head) + '<w:moveToRangeStart w:id="4" w:name="move1"/><w:moveTo w:id="5">' + run(tail) + '</w:moveTo><w:moveToRangeEnd w:id="4"/>',
+            "softHyphen": run(head.strip()) + "<w:r><w:softHyphen/></w:r>" + run("-" + tail),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                path = name + ".docx"
+                self.assertEqual(self.hits(path, _docx("<w:p>" + body + "</w:p>")), [(path + "!word/document.xml (joined text)", "sg_phone_local")])
         linked = run("pat.lee") + '<w:hyperlink r:id="rId5">' + run(AT + "synthetic-mail.sg") + "</w:hyperlink>"
         self.assertEqual(self.hits("link.docx", _docx("<w:p>" + linked + "</w:p>")), [("link.docx!word/document.xml (joined text)", "email")])
 
@@ -1206,6 +1267,69 @@ class BinaryFormatTests(unittest.TestCase):
         cells = '<sheetData><row><c r="A1"><v>' + "9" + "000</v></c><c r=\"B1\"><v>" + "00" + "17</v></c></row></sheetData>"
         strings = "<sst><si><t>" + "9" + "000</t></si><si><t>" + "00" + "17</t></si></sst>"
         self.assertEqual(self.hits("f.xlsx", _zip_bytes({"xl/worksheets/sheet1.xml": cells, "xl/sharedStrings.xml": strings}, zipfile.ZIP_DEFLATED)), [])
+
+    # #270 round 3: regressions against base found by the G2 recheck, and their family.
+
+    def test_other_archive_members_fail_closed_before_an_appended_zip(self):
+        # G2 W1: an appended zip used to take a gzip, 7z, RAR or tar member past the refusal.
+        clean = _zip_bytes({"readme.txt": "clean"}, zipfile.ZIP_DEFLATED)
+        gz = gzip.compress(("mail " + _email()).encode("ascii"))
+        members = {
+            "notes.gz": gz,
+            "a.7z": b"7z\xbc\xaf\x27\x1c" + bytes(20),
+            "a.rar": b"Rar!\x1a\x07\x00" + bytes(20),
+            "a.tar": _tar_bytes("notes.txt", "clean"),
+        }
+        for name, data in members.items():
+            with self.subTest(name=name):
+                self.assert_fails_closed("bundle.zip", _zip_bytes({name: data + clean}, zipfile.ZIP_DEFLATED))
+        nested = _zip_bytes({"inner.zip": _zip_bytes({"notes.gz": gz + clean}, zipfile.ZIP_DEFLATED)}, zipfile.ZIP_STORED)
+        self.assert_fails_closed("outer.zip", nested)
+
+    def test_wider_text_runs_keep_the_pre_270_runs(self):
+        # A run widened by a no-break space or en dash must not join a hit to an opt-out
+        # marker, or lengthen an international number past 15 digits.
+        marker = "pii-guard: allow (x)"
+        hit = "tel " + _sg_local()
+        date = " " + "2026" + " " + "10" + " " + "23"
+        for name, body in (
+            ("ascii", hit.encode("ascii") + b"\xa0" + marker.encode("ascii")),
+            ("utf16le", (hit + " " + marker).encode("utf-16-le")),
+            ("utf16be", (hit + "–" + marker).encode("utf-16-be")),
+            ("intl", ("Tel " + _intl() + date).encode("latin-1")),
+        ):
+            with self.subTest(name=name):
+                data = OLE2 + b"\x00\x00" + body + b"\x00\x00"
+                self.assertEqual(len(self.hits("note.doc", data)), 1)
+
+    def test_undeclared_stream_that_will_not_inflate_is_retried_raw(self):
+        # G2 R2-H1: a hidden FlateDecode declaration plus a bad Adler-32 used to skip the stream.
+        email = _email()
+        good = zlib.compress(("BT (contact " + email + ") Tj ET").encode("ascii"))
+        bad = good[:-4] + bytes(byte ^ 0xFF for byte in good[-4:])
+        tiny = zlib.compress(b"x")
+        for name, dictionary in (
+            ("forged.pdf", b"<< /Filter /FlateDecode /Note (stream\n" + tiny + b") >>"),
+            ("nul.pdf", b"<< /Filter\x00/FlateDecode >>"),
+            ("comment.pdf", b"<< /Filter % note\n/FlateDecode >>"),
+        ):
+            with self.subTest(name=name):
+                data = _pdf((b"<< /Type /Catalog >>", None), (dictionary, bad))
+                self.assertIn((name + " (deflated streams)", "email"), self.hits(name, data))
+        self.assert_fails_closed("declared.pdf", _pdf((b"<< /Filter /FlateDecode >>", bad)))
+
+    def test_pdf_name_escapes_are_decoded_for_the_name_checks(self):
+        # G2 R2-H2: /Encr#79pt is /Encrypt, and /Fl#61teDecode is /FlateDecode.
+        clean = _pdf((b"<< /Type /Catalog >>", None))
+        self.assert_fails_closed("secured.pdf", clean.replace(b"<< /Root 1 0 R >>", b"<< /Root 1 0 R /Encr#79pt 3 0 R >>"))
+        self.assert_fails_closed("escaped.pdf", _pdf((b"<< /Filt#65r /Fl#61teDecode >>", b"\xff" * 24)))
+        self.assertEqual(self.hits("plain.pdf", _pdf((b"<< /Note (#41#42) >>", b"\xff" * 24))), [])
+
+    def test_pdf_member_header_may_follow_leading_bytes(self):
+        # G2 L6: readers accept a header within the first 1024 bytes.
+        content = zlib.compress(("BT (contact " + _email() + ") Tj ET").encode("ascii"))
+        bundle = _zip_bytes({"x.pdf": b"\n" + _pdf((b"<< /Filter /FlateDecode >>", content))}, zipfile.ZIP_DEFLATED)
+        self.assertIn(("bundle.zip!x.pdf (deflated streams)", "email"), self.hits("bundle.zip", bundle))
 
 
 class SelfScanTests(unittest.TestCase):

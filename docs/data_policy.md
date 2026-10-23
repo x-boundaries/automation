@@ -94,7 +94,8 @@ lines. No binary file is skipped whole:
 - Printable ASCII, UTF-16LE and UTF-16BE runs of six or more characters are
   always scanned (the runs keep no-break spaces, and UTF-16 runs keep en
   dashes), so PDF metadata, image text chunks and legacy `.xls` or `.doc`
-  strings are covered.
+  strings are covered. The runs as cut before #270 (without those characters)
+  are scanned too, so a wider run cannot join a hit to an opt-out marker.
 - BOM-marked UTF-8, UTF-16 or UTF-32 text is also decoded line by line (Windows
   PowerShell 5.1 `Out-File` writes UTF-16).
 - Zip containers, recognised by their signature whatever the file is called
@@ -113,18 +114,23 @@ lines. No binary file is skipped whole:
 - Office XML parts inside a container are also scanned with their text runs
   joined (Word, PowerPoint and shared-string runs, plus XML character
   references such as `&#64;`), so a number or address split across formatting
-  runs is still seen. Hyperlinks, tracked insertions, smart tags, content
-  controls, simple fields and custom XML around runs are joined too, a
-  no-break hyphen reads as a hyphen, and tracked formatting changes are
-  stripped with the run properties. Separate paragraphs and cells are not
-  joined.
+  runs is still seen. Hyperlinks, tracked insertions, moved text, smart tags,
+  content controls, simple fields, custom XML and comment ranges around runs
+  are joined too, whichever edge the split falls on (their property elements
+  are stripped like run properties). A no-break hyphen reads as a hyphen, a
+  soft hyphen reads as nothing, and tracked formatting changes are stripped
+  with the run properties. Separate paragraphs and cells are not joined.
 - A PDF's FlateDecode streams (page content, object streams, metadata) are
   decompressed with the standard-library `zlib` within the same 64 MiB budget
   and scanned by text runs. A stream whose object names FlateDecode as its
   first filter fails the scan when its data has no zlib header or will not
-  decompress, and so does one that exceeds the budget. A PDF that names
-  `/Encrypt` (an encrypted PDF, including owner-password-only "secured" files)
-  fails the scan.
+  decompress, and so does one that exceeds the budget. A stream with a zlib
+  header that is not declared and will not decompress (a bad checksum, for
+  example) is retried as raw deflate and whatever it yields is scanned. A PDF
+  that names `/Encrypt` (an encrypted PDF, including owner-password-only
+  "secured" files) fails the scan. Both name checks also read `#xx` name
+  escapes (`/Encr#79pt` is `/Encrypt`). A zip member is read as a PDF when the
+  header appears within its first 1024 bytes.
 - A legacy `.xls` workbook has its numeric cells decoded (number, RK, multiple
   RK and cached formula results), so a phone number typed into a number cell
   is seen. A workbook the scanner cannot read, or an encrypted one, fails the
@@ -148,11 +154,16 @@ Known limits (accepted, #270):
   scan (see above).
 - PDF streams the scanner cannot place are skipped (LATER, #270 G2 L2): a
   `stream` keyword followed by a bare carriage return or a space (not
-  conforming to the PDF standard), a `/Filter` given as an indirect reference
-  or with `#` name escapes, so FlateDecode is not seen as declared, and the zip
-  members of a file embedded in a PDF (an `/EmbeddedFile` such as an `.xlsx`
-  attachment is inflated and scanned by text runs only). Reason: each needs a
-  real PDF object parser; the scanner stays a small standard-library tool.
+  conforming to the PDF standard), and the zip members of a file embedded in a
+  PDF (an `/EmbeddedFile` such as an `.xlsx` attachment is inflated and
+  scanned by text runs only). A FlateDecode declaration is also not seen when
+  the `/Filter` is an indirect reference, when a NUL byte or a `%` comment
+  sits between `/Filter` and `/FlateDecode`, or when a forged `stream` token
+  inside the object's own dictionary cuts the look-back window short (#270 G2
+  R2-H1). Such a stream is still decoded when it starts with a zlib header
+  (as raw deflate if it will not decompress); without a zlib header it is
+  skipped. Reason: each needs a real PDF object parser; the scanner stays a
+  small standard-library tool.
 - The FlateDecode check looks back from each stream to the previous stream's
   data, so a previous uncompressed stream that happens to contain the text
   `/Filter /FlateDecode` can make the next stream fail the scan (the safe
@@ -164,7 +175,12 @@ Known limits (accepted, #270):
   forms), no-break space, `&nbsp;` and en dash. Other dashes or spaces (em
   dash, figure or narrow no-break space), and two separators in a row, still
   split a number. Raw-byte text runs see the no-break space, and the en dash
-  only in UTF-16.
+  only in UTF-16. The phone patterns as they were before #270 (space, hyphen
+  and dot only) also run on every line, so the wider separators never hide a
+  number those patterns find.
+- An international number directly followed by more digit groups with plain
+  spaces, dots or hyphens (for example a date), so that the groups add up to
+  more than 15 digits, is not reported (as before #270).
 - Separators written other ways are not seen (LATER, #270 G2 L1): numeric
   character references (`&#160;`, `&#xa0;`, `&#8211;`), the `&ndash;` entity
   and the non-breaking hyphen U+2011 in text, and in raw bytes or PDF streams
@@ -172,9 +188,19 @@ Known limits (accepted, #270):
   runs keep only the Latin-1 no-break space byte. Reason: each widens the
   phone patterns or the run decoder for a rare form; a number split this way
   is still read by a human reviewer.
-- Office XML with a crafted unclosed `<w:rPr>` or `<` makes the joined-text
-  pass slow (quadratic: about 30 seconds at 380 KB) (LATER, #270 G2 L3). It
-  ends in a hook or CI timeout, which fails the check rather than passing it.
+- Office XML with a crafted unclosed `<w:rPr>`, `<w:rPrChange` or `<` makes
+  the joined-text pass slow (quadratic: an unclosed `<` repeated takes about
+  15 seconds at 100 KB and a minute at 200 KB, so minutes at 380 KB) (LATER,
+  #270 G2 L3, L8). It ends in a hook or CI timeout, which fails the check
+  rather than passing it.
+- A zip hidden inside a member's declared span (past the end of its
+  compressed data, with the central-directory size inflated to cover it, or
+  in an extra field) is neither expanded nor refused (LATER, #270 G2 L9).
+  Reaching it needs data carving, the same class as any custom encoding.
+- A text file without NUL bytes that starts with `%PDF` or holds a zip
+  end-of-central-directory record has its PDF streams or appended zip scanned
+  by the blob scan, while git's diff still decides which of its text lines are
+  added (the blob scan's own line matching can miss a moved line).
 - Random binary data can contain the 4-byte zip end-of-central-directory
   record by chance; such a file fails the scan (the safe direction). The same
   holds for a 4-byte zip file header by chance in front of an appended zip.
