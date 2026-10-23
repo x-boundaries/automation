@@ -12,6 +12,8 @@ Status: **offline build only.** Nothing here has run against SQL Server, the AC2
 
 Delivery to Google Drive is a plain file copy into a local folder that Google Drive for desktop syncs (`output.delivery_root`). Nothing calls a Drive API. The manifest says "handed to Drive sync folder", never "uploaded".
 
+Where it runs (owner decision, 23 Oct 2026): on the AC2 VM as a Windows Task Scheduler task, reading SQL Server locally. The archive is a gitignored folder inside the automation clone on the VM, and delivery writes directly into the Drive for desktop synced folder. The settings file is JSON and cannot carry comments, so this runbook documents the placeholders used in the example settings.
+
 How it reads:
 
 - Fixed `SELECT` statements only; `READ COMMITTED`, `SET LOCK_TIMEOUT` (default 5000 ms), query timeout (default 60 s), one connection per attempt. No `NOLOCK`, no snapshot isolation, no database setting changes.
@@ -70,8 +72,8 @@ Every business choice is a setting. The owner said answers may still change, so 
 | `rows.drop_zero_rows_for_inactive_items` | `true` | Drop zero rows of inactive items (non-zero inactive rows are kept). May change. |
 | `rows.uom_guard` | `"fail"` | Fail the hour (no CSV) if any balance row's UOM differs from `Item.BaseUOM`, or any item has more than one UOM, until a mapping exists. May change once a mapping is designed. |
 | `location_labels` | `{}` | Location code -> label. Every code is exported; codes are never dropped or renamed. Unmapped code label = `code - Location.Description` when present, else the code; unmapped codes are listed in the manifest. Real labels only in the local file. May change. |
-| `output.archive_root` | required | Local archive folder on the VM. |
-| `output.delivery_root` | `null` | Local folder synced by Google Drive for desktop. `null` = local archive only. Folder still to be chosen. Must differ from `archive_root`. |
+| `output.archive_root` | required | Local archive folder on the VM. Owner decision: a gitignored folder inside the automation clone, `<automation clone>\autocount_outputs\stock_balance_hourly` (ignored by the existing `autocount_outputs/` rules in `.gitignore`). May change. |
+| `output.delivery_root` | `null` | The Google Drive for desktop synced folder; the job writes into it directly. `null` = local archive only. Folder and Google account are named at V6. Must differ from `archive_root`. |
 | `output.columns` | as_of_local, ItemCode, ItemDescription, ItemType, Location, LocationLabel, UOM, BalQty, IsActive, StockControl, RowSource | Order and subset of the CSV columns; must include ItemCode, Location, UOM, BalQty. To be aligned to the owner's Stock Balance by Location report at reconciliation. May change. |
 
 ## Outputs and folder layout
@@ -114,10 +116,11 @@ A failed run writes `manifest.json` only (no CSV), never touches the latest pair
 | `latest_publish_failed` | Hourly data is good but the latest pair could not be replaced (`last_run_status.json` only). | Check whether a program holds the latest files open. |
 | `internal_error` | Unexpected error. The message has the run reference only. | Report the run reference. |
 
-## Read identity (open question)
+## Read identity
 
-- Recommended: a dedicated least-privilege SQL login, `SELECT` only on the six tables read (`ItemBatchBalQty`, `Item`, `ItemUOM`, `Location`, `ChangeCount`, `SyncRegistration`), with `auth_mode` `sql_login` and the password in Windows Credential Manager. Creating it is step V4.
-- Alternative the owner mentioned: their own admin account (Windows integrated). That account is sysadmin on the VM, so it needs `allow_privileged_identity: true`; every manifest then carries `identity.privileged: true` and a warning.
+- Owner decision (23 Oct 2026): the owner's own admin account, with any password read from Windows Credential Manager at runtime. That account is privileged (sysadmin or db_owner), so the local settings must set `allow_privileged_identity: true`. Every manifest then carries `identity.privileged: true` and a warning.
+- Still to confirm at V1/V4: whether it is a SQL login (`auth_mode: sql_login` with `identity.sql_login` and `identity.credential_target`) or the Windows account itself (`auth_mode: windows_integrated`, run by the scheduled task), and the exact Credential Manager target name.
+- The least-privilege option remains available: a dedicated SQL login with `SELECT` only on the six tables read (`ItemBatchBalQty`, `Item`, `ItemUOM`, `Location`, `ChangeCount`, `SyncRegistration`) and `allow_privileged_identity: false`.
 - Always: `SUSER_SNAME()='sa'` is refused (case-insensitive), whatever the settings say. The `AUTOCOUNT_EXPECTED_SQL_LOGIN` / `_USER` / `_DATABASE` environment values must be set for the task's account and must match; the run fails closed otherwise.
 
 ## Reconciliation
@@ -135,9 +138,9 @@ Each step **needs owner OK**. None has been run.
 - **V1** (needs owner OK): run against the test book `AED_TESTINGAPI` with the VM Windows user and `allow_privileged_identity: false` (expect `identity_refused`), then `true` (test book only).
 - **V2** (needs owner OK): reconcile the test output to the scoping totals (12,156 balance rows, SUM 26,090).
 - **V3** (needs owner OK): owner runs `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` off-peak. Note: the ledger-match step assumes `dbo.StockDTL` has a `BatchNo` column; if it errors there, nothing was written and the remaining steps can be rerun without it.
-- **V4** (needs owner OK): create the chosen read identity and grants.
+- **V4** (needs owner OK): confirm the read identity (owner's admin account: SQL login or Windows account, and the Credential Manager target), or create a dedicated login and grants if the owner changes the decision.
 - **V5** (needs owner OK): three manual live runs off-peak; reconcile with the owner's Stock Balance by Location export.
-- **V6** (needs owner OK): pick the Drive folder (`delivery_root`) and confirm the Google Drive for desktop account on the VM.
+- **V6** (needs owner OK): name the Drive for desktop synced folder (`delivery_root`) and the Google account Drive for desktop uses on the VM.
 - **V7** (needs a separate owner OK): register the hourly task with `scripts/install_autocount_stock_balance_hourly_task.ps1`.
 
 ## Retention
@@ -149,14 +152,19 @@ Each step **needs owner OK**. None has been run.
 
 - **#246** (daily money / buying package): the owner wants AutoCount's Advanced Dimensional report there (most detailed breakdown, for example marketplace shipping fees). New marketplace fee codes can land on a default term (believed to be "Adjustment") until someone adds the term in AC2, so the #246 report should flag unmapped codes. Cost and value belong in #246, not here.
 - Dashboards: planned later as Claude artifacts shared in the Work Claude organisation account. Nothing to build now.
-- Consignment stock, alert emails or webhooks, n8n delivery, Drive API upload, pruning, scheduling, SQL logins and grants.
+- Consignment stock, failure alerts (planned follow-up below), n8n, Drive API upload, pruning, scheduling, SQL logins and grants.
+
+## Planned follow-up: failure alerts
+
+Not built in this round, and nothing in n8n is touched. In this build a failure is visible only through files (`last_run_status.json`, the hourly manifest, `--check-latest`). Planned for a later #245 round:
+
+- Failure alerts go to the owner by Telegram through an n8n webhook. The VM job posts a sanitized failure event (hour, `failure_class`, `run_id`), with no stock data.
+- An hourly heartbeat, so n8n alerts when no run has been heard for about 70 minutes.
 
 ## Open questions
 
-1. Read identity: dedicated least-privilege login (recommended) or the owner's admin account (needs `allow_privileged_identity: true`).
-2. Drive folder (`delivery_root`) and which Google Drive for desktop account on the VM.
-3. Who gets failure alerts (none in this build; failures are visible through files only).
-4. Items with no balance row: keep the added "(no balance row)" rows (default) or switch `zero_row_mode`.
-5. Location labels: to confirm with the owner (kept in the local settings file only).
-6. Which SyncRegistration time column is right on live.
-7. Online marketplace stock may include consignment for some outlets, so it can differ from this export; owner to confirm that is fine.
+1. Drive for desktop folder and Google account: name them at V6.
+2. Read identity credential target, and whether the owner's account is a SQL login or the Windows account: confirm at V1/V4.
+3. Items with no balance row: keep the added "(no balance row)" rows (default) or switch `zero_row_mode`.
+4. Which SyncRegistration time column is right on live.
+5. Online marketplace stock may include consignment for some outlets, so it can differ from this export; owner to confirm that is fine.
