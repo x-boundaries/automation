@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,10 @@ class MirrorTestBase(unittest.TestCase):
         env_patch = mock.patch.dict(os.environ, self.env)
         env_patch.start()
         self.addCleanup(env_patch.stop)
+        # The throwaway local repository stands in for GitHub (test-only switch).
+        local_patch = mock.patch.object(mirror, "_ALLOW_LOCAL_SOURCE_FOR_TESTS", True)
+        local_patch.start()
+        self.addCleanup(local_patch.stop)
         self.addCleanup(self._cleanup)
 
         self.remote = self.root / "remote"
@@ -174,6 +179,19 @@ class MirrorTestBase(unittest.TestCase):
     def outside_snapshot(self):
         return (self.outside_file.read_bytes(), os.lstat(self.outside_file).st_mtime_ns,
                 snapshot(self.outside_dir))
+
+    def adopt_then_move_main(self):
+        """First run into the empty folder, then a new upstream commit so the next run syncs."""
+        self.assertEqual(self.run_mirror(), 0)
+        self.write_remote({"README.md": b"# Fake repo, next commit\n"})
+        return self.commit("next")
+
+    def run_status(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = mirror.main(["--config", str(self.config), "--status"])
+        self.last_stdout = out.getvalue()
+        return code
 
 
 class FirstRunTests(MirrorTestBase):
@@ -347,6 +365,7 @@ class OutsideTargetTests(MirrorTestBase):
         self.assertEqual(self.outside_snapshot(), before)
 
     def test_links_inside_target_are_removed_not_followed(self):
+        self.adopt_then_move_main()
         link = self.target / "link-to-outside"
         if not make_dir_link(link, self.outside_dir):
             self.skipTest("this machine cannot create a directory link or junction")
@@ -356,6 +375,8 @@ class OutsideTargetTests(MirrorTestBase):
         self.assertEqual(self.outside_snapshot(), before)
 
     def test_link_where_a_mirrored_folder_belongs_is_replaced(self):
+        self.adopt_then_move_main()
+        shutil.rmtree(self.target / "scripts")
         link = self.target / "scripts"
         if not make_dir_link(link, self.outside_dir):
             self.skipTest("this machine cannot create a directory link or junction")
@@ -444,7 +465,7 @@ class StatusAndFailureTests(MirrorTestBase):
         self.assertEqual(self.run_mirror(), 0)
         self.write_remote({"README.md": b"# Fake repo v3\n"})
         head = self.commit("fourth")
-        with mock.patch.object(mirror.shutil, "copyfile", side_effect=OSError("disk full")):
+        with mock.patch.object(mirror.shutil, "copyfileobj", side_effect=OSError("disk full")):
             self.assertEqual(self.run_mirror(), mirror.EXIT_SYNC)
         self.assertFalse((self.target / mirror.INFO_NAME).exists(),
                          "the info file must never name a commit that was not fully copied")
@@ -453,6 +474,382 @@ class StatusAndFailureTests(MirrorTestBase):
         self.assertEqual(self.run_mirror(), 0)
         self.assertIn("commit: " + head, self.info_text())
         self.assertEqual(self.mirrored()["README.md"], b"# Fake repo v3\n")
+
+
+class H1TempFileTests(MirrorTestBase):
+    """Internal temp files are created new; an existing name (link) is never written through."""
+
+    def plant(self, name, kind="hard"):
+        victim = self.root / "outside-victim.txt"
+        victim.write_bytes(b"victim content\n")
+        try:
+            if kind == "hard":
+                os.link(victim, self.target / name)
+            else:
+                os.symlink(victim, self.target / name)
+        except (OSError, NotImplementedError):
+            self.skipTest("this machine cannot create a %s link here" % kind)
+        return victim
+
+    def break_fetch(self):
+        not_a_repo = self.root / "not-a-repo"
+        not_a_repo.mkdir()
+        self.write_config(repo_url=str(not_a_repo))
+
+    def test_failure_status_not_written_through_planted_hard_link(self):
+        self.assertEqual(self.run_mirror(), 0)
+        victim = self.plant(mirror.STATUS_NAME + mirror.TEMP_SUFFIX)
+        self.break_fetch()
+        self.assertEqual(self.run_mirror(), mirror.EXIT_FETCH)
+        self.assertEqual(victim.read_bytes(), b"victim content\n")
+        self.assertEqual(self.target_status()["failure_class"], "FETCH_FAILED")
+        self.assertFalse(os.path.lexists(self.target / (mirror.STATUS_NAME + mirror.TEMP_SUFFIX)))
+
+    def test_no_change_status_not_written_through_planted_hard_link(self):
+        self.assertEqual(self.run_mirror(), 0)
+        (self.target / mirror.STATUS_NAME).write_text('{"status": "failed"}', encoding="utf-8")
+        victim = self.plant(mirror.STATUS_NAME + mirror.TEMP_SUFFIX)
+        self.assertEqual(self.run_mirror(), 0)
+        self.assertEqual(victim.read_bytes(), b"victim content\n")
+        self.assertEqual(self.target_status()["status"], "no_change")
+
+    def test_failure_status_not_written_through_planted_symlink(self):
+        self.assertEqual(self.run_mirror(), 0)
+        victim = self.plant(mirror.STATUS_NAME + mirror.TEMP_SUFFIX, kind="symlink")
+        self.break_fetch()
+        self.assertEqual(self.run_mirror(), mirror.EXIT_FETCH)
+        self.assertEqual(victim.read_bytes(), b"victim content\n")
+        self.assertEqual(self.target_status()["failure_class"], "FETCH_FAILED")
+
+    def test_copy_temp_not_written_through_planted_hard_link(self):
+        victim = self.root / "outside-victim.txt"
+        victim.write_bytes(b"victim content\n")
+        destination = self.root / "dest.txt"
+        source = self.root / "source.txt"
+        source.write_bytes(b"new content\n")
+        os.link(victim, str(destination) + mirror.TEMP_SUFFIX)
+        mirror.copy_file_into(str(source), str(destination))
+        self.assertEqual(destination.read_bytes(), b"new content\n")
+        self.assertEqual(victim.read_bytes(), b"victim content\n")
+
+
+class H2FirstRunTests(MirrorTestBase):
+    """A folder never mirrored into must hold only the marker; Drive root folders are refused."""
+
+    def assert_refused(self, reason):
+        code = self.run_mirror()
+        self.assertEqual(code, mirror.EXIT_TARGET_GUARD, self.last_stdout)
+        self.assertIn("reason=" + reason, self.last_stdout)
+
+    def test_first_run_refuses_folder_with_other_content(self):
+        plan = self.target / "team-files" / "plan.txt"
+        plan.parent.mkdir()
+        plan.write_bytes(b"fake team plan\n")
+        before = snapshot(self.target)
+        self.assert_refused("first_run_target_not_empty")
+        self.assertEqual(snapshot(self.target), before)
+        self.assertFalse(self.cache.exists())
+
+    def test_first_run_allows_marker_and_old_status_file(self):
+        (self.target / mirror.STATUS_NAME).write_text('{"status": "failed"}', encoding="utf-8")
+        self.assertEqual(self.run_mirror(), 0)
+
+    def test_interrupted_first_copy_is_finished_but_not_carried_to_another_folder(self):
+        with mock.patch.object(mirror.shutil, "copyfileobj", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_mirror(), mirror.EXIT_SYNC)
+        self.assertFalse((self.target / mirror.INFO_NAME).exists())
+        self.assertEqual(self.run_mirror(), 0, self.last_stdout)
+        other = self.drive / "other-target"
+        other.mkdir()
+        (other / mirror.MARKER_NAME).write_bytes(b"")
+        (other / "keep.txt").write_bytes(b"someone else's file\n")
+        self.write_config(target_dir=str(other))
+        self.assert_refused("first_run_target_not_empty")
+        self.assertEqual((other / "keep.txt").read_bytes(), b"someone else's file\n")
+
+    def test_refuses_drive_root_folders_by_name(self):
+        for rel in ("G/My Drive", "G/my drive", "G/Shared drives", "G/Shared drives/Fake Team",
+                    "G/Other computers", "G/Other computers/FAKE-PC"):
+            folder = self.root.joinpath(*rel.split("/"))
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / mirror.MARKER_NAME).write_bytes(b"")
+            (folder / "team-files.txt").write_bytes(b"fake\n")
+            self.write_config(target_dir=str(folder))
+            self.assert_refused("drive_root_folder")
+            self.assertTrue((folder / "team-files.txt").exists())
+
+    def test_refuses_drive_root_folder_by_resolved_path(self):
+        my_drive = self.root / "G" / "My Drive"
+        my_drive.mkdir(parents=True)
+        (my_drive / mirror.MARKER_NAME).write_bytes(b"")
+        alias = self.root / "alias"
+        if not make_dir_link(alias, my_drive):
+            self.skipTest("this machine cannot create a directory link or junction")
+        self.write_config(target_dir=str(alias))
+        self.assert_refused("drive_root_folder")
+
+
+class H3ResolvedPathTests(MirrorTestBase):
+    """Guards compare resolved paths; network and device paths are refused."""
+
+    def test_device_and_network_paths_refused(self):
+        plain = str(self.target).lstrip("\\/")
+        for value in ("\\\\?\\" + plain, "\\\\.\\" + plain, "\\\\localhost\\C$\\fake",
+                      "//fake-server/share/mirror"):
+            self.write_config(target_dir=value)
+            self.assertEqual(self.run_mirror(), mirror.EXIT_CONFIG, value)
+            self.assertIn("reason=unc_or_device_target_dir", self.last_stdout)
+        self.write_config(cache_dir="\\\\fake-server\\share\\cache")
+        self.assertEqual(self.run_mirror(), mirror.EXIT_CONFIG)
+        self.assertIn("reason=unc_or_device_cache_dir", self.last_stdout)
+
+    def test_profile_reached_through_a_junction_is_refused(self):
+        users = self.root / "users"
+        alice = users / "alice"
+        (alice / "Documents").mkdir(parents=True)
+        (alice / mirror.MARKER_NAME).write_bytes(b"")
+        keep = alice / "Documents" / "keep.txt"
+        keep.write_bytes(b"fake private file\n")
+        junction = self.root / "jn"
+        if not make_dir_link(junction, users):
+            self.skipTest("this machine cannot create a directory link or junction")
+        with mock.patch.dict(os.environ, {"USERPROFILE": str(alice), "HOME": str(alice)}):
+            self.write_config(target_dir=str(junction / "alice"))
+            self.assertEqual(self.run_mirror(), mirror.EXIT_TARGET_GUARD, self.last_stdout)
+            self.assertIn("reason=profile_root", self.last_stdout)
+        self.assertEqual(keep.read_bytes(), b"fake private file\n")
+
+    def test_cache_reached_through_a_junction_into_the_target_is_refused(self):
+        junction = self.root / "localjn"
+        if not make_dir_link(junction, self.target):
+            self.skipTest("this machine cannot create a directory link or junction")
+        before = snapshot(self.target)
+        self.write_config(cache_dir=str(junction / "cache"))
+        self.assertEqual(self.run_mirror(), mirror.EXIT_TARGET_GUARD, self.last_stdout)
+        self.assertIn("reason=work_dir_overlaps_target", self.last_stdout)
+        self.assertEqual(snapshot(self.target), before)
+
+
+KILL_AFTER_FIRST_COPY = r"""
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("mirror_kill", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m._ALLOW_LOCAL_SOURCE_FOR_TESTS = True
+real_copy = m.copy_file_into
+done = []
+def copy_then_die(source, destination):
+    if done:
+        os._exit(9)  # hard kill: no finally, no lock release, no status write
+    done.append(1)
+    real_copy(source, destination)
+m.copy_file_into = copy_then_die
+m.main(["--config", sys.argv[2]])
+"""
+
+
+class H4UnfinishedRunTests(MirrorTestBase):
+    """A hard-killed run stays visible in the status, the next run and --status."""
+
+    def age_lock(self, seconds):
+        old = time.time() - seconds
+        os.utime(self.cache / mirror.LOCK_NAME, (old, old))
+
+    def test_hard_killed_run_is_reported_truthfully(self):
+        self.assertEqual(self.run_mirror(), 0)
+        self.assertEqual(self.run_status(), 0)
+        self.assertIn("verdict: OK", self.last_stdout)
+        self.write_remote({"README.md": b"v2\n", "keep.txt": b"v2\n", "scripts/tool.py": b"v2\n"})
+        head = self.commit("three changes")
+        done = subprocess.run([sys.executable, "-c", KILL_AFTER_FIRST_COPY, str(SCRIPT),
+                               str(self.config)], capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 9, done.stderr)
+        self.assertEqual(self.log_status()["status"], "running")
+        self.assertEqual(self.target_status()["status"], "running")
+        self.assertFalse((self.target / mirror.INFO_NAME).exists())
+        self.assertTrue((self.cache / mirror.LOCK_NAME).exists())
+
+        # Straight after: the lock is younger than the task limit, so a run may still be going.
+        self.assertEqual(self.run_status(), 0)
+        self.assertIn("verdict: RUNNING", self.last_stdout)
+        self.assertEqual(self.run_mirror(), mirror.EXIT_LOCKED)
+        self.assertEqual(self.log_status()["reason"], "lock_held")
+
+        # Past the 30-minute limit: reported as a stopped run, not as "another run".
+        self.age_lock(40 * 60)
+        self.assertEqual(self.run_mirror(), mirror.EXIT_LOCKED)
+        status = self.log_status()
+        self.assertEqual(status["reason"], "previous_run_unfinished")
+        self.assertGreaterEqual(status["lock_age_minutes"], 40)
+        self.assertEqual(self.run_status(), 1)
+        self.assertIn("verdict: UNFINISHED", self.last_stdout)
+        self.assertIn("drive_info_file: missing", self.last_stdout)
+
+        # Past the stale limit: taken over, redone, and the takeover is recorded.
+        self.age_lock(mirror.LOCK_STALE_SECONDS + 60)
+        self.assertEqual(self.run_mirror(), 0, self.last_stdout)
+        status = self.log_status()
+        self.assertEqual(status["status"], "ok")
+        self.assertTrue(status["previous_run_unfinished"])
+        self.assertIn("commit: " + head, self.info_text())
+        self.assertEqual(self.mirrored()["scripts/tool.py"], b"v2\n")
+        self.assertEqual(self.run_status(), 0)
+        self.assertIn("verdict: OK", self.last_stdout)
+
+    def test_log_says_running_while_the_run_is_going(self):
+        seen = {}
+        real_fetch = mirror.fetch_main
+
+        def fetch_and_look(settings):
+            seen["status"] = self.log_status()["status"]
+            return real_fetch(settings)
+
+        with mock.patch.object(mirror, "fetch_main", side_effect=fetch_and_look):
+            self.assertEqual(self.run_mirror(), 0)
+        self.assertEqual(seen["status"], "running")
+        self.assertEqual(self.log_status()["status"], "ok")
+
+    def test_status_writes_nothing(self):
+        self.assertEqual(self.run_mirror(), 0)
+        before = (snapshot(self.target), snapshot(self.logs), snapshot(self.cache))
+        self.run_status()
+        self.assertEqual((snapshot(self.target), snapshot(self.logs), snapshot(self.cache)), before)
+        self.assertNotIn(str(self.root), self.last_stdout)
+
+
+class H5RecheckTests(MirrorTestBase):
+    """The marker and folder identity are re-checked before the sync and before every delete."""
+
+    def setUp(self):
+        super().setUp()
+        self.adopt_then_move_main()
+        self.stray = self.target / "stray.txt"
+        self.stray.write_bytes(b"stray file\n")
+        self.info_before = self.info_text()
+        self.status_before = self.target_status()
+
+    def assert_stopped(self, reason):
+        self.assertEqual(self.last_code, mirror.EXIT_TARGET_GUARD, self.last_stdout)
+        self.assertIn("reason=" + reason, self.last_stdout)
+        self.assertTrue(self.stray.exists(), "nothing may be deleted after the marker went")
+        self.assertEqual(self.info_text(), self.info_before)
+
+    def test_marker_removed_during_fetch_stops_before_the_sync(self):
+        real_fetch = mirror.fetch_main
+
+        def fetch_then_remove_marker(settings):
+            result = real_fetch(settings)
+            (self.target / mirror.MARKER_NAME).unlink()
+            return result
+
+        with mock.patch.object(mirror, "fetch_main", side_effect=fetch_then_remove_marker):
+            self.last_code = self.run_mirror()
+        self.assert_stopped("marker_missing")
+        self.assertEqual(self.target_status(), self.status_before, "refused: target not written")
+
+    def test_marker_removed_after_the_last_guard_stops_before_the_first_delete(self):
+        real_load = mirror.load_manifest
+
+        def remove_marker_then_load(settings):
+            (self.target / mirror.MARKER_NAME).unlink()
+            return real_load(settings)
+
+        with mock.patch.object(mirror, "load_manifest", side_effect=remove_marker_then_load):
+            self.last_code = self.run_mirror()
+        self.assert_stopped("marker_missing")
+
+    def test_target_folder_swapped_during_export_is_refused(self):
+        real_export = mirror.export_commit
+        moved = self.drive / "mirror-moved"
+
+        def export_then_swap(settings, sha):
+            result = real_export(settings, sha)
+            os.rename(self.target, moved)
+            self.target.mkdir()
+            shutil.copy2(moved / mirror.MARKER_NAME, self.target / mirror.MARKER_NAME)
+            shutil.copy2(moved / mirror.INFO_NAME, self.target / mirror.INFO_NAME)
+            (self.target / "stray.txt").write_bytes(b"stray file\n")
+            return result
+
+        with mock.patch.object(mirror, "export_commit", side_effect=export_then_swap):
+            self.last_code = self.run_mirror()
+        self.assert_stopped("target_changed")
+
+
+class H6SourcePinTests(MirrorTestBase):
+    """Only this repository's https address; PC-wide git config is ignored."""
+
+    def test_local_path_source_refused_without_the_test_switch(self):
+        with mock.patch.object(mirror, "_ALLOW_LOCAL_SOURCE_FOR_TESTS", False):
+            self.assertEqual(self.run_mirror(), mirror.EXIT_CONFIG)
+        self.assertIn("reason=repo_url_local_path", self.last_stdout)
+        self.assertFalse(self.cache.exists())
+
+    def test_only_this_repository_https_address_is_accepted(self):
+        with mock.patch.object(mirror, "_ALLOW_LOCAL_SOURCE_FOR_TESTS", False):
+            for url in (mirror.DEFAULT_REPO_URL, "https://github.com/x-boundaries/automation",
+                        "HTTPS://GitHub.com/X-Boundaries/automation.git"):
+                self.write_config(repo_url=url)
+                self.assertEqual(mirror.load_settings(str(self.config))["repo_url"], url)
+            for url in ("https://github.com/x-boundaries/TRANSPORT-automation.git",
+                        "https://github.example.com/x-boundaries/automation.git",
+                        "https://github.com/x-boundaries/automation.git/../other"):
+                self.write_config(repo_url=url)
+                with self.assertRaises(mirror.MirrorError) as caught:
+                    mirror.load_settings(str(self.config))
+                self.assertEqual(caught.exception.reason, "repo_url_not_this_repo")
+
+    def test_global_git_config_cannot_redirect_the_fetch(self):
+        other = self.root / "other-remote"
+        other.mkdir()
+        self.git("init", "-q", "-b", "main", cwd=other)
+        (other / "README.md").write_bytes(b"# NOT the mirrored repo\n")
+        self.git("add", "-A", cwd=other)
+        self.git("commit", "-q", "-m", "other", cwd=other)
+        remote_url = self.remote.as_posix()
+        evil = self.root / "evil.gitconfig"
+        evil.write_text('[url "%s"]\n\tinsteadOf = %s\n' % (other.as_posix(), remote_url),
+                        encoding="utf-8")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(evil)}):
+            redirected = self.git("ls-remote", remote_url, "refs/heads/main").split()[0]
+            if redirected != self.git("rev-parse", "HEAD", cwd=other):
+                self.skipTest("this git does not apply insteadOf to local paths")
+            self.write_config(repo_url=remote_url)
+            self.assertEqual(self.run_mirror(), 0, self.last_stdout)
+        self.assertIn("commit: " + self.git("rev-parse", "HEAD"), self.info_text())
+        self.assertEqual(self.mirrored()["README.md"], b"# Fake repo\n")
+
+    def test_git_env_and_command_drop_inherited_git_settings(self):
+        inherited = {"GIT_CONFIG_PARAMETERS": "'url.fake.insteadof'='x'", "GIT_CONFIG_COUNT": "1",
+                     "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": "X: fake",
+                     "GIT_DIR": "fake"}
+        with mock.patch.dict(os.environ, inherited):
+            env = mirror.git_env()
+        for key in inherited:
+            self.assertNotIn(key, env)
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        with mock.patch.object(mirror, "_ALLOW_LOCAL_SOURCE_FOR_TESTS", False):
+            command = mirror.git_base_command()
+        self.assertIn("protocol.file.allow=never", command)
+        self.assertIn("http.extraHeader=", command)
+        self.assertIn("credential.helper=", command)
+
+
+class LaterItemTests(MirrorTestBase):
+    def test_read_only_mirrored_file_does_not_block_the_next_update(self):  # L1
+        self.assertEqual(self.run_mirror(), 0)
+        os.chmod(self.target / "README.md", stat.S_IREAD)
+        self.write_remote({"README.md": b"# Fake repo v5\n"})
+        self.commit("fifth")
+        self.assertEqual(self.run_mirror(), 0, self.last_stdout)
+        self.assertEqual(self.mirrored()["README.md"], b"# Fake repo v5\n")
+
+    def test_staging_error_is_classed_as_export_failed(self):  # L6
+        with mock.patch.object(mirror, "prepare_staging", side_effect=OSError("fake")):
+            self.assertEqual(self.run_mirror(), mirror.EXIT_EXPORT)
+        self.assertEqual(self.log_status()["reason"], "staging_failed")
 
 
 class StaticFileTests(unittest.TestCase):
@@ -509,6 +906,13 @@ class StaticFileTests(unittest.TestCase):
                        "Sunday 03:00", "owner OK", "How to stop it", "manual run",
                        "no Claude usage"):
             self.assertIn(needle, text)
+
+    def test_runbook_covers_g2_hardening_notes(self):
+        text = RUNBOOK.read_text(encoding="utf-8")
+        for needle in ("Viewer", "deleted on the next update", "shortcuts", "previous_run_unfinished",
+                       "--status", "first_run_target_not_empty", "My Drive"):
+            self.assertIn(needle, text)
+        self.assertNotIn("Another run was still going. Nothing was changed.", text)
 
     def test_new_files_are_plain_ascii(self):
         for path in (SCRIPT, INSTALLER, EXAMPLE_CONFIG, RUNBOOK, Path(__file__)):
