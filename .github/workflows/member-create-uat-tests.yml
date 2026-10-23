@@ -79,6 +79,17 @@ on:
       - "scripts/autocount_stock_extract.py"
       - "tests/test_autocount_stock_extract.py"
       - "docs/autocount_stock_extraction.md"
+      # AC2 hourly stock balance export (#245). The Windows job's full-repository suite
+      # exercises tests/test_autocount_stock_balance_hourly.py (including the installer parse
+      # check and the read-only live-check SQL assertions), so a pull request confined to the
+      # exporter, its test, installer, example settings, runbook or live-check SQL must still
+      # trigger this workflow. Exact entries, not globs, for the same reason as #140 and #149.
+      - "scripts/autocount_stock_balance_hourly.py"
+      - "tests/test_autocount_stock_balance_hourly.py"
+      - "scripts/install_autocount_stock_balance_hourly_task.ps1"
+      - "config/autocount_stock_balance_hourly.example.json"
+      - "docs/autocount2-automation/stock_balance_hourly_runbook.md"
+      - "sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql"
   workflow_dispatch: {}
 
 jobs:
