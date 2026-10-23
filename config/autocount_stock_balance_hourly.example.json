@@ -1,0 +1,56 @@
+{
+  "timezone": "Asia/Singapore",
+  "schedule": {
+    "frequency": "hourly",
+    "run_minute": 0,
+    "logon_type": "S4U"
+  },
+  "stale_after_minutes": 70,
+  "source": {
+    "server": "EXAMPLE-SQL-HOST\\EXAMPLE",
+    "odbc_driver": "ODBC Driver 17 for SQL Server",
+    "expected_database": "AED_EXAMPLE_BOOK",
+    "allowed_databases": ["AED_EXAMPLE_BOOK"],
+    "encrypt": false,
+    "trust_server_certificate": false,
+    "sync_registration_time_column": "LastFinishSyncTime"
+  },
+  "identity": {
+    "auth_mode": "windows_integrated",
+    "sql_login": null,
+    "credential_target": null,
+    "allow_privileged_identity": false
+  },
+  "read": {
+    "lock_timeout_ms": 5000,
+    "query_timeout_seconds": 60,
+    "max_attempts": 3,
+    "retry_backoff_seconds": 2
+  },
+  "rows": {
+    "zero_row_mode": "keep_rows_and_add_items_without_rows",
+    "drop_zero_rows_for_inactive_items": true,
+    "uom_guard": "fail"
+  },
+  "location_labels": {
+    "LOC-A": "LOC-A - Example outlet",
+    "LOC-GIT": "LOC-GIT - Example in transit"
+  },
+  "output": {
+    "archive_root": "C:\\EXAMPLE\\automation\\autocount_outputs\\stock_balance_hourly",
+    "delivery_root": "D:\\EXAMPLE\\DriveForDesktop\\ac2_stock",
+    "columns": [
+      "as_of_local",
+      "ItemCode",
+      "ItemDescription",
+      "ItemType",
+      "Location",
+      "LocationLabel",
+      "UOM",
+      "BalQty",
+      "IsActive",
+      "StockControl",
+      "RowSource"
+    ]
+  }
+}
