@@ -24,11 +24,13 @@ BOM-marked Unicode text (UTF-8, UTF-16 or UTF-32) is also decoded line by line;
 any zip, recognised by its signature or by ``ZIP_EXTENSIONS`` (such as .xlsx), has
 every member expanded and scanned, nested zips included up to ``ZIP_MAX_DEPTH``
 levels within one shared ``ZIP_MAX_BYTES`` budget; a corrupt, encrypted,
-over-budget or too deeply nested one fails closed. A zip appended to a reviewed
-binary or to text (found by its end-of-central-directory record) is expanded the
-same way. Office XML parts are also scanned with their text runs joined. A PDF's
-FlateDecode streams are decompressed (stdlib ``zlib``) within the same budget and
-scanned by text runs; a corrupt one fails closed. A legacy ``.xls`` workbook has
+over-budget or too deeply nested one fails closed, and so does a second zip in
+the same bytes. A zip appended to a reviewed binary or to text (found by its
+end-of-central-directory record) is expanded the same way. Office XML parts are
+also scanned with their text runs joined. A PDF's FlateDecode streams are
+decompressed (stdlib ``zlib``) within the same budget and scanned by text runs; a
+stream declared FlateDecode that is not zlib data or will not decompress, and an
+encrypted PDF, fail closed. A legacy ``.xls`` workbook has
 its numeric cells decoded; an unreadable or encrypted one fails closed. A reviewed
 binary extension must match its file signature. gzip, 7z, RAR and tar archives
 fail closed at any depth. Any other NUL-bearing blob fails closed unless its
@@ -54,6 +56,7 @@ The scanner uses the Python standard library only and performs no network action
 """
 
 import argparse
+import bisect
 import codecs
 import collections
 import difflib
@@ -167,6 +170,7 @@ ZIP_MAX_DEPTH = 3
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06")
 # A zip appended to another file (a polyglot) is found by its end-of-central-directory record.
 _ZIP_EOCD = b"PK\x05\x06"
+_ZIP_LOCAL = b"PK\x03\x04"
 _OLE2_MAGIC = BINARY_MAGIC[".xls"]
 _PDF_MAGIC = BINARY_MAGIC[".pdf"]
 # (signature, offset, label) for archives the scanner cannot open; they fail closed.
@@ -188,6 +192,8 @@ _UTF16BE_RUN = re.compile(rb"(?:\x00[\x20-\x7e\xa0]|\x20\x13){6,}")
 # PDF: a stream keyword, the object header before it, and a FlateDecode first filter.
 _PDF_STREAM = re.compile(rb"(?<![A-Za-z])stream(?:\r\n|\n)")
 _PDF_FLATE = re.compile(rb"/Filter\s*(?:\[\s*)?/FlateDecode(?![A-Za-z0-9])")
+# An encryption dictionary (named in the trailer) means every stream is ciphertext.
+_PDF_ENCRYPT = re.compile(rb"/Encrypt(?![A-Za-z0-9])")
 _INFLATE_CHUNK = 4096
 # OLE2 (compound file) layout constants and the BIFF records that hold numbers.
 _CFB_END = 0xFFFFFFFE
@@ -198,11 +204,21 @@ _BIFF_NUMBER = 0x0203
 _BIFF_RK = 0x027E
 _BIFF_MULRK = 0x00BD
 _BIFF_FORMULA = 0x0006
-# Office XML: run properties hold no text; joining runs (r, t and the markers Word
-# drops between them) rebuilds text split across runs. Every other tag is a break.
+# Office XML: run properties hold no text; joining runs (r, t, the markers Word
+# drops between them and the inline wrappers around runs) rebuilds text split across
+# runs. A no-break hyphen reads as a hyphen. Every other tag is a break. A tracked
+# property change (rPrChange, which holds its own rPr) is stripped first so the
+# outer rPr strip does not stop at the inner closing tag.
+_XML_RUN_PROPS_CHANGE = re.compile(r"<((?:[\w.-]+:)?rPrChange)\b[^>]*?(?:/>|>.*?</\1>)", re.S)
 _XML_RUN_PROPS = re.compile(r"<((?:[\w.-]+:)?rPr)\b[^>]*?(?:/>|>.*?</\1>)", re.S)
 _XML_TAG = re.compile(r"<(?:/?(?:[\w.-]+:)?([\w.-]+)[^>]*|[!?][^>]*)>")
-_XML_INLINE = frozenset({"r", "t", "proofErr", "bookmarkStart", "bookmarkEnd", "lastRenderedPageBreak"})
+_XML_INLINE = frozenset(
+    {
+        "r", "t", "proofErr", "bookmarkStart", "bookmarkEnd", "lastRenderedPageBreak",
+        "hyperlink", "ins", "smartTag", "sdt", "sdtContent", "fldSimple", "customXml",
+    }
+)
+_XML_INLINE_TEXT = {"noBreakHyphen": "-"}
 # Longest BOM first: the UTF-32-LE BOM starts with the UTF-16-LE BOM.
 _BOMS = (
     (codecs.BOM_UTF32_LE, "utf-32"),
@@ -461,16 +477,24 @@ def _zlib_header(data, at):
 def _pdf_stream_runs(path, data, budget):
     """Printable runs of every zlib-compressed (FlateDecode) stream in a PDF.
 
-    Every stream whose data starts with a zlib header is inflated until the zlib
-    data ends (so a forged ``endstream`` inside it cannot cut it short), within the
-    shared ``budget``. Data that turns out not to be zlib is skipped, unless the
-    object before it names FlateDecode as its first filter: then the corrupt stream
-    fails closed, as does exceeding the budget.
+    An encrypted PDF (one that names ``/Encrypt``) fails closed. Every stream whose
+    data starts with a zlib header is inflated until the zlib data ends (so a forged
+    ``endstream`` inside it cannot cut it short), within the shared ``budget``.
+    A stream whose object names FlateDecode as its first filter fails closed when
+    its data has no zlib header or will not decompress; other data that is not
+    zlib is skipped. Exceeding the budget fails closed.
     """
+    if _PDF_ENCRYPT.search(data):
+        raise GuardError("%s is an encrypted PDF and cannot be scanned" % path)
     runs, previous = [], 0
     for match in _PDF_STREAM.finditer(data):
+        # The window runs from the previous stream's data, so it always holds this
+        # object's header (over-inclusive, the safe direction).
         start, declared_from, previous = match.end(), previous, match.end()
+        declared = _PDF_FLATE.search(data, declared_from, match.start()) is not None
         if not _zlib_header(data, start):
+            if declared:
+                raise GuardError("%s has a FlateDecode stream that is not zlib data and cannot be scanned" % path)
             continue
         inflater, pieces = zlib.decompressobj(), []
         try:
@@ -483,7 +507,7 @@ def _pdf_stream_runs(path, data, budget):
                 if inflater.eof:
                     break
         except zlib.error:
-            if _PDF_FLATE.search(data, declared_from, match.start()):
+            if declared:
                 raise GuardError("%s has a corrupt FlateDecode stream and cannot be scanned" % path)
             continue
         runs.extend(_printable_runs(b"".join(pieces)))
@@ -626,10 +650,17 @@ def _xls_numeric_cells(path, data):
     return [_number_text(value) for value in values]
 
 
+def _xml_tag_text(match):
+    name = match.group(1)
+    if name in _XML_INLINE:
+        return ""
+    return _XML_INLINE_TEXT.get(name, "\n")
+
+
 def _xml_joined_lines(text):
     """Text of an Office XML part with its runs joined, so text split across runs reads whole."""
-    text = _XML_RUN_PROPS.sub("", text)
-    joined = _XML_TAG.sub(lambda match: "" if match.group(1) in _XML_INLINE else "\n", text)
+    text = _XML_RUN_PROPS.sub("", _XML_RUN_PROPS_CHANGE.sub("", text))
+    joined = _XML_TAG.sub(_xml_tag_text, text)
     return html.unescape(joined).splitlines()
 
 
@@ -646,7 +677,8 @@ def _format_documents(name, data, budget):
 def _member_documents(name, data, budget, depth):
     """Documents for one archive member: nested or appended zips recurse, other bytes are scanned in place."""
     if _is_zip(data) or _ZIP_EOCD in data:
-        return _zip_documents(name, data, budget, depth + 1) + [(name + RUNS_SUFFIX, _printable_runs(data))]
+        docs = _zip_documents(name, data, budget, depth + 1) + _format_documents(name, data, budget)
+        return docs + [(name + RUNS_SUFFIX, _printable_runs(data))]
     _refuse_other_archives(name, data)
     docs = []
     if b"\0" not in data:
@@ -675,6 +707,7 @@ def _zip_documents(path, data, budget, depth):
     docs = []
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            _refuse_hidden_zips(path, data, archive.infolist())
             for info in archive.infolist():
                 if info.is_dir():
                     continue
@@ -691,6 +724,38 @@ def _zip_documents(path, data, budget, depth):
     except (zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError, NotImplementedError, EOFError, OSError, ValueError, zlib.error) as exc:
         raise GuardError("%s is not a readable zip container: %s" % (path, exc.__class__.__name__))
     return docs
+
+
+def _refuse_hidden_zips(path, data, infos):
+    """Fail closed when ``data`` holds zip records that ``zipfile`` would not read.
+
+    ``zipfile`` reads only the last end-of-central-directory record, so a second
+    zip in front of the parsed one (or hidden between its members) would be
+    ignored. Every local file header must start a parsed member, and only one
+    end-of-central-directory record may lie outside the members' data (records
+    inside a stored member are scanned when that member is expanded).
+    """
+    spans = []
+    for info in infos:
+        head = data[info.header_offset : info.header_offset + 30]
+        if len(head) < 30 or not head.startswith(_ZIP_LOCAL):
+            raise GuardError("%s is not a readable zip container: bad member header" % path)
+        name_length, extra_length = struct.unpack_from("<HH", head, 26)
+        spans.append((info.header_offset, info.header_offset + 30 + name_length + extra_length + info.compress_size))
+    spans.sort()
+    starts, reach, furthest = [start for start, _ in spans], [], -1
+    for _, end in spans:
+        furthest = max(furthest, end)
+        reach.append(furthest)
+
+    def outside(offset):
+        index = bisect.bisect_right(starts, offset) - 1
+        return index < 0 or offset >= reach[index]
+
+    if any(outside(match.start()) for match in re.finditer(re.escape(_ZIP_LOCAL), data)):
+        raise GuardError("%s has a zip file header outside its parsed members (a second zip) and cannot be scanned" % path)
+    if sum(1 for match in re.finditer(re.escape(_ZIP_EOCD), data) if outside(match.start())) > 1:
+        raise GuardError("%s has more than one zip end-of-central-directory record and cannot be scanned" % path)
 
 
 def _safe_name(name):
@@ -717,8 +782,10 @@ def blob_documents(path, data):
     any zip (by signature or by extension) has every member expanded and scanned,
     nested zips included up to ``ZIP_MAX_DEPTH`` levels within one shared
     ``ZIP_MAX_BYTES`` budget, and so does a zip appended to a reviewed binary or to
-    text (found by its end-of-central-directory record). A PDF's FlateDecode
-    streams and a legacy ``.xls`` workbook's numeric cells are decoded too. gzip,
+    text (found by its end-of-central-directory record); a second zip in the same
+    bytes fails closed. A PDF's FlateDecode streams and a legacy ``.xls``
+    workbook's numeric cells are decoded too, in a zip member as well; an
+    encrypted PDF fails closed. gzip,
     7z, RAR and tar archives, and any other NUL-bearing blob that is neither
     BOM-marked text nor a reviewed binary type, fail closed.
     """

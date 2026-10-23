@@ -10,6 +10,7 @@ import gzip
 import importlib.util
 import io
 import os
+import random
 import re
 import shutil
 import struct
@@ -1030,6 +1031,33 @@ class BinaryFormatTests(unittest.TestCase):
         with mock.patch.object(self.g, "ZIP_MAX_BYTES", 1024):
             self.assert_fails_closed("big.pdf", big)
 
+    def test_declared_flate_without_zlib_data_fails_closed(self):
+        # #270 B1: the declared filter is checked before the zlib-header skip.
+        text = ("BT (contact " + _email() + ") Tj ET").encode("ascii")
+        packer = zlib.compressobj(wbits=-15)
+        raw_deflate = packer.compress(text) + packer.flush()
+        bad_header = b"\x78\x9d" + zlib.compress(text)[2:]
+        self.assertFalse(self.g._zlib_header(raw_deflate, 0))
+        self.assertFalse(self.g._zlib_header(bad_header, 0))
+        rng = random.Random(270)
+        ciphertexts = [rng.randbytes(64) for _ in range(200)]
+        streams = [("badheader.pdf", bad_header), ("rawdeflate.pdf", raw_deflate)]
+        streams += [("cipher%d.pdf" % index, data) for index, data in enumerate(ciphertexts)]
+        for name, stream in streams:
+            with self.subTest(name=name):
+                declared = b"<< /Length %d /Filter /FlateDecode >>" % len(stream)
+                self.assert_fails_closed(name, _pdf((b"<< /Type /Catalog >>", None), (declared, stream)))
+        # The same bytes with nothing declared are not zlib data, so they are still skipped.
+        self.assertEqual(self.hits("plain.pdf", _pdf((b"<< /Length 64 >>", ciphertexts[0]))), [])
+
+    def test_encrypted_pdf_fails_closed(self):
+        clean = _pdf((b"<< /Type /Catalog >>", None), (b"<< /Filter /FlateDecode >>", zlib.compress(b"BT (hello) Tj ET")))
+        self.assertEqual(self.hits("clean.pdf", clean), [])
+        secured = clean.replace(b"<< /Root 1 0 R >>", b"<< /Root 1 0 R /Encrypt 3 0 R >>")
+        self.assertNotEqual(secured, clean)
+        self.assert_fails_closed("secured.pdf", secured)
+        self.assert_fails_closed("bundle.zip", _zip_bytes({"invoices/secured.pdf": secured}, zipfile.ZIP_DEFLATED))
+
     def test_xls_numeric_cells_are_decoded(self):
         local = int("9" + "000" + "00" + "17")
         stored = float("65" + "8" + "000" + "00" + "42")
@@ -1097,6 +1125,66 @@ class BinaryFormatTests(unittest.TestCase):
         self.assert_fails_closed("broken.png", png + b"PK\x05\x06" + bytes(8))
         # An unrecognised NUL-bearing file still fails closed, appended zip or not.
         self.assert_fails_closed("data.bin", b"\x00\x01\x02" + appended)
+
+    def test_member_with_appended_zip_keeps_its_format_decoder(self):
+        # #270 H1: a zip member holding an end-of-central-directory record still gets its PDF or .xls decoder.
+        email = _email()
+        content = zlib.compress(("BT (contact " + email + ") Tj ET").encode("ascii"))
+        pdf = _pdf((b"<< /Filter /FlateDecode >>", content))
+        self.assertNotIn(email.encode("ascii"), pdf)
+        clean = _zip_bytes({"readme.txt": "clean"}, zipfile.ZIP_DEFLATED)
+        bundle = _zip_bytes({"docs/invoice.pdf": pdf + clean}, zipfile.ZIP_DEFLATED)
+        self.assertIn(("bundle.zip!docs/invoice.pdf (deflated streams)", "email"), self.hits("bundle.zip", bundle))
+        book = _cfb({"Workbook": _workbook(_rk(int("9" + "000" + "00" + "17")))})
+        sheets = _zip_bytes({"exports/book.xls": book + clean}, zipfile.ZIP_DEFLATED)
+        self.assertIn(("sheets.zip!exports/book.xls (numeric cells)", "sg_phone_local"), self.hits("sheets.zip", sheets))
+
+    def test_second_zip_in_one_file_fails_closed(self):
+        # #270 H2: zipfile reads only the last end-of-central-directory record, so any other zip fails closed.
+        png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(64))
+        hidden = _zip_bytes({"notes.txt": "mail " + _email()}, zipfile.ZIP_DEFLATED)
+        clean = _zip_bytes({"readme.txt": "clean"}, zipfile.ZIP_DEFLATED)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("notes.txt", "mail " + _email())
+            archive.comment = b"PK\x05\x06" + bytes(18)
+        for name, data in (
+            ("poly.png", png + hidden + clean),
+            ("double.zip", hidden + clean),
+            ("headers.png", png + hidden[: hidden.index(b"PK\x01\x02")] + clean),
+            ("masked.zip", buffer.getvalue()),
+        ):
+            with self.subTest(name=name):
+                self.assert_fails_closed(name, data)
+        # A zip stored whole inside another (its records inside the member's data) is still expanded.
+        outer = _zip_bytes({"inner.zip": hidden, "readme.txt": "clean"}, zipfile.ZIP_STORED)
+        self.assertIn(("outer.zip!inner.zip!notes.txt", "email"), self.hits("outer.zip", outer))
+        self.assertIn(("poly.png!notes.txt", "email"), self.hits("poly.png", png + hidden))
+
+    def test_office_xml_inline_wrappers_are_joined(self):
+        # #270 H3: wrappers around runs, the no-break hyphen and a nested rPrChange do not split text.
+        head, tail = "tel " + "9" + "000 ", "00" + "17"
+
+        def run(text, props=""):
+            return '<w:r>' + props + '<w:t xml:space="preserve">' + text + "</w:t></w:r>"
+
+        change = '<w:rPr><w:b/><w:rPrChange w:id="2" w:author="Editor"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr>'
+        cases = {
+            "hyperlink": run(head) + '<w:hyperlink r:id="rId4">' + run(tail) + "</w:hyperlink>",
+            "ins": run(head) + '<w:ins w:id="1" w:author="Editor">' + run(tail) + "</w:ins>",
+            "smartTag": '<w:smartTag w:element="phone">' + run(head) + "</w:smartTag>" + run(tail),
+            "sdt": '<w:sdt><w:sdtPr><w:alias w:val="Phone"/></w:sdtPr><w:sdtContent>' + run(head) + "</w:sdtContent></w:sdt>" + run(tail),
+            "fldSimple": run(head) + '<w:fldSimple w:instr=" MERGEFIELD Phone ">' + run(tail) + "</w:fldSimple>",
+            "customXml": '<w:customXml w:element="contact">' + run(head) + "</w:customXml>" + run(tail),
+            "noBreakHyphen": run(head.strip()) + "<w:r><w:noBreakHyphen/></w:r>" + run(tail),
+            "rPrChange": run(head) + run(tail, change),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                path = name + ".docx"
+                self.assertEqual(self.hits(path, _docx("<w:p>" + body + "</w:p>")), [(path + "!word/document.xml (joined text)", "sg_phone_local")])
+        linked = run("pat.lee") + '<w:hyperlink r:id="rId5">' + run(AT + "synthetic-mail.sg") + "</w:hyperlink>"
+        self.assertEqual(self.hits("link.docx", _docx("<w:p>" + linked + "</w:p>")), [("link.docx!word/document.xml (joined text)", "email")])
 
     def test_office_xml_runs_are_joined(self):
         split_phone = (

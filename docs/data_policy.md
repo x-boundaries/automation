@@ -104,15 +104,27 @@ lines. No binary file is skipped whole:
   too deeply nested container fails the scan.
 - A zip appended to a reviewed binary or to text (a polyglot) is found by its
   end-of-central-directory record and expanded the same way; if it cannot be
-  opened, the scan fails.
+  opened, the scan fails. A zip member holding an appended zip still has its
+  PDF streams or `.xls` cells decoded.
+- A second zip in the same bytes fails the scan: more than one
+  end-of-central-directory record outside the members' data, or a zip file
+  header that does not start a parsed member (such as a zip in front of the one
+  that is read). A zip stored whole inside a member is expanded as usual.
 - Office XML parts inside a container are also scanned with their text runs
   joined (Word, PowerPoint and shared-string runs, plus XML character
   references such as `&#64;`), so a number or address split across formatting
-  runs is still seen. Separate paragraphs and cells are not joined.
+  runs is still seen. Hyperlinks, tracked insertions, smart tags, content
+  controls, simple fields and custom XML around runs are joined too, a
+  no-break hyphen reads as a hyphen, and tracked formatting changes are
+  stripped with the run properties. Separate paragraphs and cells are not
+  joined.
 - A PDF's FlateDecode streams (page content, object streams, metadata) are
   decompressed with the standard-library `zlib` within the same 64 MiB budget
-  and scanned by text runs. A stream declared as FlateDecode that will not
-  decompress, or that exceeds the budget, fails the scan.
+  and scanned by text runs. A stream whose object names FlateDecode as its
+  first filter fails the scan when its data has no zlib header or will not
+  decompress, and so does one that exceeds the budget. A PDF that names
+  `/Encrypt` (an encrypted PDF, including owner-password-only "secured" files)
+  fails the scan.
 - A legacy `.xls` workbook has its numeric cells decoded (number, RK, multiple
   RK and cached formula results), so a phone number typed into a number cell
   is seen. A workbook the scanner cannot read, or an encrypted one, fails the
@@ -133,7 +145,18 @@ Known limits (accepted, #270):
   uncompressed). Other filters and filter chains (LZW, ASCII85, ASCIIHex
   first), text drawn with font-specific encodings or hex strings, and text
   split across separate show operators are not decoded. Encrypted PDFs fail the
-  scan when a declared FlateDecode stream will not decompress.
+  scan (see above).
+- PDF streams the scanner cannot place are skipped (LATER, #270 G2 L2): a
+  `stream` keyword followed by a bare carriage return or a space (not
+  conforming to the PDF standard), a `/Filter` given as an indirect reference
+  or with `#` name escapes, so FlateDecode is not seen as declared, and the zip
+  members of a file embedded in a PDF (an `/EmbeddedFile` such as an `.xlsx`
+  attachment is inflated and scanned by text runs only). Reason: each needs a
+  real PDF object parser; the scanner stays a small standard-library tool.
+- The FlateDecode check looks back from each stream to the previous stream's
+  data, so a previous uncompressed stream that happens to contain the text
+  `/Filter /FlateDecode` can make the next stream fail the scan (the safe
+  direction).
 - Packages embedded inside OLE2 files (legacy `.xls` or `.doc` objects, or an
   `oleObject.bin` in an Office zip) are scanned by text runs only; only a file
   or member named `.xls` has its numeric cells decoded.
@@ -142,8 +165,19 @@ Known limits (accepted, #270):
   dash, figure or narrow no-break space), and two separators in a row, still
   split a number. Raw-byte text runs see the no-break space, and the en dash
   only in UTF-16.
+- Separators written other ways are not seen (LATER, #270 G2 L1): numeric
+  character references (`&#160;`, `&#xa0;`, `&#8211;`), the `&ndash;` entity
+  and the non-breaking hyphen U+2011 in text, and in raw bytes or PDF streams
+  the UTF-8 no-break space (`C2 A0`) or the cp1252 en dash (`0x96`); raw-byte
+  runs keep only the Latin-1 no-break space byte. Reason: each widens the
+  phone patterns or the run decoder for a rare form; a number split this way
+  is still read by a human reviewer.
+- Office XML with a crafted unclosed `<w:rPr>` or `<` makes the joined-text
+  pass slow (quadratic: about 30 seconds at 380 KB) (LATER, #270 G2 L3). It
+  ends in a hook or CI timeout, which fails the check rather than passing it.
 - Random binary data can contain the 4-byte zip end-of-central-directory
-  record by chance; such a file fails the scan (the safe direction).
+  record by chance; such a file fails the scan (the safe direction). The same
+  holds for a 4-byte zip file header by chance in front of an appended zip.
 - CI runs the scanner and allowlist from the pull request itself, so a pull
   request can weaken them in the same change. Once `pii-guard` is a required
   check (an owner decision, not made yet), CI should run the base branch's
