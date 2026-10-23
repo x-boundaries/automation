@@ -160,6 +160,8 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `scripts/autocount_migration_preflight.py` (with pure contract library `scripts/autocount_migration_preflight_contract.py`): repository-only migration preflight for the AutoCount 2.0 cutover and import data contract. It binds a frozen source dataset to a manifest by cryptographic hash, validates the explicit bounded paste range, checks contract-qualified source-to-destination field mappings, and validates the two external evidence documents (effective import-time field routing, and the actual import execution context across both account-book/company and import surface/entity). It prepares and validates migration evidence only: it never contacts AutoCount, never opens the vendor `.xls` templates, never reads live AutoCount settings or a live session, never writes to production SQL, and never performs, triggers or approves an import. Unknown, partial, stale or unverifiable authority fails closed as `UNKNOWN` and `NOT_IMPORT_READY`, and unrecognised input columns block rather than being silently dropped. The strongest outcome is `REPOSITORY_PREFLIGHT_SATISFIED`, which is not production import approval; production import remains a human/vendor-controlled AutoCount action. Manifest and evidence contracts live in `schemas/autocount_migration_preflight_manifest.schema.json`, `schemas/autocount_migration_routing_evidence.schema.json`, and `schemas/autocount_migration_execution_context_evidence.schema.json`. See [AutoCount migration preflight and manifest runbook](docs/autocount2-automation/migration_preflight_manifest_runbook.md).
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
+- `scripts/autocount_stock_balance_hourly.py`: hourly read-only AC2 stock balance export (#245, offline build, not scheduled): immutable hourly CSV + manifest folders, a verified latest pair and `last_run_status.json`, handed to a Drive for desktop sync folder.
+- `scripts/install_autocount_stock_balance_hourly_task.ps1`: Task Scheduler installer for the hourly stock balance export (#245); not run, registering it needs a separate owner OK.
 
 ## Configuration Templates
 
@@ -171,6 +173,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `config/autocount_stock_extract.ac2_smoke.example.json`
 - `config/autocount_stock_extract.example.json`
 - `config/autocount_stock_extract.from_probe.example.json`
+- `config/autocount_stock_balance_hourly.example.json` (#245 hourly stock balance export; fake values only, the real file is the gitignored `config/autocount_stock_balance_hourly.local.json`)
 - `config/member_gateway.production.example.json` (closed `xb.member.gateway.config.v2` example; MemberNo is fixed at 20, activation is disabled, the kill switch is on, the adapter is not ready, and all real source, database, network, watermark, and credential bindings remain external)
 
 Copy example files to local ignored config paths before use. Do not commit credentials, connection strings, production exports, or real operational data.
@@ -199,6 +202,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 
 - [SQL Server local probe runbook](docs/autocount_sql_probe.md)
 - [AutoCount stock extraction runbook](docs/autocount_stock_extraction.md)
+- [AC2 hourly stock balance export runbook](docs/autocount2-automation/stock_balance_hourly_runbook.md) (#245)
 - [AutoCount 2 automation architecture](docs/autocount2-automation/architecture.md)
 - [AutoCount 2 API research](docs/autocount2-automation/api_research.md)
 - [Inventory intelligence scope](docs/autocount2-automation/inventory_intelligence_scope.md)
