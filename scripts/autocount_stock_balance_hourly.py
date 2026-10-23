@@ -64,13 +64,17 @@ HOURLY_DIR = "hourly"
 # The scheduled task stops a run after this many minutes (installer ExecutionTimeLimit).
 TASK_EXECUTION_LIMIT_MINUTES = 15
 # A lock older than the execution limit plus this margin is cleared automatically, but only when
-# the process it records is no longer running (a run killed by the time limit or a reboot). A
-# lock whose process is still alive is always respected. The clearing run records a warning.
+# it was written before the last boot, or the process it records is no longer running (a run
+# killed by the time limit or a reboot). A post-boot lock whose process is still alive is always
+# respected. The clearing run records a warning.
 LOCK_CLEAR_MARGIN_MINUTES = 15
 LOCK_STALE_AFTER_MINUTES = TASK_EXECUTION_LIMIT_MINUTES + LOCK_CLEAR_MARGIN_MINUTES
 # A process created more than this after the lock was written reused the PID; it is not the
 # lock owner. The tolerance only absorbs small clock adjustments.
 LOCK_PID_START_TOLERANCE_SECONDS = 60
+# A lock counts as written before the last boot only when it predates the boot time by more
+# than this, so a small clock adjustment never makes a live run's lock look pre-boot.
+LOCK_BOOT_TOLERANCE_SECONDS = 300
 
 NO_BALANCE_ROW_LABEL = "(no balance row)"
 ROW_SOURCE_BALANCE = "balance"
@@ -311,7 +315,7 @@ def validate_settings(raw):
             settings[key] = value
 
     try:
-        load_timezone(_require_str(settings, "timezone"))
+        load_zone(_require_str(settings, "timezone"))
     except RuntimeError as exc:
         if not timezone_database_available():
             raise TimezoneUnavailableError("time zone data is not installed (install tzdata)") from exc
@@ -395,10 +399,26 @@ def validate_settings(raw):
     return settings
 
 
+def load_zone(name):
+    """The daily extractor's load_timezone, with every load failure raised as RuntimeError.
+
+    load_timezone converts only ZoneInfoNotFoundError. zoneinfo raises ValueError for a
+    malformed or absolute key ("Asia/Singapore/", "/Asia/Singapore", "Asia//Singapore"), and the
+    tzdata package can raise OSError for a folder-like key. Any of these is a bad setting, never
+    a crash, so callers map RuntimeError to config_invalid or timezone_unavailable.
+    """
+    try:
+        return load_timezone(name)
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any zone load failure is a config failure, not a crash.
+        raise RuntimeError("time zone could not be loaded") from exc
+
+
 def timezone_database_available():
     """False when not even the default zone loads, i.e. no zone database is installed."""
     try:
-        load_timezone(DEFAULT_SETTINGS["timezone"])
+        load_zone(DEFAULT_SETTINGS["timezone"])
     except RuntimeError:
         return False
     return True
@@ -966,8 +986,10 @@ def git_commit():
 def acquire_lock(archive_root, run_id, now, warnings):
     """Take the lock, clearing one left by a killed run. Appends a warning when it clears one.
 
-    A lock younger than LOCK_STALE_AFTER_MINUTES, or one whose process is still running, gives
-    already_running. An unreadable lock gives stale_lock and is kept for the owner to check.
+    A lock younger than LOCK_STALE_AFTER_MINUTES gives already_running. An older lock written
+    before the last boot is dead (a reboot ends every run), whatever process now has its PID.
+    Otherwise a lock whose process is still running gives already_running. An unreadable lock
+    gives stale_lock and is kept for the owner to check.
     """
     path = Path(archive_root) / LOCK_NAME
     payload = json_bytes({"run_id": run_id, "pid": os.getpid(), "started_at": now.isoformat()})
@@ -980,8 +1002,13 @@ def acquire_lock(archive_root, run_id, now, warnings):
     if held is None:
         raise RunFailure(FAILURE_STALE_LOCK, "The lock file is unreadable; check no run is active, then remove it")
     age = now - held["started_at"]
-    if age <= timedelta(minutes=LOCK_STALE_AFTER_MINUTES) or _pid_running(held["pid"], held["started_at"]):
+    if age <= timedelta(minutes=LOCK_STALE_AFTER_MINUTES):
         raise RunFailure(FAILURE_ALREADY_RUNNING, "Another run holds the lock")
+    boot = _boot_time()
+    before_boot = boot is not None and held["started_at"] < boot - timedelta(seconds=LOCK_BOOT_TOLERANCE_SECONDS)
+    if not before_boot and _pid_running(held["pid"], held["started_at"]):
+        raise RunFailure(FAILURE_ALREADY_RUNNING, "Another run holds the lock")
+    reason = "written before the last restart" if before_boot else "whose process is no longer running"
     try:
         # Remove only the lock that was inspected, never one another run has just taken.
         if path.read_bytes() != held["raw"]:
@@ -996,10 +1023,29 @@ def acquire_lock(archive_root, run_id, now, warnings):
     except FileExistsError as exc:
         raise RunFailure(FAILURE_ALREADY_RUNNING, "Another run holds the lock") from exc
     warnings.append(
-        "Cleared a lock left by run %s, whose process is no longer running (lock age %d minutes)"
-        % (held["run_id"][:8], int(age.total_seconds() // 60))
+        "Cleared a lock left by run %s, %s (lock age %d minutes)"
+        % (held["run_id"][:8], reason, int(age.total_seconds() // 60))
     )
     return path
+
+
+def _boot_time():
+    """When Windows last started (aware UTC), or None when unknown. None keeps the PID check.
+
+    Uses GetTickCount64 (milliseconds since start, stdlib ctypes only). Not used off Windows.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetTickCount64.argtypes = []
+        kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        uptime_ms = int(kernel32.GetTickCount64())
+    except (OSError, AttributeError, ValueError):
+        return None
+    return datetime.now(timezone.utc) - timedelta(milliseconds=uptime_ms)
 
 
 def _read_lock(path):
@@ -1096,7 +1142,7 @@ def run_folder_name(started, run_id):
 
 def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep):
     """Run one hourly export. Always returns the manifest dict (success or failed)."""
-    tz = load_timezone(settings["timezone"])
+    tz = load_zone(settings["timezone"])
     run_id = uuid.uuid4().hex
     started = _now(tz, clock)
     archive_root = Path(settings["output"]["archive_root"])
@@ -1328,7 +1374,7 @@ def publish_latest(root, run_dir, manifest, run_id):
 
 def check_latest(settings, clock=None):
     """Read-only freshness check of the latest pair. Returns (exit_code, status dict)."""
-    tz = load_timezone(settings["timezone"])
+    tz = load_zone(settings["timezone"])
     root = Path(settings["output"]["delivery_root"] or settings["output"]["archive_root"])
     now = _now(tz, clock)
     try:
@@ -1376,7 +1422,7 @@ def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=No
     tz, tz_name, note = timezone.utc, "UTC", "Time zone data unavailable: times are UTC"
     for name in tz_names:
         try:
-            tz, tz_name, note = load_timezone(name), name, None
+            tz, tz_name, note = load_zone(name), name, None
             break
         except RuntimeError:
             continue
@@ -1438,24 +1484,29 @@ def main(argv=None, source=None, environ=None, clock=None):
     try:
         raw = load_settings_file(args.config)
         settings = validate_settings(raw)
-    except ConfigError as exc:
-        message = "Settings invalid: %s" % exc
+    except Exception as exc:  # noqa: BLE001 - a settings failure must leave a manifest, never a traceback.
+        if isinstance(exc, ConfigError):
+            failure_class, message = exc.failure_class, "Settings invalid: %s" % exc
+        else:
+            # validate_settings raises only ConfigError; anything else is a bug, reported generically.
+            failure_class, message = FAILURE_INTERNAL, "Settings could not be validated (unexpected error)"
         if args.check_latest:
-            _print({"status": "invalid", "failure_class": exc.failure_class, "message": message})
+            _print({"status": "invalid", "failure_class": failure_class, "message": message})
             return EXIT_MISSING
         if not args.dry_run_config and raw is not None:
-            config_failure_manifest(raw, message, exc.failure_class, clock)
-        _print({"status": "failed", "failure_class": exc.failure_class, "message": message})
+            config_failure_manifest(raw, message, failure_class, clock)
+        _print({"status": "failed", "failure_class": failure_class, "message": message})
         return EXIT_FAILED
 
     if args.dry_run_config:
-        # The installer reads auth_mode and scheduled_logon_type to register the matching task.
+        # The installer reads auth_mode, scheduled_logon_type and run_minute to register the task.
         _print(
             {
                 "status": "valid",
                 "settings_sha256": settings_sha256(settings),
                 "auth_mode": settings["identity"]["auth_mode"],
                 "scheduled_logon_type": settings["schedule"]["logon_type"],
+                "run_minute": settings["schedule"]["run_minute"],
             }
         )
         return EXIT_OK

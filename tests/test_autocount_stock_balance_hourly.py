@@ -347,6 +347,7 @@ class ConfigValidationTests(TempDirTestCase):
         self.assertEqual(code, 0)
         printed = json.loads(out.getvalue())
         self.assertEqual((printed["auth_mode"], printed["scheduled_logon_type"]), ("sql_login", "Password"))
+        self.assertEqual(printed["run_minute"], 0, "the installer reads schedule.run_minute from here")
         for value in (FAKE_SQL_LOGIN, FAKE_CRED_TARGET, FAKE_SERVER):
             self.assertNotIn(value, out.getvalue())
 
@@ -487,6 +488,86 @@ class TimezoneFailureTests(TempDirTestCase):
         content["as_of_local"] = "2026-10-23T14:00:06"  # no offset
         latest.write_text(json.dumps(content), encoding="utf-8")
         self.assertEqual(hourly.check_latest(settings_for(self.tmp), clock=clock_at())[0], 3)
+
+    MALFORMED_ZONES = ("Asia/Singapore/", "/Asia/Singapore", "Asia//Singapore")
+
+    def assert_config_failure_written(self, failure_class):
+        """One failed manifest (default zone stamps) and a failed status in archive AND delivery."""
+        manifests = [json.loads(p.read_text(encoding="utf-8")) for p in self.archive.rglob(hourly.MANIFEST_NAME)]
+        failed = [m for m in manifests if m["status"] == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["failure_class"], failure_class)
+        self.assertEqual((failed[0]["timezone"], failed[0]["note"]), ("Asia/Singapore", None))
+        for root in (self.archive, self.delivery):
+            status = json.loads((root / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+            self.assertEqual((status["status"], status["failure_class"]), ("failed", failure_class))
+            self.assertEqual(status["run_id"], failed[0]["run_id"])
+
+    def test_malformed_zone_names_never_crash_any_mode(self):
+        # zoneinfo raises ValueError (not ZoneInfoNotFoundError) for these keys.
+        for name in self.MALFORMED_ZONES:
+            with self.subTest(timezone=name):
+                with self.assertRaises(ValueError):
+                    ZoneInfo(name)
+                shutil.rmtree(self.archive, ignore_errors=True)
+                shutil.rmtree(self.delivery, ignore_errors=True)
+                good = self.write_settings(output={"delivery_root": str(self.delivery)})
+                self.assertEqual(self.main("--config", str(good), source=FakeSource(), environ=ENV, clock=clock_at())[0], 0)
+                path = self.write_settings(timezone=name, output={"delivery_root": str(self.delivery)})
+                source = FakeSource()
+                code, printed = self.main("--config", str(path), source=source, environ=ENV, clock=clock_at())
+                self.assertEqual((code, json.loads(printed)["failure_class"]), (1, "config_invalid"))
+                self.assertEqual(source.sessions, 0)
+                self.assert_config_failure_written("config_invalid")
+                code, printed = self.main("--config", str(path), "--check-latest")
+                self.assertEqual((code, json.loads(printed)["failure_class"]), (3, "config_invalid"))
+                code, printed = self.main("--config", str(path), "--dry-run-config")
+                self.assertEqual((code, json.loads(printed)["failure_class"]), (1, "config_invalid"))
+                with self.assertRaises(hourly.ConfigError):
+                    hourly.validate_settings(raw_settings(self.tmp, timezone=name))
+
+    def test_any_zone_load_error_is_a_config_failure(self):
+        # For example the tzdata package raising OSError for a folder-like key such as "Asia".
+        real_zone_info = hourly.load_timezone.__globals__["ZoneInfo"]
+        for error in (OSError("is a directory"), IsADirectoryError("Asia"), PermissionError("denied"), ValueError("bad key")):
+            def zone_info(key, error=error):
+                if key == "Asia":
+                    raise error
+                return real_zone_info(key)
+
+            with self.subTest(error=type(error).__name__):
+                path = self.write_settings(timezone="Asia")
+                with mock.patch.dict(hourly.load_timezone.__globals__, {"ZoneInfo": zone_info}):
+                    code, printed = self.main("--config", str(path), source=FakeSource(), environ=ENV, clock=clock_at())
+                    self.assertEqual((code, json.loads(printed)["failure_class"]), (1, "config_invalid"))
+                    self.assertEqual(self.main("--config", str(path), "--check-latest")[0], 3)
+                    self.assertEqual(self.main("--config", str(path), "--dry-run-config")[0], 1)
+                    self.assertIsInstance(hourly.load_zone("Asia/Singapore"), type(SGT))
+                    with self.assertRaises(RuntimeError):
+                        hourly.load_zone("Asia")
+
+    def test_malformed_zone_without_zone_database_is_timezone_unavailable(self):
+        def missing_or_malformed(key):
+            raise ValueError("bad key") if key != key.strip("/") else ZoneInfoNotFoundError(key)
+
+        path = self.write_settings(timezone="Asia/Singapore/")
+        with mock.patch.dict(hourly.load_timezone.__globals__, {"ZoneInfo": missing_or_malformed}):
+            code, printed = self.main("--config", str(path), source=FakeSource(), environ=ENV, clock=clock_at())
+            self.assertEqual(self.main("--config", str(path), "--check-latest")[0], 3)
+        self.assertEqual((code, json.loads(printed)["failure_class"]), (1, "timezone_unavailable"))
+        manifest = json.loads(next(self.archive.rglob(hourly.MANIFEST_NAME)).read_text(encoding="utf-8"))
+        self.assertEqual((manifest["failure_class"], manifest["timezone"]), ("timezone_unavailable", "UTC"))
+
+    def test_unexpected_validation_error_still_writes_status_and_exits_cleanly(self):
+        path = self.write_settings(output={"delivery_root": str(self.delivery)})
+        self.assertEqual(self.main("--config", str(path), source=FakeSource(), environ=ENV, clock=clock_at())[0], 0)
+        with mock.patch.object(hourly, "validate_settings", side_effect=KeyError("boom")):
+            code, printed = self.main("--config", str(path), source=FakeSource(), environ=ENV, clock=clock_at())
+            self.assertEqual((code, json.loads(printed)["failure_class"]), (1, "internal_error"))
+            self.assertNotIn("boom", printed)
+            self.assertEqual(self.main("--config", str(path), "--check-latest")[0], 3)
+            self.assertEqual(self.main("--config", str(path), "--dry-run-config")[0], 1)
+        self.assert_config_failure_written("internal_error")
 
 
 class IdentityTests(TempDirTestCase):
@@ -986,9 +1067,20 @@ class StaleCheckTests(TempDirTestCase):
         self.assertEqual(code, 3)
 
 
+REAL_BOOT_TIME = hourly._boot_time
+
+
 class LockTests(TempDirTestCase):
     OTHER_RUN = "deadbeefcafe0001"
     OTHER_PID = 4242
+    # Mocked boot time: long before every lock below unless a test says otherwise.
+    BOOT = FIXED_NOW - timedelta(days=30)
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(hourly, "_boot_time", return_value=self.BOOT)
+        self.boot_time = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def write_lock(self, started, content=None):
         self.archive.mkdir(parents=True, exist_ok=True)
@@ -1072,6 +1164,54 @@ class LockTests(TempDirTestCase):
     def test_reused_pid_is_not_the_lock_owner_on_windows(self):
         # This test process was created long after a lock written 2 hours ago.
         self.assertFalse(hourly._pid_running(os.getpid(), datetime.now(SGT) - timedelta(hours=2)))
+
+    def test_lock_written_before_last_boot_is_cleared_even_if_pid_looks_running(self):
+        # After a reboot an uninspectable system process can reuse the killed run's PID.
+        started = FIXED_NOW - timedelta(hours=2)
+        lock = self.write_lock(started)
+        self.boot_time.return_value = started + timedelta(minutes=30)
+        with mock.patch.object(hourly, "_pid_running", side_effect=AssertionError("pre-boot lock: PID not consulted")):
+            manifest = run(settings_for(self.tmp))
+        self.assertEqual((manifest["status"], manifest["failure_class"]), ("success", None))
+        warning = "Cleared a lock left by run deadbeef, written before the last restart (lock age 120 minutes)"
+        self.assertIn(warning, manifest["warnings"])
+        on_disk = json.loads((self.run_dir(manifest) / hourly.MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertIn(warning, on_disk["warnings"])
+        self.assertFalse(lock.exists())
+
+    def test_post_boot_live_lock_or_unknown_boot_keeps_already_running(self):
+        started = FIXED_NOW - timedelta(hours=2)
+        tolerance = timedelta(seconds=hourly.LOCK_BOOT_TOLERANCE_SECONDS)
+        for boot in (started - timedelta(hours=1), started, started + tolerance - timedelta(seconds=1), None):
+            with self.subTest(boot=boot):
+                lock = self.write_lock(started)
+                before = lock.read_bytes()
+                self.boot_time.return_value = boot
+                source = FakeSource()
+                with mock.patch.object(hourly, "_pid_running", return_value=True) as pid_running:
+                    manifest = run(settings_for(self.tmp), source)
+                pid_running.assert_called_once_with(self.OTHER_PID, started)
+                self.assertEqual(manifest["failure_class"], "already_running")
+                self.assertEqual(source.sessions, 0)
+                self.assertEqual(lock.read_bytes(), before)
+
+    def test_young_lock_before_boot_waits_for_the_age_gate(self):
+        lock = self.write_lock(FIXED_NOW - timedelta(minutes=10))
+        self.boot_time.return_value = FIXED_NOW - timedelta(minutes=5)
+        with mock.patch.object(hourly, "_pid_running", side_effect=AssertionError("young lock: PID not consulted")):
+            manifest = run(settings_for(self.tmp))
+        self.assertEqual(manifest["failure_class"], "already_running")
+        self.assertTrue(lock.exists())
+
+    def test_boot_time_is_real_on_windows_and_unknown_elsewhere(self):
+        boot = REAL_BOOT_TIME()
+        if os.name != "nt":
+            self.assertIsNone(boot)
+            return
+        now = datetime.now(SGT)
+        self.assertIsNotNone(boot.tzinfo)
+        self.assertLess(boot, now)
+        self.assertGreater(boot, datetime(2000, 1, 1, tzinfo=SGT))
 
 
 class PrivacyTests(TempDirTestCase):
@@ -1235,6 +1375,18 @@ class InstallerTests(unittest.TestCase):
         limit = re.search(r"-ExecutionTimeLimit \(New-TimeSpan -Minutes (\d+)\)", self.text)
         self.assertEqual(int(limit.group(1)), hourly.TASK_EXECUTION_LIMIT_MINUTES)
         self.assertGreater(hourly.LOCK_STALE_AFTER_MINUTES, hourly.TASK_EXECUTION_LIMIT_MINUTES)
+
+    def test_repetition_never_stops_a_run_at_the_end_of_the_day(self):
+        stop = "$repeat.Repetition.StopAtDurationEnd = $false"
+        self.assertIn(stop, self.text)
+        self.assertLess(self.text.index(stop), self.text.index("$trigger.Repetition = $repeat.Repetition"))
+        self.assertNotIn("StopAtDurationEnd = $true", self.text)
+
+    def test_run_minute_comes_from_the_validated_settings(self):
+        self.assertNotIn("[int]$RunMinute = 0", self.text, "no separate RunMinute parameter")
+        self.assertIn("$RunMinute = $validated.run_minute", self.text)
+        self.assertIn("$RunMinute -lt 0 -or $RunMinute -gt 59", self.text)
+        self.assertIn("AddMinutes($RunMinute)", self.text)
 
     def test_python_exe_is_a_mandatory_full_path(self):
         self.assertRegex(self.text, r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$PythonExe\s*,")

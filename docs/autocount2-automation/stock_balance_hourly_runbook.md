@@ -50,13 +50,15 @@ Get-OdbcDriver -Name "ODBC Driver 17 for SQL Server" -Platform 64-bit
 
 ## Commands
 
+Run from the automation clone, always with the task's full-path interpreter (see [VM prerequisites](#vm-prerequisites)):
+
 ```powershell
-python scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json --dry-run-config
-python scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json
-python scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json --check-latest
+& "C:\EXAMPLE\Python311\python.exe" scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json --dry-run-config
+& "C:\EXAMPLE\Python311\python.exe" scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json
+& "C:\EXAMPLE\Python311\python.exe" scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json --check-latest
 ```
 
-Exit codes: run `0` success (and delivery verified or not configured), `1` failed or delivery not verified. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings, a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode` and `scheduled_logon_type`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths.
+Exit codes: run `0` success (and delivery verified or not configured), `1` failed or delivery not verified. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths.
 
 ## Settings
 
@@ -66,7 +68,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 | --- | --- | --- |
 | `timezone` | `"Asia/Singapore"` | Used for folder names, `as_of_local` and the stale check. May change. |
 | `schedule.frequency` | `"hourly"` | Only `hourly` is supported. Used by the installer and the stale check. May change. |
-| `schedule.run_minute` | `0` | Minute past each hour (00:00, 01:00 ... 23:00 = 24 runs a day). No separate close-of-day file. May change. |
+| `schedule.run_minute` | `0` | Minute past each hour (00:00, 01:00 ... 23:00 = 24 runs a day). The installer reads it from the validated settings (there is no installer parameter for it); changing it later means registering the task again (the installer never replaces an existing task, so that needs an owner OK). No separate close-of-day file. May change. |
 | `schedule.logon_type` | `"S4U"` | The Task Scheduler logon type. Must match `identity.auth_mode` (see [Read identity and scheduled logon](#read-identity-and-scheduled-logon)): `S4U` with `windows_integrated`, `Password` with `sql_login`. Any other pair fails validation. The installer takes the logon type from the validated settings. |
 | `stale_after_minutes` | `70` | `--check-latest` reports stale after this. May change. |
 | `source.server` | required | SQL Server instance. The example uses a fake value. |
@@ -109,7 +111,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 - Hourly files use exclusive create plus fsync and SHA-256. A rerun in the same hour makes a new folder; existing files are never touched.
 - The latest pair is written with a temp file plus `os.replace`, only after the hourly CSV re-reads to its hash. `latest_manifest.json` carries `as_of_local` and `run_id`, so an old snapshot is visible.
 - Delivery: the CSV is copied into `delivery_root` with exclusive create and re-hashed; then the manifest is copied and re-hashed; only then does the delivery latest pair advance. A mismatch gives delivery status `verify_failed` and the delivery latest pair is not advanced. `manifest.delivery` records the CSV copy; `last_run_status.json` records the final delivery result including the manifest copy.
-- Lock: `.ac2_stockbal.lock` records the run_id, process id and start time. A run killed by the 15-minute task limit or a reboot cannot remove it. The next run clears it automatically only when it is older than 30 minutes (the 15-minute limit plus a 15-minute margin) **and** its recorded process is no longer running (on Windows, a process created after the lock was written counts as a reused process id, not the owner). That run adds a warning to its manifest naming the killed run's reference and the lock age. A younger lock, or one whose process is still running, gives `already_running` and is left alone.
+- Lock: `.ac2_stockbal.lock` records the run_id, process id and start time. A run killed by the 15-minute task limit or a reboot cannot remove it. The next run clears it automatically only when it is older than 30 minutes (the 15-minute limit plus a 15-minute margin) **and** either it was written before Windows last started (a restart ends every run, whatever process later reuses its process id) or its recorded process is no longer running (on Windows, a process created after the lock was written counts as a reused process id, not the owner). That run adds a warning to its manifest naming the killed run's reference, the reason and the lock age. A younger lock, or a lock written since the last start whose process is still running, gives `already_running` and is left alone.
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
 - Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, uom_guard, pos_sync per Location, delivery.
 
@@ -121,7 +123,7 @@ A failed run writes `manifest.json` only (no CSV), never touches the latest pair
 | --- | --- | --- |
 | `config_invalid` | Settings file invalid. | Run `--dry-run-config`, fix the named setting. |
 | `timezone_unavailable` | No time zone data at all (Windows Python without `tzdata`). The manifest and `last_run_status.json` are still written, with times in UTC and a `note` saying so. | Install `tzdata` into the task's interpreter (see [VM prerequisites](#vm-prerequisites)). |
-| `already_running` | Another run holds the lock: it is younger than 30 minutes, or its process is still running. | Nothing for a single hour. If it repeats for hours, check which process holds it. |
+| `already_running` | Another run holds the lock: it is younger than 30 minutes, or it was written since the last restart and its process is still running. | Nothing for a single hour. If it repeats for hours, clear it by hand: read `pid` in `.ac2_stockbal.lock` (archive root), run `Get-Process -Id <pid>`; if that is not the exporter's `python.exe`, or no process has that id, delete `.ac2_stockbal.lock`. If it is the exporter, leave it and report. |
 | `stale_lock` | The lock file is unreadable or incomplete, or a killed run's lock could not be removed. Never removed automatically. | Check no export process is running, then delete `.ac2_stockbal.lock` in the archive root. |
 | `identity_refused` | `sa` login, sysadmin/db_owner with `allow_privileged_identity` false, expected-context mismatch (`AUTOCOUNT_EXPECTED_SQL_LOGIN` / `_USER` / `_DATABASE`), or database pin mismatch. | Check the read identity and the env values. Messages never show the values. |
 | `credential_unavailable` | The Credential Manager target could not be read. | Check `identity.credential_target` was saved by the task's own Windows account, and that the task uses a `Password` logon (an `S4U` task cannot read it). |
@@ -133,6 +135,7 @@ A failed run writes `manifest.json` only (no CSV), never touches the latest pair
 | `write_failed` | The hourly CSV or manifest could not be written or re-read. | Check disk space and folder permissions. |
 | `latest_publish_failed` | Hourly data is good but the latest pair could not be replaced (`last_run_status.json` only). The pair is replaced in two steps (CSV, then manifest). If only the second step fails, the new `stock_balance_latest.csv` sits beside the previous `latest_manifest.json`, so `--check-latest` exits `3` (invalid) until the next successful hour replaces both. | Check whether a program (for example the sync client) holds the latest files open. The hourly folder is complete either way. |
 | `internal_error` | Unexpected error. The message has the run reference only. | Report the run reference. |
+| (no new status) | The task did not run at all: `finished_at` in `last_run_status.json` is older than about 70 minutes and no new hourly folder appears (VM off or asleep, task disabled, or for pair (b) the Windows password changed). | Check the VM is on, then `Get-ScheduledTaskInfo -TaskName "XB AC2 Hourly Stock Balance"` (`LastRunTime`, `LastTaskResult`). For pair (b) after a password change, update the task's stored password (needs owner OK). The planned heartbeat round will alert on this. |
 
 ## Read identity and scheduled logon
 

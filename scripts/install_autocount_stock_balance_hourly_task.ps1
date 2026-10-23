@@ -6,7 +6,10 @@ manual VM proof runs (runbook steps V1-V6) pass. See
 docs/autocount2-automation/stock_balance_hourly_runbook.md, step V7.
 
 Behaviour:
-- Runs every hour, 24/7, at RunMinute past the hour (00:00 + RunMinute, then hourly).
+- Runs every hour, 24/7, at schedule.run_minute past the hour (00:00 + run_minute, then
+  hourly). The minute comes from the validated settings; there is no separate parameter.
+- Repetition StopAtDurationEnd is false, so the end of each day's repetition window never
+  stops a run that is still going.
 - MultipleInstances IgnoreNew: a new hour never starts while the previous run is still going.
 - ExecutionTimeLimit 15 minutes (the exporter's lock rules assume this limit).
 - RunLevel Limited (Task Scheduler's least-privilege level; "LeastPrivilege" in task XML).
@@ -31,9 +34,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PythonExe,
     [string]$TaskName = "XB AC2 Hourly Stock Balance",
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [ValidateRange(0, 59)]
-    [int]$RunMinute = 0
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,15 +76,23 @@ $supported = (($authMode -ceq "windows_integrated") -and ($logonType -ceq "S4U")
 if (-not $supported) {
     throw "Unsupported auth mode and logon type pair in the validated settings."
 }
+$RunMinute = $validated.run_minute
+if (-not ($RunMinute -is [int] -or $RunMinute -is [long]) -or $RunMinute -lt 0 -or $RunMinute -gt 59) {
+    throw "The validated settings did not give a schedule.run_minute from 0 to 59."
+}
+$RunMinute = [int]$RunMinute
 
 # Daily trigger at 00:00 + RunMinute, repeating every hour for one day. Each day's trigger
 # starts a new one-day repetition window, so the task repeats hourly indefinitely. This form
 # works on every Windows PowerShell 5.1 host, unlike an unbounded RepetitionDuration.
+# StopAtDurationEnd is set to false so the end of a day's window never stops a running run
+# (New-ScheduledTaskTrigger sets it to true for this form).
 $startAt = (Get-Date).Date.AddMinutes($RunMinute)
 $trigger = New-ScheduledTaskTrigger -Daily -At $startAt
 $repeat = New-ScheduledTaskTrigger -Once -At $startAt `
     -RepetitionInterval (New-TimeSpan -Hours 1) `
     -RepetitionDuration (New-TimeSpan -Days 1)
+$repeat.Repetition.StopAtDurationEnd = $false
 $trigger.Repetition = $repeat.Repetition
 
 $actionArgs = "`"$scriptPath`" --config `"$ConfigPath`""
