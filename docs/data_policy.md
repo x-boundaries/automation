@@ -43,7 +43,8 @@ line a change adds.
 - Scanner: `scripts/pii_guard.py` (Python standard library only). It flags email
   addresses, Singapore numbers (`+65`, the `65XXXXXXXX` storage form used by
   member intake, including inside `wa.me` links, and bare 8-digit numbers
-  starting with 6, 8 or 9) and other `+`-prefixed international numbers.
+  starting with 6, 8 or 9) and other `+`-prefixed international numbers, with
+  digit groups split by a space, hyphen, no-break space, `&nbsp;` or en dash.
 - Allowlist: `config/pii_guard_allowlist.json` covers reserved domains
   (`example.com`, `example.org`, `example.net`, `.example`, `.test`, `.invalid`,
   `.localhost`), GitHub noreply identities, named X-Boundaries role mailboxes
@@ -62,6 +63,11 @@ One-time setup per clone (git cannot enable a tracked hook by itself):
 ```bash
 git config core.hooksPath .githooks
 ```
+
+`core.hooksPath` replaces `.git/hooks` for that clone: git stops running any
+hook in `.git/hooks` (for example a personal `pre-push` hook). Move such a hook
+into `.githooks/` only through a reviewed change, or keep it outside the repo
+and call it yourself.
 
 The tracked `.githooks/pre-commit` hook then blocks a commit whose staged
 additions contain a hit, and fails closed if Python 3.9+ or the scanner is
@@ -86,7 +92,8 @@ Diffs are forced to text, so a `-diff` or `binary` attribute cannot hide added
 lines. No binary file is skipped whole:
 
 - Printable ASCII, UTF-16LE and UTF-16BE runs of six or more characters are
-  always scanned, so PDF metadata, image text chunks and legacy `.xls` or `.doc`
+  always scanned (the runs keep no-break spaces, and UTF-16 runs keep en
+  dashes), so PDF metadata, image text chunks and legacy `.xls` or `.doc`
   strings are covered.
 - BOM-marked UTF-8, UTF-16 or UTF-32 text is also decoded line by line (Windows
   PowerShell 5.1 `Out-File` writes UTF-16).
@@ -95,17 +102,64 @@ lines. No binary file is skipped whole:
   expanded and scanned, deflated members and nested zips included, up to three
   levels deep within one 64 MiB budget. A corrupt, encrypted, oversized or
   too deeply nested container fails the scan.
+- A zip appended to a reviewed binary or to text (a polyglot) is found by its
+  end-of-central-directory record and expanded the same way; if it cannot be
+  opened, the scan fails.
+- Office XML parts inside a container are also scanned with their text runs
+  joined (Word, PowerPoint and shared-string runs, plus XML character
+  references such as `&#64;`), so a number or address split across formatting
+  runs is still seen. Separate paragraphs and cells are not joined.
+- A PDF's FlateDecode streams (page content, object streams, metadata) are
+  decompressed with the standard-library `zlib` within the same 64 MiB budget
+  and scanned by text runs. A stream declared as FlateDecode that will not
+  decompress, or that exceeds the budget, fails the scan.
+- A legacy `.xls` workbook has its numeric cells decoded (number, RK, multiple
+  RK and cached formula results), so a phone number typed into a number cell
+  is seen. A workbook the scanner cannot read, or an encrypted one, fails the
+  scan.
 - gzip, 7z, RAR and tar archives fail the scan at any depth, because the
   scanner cannot open them.
 - A reviewed binary type (images, `.pdf`, `.xls`, `.doc`) must start with its
   file signature, so a renamed archive fails the scan. Any other file
   containing NUL bytes fails the scan.
 
-Known limits: compressed streams inside a non-zip binary, such as a PDF's
-deflated page content, are not decompressed; packages embedded inside OLE2
-files (legacy `.xls` or `.doc` objects) are scanned by text runs only; and CI
-runs the scanner and allowlist from the pull request itself. Hits inside binary
-content are reported as `file (text runs):N` or `container!member:N`.
+Hits inside binary content are reported as `file (text runs):N`,
+`file (deflated streams):N`, `file (numeric cells):N`, `container!member:N` or
+`container!member (joined text):N`.
+
+Known limits (accepted, #270):
+
+- PDF text is seen only when it is literal text in a FlateDecode stream (or
+  uncompressed). Other filters and filter chains (LZW, ASCII85, ASCIIHex
+  first), text drawn with font-specific encodings or hex strings, and text
+  split across separate show operators are not decoded. Encrypted PDFs fail the
+  scan when a declared FlateDecode stream will not decompress.
+- Packages embedded inside OLE2 files (legacy `.xls` or `.doc` objects, or an
+  `oleObject.bin` in an Office zip) are scanned by text runs only; only a file
+  or member named `.xls` has its numeric cells decoded.
+- Phone separators are space, hyphen, dot (in the `+65` and international
+  forms), no-break space, `&nbsp;` and en dash. Other dashes or spaces (em
+  dash, figure or narrow no-break space), and two separators in a row, still
+  split a number. Raw-byte text runs see the no-break space, and the en dash
+  only in UTF-16.
+- Random binary data can contain the 4-byte zip end-of-central-directory
+  record by chance; such a file fails the scan (the safe direction).
+- CI runs the scanner and allowlist from the pull request itself, so a pull
+  request can weaken them in the same change. Once `pii-guard` is a required
+  check (an owner decision, not made yet), CI should run the base branch's
+  scanner and allowlist against the pull-request range instead.
+
+Known false positives and deferred items:
+
+- Hex SHAs and other hex tokens: a token that starts with eight digits, the
+  first 6, 8 or 9, followed by a non-digit matches the bare 8-digit form (about
+  1 in 400 random SHAs). A token that starts with `65`, then 3, 6, 8 or 9, then
+  seven more digits and a non-digit matches the `65XXXXXXXX` storage form
+  (about 1 in 70,000). Shorten the SHA or add `pii-guard: allow (commit SHA)`.
+- Deferred (from the #263 review, not built): scanning pushes to non-main
+  branches before a pull request exists (F4); replacing three `phone=` test
+  values in `member_gateway/tests` with obvious placeholders (F6); detecting
+  URL-encoded `%40` addresses and counting added opt-out markers (F7).
 
 If the guard flags a value, two things are needed:
 

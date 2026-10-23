@@ -12,6 +12,7 @@ import io
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -80,6 +81,104 @@ def _xlsx(cell, compression=zipfile.ZIP_DEFLATED):
         },
         compression,
     )
+
+
+def _docx(body_xml):
+    return _zip_bytes({"word/document.xml": '<?xml version="1.0"?><w:document><w:body>' + body_xml + "</w:body></w:document>"}, zipfile.ZIP_DEFLATED)
+
+
+def _pdf(*objects):
+    """A minimal PDF: each object is (dictionary, stream bytes or None)."""
+    body = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+    for number, (dictionary, stream) in enumerate(objects, 1):
+        body += b"%d 0 obj\n" % number + dictionary
+        if stream is not None:
+            body += b"\nstream\n" + stream + b"\nendstream"
+        body += b"\nendobj\n"
+    return body + b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
+
+
+def _nul_free_deflate(text):
+    """zlib data for ``text`` with no NUL byte, so git diffs the file holding it as text.
+
+    Short inputs get a fixed-Huffman block whose last byte is NUL, so a filler of
+    drawing operators forces dynamic Huffman; the search varies a counter.
+    """
+    filler = "".join("%d 0 0 %d 0 0 cm\n" % (index, index * 7) for index in range(80))
+    for counter in range(3000):
+        for level in (9, 6, 1):
+            data = zlib.compress((filler + text + " %d" % counter).encode("ascii"), level)
+            if b"\0" not in data:
+                return data
+    raise AssertionError("no NUL-free deflate output")
+
+
+def _biff(kind, body):
+    return struct.pack("<HH", kind, len(body)) + body
+
+
+def _workbook(*records, pad=0):
+    """A BIFF8 workbook stream: BOF, the records, BLANK filler records, EOF."""
+    filler = _biff(0x0201, struct.pack("<HHH", 0, 0, 0)) * pad
+    return _biff(0x0809, bytes(16)) + b"".join(records) + filler + _biff(0x000A, b"")
+
+
+def _number(value):
+    return _biff(0x0203, struct.pack("<HHHd", 0, 0, 0, value))
+
+
+def _rk(value):
+    return _biff(0x027E, struct.pack("<HHHI", 0, 0, 0, (value << 2) | 2))
+
+
+def _cfb(streams):
+    """A minimal OLE2 compound file (512-byte sectors, one FAT sector) holding root streams.
+
+    Streams under 4096 bytes go to the mini stream, as the format requires.
+    """
+    size, end, free = 512, 0xFFFFFFFE, 0xFFFFFFFF
+    sectors, fat = [b""], [0xFFFFFFFD]  # sector 0 holds the FAT itself
+
+    def place(data):
+        if not data:
+            return end
+        first = len(sectors)
+        chunks = [data[at : at + size] for at in range(0, len(data), size)]
+        for index, chunk in enumerate(chunks):
+            sectors.append(chunk.ljust(size, b"\0"))
+            fat.append(first + index + 1 if index + 1 < len(chunks) else end)
+        return first
+
+    mini, minifat, entries = b"", [], []
+    for name, data in streams.items():
+        if len(data) >= 4096:
+            entries.append((name, place(data), len(data)))
+            continue
+        count = -(-len(data) // 64)
+        start = len(mini) // 64 if count else end
+        minifat.extend(start + index + 1 if index + 1 < count else end for index in range(count))
+        mini += data.ljust(count * 64, b"\0")
+        entries.append((name, start, len(data)))
+    root_start = place(mini)
+    minifat_start = place(struct.pack("<%dI" % len(minifat), *minifat))
+
+    def entry(name, kind, start, length):
+        encoded = (name + "\0").encode("utf-16-le")
+        return (
+            encoded.ljust(64, b"\0")
+            + struct.pack("<HBB3I", len(encoded), kind, 1, free, free, free)
+            + bytes(36)
+            + struct.pack("<IQ", start, length)
+        )
+
+    directory = entry("Root Entry", 5, root_start, len(mini)) + b"".join(entry(name, 2, start, length) for name, start, length in entries)
+    dir_start = place(directory.ljust(-(-len(directory) // size) * size, b"\0"))
+    assert len(fat) <= size // 4
+    sectors[0] = struct.pack("<128I", *(fat + [free] * (size // 4 - len(fat))))
+    minifat_sectors = -(-len(minifat) * 4 // size)
+    header = OLE2 + bytes(16) + struct.pack("<5H6x9I", 0x3E, 3, 0xFFFE, 9, 6, 0, 1, dir_start, 0, 4096, minifat_start, minifat_sectors, end, 0)
+    header += struct.pack("<109I", 0, *([free] * 108))
+    return header + b"".join(sectors)
 
 
 def _tar_bytes(name, body):
@@ -170,6 +269,19 @@ class ScanLineTests(unittest.TestCase):
 
     def test_flags_international_numbers(self):
         self.assertEqual(self.kinds("call " + _intl()), ["phone"])
+
+    # #270: no-break space (raw or &nbsp;) and en dash separate phone digits too.
+
+    def test_flags_numbers_split_by_no_break_space_or_en_dash(self):
+        for sep in ("\u00a0", "&nbsp;", "\u2013"):
+            with self.subTest(sep=repr(sep)):
+                self.assertEqual(self.kinds("tel " + _sg_local(sep)), ["sg_phone_local"])
+                self.assertEqual(self.kinds("tel " + _sg_prefixed(sep)), ["sg_phone"])
+                self.assertEqual(self.kinds("tel " + "65" + sep + "9" + "000" + sep + "00" + "17"), ["sg_phone"])
+                self.assertEqual(self.kinds("call +" + "44" + sep + "20" + sep + "7946" + sep + "00" + "11"), ["phone"])
+                self.assertEqual(self.kinds(_sg_local(sep), {"emails": [], "phones": {"65" + "9" + "000" + "0017"}}), [])
+        for sep in ("\u2014", "\t", "\u00a0\u00a0"):
+            self.assertEqual(self.kinds("tel " + _sg_local(sep)), [], repr(sep))
 
     def test_not_phone_numbers(self):
         for text in (
@@ -818,12 +930,194 @@ class GitScanTests(unittest.TestCase):
         self.commit("d.md", "clean\n", message="Clean change\n\nCo-Authored-By: Bot <noreply" + AT + "anthropic.com>")
         self.assertEqual(self.range_code(start)[0], 0)
 
+    # #270: new decoders run in range mode, including a NUL-free PDF git would diff as text.
+
+    def test_range_scans_hidden_binary_text(self):
+        local = int("9" + "000" + "00" + "17")
+        pdf = _pdf((b"<< /Filter /FlateDecode >>", _nul_free_deflate("BT (mail " + _email() + ") Tj ET")))
+        self.assertNotIn(b"\0", pdf)
+        self.assertNotIn(_email().encode("ascii"), pdf)
+        png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(32))
+        for name, data, expected in (
+            ("plain.pdf", pdf, "plain.pdf (deflated streams):81 email"),  # after 80 filler lines
+            ("book.xls", _cfb({"Workbook": _workbook(_rk(local))}), "book.xls (numeric cells):1 sg_phone_local"),
+            ("poly.png", png + _zip_bytes({"notes.txt": "mail " + _email()}, zipfile.ZIP_DEFLATED), "poly.png!notes.txt:1 email"),
+            ("split.docx", _docx("<w:p><w:r><w:t>" + "9" + "000</w:t></w:r><w:r><w:t>" + "00" + "17</w:t></w:r></w:p>"), "split.docx!word/document.xml (joined text):"),
+        ):
+            with self.subTest(name=name):
+                start = self.rev("HEAD")
+                self.commit_bytes(name, data)
+                code, out, err = self.range_code(start)
+                self.assertEqual(code, 1, (name, out, err))
+                self.assertIn(expected, out)
+                self.assertNotIn(_email(), out + err)
+        # A new clean cell does not re-flag the workbook's existing one; a new phone cell is caught.
+        start = self.rev("HEAD")
+        self.commit_bytes("book.xls", _cfb({"Workbook": _workbook(_rk(local), _rk(3))}))
+        self.assertEqual(self.range_code(start)[0], 0)
+        start = self.rev("HEAD")
+        self.commit_bytes("book.xls", _cfb({"Workbook": _workbook(_rk(local), _rk(3), _number(float("6" + "000" + "00" + "42")))}))
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.count("pii-guard: "), 1)
+        self.assertIn("book.xls (numeric cells):3 sg_phone_local", out)
+
+    def test_hit_message_wording_is_pinned(self):
+        # The "report it to the repository owner" step is policy; changing it is a reviewed change.
+        self.commit("a.md", "mail " + _email() + "\n")
+        code, out, err = self.run_main("--range", self.base + "..HEAD")
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(
+            err,
+            "pii-guard: 1 likely personal-data hit(s). Remove the value, use a reserved example "
+            "(name" + AT + "example.com), or add 'pii-guard: allow (<reason>)' on the line if it is justified. "
+            "A hit in an earlier commit of a pull request needs that commit rewritten, not a follow-up fix, "
+            "and a hit on a pushed branch is already public: report it to the repository owner as well.\n",
+        )
+
     def test_not_a_repository_fails_closed(self):
         outside = Path(self.tmp.name, "plain")
         outside.mkdir()
         with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": self.tmp.name}):
             code = self.g.main(["--staged"], cwd=outside, out=io.StringIO(), err=io.StringIO())
         self.assertEqual(code, 2)
+
+
+class BinaryFormatTests(unittest.TestCase):
+    """#270: formats whose raw bytes hide text, checked through blob_documents."""
+
+    def setUp(self):
+        self.g = _load_scanner()
+        self.allow = self.g.load_allowlist(ALLOWLIST)
+
+    def hits(self, path, data):
+        return [(item.path, item.kind) for item in self.g._scan_documents("t", self.g.blob_documents(path, data), self.allow)]
+
+    def assert_fails_closed(self, path, data):
+        with self.assertRaises(self.g.GuardError, msg=path):
+            self.g.blob_documents(path, data)
+
+    def test_text_runs_keep_no_break_space_and_en_dash(self):
+        for sep in ("\u00a0", "\u2013"):
+            with self.subTest(sep=repr(sep)):
+                data = OLE2 + b"\x00\x00" + ("tel " + _sg_local(sep) + " ").encode("utf-16-le") + b"\x00\x00"
+                self.assertEqual(self.hits("note.doc", data), [("note.doc (text runs)", "sg_phone_local")])
+        latin1 = b"%PDF-1.4\n\x00 (tel " + _sg_local("\u00a0").encode("latin-1") + b") Tj\n"
+        self.assertEqual(self.hits("scan.pdf", latin1), [("scan.pdf (text runs)", "sg_phone_local")])
+
+    def test_pdf_flate_streams_are_decompressed(self):
+        email = _email()
+        content = zlib.compress(("BT (contact " + email + ") Tj ET").encode("ascii"))
+        objects = zlib.compress(("<< /Author (tel " + _sg_local() + ") >>").encode("ascii"))
+        data = _pdf(
+            (b"<< /Type /Catalog >>", None),
+            (b"<< /Length %d /Filter /FlateDecode >>" % len(content), content),
+            (b"<< /Type /ObjStm /N 1 /First 0 /Filter [/FlateDecode] >>", objects),
+            (b"<< /Length 16 >>", b"80 0 0 80 0 0 cm"),
+        )
+        self.assertNotIn(email.encode("ascii"), data)
+        self.assertEqual(self.hits("invoice.pdf", data), [("invoice.pdf (deflated streams)", "email"), ("invoice.pdf (deflated streams)", "sg_phone_local")])
+        # Zlib is read to its own end, so a forged endstream inside the data cannot cut it short.
+        forged = zlib.compress(b"q endstream Q " + ("mail " + email).encode("ascii"), 0)
+        self.assertIn(("forged.pdf (deflated streams)", "email"), self.hits("forged.pdf", _pdf((b"<< /Filter /FlateDecode >>", forged))))
+
+    def test_unreadable_pdf_streams_fail_closed(self):
+        corrupt = b"\x78\x9c" + b"\xff" * 24
+        self.assert_fails_closed("corrupt.pdf", _pdf((b"<< /Filter /FlateDecode >>", corrupt)))
+        # The same bytes with no FlateDecode filter are not zlib data, so they are skipped.
+        self.assertEqual(self.hits("raw.pdf", _pdf((b"<< /Length 26 >>", corrupt))), [])
+        big = _pdf((b"<< /Filter /FlateDecode >>", zlib.compress(b"x" * 4096)))
+        with mock.patch.object(self.g, "ZIP_MAX_BYTES", 1024):
+            self.assert_fails_closed("big.pdf", big)
+
+    def test_xls_numeric_cells_are_decoded(self):
+        local = int("9" + "000" + "00" + "17")
+        stored = float("65" + "8" + "000" + "00" + "42")
+        mulrk = _biff(0x00BD, struct.pack("<HHHIHIH", 0, 0, 0, (5 << 2) | 2, 0, (local << 2) | 2, 1))
+        formula = _biff(0x0006, struct.pack("<HHHd6x", 0, 0, 0, float(local)))
+        text_formula = _biff(0x0006, struct.pack("<HHH6sH6x", 0, 0, 0, bytes(6), 0xFFFF))
+        for pad in (0, 700):  # the mini stream and the regular FAT
+            with self.subTest(pad=pad):
+                workbook = _workbook(_number(3.8), _number(stored), _rk(1), _rk(local), pad=pad)
+                self.assertEqual(len(workbook) >= 4096, bool(pad))
+                data = _cfb({"Workbook": workbook})
+                self.assertEqual(self.g._xls_numeric_cells("book.xls", data), ["3.8", "65" + "8" + "000" + "00" + "42", "1", "9" + "000" + "00" + "17"])
+                self.assertEqual(self.hits("book.xls", data), [("book.xls (numeric cells)", "sg_phone"), ("book.xls (numeric cells)", "sg_phone_local")])
+        for record in (mulrk, formula):
+            self.assertEqual(self.hits("cells.xls", _cfb({"Workbook": _workbook(record)})), [("cells.xls (numeric cells)", "sg_phone_local")])
+        self.assertEqual(self.g._xls_numeric_cells("t.xls", _cfb({"Workbook": _workbook(text_formula)})), [])
+        self.assertEqual(self.hits("clean.xls", _cfb({"Workbook": _workbook(_number(3.8), _rk(1)), "SummaryInformation": bytes(64)})), [])
+        bundle = _zip_bytes({"exports/book.xls": _cfb({"Book": _workbook(_rk(local))})}, zipfile.ZIP_DEFLATED)
+        self.assertEqual(self.hits("bundle.zip", bundle), [("bundle.zip!exports/book.xls (numeric cells)", "sg_phone_local")])
+
+    def test_rk_numbers_decode(self):
+        self.assertEqual(self.g._rk_value((7 << 2) | 2), 7)
+        self.assertEqual(self.g._rk_value((((-5) & 0x3FFFFFFF) << 2) | 2), -5)
+        self.assertAlmostEqual(self.g._rk_value((12345 << 2) | 3), 123.45)
+        self.assertEqual(self.g._rk_value(0x3FF80000), 1.5)
+        self.assertAlmostEqual(self.g._rk_value(0x3FF80001), 0.015)
+        self.assertEqual(self.g._number_text(float("9" + "000" + "00" + "17")), "9" + "000" + "00" + "17")
+
+    def test_unreadable_xls_fails_closed(self):
+        good = _cfb({"Workbook": _workbook(_number(1.0))})
+
+        def patched(offset, fmt, value):
+            data = bytearray(good)
+            struct.pack_into(fmt, data, offset, value)
+            return bytes(data)
+
+        for name, data in (
+            ("encrypted.xls", _cfb({"Workbook": _workbook(_biff(0x002F, bytes(6)), _number(1.0))})),
+            ("truncated.xls", _cfb({"Workbook": _biff(0x0809, bytes(16)) + struct.pack("<HH", 0x0203, 14) + bytes(4)})),
+            ("notbiff.xls", _cfb({"Workbook": b"plain text that is not a workbook"})),
+            ("noworkbook.xls", _cfb({"WordDocument": _workbook()})),
+            ("sectorsize.xls", patched(0x1E, "<H", 10)),
+            ("cutoff.xls", patched(0x38, "<I", 0)),
+            ("directory.xls", patched(0x30, "<I", 99)),
+            ("fatcount.xls", patched(0x2C, "<I", 500)),
+            ("short.xls", good[:300]),
+        ):
+            with self.subTest(name=name):
+                self.assert_fails_closed(name, data)
+        # Word files keep the text-run scan only: no workbook is expected there.
+        self.assertEqual(self.hits("letter.doc", OLE2 + bytes(32)), [])
+
+    def test_appended_zip_is_expanded_or_fails_closed(self):
+        appended = _zip_bytes({"notes.txt": "mail " + _email()}, zipfile.ZIP_DEFLATED)
+        png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(64))
+        for name, data in (
+            ("poly.png", png + appended),
+            ("poly.pdf", b"%PDF-1.4\n\x00\x01" + appended),
+            ("poly.txt", b"\xff\xfe" + "clean\r\n".encode("utf-16-le") + appended),
+        ):
+            with self.subTest(name=name):
+                self.assertIn((name + "!notes.txt", "email"), self.hits(name, data))
+        outer = _zip_bytes({"media/poly.png": png + appended}, zipfile.ZIP_DEFLATED)
+        self.assertIn(("outer.zip!media/poly.png!notes.txt", "email"), self.hits("outer.zip", outer))
+        self.assert_fails_closed("broken.png", png + b"PK\x05\x06" + bytes(8))
+        # An unrecognised NUL-bearing file still fails closed, appended zip or not.
+        self.assert_fails_closed("data.bin", b"\x00\x01\x02" + appended)
+
+    def test_office_xml_runs_are_joined(self):
+        split_phone = (
+            "<w:p><w:r><w:t>tel " + "9" + "000</w:t></w:r><w:proofErr w:type=\"spellStart\"/>"
+            "<w:r><w:rPr><w:b/><w:sz w:val=\"20\"/></w:rPr><w:t xml:space=\"preserve\"> " + "00" + "17</w:t></w:r></w:p>"
+        )
+        split_email = "<w:p><w:r><w:t>pat.lee</w:t></w:r><w:bookmarkStart w:id=\"0\"/><w:r><w:t>" + AT + "synthetic-mail.sg</w:t></w:r></w:p>"
+        escaped_email = "<w:p><w:r><w:t>pat.lee&#64;synthetic-mail.sg</w:t></w:r></w:p>"
+        rich = '<?xml version="1.0"?><sst><si><r><t>' + "9" + "000</t></r><r><rPr><b/></rPr><t>" + "00" + "17</t></r></si></sst>"
+        member = "word/document.xml (joined text)"
+        self.assertEqual(self.hits("a.docx", _docx(split_phone)), [("a.docx!" + member, "sg_phone_local")])
+        self.assertEqual(self.hits("b.docx", _docx(split_email)), [("b.docx!" + member, "email")])
+        self.assertEqual(self.hits("c.docx", _docx(escaped_email)), [("c.docx!" + member, "email")])
+        sheet = _zip_bytes({"xl/sharedStrings.xml": rich}, zipfile.ZIP_DEFLATED)
+        self.assertEqual(self.hits("d.xlsx", sheet), [("d.xlsx!xl/sharedStrings.xml (joined text)", "sg_phone_local")])
+        # Separate paragraphs, cells and shared strings are not joined.
+        apart = "<w:p><w:r><w:t>" + "9" + "000</w:t></w:r></w:p><w:p><w:r><w:t>" + "00" + "17</w:t></w:r></w:p>"
+        self.assertEqual(self.hits("e.docx", _docx(apart)), [])
+        cells = '<sheetData><row><c r="A1"><v>' + "9" + "000</v></c><c r=\"B1\"><v>" + "00" + "17</v></c></row></sheetData>"
+        strings = "<sst><si><t>" + "9" + "000</t></si><si><t>" + "00" + "17</t></si></sst>"
+        self.assertEqual(self.hits("f.xlsx", _zip_bytes({"xl/worksheets/sheet1.xml": cells, "xl/sharedStrings.xml": strings}, zipfile.ZIP_DEFLATED)), [])
 
 
 class SelfScanTests(unittest.TestCase):

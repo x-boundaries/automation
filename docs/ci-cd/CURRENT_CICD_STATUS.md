@@ -59,9 +59,11 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   author or committer identities), for likely email addresses and phone numbers outside
   `config/pii_guard_allowlist.json`. Diffs are forced to text; binary files are
   never skipped whole (printable text runs always, BOM text decoded, zips
-  found by signature and expanded up to three levels, binary types checked
+  found by signature and expanded up to three levels, zips appended to a
+  reviewed binary expanded, Office XML runs joined, PDF FlateDecode streams
+  decompressed, legacy `.xls` numeric cells decoded, binary types checked
   against their signature, other archives and anything unrecognised fail
-  closed). It fails
+  closed; #270). It fails
   closed on a hit, a missing or empty range, an unknown commit or a parse error,
   and it redacts matched values in the log. Scope is email addresses and phone
   numbers only; merge-time commits on `main` and commit identities are not

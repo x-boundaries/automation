@@ -24,13 +24,18 @@ BOM-marked Unicode text (UTF-8, UTF-16 or UTF-32) is also decoded line by line;
 any zip, recognised by its signature or by ``ZIP_EXTENSIONS`` (such as .xlsx), has
 every member expanded and scanned, nested zips included up to ``ZIP_MAX_DEPTH``
 levels within one shared ``ZIP_MAX_BYTES`` budget; a corrupt, encrypted,
-over-budget or too deeply nested one fails closed. A reviewed binary extension
-must match its file signature. gzip, 7z, RAR and tar archives fail closed at any
-depth. Any other NUL-bearing blob fails closed unless its extension is on the
-reviewed ``BINARY_EXTENSIONS`` list. Known limits: compressed streams inside a
-non-zip binary (for example a PDF's deflated content streams) are not
-decompressed, and packages embedded in OLE2 files are scanned by text runs only. Hits inside binary content are
-reported as ``path (text runs):N`` or ``container!member:N``.
+over-budget or too deeply nested one fails closed. A zip appended to a reviewed
+binary or to text (found by its end-of-central-directory record) is expanded the
+same way. Office XML parts are also scanned with their text runs joined. A PDF's
+FlateDecode streams are decompressed (stdlib ``zlib``) within the same budget and
+scanned by text runs; a corrupt one fails closed. A legacy ``.xls`` workbook has
+its numeric cells decoded; an unreadable or encrypted one fails closed. A reviewed
+binary extension must match its file signature. gzip, 7z, RAR and tar archives
+fail closed at any depth. Any other NUL-bearing blob fails closed unless its
+extension is on the reviewed ``BINARY_EXTENSIONS`` list. Known limits are listed
+in ``docs/data_policy.md``. Hits inside binary content are reported as
+``path (text runs):N``, ``path (deflated streams):N``, ``path (numeric cells):N``,
+``container!member:N`` or ``container!member (joined text):N``.
 
 Exit codes: 0 clean, 1 likely personal data found, 2 error. Every error fails
 closed: an unreadable allowlist, a missing or empty range, an unknown revision,
@@ -53,9 +58,12 @@ import codecs
 import collections
 import difflib
 import fnmatch
+import html
 import io
 import json
+import math
 import re
+import struct
 import subprocess
 import sys
 import zipfile
@@ -76,15 +84,19 @@ EMAIL_RE = re.compile(
     r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63})"
     r"(?![A-Za-z0-9-])"
 )
+# Phone separators: space, hyphen, no-break space (raw or as &nbsp;) and en dash;
+# the dotted form also takes a dot.
+_SEP = r"(?:[ \-\u00a0\u2013]|&nbsp;)"
+_SEP_DOT = r"(?:[ .\-\u00a0\u2013]|&nbsp;)"
 # Singapore numbers with the +65 (or (65)/(+65)) prefix: 8 digits starting 3, 6, 8 or 9.
-SG_PREFIXED_RE = re.compile(r"(?<![\w+])(?:\+65|\(\+?65\))[ .-]?[3689]\d{3}[ .-]?\d{4}(?!\d)")
+SG_PREFIXED_RE = re.compile(r"(?<![\w+])(?:\+65|\(\+?65\))" + _SEP_DOT + r"?[3689]\d{3}" + _SEP_DOT + r"?\d{4}(?!\d)")
 # Singapore numbers with the country code but no "+", the member-intake storage form
 # (65XXXXXXXX), including inside wa.me links.
-SG_COUNTRY_CODE_RE = re.compile(r"(?<![\w.+])65[ -]?[3689]\d{3}[ -]?\d{4}(?!\d|\.\d)")
+SG_COUNTRY_CODE_RE = re.compile(r"(?<![\w.+])65" + _SEP + r"?[3689]\d{3}" + _SEP + r"?\d{4}(?!\d|\.\d)")
 # Bare Singapore-style 8-digit numbers starting 6, 8 or 9, optionally split 4-4.
-SG_LOCAL_RE = re.compile(r"(?<![\w.])[689]\d{3}[ -]?\d{4}(?!\d|\.\d)")
+SG_LOCAL_RE = re.compile(r"(?<![\w.])[689]\d{3}" + _SEP + r"?\d{4}(?!\d|\.\d)")
 # Other international numbers written with a leading +: 8 to 15 digits in total.
-INTL_RE = re.compile(r"(?<![\w+])\+[1-9](?:[ .-]?\(?\d+\)?){2,7}")
+INTL_RE = re.compile(r"(?<![\w+])\+[1-9](?:" + _SEP_DOT + r"?\(?\d+\)?){2,7}")
 ALLOW_MARKER_RE = re.compile(r"pii-guard:\s*allow\s*\(\s*[^)\s][^)]*\)")
 
 ALLOWLIST_KEYS = {"emails", "phones"}
@@ -149,9 +161,14 @@ BINARY_MAGIC = {
     ".doc": b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
 }
 BINARY_EXTENSIONS = frozenset(BINARY_MAGIC)
+# One shared expansion budget per blob: zip members and decompressed PDF streams.
 ZIP_MAX_BYTES = 64 * 1024 * 1024
 ZIP_MAX_DEPTH = 3
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06")
+# A zip appended to another file (a polyglot) is found by its end-of-central-directory record.
+_ZIP_EOCD = b"PK\x05\x06"
+_OLE2_MAGIC = BINARY_MAGIC[".xls"]
+_PDF_MAGIC = BINARY_MAGIC[".pdf"]
 # (signature, offset, label) for archives the scanner cannot open; they fail closed.
 _OTHER_ARCHIVES = (
     (b"\x1f\x8b", 0, "gzip"),
@@ -160,9 +177,32 @@ _OTHER_ARCHIVES = (
     (b"ustar", 257, "tar"),
 )
 RUNS_SUFFIX = " (text runs)"
-_ASCII_RUN = re.compile(rb"[\x20-\x7e\t]{6,}")
-_UTF16LE_RUN = re.compile(rb"(?:[\x20-\x7e]\x00){6,}")
-_UTF16BE_RUN = re.compile(rb"(?:\x00[\x20-\x7e]){6,}")
+DEFLATED_SUFFIX = " (deflated streams)"
+CELLS_SUFFIX = " (numeric cells)"
+JOINED_SUFFIX = " (joined text)"
+# Runs keep the no-break space (Latin-1 byte, and in UTF-16) and the UTF-16 en dash,
+# so phone numbers split by those separators stay whole.
+_ASCII_RUN = re.compile(rb"[\x20-\x7e\t\xa0]{6,}")
+_UTF16LE_RUN = re.compile(rb"(?:[\x20-\x7e\xa0]\x00|\x13\x20){6,}")
+_UTF16BE_RUN = re.compile(rb"(?:\x00[\x20-\x7e\xa0]|\x20\x13){6,}")
+# PDF: a stream keyword, the object header before it, and a FlateDecode first filter.
+_PDF_STREAM = re.compile(rb"(?<![A-Za-z])stream(?:\r\n|\n)")
+_PDF_FLATE = re.compile(rb"/Filter\s*(?:\[\s*)?/FlateDecode(?![A-Za-z0-9])")
+_INFLATE_CHUNK = 4096
+# OLE2 (compound file) layout constants and the BIFF records that hold numbers.
+_CFB_END = 0xFFFFFFFE
+_CFB_MINI_CUTOFF = 4096
+_BIFF_BOF = b"\x09\x08"
+_BIFF_FILEPASS = 0x002F
+_BIFF_NUMBER = 0x0203
+_BIFF_RK = 0x027E
+_BIFF_MULRK = 0x00BD
+_BIFF_FORMULA = 0x0006
+# Office XML: run properties hold no text; joining runs (r, t and the markers Word
+# drops between them) rebuilds text split across runs. Every other tag is a break.
+_XML_RUN_PROPS = re.compile(r"<((?:[\w.-]+:)?rPr)\b[^>]*?(?:/>|>.*?</\1>)", re.S)
+_XML_TAG = re.compile(r"<(?:/?(?:[\w.-]+:)?([\w.-]+)[^>]*|[!?][^>]*)>")
+_XML_INLINE = frozenset({"r", "t", "proofErr", "bookmarkStart", "bookmarkEnd", "lastRenderedPageBreak"})
 # Longest BOM first: the UTF-32-LE BOM starts with the UTF-16-LE BOM.
 _BOMS = (
     (codecs.BOM_UTF32_LE, "utf-32"),
@@ -388,8 +428,8 @@ def _read_blobs(shas, cwd):
 
 
 def _printable_runs(data):
-    """Printable ASCII, UTF-16LE and UTF-16BE runs of 6+ characters in raw bytes."""
-    runs = [match.group(0).decode("ascii") for match in _ASCII_RUN.finditer(data)]
+    """Printable ASCII (plus no-break space), UTF-16LE and UTF-16BE runs of 6+ characters in raw bytes."""
+    runs = [match.group(0).decode("latin-1") for match in _ASCII_RUN.finditer(data)]
     runs.extend(match.group(0).decode("utf-16-le") for match in _UTF16LE_RUN.finditer(data))
     runs.extend(match.group(0).decode("utf-16-be") for match in _UTF16BE_RUN.finditer(data))
     return runs
@@ -413,17 +453,212 @@ def _refuse_other_archives(path, data):
             raise GuardError("%s is a %s archive, which the scanner cannot open" % (path, label))
 
 
+def _zlib_header(data, at):
+    head = data[at : at + 2]
+    return len(head) == 2 and head[0] & 0x0F == 8 and head[0] >> 4 <= 7 and (head[0] << 8 | head[1]) % 31 == 0
+
+
+def _pdf_stream_runs(path, data, budget):
+    """Printable runs of every zlib-compressed (FlateDecode) stream in a PDF.
+
+    Every stream whose data starts with a zlib header is inflated until the zlib
+    data ends (so a forged ``endstream`` inside it cannot cut it short), within the
+    shared ``budget``. Data that turns out not to be zlib is skipped, unless the
+    object before it names FlateDecode as its first filter: then the corrupt stream
+    fails closed, as does exceeding the budget.
+    """
+    runs, previous = [], 0
+    for match in _PDF_STREAM.finditer(data):
+        start, declared_from, previous = match.end(), previous, match.end()
+        if not _zlib_header(data, start):
+            continue
+        inflater, pieces = zlib.decompressobj(), []
+        try:
+            for at in range(start, len(data), _INFLATE_CHUNK):
+                piece = inflater.decompress(data[at : at + _INFLATE_CHUNK])
+                budget[0] -= len(piece)
+                if budget[0] < 0:
+                    raise GuardError("%s expands beyond %d bytes and cannot be scanned" % (path, ZIP_MAX_BYTES))
+                pieces.append(piece)
+                if inflater.eof:
+                    break
+        except zlib.error:
+            if _PDF_FLATE.search(data, declared_from, match.start()):
+                raise GuardError("%s has a corrupt FlateDecode stream and cannot be scanned" % path)
+            continue
+        runs.extend(_printable_runs(b"".join(pieces)))
+    return runs
+
+
+def _cfb_streams(path, data, names):
+    """Bytes of every stream named in ``names`` (lower case) in an OLE2 compound file.
+
+    A minimal reader: header, FAT (with DIFAT sectors), directory and mini stream.
+    Anything malformed (sector size, mini stream cutoff, a chain out of range or
+    looping, a stream shorter than its size) fails closed.
+    """
+
+    def broken(reason):
+        return GuardError("%s is not a readable OLE2 file (%s)" % (path, reason))
+
+    if len(data) < 512:
+        raise broken("short header")
+    sector_shift, mini_shift = struct.unpack_from("<HH", data, 0x1E)
+    if (sector_shift, mini_shift) not in ((9, 6), (12, 6)):
+        raise broken("sector size")
+    size = 1 << sector_shift
+    count = len(data) // size - 1
+    fat_count, dir_start = struct.unpack_from("<II", data, 0x2C)
+    cutoff, minifat_start, _, difat_start, difat_count = struct.unpack_from("<5I", data, 0x38)
+    if cutoff != _CFB_MINI_CUTOFF:
+        raise broken("mini stream cutoff")
+    if difat_count > count or fat_count > count:
+        raise broken("FAT size")
+
+    def sector(number):
+        if number >= count:
+            raise broken("sector out of range")
+        return data[(number + 1) * size : (number + 2) * size]
+
+    def chain(start, table):
+        numbers = []
+        while start != _CFB_END:
+            if start >= len(table) or len(numbers) >= len(table):
+                raise broken("sector chain")
+            numbers.append(start)
+            start = table[start]
+        return numbers
+
+    def table(sectors):
+        raw = b"".join(sector(number) for number in sectors)
+        return struct.unpack("<%dI" % (len(raw) // 4), raw)
+
+    def read(start, length, chain_table, unit):
+        raw = b"".join(unit(number) for number in chain(start, chain_table))
+        if length is None:
+            return raw
+        if len(raw) < length:
+            raise broken("short stream")
+        return raw[:length]
+
+    difat = list(struct.unpack_from("<109I", data, 0x4C))
+    following = difat_start
+    for _ in range(difat_count):
+        entries = table([following])
+        difat.extend(entries[:-1])
+        following = entries[-1]
+    if fat_count > len(difat):
+        raise broken("FAT size")
+    fat = table(difat[:fat_count])
+    directory = read(dir_start, None, fat, sector)
+    entries = []
+    for at in range(0, len(directory) - 127, 128):
+        name_length, kind = struct.unpack_from("<HB", directory, at + 64)
+        start, length = struct.unpack_from("<IQ", directory, at + 116)
+        if size == 512:
+            length &= 0xFFFFFFFF
+        name = directory[at : at + min(name_length, 64)].decode("utf-16-le", "replace").rstrip("\0")
+        entries.append((name, kind, start, length))
+    if not entries or entries[0][1] != 5:
+        raise broken("no root entry")
+    mini = minifat = None
+    streams = []
+    for name, kind, start, length in entries:
+        if kind != 2 or name.lower() not in names:
+            continue
+        if length >= _CFB_MINI_CUTOFF:
+            streams.append(read(start, length, fat, sector))
+            continue
+        if mini is None:
+            mini = read(entries[0][2], entries[0][3], fat, sector)
+            minifat = table(chain(minifat_start, fat))
+        streams.append(read(start, length, minifat, lambda number: mini[number * 64 : (number + 1) * 64]))
+    return streams
+
+
+def _rk_value(rk):
+    """Decode a BIFF RK number: a 30-bit integer or the high half of a double, optionally /100."""
+    if rk & 2:
+        value = (rk >> 2) - ((1 << 30) if rk & 0x80000000 else 0)
+    else:
+        value = struct.unpack("<d", struct.pack("<Q", (rk & 0xFFFFFFFC) << 32))[0]
+    return value / 100 if rk & 1 else value
+
+
+def _number_text(value):
+    if math.isfinite(value) and value == int(value):
+        return "%d" % value
+    return repr(value)
+
+
+def _xls_numeric_cells(path, data):
+    """Numeric cell values of a legacy .xls workbook as text, one per line.
+
+    Numbers (NUMBER, RK, MULRK and cached numeric FORMULA results) are stored as
+    binary values, so text runs never see a phone number typed into a number
+    cell. A file without a BIFF workbook stream, an encrypted workbook or a
+    truncated record fails closed.
+    """
+    streams = _cfb_streams(path, data, {"workbook", "book"})
+    if not streams:
+        raise GuardError("%s has no workbook stream and cannot be scanned" % path)
+    values = []
+    for stream in streams:
+        if not stream.startswith(_BIFF_BOF):
+            raise GuardError("%s has no BIFF workbook stream and cannot be scanned" % path)
+        at = 0
+        while at + 4 <= len(stream):
+            kind, length = struct.unpack_from("<HH", stream, at)
+            body = stream[at + 4 : at + 4 + length]
+            if len(body) != length:
+                raise GuardError("%s has a truncated workbook record and cannot be scanned" % path)
+            at += 4 + length
+            if kind == _BIFF_FILEPASS:
+                raise GuardError("%s is an encrypted workbook and cannot be scanned" % path)
+            if kind == _BIFF_NUMBER and length >= 14:
+                values.append(struct.unpack_from("<d", body, 6)[0])
+            elif kind == _BIFF_FORMULA and length >= 14 and body[12:14] != b"\xff\xff":
+                values.append(struct.unpack_from("<d", body, 6)[0])
+            elif kind == _BIFF_RK and length >= 10:
+                values.append(_rk_value(struct.unpack_from("<I", body, 6)[0]))
+            elif kind == _BIFF_MULRK:
+                values.extend(_rk_value(struct.unpack_from("<I", body, offset)[0]) for offset in range(6, length - 5, 6))
+    return [_number_text(value) for value in values]
+
+
+def _xml_joined_lines(text):
+    """Text of an Office XML part with its runs joined, so text split across runs reads whole."""
+    text = _XML_RUN_PROPS.sub("", text)
+    joined = _XML_TAG.sub(lambda match: "" if match.group(1) in _XML_INLINE else "\n", text)
+    return html.unescape(joined).splitlines()
+
+
+def _format_documents(name, data, budget):
+    """Extra documents for formats whose raw bytes hide text: PDF streams and .xls numbers."""
+    docs = []
+    if data.startswith(_PDF_MAGIC):
+        docs.append((name + DEFLATED_SUFFIX, _pdf_stream_runs(name, data, budget)))
+    if data.startswith(_OLE2_MAGIC) and Path(name).suffix.lower() == ".xls":
+        docs.append((name + CELLS_SUFFIX, _xls_numeric_cells(name, data)))
+    return docs
+
+
 def _member_documents(name, data, budget, depth):
-    """Documents for one archive member: nested zips recurse, other bytes are scanned in place."""
-    if _is_zip(data):
+    """Documents for one archive member: nested or appended zips recurse, other bytes are scanned in place."""
+    if _is_zip(data) or _ZIP_EOCD in data:
         return _zip_documents(name, data, budget, depth + 1) + [(name + RUNS_SUFFIX, _printable_runs(data))]
     _refuse_other_archives(name, data)
-    if b"\0" not in data:
-        return [(name, _text(data).splitlines())]
     docs = []
+    if b"\0" not in data:
+        text = _text(data)
+        docs.append((name, text.splitlines()))
+        if name.lower().endswith(".xml"):
+            docs.append((name + JOINED_SUFFIX, _xml_joined_lines(text)))
+        return docs + _format_documents(name, data, budget)
     text = _bom_text(data)
     if text is not None:
         docs.append((name, text.splitlines()))
+    docs.extend(_format_documents(name, data, budget))
     docs.append((name + RUNS_SUFFIX, _printable_runs(data)))
     return docs
 
@@ -464,7 +699,13 @@ def _safe_name(name):
 
 
 def needs_blob_scan(path, data):
-    return b"\0" in data or _is_zip(data) or Path(path).suffix.lower() in ZIP_EXTENSIONS
+    return (
+        b"\0" in data
+        or _is_zip(data)
+        or _ZIP_EOCD in data
+        or data.startswith(_PDF_MAGIC)
+        or Path(path).suffix.lower() in ZIP_EXTENSIONS
+    )
 
 
 def blob_documents(path, data):
@@ -472,24 +713,33 @@ def blob_documents(path, data):
 
     No such blob is skipped whole. A reviewed binary extension must match its magic
     bytes. Printable ASCII and UTF-16 runs of the raw bytes are always scanned;
-    BOM-marked Unicode text is also decoded line by line; any zip (by signature or
-    by extension) has every member expanded and scanned, nested zips included up to
-    ``ZIP_MAX_DEPTH`` levels within one shared ``ZIP_MAX_BYTES`` budget. gzip, 7z,
-    RAR and tar archives, and any other NUL-bearing blob that is neither BOM-marked
-    text nor a reviewed binary type, fail closed.
+    BOM-marked Unicode text (and NUL-free content) is also decoded line by line;
+    any zip (by signature or by extension) has every member expanded and scanned,
+    nested zips included up to ``ZIP_MAX_DEPTH`` levels within one shared
+    ``ZIP_MAX_BYTES`` budget, and so does a zip appended to a reviewed binary or to
+    text (found by its end-of-central-directory record). A PDF's FlateDecode
+    streams and a legacy ``.xls`` workbook's numeric cells are decoded too. gzip,
+    7z, RAR and tar archives, and any other NUL-bearing blob that is neither
+    BOM-marked text nor a reviewed binary type, fail closed.
     """
     suffix = Path(path).suffix.lower()
     if suffix in BINARY_EXTENSIONS and not data.startswith(BINARY_MAGIC[suffix]):
         raise GuardError("%s does not start with the %s file signature" % (path, suffix))
     _refuse_other_archives(path, data)
+    budget = [ZIP_MAX_BYTES]
     docs = []
     text = _bom_text(data)
+    if text is None and b"\0" not in data:
+        text = _text(data)
     if text is not None:
         docs.append((path, text.splitlines()))
     if suffix in ZIP_EXTENSIONS or _is_zip(data):
-        docs.extend(_zip_documents(path, data, [ZIP_MAX_BYTES], 1))
+        docs.extend(_zip_documents(path, data, budget, 1))
     elif text is None and suffix not in BINARY_EXTENSIONS:
         raise GuardError("%s contains NUL bytes but is neither BOM-marked Unicode text nor a reviewed binary type" % path)
+    elif _ZIP_EOCD in data:
+        docs.extend(_zip_documents(path, data, budget, 1))
+    docs.extend(_format_documents(path, data, budget))
     docs.append((path + RUNS_SUFFIX, _printable_runs(data)))
     return docs
 
