@@ -705,7 +705,7 @@ class Ac2ToShopifyTests(SyncTestCase):
             self.ledger.set_watermark(conn, "ac2_changelog_id", str(ids[0] - 1))
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual(len(self.shopify.created), 3)
-        self.assertEqual(result["counts"]["ac2_insert_own_or_linked"], 3)
+        self.assertEqual(result["counts"]["ac2_insert_linked_or_own_write"], 3)
 
     def test_shopify_create_disabled_refuses_and_keeps_member_pending(self):
         self.initialise()
@@ -756,7 +756,7 @@ class LoopPreventionTests(SyncTestCase):
         result = self.run_sync()
         self.assertEqual(len(self.ac2.creates), 1)
         self.assertEqual(self.shopify.created, [])
-        self.assertEqual(result["counts"]["ac2_insert_own_or_linked"], 1)
+        self.assertEqual(result["counts"]["ac2_insert_linked_or_own_write"], 1)
         result = self.run_sync()
         self.assertEqual((len(self.ac2.creates), self.shopify.created), (1, []))
 
@@ -1914,9 +1914,12 @@ class MemberNoTimeWindowTests(SyncTestCase):
     the sign-up's phone MemberNo when AC2 CreatedTime (Singapore local time,
     no offset) and the sign-up time (round 7c: the start_date metafield's
     createdAt; the ``signup`` helper sets both) are at most
-    ``memberno_link_window_minutes`` (default 10) apart, either way. Name is
-    not used. The same MemberNo outside the window: no link, no create, an
-    alert. Only stored times are compared, so any run frequency works."""
+    ``memberno_link_window_minutes`` (round 10: default 60, was 10) apart,
+    either way. Name is not used. The same MemberNo outside the window: no
+    link, no create, an alert. Only stored times are compared, so any run
+    frequency works. Round 10 (Owner UAT r4): CreatedTime is when the New
+    Member form opens, not when it is saved, so the window runs from form
+    open."""
 
     def signup(self, n: int, at: datetime, **kwargs) -> sync.ShopifyCustomer:
         return self.shopify.add(replace(customer(n, registered=at, **kwargs), created_at=at))
@@ -1953,12 +1956,12 @@ class MemberNoTimeWindowTests(SyncTestCase):
         self.staff(61, T0 + timedelta(minutes=2), name=None)
         self.assert_linked(61, self.run_sync("shopify_to_ac2"))
 
-    def test_eleven_minutes_apart_alerts_and_never_creates(self):
-        self.now = T0 + timedelta(hours=1)
+    def test_sixty_one_minutes_apart_alerts_and_never_creates(self):
+        self.now = T0 + timedelta(hours=2)
         self.signup(62, T0)
-        self.staff(62, T0 + timedelta(minutes=11))
+        self.staff(62, T0 + timedelta(minutes=61))
         self.signup(63, T0)
-        self.staff(63, T0 - timedelta(minutes=11))
+        self.staff(63, T0 - timedelta(minutes=61))
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual(result["counts"]["memberno_exists_outside_window"], 2)
         self.assertEqual((self.pending(62), self.pending(63)), (("SKIPPED", "memberno_exists_outside_window"),) * 2)
@@ -1969,20 +1972,20 @@ class MemberNoTimeWindowTests(SyncTestCase):
         self.assertEqual((self.pending(62), self.pending(63)), (("SKIPPED", "memberno_exists_outside_window"),) * 2)
 
     def test_alert_shows_only_the_last_three_characters(self):
-        self.now = T0 + timedelta(hours=1)
+        self.now = T0 + timedelta(hours=2)
         self.signup(64, T0)
-        self.staff(64, T0 + timedelta(minutes=11))
+        self.staff(64, T0 + timedelta(minutes=61))
         self.assert_alerted(64, self.run_sync("shopify_to_ac2"))
 
-    def test_exactly_ten_minutes_links_and_a_millisecond_more_does_not(self):
-        self.now = T0 + timedelta(hours=1)
-        for n, offset in ((65, timedelta(minutes=10)), (66, -timedelta(minutes=10))):
+    def test_exactly_sixty_minutes_links_and_a_millisecond_more_does_not(self):
+        self.now = T0 + timedelta(hours=2)
+        for n, offset in ((65, timedelta(minutes=60)), (66, -timedelta(minutes=60))):
             self.signup(n, T0)
             self.staff(n, T0 + offset)
         self.signup(67, T0)
-        self.staff(67, T0 + timedelta(minutes=10, milliseconds=1))
+        self.staff(67, T0 + timedelta(minutes=60, milliseconds=1))
         self.signup(68, T0)
-        self.staff(68, T0 - timedelta(minutes=10, milliseconds=1))
+        self.staff(68, T0 - timedelta(minutes=60, milliseconds=1))
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual(self.links(), {gid(65): sg(65), gid(66): sg(66)})
         self.assertEqual(result["counts"]["memberno_and_created_time_match"], 2)
@@ -1990,17 +1993,30 @@ class MemberNoTimeWindowTests(SyncTestCase):
         self.assertEqual(self.ac2.creates, [])
 
     def test_window_is_configurable_and_validated(self):
-        self.assertEqual(make_config().memberno_link_window_minutes, 10)
+        self.assertEqual(make_config().memberno_link_window_minutes, 60)
         self.now = T0 + timedelta(hours=1)
         self.signup(69, T0)
         self.staff(69, T0 + timedelta(minutes=11))
+        result = self.run_sync("shopify_to_ac2", memberno_link_window_minutes=10)
+        self.assertEqual((self.links(), result["counts"]["memberno_exists_outside_window"]), ({}, 1))
+        self.signup(59, T0)
+        self.staff(59, T0 + timedelta(minutes=11))
         result = self.run_sync("shopify_to_ac2", memberno_link_window_minutes=15)
-        self.assertEqual(self.links(), {gid(69): sg(69)})
+        self.assertEqual(self.links(), {gid(59): sg(59)})
         self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
         for bad in (0, 61, "10", True, None, 10.5):
             with self.subTest(bad=bad), self.assertRaises(dl.DirectLocalError) as caught:
                 make_config(memberno_link_window_minutes=bad)
             self.assertEqual(caught.exception.code, "sync_config_memberno_link_window_minutes_invalid")
+
+    def test_form_opened_forty_five_minutes_before_the_sign_up_links_by_default(self):
+        # Round 10 (Owner UAT r4): staff open the New Member form (CreatedTime),
+        # the customer signs up on the phone, staff save later. 45 minutes
+        # from form open to sign-up is inside the default 60-minute window.
+        self.now = T0 + timedelta(hours=1)
+        self.signup(57, T0)
+        self.staff(57, T0 - timedelta(minutes=45))
+        self.assert_linked(57, self.run_sync("shopify_to_ac2"))
 
     def test_staff_created_across_singapore_midnight_links(self):
         # Sign-up 23:58 Singapore time on 21 Oct (15:58Z); staff key the
@@ -2128,10 +2144,11 @@ class SignUpTimeWindowTests(SyncTestCase):
         self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
 
     def test_customer_created_at_alone_never_links(self):
-        # Account made at T0, sign-up (start_date metafield) 30 minutes later:
-        # staff keyed the member at T0 + 1 min, 29 minutes before the sign-up.
+        # Account made at T0, sign-up (start_date metafield) 90 minutes later:
+        # staff keyed the member at T0 + 1 min, 89 minutes before the sign-up
+        # (round 10: outside the default 60-minute window).
         self.now = T0 + timedelta(hours=2)
-        self.shopify.add(replace(customer(81, registered=T0 + timedelta(minutes=30)), created_at=T0))
+        self.shopify.add(replace(customer(81, registered=T0 + timedelta(minutes=90)), created_at=T0))
         self.staff(sg(81), T0 + timedelta(minutes=1))
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual((self.links(), self.ac2.creates), ({}, []))
@@ -2142,7 +2159,7 @@ class SignUpTimeWindowTests(SyncTestCase):
         self.shopify.add(customer(82))
         self.staff(local(82), T0 - timedelta(minutes=3))
         self.shopify.add(customer(83))
-        self.staff(local(83), T0 + timedelta(minutes=11))
+        self.staff(local(83), T0 - timedelta(minutes=61))
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual(self.links(), {gid(82): local(82)})
         self.assertEqual(self.ac2.creates, [])
@@ -2165,9 +2182,9 @@ class SignUpTimeWindowTests(SyncTestCase):
         other = "60" + "1" + "2000" + "0002"  # a second fake foreign number
         self.now = T0 + timedelta(hours=1)
         self.shopify.add(customer(85, phone=plus(FOREIGN_DIGITS)))
-        self.staff(FOREIGN_DIGITS, T0 + timedelta(minutes=10))
+        self.staff(FOREIGN_DIGITS, T0 + timedelta(minutes=60))
         self.shopify.add(customer(86, phone=plus(other)))
-        self.staff(other, T0 - timedelta(minutes=10, seconds=1))
+        self.staff(other, T0 - timedelta(minutes=60, seconds=1))
         result = self.run_sync("shopify_to_ac2")
         self.assertEqual(self.links(), {gid(85): FOREIGN_DIGITS})
         self.assertEqual(self.ac2.creates, [])
@@ -2384,7 +2401,7 @@ class StaffMemberBeforeSignUpLinkTests(SyncTestCase):
 
     def test_outside_the_window_alerts_and_never_creates(self):
         self.sign_up(93)
-        self.staff(sg(93), T0 + timedelta(minutes=30))
+        self.staff(sg(93), T0 - timedelta(minutes=61))
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual((self.links(), self.shopify.created), ({}, []))
         self.assertIn("memberno_exists_outside_window", result["alerts"])
@@ -2464,9 +2481,9 @@ class Ac2SideMatchesShopifySideTests(SyncTestCase):
     staff = StaffMemberBeforeSignUpLinkTests.staff
     ac2_pending = StaffMemberBeforeSignUpLinkTests.ac2_pending
 
-    def legacy(self, member_no: str) -> None:
+    def legacy(self, member_no: str, mobile_phone: str | None = None) -> None:
         # A record keyed long before the sync, not in the ChangeLog window.
-        self.ac2.add(sync.Ac2Member(member_no, "Legacy Holder", None, created_at=T0 - timedelta(days=400)))
+        self.ac2.add(sync.Ac2Member(member_no, "Legacy Holder", mobile_phone, created_at=T0 - timedelta(days=400)))
 
     def assert_conflict(self, result: dict, n: int) -> None:
         self.assertIn("memberno_conflict", result["alerts"])
@@ -2519,11 +2536,27 @@ class Ac2SideMatchesShopifySideTests(SyncTestCase):
         self.assert_conflict(result, 73)
 
     def test_one_form_only_still_links_by_time(self):
-        self.legacy("TILL74")  # another record, not a form of the phone
+        # Round 10 (G2 L9): the other record holds the same phone in
+        # MobilePhone, so the phone lookup returns it; only exact MemberNo
+        # forms count towards a conflict, so it still links by time.
+        self.legacy("TILL74", mobile_phone=local(74))
         self.sign_up(74)
         self.staff(sg(74), T0 + timedelta(minutes=2))
-        self.run_sync("ac2_to_shopify")
+        result = self.run_sync("ac2_to_shopify")
         self.assertEqual(self.links(), {gid(74): sg(74)})
+        self.assertEqual(result["alerts"], [])
+        self.assertEqual(self.ac2_pending(sg(74)), ("DONE", "memberno_and_created_time_match"))
+
+    def test_a_member_no_with_the_phone_embedded_is_not_a_conflict(self):
+        # Round 10 (G2 L9, probe P2): the 8 digits embedded in a longer
+        # MemberNo are a phone hit, not a MemberNo form of the phone.
+        self.legacy(local(68) + "JO")
+        self.sign_up(68)
+        self.staff(sg(68), T0 - timedelta(minutes=2))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.links(), {gid(68): sg(68)})
+        self.assertNotIn("memberno_conflict", result["counts"])
+        self.assertEqual(result["alerts"], [])
 
     def test_hold_for_an_unread_pending_sign_up_ends_as_stuck_after_the_bounded_wait(self):
         for n in range(75, 80):
@@ -2550,10 +2583,68 @@ class Ac2SideMatchesShopifySideTests(SyncTestCase):
         # Shopify -> AC2 still links the sign-up by time on its own.
         self.run_sync("shopify_to_ac2")
         self.assertEqual(self.links(), {gid(79): sg(79)})
+        # Round 10 (G2 L8): once the backlog clears the stuck row is
+        # re-queued and closes as already linked; nothing is created.
+        healed = self.run_sync("ac2_to_shopify")  # 4 pending now, bound 100
+        self.assertEqual(healed["counts"]["ac2_member_hold_requeued"], 1)
+        self.assertEqual(self.ac2_pending(sg(79)), ("DONE", "already_linked"))
+        self.assertEqual(self.shopify.created, [])
 
-    def test_ac2_side_exactly_ten_minutes_links_and_a_millisecond_more_does_not(self):
-        cases = ((80, timedelta(minutes=10)), (81, -timedelta(minutes=10)),
-                 (82, timedelta(minutes=10, milliseconds=1)), (83, -timedelta(minutes=10, milliseconds=1)))
+    def test_a_walk_in_stuck_during_a_backlog_is_requeued_and_created_once_it_clears(self):
+        # Round 10 (G2 L8, probe P3): a genuine walk-in (no Shopify customer,
+        # no sign-up) held while more sign-ups are pending than one run reads.
+        for n in range(75, 80):
+            self.sign_up(n)
+        self.run_sync("shopify_to_ac2")  # five waiting sign-ups, a bound of 3
+        self.staff(sg(60), T0 + timedelta(minutes=1))
+        for _ in range(sync.REGISTRATION_WAIT_MAX_CHECKS - 1):
+            self.assertIn("ac2_member_held_for_sign_up", self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=3)["alerts"])
+        self.assertIn("ac2_member_hold_stuck", self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=3)["alerts"])
+        # Backlog still there: stays stuck and quiet, not re-queued.
+        quiet = self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=3)
+        self.assertEqual(quiet["alerts"], [])
+        self.assertNotIn("ac2_member_hold_requeued", quiet["counts"])
+        self.assertEqual((self.ac2_pending(sg(60)), self.shopify.created), (("SKIPPED", "ac2_member_hold_stuck"), []))
+        # The backlog clears (every pending sign-up fits the bound; exactly
+        # 5 of 5 is clear, the `sure` rule): re-queued with a fresh wait and
+        # decided in the same run, created once.
+        healed = self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=5)
+        self.assertEqual(healed["counts"]["ac2_member_hold_requeued"], 1)
+        self.assertEqual([r["ref"] for r in healed["refs"] if r["code"] == "ac2_member_hold_requeued"], [self.ledger.ref("m", sync.member_no_key(sg(60)))])
+        self.assertEqual(healed["counts"]["shopify_customer_created"], 1)
+        self.assertEqual(len(self.shopify.created), 1)
+        self.assertEqual(self.ac2_pending(sg(60)), ("DONE", "shopify_customer_created"))
+        self.assert_no_pii(healed)
+        again = self.run_sync("ac2_to_shopify")
+        self.assertEqual(len(self.shopify.created), 1)
+        self.assertNotIn("ac2_member_hold_requeued", again["counts"])
+
+    def test_a_requeued_walk_in_is_held_again_if_the_backlog_returns(self):
+        # Re-queue resets checks: a new backlog gets the same bounded wait,
+        # never an unbounded hold and never a create while unsure.
+        for n in range(75, 80):
+            self.sign_up(n)
+        self.run_sync("shopify_to_ac2")
+        self.staff(sg(61), T0 + timedelta(minutes=1))
+        for _ in range(sync.REGISTRATION_WAIT_MAX_CHECKS):
+            self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=3)
+        self.assertEqual(self.ac2_pending(sg(61)), ("SKIPPED", "ac2_member_hold_stuck"))
+        # The bound covers the backlog but Shopify creates are off: re-queued,
+        # stays PENDING (would_create) with checks 0.
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(result["counts"]["ac2_member_hold_requeued"], 1)
+        self.assertEqual(self.ac2_pending(sg(61))[0], "PENDING")
+        checks = lambda: self.ledger.conn.execute("SELECT checks FROM ac2_pending WHERE member_no = ?", (sg(61),)).fetchone()[0]
+        self.assertEqual(checks(), 0)
+        for _ in range(sync.REGISTRATION_WAIT_MAX_CHECKS - 1):
+            self.assertIn("ac2_member_held_for_sign_up", self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=3)["alerts"])
+        self.assertIn("ac2_member_hold_stuck", self.run_sync("ac2_to_shopify", max_pending_rechecks_per_run=3)["alerts"])
+        self.assertEqual(self.shopify.created, [])
+
+    def test_ac2_side_exactly_sixty_minutes_links_and_a_millisecond_more_does_not(self):
+        self.now = T0 + timedelta(hours=2)
+        cases = ((80, timedelta(minutes=60)), (81, -timedelta(minutes=60)),
+                 (82, timedelta(minutes=60, milliseconds=1)), (83, -timedelta(minutes=60, milliseconds=1)))
         for n, offset in cases:
             self.sign_up(n)
             self.staff(sg(n), T0 + offset)

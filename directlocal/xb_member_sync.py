@@ -170,8 +170,10 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # The AC2 member whose MemberNo is the sign-up's phone MemberNo links when
     # its CreatedTime and the sign-up time (round 7c: registration_at, the
     # membership.start_date metafield's createdAt) are at most this many
-    # minutes apart (either way).
-    "memberno_link_window_minutes": 10,
+    # minutes apart (either way). Round 10 (Owner UAT r4, 24 Oct 2026):
+    # CreatedTime is when staff OPEN the New Member form, not when they save
+    # it, so the window runs from form open; default 60 (was 10).
+    "memberno_link_window_minutes": 60,
     # Round 7c (Owner): the one-off initial link (CLI ``initial-link``) is a
     # dry run unless ``--apply`` is given AND this is on.
     "initial_link_enabled": False,
@@ -521,7 +523,7 @@ class Ac2Member:
     mobile_phone: str | None = None
     email_address: str | None = None
     dob: str | None = None
-    created_at: datetime | None = None  # round 7: CreatedTime, in UTC
+    created_at: datetime | None = None  # round 7: CreatedTime (form open), in UTC
 
     def __repr__(self) -> str:  # never render member data
         return "Ac2Member()"
@@ -530,8 +532,9 @@ class Ac2Member:
 def ac2_created_time(value: Any) -> datetime | None:
     """Round 7: AC2 ``Member.CreatedTime`` as UTC. AC2 stores Singapore local
     time with no offset (VM fact G0, 22 Oct 2026), so the text is read as
-    Asia/Singapore (UTC+8 all year). None when absent or not in the bridge's
-    exact shape; a missing time never links."""
+    Asia/Singapore (UTC+8 all year). Round 10 (Owner UAT r4): it is the time
+    the New Member form was opened, not saved. None when absent or not in the
+    bridge's exact shape; a missing time never links."""
 
     if not isinstance(value, str) or not AC2_CREATED_TIME_RE.fullmatch(value):
         return None
@@ -608,7 +611,7 @@ def member_no_forms(phone_digits: str | None) -> set[str]:
     return {phone_digits} | ({local} if local else set())
 
 
-def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member], window: timedelta = timedelta(minutes=10),
+def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, candidates: Iterable[Ac2Member], window: timedelta = timedelta(minutes=60),
                           signed_up: datetime | None = None) -> Decision:
     """The no-review-queue rules for one Shopify registration. ``candidates``
     are AC2 rows found by phone. Email is never consulted.
@@ -1459,7 +1462,7 @@ class SyncEngine:
                     (key, row_id, self.ledger.digest(member), dl.ts(self.ledger.now())),
                 )
                 if self.ledger.link_for_member(member.member_no) is not None or self.ledger.open_write_for_member(member.member_no) is not None:
-                    self.summary.count("ac2_insert_own_or_linked")  # loop prevention
+                    self.summary.count("ac2_insert_linked_or_own_write")  # loop prevention
                 else:
                     inserted = conn.execute(
                         "INSERT OR IGNORE INTO ac2_pending(member_no_key, member_no, changelog_id, state, updated_at) VALUES (?, ?, ?, 'PENDING', ?)",
@@ -1533,7 +1536,30 @@ class SyncEngine:
                 (state, code, 1 if count_check else 0, dl.ts(self.ledger.now()), key),
             )
 
+    def _requeue_stuck_holds(self) -> None:
+        """Round 10 (G2 L8): ``ac2_member_hold_stuck`` only means the pending
+        sign-ups could not all be read. Once they can (no more PENDING than
+        ``max_pending_rechecks_per_run``, the ``sure`` rule), every stuck
+        member is PENDING again with ``checks`` 0 and is decided like any
+        other: linked, or created in Shopify for a genuine walk-in. A later
+        backlog can hold it again for the same bounded wait (one more stuck
+        alert)."""
+
+        limit = self.config.max_pending_rechecks_per_run
+        backlog = self.ledger.conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM shopify_pending WHERE state = 'PENDING' LIMIT ?)", (limit + 1,)).fetchone()[0]
+        if backlog > limit:
+            return
+        keys = [row["member_no_key"] for row in self.ledger.conn.execute("SELECT member_no_key FROM ac2_pending WHERE state = 'SKIPPED' AND code = 'ac2_member_hold_stuck'")]
+        for key in keys:
+            with self.ledger.tx() as conn:
+                conn.execute(
+                    "UPDATE ac2_pending SET state = 'PENDING', code = 'hold_requeued', checks = 0, updated_at = ? WHERE member_no_key = ?",
+                    (dl.ts(self.ledger.now()), key),
+                )
+            self.summary.count("ac2_member_hold_requeued", self.ledger.ref("m", key))
+
     def _process_ac2_pending(self) -> None:
+        self._requeue_stuck_holds()
         pending = self.ledger.conn.execute("SELECT * FROM ac2_pending WHERE state = 'PENDING' ORDER BY changelog_id LIMIT ?", (PENDING_LOOKUP_BATCH,)).fetchall()
         if not pending:
             return
@@ -1574,7 +1600,8 @@ class SyncEngine:
                         self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
                     else:
                         # Round 9 (G2 L6): the same bounded wait as the sign-up
-                        # time hold; then an operator decides (never created).
+                        # time hold; never created while stuck. Round 10 (G2
+                        # L8): re-queued once the backlog clears.
                         self._ac2_done(key, "SKIPPED", "ac2_member_hold_stuck", count_check=True)
                         self.summary.alert("ac2_member_hold_stuck", ref, member_no=member.member_no)
                     continue

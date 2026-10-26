@@ -1,7 +1,8 @@
 # Member Sync Phase 1: Two-Way Create (#155)
 
-Status (2026-10-22): source and offline tests only (build step 2, draft PR,
-round 9). Nothing here has run against AutoCount or Shopify. Every write
+Status (2026-10-27): source and offline tests, draft PR, round 10 after
+Owner UAT r4 on the test book (23-24 October 2026, PASS). Nothing here has
+run against production AutoCount or Shopify. Every write
 switch is off by default, and so are ChangeLog reads (`changelog_xml_column`
 null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Only the test book
@@ -26,7 +27,9 @@ Tests: `tests/test_member_sync.py`, `tests/test_member_sync_bridge_ps.py`.
 Both directions write the mapping (Shopify customer GID <-> MemberNo, each
 unique) to the sync ledger. That mapping is the loop prevention: an AC2
 insert for a mapped MemberNo, or for a MemberNo with an open write, is never
-sent to Shopify; a mapped customer is never sent to AC2.
+sent to Shopify (run count `ac2_insert_linked_or_own_write`; round 10
+rename of `ac2_insert_own_or_linked`, same behaviour); a mapped customer is
+never sent to AC2.
 
 ### Shopify -> AC2: staff first, deferred create (Owner, 22 Oct 2026)
 
@@ -52,8 +55,10 @@ use the name (round 7). Therefore:
      digits for a Singapore number, or round 7c the same 8 digits without
      `65`; a foreign `+` number's full digits; MemberNo trimmed, any case) is
      linked when its `CreatedTime` and the **sign-up time** are at most
-     `memberno_link_window_minutes` (default 10) apart, either way, the
-     boundary included (`memberno_and_created_time_match`). The sign-up time
+     `memberno_link_window_minutes` (default 60; 10 until round 10) apart,
+     either way, the boundary included (`memberno_and_created_time_match`).
+     `CreatedTime` is when staff open the New Member form, not when they
+     save it (Owner UAT r4, below), so the window runs from form open. The sign-up time
      (round 7c) is `ShopifyCustomer.registration_at`: the `createdAt` of the
      `membership.start_date` customer metafield the sign-up form writes,
      the same instant the sync uses for the cutover and the 06:00 cutoff
@@ -318,18 +323,27 @@ against Shopify split and whole (stayed separate).
      (G2 L6): this hold has the same bound as the sign-up-time hold below
      (`REGISTRATION_WAIT_MAX_CHECKS`, 5 runs: at most 4 holds); on the 5th
      run the member is `SKIPPED` with the alert `ac2_member_hold_stuck`
-     (masked MemberNo) and is never created. Shopify -> AC2 still links the
-     sign-up by time on its own when it reads it. Both holds share the
-     member's one `checks` counter, so a member is held at most 4 runs in
-     all;
+     (masked MemberNo) and is never created while stuck. Shopify -> AC2
+     still links the sign-up by time on its own when it reads it. Both holds
+     share the member's one `checks` counter, so a member is held at most 4
+     runs in all. Round 10 (G2 L8): stuck only means the pending sign-ups
+     could not all be read. At the start of every AC2 -> Shopify pending
+     step in which no more sign-ups are pending than
+     `max_pending_rechecks_per_run` (the backlog has cleared), every stuck
+     member is re-queued (`PENDING`, code `hold_requeued`, `checks` 0, count
+     `ac2_member_hold_requeued` with its `m-` ref) and decided like any
+     other: already linked, linked by time, or, for a genuine walk-in with
+     no sign-up, created in Shopify (when `shopify_create_enabled`). A new
+     backlog can hold it again for the same bounded wait, with one more
+     stuck alert;
    - already linked to another member: alert
      `shopify_customer_linked_to_other_member` (or `possible_duplicate_member`
      when the sync created that member), never merged;
    - otherwise the Shopify -> AC2 rule decides: `CreatedTime` within
      `memberno_link_window_minutes` of the customer's sign-up time
      (`registration_at`) links (`memberno_and_created_time_match`; inclusive:
-     exactly 10:00 apart links and 10:00.001 does not, pinned by tests on
-     both sides, round 9 G2 L7); farther
+     at the default exactly 60:00 apart links and 60:00.001 does not, pinned
+     by tests on both sides, round 9 G2 L7, round 10 default); farther
      apart: alert `memberno_exists_outside_window`, no link, no create; a
      missing time: alert `created_time_missing`;
    - a sign-up whose `start_date` metafield is not readable yet is held
@@ -401,7 +415,7 @@ Unknown keys, at the top level or nested, are refused.
 | `http_timeout_seconds` | `30` | 5-60 |
 | `deferred_create_local_time` | `"06:00"` | Round 6: `HH:MM` (00:00-23:59) in Asia/Singapore on the day after sign-up; before it an unmatched sign-up waits for staff |
 | `ac2_create_member_type` | `"REGISTERED"` | Round 6: the AutoCount member type of a member the sync creates (1-20 of `A-Z a-z 0-9 _ -`, starting with a letter or digit). The test book type is `REGISTERED`; production uses other codes (a production change is E9) |
-| `memberno_link_window_minutes` | `10` | Round 7: 1-60. The largest gap, either way, between AC2 `CreatedTime` and the sign-up time (round 7c: `registration_at`) for a MemberNo link |
+| `memberno_link_window_minutes` | `60` | Round 7: 1-60. The largest gap, either way, between AC2 `CreatedTime` (when the New Member form was opened) and the sign-up time (round 7c: `registration_at`) for a MemberNo link. Round 10 (Owner, after UAT r4): default 60, was 10 |
 | `initial_link_enabled` | `false` | Round 7c: the Owner's gate for `initial-link --apply`; a dry run needs no gate |
 
 ## What stays switched off
@@ -505,6 +519,11 @@ Unknown keys, at the top level or nested, are refused.
   (`YYYY-MM-DDTHH:MM:SS.mmm`; style 126 drops a zero fraction). The sync
   accepts only that shape (`ac2_created_time`), reads it as Asia/Singapore
   and compares in UTC. Anything else is unreadable and never links.
+- Owner UAT r4 (test book, 23 October 2026): `CreatedTime` is when the New
+  Member form is **opened**, not when it is saved (one member: CreatedTime
+  1 min 15 s before its ChangeLog insert and `LastModified`; another: about
+  14 minutes before). The link window therefore runs from form open, which
+  is why the default became 60 minutes in round 10.
 
 ## ChangeLog facts (VM read-only check r5, 2026-10-21)
 
@@ -647,8 +666,9 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
 
 - `waiting_for_staff` in a run's counts is normal: a sign-up not yet matched
   to a staff-made member. It is linked as soon as staff key the member with
-  MemberNo `65` + 8 digits or the 8 digits (round 7c) within 10 minutes of
-  the sign-up (round 7), or
+  MemberNo `65` + 8 digits or the 8 digits (round 7c) with the New Member
+  form opened within `memberno_link_window_minutes` (default 60, round 10)
+  of the sign-up (round 7), or
   hold the phone otherwise with the same name (at least 2 matching words, no
   initials).
 - `created_after_wait` (alert): the sync created a member after the cutoff.
@@ -682,9 +702,15 @@ The attended `ac2_directlocal_owner_console.ps1` path is unchanged.
   ChangeLog member's ref): both forms of one phone are MemberNos; nothing
   was linked or created on either side. `ac2_member_hold_stuck` (alert):
   the member above was held 4 runs because more sign-ups were pending than
-  one run reads, and is now left to an operator (never created). Check
-  whether a pending sign-up has that phone; Shopify -> AC2 links it by time
-  when it reads it.
+  one run reads (`shopify_pending_backlog` alerts too); nothing was created.
+  Round 10 (G2 L8): no manual re-queue is needed. The member is re-queued by
+  itself (count `ac2_member_hold_requeued`) on the first AC2 -> Shopify run
+  with no more sign-ups pending than `max_pending_rechecks_per_run`, then
+  linked (a sign-up with that phone) or, for a walk-in, created in Shopify.
+  What to do: clear the backlog (staff key the waiting members, or the
+  approved AC2 creates run) or raise `max_pending_rechecks_per_run` (up to
+  500). If the same masked MemberNo alerts stuck again, the backlog came
+  back before it cleared: check `shopify_pending_backlog` first.
 - The pending list is private ledger data; read it only on the VM (the
   read-only query style of the pre-flight step).
 
@@ -792,7 +818,9 @@ Per UAT run, before any create switch goes on for good:
    `memberno_exists_outside_window` and `created_time_missing`. Key at least
    one member on the spot with MemberNo `65` + 8 digits (it must link, with
    no AC2 write, whatever name staff typed) and check one where the times
-   are more than 10 minutes apart (it must alert, never create). Compare one
+   are more than `memberno_link_window_minutes` apart (default 60 from
+   round 10; UAT r4 ran at 10; it must alert, never create). `CreatedTime`
+   is the time the New Member form was opened. Compare one
    member's `CreatedTime` with that customer's sign-up time
    (`registration_at`: the `createdAt` of the `membership.start_date`
    metafield, UTC; round 7c, not `Customer.createdAt`) to confirm the
@@ -934,6 +962,17 @@ pinned by tests). Recorded with no code change:
   in MobilePhone (or an embedded 8-digit MemberNo) in phase 1.
 - The hold alert (`ac2_member_held_for_sign_up`, including the few-second
   `start_date` race) stays an alert until UAT shows how often it fires.
+
+Round 10 (27 October 2026, after Owner UAT r4 PASS on 23-24 October and G2
+round 9 PASS-WITH-NOTES on `43c8c70`): L8 (a member stuck during a sign-up
+backlog is re-queued once the backlog clears, so a genuine walk-in is still
+created in Shopify), L9 (tests pin that a non-form phone hit, MobilePhone or
+an embedded 8-digit MemberNo, is not an AC2-side conflict), the UAT fact
+that `CreatedTime` is form-open time, the run count rename
+`ac2_insert_own_or_linked` -> `ac2_insert_linked_or_own_write` (same
+behaviour) and `memberno_link_window_minutes` default 10 -> 60 (range 1-60
+unchanged). Gates unchanged: Shopify and AC2 creates off by default, test
+book only, `book_guard.ps1` unchanged.
 
 ## Open items
 
