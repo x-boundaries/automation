@@ -753,21 +753,20 @@ def _member_documents(name, data, budget, depth):
     # Refuse first, as blob_documents does, so an appended zip cannot take a gzip, 7z,
     # RAR or tar member past the refusal (#270 G2 W1).
     _refuse_other_archives(name, data)
-    if _is_zip(data) or _ZIP_EOCD in data:
-        docs = _zip_documents(name, data, budget, depth + 1) + _format_documents(name, data, budget)
-        return docs + [(name + RUNS_SUFFIX, _printable_runs(data))]
+    nul_free = b"\0" not in data
+    zipped = _is_zip(data) or _ZIP_EOCD in data
     docs = []
-    if b"\0" not in data:
-        text = _text(data)
-        docs.append((name, text.splitlines()))
-        if name.lower().endswith(".xml"):
-            docs.append((name + JOINED_SUFFIX, _xml_joined_lines(text)))
-        return docs + _format_documents(name, data, budget)
-    text = _bom_text(data)
+    # The decoded text is kept even when a zip follows it, as base kept BOM text (#270 G2 W3).
+    text = _text(data) if nul_free else _bom_text(data)
     if text is not None:
         docs.append((name, text.splitlines()))
+        if nul_free and name.lower().endswith(".xml"):
+            docs.append((name + JOINED_SUFFIX, _xml_joined_lines(text)))
+    if zipped:
+        docs.extend(_zip_documents(name, data, budget, depth + 1))
     docs.extend(_format_documents(name, data, budget))
-    docs.append((name + RUNS_SUFFIX, _printable_runs(data)))
+    if zipped or not nul_free:
+        docs.append((name + RUNS_SUFFIX, _printable_runs(data)))
     return docs
 
 
@@ -862,8 +861,9 @@ def blob_documents(path, data):
     bytes fails closed. A PDF's FlateDecode streams and a legacy ``.xls``
     workbook's numeric cells are decoded too, in a zip member as well; an
     encrypted PDF fails closed. gzip,
-    7z, RAR and tar archives, and any other NUL-bearing blob that is neither
-    BOM-marked text nor a reviewed binary type, fail closed.
+    7z, RAR and tar archives, any other NUL-bearing blob that is neither
+    BOM-marked text nor a reviewed binary type, and two documents with one
+    display name, fail closed.
     """
     suffix = Path(path).suffix.lower()
     if suffix in BINARY_EXTENSIONS and not data.startswith(BINARY_MAGIC[suffix]):
@@ -884,16 +884,36 @@ def blob_documents(path, data):
         docs.extend(_zip_documents(path, data, budget, 1))
     docs.extend(_format_documents(path, data, budget))
     docs.append((path + RUNS_SUFFIX, _printable_runs(data)))
+    _refuse_duplicate_names(path, docs)
     return docs
+
+
+def _refuse_duplicate_names(path, docs):
+    """Fail closed when two documents share a display name (#270 G2 W4).
+
+    Added lines are matched per name, so a second document with the same name
+    (a repeated member, a ``_safe_name`` collision, or a member named like another
+    document's suffixed or ``!`` name) would replace the first one's line set.
+    """
+    seen = set()
+    for name, _ in docs:
+        if name in seen:
+            raise GuardError("%s holds two documents named %s and cannot be scanned" % (path, name))
+        seen.add(name)
 
 
 def _parent_documents(path, data):
     if not needs_blob_scan(path, data):
         return {path: _text(data).splitlines()}
     try:
-        return dict(blob_documents(path, data))
+        docs = dict(blob_documents(path, data))
     except GuardError:
         return {}
+    if _diff_keeps_text(path, data):
+        # Base read this parent as plain text only, so its raw runs must not hide the
+        # new blob's runs that base reports as added (#270 round 4 fuzz differential).
+        docs.pop(path + RUNS_SUFFIX, None)
+    return docs
 
 
 def _scan_documents(label, docs, allowlist, keep=None):

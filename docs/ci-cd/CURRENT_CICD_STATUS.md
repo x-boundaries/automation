@@ -70,7 +70,11 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   scanned. `tests/test_pii_guard.py` pins the trigger,
   checkout, exact run lines and allowlist, and rejects `continue-on-error`,
   `|| true`, `if:` conditions, path filters, a dropped or narrowed range and
-  report-only or value-printing flags. The tracked `.githooks/pre-commit` hook
+  report-only or value-printing flags. Its seeded fuzz differential compares
+  the scanner with `main`'s scanner from before #270 (`4a73583`, read from the
+  full-history checkout; the shallow full-suite shards skip it) on 1,000
+  generated inputs and fails if any input `main` flags or fails closed passes
+  clean (#270). The tracked `.githooks/pre-commit` hook
   needs the one-time `git config core.hooksPath .githooks` per clone; see
   `docs/data_policy.md`.
 

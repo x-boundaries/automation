@@ -111,6 +111,12 @@ lines. No binary file is skipped whole:
   end-of-central-directory record outside the members' data, or a zip file
   header that does not start a parsed member (such as a zip in front of the one
   that is read). A zip stored whole inside a member is expanded as usual.
+- Two documents with the same display name in one file fail the scan: a
+  repeated member name, names that differ only in control characters, or a
+  member named like another document's ` (joined text)`, ` (deflated streams)`,
+  ` (numeric cells)`, ` (text runs)` or `member!inner` name. Added lines are
+  matched per name, so a second document with the name would hide the first
+  one's lines (#270 G2 W4; the scanner before #270 had the same gap).
 - Office XML parts inside a container are also scanned with their text runs
   joined (Word, PowerPoint and shared-string runs, plus XML character
   references such as `&#64;`), so a number or address split across formatting
@@ -188,10 +194,11 @@ Known limits (accepted, #270):
   runs keep only the Latin-1 no-break space byte. Reason: each widens the
   phone patterns or the run decoder for a rare form; a number split this way
   is still read by a human reviewer.
-- Office XML with a crafted unclosed `<w:rPr>`, `<w:rPrChange` or `<` makes
-  the joined-text pass slow (quadratic: an unclosed `<` repeated takes about
-  15 seconds at 100 KB and a minute at 200 KB, so minutes at 380 KB) (LATER,
-  #270 G2 L3, L8). It ends in a hook or CI timeout, which fails the check
+- Office XML with a crafted unclosed `<w:rPr>`, `<w:rPrChange`, `<w:sdtPr>`,
+  `<w:sdtEndPr>`, `<w:smartTagPr>`, `<w:customXmlPr>` or `<` makes the
+  joined-text pass slow (quadratic: an unclosed `<` repeated takes about 15
+  seconds at 100 KB and a minute at 200 KB, so minutes at 380 KB) (LATER, #270
+  G2 L3, L8, R3-L1). It ends in a hook or CI timeout, which fails the check
   rather than passing it.
 - A zip hidden inside a member's declared span (past the end of its
   compressed data, with the central-directory size inflated to cover it, or
@@ -200,7 +207,15 @@ Known limits (accepted, #270):
 - A text file without NUL bytes that starts with `%PDF` or holds a zip
   end-of-central-directory record has its PDF streams or appended zip scanned
   by the blob scan, while git's diff still decides which of its text lines are
-  added (the blob scan's own line matching can miss a moved line).
+  added (the blob scan's own line matching can miss a moved line). Such a
+  file is sent to the PDF decoder only when `%PDF` is its first byte, not
+  anywhere in the first 1024 bytes as for a zip member (LATER, #270 G2 R3-L2):
+  a NUL-free PDF after a leading newline has only its text lines scanned, as
+  before #270. Widening the window would send ordinary text that mentions
+  `%PDF` near its top to the PDF decoder, which can fail the scan.
+- A NUL-bearing file whose previous version had no NUL bytes counts every
+  raw-byte text run as added, as before #270, even runs the previous version
+  already held (the previous version is read as plain text, as it was then).
 - Random binary data can contain the 4-byte zip end-of-central-directory
   record by chance; such a file fails the scan (the safe direction). The same
   holds for a 4-byte zip file header by chance in front of an appended zip.

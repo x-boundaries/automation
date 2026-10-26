@@ -5,8 +5,11 @@ at runtime from fragments, so the file never contains a literal real-looking
 value and the guard does not flag its own tests (proved by the self-scan test).
 """
 
+import collections
 import contextlib
+import difflib
 import gzip
+import html
 import importlib.util
 import io
 import os
@@ -19,6 +22,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import warnings
 import zipfile
 import zlib
 from pathlib import Path
@@ -71,6 +75,23 @@ def _zip_bytes(members, compression):
         for name, body in members.items():
             archive.writestr(name, body)
     return buffer.getvalue()
+
+
+def _zip_entries(members, compression):
+    """A zip from (name, body) pairs: repeated names allowed, fixed timestamps, so the bytes are repeatable."""
+    buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # zipfile warns on a repeated name
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, body in members:
+                archive.writestr(zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0)), body, compress_type=compression)
+    return buffer.getvalue()
+
+
+def _fullwidth_tail(value):
+    """``value`` with every digit after the first one fullwidth (U+FF10 to U+FF19)."""
+    first = re.search(r"\d", value).start() + 1
+    return value[:first] + re.sub(r"\d", lambda match: chr(0xFF10 + int(match.group())), value[first:])
 
 
 def _xlsx(cell, compression=zipfile.ZIP_DEFLATED):
@@ -1029,6 +1050,33 @@ class GitScanTests(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("notes.txt:3 email [redacted]", out)
 
+    def test_round_4_shapes_in_range_and_staged_modes(self):
+        # G2 W3 flags and G2 W4 fails closed in every git mode, as base flagged or failed.
+        clean = _zip_bytes({"readme.txt": "clean"}, zipfile.ZIP_DEFLATED)
+        bom = b"\xff\xfe" + ("tel " + _fullwidth_tail(_sg_local()) + "\r\n").encode("utf-16-le") + clean
+        lines = "\n".join("line %d" % index for index in range(9)) + "\nmail " + _email()
+        collide = _zip_entries([("a.xml (joined text)", lines), ("a.xml", "<a/>")], zipfile.ZIP_DEFLATED)
+        for name, data, expected in (("w3.zip", _zip_bytes({"n.txt": bom}, zipfile.ZIP_DEFLATED), 1), ("w4.zip", collide, 2)):
+            with self.subTest(name=name):
+                start = self.rev("HEAD")
+                (self.repo / name).write_bytes(data)
+                self.git("add", "--", name)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.run_main("--staged")[0], expected)
+                self.git("commit", "-q", "-m", name)
+                self.assertEqual(self.range_code(start)[0], expected)
+
+    def test_text_parent_runs_do_not_hide_new_binary_runs(self):
+        # #270 round 4 fuzz: base read a NUL-free PDF parent as text only, so when the file
+        # gains a NUL byte every run of the new blob counts as added, as it did in base.
+        line = "BT (contact " + _email() + ") Tj ET"
+        self.commit_bytes("scan.pdf", _pdf((b"<< /Length 9 >>", line.encode("ascii"))))
+        start = self.rev("HEAD")
+        self.commit_bytes("scan.pdf", _pdf((b"<< /Length 9 >>", line.encode("ascii")), (b"<< /Length 2 >>", b"\x00\x01")))
+        code, out, _ = self.range_code(start)
+        self.assertEqual(code, 1, out)
+        self.assertIn("scan.pdf (text runs):", out)
+
 
 class BinaryFormatTests(unittest.TestCase):
     """#270: formats whose raw bytes hide text, checked through blob_documents."""
@@ -1330,6 +1378,320 @@ class BinaryFormatTests(unittest.TestCase):
         content = zlib.compress(("BT (contact " + _email() + ") Tj ET").encode("ascii"))
         bundle = _zip_bytes({"x.pdf": b"\n" + _pdf((b"<< /Filter /FlateDecode >>", content))}, zipfile.ZIP_DEFLATED)
         self.assertIn(("bundle.zip!x.pdf (deflated streams)", "email"), self.hits("bundle.zip", bundle))
+
+    # #270 round 4: the last two regressions against base found by G2 recheck 2.
+
+    def test_bom_text_member_with_an_appended_zip_keeps_its_text(self):
+        # G2 W3: base's Unicode \d reads fullwidth digits in the decoded text; the raw-byte runs never do.
+        clean = _zip_bytes({"readme.txt": "clean"}, zipfile.ZIP_DEFLATED)
+        line = "tel " + _fullwidth_tail(_sg_local()) + "\r\n"
+        for bom, encoding in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"), (b"\xef\xbb\xbf", "utf-8")):
+            member = bom + ("clean\r\n" + line).encode(encoding) + clean
+            for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                with self.subTest(encoding=encoding, compression=compression):
+                    bundle = _zip_bytes({"n.txt": member}, compression)
+                    self.assertIn(("bundle.zip!n.txt", "sg_phone_local"), self.hits("bundle.zip", bundle))
+        nested = _zip_bytes({"inner.zip": _zip_bytes({"n.txt": b"\xff\xfe" + line.encode("utf-16-le") + clean}, zipfile.ZIP_DEFLATED)}, zipfile.ZIP_STORED)
+        self.assertIn(("outer.zip!inner.zip!n.txt", "sg_phone_local"), self.hits("outer.zip", nested))
+
+    def test_duplicate_document_names_fail_closed(self):
+        # G2 W4: added lines are matched per document name, so a second document with the
+        # same name hid (or crashed on) the first one's lines; base had the same gap.
+        clean = "\n".join("line %d" % index for index in range(9))
+        content = zlib.compress(("BT (contact " + _email() + ") Tj ET").encode("ascii"))
+        png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(64))
+        book = _cfb({"Workbook": _workbook(_rk(17))})
+        cases = {
+            "joined": [("a.xml (joined text)", clean + "\nmail " + _email()), ("a.xml", "<a/>")],
+            "deflated": [("a.pdf (deflated streams)", clean + "\nmail " + _email()), ("a.pdf", _pdf((b"<< /Filter /FlateDecode >>", content)))],
+            "cells": [("a.xls (numeric cells)", clean + "\nmail " + _email()), ("a.xls", book)],
+            "runs": [("a.bin (text runs)", clean + "\nmail " + _email()), ("a.bin", b"\xff\xfe" + "clean".encode("utf-16-le"))],
+            "bang": [("m!x", clean + "\nmail " + _email()), ("m", png + _zip_bytes({"x": "clean"}, zipfile.ZIP_DEFLATED))],
+            "repeat": [("a.txt", clean + "\nmail " + _email()), ("a.txt", "clean")],
+            "safe_name": [("a\x01.txt", clean + "\nmail " + _email()), ("a\x02.txt", "clean")],
+        }
+        for label, members in cases.items():
+            with self.subTest(label=label):
+                self.assert_fails_closed("bundle.zip", _zip_entries(members, zipfile.ZIP_DEFLATED))
+        # Distinct names that only share a prefix still scan.
+        bundle = _zip_entries([("a.xml (notes)", "mail " + _email()), ("a.xml", "<a/>")], zipfile.ZIP_DEFLATED)
+        self.assertIn(("bundle.zip!a.xml (notes)", "email"), self.hits("bundle.zip", bundle))
+
+
+# --------------------------------------------------------------------------- fuzz differential
+#
+# #270 pass bar (owner, round 4): over seeded random inputs, no input that main's scanner
+# from before #270 flags or fails closed may pass this scanner clean, in tree mode or in
+# range/staged mode (an added file, or a changed file against a parent blob). CI runs
+# FUZZ_CASES inputs; set PII_GUARD_FUZZ_CASES for a longer run (it prints the counts).
+
+BASE_COMMIT = "4a73583d596f1e8680b9fa3787bfc2c537397c82"
+FUZZ_SEED = int(os.environ.get("PII_GUARD_FUZZ_SEED", "270"))
+FUZZ_CASES = int(os.environ.get("PII_GUARD_FUZZ_CASES", "1000"))
+FUZZ_MODES = ("tree", "added", "changed")
+NULL_SHA, NEW_SHA, OLD_SHA = "0" * 40, "1" * 40, "2" * 40
+FUZZ_SEPARATORS = (" ", "-", ".", "", "\u00a0", "&nbsp;", "\u2013", "  ")
+FUZZ_SUFFIXES = (" (joined text)", " (deflated streams)", " (numeric cells)", " (text runs)")
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(64))
+
+
+def _load_base_scanner():
+    """main's scanner from before #270, or None when the checkout lacks that commit (shallow clone)."""
+    if not HAS_GIT:
+        return None
+    proc = subprocess.run(["git", "show", BASE_COMMIT + ":scripts/pii_guard.py"], cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pii_guard_base.py"
+        path.write_bytes(proc.stdout)
+        spec = importlib.util.spec_from_file_location("pii_guard_base", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    return module
+
+
+class _Fuzz:
+    """One input's structure from ``rng``; ``drop`` (a second Random, or None) removes some lines.
+
+    Rendering the same seed with and without ``drop`` gives a parent blob that shares the
+    structure but lacks some lines, so the added-line matching is exercised too.
+    """
+
+    def __init__(self, rng, drop):
+        self.rng, self.drop = rng, drop
+
+    def digits(self, count):
+        return "".join(self.rng.choice("0123456789") for _ in range(count))
+
+    def value(self):
+        rng, sep = self.rng, self.rng.choice(FUZZ_SEPARATORS)
+        kind = rng.randrange(9)
+        if kind == 0:
+            value = rng.choice("689") + self.digits(3) + sep + self.digits(4)
+        elif kind == 1:
+            value = rng.choice(("+", "(+", "(")) + "6" + "5" + rng.choice((")", "")) + sep + rng.choice("3689") + self.digits(3) + sep + self.digits(4)
+        elif kind == 2:
+            value = "6" + "5" + sep + rng.choice("3689") + self.digits(3) + sep + self.digits(4)
+        elif kind == 3:
+            value = "+" + rng.choice("123456789") + "".join(sep + rng.choice(("", "(0)")) + self.digits(rng.randint(1, 5)) for _ in range(rng.randint(1, 7)))
+        elif kind == 4:
+            value = rng.choice(("pat.lee", "ops", "a_b")) + AT + rng.choice(("synthetic-mail", "mail.host")) + "." + rng.choice(("sg", "com", "net"))
+        elif kind == 5:
+            value = rng.choice(("name", "ops")) + AT + rng.choice(("example.com", "example.org", "sub.example.com"))
+        elif kind == 6:
+            value = "20" + self.digits(2) + sep + self.digits(2) + sep + self.digits(2)
+        elif kind == 7:
+            value = "".join(rng.choice("0123456789abcdef") for _ in range(rng.randint(8, 40)))
+        else:
+            value = self.digits(rng.randint(7, 17))
+        if rng.random() < 0.25 and re.search(r"\d", value):
+            value = _fullwidth_tail(value) if rng.random() < 0.7 else re.sub(r"\d", lambda match: chr(0xFF10 + int(match.group())), value)
+        if rng.random() < 0.1:
+            value += " pii-guard: allow (fuzz)"
+        return rng.choice(("", "tel ", "id ", "(", "x", "<", "+")) + value + rng.choice(("", " ok", ")", ".", ".5", "1", "-", "/"))
+
+    def lines(self):
+        out = []
+        for index in range(self.rng.randint(1, 6)):
+            line = self.value() if self.rng.random() < 0.6 else "line %d" % index
+            if self.drop is None or self.drop.random() >= 0.3:
+                out.append(line)
+        return out
+
+    def text(self, newline="\n"):
+        return newline.join(self.lines()) + self.rng.choice(("", newline))
+
+    def bom_text(self):
+        bom, encoding = self.rng.choice(((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"), (b"\xef\xbb\xbf", "utf-8")))
+        return bom + self.text(self.rng.choice(("\n", "\r\n"))).encode(encoding)
+
+    def xml(self):
+        paragraphs = []
+        for line in self.lines():
+            cuts = sorted(self.rng.sample(range(len(line) + 1), min(len(line) + 1, self.rng.randint(0, 3))))
+            parts = [line[start:end] for start, end in zip([0] + cuts, cuts + [len(line)])]
+            props = self.rng.choice(("", "<w:rPr><w:b/></w:rPr>", "<w:rPr><w:rPrChange><w:rPr/></w:rPrChange></w:rPr>"))
+            paragraphs.append("<w:p>" + "".join("<w:r>%s<w:t>%s</w:t></w:r>" % (props, html.escape(part)) for part in parts) + "</w:p>")
+        return '<?xml version="1.0"?><w:document><w:body>' + "".join(paragraphs) + "</w:body></w:document>"
+
+    def pdf(self):
+        rng, objects = self.rng, [(b"<< /Type /Catalog >>", None)]
+        for line in self.lines():
+            content = ("BT (" + line + ") Tj ET").encode("utf-8")
+            style = rng.choice((0, 0, 0, 0, 0, 0, 1, 2, 3, 3, 4, 4))
+            if style == 0:
+                objects.append((b"<< /Filter /FlateDecode >>", zlib.compress(content)))
+            elif style == 1:
+                raw = zlib.compressobj(wbits=-15)
+                objects.append((b"<< /Filter /FlateDecode >>", raw.compress(content) + raw.flush()))
+            elif style == 2:
+                good = zlib.compress(content)
+                objects.append((rng.choice((b"<< /Filter /FlateDecode >>", b"<< /Filter % c\n/FlateDecode >>")), good[:-4] + bytes(byte ^ 0xFF for byte in good[-4:])))
+            elif style == 3:
+                objects.append((b"<< /Length 9 >>", content))
+            else:
+                objects.append((b"<< /Author (" + line.encode("utf-8") + b") >>", None))
+        data = b"\n" * rng.choice((0, 0, 0, 1, 1000, 1100)) + _pdf(*objects)
+        if rng.random() < 0.05:
+            data = data.replace(b"<< /Root 1 0 R >>", b"<< /Root 1 0 R /Encrypt 3 0 R >>")
+        return data
+
+    def workbook(self):
+        values = [int(line) for line in (re.sub(r"\D", "", self.value())[:15] for _ in range(self.rng.randint(1, 4))) if line]
+        records = [_rk(value) if value < 2**29 and self.rng.random() < 0.5 else _number(float(value)) for value in values]
+        if self.drop is not None:
+            records = [record for record in records if self.drop.random() >= 0.3]
+        return _cfb({"Workbook": _workbook(*records)})
+
+    def member_name(self, kind, names):
+        rng = self.rng
+        roll = rng.random()
+        if names and roll < 0.08:
+            return rng.choice(names)  # repeated name
+        if names and roll < 0.18:
+            return rng.choice(names) + rng.choice(FUZZ_SUFFIXES + ("!x", "!readme.txt"))
+        if roll < 0.21:
+            return "n" + rng.choice(("\x01", "\x02", "\n")) + ".txt"
+        stems = ("a", "b", "m", "word/document")
+        extension = {"text": ".txt", "bom": ".txt", "xml": ".xml", "pdf": ".pdf", "xls": ".xls", "zip": ".zip", "png": ".png", "gzip": ".gz"}[kind]
+        if roll < 0.31:
+            # A name a later member's document may also carry: a suffixed name or a ``!`` path.
+            other = rng.choice(stems) + rng.choice((".xml", ".pdf", ".xls", ".png", ".txt"))
+            return other + rng.choice(FUZZ_SUFFIXES + ("!" + rng.choice(stems) + ".txt",))
+        return rng.choice(stems) + (extension if rng.random() < 0.9 else ".bin")
+
+    def body(self, kind, depth):
+        if kind == "text":
+            return self.text().encode("utf-8")
+        if kind == "bom":
+            return self.bom_text()
+        if kind == "xml":
+            return self.xml().encode("utf-8")
+        if kind == "pdf":
+            return self.pdf()
+        if kind == "xls":
+            return self.workbook()
+        if kind == "zip":
+            return self.zip(depth + 1)
+        if kind == "png":
+            return PNG + self.zip(depth + 1)
+        return gzip.compress(self.text().encode("utf-8"), mtime=0)
+
+    def zip(self, depth):
+        kinds = ("text", "bom", "bom", "xml", "pdf", "xls") + (("zip", "png") if depth < 3 else ())
+        members, names = [], []
+        for _ in range(self.rng.randint(1, 4)):
+            kind = self.rng.choice(kinds) if self.rng.random() < 0.97 else "gzip"
+            name = self.member_name(kind, names)
+            names.append(name)
+            data = self.body(kind, depth)
+            if self.rng.random() < (0.4 if kind == "bom" else 0.15) and depth < 3:
+                # An appended zip, often clean so it cannot mask what the member's own documents miss.
+                data += self.zip(depth + 1) if self.rng.random() < 0.5 else _zip_entries([("readme.txt", "clean")], zipfile.ZIP_DEFLATED)
+            members.append((name, data))
+        return _zip_entries(members, self.rng.choice((zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)))
+
+    def blob(self):
+        """(path, bytes) for one top-level file."""
+        rng = self.rng
+        kind = rng.randrange(10)
+        if kind == 0:
+            return rng.choice(("notes.md", "a.xml", "data.csv")), self.text().encode("utf-8")
+        if kind == 1:
+            data = self.bom_text()
+            return "notes.txt", data + (self.zip(1) if rng.random() < 0.4 else b"")
+        if kind in (2, 3):
+            return rng.choice(("bundle.zip", "report.docx", "sheet.xlsx", "zip.bin")), self.zip(1)
+        if kind == 4:
+            return "report.docx", _zip_entries([("word/document.xml", self.xml())], zipfile.ZIP_DEFLATED)
+        if kind == 5:
+            data = self.pdf()
+            return ("scan.pdf" if data.startswith(b"%PDF") else "scan.bin"), data
+        if kind == 6:
+            return "book.xls", self.workbook()
+        if kind == 7:
+            return "image.png", PNG + self.zip(1)
+        if kind == 8:
+            return "letter.doc", OLE2 + b"\x00\x00" + self.text().encode("utf-16-le") + b"\x00\x00"
+        return "notes.txt", self.text().encode("utf-8") + (self.zip(1) if rng.random() < 0.5 else b"")
+
+
+def _fuzz_case(seed):
+    """(path, new blob, parent blob) for one seed; the parent drops some of the new blob's lines."""
+    path, new = _Fuzz(random.Random(seed), None).blob()
+    _, old = _Fuzz(random.Random(seed), random.Random(seed + 1)).blob()
+    return path, new, old
+
+
+def _fuzz_outcomes(g, allow, path, new, old):
+    """Per mode, ("fail", error class) or ("hits", frozenset of (kind, value)), the way main() would end."""
+    blobs = {NEW_SHA: new, OLD_SHA: old}
+    outcomes = {}
+    for mode in FUZZ_MODES:
+        try:
+            if mode == "tree":
+                if g.needs_blob_scan(path, new):
+                    hits = {(item.kind, item.value) for item in g._scan_documents("t", g.blob_documents(path, new), allow)}
+                else:
+                    hits = {hit for line in g._text(new).splitlines() for hit in g.scan_line(line, allow)}
+            else:
+                parent = NULL_SHA if mode == "added" else OLD_SHA
+                with mock.patch.object(g, "_read_blobs", lambda shas, cwd: {sha: blobs[sha] for sha in shas}):
+                    handled, found = g._blob_findings([(path, NEW_SHA, [parent])], "t", None, allow)
+                hits = {(item.kind, item.value) for item in found}
+                if path not in handled:
+                    # git diffs a NUL-free blob as text: scan the lines it reports as added.
+                    before = [] if mode == "added" else g._text(old).splitlines()
+                    after = g._text(new).splitlines()
+                    for tag, _, _, j1, j2 in difflib.SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
+                        if tag in ("insert", "replace"):
+                            hits.update(hit for line in after[j1:j2] for hit in g.scan_line(line, allow))
+            outcomes[mode] = ("hits", frozenset(hits))
+        except Exception as exc:  # main() ends non-zero on any error: GuardError (exit 2) or a traceback
+            outcomes[mode] = ("fail", exc.__class__.__name__)
+    return outcomes
+
+
+def _fuzz_differential(head, base, count, seed=FUZZ_SEED):
+    """Counts over ``count`` inputs, with the inputs where base flags or fails and head passes clean."""
+    head_allow, base_allow = head.load_allowlist(ALLOWLIST), base.load_allowlist(ALLOWLIST)
+    stats = collections.Counter()
+    regressions, crashes = [], []
+    for case in range(count):
+        path, new, old = _fuzz_case(seed * 100003 + case)
+        head_out = _fuzz_outcomes(head, head_allow, path, new, old)
+        base_out = _fuzz_outcomes(base, base_allow, path, new, old)
+        stats["inputs"] += 1
+        for mode in FUZZ_MODES:
+            ours, theirs = head_out[mode], base_out[mode]
+            stats["base " + ("fails" if theirs[0] == "fail" else "flags" if theirs[1] else "clean")] += 1
+            stats["head " + ("fails" if ours[0] == "fail" else "flags" if ours[1] else "clean")] += 1
+            if ours[0] == "fail" and ours[1] != "GuardError":
+                crashes.append((case, mode, path, ours[1]))
+            if (theirs[0] == "fail" or theirs[1]) and ours == ("hits", frozenset()):
+                regressions.append((case, mode, path, theirs))
+            elif theirs[0] == "hits" and ours[0] == "hits" and not theirs[1] <= ours[1]:
+                stats["base value not in head (both flag)"] += 1
+    return stats, regressions, crashes
+
+
+class FuzzDifferentialTests(unittest.TestCase):
+    def test_no_input_main_flags_or_fails_passes_clean(self):
+        base = _load_base_scanner()
+        if base is None:
+            # Shallow CI checkouts lack main's commit; the pii-guard job fetches full history.
+            if os.environ.get("GITHUB_WORKFLOW") == "pii-guard":
+                self.fail("commit %s is missing from the pii-guard checkout" % BASE_COMMIT)
+            self.skipTest("main's scanner (%s) is not in this checkout" % BASE_COMMIT[:7])
+        stats, regressions, crashes = _fuzz_differential(_load_scanner(), base, FUZZ_CASES)
+        if "PII_GUARD_FUZZ_CASES" in os.environ:
+            sys.stderr.write("\nfuzz differential (seed %d): %s\n" % (FUZZ_SEED, dict(sorted(stats.items()))))
+        self.assertEqual(regressions, [])
+        self.assertEqual(crashes, [])
+        # The inputs must reach every outcome, or the comparison proves nothing.
+        for outcome in ("base flags", "base fails", "base clean"):
+            self.assertGreater(stats[outcome], 0, outcome)
 
 
 class SelfScanTests(unittest.TestCase):
