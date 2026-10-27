@@ -48,6 +48,7 @@ MEMBER_GATEWAY_TARGETED_JOBS = {
         "test_member_directlocal_poller",
         "test_directlocal_e7_testbook_ps",
         "test_directlocal_code_custody_ps",
+        "test_member_sync_bridge_ps",
     ),
     "powershell-worker-tooling": ("test_member_gateway_worker_deployment",),
     "bounded-import-security": (

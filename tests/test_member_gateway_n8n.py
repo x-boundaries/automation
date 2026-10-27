@@ -164,8 +164,18 @@ class MemberGatewayN8nTests(unittest.TestCase):
                 # contain "8123" by chance. Pin their opaque shapes, then scan the remaining fields.
                 self.assertRegex(body["request_id"], r"^n8n-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
                 self.assertRegex(body["payload_hash"], r"^sha256:[0-9a-f]{64}$")
+                # N1/N2 (#270): every case's own phone value, not only the base answers. The opaque
+                # fields are checked for whole values only (8+ digits, name, email): a shorter
+                # fragment could appear in random hex by chance.
+                phones = (base["phone"], supplied["phone"])
+                full = {"Synthetic Alpha", "alpha@example.test"}
+                full.update(digits for digits in (re.sub(r"\D", "", phone) for phone in phones) if len(digits) >= 8)
+                for opaque in (body["request_id"], body["payload_hash"]):
+                    for private in full:
+                        self.assertNotIn(private, opaque)
                 serialized = json.dumps({key: value for key, value in body.items() if key not in ("request_id", "payload_hash")}, ensure_ascii=False)
-                for private in ("Synthetic Alpha", "alpha@example.test", "8123"):
+                partial = {"8123"} | {phone.strip() for phone in phones if phone.strip()} | {re.sub(r"\D", "", phone) for phone in phones if re.search(r"\d", phone)}
+                for private in full | partial:
                     self.assertNotIn(private, serialized)
                 self.assertEqual(output["open"]["items"], [{"response_id": body["response_id"], "create_time": body["create_time"], "payload_hash": body["payload_hash"]}])
 

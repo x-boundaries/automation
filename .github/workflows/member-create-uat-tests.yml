@@ -90,6 +90,16 @@ on:
       - "config/autocount_stock_balance_hourly.example.json"
       - "docs/autocount2-automation/stock_balance_hourly_runbook.md"
       - "sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql"
+      # Weekly read-only Drive mirror of main (#273). The Windows job's full-repository suite
+      # exercises tests/test_mirror_main_to_drive.py (offline, temp folders and a local
+      # throwaway git repo only), so a pull request confined to the mirror script, its
+      # installer, example settings, test or runbook must still trigger this workflow.
+      # Exact entries, not globs.
+      - "scripts/mirror_main_to_drive.py"
+      - "scripts/install_mirror_main_to_drive_task.ps1"
+      - "config/mirror_main_to_drive.example.json"
+      - "tests/test_mirror_main_to_drive.py"
+      - "docs/drive_mirror_runbook.md"
   workflow_dispatch: {}
 
 jobs:

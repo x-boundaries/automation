@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to config/mirror_main_to_drive.local.json (gitignored) and replace the placeholder folders. See docs/drive_mirror_runbook.md.",
+  "repo_url": "https://github.com/x-boundaries/automation.git",
+  "branch": "main",
+  "cache_dir": "C:\\XB\\drive_mirror\\cache",
+  "target_dir": "G:\\My Drive\\REPLACE-WITH-MIRROR-FOLDER",
+  "log_dir": "C:\\XB\\drive_mirror\\logs"
+}
