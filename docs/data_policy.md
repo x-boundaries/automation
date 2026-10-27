@@ -216,6 +216,16 @@ Known limits (accepted, #270):
 - A NUL-bearing file whose previous version had no NUL bytes counts every
   raw-byte text run as added, as before #270, even runs the previous version
   already held (the previous version is read as plain text, as it was then).
+- A value already in the previous version of a file may not be reported again
+  (#270 G2 R4-A, R4-B) in two cases. (1) It moves among a binary file's raw
+  text runs that hold a no-break-space byte. (2) The previous version held it
+  where only the #270 decoders read it (an appended zip, Office XML runs, PDF
+  streams or `.xls` cells), and the new version holds it in a document with
+  the same name. The scanner before #270 reported these as added.
+- The committed fuzz harness (#270 G2 H1) builds a changed file's previous
+  version only by dropping lines, so it does not generate reordered or moved
+  content, member kind changes or two-parent merges. Its zero-differential
+  result is scoped to the shapes it generates.
 - Random binary data can contain the 4-byte zip end-of-central-directory
   record by chance; such a file fails the scan (the safe direction). The same
   holds for a 4-byte zip file header by chance in front of an appended zip.
