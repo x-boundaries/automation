@@ -31,6 +31,8 @@ Before relying on a check against real data, run it on a synthetic baseline with
 
 ## Personal-Data Guard
 
+Local adaptation: the guard described in this section is not installed here. This repository uses `scripts/pii_guard.py` (`--staged` through the opt-in `.githooks/pre-commit`, `--range` in the required `pii-guard` CI job) with `config/pii_guard_allowlist.json` and the `pii-guard: allow (<reason>)` marker. CI uses the pull request head's allowlist and does not scan pull request titles or bodies, so check allowlist, guard and test changes and the title and body by hand.
+
 The `secure-ci-cd` skill ships a zero-dependency guard (`skills/secure-ci-cd/scripts/personal-data-guard.cjs`) for email addresses, phone numbers and WhatsApp number links. It checks file content (including `.docx`, `.xlsx`, `.pptx` and PDF text), file names, commit and tag messages, branch names and pull request text, and never prints a value. Pull request titles and bodies are also checked for real home-folder paths and for AI attribution (claude.ai session and project-thread links, "Generated with" footers, the Projects attribution marker); a repository that wants attribution sets `scope.pull_request_attribution` to `false`. The CI template runs again when a pull request's title or body is edited.
 
 - Install it only on the owner's opt-in: `node <toolkit>/skills/secure-ci-cd/scripts/install-personal-data-guard.cjs --repo <repo> --identity <excluded|included> [--identity-reason <text>] --workflow`. It copies the guard to `.github/scripts/`, writes `.github/personal-data-guard.json`, and installs `pre-commit`, `commit-msg` and `pre-push` hooks in the folder git really uses (`core.hooksPath` included), keeping any existing hook. `--check` reports drift.

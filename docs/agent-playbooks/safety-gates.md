@@ -118,7 +118,7 @@ The owner answered a card with a standing OK: on one computer, agents may replac
 ## History Rewrites
 
 - In a Toolkit-governed or personal-data-guarded repository, and when pushing to an evidence store (a `TRANSPORT-*` repository), the Toolkit agent hooks refuse force pushes: `--force`, `-f`, `--force-with-lease`, `--mirror` and `+refspec`. Push a new commit or a merge commit instead. Branch rules on GitHub stay the real protection.
-- Local adaptation: Toolkit agent hooks are not installed in this repository; `AGENTS.md` still forbids history rewrites and skipping hooks.
+- Local adaptation: Toolkit agent hooks are not installed in this repository, so nothing here refuses a force push or `--no-verify` automatically. `AGENTS.md` Safety Gates require explicit current-turn approval before rewriting git history. The `main_protect` ruleset blocks force pushes and deletion on `main`, and the required `pii-guard` CI job is the backstop when a local hook is skipped.
 - Before concluding that history was rewritten, run `git rev-parse --is-shallow-repository`. A shallow clone shows its oldest fetched commit as a root and `git fetch` can print `(forced update)` for a plain fast-forward. Fetch full history first (`git fetch --unshallow`), or ask GitHub to compare the two commits, and only then check ancestry.
 
 ## Reporting
