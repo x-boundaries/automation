@@ -8,6 +8,7 @@ Use this for requested repo edits that should be committed, pushed, opened as a 
 - Run the smallest relevant local validation before committing.
 - Do not push task/product source to `main`.
 - Evidence custody follows the managed `AGENTS.md` evidence-store line: the user-selected private store, separate from the task repository, is agent-managed once its identity and privacy are verified, with the secret scan, read-back, the sole-copy rule and all safety, privacy and native denial limits. A repository name or prefix alone grants no authority.
+- Local adaptation for this repository: the `AGENTS.md` Git Completion section applies; it has no evidence-store line, so evidence custody needs owner authority that binds the repository, effect, ref, paths and content.
 - Keep commits scoped to the requested change.
 - Push and open or update the PR unless the user asked for local-only or no-push work.
 - Check PR CI/status when accessible.

@@ -4,6 +4,8 @@ Use this when a task may affect live systems, credentials, secrets, customer/pri
 
 ## Approval Rule
 
+Local adaptation for this repository: while `AGENTS.md` keeps its v1 rules, its Safety Gates and Git Completion sections apply instead of this section: explicit current-turn approval naming the target and operation is required; earlier approval does not carry forward; this repository's `AGENTS.md` has no evidence-store line, so no standing evidence-store approval applies.
+
 Before a risky action, verify that explicit approval is bound to the exact action and remains valid; request fresh approval when the scope does not cover the action or is revoked, expired, or unresolved.
 
 The evidence-store line in the managed `AGENTS.md` is the standing approval for that store: writes, deletions and merges there need no further approval.
@@ -116,6 +118,7 @@ The owner answered a card with a standing OK: on one computer, agents may replac
 ## History Rewrites
 
 - In a Toolkit-governed or personal-data-guarded repository, and when pushing to an evidence store (a `TRANSPORT-*` repository), the Toolkit agent hooks refuse force pushes: `--force`, `-f`, `--force-with-lease`, `--mirror` and `+refspec`. Push a new commit or a merge commit instead. Branch rules on GitHub stay the real protection.
+- Local adaptation: Toolkit agent hooks are not installed in this repository; `AGENTS.md` still forbids history rewrites and skipping hooks.
 - Before concluding that history was rewritten, run `git rev-parse --is-shallow-repository`. A shallow clone shows its oldest fetched commit as a root and `git fetch` can print `(forced update)` for a plain fast-forward. Fetch full history first (`git fetch --unshallow`), or ask GitHub to compare the two commits, and only then check ancestry.
 
 ## Reporting

@@ -35,11 +35,13 @@ The `secure-ci-cd` skill ships a zero-dependency guard (`skills/secure-ci-cd/scr
 
 - Install it only on the owner's opt-in: `node <toolkit>/skills/secure-ci-cd/scripts/install-personal-data-guard.cjs --repo <repo> --identity <excluded|included> [--identity-reason <text>] --workflow`. It copies the guard to `.github/scripts/`, writes `.github/personal-data-guard.json`, and installs `pre-commit`, `commit-msg` and `pre-push` hooks in the folder git really uses (`core.hooksPath` included), keeping any existing hook. `--check` reports drift.
 - Local hooks can be skipped with `--no-verify`. In a governed or guarded repository the Toolkit agent hooks refuse an agent's `git commit -n` or `--no-verify`, `git push --no-verify` and a changed `core.hooksPath`, but a person, a script or an alias can still skip them. The CI job is the backstop; make it part of a required check.
+- Local adaptation: Toolkit agent hooks are not installed in this repository.
 - In CI and in a reviewer's range check, a change cannot switch off scope or identity checks for itself: the base commit's config applies until the change is merged, and allow or `not_scanned` entries the change adds are named in the report. Review those notes like any other finding.
 - Allow a public role address (`security@`, `noreply@` and similar) in the config `allow` list. Anything else needs a line-level `personal-data-guard: allow <reason>` marker, which every run counts. Content the guard cannot read (images, legacy Office files, archives) blocks unless the config lists its path with a reason, and every run prints that list.
 
 ## Review
 
 - Check every commit in the pull request range plus its title and body, not only the final diff: `node .github/scripts/personal-data-guard.cjs range <base>..<head>` and `pr`. A value added in one commit and removed in a later one is still public once pushed.
+- Local adaptation: this repository's guard is `python scripts/pii_guard.py --range` and the `pii-guard` CI job (`scan-pr-commits`); the Node script is not present.
 - A claim that data stayed in place needs the computation location verified (the query and where it ran), not just an output that looks aggregated.
 - If personal data was pushed, follow the incident steps in [Safety gates](safety-gates.md).
