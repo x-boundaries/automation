@@ -33,11 +33,16 @@ on:
       - "scripts/launch_ac2_member_gateway_worker.ps1"
       - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
       - "scripts/ac2_directlocal_member_bridge.ps1"
+      - "scripts/ac2_member_sync_member.ps1"
       - "scripts/directlocal_connector_hook.py"
       - "config/directlocal_claude_settings.template.json"
       - "tests/test_directlocal_bridge_ps.py"
       - "tests/test_member_directlocal.py"
       - "tests/test_member_directlocal_poller.py"
+      - "tests/test_member_sync.py"
+      - "tests/test_member_sync_bridge_ps.py"
+      - "config/member_sync.example.json"
+      - "docs/autocount2-automation/member_sync_phase1.md"
       - "config/directlocal_shopify_poller.example.json"
       - "config/directlocal_shopify_poller.task.template.xml"
       - "docs/autocount2-automation/member_directlocal_shopify_poller.md"
@@ -115,11 +120,16 @@ on:
       - "scripts/launch_ac2_member_gateway_worker.ps1"
       - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
       - "scripts/ac2_directlocal_member_bridge.ps1"
+      - "scripts/ac2_member_sync_member.ps1"
       - "scripts/directlocal_connector_hook.py"
       - "config/directlocal_claude_settings.template.json"
       - "tests/test_directlocal_bridge_ps.py"
       - "tests/test_member_directlocal.py"
       - "tests/test_member_directlocal_poller.py"
+      - "tests/test_member_sync.py"
+      - "tests/test_member_sync_bridge_ps.py"
+      - "config/member_sync.example.json"
+      - "docs/autocount2-automation/member_sync_phase1.md"
       - "config/directlocal_shopify_poller.example.json"
       - "config/directlocal_shopify_poller.task.template.xml"
       - "docs/autocount2-automation/member_directlocal_shopify_poller.md"
@@ -206,7 +216,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore tests.test_member_directlocal_poller -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore tests.test_member_directlocal_poller tests.test_member_sync -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD
@@ -245,6 +255,7 @@ jobs:
           tests.test_member_directlocal_poller
           tests.test_directlocal_e7_testbook_ps
           tests.test_directlocal_code_custody_ps
+          tests.test_member_sync_bridge_ps
 
   powershell-worker-tooling:
     # The worker tooling module is the largest single module, so it runs in its own
