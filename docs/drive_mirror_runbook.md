@@ -79,9 +79,17 @@ three. Keys starting with `_` are treated as comments.
 7. Open `_MIRROR_INFO.txt` in the Drive folder. Check that `commit:` matches the newest commit on
    GitHub `main` and that the files are there.
 8. With a separate owner OK, register the weekly task (fill in the real python path and user):
-   `powershell -NoProfile -File scripts\install_mirror_main_to_drive_task.ps1 -PythonExe "C:\path\to\python.exe" -UserId "PC-NAME\user-name"`
+   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_mirror_main_to_drive_task.ps1 -PythonExe "C:\path\to\python.exe" -UserId "PC-NAME\user-name" -DryRun`
+   The dry run checks everything and prints the task it would register, then stops: nothing is
+   registered. If it looks right, run the same command again without `-DryRun`.
+   `-ExecutionPolicy Bypass` applies to this one command only; it does not change the PC's
+   PowerShell settings (Windows blocks `.ps1` files when no policy is set).
+   The task goes in the `\XB\` folder of Task Scheduler. Use `-TaskPath "\Other\"` only if the
+   owner asks for another folder (it must start and end with `\`). The installer refuses if a
+   task with the same name is already in that folder.
    The task runs the script from the clone the installer is run from, so run it from a clone
-   that stays on `main` (not a working clone used for other branches).
+   that stays on `main` (not a working clone used for other branches); `-RepoRoot` is not
+   needed.
    The task runs only while that user is logged on, because Drive for desktop drive letters
    exist only in the signed-in session. If the PC was off or logged out on Sunday, it runs at
    the next logon.
@@ -128,7 +136,8 @@ local folder paths.
 
 ## How to stop it
 
-- **Pause:** open Task Scheduler, find `XB Drive Mirror of main (weekly)`, right-click, Disable.
+- **Pause:** open Task Scheduler, open the `XB` folder, find `XB Drive Mirror of main (weekly)`,
+  right-click, Disable.
 - **Remove:** right-click the task, Delete (owner OK needed). The Drive folder stays as it is.
 - **Stop it touching a folder at once:** delete the `.xb-mirror-target` marker from the Drive
   folder. Every later run then refuses with `TARGET_GUARD` and changes nothing, and a run that

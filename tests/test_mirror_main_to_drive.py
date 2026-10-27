@@ -919,6 +919,72 @@ class StaticFileTests(unittest.TestCase):
             data = path.read_bytes()
             self.assertTrue(all(byte < 128 for byte in data), path.name)
 
+    def test_installer_repo_root_and_task_path(self):
+        # $PSScriptRoot is empty in param() defaults under Windows PowerShell 5.1, so the
+        # repo root must be worked out in the body; the task goes in \XB\ by default.
+        self.assertRegex(self.code, r'\[string\]\$RepoRoot = ""\s*,')
+        self.assertNotRegex(self.code, r"param\([^)]*\$PSScriptRoot")
+        self.assertRegex(self.code, r'\[string\]\$TaskPath = "\\XB\\"\s*,')
+        self.assertIn("Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath", self.code)
+        self.assertIn("-TaskPath $TaskPath `", self.code)
+        self.assertLess(self.code.index("if ($DryRun)"), self.code.index("Register-ScheduledTask `"))
+
+
+class InstallerPowerShell51Tests(unittest.TestCase):
+    """Runs the installer under Windows PowerShell 5.1 with -File and -DryRun.
+
+    -DryRun stops before Register-ScheduledTask, and the task name is a test-only name, so
+    nothing is ever registered. Fake user name only.
+    """
+
+    TASK_NAME = "XB mirror installer test (never registered)"
+
+    def setUp(self):
+        if os.name != "nt":
+            self.skipTest("Windows PowerShell 5.1 runs only on Windows")
+        self.shell = shutil.which("powershell")
+        if self.shell is None:
+            self.skipTest("Windows PowerShell is not installed")
+
+    def run_installer(self, *extra):
+        args = [self.shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", str(INSTALLER), "-PythonExe", sys.executable,
+                "-UserId", "EXAMPLE-PC\\example-user", "-TaskName", self.TASK_NAME,
+                "-ConfigPath", str(EXAMPLE_CONFIG), "-DryRun", *extra]
+        done = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        return done.returncode, done.stdout + done.stderr
+
+    def test_runs_under_windows_powershell_5_1(self):
+        done = subprocess.run([self.shell, "-NoProfile", "-NonInteractive", "-Command",
+                               "$PSVersionTable.PSVersion.Major"],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.stdout.strip(), "5", done.stdout + done.stderr)
+
+    def test_dry_run_without_repo_root_finds_this_clone(self):
+        code, out = self.run_installer()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Dry run: would register \\XB\\" + self.TASK_NAME, out)
+        self.assertIn("Repo root: " + str(ROOT), out)
+        self.assertIn("Nothing was registered.", out)
+
+    def test_dry_run_with_empty_repo_root_finds_this_clone(self):
+        code, out = self.run_installer("-RepoRoot", "")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Repo root: " + str(ROOT), out)
+
+    def test_dry_run_accepts_nested_task_path(self):
+        code, out = self.run_installer("-TaskPath", "\\XB\\Drive mirror\\")
+        self.assertEqual(code, 0, out)
+        self.assertIn("would register \\XB\\Drive mirror\\" + self.TASK_NAME, out)
+
+    def test_bad_task_path_is_refused(self):
+        for bad in ("\\", "XB", "\\XB", "XB\\", "\\XB\\\\", "\\X;B\\", "\\..\\", "\\XB\\..\\"):
+            with self.subTest(task_path=bad):
+                code, out = self.run_installer("-TaskPath", bad)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("TaskPath must look like", out)
+                self.assertNotIn("Dry run:", out)
+
 
 if __name__ == "__main__":
     unittest.main()

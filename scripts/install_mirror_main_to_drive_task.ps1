@@ -12,9 +12,18 @@
 #   Drive for desktop drive letters exist only inside the signed-in user's session, so S4U
 #   or a service account would not see the Drive folder.
 # - Action: <PythonExe> "<RepoRoot>\scripts\mirror_main_to_drive.py" --config "<ConfigPath>"
+# - Task Scheduler folder: -TaskPath, default \XB\ (the company folder). It must start and end
+#   with a backslash and name at least one folder; letters, digits, spaces, _ and - only.
+# - RepoRoot defaults to the clone this script is in. It is worked out in the script body
+#   because Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults of a
+#   script with [Parameter()] attributes.
 #
-# It refuses to replace an existing task (no -Force). To change the task, remove it in
-# Task Scheduler first (see the runbook), then run this again with the owner's OK.
+# It refuses to replace an existing task with the same name in that folder (no -Force). To
+# change the task, remove it in Task Scheduler first (see the runbook), then run this again
+# with the owner's OK.
+#
+# -DryRun checks every argument and builds the task, prints what it would register, and stops
+# before Register-ScheduledTask. Nothing is registered. The tests use it.
 #
 # Example (fake user name):
 #   powershell -NoProfile -File scripts\install_mirror_main_to_drive_task.ps1 `
@@ -28,11 +37,20 @@ param(
     [string]$UserId,
 
     [string]$TaskName = "XB Drive Mirror of main (weekly)",
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [string]$ConfigPath = "config\mirror_main_to_drive.local.json"
+    [string]$TaskPath = "\XB\",
+    [string]$RepoRoot = "",
+    [string]$ConfigPath = "config\mirror_main_to_drive.local.json",
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($TaskPath -notmatch '^(\\[A-Za-z0-9_-][A-Za-z0-9 _-]*)+\\$') {
+    throw "TaskPath must look like \XB\ (start and end with a backslash; letters, digits, spaces, _ and - only)."
+}
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
 
 if (-not [System.IO.Path]::IsPathRooted($PythonExe)) {
     throw "PythonExe must be the full path to python.exe."
@@ -57,9 +75,9 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
 }
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$existing = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
 if ($null -ne $existing) {
-    throw "A scheduled task with this name already exists. Nothing was changed."
+    throw "A scheduled task with this name already exists in $TaskPath. Nothing was changed."
 }
 
 $startAt = (Get-Date).Date.AddHours(3)
@@ -75,14 +93,22 @@ $principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Limited
 
+if ($DryRun) {
+    Write-Host "Dry run: would register $TaskPath$TaskName"
+    Write-Host "Repo root: $RepoRoot"
+    Write-Host "Nothing was registered."
+    exit 0
+}
+
 Register-ScheduledTask `
     -TaskName $TaskName `
+    -TaskPath $TaskPath `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
     -Description "Weekly read-only copy of GitHub main into the marked company Drive folder (#273). Do not edit the Drive copy." | Out-Null
 
-Write-Host "Registered scheduled task: $TaskName"
+Write-Host "Registered scheduled task: $TaskPath$TaskName"
 Write-Host "Schedule: every Sunday at 03:00 local time; a missed run starts at next logon."
 Write-Host "Runs only when the named user is logged on."
