@@ -995,6 +995,17 @@ class LargeBalanceTests(TempDirTestCase):
         self.assertEqual((second["status"], second["failure_class"]), ("failed", "write_failed"))
         self.assertIsNone(second["large_balances"])
         self.assertIsNone(second["_last_run_status"]["large_balance_count"])
+        self.assertFalse([w for w in second["warnings"] if w.startswith("Large balance:")])
+
+    def test_failed_run_on_disk_drops_the_warning_line(self):
+        # G2 N10: a run that fails after the rows are built must not keep the warning line.
+        balances = default_balances() + [bal("FAKE-0403", "LOC-A", 300000)]
+        with mock.patch.object(hourly, "file_sha256", return_value="0" * 64):
+            manifest = run(settings_for(self.tmp), FakeSource(balances=balances))
+        self.assertEqual((manifest["status"], manifest["failure_class"]), ("failed", "write_failed"))
+        on_disk = self.on_disk(manifest)
+        self.assertIsNone(on_disk["large_balances"])
+        self.assertFalse([w for w in on_disk["warnings"] if w.startswith("Large balance:")])
 
     def test_latest_publish_failure_reports_no_count(self):
         balances = default_balances() + [bal("FAKE-0402", "LOC-A", 300000)]
@@ -1596,6 +1607,119 @@ class InstallerTests(unittest.TestCase):
         result = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_repo_root_is_worked_out_in_the_body(self):
+        # $PSScriptRoot is empty in param() defaults under Windows PowerShell 5.1 (VM step V7).
+        # The whole param(...) block is checked, so the old default fails this test.
+        block = re.search(r"^param\((.*?)^\)", self.text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(block)
+        self.assertNotIn("$PSScriptRoot", block.group(1))
+        self.assertRegex(block.group(1), r'\[string\]\$RepoRoot = ""\s*,')
+        body = self.text[block.end():]
+        self.assertIn("if ([string]::IsNullOrWhiteSpace($RepoRoot)) {", body)
+        self.assertIn('$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path', body)
+
+    def test_task_path_folder_and_root_warning(self):
+        self.assertRegex(self.text, r'\[string\]\$TaskPath = "\\XB\\"\s*,')
+        self.assertIn("$TaskPath -cnotmatch '\\A(", self.text)
+        self.assertIn(")+\\\\\\z'", self.text)
+        self.assertIn("Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue", self.text)
+        self.assertIn('Get-ScheduledTask -TaskName $TaskName -TaskPath "\\" -ErrorAction SilentlyContinue', self.text)
+        self.assertEqual(self.text.count("Register-ScheduledTask `"), 2)
+        self.assertEqual(self.text.count("-TaskPath $TaskPath `"), 2, "both registrations use the folder")
+
+    def test_dry_run_stops_before_prompt_and_register(self):
+        dry = self.text.index("if ($DryRun) {")
+        self.assertLess(self.text.index("--dry-run-config"), dry)
+        self.assertLess(dry, self.text.index("Get-Credential -UserName"))
+        self.assertLess(dry, self.text.index("Register-ScheduledTask `"))
+        self.assertIn("Nothing was registered.", self.text[dry:self.text.index("Register-ScheduledTask `")])
+
+
+class InstallerPowerShell51Tests(TempDirTestCase):
+    """Runs the installer under Windows PowerShell 5.1 with -File and -DryRun.
+
+    -DryRun stops before the password prompt and Register-ScheduledTask, and the task name is a
+    test-only name, so nothing is ever registered. A stub pyodbc module on PYTHONPATH stands in
+    for the driver (the installer only imports it). Fake user name and fake settings only.
+    """
+
+    PATH = ROOT / "scripts" / "install_autocount_stock_balance_hourly_task.ps1"
+    TASK_NAME = "XB AC2 installer test (never registered)"
+
+    def setUp(self):
+        super().setUp()
+        if os.name != "nt":
+            self.skipTest("Windows PowerShell 5.1 runs only on Windows")
+        self.shell = shutil.which("powershell")
+        if self.shell is None:
+            self.skipTest("Windows PowerShell is not installed")
+        stub = Path(self.tmp) / "stub"
+        stub.mkdir()
+        (stub / "pyodbc.py").write_text("# test stub: the installer only imports pyodbc\n", encoding="utf-8")
+        self.env = dict(os.environ, PYTHONPATH=str(stub))
+        self.config = self.write_config(raw_settings(self.tmp))
+
+    def write_config(self, raw, name="settings.local.json"):
+        path = Path(self.tmp) / name
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        return path
+
+    def run_installer(self, *extra, config=None):
+        args = [self.shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", str(self.PATH), "-UserId", "EXAMPLE-PC\\example-user",
+                "-ConfigPath", str(config or self.config), "-PythonExe", sys.executable,
+                "-TaskName", self.TASK_NAME, "-DryRun", *extra]
+        done = subprocess.run(args, capture_output=True, text=True, timeout=120, env=self.env, cwd=self.tmp)
+        return done.returncode, done.stdout + done.stderr
+
+    def test_runs_under_windows_powershell_5_1(self):
+        done = subprocess.run([self.shell, "-NoProfile", "-NonInteractive", "-Command",
+                               "$PSVersionTable.PSVersion.Major"],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.stdout.strip(), "5", done.stdout + done.stderr)
+
+    def test_dry_run_without_repo_root_finds_this_clone(self):
+        code, out = self.run_installer()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Dry run: would register \\XB\\" + self.TASK_NAME, out)
+        self.assertIn("Repo root: " + str(ROOT), out)
+        self.assertIn("LogonType S4U (windows_integrated)", out)
+        self.assertIn("Nothing was registered.", out)
+
+    def test_dry_run_with_empty_repo_root_finds_this_clone(self):
+        code, out = self.run_installer("-RepoRoot", "")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Repo root: " + str(ROOT), out)
+
+    def test_dry_run_password_pair_never_prompts(self):
+        # -NonInteractive makes Get-Credential fail, so exit 0 proves the dry run stops first.
+        config = self.write_config(raw_settings(
+            self.tmp,
+            identity={"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
+            schedule={"logon_type": "Password"},
+        ), name="sql.local.json")
+        code, out = self.run_installer(config=config)
+        self.assertEqual(code, 0, out)
+        self.assertIn("LogonType Password (sql_login)", out)
+        self.assertIn("Nothing was registered.", out)
+
+    def test_dry_run_accepts_other_task_paths(self):
+        for good in ("\\XB\\Stock export\\", "\\Other\\", "\\X-B_1\\"):
+            with self.subTest(task_path=good):
+                code, out = self.run_installer("-TaskPath", good)
+                self.assertEqual(code, 0, out)
+                self.assertIn("would register " + good + self.TASK_NAME, out)
+
+    def test_bad_task_path_is_refused(self):
+        bad_paths = ("", "\\", "XB", "\\XB", "XB\\", "\\XB\\\\", "\\X;B\\", "\\..\\", "\\XB\\..\\",
+                     "\\XB/\\", "\\ XB\\", "\\XB \\", "\\XB\\\n", "\\XB\\\t", "\\K\\")
+        for bad in bad_paths:
+            with self.subTest(task_path=bad):
+                code, out = self.run_installer("-TaskPath", bad)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("TaskPath must look like", out)
+                self.assertNotIn("Dry run:", out)
 
 
 class RepoHygieneTests(unittest.TestCase):

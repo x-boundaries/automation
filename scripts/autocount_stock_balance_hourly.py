@@ -18,7 +18,9 @@ Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md)
   re-reads to the hash that was written.
 * Every outcome writes a manifest. A failed run writes no CSV and never touches the latest pair.
 * Passwords only come from Windows Credential Manager at runtime. Connection strings, logins,
-  host names and row data are never logged or written to a manifest.
+  host names and row data are never logged or written to a manifest, except that a successful
+  run's manifest lists at most 20 large-balance rows (ItemCode, Location, BalQty), the same
+  rows its CSV already holds.
 
 pyodbc is imported only inside SqlServerSource so the tests run without it.
 """
@@ -96,6 +98,7 @@ SCHEDULE_FREQUENCIES = ("hourly",)
 # threshold above a billion units could only hide such errors.
 LARGE_BALANCE_THRESHOLD_MAX = 1000000000
 LARGE_BALANCE_LIST_CAP = 20
+LARGE_BALANCE_WARNING_PREFIX = "Large balance:"
 AVAILABLE_COLUMNS = (
     "as_of_local",
     "ItemCode",
@@ -1256,8 +1259,8 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["large_balances"] = large
         if large["count"]:
             manifest["warnings"].append(
-                "Large balance: %d exported row(s) with |BalQty| above %d; check the AutoCount "
-                "document behind each listed item (large_balances)" % (large["count"], large["threshold"])
+                "%s %d exported row(s) with |BalQty| above %d; check the AutoCount document behind each "
+                "listed item (large_balances)" % (LARGE_BALANCE_WARNING_PREFIX, large["count"], large["threshold"])
             )
         data = render_csv(rows, settings["output"]["columns"])
 
@@ -1293,6 +1296,8 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["csv"] = None
         manifest["row_count"] = 0
         manifest["large_balances"] = None
+        # A failed run lists no large balances, so it carries no large-balance warning either.
+        manifest["warnings"] = [w for w in manifest["warnings"] if not w.startswith(LARGE_BALANCE_WARNING_PREFIX)]
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         manifest_sha, _ = write_exclusive(run_dir / MANIFEST_NAME, json_bytes(manifest))

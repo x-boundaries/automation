@@ -20,11 +20,25 @@ Behaviour:
     identity.auth_mode windows_integrated -> LogonType S4U (no stored password)
     identity.auth_mode sql_login          -> LogonType Password (Get-Credential prompt)
 - UserId has no default: the owner names the Windows account explicitly.
-- Refuses if a task with the same name already exists. It never replaces an existing task;
-  remove or rename the old task by hand first if a change is really intended.
+- Task Scheduler folder: -TaskPath, default \XB\ (the company folder). It must start and end
+  with a backslash and name at least one folder; letters, digits, spaces, _ and - only, and
+  no folder name starts or ends with a space.
+- Refuses if a task with the same name already exists in that folder. It never replaces an
+  existing task; remove or rename the old task by hand first if a change is really intended.
+  It warns (but goes on) if a task with the same name is in the Task Scheduler root, as the
+  earlier installer put it there; moving that task is a separate owner-approved step.
+- RepoRoot defaults to the clone this script is in. It is worked out in the script body
+  because Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults of a
+  script with [Parameter()] attributes.
+- -DryRun runs every check (including pyodbc and --dry-run-config), prints what it would
+  register and stops before the password prompt and Register-ScheduledTask. Nothing is
+  registered. The tests use it.
 - After registering, do the supervised "Run now" in runbook step V7 before leaving it enabled.
 
-Windows PowerShell 5.1 compatible.
+Windows PowerShell 5.1 compatible. Run it with -ExecutionPolicy Bypass (this one command only):
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_autocount_stock_balance_hourly_task.ps1 `
+      -UserId "EXAMPLE-PC\example-user" -ConfigPath "C:\path\to\settings.local.json" `
+      -PythonExe "C:\path\to\python.exe" -DryRun
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -34,10 +48,21 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PythonExe,
     [string]$TaskName = "XB AC2 Hourly Stock Balance",
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$TaskPath = "\XB\",
+    [string]$RepoRoot = "",
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+
+# Case-sensitive and anchored with \A and \z, so a trailing line break or a look-alike letter
+# never passes.
+if ($TaskPath -cnotmatch '\A(\\[A-Za-z0-9_-]([A-Za-z0-9 _-]*[A-Za-z0-9_-])?)+\\\z') {
+    throw "TaskPath must look like \XB\ (start and end with a backslash; letters, digits, spaces, _ and - only)."
+}
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
 
 $scriptPath = Join-Path $RepoRoot "scripts\autocount_stock_balance_hourly.py"
 if (-not (Test-Path -LiteralPath $scriptPath)) {
@@ -53,9 +78,13 @@ if (-not [System.IO.Path]::IsPathRooted($PythonExe) -or -not (Test-Path -Literal
     throw "PythonExe must be the full path to an existing python.exe, not a name resolved from PATH."
 }
 
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$existing = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
 if ($null -ne $existing) {
-    throw "Refusing: a scheduled task with this name already exists. It is never replaced by this installer."
+    throw "Refusing: a scheduled task with this name already exists in $TaskPath. It is never replaced by this installer."
+}
+$inRoot = Get-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction SilentlyContinue
+if ($null -ne $inRoot) {
+    Write-Warning "A task with this name is also in the Task Scheduler root (\). Registering in $TaskPath would make two hourly tasks; move or remove the root task first (runbook step V7, owner OK)."
 }
 
 # Prerequisites in the interpreter the task will use (runbook "VM prerequisites"). The settings
@@ -103,6 +132,14 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 $description = "Hourly read-only AC2 stock balance export (#245). Writes hourly CSV + manifest folders, a verified latest pair and last_run_status.json."
 
+if ($DryRun) {
+    Write-Host "Dry run: would register $TaskPath$TaskName"
+    Write-Host "Repo root: $RepoRoot"
+    Write-Host "Runs hourly at minute $RunMinute, IgnoreNew, 15 minute limit, RunLevel Limited, LogonType $logonType ($authMode)."
+    Write-Host "Nothing was registered."
+    exit 0
+}
+
 if ($logonType -ceq "S4U") {
     # windows_integrated: S4U stores no password. The task signs in to SQL Server as UserId.
     $principal = New-ScheduledTaskPrincipal `
@@ -111,6 +148,7 @@ if ($logonType -ceq "S4U") {
         -RunLevel Limited
     Register-ScheduledTask `
         -TaskName $TaskName `
+        -TaskPath $TaskPath `
         -Action $action `
         -Trigger $trigger `
         -Settings $settings `
@@ -132,6 +170,7 @@ else {
     try {
         Register-ScheduledTask `
             -TaskName $TaskName `
+            -TaskPath $TaskPath `
             -Action $action `
             -Trigger $trigger `
             -Settings $settings `
@@ -145,6 +184,6 @@ else {
     }
 }
 
-Write-Host "Registered scheduled task: $TaskName"
+Write-Host "Registered scheduled task: $TaskPath$TaskName"
 Write-Host "Runs hourly at minute $RunMinute, IgnoreNew, 15 minute limit, RunLevel Limited, LogonType $logonType ($authMode)."
-Write-Host "Next (runbook V7): Start-ScheduledTask now, wait for it to finish, and confirm last_run_status.json shows success for that run before leaving the task enabled. If it does not, run Disable-ScheduledTask and report."
+Write-Host "Next (runbook V7): Start-ScheduledTask -TaskPath $TaskPath now, wait for it to finish, and confirm last_run_status.json shows success for that run before leaving the task enabled. If it does not, run Disable-ScheduledTask -TaskPath $TaskPath and report."

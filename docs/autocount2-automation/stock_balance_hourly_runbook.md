@@ -137,7 +137,7 @@ Added before V5 (owner decision, 27 Oct 2026) after a stock transfer had an item
 ```
 
   `rows` lists at most 20 rows, largest `|BalQty|` first; `count` is the full number and `rows_truncated` is `true` when more than 20 rows qualify. When nothing qualifies, `count` is `0` and `rows` is empty. A failed run has `large_balances: null`.
-- When `count` is above 0, `warnings` gets one line: `Large balance: <count> exported row(s) with |BalQty| above <threshold>; ...`. The line names no item.
+- When `count` is above 0, `warnings` gets one line: `Large balance: <count> exported row(s) with |BalQty| above <threshold>; ...`. The line names no item. A failed run drops the line, as it has no `large_balances`.
 - `last_run_status.json`, the run's console output and `--check-latest` carry `large_balance_count` (`null` for a failed run, or for a latest manifest written before this check existed). Exit codes do not change. A later alert round (Telegram through n8n, see [Planned follow-up](#planned-follow-up-failure-alerts)) can read this field; no alert is sent today.
 - The CSV is unchanged: the flagged rows are exported as AutoCount holds them.
 
@@ -169,7 +169,7 @@ A failed run writes `manifest.json` only (no CSV), never touches the latest pair
 | `write_failed` | The hourly CSV or manifest could not be written or re-read. | Check disk space and folder permissions. |
 | `latest_publish_failed` | Hourly data is good but the latest pair could not be replaced (`last_run_status.json` only). The pair is replaced in two steps (CSV, then manifest). If only the second step fails, the new `stock_balance_latest.csv` sits beside the previous `latest_manifest.json`, so `--check-latest` exits `3` (invalid) until the next successful hour replaces both. | Check whether a program (for example the sync client) holds the latest files open. The hourly folder is complete either way. |
 | `internal_error` | Unexpected error. The message has the run reference only. | Report the run reference. |
-| (no new status) | The task did not run at all: `finished_at` in `last_run_status.json` is older than about 70 minutes and no new hourly folder appears (VM off or asleep, task disabled, or for pair (b) the Windows password changed). | Check the VM is on, then `Get-ScheduledTaskInfo -TaskName "XB AC2 Hourly Stock Balance"` (`LastRunTime`, `LastTaskResult`). For pair (b) after a password change, update the task's stored password (needs owner OK). The planned heartbeat round will alert on this. |
+| (no new status) | The task did not run at all: `finished_at` in `last_run_status.json` is older than about 70 minutes and no new hourly folder appears (VM off or asleep, task disabled, or for pair (b) the Windows password changed). | Check the VM is on, then `Get-ScheduledTaskInfo -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` (`LastRunTime`, `LastTaskResult`). For pair (b) after a password change, update the task's stored password (needs owner OK). The planned heartbeat round will alert on this. |
 
 ## Read identity and scheduled logon
 
@@ -206,11 +206,24 @@ Each step **needs owner OK**. None has been run.
 - **V6** (needs owner OK): name the Drive for desktop synced folder (`delivery_root`) and the Google account Drive for desktop uses on the VM.
 - **V7** (needs a separate owner OK): register the hourly task, then prove it with one supervised run under the scheduled context before leaving it enabled.
   1. Set the `AUTOCOUNT_EXPECTED_SQL_LOGIN` / `_USER` / `_DATABASE` environment values for the task's Windows account (user or machine level), as the job fails closed without them.
-  2. Register (in an elevated Windows PowerShell 5.1, no transcript): `.\scripts\install_autocount_stock_balance_hourly_task.ps1 -UserId <Windows account> -ConfigPath <full path to the local settings file> -PythonExe <full path to python.exe>`. The installer checks `pyodbc`, runs `--dry-run-config` with that interpreter and registers the logon type the settings require. For pair (b) it prompts for the Windows password.
-  3. Note `finished_at` in `<archive_root>\last_run_status.json` (if present), then run `Start-ScheduledTask -TaskName "XB AC2 Hourly Stock Balance"` straight away, before the first hourly trigger.
-  4. Wait until `Get-ScheduledTaskInfo -TaskName "XB AC2 Hourly Stock Balance"` shows a new `LastRunTime` and the task is no longer running (at most 15 minutes).
+  2. Dry run first (in an elevated Windows PowerShell 5.1, no transcript, from the root of the clone the task will run from):
+     `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_autocount_stock_balance_hourly_task.ps1 -UserId <Windows account> -ConfigPath <full path to the local settings file> -PythonExe <full path to python.exe> -DryRun`
+     It checks `pyodbc`, runs `--dry-run-config` with that interpreter, prints the task it would register (`\XB\XB AC2 Hourly Stock Balance`, the repo root, the minute and the logon type) and stops: nothing is registered and no password is asked for. If it looks right, run the same command again without `-DryRun` to register the logon type the settings require; for pair (b) it then prompts for the Windows password.
+     `-ExecutionPolicy Bypass` applies to this one command only; it does not change the VM's PowerShell settings. `-RepoRoot` is not needed (the installer uses the clone it is in). The task goes in the `\XB\` folder of Task Scheduler; use `-TaskPath "\Other\"` only if the owner asks for another folder (it must start and end with `\`). The installer refuses if a task with the same name is already in that folder, and warns if one is in the Task Scheduler root (see "Move an existing root task" below).
+  3. Note `finished_at` in `<archive_root>\last_run_status.json` (if present), then run `Start-ScheduledTask -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` straight away, before the first hourly trigger.
+  4. Wait until `Get-ScheduledTaskInfo -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` shows a new `LastRunTime` and the task is no longer running (at most 15 minutes).
   5. Pass only if `last_run_status.json` is newer than the noted value and shows `status: success` (and `delivery_status: handed_to_drive_sync_folder` once `delivery_root` is set). This also proves `PythonExe`, the environment values, the identity pair and the run level under the task account.
-  6. Otherwise run `Disable-ScheduledTask -TaskName "XB AC2 Hourly Stock Balance"` at once and report the `failure_class`. The task is left enabled only after a pass.
+  6. Otherwise run `Disable-ScheduledTask -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` at once and report the `failure_class`. The task is left enabled only after a pass.
+
+### Move an existing root task into `\XB\` (VM step, needs owner OK)
+
+An earlier installer registered the task in the Task Scheduler root (`\`). Move it once, with the owner's OK, at a quiet minute well away from the task's run minute (in an elevated Windows PowerShell 5.1):
+
+1. Export the root task: `Export-ScheduledTask -TaskPath "\" -TaskName "XB AC2 Hourly Stock Balance" > "$env:TEMP\xb245-root-task.xml"`.
+2. Register it under `\XB\` from that XML. For pair (a) (S4U, no stored password): `Register-ScheduledTask -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance" -Xml (Get-Content "$env:TEMP\xb245-root-task.xml" -Raw)`. For pair (b) (Password logon), do not register from XML (that would put the password on the command line): unregister the root task (step 4), then run the installer as in V7 step 2, dry run first, and do the V7 steps 3-6 supervised run again.
+3. Compare: `Export-ScheduledTask -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` must match the saved XML apart from the `<URI>`, `<Date>` and `<Author>` lines. Check the trigger, IgnoreNew, the 15 minute limit, StartWhenAvailable, the logon type and RunLevel `LeastPrivilege`.
+4. Unregister the root copy: `Unregister-ScheduledTask -TaskPath "\" -TaskName "XB AC2 Hourly Stock Balance" -Confirm:$false`.
+5. Check that `Get-ScheduledTask -TaskName "XB AC2 Hourly Stock Balance"` lists only the `\XB\` task, then delete the saved XML. After the next hourly run, confirm `last_run_status.json` shows a new `success`. Record the result in the private mailbox.
 
 ## Retention
 
