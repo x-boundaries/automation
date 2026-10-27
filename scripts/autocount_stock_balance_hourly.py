@@ -90,6 +90,12 @@ LOGON_TYPES = ("S4U", "Password")
 SUPPORTED_LOGON_PAIRS = {"windows_integrated": "S4U", "sql_login": "Password"}
 UOM_GUARD_MODES = ("fail",)
 SCHEDULE_FREQUENCIES = ("hourly",)
+# Large-balance warning (owner decision 27 Oct 2026): a quantity keyed into the wrong field can
+# give a balance in the billions. Rows with |BalQty| above the threshold are listed in the
+# manifest and the run still succeeds. No off switch: the check never blocks an export, and a
+# threshold above a billion units could only hide such errors.
+LARGE_BALANCE_THRESHOLD_MAX = 1000000000
+LARGE_BALANCE_LIST_CAP = 20
 AVAILABLE_COLUMNS = (
     "as_of_local",
     "ItemCode",
@@ -277,6 +283,7 @@ DEFAULT_SETTINGS = {
         "archive_root": None,
         "delivery_root": None,
         "columns": DEFAULT_COLUMNS,
+        "large_balance_threshold": 100000,
     },
 }
 # Sections whose keys are a closed set. location_labels is an open code -> label map.
@@ -396,6 +403,7 @@ def validate_settings(raw):
     missing = [c for c in REQUIRED_COLUMNS if c not in columns]
     if missing:
         raise ConfigError("output.columns must include: " + ", ".join(missing))
+    _require_int(output["large_balance_threshold"], "output.large_balance_threshold", 1, LARGE_BALANCE_THRESHOLD_MAX)
     return settings
 
 
@@ -884,6 +892,23 @@ def build_rows(snapshot, settings, as_of_local):
     return out, counts, locations, sorted(unmapped)
 
 
+def find_large_balances(rows, threshold):
+    """Exported rows with |BalQty| strictly above threshold, largest first, listed up to the cap. Pure."""
+    large = sorted(
+        (r for r in rows if abs(r["BalQty"]) > threshold),
+        key=lambda r: (-abs(r["BalQty"]), r["ItemCode"], r["Location"]),
+    )
+    return {
+        "threshold": threshold,
+        "count": len(large),
+        "rows": [
+            {"ItemCode": r["ItemCode"], "Location": r["Location"], "BalQty": str(r["BalQty"])}
+            for r in large[:LARGE_BALANCE_LIST_CAP]
+        ],
+        "rows_truncated": len(large) > LARGE_BALANCE_LIST_CAP,
+    }
+
+
 def _row(as_of_local, src, code, label, uom, qty, row_source):
     return {
         "as_of_local": as_of_local,
@@ -1188,6 +1213,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "counts": None,
         "per_location": None,
         "unmapped_location_codes": [],
+        "large_balances": None,
         "uom_guard": None,
         "pos_sync": [],
         "delivery": {"status": DELIVERY_SKIPPED if delivery_root else DELIVERY_NOT_CONFIGURED, "files": []},
@@ -1226,6 +1252,13 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["per_location"] = per_location
         manifest["unmapped_location_codes"] = unmapped
         manifest["row_count"] = len(rows)
+        large = find_large_balances(rows, settings["output"]["large_balance_threshold"])
+        manifest["large_balances"] = large
+        if large["count"]:
+            manifest["warnings"].append(
+                "Large balance: %d exported row(s) with |BalQty| above %d; check the AutoCount "
+                "document behind each listed item (large_balances)" % (large["count"], large["threshold"])
+            )
         data = render_csv(rows, settings["output"]["columns"])
 
         try:
@@ -1259,6 +1292,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     if manifest["status"] != "success":
         manifest["csv"] = None
         manifest["row_count"] = 0
+        manifest["large_balances"] = None
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         manifest_sha, _ = write_exclusive(run_dir / MANIFEST_NAME, json_bytes(manifest))
@@ -1287,6 +1321,9 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "finished_at": manifest["finished_at"],
         "hourly_folder": manifest["hourly_folder"],
         "delivery_status": final_delivery,
+        "large_balance_count": (
+            _large_balance_count(manifest) if manifest["status"] == "success" and not publish_failure else None
+        ),
     }
     manifest["_last_run_status"] = status
     for root in (archive_root, delivery_root):
@@ -1300,6 +1337,13 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     if lock_path is not None:
         release_lock(lock_path, run_id)
     return manifest
+
+
+def _large_balance_count(manifest):
+    """The large-balance count of a manifest, or None when it has none (failed, or written before the check)."""
+    large = manifest.get("large_balances")
+    count = large.get("count") if isinstance(large, dict) else None
+    return count if isinstance(count, int) and not isinstance(count, bool) else None
 
 
 def _as_local(value, tz):
@@ -1393,7 +1437,12 @@ def check_latest(settings, clock=None):
         age_minutes = int((now - as_of).total_seconds() // 60)
     except (KeyError, TypeError, ValueError):
         return EXIT_MISSING, {"status": "invalid"}
-    result = {"as_of_local": latest["as_of_local"], "age_minutes": age_minutes, "run_id": latest.get("run_id")}
+    result = {
+        "as_of_local": latest["as_of_local"],
+        "age_minutes": age_minutes,
+        "run_id": latest.get("run_id"),
+        "large_balance_count": _large_balance_count(latest),
+    }
     if age_minutes > settings["stale_after_minutes"]:
         return EXIT_STALE, dict(result, status="stale")
     return EXIT_OK, dict(result, status="fresh")
@@ -1445,6 +1494,7 @@ def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=No
     }
     status = {k: manifest[k] for k in ("job", "run_id", "status", "failure_class", "as_of_local", "started_at", "finished_at", "hourly_folder", "note")}
     status["delivery_status"] = DELIVERY_SKIPPED
+    status["large_balance_count"] = None
     try:
         run_dir = Path(root) / relative
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -1528,6 +1578,7 @@ def main(argv=None, source=None, environ=None, clock=None):
             "as_of_local": manifest["as_of_local"],
             "row_count": manifest["row_count"],
             "delivery_status": status["delivery_status"],
+            "large_balance_count": status["large_balance_count"],
             "message": manifest["message"],
         }
     )

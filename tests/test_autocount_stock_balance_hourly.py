@@ -248,6 +248,7 @@ class ConfigValidationTests(TempDirTestCase):
         self.assertEqual(settings["rows"]["zero_row_mode"], "keep_rows_and_add_items_without_rows")
         self.assertFalse(settings["identity"]["allow_privileged_identity"])
         self.assertEqual(settings["output"]["columns"], hourly.DEFAULT_COLUMNS)
+        self.assertEqual(settings["output"]["large_balance_threshold"], 100000)
         for code in raw["location_labels"]:
             self.assertTrue(code.startswith("LOC-"), "example labels must use fake codes")
         self.assertIn("EXAMPLE", raw["output"]["delivery_root"])
@@ -872,6 +873,168 @@ class CsvOutputTests(TempDirTestCase):
         self.assertEqual(folder.parts[1], "2026-10-23")
         self.assertRegex(folder.parts[2], r"^ac2_stockbal_20261023T140005\+0800_[0-9a-f]{8}$")
         self.assertTrue(folder.parts[2].endswith(on_disk["run_id"][:8]))
+
+
+class LargeBalanceTests(TempDirTestCase):
+    def assert_config_error(self, threshold):
+        with self.assertRaises(hourly.ConfigError) as ctx:
+            settings_for(self.tmp, output={"large_balance_threshold": threshold})
+        self.assertIn("output.large_balance_threshold", str(ctx.exception))
+
+    def on_disk(self, manifest, name=hourly.MANIFEST_NAME, root=None):
+        return json.loads((self.run_dir(manifest, root) / name).read_text(encoding="utf-8"))
+
+    def test_setting_default_and_validation(self):
+        self.assertEqual(settings_for(self.tmp)["output"]["large_balance_threshold"], 100000)
+        for good in (1, 250, hourly.LARGE_BALANCE_THRESHOLD_MAX):
+            self.assertEqual(settings_for(self.tmp, output={"large_balance_threshold": good})["output"]["large_balance_threshold"], good)
+        for bad in (0, -1, None, True, 1.5, 100000.0, "100000", hourly.LARGE_BALANCE_THRESHOLD_MAX + 1):
+            self.assert_config_error(bad)
+
+    def test_threshold_boundary_is_strictly_above(self):
+        balances = [
+            bal("FAKE-0101", "LOC-A", "100000.00000000"),
+            bal("FAKE-0102", "LOC-A", "-100000.00000000"),
+            bal("FAKE-0103", "LOC-A", "100000.00010000"),
+            bal("FAKE-0104", "LOC-B", "-100001.00000000"),
+            bal("FAKE-0105", "LOC-A", "99999.00000000"),
+        ]
+        manifest = run(settings_for(self.tmp), FakeSource(balances=balances, no_row_items=[]))
+        large = manifest["large_balances"]
+        self.assertEqual(large["count"], 2)
+        self.assertEqual(
+            large["rows"],
+            [
+                {"ItemCode": "FAKE-0104", "Location": "LOC-B", "BalQty": "-100001"},
+                {"ItemCode": "FAKE-0103", "Location": "LOC-A", "BalQty": "100000.0001"},
+            ],
+        )
+
+    def test_positive_and_negative_pair_flagged_and_run_still_succeeds(self):
+        balances = default_balances() + [
+            bal("FAKE-0201", "LOC-A", "123456789000.00000000"),
+            bal("FAKE-0201", "LOC-B", "-123456789000.00000000"),
+        ]
+        manifest = run(settings_for(self.tmp), FakeSource(balances=balances))
+        self.assertEqual(manifest["status"], "success")
+        self.assertIsNone(manifest["failure_class"])
+        on_disk = self.on_disk(manifest)
+        self.assertEqual(on_disk["large_balances"], {
+            "threshold": 100000,
+            "count": 2,
+            "rows": [
+                {"ItemCode": "FAKE-0201", "Location": "LOC-A", "BalQty": "123456789000"},
+                {"ItemCode": "FAKE-0201", "Location": "LOC-B", "BalQty": "-123456789000"},
+            ],
+            "rows_truncated": False,
+        })
+        warnings = [w for w in on_disk["warnings"] if w.startswith("Large balance:")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("2 exported row(s)", warnings[0])
+        self.assertIn("above 100000", warnings[0])
+        self.assertNotIn("FAKE-0201", warnings[0], "the warning line names no item")
+        # The flagged rows are still exported unchanged and the latest pair still advances.
+        rows = read_csv(self.run_dir(manifest) / hourly.CSV_NAME)
+        flagged = sorted(r["BalQty"] for r in rows if r["ItemCode"] == "FAKE-0201")
+        self.assertEqual(flagged, ["-123456789000", "123456789000"])
+        latest = json.loads((self.archive / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["run_id"], manifest["run_id"])
+        self.assertEqual(latest["large_balances"]["count"], 2)
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["status"], status["large_balance_count"]), ("success", 2))
+
+    def test_list_capped_at_20_largest_first(self):
+        balances = [bal("FAKE-%04d" % n, "LOC-A", (200000 + n) * (1 if n % 2 else -1)) for n in range(1, 26)]
+        manifest = run(settings_for(self.tmp), FakeSource(balances=balances, no_row_items=[]))
+        large = manifest["large_balances"]
+        self.assertEqual(large["count"], 25)
+        self.assertEqual(len(large["rows"]), hourly.LARGE_BALANCE_LIST_CAP)
+        self.assertEqual(len(large["rows"]), 20)
+        self.assertTrue(large["rows_truncated"])
+        sizes = [abs(Decimal(r["BalQty"])) for r in large["rows"]]
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        self.assertEqual(large["rows"][0], {"ItemCode": "FAKE-0025", "Location": "LOC-A", "BalQty": "200025"})
+        self.assertEqual(large["rows"][1]["BalQty"], "-200024")
+        self.assertIn("25 exported row(s)", " ".join(manifest["warnings"]))
+
+    def test_exactly_20_is_not_truncated(self):
+        balances = [bal("FAKE-%04d" % n, "LOC-A", 500000) for n in range(1, 21)]
+        large = run(settings_for(self.tmp), FakeSource(balances=balances, no_row_items=[]))["large_balances"]
+        self.assertEqual((large["count"], len(large["rows"]), large["rows_truncated"]), (20, 20, False))
+
+    def test_no_large_balance_gives_empty_block_and_no_warning(self):
+        manifest = run(settings_for(self.tmp))
+        self.assertEqual(manifest["large_balances"], {"threshold": 100000, "count": 0, "rows": [], "rows_truncated": False})
+        self.assertFalse([w for w in manifest["warnings"] if w.startswith("Large balance:")])
+        self.assertEqual(manifest["_last_run_status"]["large_balance_count"], 0)
+
+    def test_custom_threshold(self):
+        manifest = run(settings_for(self.tmp, output={"large_balance_threshold": 3}))
+        large = manifest["large_balances"]
+        self.assertEqual(large["threshold"], 3)
+        self.assertEqual(
+            [(r["ItemCode"], r["Location"], r["BalQty"]) for r in large["rows"]],
+            [("FAKE-0001", "LOC-A", "5"), ("FAKE-0004", "LOC-GIT", "3.5")],
+        )
+
+    def test_failed_run_has_no_count(self):
+        manifest = run(settings_for(self.tmp), FakeSource(multi_uom=1))
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIsNone(manifest["large_balances"])
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertIsNone(status["large_balance_count"])
+
+    def test_failure_after_rows_are_built_clears_the_block(self):
+        settings = settings_for(self.tmp)
+        balances = default_balances() + [bal("FAKE-0401", "LOC-A", 300000)]
+        fixed = "0123456789abcdef0123456789abcdef"
+        with mock.patch.object(hourly.uuid, "uuid4", return_value=mock.Mock(hex=fixed)):
+            first = run(settings, FakeSource(balances=balances))
+            second = run(settings, FakeSource(balances=balances))
+        self.assertEqual(first["large_balances"]["count"], 1)
+        self.assertEqual((second["status"], second["failure_class"]), ("failed", "write_failed"))
+        self.assertIsNone(second["large_balances"])
+        self.assertIsNone(second["_last_run_status"]["large_balance_count"])
+
+    def test_latest_publish_failure_reports_no_count(self):
+        balances = default_balances() + [bal("FAKE-0402", "LOC-A", 300000)]
+        with mock.patch.object(hourly, "publish_latest", side_effect=OSError("held open")):
+            manifest = run(settings_for(self.tmp), FakeSource(balances=balances))
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["status"], status["failure_class"]), ("failed", "latest_publish_failed"))
+        self.assertIsNone(status["large_balance_count"])
+        self.assertEqual(manifest["large_balances"]["count"], 1, "the hourly manifest itself is a success")
+
+    def test_cli_and_check_latest_report_the_count_without_row_values(self):
+        raw = raw_settings(self.tmp, output={"delivery_root": str(self.delivery)})
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        balances = default_balances() + [bal("FAKE-0301", "LOC-A", "-987654321")]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=FakeSource(balances=balances), environ=ENV, clock=clock_at())
+        self.assertEqual(code, 0, "a large balance is a warning, never a failure")
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["status"], printed["large_balance_count"]), ("success", 1))
+        with contextlib.redirect_stdout(io.StringIO()) as out2:
+            code = hourly.main(["--config", str(path), "--check-latest"], clock=clock_at(FIXED_NOW + timedelta(minutes=5)))
+        self.assertEqual(code, 0)
+        checked = json.loads(out2.getvalue())
+        self.assertEqual((checked["status"], checked["large_balance_count"]), ("fresh", 1))
+        for text in (out.getvalue(), out2.getvalue()):
+            self.assertNotIn("FAKE-0301", text)
+            self.assertNotIn("987654321", text)
+        status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(status["large_balance_count"], 1)
+
+    def test_check_latest_on_a_manifest_written_before_the_check(self):
+        settings = settings_for(self.tmp)
+        run(settings)
+        path = self.archive / hourly.LATEST_MANIFEST_NAME
+        latest = json.loads(path.read_text(encoding="utf-8"))
+        del latest["large_balances"]
+        path.write_text(json.dumps(latest), encoding="utf-8")
+        code, result = hourly.check_latest(settings, clock=clock_at(FIXED_NOW))
+        self.assertEqual((code, result["status"], result["large_balance_count"]), (0, "fresh", None))
 
 
 class NoOverwriteTests(TempDirTestCase):

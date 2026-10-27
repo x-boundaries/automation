@@ -58,7 +58,7 @@ Run from the automation clone, always with the task's full-path interpreter (see
 & "C:\EXAMPLE\Python311\python.exe" scripts\autocount_stock_balance_hourly.py --config config\autocount_stock_balance_hourly.local.json --check-latest
 ```
 
-Exit codes: run `0` success (and delivery verified or not configured), `1` failed or delivery not verified. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths.
+Exit codes: run `0` success (and delivery verified or not configured), `1` failed or delivery not verified. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code.
 
 ## Settings
 
@@ -92,6 +92,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 | `location_labels` | `{}` | Location code -> label. Every code is exported; codes are never dropped or renamed. Unmapped code label = `code - Location.Description` when present, else the code; unmapped codes are listed in the manifest. Real labels only in the local file. May change. |
 | `output.archive_root` | required | Local archive folder on the VM. Owner decision: a gitignored folder inside the automation clone, `<automation clone>\autocount_outputs\stock_balance_hourly` (ignored by the existing `autocount_outputs/` rules in `.gitignore`). May change. |
 | `output.delivery_root` | `null` | The Google Drive for desktop synced folder; the job writes into it directly. `null` = local archive only. Folder and Google account are named at V6. Must differ from `archive_root`. |
+| `output.large_balance_threshold` | `100000` | Whole number from 1 to 1000000000. Every exported row whose BalQty is strictly above it, positive or negative, is listed in the manifest as a warning; the run still succeeds and publishes (see [Large-balance warning](#large-balance-warning)). There is no off switch: the check never blocks an export, so if it is noisy, raise the threshold. May change. |
 | `output.columns` | as_of_local, ItemCode, ItemDescription, ItemType, Location, LocationLabel, UOM, BalQty, IsActive, StockControl, RowSource | Order and subset of the CSV columns; must include ItemCode, Location, UOM, BalQty. To be aligned to the owner's Stock Balance by Location report at reconciliation. May change. |
 
 ## Outputs and folder layout
@@ -113,7 +114,40 @@ Every business choice is a setting. The owner said answers may still change, so 
 - Delivery: the CSV is copied into `delivery_root` with exclusive create and re-hashed; then the manifest is copied and re-hashed; only then does the delivery latest pair advance. A mismatch gives delivery status `verify_failed` and the delivery latest pair is not advanced. `manifest.delivery` records the CSV copy; `last_run_status.json` records the final delivery result including the manifest copy.
 - Lock: `.ac2_stockbal.lock` records the run_id, process id and start time. A run killed by the 15-minute task limit or a reboot cannot remove it. The next run clears it automatically only when it is older than 30 minutes (the 15-minute limit plus a 15-minute margin) **and** either it was written before Windows last started (a restart ends every run, whatever process later reuses its process id) or its recorded process is no longer running (on Windows, a process created after the lock was written counts as a reused process id, not the owner). That run adds a warning to its manifest naming the killed run's reference, the reason and the lock age. A younger lock, or a lock written since the last start whose process is still running, gives `already_running` and is left alone.
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
-- Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, uom_guard, pos_sync per Location, delivery.
+- Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, large_balances, uom_guard, pos_sync per Location, delivery, warnings.
+- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run).
+
+## Large-balance warning
+
+Added before V5 (owner decision, 27 Oct 2026) after a stock transfer had an item code keyed into the quantity field, which gave balances in the billions at two locations. The job cannot tell a keying error from a real balance, so it warns and never blocks.
+
+- Every exported row with `|BalQty|` strictly above `output.large_balance_threshold` (default `100000`) counts, positive or negative. A balance equal to the threshold does not.
+- The manifest (hourly and `latest_manifest.json`) gets:
+
+```json
+"large_balances": {
+  "threshold": 100000,
+  "count": 2,
+  "rows": [
+    {"ItemCode": "FAKE-0201", "Location": "LOC-A", "BalQty": "123456789000"},
+    {"ItemCode": "FAKE-0201", "Location": "LOC-B", "BalQty": "-123456789000"}
+  ],
+  "rows_truncated": false
+}
+```
+
+  `rows` lists at most 20 rows, largest `|BalQty|` first; `count` is the full number and `rows_truncated` is `true` when more than 20 rows qualify. When nothing qualifies, `count` is `0` and `rows` is empty. A failed run has `large_balances: null`.
+- When `count` is above 0, `warnings` gets one line: `Large balance: <count> exported row(s) with |BalQty| above <threshold>; ...`. The line names no item.
+- `last_run_status.json`, the run's console output and `--check-latest` carry `large_balance_count` (`null` for a failed run, or for a latest manifest written before this check existed). Exit codes do not change. A later alert round (Telegram through n8n, see [Planned follow-up](#planned-follow-up-failure-alerts)) can read this field; no alert is sent today.
+- The CSV is unchanged: the flagged rows are exported as AutoCount holds them.
+
+What to do when `large_balance_count` is above 0:
+
+- [ ] Open `latest_manifest.json` (or the hourly `manifest.json`) and read `large_balances.rows`.
+- [ ] For each item and location, open the item's stock movement history in AutoCount (for example a stock card report for that item and location) and find the document behind the balance, typically a stock transfer, adjustment or receive whose quantity looks like a code or a typo.
+- [ ] If it is a keying error, have the document corrected in AutoCount. The next hourly run picks up the corrected balance; the job never edits AutoCount.
+- [ ] If the balance is real, leave it, and consider raising `output.large_balance_threshold` in the local settings file.
+- [ ] Record what was found in the private mailbox, never in this public repository (item codes and document numbers are business data).
 
 ## Failure classes (what the owner sees in Drive)
 
@@ -194,6 +228,7 @@ Each step **needs owner OK**. None has been run.
 Not built in this round, and nothing in n8n is touched. In this build a failure is visible only through files (`last_run_status.json`, the hourly manifest, `--check-latest`). Planned for a later #245 round:
 
 - Failure alerts go to the owner by Telegram through an n8n webhook. The VM job posts a sanitized failure event (hour, `failure_class`, `run_id`), with no stock data.
+- The same round can alert on `large_balance_count` above 0 in `last_run_status.json` (count only, no item codes or quantities).
 - An hourly heartbeat, so n8n alerts when no run has been heard for about 70 minutes.
 
 ## Open questions

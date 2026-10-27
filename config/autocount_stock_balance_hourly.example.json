@@ -51,6 +51,7 @@
       "IsActive",
       "StockControl",
       "RowSource"
-    ]
+    ],
+    "large_balance_threshold": 100000
   }
 }
