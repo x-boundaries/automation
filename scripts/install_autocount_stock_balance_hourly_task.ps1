@@ -1,15 +1,18 @@
 <#
-Registers the hourly AC2 stock balance export (#245) as a Windows Task Scheduler task.
+Registers the hourly AC2 stock balance export (#245) as a Windows Task Scheduler task. The
+first run after local midnight also publishes the daily close; there is no separate daily task.
 
 NOT RUN BY THE BUILD. Registering this task needs a separate owner OK, given only after the
 manual VM proof runs (runbook steps V1-V6) pass. See
 docs/autocount2-automation/stock_balance_hourly_runbook.md, step V7.
 
 Behaviour:
-- Runs every hour, 24/7, at schedule.run_minute past the hour (00:00 + run_minute, then
-  hourly). The minute comes from the validated settings; there is no separate parameter.
-- Repetition StopAtDurationEnd is false, so the end of each day's repetition window never
-  stops a run that is still going.
+- ONE trigger: a one-time start at 00:00 + schedule.run_minute that repeats every hour with
+  no end, so the task runs exactly once an hour, 24/7. There is no daily trigger: the earlier
+  daily start plus a one-day hourly repeat ran twice at 00:00 (VM, 28 Oct 2026). The minute
+  comes from the validated settings; there is no separate parameter.
+- Repetition StopAtDurationEnd is false (the repeat has no end, so nothing ever stops a run
+  that is still going).
 - MultipleInstances IgnoreNew: a new hour never starts while the previous run is still going.
 - ExecutionTimeLimit 15 minutes (the exporter's lock rules assume this limit).
 - RunLevel Limited (Task Scheduler's least-privilege level; "LeastPrivilege" in task XML).
@@ -111,18 +114,19 @@ if (-not ($RunMinute -is [int] -or $RunMinute -is [long]) -or $RunMinute -lt 0 -
 }
 $RunMinute = [int]$RunMinute
 
-# Daily trigger at 00:00 + RunMinute, repeating every hour for one day. Each day's trigger
-# starts a new one-day repetition window, so the task repeats hourly indefinitely. This form
-# works on every Windows PowerShell 5.1 host, unlike an unbounded RepetitionDuration.
-# StopAtDurationEnd is set to false so the end of a day's window never stops a running run
-# (New-ScheduledTaskTrigger sets it to true for this form).
+# One trigger: a one-time start at 00:00 + RunMinute today that repeats every hour. With no
+# -RepetitionDuration the repeat has no end (Duration is empty = indefinitely), so every hour has
+# exactly one start and 00:00 is not started twice. Do not add a -Daily trigger or a one-day
+# duration: their 24th repeat and the next day's start fall on the same minute. Do not pass
+# [TimeSpan]::MaxValue either; some Windows PowerShell 5.1 hosts reject it.
 $startAt = (Get-Date).Date.AddMinutes($RunMinute)
-$trigger = New-ScheduledTaskTrigger -Daily -At $startAt
-$repeat = New-ScheduledTaskTrigger -Once -At $startAt `
-    -RepetitionInterval (New-TimeSpan -Hours 1) `
-    -RepetitionDuration (New-TimeSpan -Days 1)
-$repeat.Repetition.StopAtDurationEnd = $false
-$trigger.Repetition = $repeat.Repetition
+$trigger = New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1)
+$trigger.Repetition.StopAtDurationEnd = $false
+$repeatEvery = [string]$trigger.Repetition.Interval
+$repeatFor = [string]$trigger.Repetition.Duration
+if (($repeatEvery -cne "PT1H") -or (-not [string]::IsNullOrEmpty($repeatFor))) {
+    throw "The trigger is not a single hourly repeat with no end on this host; nothing was registered."
+}
 
 $actionArgs = "`"$scriptPath`" --config `"$ConfigPath`""
 $action = New-ScheduledTaskAction -Execute $PythonExe -Argument $actionArgs -WorkingDirectory $RepoRoot
@@ -130,12 +134,13 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
-$description = "Hourly read-only AC2 stock balance export (#245). Writes hourly CSV + manifest folders, a verified latest pair and last_run_status.json."
+$description = "Hourly read-only AC2 stock balance export (#245). One run per hour; the first run after midnight also writes the daily close. Drive gets the latest pair, the dashboard feed, last_run_status.json and the daily files."
 
 if ($DryRun) {
     Write-Host "Dry run: would register $TaskPath$TaskName"
     Write-Host "Repo root: $RepoRoot"
     Write-Host "Runs hourly at minute $RunMinute, IgnoreNew, 15 minute limit, RunLevel Limited, LogonType $logonType ($authMode)."
+    Write-Host "Trigger: one trigger, starts $($startAt.ToString('HH:mm')), repeats every $repeatEvery, no end (exactly one run per hour; no daily trigger)."
     Write-Host "Nothing was registered."
     exit 0
 }

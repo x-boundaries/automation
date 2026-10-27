@@ -8,6 +8,7 @@ No fixture files: data is built in memory.
 import contextlib
 import copy
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -89,6 +90,34 @@ def no_row_item(item, base="PCS"):
     }
 
 
+# Default business day of the fake ledger rows that back the fake balances.
+LEDGER_DAY = date(2026, 10, 1)
+
+
+def led(item, loc, qty, day=LEDGER_DAY, uom="PCS", rows=1, batch=0, null_rows=0):
+    return {
+        "ItemCode": item,
+        "UOM": uom,
+        "Location": loc,
+        "DocDay": day,
+        "Qty": Decimal(str(qty)),
+        "LedgerRows": rows,
+        "NullQtyRows": null_rows,
+        "NonEmptyBatchRows": batch,
+    }
+
+
+def master(item, base="PCS", active="T", stock="T", desc="Fake item", item_type="FAKE-BRAND"):
+    return {
+        "ItemCode": item,
+        "ItemDescription": desc,
+        "ItemType": item_type,
+        "IsActive": active,
+        "StockControl": stock,
+        "BaseUOM": base,
+    }
+
+
 def default_balances():
     return [
         bal("FAKE-0001", "LOC-A", "5.00000000"),
@@ -122,7 +151,7 @@ class FakeSession:
         return value
 
     def read_sql_time(self):
-        return SQL_NOW
+        return self.source.sql_now
 
     def read_balances(self):
         if self.lock_timeout:
@@ -136,6 +165,40 @@ class FakeSession:
         self.source.no_row_reads += 1
         return copy.deepcopy(self.source.no_row_items)
 
+    def read_ledger(self):
+        self.source.ledger_reads += 1
+        if self.source.ledger is not None:
+            return copy.deepcopy(self.source.ledger)
+        # By default the ledger backs every fake balance exactly, on one early business day.
+        return [
+            led(b["ItemCode"], b["Location"], b["BalQty"], uom=b["UOM"])
+            for b in self.source.balances
+            if b["BalQty"] is not None
+        ]
+
+    def read_item_master(self):
+        if self.source.item_master is not None:
+            return copy.deepcopy(self.source.item_master)
+        items = {}
+        for b in self.source.balances:
+            items.setdefault(b["ItemCode"], master(b["ItemCode"], base=b["BaseUOM"], active=b["IsActive"],
+                                                   stock=b["StockControl"], desc=b["ItemDescription"],
+                                                   item_type=b["ItemType"]))
+        for item in self.source.no_row_items:
+            items.setdefault(item["ItemCode"], dict(item))
+        return list(items.values())
+
+    def read_locations(self):
+        if self.source.locations is not None:
+            return copy.deepcopy(self.source.locations)
+        codes = {}
+        for b in self.source.balances:
+            codes.setdefault(b["Location"], b["LocationDescription"])
+        return [{"Location": code, "LocationDescription": desc} for code, desc in codes.items()]
+
+    def read_reorder_levels(self):
+        return copy.deepcopy(self.source.reorder_levels)
+
     def read_sync(self):
         if self.source.sync_error:
             raise hourly.SyncReadError("SyncRegistration read failed")
@@ -144,8 +207,15 @@ class FakeSession:
 
 class FakeSource:
     def __init__(self, balances=None, no_row_items=None, sync_rows=None, identity=None,
-                 changecounts=None, multi_uom=0, lock_timeouts=None, sync_error=False):
+                 changecounts=None, multi_uom=0, lock_timeouts=None, sync_error=False, ledger=None,
+                 item_master=None, locations=None, reorder_levels=None, sql_now=SQL_NOW):
+        self.sql_now = sql_now
         self.balances = default_balances() if balances is None else balances
+        self.ledger = ledger
+        self.item_master = item_master
+        self.locations = locations
+        self.reorder_levels = list(reorder_levels or [])
+        self.ledger_reads = 0
         self.no_row_items = [no_row_item("FAKE-0009")] if no_row_items is None else no_row_items
         self.sync_rows = (
             [{"Location": "LOC-A", "LastSyncTime": datetime(2026, 10, 23, 13, 50, 0)}]
@@ -172,6 +242,8 @@ def raw_settings(tmp, **overrides):
         "location_labels": {"LOC-A": "LOC-A - Example outlet", "LOC-GIT": "LOC-GIT - Example in transit"},
         "output": {"archive_root": str(Path(tmp) / "archive"), "delivery_root": None},
         "read": {"retry_backoff_seconds": 0},
+        # Three close days before FIXED_NOW keep each test run small.
+        "daily_close": {"backfill_start": "2026-10-20"},
     }
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(raw.get(key), dict):
@@ -252,6 +324,12 @@ class ConfigValidationTests(TempDirTestCase):
         for code in raw["location_labels"]:
             self.assertTrue(code.startswith("LOC-"), "example labels must use fake codes")
         self.assertIn("EXAMPLE", raw["output"]["delivery_root"])
+        # Drive folder naming: <Feed name (cadence)>, daily since round 6 (no hourly folders in Drive).
+        self.assertTrue(raw["output"]["delivery_root"].endswith("AC2 Stock Balance (daily)"))
+        self.assertNotIn("hourly", raw["output"]["delivery_root"].lower())
+        self.assertEqual(settings["daily_close"], {"backfill_start": "2026-08-01", "restate_days": 7})
+        self.assertFalse(settings["retention"]["prune_enabled"], "pruning is switched on at the VM step only")
+        self.assertTrue(settings["rows"]["exclude_non_stock_items"])
 
     def test_defaults_apply(self):
         settings = settings_for(self.tmp)
@@ -1116,74 +1194,89 @@ class DeliveryTests(TempDirTestCase):
     def settings(self):
         return settings_for(self.tmp, output={"delivery_root": str(self.delivery)})
 
-    def test_delivery_copies_verified(self):
+    def status(self):
+        return json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+
+    def tamper(self, name_fragment):
+        real = hourly.copy_bytes_exclusive
+
+        def bad_copy(path, data):
+            real(path, data + b"x" if name_fragment in Path(path).name else data)
+
+        return mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=bad_copy)
+
+    def test_delivery_is_latest_only_no_hourly_folders(self):
         manifest = run(self.settings())
-        self.assertEqual(manifest["delivery"]["status"], "handed_to_drive_sync_folder")
-        self.assertEqual(manifest["delivery"]["files"], [manifest["hourly_folder"] + "/" + hourly.CSV_NAME])
-        for name in (hourly.CSV_NAME, hourly.MANIFEST_NAME):
-            self.assertEqual(
-                (self.run_dir(manifest, self.delivery) / name).read_bytes(),
-                (self.run_dir(manifest) / name).read_bytes(),
-            )
+        self.assertEqual(manifest["delivery"]["mode"], "latest_only")
+        self.assertEqual(
+            manifest["delivery"]["files"], [hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME, hourly.FEED_NAME]
+        )
+        self.assertFalse((self.delivery / "hourly").exists(), "no hourly folders in Drive")
+        self.assertEqual(
+            sorted(p.name for p in self.delivery.iterdir()),
+            sorted([hourly.DAILY_DIR, hourly.FEED_NAME, hourly.LAST_RUN_STATUS_NAME, hourly.LATEST_CSV_NAME,
+                    hourly.LATEST_MANIFEST_NAME]),
+        )
         self.assertEqual(
             (self.delivery / hourly.LATEST_CSV_NAME).read_bytes(),
             (self.run_dir(manifest) / hourly.CSV_NAME).read_bytes(),
         )
-        status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
-        self.assertEqual(status["delivery_status"], "handed_to_drive_sync_folder")
+        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["run_id"], manifest["run_id"])
+        self.assertEqual((self.delivery / hourly.FEED_NAME).read_bytes(), (self.archive / hourly.FEED_NAME).read_bytes())
+        self.assertEqual(self.status()["delivery_status"], "handed_to_drive_sync_folder")
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [])
+        self.assertNotIn(hourly.CLOSE_STATE_NAME, [p.name for p in self.delivery.rglob("*")], "state stays local")
         manifest_text = (self.run_dir(manifest) / hourly.MANIFEST_NAME).read_text(encoding="utf-8")
         self.assertNotIn("uploaded", manifest_text.lower())
         self.assertNotIn(str(self.tmp), manifest_text, "delivery paths are relative")
 
-    def test_tampered_copy_is_verify_failed_and_latest_not_advanced(self):
+    def test_second_run_replaces_the_pair_and_adds_nothing(self):
+        settings = self.settings()
+        run(settings)
+        before = sorted(str(p.relative_to(self.delivery)) for p in self.delivery.rglob("*"))
+        second = run(settings, clock=clock_at(FIXED_NOW + timedelta(hours=1)))
+        after = sorted(str(p.relative_to(self.delivery)) for p in self.delivery.rglob("*"))
+        self.assertEqual(before, after, "an hourly run adds no files to Drive")
+        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["run_id"], second["run_id"])
+
+    def test_tampered_csv_copy_is_verify_failed_and_latest_not_advanced(self):
         settings = self.settings()
         good = run(settings)
-        latest_before = (self.delivery / hourly.LATEST_CSV_NAME).read_bytes()
-        real_copy = hourly.copy_exclusive
-
-        def bad_copy(src, dst):
-            real_copy(src, dst)
-            if Path(dst).name == hourly.CSV_NAME:
-                with open(dst, "ab") as handle:
-                    handle.write(b"x")
-
-        with mock.patch.object(hourly, "copy_exclusive", side_effect=bad_copy):
+        before = {n: (self.delivery / n).read_bytes() for n in (hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME)}
+        with self.tamper(hourly.LATEST_CSV_NAME):
             manifest = run(settings)
         self.assertEqual(manifest["status"], "success", "archive data is still good")
-        self.assertEqual(manifest["delivery"]["status"], "verify_failed")
-        self.assertEqual((self.delivery / hourly.LATEST_CSV_NAME).read_bytes(), latest_before)
-        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
-        self.assertEqual(latest["run_id"], good["run_id"])
-        status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
-        self.assertEqual(status["delivery_status"], "verify_failed")
-        # The archive latest pair still advances: the archive copy verified.
+        self.assertEqual(self.status()["delivery_status"], "verify_failed")
+        for name, data in before.items():
+            self.assertEqual((self.delivery / name).read_bytes(), data, name)
+        self.assertEqual(json.loads(before[hourly.LATEST_MANIFEST_NAME])["run_id"], good["run_id"])
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [])
+        # The archive latest pair still advances: it does not depend on the Drive copy.
         archive_latest = json.loads((self.archive / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
         self.assertEqual(archive_latest["run_id"], manifest["run_id"])
 
-    def test_tampered_manifest_copy_blocks_delivery_latest(self):
+    def test_tampered_manifest_copy_is_verify_failed(self):
         settings = self.settings()
-        real_copy = hourly.copy_exclusive
-
-        def bad_copy(src, dst):
-            real_copy(src, dst)
-            if Path(dst).name == hourly.MANIFEST_NAME:
-                with open(dst, "ab") as handle:
-                    handle.write(b" ")
-
-        with mock.patch.object(hourly, "copy_exclusive", side_effect=bad_copy):
+        good = run(settings)
+        with self.tamper(hourly.LATEST_MANIFEST_NAME):
             run(settings)
+        self.assertEqual(self.status()["delivery_status"], "verify_failed")
+        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["run_id"], good["run_id"], "the previous verified manifest is kept")
+
+    def test_first_run_with_bad_copy_leaves_no_latest(self):
+        with self.tamper(hourly.LATEST_CSV_NAME):
+            run(self.settings())
         self.assertFalse((self.delivery / hourly.LATEST_CSV_NAME).exists())
-        status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
-        self.assertEqual(status["delivery_status"], "verify_failed")
+        self.assertFalse((self.delivery / hourly.LATEST_MANIFEST_NAME).exists())
+        self.assertEqual(self.status()["delivery_status"], "verify_failed")
 
     def test_cli_exit_code_when_delivery_fails(self):
         path = Path(self.tmp) / "settings.local.json"
         path.write_text(json.dumps(raw_settings(self.tmp, output={"delivery_root": str(self.delivery)})), encoding="utf-8")
-
-        def bad_copy(src, dst):
-            hourly.write_exclusive(dst, b"not the same")
-
-        with mock.patch.object(hourly, "copy_exclusive", side_effect=bad_copy), contextlib.redirect_stdout(io.StringIO()) as out:
+        with self.tamper(hourly.LATEST_CSV_NAME), contextlib.redirect_stdout(io.StringIO()) as out:
             code = hourly.main(["--config", str(path)], source=FakeSource(), environ=ENV, clock=clock_at())
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())["delivery_status"], "verify_failed")
@@ -1197,9 +1290,12 @@ class DeliveryTests(TempDirTestCase):
     def test_failed_run_status_reaches_delivery_root(self):
         manifest = run(self.settings(), FakeSource(multi_uom=1))
         self.assertEqual(manifest["delivery"]["status"], "skipped_failed_run")
-        status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        status = self.status()
         self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["daily_close_status"], "skipped_failed_run")
         self.assertFalse((self.delivery / hourly.LATEST_CSV_NAME).exists())
+        self.assertFalse((self.delivery / hourly.FEED_NAME).exists())
+        self.assertFalse((self.delivery / hourly.DAILY_DIR).exists())
         self.assertFalse(self.run_dir(manifest, self.delivery).exists())
 
 
@@ -1550,11 +1646,24 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(int(limit.group(1)), hourly.TASK_EXECUTION_LIMIT_MINUTES)
         self.assertGreater(hourly.LOCK_STALE_AFTER_MINUTES, hourly.TASK_EXECUTION_LIMIT_MINUTES)
 
-    def test_repetition_never_stops_a_run_at_the_end_of_the_day(self):
-        stop = "$repeat.Repetition.StopAtDurationEnd = $false"
-        self.assertIn(stop, self.text)
-        self.assertLess(self.text.index(stop), self.text.index("$trigger.Repetition = $repeat.Repetition"))
+    def test_repetition_never_stops_a_run(self):
+        self.assertIn("$trigger.Repetition.StopAtDurationEnd = $false", self.text)
         self.assertNotIn("StopAtDurationEnd = $true", self.text)
+
+    def test_single_hourly_trigger_without_daily_start(self):
+        # R1 (28 Oct 2026): a daily 00:00 start plus a one-day hourly repeat started 00:00 twice.
+        code = re.sub(r"<#.*?#>", "", self.text, flags=re.S)
+        code = "\n".join(line for line in code.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(code.count("New-ScheduledTaskTrigger"), 1, "exactly one trigger")
+        self.assertIn(
+            "$trigger = New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1)\n",
+            code,
+        )
+        self.assertNotIn("-Daily", code)
+        self.assertNotIn("-RepetitionDuration", code)
+        self.assertNotIn("MaxValue", code)
+        self.assertEqual(code.count("-Trigger $trigger "), 2, "both registration paths use the one trigger")
+        self.assertLess(code.index('$repeatEvery -cne "PT1H"'), code.index("if ($DryRun) {"))
 
     def test_run_minute_comes_from_the_validated_settings(self):
         self.assertNotIn("[int]$RunMinute = 0", self.text, "no separate RunMinute parameter")
@@ -1685,6 +1794,8 @@ class InstallerPowerShell51Tests(TempDirTestCase):
         self.assertIn("Dry run: would register \\XB\\" + self.TASK_NAME, out)
         self.assertIn("Repo root: " + str(ROOT), out)
         self.assertIn("LogonType S4U (windows_integrated)", out)
+        # The trigger object is really built on this host: one trigger, hourly, no end.
+        self.assertIn("Trigger: one trigger, starts 00:00, repeats every PT1H, no end", out)
         self.assertIn("Nothing was registered.", out)
 
     def test_dry_run_with_empty_repo_root_finds_this_clone(self):
@@ -1720,6 +1831,602 @@ class InstallerPowerShell51Tests(TempDirTestCase):
                 self.assertNotEqual(code, 0, out)
                 self.assertIn("TaskPath must look like", out)
                 self.assertNotIn("Dry run:", out)
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 6: ledger check, daily close, backfill, restate window, feed, retention (#245)
+# ---------------------------------------------------------------------------------------------
+
+
+def at(year, month, day, hour=0, minute=0, second=5):
+    return datetime(year, month, day, hour, minute, second, tzinfo=SGT)
+
+
+def ledger_source(ledger, items, **kwargs):
+    """A fake source whose stored balances are the ledger totals, so the balance check passes."""
+    totals = {}
+    for r in ledger:
+        key = (r["ItemCode"], r["UOM"], r["Location"])
+        totals[key] = totals.get(key, Decimal(0)) + r["Qty"]
+    by_item = {i["ItemCode"]: i for i in items}
+    balances = [
+        bal(item, loc, qty, uom=uom, base=by_item[item]["BaseUOM"], active=by_item[item]["IsActive"],
+            stock=by_item[item]["StockControl"], desc=by_item[item]["ItemDescription"])
+        for (item, uom, loc), qty in sorted(totals.items())
+    ]
+    kwargs.setdefault("no_row_items", [])
+    return FakeSource(balances=balances, ledger=ledger, item_master=items, **kwargs)
+
+
+# Fake August: a timed POS-like sale before go-live, opening stock on 31 Jul, a fee code that is
+# not stock-controlled, and ordinary movements.
+AUG_ITEMS = [
+    master("FAKE-A"),
+    master("FAKE-B"),
+    master("FAKE-LOW", desc="Fake low item"),
+    master("FAKE-FEE", stock="F", desc="Fake marketplace fee"),
+]
+
+
+def aug_ledger():
+    return [
+        led("FAKE-A", "LOC-A", -1, day=datetime(2026, 7, 3, 18, 34, 0)),
+        led("FAKE-A", "LOC-A", 10, day=date(2026, 7, 31)),
+        led("FAKE-B", "LOC-B", 5, day=date(2026, 7, 31)),
+        led("FAKE-LOW", "LOC-B", 2, day=date(2026, 7, 31)),
+        led("FAKE-FEE", "LOC-W", -3, day=date(2026, 8, 1)),
+        led("FAKE-A", "LOC-A", -2, day=date(2026, 8, 2)),
+    ]
+
+
+class Round6TestCase(TempDirTestCase):
+    def settings(self, **overrides):
+        base = {"daily_close": {"backfill_start": "2026-08-01"}, "location_labels": {"LOC-A": "LOC-A - Example outlet"}}
+        base.update(overrides)
+        return settings_for(self.tmp, **base)
+
+    def run_at(self, settings, when, ledger=None, items=None, **kwargs):
+        source = ledger_source(aug_ledger() if ledger is None else ledger, AUG_ITEMS if items is None else items,
+                               sql_now=when + timedelta(seconds=1), **kwargs)
+        return run(settings, source, clock=clock_at(when))
+
+    def daily(self, day, root=None, suffix=".csv"):
+        return Path(root or self.archive) / "daily" / day[:7] / ("stock_close_%s%s" % (day, suffix))
+
+    def daily_rows(self, day, root=None):
+        return read_csv(self.daily(day, root))
+
+    def daily_meta(self, day, root=None):
+        return json.loads(self.daily(day, root, ".manifest.json").read_text(encoding="utf-8"))
+
+    def feed(self, root=None):
+        return json.loads(gzip.decompress((Path(root or self.archive) / hourly.FEED_NAME).read_bytes()))
+
+    def qty(self, day, item, loc):
+        found = [r["CloseQty"] for r in self.daily_rows(day) if r["ItemCode"] == item and r["Location"] == loc]
+        return found[0] if found else None
+
+
+class LedgerCloseTests(Round6TestCase):
+    def test_sum_from_first_row_not_from_the_backfill_date(self):
+        manifest = self.run_at(self.settings(), at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        close = manifest["daily_close"]
+        self.assertEqual((close["status"], close["mode"], close["days_written"]), ("published", "initial", 3))
+        self.assertEqual(close["published_close_day"], "2026-08-03")
+        # 1 Aug = the 3 Jul sale (-1) + 31 Jul opening (+10), both before the backfill start.
+        self.assertEqual(self.qty("2026-08-01", "FAKE-A", "LOC-A"), "9")
+        self.assertEqual(self.qty("2026-08-02", "FAKE-A", "LOC-A"), "7")
+        self.assertEqual(self.qty("2026-08-03", "FAKE-B", "LOC-B"), "5")
+        self.assertFalse(self.daily("2026-07-31").exists(), "nothing before backfill_start")
+        self.assertFalse(self.daily("2026-08-04").exists(), "today is not closed yet")
+        meta = self.daily_meta("2026-08-01")
+        self.assertEqual(meta["close_rule"].split(" dated before ")[1][:16], "2026-08-02 00:00")
+        self.assertEqual((meta["revision"], meta["write_reason"], meta["final_from"]), (1, "rebuild", "2026-08-09"))
+        self.assertEqual(meta["csv"]["sha256"], hashlib.sha256(self.daily("2026-08-01").read_bytes()).hexdigest())
+
+    def test_as_of_boundary_with_timed_rows(self):
+        ledger = aug_ledger() + [
+            led("FAKE-B", "LOC-B", -1, day=datetime(2026, 8, 1, 23, 59, 59)),
+            led("FAKE-B", "LOC-B", -2, day=datetime(2026, 8, 2, 0, 0, 0)),
+        ]
+        self.run_at(self.settings(), at(2026, 8, 3), ledger=ledger)
+        self.assertEqual(self.qty("2026-08-01", "FAKE-B", "LOC-B"), "4", "23:59:59 belongs to 1 Aug")
+        self.assertEqual(self.qty("2026-08-02", "FAKE-B", "LOC-B"), "2", "00:00:00 belongs to 2 Aug")
+
+    def test_iter_closes_uses_next_midnight_and_skips_zero(self):
+        key = ("FAKE-A", "PCS", "LOC-A")
+        moves = {date(2026, 7, 3): {key: Decimal(-1)}, date(2026, 8, 1): {key: Decimal(1)}, date(2026, 8, 2): {key: Decimal(4)}}
+        closes = {day: dict(c) for day, c in hourly.iter_closes(moves, date(2026, 8, 2), first_day=date(2026, 8, 1))}
+        self.assertEqual(closes, {date(2026, 8, 1): {}, date(2026, 8, 2): {key: Decimal(4)}})
+
+    def test_non_stock_items_excluded_and_counted(self):
+        manifest = self.run_at(self.settings(), at(2026, 8, 4))
+        self.assertEqual(manifest["ledger_check"]["result"], "pass", "the check still covers every item")
+        self.assertEqual(manifest["ledger"]["non_stock_items_excluded"], 1)
+        self.assertEqual(manifest["ledger"]["non_stock_rows_excluded"], 1)
+        self.assertEqual(manifest["counts"]["non_stock_excluded"], 1)
+        latest = read_csv(self.archive / hourly.LATEST_CSV_NAME)
+        self.assertNotIn("FAKE-FEE", {r["ItemCode"] for r in latest})
+        for day in ("2026-08-01", "2026-08-03"):
+            self.assertNotIn("FAKE-FEE", {r["ItemCode"] for r in self.daily_rows(day)})
+        feed = self.feed()
+        self.assertNotIn("FAKE-FEE", json.dumps(feed))
+        self.assertNotIn("LOC-W", feed["latest"])
+        self.assertEqual(feed["anomalies"]["non_stock_items_excluded"], 1)
+
+    def test_exclusion_can_be_switched_off(self):
+        manifest = self.run_at(self.settings(rows={"exclude_non_stock_items": False}), at(2026, 8, 4))
+        self.assertEqual(self.qty("2026-08-01", "FAKE-FEE", "LOC-W"), "-3")
+        self.assertEqual(manifest["counts"]["non_stock_excluded"], 0)
+
+    def test_item_missing_from_master_is_kept_not_hidden(self):
+        ledger = aug_ledger() + [led("FAKE-GONE", "LOC-A", 1, day=date(2026, 8, 1))]
+        source = ledger_source(ledger, AUG_ITEMS + [master("FAKE-GONE")], sql_now=at(2026, 8, 3, second=6))
+        source.item_master = list(AUG_ITEMS)
+        manifest = run(self.settings(), source, clock=clock_at(at(2026, 8, 3)))
+        # Its UOM cannot be checked against a base UOM, so the guard fails closed.
+        self.assertEqual(manifest["failure_class"], "uom_guard")
+        self.assertEqual(manifest["ledger"]["items_missing_from_master"], 1)
+
+    def test_unmapped_location_is_kept_labelled_and_counted(self):
+        ledger = aug_ledger() + [
+            led("FAKE-B", "LOC-Z", 1, day=date(2026, 8, 1)),
+            led("FAKE-B", "LOC-Z", -1, day=date(2026, 8, 2)),
+        ]
+        source = ledger_source(ledger, AUG_ITEMS, sql_now=at(2026, 8, 3, second=6),
+                               locations=[{"Location": "LOC-Z", "LocationDescription": "Fake unlisted"}])
+        manifest = run(self.settings(), source, clock=clock_at(at(2026, 8, 3)))
+        row = [r for r in self.daily_rows("2026-08-01") if r["Location"] == "LOC-Z"][0]
+        self.assertEqual(row["LocationLabel"], "LOC-Z - Fake unlisted")
+        self.assertIn("LOC-Z", self.daily_meta("2026-08-01")["unmapped_location_codes"])
+        self.assertIn("LOC-Z", manifest["daily_close"]["unmapped_location_codes"])
+        feed = self.feed()
+        self.assertIn({"code": "LOC-Z", "label": "LOC-Z - Fake unlisted", "mapped": False}, feed["locations"])
+        self.assertEqual(feed["history"]["per_location"]["LOC-Z"]["units"], [1, 0])
+        self.assertGreaterEqual(feed["anomalies"]["unmapped_location_count"], 1)
+
+    def test_future_dated_rows_are_counted_and_not_closed(self):
+        ledger = aug_ledger() + [led("FAKE-B", "LOC-B", 7, day=date(2026, 8, 20))]
+        manifest = self.run_at(self.settings(), at(2026, 8, 4), ledger=ledger)
+        self.assertEqual(manifest["ledger"]["future_dated_rows"], 1)
+        self.assertEqual(self.qty("2026-08-03", "FAKE-B", "LOC-B"), "5")
+        self.assertEqual(self.feed()["anomalies"]["future_dated_ledger_rows"], 1)
+
+    def test_ledger_with_non_base_uom_fails_the_uom_guard(self):
+        ledger = aug_ledger() + [led("FAKE-B", "LOC-B", 0, day=date(2026, 8, 1), uom="CTN")]
+        manifest = self.run_at(self.settings(), at(2026, 8, 4), ledger=ledger)
+        self.assertEqual(manifest["failure_class"], "uom_guard")
+        self.assertEqual(manifest["uom_guard"]["ledger_non_base_uom_groups"], 1)
+        self.assertFalse((self.archive / "daily").exists())
+
+    def test_ledger_query_contract(self):
+        q = hourly.LEDGER_QUERY
+        self.assertIn("FROM dbo.StockDTL AS d", q)
+        self.assertIn("CAST(d.DocDate AS date) AS DocDay", q)
+        self.assertIn("GROUP BY d.ItemCode, d.UOM, d.Location, CAST(d.DocDate AS date)", q)
+        self.assertNotIn("WHERE", q.upper(), "never filtered by date: every close sums from the first row")
+        self.assertNotIn("DocInfo", q)
+        self.assertNotIn("DocNo", q)
+        self.assertIn("FROM dbo.ItemUOM AS u", hourly.REORDER_QUERY)
+        self.assertIn("ReOLevel", hourly.REORDER_QUERY)
+
+
+class LedgerCheckTests(Round6TestCase):
+    def assert_fail_closed(self, manifest):
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["failure_class"], "ledger_mismatch")
+        self.assertNotIn("FAKE-", manifest["message"])
+        for name in (hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME, hourly.FEED_NAME):
+            self.assertFalse((self.archive / name).exists(), name)
+        self.assertFalse((self.archive / "daily").exists())
+        self.assertFalse((self.run_dir(manifest) / hourly.CSV_NAME).exists())
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["status"], status["failure_class"]), ("failed", "ledger_mismatch"))
+
+    def test_mismatch_fails_closed(self):
+        source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6))
+        source.balances[0]["BalQty"] += 1
+        manifest = run(self.settings(), source, clock=clock_at(at(2026, 8, 4)))
+        self.assert_fail_closed(manifest)
+        self.assertEqual(manifest["ledger_check"]["mismatched"], 1)
+
+    def test_balance_only_non_zero_fails(self):
+        source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6))
+        source.balances.append(bal("FAKE-B", "LOC-C", "3"))
+        self.assert_fail_closed(run(self.settings(), source, clock=clock_at(at(2026, 8, 4))))
+
+    def test_ledger_only_non_zero_fails(self):
+        source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6))
+        source.ledger.append(led("FAKE-B", "LOC-C", 3, day=date(2026, 8, 1)))
+        self.assert_fail_closed(run(self.settings(), source, clock=clock_at(at(2026, 8, 4))))
+
+    def test_zero_only_keys_on_either_side_pass(self):
+        source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6))
+        source.balances.append(bal("FAKE-B", "LOC-C", "0"))
+        source.ledger += [led("FAKE-B", "LOC-D", 2, day=date(2026, 8, 1)), led("FAKE-B", "LOC-D", -2, day=date(2026, 8, 2))]
+        manifest = run(self.settings(), source, clock=clock_at(at(2026, 8, 4)))
+        self.assertEqual(manifest["status"], "success")
+        check = manifest["ledger_check"]
+        self.assertEqual((check["balance_only"], check["ledger_only"], check["result"]), (1, 1, "pass"))
+        self.assertEqual(self.qty("2026-08-01", "FAKE-B", "LOC-D"), "2", "a key that nets 0 today still had stock")
+
+    def test_ledger_read_is_inside_every_changecount_window(self):
+        source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6), changecounts=[(1, 2), (2, 2)])
+        manifest = run(self.settings(), source, clock=clock_at(at(2026, 8, 4)))
+        self.assertEqual((manifest["status"], manifest["attempts"]), ("success", 2))
+        self.assertEqual(source.ledger_reads, 2, "the ledger is read again with each balance read")
+
+
+class RestateWindowTests(Round6TestCase):
+    def test_hourly_runs_after_the_close_write_no_daily_files(self):
+        settings = self.settings()
+        self.run_at(settings, at(2026, 8, 10))
+        before = tree_bytes(self.archive / "daily")
+        later = self.run_at(settings, at(2026, 8, 10, 5))
+        self.assertEqual(later["daily_close"]["status"], "not_due")
+        self.assertEqual(tree_bytes(self.archive / "daily"), before)
+
+    def test_double_start_at_midnight_closes_once(self):
+        settings = self.settings()
+        first = self.run_at(settings, at(2026, 8, 10, second=0))
+        before = tree_bytes(self.archive / "daily")
+        second = self.run_at(settings, at(2026, 8, 10, second=1))
+        self.assertEqual(first["daily_close"]["status"], "published")
+        self.assertEqual(second["daily_close"]["status"], "not_due")
+        self.assertEqual(tree_bytes(self.archive / "daily"), before)
+
+    def test_missed_midnights_are_caught_up(self):
+        settings = self.settings()
+        self.run_at(settings, at(2026, 8, 10))
+        manifest = self.run_at(settings, at(2026, 8, 13, 3))
+        close = manifest["daily_close"]
+        self.assertEqual((close["mode"], close["new_days"], close["revised_day_count"]), ("nightly", 3, 0))
+        for day in ("2026-08-10", "2026-08-11", "2026-08-12"):
+            self.assertEqual(self.daily_meta(day)["write_reason"], "new")
+
+    def test_restate_inside_window_and_flag_outside(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        self.run_at(settings, at(2026, 8, 10))
+        old_aug2 = self.daily("2026-08-02").read_bytes()
+        old_aug3_drive = self.daily("2026-08-03", self.delivery).read_bytes()
+        # Keyed late: one document backdated into the window, one older than the window.
+        ledger = aug_ledger() + [
+            led("FAKE-B", "LOC-B", -1, day=date(2026, 8, 5)),
+            led("FAKE-A", "LOC-A", 4, day=date(2026, 8, 2)),
+        ]
+        manifest = self.run_at(settings, at(2026, 8, 11), ledger=ledger)
+        close = manifest["daily_close"]
+        self.assertEqual(close["status"], "published")
+        self.assertEqual(close["provisional_from"], "2026-08-04")
+        self.assertEqual(close["new_days"], 1)
+        self.assertEqual([d["day"] for d in close["revised_days"]], ["2026-08-04", "2026-08-05", "2026-08-06",
+                                                                     "2026-08-07", "2026-08-08", "2026-08-09"])
+        self.assertEqual(close["revised_days"][1], {"day": "2026-08-05", "rows_changed": 2, "net_qty_change": "3"})
+        self.assertEqual(close["late_change_day_count"], 2)
+        self.assertEqual(close["late_changes_beyond_window"][0], {"day": "2026-08-02", "rows_changed": 1, "net_qty_change": "4"})
+        self.assertTrue(any(w.startswith("Late change: 2 day(s)") for w in manifest["warnings"]))
+        # Older days are left exactly as published, locally and in Drive.
+        self.assertEqual(self.daily("2026-08-02").read_bytes(), old_aug2)
+        self.assertEqual(self.daily("2026-08-03", self.delivery).read_bytes(), old_aug3_drive)
+        # Days inside the window are replaced with the rebuilt truth, in both places.
+        self.assertEqual(self.qty("2026-08-05", "FAKE-B", "LOC-B"), "4")
+        self.assertEqual(self.qty("2026-08-05", "FAKE-A", "LOC-A"), "11")
+        self.assertEqual(self.daily_meta("2026-08-05")["revision"], 2)
+        self.assertEqual(self.daily_meta("2026-08-05")["write_reason"], "revised")
+        self.assertEqual(self.daily("2026-08-05").read_bytes(), self.daily("2026-08-05", self.delivery).read_bytes())
+        # The feed always shows the rebuilt truth, including the flagged older days.
+        feed = self.feed(self.delivery)
+        aug2 = feed["history"]["days"].index("2026-08-02")
+        self.assertEqual(feed["history"]["per_location"]["LOC-A"]["units"][aug2], 11)
+        self.assertEqual(feed["anomalies"]["late_change_day_count"], 2)
+        status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["revised_day_count"], status["late_change_day_count"]), (6, 2))
+        # The flag is raised once: the next night compares against what was read this time.
+        nxt = self.run_at(settings, at(2026, 8, 12), ledger=ledger)
+        self.assertEqual((nxt["daily_close"]["late_change_day_count"], nxt["daily_close"]["revised_day_count"]), (0, 0))
+
+    def test_backfill_command_rewrites_every_day(self):
+        settings = self.settings()
+        self.run_at(settings, at(2026, 8, 10))
+        ledger = aug_ledger() + [led("FAKE-A", "LOC-A", 4, day=date(2026, 8, 2))]
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw_settings(self.tmp, daily_close={"backfill_start": "2026-08-01"})), encoding="utf-8")
+        source = ledger_source(ledger, AUG_ITEMS, sql_now=at(2026, 8, 10, 9, second=6))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path), "--backfill"], source=source, environ=ENV,
+                               clock=clock_at(at(2026, 8, 10, 9)))
+        self.assertEqual(code, 0, out.getvalue())
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["daily_close_status"], printed["published_close_day"]), ("published", "2026-08-09"))
+        self.assertEqual(self.qty("2026-08-02", "FAKE-A", "LOC-A"), "11")
+        self.assertEqual(self.daily_meta("2026-08-02")["revision"], 2)
+        self.assertEqual(self.daily_meta("2026-08-02")["write_reason"], "rebuild")
+
+    def test_missing_state_rebuilds_with_a_warning(self):
+        settings = self.settings()
+        self.run_at(settings, at(2026, 8, 10))
+        (self.archive / "daily" / hourly.CLOSE_STATE_NAME).unlink()
+        manifest = self.run_at(settings, at(2026, 8, 10, 1))
+        self.assertEqual((manifest["daily_close"]["mode"], manifest["daily_close"]["state"]), ("initial", "missing"))
+        self.assertIn("Close state was missing: every day from backfill_start is written again", manifest["warnings"])
+        self.assertTrue((self.archive / "daily" / hourly.CLOSE_STATE_NAME).exists())
+
+    def test_unreadable_state_rebuilds_with_a_warning(self):
+        settings = self.settings()
+        self.run_at(settings, at(2026, 8, 10))
+        (self.archive / "daily" / hourly.CLOSE_STATE_NAME).write_bytes(b"not gzip")
+        manifest = self.run_at(settings, at(2026, 8, 10, 1))
+        self.assertEqual(manifest["daily_close"]["state"], "unreadable")
+        self.assertEqual(manifest["daily_close"]["status"], "published")
+
+    def test_close_write_failure_keeps_snapshot_and_retries_next_run(self):
+        settings = self.settings()
+        real = hourly.publish_verified
+
+        def failing(path, data, tag):
+            if "stock_close_2026-08-02" in Path(path).name:
+                raise OSError("disk full")
+            return real(path, data, tag)
+
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw_settings(self.tmp, daily_close={"backfill_start": "2026-08-01"})), encoding="utf-8")
+        source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6))
+        with mock.patch.object(hourly, "publish_verified", side_effect=failing), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=source, environ=ENV, clock=clock_at(at(2026, 8, 4)))
+        self.assertEqual(code, 1)
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["status"], printed["daily_close_status"]), ("success", "failed"))
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(status["daily_close_failure_class"], "daily_close_write_failed")
+        self.assertTrue((self.archive / hourly.LATEST_CSV_NAME).exists(), "the hourly snapshot is still published")
+        self.assertFalse((self.archive / "daily" / hourly.CLOSE_STATE_NAME).exists())
+        retry = self.run_at(settings, at(2026, 8, 4, 1))
+        self.assertEqual(retry["daily_close"]["status"], "published")
+        self.assertTrue(self.daily("2026-08-03").exists())
+
+    def test_restate_days_setting_moves_the_window(self):
+        settings = self.settings(daily_close={"backfill_start": "2026-08-01", "restate_days": 2})
+        self.run_at(settings, at(2026, 8, 10))
+        ledger = aug_ledger() + [led("FAKE-B", "LOC-B", -1, day=date(2026, 8, 7))]
+        close = self.run_at(settings, at(2026, 8, 11), ledger=ledger)["daily_close"]
+        self.assertEqual([d["day"] for d in close["revised_days"]], ["2026-08-09"])
+        self.assertEqual([d["day"] for d in close["late_changes_beyond_window"]], ["2026-08-07", "2026-08-08"])
+
+    def test_changed_closes_is_pure_and_cumulative(self):
+        key = ("FAKE-A", "PCS", "LOC-A")
+        old = {date(2026, 8, 1): {key: Decimal(5)}}
+        new = {date(2026, 8, 1): {key: Decimal(5)}, date(2026, 8, 2): {key: Decimal(-1)}}
+        days = hourly.day_range(date(2026, 8, 1), date(2026, 8, 3))
+        changed = hourly.changed_closes(old, new, days)
+        self.assertEqual(sorted(changed), [date(2026, 8, 2), date(2026, 8, 3)])
+        self.assertEqual(changed[date(2026, 8, 3)], {"rows_changed": 1, "net_qty_change": Decimal(-1)})
+        self.assertEqual(hourly.changed_closes(new, new, days), {})
+
+
+class FeedTests(Round6TestCase):
+    TOP_KEYS = {
+        "schema", "schema_version", "job", "run_id", "as_of_local", "timezone", "cadence_minutes", "next_run_local",
+        "stale_after_minutes", "backfill_start", "last_close_day", "published_close_day", "provisional_from",
+        "quantity_rule", "locations", "latest", "history", "movers", "negatives", "low_stock", "anomalies", "pos_sync",
+    }
+
+    def test_schema_and_shape(self):
+        manifest = self.run_at(self.settings(), at(2026, 8, 4, 14))
+        data = (self.archive / hourly.FEED_NAME).read_bytes()
+        self.assertEqual(data[:2], b"\x1f\x8b", "gzip")
+        self.assertEqual(manifest["feed"]["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(manifest["feed"]["status"], "published")
+        feed = self.feed()
+        self.assertEqual(set(feed), self.TOP_KEYS)
+        self.assertEqual((feed["schema"], feed["schema_version"]), ("xb.ac2.stock_dashboard_feed", 1))
+        self.assertEqual(feed["run_id"], manifest["run_id"])
+        self.assertEqual((feed["last_close_day"], feed["published_close_day"]), ("2026-08-03", "2026-08-03"))
+        self.assertEqual(feed["next_run_local"], "2026-08-04T15:00:00+08:00")
+        self.assertEqual(feed["history"]["days"], ["2026-08-01", "2026-08-02", "2026-08-03"])
+        for loc, series in feed["history"]["per_location"].items():
+            for name in ("units", "skus_in_stock", "negative"):
+                self.assertEqual(len(series[name]), 3, (loc, name))
+        self.assertEqual(feed["history"]["per_location"]["LOC-A"]["units"], [9, 7, 7])
+        self.assertEqual(feed["latest"]["LOC-A"], {"units": 7, "skus_in_stock": 1, "zero": 0, "negative": 0, "low_stock": 0})
+        self.assertEqual(set(feed["movers"]), {"1d", "7d", "30d"})
+        text = json.dumps(feed).lower()
+        for word in ("cost", "price", "amount", "customer", "member", "phone", "email", "debtor", "docno"):
+            self.assertNotIn(word, text)
+
+    def test_negatives_low_stock_and_caps(self):
+        ledger = aug_ledger() + [
+            led("FAKE-B", "LOC-B", -6, day=date(2026, 8, 2)),
+            led("FAKE-A", "LOC-B", 1, day=date(2026, 8, 3)),
+        ]
+        reorder = [{"ItemCode": "FAKE-LOW", "UOM": "PCS", "ReOLevel": Decimal("3")}]
+        settings = self.settings(feed={"low_stock_threshold": 2, "list_cap": 1})
+        self.run_at(settings, at(2026, 8, 4, 9), ledger=ledger, reorder_levels=reorder)
+        feed = self.feed()
+        self.assertEqual(feed["negatives"]["count"], 1)
+        self.assertEqual(
+            feed["negatives"]["rows"][0],
+            {"item": "FAKE-B", "description": "Fake item", "location": "LOC-B", "uom": "PCS", "qty": -1,
+             "negative_since": "2026-08-02"},
+        )
+        low = feed["low_stock"]
+        self.assertEqual((low["count"], low["truncated"], len(low["rows"])), (2, True, 1))
+        self.assertEqual(low["rows"][0]["qty"], 1)
+        self.assertEqual(low["items_with_reorder_level"], 1)
+        self.assertEqual(feed["latest"]["LOC-B"]["low_stock"], 2)
+
+    def test_movers(self):
+        self.run_at(self.settings(), at(2026, 8, 4))
+        movers = self.feed()["movers"]
+        self.assertEqual(movers["1d"]["from"], "2026-08-02")
+        self.assertEqual(movers["1d"]["changed_keys"], 0)
+        week = movers["7d"]
+        self.assertEqual(week["from"], "2026-07-27")
+        self.assertEqual([(m["item"], m["change"], m["close"]) for m in week["up"]],
+                         [("FAKE-A", 8, 7), ("FAKE-B", 5, 5), ("FAKE-LOW", 2, 2)])
+        # FAKE-A was -1 on 27 Jul (the 3 Jul sale before go-live), so its 7-day change is +8.
+
+    def test_feed_written_every_hour_beside_the_latest_pair(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        self.run_at(settings, at(2026, 8, 4))
+        second = self.run_at(settings, at(2026, 8, 4, 1))
+        self.assertEqual(self.feed(self.delivery)["run_id"], second["run_id"])
+        self.assertEqual((self.delivery / hourly.FEED_NAME).read_bytes(), (self.archive / hourly.FEED_NAME).read_bytes())
+
+    def test_feed_failure_is_reported_and_snapshot_kept(self):
+        with mock.patch.object(hourly, "build_feed", side_effect=RuntimeError("bug")):
+            manifest = self.run_at(self.settings(), at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual(manifest["feed"], {"status": "failed", "failure_class": "feed_publish_failed"})
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(status["feed_status"], "failed")
+        self.assertFalse((self.archive / hourly.FEED_NAME).exists())
+
+    def test_size_stays_compact_for_a_realistic_book(self):
+        items = [master("FAKE-%05d" % n) for n in range(3000)]
+        ledger = []
+        for n in range(3000):
+            ledger.append(led("FAKE-%05d" % n, "LOC-%d" % (n % 6), 5 + n % 7, day=date(2026, 7, 31)))
+            for d in range(1, 30, 3):
+                ledger.append(led("FAKE-%05d" % n, "LOC-%d" % (n % 6), -1 if n % 2 else 1, day=date(2026, 8, d)))
+        settings = self.settings()
+        manifest = self.run_at(settings, at(2026, 9, 1), ledger=ledger, items=items)
+        self.assertEqual(manifest["status"], "success")
+        self.assertLess(manifest["feed"]["byte_size"], 1000000)
+        self.assertEqual(manifest["daily_close"]["days_written"], 31)
+
+
+class RetentionTests(Round6TestCase):
+    OLD = "ac2_stockbal_20261020T100000+0800_aaaaaaaa"
+    NEW = "ac2_stockbal_20261023T120000+0800_bbbbbbbb"
+
+    def make(self, relative, data=b"x"):
+        path = self.archive / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def build_tree(self):
+        self.make("hourly/2026-10-20/%s/stock_balance.csv" % self.OLD)
+        self.make("hourly/2026-10-20/%s/manifest.json" % self.OLD)
+        # An expired run folder holding a foreign file: its own manifest goes, the rest stays.
+        own_beside_foreign = self.make("hourly/2026-10-20/ac2_stockbal_20261020T110000+0800_cccccccc/manifest.json")
+        foreign = self.make("hourly/2026-10-20/ac2_stockbal_20261020T110000+0800_cccccccc/notes.txt")
+        self.make("hourly/2026-10-23/%s/stock_balance.csv" % self.NEW)
+        odd_folder = self.make("hourly/misc/stock_balance.csv")
+        odd_run = self.make("hourly/2026-10-20/backup/stock_balance.csv")
+        old_daily = self.make("daily/2026-07/stock_close_2026-07-20.csv")
+        old_meta = self.make("daily/2026-07/stock_close_2026-07-20.manifest.json")
+        keep_daily = self.make("daily/2026-07/stock_close_2026-07-25.csv")
+        foreign_daily = self.make("daily/2026-07/other.csv")
+        state = self.make("daily/" + hourly.CLOSE_STATE_NAME)
+        return {
+            "removed": [old_daily, old_meta, own_beside_foreign],
+            "kept": [foreign, odd_folder, odd_run, keep_daily, foreign_daily, state],
+        }
+
+    def test_off_by_default(self):
+        tree = self.build_tree()
+        before = tree_bytes(self.archive)
+        result = hourly.prune_archive(self.archive, self.settings(), at(2026, 10, 23, 14), date(2026, 10, 23), None)
+        self.assertFalse(result["prune_enabled"])
+        self.assertEqual(tree_bytes(self.archive), before)
+        self.assertTrue(all(p.exists() for p in tree["removed"]))
+
+    def test_prunes_only_own_expired_files(self):
+        tree = self.build_tree()
+        outside = Path(self.tmp) / "outside" / "stock_close_2026-01-01.csv"
+        outside.parent.mkdir()
+        outside.write_bytes(b"keep")
+        settings = self.settings(retention={"prune_enabled": True})
+        result = hourly.prune_archive(self.archive, settings, at(2026, 10, 23, 14), date(2026, 10, 23), None)
+        self.assertFalse((self.archive / "hourly" / "2026-10-20" / self.OLD).exists())
+        self.assertTrue((self.archive / "hourly" / "2026-10-23" / self.NEW / "stock_balance.csv").exists())
+        for path in tree["removed"]:
+            self.assertFalse(path.exists(), path)
+        for path in tree["kept"]:
+            self.assertTrue(path.exists(), path)
+        self.assertTrue(outside.exists())
+        self.assertEqual((result["hourly_folders_removed"], result["daily_files_removed"]), (1, 2))
+        self.assertGreaterEqual(result["kept_unexpected"], 4)
+        self.assertEqual(result["errors"], 0)
+
+    def test_never_follows_a_junction_out_of_the_archive(self):
+        if os.name != "nt":
+            self.skipTest("junctions are Windows only")
+        target = Path(self.tmp) / "elsewhere"
+        target.mkdir()
+        (target / "stock_balance.csv").write_bytes(b"not ours")
+        (target / "manifest.json").write_bytes(b"not ours")
+        link = self.archive / "hourly" / "2026-10-01" / "ac2_stockbal_20261001T000000+0800_dddddddd"
+        link.parent.mkdir(parents=True)
+        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if done.returncode != 0:
+            self.skipTest("could not create a junction here")
+        # Remove the junction itself (never its target) before the temp folder is deleted.
+        self.addCleanup(os.rmdir, link)
+        month_target = Path(self.tmp) / "elsewhere_daily"
+        month_target.mkdir()
+        (month_target / "stock_close_2026-01-01.csv").write_bytes(b"not ours")
+        month_link = self.archive / "daily" / "2026-01"
+        month_link.parent.mkdir(parents=True)
+        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(month_link), str(month_target)], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.addCleanup(os.rmdir, month_link)
+        settings = self.settings(retention={"prune_enabled": True})
+        result = hourly.prune_archive(self.archive, settings, at(2026, 10, 23, 14), date(2026, 10, 23), None)
+        self.assertEqual(sorted(p.name for p in target.iterdir()), ["manifest.json", "stock_balance.csv"])
+        self.assertTrue((month_target / "stock_close_2026-01-01.csv").exists())
+        self.assertGreaterEqual(result["kept_unexpected"], 2)
+
+    def test_run_prunes_when_enabled_and_keeps_its_own_folder(self):
+        self.build_tree()
+        settings = self.settings(retention={"prune_enabled": True, "hourly_keep_hours": 2})
+        manifest = self.run_at(settings, at(2026, 10, 23, 14))
+        self.assertTrue((self.run_dir(manifest) / hourly.CSV_NAME).exists())
+        self.assertEqual(manifest["retention"]["hourly_folders_removed"], 2)
+        on_disk = json.loads((self.run_dir(manifest) / hourly.MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["retention"], manifest["retention"])
+        self.assertTrue((self.archive / "daily" / hourly.CLOSE_STATE_NAME).exists())
+
+    def test_drive_folder_is_never_pruned(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)},
+                                 retention={"prune_enabled": True, "daily_keep_days": 8})
+        self.run_at(settings, at(2026, 8, 4))
+        drive_daily = self.daily("2026-08-01", self.delivery).read_bytes()
+        self.run_at(settings, at(2026, 8, 20))
+        self.assertFalse(self.daily("2026-08-01").exists(), "local copy pruned after 8 days")
+        self.assertEqual(self.daily("2026-08-01", self.delivery).read_bytes(), drive_daily)
+
+
+class Round6ConfigTests(TempDirTestCase):
+    def assert_config_error(self, fragment, **overrides):
+        with self.assertRaises(hourly.ConfigError) as caught:
+            settings_for(self.tmp, **overrides)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_defaults(self):
+        raw = raw_settings(self.tmp)
+        del raw["daily_close"]
+        settings = hourly.validate_settings(raw)
+        self.assertEqual(settings["daily_close"], {"backfill_start": "2026-08-01", "restate_days": 7})
+        self.assertEqual(settings["retention"], {"prune_enabled": False, "hourly_keep_hours": 48, "daily_keep_days": 90})
+        self.assertEqual(settings["feed"], {"low_stock_threshold": 2, "list_cap": 200, "movers_top": 20})
+        self.assertTrue(settings["rows"]["exclude_non_stock_items"])
+        self.assertEqual(settings["schedule"]["frequency"], "hourly")
+
+    def test_bad_values(self):
+        for bad in ("2026-W31-1", "01/08/2026", "2026-8-1", "2026-02-30", 20260801, None):
+            self.assert_config_error("daily_close.backfill_start", daily_close={"backfill_start": bad})
+        self.assert_config_error("daily_close.restate_days", daily_close={"restate_days": 0})
+        self.assert_config_error("retention.daily_keep_days", retention={"daily_keep_days": 7})
+        self.assert_config_error("retention.prune_enabled", retention={"prune_enabled": "yes"})
+        self.assert_config_error("retention.hourly_keep_hours", retention={"hourly_keep_hours": 1})
+        self.assert_config_error("feed.list_cap", feed={"list_cap": 0})
+        self.assert_config_error("rows.exclude_non_stock_items", rows={"exclude_non_stock_items": 1})
+        self.assert_config_error("daily_close.hourly", daily_close={"hourly": True})
+        self.assert_config_error("schedule.frequency", schedule={"frequency": "daily"})
 
 
 class RepoHygieneTests(unittest.TestCase):

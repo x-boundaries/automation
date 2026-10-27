@@ -30,7 +30,8 @@
   "rows": {
     "zero_row_mode": "keep_rows_and_add_items_without_rows",
     "drop_zero_rows_for_inactive_items": true,
-    "uom_guard": "fail"
+    "uom_guard": "fail",
+    "exclude_non_stock_items": true
   },
   "location_labels": {
     "LOC-A": "LOC-A - Example outlet",
@@ -38,7 +39,7 @@
   },
   "output": {
     "archive_root": "C:\\EXAMPLE\\automation\\autocount_outputs\\stock_balance_hourly",
-    "delivery_root": "D:\\EXAMPLE\\DriveForDesktop\\ac2_stock",
+    "delivery_root": "D:\\EXAMPLE\\DriveForDesktop\\Report\\AC2 Stock Balance (daily)",
     "columns": [
       "as_of_local",
       "ItemCode",
@@ -53,5 +54,19 @@
       "RowSource"
     ],
     "large_balance_threshold": 100000
+  },
+  "daily_close": {
+    "backfill_start": "2026-08-01",
+    "restate_days": 7
+  },
+  "retention": {
+    "prune_enabled": false,
+    "hourly_keep_hours": 48,
+    "daily_keep_days": 90
+  },
+  "feed": {
+    "low_stock_threshold": 2,
+    "list_cap": 200,
+    "movers_top": 20
   }
 }

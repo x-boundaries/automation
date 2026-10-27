@@ -1,9 +1,13 @@
-"""Hourly AutoCount (AC2) stock balance export (#245).
+"""Hourly AutoCount (AC2) stock balance export with a daily close (#245).
 
-Reads the stored on-hand balance (dbo.ItemBatchBalQty) read-only, once per hour, and writes an
-immutable hourly CSV plus a manifest, a verified "latest" pair, and a last_run_status.json that
-also records failed hours. Delivery to Google Drive is a plain copy into a local folder that
-Google Drive for desktop syncs; nothing here calls a Drive API.
+Reads the stored on-hand balance (dbo.ItemBatchBalQty) and the stock ledger (dbo.StockDTL)
+read-only, once per hour, and writes an immutable local hourly CSV plus a manifest, a verified
+"latest" pair, a compact dashboard feed and a last_run_status.json that also records failed
+hours. The first run after local midnight also publishes the previous day's closing balance,
+rebuilt from the ledger, as one daily file (round 6, accepted design 27 Oct 2026). Delivery to
+Google Drive is a plain copy into a local folder that Google Drive for desktop syncs; only the
+latest pair, the feed, the run status and the daily files go there, never hourly folders.
+Nothing here calls a Drive API.
 
 Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md):
 
@@ -17,6 +21,12 @@ Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md)
   and the latest pair is replaced (temp file + os.replace) only after the new hourly CSV
   re-reads to the hash that was written.
 * Every outcome writes a manifest. A failed run writes no CSV and never touches the latest pair.
+* Every run checks that the ledger summed over all dates equals the stored balance per key, read
+  inside the same ChangeCount window. A mismatch fails the run (ledger_mismatch): no latest pair,
+  no daily close, no feed.
+* Daily files may be replaced only inside the restate window (default 7 days); a change to an
+  older day is counted and flagged, never written. Pruning (off by default) deletes only the
+  exporter's own file names inside its own archive folders.
 * Passwords only come from Windows Credential Manager at runtime. Connection strings, logins,
   host names and row data are never logged or written to a manifest, except that a successful
   run's manifest lists at most 20 large-balance rows (ItemCode, Location, BalQty), the same
@@ -28,15 +38,18 @@ pyodbc is imported only inside SqlServerSource so the tests run without it.
 import argparse
 import copy
 import csv
+import gzip
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
+import stat
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -53,8 +66,10 @@ from autocount_stock_extract import (  # noqa: E402 - reuse, the daily extractor
 from csv_safety import safe_csv_row  # noqa: E402
 
 JOB = "ac2_hourly_stock_balance"
-SCHEMA_VERSION = "1"
+# 2: round 6 adds the ledger check, the daily close, the feed and retention blocks.
+SCHEMA_VERSION = "2"
 SOURCE_SURFACE = "dbo.ItemBatchBalQty"
+LEDGER_SURFACE = "dbo.StockDTL"
 
 CSV_NAME = "stock_balance.csv"
 MANIFEST_NAME = "manifest.json"
@@ -63,6 +78,33 @@ LATEST_MANIFEST_NAME = "latest_manifest.json"
 LAST_RUN_STATUS_NAME = "last_run_status.json"
 LOCK_NAME = ".ac2_stockbal.lock"
 HOURLY_DIR = "hourly"
+DAILY_DIR = "daily"
+# Local only (never delivered, never pruned): what the daily files were built from.
+CLOSE_STATE_NAME = "close_state.json.gz"
+CLOSE_STATE_SCHEMA = "xb.ac2.stock_close_state.v1"
+FEED_NAME = "stock_dashboard_feed.json.gz"
+FEED_SCHEMA = "xb.ac2.stock_dashboard_feed"
+FEED_SCHEMA_VERSION = 1
+DAILY_JOB = "ac2_daily_stock_close"
+DAILY_COLUMNS = (
+    "close_date",
+    "ItemCode",
+    "ItemDescription",
+    "ItemType",
+    "Location",
+    "LocationLabel",
+    "UOM",
+    "CloseQty",
+    "IsActive",
+    "StockControl",
+)
+# Exporter-owned names. Pruning matches these exactly and deletes nothing else.
+HOURLY_DATE_DIR_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+RUN_FOLDER_RE = re.compile(r"\Aac2_stockbal_(\d{8}T\d{6}[+-]\d{4})_[0-9a-f]{8}\Z")
+DAILY_MONTH_DIR_RE = re.compile(r"\A\d{4}-\d{2}\Z")
+DAILY_FILE_RE = re.compile(r"\Astock_close_(\d{4}-\d{2}-\d{2})\.(csv|manifest\.json)\Z")
+# Lists in the manifest and feed are capped; the counts are always complete.
+CHANGED_DAYS_LIST_CAP = 31
 # The scheduled task stops a run after this many minutes (installer ExecutionTimeLimit).
 TASK_EXECUTION_LIMIT_MINUTES = 15
 # A lock older than the execution limit plus this margin is cleared automatically, but only when
@@ -136,12 +178,23 @@ FAILURE_SOURCE = "source_error"
 FAILURE_WRITE = "write_failed"
 FAILURE_LATEST = "latest_publish_failed"
 FAILURE_INTERNAL = "internal_error"
+FAILURE_LEDGER_MISMATCH = "ledger_mismatch"
+# Daily close and feed outcomes (the hourly snapshot itself can still be a success).
+FAILURE_CLOSE_WRITE = "daily_close_write_failed"
+FAILURE_FEED = "feed_publish_failed"
+
+CLOSE_NOT_DUE = "not_due"
+CLOSE_PUBLISHED = "published"
+CLOSE_FAILED = "failed"
+CLOSE_SKIPPED = "skipped_failed_run"
 
 DELIVERY_NOT_CONFIGURED = "not_configured"
 DELIVERY_HANDED = "handed_to_drive_sync_folder"
 DELIVERY_VERIFY_FAILED = "verify_failed"
 DELIVERY_COPY_FAILED = "copy_failed"
 DELIVERY_SKIPPED = "skipped_failed_run"
+# Written into the run manifest before delivery; the result is in last_run_status.json.
+DELIVERY_PENDING = "pending_see_last_run_status"
 
 # ---------------------------------------------------------------------------------------------
 # SQL. Fixed strings: parameters only, and the one allowlisted SyncRegistration column is the
@@ -193,6 +246,33 @@ ITEMS_WITHOUT_ROWS_QUERY = """SELECT
 FROM dbo.Item AS i
 WHERE i.IsActive = N'T' AND i.StockControl = N'T'
     AND NOT EXISTS (SELECT 1 FROM dbo.ItemBatchBalQty AS b WHERE b.ItemCode = i.ItemCode)"""
+# The whole stock ledger, summed per key and business day. DocDay is the date part of DocDate
+# (AutoCount stores local wall-clock time; one document type carries real times), so a close
+# "as at the end of day D" sums every group with DocDay < D + 1, which is exactly
+# DocDate < next local midnight. Never filtered by date: every close sums from the first row.
+LEDGER_QUERY = """SELECT
+    d.ItemCode,
+    d.UOM,
+    d.Location,
+    CAST(d.DocDate AS date) AS DocDay,
+    SUM(d.Qty) AS Qty,
+    COUNT_BIG(*) AS LedgerRows,
+    SUM(CASE WHEN d.Qty IS NULL THEN 1 ELSE 0 END) AS NullQtyRows,
+    SUM(CASE WHEN d.BatchNo IS NOT NULL AND d.BatchNo <> N'' THEN 1 ELSE 0 END) AS NonEmptyBatchRows
+FROM dbo.StockDTL AS d
+GROUP BY d.ItemCode, d.UOM, d.Location, CAST(d.DocDate AS date)"""
+ITEM_MASTER_QUERY = """SELECT
+    i.ItemCode,
+    i.Description AS ItemDescription,
+    i.ItemType,
+    i.IsActive,
+    i.StockControl,
+    i.BaseUOM
+FROM dbo.Item AS i"""
+LOCATION_QUERY = "SELECT l.Location, l.Description AS LocationDescription FROM dbo.Location AS l"
+# Reorder levels live in dbo.ItemUOM (not dbo.Item). Read for information only: the low-stock
+# rule is the global feed.low_stock_threshold (owner, 28 Oct 2026).
+REORDER_QUERY = "SELECT u.ItemCode, u.UOM, u.ReOLevel FROM dbo.ItemUOM AS u WHERE u.ReOLevel > 0"
 
 
 def sync_query(column):
@@ -280,6 +360,7 @@ DEFAULT_SETTINGS = {
         "zero_row_mode": "keep_rows_and_add_items_without_rows",
         "drop_zero_rows_for_inactive_items": True,
         "uom_guard": "fail",
+        "exclude_non_stock_items": True,
     },
     "location_labels": {},
     "output": {
@@ -288,9 +369,24 @@ DEFAULT_SETTINGS = {
         "columns": DEFAULT_COLUMNS,
         "large_balance_threshold": 100000,
     },
+    "daily_close": {
+        # Owner decision 27 Oct 2026: the later of 1 Aug 2026 and the opening-stock date (R1: 31 Jul).
+        "backfill_start": "2026-08-01",
+        "restate_days": 7,
+    },
+    "retention": {
+        "prune_enabled": False,
+        "hourly_keep_hours": 48,
+        "daily_keep_days": 90,
+    },
+    "feed": {
+        "low_stock_threshold": 2,
+        "list_cap": 200,
+        "movers_top": 20,
+    },
 }
 # Sections whose keys are a closed set. location_labels is an open code -> label map.
-CLOSED_SECTIONS = ("schedule", "source", "identity", "read", "rows", "output")
+CLOSED_SECTIONS = ("schedule", "source", "identity", "read", "rows", "output", "daily_close", "retention", "feed")
 
 
 def load_settings_file(path):
@@ -383,6 +479,7 @@ def validate_settings(raw):
     _require_enum(rows["zero_row_mode"], ZERO_ROW_MODES, "rows.zero_row_mode")
     _require_bool(rows["drop_zero_rows_for_inactive_items"], "rows.drop_zero_rows_for_inactive_items")
     _require_enum(rows["uom_guard"], UOM_GUARD_MODES, "rows.uom_guard")
+    _require_bool(rows["exclude_non_stock_items"], "rows.exclude_non_stock_items")
 
     labels = settings["location_labels"]
     if not isinstance(labels, dict) or not all(
@@ -407,6 +504,28 @@ def validate_settings(raw):
     if missing:
         raise ConfigError("output.columns must include: " + ", ".join(missing))
     _require_int(output["large_balance_threshold"], "output.large_balance_threshold", 1, LARGE_BALANCE_THRESHOLD_MAX)
+
+    close = settings["daily_close"]
+    start = close["backfill_start"]
+    try:
+        # Python 3.11 fromisoformat also takes other ISO forms (week dates), so match first.
+        if not isinstance(start, str) or not HOURLY_DATE_DIR_RE.match(start):
+            raise ValueError("not YYYY-MM-DD")
+        date.fromisoformat(start)
+    except ValueError as exc:
+        raise ConfigError("daily_close.backfill_start must be a date as YYYY-MM-DD") from exc
+    _require_int(close["restate_days"], "daily_close.restate_days", 1, 31)
+
+    retention = settings["retention"]
+    _require_bool(retention["prune_enabled"], "retention.prune_enabled")
+    _require_int(retention["hourly_keep_hours"], "retention.hourly_keep_hours", 2, 24 * 366)
+    # Daily files inside the restate window are never pruned.
+    _require_int(retention["daily_keep_days"], "retention.daily_keep_days", close["restate_days"] + 1, 3660)
+
+    feed = settings["feed"]
+    _require_int(feed["low_stock_threshold"], "feed.low_stock_threshold", 0, 1000000)
+    _require_int(feed["list_cap"], "feed.list_cap", 1, 5000)
+    _require_int(feed["movers_top"], "feed.movers_top", 1, 200)
     return settings
 
 
@@ -678,6 +797,18 @@ class SqlServerSession:
     def read_items_without_rows(self):
         return self._fetch_dicts(ITEMS_WITHOUT_ROWS_QUERY)
 
+    def read_ledger(self):
+        return self._fetch_dicts(LEDGER_QUERY)
+
+    def read_item_master(self):
+        return self._fetch_dicts(ITEM_MASTER_QUERY)
+
+    def read_locations(self):
+        return self._fetch_dicts(LOCATION_QUERY)
+
+    def read_reorder_levels(self):
+        return self._fetch_dicts(REORDER_QUERY)
+
     def read_sync(self):
         try:
             return [{"Location": r[0], "LastSyncTime": r[1]} for r in self._fetchall(sync_query(self.sync_column))]
@@ -728,6 +859,9 @@ def read_snapshot(source, settings, environ=None, sleep=time.sleep):
 
     ChangeCount is read before and after the business reads on the same connection; equal
     values mean no balance write landed in between. A fresh connection is opened per attempt.
+    dbo.ChangeCount has no row for the ledger (R1), so the ledger read sits inside the same
+    balance-table window: a stock posting writes both tables, so it moves the balance counter.
+    The ledger-equals-balance check after the read then catches anything the counter missed.
     """
     read = settings["read"]
     max_attempts = read["max_attempts"]
@@ -754,6 +888,10 @@ def read_snapshot(source, settings, environ=None, sleep=time.sleep):
                 no_row_items = (
                     session.read_items_without_rows() if zero_mode == "keep_rows_and_add_items_without_rows" else []
                 )
+                ledger = session.read_ledger()
+                item_master = session.read_item_master()
+                location_rows = session.read_locations()
+                reorder_rows = session.read_reorder_levels()
                 sync_rows = session.read_sync()
                 after = session.read_change_count()
         except SyncReadError as exc:
@@ -771,6 +909,10 @@ def read_snapshot(source, settings, environ=None, sleep=time.sleep):
                 "balances": balances,
                 "multi_uom_items": multi_uom,
                 "no_row_items": no_row_items,
+                "ledger": ledger,
+                "item_master": item_master,
+                "location_rows": location_rows,
+                "reorder_rows": reorder_rows,
                 "sync_rows": sync_rows,
             }
             return snapshot, attempt, identity
@@ -809,15 +951,26 @@ def tidy_qty(value):
     return Decimal(text)
 
 
-def check_uom_guard(balances, multi_uom_items):
+def check_uom_guard(balances, multi_uom_items, ledger_non_base_groups=0):
     mismatched = sum(1 for b in balances if _clean(b.get("UOM")) != _clean(b.get("BaseUOM")) or not _clean(b.get("BaseUOM")))
     result = {
         "mode": "fail",
         "non_base_uom_rows": mismatched,
         "multi_uom_items": int(multi_uom_items),
+        "ledger_non_base_uom_groups": int(ledger_non_base_groups),
     }
-    result["result"] = "pass" if mismatched == 0 and multi_uom_items == 0 else "fail"
+    clean = mismatched == 0 and multi_uom_items == 0 and ledger_non_base_groups == 0
+    result["result"] = "pass" if clean else "fail"
     return result
+
+
+def is_non_stock_item(item, rows_cfg):
+    """True for an item AutoCount marks as not stock-controlled (StockControl 'F'), when excluded.
+
+    Only an explicit 'F' counts. An item missing from the item master (no StockControl) is kept,
+    so nothing unknown is silently hidden.
+    """
+    return bool(rows_cfg["exclude_non_stock_items"]) and _clean(item.get("StockControl")) == "F"
 
 
 def location_label(code, description, labels):
@@ -842,6 +995,7 @@ def build_rows(snapshot, settings, as_of_local):
         "null_balqty_rows": 0,
         "inactive_dropped": 0,
         "zero_dropped": 0,
+        "non_stock_excluded": 0,
     }
     per_location = {}
     unmapped = set()
@@ -855,6 +1009,10 @@ def build_rows(snapshot, settings, as_of_local):
         qty = to_decimal(b.get("BalQty"))
         active = _clean(b.get("IsActive")) == "T"
         loc = per_location.setdefault(code, {"rows": 0, "non_zero": 0, "negative": 0, "sum_qty": Decimal(0)})
+        if is_non_stock_item(b, rows_cfg):
+            # Non-stock-controlled codes (for example marketplace fee codes) are not stock.
+            counts["non_stock_excluded"] += 1
+            continue
         if qty == 0 and not active and rows_cfg["drop_zero_rows_for_inactive_items"]:
             counts["inactive_dropped"] += 1
             continue
@@ -937,6 +1095,302 @@ def render_csv(rows, columns):
 
 
 # ---------------------------------------------------------------------------------------------
+# Ledger, daily closes and history (pure; no I/O)
+# ---------------------------------------------------------------------------------------------
+
+
+def _as_day(value):
+    """A ledger DocDay as a date. pyodbc returns datetime.date for a SQL date column."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raise RunFailure(FAILURE_SOURCE, "A ledger row had no usable date")
+
+
+def _key(row):
+    return (_clean(row.get("ItemCode")), _clean(row.get("UOM")), _clean(row.get("Location")))
+
+
+def build_ledger(snapshot, settings, today):
+    """Group the ledger read by business day. Pure.
+
+    Returns a dict:
+      totals    {key: qty} over every row and every date, all items (for the balance check);
+      movements {day: {key: qty}} for stock items only; non-stock codes are excluded and counted;
+      items     {ItemCode: item master row};
+      counts    ledger counts for the manifest (no item-level values).
+    key = (ItemCode, UOM, Location).
+    """
+    rows_cfg = settings["rows"]
+    items = {_clean(i.get("ItemCode")): i for i in snapshot["item_master"]}
+    totals = {}
+    movements = {}
+    non_stock_items = set()
+    missing_items = set()
+    counts = {
+        "ledger_groups": 0,
+        "ledger_rows": 0,
+        "null_qty_rows": 0,
+        "non_empty_batch": 0,
+        "future_dated_rows": 0,
+        "non_base_uom_groups": 0,
+        "non_stock_rows_excluded": 0,
+        "non_stock_items_excluded": 0,
+        "items_missing_from_master": 0,
+        "first_day": None,
+        "last_day": None,
+    }
+    days = set()
+    for r in snapshot["ledger"]:
+        counts["ledger_groups"] += 1
+        ledger_rows = int(r.get("LedgerRows") or 0)
+        counts["ledger_rows"] += ledger_rows
+        counts["null_qty_rows"] += int(r.get("NullQtyRows") or 0)
+        counts["non_empty_batch"] += int(r.get("NonEmptyBatchRows") or 0)
+        day = _as_day(r.get("DocDay"))
+        days.add(day)
+        key = _key(r)
+        qty = to_decimal(r.get("Qty"))
+        totals[key] = totals.get(key, Decimal(0)) + qty
+        if day > today:
+            counts["future_dated_rows"] += ledger_rows
+        item = items.get(key[0])
+        if item is None:
+            missing_items.add(key[0])
+        # Same rule as the balance UOM guard: the ledger UOM must be the item's base UOM.
+        base = _clean(item.get("BaseUOM")) if item is not None else ""
+        if not base or key[1] != base:
+            counts["non_base_uom_groups"] += 1
+        if item is not None and is_non_stock_item(item, rows_cfg):
+            counts["non_stock_rows_excluded"] += ledger_rows
+            non_stock_items.add(key[0])
+            continue
+        day_moves = movements.setdefault(day, {})
+        day_moves[key] = day_moves.get(key, Decimal(0)) + qty
+    for day in list(movements):
+        movements[day] = {k: q for k, q in movements[day].items() if q != 0}
+        if not movements[day]:
+            del movements[day]
+    counts["non_stock_items_excluded"] = len(non_stock_items)
+    counts["items_missing_from_master"] = len(missing_items)
+    if days:
+        counts["first_day"] = min(days).isoformat()
+        counts["last_day"] = max(days).isoformat()
+    return {"totals": totals, "movements": movements, "items": items, "counts": counts}
+
+
+def check_ledger_identity(balances, totals):
+    """The ledger summed over all dates must equal the stored balance for every key. Pure.
+
+    Keys on both sides must match exactly; a balance-only key must be 0 and a ledger-only key
+    must net 0 (R1 found both kinds, all zero). Counts only, never keys or quantities.
+    """
+    stored = {}
+    for b in balances:
+        key = _key(b)
+        stored[key] = stored.get(key, Decimal(0)) + to_decimal(b.get("BalQty"))
+    result = {
+        "keys_compared": 0,
+        "mismatched": 0,
+        "balance_only": 0,
+        "balance_only_non_zero": 0,
+        "ledger_only": 0,
+        "ledger_only_non_zero": 0,
+    }
+    for key in set(stored) | set(totals):
+        if key in stored and key in totals:
+            result["keys_compared"] += 1
+            if stored[key] != totals[key]:
+                result["mismatched"] += 1
+        elif key in stored:
+            result["balance_only"] += 1
+            if stored[key] != 0:
+                result["balance_only_non_zero"] += 1
+        else:
+            result["ledger_only"] += 1
+            if totals[key] != 0:
+                result["ledger_only_non_zero"] += 1
+    bad = result["mismatched"] + result["balance_only_non_zero"] + result["ledger_only_non_zero"]
+    result["result"] = "pass" if bad == 0 else "fail"
+    return result
+
+
+def iter_closes(movements, last_day, first_day=None):
+    """Yield (day, close) for every day from first_day to last_day.
+
+    close is the balance as at the end of that day: the sum of every movement whose business day
+    is before the next local midnight (DocDay < day + 1, i.e. DocDate < next midnight), summed
+    from the very first ledger row whatever first_day is. Zero balances are left out. The same
+    dict is updated in place for the next day: a caller that keeps a close must copy it.
+    """
+    days = sorted(movements)
+    if first_day is None:
+        if not days:
+            return
+        first_day = days[0]
+    current = {}
+    index = 0
+    day = first_day
+    while day <= last_day:
+        next_midnight = day + timedelta(days=1)
+        while index < len(days) and days[index] < next_midnight:
+            for key, qty in movements[days[index]].items():
+                value = current.get(key, Decimal(0)) + qty
+                if value == 0:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
+            index += 1
+        yield day, current
+        day = next_midnight
+
+
+def day_range(first, last):
+    out = []
+    day = first
+    while day <= last:
+        out.append(day)
+        day += timedelta(days=1)
+    return out
+
+
+def changed_closes(old_movements, new_movements, days):
+    """Close days whose close differs between two ledger reads. Pure.
+
+    Returns {day: {"rows_changed": n, "net_qty_change": Decimal}} for the changed days in days.
+    The difference ledger is summed with iter_closes, so a backdated movement changes every
+    close from its day on, exactly as it changes the real closes.
+    """
+    if not days:
+        return {}
+    diff = {}
+    for day in set(old_movements) | set(new_movements):
+        old = old_movements.get(day, {})
+        new = new_movements.get(day, {})
+        for key in set(old) | set(new):
+            delta = new.get(key, Decimal(0)) - old.get(key, Decimal(0))
+            if delta != 0:
+                diff.setdefault(day, {})[key] = delta
+    wanted = set(days)
+    out = {}
+    for day, cumulative in iter_closes(diff, days[-1], first_day=min(days[0], min(diff) if diff else days[0])):
+        if day in wanted and cumulative:
+            out[day] = {"rows_changed": len(cumulative), "net_qty_change": sum(cumulative.values(), Decimal(0))}
+    return out
+
+
+def plan_daily_close(state, movements, today, settings, force):
+    """Which daily files this run writes. Pure.
+
+    The close of day D-1 is due when the published state has no close for it yet (the first run
+    after local midnight, or the next run after a missed or failed one). A due run rebuilds every
+    close from the ledger and compares it with what was published:
+      * a day never published is written ("new");
+      * a changed day inside the restate window (D-1 .. D-restate_days) is replaced ("revised");
+      * a changed older day is left as published and flagged ("late").
+    force (--backfill) or a missing state writes every day from backfill_start ("rebuild").
+    """
+    close_cfg = settings["daily_close"]
+    start = date.fromisoformat(close_cfg["backfill_start"])
+    last_day = today - timedelta(days=1)
+    window_start = today - timedelta(days=close_cfg["restate_days"])
+    plan = {
+        "due": False,
+        "mode": None,
+        "close_day": last_day.isoformat(),
+        "window_start": window_start,
+        "write": {},
+        "revised": {},
+        "late": {},
+    }
+    if last_day < start:
+        return plan
+    days = day_range(start, last_day)
+    if force or state is None:
+        plan.update(due=True, mode="backfill" if force else "initial")
+        plan["write"] = {day: "rebuild" for day in days}
+        return plan
+    last_published = state.get("last_close_day")
+    if last_published is not None and date.fromisoformat(last_published) >= last_day:
+        return plan
+    plan.update(due=True, mode="nightly")
+    published = state.get("published", {})
+    changed = changed_closes(state.get("movements", {}), movements, days)
+    for day in days:
+        if day.isoformat() not in published:
+            plan["write"][day] = "new"
+        elif day in changed:
+            if day >= window_start:
+                plan["write"][day] = "revised"
+                plan["revised"][day] = changed[day]
+            else:
+                plan["late"][day] = changed[day]
+    return plan
+
+
+def rebuild_history(movements, settings, last_day, on_close=None):
+    """Walk every close from the first ledger day to last_day once. Pure apart from on_close.
+
+    Returns per-location daily totals from backfill_start, the closes kept for the movers, and
+    the day each currently negative key turned negative. on_close(day, close) is called for each
+    day from backfill_start (the caller writes the due daily files there).
+    """
+    start = date.fromisoformat(settings["daily_close"]["backfill_start"])
+    keep = {last_day - timedelta(days=n) for n in (0, 1, 7, 30)}
+    per_day = []
+    snapshots = {}
+    negative_since = {}
+    locations = set()
+    if movements and min(movements) <= last_day:
+        for day, close in iter_closes(movements, last_day):
+            for key, qty in close.items():
+                if qty < 0 and key not in negative_since:
+                    negative_since[key] = day
+            for key in [k for k in negative_since if close.get(k, Decimal(0)) >= 0]:
+                del negative_since[key]
+            if day in keep:
+                snapshots[day] = dict(close)
+            if day < start:
+                continue
+            totals = {}
+            for (item, uom, loc), qty in close.items():
+                entry = totals.setdefault(loc, [Decimal(0), 0, 0])
+                entry[0] += qty
+                if qty > 0:
+                    entry[1] += 1
+                else:
+                    entry[2] += 1
+                locations.add(loc)
+            per_day.append((day, totals))
+            if on_close is not None:
+                on_close(day, close)
+    # Days with no ledger movement at all before them still get an (empty) entry.
+    seen = {day for day, _ in per_day}
+    for day in day_range(start, last_day):
+        if day not in seen:
+            per_day.append((day, {}))
+            if on_close is not None:
+                on_close(day, {})
+    per_day.sort(key=lambda entry: entry[0])
+    series = {
+        loc: {
+            "units": [totals.get(loc, [Decimal(0), 0, 0])[0] for _, totals in per_day],
+            "skus_in_stock": [totals.get(loc, [Decimal(0), 0, 0])[1] for _, totals in per_day],
+            "negative": [totals.get(loc, [Decimal(0), 0, 0])[2] for _, totals in per_day],
+        }
+        for loc in sorted(locations)
+    }
+    return {
+        "days": [day for day, _ in per_day],
+        "per_location": series,
+        "snapshots": snapshots,
+        "negative_since": negative_since,
+        "last_day": last_day,
+    }
+
+
+# ---------------------------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------------------------
 
@@ -959,6 +1413,10 @@ def replace_atomic(path, data, tag):
     path = Path(path)
     temp = path.with_name(".%s.%s.tmp" % (path.name, tag))
     write_exclusive(temp, data)
+    _replace_with_retry(temp, path)
+
+
+def _replace_with_retry(temp, path):
     for attempt in range(3):
         try:
             os.replace(temp, path)
@@ -970,9 +1428,34 @@ def replace_atomic(path, data, tag):
             time.sleep(1)
 
 
-def copy_exclusive(src, dst):
-    """Copy one file with exclusive create. Patched in tests to simulate a bad copy."""
-    write_exclusive(dst, Path(src).read_bytes())
+class VerifyError(OSError):
+    """A written copy did not re-read to the hash of the data."""
+
+
+def copy_bytes_exclusive(path, data):
+    """Write one copy with exclusive create. Patched in tests to simulate a bad copy."""
+    write_exclusive(path, data)
+
+
+def publish_verified(path, data, tag):
+    """Replace path with data only after a temp copy re-reads to the data's hash.
+
+    Used for everything that goes to the Drive sync folder and for the daily files. On a hash
+    mismatch the target is left as it was and VerifyError is raised. Returns the sha256.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(".%s.%s.tmp" % (path.name, tag))
+    expected = hashlib.sha256(data).hexdigest()
+    copy_bytes_exclusive(temp, data)
+    try:
+        if file_sha256(temp) != expected:
+            raise VerifyError("copy did not re-read to the written hash")
+    except OSError:
+        _remove_quietly(temp)
+        raise
+    _replace_with_retry(temp, path)
+    return expected
 
 
 def _remove_quietly(path):
@@ -984,6 +1467,12 @@ def _remove_quietly(path):
 
 def json_bytes(payload):
     return (json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
+
+
+def gzip_json_bytes(payload):
+    """Compact JSON, gzipped with a fixed header time so equal content gives equal bytes."""
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return gzip.compress(raw, compresslevel=9, mtime=0)
 
 
 def git_commit():
@@ -1004,6 +1493,552 @@ def git_commit():
     except OSError:
         return None
     return None
+
+
+# ---------------------------------------------------------------------------------------------
+# Daily close files and the close state
+# ---------------------------------------------------------------------------------------------
+
+
+def close_state_path(archive_root):
+    return Path(archive_root) / DAILY_DIR / CLOSE_STATE_NAME
+
+
+def load_close_state(archive_root):
+    """(state, "loaded") or (None, "missing" / "unreadable"). Local only; never in Drive.
+
+    The state holds the ledger movements the published daily files were built from, plus one
+    small entry per published day. A missing or unreadable state makes the next due run write
+    every day again from the ledger (self-healing, with a warning).
+    """
+    try:
+        raw = json.loads(gzip.decompress(close_state_path(archive_root).read_bytes()).decode("utf-8"))
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, EOFError, ValueError):
+        return None, "unreadable"
+    try:
+        if raw.get("schema") != CLOSE_STATE_SCHEMA:
+            raise ValueError("unknown state schema")
+        movements = {
+            date.fromisoformat(day): {(i, u, l): Decimal(q) for i, u, l, q in entries}
+            for day, entries in raw["movements"].items()
+        }
+        published = raw["published"]
+        if not isinstance(published, dict):
+            raise ValueError("published is not a map")
+        for day in published:
+            date.fromisoformat(day)
+        last_close_day = raw.get("last_close_day")
+        if last_close_day is not None:
+            date.fromisoformat(last_close_day)
+    except (AttributeError, KeyError, TypeError, ValueError, InvalidOperation):
+        return None, "unreadable"
+    return {
+        "last_close_day": last_close_day,
+        "published": published,
+        "movements": movements,
+        "last_close_run": raw.get("last_close_run"),
+    }, "loaded"
+
+
+def close_state_bytes(state):
+    movements = {
+        day.isoformat(): [[i, u, l, str(tidy_qty(q))] for (i, u, l), q in sorted(moves.items())]
+        for day, moves in sorted(state["movements"].items())
+    }
+    return gzip_json_bytes(
+        {
+            "schema": CLOSE_STATE_SCHEMA,
+            "last_close_day": state["last_close_day"],
+            "published": state["published"],
+            "movements": movements,
+            "last_close_run": state.get("last_close_run"),
+        }
+    )
+
+
+def daily_relative_paths(day):
+    folder = Path(DAILY_DIR) / day.strftime("%Y-%m")
+    base = "stock_close_%s" % day.isoformat()
+    return folder / (base + ".csv"), folder / (base + ".manifest.json")
+
+
+def render_daily_rows(day, close, items, location_names, labels):
+    """Non-zero close rows for one day, plus per-location totals and unmapped codes. Pure."""
+    rows = []
+    per_location = {}
+    unmapped = set()
+    for (item_code, uom, loc), qty in close.items():
+        item = items.get(item_code, {})
+        label, mapped = location_label(loc, location_names.get(loc), labels)
+        if not mapped:
+            unmapped.add(loc)
+        entry = per_location.setdefault(loc, {"rows": 0, "negative": 0, "sum_qty": Decimal(0)})
+        entry["rows"] += 1
+        entry["sum_qty"] += qty
+        if qty < 0:
+            entry["negative"] += 1
+        rows.append(
+            {
+                "close_date": day.isoformat(),
+                "ItemCode": item_code,
+                "ItemDescription": _clean(item.get("ItemDescription")),
+                "ItemType": _clean(item.get("ItemType")),
+                "Location": loc,
+                "LocationLabel": label,
+                "UOM": uom,
+                "CloseQty": tidy_qty(qty),
+                "IsActive": _clean(item.get("IsActive")),
+                "StockControl": _clean(item.get("StockControl")),
+            }
+        )
+    rows.sort(key=lambda r: (r["ItemCode"], r["Location"], r["UOM"]))
+    totals = {
+        code: {"rows": v["rows"], "negative": v["negative"], "sum_qty": str(tidy_qty(v["sum_qty"]))}
+        for code, v in sorted(per_location.items())
+    }
+    return rows, totals, sorted(unmapped)
+
+
+def write_daily_day(roots, day, close, ctx, reason, previous):
+    """Write one day's close CSV and manifest to every root (archive, then Drive sync folder).
+
+    Each file goes through publish_verified. Raises OSError when any write or check fails.
+    Returns the published-day entry for the close state.
+    """
+    rows, per_location, unmapped = render_daily_rows(day, close, ctx["items"], ctx["location_names"], ctx["labels"])
+    data = render_csv(rows, list(DAILY_COLUMNS))
+    revision = int((previous or {}).get("revision", 0)) + 1
+    csv_rel, manifest_rel = daily_relative_paths(day)
+    meta = {
+        "job": DAILY_JOB,
+        "schema_version": "1",
+        "close_date": day.isoformat(),
+        "close_rule": "Sum of every stock ledger row dated before %s 00:00 local, from the first ledger row"
+        % (day + timedelta(days=1)).isoformat(),
+        "rows_rule": "Non-zero balances only; non-stock-controlled items excluded",
+        "write_reason": reason,
+        "revision": revision,
+        "run_id": ctx["run_id"],
+        "written_at": ctx["written_at"],
+        "ledger_read_as_of_local": ctx["as_of_local"],
+        # Replaced only while the day is inside the restate window; from this date it is final.
+        "final_from": (day + timedelta(days=ctx["restate_days"] + 1)).isoformat(),
+        "row_count": len(rows),
+        "csv": {"name": csv_rel.name, "sha256": hashlib.sha256(data).hexdigest(), "byte_size": len(data)},
+        "per_location": per_location,
+        "unmapped_location_codes": unmapped,
+    }
+    meta_data = json_bytes(meta)
+    for root in roots:
+        publish_verified(Path(root) / csv_rel, data, ctx["tag"])
+        publish_verified(Path(root) / manifest_rel, meta_data, ctx["tag"])
+    return {
+        "revision": revision,
+        "row_count": len(rows),
+        "csv_sha256": meta["csv"]["sha256"],
+        "written_at": ctx["written_at"],
+    }, unmapped
+
+
+def _day_change_list(changes):
+    entries = [
+        {"day": day.isoformat(), "rows_changed": v["rows_changed"], "net_qty_change": str(tidy_qty(v["net_qty_change"]))}
+        for day, v in sorted(changes.items())
+    ]
+    return entries[:CHANGED_DAYS_LIST_CAP], len(entries) > CHANGED_DAYS_LIST_CAP
+
+
+def run_daily_close(settings, archive_root, delivery_root, ledger, snapshot, today, ctx, force, warnings):
+    """Rebuild every close from the ledger, write the due daily files, and return
+    (close_result, history). History (for the feed) is built on every run, due or not.
+
+    A write failure stops further writes and leaves the close state as it was, so the next run
+    retries the same days. The feed still gets the full rebuilt history.
+    """
+    close_cfg = settings["daily_close"]
+    state, state_status = load_close_state(archive_root)
+    plan = plan_daily_close(state, ledger["movements"], today, settings, force)
+    result = {
+        "status": CLOSE_NOT_DUE,
+        "failure_class": None,
+        "mode": plan["mode"],
+        "close_day": plan["close_day"],
+        "restate_days": close_cfg["restate_days"],
+        "provisional_from": plan["window_start"].isoformat(),
+        "state": state_status,
+        "days_written": 0,
+        "new_days": 0,
+        "rebuilt_days": 0,
+        "revised_day_count": len(plan["revised"]),
+        "revised_days": [],
+        "late_change_day_count": len(plan["late"]),
+        "late_changes_beyond_window": [],
+        "unmapped_location_codes": [],
+        "published_close_day": state.get("last_close_day") if state else None,
+    }
+    result["revised_days"], _ = _day_change_list(plan["revised"])
+    result["late_changes_beyond_window"], result["late_changes_truncated"] = _day_change_list(plan["late"])
+    if plan["due"] and plan["mode"] == "initial" and state_status != "missing":
+        warnings.append("Close state was %s: every day from backfill_start is written again" % state_status)
+    elif plan["due"] and plan["mode"] == "initial" and (Path(archive_root) / DAILY_DIR).exists():
+        warnings.append("Close state was missing: every day from backfill_start is written again")
+    if plan["late"]:
+        warnings.append(
+            "Late change: %d day(s) older than the %d-day restate window changed in the ledger; their daily "
+            "files were left as published (daily_close.late_changes_beyond_window)"
+            % (len(plan["late"]), close_cfg["restate_days"])
+        )
+
+    roots = [archive_root] + ([delivery_root] if delivery_root else [])
+    published = dict(state["published"]) if state else {}
+    unmapped = set()
+    failed = []
+
+    def on_close(day, close):
+        reason = plan["write"].get(day)
+        if reason is None or failed:
+            return
+        try:
+            entry, codes = write_daily_day(roots, day, close, ctx, reason, published.get(day.isoformat()))
+        except OSError:
+            failed.append(day)
+            return
+        published[day.isoformat()] = entry
+        unmapped.update(codes)
+        result["days_written"] += 1
+        if reason == "new":
+            result["new_days"] += 1
+        elif reason == "rebuild":
+            result["rebuilt_days"] += 1
+
+    history = rebuild_history(ledger["movements"], settings, today - timedelta(days=1), on_close if plan["write"] else None)
+    result["unmapped_location_codes"] = sorted(unmapped)
+    if not plan["due"]:
+        return result, history
+    if failed:
+        result["status"] = CLOSE_FAILED
+        result["failure_class"] = FAILURE_CLOSE_WRITE
+        return result, history
+    for day in plan["late"]:
+        published[day.isoformat()] = dict(published[day.isoformat()], late_change_flagged=True)
+    new_state = {
+        "last_close_day": plan["close_day"],
+        "published": published,
+        "movements": ledger["movements"],
+        "last_close_run": {
+            "run_id": ctx["run_id"],
+            "close_day": plan["close_day"],
+            "mode": plan["mode"],
+            "days_written": result["days_written"],
+            "revised_day_count": result["revised_day_count"],
+            "late_change_day_count": result["late_change_day_count"],
+        },
+    }
+    try:
+        replace_atomic(close_state_path(archive_root), close_state_bytes(new_state), ctx["tag"])
+    except OSError:
+        result["status"] = CLOSE_FAILED
+        result["failure_class"] = FAILURE_CLOSE_WRITE
+        return result, history
+    result["status"] = CLOSE_PUBLISHED
+    result["published_close_day"] = plan["close_day"]
+    return result, history
+
+
+# ---------------------------------------------------------------------------------------------
+# Dashboard feed (pure)
+# ---------------------------------------------------------------------------------------------
+
+
+def _num(value):
+    """A quantity as a JSON number: whole numbers as int, others as float."""
+    value = tidy_qty(value)
+    return int(value) if value == value.to_integral_value() else float(value)
+
+
+def next_run_local(started, run_minute):
+    nxt = started.replace(minute=run_minute, second=0, microsecond=0)
+    while nxt <= started:
+        nxt += timedelta(hours=1)
+    return nxt.isoformat()
+
+
+def build_feed(settings, manifest, rows, history, ledger, snapshot, close_result, started):
+    """The compact dashboard feed (schema xb.ac2.stock_dashboard_feed, version 1). Pure.
+
+    Quantities only: no cost, no sales value, no customer data. Item-level lists are capped at
+    feed.list_cap; every count is complete.
+    """
+    feed_cfg = settings["feed"]
+    labels = settings["location_labels"]
+    cap = feed_cfg["list_cap"]
+    top = feed_cfg["movers_top"]
+    threshold = Decimal(feed_cfg["low_stock_threshold"])
+    items = ledger["items"]
+    location_names = {_clean(r.get("Location")): r.get("LocationDescription") for r in snapshot["location_rows"]}
+    reorder = {
+        (_clean(r.get("ItemCode")), _clean(r.get("UOM"))): to_decimal(r.get("ReOLevel")) for r in snapshot["reorder_rows"]
+    }
+    negative_since = history["negative_since"]
+
+    def item_entry(item_code, uom, loc, **extra):
+        entry = {
+            "item": item_code,
+            "description": _clean(items.get(item_code, {}).get("ItemDescription")),
+            "location": loc,
+            "uom": uom,
+        }
+        entry.update(extra)
+        return entry
+
+    latest = {}
+    negatives = []
+    low = []
+    for r in rows:
+        if r["RowSource"] != ROW_SOURCE_BALANCE:
+            continue
+        loc, qty = r["Location"], r["BalQty"]
+        entry = latest.setdefault(loc, {"units": Decimal(0), "skus_in_stock": 0, "zero": 0, "negative": 0, "low_stock": 0})
+        entry["units"] += qty
+        if qty > 0:
+            entry["skus_in_stock"] += 1
+        elif qty == 0:
+            entry["zero"] += 1
+        else:
+            entry["negative"] += 1
+            negatives.append(r)
+        if 0 < qty <= threshold and r["IsActive"] == "T":
+            entry["low_stock"] += 1
+            low.append(r)
+    negatives.sort(key=lambda r: (r["BalQty"], r["ItemCode"], r["Location"]))
+    low.sort(key=lambda r: (r["BalQty"], r["ItemCode"], r["Location"]))
+
+    def since(r):
+        day = negative_since.get((r["ItemCode"], r["UOM"], r["Location"]))
+        return day.isoformat() if day else None
+
+    def reorder_level(r):
+        level = reorder.get((r["ItemCode"], r["UOM"]))
+        return _num(level) if level is not None else None
+
+    last = history["last_day"]
+    snapshots = history["snapshots"]
+    current = snapshots.get(last, {})
+    movers = {}
+    for name, days_back in (("1d", 1), ("7d", 7), ("30d", 30)):
+        earlier_day = last - timedelta(days=days_back)
+        earlier = snapshots.get(earlier_day, {})
+        changes = []
+        for key in set(current) | set(earlier):
+            delta = current.get(key, Decimal(0)) - earlier.get(key, Decimal(0))
+            if delta != 0:
+                changes.append((delta, key))
+        up = sorted((c for c in changes if c[0] > 0), key=lambda c: (-c[0], c[1]))[:top]
+        down = sorted((c for c in changes if c[0] < 0), key=lambda c: (c[0], c[1]))[:top]
+        movers[name] = {
+            "from": earlier_day.isoformat(),
+            "to": last.isoformat(),
+            "changed_keys": len(changes),
+            "up": [item_entry(*key, change=_num(d), close=_num(current.get(key, Decimal(0)))) for d, key in up],
+            "down": [item_entry(*key, change=_num(d), close=_num(current.get(key, Decimal(0)))) for d, key in down],
+        }
+
+    codes = set(latest) | set(history["per_location"]) | set(labels)
+    locations = []
+    for code in sorted(codes):
+        label, mapped = location_label(code, location_names.get(code), labels)
+        locations.append({"code": code, "label": label, "mapped": mapped})
+    large = manifest.get("large_balances") or {}
+    ledger_counts = ledger["counts"]
+    return {
+        "schema": FEED_SCHEMA,
+        "schema_version": FEED_SCHEMA_VERSION,
+        "job": JOB,
+        "run_id": manifest["run_id"],
+        "as_of_local": manifest["as_of_local"],
+        "timezone": settings["timezone"],
+        "cadence_minutes": 60,
+        "next_run_local": next_run_local(started, settings["schedule"]["run_minute"]),
+        "stale_after_minutes": settings["stale_after_minutes"],
+        "backfill_start": settings["daily_close"]["backfill_start"],
+        "last_close_day": last.isoformat(),
+        "published_close_day": close_result["published_close_day"],
+        "provisional_from": close_result["provisional_from"],
+        "quantity_rule": "Units only; non-stock-controlled items excluded",
+        "locations": locations,
+        "latest": {
+            loc: {k: (_num(v) if k == "units" else v) for k, v in entry.items()} for loc, entry in sorted(latest.items())
+        },
+        "history": {
+            "days": [day.isoformat() for day in history["days"]],
+            "per_location": {
+                loc: {
+                    "units": [_num(v) for v in series["units"]],
+                    "skus_in_stock": series["skus_in_stock"],
+                    "negative": series["negative"],
+                }
+                for loc, series in history["per_location"].items()
+            },
+        },
+        "movers": movers,
+        "negatives": {
+            "count": len(negatives),
+            "rows": [
+                item_entry(r["ItemCode"], r["UOM"], r["Location"], qty=_num(r["BalQty"]), negative_since=since(r))
+                for r in negatives[:cap]
+            ],
+            "truncated": len(negatives) > cap,
+        },
+        "low_stock": {
+            "rule": "0 < quantity <= threshold, active items",
+            "threshold": feed_cfg["low_stock_threshold"],
+            "count": len(low),
+            "items_with_reorder_level": len(reorder),
+            "rows": [
+                item_entry(r["ItemCode"], r["UOM"], r["Location"], qty=_num(r["BalQty"]), reorder_level=reorder_level(r))
+                for r in low[:cap]
+            ],
+            "truncated": len(low) > cap,
+        },
+        "anomalies": {
+            "ledger_check": (manifest.get("ledger_check") or {}).get("result"),
+            "large_balance_count": large.get("count"),
+            "negative_rows": len(negatives),
+            "future_dated_ledger_rows": ledger_counts["future_dated_rows"],
+            "unmapped_location_count": sum(1 for loc in locations if not loc["mapped"]),
+            "non_stock_items_excluded": ledger_counts["non_stock_items_excluded"],
+            "daily_close_status": close_result["status"],
+            "revised_day_count": close_result["revised_day_count"],
+            "late_change_day_count": close_result["late_change_day_count"],
+        },
+        "pos_sync": manifest.get("pos_sync", []),
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# Retention (local archive only)
+# ---------------------------------------------------------------------------------------------
+
+
+def _is_link(path):
+    """True for a symlink or any reparse point (junction), or when it cannot be inspected."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return True
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _inside(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _children(folder):
+    try:
+        return sorted(Path(folder).iterdir())
+    except OSError:
+        return []
+
+
+def _rmdir_if_empty(folder):
+    try:
+        os.rmdir(folder)
+    except OSError:
+        pass
+
+
+def prune_archive(archive_root, settings, now, today, keep_run_dir):
+    """Delete the exporter's own expired files from the local archive. Never raises.
+
+    Only hourly run folders (archive_root/hourly/<YYYY-MM-DD>/ac2_stockbal_...) older than
+    retention.hourly_keep_hours and daily files (archive_root/daily/<YYYY-MM>/stock_close_...)
+    older than retention.daily_keep_days. Inside them only the exporter's own file names are
+    removed; anything else (other names, links, junctions) is kept and counted. The close state,
+    the latest pair, the feed and the Drive sync folder are never touched.
+    """
+    retention = settings["retention"]
+    result = {
+        "prune_enabled": retention["prune_enabled"],
+        "hourly_folders_removed": 0,
+        "daily_files_removed": 0,
+        "kept_unexpected": 0,
+        "errors": 0,
+    }
+    if not retention["prune_enabled"]:
+        return result
+    root = Path(archive_root)
+    hourly_cutoff = now - timedelta(hours=retention["hourly_keep_hours"])
+    daily_cutoff = today - timedelta(days=retention["daily_keep_days"])
+
+    def remove(path):
+        if _is_link(path) or not path.is_file() or not _inside(path, root):
+            result["kept_unexpected"] += 1
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            result["errors"] += 1
+            return False
+        return True
+
+    hourly_root = root / HOURLY_DIR
+    if hourly_root.is_dir() and not _is_link(hourly_root):
+        for date_dir in _children(hourly_root):
+            if not HOURLY_DATE_DIR_RE.match(date_dir.name) or _is_link(date_dir) or not date_dir.is_dir():
+                result["kept_unexpected"] += 1
+                continue
+            for run_dir in _children(date_dir):
+                match = RUN_FOLDER_RE.match(run_dir.name)
+                if not match or _is_link(run_dir) or not run_dir.is_dir():
+                    result["kept_unexpected"] += 1
+                    continue
+                try:
+                    run_started = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S%z")
+                except ValueError:
+                    result["kept_unexpected"] += 1
+                    continue
+                if run_started >= hourly_cutoff or (keep_run_dir is not None and _same_path(run_dir, keep_run_dir)):
+                    continue
+                for child in _children(run_dir):
+                    if child.name in (CSV_NAME, MANIFEST_NAME):
+                        remove(child)
+                    else:
+                        result["kept_unexpected"] += 1
+                if not _children(run_dir):
+                    _rmdir_if_empty(run_dir)
+                    result["hourly_folders_removed"] += 1
+            _rmdir_if_empty(date_dir)
+
+    daily_root = root / DAILY_DIR
+    if daily_root.is_dir() and not _is_link(daily_root):
+        for month_dir in _children(daily_root):
+            if month_dir.name == CLOSE_STATE_NAME:
+                continue
+            if not DAILY_MONTH_DIR_RE.match(month_dir.name) or _is_link(month_dir) or not month_dir.is_dir():
+                result["kept_unexpected"] += 1
+                continue
+            for child in _children(month_dir):
+                match = DAILY_FILE_RE.match(child.name)
+                if not match:
+                    result["kept_unexpected"] += 1
+                    continue
+                try:
+                    day = date.fromisoformat(match.group(1))
+                except ValueError:
+                    result["kept_unexpected"] += 1
+                    continue
+                if day < daily_cutoff and remove(child):
+                    result["daily_files_removed"] += 1
+            _rmdir_if_empty(month_dir)
+    return result
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1168,8 +2203,11 @@ def run_folder_name(started, run_id):
     return "ac2_stockbal_%s_%s" % (started.strftime("%Y%m%dT%H%M%S%z"), run_id[:8])
 
 
-def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep):
-    """Run one hourly export. Always returns the manifest dict (success or failed)."""
+def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep, force_close=False):
+    """Run one hourly export. Always returns the manifest dict (success or failed).
+
+    force_close (--backfill) writes every daily file from daily_close.backfill_start again.
+    """
     tz = load_zone(settings["timezone"])
     run_id = uuid.uuid4().hex
     started = _now(tz, clock)
@@ -1194,12 +2232,17 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "hourly_folder": relative_folder.as_posix(),
         "source": {
             "surface": SOURCE_SURFACE,
+            "ledger_surface": LEDGER_SURFACE,
             "database": settings["source"]["expected_database"],
             "query_sha256": query_sha256(BALANCE_QUERY),
             "queries_sha256": {
                 "balance": query_sha256(BALANCE_QUERY),
                 "items_without_rows": query_sha256(ITEMS_WITHOUT_ROWS_QUERY),
                 "multi_uom": query_sha256(MULTI_UOM_QUERY),
+                "ledger": query_sha256(LEDGER_QUERY),
+                "item_master": query_sha256(ITEM_MASTER_QUERY),
+                "locations": query_sha256(LOCATION_QUERY),
+                "reorder_levels": query_sha256(REORDER_QUERY),
                 "sync": query_sha256(sync_query(settings["source"]["sync_registration_time_column"])),
                 "identity": query_sha256(IDENTITY_QUERY),
                 "change_count": query_sha256(CHANGE_COUNT_QUERY),
@@ -1218,14 +2261,25 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "unmapped_location_codes": [],
         "large_balances": None,
         "uom_guard": None,
+        "ledger": None,
+        "ledger_check": None,
+        "daily_close": {"status": CLOSE_SKIPPED, "mode": "backfill" if force_close else None},
+        "feed": None,
+        "retention": None,
         "pos_sync": [],
-        "delivery": {"status": DELIVERY_SKIPPED if delivery_root else DELIVERY_NOT_CONFIGURED, "files": []},
+        # Drive gets the latest pair, the feed, the run status and the daily files only. The
+        # final delivery result is delivery_status in last_run_status.json.
+        "delivery": {
+            "mode": "latest_only",
+            "status": DELIVERY_SKIPPED if delivery_root else DELIVERY_NOT_CONFIGURED,
+            "files": [],
+        },
         "warnings": [],
     }
 
     lock_path = None
-    final_delivery = manifest["delivery"]["status"]
     publish_failure = None
+    work = None
     try:
         archive_root.mkdir(parents=True, exist_ok=True)
         lock_path = acquire_lock(archive_root, run_id, started, manifest["warnings"])
@@ -1244,11 +2298,22 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["as_of_sql"] = as_of_sql.isoformat() if hasattr(as_of_sql, "isoformat") else None
         manifest["as_of_local"] = as_of_local
         manifest["pos_sync"] = _pos_sync(snapshot["sync_rows"], tz)
+        today = datetime.fromisoformat(as_of_local).date()
 
-        uom = check_uom_guard(snapshot["balances"], snapshot["multi_uom_items"])
+        ledger = build_ledger(snapshot, settings, today)
+        manifest["ledger"] = ledger["counts"]
+        uom = check_uom_guard(snapshot["balances"], snapshot["multi_uom_items"], ledger["counts"]["non_base_uom_groups"])
         manifest["uom_guard"] = uom
         if uom["result"] != "pass":
             raise RunFailure(FAILURE_UOM, "Non-base UOM found; no CSV until the UOM is mapped")
+        ledger_check = check_ledger_identity(snapshot["balances"], ledger["totals"])
+        manifest["ledger_check"] = ledger_check
+        if ledger_check["result"] != "pass":
+            bad = ledger_check["mismatched"] + ledger_check["balance_only_non_zero"] + ledger_check["ledger_only_non_zero"]
+            raise RunFailure(
+                FAILURE_LEDGER_MISMATCH,
+                "The stock ledger does not add up to the stored balance for %d key(s); nothing published" % bad,
+            )
 
         rows, counts, per_location, unmapped = build_rows(snapshot, settings, as_of_local)
         manifest["counts"] = counts
@@ -1273,10 +2338,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
             raise RunFailure(FAILURE_WRITE, "Hourly CSV did not re-read to the written hash")
         manifest["csv"] = {"name": CSV_NAME, "sha256": csv_sha, "byte_size": csv_size}
         manifest["status"] = "success"
-
-        if delivery_root:
-            manifest["delivery"] = _deliver_csv(run_dir, delivery_root / relative_folder, relative_folder, csv_sha)
-        final_delivery = manifest["delivery"]["status"]
+        work = {"snapshot": snapshot, "ledger": ledger, "rows": rows, "today": today}
     except RunFailure as exc:
         manifest["status"] = "failed"
         manifest["failure_class"] = exc.failure_class
@@ -1291,6 +2353,51 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["failure_class"] = FAILURE_INTERNAL
         manifest["message"] = "Unexpected error (run %s)" % run_id[:8]
 
+    # The daily close and the feed come from the same verified read. Their failures are
+    # recorded separately: the hourly snapshot above is still good.
+    feed_data = None
+    if manifest["status"] == "success" and work is not None:
+        ctx = {
+            "items": work["ledger"]["items"],
+            "location_names": {
+                _clean(r.get("Location")): r.get("LocationDescription") for r in work["snapshot"]["location_rows"]
+            },
+            "labels": settings["location_labels"],
+            "run_id": run_id,
+            "tag": run_id[:8],
+            "written_at": started.isoformat(),
+            "as_of_local": manifest["as_of_local"],
+            "restate_days": settings["daily_close"]["restate_days"],
+        }
+        history = None
+        try:
+            close_result, history = run_daily_close(
+                settings, archive_root, delivery_root, work["ledger"], work["snapshot"], work["today"], ctx,
+                force_close, manifest["warnings"],
+            )
+        except Exception:  # noqa: BLE001 - a close bug must not hide the good hourly snapshot.
+            close_result = {"status": CLOSE_FAILED, "failure_class": FAILURE_INTERNAL, "mode": None}
+        manifest["daily_close"] = close_result
+        try:
+            if history is None:
+                raise RuntimeError("no history")
+            feed = build_feed(
+                settings, manifest, work["rows"], history, work["ledger"], work["snapshot"], close_result, started
+            )
+            feed_data = gzip_json_bytes(feed)
+            manifest["feed"] = {
+                "status": "built",
+                "name": FEED_NAME,
+                "schema": FEED_SCHEMA,
+                "schema_version": FEED_SCHEMA_VERSION,
+                "sha256": hashlib.sha256(feed_data).hexdigest(),
+                "byte_size": len(feed_data),
+            }
+        except Exception:  # noqa: BLE001 - the feed is derived data; its failure is reported, not raised.
+            manifest["feed"] = {"status": "failed", "failure_class": FAILURE_FEED}
+        # Never raises; only expired exporter-owned files, never this run's folder.
+        manifest["retention"] = prune_archive(archive_root, settings, started, work["today"], run_dir)
+
     manifest["finished_at"] = _now(tz, clock).isoformat()
     if manifest["status"] != "success":
         manifest["csv"] = None
@@ -1298,6 +2405,9 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["large_balances"] = None
         # A failed run lists no large balances, so it carries no large-balance warning either.
         manifest["warnings"] = [w for w in manifest["warnings"] if not w.startswith(LARGE_BALANCE_WARNING_PREFIX)]
+    elif delivery_root:
+        manifest["delivery"]["status"] = DELIVERY_PENDING
+        manifest["delivery"]["files"] = [LATEST_CSV_NAME, LATEST_MANIFEST_NAME] + ([FEED_NAME] if feed_data else [])
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         manifest_sha, _ = write_exclusive(run_dir / MANIFEST_NAME, json_bytes(manifest))
@@ -1308,14 +2418,26 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
             manifest["failure_class"] = FAILURE_WRITE
             manifest["message"] = "Could not write the manifest (run %s)" % run_id[:8]
 
+    final_delivery = manifest["delivery"]["status"]
     if manifest["status"] == "success":
         try:
             publish_latest(archive_root, run_dir, manifest, run_id)
         except (OSError, RunFailure):
             publish_failure = FAILURE_LATEST
-        if delivery_root and final_delivery == DELIVERY_HANDED:
-            final_delivery = _deliver_manifest_and_latest(run_dir, delivery_root / relative_folder, manifest_sha, manifest, run_id, delivery_root)
+        if feed_data is not None:
+            try:
+                publish_verified(archive_root / FEED_NAME, feed_data, run_id[:8])
+            except OSError:
+                manifest["feed"]["status"] = "failed"
+                manifest["feed"]["failure_class"] = FAILURE_FEED
+        if delivery_root:
+            final_delivery = deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, run_id)
+        if manifest["feed"] and manifest["feed"]["status"] == "built":
+            manifest["feed"]["status"] = "published"
+    elif manifest["status"] != "success" and delivery_root and manifest["delivery"]["status"] == DELIVERY_PENDING:
+        final_delivery = DELIVERY_SKIPPED
 
+    close = manifest["daily_close"]
     status = {
         "job": JOB,
         "run_id": run_id,
@@ -1329,6 +2451,13 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "large_balance_count": (
             _large_balance_count(manifest) if manifest["status"] == "success" and not publish_failure else None
         ),
+        "daily_close_status": close.get("status"),
+        "daily_close_failure_class": close.get("failure_class"),
+        "published_close_day": close.get("published_close_day"),
+        "revised_day_count": close.get("revised_day_count"),
+        "late_change_day_count": close.get("late_change_day_count"),
+        "feed_status": (manifest["feed"] or {}).get("status"),
+        "next_run_local": next_run_local(started, settings["schedule"]["run_minute"]),
     }
     manifest["_last_run_status"] = status
     for root in (archive_root, delivery_root):
@@ -1342,6 +2471,31 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     if lock_path is not None:
         release_lock(lock_path, run_id)
     return manifest
+
+
+def deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, run_id):
+    """Replace the Drive latest pair and the feed, each only after its copy verifies.
+
+    No hourly folder goes to Drive. The CSV goes first: if it does not verify, the latest
+    manifest is not replaced either, so Drive keeps the previous verified pair.
+    """
+    tag = run_id[:8]
+    try:
+        data = Path(run_dir, CSV_NAME).read_bytes()
+        if hashlib.sha256(data).hexdigest() != manifest["csv"]["sha256"]:
+            return DELIVERY_VERIFY_FAILED
+        if manifest_sha is None or file_sha256(Path(run_dir, MANIFEST_NAME)) != manifest_sha:
+            return DELIVERY_VERIFY_FAILED
+        latest = {key: value for key, value in manifest.items() if not key.startswith("_")}
+        publish_verified(delivery_root / LATEST_CSV_NAME, data, tag)
+        publish_verified(delivery_root / LATEST_MANIFEST_NAME, json_bytes(latest), tag)
+        if feed_data is not None:
+            publish_verified(delivery_root / FEED_NAME, feed_data, tag)
+    except VerifyError:
+        return DELIVERY_VERIFY_FAILED
+    except OSError:
+        return DELIVERY_COPY_FAILED
+    return DELIVERY_HANDED
 
 
 def _large_balance_count(manifest):
@@ -1371,39 +2525,6 @@ def _pos_sync(rows, tz):
         out.append({"Location": _clean(r.get("Location")), "last_sync_local": value})
     out.sort(key=lambda r: (r["Location"], r["last_sync_local"] or ""))
     return out
-
-
-def _deliver_csv(run_dir, target_dir, relative_folder, csv_sha):
-    files = [(relative_folder / CSV_NAME).as_posix()]
-    try:
-        target_dir.mkdir(parents=True, exist_ok=False)
-        copy_exclusive(run_dir / CSV_NAME, target_dir / CSV_NAME)
-    except OSError:
-        return {"status": DELIVERY_COPY_FAILED, "files": files}
-    try:
-        verified = file_sha256(target_dir / CSV_NAME) == csv_sha
-    except OSError:
-        verified = False
-    return {"status": DELIVERY_HANDED if verified else DELIVERY_VERIFY_FAILED, "files": files}
-
-
-def _deliver_manifest_and_latest(run_dir, target_dir, manifest_sha, manifest, run_id, delivery_root):
-    """Copy the manifest, verify it, then advance the delivery latest pair."""
-    try:
-        copy_exclusive(run_dir / MANIFEST_NAME, target_dir / MANIFEST_NAME)
-    except OSError:
-        return DELIVERY_COPY_FAILED
-    try:
-        verified = manifest_sha is not None and file_sha256(target_dir / MANIFEST_NAME) == manifest_sha
-    except OSError:
-        verified = False
-    if not verified:
-        return DELIVERY_VERIFY_FAILED
-    try:
-        publish_latest(delivery_root, target_dir, manifest, run_id)
-    except (OSError, RunFailure):
-        return DELIVERY_VERIFY_FAILED
-    return DELIVERY_HANDED
 
 
 def publish_latest(root, run_dir, manifest, run_id):
@@ -1521,11 +2642,16 @@ def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=No
 
 
 def main(argv=None, source=None, environ=None, clock=None):
-    parser = argparse.ArgumentParser(description="Hourly read-only AC2 stock balance export (#245).")
+    parser = argparse.ArgumentParser(description="Hourly read-only AC2 stock balance export with a daily close (#245).")
     parser.add_argument("--config", required=True, help="Local settings JSON (config/*.local.json, never committed).")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-latest", action="store_true", help="Read-only stale check of the latest pair.")
     mode.add_argument("--dry-run-config", action="store_true", help="Validate the settings only.")
+    mode.add_argument(
+        "--backfill",
+        action="store_true",
+        help="A normal run that also writes every daily close from daily_close.backfill_start again.",
+    )
     # --check-latest exits only 0, 2 or 3, so a usage error there is 3, never argparse's 2.
     check_mode = "--check-latest" in (sys.argv[1:] if argv is None else argv)
     try:
@@ -1573,7 +2699,7 @@ def main(argv=None, source=None, environ=None, clock=None):
         _print(result)
         return code
 
-    manifest = run_hourly(settings, source=source, environ=environ, clock=clock)
+    manifest = run_hourly(settings, source=source, environ=environ, clock=clock, force_close=args.backfill)
     status = manifest["_last_run_status"]
     _print(
         {
@@ -1584,12 +2710,17 @@ def main(argv=None, source=None, environ=None, clock=None):
             "row_count": manifest["row_count"],
             "delivery_status": status["delivery_status"],
             "large_balance_count": status["large_balance_count"],
+            "daily_close_status": status["daily_close_status"],
+            "published_close_day": status["published_close_day"],
+            "feed_status": status["feed_status"],
             "message": manifest["message"],
         }
     )
     if status["status"] != "success":
         return EXIT_FAILED
     if status["delivery_status"] not in (DELIVERY_HANDED, DELIVERY_NOT_CONFIGURED):
+        return EXIT_FAILED
+    if status["daily_close_status"] == CLOSE_FAILED or status["feed_status"] != "published":
         return EXIT_FAILED
     return EXIT_OK
 
