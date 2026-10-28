@@ -70,4 +70,13 @@ SELECT
 FROM sys.database_files
 GROUP BY type_desc;
 
+-- 6. Columns the item index reads (#245 dashboard v2). Run before pulling that code onto the VM:
+--    a NULL means the column is missing and the export would fail as source_error.
+SELECT
+    COL_LENGTH(N'dbo.Item', N'ItemGroup') AS ItemGroupLength,
+    COL_LENGTH(N'dbo.Item', N'ItemBrand') AS ItemBrandLength,
+    COL_LENGTH(N'dbo.ItemUOM', N'BarCode') AS BarCodeLength,
+    COL_LENGTH(N'dbo.ItemUOM', N'ReOLevel') AS ReOLevelLength,
+    COL_LENGTH(N'dbo.ItemUOM', N'MinQty') AS MinQtyLength;
+
 SET NOEXEC OFF;

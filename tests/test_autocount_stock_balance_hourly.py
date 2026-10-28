@@ -107,7 +107,8 @@ def led(item, loc, qty, day=LEDGER_DAY, uom="PCS", rows=1, batch=0, null_rows=0)
     }
 
 
-def master(item, base="PCS", active="T", stock="T", desc="Fake item", item_type="FAKE-BRAND"):
+def master(item, base="PCS", active="T", stock="T", desc="Fake item", item_type="FAKE-BRAND", group="FAKE-GRP",
+           brand="FAKE-BRD"):
     return {
         "ItemCode": item,
         "ItemDescription": desc,
@@ -115,6 +116,18 @@ def master(item, base="PCS", active="T", stock="T", desc="Fake item", item_type=
         "IsActive": active,
         "StockControl": stock,
         "BaseUOM": base,
+        "ItemGroup": group,
+        "ItemBrand": brand,
+    }
+
+
+def item_uom(item, uom="PCS", barcode=None, reorder=None, min_qty=None):
+    return {
+        "ItemCode": item,
+        "UOM": uom,
+        "BarCode": barcode,
+        "ReOLevel": None if reorder is None else Decimal(str(reorder)),
+        "MinQty": None if min_qty is None else Decimal(str(min_qty)),
     }
 
 
@@ -196,8 +209,8 @@ class FakeSession:
             codes.setdefault(b["Location"], b["LocationDescription"])
         return [{"Location": code, "LocationDescription": desc} for code, desc in codes.items()]
 
-    def read_reorder_levels(self):
-        return copy.deepcopy(self.source.reorder_levels)
+    def read_item_uoms(self):
+        return copy.deepcopy(self.source.item_uoms)
 
     def read_sync(self):
         if self.source.sync_error:
@@ -208,13 +221,13 @@ class FakeSession:
 class FakeSource:
     def __init__(self, balances=None, no_row_items=None, sync_rows=None, identity=None,
                  changecounts=None, multi_uom=0, lock_timeouts=None, sync_error=False, ledger=None,
-                 item_master=None, locations=None, reorder_levels=None, sql_now=SQL_NOW):
+                 item_master=None, locations=None, item_uoms=None, sql_now=SQL_NOW):
         self.sql_now = sql_now
         self.balances = default_balances() if balances is None else balances
         self.ledger = ledger
         self.item_master = item_master
         self.locations = locations
-        self.reorder_levels = list(reorder_levels or [])
+        self.item_uoms = list(item_uoms or [])
         self.ledger_reads = 0
         self.no_row_items = [no_row_item("FAKE-0009")] if no_row_items is None else no_row_items
         self.sync_rows = (
@@ -1235,13 +1248,14 @@ class DeliveryTests(TempDirTestCase):
         manifest = run(self.settings())
         self.assertEqual(manifest["delivery"]["mode"], "latest_only")
         self.assertEqual(
-            manifest["delivery"]["files"], [hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME, hourly.FEED_NAME]
+            manifest["delivery"]["files"],
+            [hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME, hourly.FEED_NAME, hourly.ITEM_INDEX_NAME],
         )
         self.assertFalse((self.delivery / "hourly").exists(), "no hourly folders in Drive")
         self.assertEqual(
             sorted(p.name for p in self.delivery.iterdir()),
-            sorted([hourly.DAILY_DIR, hourly.FEED_NAME, hourly.LAST_RUN_STATUS_NAME, hourly.LATEST_CSV_NAME,
-                    hourly.LATEST_MANIFEST_NAME]),
+            sorted([hourly.DAILY_DIR, hourly.FEED_NAME, hourly.ITEM_INDEX_NAME, hourly.LAST_RUN_STATUS_NAME,
+                    hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME]),
         )
         self.assertEqual(
             (self.delivery / hourly.LATEST_CSV_NAME).read_bytes(),
@@ -1667,11 +1681,12 @@ class QueryContractTests(unittest.TestCase):
         hourly.ITEMS_WITHOUT_ROWS_QUERY,
         hourly.sync_query("LastFinishSyncTime"),
         hourly.sync_query("LastTransFinishSyncTime"),
-        # Round 6 (G2 r6 H5): the ledger, item master, location and reorder-level reads.
+        # Round 6 (G2 r6 H5): the ledger, item master and location reads.
         hourly.LEDGER_QUERY,
         hourly.ITEM_MASTER_QUERY,
         hourly.LOCATION_QUERY,
-        hourly.REORDER_QUERY,
+        # Dashboard v2: barcode, reorder level and minimum quantity per item and UOM.
+        hourly.ITEM_UOM_QUERY,
     )
 
     def test_no_cost_column(self):
@@ -1744,6 +1759,11 @@ class LiveCheckSqlTests(unittest.TestCase):
         self.assertNotIn("changelog", self.code.lower())
         self.assertNotIn("NOLOCK", self.code.upper())
         self.assertNotIn("DocInfo", self.code)
+
+    def test_item_index_column_check(self):
+        for table, column in (("Item", "ItemGroup"), ("Item", "ItemBrand"), ("ItemUOM", "BarCode"),
+                              ("ItemUOM", "ReOLevel"), ("ItemUOM", "MinQty")):
+            self.assertIn("COL_LENGTH(N'dbo.%s', N'%s')" % (table, column), self.code)
 
 
 class InstallerTests(unittest.TestCase):
@@ -2130,8 +2150,11 @@ class LedgerCloseTests(Round6TestCase):
         self.assertNotIn("WHERE", q.upper(), "never filtered by date: every close sums from the first row")
         self.assertNotIn("DocInfo", q)
         self.assertNotIn("DocNo", q)
-        self.assertIn("FROM dbo.ItemUOM AS u", hourly.REORDER_QUERY)
-        self.assertIn("ReOLevel", hourly.REORDER_QUERY)
+        q = hourly.ITEM_UOM_QUERY
+        self.assertEqual(q, "SELECT u.ItemCode, u.UOM, u.BarCode, u.ReOLevel, u.MinQty FROM dbo.ItemUOM AS u")
+        self.assertNotIn("Price", q)
+        self.assertIn("i.ItemGroup", hourly.ITEM_MASTER_QUERY)
+        self.assertIn("i.ItemBrand", hourly.ITEM_MASTER_QUERY)
 
 
 class LedgerCheckTests(Round6TestCase):
@@ -2395,9 +2418,10 @@ class FeedTests(Round6TestCase):
             led("FAKE-B", "LOC-B", -6, day=date(2026, 8, 2)),
             led("FAKE-A", "LOC-B", 1, day=date(2026, 8, 3)),
         ]
-        reorder = [{"ItemCode": "FAKE-LOW", "UOM": "PCS", "ReOLevel": Decimal("3")}]
+        # Only a positive ReOLevel counts as a reorder level in the feed.
+        uoms = [item_uom("FAKE-LOW", reorder=3), item_uom("FAKE-A", reorder=0, min_qty=4)]
         settings = self.settings(feed={"low_stock_threshold": 2, "list_cap": 1})
-        self.run_at(settings, at(2026, 8, 4, 9), ledger=ledger, reorder_levels=reorder)
+        self.run_at(settings, at(2026, 8, 4, 9), ledger=ledger, item_uoms=uoms)
         feed = self.feed()
         self.assertEqual(feed["negatives"]["count"], 1)
         self.assertEqual(
@@ -2450,6 +2474,227 @@ class FeedTests(Round6TestCase):
         self.assertEqual(manifest["status"], "success")
         self.assertLess(manifest["feed"]["byte_size"], 1000000)
         self.assertEqual(manifest["daily_close"]["days_written"], 31)
+
+
+class ItemIndexTests(Round6TestCase):
+    """Dashboard v2 (#245): the item index beside the feed."""
+
+    TOP_KEYS = {
+        "schema", "schema_version", "job", "run_id", "as_of_local", "timezone", "quantity_rule", "last_close_day",
+        "history_from", "history_days", "low_stock_default_threshold", "large_balance_threshold", "locations",
+        "item_fields", "items", "stock_fields", "stock", "history_fields", "history", "counts",
+    }
+
+    def index(self, root=None):
+        return json.loads(gzip.decompress((Path(root or self.archive) / hourly.ITEM_INDEX_NAME).read_bytes()))
+
+    def items_by_code(self, index):
+        fields = index["item_fields"]
+        return {row[0]: dict(zip(fields, row)) for row in index["items"]}
+
+    def stock_by_key(self, index):
+        codes = [row[0] for row in index["items"]]
+        return {(codes[i], index["locations"][l]): (qty, last) for i, l, qty, last in index["stock"]}
+
+    def history_by_key(self, index):
+        codes = [row[0] for row in index["items"]]
+        return {(codes[i], index["locations"][l]): changes for i, l, changes in index["history"]}
+
+    def status(self, root=None):
+        return json.loads((Path(root or self.archive) / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+
+    def test_schema_shape_and_content(self):
+        items = AUG_ITEMS + [
+            master("FAKE-OLD", active="F"),
+            master("FAKE-INACT", active="F", desc="", group="", brand=""),
+        ]
+        ledger = aug_ledger() + [led("FAKE-INACT", "LOC-A", 1, day=date(2026, 8, 3))]
+        uoms = [
+            item_uom("FAKE-A", barcode="0000000000017", reorder=3, min_qty=1),
+            item_uom("FAKE-LOW", barcode="", min_qty=2),
+            # Not the base UOM: never used for the barcode or the levels.
+            item_uom("FAKE-B", uom="CTN", barcode="0000000000099", reorder=9),
+        ]
+        manifest = self.run_at(self.settings(), at(2026, 8, 4, 14), ledger=ledger, items=items, item_uoms=uoms)
+        self.assertEqual(manifest["status"], "success")
+        data = (self.archive / hourly.ITEM_INDEX_NAME).read_bytes()
+        self.assertEqual(data[:2], b"\x1f\x8b", "gzip")
+        self.assertEqual(manifest["item_index"]["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(manifest["item_index"]["byte_size"], len(data))
+        self.assertEqual(manifest["item_index"]["status"], "published")
+        self.assertEqual(self.status()["item_index_status"], "published")
+
+        index = self.index()
+        self.assertEqual(set(index), self.TOP_KEYS)
+        self.assertEqual((index["schema"], index["schema_version"]), ("xb.ac2.stock_item_index", 1))
+        self.assertEqual(index["run_id"], manifest["run_id"])
+        self.assertEqual((index["last_close_day"], index["history_from"], index["history_days"]), ("2026-08-03", "2026-08-01", 3))
+        self.assertEqual((index["low_stock_default_threshold"], index["large_balance_threshold"]), (2, 100000))
+        self.assertEqual(index["locations"], ["LOC-A", "LOC-B"], "the non-stock fee code's location is not listed")
+
+        by_code = self.items_by_code(index)
+        self.assertEqual(sorted(by_code), ["FAKE-A", "FAKE-B", "FAKE-INACT", "FAKE-LOW"])
+        self.assertEqual(
+            by_code["FAKE-A"],
+            {"code": "FAKE-A", "description": "Fake item", "barcode": "0000000000017", "group": "FAKE-GRP",
+             "brand": "FAKE-BRD", "uom": "PCS", "active": True, "reorder_level": 3, "min_qty": 1},
+        )
+        self.assertEqual((by_code["FAKE-B"]["barcode"], by_code["FAKE-B"]["reorder_level"]), ("", None))
+        self.assertEqual((by_code["FAKE-LOW"]["reorder_level"], by_code["FAKE-LOW"]["min_qty"]), (None, 2))
+        self.assertFalse(by_code["FAKE-INACT"]["active"], "inactive but holding stock: listed")
+        self.assertEqual(index["counts"], {
+            "items": 4,
+            "inactive_without_stock_or_movement_excluded": 1,
+            "non_stock_items_excluded": 1,
+            "items_without_description": 1,
+            "items_without_barcode": 3,
+            "items_with_reorder_level": 1,
+            "items_with_min_qty": 2,
+            "stock_keys": 4,
+            "history_keys": 4,
+        })
+        self.assertEqual(manifest["item_index"]["counts"], index["counts"])
+
+        self.assertEqual(self.stock_by_key(index), {
+            ("FAKE-A", "LOC-A"): (7, "2026-08-02"),
+            ("FAKE-B", "LOC-B"): (5, "2026-07-31"),
+            ("FAKE-INACT", "LOC-A"): (1, "2026-08-03"),
+            ("FAKE-LOW", "LOC-B"): (2, "2026-07-31"),
+        })
+        # Closes sum from the first ledger row (the 3 Jul sale), as the daily files do.
+        self.assertEqual(self.history_by_key(index), {
+            ("FAKE-A", "LOC-A"): [[0, 9], [1, 7]],
+            ("FAKE-B", "LOC-B"): [[0, 5]],
+            ("FAKE-INACT", "LOC-A"): [[2, 1]],
+            ("FAKE-LOW", "LOC-B"): [[0, 2]],
+        })
+        self.assertEqual(self.qty("2026-08-01", "FAKE-A", "LOC-A"), "9")
+        text = json.dumps(index).lower()
+        for word in ("cost", "price", "amount", "customer", "member", "phone", "email", "debtor", "docno", "fake-fee"):
+            self.assertNotIn(word, text)
+
+    def test_last_movement_counts_net_zero_days_and_skips_future_rows(self):
+        ledger = aug_ledger() + [
+            # A transfer in and out on the same day nets to zero: still a movement.
+            led("FAKE-B", "LOC-B", 0, day=date(2026, 8, 3), rows=2),
+            led("FAKE-B", "LOC-B", 7, day=date(2026, 8, 20)),
+            # Sold out: the zero balance row stays, with its last movement.
+            led("FAKE-LOW", "LOC-B", -2, day=date(2026, 8, 3)),
+        ]
+        manifest = self.run_at(self.settings(), at(2026, 8, 4), ledger=ledger)
+        self.assertEqual(manifest["status"], "success")
+        index = self.index()
+        stock = self.stock_by_key(index)
+        self.assertEqual(stock[("FAKE-B", "LOC-B")], (12, "2026-08-03"), "the 20 Aug row is future-dated")
+        self.assertEqual(stock[("FAKE-LOW", "LOC-B")], (0, "2026-08-03"))
+        history = self.history_by_key(index)
+        self.assertEqual(history[("FAKE-B", "LOC-B")], [[0, 5]], "a net-zero day does not change the close")
+        self.assertEqual(history[("FAKE-LOW", "LOC-B")], [[0, 2], [2, 0]])
+
+    def test_zero_rows_that_never_moved_are_left_out(self):
+        items = AUG_ITEMS + [master("FAKE-Z")]
+        source = ledger_source(aug_ledger(), items, sql_now=at(2026, 8, 4) + timedelta(seconds=1))
+        source.balances.append(bal("FAKE-Z", "LOC-A", 0))
+        manifest = run(self.settings(), source, clock=clock_at(at(2026, 8, 4)))
+        self.assertEqual(manifest["status"], "success")
+        index = self.index()
+        self.assertIn("FAKE-Z", self.items_by_code(index), "active item: still searchable")
+        self.assertNotIn(("FAKE-Z", "LOC-A"), self.stock_by_key(index))
+
+    def test_history_window_is_ninety_days(self):
+        ledger = aug_ledger() + [
+            led("FAKE-A", "LOC-A", 1, day=date(2026, 9, 1)),
+            led("FAKE-A", "LOC-A", -3, day=date(2026, 9, 3)),
+        ]
+        self.run_at(self.settings(), at(2026, 12, 1), ledger=ledger)
+        index = self.index()
+        self.assertEqual((index["history_from"], index["last_close_day"], index["history_days"]),
+                         ("2026-09-02", "2026-11-30", 90))
+        self.assertEqual(self.history_by_key(index)[("FAKE-A", "LOC-A")], [[0, 8], [1, 5]])
+
+    def test_index_travels_in_the_drive_latest_set(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        manifest = self.run_at(settings, at(2026, 8, 4))
+        self.assertIn(hourly.ITEM_INDEX_NAME, manifest["delivery"]["files"])
+        self.assertEqual((self.delivery / hourly.ITEM_INDEX_NAME).read_bytes(),
+                         (self.archive / hourly.ITEM_INDEX_NAME).read_bytes())
+        self.assertEqual(self.status(self.delivery)["item_index_status"], "published")
+        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["item_index"]["sha256"], manifest["item_index"]["sha256"])
+
+    def tamper(self, root):
+        real = hourly.copy_bytes_exclusive
+
+        def bad_copy(path, data):
+            hit = hourly.ITEM_INDEX_NAME in Path(path).name and Path(path).parent == Path(root)
+            real(path, data + b"x" if hit else data)
+
+        return mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=bad_copy)
+
+    def test_bad_drive_copy_keeps_the_previous_latest_set(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        good = self.run_at(settings, at(2026, 8, 4))
+        before = tree_bytes(self.delivery)
+        with self.tamper(self.delivery):
+            second = self.run_at(settings, at(2026, 8, 4, 1))
+        for name in (hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME, hourly.FEED_NAME, hourly.ITEM_INDEX_NAME):
+            self.assertEqual((self.delivery / name).read_bytes(), before[name], name)
+        status = self.status(self.delivery)
+        self.assertEqual(status["delivery_status"], "verify_failed")
+        self.assertEqual((status["feed_status"], status["item_index_status"]), ("failed", "failed"))
+        self.assertEqual(second["item_index"]["failure_class"], "item_index_publish_failed")
+        self.assertEqual(self.index(self.delivery)["run_id"], good["run_id"])
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [])
+
+    def test_bad_archive_write_keeps_both_previous_copies(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        self.run_at(settings, at(2026, 8, 4))
+        before = {root: (root / hourly.ITEM_INDEX_NAME).read_bytes() for root in (self.archive, self.delivery)}
+        with self.tamper(self.archive):
+            second = self.run_at(settings, at(2026, 8, 4, 1))
+        for root, data in before.items():
+            self.assertEqual((root / hourly.ITEM_INDEX_NAME).read_bytes(), data, root.name)
+        self.assertEqual(second["item_index"]["status"], "failed")
+        status = self.status(self.delivery)
+        self.assertEqual((status["delivery_status"], status["feed_status"]), ("handed_to_drive_sync_folder", "published"))
+        self.assertEqual(status["item_index_status"], "failed")
+        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["run_id"], second["run_id"], "the latest pair still advances")
+        self.assertEqual(latest["item_index"]["status"], "failed", "the Drive manifest does not claim a new index")
+
+    def test_build_failure_is_reported_and_exits_one(self):
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw_settings(self.tmp)), encoding="utf-8")
+        with mock.patch.object(hourly, "build_item_index", side_effect=RuntimeError("bug")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=FakeSource(), environ=ENV, clock=clock_at())
+        self.assertEqual(code, hourly.EXIT_FAILED)
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["status"], printed["feed_status"], printed["item_index_status"]),
+                         ("success", "published", "failed"))
+        self.assertFalse((self.archive / hourly.ITEM_INDEX_NAME).exists())
+        self.assertTrue((self.archive / hourly.LATEST_CSV_NAME).exists(), "the latest pair is still published")
+
+    def test_failed_run_writes_no_index(self):
+        manifest = run(self.settings(), FakeSource(identity=observed_identity(login="sa")))
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIsNone(manifest["item_index"])
+        self.assertIsNone(self.status()["item_index_status"])
+        self.assertFalse((self.archive / hourly.ITEM_INDEX_NAME).exists())
+
+    def test_size_stays_compact_for_a_realistic_book(self):
+        items = [master("FAKE-%05d" % n, desc="Fake outdoor item number %05d size M colour blue" % n)
+                 for n in range(6000)]
+        uoms = [item_uom("FAKE-%05d" % n, barcode="%013d" % n, reorder=n % 4) for n in range(6000)]
+        ledger = []
+        for n in range(6000):
+            ledger.append(led("FAKE-%05d" % n, "LOC-%d" % (n % 6), 5 + n % 7, day=date(2026, 7, 31)))
+            for d in range(1, 30, 3):
+                ledger.append(led("FAKE-%05d" % n, "LOC-%d" % (n % 6), -1 if n % 2 else 1, day=date(2026, 8, d)))
+        manifest = self.run_at(self.settings(), at(2026, 9, 1), ledger=ledger, items=items, item_uoms=uoms)
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual(manifest["item_index"]["counts"]["items"], 6000)
+        self.assertLess(manifest["item_index"]["byte_size"], 1000000)
 
 
 class RetentionTests(Round6TestCase):
