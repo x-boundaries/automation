@@ -6,8 +6,8 @@ read-only, once per hour, and writes an immutable local hourly CSV plus a manife
 hours. The first run after local midnight also publishes the previous day's closing balance,
 rebuilt from the ledger, as one daily file (round 6, accepted design 27 Oct 2026). Delivery to
 Google Drive is a plain copy into a local folder that Google Drive for desktop syncs; only the
-latest pair, the feed, the run status and the daily files go there, never hourly folders.
-Nothing here calls a Drive API.
+latest pair, the feed, the item index, the run status and the daily files go there, never
+hourly folders. Nothing here calls a Drive API.
 
 Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md):
 
@@ -85,6 +85,12 @@ CLOSE_STATE_SCHEMA = "xb.ac2.stock_close_state.v1"
 FEED_NAME = "stock_dashboard_feed.json.gz"
 FEED_SCHEMA = "xb.ac2.stock_dashboard_feed"
 FEED_SCHEMA_VERSION = 1
+# Item-level file for the dashboard's item search, item detail and data-issues views (#245 v2).
+ITEM_INDEX_NAME = "stock_item_index.json.gz"
+ITEM_INDEX_SCHEMA = "xb.ac2.stock_item_index"
+ITEM_INDEX_SCHEMA_VERSION = 1
+# Close history per item and location kept in the item index (never before backfill_start).
+ITEM_HISTORY_DAYS = 90
 DAILY_JOB = "ac2_daily_stock_close"
 DAILY_COLUMNS = (
     "close_date",
@@ -182,6 +188,7 @@ FAILURE_LEDGER_MISMATCH = "ledger_mismatch"
 # Daily close and feed outcomes (the hourly snapshot itself can still be a success).
 FAILURE_CLOSE_WRITE = "daily_close_write_failed"
 FAILURE_FEED = "feed_publish_failed"
+FAILURE_ITEM_INDEX = "item_index_publish_failed"
 
 CLOSE_NOT_DUE = "not_due"
 CLOSE_PUBLISHED = "published"
@@ -267,12 +274,15 @@ ITEM_MASTER_QUERY = """SELECT
     i.ItemType,
     i.IsActive,
     i.StockControl,
-    i.BaseUOM
+    i.BaseUOM,
+    i.ItemGroup,
+    i.ItemBrand
 FROM dbo.Item AS i"""
 LOCATION_QUERY = "SELECT l.Location, l.Description AS LocationDescription FROM dbo.Location AS l"
-# Reorder levels live in dbo.ItemUOM (not dbo.Item). Read for information only: the low-stock
-# rule is the global feed.low_stock_threshold (owner, 28 Oct 2026).
-REORDER_QUERY = "SELECT u.ItemCode, u.UOM, u.ReOLevel FROM dbo.ItemUOM AS u WHERE u.ReOLevel > 0"
+# Barcode, reorder level and minimum quantity live in dbo.ItemUOM, one row per item and UOM (R1:
+# no reorder column in dbo.Item). The feed lists ReOLevel beside low-stock rows for information
+# (its rule stays feed.low_stock_threshold); the item index carries all three for the dashboard.
+ITEM_UOM_QUERY = "SELECT u.ItemCode, u.UOM, u.BarCode, u.ReOLevel, u.MinQty FROM dbo.ItemUOM AS u"
 
 
 def sync_query(column):
@@ -819,8 +829,8 @@ class SqlServerSession:
     def read_locations(self):
         return self._fetch_dicts(LOCATION_QUERY)
 
-    def read_reorder_levels(self):
-        return self._fetch_dicts(REORDER_QUERY)
+    def read_item_uoms(self):
+        return self._fetch_dicts(ITEM_UOM_QUERY)
 
     def read_sync(self):
         try:
@@ -904,7 +914,7 @@ def read_snapshot(source, settings, environ=None, sleep=time.sleep):
                 ledger = session.read_ledger()
                 item_master = session.read_item_master()
                 location_rows = session.read_locations()
-                reorder_rows = session.read_reorder_levels()
+                item_uom_rows = session.read_item_uoms()
                 sync_rows = session.read_sync()
                 after = session.read_change_count()
         except SyncReadError as exc:
@@ -925,7 +935,7 @@ def read_snapshot(source, settings, environ=None, sleep=time.sleep):
                 "ledger": ledger,
                 "item_master": item_master,
                 "location_rows": location_rows,
-                "reorder_rows": reorder_rows,
+                "item_uom_rows": item_uom_rows,
                 "sync_rows": sync_rows,
             }
             return snapshot, attempt, identity
@@ -1812,9 +1822,11 @@ def build_feed(settings, manifest, rows, history, ledger, snapshot, close_result
     threshold = Decimal(feed_cfg["low_stock_threshold"])
     items = ledger["items"]
     location_names = {_clean(r.get("Location")): r.get("LocationDescription") for r in snapshot["location_rows"]}
-    reorder = {
-        (_clean(r.get("ItemCode")), _clean(r.get("UOM"))): to_decimal(r.get("ReOLevel")) for r in snapshot["reorder_rows"]
-    }
+    reorder = {}
+    for r in snapshot["item_uom_rows"]:
+        level = to_decimal(r.get("ReOLevel"))
+        if level > 0:
+            reorder[(_clean(r.get("ItemCode")), _clean(r.get("UOM")))] = level
     negative_since = history["negative_since"]
 
     def item_entry(item_code, uom, loc, **extra):
@@ -1948,6 +1960,174 @@ def build_feed(settings, manifest, rows, history, ledger, snapshot, close_result
             "late_change_day_count": close_result["late_change_day_count"],
         },
         "pos_sync": manifest.get("pos_sync", []),
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# Item index (pure): the dashboard's item search, item detail and data-issues views
+# ---------------------------------------------------------------------------------------------
+
+
+def last_movement_days(ledger_rows, today):
+    """The last business day (up to today) with any ledger row, per key. Pure.
+
+    Read from the grouped ledger, so a day whose movements net to zero (a transfer in and out)
+    still counts as a movement. Future-dated rows are left out (they are counted elsewhere).
+    """
+    out = {}
+    for r in ledger_rows:
+        day = _as_day(r.get("DocDay"))
+        if day > today:
+            continue
+        key = _key(r)
+        if key not in out or day > out[key]:
+            out[key] = day
+    return out
+
+
+def item_close_history(movements, history_from, last_day):
+    """Close change points per key from history_from to last_day. Pure.
+
+    Returns {key: [(offset, close), ...]} with offset in days from history_from. Offset 0 holds
+    the close on history_from (non-zero closes only); later entries are the days the close
+    changed (close 0 when it went to zero). Closes sum from the first ledger row, as the daily
+    files do. A key that is zero all through the window is left out.
+    """
+    out = {}
+    if not movements or history_from > last_day:
+        return out
+    for day, close in iter_closes(movements, last_day, first_day=history_from):
+        offset = (day - history_from).days
+        if offset == 0:
+            for key, qty in close.items():
+                out[key] = [(0, qty)]
+            continue
+        for key in movements.get(day, {}):
+            out.setdefault(key, []).append((offset, close.get(key, Decimal(0))))
+    return out
+
+
+def build_item_index(settings, manifest, rows, ledger, snapshot, today):
+    """The item index (schema xb.ac2.stock_item_index, version 1). Pure.
+
+    Every stock-controlled item that is active, holds stock or moved in the history window, with
+    its group, brand, base-UOM barcode, reorder level and minimum quantity; the current balance
+    and last movement day per item and location; and the close history of the last
+    ITEM_HISTORY_DAYS days. Quantities only: no cost, no price, no document or customer data.
+    Rows are arrays keyed by the *_fields lists; items and locations are referenced by index.
+    """
+    rows_cfg = settings["rows"]
+    backfill_start = date.fromisoformat(settings["daily_close"]["backfill_start"])
+    last_day = today - timedelta(days=1)
+    history_from = max(backfill_start, last_day - timedelta(days=ITEM_HISTORY_DAYS - 1))
+
+    stock = {}
+    for r in rows:
+        if r["RowSource"] == ROW_SOURCE_BALANCE:
+            stock[(r["ItemCode"], r["UOM"], r["Location"])] = r["BalQty"]
+    last_moves = last_movement_days(snapshot["ledger"], today)
+    history = item_close_history(ledger["movements"], history_from, last_day)
+    # A zero balance row is kept when the key has ever moved (the item detail shows "0, last
+    # moved ..."); zero rows that never moved carry nothing.
+    keys = {k for k, qty in stock.items() if qty != 0 or k in last_moves}
+
+    # Items in the latest rows but missing from the master (R1: none) are still listed.
+    master = dict(ledger["items"])
+    for r in rows:
+        if r["RowSource"] == ROW_SOURCE_BALANCE and r["ItemCode"] not in master:
+            master[r["ItemCode"]] = {"ItemCode": r["ItemCode"], "ItemDescription": r["ItemDescription"]}
+    held = {k[0] for k in keys} | {k[0] for k in history}
+    codes = []
+    non_stock = 0
+    quiet_inactive = 0
+    for code, item in master.items():
+        if is_non_stock_item(item, rows_cfg):
+            non_stock += 1
+        elif _clean(item.get("IsActive")) == "T" or code in held:
+            codes.append(code)
+        else:
+            quiet_inactive += 1
+    codes.sort()
+    item_pos = {code: n for n, code in enumerate(codes)}
+
+    # One barcode, reorder level and minimum quantity per item, from its base-UOM row (the UOM
+    # guard allows one UOM per item, so this is that row).
+    uom_rows = {(_clean(r.get("ItemCode")), _clean(r.get("UOM"))): r for r in snapshot["item_uom_rows"]}
+
+    def positive(value):
+        value = to_decimal(value)
+        return _num(value) if value > 0 else None
+
+    counts = {
+        "items": len(codes),
+        "inactive_without_stock_or_movement_excluded": quiet_inactive,
+        "non_stock_items_excluded": non_stock,
+        "items_without_description": 0,
+        "items_without_barcode": 0,
+        "items_with_reorder_level": 0,
+        "items_with_min_qty": 0,
+    }
+    items_out = []
+    for code in codes:
+        item = master[code]
+        uom = _clean(item.get("BaseUOM"))
+        uom_row = uom_rows.get((code, uom), {})
+        description = _clean(item.get("ItemDescription"))
+        barcode = _clean(uom_row.get("BarCode"))
+        reorder_level = positive(uom_row.get("ReOLevel"))
+        min_qty = positive(uom_row.get("MinQty"))
+        counts["items_without_description"] += not description
+        counts["items_without_barcode"] += not barcode
+        counts["items_with_reorder_level"] += reorder_level is not None
+        counts["items_with_min_qty"] += min_qty is not None
+        items_out.append(
+            [
+                code,
+                description,
+                barcode,
+                _clean(item.get("ItemGroup")),
+                _clean(item.get("ItemBrand")),
+                uom,
+                _clean(item.get("IsActive")) == "T",
+                reorder_level,
+                min_qty,
+            ]
+        )
+
+    # Non-stock keys never reach here: the latest rows and the movements already exclude them.
+    locations = sorted({k[2] for k in keys} | {k[2] for k in history})
+    loc_pos = {code: n for n, code in enumerate(locations)}
+    stock_out = []
+    for key in sorted(k for k in keys if k[0] in item_pos):
+        day = last_moves.get(key)
+        stock_out.append([item_pos[key[0]], loc_pos[key[2]], _num(stock[key]), day.isoformat() if day else None])
+    history_out = [
+        [item_pos[key[0]], loc_pos[key[2]], [[offset, _num(qty)] for offset, qty in history[key]]]
+        for key in sorted(k for k in history if k[0] in item_pos)
+    ]
+    counts["stock_keys"] = len(stock_out)
+    counts["history_keys"] = len(history_out)
+    return {
+        "schema": ITEM_INDEX_SCHEMA,
+        "schema_version": ITEM_INDEX_SCHEMA_VERSION,
+        "job": JOB,
+        "run_id": manifest["run_id"],
+        "as_of_local": manifest["as_of_local"],
+        "timezone": settings["timezone"],
+        "quantity_rule": "Units only; non-stock-controlled items excluded",
+        "last_close_day": last_day.isoformat(),
+        "history_from": history_from.isoformat(),
+        "history_days": max(0, (last_day - history_from).days + 1),
+        "low_stock_default_threshold": settings["feed"]["low_stock_threshold"],
+        "large_balance_threshold": settings["output"]["large_balance_threshold"],
+        "locations": locations,
+        "item_fields": ["code", "description", "barcode", "group", "brand", "uom", "active", "reorder_level", "min_qty"],
+        "items": items_out,
+        "stock_fields": ["item", "location", "qty", "last_movement"],
+        "stock": stock_out,
+        "history_fields": ["item", "location", "changes"],
+        "history": history_out,
+        "counts": counts,
     }
 
 
@@ -2276,7 +2456,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
                 "ledger": query_sha256(LEDGER_QUERY),
                 "item_master": query_sha256(ITEM_MASTER_QUERY),
                 "locations": query_sha256(LOCATION_QUERY),
-                "reorder_levels": query_sha256(REORDER_QUERY),
+                "item_uom": query_sha256(ITEM_UOM_QUERY),
                 "sync": query_sha256(sync_query(settings["source"]["sync_registration_time_column"])),
                 "identity": query_sha256(IDENTITY_QUERY),
                 "change_count": query_sha256(CHANGE_COUNT_QUERY),
@@ -2299,6 +2479,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "ledger_check": None,
         "daily_close": {"status": CLOSE_SKIPPED, "mode": "backfill" if force_close else None},
         "feed": None,
+        "item_index": None,
         "retention": None,
         "pos_sync": [],
         # Drive gets the latest pair, the feed, the run status and the daily files only. The
@@ -2390,6 +2571,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     # The daily close and the feed come from the same verified read. Their failures are
     # recorded separately: the hourly snapshot above is still good.
     feed_data = None
+    item_index_data = None
     if manifest["status"] == "success" and work is not None:
         ctx = {
             "items": work["ledger"]["items"],
@@ -2429,6 +2611,20 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
             }
         except Exception:  # noqa: BLE001 - the feed is derived data; its failure is reported, not raised.
             manifest["feed"] = {"status": "failed", "failure_class": FAILURE_FEED}
+        try:
+            index = build_item_index(settings, manifest, work["rows"], work["ledger"], work["snapshot"], work["today"])
+            item_index_data = gzip_json_bytes(index)
+            manifest["item_index"] = {
+                "status": "built",
+                "name": ITEM_INDEX_NAME,
+                "schema": ITEM_INDEX_SCHEMA,
+                "schema_version": ITEM_INDEX_SCHEMA_VERSION,
+                "sha256": hashlib.sha256(item_index_data).hexdigest(),
+                "byte_size": len(item_index_data),
+                "counts": index["counts"],
+            }
+        except Exception:  # noqa: BLE001 - derived data like the feed; its failure is reported, not raised.
+            manifest["item_index"] = {"status": "failed", "failure_class": FAILURE_ITEM_INDEX}
         # Never raises; only expired exporter-owned files, never this run's folder.
         manifest["retention"] = prune_archive(archive_root, settings, started, work["today"], run_dir)
 
@@ -2441,7 +2637,11 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         manifest["warnings"] = [w for w in manifest["warnings"] if not w.startswith(LARGE_BALANCE_WARNING_PREFIX)]
     elif delivery_root:
         manifest["delivery"]["status"] = DELIVERY_PENDING
-        manifest["delivery"]["files"] = [LATEST_CSV_NAME, LATEST_MANIFEST_NAME] + ([FEED_NAME] if feed_data else [])
+        manifest["delivery"]["files"] = (
+            [LATEST_CSV_NAME, LATEST_MANIFEST_NAME]
+            + ([FEED_NAME] if feed_data else [])
+            + ([ITEM_INDEX_NAME] if item_index_data else [])
+        )
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         manifest_sha, _ = write_exclusive(run_dir / MANIFEST_NAME, json_bytes(manifest))
@@ -2466,15 +2666,25 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
                 feed_data = None
                 manifest["feed"]["status"] = "failed"
                 manifest["feed"]["failure_class"] = FAILURE_FEED
+        if item_index_data is not None:
+            try:
+                publish_verified(archive_root / ITEM_INDEX_NAME, item_index_data, run_id[:8])
+            except OSError:
+                # Same rule as the feed: Drive is not sent an item index the archive lacks.
+                item_index_data = None
+                manifest["item_index"]["status"] = "failed"
+                manifest["item_index"]["failure_class"] = FAILURE_ITEM_INDEX
         if delivery_root:
-            final_delivery = deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, run_id)
-        if manifest["feed"] and manifest["feed"]["status"] == "built":
-            if delivery_root and final_delivery != DELIVERY_HANDED:
-                # The feed travels in the Drive latest set, so Drive kept its previous feed.
-                manifest["feed"]["status"] = "failed"
-                manifest["feed"]["failure_class"] = FAILURE_FEED
-            else:
-                manifest["feed"]["status"] = "published"
+            extras = [(name, data) for name, data in ((FEED_NAME, feed_data), (ITEM_INDEX_NAME, item_index_data)) if data]
+            final_delivery = deliver_latest(run_dir, delivery_root, manifest, manifest_sha, extras, run_id)
+        for key, failure_class in (("feed", FAILURE_FEED), ("item_index", FAILURE_ITEM_INDEX)):
+            if manifest[key] and manifest[key]["status"] == "built":
+                if delivery_root and final_delivery != DELIVERY_HANDED:
+                    # The file travels in the Drive latest set, so Drive kept its previous copy.
+                    manifest[key]["status"] = "failed"
+                    manifest[key]["failure_class"] = failure_class
+                else:
+                    manifest[key]["status"] = "published"
     elif manifest["status"] != "success" and delivery_root and manifest["delivery"]["status"] == DELIVERY_PENDING:
         final_delivery = DELIVERY_SKIPPED
 
@@ -2498,6 +2708,7 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "revised_day_count": close.get("revised_day_count"),
         "late_change_day_count": close.get("late_change_day_count"),
         "feed_status": (manifest["feed"] or {}).get("status"),
+        "item_index_status": (manifest["item_index"] or {}).get("status"),
         "next_run_local": next_run_local(started, settings["schedule"]["run_minute"]),
     }
     manifest["_last_run_status"] = status
@@ -2514,11 +2725,12 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     return manifest
 
 
-def deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, run_id):
-    """Replace the Drive latest pair and the feed as one set (publish_verified_set).
+def deliver_latest(run_dir, delivery_root, manifest, manifest_sha, extras, run_id):
+    """Replace the Drive latest pair, the feed and the item index as one set (publish_verified_set).
 
-    No hourly folder goes to Drive. Every temp copy is written and verified before any is moved,
-    so a bad copy of any of them leaves Drive with the previous verified pair and feed.
+    extras is a list of (file name, data) published after the pair. No hourly folder goes to
+    Drive. Every temp copy is written and verified before any is moved, so a bad copy of any of
+    them leaves Drive with the previous verified pair, feed and item index.
     """
     tag = run_id[:8]
     try:
@@ -2529,8 +2741,7 @@ def deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, ru
             return DELIVERY_VERIFY_FAILED
         latest = {key: value for key, value in manifest.items() if not key.startswith("_")}
         entries = [(delivery_root / LATEST_CSV_NAME, data), (delivery_root / LATEST_MANIFEST_NAME, json_bytes(latest))]
-        if feed_data is not None:
-            entries.append((delivery_root / FEED_NAME, feed_data))
+        entries.extend((delivery_root / name, extra) for name, extra in extras)
         publish_verified_set(entries, tag)
     except VerifyError:
         return DELIVERY_VERIFY_FAILED
@@ -2757,6 +2968,7 @@ def main(argv=None, source=None, environ=None, clock=None):
             "daily_close_status": status["daily_close_status"],
             "published_close_day": status["published_close_day"],
             "feed_status": status["feed_status"],
+            "item_index_status": status["item_index_status"],
             "message": manifest["message"],
         }
     )
@@ -2765,6 +2977,8 @@ def main(argv=None, source=None, environ=None, clock=None):
     if status["delivery_status"] not in (DELIVERY_HANDED, DELIVERY_NOT_CONFIGURED):
         return EXIT_FAILED
     if status["daily_close_status"] == CLOSE_FAILED or status["feed_status"] != "published":
+        return EXIT_FAILED
+    if status["item_index_status"] != "published":
         return EXIT_FAILED
     return EXIT_OK
 

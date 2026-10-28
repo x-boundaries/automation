@@ -2,6 +2,8 @@
 
 Status: **offline build only.** Nothing here has run against SQL Server, the AC2 VM, Google Drive or Task Scheduler. Every step under [VM proof steps](#vm-proof-steps-v1-v7) and [Round 6 VM proof](#round-6-vm-proof-steps-d1-d6) needs a separate owner OK.
 
+Dashboard v2 (28 Oct 2026): every successful run also writes the item index `stock_item_index.json.gz` beside the feed, for the dashboard's item search, item detail and data-issues views (see [Item index](#item-index-schema-v1)). The item master read adds `ItemGroup` and `ItemBrand`, and the `dbo.ItemUOM` read adds `BarCode` and `MinQty`. Nothing else changes.
+
 Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close rebuilt from the stock ledger, a backfill from 1 Aug 2026, one latest pair in Drive (no hourly folders in Drive), local retention, and a compact dashboard feed. File, setting and task names keep the word "hourly" (the job still runs hourly); only the Drive folder is renamed to "daily".
 
 ## What it does
@@ -11,11 +13,12 @@ Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close 
 - locally, an immutable hourly folder with `stock_balance.csv` and `manifest.json` (kept 48 hours once pruning is on);
 - a "latest" pair (`stock_balance_latest.csv`, `latest_manifest.json`) that is replaced only after the new hourly CSV re-reads to the hash that was written;
 - the dashboard feed `stock_dashboard_feed.json.gz`, beside the latest pair (see [Dashboard feed](#dashboard-feed-schema-v1));
+- the item index `stock_item_index.json.gz`, beside the feed (see [Item index](#item-index-schema-v1));
 - `last_run_status.json`, updated on every run, success or failed, so a failed hour is visible in Drive.
 
 The first run after local midnight also publishes the **daily close** of the previous day (see [Daily close](#daily-close)): one CSV of non-zero closing balances plus its manifest, in `daily/<YYYY-MM>/`.
 
-Delivery to Google Drive is a plain file copy into a local folder that Google Drive for desktop syncs (`output.delivery_root`). Drive gets only the latest pair, the feed, `last_run_status.json` and the daily files, each replaced through a temp copy that must re-read to the right hash. **No hourly folders go to Drive.** Nothing calls a Drive API. The manifest says "handed to Drive sync folder", never "uploaded".
+Delivery to Google Drive is a plain file copy into a local folder that Google Drive for desktop syncs (`output.delivery_root`). Drive gets only the latest pair, the feed, the item index, `last_run_status.json` and the daily files, each replaced through a temp copy that must re-read to the right hash. **No hourly folders go to Drive.** Nothing calls a Drive API. The manifest says "handed to Drive sync folder", never "uploaded".
 
 Where it runs (owner decision, 23 Oct 2026): on the AC2 VM as a Windows Task Scheduler task, reading SQL Server locally. The archive is a gitignored folder inside the automation clone on the VM, and delivery writes directly into the Drive for desktop synced folder. The settings file is JSON and cannot carry comments, so this runbook documents the placeholders used in the example settings.
 
@@ -24,7 +27,7 @@ How it reads:
 - Fixed `SELECT` statements only; `READ COMMITTED`, `SET LOCK_TIMEOUT` (default 5000 ms), query timeout (default 60 s), one connection per attempt. No `NOLOCK`, no snapshot isolation, no database setting changes.
 - Consistency: `dbo.ChangeCount` (row `ItemBatchBalQty`) is read before and after the balance read on the same connection. Equal values mean no balance write landed in between. If it keeps moving, the run retries (default 3 attempts, short backoff), then fails as `unstable_snapshot`. A lock timeout is also retried within the same attempt budget.
 - Balance rows are summed by ItemCode, UOM and Location (BatchNo is always empty today; rows with a non-empty BatchNo are counted in the manifest).
-- The ledger read (`dbo.StockDTL`: `SUM(Qty)` per ItemCode, UOM, Location and `CAST(DocDate AS date)`, never filtered by date), the item master (`dbo.Item`), the location list (`dbo.Location`) and the reorder levels (`dbo.ItemUOM.ReOLevel > 0`, information only) are read **inside the same ChangeCount window** as the balance read. `dbo.ChangeCount` has no row for `StockDTL` (R1, 28 Oct 2026); a stock posting writes both tables, so it moves the balance counter, and the per-run [ledger check](#ledger-check-every-run) catches anything the counter missed.
+- The ledger read (`dbo.StockDTL`: `SUM(Qty)` per ItemCode, UOM, Location and `CAST(DocDate AS date)`, never filtered by date), the item master (`dbo.Item`, including the `ItemGroup` and `ItemBrand` codes), the location list (`dbo.Location`) and the item UOM rows (`dbo.ItemUOM`: `BarCode`, `ReOLevel`, `MinQty`; no `Cost` or `Price`) are read **inside the same ChangeCount window** as the balance read. `dbo.ChangeCount` has no row for `StockDTL` (R1, 28 Oct 2026); a stock posting writes both tables, so it moves the balance counter, and the per-run [ledger check](#ledger-check-every-run) catches anything the counter missed.
 - No cost column is selected. `MostRecentlyCost`, `StockDTL.Cost` / `TotalCost` and every cost table stay out. Consignment (`dbo.CSGNItemBalQty`) is out. `StockDTL.DocInfo` (free text) is never read.
 - `dbo.ChangeLog` is never read.
 
@@ -67,7 +70,7 @@ Run from the automation clone, always with the task's full-path interpreter (see
 
 `--backfill` is a normal run (same reads, same checks, same latest pair and feed) that also writes **every** daily close from `daily_close.backfill_start` to yesterday again, replacing any that exist (`write_reason: rebuild`, revision + 1). It uses the same code path as the nightly close. Run it once at the VM step (step D2), and again only if the owner wants Drive's older daily files rebuilt from the ledger.
 
-Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed published), `1` failed, delivery not verified, daily close failed or feed failed. A daily close or feed failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code.
+Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code.
 
 ## Settings
 
@@ -109,7 +112,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 | `retention.prune_enabled` | `false` | Pruning of the local archive. Off until the owner OKs it at VM step D3. Never touches Drive. |
 | `retention.hourly_keep_hours` | `48` | Local hourly run folders older than this (by the time in the folder name) are removed. 2 to 8784. |
 | `retention.daily_keep_days` | `90` | Local daily close files whose close date is older than this are removed. Must be more than `restate_days`. Drive keeps every daily file. |
-| `feed.low_stock_threshold` | `2` | Low stock = `0 < quantity <= threshold`, active items (owner, 28 Oct 2026: global 2 units for now). `ItemUOM.ReOLevel` is shown beside each low-stock row when set but does not change the rule yet. |
+| `feed.low_stock_threshold` | `2` | Feed low stock = `0 < quantity <= threshold`, active items (owner, 28 Oct 2026: global 2 units for now). `ItemUOM.ReOLevel` is shown beside each feed low-stock row when set but does not change the feed rule. The dashboard v2 page uses the item index instead: the item's reorder level, else its minimum quantity, else this threshold (see [Item index](#item-index-schema-v1)). |
 | `feed.list_cap` | `200` | Most rows listed in the feed's negatives and low-stock lists; counts are always complete. |
 | `feed.movers_top` | `20` | Biggest risers and fallers listed per period (1, 7, 30 days). |
 
@@ -122,6 +125,7 @@ Every business choice is a setting. The owner said answers may still change, so 
   stock_balance_latest.csv                (latest verified success only)
   latest_manifest.json                    (latest verified success only)
   stock_dashboard_feed.json.gz            (every successful run)
+  stock_item_index.json.gz                (every successful run)
   hourly\<YYYY-MM-DD>\ac2_stockbal_<YYYYMMDDTHHMMSS+0800>_<run_id first 8>\
       stock_balance.csv                   (success only; kept 48 h when pruning is on)
       manifest.json                       (every outcome; kept 48 h when pruning is on)
@@ -133,22 +137,23 @@ Every business choice is a setting. The owner said answers may still change, so 
   stock_balance_latest.csv                (replaced every run)
   latest_manifest.json                    (replaced every run)
   stock_dashboard_feed.json.gz            (replaced every run)
+  stock_item_index.json.gz                (replaced every run)
   last_run_status.json                    (replaced every run)
   daily\<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv            (one per day, never pruned)
   daily\<YYYY-MM>\stock_close_<YYYY-MM-DD>.manifest.json
 ```
 
-- No `hourly\` folder is ever written to Drive. An hourly run that is not the daily close adds no file to Drive; it only replaces the four top-level files.
+- No `hourly\` folder is ever written to Drive. An hourly run that is not the daily close adds no file to Drive; it only replaces the five top-level files.
 - Local hourly files use exclusive create plus fsync and SHA-256. A rerun in the same hour makes a new folder; existing files are never touched.
-- Published sets (`publish_verified_set`): the latest pair (archive), the Drive latest set (CSV, manifest and feed), each day's CSV + manifest (per folder) and the archive feed are each written as a set. Every file of the set is first written to a temp name beside its target, re-read and hashed; only when **all** of them verify are they moved over the old files with `os.replace`, in order (CSV first). A bad or failed copy of any file removes all the temps and replaces nothing, so Drive keeps the previous verified pair (and feed) and a day keeps its previous CSV + manifest, each pair still matching by hash. The archive latest pair is published only after the hourly CSV re-reads to its hash. `latest_manifest.json` carries `as_of_local` and `run_id`, so an old snapshot is visible.
+- Published sets (`publish_verified_set`): the latest pair (archive), the Drive latest set (CSV, manifest, feed and item index), each day's CSV + manifest (per folder), the archive feed and the archive item index are each written as a set. Every file of the set is first written to a temp name beside its target, re-read and hashed; only when **all** of them verify are they moved over the old files with `os.replace`, in order (CSV first). A bad or failed copy of any file removes all the temps and replaces nothing, so Drive keeps the previous verified pair (and feed and item index) and a day keeps its previous CSV + manifest, each pair still matching by hash. The archive latest pair is published only after the hourly CSV re-reads to its hash. `latest_manifest.json` carries `as_of_local` and `run_id`, so an old snapshot is visible.
 - One limit remains, as before round 6: if a target is still held (for example by the sync client) after the move's three tries, the files already moved stay moved and the rest are dropped; the run reports `copy_failed` and `--check-latest` may say `invalid` until the next good hour.
 - Delivery status `verify_failed` (hash mismatch) or `copy_failed` (write error) is in `last_run_status.json`; the run manifest records `delivery.mode: latest_only`, the files and `pending_see_last_run_status`.
-- Size, measured offline with a generated fake book (50,000 ledger groups, 12,000 keys, 6,000 items): daily close CSV about 1 MB a day; feed under 10 KB; the 88-day backfill run took about 11 s and an ordinary hourly run about 1 s on the server PC. Real sizes are measured at VM step D2.
+- Size, measured offline with a generated fake book (50,000 ledger groups, 12,000 keys, 6,000 items): daily close CSV about 1 MB a day; feed under 10 KB; the 88-day backfill run took about 11 s and an ordinary hourly run about 1 s on the server PC. Real sizes are measured at VM step D2. Item index (dashboard v2), measured with a generated fake book of 24,000 items (19,473 listed), 12,000 item-location keys and 47,000 ledger groups, random descriptions and barcodes: 671 KB gzipped (2.7 MB raw); the backfill run still took about 10 s. Real text compresses better; the real size is measured at VM step D7.
 - Lock: `.ac2_stockbal.lock` records the run_id, process id and start time. A run killed by the 15-minute task limit or a reboot cannot remove it. The next run clears it automatically only when it is older than 30 minutes (the 15-minute limit plus a 15-minute margin) **and** either it was written before Windows last started (a restart ends every run, whatever process later reuses its process id) or its recorded process is no longer running (on Windows, a process created after the lock was written counts as a reused process id, not the owner). That run adds a warning to its manifest naming the killed run's reference, the reason and the lock age. A younger lock, or a lock written since the last start whose process is still running, gives `already_running` and is left alone.
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
 - Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, large_balances, uom_guard, pos_sync per Location, delivery, warnings.
-  Round 6 adds (schema_version `2`): `ledger` (groups, rows, null_qty_rows, non_empty_batch, future_dated_rows, non_base_uom_groups, non_stock_rows_excluded, non_stock_items_excluded, items_missing_from_master, first_day, last_day), `ledger_check`, `uom_guard.ledger_non_base_uom_groups`, `counts.non_stock_excluded`, `daily_close`, `feed` (status, sha256, byte_size), `retention`, and the extra query hashes (`ledger`, `item_master`, `locations`, `reorder_levels`).
-- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), next_run_local. `status` and `failure_class` describe the hourly snapshot as before.
+  Round 6 adds (schema_version `2`): `ledger` (groups, rows, null_qty_rows, non_empty_batch, future_dated_rows, non_base_uom_groups, non_stock_rows_excluded, non_stock_items_excluded, items_missing_from_master, first_day, last_day), `ledger_check`, `uom_guard.ledger_non_base_uom_groups`, `counts.non_stock_excluded`, `daily_close`, `feed` (status, sha256, byte_size), `retention`, and the extra query hashes (`ledger`, `item_master`, `locations`, `item_uom`; the last was `reorder_levels` before dashboard v2). Dashboard v2 adds `item_index` (status, sha256, byte_size, counts).
+- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local. `status` and `failure_class` describe the hourly snapshot as before.
 
 ## Ledger check (every run)
 
@@ -194,6 +199,27 @@ Owner-accepted design, section 2.2: every run proves itself before anything is p
 | `pos_sync` | Last POS sync time per location, as in the manifest. |
 
 Numbers are JSON numbers (whole quantities as integers). A feed that cannot be built or written sets `feed_status: failed` (`feed_publish_failed`). If it cannot be built or written to the archive, the previous feed file stays in the archive and in Drive (Drive is not sent a feed the archive lacks) and the hourly latest pair is still published. The Drive feed travels in the same set as the Drive latest pair, so a failed Drive delivery keeps the previous pair **and** the previous feed there, and `feed_status` also reads `failed`.
+
+## Item index (schema v1)
+
+`stock_item_index.json.gz` (dashboard v2, 28 Oct 2026) is written beside the feed on every successful run (archive and Drive), from the same verified read, gzip with a fixed header time. The private dashboard page reads it once per open or refresh for item search ("where can I get it"), item detail (per-outlet quantity, close history, last movement), low stock by reorder level, fix-up lists, downloads and the data-issues view. Quantities and item master fields only: no cost, price, document, customer or member data. The feed keeps schema v1 unchanged.
+
+| Key | Content |
+| --- | --- |
+| `schema`, `schema_version` | `xb.ac2.stock_item_index`, `1`. A breaking change raises the version. |
+| `job`, `run_id`, `as_of_local`, `timezone`, `quantity_rule` | As in the feed. |
+| `last_close_day`, `history_from`, `history_days` | The close history range: the last 90 closes, never before `daily_close.backfill_start`. |
+| `low_stock_default_threshold` | `feed.low_stock_threshold`, the page's fallback when an item has no reorder level or minimum quantity. |
+| `large_balance_threshold` | `output.large_balance_threshold`, for the page's large-balance list. |
+| `locations` | Location codes, referenced by index below. Labels come from the feed. |
+| `item_fields`, `items` | One array per item: `code, description, barcode, group, brand, uom, active, reorder_level, min_qty`. Listed: every stock-controlled item that is active, holds a balance or moved in the history window. `barcode`, `reorder_level` and `min_qty` come from the item's base-UOM `dbo.ItemUOM` row (the UOM guard allows one UOM per item); a level of 0 or none is `null`; `group` and `brand` are the AutoCount codes. |
+| `stock_fields`, `stock` | One array per item and location: `item` (index), `location` (index), `qty` (the latest balance), `last_movement` (the last ledger day up to today with any row for the key, a net-zero day included; `null` when none). Non-zero balances, plus zero balances that ever moved. |
+| `history_fields`, `history` | One array per item and location: `item`, `location`, `changes` = `[[offset, close], ...]`, with offset in days from `history_from`. Offset 0 is the close on `history_from`; later entries are the days the close changed (0 when it went to zero). Closes sum from the first ledger row, exactly like the daily files. A key that is zero all through the window is left out. |
+| `counts` | `items`, `inactive_without_stock_or_movement_excluded`, `non_stock_items_excluded`, `items_without_description`, `items_without_barcode`, `items_with_reorder_level`, `items_with_min_qty`, `stock_keys`, `history_keys`. Also in the run manifest under `item_index.counts`. |
+
+Failure handling is the feed's: a build or archive write failure keeps the previous file in both places and sets `item_index_status: failed` (`item_index_publish_failed`, exit code `1`); the hourly latest pair is still published. The Drive copy travels in the same verified set as the Drive latest pair and the feed.
+
+Page rules that use it (documented here so the numbers can be checked): low stock = `0 < qty <= level` per outlet for active items, where level is the item's `reorder_level`, else its `min_qty`, else `low_stock_default_threshold`, and the page says which one applied. AutoCount keeps these levels per item, not per outlet, so the page applies the item's level to each outlet's quantity.
 
 ## Large-balance warning
 
@@ -317,6 +343,7 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
 - **D3 retention** (needs owner OK): set `retention.prune_enabled: true`, run once, and check `retention` in the manifest: only local hourly folders older than 48 h and daily files older than 90 days removed, `errors: 0`, nothing removed from Drive or outside the archive.
 - **D4 Drive folder rename** (needs owner OK, Drive change): rename `Report/AC2 Stock Balance (hourly)` to `Report/AC2 Stock Balance (daily)` and set `output.delivery_root` to the new local path. Check Drive for desktop still syncs it.
 - **D5 task** (needs owner OK, VM change): replace the paused root task with the `\XB\` task, see [Replace the paused root task](#replace-the-paused-root-task-vm-step-d5-needs-owner-ok).
+- **D7 dashboard v2 update** (needs owner OK, after the dashboard v2 PR is merged): first run step 6 of `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` (column check; all five lengths must be non-NULL), then pull main into the VM clone, run `--dry-run-config`, and one supervised manual run (no `--backfill`). Pass when `status: success`, `item_index_status: published`, `stock_item_index.json.gz` is in Drive beside the feed, and `item_index.counts` look sane. Record the item index size and run time in the private mailbox. No settings change is needed.
 - **D6 first 00:00 close** (needs owner OK to leave it enabled): after the first midnight, check `last_run_status.json` from the 00:00 run: `daily_close_status: published`, `published_close_day` = the day before, exactly one task start at 00:00 (`Get-WinEvent` Task Scheduler history or one 00:xx hourly folder), and the 01:00 run shows `daily_close_status: not_due`.
 
 ## Retention
@@ -333,7 +360,7 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
 ## Out of scope
 
 - **#246** (daily money / buying package): the owner wants AutoCount's Advanced Dimensional report there (most detailed breakdown, for example marketplace shipping fees). New marketplace fee codes can land on a default term (believed to be "Adjustment") until someone adds the term in AC2, so the #246 report should flag unmapped codes. Cost and value belong in #246, not here.
-- The dashboard page: a later round builds it as a private Claude artifact that reads `stock_dashboard_feed.json.gz` through the viewer's own Drive connector. This build only writes the feed.
+- The dashboard page: a private Claude artifact that reads `stock_dashboard_feed.json.gz` and `stock_item_index.json.gz` through the viewer's own Drive connector. Its source lives in the private mailbox, not in this repository. This build only writes the files.
 - Consignment stock, failure alerts (planned follow-up below), n8n, Drive API upload, Drive clean-up, SQL logins and grants.
 
 ## Planned follow-up: failure alerts
