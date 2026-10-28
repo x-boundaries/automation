@@ -442,6 +442,17 @@ class ConfigValidationTests(TempDirTestCase):
         archive = str(Path(self.tmp) / "archive")
         self.assert_config_error(raw_settings(self.tmp, output={"delivery_root": archive}), "delivery_root")
 
+    def test_roots_must_not_be_nested(self):
+        # G2 r6 N20: an archive inside the Drive folder would sync the hourly folders to Drive.
+        drive = Path(self.tmp) / "drive_sync"
+        nested = {"archive_root": str(drive / "archive"), "delivery_root": str(drive)}
+        self.assert_config_error(raw_settings(self.tmp, output=nested), "inside each other")
+        nested = {"archive_root": str(drive), "delivery_root": str(drive / "Report" / "AC2")}
+        self.assert_config_error(raw_settings(self.tmp, output=nested), "inside each other")
+        # Siblings with a shared name prefix are not nested.
+        siblings = {"archive_root": str(drive), "delivery_root": str(Path(self.tmp) / "drive_sync_2")}
+        self.assertEqual(hourly.validate_settings(raw_settings(self.tmp, output=siblings))["output"]["archive_root"], str(drive))
+
     def test_dry_run_config_cli(self):
         path = Path(self.tmp) / "settings.local.json"
         path.write_text(json.dumps(raw_settings(self.tmp)), encoding="utf-8")
@@ -1197,13 +1208,28 @@ class DeliveryTests(TempDirTestCase):
     def status(self):
         return json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
 
-    def tamper(self, name_fragment):
+    def tamper(self, name_fragment, root=None):
+        """Corrupt the copies of one file name, in the Drive sync folder only unless root is given."""
         real = hourly.copy_bytes_exclusive
+        root = Path(root or self.delivery)
 
         def bad_copy(path, data):
-            real(path, data + b"x" if name_fragment in Path(path).name else data)
+            hit = name_fragment in Path(path).name and Path(path).parent == root
+            real(path, data + b"x" if hit else data)
 
         return mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=bad_copy)
+
+    def changed_source(self):
+        """A second run whose balances (and so CSV hash) differ from the first."""
+        return FakeSource(balances=default_balances() + [bal("FAKE-0005", "LOC-A", "7.00000000")])
+
+    def assert_drive_pair_is(self, run_id):
+        """Drive's latest CSV and manifest both belong to run_id and their hashes agree."""
+        latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        csv_data = (self.delivery / hourly.LATEST_CSV_NAME).read_bytes()
+        self.assertEqual(latest["run_id"], run_id)
+        self.assertEqual(hashlib.sha256(csv_data).hexdigest(), latest["csv"]["sha256"], "CSV and manifest agree")
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [], "no temp file is left")
 
     def test_delivery_is_latest_only_no_hourly_folders(self):
         manifest = run(self.settings())
@@ -1257,14 +1283,105 @@ class DeliveryTests(TempDirTestCase):
         archive_latest = json.loads((self.archive / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
         self.assertEqual(archive_latest["run_id"], manifest["run_id"])
 
-    def test_tampered_manifest_copy_is_verify_failed(self):
+    def test_tampered_manifest_copy_keeps_the_previous_consistent_pair(self):
+        # G2 r6 H4: the CSV used to be replaced before the manifest copy was checked.
         settings = self.settings()
         good = run(settings)
+        before = tree_bytes(self.delivery)
         with self.tamper(hourly.LATEST_MANIFEST_NAME):
-            run(settings)
+            second = run(settings, self.changed_source())
+        self.assertNotEqual(second["csv"]["sha256"], good["csv"]["sha256"], "run 2 has a different CSV")
         self.assertEqual(self.status()["delivery_status"], "verify_failed")
+        self.assert_drive_pair_is(good["run_id"])
+        for name in (hourly.LATEST_CSV_NAME, hourly.LATEST_MANIFEST_NAME, hourly.FEED_NAME):
+            self.assertEqual((self.delivery / name).read_bytes(), before[name], name)
+        self.assertEqual(hourly.check_latest(self.settings(), clock=clock_at())[0], hourly.EXIT_OK)
+
+    def test_tampered_feed_copy_keeps_the_previous_latest_set(self):
+        settings = self.settings()
+        good = run(settings)
+        before = tree_bytes(self.delivery)
+        with self.tamper(hourly.FEED_NAME):
+            second = run(settings, self.changed_source())
+        self.assertEqual(self.status()["delivery_status"], "verify_failed")
+        self.assert_drive_pair_is(good["run_id"])
+        self.assertEqual((self.delivery / hourly.FEED_NAME).read_bytes(), before[hourly.FEED_NAME])
+        # N18: the feed did not reach Drive, so it is not reported as published.
+        self.assertEqual(self.status()["feed_status"], "failed")
+        self.assertEqual(second["feed"]["failure_class"], "feed_publish_failed")
+        # The archive still advanced: it does not depend on the Drive copy.
+        archive_latest = json.loads((self.archive / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(archive_latest["run_id"], second["run_id"])
+
+    def test_tampered_archive_feed_write_keeps_both_previous_feeds(self):
+        # N18: the archive feed goes through a verified temp file; a bad write keeps the old feed
+        # there, and Drive is not sent a feed the archive lacks. The latest pair still advances.
+        settings = self.settings()
+        run(settings)
+        before = {root: (root / hourly.FEED_NAME).read_bytes() for root in (self.archive, self.delivery)}
+        with self.tamper(hourly.FEED_NAME, root=self.archive):
+            second = run(settings, self.changed_source())
+        for root, data in before.items():
+            self.assertEqual((root / hourly.FEED_NAME).read_bytes(), data, root.name)
+        self.assertEqual(self.status()["feed_status"], "failed")
+        self.assertEqual(self.status()["delivery_status"], "handed_to_drive_sync_folder")
+        self.assert_drive_pair_is(second["run_id"])
         latest = json.loads((self.delivery / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
-        self.assertEqual(latest["run_id"], good["run_id"], "the previous verified manifest is kept")
+        self.assertEqual(latest["feed"]["status"], "failed", "the Drive manifest does not claim a new feed")
+        self.assertEqual([p.name for p in self.archive.glob("*.tmp")], [])
+
+    def test_tampered_archive_manifest_write_keeps_the_previous_archive_pair(self):
+        settings = settings_for(self.tmp)
+        good = run(settings)
+        with self.tamper(hourly.LATEST_MANIFEST_NAME, root=self.archive):
+            second = run(settings, self.changed_source())
+        self.assertEqual(second["status"], "success", "the hourly archive itself is good")
+        status = json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["status"], status["failure_class"]), ("failed", "latest_publish_failed"))
+        latest = json.loads((self.archive / hourly.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(latest["run_id"], good["run_id"])
+        data = (self.archive / hourly.LATEST_CSV_NAME).read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), latest["csv"]["sha256"])
+
+    def test_publish_set_moves_nothing_until_every_copy_verifies(self):
+        root = Path(self.tmp) / "set"
+        root.mkdir()
+        (root / "a").write_bytes(b"old a")
+        (root / "b").write_bytes(b"old b")
+        real = hourly.copy_bytes_exclusive
+
+        def bad_b(path, data):
+            real(path, data + b"x" if Path(path).name.startswith(".b.") else data)
+
+        with mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=bad_b):
+            with self.assertRaises(hourly.VerifyError):
+                hourly.publish_verified_set([(root / "a", b"new a"), (root / "b", b"new b")], "t1")
+        self.assertEqual(((root / "a").read_bytes(), (root / "b").read_bytes()), (b"old a", b"old b"))
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["a", "b"])
+        with mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                hourly.publish_verified_set([(root / "a", b"new a"), (root / "b", b"new b")], "t2")
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["a", "b"])
+        hashes = hourly.publish_verified_set([(root / "a", b"new a"), (root / "b", b"new b")], "t3")
+        self.assertEqual(((root / "a").read_bytes(), (root / "b").read_bytes()), (b"new a", b"new b"))
+        self.assertEqual(hashes, [hashlib.sha256(b"new a").hexdigest(), hashlib.sha256(b"new b").hexdigest()])
+
+    def test_publish_set_drops_the_rest_when_a_move_fails(self):
+        # The documented limit: a target a sync client still holds after the retries stops the set.
+        root = Path(self.tmp) / "set"
+        root.mkdir()
+        real = os.replace
+
+        def held_b(src, dst):
+            if Path(dst).name == "b":
+                raise PermissionError("held")
+            real(src, dst)
+
+        with mock.patch.object(hourly.os, "replace", side_effect=held_b), \
+                mock.patch.object(hourly.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                hourly.publish_verified_set([(root / "a", b"a"), (root / "b", b"b"), (root / "c", b"c")], "t1")
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["a"], "no temp file is left")
 
     def test_first_run_with_bad_copy_leaves_no_latest(self):
         with self.tamper(hourly.LATEST_CSV_NAME):
@@ -1550,6 +1667,11 @@ class QueryContractTests(unittest.TestCase):
         hourly.ITEMS_WITHOUT_ROWS_QUERY,
         hourly.sync_query("LastFinishSyncTime"),
         hourly.sync_query("LastTransFinishSyncTime"),
+        # Round 6 (G2 r6 H5): the ledger, item master, location and reorder-level reads.
+        hourly.LEDGER_QUERY,
+        hourly.ITEM_MASTER_QUERY,
+        hourly.LOCATION_QUERY,
+        hourly.REORDER_QUERY,
     )
 
     def test_no_cost_column(self):
@@ -2162,17 +2284,17 @@ class RestateWindowTests(Round6TestCase):
 
     def test_close_write_failure_keeps_snapshot_and_retries_next_run(self):
         settings = self.settings()
-        real = hourly.publish_verified
+        real = hourly.copy_bytes_exclusive
 
-        def failing(path, data, tag):
+        def failing(path, data):
             if "stock_close_2026-08-02" in Path(path).name:
                 raise OSError("disk full")
-            return real(path, data, tag)
+            return real(path, data)
 
         path = Path(self.tmp) / "settings.local.json"
         path.write_text(json.dumps(raw_settings(self.tmp, daily_close={"backfill_start": "2026-08-01"})), encoding="utf-8")
         source = ledger_source(aug_ledger(), AUG_ITEMS, sql_now=at(2026, 8, 4, second=6))
-        with mock.patch.object(hourly, "publish_verified", side_effect=failing), \
+        with mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=failing), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             code = hourly.main(["--config", str(path)], source=source, environ=ENV, clock=clock_at(at(2026, 8, 4)))
         self.assertEqual(code, 1)
@@ -2185,6 +2307,39 @@ class RestateWindowTests(Round6TestCase):
         retry = self.run_at(settings, at(2026, 8, 4, 1))
         self.assertEqual(retry["daily_close"]["status"], "published")
         self.assertTrue(self.daily("2026-08-03").exists())
+
+    def assert_day_pair_agrees(self, day, root, revision):
+        meta = self.daily_meta(day, root)
+        self.assertEqual(meta["revision"], revision, (day, root.name))
+        self.assertEqual(hashlib.sha256(self.daily(day, root).read_bytes()).hexdigest(), meta["csv"]["sha256"])
+
+    def test_bad_day_manifest_copy_keeps_the_previous_consistent_day_pair(self):
+        # G2 r6 H4 for the daily files: a revised day's CSV is not replaced unless its manifest
+        # copy verifies too.
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        self.run_at(settings, at(2026, 8, 10))
+        before = tree_bytes(self.delivery / "daily")
+        ledger = aug_ledger() + [led("FAKE-B", "LOC-B", -1, day=date(2026, 8, 5))]
+        real = hourly.copy_bytes_exclusive
+
+        def bad_copy(path, data):
+            hit = Path(path).name.startswith(".stock_close_2026-08-05.manifest.json") and self.delivery in Path(path).parents
+            real(path, data + b"x" if hit else data)
+
+        with mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=bad_copy):
+            failed = self.run_at(settings, at(2026, 8, 11), ledger=ledger)
+        self.assertEqual(failed["daily_close"]["status"], "failed")
+        self.assertEqual(failed["status"], "success", "the hourly snapshot is still published")
+        self.assert_day_pair_agrees("2026-08-05", self.delivery, 1)
+        for name in ("2026-08/stock_close_2026-08-05.csv", "2026-08/stock_close_2026-08-05.manifest.json"):
+            key = str(Path(name))
+            self.assertEqual((self.delivery / "daily" / key).read_bytes(), before[key], name)
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [])
+        # The close state was not saved, so the next run rewrites the day in both places.
+        retry = self.run_at(settings, at(2026, 8, 11, 1), ledger=ledger)
+        self.assertEqual(retry["daily_close"]["status"], "published")
+        self.assert_day_pair_agrees("2026-08-05", self.delivery, 2)
+        self.assertEqual(self.daily("2026-08-05").read_bytes(), self.daily("2026-08-05", self.delivery).read_bytes())
 
     def test_restate_days_setting_moves_the_window(self):
         settings = self.settings(daily_close={"backfill_start": "2026-08-01", "restate_days": 2})

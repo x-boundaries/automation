@@ -493,6 +493,9 @@ def validate_settings(raw):
         _require_str(output, "delivery_root", "output.")
         if _same_path(output["delivery_root"], output["archive_root"]):
             raise ConfigError("output.delivery_root must differ from output.archive_root")
+        if _nested_path(output["delivery_root"], output["archive_root"]):
+            # An archive inside the Drive folder would sync the hourly folders to Drive.
+            raise ConfigError("output.delivery_root and output.archive_root must not be inside each other")
     columns = output["columns"]
     if not isinstance(columns, list) or not columns or not all(isinstance(c, str) for c in columns):
         raise ConfigError("output.columns must be a non-empty list")
@@ -592,6 +595,16 @@ def _require_number(value, name, low, high):
 
 def _same_path(a, b):
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _nested_path(a, b):
+    """True when either path is inside the other (compared like _same_path, by name)."""
+    a, b = os.path.normcase(os.path.abspath(a)), os.path.normcase(os.path.abspath(b))
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:  # different drives
+        return False
+    return common in (a, b)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1437,25 +1450,46 @@ def copy_bytes_exclusive(path, data):
     write_exclusive(path, data)
 
 
-def publish_verified(path, data, tag):
-    """Replace path with data only after a temp copy re-reads to the data's hash.
+def publish_verified_set(entries, tag):
+    """Replace a set of files together: every temp copy is written and verified before any move.
 
-    Used for everything that goes to the Drive sync folder and for the daily files. On a hash
-    mismatch the target is left as it was and VerifyError is raised. Returns the sha256.
+    entries is a list of (path, data). Each file is first written to a temp name beside its
+    target and must re-read to its data's hash. Only when every temp has verified are they moved
+    over their targets with os.replace, in the given order. On any write or check failure every
+    temp is removed and no target is replaced, so a reader never sees a new file next to its old
+    partner. Used for both latest pairs (Drive: + feed), each day's CSV + manifest and the feed.
+    Raises VerifyError on a hash mismatch and OSError on a write error. Returns the sha256s.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(".%s.%s.tmp" % (path.name, tag))
-    expected = hashlib.sha256(data).hexdigest()
-    copy_bytes_exclusive(temp, data)
+    staged = []
     try:
-        if file_sha256(temp) != expected:
-            raise VerifyError("copy did not re-read to the written hash")
+        for path, data in entries:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_name(".%s.%s.tmp" % (path.name, tag))
+            expected = hashlib.sha256(data).hexdigest()
+            staged.append((temp, path, expected))
+            copy_bytes_exclusive(temp, data)
+            if file_sha256(temp) != expected:
+                raise VerifyError("copy did not re-read to the written hash")
     except OSError:
-        _remove_quietly(temp)
+        for temp, _, _ in staged:
+            _remove_quietly(temp)
         raise
-    _replace_with_retry(temp, path)
-    return expected
+    # Moves only from here. A target still held after the retries (a sync client) stops the set:
+    # the earlier moves stand, the rest are dropped and the caller reports the failure.
+    for index, (temp, path, _) in enumerate(staged):
+        try:
+            _replace_with_retry(temp, path)
+        except OSError:
+            for left, _, _ in staged[index:]:
+                _remove_quietly(left)
+            raise
+    return [expected for _, _, expected in staged]
+
+
+def publish_verified(path, data, tag):
+    """Replace one file through publish_verified_set. Returns the sha256."""
+    return publish_verified_set([(path, data)], tag)[0]
 
 
 def _remove_quietly(path):
@@ -1604,7 +1638,8 @@ def render_daily_rows(day, close, items, location_names, labels):
 def write_daily_day(roots, day, close, ctx, reason, previous):
     """Write one day's close CSV and manifest to every root (archive, then Drive sync folder).
 
-    Each file goes through publish_verified. Raises OSError when any write or check fails.
+    Each root's pair goes through publish_verified_set, so a bad copy of either file replaces
+    neither. Raises OSError when any write or check fails.
     Returns the published-day entry for the close state.
     """
     rows, per_location, unmapped = render_daily_rows(day, close, ctx["items"], ctx["location_names"], ctx["labels"])
@@ -1632,8 +1667,7 @@ def write_daily_day(roots, day, close, ctx, reason, previous):
     }
     meta_data = json_bytes(meta)
     for root in roots:
-        publish_verified(Path(root) / csv_rel, data, ctx["tag"])
-        publish_verified(Path(root) / manifest_rel, meta_data, ctx["tag"])
+        publish_verified_set([(Path(root) / csv_rel, data), (Path(root) / manifest_rel, meta_data)], ctx["tag"])
     return {
         "revision": revision,
         "row_count": len(rows),
@@ -2428,12 +2462,19 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
             try:
                 publish_verified(archive_root / FEED_NAME, feed_data, run_id[:8])
             except OSError:
+                # The previous feed stays in both places: Drive is not sent a feed the archive lacks.
+                feed_data = None
                 manifest["feed"]["status"] = "failed"
                 manifest["feed"]["failure_class"] = FAILURE_FEED
         if delivery_root:
             final_delivery = deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, run_id)
         if manifest["feed"] and manifest["feed"]["status"] == "built":
-            manifest["feed"]["status"] = "published"
+            if delivery_root and final_delivery != DELIVERY_HANDED:
+                # The feed travels in the Drive latest set, so Drive kept its previous feed.
+                manifest["feed"]["status"] = "failed"
+                manifest["feed"]["failure_class"] = FAILURE_FEED
+            else:
+                manifest["feed"]["status"] = "published"
     elif manifest["status"] != "success" and delivery_root and manifest["delivery"]["status"] == DELIVERY_PENDING:
         final_delivery = DELIVERY_SKIPPED
 
@@ -2474,10 +2515,10 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
 
 
 def deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, run_id):
-    """Replace the Drive latest pair and the feed, each only after its copy verifies.
+    """Replace the Drive latest pair and the feed as one set (publish_verified_set).
 
-    No hourly folder goes to Drive. The CSV goes first: if it does not verify, the latest
-    manifest is not replaced either, so Drive keeps the previous verified pair.
+    No hourly folder goes to Drive. Every temp copy is written and verified before any is moved,
+    so a bad copy of any of them leaves Drive with the previous verified pair and feed.
     """
     tag = run_id[:8]
     try:
@@ -2487,10 +2528,10 @@ def deliver_latest(run_dir, delivery_root, manifest, manifest_sha, feed_data, ru
         if manifest_sha is None or file_sha256(Path(run_dir, MANIFEST_NAME)) != manifest_sha:
             return DELIVERY_VERIFY_FAILED
         latest = {key: value for key, value in manifest.items() if not key.startswith("_")}
-        publish_verified(delivery_root / LATEST_CSV_NAME, data, tag)
-        publish_verified(delivery_root / LATEST_MANIFEST_NAME, json_bytes(latest), tag)
+        entries = [(delivery_root / LATEST_CSV_NAME, data), (delivery_root / LATEST_MANIFEST_NAME, json_bytes(latest))]
         if feed_data is not None:
-            publish_verified(delivery_root / FEED_NAME, feed_data, tag)
+            entries.append((delivery_root / FEED_NAME, feed_data))
+        publish_verified_set(entries, tag)
     except VerifyError:
         return DELIVERY_VERIFY_FAILED
     except OSError:
@@ -2528,13 +2569,16 @@ def _pos_sync(rows, tz):
 
 
 def publish_latest(root, run_dir, manifest, run_id):
-    """Replace the latest pair only after the hourly CSV re-reads to the manifest hash."""
+    """Replace the latest pair only after the hourly CSV re-reads to the manifest hash.
+
+    Both temps are written and verified before either is moved (publish_verified_set).
+    """
     data = Path(run_dir, CSV_NAME).read_bytes()
     if hashlib.sha256(data).hexdigest() != manifest["csv"]["sha256"]:
         raise RunFailure(FAILURE_LATEST, "Hourly CSV hash changed before publishing latest")
     latest = {key: value for key, value in manifest.items() if not key.startswith("_")}
-    replace_atomic(Path(root) / LATEST_CSV_NAME, data, run_id[:8])
-    replace_atomic(Path(root) / LATEST_MANIFEST_NAME, json_bytes(latest), run_id[:8])
+    root = Path(root)
+    publish_verified_set([(root / LATEST_CSV_NAME, data), (root / LATEST_MANIFEST_NAME, json_bytes(latest))], run_id[:8])
 
 
 # ---------------------------------------------------------------------------------------------
