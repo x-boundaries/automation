@@ -68,5 +68,14 @@
     "low_stock_threshold": 2,
     "list_cap": 200,
     "movers_top": 20
+  },
+  "alert": {
+    "webhook_enabled": false,
+    "webhook_url": "https://n8n.example.com/webhook/REPLACE_WITH_ALERT_WEBHOOK_PATH",
+    "auth_header_name": "X-XB-Alert-Token",
+    "secret_env_var": "XB_AC2_STOCK_ALERT_SECRET",
+    "secret_credential_target": null,
+    "timeout_seconds": 10,
+    "repeat_hours": 24
   }
 }

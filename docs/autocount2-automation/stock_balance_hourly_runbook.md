@@ -4,6 +4,8 @@ Status: **offline build only.** Nothing here has run against SQL Server, the AC2
 
 Dashboard v2 (28 Oct 2026): every successful run also writes the item index `stock_item_index.json.gz` beside the feed, for the dashboard's item search, item detail and data-issues views (see [Item index](#item-index-schema-v1)). The item master read adds `ItemGroup` and `ItemBrand`, and the `dbo.ItemUOM` read adds `BarCode` and `MinQty`. Nothing else changes.
 
+Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one Telegram message to the owner. Off by default and shipped inactive; see [Error alerts](#error-alerts-telegram-through-n8n).
+
 Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close rebuilt from the stock ledger, a backfill from 1 Aug 2026, one latest pair in Drive (no hourly folders in Drive), local retention, and a compact dashboard feed. File, setting and task names keep the word "hourly" (the job still runs hourly); only the Drive folder is renamed to "daily".
 
 ## What it does
@@ -41,6 +43,8 @@ How it reads:
 | `scripts/install_autocount_stock_balance_hourly_task.ps1` | Task Scheduler installer. Not run by the build; step V7 only. |
 | `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` | Owner-run read-only live check (step V3). Aggregates only. |
 | `tests/test_autocount_stock_balance_hourly.py` | Offline tests with in-memory fakes and temp folders. |
+| `n8n-workflows/ac2_stock_alert.workflow.json` | The inactive n8n workflow that turns an alert event into one Telegram message (see [Error alerts](#error-alerts-telegram-through-n8n)). |
+| `tests/test_ac2_stock_alert_workflow.py` | Offline contract of that workflow; runs its Code node with Node against real events. |
 
 ## VM prerequisites
 
@@ -70,7 +74,7 @@ Run from the automation clone, always with the task's full-path interpreter (see
 
 `--backfill` is a normal run (same reads, same checks, same latest pair and feed) that also writes **every** daily close from `daily_close.backfill_start` to yesterday again, replacing any that exist (`write_reason: rebuild`, revision + 1). It uses the same code path as the nightly close. Run it once at the VM step (step D2), and again only if the owner wants Drive's older daily files rebuilt from the ledger.
 
-Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code.
+Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code. The run output and `last_run_status.json` carry `alert_status` (see [Error alerts](#error-alerts-telegram-through-n8n)); an alert, sent or lost, never changes an exit code either.
 
 ## Settings
 
@@ -115,12 +119,20 @@ Every business choice is a setting. The owner said answers may still change, so 
 | `feed.low_stock_threshold` | `2` | Feed low stock = `0 < quantity <= threshold`, active items (owner, 28 Oct 2026: global 2 units for now). `ItemUOM.ReOLevel` is shown beside each feed low-stock row when set but does not change the feed rule. The dashboard v2 page uses the item index instead: the item's reorder level, else its minimum quantity, else this threshold (see [Item index](#item-index-schema-v1)). |
 | `feed.list_cap` | `200` | Most rows listed in the feed's negatives and low-stock lists; counts are always complete. |
 | `feed.movers_top` | `20` | Biggest risers and fallers listed per period (1, 7, 30 days). |
+| `alert.webhook_enabled` | `false` | Error alerts on or off (see [Error alerts](#error-alerts-telegram-through-n8n)). Switched on only at go-live step A3 with the owner's OK. |
+| `alert.webhook_url` | `null` | The n8n webhook, `https://<n8n host>/webhook/<private path>`. `https` only; no user, password, query or fragment (the secret travels only in the header). Required when enabled. Example placeholder: `https://n8n.example.com/webhook/REPLACE_WITH_ALERT_WEBHOOK_PATH`. |
+| `alert.auth_header_name` | `"X-XB-Alert-Token"` | Header that carries the shared secret; must equal the header name of the n8n Header Auth credential. |
+| `alert.secret_env_var` | `null` | Name of the environment variable (user or machine level, for the task's Windows account) that holds the shared secret. The way for pair (a) S4U. The value is read at runtime and never stored, printed or logged. |
+| `alert.secret_credential_target` | `null` | Instead of the env var: a Windows Credential Manager generic credential target holding the secret. Only with `schedule.logon_type: Password` (an S4U task cannot read Credential Manager), so validation refuses it under S4U. Set exactly one of the two when enabled. |
+| `alert.timeout_seconds` | `10` | One POST per run at most, 1 to 30 s. No retry inside the run. |
+| `alert.repeat_hours` | `24` | A problem that is still there is repeated after this many hours (1 to 168). |
 
 ## Outputs and folder layout
 
 ```
 <archive_root>\                           (local, on the VM)
   .ac2_stockbal.lock                      (while a run is active, or left by a killed run)
+  alert_state.json                        (error alerts on: which problems were last alerted, and when; local only)
   last_run_status.json                    (every run)
   stock_balance_latest.csv                (latest verified success only)
   latest_manifest.json                    (latest verified success only)
@@ -153,7 +165,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
 - Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, large_balances, uom_guard, pos_sync per Location, delivery, warnings.
   Round 6 adds (schema_version `2`): `ledger` (groups, rows, null_qty_rows, non_empty_batch, future_dated_rows, non_base_uom_groups, non_stock_rows_excluded, non_stock_items_excluded, items_missing_from_master, first_day, last_day), `ledger_check`, `uom_guard.ledger_non_base_uom_groups`, `counts.non_stock_excluded`, `daily_close`, `feed` (status, sha256, byte_size), `retention`, and the extra query hashes (`ledger`, `item_master`, `locations`, `item_uom`; the last was `reorder_levels` before dashboard v2). Dashboard v2 adds `item_index` (status, sha256, byte_size, counts).
-- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local. `status` and `failure_class` describe the hourly snapshot as before.
+- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local, alert_status (see [Error alerts](#error-alerts-telegram-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
 
 ## Ledger check (every run)
 
@@ -174,7 +186,7 @@ Owner-accepted design, section 2.2: every run proves itself before anything is p
   - a changed day within D-1 .. D-`restate_days` is replaced (`revised`, revision + 1) and listed in `daily_close.revised_days` (day, rows_changed, net_qty_change);
   - a changed older day is **left as published** and listed in `daily_close.late_changes_beyond_window` (day, rows_changed, net_qty_change; at most 31 listed, the count is complete), with one `Late change: ...` warning. The flag is raised once; the state then holds the new ledger. The dashboard feed always shows the rebuilt truth.
   - Days inside the window are provisional (`daily_close.provisional_from`); a day is final from its manifest's `final_from`.
-- **Missing or unreadable close state:** the next due run writes every day from `backfill_start` again and warns `Close state was missing ...` (self-healing; the files then match the ledger).
+- **Missing or unreadable close state:** the next due run writes every day from `backfill_start` again (self-healing; the files then match the ledger) and records `daily_close.state` (`missing` or `unreadable`). It warns `Close state was ...` only when the state was lost: an unreadable state, or a missing state on a normal run while `daily\` already exists. The very first run (no `daily\` yet) and a `--backfill` run rewrite every day anyway, so they do not warn; `daily_close.state: missing` still shows it (VM step D2, 28 Oct 2026, was such a `--backfill`).
 - **Failure:** a daily file that cannot be written or does not verify stops further day writes, keeps the old close state, and sets `daily_close_status: failed` with `daily_close_write_failed`. The hourly latest pair is still published; the next run retries the same days. Exit code `1`.
 - Backfill: `--backfill` (above). The first run after the round-6 code is installed also writes every day from `backfill_start`, because no close state exists yet.
 
@@ -242,7 +254,7 @@ Added before V5 (owner decision, 27 Oct 2026) after a stock transfer had an item
 
   `rows` lists at most 20 rows, largest `|BalQty|` first; `count` is the full number and `rows_truncated` is `true` when more than 20 rows qualify. When nothing qualifies, `count` is `0` and `rows` is empty. A failed run has `large_balances: null`.
 - When `count` is above 0, `warnings` gets one line: `Large balance: <count> exported row(s) with |BalQty| above <threshold>; ...`. The line names no item. A failed run drops the line, as it has no `large_balances`.
-- `last_run_status.json`, the run's console output and `--check-latest` carry `large_balance_count` (`null` for a failed run, or for a latest manifest written before this check existed). Exit codes do not change. A later alert round (Telegram through n8n, see [Planned follow-up](#planned-follow-up-failure-alerts)) can read this field; no alert is sent today.
+- `last_run_status.json`, the run's console output and `--check-latest` carry `large_balance_count` (`null` for a failed run, or for a latest manifest written before this check existed). Exit codes do not change. When error alerts are on, a count above 0 raises the `large_balance` alert (count only; see [Error alerts](#error-alerts-telegram-through-n8n)).
 - The CSV is unchanged: the flagged rows are exported as AutoCount holds them.
 
 What to do when `large_balance_count` is above 0:
@@ -272,13 +284,14 @@ One exception: a run that fails only at its own manifest write (`write_failed` a
 | `uom_guard` | A non-base UOM or a multi-UOM item exists (balance rows or ledger groups). | Map the UOM before the export can continue. |
 | `ledger_mismatch` | The ledger summed over all dates does not equal the stored balance (see [Ledger check](#ledger-check-every-run)). Nothing is published. | Wait for the next hour; if it repeats, report the `ledger_check` counts. |
 | `daily_close_write_failed` (in `daily_close_failure_class`; `status` stays `success`) | A daily file could not be written or did not verify, or the close state could not be saved. The hourly latest pair and feed are still published. | Check disk space, permissions and whether the sync client holds a file. The next run retries. |
+| `item_index_publish_failed` (in the manifest `item_index`; `item_index_status: failed`) | The item index could not be built, written to the archive, or delivered to Drive. The previous index stays where it was not replaced (see [Item index](#item-index-schema-v1)). | Report the run reference. |
 | `feed_publish_failed` (in the manifest `feed`; `feed_status: failed`) | The feed could not be built, written to the archive, or delivered to Drive. The previous feed stays where it was not replaced (see [Dashboard feed](#dashboard-feed-schema-v1)). | Report the run reference. |
 | `sync_read_failed` | SyncRegistration read failed (for example the wrong time column). | Check `source.sync_registration_time_column`. |
 | `source_error` | Connection or other read failure. | Check SQL Server and the driver. |
 | `write_failed` | The hourly CSV or manifest could not be written or re-read. | Check disk space and folder permissions. |
 | `latest_publish_failed` | Hourly data is good but the latest pair could not be replaced (`last_run_status.json` only). The pair is replaced in two steps (CSV, then manifest). If only the second step fails, the new `stock_balance_latest.csv` sits beside the previous `latest_manifest.json`, so `--check-latest` exits `3` (invalid) until the next successful hour replaces both. | Check whether a program (for example the sync client) holds the latest files open. The hourly folder is complete either way. |
 | `internal_error` | Unexpected error. The message has the run reference only. | Report the run reference. |
-| (no new status) | The task did not run at all: `finished_at` in `last_run_status.json` is older than about 70 minutes and no new hourly folder appears (VM off or asleep, task disabled, or for pair (b) the Windows password changed). | Check the VM is on, then `Get-ScheduledTaskInfo -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` (`LastRunTime`, `LastTaskResult`). For pair (b) after a password change, update the task's stored password (needs owner OK). The planned heartbeat round will alert on this. |
+| (no new status) | The task did not run at all: `finished_at` in `last_run_status.json` is older than about 70 minutes and no new hourly folder appears (VM off or asleep, task disabled, or for pair (b) the Windows password changed). | Check the VM is on, then `Get-ScheduledTaskInfo -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` (`LastRunTime`, `LastTaskResult`). For pair (b) after a password change, update the task's stored password (needs owner OK). No alert is sent for this (owner decision 29 Oct 2026: errors only, no heartbeat); the dashboard's status badge shows the staleness. |
 
 ## Read identity and scheduled logon
 
@@ -318,7 +331,7 @@ Each step **needs owner OK**. None has been run.
   2. Dry run first (in an elevated Windows PowerShell 5.1, no transcript, from the root of the clone the task will run from):
      `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_autocount_stock_balance_hourly_task.ps1 -UserId <Windows account> -ConfigPath <full path to the local settings file> -PythonExe <full path to python.exe> -DryRun`
      It checks `pyodbc`, runs `--dry-run-config` with that interpreter, prints the task it would register (`\XB\XB AC2 Hourly Stock Balance`, the repo root, the minute and the logon type) and stops: nothing is registered and no password is asked for. If it looks right, run the same command again without `-DryRun` to register the logon type the settings require; for pair (b) it then prompts for the Windows password.
-     `-ExecutionPolicy Bypass` applies to this one command only; it does not change the VM's PowerShell settings. `-RepoRoot` is not needed (the installer uses the clone it is in). The task goes in the `\XB\` folder of Task Scheduler; use `-TaskPath "\Other\"` only if the owner asks for another folder (it must start and end with `\`). The installer refuses if a task with the same name is already in that folder, and warns if one is in the Task Scheduler root (see "Replace the paused root task" below). The dry run also prints the one hourly trigger it built.
+     `-ExecutionPolicy Bypass` applies to this one command only; it does not change the VM's PowerShell settings. `-RepoRoot` is not needed (the installer uses the clone it is in). The task goes in the `\XB\` folder of Task Scheduler; use `-TaskPath "\Other\"` only if the owner asks for another folder (it must start and end with `\`). For a folder name with a space, double the last backslash (`-TaskPath "\XB\Stock export\\"`) or avoid the space: Windows PowerShell 5.1 otherwise passes the closing `\"` as a literal quote and swallows the next argument (the installer then refuses the path, so this fails safe). The installer refuses if a task with the same name is already in that folder, and warns if one is in the Task Scheduler root (see "Replace the paused root task" below). The dry run also prints the one hourly trigger it built.
   3. Note `finished_at` in `<archive_root>\last_run_status.json` (if present), then run `Start-ScheduledTask -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` straight away, before the first hourly trigger.
   4. Wait until `Get-ScheduledTaskInfo -TaskPath "\XB\" -TaskName "XB AC2 Hourly Stock Balance"` shows a new `LastRunTime` and the task is no longer running (at most 15 minutes).
   5. Pass only if `last_run_status.json` is newer than the noted value and shows `status: success` (and `delivery_status: handed_to_drive_sync_folder` once `delivery_root` is set). This also proves `PythonExe`, the environment values, the identity pair and the run level under the task account.
@@ -361,15 +374,106 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
 
 - **#246** (daily money / buying package): the owner wants AutoCount's Advanced Dimensional report there (most detailed breakdown, for example marketplace shipping fees). New marketplace fee codes can land on a default term (believed to be "Adjustment") until someone adds the term in AC2, so the #246 report should flag unmapped codes. Cost and value belong in #246, not here.
 - The dashboard page: a private Claude artifact that reads `stock_dashboard_feed.json.gz` and `stock_item_index.json.gz` through the viewer's own Drive connector. Its source lives in the private mailbox, not in this repository. This build only writes the files.
-- Consignment stock, failure alerts (planned follow-up below), n8n, Drive API upload, Drive clean-up, SQL logins and grants.
+- Consignment stock, a heartbeat or "still alive" alert (owner decision 29 Oct 2026: errors only), Drive API upload, Drive clean-up, SQL logins and grants.
 
-## Planned follow-up: failure alerts
+## Error alerts (Telegram through n8n)
 
-Not built in this round, and nothing in n8n is touched. In this build a failure is visible only through files (`last_run_status.json`, the hourly manifest, `--check-latest`). Planned for a later #245 round:
+Owner decision (29 Oct 2026): **errors only.** No heartbeat, no "still alive" message, no success or "resolved" message. Built off by default; the n8n workflow ships inactive. Every live step is listed under [Go-live](#alert-go-live-steps-a1-a5) and needs its own owner OK.
 
-- Failure alerts go to the owner by Telegram through an n8n webhook. The VM job posts a sanitized failure event (hour, `failure_class`, `run_id`), with no stock data.
-- The same round can alert on `large_balance_count` above 0 in `last_run_status.json` (count only, no item codes or quantities), on `daily_close_status: failed` or no `published_close_day` for yesterday by 01:00, on `late_change_day_count` above 0, and on `failure_class: ledger_mismatch`.
-- An hourly heartbeat, so n8n alerts when no run has been heard for about 70 minutes.
+How it works:
+
+1. At the end of every run (after the daily close, the feed, the item index and delivery, just before `last_run_status.json` is written) the exporter works out which alert conditions the run raises, from the same values it writes to `last_run_status.json`.
+2. If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s), no proxy, no redirect, the shared secret in the `alert.auth_header_name` header.
+3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), sends one plain-text Telegram message to the owner chat through the existing Telegram credential, and answers 200 (502 when Telegram refuses, 500 on an unexpected error).
+4. The exporter writes the outcome as `alert_status`. **An alert, sent or lost, never changes the run's status, exit code or files.**
+
+The VM reaches n8n through the public `/webhook/` path (n8n sits behind Cloudflare Access, which leaves `/webhook/` open). n8n's `WEBHOOK_URL` is not changed.
+
+### Conditions
+
+| Condition | Raised when (in `last_run_status.json`) |
+| --- | --- |
+| `run_failed` | `status: failed`, any `failure_class` (including `ledger_mismatch`). A failed run raises only this one. |
+| `daily_close_failed` | `daily_close_status: failed` |
+| `delivery_failed` | `delivery_status: verify_failed` or `copy_failed` (Drive did not get the latest set) |
+| `feed_failed` | `feed_status: failed` |
+| `item_index_failed` | `item_index_status: failed` |
+| `large_balance` | `large_balance_count` above 0 |
+| `late_change` | `late_change_day_count` above 0 (only on a run that publishes a close) |
+
+Not alerted (accepted gaps): a run that never starts (VM off, task not firing; the dashboard's status badge shows the staleness); `config_invalid` from `main` (the alert settings cannot be trusted, so `alert_status: skipped_config_invalid`); `--check-latest` and `--dry-run-config`, which never alert.
+
+### De-duplication rule
+
+- Each condition is tracked by key (`run_failed` is keyed by its failure class, so a different failure is a different key) in `alert_state.json` in the archive root (local only, never in Drive, never pruned).
+- **Send** when any active key is new, or when an active key was last sent `alert.repeat_hours` (24) or more ago. The message lists every active condition, and every active key's time is reset.
+- **Suppress** otherwise (`alert_status: suppressed`): the same problem alerts once, then once a day while it lasts.
+- A key that is no longer active is dropped, so if it comes back it alerts as new. Recovery itself sends nothing.
+- A failed send leaves the state as it was, so the next hour tries again (at most one POST an hour, no retry storm). A missing or unreadable state counts as empty (one extra alert at worst).
+
+### Event (schema `xb.ac2.stock_alert.v1`)
+
+Exactly these keys, closed values only: `schema`, `event` (`ac2_stock_alert`), `run_id`, `run_hour_local` (the run's hour, for example `2026-10-29T14:00:00+08:00`), `alert_kind` (`new` or `repeat`), `status`, `failure_class`, `conditions` (names from the table), `daily_close_status`, `delivery_status`, `feed_status`, `item_index_status`, `large_balance_count`, `late_change_day_count`. **No item code, quantity, location, path, message, host or login**, whatever the run found; a value outside its closed set is sent as `null` or `unknown`. Example message (fake values):
+
+```text
+AC2 stock export: ERROR
+
+- Hourly export FAILED: ledger_mismatch (nothing new published this hour)
+
+Hour: 2026-10-29 14:00 (UTC+08:00)
+Run: 0123abcd
+Details: last_run_status.json in the Drive folder; runbook section "Failure classes".
+```
+
+### alert_status values
+
+| Value | Meaning |
+| --- | --- |
+| `disabled` | `alert.webhook_enabled` is false. |
+| `no_alert` | The run raised no condition. |
+| `suppressed` | Conditions active, all alerted less than `repeat_hours` ago. |
+| `sent` | n8n answered 2xx. |
+| `send_failed` | No answer, a timeout, or a non-2xx answer (400 rejected, 403 or 401 secret mismatch, 404 workflow inactive or wrong path, 502 Telegram refused). Retried next hour. |
+| `secret_unavailable` | The env var (or Credential Manager target) is missing, empty or not one printable line. Nothing was sent. |
+| `error` | Unexpected error in the alert step. Nothing changes for the run. |
+| `skipped_config_invalid` | Settings invalid; no alert attempted. |
+
+### Alert go-live steps (A1-A5)
+
+Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run. Results go to the private mailbox only (never the secret, the chat id or the webhook path).
+
+- **A1 n8n import, inactive** (needs owner OK): import `ac2_stock_alert.workflow.json` as a new workflow, inactive, through the local n8n API or editor on the server PC. In the local import copy only: replace `REPLACE_WITH_ALERT_WEBHOOK_PATH` with a private, unguessable path; replace `REPLACE_WITH_TELEGRAM_CHAT_ID` with the owner chat; bind the existing Telegram credential; create a Header Auth credential with header name `X-XB-Alert-Token` and a new random secret that the owner generates and keeps (never pasted into chat, the repo or a mailbox file).
+- **A2 test event** (needs owner OK, sends one Telegram message): in the editor, listen for a test event, then from the server PC POST this fake event to the local test address `http://127.0.0.1:5678/webhook-test/<private path>` with the secret header. Pass: one Telegram message reading "AC2 stock export: ERROR ... Run: 00000000"; a second POST with an extra key answers 400 and sends nothing; a POST without the header answers 401 or 403 and sends nothing.
+
+  ```json
+  {"schema": "xb.ac2.stock_alert.v1", "event": "ac2_stock_alert", "run_id": "00000000000000000000000000000000", "run_hour_local": "2026-10-29T14:00:00+08:00", "alert_kind": "new", "status": "failed", "failure_class": "internal_error", "conditions": ["run_failed"], "daily_close_status": "skipped_failed_run", "delivery_status": "skipped_failed_run", "feed_status": null, "item_index_status": null, "large_balance_count": 0, "late_change_day_count": 0}
+  ```
+
+  Then **activate** the workflow (the same owner OK covers activation only if it names it).
+- **A3 VM settings and secret** (needs owner OK, VM change): signed in as the task's Windows account (pair (a)), store the secret as a user environment variable without echoing it, then add the alert block to the local settings and validate:
+
+  ```powershell
+  $s = Read-Host -AsSecureString "Alert secret"
+  [Environment]::SetEnvironmentVariable("XB_AC2_STOCK_ALERT_SECRET", [System.Net.NetworkCredential]::new("", $s).Password, "User")
+  ```
+
+  Settings: `"alert": {"webhook_enabled": true, "webhook_url": "https://<n8n host>/webhook/<private path>", "secret_env_var": "XB_AC2_STOCK_ALERT_SECRET"}` (other keys default). Open a **new** PowerShell window (the variable reaches new processes only) and run `--dry-run-config`.
+- **A4 one forced-failure test** (needs owner OK, sends one Telegram message): at a quiet minute (not :00), in a new window as the task's account, make one manual run fail safely by giving only that window a wrong expected book: `$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"`, then the normal run command. It stops at the identity check before any business query (`identity_refused`) and writes a failed manifest and `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: one Telegram message "Hourly export FAILED: identity_refused", and `alert_status: sent`. Close that window. The next scheduled run must show `status: success` and `alert_status: no_alert`, and `alert_state.json` must be empty again.
+
+  If A4 gives `send_failed`: a 403 from Cloudflare (not n8n) means its bot protection blocked the request (the job sends `User-Agent: xb-ac2-stock-alert/1`); a Cloudflare rule change needs its own owner OK. `secret_unavailable` means the window or the task does not see the variable.
+- **A5 first day** (read-only): after 24 hours, check that `alert_status` reads `no_alert` (or `sent` / `suppressed` for a real problem) on the hourly runs, and that no Telegram message arrived without a matching `alert_status: sent`.
+
+### Rollback
+
+- **Switch off alerts** (VM settings change, needs owner OK): set `alert.webhook_enabled` to `false`. The next run shows `alert_status: disabled`. Optionally remove the variable: `[Environment]::SetEnvironmentVariable("XB_AC2_STOCK_ALERT_SECRET", $null, "User")`, and delete `alert_state.json` in the archive root.
+- **Deactivate the n8n workflow** (n8n change, needs owner OK): the VM then gets 404 and records `send_failed` every hour that has a problem; runs and exit codes are unchanged.
+- **Rotate the secret**: change the Header Auth credential value in n8n and the VM variable together (A3), then repeat A4.
+
+### Not in this round (LATER)
+
+- A heartbeat or "resolved" message: excluded by the owner (29 Oct 2026). Revisit only if the owner asks.
+- A large-balance count that grows while the condition stays active is not re-alerted until the daily repeat.
+- `config_invalid` is not alerted (the alert settings themselves may be what is invalid).
 
 ## Open questions
 

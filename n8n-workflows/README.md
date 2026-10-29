@@ -137,6 +137,16 @@ Committing either file performs no import, activation, execution, Drive read or 
 - Committing this file performs no import, activation, execution, Gmail read or Drive write. Import, credential binding and activation each need separate explicit current-turn approval in #244.
 - Focused offline coverage: [tests/test_simba_invoice_intake_workflow.py](../tests/test_simba_invoice_intake_workflow.py), run by `.github/workflows/simba-invoice-intake-tests.yml`.
 
+### ac2_stock_alert.workflow.json
+
+- Purpose: error alerts for the AC2 hourly stock balance export (#245, live name `AC2 Stock Export - Error Alert`). The exporter on the AC2 VM POSTs one sanitized `xb.ac2.stock_alert.v1` event after a failed or flagged run; the workflow checks it and sends one plain-text Telegram message to the owner. Errors only: no heartbeat and no success message. The exporter decides what to send and repeats a still-open problem at most once a day.
+- Architecture: `AC2 Stock Alert Webhook` (POST, Header Auth, `responseMode: responseNode`) -> `Validate Alert Event` (Code: exact keys, closed values, counts only; anything else is rejected with a fixed reason code) -> `Event Is Valid` -> `Send Telegram Alert` -> `Respond Alert Sent` (200). A rejected event answers 400, a Telegram failure 502 and an unexpected Code error 500; the exporter records the answer as `alert_status` and never changes its run result.
+- Privacy: the event carries no item code, quantity, location, path, message or host, and the Code node never reads request headers. No executions are saved (`saveDataSuccessExecution` and `saveDataErrorExecution` `none`), because the webhook item holds the request headers, including the shared secret.
+- Status: source-controlled, inactive, credential-free, MCP exposure disabled, `staticData: null`, no `webhookId`. The webhook path ships as `REPLACE_WITH_ALERT_WEBHOOK_PATH` and the chat as `REPLACE_WITH_TELEGRAM_CHAT_ID`; the Header Auth credential and the existing Telegram credential are bound only in n8n. The VM reaches it through the public `/webhook/` path (n8n's `WEBHOOK_URL` is unchanged). Telegram has no automatic retry: the exporter retries once an hour while the problem lasts.
+- Runbook: [AC2 hourly stock balance export runbook](../docs/autocount2-automation/stock_balance_hourly_runbook.md) (Error alerts).
+- Committing this file performs no import, activation, execution or Telegram send. Import (inactive), credential binding, a test event and activation each need a separate owner OK in #245.
+- Focused offline coverage: [tests/test_ac2_stock_alert_workflow.py](../tests/test_ac2_stock_alert_workflow.py).
+
 ## Directory Rules
 
 - Do not rename existing workflow files during unrelated work. Existing filenames are canonical and are referenced by tests, README links, and runbooks.
