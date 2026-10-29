@@ -7,7 +7,8 @@ Scope (Owner decisions, #155 build step 2)
   becomes an AutoCount member. MemberNo is the phone number in digits
   (Singapore ``65`` + 8 digits; a foreign number keeps its country code; a
   Singapore 8-digit number starting 3/6/8/9 gets ``65``). Without a usable
-  phone the member gets AutoCount's own ``GetNextMemberNo`` number. MemberType ``REGISTERED``, ExpiryDate NULL, DOB ``2000-MM-01``
+  phone the member gets AutoCount's own ``GetNextMemberNo`` number (test book only;
+  go-live R8: never on the live book). MemberType ``REGISTERED`` (live: ``Default``), ExpiryDate NULL, DOB ``2000-MM-01``
   from the configured birthday-month metafield (NULL when absent), IsActive
   ``T``. The Shopify expiry metafield is ignored.
 * AC2 -> Shopify: a member created in AutoCount (for example at the till)
@@ -35,8 +36,15 @@ Scope (Owner decisions, #155 build step 2)
 
 Safety
 ------
-* ``AED_XBOUNDARIES`` is refused here and in the PowerShell bridge; only
-  ``AED_TESTINGAPI`` is authorised in this source.
+* Go-live (G0 go-live design R1-R8, Owner SCOPE-CONFIRMED 29 Oct 2026): the
+  test book ``AED_TESTINGAPI`` and the production book ``AED_XBOUNDARIES``
+  are the only books, compared exactly. The production book is admitted for
+  this sync only: in the PowerShell bridge only ``sync-lookup``,
+  ``sync-changelog`` and ``write-once`` with profile ``sync_p1``; here no
+  create without a usable phone (no ``GetNextMemberNo``), and the AutoCount
+  login only through the sync's own Credential Manager entry with the
+  configured refused user IDs. The Core, owner console and E7 scripts stay
+  test-book only.
 * Every write switch defaults OFF; at most ``max_writes_per_run`` (<= 5)
   writes per run across both directions; unknown config keys are refused.
 * A write is recorded (INTENT) before it starts. A crash, timeout or unclear
@@ -81,10 +89,18 @@ SUMMARY_SCHEMA = "xb.directlocal.member_sync.run.v1"
 LEDGER_FILE = "member_sync.sqlite3"
 # v2 (2026-10-22, G2 B2 and fact 7): writes.intent_digest and changelog_seen,
 # added to a v1 ledger in one transaction (additive; nothing else changes).
-SCHEMA_VERSION = 2
+# v3 (go-live R2): a fresh ledger may hold the production book. SQLite cannot
+# change a table CHECK in place, so v2 -> v3 is a version bump only: an older
+# ledger is always a test-book ledger and keeps its old CHECK.
+SCHEMA_VERSION = 3
 
-AUTHORISED_BOOKS = frozenset({"AED_TESTINGAPI"})
-FORBIDDEN_BOOKS = frozenset({"AED_XBOUNDARIES"})
+TEST_BOOK = "AED_TESTINGAPI"
+LIVE_BOOK = "AED_XBOUNDARIES"
+AUTHORISED_BOOKS = frozenset({TEST_BOOK, LIVE_BOOK})
+# Go-live V9 (Owner): on the live book the sync logs in only as its own
+# AutoCount user, read from this Credential Manager target.
+LIVE_CREDENTIAL_TARGET = "XB-AC2-MemberSync"
+AC2_USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 MAX_WRITES_PER_RUN_LIMIT = 5
 MEMBER_NO_WIDTH = 20  # AutoCount Member.MemberNo nvarchar(20)
 SGT = timezone(timedelta(hours=8))
@@ -177,6 +193,15 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # Round 7c (Owner): the one-off initial link (CLI ``initial-link``) is a
     # dry run unless ``--apply`` is given AND this is on.
     "initial_link_enabled": False,
+    # Go-live R8 (Owner Q2 = A): a sign-up with no usable phone is created
+    # with AutoCount's GetNextMemberNo number only when this is true. null
+    # means the book's default: true on the test book (phase 1 as merged),
+    # false on the live book, where true is refused.
+    "ac2_create_without_phone": None,
+    # Go-live V9 (Owner): AutoCount user IDs the sync must never log in as
+    # (the Owner's own account at least). Required on the live book. Kept
+    # only in the private config on the VM, never in this repository.
+    "ac2_refused_user_ids": [],
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -230,6 +255,8 @@ class SyncConfig:
     http_timeout_seconds: int
     memberno_link_window_minutes: int
     initial_link_enabled: bool
+    ac2_create_without_phone: bool = False
+    ac2_refused_user_ids: tuple[str, ...] = ()
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -242,16 +269,15 @@ class SyncConfig:
             "changelog_configured": self.changelog_xml_column is not None,
             "deferred_create_local_time": self.deferred_create_local_time, "ac2_create_member_type": self.ac2_create_member_type,
             "memberno_link_window_minutes": self.memberno_link_window_minutes, "initial_link_enabled": self.initial_link_enabled,
+            "ac2_create_without_phone": self.ac2_create_without_phone, "ac2_refused_user_ids_count": len(self.ac2_refused_user_ids),
         }
 
 
 def check_book(book: Any) -> str:
-    """The production book is refused by name; anything not authorised is
-    refused too."""
+    """Exactly one of the two book names (ordinal string equality: a
+    lookalike, another case or any other value is refused)."""
 
-    if book in FORBIDDEN_BOOKS:
-        raise dl.DirectLocalError("production_book_refused")
-    if book not in AUTHORISED_BOOKS:
+    if not isinstance(book, str) or book not in AUTHORISED_BOOKS:
         raise dl.DirectLocalError("autocount_book_not_authorised")
     return book
 
@@ -312,13 +338,29 @@ def parse_config(value: Any) -> SyncConfig:
     member_type = merged["ac2_create_member_type"]
     if not isinstance(member_type, str) or not MEMBER_TYPE_RE.fullmatch(member_type):
         raise dl.DirectLocalError("sync_config_ac2_create_member_type_invalid")
+    live = book == LIVE_BOOK
+    without_phone = merged["ac2_create_without_phone"]
+    if without_phone is None:
+        without_phone = not live
+    elif _bool(without_phone, "ac2_create_without_phone") and live:
+        # Go-live R8 (Owner Q2 = A): never GetNextMemberNo on the live book.
+        raise dl.DirectLocalError("sync_config_ac2_create_without_phone_live_refused")
+    refused_users = merged["ac2_refused_user_ids"]
+    if not isinstance(refused_users, list) or len(refused_users) > 10 or any(not isinstance(u, str) or not AC2_USER_ID_RE.fullmatch(u) for u in refused_users):
+        raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_invalid")
+    if live and target != LIVE_CREDENTIAL_TARGET:
+        # Go-live V9: never the attended owner-console credential path.
+        raise dl.DirectLocalError("sync_config_ac2_credential_target_live_required")
+    if live and not refused_users:
+        raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_live_required")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
         shopify_create_enabled=_bool(merged["shopify_create_enabled"], "shopify_create_enabled"),
         initial_link_enabled=_bool(merged["initial_link_enabled"], "initial_link_enabled"),
         birthday_month_metafield=dict(birthday), ac2_member_no_metafield=dict(member_no_field), shopify_create_tags=tuple(tags), ac2_credential_target=target,
-        changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type, **numbers,
+        changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type,
+        ac2_create_without_phone=without_phone, ac2_refused_user_ids=tuple(refused_users), **numbers,
     )
 
 
@@ -711,7 +753,7 @@ LEDGER_SCHEMA = """
 CREATE TABLE meta(
   id INTEGER PRIMARY KEY CHECK (id = 1), ledger_id TEXT NOT NULL, autocount_book TEXT NOT NULL,
   store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL,
-  CHECK (autocount_book <> 'AED_XBOUNDARIES'));
+  CHECK (autocount_book IN ('AED_TESTINGAPI', 'AED_XBOUNDARIES')));
 CREATE TABLE links(
   customer_gid TEXT NOT NULL UNIQUE, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL UNIQUE,
   origin TEXT NOT NULL CHECK (origin IN ('created_in_ac2', 'created_in_shopify', 'matched')),
@@ -789,11 +831,14 @@ class SyncLedger:
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
-            elif version == 1:
+            elif version in (1, 2):
+                # v1 -> v2 (additive), then v2 -> v3 (version bump only: an
+                # existing ledger keeps its test-book-only meta CHECK).
                 self.conn.execute("BEGIN IMMEDIATE")
                 try:
-                    for statement in _LEDGER_V2_MIGRATION:
-                        self.conn.execute(statement)
+                    if version == 1:
+                        for statement in _LEDGER_V2_MIGRATION:
+                            self.conn.execute(statement)
                     self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     self.conn.execute("COMMIT")
                 except Exception:
@@ -900,6 +945,14 @@ class SyncLedger:
         )
 
 
+def check_binding(meta: Mapping[str, Any], config: SyncConfig) -> None:
+    """A ledger serves only the book, store and domain it was made for (I2):
+    a live config never opens a test ledger, and the reverse."""
+
+    if (meta["autocount_book"], meta["store_gid"], meta["shop_domain"]) != (check_book(config.autocount_book), config.shopify.store_gid, config.shopify.shop_domain):
+        raise dl.DirectLocalError("sync_ledger_binding_mismatch")
+
+
 # --------------------------------------------------------------------------
 # Ports (real clients below; fakes in tests)
 # --------------------------------------------------------------------------
@@ -946,9 +999,7 @@ class SyncEngine:
         self.config = config
         self.shopify = shopify
         self.ac2 = ac2
-        meta = ledger.meta()
-        if (meta["autocount_book"], meta["store_gid"], meta["shop_domain"]) != (check_book(config.autocount_book), config.shopify.store_gid, config.shopify.shop_domain):
-            raise dl.DirectLocalError("sync_ledger_binding_mismatch")
+        check_binding(ledger.meta(), config)
         self.summary = RunSummary()
         self._pending_sign_ups: tuple[dict[str, list[ShopifyCustomer]], bool] | None = None  # round 8: per run
 
@@ -999,8 +1050,11 @@ class SyncEngine:
             "ac2_create_enabled": self.config.ac2_create_enabled, "shopify_create_enabled": self.config.shopify_create_enabled,
             "counts": dict(sorted(self.summary.counts.items())), "refs": self.summary.refs,
         }
+        # Go-live (digest): counts, alert codes and keyed refs with masked
+        # MemberNos only, as the run prints them. Older rows hold counts only.
+        stored = {"counts": result["counts"], "alerts": result["alerts"], "refs": result["refs"]}
         with self.ledger.tx() as conn:
-            conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(result["counts"], sort_keys=True), run_id))
+            conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
         return result
 
     def initial_link(self, *, apply: bool) -> dict[str, Any]:
@@ -1265,6 +1319,13 @@ class SyncEngine:
             self._shopify_pending(gid, "PENDING", "waiting_for_staff")
             self.summary.count("waiting_for_staff", ref)
             return
+        if decision.action == "CREATE" and decision.member_no is None and not self.config.ac2_create_without_phone:
+            # Go-live R8 (Owner Q2 = A): past the cutoff and no usable phone.
+            # Never GetNextMemberNo here: staff key this member by hand.
+            # SKIPPED rows are never read again, so the alert is raised once.
+            self._shopify_pending(gid, "SKIPPED", "no_phone_sign_up_needs_staff")
+            self.summary.alert("no_phone_sign_up_needs_staff", ref)
+            return
         member_no = decision.member_no
         if member_no is None:
             self._create_in_ac2(customer, digits, decision, ref)  # GetNextMemberNo at write time
@@ -1319,6 +1380,10 @@ class SyncEngine:
         the generator's format (``member_no_successor``), at most three
         candidates, each checked against AC2 and this ledger."""
 
+        if self.config.autocount_book == LIVE_BOOK:
+            # Go-live R8: never on the live book (the bridge refuses
+            # next-member-no there too); config and _register stop it first.
+            return None, "member_no_generator_not_authorised"
         try:
             candidate = self.ac2.next_member_no()
         except dl.DirectLocalError:
@@ -1415,6 +1480,10 @@ class SyncEngine:
         elif state == "NOT_WRITTEN_PROVEN":
             self._shopify_pending(gid, "PENDING", "ac2_not_written")
             self.summary.count("ac2_create_not_written", member_ref)
+            if code == "member_type_unknown":
+                # Go-live R7: the configured type is not in the book; every
+                # create is refused before the claim until an operator fixes it.
+                self.summary.alert("member_type_unknown", member_ref)
         else:
             self._shopify_pending(gid, "SKIPPED", "ac2_write_uncertain")
             self.summary.count("ac2_create_uncertain", member_ref)
@@ -1560,9 +1629,18 @@ class SyncEngine:
 
     def _process_ac2_pending(self) -> None:
         self._requeue_stuck_holds()
-        pending = self.ledger.conn.execute("SELECT * FROM ac2_pending WHERE state = 'PENDING' ORDER BY changelog_id LIMIT ?", (PENDING_LOOKUP_BATCH,)).fetchall()
+        # Go-live L10 (G2 r10): a row waiting only for shopify_create_enabled
+        # (code would_create) must not hold a batch slot while creates are
+        # off, so every other PENDING row is read first, oldest first; the
+        # would_create rows follow oldest first (the create order once on).
+        pending = self.ledger.conn.execute(
+            "SELECT * FROM ac2_pending WHERE state = 'PENDING' ORDER BY (code IS 'would_create'), changelog_id LIMIT ?", (PENDING_LOOKUP_BATCH,),
+        ).fetchall()
         if not pending:
             return
+        if len(pending) == PENDING_LOOKUP_BATCH and all(row["code"] == "would_create" for row in pending):
+            # Nothing decidable is left in a full batch: one alert per run.
+            self.summary.alert("ac2_pending_would_create_backlog")
         found = {member_no_key(m.member_no): m for m in self.ac2.lookup(None, [row["member_no"] for row in pending])}
         for row in pending:
             key = row["member_no_key"]
@@ -1707,6 +1785,9 @@ class SyncEngine:
             self._spend_write(self.config.shopify_create_enabled, "shopify_create_disabled")
         except WriteRefused as refused:
             self.summary.count(refused.code, ref, "would_create")  # stays PENDING
+            if refused.code == "shopify_create_disabled":
+                # Go-live L10: read after every decidable row (see above).
+                self._ac2_done(key, "PENDING", "would_create")
             return
         customer_input: dict[str, Any] = {"firstName": name, "tags": list(self.config.shopify_create_tags)}
         if digits is not None:
@@ -1961,11 +2042,13 @@ def _win_cred_read(target: str) -> tuple[str, str] | None:
         advapi32.CredFree(pointer)
 
 
-def load_ac2_credential(target: str, *, cred_read: Callable[[str], tuple[str, str] | None] | None = None) -> Ac2Credential:
+def load_ac2_credential(target: str, *, refused_user_ids: Iterable[str] = (), cred_read: Callable[[str], tuple[str, str] | None] | None = None) -> Ac2Credential:
     """Load the credential of the AutoCount account the sync logs in with.
     Never prints, logs or returns the secret in an error; failures are fixed
     codes. ``ac2_credential_sa_refused`` refuses an AutoCount user ID of
-    ``sa`` only; it does not change the SQL login (always ``sa``)."""
+    ``sa`` only; it does not change the SQL login (always ``sa``). Go-live
+    V9: ``ac2_credential_user_refused`` refuses any of ``refused_user_ids``
+    (the Owner's own account), case-insensitively, before any login."""
 
     if not isinstance(target, str) or not CREDENTIAL_TARGET_RE.fullmatch(target):
         raise dl.DirectLocalError("ac2_credential_target_invalid")
@@ -1980,6 +2063,8 @@ def load_ac2_credential(target: str, *, cred_read: Callable[[str], tuple[str, st
         raise dl.DirectLocalError("ac2_credential_user_invalid")
     if user_id.casefold() == "sa":
         raise dl.DirectLocalError("ac2_credential_sa_refused")
+    if user_id.casefold() in {refused.casefold() for refused in refused_user_ids}:
+        raise dl.DirectLocalError("ac2_credential_user_refused")
     if not isinstance(password, str) or not password or len(password) > 256:
         raise dl.DirectLocalError("ac2_credential_secret_invalid")
     return Ac2Credential(user_id, password)
@@ -2041,7 +2126,34 @@ class SyncBridgeClient(dl.BridgeClient):
             stdin_value={"fence_id": fence_id, "member_no": member_no, "salt": salt, "payload_canonical": text, "payload_digest": digest},
             wait_seconds=self.deadline_seconds + dl.WRITER_GRACE_SECONDS, on_started=lambda pid, created: None,
         )
-        return dl.classify_write(run, claim_exists=(self.claims / f"{fence_id}.claim").exists())
+        state, code = dl.classify_write(run, claim_exists=(self.claims / f"{fence_id}.claim").exists())
+        if (state, code) == ("NOT_WRITTEN_PROVEN", "writer_failed_before_claim"):
+            # Go-live R7: name the bridge's own refusal when it is one the
+            # engine acts on (classify_write proves only "before the claim").
+            refusal = _bridge_refusal(run.stdout)
+            if refusal in BRIDGE_REFUSALS_BEFORE_CLAIM:
+                code = refusal
+        return state, code
+
+
+# Child refusals before the claim that the engine reports by name.
+BRIDGE_REFUSALS_BEFORE_CLAIM = frozenset({"member_type_unknown", "member_no_taken", "production_book_not_authorised"})
+
+
+def _bridge_refusal(stdout: Any) -> str | None:
+    """The ``error`` code of the child's last output line, or None."""
+
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    if not isinstance(stdout, str):
+        return None
+    lines = [line for line in stdout.replace("\r", "\n").split("\n") if line.strip()]
+    try:
+        value = json.loads(lines[-1]) if lines else None
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    code = value.get("error") if isinstance(value, dict) else None
+    return code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,64}", code) else None
 
 
 # --------------------------------------------------------------------------
@@ -2070,17 +2182,112 @@ def build_real_engine(config: SyncConfig, ledger: SyncLedger, *, environ: Mappin
     shopify.verify_session(store_gid=config.shopify.store_gid)
     env = None
     if config.ac2_credential_target is not None:
-        env = load_ac2_credential(config.ac2_credential_target).child_environment(environ)
+        env = load_ac2_credential(config.ac2_credential_target, refused_user_ids=config.ac2_refused_user_ids).child_environment(environ)
+    elif config.autocount_book == LIVE_BOOK:
+        raise dl.DirectLocalError("ac2_credential_target_unconfigured")  # parse_config refuses this first
     ac2 = SyncBridgeClient(dl.default_bridge_command(), autocount_book=config.autocount_book, claims=ledger.root / "claims", env=env)
     return SyncEngine(ledger, config, shopify=shopify, ac2=ac2)
 
 
+DIGEST_SCHEMA = "xb.directlocal.member_sync.digest.v1"
+DIGEST_MAX_HOURS = 720
+DIGEST_MAX_REFS = 200
+_DIGEST_REF_RE = re.compile(r"^[cm]-[0-9a-f]{1,64}$")
+_DIGEST_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) -> dict[str, Any]:
+    """Go-live S7: the read-only daily digest. Opens the ledger read-only
+    (no lock, no migration, no write), reads the ``runs`` of the last
+    ``hours`` and the open-work totals. Output: run counts and durations,
+    counts per code, alerts per code with keyed refs and masked MemberNos
+    only (what each run already printed), never a name, phone, email,
+    customer GID or full MemberNo."""
+
+    path = Path(root) / LEDGER_FILE
+    if not path.is_file():
+        raise dl.DirectLocalError("sync_ledger_missing")
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        raise dl.DirectLocalError("sync_ledger_unreadable") from None
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA user_version").fetchone()[0] not in (2, SCHEMA_VERSION):
+            raise dl.DirectLocalError("sync_ledger_schema_unsupported")
+        meta = conn.execute("SELECT autocount_book, store_gid, shop_domain FROM meta WHERE id = 1").fetchone()
+        if meta is None:
+            raise dl.DirectLocalError("sync_ledger_not_initialised")
+        check_binding(meta, config)
+        since = dl.ts(now - timedelta(hours=hours))
+        runs = conn.execute("SELECT started_at, finished_at, summary FROM runs WHERE started_at >= ? ORDER BY started_at", (since,)).fetchall()
+        counts: dict[str, int] = {}
+        alerts: dict[str, int] = {}
+        refs: list[dict[str, str]] = []
+        durations: list[int] = []
+        unfinished = 0
+        for row in runs:
+            started, finished = dl.parse_created_at(row["started_at"]), dl.parse_created_at(row["finished_at"]) if row["finished_at"] else None
+            if finished is None or started is None:
+                unfinished += 1  # refused or stopped part-way (exit 2 or killed)
+                continue
+            durations.append(int((finished - started).total_seconds()))
+            try:
+                stored = json.loads(row["summary"] or "{}")
+            except (json.JSONDecodeError, RecursionError):
+                stored = {}
+            run_counts = stored.get("counts", stored) if isinstance(stored, dict) else {}
+            for code, number in (run_counts.items() if isinstance(run_counts, dict) else ()):
+                if isinstance(code, str) and _DIGEST_CODE_RE.fullmatch(code) and isinstance(number, int) and not isinstance(number, bool):
+                    counts[code] = counts.get(code, 0) + number
+            run_alerts = [code for code in stored.get("alerts", []) if isinstance(code, str) and _DIGEST_CODE_RE.fullmatch(code)] if isinstance(stored, dict) else []
+            for code in run_alerts:
+                alerts[code] = alerts.get(code, 0) + 1
+            for entry in (stored.get("refs", []) if isinstance(stored, dict) else []):
+                # Only the refs of alert codes, re-checked field by field.
+                if not isinstance(entry, dict) or entry.get("code") not in run_alerts or len(refs) >= DIGEST_MAX_REFS:
+                    continue
+                ref = entry.get("ref")
+                if not isinstance(ref, str) or not _DIGEST_REF_RE.fullmatch(ref):
+                    continue
+                item = {"ref": ref, "code": entry["code"]}
+                masked = entry.get("member_no_masked")
+                if isinstance(masked, str) and re.fullmatch(r"\*{3,}[^*]{1,3}", masked):
+                    item["member_no_masked"] = masked
+                refs.append(item)
+        durations.sort()
+
+        def total(sql: str) -> int:
+            return int(conn.execute(sql).fetchone()[0])
+
+        return {
+            "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
+            "runs": {"completed": len(durations), "unfinished": unfinished,
+                     "duration_seconds_max": durations[-1] if durations else None,
+                     "duration_seconds_median": durations[len(durations) // 2] if durations else None},
+            "counts": dict(sorted(counts.items())), "alerts": dict(sorted(alerts.items())), "alert_refs": refs,
+            "open": {
+                "shopify_pending": total("SELECT COUNT(*) FROM shopify_pending WHERE state = 'PENDING'"),
+                "ac2_pending": total("SELECT COUNT(*) FROM ac2_pending WHERE state = 'PENDING'"),
+                "ac2_pending_would_create": total("SELECT COUNT(*) FROM ac2_pending WHERE state = 'PENDING' AND code = 'would_create'"),
+                "uncertain_writes": total("SELECT COUNT(*) FROM writes WHERE state = 'UNCERTAIN'"),
+                "links": total("SELECT COUNT(*) FROM links"),
+            },
+        }
+    except sqlite3.Error:
+        raise dl.DirectLocalError("sync_ledger_unreadable") from None
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#155 phase 1 two-way member create sync")
-    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link"))
+    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link", "digest"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--apply", action="store_true", help="initial-link only: write the links (needs initial_link_enabled); default is a dry run")
     parser.add_argument("--direction", default="both", choices=("both", "shopify_to_ac2", "ac2_to_shopify"))
+    parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -2090,8 +2297,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check-credential":
             if config.ac2_credential_target is None:
                 raise dl.DirectLocalError("ac2_credential_target_unconfigured")
-            credential = load_ac2_credential(config.ac2_credential_target)
+            credential = load_ac2_credential(config.ac2_credential_target, refused_user_ids=config.ac2_refused_user_ids)
             _emit({"status": "ok", "user_id": mask_last3(credential.user_id), "secret_present": True})
+            return 0
+        if args.command == "digest":
+            # Read-only: no lock, no migration, no login (go-live S7).
+            if not 1 <= args.hours <= DIGEST_MAX_HOURS:
+                raise dl.DirectLocalError("digest_hours_invalid")
+            root = dl.validate_state_root(config.state_root)
+            dl.verify_private_state(root)
+            _emit(ledger_digest(root, hours=args.hours, now=dl.utc_now(), config=config))
             return 0
         if args.command == "initial-link" and args.apply and not config.initial_link_enabled:
             raise dl.DirectLocalError("initial_link_disabled")  # before any login or read
@@ -2101,7 +2316,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "init":
                 _emit(ledger.init_meta(autocount_book=config.autocount_book, store_gid=config.shopify.store_gid, shop_domain=config.shopify.shop_domain))
             elif args.command == "status":
-                ledger.meta()
+                check_binding(ledger.meta(), config)  # go-live L4
                 counts = {name: ledger.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] for name in ("links", "writes", "ac2_pending", "shopify_pending")}
                 _emit({"status": "ok", "counts": counts, "uncertain_writes": ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'UNCERTAIN'").fetchone()[0]})
             elif args.command == "initial-link":

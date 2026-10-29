@@ -3,8 +3,11 @@
 # Dot-sourced by ac2_directlocal_member_bridge.ps1. Mirrors the E7 test-book
 # guards (scripts/ac2_directlocal_e7_testbook_create.ps1, unchanged) so every
 # real bridge child proves, before any member lookup, numbering or write:
-#   - the target book is authorised by this source (AED_TESTINGAPI only; the
-#     production book is refused until a separately approved change, gate E9);
+#   - the target book is authorised by this source: AED_TESTINGAPI for every
+#     operation; AED_XBOUNDARIES (go-live, Owner SCOPE-CONFIRMED 29 Oct 2026)
+#     only for the #155 sync's sync-lookup, sync-changelog and write-once
+#     with payload profile sync_p1. Names, operations and profiles compare
+#     ordinally (a lookalike never passes);
 #   - host DESKTOP-4I042L6 and no XB_AC2_SESSION_FACTORY override;
 #   - the live AutoCount assemblies equal the pins the outbound qualification
 #     was made against;
@@ -24,16 +27,51 @@ Set-StrictMode -Version Latest
 $script:XbDlHost = "DESKTOP-4I042L6"
 $script:XbDlAuthorisedBooks = @("AED_TESTINGAPI")
 $script:XbDlForbiddenBooks = @("AED_XBOUNDARIES")
+# Go-live R3: the production book is not in $XbDlAuthorisedBooks (that list
+# serves every caller: Core, owner console, E7). It is admitted only for these
+# sync operations, and write-once only with the sync_p1 profile. Q2 = A:
+# next-member-no is not admitted.
+$script:XbDlLiveBook = "AED_XBOUNDARIES"
+$script:XbDlLiveBookOperations = @("sync-lookup", "sync-changelog", "write-once")
+$script:XbDlLiveBookWriteProfile = "sync_p1"
 # Must equal QUALIFIED_ASSEMBLIES in ac2_directlocal_e7_isolation_check.py.
 $script:XbDlQualifiedAssemblies = [ordered]@{
     "AutoCount.dll" = "8e86273018c01c715e440c7975f759951f4a0e979fc3edb0c281db6696090f93"
     "AutoCount.Invoicing.dll" = "5c748b71e54f13313968276530fe110412a4d97a3c9b44d8f43100379849967f"
 }
 
+function Test-XbDlOrdinalIn {
+    # Ordinal membership (go-live R6): PowerShell's -ccontains and -ceq are
+    # culture-aware and ignore characters such as U+00AD.
+    param([AllowNull()][AllowEmptyString()][string]$Value, [Parameter(Mandatory)][string[]]$Set)
+    foreach ($item in $Set) { if ([string]::Equals($Value, $item, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
 function Assert-XbDlAuthorisedBook {
+    # Test book: every operation (unchanged). Live book: only the sync's
+    # operations; write-once only with the sync_p1 profile. Without
+    # -Operation (any other caller) the live book is refused as before.
+    # -ProfileNotYetRead is the bridge's pre-stdin check of write-once; the
+    # profile is checked again once the payload is read, before any session.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Book,
+        [AllowNull()][AllowEmptyString()][string]$Operation,
+        [AllowNull()][AllowEmptyString()][string]$PayloadProfile,
+        [switch]$ProfileNotYetRead
+    )
+    if (Test-XbDlOrdinalIn -Value $Book -Set $script:XbDlAuthorisedBooks) { return }
+    if (-not (Test-XbDlLiveBook -Book $Book)) { throw "target_book_not_authorised" }
+    if (-not (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlLiveBookOperations)) { throw "production_book_not_authorised" }
+    if ([string]::Equals($Operation, "write-once", [StringComparison]::Ordinal) -and -not $ProfileNotYetRead -and
+        -not [string]::Equals($PayloadProfile, $script:XbDlLiveBookWriteProfile, [StringComparison]::Ordinal)) {
+        throw "production_book_not_authorised"
+    }
+}
+
+function Test-XbDlLiveBook {
     param([AllowNull()][AllowEmptyString()][string]$Book)
-    if ($script:XbDlForbiddenBooks -ccontains $Book) { throw "production_book_not_authorised" }
-    if ($script:XbDlAuthorisedBooks -cnotcontains $Book) { throw "target_book_not_authorised" }
+    return [string]::Equals($Book, $script:XbDlLiveBook, [StringComparison]::Ordinal)
 }
 
 function Get-XbDlSha256Hex {
@@ -72,6 +110,8 @@ $script:XbDlSqlText = [ordered]@{
     server_now_local = "SELECT CONVERT(varchar(19), GETDATE(), 126)"
     member_change_counter = "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'"
     changelog_max_id = "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog"
+    # Go-live R7 (Owner Q7, SCOPE-CONFIRMED 29 Oct 2026): exactly one parameter.
+    member_type_exists = "SELECT COUNT_BIG(*) FROM MemberType WHERE MemberType = ?"
 }
 # Refused in any text: statement separators, comments, every non-read verb,
 # xp_/sp_ procedures, the production book, and 3- or 4-part object names
@@ -132,13 +172,27 @@ function Assert-XbDlBookIdentity {
         $vendorHost = [string](Get-XbDlScalar -DBSetting $db -Sql $script:XbDlSqlText.machine_name)
     }
     catch { throw "book_identity_unverifiable" }
-    foreach ($name in @($declared, $vendorDb)) {
-        if ($script:XbDlForbiddenBooks -ccontains $name) { throw "production_book_refused" }
+    # Go-live R3: the production name is refused here unless the live book is
+    # the book this session was admitted for (Assert-XbDlAuthorisedBook ran
+    # first, with the operation); the identity proof below is unchanged.
+    if (-not (Test-XbDlLiveBook -Book $Book)) {
+        foreach ($name in @($declared, $vendorDb)) {
+            if (Test-XbDlOrdinalIn -Value $name -Set $script:XbDlForbiddenBooks) { throw "production_book_refused" }
+        }
     }
     if ([string]::IsNullOrWhiteSpace($declared) -or [string]::IsNullOrWhiteSpace($vendorDb)) { throw "book_identity_missing" }
-    if ($declared -cne $vendorDb) { throw "book_identity_ambiguous" }
-    if ($vendorDb -cne $Book) { throw "book_identity_wrong" }
-    if ($vendorHost -ine $ExpectedHost) { throw "book_host_wrong" }
+    # Go-live R6: ordinal compares.
+    if (-not [string]::Equals($declared, $vendorDb, [StringComparison]::Ordinal)) { throw "book_identity_ambiguous" }
+    if (-not [string]::Equals($vendorDb, $Book, [StringComparison]::Ordinal)) { throw "book_identity_wrong" }
+    if (-not [string]::Equals($vendorHost, $ExpectedHost, [StringComparison]::OrdinalIgnoreCase)) { throw "book_host_wrong" }
+}
+
+function Assert-XbDlMemberTypeExists {
+    # Go-live R7: a sync_p1 create needs its member type code to exist in the
+    # book (VM fact V1: MemberType.MemberType). Read-only, before the claim.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)][string]$MemberType)
+    $count = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.member_type_exists -Params @($MemberType))
+    if ($count -lt 1) { throw "member_type_unknown" }
 }
 
 function Get-XbDlOutboundCounts {
@@ -202,7 +256,7 @@ function Get-XbDlSessionFailureStage {
         $name = [string](Get-XbDlScalar -DBSetting $db -Sql $script:XbDlSqlText.db_name)
     }
     catch { return "autocount_sql_connection_failed" }
-    if ($name -cne $Book) { return "autocount_sql_book_mismatch" }
+    if (-not [string]::Equals($name, $Book, [StringComparison]::Ordinal)) { return "autocount_sql_book_mismatch" }
     return "autocount_login_rejected"
 }
 
@@ -253,8 +307,15 @@ namespace XbDirectLocal {
 
 function New-XbDlRealSession {
     # Every guard runs in this order; any failure stops before the next step.
-    param([Parameter(Mandatory)][string]$Book, [Parameter(Mandatory)][string]$AcRoot)
-    Assert-XbDlAuthorisedBook -Book $Book
+    # Operation and PayloadProfile (go-live R3/R4) admit the live book for the sync
+    # only; a caller without them (Core, owner console, E7) gets the test book.
+    param(
+        [Parameter(Mandatory)][string]$Book,
+        [Parameter(Mandatory)][string]$AcRoot,
+        [AllowNull()][AllowEmptyString()][string]$Operation,
+        [AllowNull()][AllowEmptyString()][string]$PayloadProfile
+    )
+    Assert-XbDlAuthorisedBook -Book $Book -Operation $Operation -PayloadProfile $PayloadProfile
     if ($env:COMPUTERNAME -ine $script:XbDlHost) { throw "host_not_authorised" }
     if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("XB_AC2_SESSION_FACTORY", "Process"))) { throw "session_factory_env_refused" }
     Assert-XbDlQualifiedAssemblies -Root $AcRoot

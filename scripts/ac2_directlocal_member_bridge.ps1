@@ -7,8 +7,11 @@
 #   synthetic: -SessionFactory returning a binding marked
 #     XbDirectLocalSyntheticFake, whose UserSession, DBSetting and every
 #     MemberCommand are not AutoCount types. -TargetBook is refused with it.
-#   real: -TargetBook naming a book this source authorises (AED_TESTINGAPI
-#     only). New-XbDlRealSession (ac2_directlocal_book_guard.ps1) checks host,
+#   real: -TargetBook naming a book this source authorises (AED_TESTINGAPI;
+#     go-live: AED_XBOUNDARIES only for sync-lookup, sync-changelog and
+#     write-once with profile sync_p1, checked before stdin and again once
+#     the payload is read, before any session or claim).
+#     New-XbDlRealSession (ac2_directlocal_book_guard.ps1) checks host,
 #     assembly pins, pins the book for this process, proves the authenticated
 #     book identity, vendor telemetry off and empty outbound queues before any
 #     member operation. Credentials come only from the process environment,
@@ -112,8 +115,9 @@ function New-XbDirectLocalSyntheticSession {
 }
 
 function New-XbDirectLocalSession {
+    param([AllowNull()][AllowEmptyString()][string]$PayloadProfile)
     if ($null -ne $SessionFactory) { return (New-XbDirectLocalSyntheticSession) }
-    return (New-XbDlRealSession -Book $TargetBook -AcRoot $AcRoot)
+    return (New-XbDlRealSession -Book $TargetBook -AcRoot $AcRoot -Operation $Operation -PayloadProfile $PayloadProfile)
 }
 
 function Assert-XbDirectLocalMemberNo {
@@ -246,15 +250,20 @@ function Invoke-XbDirectLocalWriteOnce {
         }
     }
     else { throw "member_field_not_allowed" }
+    # Go-live R4: the live book takes only the sync_p1 profile; checked now
+    # the payload is read, before any session, login or claim.
+    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook -Operation $Operation -PayloadProfile $profile }
     if ($null -ne $payload.mobile_phone) { $member.MobilePhone = [string]$payload.mobile_phone }
     if ($null -ne $payload.email_address) { $member.EmailAddress = [string]$payload.email_address }
     # A login, identity or outbound-queue failure here stops before the claim.
-    $session = New-XbDirectLocalSession
+    $session = New-XbDirectLocalSession -PayloadProfile $profile
     if ($profile -ceq "sync_p1") {
         # VM fact r5-6: SaveMember and the member API check no access right,
         # so the write limits are ours. A number already held is refused
         # here, before the claim (proven not written), never left to SaveMember.
         if ($null -ne (Get-XbAutoCountMember -Session $session -MemberNo $member.MemberNo)) { throw "member_no_taken" }
+        # Go-live R7 (Owner Q7): the member type must exist in this book.
+        Assert-XbDlMemberTypeExists -DBSetting $session.DBSetting -MemberType $memberType
     }
 
     # Exclusive claim immediately before the sole SaveMember path.
@@ -303,7 +312,8 @@ try {
     # Session source decided before stdin, claims or any adapter call.
     if ($null -eq $SessionFactory -and [string]::IsNullOrEmpty($TargetBook)) { throw "autocount_real_bridge_disabled" }
     if ($null -ne $SessionFactory -and -not [string]::IsNullOrEmpty($TargetBook)) { throw "synthetic_session_with_target_book" }
-    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook }
+    # Go-live R4: the operation is known here; a write-once profile is not yet.
+    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook -Operation $Operation -ProfileNotYetRead:($Operation -ceq "write-once") }
     if ($Operation -eq "write-once") {
         if ($FenceId -cnotmatch '^fence-[0-9a-f]{32}$') { throw "fence_id_invalid" }
         if ([string]::IsNullOrWhiteSpace($ClaimDirectory) -or -not (Test-Path -LiteralPath $ClaimDirectory -PathType Container)) { throw "claim_directory_invalid" }
