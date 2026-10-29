@@ -3,9 +3,10 @@ name: simba-invoice-intake-tests
 on:
   pull_request:
     paths:
-      # SIMBA invoice intake (#244): the inactive export, its focused offline test, its runbook,
+      # SIMBA invoice intake (#244): the inactive exports, its focused offline test, its runbook,
       # and the offline validator it is checked with. Exact entries keep the trigger surface owned.
       - "n8n-workflows/simba_invoice_intake.workflow.json"
+      - "n8n-workflows/simba_invoice_intake_error_alert.workflow.json"
       - "tests/test_simba_invoice_intake_workflow.py"
       - "docs/simba_invoice_intake.md"
       - "n8n-workflows/scripts/validate-n8n-workflows.cjs"
