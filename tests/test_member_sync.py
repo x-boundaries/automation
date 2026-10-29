@@ -810,7 +810,7 @@ class CredentialTests(unittest.TestCase):
         temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-cli-"))
         try:
             path = temp / "config.json"
-            path.write_text(json.dumps(config_value(ac2_credential_target="XB-AC2-MemberSync")), encoding="utf-8")
+            path.write_text(json.dumps(config_value(ac2_credential_target=sync.TEST_CREDENTIAL_TARGET)), encoding="utf-8")
             out = io.StringIO()
             with mock.patch.object(sync, "_win_cred_read", return_value=("fakeuser01", self.SECRET)), redirect_stdout(out):
                 code = sync.main(["check-credential", "--config", str(path)])
@@ -2717,8 +2717,8 @@ class PendingBudgetTests(SyncTestCase):
 
 # --------------------------------------------------------------------------
 # Go-live closure matrix (G0 go-live design section 4.4, Owner SCOPE-CONFIRMED
-# 29 Oct 2026, plus the V4 and V9 rows). One row = one test, named
-# ``test_row_<ID>_...``; the PowerShell rows (B1-B16, B18, T1-T3) are in
+# 29 Oct 2026, plus the V4 and V9 rows, and ML10d, V9b, T6 from the G2 #281 LATER notes). One row = one test, named
+# ``test_row_<ID>_...``; the PowerShell rows (B1-B16, B18, T1-T3, T6) are in
 # tests/test_member_sync_bridge_ps.py. GoLiveRowCoverageTests proves every
 # row has its test. Fake data only: reserved phones, example.com, fake IDs.
 # --------------------------------------------------------------------------
@@ -2728,9 +2728,9 @@ GOLIVE_ROWS = (
     "L1", "L2", "L3", "L4", "L5", "L6",
     "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
     "D1", "D2", "D3", "D4", "D5", "D6", "D7",
-    "ML10a", "ML10b", "ML10c",
-    "T1", "T2", "T3", "T4", "T5",
-    "V4", "V9",
+    "ML10a", "ML10b", "ML10c", "ML10d",
+    "T1", "T2", "T3", "T4", "T5", "T6",
+    "V4", "V9", "V9b",
 )
 FAKE_OWNER_USER = "ownerfake01"
 LIVE_KEYS = {
@@ -3110,17 +3110,30 @@ class GoLiveMatrixTests(GoLiveTestCase):
             self.assertEqual((result["alerts"], result["counts"]["ac2_pending_would_create_backlog"]), (["ac2_pending_would_create_backlog"], 1))
             self.assertEqual((result["writes"], self.shopify.created), (0, []))
 
-    def test_row_ML10c_creates_turned_on_drain_the_backlog_oldest_first_within_the_cap(self):
+    def would_create_backlog(self, count: int) -> None:
         off = {"shopify_create_enabled": False}
         self.run_sync("ac2_to_shopify", **off)  # watermark
-        self.walk_ins(range(1, 26))
+        self.walk_ins(range(1, count + 1))
         self.run_sync("ac2_to_shopify", **off)
         self.run_sync("ac2_to_shopify", **off)
-        result = self.run_sync("ac2_to_shopify", max_writes_per_run=5)
-        self.assertEqual([c["phone"] for c in self.shopify.created], [plus(sg(n)) for n in range(1, 6)])
-        self.assertEqual(result["writes"], 5)
-        self.run_sync("ac2_to_shopify", max_writes_per_run=5)
-        self.assertEqual([c["phone"] for c in self.shopify.created], [plus(sg(n)) for n in range(1, 11)])
+
+    def test_row_ML10c_creates_turned_on_drain_the_backlog_oldest_first_within_the_cap(self):
+        self.would_create_backlog(25)
+        for run in range(1, 6):
+            result = self.run_sync("ac2_to_shopify", max_writes_per_run=5)
+            self.assertEqual(result["writes"], 5)
+            self.assertEqual([c["phone"] for c in self.shopify.created], [plus(sg(n)) for n in range(1, 5 * run + 1)])
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM ac2_pending WHERE state = 'PENDING'").fetchone()[0], 0)
+        self.assertEqual(self.run_sync("ac2_to_shopify", max_writes_per_run=5)["writes"], 0)  # each created exactly once
+
+    def test_row_ML10d_creates_on_a_new_walk_in_waits_behind_the_older_backlog(self):
+        # G2 #281 LATER-1: 25 would_create rows + 1 new walk-in after the
+        # switch: the whole queue is created oldest first, the new one last.
+        self.would_create_backlog(25)
+        self.walk_ins([26])
+        for _ in range(6):
+            self.run_sync("ac2_to_shopify", max_writes_per_run=5)
+        self.assertEqual([c["phone"] for c in self.shopify.created], [plus(sg(n)) for n in range(1, 27)])
 
     # -- task ----------------------------------------------------------------------
     def test_row_T4_a_second_runner_is_refused_by_the_ledger_lock(self):
@@ -3216,6 +3229,30 @@ class GoLiveMatrixTests(GoLiveTestCase):
                 sync.build_real_engine(live_config(), self.ledger, environ={"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"})
         self.assertEqual((caught.exception.code, built), ("ac2_credential_user_refused", []))  # no bridge, so no login
 
+    def test_row_V9b_the_live_credential_target_is_used_only_by_the_live_config(self):
+        # G2 #281 LATER-3: the test book has its own target; any spelling of
+        # the live target is refused there (Credential Manager ignores case).
+        for target in (sync.LIVE_CREDENTIAL_TARGET, "xb-ac2-membersync", "XB-AC2-MEMBERSYNC", "XB-AC2-MemberSync "):
+            with self.subTest(target=target), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(ac2_credential_target=target)
+            self.assertEqual(caught.exception.code, "sync_config_ac2_credential_target_live_only")
+        secret = "fake-secret-value-9f2c"
+        read = []
+        with mock.patch.object(sync, "_win_cred_read", side_effect=lambda target: read.append(target) or ("syncfake02", secret)):
+            refused = self.cli("check-credential", config=config_value(ac2_credential_target=sync.LIVE_CREDENTIAL_TARGET))
+            accepted = self.cli("check-credential", config=config_value(ac2_credential_target=sync.TEST_CREDENTIAL_TARGET))
+        self.assertEqual(refused, (2, {"status": "refused", "code": "sync_config_ac2_credential_target_live_only"}))
+        self.assertEqual(accepted, (0, {"status": "ok", "user_id": "*******e02", "secret_present": True}))
+        self.assertEqual(read, [sync.TEST_CREDENTIAL_TARGET])  # the refused config never read a credential
+        # The other way: the live config still needs exactly the live target,
+        # and the test book keeps its other options (null, any other target).
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            live_config(ac2_credential_target=sync.TEST_CREDENTIAL_TARGET)
+        self.assertEqual(caught.exception.code, "sync_config_ac2_credential_target_live_required")
+        self.assertEqual(live_config().ac2_credential_target, sync.LIVE_CREDENTIAL_TARGET)
+        self.assertIsNone(make_config(ac2_credential_target=None).ac2_credential_target)
+        self.assertEqual(make_config(ac2_credential_target=sync.TEST_CREDENTIAL_TARGET).ac2_credential_target, "XB-AC2-MemberSync-Test")
+
 
 class GoLiveEngineExtrasTests(GoLiveTestCase):
     """Go-live behaviour that is not its own matrix row."""
@@ -3227,6 +3264,26 @@ class GoLiveEngineExtrasTests(GoLiveTestCase):
         self.assertIn("member_type_unknown", result["alerts"])
         self.assertEqual((self.links(), self.pending(24)), ({}, ("PENDING", "ac2_not_written")))
         self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM writes").fetchone()[:], ("NOT_WRITTEN", "member_type_unknown"))
+
+    def test_digest_prints_the_longest_and_median_run_time(self):
+        # G2 #281 LATER-2: S4 and S7 compare duration_seconds_max with the
+        # 600 s execution limit, so the digest must print it.
+        root = self.private_root()
+        ledger = sync.SyncLedger(root, clock=lambda: self.now)
+        try:
+            ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+            with ledger.tx() as conn:
+                for n, seconds in enumerate((40, 595, 310)):
+                    start = self.now - timedelta(hours=3, minutes=20 * n)
+                    conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES (?, ?, ?, '{}')",
+                                 (f"run-{n}", dl.ts(start), dl.ts(start + timedelta(seconds=seconds))))
+                conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('run-stopped', ?, NULL, NULL)", (dl.ts(self.now - timedelta(hours=1)),))
+        finally:
+            ledger.close()
+        with mock.patch.object(dl, "utc_now", return_value=self.now):
+            code, out = self.cli("digest", "--hours", "24", config=config_value(**LIVE_KEYS, state_root=str(root)))
+        self.assertEqual(code, 0)
+        self.assertEqual(out["runs"], {"completed": 3, "unfinished": 1, "duration_seconds_max": 595, "duration_seconds_median": 310})
 
     def test_generator_is_never_used_on_the_live_book(self):
         self.assertEqual(self.engine()._allocate_generator(), (None, "member_no_generator_not_authorised"))

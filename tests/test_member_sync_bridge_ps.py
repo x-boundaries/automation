@@ -957,6 +957,18 @@ class GoLiveInstallerTests(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertIn("safe minimum", out)
 
+    def test_row_T6_the_task_folder_is_pinned_to_xb(self):
+        # G2 #281 LATER-4: only exactly \XB\ (ordinal), the folder the runbook off switch names.
+        for bad in ("\\Other\\", "\\xb\\", "\\XB\\Sub\\", "\\XB", "\\XB\\ ", "\\X\u0412\\", "\\"):
+            with self.subTest(task_path=bad):
+                code, out = self.run_installer("-TaskPath", bad)
+                self.assertNotEqual(code, 0)
+                self.assertIn("TaskPath is pinned to \\XB\\", out)
+                self.assertNotIn("Task XML:", out)
+        code, out = self.run_installer("-TaskPath", "\\XB\\")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.task_xml(out).findtext(f"{TASK_NS}RegistrationInfo/{TASK_NS}URI"), "\\XB\\XB-MemberSync-installer-test-never-registered")
+
     def test_refuses_a_config_check_config_refuses(self):
         self.config.write_text(json.dumps({"schema": sync.CONFIG_SCHEMA}), encoding="utf-8")
         code, out = self.run_installer()

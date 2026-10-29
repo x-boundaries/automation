@@ -23,8 +23,10 @@ Behaviour:
   Manager target, the token cache, the environment variables and the state root.
 - PythonExe is the full path to python.exe, never a name resolved from PATH. The config is
   validated first with that interpreter (check-config: no login, no network, no ledger).
-- Task Scheduler folder -TaskPath, default \XB\; name -TaskName, default XB-MemberSync.
-  Refuses if a task with that name already exists in that folder (never replaced).
+- Task Scheduler folder pinned to \XB\ (-TaskPath accepts only exactly \XB\, compared
+  ordinally, so the runbook off switch \XB\XB-MemberSync always names this task); name
+  -TaskName, default XB-MemberSync. Refuses if a task with that name already exists in that
+  folder (never replaced).
 - The printed XML is exactly the XML that -Register registers (Register-ScheduledTask -Xml).
   No password or secret is in it; the Windows password is typed into the Get-Credential
   prompt and goes straight to Task Scheduler. Do not run this inside a transcript.
@@ -62,10 +64,12 @@ $SafeMinimumIntervalMinutes = 10
 if ($IntervalMinutes -lt $SafeMinimumIntervalMinutes -or $IntervalMinutes -gt 1440) {
     throw "IntervalMinutes must be from $SafeMinimumIntervalMinutes (the safe minimum) to 1440."
 }
-# Case-sensitive and anchored with \A and \z, so a trailing line break or a look-alike letter
-# never passes.
-if ($TaskPath -cnotmatch '\A(\\[A-Za-z0-9_-]([A-Za-z0-9 _-]*[A-Za-z0-9_-])?)+\\\z') {
-    throw "TaskPath must look like \XB\ (start and end with a backslash; letters, digits, spaces, _ and - only)."
+# G2 #281 LATER-4: the folder is pinned, so the runbook off switch \XB\XB-MemberSync always
+# names the task this installer registered. Ordinal: another case, a trailing line break or a
+# look-alike letter never passes.
+$PinnedTaskPath = "\XB\"
+if (-not [string]::Equals($TaskPath, $PinnedTaskPath, [StringComparison]::Ordinal)) {
+    throw "TaskPath is pinned to \XB\ (the runbook off switch is \XB\XB-MemberSync)."
 }
 if ($TaskName -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9 _-]{0,63}\z') {
     throw "TaskName may use letters, digits, spaces, _ and - only."
