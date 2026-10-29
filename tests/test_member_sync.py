@@ -335,14 +335,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "sync_config_birthday_month_metafield_invalid")
 
     def test_production_book_refused(self):
+        # Go-live R1 (moved refusal): the production book is admitted only
+        # with the sync's own credential (V9); any other name stays refused.
+        # The GoLive closure matrix below pins every row.
         with self.assertRaises(dl.DirectLocalError) as caught:
             sync.parse_config(config_value(autocount_book=PROD_BOOK))
-        self.assertEqual(caught.exception.code, "production_book_refused")
+        self.assertEqual(caught.exception.code, "sync_config_ac2_credential_target_live_required")
         with self.assertRaises(dl.DirectLocalError) as caught:
             sync.parse_config(config_value(autocount_book="AED_OTHER"))
         self.assertEqual(caught.exception.code, "autocount_book_not_authorised")
         with self.assertRaises(dl.DirectLocalError):
-            sync.SyncBridgeClient(["x"], autocount_book=PROD_BOOK, claims=Path("."))
+            sync.SyncBridgeClient(["x"], autocount_book="AED_OTHER", claims=Path("."))
 
     def test_write_cap_bounds(self):
         for bad in (6, -1, True, "5"):
@@ -375,11 +378,14 @@ class LedgerTests(unittest.TestCase):
         try:
             ledger = sync.SyncLedger(temp, check_custody=False)
             try:
+                # Go-live R2 (moved refusal): a v3 ledger may hold the
+                # production book; any other name is refused by check_book
+                # and by the meta CHECK.
                 with self.assertRaises(dl.DirectLocalError):
-                    ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+                    ledger.init_meta(autocount_book="AED_OTHER", store_gid=STORE, shop_domain=DOMAIN)
                 import sqlite3
                 with self.assertRaises(sqlite3.IntegrityError):
-                    ledger.conn.execute("INSERT INTO meta(id, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, 'x', ?, 's', 'd', ?, 't')", (PROD_BOOK, "0" * 64))
+                    ledger.conn.execute("INSERT INTO meta(id, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, 'x', ?, 's', 'd', ?, 't')", ("AED_OTHER", "0" * 64))
             finally:
                 ledger.close()
         finally:
@@ -2707,6 +2713,546 @@ class PendingBudgetTests(SyncTestCase):
             with self.subTest(bad=bad), self.assertRaises(dl.DirectLocalError) as caught:
                 make_config(max_pending_rechecks_per_run=bad)
             self.assertEqual(caught.exception.code, "sync_config_max_pending_rechecks_per_run_invalid")
+
+
+# --------------------------------------------------------------------------
+# Go-live closure matrix (G0 go-live design section 4.4, Owner SCOPE-CONFIRMED
+# 29 Oct 2026, plus the V4 and V9 rows). One row = one test, named
+# ``test_row_<ID>_...``; the PowerShell rows (B1-B16, B18, T1-T3) are in
+# tests/test_member_sync_bridge_ps.py. GoLiveRowCoverageTests proves every
+# row has its test. Fake data only: reserved phones, example.com, fake IDs.
+# --------------------------------------------------------------------------
+
+GOLIVE_ROWS = (
+    "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18",
+    "L1", "L2", "L3", "L4", "L5", "L6",
+    "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "D1", "D2", "D3", "D4", "D5", "D6", "D7",
+    "ML10a", "ML10b", "ML10c",
+    "T1", "T2", "T3", "T4", "T5",
+    "V4", "V9",
+)
+FAKE_OWNER_USER = "ownerfake01"
+LIVE_KEYS = {
+    "autocount_book": PROD_BOOK, "ac2_credential_target": "XB-AC2-MemberSync", "ac2_refused_user_ids": [FAKE_OWNER_USER],
+    "ac2_create_member_type": "Default",
+}
+V2_META_CHECK = "CHECK (autocount_book <> 'AED_XBOUNDARIES'));"
+
+
+def live_config(**overrides) -> sync.SyncConfig:
+    return make_config(**{**LIVE_KEYS, **overrides})
+
+
+class GoLiveRowCoverageTests(unittest.TestCase):
+    def test_every_closure_matrix_row_has_its_test(self):
+        sources = (Path(__file__).read_text(encoding="utf-8") + (ROOT / "tests" / "test_member_sync_bridge_ps.py").read_text(encoding="utf-8"))
+        found = re.findall(r"def test_row_([A-Za-z0-9]+)_", sources)
+        self.assertEqual(sorted(set(found)), sorted(GOLIVE_ROWS))
+        self.assertEqual(len(found), len(set(found)))  # one test per row
+
+
+class GoLiveTestCase(SyncTestCase):
+    """A live-book ledger (same engine, book = AED_XBOUNDARIES)."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-live-"))
+        self.now = T0 + timedelta(days=1)
+        self.ledger = sync.SyncLedger(self.temp, clock=lambda: self.now, check_custody=False)
+        self.ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+        self.shopify = FakeShopify()
+        self.ac2 = FakeAc2()
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, "initial_link_completed_at", dl.ts(CUTOVER))
+
+    def engine(self, **overrides) -> sync.SyncEngine:
+        settings = {**LIVE_KEYS, "ac2_create_enabled": True, "shopify_create_enabled": True, "changelog_xml_column": "Content"}
+        settings.update(overrides)
+        return sync.SyncEngine(self.ledger, make_config(**settings), shopify=self.shopify, ac2=self.ac2)
+
+    def pending(self, n: int):
+        row = self.ledger.conn.execute("SELECT state, code FROM shopify_pending WHERE customer_gid = ?", (gid(n),)).fetchone()
+        return None if row is None else tuple(row)
+
+    def signup(self, n: int, at: datetime = T0, **kwargs) -> sync.ShopifyCustomer:
+        return self.shopify.add(replace(customer(n, registered=at, **kwargs), created_at=at))
+
+    def private_root(self) -> Path:
+        holder = Path(tempfile.mkdtemp(prefix="xb-member-sync-root-"))
+        self.addCleanup(shutil.rmtree, holder, True)
+        root = holder / "state"
+        dl.prepare_state_root(root, environ={})
+        return root
+
+    def cli(self, *args: str, config: dict) -> tuple[int, dict]:
+        path = self.temp / "cli-config.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        out = io.StringIO()
+        real = dl.validate_state_root
+        # Temp folders sit under %LOCALAPPDATA% on Windows, which the location
+        # rule refuses for a real root; the custody check itself still runs.
+        with redirect_stdout(out), mock.patch.object(dl, "validate_state_root", side_effect=lambda path, environ=None: real(path, environ={})):
+            code = sync.main([args[0], "--config", str(path), *args[1:]])
+        return code, json.loads(out.getvalue())
+
+
+
+class GoLiveMatrixTests(GoLiveTestCase):
+    # -- book (Python layer) ---------------------------------------------------
+    def test_row_B17_core_refuses_the_production_environment(self):
+        self.assertEqual(dl.AUTHORISED_REAL_ENVIRONMENTS, frozenset({"development"}))
+        ledger = dl.Ledger(self.private_root())
+        try:
+            with self.assertRaises(dl.DirectLocalError) as caught:
+                dl.Processor(ledger).init_ledger(mode="connector", environment="production", store_gid=STORE, shop_domain=DOMAIN)
+            self.assertEqual(caught.exception.code, "production_environment_not_authorised")
+        finally:
+            ledger.close()
+
+    # -- ledger ------------------------------------------------------------------
+    def test_row_L1_fresh_ledger_is_v3_and_holds_the_live_book(self):
+        self.assertEqual(sync.SCHEMA_VERSION, 3)
+        self.assertEqual(self.ledger.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.ledger.meta()["autocount_book"], PROD_BOOK)
+        self.assertEqual(self.ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN), {"status": "existing"})
+
+    def build_old_ledger(self, version: int) -> Path:
+        import sqlite3
+
+        root = Path(tempfile.mkdtemp(prefix=f"xb-member-sync-v{version}-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        schema = sync.LEDGER_SCHEMA.replace("CHECK (autocount_book IN ('AED_TESTINGAPI', 'AED_XBOUNDARIES')));", V2_META_CHECK)
+        self.assertIn(V2_META_CHECK, schema)
+        if version == 1:
+            schema = schema.replace(", intent_digest TEXT", "").replace("CREATE TABLE changelog_seen(id INTEGER PRIMARY KEY, seen_at TEXT NOT NULL);\n", "")
+            schema = schema.replace("created_at, intent_digest ON writes", "created_at ON writes")
+        conn = sqlite3.connect(root / sync.LEDGER_FILE)
+        conn.executescript(schema)
+        conn.execute("INSERT INTO meta(id, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, 'sync-old', ?, ?, ?, ?, 't')", (TEST_BOOK, STORE, DOMAIN, "a" * 64))
+        conn.execute("INSERT INTO links VALUES (?, ?, ?, 'matched', 'phone_and_name_match', 't')", (gid(1), sg(1), sg(1)))
+        conn.execute("INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, created_at, updated_at) VALUES ('write-1', 'shopify_to_ac2', ?, ?, ?, 'DONE', 't', 't')", (gid(2), sg(2), sg(2)))
+        conn.execute("INSERT INTO watermarks VALUES ('ac2_changelog_id', '1000', 't')")
+        conn.execute(f"PRAGMA user_version={version}")
+        conn.commit()
+        conn.close()
+        return root
+
+    def dump_rows(self, ledger: sync.SyncLedger) -> dict:
+        return {name: [tuple(r) for r in ledger.conn.execute(f"SELECT * FROM {name} ORDER BY 1")] for name in ("meta", "links", "writes", "watermarks")}
+
+    def test_row_L2_v2_test_ledger_is_bumped_to_v3_rows_unchanged(self):
+        import sqlite3
+
+        root = self.build_old_ledger(2)
+        conn = sqlite3.connect(root / sync.LEDGER_FILE)
+        before = {name: [tuple(r) for r in conn.execute(f"SELECT * FROM {name} ORDER BY 1")] for name in ("meta", "links", "writes", "watermarks")}
+        conn.close()
+        ledger = sync.SyncLedger(root, check_custody=False)
+        try:
+            self.assertEqual(ledger.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(self.dump_rows(ledger), before)
+            self.assertIn(V2_META_CHECK.rstrip(";"), ledger.conn.execute("SELECT sql FROM sqlite_master WHERE name = 'meta'").fetchone()[0])
+            sync.SyncEngine(ledger, make_config(), shopify=FakeShopify(), ac2=FakeAc2())  # the test config still binds
+        finally:
+            ledger.close()
+
+    def test_row_L3_v1_ledger_migrates_through_v2_to_v3(self):
+        root = self.build_old_ledger(1)
+        ledger = sync.SyncLedger(root, check_custody=False)
+        try:
+            self.assertEqual(ledger.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertIsNone(ledger.conn.execute("SELECT intent_digest FROM writes").fetchone()[0])
+            self.assertEqual(ledger.conn.execute("SELECT COUNT(*) FROM changelog_seen").fetchone()[0], 0)
+            self.assertEqual(ledger.link_for_gid(gid(1))["member_no"], sg(1))
+        finally:
+            ledger.close()
+
+    def test_row_L4_live_config_and_test_ledger_never_meet(self):
+        test_ledger_root = Path(tempfile.mkdtemp(prefix="xb-member-sync-test-ledger-"))
+        self.addCleanup(shutil.rmtree, test_ledger_root, True)
+        test_ledger = sync.SyncLedger(test_ledger_root, check_custody=False)
+        try:
+            test_ledger.init_meta(autocount_book=TEST_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+            for ledger, config in ((test_ledger, live_config()), (self.ledger, make_config())):
+                with self.subTest(book=config.autocount_book), self.assertRaises(dl.DirectLocalError) as caught:
+                    sync.SyncEngine(ledger, config, shopify=self.shopify, ac2=self.ac2)  # run and initial-link
+                self.assertEqual(caught.exception.code, "sync_ledger_binding_mismatch")
+        finally:
+            test_ledger.close()
+        root = self.private_root()
+        ledger = sync.SyncLedger(root)
+        ledger.init_meta(autocount_book=TEST_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+        ledger.close()
+        for command in ("status", "digest"):
+            with self.subTest(command=command):
+                self.assertEqual(self.cli(command, config=config_value(**LIVE_KEYS, state_root=str(root))), (2, {"status": "refused", "code": "sync_ledger_binding_mismatch"}))
+        self.assertEqual(self.cli("status", config=config_value(state_root=str(root)))[0], 0)  # its own config still reads it
+
+    def test_row_L5_meta_links_and_writes_are_immutable(self):
+        import sqlite3
+
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(5), sg(5), "matched", "x")
+            conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) VALUES ('write-5', 'shopify_to_ac2', 'M5', 'm5', 'DONE', 't', 't')")
+        for statement in (
+            "UPDATE meta SET autocount_book = 'AED_TESTINGAPI'", "DELETE FROM meta", "UPDATE links SET member_no = 'X'", "DELETE FROM links", "DELETE FROM writes",
+        ):
+            with self.subTest(statement=statement), self.assertRaises(sqlite3.DatabaseError):
+                self.ledger.conn.execute(statement)
+
+    def test_row_L6_unknown_schema_version_is_refused(self):
+        import sqlite3
+
+        root = Path(tempfile.mkdtemp(prefix="xb-member-sync-v4-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        conn = sqlite3.connect(root / sync.LEDGER_FILE)
+        conn.execute("PRAGMA user_version=4")
+        conn.close()
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            sync.SyncLedger(root, check_custody=False)
+        self.assertEqual(caught.exception.code, "sync_ledger_schema_unsupported")
+
+    # -- switches and scope ------------------------------------------------------
+    def test_row_S1_shadow_mode_links_and_counts_but_writes_nothing(self):
+        shadow = {"ac2_create_enabled": False, "shopify_create_enabled": False}
+        self.assertEqual(self.run_sync("ac2_to_shopify", **shadow)["counts"], {"changelog_watermark_initialised": 1})
+        self.signup(1)  # past the cutoff, no AC2 member
+        self.signup(3)
+        self.ac2.add(sync.Ac2Member(sg(3), "SOMEONE", None, created_at=T0 + timedelta(minutes=2)), log=True)  # staff keyed
+        self.ac2.add(sync.Ac2Member(sg(2), "Walk In", sg(2)), log=True)  # a walk-in: no Shopify customer
+        first = self.run_sync("both", **shadow)
+        second = self.run_sync("both", **shadow)
+        self.assertEqual((self.ac2.creates, self.shopify.created), ([], []))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+        self.assertEqual(self.links(), {gid(3): sg(3)})
+        for result in (first, second):
+            self.assertEqual((result["writes"], result["counts"]["ac2_create_disabled"], result["counts"]["shopify_create_disabled"]), (0, 1, 1))
+
+    def test_row_S2_ac2_create_on_past_cutoff_creates_once_with_the_live_type(self):
+        self.signup(4)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual([(no, p["member_type"], p["profile"]) for no, p in self.ac2.creates], [(sg(4), "Default", "sync_p1")])
+        self.assertEqual((self.links(), result["status"], result["alerts"]), ({gid(4): sg(4)}, "completed_with_alerts", ["created_after_wait"]))
+        self.assertEqual(self.run_sync("shopify_to_ac2")["counts"].get("ac2_member_created", 0), 0)
+
+    def test_row_S3_no_usable_phone_is_skipped_with_one_staff_alert(self):
+        self.now = T0 + timedelta(hours=1)  # before the cutoff it waits for staff, as any sign-up
+        self.signup(5, phone=None)
+        self.signup(6, phone="+" + "1" * 3)  # invalid: treated as absent
+        self.assertEqual(self.run_sync("shopify_to_ac2")["counts"]["waiting_for_staff"], 2)
+        self.now = T0 + timedelta(days=1)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.ac2.creates, self.ac2.generator_calls), ([], 0))
+        self.assertEqual((self.pending(5), self.pending(6)), (("SKIPPED", "no_phone_sign_up_needs_staff"),) * 2)
+        self.assertEqual((result["alerts"], result["counts"]["no_phone_sign_up_needs_staff"]), (["no_phone_sign_up_needs_staff"], 2))
+        flagged = [r for r in result["refs"] if r["code"] == "no_phone_sign_up_needs_staff"]
+        self.assertEqual(sorted(r["ref"] for r in flagged), sorted([self.ledger.ref("c", gid(5)), self.ledger.ref("c", gid(6))]))
+        self.assert_no_pii(result)
+        self.now += timedelta(hours=1)
+        self.assertEqual(self.run_sync("shopify_to_ac2")["alerts"], [])  # SKIPPED: raised once
+
+    def test_row_S4_create_without_phone_is_refused_on_the_live_book(self):
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            live_config(ac2_create_without_phone=True)
+        self.assertEqual(caught.exception.code, "sync_config_ac2_create_without_phone_live_refused")
+        self.assertEqual(self.cli("check-config", config=config_value(**LIVE_KEYS, ac2_create_without_phone=True)), (2, {"status": "refused", "code": "sync_config_ac2_create_without_phone_live_refused"}))
+        self.assertFalse(live_config().ac2_create_without_phone)
+        self.assertFalse(live_config(ac2_create_without_phone=False).ac2_create_without_phone)
+        self.assertTrue(make_config().ac2_create_without_phone)  # the test book keeps phase 1
+        self.assertFalse(make_config(ac2_create_without_phone=False).ac2_create_without_phone)
+        with self.assertRaises(dl.DirectLocalError):
+            make_config(ac2_create_without_phone="yes")
+
+    def scoped_client(self, scopes, *, create_enabled):
+        session = {"shop": {"id": STORE, "myshopifyDomain": DOMAIN}, "currentAppInstallation": {"accessScopes": [{"handle": s} for s in scopes]}}
+        responses = [_graphql(session)]
+        return sync.SyncShopifyClient(
+            create_enabled=create_enabled, shop_domain=DOMAIN, api_version="2026-07", token_provider=direct.StaticTokenProvider("shpat_synthetic_token_value_0001"),
+            transport=lambda url, body, headers, timeout: responses.pop(0), sleep=lambda s: None,
+        )
+
+    def test_row_S5_creates_off_with_write_scope_refuses_every_run(self):
+        with self.assertRaises(direct.ShopifyDirectError) as caught:
+            self.scoped_client(("read_customers", "write_customers"), create_enabled=False).verify_session(store_gid=STORE)
+        self.assertEqual(caught.exception.code, "shopify_token_scope_not_expected")
+
+    def test_row_S6_creates_on_with_read_scope_only_is_refused(self):
+        with self.assertRaises(direct.ShopifyDirectError) as caught:
+            self.scoped_client(("read_customers",), create_enabled=True).verify_session(store_gid=STORE)
+        self.assertEqual(caught.exception.code, "shopify_token_scope_not_expected")
+        self.scoped_client(("read_customers", "write_customers"), create_enabled=True).verify_session(store_gid=STORE)
+
+    def test_row_S7_write_budget_reached_counts_and_writes_no_more(self):
+        for n in (7, 8, 9):
+            self.signup(n)
+        result = self.run_sync("shopify_to_ac2", max_writes_per_run=1)
+        self.assertEqual((len(self.ac2.creates), result["writes"], result["counts"]["max_writes_per_run_reached"]), (1, 1, 2))
+
+    def test_row_S8_initial_link_apply_needs_its_switch_before_any_login(self):
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            self.engine().initial_link(apply=True)
+        self.assertEqual(caught.exception.code, "initial_link_disabled")
+        missing = config_value(**LIVE_KEYS, state_root=str(self.temp / "no-such-root"))
+        self.assertEqual(self.cli("initial-link", "--apply", config=missing), (2, {"status": "refused", "code": "initial_link_disabled"}))
+        self.assertEqual(self.links(), {})
+
+    def test_row_S9_no_sign_up_is_read_until_the_initial_link_completes(self):
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = 'initial_link_completed_at'")
+        self.signup(10)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertIn("initial_link_not_complete", result["alerts"])
+        self.assertEqual((self.ac2.lookups, self.ac2.creates, self.shopify.searches), (0, [], []))
+
+    # -- decisions on the live book -----------------------------------------------
+    def test_row_D1_member_no_and_created_time_within_the_window_links(self):
+        self.signup(11)
+        self.ac2.add(sync.Ac2Member(sg(11), "STAFF TYPED", None, created_at=T0 + timedelta(minutes=59)))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates, result["counts"]["memberno_and_created_time_match"]), ({gid(11): sg(11)}, [], 1))
+
+    def test_row_D2_one_millisecond_outside_the_window_alerts_never_creates(self):
+        self.signup(12)
+        self.ac2.add(sync.Ac2Member(sg(12), "STAFF TYPED", None, created_at=T0 + timedelta(minutes=60, milliseconds=1)))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates), ({}, []))
+        self.assertIn("memberno_exists_outside_window", result["alerts"])
+        self.assertEqual(self.pending(12), ("SKIPPED", "memberno_exists_outside_window"))
+
+    def test_row_D3_both_number_forms_are_a_conflict_both_ways(self):
+        self.signup(13)
+        self.ac2.add(sync.Ac2Member(sg(13), "STAFF ONE", None, created_at=T0))
+        self.ac2.add(sync.Ac2Member(local(13), "STAFF TWO", None, created_at=T0))
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates, self.pending(13)), ({}, [], ("SKIPPED", "memberno_conflict")))
+        self.assertIn("memberno_conflict", result["alerts"])
+        self.run_sync("ac2_to_shopify")  # watermark
+        self.ac2.add(sync.Ac2Member(sg(14), "STAFF ONE", sg(14), created_at=T0), log=True)
+        self.ac2.add(sync.Ac2Member(local(14), "STAFF TWO", None, created_at=T0))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.shopify.created, result["counts"].get("memberno_conflict")), ([], 1))
+        self.assertNotIn(sg(14), self.links().values())
+
+    def test_row_D4_email_alone_never_links(self):
+        self.signup(15, email="alpha@example.com")
+        self.ac2.add(sync.Ac2Member("TILLX15", "Alpha Tester", None, "alpha@example.com"))
+        self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), [no for no, _ in self.ac2.creates]), ({gid(15): sg(15)}, [sg(15)]))
+        self.run_sync("ac2_to_shopify")  # watermark
+        self.shopify.add(customer(16, email="bravo@example.com", tags=()))
+        self.ac2.add(sync.Ac2Member("TILLX16", "Alpha Tester", None, "bravo@example.com"), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((result["counts"].get("ac2_member_without_phone"), self.shopify.created), (1, []))
+        self.assertNotIn("TILLX16", self.links().values())
+
+    def test_row_D5_open_uncertain_write_holds_the_customer(self):
+        now = dl.ts(self.now)
+        with self.ledger.tx() as conn:
+            conn.execute(
+                "INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, code, created_at, updated_at, intent_digest) "
+                "VALUES ('write-d5', 'shopify_to_ac2', ?, 'M000901', 'm000901', 'UNCERTAIN', 'writer_timeout', ?, ?, 'sha256:x')", (gid(17), now, now),
+            )
+        self.signup(17)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.ac2.creates, self.pending(17)), ([], ("SKIPPED", "customer_held_by_open_write")))
+        self.assertIn("customer_held_by_open_write", result["alerts"])
+
+    def uncertain_create(self, n: int, found_name: str) -> None:
+        def taken_by(member_no, payload, *, write_id):
+            self.ac2.creates.append((member_no, dict(payload)))
+            self.ac2.add(sync.Ac2Member(member_no, found_name, payload["mobile_phone"] if found_name == payload["name"] else None))
+            return "WRITE_OUTCOME_UNCERTAIN", "writer_failed_after_claim"
+
+        self.ac2.create_member = taken_by
+        self.signup(n)
+        self.run_sync("shopify_to_ac2")
+        del self.ac2.create_member
+
+    def test_row_D6_uncertain_write_found_with_equal_digest_resolves_and_links(self):
+        self.uncertain_create(18, "Alpha Tester")
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), result["counts"]["uncertain_write_resolved_linked"]), ({gid(18): sg(18)}, 1))
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "RESOLVED")
+        self.assertEqual(len(self.ac2.creates), 1)
+
+    def test_row_D7_uncertain_write_found_with_another_digest_stays_uncertain(self):
+        self.uncertain_create(19, "Kilo Other")
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), result["counts"]["uncertain_write_identity_mismatch"]), ({}, 1))
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.assertEqual(len(self.ac2.creates), 1)
+
+    # -- L10 -----------------------------------------------------------------------
+    def walk_ins(self, numbers) -> None:
+        for n in numbers:
+            self.ac2.add(sync.Ac2Member(sg(n), "Walk In", sg(n)), log=True)
+
+    def test_row_ML10a_a_linkable_row_is_decided_behind_twenty_would_create_rows(self):
+        off = {"shopify_create_enabled": False}
+        self.run_sync("ac2_to_shopify", **off)  # watermark
+        self.walk_ins(range(1, 21))
+        self.assertEqual(self.run_sync("ac2_to_shopify", **off)["counts"]["shopify_create_disabled"], 20)
+        self.shopify.add(customer(21, tags=()))
+        self.ac2.add(sync.Ac2Member("TILL21", "Alpha Tester", local(21)), log=True)
+        result = self.run_sync("ac2_to_shopify", **off)
+        self.assertEqual(self.links(), {gid(21): "TILL21"})
+        self.assertEqual((result["counts"]["linked_existing_shopify_customer"], self.shopify.created), (1, []))
+
+    def test_row_ML10b_a_full_batch_of_would_create_rows_alerts_once_per_run(self):
+        off = {"shopify_create_enabled": False}
+        self.run_sync("ac2_to_shopify", **off)  # watermark
+        self.walk_ins(range(1, 26))
+        self.run_sync("ac2_to_shopify", **off)
+        self.run_sync("ac2_to_shopify", **off)  # the last 5 are read: all 25 wait for the switch
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM ac2_pending WHERE state = 'PENDING' AND code = 'would_create'").fetchone()[0], 25)
+        for _ in range(2):
+            result = self.run_sync("ac2_to_shopify", **off)
+            self.assertEqual((result["alerts"], result["counts"]["ac2_pending_would_create_backlog"]), (["ac2_pending_would_create_backlog"], 1))
+            self.assertEqual((result["writes"], self.shopify.created), (0, []))
+
+    def test_row_ML10c_creates_turned_on_drain_the_backlog_oldest_first_within_the_cap(self):
+        off = {"shopify_create_enabled": False}
+        self.run_sync("ac2_to_shopify", **off)  # watermark
+        self.walk_ins(range(1, 26))
+        self.run_sync("ac2_to_shopify", **off)
+        self.run_sync("ac2_to_shopify", **off)
+        result = self.run_sync("ac2_to_shopify", max_writes_per_run=5)
+        self.assertEqual([c["phone"] for c in self.shopify.created], [plus(sg(n)) for n in range(1, 6)])
+        self.assertEqual(result["writes"], 5)
+        self.run_sync("ac2_to_shopify", max_writes_per_run=5)
+        self.assertEqual([c["phone"] for c in self.shopify.created], [plus(sg(n)) for n in range(1, 11)])
+
+    # -- task ----------------------------------------------------------------------
+    def test_row_T4_a_second_runner_is_refused_by_the_ledger_lock(self):
+        runs = self.ledger.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            sync.SyncLedger(self.temp, check_custody=False)
+        self.assertEqual(caught.exception.code, "ledger_locked_by_another_owner")
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], runs)
+
+    def test_row_T5_digest_is_read_only_masked_and_exits_0(self):
+        import hashlib
+
+        root = self.private_root()
+        self.ledger.close()
+        self.ledger = sync.SyncLedger(root, clock=lambda: self.now)
+        self.ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, "initial_link_completed_at", dl.ts(CUTOVER))
+        self.signup(20, phone=None)
+        self.signup(22)
+        self.ac2.add(sync.Ac2Member(sg(22), "STAFF TYPED", None, created_at=T0 + timedelta(hours=3)))
+        self.run_sync("shopify_to_ac2", ac2_create_enabled=False)
+        self.run_sync("shopify_to_ac2", ac2_create_enabled=False)
+        self.ledger.close()
+        self.ledger = sync.SyncLedger(self.temp, check_custody=False)  # tearDown closes this one
+
+        def fingerprint():
+            # The database file itself, plus any write-ahead log content (a
+            # read-only reader may leave SQLite's empty -wal/-shm files).
+            wal = root / (sync.LEDGER_FILE + "-wal")
+            return hashlib.sha256((root / sync.LEDGER_FILE).read_bytes()).hexdigest(), (wal.stat().st_size if wal.exists() else 0)
+
+        before = fingerprint()
+        config = config_value(**LIVE_KEYS, state_root=str(root))
+        with mock.patch.object(dl, "utc_now", return_value=self.now + timedelta(minutes=1)):
+            code, out = self.cli("digest", "--hours", "24", config=config)
+        self.assertEqual(code, 0)
+        self.assertEqual(fingerprint(), before)
+        self.assertEqual(before[1], 0)
+        self.assertEqual((out["schema"], out["status"], out["autocount_book"], out["runs"]["completed"], out["runs"]["unfinished"]), (sync.DIGEST_SCHEMA, "ok", PROD_BOOK, 2, 0))
+        self.assertEqual(out["alerts"], {"memberno_exists_outside_window": 1, "no_phone_sign_up_needs_staff": 1})
+        self.assertEqual(out["open"]["uncertain_writes"], 0)
+        refs = {(r["code"], r.get("member_no_masked")) for r in out["alert_refs"]}
+        self.assertEqual(refs, {("no_phone_sign_up_needs_staff", None), ("memberno_exists_outside_window", "*******" + sg(22)[-3:])})
+        self.assertTrue(all(re.fullmatch(r"c-[0-9a-f]+", r["ref"]) for r in out["alert_refs"]))
+        self.assert_no_pii(out)
+        self.assertNotIn("gid://", json.dumps(out))
+        for bad in ("0", "721"):
+            self.assertEqual(self.cli("digest", "--hours", bad, config=config), (2, {"status": "refused", "code": "digest_hours_invalid"}))
+
+    # -- VM facts ------------------------------------------------------------------
+    def test_row_V4_initial_link_never_links_a_phone_held_by_two_members(self):
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = 'initial_link_completed_at'")
+        made = CUTOVER - timedelta(days=30)
+        self.shopify.add(replace(customer(23, tags=()), created_at=made, updated_at=made, registration_at=None))
+        self.ac2.add(sync.Ac2Member(sg(23), "ONE", None))
+        self.ac2.add(sync.Ac2Member(local(23), "TWO", None))  # the same phone in its 8-digit form
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result = self.engine(initial_link_enabled=True).initial_link(apply=apply)
+                self.assertEqual(result["alerts"], ["initial_link_member_no_conflict"])
+                flagged = [r for r in result["refs"] if r["code"] == "initial_link_member_no_conflict"]
+                self.assertEqual(flagged, [{"ref": self.ledger.ref("c", gid(23)), "action": "skip", "code": "initial_link_member_no_conflict", "member_no_masked": sync.mask_last3(sg(23))}])
+                self.assertEqual(self.links(), {})
+                self.assert_no_pii(result)
+
+    def test_row_V9_the_live_book_logs_in_only_as_the_sync_user(self):
+        for overrides, code in (
+            ({"ac2_credential_target": None}, "sync_config_ac2_credential_target_live_required"),
+            ({"ac2_credential_target": "XB-AC2-Owner"}, "sync_config_ac2_credential_target_live_required"),
+            ({"ac2_refused_user_ids": []}, "sync_config_ac2_refused_user_ids_live_required"),
+            ({"ac2_refused_user_ids": ["bad user"]}, "sync_config_ac2_refused_user_ids_invalid"),
+        ):
+            with self.subTest(code=code, overrides=overrides), self.assertRaises(dl.DirectLocalError) as caught:
+                live_config(**overrides)
+            self.assertEqual(caught.exception.code, code)
+        secret = "fake-secret-value-9f2c"
+        for user in (FAKE_OWNER_USER, FAKE_OWNER_USER.upper()):
+            with self.subTest(user=user), self.assertRaises(dl.DirectLocalError) as caught:
+                sync.load_ac2_credential("XB-AC2-MemberSync", refused_user_ids=live_config().ac2_refused_user_ids, cred_read=lambda target: (user, secret))
+            self.assertEqual(caught.exception.code, "ac2_credential_user_refused")
+            self.assertNotIn(secret, str(caught.exception))
+        with mock.patch.object(sync, "_win_cred_read", return_value=(FAKE_OWNER_USER, secret)):
+            self.assertEqual(self.cli("check-credential", config=config_value(**LIVE_KEYS)), (2, {"status": "refused", "code": "ac2_credential_user_refused"}))
+        with mock.patch.object(sync, "_win_cred_read", return_value=("syncfake02", secret)):
+            self.assertEqual(self.cli("check-credential", config=config_value(**LIVE_KEYS)), (0, {"status": "ok", "user_id": "*******e02", "secret_present": True}))
+        built = []
+        with mock.patch.object(sync, "_win_cred_read", return_value=(FAKE_OWNER_USER, secret)), \
+                mock.patch.object(sync.SyncShopifyClient, "verify_session", lambda self, **kw: None), \
+                mock.patch.object(sync, "SyncBridgeClient", side_effect=lambda *a, **kw: built.append(1)):
+            with self.assertRaises(dl.DirectLocalError) as caught:
+                sync.build_real_engine(live_config(), self.ledger, environ={"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"})
+        self.assertEqual((caught.exception.code, built), ("ac2_credential_user_refused", []))  # no bridge, so no login
+
+
+class GoLiveEngineExtrasTests(GoLiveTestCase):
+    """Go-live behaviour that is not its own matrix row."""
+
+    def test_member_type_unknown_is_not_written_and_alerts(self):
+        self.ac2.create_result = ("NOT_WRITTEN_PROVEN", "member_type_unknown")
+        self.signup(24)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertIn("member_type_unknown", result["alerts"])
+        self.assertEqual((self.links(), self.pending(24)), ({}, ("PENDING", "ac2_not_written")))
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM writes").fetchone()[:], ("NOT_WRITTEN", "member_type_unknown"))
+
+    def test_generator_is_never_used_on_the_live_book(self):
+        self.assertEqual(self.engine()._allocate_generator(), (None, "member_no_generator_not_authorised"))
+        self.assertEqual(self.ac2.generator_calls, 0)
+
+    def test_bridge_refusal_before_the_claim_is_named(self):
+        self.assertEqual(sync._bridge_refusal('vendor noise\n{"error":"member_type_unknown"}\n'), "member_type_unknown")
+        self.assertIsNone(sync._bridge_refusal('{"error":"Login failed for user"}'))
+        self.assertIsNone(sync._bridge_refusal("not json"))
+
+    def test_live_example_config_fails_until_its_placeholders_are_set(self):
+        example = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            sync.parse_config(example)
+        self.assertEqual(caught.exception.code, "sync_config_cutover_invalid")
+        example["shopify_cutover_utc"] = dl.ts(CUTOVER)
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            sync.parse_config(example)
+        self.assertEqual(caught.exception.code, "sync_config_ac2_refused_user_ids_invalid")
+        example["ac2_refused_user_ids"] = [FAKE_OWNER_USER]
+        config = sync.parse_config(example)
+        self.assertEqual((config.autocount_book, config.ac2_create_member_type, config.ac2_credential_target), (PROD_BOOK, "Default", "XB-AC2-MemberSync"))
+        self.assertFalse(config.ac2_create_enabled or config.shopify_create_enabled or config.initial_link_enabled or config.ac2_create_without_phone)
+        self.assertIsNone(config.changelog_xml_column)
+        test_example = sync.parse_config(json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8")))
+        self.assertNotEqual(config.state_root, test_example.state_root)
 
 
 if __name__ == "__main__":

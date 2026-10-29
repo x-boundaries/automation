@@ -30,7 +30,10 @@ Bridge entrypoint (`ac2_directlocal_member_bridge.ps1`): without
 (`autocount_real_bridge_disabled`) before stdin is read, exactly as before. A
 synthetic factory with `-TargetBook` is refused. With `-TargetBook`,
 `ac2_directlocal_book_guard.ps1` runs, in order, before any member operation:
-authorised book (`AED_TESTINGAPI` only; `production_book_not_authorised`), host
+authorised book (`AED_TESTINGAPI` for every caller; `AED_XBOUNDARIES` only for the
+#155 sync's `sync-lookup`, `sync-changelog` and `write-once` with profile `sync_p1`,
+go-live R3, see [member sync phase 1](member_sync_phase1.md); otherwise
+`production_book_not_authorised`; ordinal compares), host
 `DESKTOP-4I042L6`, no `XB_AC2_SESSION_FACTORY`, assembly pins equal to the E7
 qualification, book pinned for the process, vendor login, telemetry off,
 `DBSetting.DBName` = `DB_NAME()` = book and `MachineName` = host, then empty

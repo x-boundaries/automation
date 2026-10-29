@@ -1211,7 +1211,7 @@ BRIDGE_CHILD_ERROR_CODES = frozenset({
     "fence_already_claimed", "fence_binding_mismatch", "fence_id_invalid", "host_not_authorised",
     "legacy_lookup_columns_missing", "legacy_lookup_input_invalid", "legacy_lookup_table_unavailable",
     "member_date_invalid", "member_expiry_before_register", "member_field_not_allowed", "member_field_required",
-    "member_no_generator_failed", "member_no_invalid", "member_no_probe_failed", "member_no_required", "member_no_taken", "member_type_invalid",
+    "member_no_generator_failed", "member_no_invalid", "member_no_probe_failed", "member_no_required", "member_no_taken", "member_type_invalid", "member_type_unknown",
     "outbound_queue_not_empty", "payload_digest_mismatch", "phone_keys_invalid", "pos_sync_state_unreadable",
     "pos_sync_status_requires_real_session", "production_book_not_authorised", "production_book_refused",
     "real_autocount_object_refused", "resolve_guard_unavailable", "save_member_invocation_count_invalid", "session_factory_env_refused",

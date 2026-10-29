@@ -37,6 +37,7 @@ $db | Add-Member -MemberType ScriptMethod -Name ExecuteScalar -Value {
     if ($s.db_throws) { throw "vendor sql failure" }
     if ($Sql -like "*MAX(Id)*") { return [long]$s.max_id }
     if ($Sql -like "*FROM ChangeLog*") { return [string]$s.changelog_json }
+    if ($Sql -like "*FROM MemberType WHERE*") { return [long]@($s.member_types | Where-Object { [string]::Equals([string]$_, [string]$Params[0], [StringComparison]::Ordinal) }).Count }
     if ($Sql -like "*FROM Member*") { return [string]$s.lookup_json }
     throw "unexpected sql"
 }
@@ -136,6 +137,8 @@ ALLOWED_SQL_TEXTS = {
     "server_now_local": "SELECT CONVERT(varchar(19), GETDATE(), 126)",
     "member_change_counter": "SELECT ISNULL(MAX(Counter), 0) FROM ChangeCount WHERE TableName = 'Member'",
     "changelog_max_id": "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog",
+    # Go-live R7 (Owner Q7, SCOPE-CONFIRMED 29 Oct 2026): exactly one parameter.
+    "member_type_exists": "SELECT COUNT_BIG(*) FROM MemberType WHERE MemberType = ?",
 }
 
 
@@ -292,7 +295,7 @@ class SqlAllowlistGuardTests(unittest.TestCase):
 
     def test_every_allowlisted_text_runs(self):
         phone, sg_local = [LOOKUP_KEY, LOOKUP_MOBILE], [LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_EMBEDDED]
-        cases = [(text, ()) for text in ALLOWED_SQL_TEXTS.values()]
+        cases = [(text, ("1",) * text.count("?")) for text in ALLOWED_SQL_TEXTS.values()]
         cases += [(changelog_sql(limit, column), ("1",)) for limit in (1, 200, 1000) for column in ("Content", "XmlData")]
         cases += [(lookup_sql(conditions), ("1",) * sum(c.count("?") for c in conditions)) for conditions in (
             phone, sg_local, phone + sg_local, [LOOKUP_NUMBER], [LOOKUP_NUMBER] * 20, phone + sg_local + [LOOKUP_NUMBER] * 20,
@@ -309,7 +312,7 @@ class SqlAllowlistGuardTests(unittest.TestCase):
         # before any other check, on Windows PowerShell 5.1 and pwsh alike.
         db_name = ALLOWED_SQL_TEXTS["db_name"]
         counter = ALLOWED_SQL_TEXTS["member_change_counter"]
-        bases = [(text, ()) for text in ALLOWED_SQL_TEXTS.values()]
+        bases = [(text, ("1",) * text.count("?")) for text in ALLOWED_SQL_TEXTS.values()]
         bases += [(changelog_sql(200), ("1",)), (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE]), ("1", "2"))]
         cases = []
         for code in NON_ASCII_CODE_POINTS:
@@ -389,6 +392,25 @@ class SqlAllowlistAsciiStaticTests(unittest.TestCase):
             path.read_bytes().decode("ascii")
 
 
+def run_direct_offline(operation: str, stdin: dict, *extra: str, temp: Path, host: str = "XB-CI-NOT-THE-VM"):
+    """The real bridge entry point, never able to log in: COMPUTERNAME is not
+    the pinned AC2 host and -AcRoot is an empty folder (no assemblies), so a
+    request that passes the book guard stops at the host pin (or, with the
+    pinned host name, at the assembly pin). No credential env is passed."""
+
+    import os
+
+    ac_root = temp / "no-autocount"
+    ac_root.mkdir(exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k not in ("AC2_PROBE_USER_ID", "AC2_PROBE_PASSWORD", "XB_AC2_USER_ID", "XB_AC2_PASSWORD_ENV_VAR", "XB_AC2_SESSION_FACTORY", "XB_AC2_SYNC_PASSWORD")}
+    env["COMPUTERNAME"] = host
+    command = [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(BRIDGE),
+               "-Operation", operation, "-EnableProductionAdapter", "-AcRoot", str(ac_root), *extra]
+    proc = subprocess.run(command, input=(json.dumps(stdin) + "\n").encode("ascii"), capture_output=True, timeout=120, check=False, env=env)
+    lines = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+    return proc.returncode, (json.loads(lines[-1]) if lines else None)
+
+
 @unittest.skipUnless(powershell(), "no PowerShell executable available")
 class SyncBridgeTests(unittest.TestCase):
     def setUp(self):
@@ -406,7 +428,8 @@ class SyncBridgeTests(unittest.TestCase):
 
     def set_state(self, **overrides):
         state = {"members": [], "browse": [], "saves": 0, "next": [], "next_index": 0, "browse_error": False, "save_throws": False, "hang_after_save_ms": 0,
-                 "sql": [], "params": [], "db_throws": False, "lookup_json": "", "changelog_json": "", "max_id": 0}
+                 "sql": [], "params": [], "db_throws": False, "lookup_json": "", "changelog_json": "", "max_id": 0,
+                 "member_types": ["REGISTERED", "GUEST"]}
         state.update(overrides)
         self.state.write_text(json.dumps(state), encoding="utf-8")
 
@@ -549,11 +572,17 @@ class SyncBridgeTests(unittest.TestCase):
         self.assertEqual(self.fake()["members"][0]["MemberType"], "GUEST")
 
     def test_production_book_refused_by_entrypoint(self):
-        direct = [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(BRIDGE)]
-        for operation, request in (("sync-lookup", {"phone_digits": sg(5), "sg_local": None, "member_nos": []}), ("sync-changelog", {"after_id": 0, "limit": 1, "xml_column": "XmlData"})):
+        # Go-live R3/R4 (moved refusal): the sync's reads on the live book now
+        # pass the book guard and stop at the next guard (the host pin; this
+        # is never the AC2 VM); any other operation is still refused by book.
+        for operation, request, error in (
+            ("sync-lookup", {"phone_digits": sg(5), "sg_local": None, "member_nos": []}, "host_not_authorised"),
+            ("sync-changelog", {"after_id": 0, "limit": 1, "xml_column": "XmlData"}, "host_not_authorised"),
+            ("probe", {"member_no": "ALPHA"}, "production_book_not_authorised"),
+            ("next-member-no", {}, "production_book_not_authorised"),
+        ):
             with self.subTest(operation=operation):
-                code, out, _ = self.run_bridge(operation, request, "-TargetBook", "AED_XBOUNDARIES", command=direct)
-                self.assertEqual((code, out), (1, {"error": "production_book_not_authorised"}))
+                self.assertEqual(run_direct_offline(operation, request, "-TargetBook", "AED_XBOUNDARIES", temp=self.temp), (1, {"error": error}))
 
     def test_python_client_end_to_end(self):
         rows = [{"member_no": sg(6), "name": "Alpha Tester", "mobile_phone": sg(6), "email_address": None, "dob": None}]
@@ -565,6 +594,374 @@ class SyncBridgeTests(unittest.TestCase):
         payload = {"profile": "sync_p1", "member_type": "REGISTERED", "name": "Bravo Tester", "mobile_phone": sg(7), "email_address": None, "register_date": "2026-10-21", "dob": "2000-01-01"}
         self.assertEqual(client.create_member(sg(7), payload, write_id="write-" + "e" * 32), ("CREATED_VERIFIED", None))
         self.assertEqual(self.fake()["saves"], 1)
+
+
+# --------------------------------------------------------------------------
+# Go-live closure matrix, PowerShell rows (G0 go-live design 4.4; the Python
+# rows and the row coverage test are in tests/test_member_sync.py). Offline:
+# fake DBSettings, the marked synthetic host, and the real entry point only
+# where it cannot log in (run_direct_offline). Lookalike names are built at
+# runtime so this file stays ASCII.
+# --------------------------------------------------------------------------
+
+LIVE_BOOK = "AED_XBOUNDARIES"
+TEST_BOOK = "AED_TESTINGAPI"
+PINNED_HOST = "DESKTOP-4I042L6"
+ADAPTER = ROOT / "scripts" / "ac2_member_gateway_autocount_adapter.ps1"
+ALL_OPERATIONS = ("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog")
+
+
+def lookalikes(name: str) -> list[str]:
+    middle = len(name) // 2
+    return [name[:middle] + chr(0xAD) + name[middle:], name + chr(0x200B), chr(0xFEFF) + name, name.replace("_", chr(0xA0)), name + " ", name.replace("A", chr(0x410), 1)]
+
+
+GOLIVE_GUARD_HARNESS = r"""
+$ErrorActionPreference = "Stop"
+. $args[0]
+. $args[1]
+$doc = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $args[2] -Raw -Encoding UTF8)
+function New-FakeDb($Name, $Values) {
+    $db = [pscustomobject]@{ DBName = $Name; Values = $Values; Sent = @() }
+    $db | Add-Member -MemberType ScriptMethod -Name ExecuteScalar -Value {
+        param([string]$Sql, [object[]]$Params)
+        $this.Sent += $Sql
+        foreach ($key in $this.Values.Keys) { if ($Sql -like "*$key*") { return $this.Values[$key] } }
+        throw "unexpected sql"
+    }
+    return $db
+}
+function Try-Code([scriptblock]$Block) { try { [void](& $Block); return "ok" } catch { return [string]$_.Exception.Message } }
+$results = @()
+foreach ($c in @($doc.cases)) {
+    switch ([string]$c.kind) {
+        "book" {
+            $code = Try-Code {
+                if ($c.not_yet) { Assert-XbDlAuthorisedBook -Book $c.book -Operation $c.operation -ProfileNotYetRead }
+                else { Assert-XbDlAuthorisedBook -Book $c.book -Operation $c.operation -PayloadProfile $c.profile }
+            }
+        }
+        "identity" {
+            $values = @{ "DB_NAME()" = [string]$c.vendor; "MachineName" = "DESKTOP-4I042L6" }
+            $code = Try-Code { Assert-XbDlBookIdentity -Session @{ DBSetting = (New-FakeDb ([string]$c.declared) $values) } -Book ([string]$c.book) -ExpectedHost "DESKTOP-4I042L6" }
+        }
+        "outbound" {
+            $values = @{ "UserScript" = [long]$c.user_script; "MailQueue" = [long]$c.mail; "EInvoiceQueue" = [long]$c.einvoice }
+            $code = Try-Code { Assert-XbDlOutboundQuiet -Counts (Get-XbDlOutboundCounts -DBSetting (New-FakeDb "x" $values)) }
+        }
+        "sql" {
+            $params = @(); foreach ($p in @($c.params)) { if ($null -ne $p) { $params += [string]$p } }
+            $code = Try-Code { Get-XbDlScalar -DBSetting (New-FakeDb "x" @{ "FROM" = 1 }) -Sql ([string]$c.sql) -Params $params }
+        }
+        "member_type" {
+            $db = New-FakeDb "x" @{ "FROM MemberType" = [long]$c.count }
+            $code = Try-Code { Assert-XbDlMemberTypeExists -DBSetting $db -MemberType ([string]$c.type) }
+            $code = "$code|$(@($db.Sent).Count)"
+        }
+        "session" {
+            $env:COMPUTERNAME = [string]$c.host
+            if ($c.factory) { $env:XB_AC2_SESSION_FACTORY = "New-Anything" } else { Remove-Item Env:XB_AC2_SESSION_FACTORY -ErrorAction SilentlyContinue }
+            $code = Try-Code { New-XbDlRealSession -Book ([string]$c.book) -AcRoot ([string]$c.acroot) -Operation $c.operation -PayloadProfile $c.profile }
+        }
+        default { $code = "unknown_case" }
+    }
+    $results += $code
+}
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject @($results) -Compress))
+"""
+
+
+@unittest.skipUnless(powershell(), "no PowerShell executable available")
+class GoLivePsMatrixTests(unittest.TestCase):
+    """Go-live rows in the PowerShell layer: the book guard admits the live
+    book for the sync's three operations only (write-once only with sync_p1),
+    compares ordinally, keeps the identity proof, and the member type read is
+    one pinned parameterised text."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="xb-golive-guard-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+
+    def guard(self, cases: list[dict]) -> list[str]:
+        harness = self.temp / "harness.ps1"
+        harness.write_text(GOLIVE_GUARD_HARNESS, encoding="utf-8")
+        (self.temp / "cases.json").write_text(json.dumps({"cases": cases}), encoding="utf-8")
+        env = {k: v for k, v in __import__("os").environ.items() if k not in ("XB_AC2_SESSION_FACTORY", "XB_AC2_USER_ID", "AC2_PROBE_USER_ID", "AC2_PROBE_PASSWORD")}
+        proc = subprocess.run([powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness), str(ADAPTER), str(GUARD), str(self.temp / "cases.json")],
+                              capture_output=True, timeout=180, check=False, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace")[-2000:])
+        out = json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
+        out = out if isinstance(out, list) else [out]
+        self.assertEqual(len(out), len(cases))
+        return out
+
+    def assert_codes(self, cases: list[dict], expected: list[str]) -> None:
+        for case, code, want in zip(cases, self.guard(cases), expected):
+            with self.subTest(case=ascii(case)):
+                self.assertEqual(code, want)
+
+    @staticmethod
+    def book(book, operation=None, profile=None, not_yet=False) -> dict:
+        return {"kind": "book", "book": book, "operation": operation, "profile": profile, "not_yet": not_yet}
+
+    def test_row_B1_test_book_keeps_every_operation(self):
+        cases = [self.book(TEST_BOOK, op) for op in ALL_OPERATIONS] + [self.book(TEST_BOOK)]
+        cases += [self.book(TEST_BOOK, "write-once", profile) for profile in ("shopify_m1", "sync_p1", None)] + [self.book(TEST_BOOK, "write-once", not_yet=True)]
+        self.assert_codes(cases, ["ok"] * len(cases))
+
+    def test_row_B2_live_book_sync_lookup_is_admitted(self):
+        self.assert_codes([self.book(LIVE_BOOK, "sync-lookup")], ["ok"])
+
+    def test_row_B3_live_book_sync_changelog_is_admitted(self):
+        self.assert_codes([self.book(LIVE_BOOK, "sync-changelog")], ["ok"])
+
+    def test_row_B4_live_book_write_once_sync_p1_is_admitted(self):
+        # Before stdin the profile is not known yet; it is checked again once read.
+        self.assert_codes([self.book(LIVE_BOOK, "write-once", "sync_p1"), self.book(LIVE_BOOK, "write-once", not_yet=True)], ["ok", "ok"])
+
+    def test_row_B5_live_book_write_once_with_another_profile_is_refused_before_the_claim(self):
+        profiles = ["shopify_m1", "", None, "SYNC_P1", "sync_p1 ", "sync" + chr(0xAD) + "_p1", "sync_p2"]
+        self.assert_codes([self.book(LIVE_BOOK, "write-once", p) for p in profiles], ["production_book_not_authorised"] * len(profiles))
+        # End to end: the Core's shopify_m1 payload through the real entry point stops at the book
+        # guard once the payload is read, before any session, login or claim.
+        claims = self.temp / "claims"
+        claims.mkdir()
+        fence = "fence-" + "7" * 32
+        payload = {"name": "Alpha Tester", "register_date": "2026-10-21", "expiry_date": "2027-10-21", "mobile_phone": None, "email_address": None}
+        text = dl.canonical_payload(payload)
+        salt = "b2" * 16
+        request = {"fence_id": fence, "member_no": "ALPHA", "salt": salt, "payload_canonical": text, "payload_digest": dl.payload_digest(salt, text)}
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        extra = ["-TargetBook", LIVE_BOOK, "-FenceId", fence, "-ClaimDirectory", str(claims), "-WriteDeadlineUtc", deadline]
+        for host in ("XB-CI-NOT-THE-VM", PINNED_HOST):
+            with self.subTest(host=host):
+                self.assertEqual(run_direct_offline("write-once", request, *extra, temp=self.temp, host=host), (1, {"error": "production_book_not_authorised"}))
+        self.assertEqual(list(claims.iterdir()), [])
+
+    def test_row_B6_live_book_next_member_no_is_refused(self):
+        # Owner Q2 = A: never GetNextMemberNo on the live book.
+        self.assert_codes([self.book(LIVE_BOOK, "next-member-no")], ["production_book_not_authorised"])
+
+    def test_row_B7_live_book_other_operations_and_other_callers_are_refused(self):
+        operations = ["book-check", "pos-sync-status", "legacy-precheck", "probe", "reconcile", None, "", "Sync-Lookup", "sync-lookup "]
+        self.assert_codes([self.book(LIVE_BOOK, op) for op in operations], ["production_book_not_authorised"] * len(operations))
+
+    def test_row_B8_lookalike_book_names_are_refused_in_both_layers(self):
+        names = lookalikes(LIVE_BOOK) + lookalikes(TEST_BOOK)
+        self.assert_codes([self.book(name, "sync-lookup") for name in names], ["target_book_not_authorised"] * len(names))
+        identity = [{"kind": "identity", "book": book, "declared": name, "vendor": name} for book in (LIVE_BOOK, TEST_BOOK) for name in lookalikes(book)]
+        self.assert_codes(identity, ["book_identity_wrong"] * len(identity))
+        for name in names:
+            with self.subTest(name=ascii(name)), self.assertRaises(dl.DirectLocalError) as caught:
+                sync.check_book(name)
+            self.assertEqual(caught.exception.code, "autocount_book_not_authorised")
+
+    def test_row_B9_empty_other_and_lower_case_names_are_refused_in_both_layers(self):
+        names = ["", "aed_xboundaries", "aed_testingapi", "AED_OTHER", "AED_XBOUNDARIES2"]
+        self.assert_codes([self.book(name, "sync-lookup") for name in names], ["target_book_not_authorised"] * len(names))
+        for name in names + [None, 5, [LIVE_BOOK]]:
+            with self.subTest(name=name), self.assertRaises(dl.DirectLocalError) as caught:
+                sync.check_book(name)
+            self.assertEqual(caught.exception.code, "autocount_book_not_authorised")
+
+    def test_row_B10_session_on_the_other_book_is_refused(self):
+        self.assert_codes([
+            {"kind": "identity", "book": LIVE_BOOK, "declared": TEST_BOOK, "vendor": TEST_BOOK},
+            {"kind": "identity", "book": TEST_BOOK, "declared": LIVE_BOOK, "vendor": LIVE_BOOK},  # unchanged for test-book callers
+            {"kind": "identity", "book": LIVE_BOOK, "declared": LIVE_BOOK, "vendor": LIVE_BOOK},
+        ], ["book_identity_wrong", "production_book_refused", "ok"])
+
+    def test_row_B11_declared_and_vendor_book_differ(self):
+        self.assert_codes([
+            {"kind": "identity", "book": LIVE_BOOK, "declared": LIVE_BOOK, "vendor": TEST_BOOK},
+            {"kind": "identity", "book": LIVE_BOOK, "declared": TEST_BOOK, "vendor": LIVE_BOOK},
+        ], ["book_identity_ambiguous", "book_identity_ambiguous"])
+
+    def test_row_B12_sql_naming_the_production_book_is_refused(self):
+        texts = ["SELECT COUNT_BIG(*) FROM AED_XBOUNDARIES.dbo.Member", "SELECT DB_NAME() FROM AED_XBOUNDARIES", "SELECT COUNT_BIG(*) FROM MemberType WHERE MemberType = 'AED_XBOUNDARIES'"]
+        self.assert_codes([{"kind": "sql", "sql": text, "params": []} for text in texts], ["vendor_query_not_read_only"] * len(texts))
+
+    def test_row_B13_member_type_must_exist_before_the_claim(self):
+        text = ALLOWED_SQL_TEXTS["member_type_exists"]
+        self.assertEqual((text.count("?"), re.fullmatch(r"[\x20-\x7E]+", text) is not None), (1, True))
+        self.assert_codes([
+            {"kind": "member_type", "type": "Default", "count": 0},
+            {"kind": "member_type", "type": "Default", "count": 1},
+            {"kind": "sql", "sql": text, "params": []},
+            {"kind": "sql", "sql": text, "params": ["Default", "x"]},
+            {"kind": "sql", "sql": text, "params": ["Default"]},
+        ], ["member_type_unknown|1", "ok|1", "vendor_query_not_allowlisted", "vendor_query_not_allowlisted", "ok"])
+        # Through the bridge (synthetic session) and the Python client: refused before the claim,
+        # proven not written, the code named.
+        bridge = SyncBridgeTests("test_lookup_single_row_and_empty")
+        bridge.setUp()
+        try:
+            bridge.set_state(member_types=["REGISTERED"])
+            fence = "fence-" + "c" * 32
+            payload = {"profile": "sync_p1", "member_type": "Default", "name": "Alpha Tester", "mobile_phone": sg(9), "email_address": None, "register_date": "2026-10-21", "dob": None}
+            code, out, _ = bridge.run_bridge("write-once", bridge.write_request(fence, payload, sg(9)), *bridge.write_args(fence))
+            self.assertEqual((code, out), (1, {"error": "member_type_unknown"}))
+            self.assertEqual(bridge.fake()["saves"], 0)
+            self.assertFalse((bridge.claims / f"{fence}.claim").exists())
+            last = bridge.fake()["params"][-1]  # the fake's JSON flattens a one-item array
+            self.assertEqual(last if isinstance(last, list) else [last], ["Default"])
+            client = sync.SyncBridgeClient(bridge.command(), autocount_book=TEST_BOOK, claims=bridge.claims, deadline_seconds=60)
+            client.autocount_book = None  # the marked fake host takes no -TargetBook (test-only)
+            self.assertEqual(client.create_member(sg(9), payload, write_id="write-" + "d" * 32), ("NOT_WRITTEN_PROVEN", "member_type_unknown"))
+            self.assertEqual(bridge.fake()["saves"], 0)
+        finally:
+            bridge.tearDown()
+
+    def test_row_B14_member_no_taken_is_refused_before_the_type_check_and_the_claim(self):
+        bridge = SyncBridgeTests("test_lookup_single_row_and_empty")
+        bridge.setUp()
+        try:
+            bridge.set_state(members=[{"MemberNo": sg(10), "Name": "Kilo Other"}], member_types=["Default"])
+            fence = "fence-" + "f" * 32
+            payload = {"profile": "sync_p1", "member_type": "Default", "name": "Alpha Tester", "mobile_phone": sg(10), "email_address": None, "register_date": "2026-10-21", "dob": None}
+            code, out, _ = bridge.run_bridge("write-once", bridge.write_request(fence, payload, sg(10)), *bridge.write_args(fence))
+            self.assertEqual((code, out), (1, {"error": "member_no_taken"}))
+            self.assertEqual((bridge.fake()["saves"], bridge.fake()["sql"]), (0, []))
+            self.assertFalse((bridge.claims / f"{fence}.claim").exists())
+        finally:
+            bridge.tearDown()
+
+    def test_row_B15_outbound_queue_or_user_script_refuses_the_session(self):
+        self.assert_codes([
+            {"kind": "outbound", "user_script": 1, "mail": 0, "einvoice": 0},
+            {"kind": "outbound", "user_script": 0, "mail": 2, "einvoice": 0},
+            {"kind": "outbound", "user_script": 0, "mail": 0, "einvoice": 3},
+            {"kind": "outbound", "user_script": 0, "mail": 0, "einvoice": 0},
+        ], ["user_script_present", "outbound_queue_not_empty", "outbound_queue_not_empty", "ok"])
+
+    def test_row_B16_host_pin_and_session_factory_env_still_refuse_the_live_book(self):
+        empty = str(self.temp / "no-autocount")
+        Path(empty).mkdir()
+        session = {"kind": "session", "book": LIVE_BOOK, "acroot": empty, "operation": "sync-lookup", "profile": None}
+        self.assert_codes([
+            {**session, "host": "XB-CI-NOT-THE-VM", "factory": False},
+            {**session, "host": PINNED_HOST, "factory": True},
+            {**session, "host": PINNED_HOST, "factory": False},  # stops at the assembly pin: no login
+            {**session, "host": PINNED_HOST, "factory": False, "operation": "probe"},
+            {**session, "host": PINNED_HOST, "factory": False, "operation": "write-once", "profile": "shopify_m1"},
+        ], ["host_not_authorised", "session_factory_env_refused", "autocount_build_not_qualified", "production_book_not_authorised", "production_book_not_authorised"])
+
+    def test_row_B18_core_owner_console_and_e7_stay_test_book_only(self):
+        # Their call shape (no operation) never reaches the live book, and their sources are the
+        # merged ones (blob IDs pinned when the go-live round was built on main ac2d1d4).
+        empty = str(self.temp / "no-autocount")
+        Path(empty).mkdir()
+        self.assert_codes([
+            self.book(LIVE_BOOK),
+            {"kind": "session", "book": LIVE_BOOK, "acroot": empty, "operation": None, "profile": None, "host": PINNED_HOST, "factory": False},
+        ], ["production_book_not_authorised", "production_book_not_authorised"])
+        pins = {
+            "scripts/ac2_directlocal_owner_console.ps1": "bd044be3b220b57306f7fa7115e3b6b5bc2f79db",
+            "scripts/ac2_directlocal_e7_testbook_create.ps1": "fea238051ebd9e654b578f1c4e77ee8c3daea450",
+            "scripts/ac2_directlocal_e7_owner_console.ps1": "8fcf4b65d7f48e99a90408cf10c994ef31ed3740",
+            "scripts/ac2_member_gateway_autocount_adapter.ps1": "590f9e6f808d288da9da11edbbd2b030f871dc1e",
+        }
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git is not available")
+        for path, blob in pins.items():
+            with self.subTest(path=path):
+                found = subprocess.run([git, "hash-object", path], cwd=ROOT, capture_output=True, check=True).stdout.decode().strip()
+                self.assertEqual(found, blob)
+        self.assertEqual(dl.ENVIRONMENT_BOOKS["development"], TEST_BOOK)
+        for name in ("ac2_directlocal_owner_console.ps1", "ac2_directlocal_e7_owner_console.ps1"):
+            self.assertIn('-cne "AED_TESTINGAPI"', (ROOT / "scripts" / name).read_text(encoding="utf-8"))
+
+
+INSTALLER = ROOT / "scripts" / "install_member_sync_task.ps1"
+TASK_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+
+
+@unittest.skipUnless(shutil.which("powershell"), "Windows PowerShell 5.1 is not installed")
+class GoLiveInstallerTests(unittest.TestCase):
+    """T1-T3 under Windows PowerShell 5.1, -DryRun behaviour only (the default:
+    no -Register). Nothing is registered; Register-ScheduledTask is never
+    reached (PS 5.1 module-shadow pitfall: no stand-in is used either). Fake
+    account and a fake test-book config only."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-installer-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.config = self.temp / "member_sync.json"
+        self.config.write_text(json.dumps({
+            "schema": sync.CONFIG_SCHEMA, "state_root": "C:\\XB\\xb155-member-sync-example", "autocount_book": TEST_BOOK,
+            "shopify": {"store_gid": "gid://shopify/Shop/900000001", "shop_domain": "xb-sync-test.synthetic.invalid", "api_version": "2026-07",
+                        "auth": {"method": "admin_api_access_token", "token_env": "XB_SHOPIFY_SYNC_TOKEN"}},
+            "shopify_cutover_utc": "2026-11-01T00:00:00Z",
+        }), encoding="utf-8")
+
+    def run_installer(self, *extra: str):
+        command = [shutil.which("powershell"), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(INSTALLER),
+                   "-UserId", "EXAMPLE-PC\\example-user", "-ConfigPath", str(self.config), "-PythonExe", sys.executable,
+                   "-TaskName", "XB-MemberSync-installer-test-never-registered", *extra]
+        proc = subprocess.run(command, capture_output=True, timeout=180, check=False)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")
+
+    def task_xml(self, output: str):
+        import xml.etree.ElementTree as ElementTree
+
+        text = output.split("Task XML:", 1)[1].split("Nothing was registered.", 1)[0].strip()
+        return ElementTree.fromstring(text.replace('encoding="UTF-16"', ""))
+
+    def test_row_T1_s4u_and_other_logons_are_refused(self):
+        for logon in ("S4U", "s4u", "Interactive", "InteractiveOrPassword", "password"):
+            with self.subTest(logon=logon):
+                code, out = self.run_installer("-LogonType", logon)
+                self.assertNotEqual(code, 0)
+                self.assertIn("LogonType must be Password", out)
+                self.assertNotIn("Task XML:", out)
+
+    def test_row_T2_default_is_a_dry_run_that_registers_nothing(self):
+        code, out = self.run_installer()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Dry run (the default)", out)
+        self.assertIn("Nothing was registered.", out)
+        source = INSTALLER.read_text(encoding="utf-8")
+        dry = source.index("if (-not $Register) {")
+        self.assertLess(dry, source.index("$credential = Get-Credential"))
+        self.assertLess(dry, source.index("Register-ScheduledTask -TaskName"))
+        self.assertEqual(source.count("Register-ScheduledTask -TaskName"), 1)
+        self.assertIn("-Xml $taskXml", source)  # what -Register registers is the XML printed here
+
+    def test_row_T3_task_shape(self):
+        code, out = self.run_installer()
+        self.assertEqual(code, 0, out)
+        task = self.task_xml(out)
+        ns = TASK_NS
+        self.assertEqual(task.findtext(f"{ns}RegistrationInfo/{ns}URI"), "\\XB\\XB-MemberSync-installer-test-never-registered")
+        principal = task.find(f"{ns}Principals/{ns}Principal")
+        self.assertEqual((principal.findtext(f"{ns}LogonType"), principal.findtext(f"{ns}RunLevel"), principal.findtext(f"{ns}UserId")),
+                         ("Password", "LeastPrivilege", "EXAMPLE-PC\\example-user"))
+        settings = task.find(f"{ns}Settings")
+        self.assertEqual((settings.findtext(f"{ns}MultipleInstancesPolicy"), settings.findtext(f"{ns}ExecutionTimeLimit")), ("IgnoreNew", "PT10M"))
+        triggers = list(task.find(f"{ns}Triggers"))
+        self.assertEqual([t.tag for t in triggers], [f"{ns}TimeTrigger"])
+        self.assertEqual((triggers[0].findtext(f"{ns}Repetition/{ns}Interval"), triggers[0].findtext(f"{ns}Repetition/{ns}Duration")), ("PT15M", None))
+        exec_ = task.find(f"{ns}Actions/{ns}Exec")
+        self.assertEqual(Path(exec_.findtext(f"{ns}Command")), Path(sys.executable))
+        arguments = exec_.findtext(f"{ns}Arguments")
+        # The runner's temp folder may be an 8.3 short path, so only the shape is compared.
+        self.assertRegex(arguments, r'^"[^"]+\\directlocal\\xb_member_sync\.py" run --config "[^"]+\\member_sync\.json" --direction both$')
+        self.assertNotRegex(out, r"(?i)password\s*[:=]")
+        # The interval: 15 by default, the safe minimum 10, nothing lower.
+        code, out = self.run_installer("-IntervalMinutes", "10")
+        self.assertEqual((code, self.task_xml(out).findtext(f"{ns}Triggers/{ns}TimeTrigger/{ns}Repetition/{ns}Interval")), (0, "PT10M"))
+        for bad in ("9", "5", "0", "1441"):
+            with self.subTest(interval=bad):
+                code, out = self.run_installer("-IntervalMinutes", bad)
+                self.assertNotEqual(code, 0)
+                self.assertIn("safe minimum", out)
+
+    def test_refuses_a_config_check_config_refuses(self):
+        self.config.write_text(json.dumps({"schema": sync.CONFIG_SCHEMA}), encoding="utf-8")
+        code, out = self.run_installer()
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused by check-config", out)
 
 
 if __name__ == "__main__":
