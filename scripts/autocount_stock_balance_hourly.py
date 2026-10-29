@@ -45,6 +45,7 @@ import copy
 import csv
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -217,7 +218,6 @@ ALERT_STATE_SCHEMA = "xb.ac2.stock_alert_state.v1"
 ALERT_SCHEMA = "xb.ac2.stock_alert.v1"
 ALERT_EVENT = "ac2_stock_alert"
 ALERT_USER_AGENT = "xb-ac2-stock-alert/1"
-ALERT_RESPONSE_READ_LIMIT = 64 * 1024
 # The only keys a payload may carry, in this order. No item, quantity, location, path or message.
 ALERT_PAYLOAD_KEYS = (
     "schema",
@@ -2980,10 +2980,16 @@ def plan_alert(alerted, active, now, repeat_hours):
     """De-duplication rule. Pure. Returns (alert_kind or None, state to keep if nothing is sent).
 
     alerted maps condition key -> ISO time it was last sent. Send when a condition is new (not
-    in alerted) or was last sent repeat_hours or more ago; otherwise suppress. Conditions that
-    are no longer active are dropped, so a recurrence counts as new.
+    in alerted) or was last sent repeat_hours or more ago; otherwise suppress. Conditions a run
+    saw cleared are dropped, so a recurrence counts as new. A failed run cannot see the
+    success-side conditions, so it keeps them with their last-sent times and drops only the
+    other run_failed keys.
     """
-    kept = {key: when for key, when in alerted.items() if key in active}
+    failed_run = any(key.startswith("run_failed:") for key in active)
+    kept = {
+        key: when for key, when in alerted.items()
+        if key in active or (failed_run and not key.startswith("run_failed:"))
+    }
     if not active:
         return None, kept
     if any(key not in kept for key in active):
@@ -2991,10 +2997,11 @@ def plan_alert(alerted, active, now, repeat_hours):
     for key in active:
         try:
             last = datetime.fromisoformat(kept[key])
-            if last.tzinfo is None:
-                raise ValueError("naive time")
+            if last.tzinfo is None or last > now:
+                raise ValueError("naive or future time")
         except (TypeError, ValueError):
-            # A damaged entry counts as never sent: one extra alert is safer than none.
+            # A damaged entry counts as never sent: one extra alert is safer than none. A time
+            # later than now (the clock ran ahead, then was corrected) is damaged too.
             return "new", kept
         if now - last >= timedelta(hours=repeat_hours):
             return "repeat", kept
@@ -3086,7 +3093,9 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def post_alert(url, headers, body, timeout):
-    """POST once. Returns the HTTP status, or raises OSError. No proxy, no redirect."""
+    """POST once. Returns the HTTP status, or raises OSError or http.client.HTTPException.
+    No proxy, no redirect. The body is never read: the timeout is per socket operation, so a
+    slowly dripped body could otherwise hold the run past it."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
     request = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
@@ -3095,7 +3104,6 @@ def post_alert(url, headers, body, timeout):
         exc.close()
         return exc.code
     with response:
-        response.read(ALERT_RESPONSE_READ_LIMIT)
         return response.status
 
 
@@ -3113,13 +3121,15 @@ def send_run_alert(settings, archive_root, status, started, run_id, environ=None
         active = alert_conditions(status)
         alerted = load_alert_state(archive_root)
         kind, kept = plan_alert(alerted, active, started, alert["repeat_hours"])
-        if kind is None:
-            _keep_alert_state(archive_root, kept, alerted, run_id[:8])
-            return ALERT_NONE if not active else ALERT_SUPPRESSED
+        # The secret is checked on every run, not only when an alert is due, so a clean
+        # scheduled run already shows whether the task can see it. Nothing is sent here.
         secret = read_alert_secret(alert, environ, credential_reader)
         if secret is None:
             _keep_alert_state(archive_root, kept, alerted, run_id[:8])
             return ALERT_SECRET_UNAVAILABLE
+        if kind is None:
+            _keep_alert_state(archive_root, kept, alerted, run_id[:8])
+            return ALERT_NONE if not active else ALERT_SUPPRESSED
         payload = build_alert_payload(status, active, kind, started)
         if tuple(payload) != ALERT_PAYLOAD_KEYS:
             return ALERT_ERROR
@@ -3131,14 +3141,16 @@ def send_run_alert(settings, archive_root, status, started, run_id, environ=None
         }
         try:
             code = (transport or post_alert)(alert["webhook_url"], headers, body, alert["timeout_seconds"])
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             code = None
         if not isinstance(code, int) or not 200 <= code < 300:
             _keep_alert_state(archive_root, kept, alerted, run_id[:8])
             return ALERT_SEND_FAILED
         sent_at = started.isoformat()
+        sent_state = dict(kept)
+        sent_state.update((key, sent_at) for key in active)
         try:
-            save_alert_state(archive_root, {key: sent_at for key in active}, run_id[:8])
+            save_alert_state(archive_root, sent_state, run_id[:8])
         except OSError:
             pass  # The alert went out; without the state the next hour may repeat it once.
         return ALERT_SENT

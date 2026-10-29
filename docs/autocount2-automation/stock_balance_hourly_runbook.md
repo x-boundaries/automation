@@ -383,7 +383,7 @@ Owner decision (29 Oct 2026): **errors only.** No heartbeat, no "still alive" me
 How it works:
 
 1. At the end of every run (after the daily close, the feed, the item index and delivery, just before `last_run_status.json` is written) the exporter works out which alert conditions the run raises, from the same values it writes to `last_run_status.json`.
-2. If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s), no proxy, no redirect, the shared secret in the `alert.auth_header_name` header.
+2. It checks that the shared secret is readable (every run, even with no condition; nothing is sent). If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s) per socket operation, no proxy, no redirect, the shared secret in the `alert.auth_header_name` header. Only the answer's status is used; its body is never read.
 3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), sends one plain-text Telegram message to the owner chat through the existing Telegram credential, and answers 200 (502 when Telegram refuses, 500 on an unexpected error).
 4. The exporter writes the outcome as `alert_status`. **An alert, sent or lost, never changes the run's status, exit code or files.**
 
@@ -401,7 +401,7 @@ The VM reaches n8n through the public `/webhook/` path (n8n sits behind Cloudfla
 | `large_balance` | `large_balance_count` above 0 |
 | `late_change` | `late_change_day_count` above 0 (only on a run that publishes a close) |
 
-Not alerted (accepted gaps): a run that never starts (VM off, task not firing; the dashboard's status badge shows the staleness); `config_invalid` from `main` (the alert settings cannot be trusted, so `alert_status: skipped_config_invalid`); `--check-latest` and `--dry-run-config`, which never alert.
+Not alerted (accepted gaps): a run that never starts (VM off, task not firing; the dashboard's status badge shows the staleness); `config_invalid` and `timezone_unavailable` from `main` (both fail while the settings are loaded, so the alert settings cannot be trusted: `alert_status: skipped_config_invalid`); `--check-latest` and `--dry-run-config`, which never alert.
 
 ### De-duplication rule
 
@@ -409,7 +409,8 @@ Not alerted (accepted gaps): a run that never starts (VM off, task not firing; t
 - **Send** when any active key is new, or when an active key was last sent `alert.repeat_hours` (24) or more ago. The message lists every active condition, and every active key's time is reset.
 - **Suppress** otherwise (`alert_status: suppressed`): the same problem alerts once, then once a day while it lasts.
 - A key that is no longer active is dropped, so if it comes back it alerts as new. Recovery itself sends nothing.
-- A failed send leaves the state as it was, so the next hour tries again (at most one POST an hour, no retry storm). A missing or unreadable state counts as empty (one extra alert at worst).
+- A failed run (including `already_running` and `stale_lock`) cannot see the success-side conditions (`large_balance` and the rest), so it keeps their keys and last-sent times and drops only the other `run_failed` keys. A large balance that lasts through failed hours therefore still alerts once a day, not again after every failed hour.
+- A failed send leaves the state as it was, so the next hour tries again (at most one POST an hour, no retry storm). A missing or unreadable state counts as empty (one extra alert at worst). A last-sent time that is unreadable, has no UTC offset, or lies in the future (the VM clock ran ahead, then was corrected) counts as never sent.
 
 ### Event (schema `xb.ac2.stock_alert.v1`)
 
@@ -430,11 +431,11 @@ Details: last_run_status.json in the Drive folder; runbook section "Failure clas
 | Value | Meaning |
 | --- | --- |
 | `disabled` | `alert.webhook_enabled` is false. |
-| `no_alert` | The run raised no condition. |
-| `suppressed` | Conditions active, all alerted less than `repeat_hours` ago. |
+| `no_alert` | The run raised no condition and the secret is readable. |
+| `suppressed` | Conditions active, all alerted less than `repeat_hours` ago; the secret is readable. |
 | `sent` | n8n answered 2xx. |
-| `send_failed` | No answer, a timeout, or a non-2xx answer (400 rejected, 403 or 401 secret mismatch, 404 workflow inactive or wrong path, 502 Telegram refused). Retried next hour. |
-| `secret_unavailable` | The env var (or Credential Manager target) is missing, empty or not one printable line. Nothing was sent. |
+| `send_failed` | No answer, a timeout, a malformed answer, or a non-2xx answer (400 rejected, 403 missing or wrong secret header, 404 workflow inactive or wrong path, 500 n8n error such as an empty Header Auth credential, 502 Telegram refused). Retried next hour. |
+| `secret_unavailable` | The env var (or Credential Manager target) is missing, empty or not one printable line. Checked on **every** run while alerts are on, with or without a condition, so a clean hour shows it too. Nothing was sent. |
 | `error` | Unexpected error in the alert step. Nothing changes for the run. |
 | `skipped_config_invalid` | Settings invalid; no alert attempted. |
 
@@ -443,7 +444,7 @@ Details: last_run_status.json in the Drive folder; runbook section "Failure clas
 Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run. Results go to the private mailbox only (never the secret, the chat id or the webhook path).
 
 - **A1 n8n import, inactive** (needs owner OK): import `ac2_stock_alert.workflow.json` as a new workflow, inactive, through the local n8n API or editor on the server PC. In the local import copy only: replace `REPLACE_WITH_ALERT_WEBHOOK_PATH` with a private, unguessable path; replace `REPLACE_WITH_TELEGRAM_CHAT_ID` with the owner chat; bind the existing Telegram credential; create a Header Auth credential with header name `X-XB-Alert-Token` and a new random secret that the owner generates and keeps (never pasted into chat, the repo or a mailbox file).
-- **A2 test event** (needs owner OK, sends one Telegram message): in the editor, listen for a test event, then from the server PC POST this fake event to the local test address `http://127.0.0.1:5678/webhook-test/<private path>` with the secret header. Pass: one Telegram message reading "AC2 stock export: ERROR ... Run: 00000000"; a second POST with an extra key answers 400 and sends nothing; a POST without the header answers 401 or 403 and sends nothing.
+- **A2 test event** (needs owner OK, sends one Telegram message): in the editor, listen for a test event, then from the server PC POST this fake event to the local test address `http://127.0.0.1:5678/webhook-test/<private path>` with the secret header. Pass: one Telegram message reading "AC2 stock export: ERROR ... Run: 00000000"; a second POST with an extra key answers 400 and sends nothing; a POST without the header answers 403 and sends nothing.
 
   ```json
   {"schema": "xb.ac2.stock_alert.v1", "event": "ac2_stock_alert", "run_id": "00000000000000000000000000000000", "run_hour_local": "2026-10-29T14:00:00+08:00", "alert_kind": "new", "status": "failed", "failure_class": "internal_error", "conditions": ["run_failed"], "daily_close_status": "skipped_failed_run", "delivery_status": "skipped_failed_run", "feed_status": null, "item_index_status": null, "large_balance_count": 0, "late_change_day_count": 0}
@@ -458,10 +459,10 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
   ```
 
   Settings: `"alert": {"webhook_enabled": true, "webhook_url": "https://<n8n host>/webhook/<private path>", "secret_env_var": "XB_AC2_STOCK_ALERT_SECRET"}` (other keys default). Open a **new** PowerShell window (the variable reaches new processes only) and run `--dry-run-config`.
-- **A4 one forced-failure test** (needs owner OK, sends one Telegram message): at a quiet minute (not :00), in a new window as the task's account, make one manual run fail safely by giving only that window a wrong expected book: `$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"`, then the normal run command. It stops at the identity check before any business query (`identity_refused`) and writes a failed manifest and `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: one Telegram message "Hourly export FAILED: identity_refused", and `alert_status: sent`. Close that window. The next scheduled run must show `status: success` and `alert_status: no_alert`, and `alert_state.json` must be empty again.
+- **A4 one forced-failure test** (needs owner OK, sends one Telegram message): at a quiet minute (not :00), in a new window as the task's account, make one manual run fail safely by giving only that window a wrong expected book: `$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"`, then the normal run command. It stops at the identity check before any business query (`identity_refused`) and writes a failed manifest and `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: one Telegram message "Hourly export FAILED: identity_refused", and `alert_status: sent`. Close that window. The next **scheduled** run must show `status: success` and `alert_status: no_alert`, and `alert_state.json` must be empty again. Because the secret is checked on every run, `no_alert` here proves the scheduled (S4U) task sees the variable; `secret_unavailable` means it does not (A4's own send ran in an interactive window, which proves nothing about the task).
 
-  If A4 gives `send_failed`: a 403 from Cloudflare (not n8n) means its bot protection blocked the request (the job sends `User-Agent: xb-ac2-stock-alert/1`); a Cloudflare rule change needs its own owner OK. `secret_unavailable` means the window or the task does not see the variable.
-- **A5 first day** (read-only): after 24 hours, check that `alert_status` reads `no_alert` (or `sent` / `suppressed` for a real problem) on the hourly runs, and that no Telegram message arrived without a matching `alert_status: sent`.
+  If A4 gives `send_failed`: a 403 from Cloudflare (not n8n) means its bot protection blocked the request (the job sends `User-Agent: xb-ac2-stock-alert/1`); a Cloudflare rule change needs its own owner OK. n8n itself answers 403 for a missing or wrong secret header. `secret_unavailable` means the window or the task does not see the variable.
+- **A5 first day** (read-only): after 24 hours, check that `alert_status` reads `no_alert` (or `sent` / `suppressed` for a real problem) on every scheduled hourly run, never `secret_unavailable`, and that no Telegram message arrived without a matching `alert_status: sent`. Outbound HTTPS from the scheduled (S4U) task is not proven until its first real alert reads `sent`: A4's POST came from an interactive window.
 
 ### Rollback
 
@@ -473,7 +474,9 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
 
 - A heartbeat or "resolved" message: excluded by the owner (29 Oct 2026). Revisit only if the owner asks.
 - A large-balance count that grows while the condition stays active is not re-alerted until the daily repeat.
-- `config_invalid` is not alerted (the alert settings themselves may be what is invalid).
+- `config_invalid` and `timezone_unavailable` are not alerted (the alert settings themselves may be what is invalid).
+- The daily repeat compares exact times, so start-up jitter can push a reminder to the next hour's run.
+- If Telegram answers slower than the VM's timeout, the message can still arrive after the VM recorded `send_failed`, and the next hour sends it again: one duplicate at worst.
 
 ## Open questions
 

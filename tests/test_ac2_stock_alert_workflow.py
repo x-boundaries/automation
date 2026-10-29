@@ -112,6 +112,8 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(settings["saveDataSuccessExecution"], "none")
         self.assertEqual(settings["saveDataErrorExecution"], "none")
         self.assertIs(settings["saveManualExecutions"], False)
+        # Pinned so an instance that turns on save-on-progress still keeps in-flight data out.
+        self.assertIs(settings["saveExecutionProgress"], False)
         self.assertIsNone(self.workflow["staticData"])
         self.assertNotIn("pinData", self.workflow)
         for node in self.workflow["nodes"]:

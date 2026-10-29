@@ -10,6 +10,7 @@ import copy
 import csv
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -3033,6 +3035,17 @@ class AlertRuleTests(unittest.TestCase):
             ("damaged time", {"large_balance": "not a time"}, ["large_balance"], ("new", {"large_balance": "not a time"})),
             ("naive time", {"large_balance": "2026-10-23T13:00:00"}, ["large_balance"],
              ("new", {"large_balance": "2026-10-23T13:00:00"})),
+            # A time later than now (the clock ran ahead, then was corrected) is damaged too.
+            ("future time", {"large_balance": ago(-24 * 30)}, ["large_balance"],
+             ("new", {"large_balance": ago(-24 * 30)})),
+            # A failed run cannot see the success-side conditions: it keeps them with their
+            # last-sent times and drops only the other run_failed keys.
+            ("failed run keeps success-side keys", {"large_balance": ago(1), "run_failed:lock_timeout": ago(2)},
+             ["run_failed:source_error"], ("new", {"large_balance": ago(1)})),
+            ("same failure, success-side kept", {"large_balance": ago(3), "run_failed:source_error": ago(1)},
+             ["run_failed:source_error"], (None, {"large_balance": ago(3), "run_failed:source_error": ago(1)})),
+            ("success run drops run_failed", {"large_balance": ago(3), "run_failed:source_error": ago(1)},
+             ["large_balance"], (None, {"large_balance": ago(3)})),
         ]
         for name, alerted, active, expected in cases:
             with self.subTest(name):
@@ -3210,6 +3223,23 @@ class AlertRunTests(TempDirTestCase):
         self.assertEqual(transport.calls, [])
         self.assertEqual(self.status_file()["alert_status"], "secret_unavailable")
 
+    def test_secret_is_checked_on_every_run(self):
+        # A clean or suppressed hour still says when the secret is missing, so a scheduled run
+        # proves the task can see it before the first real alert is due. Nothing is sent.
+        settings = self.settings()
+        transport = FakeTransport()
+        self.run_alert(settings, transport=transport, environ=ENV)
+        self.assertEqual(self.status_file()["alert_status"], "secret_unavailable")
+        self.assertIsNone(self.state())
+        self.run_alert(settings, hours=1, transport=transport)
+        self.assertEqual(self.status_file()["alert_status"], "no_alert")
+        self.run_alert(settings, self.mismatch_source(), hours=2, transport=transport)
+        sent_state = self.state()
+        self.run_alert(settings, self.mismatch_source(), hours=3, transport=transport, environ=ENV)
+        self.assertEqual(self.status_file()["alert_status"], "secret_unavailable")
+        self.assertEqual(self.state(), sent_state)
+        self.assertEqual(len(transport.calls), 1)
+
     def test_unreadable_state_alerts_again(self):
         settings = self.settings()
         transport = FakeTransport()
@@ -3245,6 +3275,46 @@ class AlertRunTests(TempDirTestCase):
         self.assertEqual(self.status_file()["alert_status"], "skipped_config_invalid")
 
 
+class AlertSequenceTests(TempDirTestCase):
+    """Hour-by-hour sequences through send_run_alert: fake transport, local state only."""
+
+    def run_sequence(self, statuses):
+        settings = settings_for(self.tmp, alert=alert_block())
+        self.archive.mkdir(parents=True, exist_ok=True)
+        transport = FakeTransport()
+        start = FIXED_NOW.replace(hour=9)
+        results = [
+            hourly.send_run_alert(settings, self.archive, status, start + timedelta(hours=hour), status["run_id"],
+                                  ALERT_ENV, transport)
+            for hour, status in enumerate(statuses)
+        ]
+        return results, [(call["body"]["conditions"], call["body"]["alert_kind"]) for call in transport.calls]
+
+    def test_table(self):
+        large = clean_status(large_balance_count=2)
+        mismatch = failed_status()
+        lb_new, lb_repeat, failed_new = (["large_balance"], "new"), (["large_balance"], "repeat"), (["run_failed"], "new")
+        cases = [
+            # G2 H1 reproducer: large_balance steady while ledger_mismatch fails every other hour,
+            # 09:00 to 13:00. "Once a day while it lasts" gives 3 POSTs, not 5.
+            ("large balance steady, mismatch every other hour", [large, mismatch, large, mismatch, large],
+             ["sent", "sent", "suppressed", "sent", "suppressed"], [lb_new, failed_new, failed_new]),
+            # Runs that fail before taking the lock keep the success-side state too.
+            ("already running and stale lock between",
+             [large, failed_status(hourly.FAILURE_ALREADY_RUNNING), failed_status(hourly.FAILURE_STALE_LOCK), large],
+             ["sent", "sent", "sent", "suppressed"], [lb_new, failed_new, failed_new]),
+            # The daily repeat still counts from the last send across a day of failed runs.
+            ("a day of failures, then the same large balance", [large] + [mismatch] * 23 + [large],
+             ["sent", "sent"] + ["suppressed"] * 22 + ["sent"], [lb_new, failed_new, lb_repeat]),
+        ]
+        for name, statuses, expected_results, expected_calls in cases:
+            with self.subTest(name):
+                state = self.archive / hourly.ALERT_STATE_NAME
+                if state.exists():
+                    state.unlink()
+                self.assertEqual(self.run_sequence(statuses), (expected_results, expected_calls))
+
+
 class AlertNeverChangesTheRunTests(TempDirTestCase):
     """An alert failure must never change the exit code, the run status or any output file."""
 
@@ -3277,6 +3347,7 @@ class AlertNeverChangesTheRunTests(TempDirTestCase):
             "answer 302": (lambda: FakeTransport(codes=[302]), ALERT_ENV),
             "timeout": (lambda: FakeTransport(error=TimeoutError("timed out")), ALERT_ENV),
             "network error": (lambda: FakeTransport(error=OSError("unreachable")), ALERT_ENV),
+            "malformed answer": (lambda: FakeTransport(error=http.client.BadStatusLine("x")), ALERT_ENV),
             "bug in transport": (lambda: FakeTransport(error=RuntimeError("bug")), ALERT_ENV),
             "secret missing": (lambda: FakeTransport(), ENV),
         }
@@ -3292,12 +3363,12 @@ class AlertNeverChangesTheRunTests(TempDirTestCase):
                         {k: v for k, v in base_printed.items() if k not in ignored},
                     )
                     self.assertEqual(files, base_files)
-                    if scenario == "clean hour":
+                    if name == "secret missing":
+                        self.assertEqual(printed["alert_status"], "secret_unavailable")
+                    elif scenario == "clean hour":
                         self.assertEqual(printed["alert_status"], "no_alert")
                     elif name == "answer 200":
                         self.assertEqual(printed["alert_status"], "sent")
-                    elif name == "secret missing":
-                        self.assertEqual(printed["alert_status"], "secret_unavailable")
                     elif name == "bug in transport":
                         self.assertEqual(printed["alert_status"], "error")
                     else:
@@ -3307,7 +3378,7 @@ class AlertNeverChangesTheRunTests(TempDirTestCase):
 class AlertTransportTests(unittest.TestCase):
     """The real POST helper against a loopback HTTP server (no proxy, no redirect)."""
 
-    def serve(self, code, location=None):
+    def serve(self, code, location=None, drip_seconds=None):
         import http.server
         import threading
 
@@ -3321,9 +3392,20 @@ class AlertTransportTests(unittest.TestCase):
                 self.send_response(code)
                 if location:
                     self.send_header("Location", location)
-                self.send_header("Content-Length", "2")
+                if drip_seconds is None:
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
+                # A slow body: one byte at a time, each well inside the per-read timeout.
+                self.send_header("Content-Length", "6")
                 self.end_headers()
-                self.wfile.write(b"{}")
+                try:
+                    for byte in b"abcdef":
+                        time.sleep(drip_seconds)
+                        self.wfile.write(bytes([byte]))
+                except OSError:
+                    pass  # The client hung up without reading the body.
 
             def do_GET(self):  # noqa: N802 - a followed redirect would arrive here
                 seen.append({"path": self.path, "headers": {}, "body": b"GET"})
@@ -3347,6 +3429,15 @@ class AlertTransportTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(seen[0]["headers"]["x-xb-alert-token"], FAKE_SECRET)
         self.assertEqual(seen[0]["body"], b"{}")
+
+    def test_slow_body_does_not_hold_the_run(self):
+        # The timeout covers one socket read, not the whole request: a body dripped 0.5 s a byte
+        # against a 1 s timeout would take 3 s to read. The body is not read at all.
+        url, seen = self.serve(200, drip_seconds=0.5)
+        began = time.monotonic()
+        self.assertEqual(hourly.post_alert(url, {}, b"{}", 1), 200)
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual(len(seen), 1)
 
     def test_error_answer_is_returned_not_raised(self):
         url, _ = self.serve(502)
