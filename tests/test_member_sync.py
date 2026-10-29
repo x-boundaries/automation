@@ -2717,7 +2717,8 @@ class PendingBudgetTests(SyncTestCase):
 
 # --------------------------------------------------------------------------
 # Go-live closure matrix (G0 go-live design section 4.4, Owner SCOPE-CONFIRMED
-# 29 Oct 2026, plus the V4 and V9 rows, and ML10d, V9b, T6 from the G2 #281 LATER notes). One row = one test, named
+# 29 Oct 2026, plus the V4 and V9 rows, and ML10d, V9b, T6 from the G2 #281 LATER notes,
+# and V9c, V9d for the Owner's login decision of 30 Oct 2026). One row = one test, named
 # ``test_row_<ID>_...``; the PowerShell rows (B1-B16, B18, T1-T3, T6) are in
 # tests/test_member_sync_bridge_ps.py. GoLiveRowCoverageTests proves every
 # row has its test. Fake data only: reserved phones, example.com, fake IDs.
@@ -2730,13 +2731,16 @@ GOLIVE_ROWS = (
     "D1", "D2", "D3", "D4", "D5", "D6", "D7",
     "ML10a", "ML10b", "ML10c", "ML10d",
     "T1", "T2", "T3", "T4", "T5", "T6",
-    "V4", "V9", "V9b",
+    "V4", "V9", "V9b", "V9c", "V9d",
 )
 FAKE_OWNER_USER = "ownerfake01"
+# Owner 30 Oct 2026 ("Use my login"): the live config logs in with the
+# Owner's own AutoCount user. DEDICATED_KEYS is the other mode (V9 as built).
 LIVE_KEYS = {
-    "autocount_book": PROD_BOOK, "ac2_credential_target": "XB-AC2-MemberSync", "ac2_refused_user_ids": [FAKE_OWNER_USER],
+    "autocount_book": PROD_BOOK, "ac2_credential_target": "XB-AC2-MemberSync", "ac2_login_mode": "owner_shared",
     "ac2_create_member_type": "Default",
 }
+DEDICATED_KEYS = {**LIVE_KEYS, "ac2_login_mode": "dedicated", "ac2_refused_user_ids": [FAKE_OWNER_USER]}
 V2_META_CHECK = "CHECK (autocount_book <> 'AED_XBOUNDARIES'));"
 
 
@@ -3202,6 +3206,7 @@ class GoLiveMatrixTests(GoLiveTestCase):
                 self.assert_no_pii(result)
 
     def test_row_V9_the_live_book_logs_in_only_as_the_sync_user(self):
+        # The ``dedicated`` login mode (a separate sync user).
         for overrides, code in (
             ({"ac2_credential_target": None}, "sync_config_ac2_credential_target_live_required"),
             ({"ac2_credential_target": "XB-AC2-Owner"}, "sync_config_ac2_credential_target_live_required"),
@@ -3209,24 +3214,24 @@ class GoLiveMatrixTests(GoLiveTestCase):
             ({"ac2_refused_user_ids": ["bad user"]}, "sync_config_ac2_refused_user_ids_invalid"),
         ):
             with self.subTest(code=code, overrides=overrides), self.assertRaises(dl.DirectLocalError) as caught:
-                live_config(**overrides)
+                live_config(**{**DEDICATED_KEYS, **overrides})
             self.assertEqual(caught.exception.code, code)
         secret = "fake-secret-value-9f2c"
         for user in (FAKE_OWNER_USER, FAKE_OWNER_USER.upper()):
             with self.subTest(user=user), self.assertRaises(dl.DirectLocalError) as caught:
-                sync.load_ac2_credential("XB-AC2-MemberSync", refused_user_ids=live_config().ac2_refused_user_ids, cred_read=lambda target: (user, secret))
+                sync.load_ac2_credential("XB-AC2-MemberSync", refused_user_ids=live_config(**DEDICATED_KEYS).ac2_refused_user_ids, cred_read=lambda target: (user, secret))
             self.assertEqual(caught.exception.code, "ac2_credential_user_refused")
             self.assertNotIn(secret, str(caught.exception))
         with mock.patch.object(sync, "_win_cred_read", return_value=(FAKE_OWNER_USER, secret)):
-            self.assertEqual(self.cli("check-credential", config=config_value(**LIVE_KEYS)), (2, {"status": "refused", "code": "ac2_credential_user_refused"}))
+            self.assertEqual(self.cli("check-credential", config=config_value(**DEDICATED_KEYS)), (2, {"status": "refused", "code": "ac2_credential_user_refused"}))
         with mock.patch.object(sync, "_win_cred_read", return_value=("syncfake02", secret)):
-            self.assertEqual(self.cli("check-credential", config=config_value(**LIVE_KEYS)), (0, {"status": "ok", "user_id": "*******e02", "secret_present": True}))
+            self.assertEqual(self.cli("check-credential", config=config_value(**DEDICATED_KEYS)), (0, {"status": "ok", "user_id": "*******e02", "secret_present": True}))
         built = []
         with mock.patch.object(sync, "_win_cred_read", return_value=(FAKE_OWNER_USER, secret)), \
                 mock.patch.object(sync.SyncShopifyClient, "verify_session", lambda self, **kw: None), \
                 mock.patch.object(sync, "SyncBridgeClient", side_effect=lambda *a, **kw: built.append(1)):
             with self.assertRaises(dl.DirectLocalError) as caught:
-                sync.build_real_engine(live_config(), self.ledger, environ={"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"})
+                sync.build_real_engine(live_config(**DEDICATED_KEYS), self.ledger, environ={"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"})
         self.assertEqual((caught.exception.code, built), ("ac2_credential_user_refused", []))  # no bridge, so no login
 
     def test_row_V9b_the_live_credential_target_is_used_only_by_the_live_config(self):
@@ -3252,6 +3257,96 @@ class GoLiveMatrixTests(GoLiveTestCase):
         self.assertEqual(live_config().ac2_credential_target, sync.LIVE_CREDENTIAL_TARGET)
         self.assertIsNone(make_config(ac2_credential_target=None).ac2_credential_target)
         self.assertEqual(make_config(ac2_credential_target=sync.TEST_CREDENTIAL_TARGET).ac2_credential_target, "XB-AC2-MemberSync-Test")
+
+    def test_row_V9c_the_live_config_states_its_login_mode_and_owner_shared_uses_the_owners_login(self):
+        # Owner 30 Oct 2026 ("Use my login"): no silent default either way.
+        for overrides, code in (
+            ({"ac2_login_mode": None}, "sync_config_ac2_login_mode_live_required"),
+            ({"ac2_login_mode": "Owner_Shared"}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": "owner_shared "}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": "shared"}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": ""}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": True}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": ["owner_shared"]}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_refused_user_ids": [FAKE_OWNER_USER]}, "sync_config_ac2_refused_user_ids_owner_shared_refused"),
+            ({"ac2_credential_target": None}, "sync_config_ac2_credential_target_live_required"),
+            ({"ac2_create_without_phone": True}, "sync_config_ac2_create_without_phone_live_refused"),
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(dl.DirectLocalError) as caught:
+                live_config(**overrides)
+            self.assertEqual(caught.exception.code, code)
+        missing = config_value(**LIVE_KEYS)
+        del missing["ac2_login_mode"]
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            sync.parse_config(missing)
+        self.assertEqual(caught.exception.code, "sync_config_ac2_login_mode_live_required")
+        config = live_config()
+        self.assertEqual((config.ac2_login_mode, config.ac2_refused_user_ids), ("owner_shared", ()))
+        self.assertEqual(config.summary()["ac2_login_mode"], "owner_shared")
+        self.assertEqual(live_config(**DEDICATED_KEYS).summary()["ac2_login_mode"], "dedicated")
+        # The test book: the mode may be left out (UAT as merged) or stated;
+        # owner_shared with a refused list is a contradiction on either book.
+        self.assertIsNone(make_config().ac2_login_mode)
+        self.assertEqual(make_config(ac2_login_mode="owner_shared").ac2_login_mode, "owner_shared")
+        self.assertEqual(make_config(ac2_login_mode="dedicated", ac2_refused_user_ids=[FAKE_OWNER_USER]).ac2_refused_user_ids, (FAKE_OWNER_USER,))
+        for overrides, code in (({"ac2_login_mode": "other"}, "sync_config_ac2_login_mode_invalid"),
+                                ({"ac2_login_mode": "owner_shared", "ac2_refused_user_ids": [FAKE_OWNER_USER]}, "sync_config_ac2_refused_user_ids_owner_shared_refused")):
+            with self.subTest(book=TEST_BOOK, overrides=overrides), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(**overrides)
+            self.assertEqual(caught.exception.code, code)
+        # owner_shared: the Owner's own user is loaded and handed to the
+        # bridge child; sa stays refused and the secret is never printed.
+        secret = "fake-secret-value-9f2c"
+        with mock.patch.object(sync, "_win_cred_read", return_value=(FAKE_OWNER_USER, secret)):
+            self.assertEqual(self.cli("check-credential", config=config_value(**LIVE_KEYS)), (0, {"status": "ok", "user_id": "********e01", "secret_present": True}))
+        code, out = self.cli("check-config", config=config_value(**LIVE_KEYS))
+        self.assertEqual((code, out["ac2_login_mode"], out["ac2_refused_user_ids_count"]), (0, "owner_shared", 0))
+        with mock.patch.object(sync, "_win_cred_read", return_value=("SA", secret)):
+            self.assertEqual(self.cli("check-credential", config=config_value(**LIVE_KEYS)), (2, {"status": "refused", "code": "ac2_credential_sa_refused"}))
+        built = []
+        with mock.patch.object(sync, "_win_cred_read", return_value=(FAKE_OWNER_USER, secret)), \
+                mock.patch.object(sync.SyncShopifyClient, "verify_session", lambda self, **kw: None), \
+                mock.patch.object(sync, "SyncBridgeClient", side_effect=lambda *a, **kw: built.append(kw["env"]) or object()):
+            sync.build_real_engine(live_config(), self.ledger, environ={"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"})
+        self.assertEqual(len(built), 1)
+        self.assertEqual((built[0]["XB_AC2_USER_ID"], built[0][sync.AC2_PASSWORD_ENV]), (FAKE_OWNER_USER, secret))
+
+    def test_row_V9d_owner_shared_fails_closed_when_autocount_refuses_the_login(self):
+        # Owner 30 Oct 2026: the Owner's user may be refused by AutoCount
+        # (signed in elsewhere in a way AutoCount rejects, no free licence,
+        # wrong password). Same codes as before the decision; nothing written.
+        self.assertEqual(live_config().ac2_login_mode, "owner_shared")
+        claims = self.temp / "claims"
+        claims.mkdir()
+        for child_code in ("autocount_login_rejected", "autocount_authentication_failed", "autocount_session_initialization_failed"):
+            refused = b"vendor noise\n" + json.dumps({"error": child_code}).encode()
+
+            class Process:
+                returncode = 1
+                pid = 1
+
+                def communicate(self, data, timeout=None):
+                    return (refused, b"")
+
+            client = sync.SyncBridgeClient(["powershell.exe"], autocount_book=PROD_BOOK, claims=claims, env={}, popen=lambda args, **kwargs: Process())
+            with self.subTest(child_code=child_code, stage="read"), self.assertRaises(dl.BridgeError) as caught:
+                client.lookup(sg(25), [])
+            self.assertEqual(caught.exception.code, f"bridge_read_failed:{child_code}")
+            # The run stops at its first AutoCount read: no write either side.
+            self.signup(25)
+            with self.subTest(child_code=child_code, stage="run"), \
+                    mock.patch.object(self.ac2, "lookup", side_effect=dl.BridgeError(f"bridge_read_failed:{child_code}")), \
+                    self.assertRaises(dl.BridgeError) as caught:
+                self.engine().run(direction="both")
+            self.assertEqual(caught.exception.code, f"bridge_read_failed:{child_code}")
+            self.assertEqual((self.ac2.creates, self.shopify.created, self.links()), ([], [], {}))
+            self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+            # A create whose child is refused at login stops before its claim:
+            # proven not written, under the same code as today.
+            with mock.patch.object(client, "write_once", return_value=dl.WriteRun(started=True, exit_code=1, stdout=refused.decode())):
+                state = client.create_member(sg(25), {"name": "Alpha"}, write_id="write-0001")
+            self.assertEqual(state, ("NOT_WRITTEN_PROVEN", "writer_failed_before_claim"))
+            self.assertEqual(list(claims.iterdir()), [])
 
 
 class GoLiveEngineExtrasTests(GoLiveTestCase):
@@ -3300,11 +3395,9 @@ class GoLiveEngineExtrasTests(GoLiveTestCase):
             sync.parse_config(example)
         self.assertEqual(caught.exception.code, "sync_config_cutover_invalid")
         example["shopify_cutover_utc"] = dl.ts(CUTOVER)
-        with self.assertRaises(dl.DirectLocalError) as caught:
-            sync.parse_config(example)
-        self.assertEqual(caught.exception.code, "sync_config_ac2_refused_user_ids_invalid")
-        example["ac2_refused_user_ids"] = [FAKE_OWNER_USER]
         config = sync.parse_config(example)
+        # Owner 30 Oct 2026 ("Use my login"): the example states that decision.
+        self.assertEqual((config.ac2_login_mode, config.ac2_refused_user_ids), ("owner_shared", ()))
         self.assertEqual((config.autocount_book, config.ac2_create_member_type, config.ac2_credential_target), (PROD_BOOK, "Default", "XB-AC2-MemberSync"))
         self.assertFalse(config.ac2_create_enabled or config.shopify_create_enabled or config.initial_link_enabled or config.ac2_create_without_phone)
         self.assertIsNone(config.changelog_xml_column)
