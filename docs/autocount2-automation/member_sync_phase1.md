@@ -411,7 +411,7 @@ Unknown keys, at the top level or nested, are refused.
 | `birthday_month_metafield` | `custom.birthday_month`, `number_integer` | Owner: placeholder until Shopify's developer confirms it |
 | `ac2_member_no_metafield` | `custom.ac2_member_no`, `single_line_text_field` | Sent on every create from AC2 (Owner round 2, Q2) |
 | `shopify_create_tags` | `["ac2-member"]` | Owner-confirmed; `member-mg` is refused (it would loop) |
-| `ac2_credential_target` | `null` | Credential Manager target holding the AutoCount account the sync logs in with (example `XB-AC2-MemberSync`); `null` keeps the attended owner-console path (test book only). Go-live V9: on the live book it must be `XB-AC2-MemberSync`, holding the sync's own AutoCount user |
+| `ac2_credential_target` | `null` | Credential Manager target holding the AutoCount account the sync logs in with; `null` keeps the attended owner-console path (test book only). Go-live V9: on the live book it must be `XB-AC2-MemberSync`, holding the sync's own AutoCount user. G2 #281 LATER-3: the test book uses its own target (example `XB-AC2-MemberSync-Test`) and refuses `XB-AC2-MemberSync` in any case (`sync_config_ac2_credential_target_live_only`), so the live sync user is never used on the test book |
 | `ac2_refused_user_ids` | `[]` | Go-live V9: AutoCount user IDs the sync must never log in as (at least the Owner's own account), up to 10, compared case-insensitively before any login (`ac2_credential_user_refused`). Required on the live book. Kept only in the private config on the VM |
 | `ac2_create_without_phone` | `null` | Go-live R8 (Owner Q2 = A): `null` means the book's default: `true` on the test book (phase 1: a no-phone sign-up gets `GetNextMemberNo`), `false` on the live book (skipped with the alert `no_phone_sign_up_needs_staff`). `true` with the live book is refused |
 | `changelog_xml_column` | `null` | Owner Q4: off. AC2 -> Shopify then reads no ChangeLog and makes no links. Set to `"Content"` (VM fact r5-1) at UAT, deliberately, after the name rule is confirmed; Shopify creates still need `shopify_create_enabled` |
@@ -649,11 +649,27 @@ Each step is a later, Owner-approved VM step.
    the repository or the config:
 
    ```bat
+   rem Test book (UAT) config:
+   cmdkey /generic:XB-AC2-MemberSync-Test /user:<the test-book AutoCount user ID> /pass
+   rem Live config only (go-live S1):
    cmdkey /generic:XB-AC2-MemberSync /user:<the sync's own AutoCount user ID> /pass
    ```
 
    `cmdkey` prompts for the password, so it is not in the command history.
-3. Set `ac2_credential_target` to `XB-AC2-MemberSync` and check it:
+   The two targets are separate (G2 #281 LATER-3): a test-book config that
+   names `XB-AC2-MemberSync` (any case) is refused with
+   `sync_config_ac2_credential_target_live_only`, so the live sync user is
+   never used on the test book.
+
+   Migration for an existing UAT config (Owner, once, before S0b): the UAT
+   config still names `XB-AC2-MemberSync`. Store the same test-book login
+   again under `XB-AC2-MemberSync-Test` (first `cmdkey` line above), set the
+   UAT config's `ac2_credential_target` to `XB-AC2-MemberSync-Test`, and run
+   `check-credential` on it (step 3). The old entry is then read by nothing
+   until S1, whose `cmdkey /generic:XB-AC2-MemberSync` replaces it with the
+   sync's own user.
+3. Set `ac2_credential_target` (test book `XB-AC2-MemberSync-Test`, live
+   book `XB-AC2-MemberSync`) and check it:
 
    ```powershell
    python directlocal\xb_member_sync.py check-credential --config <config>
@@ -858,7 +874,7 @@ the OK.
 
 | Layer | Live book `AED_XBOUNDARIES` | Still refused |
 |---|---|---|
-| Python config (`parse_config`) | Exact name only; `ac2_credential_target` must be `XB-AC2-MemberSync`; `ac2_refused_user_ids` must list at least the Owner's AutoCount user ID | Any other name or lookalike (`autocount_book_not_authorised`); `ac2_create_without_phone` `true` |
+| Python config (`parse_config`) | Exact name only; `ac2_credential_target` must be `XB-AC2-MemberSync`; `ac2_refused_user_ids` must list at least the Owner's AutoCount user ID | Any other name or lookalike (`autocount_book_not_authorised`); `ac2_create_without_phone` `true`; `XB-AC2-MemberSync` in a test-book config (`sync_config_ac2_credential_target_live_only`) |
 | Ledger | Schema v3, a fresh ledger in its own state root (example `C:\XB\xb155-member-sync-live`) | A test ledger with the live config and the reverse (`sync_ledger_binding_mismatch`, also for `status` and `digest`) |
 | Engine | Same rules as the test book, plus: a sign-up with no usable phone is never created (R8) | `GetNextMemberNo` (`member_no_generator_not_authorised`) |
 | PowerShell book guard | `sync-lookup`, `sync-changelog`, and `write-once` with payload profile `sync_p1`. The operation is checked before stdin; the profile once the payload is read, before any session, login or claim | Every other operation, `next-member-no` included, any other profile and any caller without an operation (`production_book_not_authorised`) |
@@ -879,15 +895,24 @@ and `tests/test_member_sync_bridge_ps.py`.
 | Step | What | Owner OK | Pass bar | Off switch / rollback |
 |---|---|---|---|---|
 | S0 | This PR: G2 review, Owner merge | OK-0 (merge) | G2 PASS; CI green on the exact head | Revert the PR (nothing runs on merge) |
-| S0b | Test-book smoke at the merged SHA (inside the existing UAT gate): copy the UAT ledger first, then `check-config`, one `initial-link` dry run, one `run --direction shopify_to_ac2` | none (test book, no writes) | The v2 UAT ledger opens as v3 with no other change; no new refusal code; 0 writes either side | Restore the ledger copy |
-| S1+S2 | Live read-only check: `prepare-state-root` for the new root, the live config (all switches off, cutover = the minute S2 starts), `check-config`, `check-credential`, `init`, initial-link dry runs until `complete: true`, then one `run --direction shopify_to_ac2` | OK-1 "LIVE READ-ONLY" | Book `AED_XBOUNDARIES`; credential masked and not the Owner's; no `book_*`, `vendor_query_*`, `outbound_*`, `user_script_present` refusal; counts recorded (would link, no phone, no member, conflicts, `initial_link_cursor_stuck` 0); the run returns only `initial_link_not_complete`; 0 writes | Nothing live to undo; the live ledger may be deleted (no links yet) |
+| S0b | Test-book smoke at the merged SHA (inside the existing UAT gate): first the credential migration (Owner re-stores the test-book login under `XB-AC2-MemberSync-Test` and sets it in the UAT config, "AutoCount login and credential" above), copy the UAT ledger, then `check-config`, `check-credential`, one `initial-link` dry run, one `run --direction shopify_to_ac2` | none (test book, no writes) | The v2 UAT ledger opens as v3 with no other change; no new refusal code (a UAT config still naming `XB-AC2-MemberSync` gets `sync_config_ac2_credential_target_live_only`: do the migration, then repeat); 0 writes either side | Restore the ledger copy |
+| S1+S2 | Live read-only check: `prepare-state-root` for the new root, the live config (all switches off, cutover = the minute S2 starts), `check-config`, `check-credential`, `init`, initial-link dry runs until `complete: true`, then one `run --direction shopify_to_ac2` | OK-1 "LIVE READ-ONLY" | Book `AED_XBOUNDARIES`; credential masked and not the Owner's; no `book_*`, `vendor_query_*`, `outbound_*`, `user_script_present` refusal; counts recorded (would link, no phone, no member, conflicts, `initial_link_cursor_stuck` 0); the run returns only `initial_link_not_complete`; 0 writes; after the first initial-link dry run ends, the sync user no longer appears in AutoCount's logged-in users list (licence released when the bridge child exits; read-only check, see "AutoCount sign-in and licence") | Nothing live to undo; the live ledger may be deleted (no links yet) |
 | S3 | `initial_link_enabled` true, `initial-link --apply` until complete, back to false | OK-2 "INITIAL LINK" (may be merged with OK-3, Q8) | `initial_link_linked` = the last dry run's would-link; one linked member unchanged in AutoCount | Before S5 only: archive the live ledger and redo S1-S3 (no external effect). After S5, never delete the live ledger |
-| S4 | Shadow schedule: `changelog_xml_column` `"Content"`, installer `-DryRun` output reviewed, one manual `run --direction both` as the task account, then `-Register` | OK-3 "SHADOW SCHEDULE" | 3 scheduled runs with result 0 or 3 and only expected alerts (`waiting_for_staff` counts, `sign_up_past_cutoff_create_disabled`, `no_phone_sign_up_needs_staff`, `memberno_*`, `ac2_pending_would_create_backlog`); 0 writes; `digest` readable; then at least 2 days in shadow | Disable `\XB\XB-MemberSync` in Task Scheduler |
+| S4 | Shadow schedule: `changelog_xml_column` `"Content"`, installer dry run (no `-Register`) output reviewed, one manual `run --direction both` as the task account, then `-Register` | OK-3 "SHADOW SCHEDULE" | 3 scheduled runs with result 0 or 3 and only expected alerts (`waiting_for_staff` counts, `sign_up_past_cutoff_create_disabled`, `no_phone_sign_up_needs_staff`, `memberno_*`, `ac2_pending_would_create_backlog`); 0 writes; `digest` readable and its `runs.duration_seconds_max` well under 600 s (above about 300 s: lower `max_pending_rechecks_per_run` first, "Schedule" below); then at least 2 days in shadow | Disable `\XB\XB-MemberSync` in Task Scheduler |
 | S5 | `max_writes_per_run` 1 and `ac2_create_enabled` true before a 06:00 run; check the first create in AutoCount and at one till; then `max_writes_per_run` 5 | OK-4 "AC2 CREATES" (never merged) | First create correct (MemberNo, type `Default`, name, mobile, DOB, RegisterDate, no ExpiryDate) and seen at a till; no `uncertain` write; `created_after_wait` raised; no duplicate next run | `ac2_create_enabled` false (next run). A wrong record is fixed or deleted by the Owner in AutoCount; the sync has no update or delete |
 | S6 | In one sitting: Owner adds `write_customers`; the Q3/Q9 probe through the TEST book (one fake member, real `customerCreate`, deleted straight after); production `shopify_create_enabled` true | OK-5 "SHOPIFY CREATES" (never merged) | Probe customer accepted with first name only; a second customer with the same phone refused by Shopify; first production create checked in admin | `shopify_create_enabled` false AND remove `write_customers` (with only one of them every run refuses on scope, `shopify_token_scope_not_expected`, which is safe but stops the sync) |
-| S7 | Hypercare, 14 days: `digest --hours 24` and `status` daily, masked counts to the Controller | none (read-only) | No action-needing alert left open | Disable the task after two non-0/3 results in a row |
+| S7 | Hypercare, 14 days: `digest --hours 24` and `status` daily, masked counts and `runs.duration_seconds_max` to the Controller | none (read-only) | No action-needing alert left open; `duration_seconds_max` stays under about 300 s (else lower `max_pending_rechecks_per_run`) | Disable the task after two non-0/3 results in a row |
 
 S5 and S6 must stay separate OKs, and never merge with OK-0.
+
+Before S6 (the Q9 probe login, G2 #281 LATER-3): the probe runs with the
+test-book config, which signs in with its own target
+`XB-AC2-MemberSync-Test` (the test-book login), never the live sync user.
+Before the S6 sitting, run `check-credential` on that test config: it must
+show the test-book user's last 3 characters, and `check-config` must not
+return `sync_config_ac2_credential_target_live_only`. Otherwise do the
+credential migration first, so the probe does not fail
+(`autocount_login_rejected`) inside the one-sitting window.
 
 ### Schedule: interval and the safe minimum
 
@@ -898,17 +923,43 @@ S5 and S6 must stay separate OKs, and never merge with OK-0.
   process with its own AutoCount login (one lookup, one ChangeLog read, one
   write each). A run makes them one after another: about 2 plus one per
   pending sign-up re-checked plus one or two per pending AC2 member (at most
-  20 per run) plus up to 20 for the duplicate watch. How long one login
-  takes on the VM is not known yet; S4 measures it (`digest` prints the
-  longest and median run time).
+  20 per run) plus up to 20 for the duplicate watch. Worst case (G2 #281
+  LATER-2) about 160 children in one run: up to 100 pending sign-up
+  re-checks (`max_pending_rechecks_per_run` 100), 20 new sign-ups, 20
+  duplicate-watch lookups, 1-2 ChangeLog reads, 1 batch lookup and up to 20
+  more lookups on the AC2 side. The re-check backlog grows during shadow,
+  because past-cutoff sign-ups stay PENDING while AC2 creates are off. How
+  long one login takes on the VM is not known yet; S4 measures it (`digest`
+  prints `runs.duration_seconds_max` and `duration_seconds_median`).
+- Run-time check (S4, then daily in S7): compare the digest's
+  `duration_seconds_max` with the 600 s execution limit. If it passes about
+  300 s, lower `max_pending_rechecks_per_run` (config edit, next run). A
+  longer interval does not help: it does not shorten a run, only spaces the
+  runs out, and a run that reaches the limit is still stopped part-way.
+- At the limit Task Scheduler stops the run part-way. That is safe (the OS
+  releases the ledger lock; an open INTENT becomes UNCERTAIN and holds its
+  customer; nothing is re-sent), but the run's remaining work waits for
+  the next run.
 - The task's execution limit is 10 minutes (`PT10M`). With an interval of at
   least 10 minutes a new start never meets a run that is still inside its
   limit, so `IgnoreNew` only ever skips a start behind a hung run.
-- AutoCount licences (VM fact V9: 5 concurrent): the sync holds at most one,
-  only while one bridge child runs (children never overlap; `IgnoreNew` and
-  the ledger lock stop a second runner). Assumption to confirm at S1: the
-  licence is released when the child process exits (check the AutoCount
-  logged-in users screen after a run).
+- AutoCount licences (VM fact V9: 5 concurrent): the sync holds one, only
+  while one bridge child runs. Within a run the children run one after
+  another, and `IgnoreNew` and the ledger lock stop a second runner. One
+  exception (G2 #281 LATER-2): when Task Scheduler hard-stops a run at the
+  limit, a write-once child it started may be left running on its own (at
+  most 120 s: its own deadline watchdog stops it), so it can briefly
+  overlap the next run and hold a second licence for that time.
+- Licence release (carried from G1/G2 #281; confirm at S1, read-only): when
+  the first initial-link dry run (the first command that logs in) has
+  ended, open AutoCount's logged-in users list (as the Owner, on the VM)
+  and check the sync user is no longer listed, and that no `powershell.exe`
+  bridge child is left in Task Manager. If it is still listed after the
+  child exits, stop and report before any further step: every run would
+  then hold a licence until AutoCount times the session out.
+- Run-time measurement before any interval under 15 (carried from G1/G2
+  #281): S4's `digest` gives the first `duration_seconds_max`; the rule
+  below needs the S7 digests on 3 days in a row.
 - ChangeLog volume (V5): about 272,000 rows in 30 days, but the sync reads
   only Member inserts after its ID watermark (3-8 new members a day, median
   3), at most 200 per run: the volume is no limit at any interval.
@@ -942,8 +993,10 @@ code change (the execution limit and this floor) and its own review.
   tries again; a run never retries a login. Do not run attended commands
   with the same AutoCount user while the task is running: disable the task
   first.
-- Licence use: one of the five, for the length of one bridge child, never
-  two at once (above).
+- Licence use: one of the five, for the length of one bridge child. Not two
+  at once, except briefly after a run is hard-stopped at the execution
+  limit, when an orphan write-once child (at most 120 s) can overlap the
+  next run (above).
 
 ### Scheduled task account (VM fact V8, design T1)
 
@@ -960,7 +1013,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_member_sync_
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_member_sync_task.ps1 -UserId "<PC>\<account>" -ConfigPath "<live config>" -PythonExe "<full path to python.exe>" -Register
 ```
 
-The dry run prints the task XML that `-Register` registers: folder `\XB\`,
+The dry run prints the task XML that `-Register` registers: folder `\XB\`
+(pinned: `-TaskPath` accepts only exactly `\XB\`, G2 #281 LATER-4),
 name `XB-MemberSync`, one trigger repeating every `-IntervalMinutes` with no
 end, `IgnoreNew`, `PT10M`, `LeastPrivilege`, logon `Password`, action
 `python <repo>\directlocal\xb_member_sync.py run --config <live config> --direction both`.
@@ -975,7 +1029,9 @@ It never replaces an existing task.
 member by hand; it stays unlinked in phase 1), `member_type_unknown`
 (the configured type is missing in the book; every create is refused until
 fixed), `ac2_pending_would_create_backlog` (expected in shadow; after S6 it
-means the backlog is draining), and any refusal (exit 2), for example
+means the backlog is draining: once `shopify_create_enabled` is true the
+whole AC2 queue is read oldest first by ChangeLog ID, so a new walk-in waits
+behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for example
 `ac2_credential_user_refused`. A Telegram push for these is a later lane
 (Q6); in this round they reach the Owner through the daily digest.
 

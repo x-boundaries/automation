@@ -100,6 +100,9 @@ AUTHORISED_BOOKS = frozenset({TEST_BOOK, LIVE_BOOK})
 # Go-live V9 (Owner): on the live book the sync logs in only as its own
 # AutoCount user, read from this Credential Manager target.
 LIVE_CREDENTIAL_TARGET = "XB-AC2-MemberSync"
+# G2 #281 LATER-3: the test book has its own target, so the live sync user is
+# never used against the test book (and the S6 probe never needs it there).
+TEST_CREDENTIAL_TARGET = "XB-AC2-MemberSync-Test"
 AC2_USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 MAX_WRITES_PER_RUN_LIMIT = 5
 MEMBER_NO_WIDTH = 20  # AutoCount Member.MemberNo nvarchar(20)
@@ -351,6 +354,11 @@ def parse_config(value: Any) -> SyncConfig:
     if live and target != LIVE_CREDENTIAL_TARGET:
         # Go-live V9: never the attended owner-console credential path.
         raise dl.DirectLocalError("sync_config_ac2_credential_target_live_required")
+    if not live and target is not None and target.strip().casefold() == LIVE_CREDENTIAL_TARGET.casefold():
+        # G2 #281 LATER-3: Credential Manager targets ignore case, so any
+        # spelling of the live target is refused for the test book. Migration:
+        # store the test credential under TEST_CREDENTIAL_TARGET (runbook).
+        raise dl.DirectLocalError("sync_config_ac2_credential_target_live_only")
     if live and not refused_users:
         raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_live_required")
     return SyncConfig(
@@ -1632,10 +1640,14 @@ class SyncEngine:
         # Go-live L10 (G2 r10): a row waiting only for shopify_create_enabled
         # (code would_create) must not hold a batch slot while creates are
         # off, so every other PENDING row is read first, oldest first; the
-        # would_create rows follow oldest first (the create order once on).
-        pending = self.ledger.conn.execute(
-            "SELECT * FROM ac2_pending WHERE state = 'PENDING' ORDER BY (code IS 'would_create'), changelog_id LIMIT ?", (PENDING_LOOKUP_BATCH,),
-        ).fetchall()
+        # would_create rows follow oldest first. G2 #281 LATER-1: once creates
+        # are on, the whole queue is read oldest first (plain changelog_id),
+        # so a new walk-in never jumps the backlog.
+        if self.config.shopify_create_enabled:
+            order_sql = "SELECT * FROM ac2_pending WHERE state = 'PENDING' ORDER BY changelog_id LIMIT ?"
+        else:
+            order_sql = "SELECT * FROM ac2_pending WHERE state = 'PENDING' ORDER BY (code IS 'would_create'), changelog_id LIMIT ?"
+        pending = self.ledger.conn.execute(order_sql, (PENDING_LOOKUP_BATCH,)).fetchall()
         if not pending:
             return
         if len(pending) == PENDING_LOOKUP_BATCH and all(row["code"] == "would_create" for row in pending):
