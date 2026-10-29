@@ -31,6 +31,11 @@ Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md)
   host names and row data are never logged or written to a manifest, except that a successful
   run's manifest lists at most 20 large-balance rows (ItemCode, Location, BalQty), the same
   rows its CSV already holds.
+* Error alerts are off by default. When on, a failed or flagged run POSTs at most one sanitized
+  event (closed keys and values: run id, hour, failure class, condition names, statuses and two
+  counts; never an item, quantity, location, path or message) to an n8n webhook, which sends it
+  to Telegram. The shared secret comes from an environment variable or Credential Manager at
+  runtime. An alert failure is recorded as alert_status and never changes the run's result.
 
 pyodbc is imported only inside SqlServerSource so the tests run without it.
 """
@@ -40,6 +45,7 @@ import copy
 import csv
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -48,6 +54,9 @@ import shutil
 import stat
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -202,6 +211,80 @@ DELIVERY_COPY_FAILED = "copy_failed"
 DELIVERY_SKIPPED = "skipped_failed_run"
 # Written into the run manifest before delivery; the result is in last_run_status.json.
 DELIVERY_PENDING = "pending_see_last_run_status"
+
+# Error alerts (Telegram through an n8n webhook). Errors only: no heartbeat, no success message.
+ALERT_STATE_NAME = "alert_state.json"
+ALERT_STATE_SCHEMA = "xb.ac2.stock_alert_state.v1"
+ALERT_SCHEMA = "xb.ac2.stock_alert.v1"
+ALERT_EVENT = "ac2_stock_alert"
+ALERT_USER_AGENT = "xb-ac2-stock-alert/1"
+# The only keys a payload may carry, in this order. No item, quantity, location, path or message.
+ALERT_PAYLOAD_KEYS = (
+    "schema",
+    "event",
+    "run_id",
+    "run_hour_local",
+    "alert_kind",
+    "status",
+    "failure_class",
+    "conditions",
+    "daily_close_status",
+    "delivery_status",
+    "feed_status",
+    "item_index_status",
+    "large_balance_count",
+    "late_change_day_count",
+)
+ALERT_CONDITIONS = (
+    "run_failed",
+    "daily_close_failed",
+    "delivery_failed",
+    "feed_failed",
+    "item_index_failed",
+    "large_balance",
+    "late_change",
+)
+ALERT_KINDS = ("new", "repeat")
+ALERT_FAILURE_CLASSES = (
+    FAILURE_CONFIG,
+    FAILURE_TIMEZONE,
+    FAILURE_ALREADY_RUNNING,
+    FAILURE_STALE_LOCK,
+    FAILURE_IDENTITY,
+    FAILURE_CREDENTIAL,
+    FAILURE_LOCK_TIMEOUT,
+    FAILURE_UNSTABLE,
+    FAILURE_UOM,
+    FAILURE_SYNC,
+    FAILURE_SOURCE,
+    FAILURE_WRITE,
+    FAILURE_LATEST,
+    FAILURE_INTERNAL,
+    FAILURE_LEDGER_MISMATCH,
+)
+ALERT_CLOSE_STATUSES = (CLOSE_NOT_DUE, CLOSE_PUBLISHED, CLOSE_FAILED, CLOSE_SKIPPED)
+ALERT_DELIVERY_STATUSES = (
+    DELIVERY_NOT_CONFIGURED,
+    DELIVERY_HANDED,
+    DELIVERY_VERIFY_FAILED,
+    DELIVERY_COPY_FAILED,
+    DELIVERY_SKIPPED,
+)
+ALERT_PUBLISH_STATUSES = ("published", "failed")
+ALERT_COUNT_MAX = 1000000000
+# alert_status in last_run_status.json.
+ALERT_DISABLED = "disabled"
+ALERT_NONE = "no_alert"
+ALERT_SUPPRESSED = "suppressed"
+ALERT_SENT = "sent"
+ALERT_SEND_FAILED = "send_failed"
+ALERT_SECRET_UNAVAILABLE = "secret_unavailable"
+ALERT_ERROR = "error"
+ALERT_SKIPPED_CONFIG = "skipped_config_invalid"
+ALERT_ENV_VAR_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+ALERT_HEADER_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9-]{0,63}\Z")
+# Headers the job sets itself; the shared-secret header may not be one of them.
+ALERT_RESERVED_HEADERS = ("content-type", "content-length", "host", "user-agent", "connection", "transfer-encoding")
 
 # ---------------------------------------------------------------------------------------------
 # SQL. Fixed strings: parameters only, and the one allowlisted SyncRegistration column is the
@@ -394,9 +477,22 @@ DEFAULT_SETTINGS = {
         "list_cap": 200,
         "movers_top": 20,
     },
+    # Off by default. The shared secret is never a setting: only the name of the environment
+    # variable or of the Windows Credential Manager target that holds it.
+    "alert": {
+        "webhook_enabled": False,
+        "webhook_url": None,
+        "auth_header_name": "X-XB-Alert-Token",
+        "secret_env_var": None,
+        "secret_credential_target": None,
+        "timeout_seconds": 10,
+        "repeat_hours": 24,
+    },
 }
 # Sections whose keys are a closed set. location_labels is an open code -> label map.
-CLOSED_SECTIONS = ("schedule", "source", "identity", "read", "rows", "output", "daily_close", "retention", "feed")
+CLOSED_SECTIONS = (
+    "schedule", "source", "identity", "read", "rows", "output", "daily_close", "retention", "feed", "alert",
+)
 
 
 def load_settings_file(path):
@@ -539,7 +635,56 @@ def validate_settings(raw):
     _require_int(feed["low_stock_threshold"], "feed.low_stock_threshold", 0, 1000000)
     _require_int(feed["list_cap"], "feed.list_cap", 1, 5000)
     _require_int(feed["movers_top"], "feed.movers_top", 1, 200)
+    _validate_alert_settings(settings["alert"], schedule["logon_type"])
     return settings
+
+
+def _validate_alert_settings(alert, logon_type):
+    """The alert block. A value that is set is always checked; enabling also requires the URL and
+    exactly one secret source. Messages name the setting only, never its value."""
+    _require_bool(alert["webhook_enabled"], "alert.webhook_enabled")
+    _require_int(alert["timeout_seconds"], "alert.timeout_seconds", 1, 30)
+    _require_int(alert["repeat_hours"], "alert.repeat_hours", 1, 168)
+    header = alert["auth_header_name"]
+    if not isinstance(header, str) or not ALERT_HEADER_RE.match(header) or header.lower() in ALERT_RESERVED_HEADERS:
+        raise ConfigError("alert.auth_header_name must be a plain header name")
+    url = alert["webhook_url"]
+    if url is not None:
+        if not isinstance(url, str) or len(url) > 2048:
+            raise ConfigError("alert.webhook_url must be an https URL")
+        try:
+            parts = urllib.parse.urlsplit(url)
+            parts.port  # noqa: B018 - raises ValueError for a bad port.
+        except ValueError as exc:
+            raise ConfigError("alert.webhook_url must be an https URL") from exc
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or any(ch.isspace() for ch in url)
+        ):
+            # No credentials, query or fragment in the URL: the secret travels only in the header.
+            raise ConfigError("alert.webhook_url must be an https URL without credentials, query or fragment")
+    env_var = alert["secret_env_var"]
+    if env_var is not None and (not isinstance(env_var, str) or not ALERT_ENV_VAR_RE.match(env_var)):
+        raise ConfigError("alert.secret_env_var must be an environment variable name")
+    target = alert["secret_credential_target"]
+    if target is not None:
+        if not isinstance(target, str) or not target.strip() or len(target) > 256:
+            raise ConfigError("alert.secret_credential_target must be a credential target name")
+        if logon_type != "Password":
+            # Same rule as the SQL password: an S4U task cannot read Credential Manager secrets.
+            raise ConfigError("alert.secret_credential_target needs schedule.logon_type Password; use alert.secret_env_var")
+    if env_var is not None and target is not None:
+        raise ConfigError("alert: set only one of secret_env_var and secret_credential_target")
+    if alert["webhook_enabled"]:
+        if url is None:
+            raise ConfigError("alert.webhook_url is required when alert.webhook_enabled is true")
+        if env_var is None and target is None:
+            raise ConfigError("alert: secret_env_var or secret_credential_target is required when enabled")
 
 
 def load_zone(name):
@@ -2417,10 +2562,13 @@ def run_folder_name(started, run_id):
     return "ac2_stockbal_%s_%s" % (started.strftime("%Y%m%dT%H%M%S%z"), run_id[:8])
 
 
-def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep, force_close=False):
+def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep, force_close=False,
+               alert_transport=None, credential_reader=None):
     """Run one hourly export. Always returns the manifest dict (success or failed).
 
     force_close (--backfill) writes every daily file from daily_close.backfill_start again.
+    alert_transport and credential_reader replace the real POST and Credential Manager read in
+    tests only.
     """
     tz = load_zone(settings["timezone"])
     run_id = uuid.uuid4().hex
@@ -2711,6 +2859,11 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "item_index_status": (manifest["item_index"] or {}).get("status"),
         "next_run_local": next_run_local(started, settings["schedule"]["run_minute"]),
     }
+    # Last step before the status file: the alert reads the final status, and its own outcome is
+    # recorded beside it. It never changes the status, the exit code or any other file.
+    status["alert_status"] = send_run_alert(
+        settings, archive_root, status, started, run_id, environ, alert_transport, credential_reader
+    )
     manifest["_last_run_status"] = status
     for root in (archive_root, delivery_root):
         if root is None:
@@ -2790,6 +2943,219 @@ def publish_latest(root, run_dir, manifest, run_id):
     latest = {key: value for key, value in manifest.items() if not key.startswith("_")}
     root = Path(root)
     publish_verified_set([(root / LATEST_CSV_NAME, data), (root / LATEST_MANIFEST_NAME, json_bytes(latest))], run_id[:8])
+
+
+# ---------------------------------------------------------------------------------------------
+# Error alerts (Telegram through an n8n webhook). Errors only; never changes a run's outcome.
+# ---------------------------------------------------------------------------------------------
+
+
+def alert_conditions(status):
+    """The alert condition keys a last_run_status dict raises. Pure.
+
+    A failed run raises only run_failed, keyed by its failure class so a different failure is a
+    new condition. A successful snapshot can still raise the other conditions.
+    """
+    keys = []
+    if status.get("status") != "success":
+        failure_class = status.get("failure_class")
+        keys.append("run_failed:%s" % (failure_class if failure_class in ALERT_FAILURE_CLASSES else "unknown"))
+        return keys
+    if status.get("daily_close_status") == CLOSE_FAILED:
+        keys.append("daily_close_failed")
+    if status.get("delivery_status") in (DELIVERY_VERIFY_FAILED, DELIVERY_COPY_FAILED):
+        keys.append("delivery_failed")
+    if status.get("feed_status") == "failed":
+        keys.append("feed_failed")
+    if status.get("item_index_status") == "failed":
+        keys.append("item_index_failed")
+    if _alert_count(status.get("large_balance_count")):
+        keys.append("large_balance")
+    if _alert_count(status.get("late_change_day_count")):
+        keys.append("late_change")
+    return keys
+
+
+def plan_alert(alerted, active, now, repeat_hours):
+    """De-duplication rule. Pure. Returns (alert_kind or None, state to keep if nothing is sent).
+
+    alerted maps condition key -> ISO time it was last sent. Send when a condition is new (not
+    in alerted) or was last sent repeat_hours or more ago; otherwise suppress. Conditions a run
+    saw cleared are dropped, so a recurrence counts as new. A failed run cannot see the
+    success-side conditions, so it keeps them with their last-sent times and drops only the
+    other run_failed keys.
+    """
+    failed_run = any(key.startswith("run_failed:") for key in active)
+    kept = {
+        key: when for key, when in alerted.items()
+        if key in active or (failed_run and not key.startswith("run_failed:"))
+    }
+    if not active:
+        return None, kept
+    if any(key not in kept for key in active):
+        return "new", kept
+    for key in active:
+        try:
+            last = datetime.fromisoformat(kept[key])
+            if last.tzinfo is None or last > now:
+                raise ValueError("naive or future time")
+        except (TypeError, ValueError):
+            # A damaged entry counts as never sent: one extra alert is safer than none. A time
+            # later than now (the clock ran ahead, then was corrected) is damaged too.
+            return "new", kept
+        if now - last >= timedelta(hours=repeat_hours):
+            return "repeat", kept
+    return None, kept
+
+
+def load_alert_state(archive_root):
+    """The alert de-dup state ({condition key: last sent time}); empty when missing or unreadable."""
+    try:
+        raw = json.loads(Path(archive_root, ALERT_STATE_NAME).read_text(encoding="utf-8"))
+        if raw.get("schema") != ALERT_STATE_SCHEMA or not isinstance(raw.get("alerted"), dict):
+            return {}
+        return {str(k): v for k, v in raw["alerted"].items() if isinstance(v, str)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_alert_state(archive_root, alerted, tag):
+    replace_atomic(
+        Path(archive_root) / ALERT_STATE_NAME,
+        json_bytes({"schema": ALERT_STATE_SCHEMA, "alerted": dict(sorted(alerted.items()))}),
+        tag,
+    )
+
+
+def _keep_alert_state(archive_root, kept, alerted, tag):
+    """Drop cleared conditions from the state when nothing was sent. A write error is ignored:
+    the stale entries only make a recurrence look like a repeat instead of new."""
+    if kept != alerted:
+        try:
+            save_alert_state(archive_root, kept, tag)
+        except OSError:
+            pass
+
+
+def _alert_count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= ALERT_COUNT_MAX else 0
+
+
+def _alert_enum(value, allowed):
+    return value if value in allowed else None
+
+
+def build_alert_payload(status, active, kind, started):
+    """The sanitized event. Closed keys and closed values only: no item code, quantity,
+    location, path, message or host, whatever the status dict holds."""
+    run_id = status.get("run_id")
+    failure_class = status.get("failure_class")
+    return {
+        "schema": ALERT_SCHEMA,
+        "event": ALERT_EVENT,
+        "run_id": run_id if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) else "unknown",
+        "run_hour_local": started.replace(minute=0, second=0, microsecond=0).isoformat(),
+        "alert_kind": kind if kind in ALERT_KINDS else "new",
+        "status": "success" if status.get("status") == "success" else "failed",
+        "failure_class": (
+            None if failure_class is None else (failure_class if failure_class in ALERT_FAILURE_CLASSES else "unknown")
+        ),
+        "conditions": sorted({key.split(":", 1)[0] for key in active} & set(ALERT_CONDITIONS)),
+        "daily_close_status": _alert_enum(status.get("daily_close_status"), ALERT_CLOSE_STATUSES),
+        "delivery_status": _alert_enum(status.get("delivery_status"), ALERT_DELIVERY_STATUSES),
+        "feed_status": _alert_enum(status.get("feed_status"), ALERT_PUBLISH_STATUSES),
+        "item_index_status": _alert_enum(status.get("item_index_status"), ALERT_PUBLISH_STATUSES),
+        "large_balance_count": _alert_count(status.get("large_balance_count")),
+        "late_change_day_count": _alert_count(status.get("late_change_day_count")),
+    }
+
+
+def read_alert_secret(alert, environ=None, credential_reader=None):
+    """The shared secret from the named environment variable or Credential Manager target.
+
+    Returns None when it cannot be read or is not a single printable line. Never logged.
+    """
+    try:
+        if alert["secret_env_var"]:
+            value = (os.environ if environ is None else environ).get(alert["secret_env_var"])
+        else:
+            value = (credential_reader or read_credential_password)(alert["secret_credential_target"])
+    except (CredentialUnavailableError, OSError):
+        return None
+    if not isinstance(value, str) or not value or len(value) > 4096 or not value.isprintable():
+        return None
+    return value
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401 - urllib hook
+        return None
+
+
+def post_alert(url, headers, body, timeout):
+    """POST once. Returns the HTTP status, or raises OSError or http.client.HTTPException.
+    No proxy, no redirect. The body is never read: the timeout is per socket operation, so a
+    slowly dripped body could otherwise hold the run past it."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
+    request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    try:
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return exc.code
+    with response:
+        return response.status
+
+
+def send_run_alert(settings, archive_root, status, started, run_id, environ=None, transport=None,
+                   credential_reader=None):
+    """Alert step of one run: one bounded POST at most. Returns the alert_status value.
+
+    Never raises: a lost alert is recorded and never changes the run's status, exit code or
+    files. A failed send leaves the de-dup state as it was, so the next hour tries again.
+    """
+    alert = settings["alert"]
+    if not alert["webhook_enabled"]:
+        return ALERT_DISABLED
+    try:
+        active = alert_conditions(status)
+        alerted = load_alert_state(archive_root)
+        kind, kept = plan_alert(alerted, active, started, alert["repeat_hours"])
+        # The secret is checked on every run, not only when an alert is due, so a clean
+        # scheduled run already shows whether the task can see it. Nothing is sent here.
+        secret = read_alert_secret(alert, environ, credential_reader)
+        if secret is None:
+            _keep_alert_state(archive_root, kept, alerted, run_id[:8])
+            return ALERT_SECRET_UNAVAILABLE
+        if kind is None:
+            _keep_alert_state(archive_root, kept, alerted, run_id[:8])
+            return ALERT_NONE if not active else ALERT_SUPPRESSED
+        payload = build_alert_payload(status, active, kind, started)
+        if tuple(payload) != ALERT_PAYLOAD_KEYS:
+            return ALERT_ERROR
+        body = json.dumps(payload, ensure_ascii=True).encode("ascii")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": ALERT_USER_AGENT,
+            alert["auth_header_name"]: secret,
+        }
+        try:
+            code = (transport or post_alert)(alert["webhook_url"], headers, body, alert["timeout_seconds"])
+        except (OSError, ValueError, http.client.HTTPException):
+            code = None
+        if not isinstance(code, int) or not 200 <= code < 300:
+            _keep_alert_state(archive_root, kept, alerted, run_id[:8])
+            return ALERT_SEND_FAILED
+        sent_at = started.isoformat()
+        sent_state = dict(kept)
+        sent_state.update((key, sent_at) for key in active)
+        try:
+            save_alert_state(archive_root, sent_state, run_id[:8])
+        except OSError:
+            pass  # The alert went out; without the state the next hour may repeat it once.
+        return ALERT_SENT
+    except Exception:  # noqa: BLE001 - an alert bug must never change the run's result.
+        return ALERT_ERROR
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2876,6 +3242,8 @@ def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=No
     status = {k: manifest[k] for k in ("job", "run_id", "status", "failure_class", "as_of_local", "started_at", "finished_at", "hourly_folder", "note")}
     status["delivery_status"] = DELIVERY_SKIPPED
     status["large_balance_count"] = None
+    # The alert settings cannot be trusted when the settings are invalid: no alert is attempted.
+    status["alert_status"] = ALERT_SKIPPED_CONFIG
     try:
         run_dir = Path(root) / relative
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -2896,7 +3264,7 @@ def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=No
     return manifest
 
 
-def main(argv=None, source=None, environ=None, clock=None):
+def main(argv=None, source=None, environ=None, clock=None, alert_transport=None, credential_reader=None):
     parser = argparse.ArgumentParser(description="Hourly read-only AC2 stock balance export with a daily close (#245).")
     parser.add_argument("--config", required=True, help="Local settings JSON (config/*.local.json, never committed).")
     mode = parser.add_mutually_exclusive_group()
@@ -2954,7 +3322,10 @@ def main(argv=None, source=None, environ=None, clock=None):
         _print(result)
         return code
 
-    manifest = run_hourly(settings, source=source, environ=environ, clock=clock, force_close=args.backfill)
+    manifest = run_hourly(
+        settings, source=source, environ=environ, clock=clock, force_close=args.backfill,
+        alert_transport=alert_transport, credential_reader=credential_reader,
+    )
     status = manifest["_last_run_status"]
     _print(
         {
@@ -2969,6 +3340,7 @@ def main(argv=None, source=None, environ=None, clock=None):
             "published_close_day": status["published_close_day"],
             "feed_status": status["feed_status"],
             "item_index_status": status["item_index_status"],
+            "alert_status": status["alert_status"],
             "message": manifest["message"],
         }
     )
@@ -2980,6 +3352,7 @@ def main(argv=None, source=None, environ=None, clock=None):
         return EXIT_FAILED
     if status["item_index_status"] != "published":
         return EXIT_FAILED
+    # alert_status is deliberately not read: an alert outcome never changes the exit code.
     return EXIT_OK
 
 

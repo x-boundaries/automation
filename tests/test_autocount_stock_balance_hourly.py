@@ -10,6 +10,7 @@ import copy
 import csv
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -1946,7 +1948,9 @@ class InstallerPowerShell51Tests(TempDirTestCase):
         self.assertIn("Repo root: " + str(ROOT), out)
 
     def test_dry_run_password_pair_never_prompts(self):
-        # -NonInteractive makes Get-Credential fail, so exit 0 proves the dry run stops first.
+        # Windows PowerShell 5.1 does not make Get-Credential fail under -NonInteractive: it waits
+        # on the prompt. A regression past the dry run therefore shows as a timeout here, not as a
+        # quick failure; exit 0 within the timeout proves the dry run stops first (G2 N14).
         config = self.write_config(raw_settings(
             self.tmp,
             identity={"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
@@ -2839,6 +2843,654 @@ class RepoHygieneTests(unittest.TestCase):
 
         for name in ("SqlExecutionContextError", "resolve_expected_sql_context", "sanitize_error", "load_timezone"):
             self.assertTrue(hasattr(extract, name), name)
+
+
+
+# ---------------------------------------------------------------------------------------------
+# Error alerts (Telegram through an n8n webhook). Fake URL, fake secret, fake transport only.
+# ---------------------------------------------------------------------------------------------
+
+FAKE_ALERT_URL = "https://alerts.example.com/webhook/fake-alert-path"
+FAKE_SECRET_ENV = "XB_FAKE_ALERT_SECRET"
+FAKE_SECRET = "fake-shared-secret-0001"
+ALERT_ENV = dict(ENV, **{FAKE_SECRET_ENV: FAKE_SECRET})
+CANARY_ITEM = "CANARY-ITEM-0201"
+CANARY_LOCATION = "CANARY-LOC"
+
+
+def alert_block(**overrides):
+    value = {"webhook_enabled": True, "webhook_url": FAKE_ALERT_URL, "secret_env_var": FAKE_SECRET_ENV}
+    value.update(overrides)
+    return value
+
+
+class FakeTransport:
+    """Records every POST. codes: HTTP answers in order (default 200); error: raised instead."""
+
+    def __init__(self, codes=None, error=None):
+        self.calls = []
+        self.codes = list(codes or [])
+        self.error = error
+
+    def __call__(self, url, headers, body, timeout):
+        self.calls.append({"url": url, "headers": dict(headers), "raw": body, "body": json.loads(body), "timeout": timeout})
+        if self.error is not None:
+            raise self.error
+        return self.codes.pop(0) if self.codes else 200
+
+
+def clean_status(**overrides):
+    value = {
+        "job": hourly.JOB,
+        "run_id": "0123456789abcdef0123456789abcdef",
+        "status": "success",
+        "failure_class": None,
+        "daily_close_status": "not_due",
+        "delivery_status": "handed_to_drive_sync_folder",
+        "feed_status": "published",
+        "item_index_status": "published",
+        "large_balance_count": 0,
+        "late_change_day_count": None,
+    }
+    value.update(overrides)
+    return value
+
+
+def failed_status(failure_class="ledger_mismatch", **overrides):
+    value = clean_status(
+        status="failed", failure_class=failure_class, daily_close_status="skipped_failed_run",
+        delivery_status="skipped_failed_run", feed_status=None, item_index_status=None, large_balance_count=None,
+    )
+    value.update(overrides)
+    return value
+
+
+class AlertConfigTests(TempDirTestCase):
+    def assert_config_error(self, alert, fragment, **extra):
+        with self.assertRaises(hourly.ConfigError) as caught:
+            settings_for(self.tmp, alert=alert, **extra)
+        self.assertIn(fragment, str(caught.exception))
+        # A rejected value never appears in the message.
+        for value in alert.values():
+            if isinstance(value, str) and len(value) > 3:
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_off_by_default_with_bounded_defaults(self):
+        self.assertEqual(
+            settings_for(self.tmp)["alert"],
+            {
+                "webhook_enabled": False,
+                "webhook_url": None,
+                "auth_header_name": "X-XB-Alert-Token",
+                "secret_env_var": None,
+                "secret_credential_target": None,
+                "timeout_seconds": 10,
+                "repeat_hours": 24,
+            },
+        )
+
+    def test_example_settings_ship_alerts_off_without_a_secret(self):
+        example = json.loads((ROOT / "config" / "autocount_stock_balance_hourly.example.json").read_text(encoding="utf-8"))
+        alert = example["alert"]
+        self.assertIs(alert["webhook_enabled"], False)
+        self.assertTrue(alert["webhook_url"].startswith("https://n8n.example.com/webhook/"))
+        self.assertIsNone(alert["secret_credential_target"])
+        self.assertTrue(hourly.ALERT_ENV_VAR_RE.match(alert["secret_env_var"]))
+        self.assertEqual(set(alert), set(hourly.DEFAULT_SETTINGS["alert"]))
+
+    def test_enabled_needs_url_and_one_secret_source(self):
+        self.assertTrue(settings_for(self.tmp, alert=alert_block())["alert"]["webhook_enabled"])
+        self.assert_config_error(alert_block(webhook_url=None), "alert.webhook_url is required")
+        self.assert_config_error(alert_block(secret_env_var=None), "secret_env_var or secret_credential_target is required")
+
+    def test_rejected_values(self):
+        cases = [
+            ({"webhook_enabled": "yes"}, "alert.webhook_enabled"),
+            ({"webhook_url": "http://alerts.example.com/webhook/x"}, "alert.webhook_url"),
+            ({"webhook_url": "https://user:pw@alerts.example.com/webhook/x"}, "alert.webhook_url"),
+            ({"webhook_url": "https://alerts.example.com/webhook/x?token=abc"}, "alert.webhook_url"),
+            ({"webhook_url": "https://alerts.example.com/webhook/x#frag"}, "alert.webhook_url"),
+            ({"webhook_url": "https://alerts.example.com:99999/webhook/x"}, "alert.webhook_url"),
+            ({"webhook_url": "https:///webhook/x"}, "alert.webhook_url"),
+            ({"webhook_url": "https://alerts.example.com/web hook"}, "alert.webhook_url"),
+            ({"webhook_url": 42}, "alert.webhook_url"),
+            ({"secret_env_var": "1BAD"}, "alert.secret_env_var"),
+            ({"secret_env_var": "BAD-NAME"}, "alert.secret_env_var"),
+            ({"secret_env_var": ""}, "alert.secret_env_var"),
+            ({"auth_header_name": "Content-Type"}, "alert.auth_header_name"),
+            ({"auth_header_name": "X Bad"}, "alert.auth_header_name"),
+            ({"auth_header_name": None}, "alert.auth_header_name"),
+            ({"timeout_seconds": 0}, "alert.timeout_seconds"),
+            ({"timeout_seconds": 31}, "alert.timeout_seconds"),
+            ({"timeout_seconds": True}, "alert.timeout_seconds"),
+            ({"repeat_hours": 0}, "alert.repeat_hours"),
+            ({"repeat_hours": 169}, "alert.repeat_hours"),
+            ({"secret": "x"}, "unknown setting(s): alert.secret"),
+        ]
+        for override, fragment in cases:
+            with self.subTest(override=override):
+                self.assert_config_error(alert_block(**override), fragment)
+
+    def test_credential_target_only_with_a_password_logon(self):
+        # Pair (a) is S4U, which cannot read Credential Manager secrets: the env var is the way.
+        self.assert_config_error(
+            alert_block(secret_env_var=None, secret_credential_target="FAKE-ALERT-TARGET"),
+            "needs schedule.logon_type Password",
+        )
+        pair_b = {
+            "identity": {"auth_mode": "sql_login", "sql_login": FAKE_SQL_LOGIN, "credential_target": FAKE_CRED_TARGET},
+            "schedule": {"logon_type": "Password"},
+        }
+        settings = settings_for(self.tmp, alert=alert_block(secret_env_var=None, secret_credential_target="FAKE-ALERT-TARGET"), **pair_b)
+        self.assertEqual(settings["alert"]["secret_credential_target"], "FAKE-ALERT-TARGET")
+        self.assert_config_error(
+            alert_block(secret_credential_target="FAKE-ALERT-TARGET"), "set only one of", **pair_b
+        )
+
+
+class AlertRuleTests(unittest.TestCase):
+    def test_conditions_table(self):
+        cases = [
+            ("clean hour", clean_status(), []),
+            ("clean, no delivery configured", clean_status(delivery_status="not_configured"), []),
+            ("close published", clean_status(daily_close_status="published", late_change_day_count=0), []),
+            ("ledger mismatch", failed_status(), ["run_failed:ledger_mismatch"]),
+            ("source error", failed_status("source_error"), ["run_failed:source_error"]),
+            ("latest publish failed", failed_status("latest_publish_failed"), ["run_failed:latest_publish_failed"]),
+            ("unknown failure class", failed_status("made_up"), ["run_failed:unknown"]),
+            ("daily close failed", clean_status(daily_close_status="failed"), ["daily_close_failed"]),
+            ("delivery verify failed", clean_status(delivery_status="verify_failed"), ["delivery_failed"]),
+            ("delivery copy failed", clean_status(delivery_status="copy_failed", feed_status="failed", item_index_status="failed"),
+             ["delivery_failed", "feed_failed", "item_index_failed"]),
+            ("feed failed", clean_status(feed_status="failed"), ["feed_failed"]),
+            ("item index failed", clean_status(item_index_status="failed"), ["item_index_failed"]),
+            ("large balance", clean_status(large_balance_count=2), ["large_balance"]),
+            ("large balance not an int", clean_status(large_balance_count=True), []),
+            ("late change", clean_status(late_change_day_count=3), ["late_change"]),
+            ("all success-side conditions",
+             clean_status(daily_close_status="failed", delivery_status="copy_failed", feed_status="failed",
+                          item_index_status="failed", large_balance_count=1, late_change_day_count=1),
+             ["daily_close_failed", "delivery_failed", "feed_failed", "item_index_failed", "large_balance", "late_change"]),
+            # A failed run raises run_failed only, whatever else the dict says.
+            ("failed run with flags", failed_status(large_balance_count=5, daily_close_status="failed"),
+             ["run_failed:ledger_mismatch"]),
+        ]
+        for name, status, expected in cases:
+            with self.subTest(name):
+                self.assertEqual(hourly.alert_conditions(status), expected)
+
+    def test_dedup_rule_table(self):
+        now = FIXED_NOW
+        ago = lambda hours: (now - timedelta(hours=hours)).isoformat()  # noqa: E731
+        cases = [
+            ("nothing active", {}, [], (None, {})),
+            ("cleared conditions are dropped", {"large_balance": ago(1)}, [], (None, {})),
+            ("new condition", {}, ["large_balance"], ("new", {})),
+            ("same condition within the day", {"large_balance": ago(1)}, ["large_balance"], (None, {"large_balance": ago(1)})),
+            ("just under the repeat", {"large_balance": ago(23.99)}, ["large_balance"], (None, {"large_balance": ago(23.99)})),
+            ("daily repeat", {"large_balance": ago(24)}, ["large_balance"], ("repeat", {"large_balance": ago(24)})),
+            ("another condition joins", {"large_balance": ago(1)}, ["large_balance", "late_change"],
+             ("new", {"large_balance": ago(1)})),
+            ("different failure class is new", {"run_failed:lock_timeout": ago(1)}, ["run_failed:source_error"], ("new", {})),
+            ("damaged time", {"large_balance": "not a time"}, ["large_balance"], ("new", {"large_balance": "not a time"})),
+            ("naive time", {"large_balance": "2026-10-23T13:00:00"}, ["large_balance"],
+             ("new", {"large_balance": "2026-10-23T13:00:00"})),
+            # A time later than now (the clock ran ahead, then was corrected) is damaged too.
+            ("future time", {"large_balance": ago(-24 * 30)}, ["large_balance"],
+             ("new", {"large_balance": ago(-24 * 30)})),
+            # A failed run cannot see the success-side conditions: it keeps them with their
+            # last-sent times and drops only the other run_failed keys.
+            ("failed run keeps success-side keys", {"large_balance": ago(1), "run_failed:lock_timeout": ago(2)},
+             ["run_failed:source_error"], ("new", {"large_balance": ago(1)})),
+            ("same failure, success-side kept", {"large_balance": ago(3), "run_failed:source_error": ago(1)},
+             ["run_failed:source_error"], (None, {"large_balance": ago(3), "run_failed:source_error": ago(1)})),
+            ("success run drops run_failed", {"large_balance": ago(3), "run_failed:source_error": ago(1)},
+             ["large_balance"], (None, {"large_balance": ago(3)})),
+        ]
+        for name, alerted, active, expected in cases:
+            with self.subTest(name):
+                self.assertEqual(hourly.plan_alert(alerted, active, now, 24), expected)
+
+    def test_payload_allowlist_holds_against_a_poisoned_status(self):
+        poisoned = clean_status(
+            large_balance_count=3,
+            failure_class=None,
+            message="Large balance " + CANARY_ITEM,
+            hourly_folder="hourly/" + CANARY_LOCATION,
+            large_balances={"rows": [{"ItemCode": CANARY_ITEM, "Location": CANARY_LOCATION, "BalQty": "123456789"}]},
+            delivery_status="handed_to_drive_sync_folder " + CANARY_LOCATION,
+            daily_close_status=CANARY_ITEM,
+            feed_status="built",
+            run_id="../" + CANARY_ITEM,
+            late_change_day_count="7",
+        )
+        payload = hourly.build_alert_payload(poisoned, hourly.alert_conditions(poisoned) + ["x:" + CANARY_ITEM], "new", FIXED_NOW)
+        self.assertEqual(tuple(payload), hourly.ALERT_PAYLOAD_KEYS)
+        text = json.dumps(payload)
+        for canary in (CANARY_ITEM, CANARY_LOCATION, "123456789", "hourly/", "Large balance"):
+            self.assertNotIn(canary, text)
+        self.assertEqual(
+            payload,
+            {
+                "schema": "xb.ac2.stock_alert.v1",
+                "event": "ac2_stock_alert",
+                "run_id": "unknown",
+                "run_hour_local": "2026-10-23T14:00:00+08:00",
+                "alert_kind": "new",
+                "status": "success",
+                "failure_class": None,
+                "conditions": ["large_balance"],
+                "daily_close_status": None,
+                "delivery_status": None,
+                "feed_status": None,
+                "item_index_status": "published",
+                "large_balance_count": 3,
+                "late_change_day_count": 0,
+            },
+        )
+
+    def test_payload_failed_run(self):
+        status = failed_status("made_up_class")
+        payload = hourly.build_alert_payload(status, hourly.alert_conditions(status), "repeat", FIXED_NOW)
+        self.assertEqual(
+            (payload["status"], payload["failure_class"], payload["conditions"], payload["alert_kind"], payload["run_id"]),
+            ("failed", "unknown", ["run_failed"], "repeat", "0123456789abcdef0123456789abcdef"),
+        )
+
+    def test_secret_read(self):
+        alert = settings_for(tempfile.gettempdir(), alert=alert_block())["alert"]
+        self.assertEqual(hourly.read_alert_secret(alert, ALERT_ENV), FAKE_SECRET)
+        for bad in (None, "", "two\nlines", "x" * 4097, "tab\there"):
+            env = dict(ENV) if bad is None else dict(ENV, **{FAKE_SECRET_ENV: bad})
+            self.assertIsNone(hourly.read_alert_secret(alert, env), repr(bad)[:20])
+        target = dict(alert, secret_env_var=None, secret_credential_target="FAKE-ALERT-TARGET")
+        self.assertEqual(hourly.read_alert_secret(target, {}, lambda name: FAKE_SECRET), FAKE_SECRET)
+
+        def unavailable(name):
+            raise hourly.CredentialUnavailableError("no credential")
+
+        self.assertIsNone(hourly.read_alert_secret(target, {}, unavailable))
+
+
+class AlertRunTests(TempDirTestCase):
+    def settings(self, **alert):
+        return settings_for(self.tmp, alert=alert_block(**alert))
+
+    def run_alert(self, settings, source=None, hours=0, transport=None, environ=None):
+        when = FIXED_NOW + timedelta(hours=hours)
+        return hourly.run_hourly(
+            settings,
+            source=source or FakeSource(),
+            environ=ALERT_ENV if environ is None else environ,
+            clock=clock_at(when),
+            sleep=lambda seconds: None,
+            alert_transport=transport,
+        )
+
+    def status_file(self):
+        return json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+
+    def state(self):
+        path = self.archive / hourly.ALERT_STATE_NAME
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def mismatch_source(self):
+        return FakeSource(ledger=[])
+
+    def test_disabled_sends_nothing_and_says_so(self):
+        transport = FakeTransport()
+        manifest = self.run_alert(settings_for(self.tmp), self.mismatch_source(), transport=transport)
+        self.assertEqual(manifest["failure_class"], "ledger_mismatch")
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self.status_file()["alert_status"], "disabled")
+        self.assertIsNone(self.state())
+
+    def test_clean_hour_sends_nothing(self):
+        transport = FakeTransport()
+        self.run_alert(self.settings(), transport=transport)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self.status_file()["alert_status"], "no_alert")
+
+    def test_failed_run_posts_one_sanitized_event(self):
+        transport = FakeTransport()
+        manifest = self.run_alert(self.settings(), self.mismatch_source(), transport=transport)
+        (call,) = transport.calls
+        self.assertEqual(call["url"], FAKE_ALERT_URL)
+        self.assertEqual(call["timeout"], 10)
+        self.assertEqual(
+            call["headers"],
+            {"Content-Type": "application/json", "User-Agent": hourly.ALERT_USER_AGENT, "X-XB-Alert-Token": FAKE_SECRET},
+        )
+        body = call["body"]
+        self.assertEqual(tuple(body), hourly.ALERT_PAYLOAD_KEYS)
+        self.assertEqual(
+            (body["status"], body["failure_class"], body["conditions"], body["alert_kind"], body["run_id"]),
+            ("failed", "ledger_mismatch", ["run_failed"], "new", manifest["run_id"]),
+        )
+        self.assertEqual(body["run_hour_local"], "2026-10-23T14:00:00+08:00")
+        raw = call["raw"].decode("ascii")
+        for leak in ("FAKE-0001", "LOC-A", FAKE_SECRET, FAKE_DB, FAKE_SERVER.split("\\")[0], str(self.tmp), "hourly/"):
+            self.assertNotIn(leak, raw)
+        self.assertEqual(self.status_file()["alert_status"], "sent")
+        self.assertEqual(self.state()["alerted"], {"run_failed:ledger_mismatch": FIXED_NOW.isoformat()})
+        # The shared secret never lands on disk.
+        for path in self.archive.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(FAKE_SECRET.encode(), path.read_bytes(), path.name)
+
+    def test_large_balance_event_carries_the_count_only(self):
+        balances = default_balances() + [bal(CANARY_ITEM, "LOC-A", "123456789")]
+        transport = FakeTransport()
+        manifest = self.run_alert(self.settings(), FakeSource(balances=balances), transport=transport)
+        self.assertEqual(manifest["status"], "success")
+        (call,) = transport.calls
+        self.assertEqual((call["body"]["conditions"], call["body"]["large_balance_count"]), (["large_balance"], 1))
+        self.assertNotIn(CANARY_ITEM, call["raw"].decode("ascii"))
+        self.assertNotIn("123456789", call["raw"].decode("ascii"))
+
+    def test_same_problem_alerts_once_a_day_then_again_after_recovery(self):
+        settings = self.settings()
+        transport = FakeTransport()
+        expected_kinds = []
+        for hours in range(0, 26):
+            self.run_alert(settings, self.mismatch_source(), hours=hours, transport=transport)
+            if hours in (0, 24):
+                expected_kinds.append("new" if hours == 0 else "repeat")
+            self.assertEqual(self.status_file()["alert_status"], "sent" if hours in (0, 24) else "suppressed", hours)
+        self.assertEqual([c["body"]["alert_kind"] for c in transport.calls], expected_kinds)
+        # Recovery sends nothing (errors only) and clears the state ...
+        self.run_alert(settings, hours=26, transport=transport)
+        self.assertEqual(self.status_file()["alert_status"], "no_alert")
+        self.assertEqual(self.state()["alerted"], {})
+        self.assertEqual(len(transport.calls), 2)
+        # ... so the next occurrence is new again.
+        self.run_alert(settings, self.mismatch_source(), hours=27, transport=transport)
+        self.assertEqual([c["body"]["alert_kind"] for c in transport.calls], ["new", "repeat", "new"])
+
+    def test_failed_send_is_retried_next_hour(self):
+        settings = self.settings()
+        transport = FakeTransport(codes=[502, 200])
+        self.run_alert(settings, self.mismatch_source(), transport=transport)
+        self.assertEqual(self.status_file()["alert_status"], "send_failed")
+        self.assertIsNone(self.state())
+        self.run_alert(settings, self.mismatch_source(), hours=1, transport=transport)
+        self.assertEqual(self.status_file()["alert_status"], "sent")
+        self.assertEqual([c["body"]["alert_kind"] for c in transport.calls], ["new", "new"])
+
+    def test_missing_secret_sends_nothing(self):
+        transport = FakeTransport()
+        self.run_alert(self.settings(), self.mismatch_source(), transport=transport, environ=ENV)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self.status_file()["alert_status"], "secret_unavailable")
+
+    def test_secret_is_checked_on_every_run(self):
+        # A clean or suppressed hour still says when the secret is missing, so a scheduled run
+        # proves the task can see it before the first real alert is due. Nothing is sent.
+        settings = self.settings()
+        transport = FakeTransport()
+        self.run_alert(settings, transport=transport, environ=ENV)
+        self.assertEqual(self.status_file()["alert_status"], "secret_unavailable")
+        self.assertIsNone(self.state())
+        self.run_alert(settings, hours=1, transport=transport)
+        self.assertEqual(self.status_file()["alert_status"], "no_alert")
+        self.run_alert(settings, self.mismatch_source(), hours=2, transport=transport)
+        sent_state = self.state()
+        self.run_alert(settings, self.mismatch_source(), hours=3, transport=transport, environ=ENV)
+        self.assertEqual(self.status_file()["alert_status"], "secret_unavailable")
+        self.assertEqual(self.state(), sent_state)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_unreadable_state_alerts_again(self):
+        settings = self.settings()
+        transport = FakeTransport()
+        self.run_alert(settings, self.mismatch_source(), transport=transport)
+        (self.archive / hourly.ALERT_STATE_NAME).write_text("{not json", encoding="utf-8")
+        self.run_alert(settings, self.mismatch_source(), hours=1, transport=transport)
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_state_write_failure_after_a_send_still_reports_sent(self):
+        transport = FakeTransport()
+        with mock.patch.object(hourly, "save_alert_state", side_effect=OSError("disk full")):
+            self.run_alert(self.settings(), self.mismatch_source(), transport=transport)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(self.status_file()["alert_status"], "sent")
+
+    def test_alert_state_stays_local_and_out_of_drive(self):
+        settings = settings_for(self.tmp, alert=alert_block(), output={"delivery_root": str(self.delivery)})
+        self.run_alert(settings, self.mismatch_source(), transport=FakeTransport())
+        self.assertTrue((self.archive / hourly.ALERT_STATE_NAME).exists())
+        self.assertFalse((self.delivery / hourly.ALERT_STATE_NAME).exists())
+        self.assertEqual(json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))["alert_status"], "sent")
+
+    def test_config_failure_status_records_no_alert_attempt(self):
+        raw = raw_settings(self.tmp, alert=alert_block(webhook_url="http://insecure.example.com/x"))
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        transport = FakeTransport()
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = hourly.main(["--config", str(path)], source=FakeSource(), environ=ALERT_ENV, clock=clock_at(),
+                               alert_transport=transport)
+        self.assertEqual(code, hourly.EXIT_FAILED)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(self.status_file()["alert_status"], "skipped_config_invalid")
+
+
+class AlertSequenceTests(TempDirTestCase):
+    """Hour-by-hour sequences through send_run_alert: fake transport, local state only."""
+
+    def run_sequence(self, statuses):
+        settings = settings_for(self.tmp, alert=alert_block())
+        self.archive.mkdir(parents=True, exist_ok=True)
+        transport = FakeTransport()
+        start = FIXED_NOW.replace(hour=9)
+        results = [
+            hourly.send_run_alert(settings, self.archive, status, start + timedelta(hours=hour), status["run_id"],
+                                  ALERT_ENV, transport)
+            for hour, status in enumerate(statuses)
+        ]
+        return results, [(call["body"]["conditions"], call["body"]["alert_kind"]) for call in transport.calls]
+
+    def test_table(self):
+        large = clean_status(large_balance_count=2)
+        mismatch = failed_status()
+        lb_new, lb_repeat, failed_new = (["large_balance"], "new"), (["large_balance"], "repeat"), (["run_failed"], "new")
+        cases = [
+            # G2 H1 reproducer: large_balance steady while ledger_mismatch fails every other hour,
+            # 09:00 to 13:00. "Once a day while it lasts" gives 3 POSTs, not 5.
+            ("large balance steady, mismatch every other hour", [large, mismatch, large, mismatch, large],
+             ["sent", "sent", "suppressed", "sent", "suppressed"], [lb_new, failed_new, failed_new]),
+            # Runs that fail before taking the lock keep the success-side state too.
+            ("already running and stale lock between",
+             [large, failed_status(hourly.FAILURE_ALREADY_RUNNING), failed_status(hourly.FAILURE_STALE_LOCK), large],
+             ["sent", "sent", "sent", "suppressed"], [lb_new, failed_new, failed_new]),
+            # The daily repeat still counts from the last send across a day of failed runs.
+            ("a day of failures, then the same large balance", [large] + [mismatch] * 23 + [large],
+             ["sent", "sent"] + ["suppressed"] * 22 + ["sent"], [lb_new, failed_new, lb_repeat]),
+        ]
+        for name, statuses, expected_results, expected_calls in cases:
+            with self.subTest(name):
+                state = self.archive / hourly.ALERT_STATE_NAME
+                if state.exists():
+                    state.unlink()
+                self.assertEqual(self.run_sequence(statuses), (expected_results, expected_calls))
+
+
+class AlertNeverChangesTheRunTests(TempDirTestCase):
+    """An alert failure must never change the exit code, the run status or any output file."""
+
+    def main_run(self, alert, source_factory, transport, environ=ALERT_ENV):
+        root = Path(self.tmp) / ("case_%d" % len(os.listdir(self.tmp)))
+        raw = raw_settings(root, alert=alert, output={"delivery_root": str(root / "drive_sync")})
+        path = Path(self.tmp) / ("settings_%s.local.json" % root.name)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=source_factory(), environ=environ, clock=clock_at(),
+                               alert_transport=transport)
+        printed = json.loads(out.getvalue())
+        archive = root / "archive"
+        files = sorted(
+            str(p.relative_to(archive)).replace("\\", "/").split("/ac2_stockbal_")[0]
+            for p in archive.rglob("*") if p.is_file() and p.name != hourly.ALERT_STATE_NAME
+        )
+        return code, printed, files
+
+    def test_table(self):
+        scenarios = {
+            "clean hour": lambda: FakeSource(),
+            "ledger mismatch": lambda: FakeSource(ledger=[]),
+            "large balance": lambda: FakeSource(balances=default_balances() + [bal("FAKE-0201", "LOC-A", "123456789")]),
+        }
+        # Factories: every case gets a fresh transport.
+        behaviours = {
+            "answer 200": (lambda: FakeTransport(), ALERT_ENV),
+            "answer 500": (lambda: FakeTransport(codes=[500]), ALERT_ENV),
+            "answer 302": (lambda: FakeTransport(codes=[302]), ALERT_ENV),
+            "timeout": (lambda: FakeTransport(error=TimeoutError("timed out")), ALERT_ENV),
+            "network error": (lambda: FakeTransport(error=OSError("unreachable")), ALERT_ENV),
+            "malformed answer": (lambda: FakeTransport(error=http.client.BadStatusLine("x")), ALERT_ENV),
+            "bug in transport": (lambda: FakeTransport(error=RuntimeError("bug")), ALERT_ENV),
+            "secret missing": (lambda: FakeTransport(), ENV),
+        }
+        ignored = ("alert_status", "run_id", "message")
+        for scenario, factory in scenarios.items():
+            base_code, base_printed, base_files = self.main_run({"webhook_enabled": False}, factory, None)
+            for name, (make_transport, environ) in behaviours.items():
+                with self.subTest(scenario=scenario, behaviour=name):
+                    code, printed, files = self.main_run(alert_block(), factory, make_transport(), environ)
+                    self.assertEqual(code, base_code)
+                    self.assertEqual(
+                        {k: v for k, v in printed.items() if k not in ignored},
+                        {k: v for k, v in base_printed.items() if k not in ignored},
+                    )
+                    self.assertEqual(files, base_files)
+                    if name == "secret missing":
+                        self.assertEqual(printed["alert_status"], "secret_unavailable")
+                    elif scenario == "clean hour":
+                        self.assertEqual(printed["alert_status"], "no_alert")
+                    elif name == "answer 200":
+                        self.assertEqual(printed["alert_status"], "sent")
+                    elif name == "bug in transport":
+                        self.assertEqual(printed["alert_status"], "error")
+                    else:
+                        self.assertEqual(printed["alert_status"], "send_failed")
+
+
+class AlertTransportTests(unittest.TestCase):
+    """The real POST helper against a loopback HTTP server (no proxy, no redirect)."""
+
+    def serve(self, code, location=None, drip_seconds=None):
+        import http.server
+        import threading
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - http.server hook
+                length = int(self.headers.get("Content-Length", "0"))
+                headers = {key.lower(): value for key, value in self.headers.items()}
+                seen.append({"path": self.path, "headers": headers, "body": self.rfile.read(length)})
+                self.send_response(code)
+                if location:
+                    self.send_header("Location", location)
+                if drip_seconds is None:
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
+                # A slow body: one byte at a time, each well inside the per-read timeout.
+                self.send_header("Content-Length", "6")
+                self.end_headers()
+                try:
+                    for byte in b"abcdef":
+                        time.sleep(drip_seconds)
+                        self.wfile.write(bytes([byte]))
+                except OSError:
+                    pass  # The client hung up without reading the body.
+
+            def do_GET(self):  # noqa: N802 - a followed redirect would arrive here
+                seen.append({"path": self.path, "headers": {}, "body": b"GET"})
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return "http://127.0.0.1:%d/webhook/fake" % server.server_address[1], seen
+
+    def test_post_returns_the_status_and_sends_the_headers(self):
+        url, seen = self.serve(200)
+        code = hourly.post_alert(url, {"Content-Type": "application/json", "X-XB-Alert-Token": FAKE_SECRET}, b"{}", 5)
+        self.assertEqual(code, 200)
+        self.assertEqual(seen[0]["headers"]["x-xb-alert-token"], FAKE_SECRET)
+        self.assertEqual(seen[0]["body"], b"{}")
+
+    def test_slow_body_does_not_hold_the_run(self):
+        # The timeout covers one socket read, not the whole request: a body dripped 0.5 s a byte
+        # against a 1 s timeout would take 3 s to read. The body is not read at all.
+        url, seen = self.serve(200, drip_seconds=0.5)
+        began = time.monotonic()
+        self.assertEqual(hourly.post_alert(url, {}, b"{}", 1), 200)
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual(len(seen), 1)
+
+    def test_error_answer_is_returned_not_raised(self):
+        url, _ = self.serve(502)
+        self.assertEqual(hourly.post_alert(url, {}, b"{}", 5), 502)
+
+    def test_redirect_is_not_followed(self):
+        target, followed = self.serve(200)
+        # urllib's default handler would follow a 302 to a POST (as a GET, with the headers).
+        for code in (302, 307):
+            url, seen = self.serve(code, location=target)
+            self.assertEqual(hourly.post_alert(url, {"X-XB-Alert-Token": FAKE_SECRET}, b"{}", 5), code)
+            self.assertEqual((len(seen), followed), (1, []))
+
+    def test_proxy_settings_are_ignored(self):
+        url, seen = self.serve(200)
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
+                                          "NO_PROXY": ""}):
+            self.assertEqual(hourly.post_alert(url, {}, b"{}", 5), 200)
+        self.assertEqual(len(seen), 1)
+
+
+class CloseStateWarningTests(Round6TestCase):
+    """VM D2 (28 Oct): a first --backfill with no close state wrote everything and gave no
+    "Close state was missing" warning. That is by design: the warning is for a lost state on a
+    normal run; daily_close.state still records "missing"."""
+
+    def test_first_backfill_and_first_run_do_not_warn(self):
+        for force in (True, False):
+            with self.subTest(force=force):
+                shutil.rmtree(self.archive, ignore_errors=True)
+                when = at(2026, 8, 10)
+                manifest = hourly.run_hourly(
+                    self.settings(), source=ledger_source(aug_ledger(), AUG_ITEMS, sql_now=when + timedelta(seconds=1)),
+                    environ=ENV, clock=clock_at(when), sleep=lambda seconds: None, force_close=force,
+                )
+                self.assertEqual(manifest["daily_close"]["status"], "published")
+                self.assertEqual(
+                    (manifest["daily_close"]["mode"], manifest["daily_close"]["state"]),
+                    ("backfill" if force else "initial", "missing"),
+                )
+                self.assertFalse([w for w in manifest["warnings"] if w.startswith("Close state was")])
+
+    def test_backfill_over_a_lost_state_does_not_warn(self):
+        settings = self.settings()
+        self.run_at(settings, at(2026, 8, 10))
+        (self.archive / "daily" / hourly.CLOSE_STATE_NAME).unlink()
+        when = at(2026, 8, 10, 1)
+        manifest = hourly.run_hourly(
+            settings, source=ledger_source(aug_ledger(), AUG_ITEMS, sql_now=when + timedelta(seconds=1)),
+            environ=ENV, clock=clock_at(when), sleep=lambda seconds: None, force_close=True,
+        )
+        self.assertEqual((manifest["daily_close"]["mode"], manifest["daily_close"]["state"]), ("backfill", "missing"))
+        self.assertFalse([w for w in manifest["warnings"] if w.startswith("Close state was")])
 
 
 if __name__ == "__main__":

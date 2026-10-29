@@ -1,0 +1,270 @@
+{
+  "id": "ac2StockAlert0001",
+  "name": "AC2 Stock Export - Error Alert",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8245-000000000001",
+      "name": "AC2 Stock Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "REPLACE_WITH_ALERT_WEBHOOK_PATH",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000002",
+      "name": "Validate Alert Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "jsCode": "// Strict allowlist for the xb.ac2.stock_alert.v1 event from the AC2 stock export (#245).\n// Anything outside the closed contract is rejected with a fixed reason code (HTTP 400 to the\n// VM); nothing unvalidated reaches Telegram. Request headers are never read or passed on.\nconst items = $input.all();\nconst reject = (reason) => [{ json: { valid: false, reason } }];\nif (items.length !== 1) return reject('AC2_ALERT_ITEM_COUNT');\nconst body = items[0].json && items[0].json.body;\nif (!body || typeof body !== 'object' || Array.isArray(body)) return reject('AC2_ALERT_BODY');\n\nconst KEYS = ['schema', 'event', 'run_id', 'run_hour_local', 'alert_kind', 'status', 'failure_class', 'conditions', 'daily_close_status', 'delivery_status', 'feed_status', 'item_index_status', 'large_balance_count', 'late_change_day_count'];\nconst CONDITIONS = ['run_failed', 'daily_close_failed', 'delivery_failed', 'feed_failed', 'item_index_failed', 'large_balance', 'late_change'];\nconst KINDS = ['new', 'repeat'];\nconst FAILURE_CLASSES = ['config_invalid', 'timezone_unavailable', 'already_running', 'stale_lock', 'identity_refused', 'credential_unavailable', 'lock_timeout', 'unstable_snapshot', 'uom_guard', 'sync_read_failed', 'source_error', 'write_failed', 'latest_publish_failed', 'internal_error', 'ledger_mismatch', 'unknown'];\nconst CLOSE_STATUSES = ['not_due', 'published', 'failed', 'skipped_failed_run'];\nconst DELIVERY_STATUSES = ['not_configured', 'handed_to_drive_sync_folder', 'verify_failed', 'copy_failed', 'skipped_failed_run'];\nconst PUBLISH_STATUSES = ['published', 'failed'];\nconst COUNT_MAX = 1000000000;\n\nconst keys = Object.keys(body);\nif (keys.length !== KEYS.length || !KEYS.every((key) => keys.includes(key))) return reject('AC2_ALERT_KEYS');\nif (body.schema !== 'xb.ac2.stock_alert.v1') return reject('AC2_ALERT_SCHEMA');\nif (body.event !== 'ac2_stock_alert') return reject('AC2_ALERT_EVENT');\nif (typeof body.run_id !== 'string' || !/^([0-9a-f]{32}|unknown)$/.test(body.run_id)) return reject('AC2_ALERT_RUN_ID');\nif (typeof body.run_hour_local !== 'string' || !/^\\d{4}-\\d\\d-\\d\\dT\\d\\d:00:00[+-]\\d\\d:\\d\\d$/.test(body.run_hour_local)) return reject('AC2_ALERT_HOUR');\nif (!KINDS.includes(body.alert_kind)) return reject('AC2_ALERT_KIND');\nif (body.status !== 'success' && body.status !== 'failed') return reject('AC2_ALERT_STATUS');\nconst failed = body.status === 'failed';\nif (failed ? !FAILURE_CLASSES.includes(body.failure_class) : body.failure_class !== null) return reject('AC2_ALERT_FAILURE_CLASS');\nconst conditions = body.conditions;\nif (!Array.isArray(conditions) || conditions.length === 0 || conditions.length > CONDITIONS.length) return reject('AC2_ALERT_CONDITIONS');\nif (new Set(conditions).size !== conditions.length || !conditions.every((c) => CONDITIONS.includes(c))) return reject('AC2_ALERT_CONDITIONS');\nif (failed ? !(conditions.length === 1 && conditions[0] === 'run_failed') : conditions.includes('run_failed')) return reject('AC2_ALERT_CONDITIONS');\nconst oneOf = (value, allowed) => value === null || allowed.includes(value);\nif (!oneOf(body.daily_close_status, CLOSE_STATUSES)) return reject('AC2_ALERT_CLOSE_STATUS');\nif (!oneOf(body.delivery_status, DELIVERY_STATUSES)) return reject('AC2_ALERT_DELIVERY_STATUS');\nif (!oneOf(body.feed_status, PUBLISH_STATUSES)) return reject('AC2_ALERT_FEED_STATUS');\nif (!oneOf(body.item_index_status, PUBLISH_STATUSES)) return reject('AC2_ALERT_INDEX_STATUS');\nfor (const key of ['large_balance_count', 'late_change_day_count']) {\n  if (!Number.isInteger(body[key]) || body[key] < 0 || body[key] > COUNT_MAX) return reject('AC2_ALERT_COUNTS');\n}\n\nconst LABELS = {\n  run_failed: 'Hourly export FAILED: ' + body.failure_class + ' (nothing new published this hour)',\n  daily_close_failed: 'Daily close file not written (the next run retries)',\n  delivery_failed: 'Drive delivery failed: ' + body.delivery_status,\n  feed_failed: 'Dashboard feed not published',\n  item_index_failed: 'Item index not published',\n  large_balance: 'Large balances: ' + body.large_balance_count + ' row(s) above the threshold (check the AutoCount documents)',\n  late_change: 'Late ledger changes: ' + body.late_change_day_count + ' day(s) older than the restate window',\n};\nconst lines = [\n  body.alert_kind === 'repeat' ? 'AC2 stock export: still not resolved (daily reminder)' : 'AC2 stock export: ERROR',\n  '',\n  ...CONDITIONS.filter((c) => conditions.includes(c)).map((c) => '- ' + LABELS[c]),\n  '',\n  'Hour: ' + body.run_hour_local.slice(0, 16).replace('T', ' ') + ' (UTC' + body.run_hour_local.slice(19) + ')',\n  'Run: ' + body.run_id.slice(0, 8),\n  'Details: last_run_status.json in the Drive folder; runbook section \"Failure classes\".',\n];\nreturn [{ json: { valid: true, alert_text: lines.join('\\n') } }];\n"
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000003",
+      "name": "Event Is Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8245-000000000004",
+              "leftValue": "={{ $json.valid === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000005",
+      "name": "Send Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        200
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.alert_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000006",
+      "name": "Respond Alert Sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        120
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000007",
+      "name": "Respond Telegram Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'upstream_error', message: 'Telegram did not accept the alert' } }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000008",
+      "name": "Respond Event Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        720,
+        420
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'validation_error', message: $json.reason } }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000009",
+      "name": "Respond Internal Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        560
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'internal_error', message: 'Alert event could not be checked' } }}",
+        "options": {
+          "responseCode": 500
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000010",
+      "name": "Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -260
+      ],
+      "parameters": {
+        "content": "# START HERE: AC2 Stock Export - Error Alert\n\n- **When:** the AC2 stock export on the VM POSTs one event after a failed or flagged hourly run. Errors only: no heartbeat, no success message.\n- **Input:** `xb.ac2.stock_alert.v1`, counts and closed codes only (no item, quantity, location or path). The VM decides what to send and repeats a still-open problem at most once a day.\n- **Flow:** Header Auth on the webhook -> strict schema check (any extra or unknown field: 400) -> one Telegram message -> 200. A Telegram failure answers 502, an unexpected error 500; the VM records it as `alert_status` and tries again next hour.\n- **Saved data:** no executions are saved (the request headers carry the shared secret).\n- Do not add HTTP Request, Execute Command, file, database or AI nodes. Keep it inactive until the owner approves activation.",
+        "height": 360,
+        "width": 760
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8245-000000000011",
+      "name": "Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        760,
+        -260
+      ],
+      "parameters": {
+        "content": "# Setup (local import copy only)\n\n- Import inactive; activation is a separate owner OK.\n\n## Required manual configuration:\n\n- **AC2 Stock Alert Webhook**\n  - `Path`: replace `REPLACE_WITH_ALERT_WEBHOOK_PATH` with a private, unguessable path under `/webhook/`.\n- **Send Telegram Alert**\n  - `Chat ID`: replace `REPLACE_WITH_TELEGRAM_CHAT_ID` with the owner chat.\n\nCredentials are bound in n8n only: a Header Auth credential on the webhook (same header name as the VM's `alert.auth_header_name`) and the existing Telegram credential.",
+        "height": 360,
+        "width": 520
+      }
+    }
+  ],
+  "connections": {
+    "AC2 Stock Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Alert Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Alert Event": {
+      "main": [
+        [
+          {
+            "node": "Event Is Valid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Internal Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event Is Valid": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Event Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Telegram Alert": {
+      "main": [
+        [
+          {
+            "node": "Respond Alert Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Telegram Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8245-000000000100",
+  "sourceWorkflowId": null
+}

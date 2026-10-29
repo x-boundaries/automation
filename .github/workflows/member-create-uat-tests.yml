@@ -90,6 +90,11 @@ on:
       - "config/autocount_stock_balance_hourly.example.json"
       - "docs/autocount2-automation/stock_balance_hourly_runbook.md"
       - "sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql"
+      # Its error-alert n8n workflow and that workflow's offline contract test, which also reads
+      # the n8n-workflows README entry.
+      - "n8n-workflows/ac2_stock_alert.workflow.json"
+      - "tests/test_ac2_stock_alert_workflow.py"
+      - "n8n-workflows/README.md"
       # Weekly read-only Drive mirror of main (#273). The Windows job's full-repository suite
       # exercises tests/test_mirror_main_to_drive.py (offline, temp folders and a local
       # throwaway git repo only), so a pull request confined to the mirror script, its
