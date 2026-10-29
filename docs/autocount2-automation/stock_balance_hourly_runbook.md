@@ -384,7 +384,7 @@ How it works:
 
 1. At the end of every run (after the daily close, the feed, the item index and delivery, just before `last_run_status.json` is written) the exporter works out which alert conditions the run raises, from the same values it writes to `last_run_status.json`.
 2. It checks that the shared secret is readable (every run, even with no condition; nothing is sent). If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s) per socket operation, no proxy, no redirect, the shared secret in the `alert.auth_header_name` header. Only the answer's status is used; its body is never read.
-3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), sends one plain-text Telegram message to the owner chat through the existing Telegram credential, and answers 200 (502 when Telegram refuses, 500 on an unexpected error).
+3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), sends one Telegram message to the owner chat through the existing Telegram credential (HTML parse mode with every value escaped; without a parse mode n8n sends Markdown, which Telegram refused for a value with `_` in go-live A2), and answers 200 (502 when Telegram refuses, 500 on an unexpected error).
 4. The exporter writes the outcome as `alert_status`. **An alert, sent or lost, never changes the run's status, exit code or files.**
 
 The VM reaches n8n through the public `/webhook/` path (n8n sits behind Cloudflare Access, which leaves `/webhook/` open). n8n's `WEBHOOK_URL` is not changed.
@@ -451,6 +451,8 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
   ```
 
   Then **activate** the workflow (the same owner OK covers activation only if it names it).
+
+  A2 re-run (29 Oct): the first A2 answered 502 ("can't parse entities": Markdown and `internal_error`). Re-run A2 with the same fake event after the live copy gets the HTML parse mode change from the fix PR (its own owner OK).
 - **A3 VM settings and secret** (needs owner OK, VM change): signed in as the task's Windows account (pair (a)), store the secret as a user environment variable without echoing it, then add the alert block to the local settings and validate:
 
   ```powershell

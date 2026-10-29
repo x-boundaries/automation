@@ -5,7 +5,9 @@ local Node runtime against events built by the real exporter (build_alert_payloa
 Every value here is synthetic.
 """
 
+import html
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -50,12 +52,19 @@ RESPONSE_CODES = {
 STARTED = datetime(2026, 10, 29, 14, 0, 5, tzinfo=ZoneInfo("Asia/Singapore"))
 RUN_ID = "0123456789abcdef0123456789abcdef"
 CANARY_ITEM = "CANARY-ITEM-0201"
+# Every character Markdown or HTML treats as markup (go-live A2, 29 Oct: Markdown refused "_").
+HOSTILE = "a_b*c[d]e`f&g<h>i</b>j&amp;k"
+# Tags Telegram's HTML parse mode accepts without attributes; the alert itself uses none.
+TELEGRAM_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "tg-spoiler", "blockquote"}
+TELEGRAM_ENTITY = re.compile(r"&(?:lt|gt|amp|quot|#[0-9]+|#x[0-9a-fA-F]+);")
 
 HARNESS = r"""
 const fs = require('fs');
-const [workflowPath, casesPath] = process.argv.slice(2);
+const [workflowPath, casesPath, codePath] = process.argv.slice(2);
 const wf = JSON.parse(fs.readFileSync(workflowPath, 'utf8'));
-const code = wf.nodes.find((n) => n.name === 'Validate Alert Event').parameters.jsCode;
+const code = codePath
+  ? fs.readFileSync(codePath, 'utf8')
+  : wf.nodes.find((n) => n.name === 'Validate Alert Event').parameters.jsCode;
 const cases = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
 const results = cases.map((body) => {
   const $input = { all: () => [{ json: { body, headers: { 'x-xb-alert-token': 'FAKE-SECRET-NOT-READ' } } }] };
@@ -96,6 +105,28 @@ def failed_event(failure_class="ledger_mismatch"):
         status="failed", failure_class=failure_class, daily_close_status="skipped_failed_run",
         delivery_status="skipped_failed_run", feed_status=None, item_index_status=None, large_balance_count=None,
     )
+
+
+def telegram_html_problems(text):
+    """Return why Telegram's HTML parse mode would refuse text (an empty list: it parses)."""
+    problems, stack = [], []
+    for token in re.split(r"(<[^<>]*>)", text):
+        if len(token) > 1 and token.startswith("<") and token.endswith(">"):
+            tag = re.fullmatch(r"<(/?)([a-z-]+)>", token)
+            if not tag or tag.group(2) not in TELEGRAM_TAGS:
+                problems.append("unsupported tag %r" % token)
+            elif not tag.group(1):
+                stack.append(tag.group(2))
+            elif not stack or stack.pop() != tag.group(2):
+                problems.append("unbalanced tag %r" % token)
+            continue
+        if "<" in token or ">" in token:
+            problems.append("raw angle bracket in %r" % token)
+        for amp in re.finditer("&", token):
+            if not TELEGRAM_ENTITY.match(token, amp.start()):
+                problems.append("bare & in %r" % token)
+    problems.extend("unclosed tag <%s>" % name for name in stack)
+    return problems
 
 
 class WorkflowShapeTests(unittest.TestCase):
@@ -153,12 +184,14 @@ class WorkflowShapeTests(unittest.TestCase):
         for name in ("Validate Alert Event", "Send Telegram Alert"):
             self.assertEqual(self.nodes[name].get("onError"), "continueErrorOutput", name)
 
-    def test_telegram_is_plain_text_from_validated_text_only(self):
+    def test_telegram_is_html_from_validated_text_only(self):
         node = self.nodes["Send Telegram Alert"]
         params = node["parameters"]
         self.assertEqual(params["chatId"], "REPLACE_WITH_TELEGRAM_CHAT_ID")
         self.assertEqual(params["text"], "={{ $json.alert_text }}")
-        self.assertNotIn("parse_mode", params["additionalFields"], "plain text: no markup injection surface")
+        # Without a parse mode n8n sends Markdown, and Telegram refuses any "_" in a value
+        # ("can't parse entities", go-live A2). HTML needs only &, < and > escaped.
+        self.assertEqual(params["additionalFields"].get("parse_mode"), "HTML")
         self.assertIs(params["additionalFields"]["appendAttribution"], False)
         # No automatic retry: a slow retry would outlive the VM's timeout and duplicate the message.
         for key in ("retryOnFail", "maxTries", "waitBetweenTries", "continueOnFail", "alwaysOutputData"):
@@ -201,16 +234,18 @@ class WorkflowShapeTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code node")
 class WorkflowCodeExecutionTests(unittest.TestCase):
-    def run_cases(self, cases):
+    def run_cases(self, cases, code=None):
         with tempfile.TemporaryDirectory() as tmp:
             harness = Path(tmp) / "harness.js"
             harness.write_text(HARNESS, encoding="utf-8")
             cases_path = Path(tmp) / "cases.json"
             cases_path.write_text(json.dumps(cases), encoding="utf-8")
-            done = subprocess.run(
-                [shutil.which("node"), str(harness), str(WORKFLOW), str(cases_path)],
-                capture_output=True, text=True, timeout=60,
-            )
+            args = [shutil.which("node"), str(harness), str(WORKFLOW), str(cases_path)]
+            if code is not None:
+                code_path = Path(tmp) / "code.js"
+                code_path.write_text(code, encoding="utf-8")
+                args.append(str(code_path))
+            done = subprocess.run(args, capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         return json.loads(done.stdout)
 
@@ -233,6 +268,50 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
                 for text in expected:
                     self.assertIn(text, item["json"]["alert_text"])
                 self.assertNotIn("FAKE-SECRET", item["json"]["alert_text"])
+                self.assertEqual(telegram_html_problems(item["json"]["alert_text"]), [])
+
+    def test_every_closed_value_renders_valid_telegram_html(self):
+        # The real values are full of "_" (internal_error, copy_failed, last_run_status.json),
+        # the exact text that Markdown refused in go-live A2.
+        cases = [failed_event(failure_class) for failure_class in hourly.ALERT_FAILURE_CLASSES]
+        cases += [event(delivery_status=value, large_balance_count=1) for value in ("verify_failed", "copy_failed")]
+        cases += [event("repeat", daily_close_status="failed", late_change_day_count=2, feed_status="failed")]
+        for body, result in zip(cases, self.run_cases(cases)):
+            with self.subTest(failure_class=body["failure_class"], delivery=body["delivery_status"]):
+                self.assertTrue(result["ok"], result)
+                (item,) = result["out"]
+                self.assertIs(item["json"]["valid"], True, item)
+                text = item["json"]["alert_text"]
+                self.assertEqual(telegram_html_problems(text), [])
+                # No value needs an entity, so Telegram shows the fixed wording exactly as written.
+                self.assertEqual(html.unescape(text), text)
+
+    def test_markup_in_any_interpolated_value_is_escaped_for_telegram_html(self):
+        # The strict allowlist already refuses these characters (see the rejection test), so the
+        # escaping is defence in depth. To exercise it end to end, run the committed Code node with
+        # its two free-text-shaped allowlists widened by one hostile value; nothing else changes.
+        workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        code = next(n for n in workflow["nodes"] if n["name"] == CODE_NODE)["parameters"]["jsCode"]
+        for name in ("FAILURE_CLASSES", "DELIVERY_STATUSES"):
+            marker = "const %s = [" % name
+            self.assertEqual(code.count(marker), 1, name)
+            code = code.replace(marker, marker + json.dumps(HOSTILE) + ", ")
+        cases = [
+            {**failed_event(), "failure_class": HOSTILE},
+            {**event(delivery_status="copy_failed"), "delivery_status": HOSTILE},
+        ]
+        for body, result in zip(cases, self.run_cases(cases, code=code)):
+            with self.subTest(conditions=body["conditions"]):
+                self.assertTrue(result["ok"], result)
+                (item,) = result["out"]
+                self.assertIs(item["json"]["valid"], True, item)
+                text = item["json"]["alert_text"]
+                self.assertIn("a_b*c[d]e`f&amp;g&lt;h&gt;i&lt;/b&gt;j&amp;amp;k", text)
+                self.assertNotIn("<", text)
+                self.assertNotIn(">", text)
+                self.assertEqual(telegram_html_problems(text), [])
+                # What the owner sees once Telegram decodes the entities is the value itself.
+                self.assertIn(HOSTILE, html.unescape(text))
 
     def test_every_departure_from_the_contract_is_rejected(self):
         base = event(large_balance_count=2)
