@@ -74,7 +74,7 @@ Run from the automation clone, always with the task's full-path interpreter (see
 
 `--backfill` is a normal run (same reads, same checks, same latest pair and feed) that also writes **every** daily close from `daily_close.backfill_start` to yesterday again, replacing any that exist (`write_reason: rebuild`, revision + 1). It uses the same code path as the nightly close. Run it once at the VM step (step D2), and again only if the owner wants Drive's older daily files rebuilt from the ledger.
 
-Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code. The run output and `last_run_status.json` carry `alert_status` (see [Error alerts](#error-alerts-telegram-through-n8n)); an alert, sent or lost, never changes an exit code either.
+Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code. The run output and `last_run_status.json` carry `alert_status` (see [Error alerts](#error-alerts-telegram-through-n8n)), and `last_run_status.json` and the run's `alert_record.json` also carry the webhook's HTTP status; an alert, sent or lost, never changes an exit code either.
 
 ## Settings
 
@@ -141,6 +141,7 @@ Every business choice is a setting. The owner said answers may still change, so 
   hourly\<YYYY-MM-DD>\ac2_stockbal_<YYYYMMDDTHHMMSS+0800>_<run_id first 8>\
       stock_balance.csv                   (success only; kept 48 h when pruning is on)
       manifest.json                       (every outcome; kept 48 h when pruning is on)
+      alert_record.json                   (every run: alert_status and the webhook's HTTP status; local only; kept 48 h when pruning is on)
   daily\close_state.json.gz               (what the published daily files were built from; local only, never pruned)
   daily\<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv            (kept 90 days when pruning is on)
   daily\<YYYY-MM>\stock_close_<YYYY-MM-DD>.manifest.json  (kept 90 days when pruning is on)
@@ -165,7 +166,8 @@ Every business choice is a setting. The owner said answers may still change, so 
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
 - Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, large_balances, uom_guard, pos_sync per Location, delivery, warnings.
   Round 6 adds (schema_version `2`): `ledger` (groups, rows, null_qty_rows, non_empty_batch, future_dated_rows, non_base_uom_groups, non_stock_rows_excluded, non_stock_items_excluded, items_missing_from_master, first_day, last_day), `ledger_check`, `uom_guard.ledger_non_base_uom_groups`, `counts.non_stock_excluded`, `daily_close`, `feed` (status, sha256, byte_size), `retention`, and the extra query hashes (`ledger`, `item_master`, `locations`, `item_uom`; the last was `reorder_levels` before dashboard v2). Dashboard v2 adds `item_index` (status, sha256, byte_size, counts).
-- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local, alert_status (see [Error alerts](#error-alerts-telegram-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
+- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local, alert_status and alert_http_status (see [Error alerts](#error-alerts-telegram-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
+- `alert_record.json` fields (one per run, see [Per-run alert record](#per-run-alert-record)): schema `xb.ac2.stock_alert_record.v1`, job, run_id, started_at, finished_at, status, failure_class, alert_status, http_status.
 
 ## Ledger check (every run)
 
@@ -267,7 +269,7 @@ What to do when `large_balance_count` is above 0:
 
 ## Failure classes (what the owner sees in Drive)
 
-A failed run writes `manifest.json` only (no CSV), never touches the latest pair, and updates `last_run_status.json` to `failed`. In Drive the owner sees `last_run_status.json` with `status: failed`, while `latest_manifest.json` still shows the last good `as_of_local`.
+A failed run writes `manifest.json` and `alert_record.json` only (no CSV), never touches the latest pair, and updates `last_run_status.json` to `failed`. In Drive the owner sees `last_run_status.json` with `status: failed`, while `latest_manifest.json` still shows the last good `as_of_local`.
 
 One exception: a run that fails only at its own manifest write (`write_failed` after the hourly CSV was written) has already done the daily close and retention by then. Any due daily files are published (archive and Drive), the close state is saved, and expired local files may have been pruned; the latest pair and the feed are not touched. The daily files are complete and verified, so nothing needs undoing; the next run is `not_due` for that day.
 
@@ -364,7 +366,7 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
 - Drive keeps one latest pair, the feed, the run status and one daily file pair per day. Nothing in Drive is ever pruned or deleted by the job.
 - Local archive (behind `retention.prune_enabled`, default `false`; switched on at VM step D3 with the owner's OK): hourly run folders are kept `hourly_keep_hours` (48 h), daily close files `daily_keep_days` (90 days, per [Security guardrails](security_guardrails.md)). Runs every successful hour, after the close; never fails a run (`retention` in the manifest counts what was removed, kept and any errors).
 - Safety rules (all tested):
-  - only inside `archive_root\hourly\` and `archive_root\daily\`, and only names the exporter makes: `<YYYY-MM-DD>\ac2_stockbal_<timestamp>_<8 hex>\` with `stock_balance.csv` / `manifest.json`, and `<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv` / `.manifest.json`;
+  - only inside `archive_root\hourly\` and `archive_root\daily\`, and only names the exporter makes: `<YYYY-MM-DD>\ac2_stockbal_<timestamp>_<8 hex>\` with `stock_balance.csv` / `manifest.json` / `alert_record.json`, and `<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv` / `.manifest.json`;
   - the age comes from the folder or file name, never from file times;
   - anything else (other names, other folders, symlinks or junctions, anything resolving outside the archive) is kept and counted as `kept_unexpected`; a folder is removed only when it is empty;
   - the current run's folder, `daily\close_state.json.gz`, the latest pair, the feed, the lock and `delivery_root` are never touched.
@@ -385,7 +387,7 @@ How it works:
 1. At the end of every run (after the daily close, the feed, the item index and delivery, just before `last_run_status.json` is written) the exporter works out which alert conditions the run raises, from the same values it writes to `last_run_status.json`.
 2. It checks that the shared secret is readable (every run, even with no condition; nothing is sent). If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s) per socket operation, no proxy, no redirect, the shared secret in the `alert.auth_header_name` header. Only the answer's status is used; its body is never read.
 3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), sends one Telegram message to the owner chat through the existing Telegram credential (HTML parse mode with every value escaped; without a parse mode n8n sends Markdown, which Telegram refused for a value with `_` in go-live A2), and answers 200 (502 when Telegram refuses, 500 on an unexpected error).
-4. The exporter writes the outcome as `alert_status`. **An alert, sent or lost, never changes the run's status, exit code or files.**
+4. The exporter writes the outcome as `alert_status`, with the answer's HTTP status, in `last_run_status.json` and in the run's own `alert_record.json` (see [Per-run alert record](#per-run-alert-record)). **An alert, sent or lost, never changes the run's status, exit code or other files.**
 
 The VM reaches n8n through the public `/webhook/` path (n8n sits behind Cloudflare Access, which leaves `/webhook/` open). n8n's `WEBHOOK_URL` is not changed.
 
@@ -439,6 +441,18 @@ Details: last_run_status.json in the Drive folder; runbook section "Failure clas
 | `error` | Unexpected error in the alert step. Nothing changes for the run. |
 | `skipped_config_invalid` | Settings invalid; no alert attempted. |
 
+### Per-run alert record
+
+`last_run_status.json` is replaced every run, so on its own it cannot show what the alert step did in past hours. Every run therefore also writes `alert_record.json` into its own hourly folder (`archive_root\hourly\<YYYY-MM-DD>\ac2_stockbal_...\`), beside `manifest.json`:
+
+- **Every run, success or failed**, including a run refused by the lock and a run whose settings are invalid (`skipped_config_invalid`). It is written once (exclusive create), right after the alert step and before `last_run_status.json`; it is never replaced.
+- **Local only.** It never goes to Drive (no hourly folder does). With pruning on it is removed with its folder after `retention.hourly_keep_hours` (48 h); pruning runs on successful hours.
+- **Not in `manifest.json`** (owner asked 3 Nov 2026 for "alert_status in the hourly manifest"): the manifest is written once and hashed before the alert runs, because the alert reads the final delivery result, and the latest pair and Drive copy are checked against that hash. Rewriting it afterwards would break that check, so the record is a sibling file in the same folder, kept and pruned exactly like the manifest.
+- Fields: `schema` (`xb.ac2.stock_alert_record.v1`), `job`, `run_id`, `started_at`, `finished_at`, `status` and `failure_class` (as in `last_run_status.json`), `alert_status` (values above), `http_status`.
+- `http_status`: the webhook answer's HTTP status as a number (for example `200` with `sent`; `403`, `404`, `500` or `502` with `send_failed`), or `null` when no POST was made (`disabled`, `no_alert`, `suppressed`, `secret_unavailable`, `skipped_config_invalid`) or the POST got no usable answer (`send_failed` after a timeout, network error or malformed answer; `error` before the answer). `error` after an answer keeps that answer's status. `last_run_status.json` carries the same value as `alert_http_status`.
+- **Never** the webhook URL, a header, the secret or the answer's body; no path, message, item or quantity.
+- If the hourly folder cannot be written (the archive disk is full or read-only), there is no record for that run, as there is no manifest; `last_run_status.json` still shows that run until the next one. Writing the record never changes the run's status, exit code or other files.
+
 ### Alert go-live steps (A1-A5)
 
 Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run. Results go to the private mailbox only (never the secret, the chat id or the webhook path).
@@ -460,11 +474,23 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
   [Environment]::SetEnvironmentVariable("XB_AC2_STOCK_ALERT_SECRET", [System.Net.NetworkCredential]::new("", $s).Password, "User")
   ```
 
+  At the `Alert secret` prompt, paste the secret with a **right-click**: Ctrl+V does not paste at this `Read-Host` prompt in Windows PowerShell (it stores a control character instead of the secret). The next run then shows `alert_status: secret_unavailable`, because the value is not one printable line.
+
   Settings: `"alert": {"webhook_enabled": true, "webhook_url": "https://<n8n host>/webhook/<private path>", "secret_env_var": "XB_AC2_STOCK_ALERT_SECRET"}` (other keys default). Open a **new** PowerShell window (the variable reaches new processes only) and run `--dry-run-config`.
 - **A4 one forced-failure test** (needs owner OK, sends one Telegram message): at a quiet minute (not :00), in a new window as the task's account, make one manual run fail safely by giving only that window a wrong expected book: `$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"`, then the normal run command. It stops at the identity check before any business query (`identity_refused`) and writes a failed manifest and `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: one Telegram message "Hourly export FAILED: identity_refused", and `alert_status: sent`. Close that window. The next **scheduled** run must show `status: success` and `alert_status: no_alert`, and `alert_state.json` must be empty again. Because the secret is checked on every run, `no_alert` here proves the scheduled (S4U) task sees the variable; `secret_unavailable` means it does not (A4's own send ran in an interactive window, which proves nothing about the task).
 
   If A4 gives `send_failed`: a 403 from Cloudflare (not n8n) means its bot protection blocked the request (the job sends `User-Agent: xb-ac2-stock-alert/1`); a Cloudflare rule change needs its own owner OK. n8n itself answers 403 for a missing or wrong secret header. `secret_unavailable` means the window or the task does not see the variable.
-- **A5 first day** (read-only): after 24 hours, check that `alert_status` reads `no_alert` (or `sent` / `suppressed` for a real problem) on every scheduled hourly run, never `secret_unavailable`, and that no Telegram message arrived without a matching `alert_status: sent`. Outbound HTTPS from the scheduled (S4U) task is not proven until its first real alert reads `sent`: A4's POST came from an interactive window.
+- **A5 first day** (read-only): after 24 hours, read every run's `alert_record.json` from the last 24 hours (see [Per-run alert record](#per-run-alert-record)); `last_run_status.json` shows only the latest run:
+
+  ```powershell
+  Get-ChildItem "<archive_root>\hourly" -Recurse -Filter alert_record.json |
+    ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } |
+    Where-Object { [datetimeoffset]$_.started_at -gt [datetimeoffset]::Now.AddHours(-24) } |
+    Sort-Object started_at |
+    Format-Table started_at, status, failure_class, alert_status, http_status -AutoSize
+  ```
+
+  Pass when there is one record per scheduled hour (a missing hour means no run or an unwritable archive), every record reads `no_alert` (or `sent` / `suppressed` for a real problem), none reads `secret_unavailable`, `send_failed` or `error`, and every Telegram message has a record with `alert_status: sent` and a 2xx `http_status` at that hour. Outbound HTTPS from the scheduled (S4U) task is proven by the first scheduled-run record that reads `sent` with a 2xx `http_status` (A4's POST came from an interactive window). Records exist only for runs on a version with this record (3 Nov 2026 follow-up) and are kept 48 h when pruning is on.
 
 ### Rollback
 

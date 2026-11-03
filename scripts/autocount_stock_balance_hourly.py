@@ -36,6 +36,8 @@ Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md)
   counts; never an item, quantity, location, path or message) to an n8n webhook, which sends it
   to Telegram. The shared secret comes from an environment variable or Credential Manager at
   runtime. An alert failure is recorded as alert_status and never changes the run's result.
+  Every run also keeps its alert_status and the webhook's HTTP status in alert_record.json in
+  its own hourly folder (written once after the alert, local only, pruned with the folder).
 
 pyodbc is imported only inside SqlServerSource so the tests run without it.
 """
@@ -215,6 +217,9 @@ DELIVERY_PENDING = "pending_see_last_run_status"
 # Error alerts (Telegram through an n8n webhook). Errors only: no heartbeat, no success message.
 ALERT_STATE_NAME = "alert_state.json"
 ALERT_STATE_SCHEMA = "xb.ac2.stock_alert_state.v1"
+# One per run, beside the manifest: the manifest is written (and hashed) before the alert runs.
+ALERT_RECORD_NAME = "alert_record.json"
+ALERT_RECORD_SCHEMA = "xb.ac2.stock_alert_record.v1"
 ALERT_SCHEMA = "xb.ac2.stock_alert.v1"
 ALERT_EVENT = "ac2_stock_alert"
 ALERT_USER_AGENT = "xb-ac2-stock-alert/1"
@@ -2367,7 +2372,7 @@ def prune_archive(archive_root, settings, now, today, keep_run_dir):
                 if run_started >= hourly_cutoff or (keep_run_dir is not None and _same_path(run_dir, keep_run_dir)):
                     continue
                 for child in _children(run_dir):
-                    if child.name in (CSV_NAME, MANIFEST_NAME):
+                    if child.name in (CSV_NAME, MANIFEST_NAME, ALERT_RECORD_NAME):
                         remove(child)
                     else:
                         result["kept_unexpected"] += 1
@@ -2861,9 +2866,10 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     }
     # Last step before the status file: the alert reads the final status, and its own outcome is
     # recorded beside it. It never changes the status, the exit code or any other file.
-    status["alert_status"] = send_run_alert(
+    status["alert_status"], status["alert_http_status"] = send_run_alert(
         settings, archive_root, status, started, run_id, environ, alert_transport, credential_reader
     )
+    write_alert_record(run_dir, status)
     manifest["_last_run_status"] = status
     for root in (archive_root, delivery_root):
         if root is None:
@@ -3107,16 +3113,24 @@ def post_alert(url, headers, body, timeout):
         return response.status
 
 
+def _http_status(code):
+    """The webhook answer's HTTP status as an int, or None when there was no usable answer."""
+    return code if isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599 else None
+
+
 def send_run_alert(settings, archive_root, status, started, run_id, environ=None, transport=None,
                    credential_reader=None):
-    """Alert step of one run: one bounded POST at most. Returns the alert_status value.
+    """Alert step of one run: one bounded POST at most. Returns (alert_status, http_status).
 
+    http_status is the answer's HTTP status, or None when no POST was made or it got no usable
+    answer (timeout, network error, malformed answer). Never the URL, headers, secret or body.
     Never raises: a lost alert is recorded and never changes the run's status, exit code or
     files. A failed send leaves the de-dup state as it was, so the next hour tries again.
     """
     alert = settings["alert"]
     if not alert["webhook_enabled"]:
-        return ALERT_DISABLED
+        return ALERT_DISABLED, None
+    http_status = None
     try:
         active = alert_conditions(status)
         alerted = load_alert_state(archive_root)
@@ -3126,13 +3140,13 @@ def send_run_alert(settings, archive_root, status, started, run_id, environ=None
         secret = read_alert_secret(alert, environ, credential_reader)
         if secret is None:
             _keep_alert_state(archive_root, kept, alerted, run_id[:8])
-            return ALERT_SECRET_UNAVAILABLE
+            return ALERT_SECRET_UNAVAILABLE, None
         if kind is None:
             _keep_alert_state(archive_root, kept, alerted, run_id[:8])
-            return ALERT_NONE if not active else ALERT_SUPPRESSED
+            return (ALERT_NONE if not active else ALERT_SUPPRESSED), None
         payload = build_alert_payload(status, active, kind, started)
         if tuple(payload) != ALERT_PAYLOAD_KEYS:
-            return ALERT_ERROR
+            return ALERT_ERROR, None
         body = json.dumps(payload, ensure_ascii=True).encode("ascii")
         headers = {
             "Content-Type": "application/json",
@@ -3143,9 +3157,10 @@ def send_run_alert(settings, archive_root, status, started, run_id, environ=None
             code = (transport or post_alert)(alert["webhook_url"], headers, body, alert["timeout_seconds"])
         except (OSError, ValueError, http.client.HTTPException):
             code = None
-        if not isinstance(code, int) or not 200 <= code < 300:
+        http_status = _http_status(code)
+        if http_status is None or not 200 <= http_status < 300:
             _keep_alert_state(archive_root, kept, alerted, run_id[:8])
-            return ALERT_SEND_FAILED
+            return ALERT_SEND_FAILED, http_status
         sent_at = started.isoformat()
         sent_state = dict(kept)
         sent_state.update((key, sent_at) for key in active)
@@ -3153,9 +3168,34 @@ def send_run_alert(settings, archive_root, status, started, run_id, environ=None
             save_alert_state(archive_root, sent_state, run_id[:8])
         except OSError:
             pass  # The alert went out; without the state the next hour may repeat it once.
-        return ALERT_SENT
+        return ALERT_SENT, http_status
     except Exception:  # noqa: BLE001 - an alert bug must never change the run's result.
-        return ALERT_ERROR
+        return ALERT_ERROR, http_status
+
+
+def write_alert_record(run_dir, status):
+    """Keep this run's alert outcome in its hourly folder (alert_record.json). Never raises.
+
+    The manifest cannot hold it: the manifest is written once and hashed before the alert runs,
+    and the latest pair and Drive copy are checked against that hash. Closed fields only, taken
+    from the run's status: no URL, header, secret, path or message. Exclusive create, so a
+    record is never replaced; the folder (and the record) is pruned like any hourly folder.
+    """
+    record = {
+        "schema": ALERT_RECORD_SCHEMA,
+        "job": JOB,
+        "run_id": status.get("run_id"),
+        "started_at": status.get("started_at"),
+        "finished_at": status.get("finished_at"),
+        "status": status.get("status"),
+        "failure_class": status.get("failure_class"),
+        "alert_status": status.get("alert_status"),
+        "http_status": _http_status(status.get("alert_http_status")),
+    }
+    try:
+        write_exclusive(Path(run_dir) / ALERT_RECORD_NAME, json_bytes(record))
+    except (OSError, ValueError):
+        pass  # Same folder as the manifest: when it cannot be written, last_run_status.json still says.
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3244,12 +3284,14 @@ def config_failure_manifest(raw, message, failure_class=FAILURE_CONFIG, clock=No
     status["large_balance_count"] = None
     # The alert settings cannot be trusted when the settings are invalid: no alert is attempted.
     status["alert_status"] = ALERT_SKIPPED_CONFIG
+    status["alert_http_status"] = None
+    run_dir = Path(root) / relative
     try:
-        run_dir = Path(root) / relative
         run_dir.mkdir(parents=True, exist_ok=False)
         write_exclusive(run_dir / MANIFEST_NAME, json_bytes(manifest))
     except (OSError, ValueError):
         manifest = None
+    write_alert_record(run_dir, status)
     roots = [root]
     if isinstance(delivery, str) and delivery.strip():
         roots.append(delivery)
