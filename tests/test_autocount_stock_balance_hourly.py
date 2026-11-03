@@ -3285,7 +3285,7 @@ class AlertSequenceTests(TempDirTestCase):
         start = FIXED_NOW.replace(hour=9)
         results = [
             hourly.send_run_alert(settings, self.archive, status, start + timedelta(hours=hour), status["run_id"],
-                                  ALERT_ENV, transport)
+                                  ALERT_ENV, transport)[0]
             for hour, status in enumerate(statuses)
         ]
         return results, [(call["body"]["conditions"], call["body"]["alert_kind"]) for call in transport.calls]
@@ -3373,6 +3373,221 @@ class AlertNeverChangesTheRunTests(TempDirTestCase):
                         self.assertEqual(printed["alert_status"], "error")
                     else:
                         self.assertEqual(printed["alert_status"], "send_failed")
+
+
+ALERT_RECORD = "alert_record.json"
+ALERT_RECORD_KEYS = (
+    "schema", "job", "run_id", "started_at", "finished_at", "status", "failure_class", "alert_status", "http_status",
+)
+
+
+class AlertRecordTests(TempDirTestCase):
+    """Every run keeps its alert outcome in its own hourly folder (A5 follow-up, 3 Nov 2026)."""
+
+    def settings(self, **extra):
+        return settings_for(self.tmp, alert=alert_block(), **extra)
+
+    def run_alert(self, settings, source=None, hours=0, transport=None, environ=None):
+        return hourly.run_hourly(
+            settings,
+            source=source or FakeSource(),
+            environ=ALERT_ENV if environ is None else environ,
+            clock=clock_at(FIXED_NOW + timedelta(hours=hours)),
+            sleep=lambda seconds: None,
+            alert_transport=transport,
+        )
+
+    def record(self, manifest):
+        path = self.run_dir(manifest) / ALERT_RECORD
+        self.assertTrue(path.is_file(), "no alert record in the hourly folder")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def status_file(self):
+        return json.loads((self.archive / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+
+    def assert_record(self, manifest, alert_status, http_status):
+        record = self.record(manifest)
+        self.assertEqual(sorted(record), sorted(ALERT_RECORD_KEYS))
+        self.assertEqual(record["schema"], "xb.ac2.stock_alert_record.v1")
+        self.assertEqual(record["run_id"], manifest["run_id"])
+        self.assertEqual((record["alert_status"], record["http_status"]), (alert_status, http_status))
+        status = self.status_file()
+        # The record matches the run's last_run_status.json, which now carries the HTTP status too.
+        self.assertEqual((status["alert_status"], status["alert_http_status"]), (alert_status, http_status))
+        self.assertEqual((record["status"], record["failure_class"]), (status["status"], status["failure_class"]))
+        self.assertEqual((record["started_at"], record["finished_at"]), (status["started_at"], status["finished_at"]))
+        return record
+
+    def test_record_name_constant(self):
+        self.assertEqual(hourly.ALERT_RECORD_NAME, ALERT_RECORD)
+
+    def test_successful_run_writes_a_record(self):
+        manifest = self.run_alert(self.settings(), transport=FakeTransport())
+        self.assertEqual(manifest["status"], "success")
+        record = self.assert_record(manifest, "no_alert", None)
+        self.assertEqual((record["status"], record["failure_class"]), ("success", None))
+
+    def test_failed_run_writes_a_record(self):
+        manifest = self.run_alert(self.settings(), FakeSource(ledger=[]), transport=FakeTransport())
+        self.assertEqual(manifest["status"], "failed")
+        record = self.assert_record(manifest, "sent", 200)
+        self.assertEqual((record["status"], record["failure_class"]), ("failed", "ledger_mismatch"))
+
+    def test_failed_run_before_any_read_writes_a_record(self):
+        # A run refused by a live lock reads nothing; its folder still gets a manifest and a record.
+        self.archive.mkdir(parents=True)
+        (self.archive / hourly.LOCK_NAME).write_text(
+            json.dumps({"run_id": "f" * 32, "pid": os.getpid(), "started_at": FIXED_NOW.isoformat()}), encoding="utf-8"
+        )
+        manifest = self.run_alert(self.settings(), transport=FakeTransport())
+        self.assertEqual(manifest["failure_class"], "already_running")
+        self.assert_record(manifest, "sent", 200)
+
+    def test_sent_records_the_2xx_status(self):
+        manifest = self.run_alert(self.settings(), FakeSource(ledger=[]), transport=FakeTransport(codes=[204]))
+        self.assert_record(manifest, "sent", 204)
+
+    def test_suppressed_records_no_http_status(self):
+        settings = self.settings()
+        transport = FakeTransport()
+        self.run_alert(settings, FakeSource(ledger=[]), transport=transport)
+        manifest = self.run_alert(settings, FakeSource(ledger=[]), hours=1, transport=transport)
+        self.assert_record(manifest, "suppressed", None)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_secret_unavailable_records_no_http_status(self):
+        transport = FakeTransport()
+        manifest = self.run_alert(self.settings(), FakeSource(ledger=[]), transport=transport, environ=ENV)
+        self.assert_record(manifest, "secret_unavailable", None)
+        self.assertEqual(transport.calls, [])
+
+    def test_error_before_the_post_records_no_http_status(self):
+        manifest = self.run_alert(self.settings(), FakeSource(ledger=[]), transport=FakeTransport(error=RuntimeError("bug")))
+        self.assert_record(manifest, "error", None)
+
+    def test_error_after_the_post_keeps_its_http_status(self):
+        # The POST was made and answered; a bug afterwards is still an error, with the answer kept.
+        with mock.patch.object(hourly, "save_alert_state", side_effect=RuntimeError("bug")):
+            manifest = self.run_alert(self.settings(), FakeSource(ledger=[]), transport=FakeTransport())
+        self.assert_record(manifest, "error", 200)
+
+    def test_send_failed_records_the_answer_or_null(self):
+        cases = [
+            ("answer 502", FakeTransport(codes=[502]), 502),
+            ("answer 403", FakeTransport(codes=[403]), 403),
+            ("timeout", FakeTransport(error=TimeoutError("timed out")), None),
+            ("network error", FakeTransport(error=OSError("unreachable")), None),
+            ("malformed answer", FakeTransport(error=http.client.BadStatusLine("x")), None),
+            ("not a status code", FakeTransport(codes=[True]), None),
+            ("out of range", FakeTransport(codes=[999]), None),
+        ]
+        for hours, (name, transport, expected) in enumerate(cases):
+            with self.subTest(name):
+                # A failed send keeps no state, so every hour posts again.
+                manifest = self.run_alert(self.settings(), FakeSource(ledger=[]), hours=hours, transport=transport)
+                self.assert_record(manifest, "send_failed", expected)
+
+    def test_disabled_records_no_http_status(self):
+        manifest = self.run_alert(settings_for(self.tmp), FakeSource(ledger=[]), transport=FakeTransport())
+        self.assert_record(manifest, "disabled", None)
+
+    def test_config_failure_writes_a_record(self):
+        raw = raw_settings(self.tmp, alert=alert_block(webhook_url="http://insecure.example.com/x"))
+        path = Path(self.tmp) / "settings.local.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = hourly.main(["--config", str(path)], source=FakeSource(), environ=ALERT_ENV, clock=clock_at(),
+                               alert_transport=FakeTransport())
+        self.assertEqual(code, hourly.EXIT_FAILED)
+        status = self.status_file()
+        record = json.loads((self.archive / status["hourly_folder"] / ALERT_RECORD).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(record), sorted(ALERT_RECORD_KEYS))
+        self.assertEqual((record["alert_status"], record["http_status"]), ("skipped_config_invalid", None))
+        self.assertEqual((record["status"], record["failure_class"]), ("failed", "config_invalid"))
+        self.assertIsNone(status["alert_http_status"])
+
+    def test_record_holds_nothing_secret_or_url_like(self):
+        settings = self.settings(output={"delivery_root": str(self.delivery)})
+        # A 502 keeps no state, so the next hour posts again and is answered 200: two real POSTs.
+        for hours, (transport, expected) in enumerate(((FakeTransport(codes=[502]), "send_failed"), (FakeTransport(), "sent"))):
+            manifest = self.run_alert(settings, FakeSource(ledger=[]), hours=hours, transport=transport)
+            self.assertEqual(len(transport.calls), 1)
+            raw = (self.run_dir(manifest) / ALERT_RECORD).read_text(encoding="utf-8")
+            self.assertEqual(json.loads(raw)["alert_status"], expected)
+            for leak in (FAKE_SECRET, FAKE_SECRET_ENV, FAKE_ALERT_URL, "example.com", "http:", "https:", "://", "webhook",
+                         "X-XB-Alert-Token", "Content-Type", hourly.ALERT_USER_AGENT, FAKE_DB, FAKE_SERVER.split("\\")[0],
+                         str(self.tmp), "FAKE-0001", "LOC-A", "\\", "/"):
+                self.assertNotIn(leak, raw)
+        # The record stays local: Drive gets no hourly folder and no record.
+        self.assertEqual(list(self.delivery.rglob(ALERT_RECORD)), [])
+
+    def test_record_is_written_once_and_never_replaced(self):
+        manifest = self.run_alert(self.settings(), transport=FakeTransport())
+        path = self.run_dir(manifest) / ALERT_RECORD
+        with self.assertRaises(FileExistsError):
+            hourly.write_exclusive(path, b"{}")
+
+    def test_record_write_failure_never_changes_the_run(self):
+        real = hourly.write_exclusive
+        refused = []
+
+        def refuse_record(path, data):
+            if Path(path).name == ALERT_RECORD:
+                refused.append(path)
+                raise OSError("disk full")
+            return real(path, data)
+
+        with mock.patch.object(hourly, "write_exclusive", side_effect=refuse_record):
+            manifest = self.run_alert(self.settings(), transport=FakeTransport())
+        self.assertEqual(len(refused), 1, "the record write was attempted once")
+        self.assertEqual(manifest["status"], "success")
+        self.assertFalse((self.run_dir(manifest) / ALERT_RECORD).exists())
+        self.assertEqual(self.status_file()["status"], "success")
+
+    def test_record_is_pruned_with_its_hourly_folder(self):
+        old = self.archive / "hourly" / "2026-10-20" / "ac2_stockbal_20261020T100000+0800_aaaaaaaa"
+        old.mkdir(parents=True)
+        for name in (hourly.CSV_NAME, hourly.MANIFEST_NAME, ALERT_RECORD):
+            (old / name).write_bytes(b"x")
+        settings = settings_for(self.tmp, alert=alert_block(), retention={"prune_enabled": True})
+        result = hourly.prune_archive(self.archive, settings, FIXED_NOW, FIXED_NOW.date(), None)
+        self.assertFalse(old.exists())
+        self.assertEqual((result["hourly_folders_removed"], result["kept_unexpected"], result["errors"]), (1, 0, 0))
+
+    def test_run_prunes_expired_records_and_keeps_its_own(self):
+        settings = settings_for(self.tmp, alert=alert_block(), retention={"prune_enabled": True, "hourly_keep_hours": 2})
+        first = self.run_alert(settings, transport=FakeTransport())
+        self.run_alert(settings, hours=1, transport=FakeTransport())
+        third = self.run_alert(settings, hours=3, transport=FakeTransport())
+        self.assertFalse(self.run_dir(first).exists())
+        self.assertEqual(third["retention"]["kept_unexpected"], 0)
+        self.assertEqual(len(list(self.archive.rglob(ALERT_RECORD))), 2)
+
+    def test_exit_code_is_unchanged_by_alert_failure(self):
+        def main_code(alert, transport, environ, source):
+            root = Path(self.tmp) / ("case_%d" % len(os.listdir(self.tmp)))
+            path = Path(self.tmp) / ("settings_%s.local.json" % root.name)
+            path.write_text(json.dumps(raw_settings(root, alert=alert)), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = hourly.main(["--config", str(path)], source=source(), environ=environ, clock=clock_at(),
+                                   alert_transport=transport)
+            records = list((root / "archive").rglob(ALERT_RECORD))
+            self.assertEqual(len(records), 1)
+            return code, json.loads(records[0].read_text(encoding="utf-8"))
+
+        for scenario, source in (("clean hour", FakeSource), ("ledger mismatch", lambda: FakeSource(ledger=[]))):
+            base_code, base_record = main_code({"webhook_enabled": False}, None, ALERT_ENV, source)
+            self.assertEqual(base_record["alert_status"], "disabled")
+            for name, transport, environ in (
+                ("answer 500", FakeTransport(codes=[500]), ALERT_ENV),
+                ("timeout", FakeTransport(error=TimeoutError("timed out")), ALERT_ENV),
+                ("bug in transport", FakeTransport(error=RuntimeError("bug")), ALERT_ENV),
+                ("secret missing", FakeTransport(), ENV),
+            ):
+                with self.subTest(scenario=scenario, behaviour=name):
+                    code, record = main_code(alert_block(), transport, environ, source)
+                    self.assertEqual(code, base_code)
+                    self.assertEqual(record["status"], base_record["status"])
 
 
 class AlertTransportTests(unittest.TestCase):
