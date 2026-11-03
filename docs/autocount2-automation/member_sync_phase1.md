@@ -401,7 +401,7 @@ Unknown keys, at the top level or nested, are refused.
 
 | Key | Default | Notes |
 |---|---|---|
-| `autocount_book` | required | `AED_TESTINGAPI` or `AED_XBOUNDARIES` (go-live), compared exactly; anything else is refused. The live book needs `ac2_credential_target` `XB-AC2-MemberSync` and `ac2_refused_user_ids`, and refuses `ac2_create_without_phone` `true` |
+| `autocount_book` | required | `AED_TESTINGAPI` or `AED_XBOUNDARIES` (go-live), compared exactly; anything else is refused. The live book needs `ac2_credential_target` `XB-AC2-MemberSync` and `ac2_login_mode` (in `dedicated` mode also `ac2_refused_user_ids`), and refuses `ac2_create_without_phone` `true` |
 | `state_root` | required | Private root (same custody check as the Core); ledger `member_sync.sqlite3`, `claims\` |
 | `shopify` | required | Store, API version, auth env names, token cache (as the poller) |
 | `shopify_cutover_utc` | required | Registrations before it are skipped by the regular sync; customers made before it are linked once by the initial link (round 7c); creating historic members is phase 2 |
@@ -411,8 +411,9 @@ Unknown keys, at the top level or nested, are refused.
 | `birthday_month_metafield` | `custom.birthday_month`, `number_integer` | Owner: placeholder until Shopify's developer confirms it |
 | `ac2_member_no_metafield` | `custom.ac2_member_no`, `single_line_text_field` | Sent on every create from AC2 (Owner round 2, Q2) |
 | `shopify_create_tags` | `["ac2-member"]` | Owner-confirmed; `member-mg` is refused (it would loop) |
-| `ac2_credential_target` | `null` | Credential Manager target holding the AutoCount account the sync logs in with; `null` keeps the attended owner-console path (test book only). Go-live V9: on the live book it must be `XB-AC2-MemberSync`, holding the sync's own AutoCount user. G2 #281 LATER-3: the test book uses its own target (example `XB-AC2-MemberSync-Test`) and refuses `XB-AC2-MemberSync` in any case (`sync_config_ac2_credential_target_live_only`), so the live sync user is never used on the test book |
-| `ac2_refused_user_ids` | `[]` | Go-live V9: AutoCount user IDs the sync must never log in as (at least the Owner's own account), up to 10, compared case-insensitively before any login (`ac2_credential_user_refused`). Required on the live book. Kept only in the private config on the VM |
+| `ac2_credential_target` | `null` | Credential Manager target holding the AutoCount account the sync logs in with; `null` keeps the attended owner-console path (test book only). Go-live V9: on the live book it must be `XB-AC2-MemberSync`, holding the AutoCount user that `ac2_login_mode` names. G2 #281 LATER-3: the test book uses its own target (example `XB-AC2-MemberSync-Test`) and refuses `XB-AC2-MemberSync` in any case (`sync_config_ac2_credential_target_live_only`), so the live sync user is never used on the test book |
+| `ac2_login_mode` | `null` | Owner, 30 Oct 2026 ("Use my login"): which AutoCount user the credential holds. `"owner_shared"`: the Owner's own user, shared with the Owner's all-day session on the VM; `ac2_refused_user_ids` must then be empty (`sync_config_ac2_refused_user_ids_owner_shared_refused`). `"dedicated"`: a separate sync user, with the Owner's ID in `ac2_refused_user_ids`. Compared exactly; anything else is `sync_config_ac2_login_mode_invalid`. Required on the live book, with no default (`sync_config_ac2_login_mode_live_required`); optional on the test book. `check-config` prints it |
+| `ac2_refused_user_ids` | `[]` | Go-live V9: AutoCount user IDs the sync must never log in as, up to 10, compared case-insensitively before any login (`ac2_credential_user_refused`). `dedicated` mode: at least the Owner's own account, required on the live book. `owner_shared` mode: must be empty. Kept only in the private config on the VM |
 | `ac2_create_without_phone` | `null` | Go-live R8 (Owner Q2 = A): `null` means the book's default: `true` on the test book (phase 1: a no-phone sign-up gets `GetNextMemberNo`), `false` on the live book (skipped with the alert `no_phone_sign_up_needs_staff`). `true` with the live book is refused |
 | `changelog_xml_column` | `null` | Owner Q4: off. AC2 -> Shopify then reads no ChangeLog and makes no links. Set to `"Content"` (VM fact r5-1) at UAT, deliberately, after the name rule is confirmed; Shopify creates still need `shopify_create_enabled` |
 | `changelog_batch` | `200` | 1-500 new rows per run |
@@ -636,13 +637,17 @@ Each step is a later, Owner-approved VM step.
 ### AutoCount login and credential
 
 1. Test book (UAT): the sync logged in with the Owner's own AutoCount
-   account (Owner, 2026-10-21). Live book (go-live V9, Owner 29 Oct 2026):
-   the sync logs in as its **own** AutoCount user, never the Owner's, and
-   the live config lists the Owner's user ID in `ac2_refused_user_ids`, so
-   a credential holding it is refused before any login. No user ID is
-   written in this repository. AutoCount rights do not limit the member API
-   (VM fact r5-6) and the SQL login is always `sa` (see Write safety), so
-   the limits are this source's guards.
+   account (Owner, 2026-10-21). Live book (Owner, 30 Oct 2026, "Use my
+   login", replacing the separate sync user of 29 Oct): the sync logs in
+   with the Owner's **own** AutoCount user too, and the live config says so
+   with `"ac2_login_mode": "owner_shared"` and `"ac2_refused_user_ids": []`.
+   The other mode, `"dedicated"`, is kept for a switch-back (a separate
+   sync user, with the Owner's user ID in `ac2_refused_user_ids` so a
+   credential holding it is refused before any login); see "AutoCount
+   sign-in and licence" for when to switch. No user ID is written in this
+   repository. AutoCount rights do not limit the member API (VM fact r5-6)
+   and the SQL login is always `sa` (see Write safety), so the limits are
+   this source's guards.
 2. Signed in as the Windows account that will run the sync (the same account
    that owns the state root), store the credential in Windows Credential
    Manager as a generic credential. The password lives only there, never in
@@ -651,8 +656,9 @@ Each step is a later, Owner-approved VM step.
    ```bat
    rem Test book (UAT) config:
    cmdkey /generic:XB-AC2-MemberSync-Test /user:<the test-book AutoCount user ID> /pass
-   rem Live config only (go-live S1):
-   cmdkey /generic:XB-AC2-MemberSync /user:<the sync's own AutoCount user ID> /pass
+   rem Live config only (go-live S1), owner_shared mode:
+   cmdkey /generic:XB-AC2-MemberSync /user:<the Owner's own AutoCount user ID> /pass
+   rem (dedicated mode instead: /user:<the separate sync user ID>)
    ```
 
    `cmdkey` prompts for the password, so it is not in the command history.
@@ -667,7 +673,7 @@ Each step is a later, Owner-approved VM step.
    UAT config's `ac2_credential_target` to `XB-AC2-MemberSync-Test`, and run
    `check-credential` on it (step 3). The old entry is then read by nothing
    until S1, whose `cmdkey /generic:XB-AC2-MemberSync` replaces it with the
-   sync's own user.
+   live login (in `owner_shared` mode the same Owner user).
 3. Set `ac2_credential_target` (test book `XB-AC2-MemberSync-Test`, live
    book `XB-AC2-MemberSync`) and check it:
 
@@ -874,7 +880,7 @@ the OK.
 
 | Layer | Live book `AED_XBOUNDARIES` | Still refused |
 |---|---|---|
-| Python config (`parse_config`) | Exact name only; `ac2_credential_target` must be `XB-AC2-MemberSync`; `ac2_refused_user_ids` must list at least the Owner's AutoCount user ID | Any other name or lookalike (`autocount_book_not_authorised`); `ac2_create_without_phone` `true`; `XB-AC2-MemberSync` in a test-book config (`sync_config_ac2_credential_target_live_only`) |
+| Python config (`parse_config`) | Exact name only; `ac2_credential_target` must be `XB-AC2-MemberSync`; `ac2_login_mode` must be stated: `owner_shared` (the Owner's own user, `ac2_refused_user_ids` empty) or `dedicated` (`ac2_refused_user_ids` lists at least the Owner's AutoCount user ID) | A missing or unknown `ac2_login_mode` (`sync_config_ac2_login_mode_live_required`, `sync_config_ac2_login_mode_invalid`); `owner_shared` with a refused list; any other name or lookalike (`autocount_book_not_authorised`); `ac2_create_without_phone` `true`; `XB-AC2-MemberSync` in a test-book config (`sync_config_ac2_credential_target_live_only`) |
 | Ledger | Schema v3, a fresh ledger in its own state root (example `C:\XB\xb155-member-sync-live`) | A test ledger with the live config and the reverse (`sync_ledger_binding_mismatch`, also for `status` and `digest`) |
 | Engine | Same rules as the test book, plus: a sign-up with no usable phone is never created (R8) | `GetNextMemberNo` (`member_no_generator_not_authorised`) |
 | PowerShell book guard | `sync-lookup`, `sync-changelog`, and `write-once` with payload profile `sync_p1`. The operation is checked before stdin; the profile once the payload is read, before any session, login or claim | Every other operation, `next-member-no` included, any other profile and any caller without an operation (`production_book_not_authorised`) |
@@ -896,7 +902,7 @@ and `tests/test_member_sync_bridge_ps.py`.
 |---|---|---|---|---|
 | S0 | This PR: G2 review, Owner merge | OK-0 (merge) | G2 PASS; CI green on the exact head | Revert the PR (nothing runs on merge) |
 | S0b | Test-book smoke at the merged SHA (inside the existing UAT gate): first the credential migration (Owner re-stores the test-book login under `XB-AC2-MemberSync-Test` and sets it in the UAT config, "AutoCount login and credential" above), copy the UAT ledger, then `check-config`, `check-credential`, one `initial-link` dry run, one `run --direction shopify_to_ac2` | none (test book, no writes) | The v2 UAT ledger opens as v3 with no other change; no new refusal code (a UAT config still naming `XB-AC2-MemberSync` gets `sync_config_ac2_credential_target_live_only`: do the migration, then repeat); 0 writes either side | Restore the ledger copy |
-| S1+S2 | Live read-only check: `prepare-state-root` for the new root, the live config (all switches off, cutover = the minute S2 starts), `check-config`, `check-credential`, `init`, initial-link dry runs until `complete: true`, then one `run --direction shopify_to_ac2` | OK-1 "LIVE READ-ONLY" | Book `AED_XBOUNDARIES`; credential masked and not the Owner's; no `book_*`, `vendor_query_*`, `outbound_*`, `user_script_present` refusal; counts recorded (would link, no phone, no member, conflicts, `initial_link_cursor_stuck` 0); the run returns only `initial_link_not_complete`; 0 writes; after the first initial-link dry run ends, the sync user no longer appears in AutoCount's logged-in users list (licence released when the bridge child exits; read-only check, see "AutoCount sign-in and licence") | Nothing live to undo; the live ledger may be deleted (no links yet) |
+| S1+S2 | Live read-only check: `prepare-state-root` for the new root, the live config (all switches off, cutover = the minute S2 starts), `check-config`, `check-credential`, `init`, initial-link dry runs until `complete: true`, then one `run --direction shopify_to_ac2` | OK-1 "LIVE READ-ONLY" | Book `AED_XBOUNDARIES`; `check-config` shows `ac2_login_mode` `owner_shared` and `ac2_refused_user_ids_count` 0; credential masked (the Owner's user, last 3 characters); the Owner's own AutoCount session on the VM is still signed in after each login of S1 (Owner session check, see "AutoCount sign-in and licence"; recorded yes/no); no `book_*`, `vendor_query_*`, `outbound_*`, `user_script_present` refusal; counts recorded (would link, no phone, no member, conflicts, `initial_link_cursor_stuck` 0); the run returns only `initial_link_not_complete`; 0 writes; after the first initial-link dry run ends, AutoCount's logged-in users list shows the Owner's user only for the Owner's own session (the sync's session released when the bridge child exits; read-only check, see "AutoCount sign-in and licence") | Nothing live to undo; the live ledger may be deleted (no links yet) |
 | S3 | `initial_link_enabled` true, `initial-link --apply` until complete, back to false | OK-2 "INITIAL LINK" (may be merged with OK-3, Q8) | `initial_link_linked` = the last dry run's would-link; one linked member unchanged in AutoCount | Before S5 only: archive the live ledger and redo S1-S3 (no external effect). After S5, never delete the live ledger |
 | S4 | Shadow schedule: `changelog_xml_column` `"Content"`, installer dry run (no `-Register`) output reviewed, one manual `run --direction both` as the task account, then `-Register` | OK-3 "SHADOW SCHEDULE" | 3 scheduled runs with result 0 or 3 and only expected alerts (`waiting_for_staff` counts, `sign_up_past_cutoff_create_disabled`, `no_phone_sign_up_needs_staff`, `memberno_*`, `ac2_pending_would_create_backlog`); 0 writes; `digest` readable and its `runs.duration_seconds_max` well under 600 s (above about 300 s: lower `max_pending_rechecks_per_run` first, "Schedule" below); then at least 2 days in shadow | Disable `\XB\XB-MemberSync` in Task Scheduler |
 | S5 | `max_writes_per_run` 1 and `ac2_create_enabled` true before a 06:00 run; check the first create in AutoCount and at one till; then `max_writes_per_run` 5 | OK-4 "AC2 CREATES" (never merged) | First create correct (MemberNo, type `Default`, name, mobile, DOB, RegisterDate, no ExpiryDate) and seen at a till; no `uncertain` write; `created_after_wait` raised; no duplicate next run | `ac2_create_enabled` false (next run). A wrong record is fixed or deleted by the Owner in AutoCount; the sync has no update or delete |
@@ -953,10 +959,12 @@ credential migration first, so the probe does not fail
 - Licence release (carried from G1/G2 #281; confirm at S1, read-only): when
   the first initial-link dry run (the first command that logs in) has
   ended, open AutoCount's logged-in users list (as the Owner, on the VM)
-  and check the sync user is no longer listed, and that no `powershell.exe`
-  bridge child is left in Task Manager. If it is still listed after the
-  child exits, stop and report before any further step: every run would
-  then hold a licence until AutoCount times the session out.
+  and check that the sync's session is gone (in `owner_shared` mode: the
+  Owner's user is listed only for the Owner's own session, as before the
+  run), and that no `powershell.exe` bridge child is left in Task Manager.
+  If the sync's session is still listed after the child exits, stop and
+  report before any further step: every run would then hold a licence
+  until AutoCount times the session out.
 - Run-time measurement before any interval under 15 (carried from G1/G2
   #281): S4's `digest` gives the first `duration_seconds_max`; the rule
   below needs the S7 digests on 3 days in a row.
@@ -977,26 +985,53 @@ code change (the execution limit and this floor) and its own review.
 
 ### AutoCount sign-in and licence (VM fact V9)
 
-- The sync signs in as its own AutoCount user, read from the Credential
-  Manager target `XB-AC2-MemberSync` of the task account, never the Owner's
-  account (signed in on the VM all day): the live config refuses any other
-  target and lists the Owner's user ID in `ac2_refused_user_ids`, so a
-  credential holding it is refused (`ac2_credential_user_refused`, exit 2)
-  before any bridge child starts. The Owner creates that user in AutoCount
-  and stores it with `cmdkey` (runbook above) before S1; `check-credential`
-  shows only its last 3 characters.
+- Owner decision, 30 Oct 2026 ("Use my login"): the sync signs in with the
+  Owner's own AutoCount user, the same login the October UAT used, read
+  from the Credential Manager target `XB-AC2-MemberSync` of the task
+  account. The Owner's user is also signed in on the VM all day, so each
+  bridge child opens a second session of the same user. The live config
+  records the choice (`"ac2_login_mode": "owner_shared"`,
+  `"ac2_refused_user_ids": []`) and refuses any other target; the code has
+  no default for the mode on the live book. `check-credential` shows only
+  the user ID's last 3 characters.
+- Other mode, `dedicated` (the 29 Oct design, kept for a switch-back): a
+  separate AutoCount user for the sync, with the Owner's user ID in
+  `ac2_refused_user_ids`, so a credential holding the Owner's user is
+  refused (`ac2_credential_user_refused`, exit 2) before any bridge child
+  starts. Switching is a config edit plus a new `cmdkey` entry; the Owner
+  creates that user in AutoCount first.
+- Owner session check (S1, read-only, `owner_shared` mode): it is not known
+  whether a second sign-in of the same user signs the first one out (the
+  October UAT did not record it). Before S1, the Owner has their AutoCount
+  window open and signed in on the VM. After `check-credential` (no login
+  yet: a baseline), after the first initial-link dry run (the first command
+  that logs in) and again after the S2 run, the Owner checks that window is still signed in
+  and usable (open any list, no sign-in prompt, no "signed out" or
+  "session ended" message), and records yes or no each time. If any answer
+  is no: stop, run nothing further, report; the sync then moves to
+  `dedicated` mode (a separate AutoCount user, Owner's OK), and S1 is
+  repeated in that mode.
 - When AutoCount refuses the sign-in (the user is already signed in
-  elsewhere, all licences are in use, a wrong password): the reviewed login
-  fails, the bridge returns a fixed code (`autocount_login_rejected` or the
-  stage code), the run stops with exit 2, and nothing is written (a create
-  fails before its claim and is proven not written). The next scheduled run
-  tries again; a run never retries a login. Do not run attended commands
-  with the same AutoCount user while the task is running: disable the task
-  first.
-- Licence use: one of the five, for the length of one bridge child. Not two
-  at once, except briefly after a run is hard-stopped at the execution
-  limit, when an orphan write-once child (at most 120 s) can overlap the
-  next run (above).
+  elsewhere in a way AutoCount rejects, all licences are in use, a wrong
+  password): the reviewed login fails, the bridge returns a fixed code
+  (`autocount_login_rejected` or the stage code), the run stops with exit
+  2, and nothing is written (a create fails before its claim and is proven
+  not written). This is the same in both modes (closure matrix row V9d).
+  The next scheduled run tries again; a run never retries a login. In
+  `owner_shared` mode the Owner's own attended use of AutoCount continues
+  while the task runs; in `dedicated` mode do not run attended commands
+  with the sync user while the task is running: disable the task first.
+- Licence use: the Owner's all-day session holds one licence; the sync
+  holds one more (of the five), for the length of one bridge child, also
+  in `owner_shared` mode, where it is a second session of the Owner's user.
+  Not two sync sessions at once, except briefly after a run is
+  hard-stopped at the execution limit, when an orphan write-once child (at
+  most 120 s) can overlap the next run (above).
+- Audit fields (`owner_shared` mode, accepted by the Owner on 30 Oct 2026):
+  AutoCount records the signed-in user as the creator of a record, so a
+  member the sync creates shows the Owner's user as its creator, the same
+  as one the Owner keys by hand. The sync's own ledger (`writes`, keyed
+  refs) is the record of which members the sync made.
 
 ### Scheduled task account (VM fact V8, design T1)
 
@@ -1043,6 +1078,10 @@ behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for exampl
   a later hardening step.
 - The first production sign-in (S1) may take a licence during shop hours:
   run S1 outside them.
+- `owner_shared` mode (Owner, 30 Oct 2026): if AutoCount signs a user's
+  earlier session out when the same user signs in again, every run would
+  sign the Owner out on the VM. The S1 Owner session check finds this
+  before anything is scheduled; the remedy is `dedicated` mode.
 - Shadow runs exit 3 every run while past-cutoff sign-ups wait for AC2
   creates; the digest groups them.
 - On rollback of Shopify creates the switch and the scope go together, or
@@ -1211,6 +1250,17 @@ that `CreatedTime` is form-open time, the run count rename
 behaviour) and `memberno_link_window_minutes` default 10 -> 60 (range 1-60
 unchanged). Gates unchanged: Shopify and AC2 creates off by default, test
 book only, `book_guard.ps1` unchanged.
+
+Login mode (30 October 2026, Owner "Use my login", after the go-live merge
+at `03acf97`): the live sync logs in with the Owner's own AutoCount user on
+both books, not a separate sync user. Recorded explicitly as
+`"ac2_login_mode": "owner_shared"` (the live config must state a mode; the
+29 Oct separate-user design stays available as `"dedicated"`). Accepted by
+the Owner: one more licence in use while a bridge child runs, and the
+Owner's user shown as creator of sync-created members. S1 adds the Owner
+session check; if the Owner's session is signed out, stop and switch to
+`dedicated`. No change to the bridge, book guard, live-book admission,
+ledger or installer.
 
 ## Open items
 

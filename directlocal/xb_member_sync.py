@@ -42,9 +42,10 @@ Safety
   this sync only: in the PowerShell bridge only ``sync-lookup``,
   ``sync-changelog`` and ``write-once`` with profile ``sync_p1``; here no
   create without a usable phone (no ``GetNextMemberNo``), and the AutoCount
-  login only through the sync's own Credential Manager entry with the
-  configured refused user IDs. The Core, owner console and E7 scripts stay
-  test-book only.
+  login only through the sync's own Credential Manager entry, in the login
+  mode the live config states (``ac2_login_mode``: ``owner_shared`` or
+  ``dedicated`` with its refused user IDs). The Core, owner console and E7
+  scripts stay test-book only.
 * Every write switch defaults OFF; at most ``max_writes_per_run`` (<= 5)
   writes per run across both directions; unknown config keys are refused.
 * A write is recorded (INTENT) before it starts. A crash, timeout or unclear
@@ -97,13 +98,19 @@ SCHEMA_VERSION = 3
 TEST_BOOK = "AED_TESTINGAPI"
 LIVE_BOOK = "AED_XBOUNDARIES"
 AUTHORISED_BOOKS = frozenset({TEST_BOOK, LIVE_BOOK})
-# Go-live V9 (Owner): on the live book the sync logs in only as its own
-# AutoCount user, read from this Credential Manager target.
+# Go-live V9 (Owner): on the live book the sync logs in only with the
+# AutoCount user read from this Credential Manager target.
 LIVE_CREDENTIAL_TARGET = "XB-AC2-MemberSync"
 # G2 #281 LATER-3: the test book has its own target, so the live sync user is
 # never used against the test book (and the S6 probe never needs it there).
 TEST_CREDENTIAL_TARGET = "XB-AC2-MemberSync-Test"
 AC2_USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# Owner decision 30 Oct 2026 ("Use my login"): which AutoCount user that
+# target holds. ``owner_shared``: the Owner's own user, shared with the
+# Owner's all-day session on the VM (no refused user IDs). ``dedicated``: a
+# separate sync user, with the Owner's ID in ``ac2_refused_user_ids``. The
+# live config must state one; there is no default.
+AC2_LOGIN_MODES = ("owner_shared", "dedicated")
 MAX_WRITES_PER_RUN_LIMIT = 5
 MEMBER_NO_WIDTH = 20  # AutoCount Member.MemberNo nvarchar(20)
 SGT = timezone(timedelta(hours=8))
@@ -202,9 +209,13 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # false on the live book, where true is refused.
     "ac2_create_without_phone": None,
     # Go-live V9 (Owner): AutoCount user IDs the sync must never log in as
-    # (the Owner's own account at least). Required on the live book. Kept
-    # only in the private config on the VM, never in this repository.
+    # (the Owner's own account at least). Required on the live book in
+    # ``dedicated`` mode, refused in ``owner_shared`` mode. Kept only in the
+    # private config on the VM, never in this repository.
     "ac2_refused_user_ids": [],
+    # Owner 30 Oct 2026: ``owner_shared`` or ``dedicated`` (AC2_LOGIN_MODES).
+    # null is accepted on the test book only; the live book must state it.
+    "ac2_login_mode": None,
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -260,6 +271,7 @@ class SyncConfig:
     initial_link_enabled: bool
     ac2_create_without_phone: bool = False
     ac2_refused_user_ids: tuple[str, ...] = ()
+    ac2_login_mode: str | None = None
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -273,6 +285,7 @@ class SyncConfig:
             "deferred_create_local_time": self.deferred_create_local_time, "ac2_create_member_type": self.ac2_create_member_type,
             "memberno_link_window_minutes": self.memberno_link_window_minutes, "initial_link_enabled": self.initial_link_enabled,
             "ac2_create_without_phone": self.ac2_create_without_phone, "ac2_refused_user_ids_count": len(self.ac2_refused_user_ids),
+            "ac2_login_mode": self.ac2_login_mode,
         }
 
 
@@ -359,7 +372,18 @@ def parse_config(value: Any) -> SyncConfig:
         # spelling of the live target is refused for the test book. Migration:
         # store the test credential under TEST_CREDENTIAL_TARGET (runbook).
         raise dl.DirectLocalError("sync_config_ac2_credential_target_live_only")
-    if live and not refused_users:
+    login_mode = merged["ac2_login_mode"]
+    if login_mode is not None and (not isinstance(login_mode, str) or login_mode not in AC2_LOGIN_MODES):
+        raise dl.DirectLocalError("sync_config_ac2_login_mode_invalid")
+    if live and login_mode is None:
+        # Owner 30 Oct 2026: the live config states which AutoCount user the
+        # sync logs in with; neither choice is a silent default.
+        raise dl.DirectLocalError("sync_config_ac2_login_mode_live_required")
+    if login_mode == "owner_shared" and refused_users:
+        # The Owner's own user is the login in this mode, so a refused list
+        # (meant to hold the Owner's ID) contradicts it, on either book.
+        raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_owner_shared_refused")
+    if live and login_mode == "dedicated" and not refused_users:
         raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_live_required")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
@@ -368,7 +392,7 @@ def parse_config(value: Any) -> SyncConfig:
         initial_link_enabled=_bool(merged["initial_link_enabled"], "initial_link_enabled"),
         birthday_month_metafield=dict(birthday), ac2_member_no_metafield=dict(member_no_field), shopify_create_tags=tuple(tags), ac2_credential_target=target,
         changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type,
-        ac2_create_without_phone=without_phone, ac2_refused_user_ids=tuple(refused_users), **numbers,
+        ac2_create_without_phone=without_phone, ac2_refused_user_ids=tuple(refused_users), ac2_login_mode=login_mode, **numbers,
     )
 
 
@@ -2060,7 +2084,8 @@ def load_ac2_credential(target: str, *, refused_user_ids: Iterable[str] = (), cr
     codes. ``ac2_credential_sa_refused`` refuses an AutoCount user ID of
     ``sa`` only; it does not change the SQL login (always ``sa``). Go-live
     V9: ``ac2_credential_user_refused`` refuses any of ``refused_user_ids``
-    (the Owner's own account), case-insensitively, before any login."""
+    (the Owner's own account in ``dedicated`` mode; none in
+    ``owner_shared`` mode), case-insensitively, before any login."""
 
     if not isinstance(target, str) or not CREDENTIAL_TARGET_RE.fullmatch(target):
         raise dl.DirectLocalError("ac2_credential_target_invalid")
