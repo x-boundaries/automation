@@ -32,6 +32,11 @@ Behaviour:
   prompt and goes straight to Task Scheduler. Do not run this inside a transcript.
 - RepoRoot defaults to the clone this script is in (worked out in the body: Windows
   PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults).
+- -Probe (#155 P2, G0 r2): the sign-up probe task instead, default name XB-MemberSync-Probe in
+  the same \XB\ folder: action "xb_member_sync.py probe --config <config>", every 1 minute
+  with no end, IgnoreNew, a short PT2M limit, StartWhenAvailable false (a missed tick is not
+  caught up). -IntervalMinutes is refused with -Probe, and so is the main task's name: the
+  probe installer never replaces, changes or reads the main task. Dry run by default, as above.
 
 Windows PowerShell 5.1 compatible. Dry run (the default):
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_member_sync_task.ps1 `
@@ -47,9 +52,10 @@ param(
     [string]$PythonExe,
     [int]$IntervalMinutes = 15,
     [string]$LogonType = "Password",
-    [string]$TaskName = "XB-MemberSync",
+    [string]$TaskName = "",
     [string]$TaskPath = "\XB\",
     [string]$RepoRoot = "",
+    [switch]$Probe,
     [switch]$Register
 )
 
@@ -58,6 +64,17 @@ $ErrorActionPreference = "Stop"
 # Go-live T1: an S4U task cannot read Credential Manager or decrypt the DPAPI token cache.
 if (-not [string]::Equals($LogonType, "Password", [StringComparison]::Ordinal)) {
     throw "LogonType must be Password: an S4U (or any other) logon cannot read the Credential Manager entry or the DPAPI token cache the sync needs."
+}
+# #155 P2: the probe task runs every minute (fixed); the main task's name is never used for it.
+$MainTaskName = "XB-MemberSync"
+if ($Probe -and $PSBoundParameters.ContainsKey("IntervalMinutes")) {
+    throw "-IntervalMinutes does not apply with -Probe: the probe runs every 1 minute."
+}
+if ([string]::IsNullOrEmpty($TaskName)) {
+    $TaskName = $(if ($Probe) { "XB-MemberSync-Probe" } else { $MainTaskName })
+}
+if ($Probe -and [string]::Equals($TaskName.Trim(), $MainTaskName, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "-Probe never replaces or touches the main task $MainTaskName; use the default name XB-MemberSync-Probe."
 }
 # Safe minimum 10 minutes (the execution time limit); at most once a day.
 $SafeMinimumIntervalMinutes = 10
@@ -113,10 +130,21 @@ function ConvertTo-XbXmlText {
     return [System.Security.SecurityElement]::Escape($Value)
 }
 
-$interval = "PT$($IntervalMinutes)M"
 $startAt = (Get-Date).Date.ToString("yyyy-MM-ddTHH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
-$arguments = "`"$scriptPath`" run --config `"$ConfigPath`" --direction both"
-$description = "#155 member sync, both directions, every $IntervalMinutes minutes (book $book). Create switches live in the config; see member_sync_phase1.md Go-live."
+if ($Probe) {
+    $interval = "PT1M"
+    $timeLimit = "PT2M"
+    $startWhenAvailable = "false"
+    $arguments = "`"$scriptPath`" probe --config `"$ConfigPath`""
+    $description = "#155 sign-up probe, every minute (book $book): Shopify read only; may start \XB\$MainTaskName on demand. Wake switch probe_wake_enabled lives in the config; see member_sync_phase1.md Immediate create."
+}
+else {
+    $interval = "PT$($IntervalMinutes)M"
+    $timeLimit = "PT10M"
+    $startWhenAvailable = "true"
+    $arguments = "`"$scriptPath`" run --config `"$ConfigPath`" --direction both"
+    $description = "#155 member sync, both directions, every $IntervalMinutes minutes (book $book). Create switches live in the config; see member_sync_phase1.md Go-live."
+}
 $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -146,7 +174,7 @@ $taskXml = @"
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
+    <StartWhenAvailable>$startWhenAvailable</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <IdleSettings>
       <StopOnIdleEnd>false</StopOnIdleEnd>
@@ -157,7 +185,7 @@ $taskXml = @"
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>$timeLimit</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
   <Actions Context="Author">
@@ -174,10 +202,15 @@ $taskXml = @"
 
 if (-not $Register) {
     Write-Host "Dry run (the default): would register $TaskPath$TaskName"
-    Write-Host "Book $book; every $IntervalMinutes minutes, no end; IgnoreNew; PT10M limit; LeastPrivilege; LogonType Password."
+    if ($Probe) {
+        Write-Host "Sign-up probe. Book $book; every 1 minute, no end; IgnoreNew; $timeLimit limit; LeastPrivilege; LogonType Password."
+    }
+    else {
+        Write-Host "Book $book; every $IntervalMinutes minutes, no end; IgnoreNew; $timeLimit limit; LeastPrivilege; LogonType Password."
+    }
     Write-Host "Task XML:"
     Write-Host $taskXml
-    Write-Host "Nothing was registered. Registering needs -Register and the owner's OK (go-live step S4)."
+    Write-Host "Nothing was registered. Registering needs -Register and the owner's OK (go-live step S4; P3 for -Probe)."
     exit 0
 }
 
@@ -196,6 +229,11 @@ try {
 }
 finally {
     $credential = $null
+}
+if ($Probe) {
+    Write-Host "Registered scheduled task: $TaskPath$TaskName (book $book, sign-up probe every 1 minute)."
+    Write-Host "Next (P3 PROBE OBSERVE): keep probe_wake_enabled false; check member_sync_probe_status.json and the digest's probe figures. Off switch: Disable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName."
+    exit 0
 }
 Write-Host "Registered scheduled task: $TaskPath$TaskName (book $book, every $IntervalMinutes minutes)."
 Write-Host "Next (go-live S4): Start-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName, wait for it to finish, check the run summary and digest, and keep it enabled only if the result is 0 or 3. Otherwise Disable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName and report."

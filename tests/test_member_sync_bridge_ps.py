@@ -969,6 +969,61 @@ class GoLiveInstallerTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.task_xml(out).findtext(f"{TASK_NS}RegistrationInfo/{TASK_NS}URI"), "\\XB\\XB-MemberSync-installer-test-never-registered")
 
+    # -- #155 P2: the sign-up probe task (G0 r2 slice P2) ----------------------
+    def run_probe_installer(self, *extra: str, task_name: str = "XB-MemberSync-Probe-installer-test-never-registered"):
+        command = [shutil.which("powershell"), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(INSTALLER),
+                   "-UserId", "EXAMPLE-PC\\example-user", "-ConfigPath", str(self.config), "-PythonExe", sys.executable, "-Probe", *extra]
+        if task_name is not None:
+            command += ["-TaskName", task_name]
+        proc = subprocess.run(command, capture_output=True, timeout=180, check=False)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")
+
+    def test_probe_dry_run_task_xml_is_pinned(self):
+        code, out = self.run_probe_installer()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Dry run (the default): would register \\XB\\XB-MemberSync-Probe-installer-test-never-registered", out)
+        self.assertIn("Nothing was registered.", out)
+        task = self.task_xml(out)
+        ns = TASK_NS
+        flat = [(element.tag.replace(ns, ""), (element.text or "").strip()) for element in task.iter() if len(element) == 0]
+        variable = {"Description", "StartBoundary", "Command", "Arguments", "WorkingDirectory"}
+        self.assertEqual([item for item in flat if item[0] not in variable], [
+            ("URI", "\\XB\\XB-MemberSync-Probe-installer-test-never-registered"),
+            ("Interval", "PT1M"), ("StopAtDurationEnd", "false"), ("Enabled", "true"),
+            ("UserId", "EXAMPLE-PC\\example-user"), ("LogonType", "Password"), ("RunLevel", "LeastPrivilege"),
+            ("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnBatteries", "false"), ("StopIfGoingOnBatteries", "false"),
+            ("AllowHardTerminate", "true"), ("StartWhenAvailable", "false"), ("RunOnlyIfNetworkAvailable", "false"),
+            ("StopOnIdleEnd", "false"), ("RestartOnIdle", "false"), ("AllowStartOnDemand", "true"), ("Enabled", "true"), ("Hidden", "false"),
+            ("RunOnlyIfIdle", "false"), ("WakeToRun", "false"), ("ExecutionTimeLimit", "PT2M"), ("Priority", "7"),
+        ])
+        self.assertEqual([tag for tag, _ in flat if tag in variable], ["Description", "StartBoundary", "Command", "Arguments", "WorkingDirectory"])
+        self.assertTrue(task.findtext(f"{ns}RegistrationInfo/{ns}Description").startswith("#155 sign-up probe, every minute (book AED_TESTINGAPI)"))
+        self.assertIsNone(task.find(f"{ns}Triggers/{ns}TimeTrigger/{ns}Repetition/{ns}Duration"))
+        self.assertEqual(Path(task.findtext(f"{ns}Actions/{ns}Exec/{ns}Command")), Path(sys.executable))
+        self.assertRegex(task.findtext(f"{ns}Actions/{ns}Exec/{ns}Arguments"), r'^"[^"]+\\directlocal\\xb_member_sync\.py" probe --config "[^"]+\\member_sync\.json"$')
+        # The main task's XML is unchanged by the switch.
+        code, out = self.run_installer()
+        settings = self.task_xml(out).find(f"{ns}Settings")
+        self.assertEqual((code, settings.findtext(f"{ns}StartWhenAvailable"), settings.findtext(f"{ns}ExecutionTimeLimit")), (0, "true", "PT10M"))
+
+    def test_probe_never_takes_the_main_task_or_an_interval(self):
+        for name in ("XB-MemberSync", "xb-membersync", "XB-MemberSync "):
+            with self.subTest(task_name=name):
+                code, out = self.run_probe_installer(task_name=name)
+                self.assertNotEqual(code, 0)
+                self.assertIn("-Probe never replaces or touches the main task", out)
+                self.assertNotIn("Task XML:", out)
+        for interval in ("15", "1"):
+            with self.subTest(interval=interval):
+                code, out = self.run_probe_installer("-IntervalMinutes", interval)
+                self.assertNotEqual(code, 0)
+                self.assertIn("-IntervalMinutes does not apply with -Probe", out)
+        source = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn('$TaskName = $(if ($Probe) { "XB-MemberSync-Probe" } else { $MainTaskName })', source)
+        self.assertEqual(source.count("Register-ScheduledTask -TaskName"), 1)
+        # The only task the script reads is the one it would register.
+        self.assertEqual(re.findall(r"Get-ScheduledTask[^\n]*", source), ["Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue"])
+
     def test_refuses_a_config_check_config_refuses(self):
         self.config.write_text(json.dumps({"schema": sync.CONFIG_SCHEMA}), encoding="utf-8")
         code, out = self.run_installer()

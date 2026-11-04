@@ -118,6 +118,21 @@ REGISTRATION_TAG = "member-mg"
 SHOPIFY_PAGE_SIZE = 50
 SHOPIFY_WATERMARK_MARGIN_SECONDS = 900  # search-index lag overlap, as in the Core
 REGISTRATION_WAIT_MAX_CHECKS = 5  # Forms writes start_date ~3 s after the tag
+# #155 P1 (G0 r2): with immediate_create_enabled, runs are also started by the
+# sign-up probe, so the two bounded holds (the sign-up time hold and the AC2
+# held_for_sign_up / stuck hold) are wall-clock: today's 5 checks at the
+# 15-minute schedule, i.e. the first hold plus 4 intervals. With the switch
+# off they stay run counts, exactly as before.
+SCHEDULE_MINUTES = 15
+REGISTRATION_WAIT = timedelta(minutes=(REGISTRATION_WAIT_MAX_CHECKS - 1) * SCHEDULE_MINUTES)
+HOLD_SINCE_PREFIX = "hold_since:"  # watermarks rows: first hold time per held item
+CAP_ALERT_MARK = "create_rate_capped_alerted_at"  # once per hour (owner D5)
+CAP_ALERT_INTERVAL = timedelta(hours=1)
+# Owner D1 (4 Nov 2026): all hours. A window is either this word or
+# "HH:MM-HH:MM" (Asia/Singapore, start included, end excluded; a start after
+# the end runs over midnight; start == end is refused, use all_day).
+ALL_DAY = "all_day"
+CREATE_WINDOW_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 LOOKUP_MAX_ROWS = 50
 PENDING_LOOKUP_BATCH = 20
 # Round 6: after a sync create, re-check for a later staff-made member of
@@ -216,6 +231,21 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # Owner 30 Oct 2026: ``owner_shared`` or ``dedicated`` (AC2_LOGIN_MODES).
     # null is accepted on the test book only; the live book must state it.
     "ac2_login_mode": None,
+    # #155 P1 (G0 r2, owner decisions 4 Nov 2026). Off: today's 06:00 rule,
+    # unchanged. On (with ac2_create_enabled): an unmatched sign-up inside the
+    # window is created at once, within the caps below; outside the window or
+    # over a cap it waits for the 06:00 rule as before.
+    "immediate_create_enabled": False,
+    "immediate_create_window_local": ALL_DAY,
+    # Owner D5: both directions together, counted from the ledger's writes
+    # rows (rolling 60 minutes and 24 hours), so a restart never resets them.
+    # They gate only the immediate path.
+    "max_creates_per_hour": 6,
+    "max_creates_per_day": 144,
+    # #155 P2: the sign-up probe (``probe``) starts \XB\XB-MemberSync only
+    # when this is true; otherwise it records "would wake" (observe).
+    "probe_wake_enabled": False,
+    "probe_max_wakes_per_day": 60,
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -228,6 +258,9 @@ _BOUNDS = {
     "shopify_max_pages": (1, 40),
     "http_timeout_seconds": (5, 60),
     "memberno_link_window_minutes": (1, 60),
+    "max_creates_per_hour": (1, 30),
+    "max_creates_per_day": (1, 720),
+    "probe_max_wakes_per_day": (1, 240),
 }
 
 
@@ -272,6 +305,19 @@ class SyncConfig:
     ac2_create_without_phone: bool = False
     ac2_refused_user_ids: tuple[str, ...] = ()
     ac2_login_mode: str | None = None
+    immediate_create_enabled: bool = False
+    immediate_create_window_local: str = ALL_DAY
+    max_creates_per_hour: int = 6
+    max_creates_per_day: int = 144
+    probe_wake_enabled: bool = False
+    probe_max_wakes_per_day: int = 60
+
+    @property
+    def immediate_path_active(self) -> bool:
+        """The immediate path needs both switches: ``ac2_create_enabled``
+        false stops every create (the S5 rollback) whatever this one says."""
+
+        return self.immediate_create_enabled and self.ac2_create_enabled
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -286,6 +332,9 @@ class SyncConfig:
             "memberno_link_window_minutes": self.memberno_link_window_minutes, "initial_link_enabled": self.initial_link_enabled,
             "ac2_create_without_phone": self.ac2_create_without_phone, "ac2_refused_user_ids_count": len(self.ac2_refused_user_ids),
             "ac2_login_mode": self.ac2_login_mode,
+            "immediate_create_enabled": self.immediate_create_enabled, "immediate_create_window_local": self.immediate_create_window_local,
+            "max_creates_per_hour": self.max_creates_per_hour, "max_creates_per_day": self.max_creates_per_day,
+            "probe_wake_enabled": self.probe_wake_enabled, "probe_max_wakes_per_day": self.probe_max_wakes_per_day,
         }
 
 
@@ -385,6 +434,11 @@ def parse_config(value: Any) -> SyncConfig:
         raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_owner_shared_refused")
     if live and login_mode == "dedicated" and not refused_users:
         raise dl.DirectLocalError("sync_config_ac2_refused_user_ids_live_required")
+    window = merged["immediate_create_window_local"]
+    if not isinstance(window, str) or not (window == ALL_DAY or (CREATE_WINDOW_RE.fullmatch(window) and window[:5] != window[6:])):
+        raise dl.DirectLocalError("sync_config_immediate_create_window_local_invalid")
+    if numbers["max_creates_per_hour"] > numbers["max_creates_per_day"]:
+        raise dl.DirectLocalError("sync_config_max_creates_per_day_invalid")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
@@ -392,7 +446,9 @@ def parse_config(value: Any) -> SyncConfig:
         initial_link_enabled=_bool(merged["initial_link_enabled"], "initial_link_enabled"),
         birthday_month_metafield=dict(birthday), ac2_member_no_metafield=dict(member_no_field), shopify_create_tags=tuple(tags), ac2_credential_target=target,
         changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type,
-        ac2_create_without_phone=without_phone, ac2_refused_user_ids=tuple(refused_users), ac2_login_mode=login_mode, **numbers,
+        ac2_create_without_phone=without_phone, ac2_refused_user_ids=tuple(refused_users), ac2_login_mode=login_mode,
+        immediate_create_enabled=_bool(merged["immediate_create_enabled"], "immediate_create_enabled"), immediate_create_window_local=window,
+        probe_wake_enabled=_bool(merged["probe_wake_enabled"], "probe_wake_enabled"), **numbers,
     )
 
 
@@ -562,6 +618,21 @@ def deferred_create_cutoff(signed_up: datetime, local_time: str) -> datetime:
 
     day = signed_up.astimezone(SGT).date() + timedelta(days=1)
     return datetime(day.year, day.month, day.day, int(local_time[:2]), int(local_time[3:]), tzinfo=SGT)
+
+
+def in_create_window(moment: datetime, window: str) -> bool:
+    """#155 P1: whether ``moment`` (any timezone) falls in the immediate-create
+    window, read in Asia/Singapore. ``all_day`` is always inside; otherwise
+    the start minute is inside and the end minute is not, and a start after
+    the end runs over midnight ("22:00-06:00")."""
+
+    if window == ALL_DAY:
+        return True
+    local = moment.astimezone(SGT)
+    second = local.hour * 3600 + local.minute * 60 + local.second
+    start = int(window[:2]) * 3600 + int(window[3:5]) * 60
+    end = int(window[6:8]) * 3600 + int(window[9:11]) * 60
+    return start <= second < end if start < end else (second >= start or second < end)
 
 
 def birthday_month(value: Any) -> int | None:
@@ -999,6 +1070,9 @@ class RunSummary:
     refs: list[dict[str, str]] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     writes: int = 0
+    # #155 P1: seconds from sign-up to the HQ create, recorded only while
+    # immediate_create_enabled is true (the digest's latency figures).
+    latencies: list[int] = field(default_factory=list)
 
     def alert(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
         """Needs an operator; the run summary status says so."""
@@ -1060,6 +1134,75 @@ class SyncEngine:
             (state, code, gid, dl.ts(self.ledger.now()), write_id),
         )
 
+    # -- #155 P1: immediate create, caps and wall-clock holds ---------------------
+    def _immediate_create_allowed(self) -> bool:
+        """An unmatched sign-up may be created before the 06:00 cutoff only
+        with both switches on and inside the window (owner D1: all hours by
+        default). The caps are checked just before the write."""
+
+        return self.config.immediate_path_active and in_create_window(self.ledger.now(), self.config.immediate_create_window_local)
+
+    def _create_rate_capped(self) -> bool:
+        """Owner D5: writes in both directions together, from the ledger's
+        ``writes`` rows (any state: an attempt counts), so a restart or a new
+        process never resets the count."""
+
+        now = self.ledger.now()
+
+        def since(span: timedelta) -> int:
+            return int(self.ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE created_at >= ?", (dl.ts(now - span),)).fetchone()[0])
+
+        return since(timedelta(hours=1)) >= self.config.max_creates_per_hour or since(timedelta(hours=24)) >= self.config.max_creates_per_day
+
+    def _cap_hold(self, gid: str, ref: str) -> None:
+        """Over a cap: held (the 06:00 rule still creates it at the cutoff),
+        one alert per hour at most (the time is kept in the ledger)."""
+
+        self._shopify_pending(gid, "PENDING", "create_rate_capped")
+        last = self.ledger.watermark(CAP_ALERT_MARK)
+        now = self.ledger.now()
+        if last is None or now - dl.parse_ts(last) >= CAP_ALERT_INTERVAL:
+            with self.ledger.tx() as conn:
+                self.ledger.set_watermark(conn, CAP_ALERT_MARK, dl.ts(now))
+            self.summary.alert("create_rate_capped", ref)
+        else:
+            self.summary.count("create_rate_capped", ref)
+
+    def _wait_continues(self, kind: str, key: str, checks: int) -> bool:
+        """The bounded hold for a sign-up time that is not readable yet. Off
+        (``immediate_create_enabled`` false): today's rule, at most
+        REGISTRATION_WAIT_MAX_CHECKS - 1 held runs. On: held while less than
+        REGISTRATION_WAIT has passed since the first hold (kept in the
+        watermarks table, so a restart or extra woken runs change nothing)."""
+
+        if not self.config.immediate_create_enabled:
+            return checks + 1 < REGISTRATION_WAIT_MAX_CHECKS
+        name = f"{HOLD_SINCE_PREFIX}{kind}:{key}"
+        first = self.ledger.watermark(name)
+        now = self.ledger.now()
+        if first is None:
+            with self.ledger.tx() as conn:
+                self.ledger.set_watermark(conn, name, dl.ts(now))
+            return True
+        if now - dl.parse_ts(first) < REGISTRATION_WAIT:
+            return True
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = ?", (name,))
+        return False
+
+    def _prune_hold_clocks(self) -> None:
+        """Drop the first-hold times of items no longer held, so a later hold
+        of the same item starts a new bounded wait."""
+
+        held = {f"{HOLD_SINCE_PREFIX}shopify:{row[0]}" for row in self.ledger.conn.execute(
+            "SELECT customer_gid FROM shopify_pending WHERE state = 'PENDING' AND code = 'registration_event_pending'")}
+        held |= {f"{HOLD_SINCE_PREFIX}ac2:{row[0]}" for row in self.ledger.conn.execute(
+            "SELECT member_no_key FROM ac2_pending WHERE state = 'PENDING' AND code = 'held_for_sign_up'")}
+        stale = [row[0] for row in self.ledger.conn.execute("SELECT name FROM watermarks WHERE substr(name, 1, ?) = ?", (len(HOLD_SINCE_PREFIX), HOLD_SINCE_PREFIX)) if row[0] not in held]
+        if stale:
+            with self.ledger.tx() as conn:
+                conn.executemany("DELETE FROM watermarks WHERE name = ?", [(name,) for name in stale])
+
     # -- run -------------------------------------------------------------------
     def run(self, *, direction: str = "both") -> dict[str, Any]:
         if direction not in ("both", "shopify_to_ac2", "ac2_to_shopify"):
@@ -1069,6 +1212,8 @@ class SyncEngine:
         with self.ledger.tx() as conn:
             conn.execute("INSERT INTO runs(run_id, started_at) VALUES (?, ?)", (run_id, dl.ts(started)))
         self._recover_crashed_intents()
+        if self.config.immediate_create_enabled:
+            self._prune_hold_clocks()
         if direction in ("both", "shopify_to_ac2"):
             self._resolve_uncertain("shopify_to_ac2")
             self.shopify_to_ac2(started)
@@ -1085,6 +1230,9 @@ class SyncEngine:
         # Go-live (digest): counts, alert codes and keyed refs with masked
         # MemberNos only, as the run prints them. Older rows hold counts only.
         stored = {"counts": result["counts"], "alerts": result["alerts"], "refs": result["refs"]}
+        if self.summary.latencies:
+            # #155 P1: only ever set with immediate_create_enabled (seconds only).
+            result["create_latency_seconds"] = stored["create_latency_seconds"] = list(self.summary.latencies)
         with self.ledger.tx() as conn:
             conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
         return result
@@ -1320,7 +1468,7 @@ class SyncEngine:
         instant = customer.registration_at
         if instant is None:
             row = self.ledger.conn.execute("SELECT checks FROM shopify_pending WHERE customer_gid = ?", (gid,)).fetchone()
-            if row is None or row["checks"] + 1 < REGISTRATION_WAIT_MAX_CHECKS:
+            if self._wait_continues("shopify", gid, 0 if row is None else row["checks"]):
                 self._shopify_pending(gid, "PENDING", "registration_event_pending", count_check=True)
                 self.summary.count("shopify_registration_event_pending", ref)
                 return
@@ -1343,14 +1491,21 @@ class SyncEngine:
             else:
                 self.summary.count(decision.code, ref)
             return
+        immediate = False
         if decision.action == "CREATE" and self.ledger.now() < deferred_create_cutoff(instant, self.config.deferred_create_local_time):
-            # Round 6 (Owner): staff create members by hand from the sign-up
-            # sheet. Until the next morning's cutoff the sync only looks for
-            # their member (each run re-reads this pending customer) and
-            # writes nothing.
-            self._shopify_pending(gid, "PENDING", "waiting_for_staff")
-            self.summary.count("waiting_for_staff", ref)
-            return
+            # #155 P1 (owner D1, D3): with the immediate path on and inside
+            # its window the create goes ahead now (the caps are checked just
+            # before the write); staff keying still links or wins, see
+            # _create_in_ac2. Otherwise round 6 as before:
+            immediate = self._immediate_create_allowed()
+            if not immediate:
+                # Round 6 (Owner): staff create members by hand from the sign-up
+                # sheet. Until the next morning's cutoff the sync only looks for
+                # their member (each run re-reads this pending customer) and
+                # writes nothing.
+                self._shopify_pending(gid, "PENDING", "waiting_for_staff")
+                self.summary.count("waiting_for_staff", ref)
+                return
         if decision.action == "CREATE" and decision.member_no is None and not self.config.ac2_create_without_phone:
             # Go-live R8 (Owner Q2 = A): past the cutoff and no usable phone.
             # Never GetNextMemberNo here: staff key this member by hand.
@@ -1360,7 +1515,7 @@ class SyncEngine:
             return
         member_no = decision.member_no
         if member_no is None:
-            self._create_in_ac2(customer, digits, decision, ref)  # GetNextMemberNo at write time
+            self._create_in_ac2(customer, digits, decision, ref, immediate=immediate, signed_up=instant)  # GetNextMemberNo at write time
             return
         if decision.code in ("shared_phone_name_fallback", "shared_phone_digit_fallback"):
             member_no = self._free_suffix(member_no, include_base=decision.code == "shared_phone_name_fallback")
@@ -1389,7 +1544,7 @@ class SyncEngine:
             self._shopify_pending(gid, "SKIPPED", "member_no_held_by_open_write")
             self.summary.count("member_no_held_by_open_write", ref)
             return
-        self._create_in_ac2(customer, digits, decision, member_ref)
+        self._create_in_ac2(customer, digits, decision, member_ref, immediate=immediate, signed_up=instant)
 
     def _member_no_taken(self, numbers: list[str]) -> set[str]:
         """Keys of the numbers held in AC2 (trimmed, case-insensitive) or by
@@ -1434,7 +1589,12 @@ class SyncEngine:
                 return None, "member_no_generator_not_advancing"
         return None, "member_no_candidates_exhausted"
 
-    def _create_in_ac2(self, customer: ShopifyCustomer, digits: str | None, decision: Decision, member_ref: str) -> None:
+    def _create_in_ac2(self, customer: ShopifyCustomer, digits: str | None, decision: Decision, member_ref: str, *,
+                       immediate: bool = False, signed_up: datetime | None = None) -> None:
+        """``immediate``: before the 06:00 cutoff, through the #155 P1 path
+        (capped; counted ``created_immediately``). Otherwise the 06:00 rule
+        (``created_after_wait``). Every other rule is the same for both."""
+
         gid = customer.gid
         member_no = decision.member_no
         if self.ledger.open_write_for_customer(gid) is not None:
@@ -1464,6 +1624,9 @@ class SyncEngine:
         if issue or (member_no is not None and not dl.MEMBER_NO_RE.fullmatch(member_no)):
             self._shopify_pending(gid, "SKIPPED", issue or "member_no_invalid")
             self.summary.count(issue or "member_no_invalid", member_ref)
+            return
+        if immediate and self._create_rate_capped():
+            self._cap_hold(gid, member_ref)
             return
         try:
             self._spend_write(self.config.ac2_create_enabled, "ac2_create_disabled")
@@ -1505,9 +1668,16 @@ class SyncEngine:
         if state == "CREATED_VERIFIED":
             self._shopify_pending(gid, "DONE", decision.code)
             self.summary.count("ac2_member_created", member_ref, "create")
-            # Round 6: every sync create comes after the staff wait; the
-            # operator checks staff did not make the member too.
-            self.summary.alert("created_after_wait")
+            if immediate:
+                # #155 P1: a count, not an alert (one per sign-up would flood
+                # the digest); the 06:00 path below keeps its alert.
+                self.summary.count("created_immediately")
+            else:
+                # Round 6: every sync create comes after the staff wait; the
+                # operator checks staff did not make the member too.
+                self.summary.alert("created_after_wait")
+            if self.config.immediate_create_enabled and signed_up is not None:
+                self.summary.latencies.append(max(int((self.ledger.now() - signed_up).total_seconds()), 0))
             self._count_decision(decision)
         elif state == "NOT_WRITTEN_PROVEN":
             self._shopify_pending(gid, "PENDING", "ac2_not_written")
@@ -1709,7 +1879,7 @@ class SyncEngine:
                 # yet is still a sign-up: look in the pending list too.
                 customers, sure = self._pending_sign_ups_with_phone(digits)
                 if not customers and not sure:
-                    if row["checks"] + 1 < REGISTRATION_WAIT_MAX_CHECKS:
+                    if self._wait_continues("ac2", key, row["checks"]):
                         self._ac2_done(key, "PENDING", "held_for_sign_up", count_check=True)
                         self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
                     else:
@@ -1771,7 +1941,7 @@ class SyncEngine:
         # The phone search returns no sign-up fields: read the customer.
         full = self.shopify.customer(customer.gid, self.config.birthday_month_metafield) or customer
         signed_up = full.registration_at
-        if signed_up is None and REGISTRATION_TAG in full.tags and row["checks"] + 1 < REGISTRATION_WAIT_MAX_CHECKS:
+        if signed_up is None and REGISTRATION_TAG in full.tags and self._wait_continues("ac2", key, row["checks"]):
             self._ac2_done(key, "PENDING", "held_for_sign_up", count_check=True)
             self.summary.alert("ac2_member_held_for_sign_up", ref, member_no=member.member_no)
             return
@@ -2231,6 +2401,15 @@ DIGEST_MAX_HOURS = 720
 DIGEST_MAX_REFS = 200
 _DIGEST_REF_RE = re.compile(r"^[cm]-[0-9a-f]{1,64}$")
 _DIGEST_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+DIGEST_MAX_LATENCY_SECONDS = 30 * 24 * 3600
+
+
+def _nearest_rank(ordered: list[int], percent: int) -> int | None:
+    """Nearest-rank percentile of an ascending list (None when empty)."""
+
+    if not ordered:
+        return None
+    return ordered[max(-(-len(ordered) * percent // 100), 1) - 1]
 
 
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) -> dict[str, Any]:
@@ -2263,6 +2442,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
         alerts: dict[str, int] = {}
         refs: list[dict[str, str]] = []
         durations: list[int] = []
+        latencies: list[int] = []
         unfinished = 0
         for row in runs:
             started, finished = dl.parse_created_at(row["started_at"]), dl.parse_created_at(row["finished_at"]) if row["finished_at"] else None
@@ -2278,6 +2458,10 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
             for code, number in (run_counts.items() if isinstance(run_counts, dict) else ()):
                 if isinstance(code, str) and _DIGEST_CODE_RE.fullmatch(code) and isinstance(number, int) and not isinstance(number, bool):
                     counts[code] = counts.get(code, 0) + number
+            stored_latencies = stored.get("create_latency_seconds") if isinstance(stored, dict) else None
+            for seconds in (stored_latencies if isinstance(stored_latencies, list) else []):
+                if isinstance(seconds, int) and not isinstance(seconds, bool) and 0 <= seconds <= DIGEST_MAX_LATENCY_SECONDS:
+                    latencies.append(seconds)
             run_alerts = [code for code in stored.get("alerts", []) if isinstance(code, str) and _DIGEST_CODE_RE.fullmatch(code)] if isinstance(stored, dict) else []
             for code in run_alerts:
                 alerts[code] = alerts.get(code, 0) + 1
@@ -2294,9 +2478,20 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
                     item["member_no_masked"] = masked
                 refs.append(item)
         durations.sort()
+        latencies.sort()
+        # #155 P1: writes per Singapore clock hour, both directions, any state
+        # (what the caps count), from the ledger's own rows.
+        per_hour: dict[str, int] = {}
+        for (created,) in conn.execute("SELECT created_at FROM writes WHERE created_at >= ?", (since,)):
+            moment = dl.parse_created_at(created)
+            if moment is not None:
+                hour = moment.astimezone(SGT).strftime("%Y-%m-%dT%H")
+                per_hour[hour] = per_hour.get(hour, 0) + 1
 
         def total(sql: str) -> int:
             return int(conn.execute(sql).fetchone()[0])
+
+        import xb_member_sync_probe as probe  # the probe module reads only its status file here
 
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
@@ -2311,6 +2506,16 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
                 "uncertain_writes": total("SELECT COUNT(*) FROM writes WHERE state = 'UNCERTAIN'"),
                 "links": total("SELECT COUNT(*) FROM links"),
             },
+            # #155 P1 / P2 (G0 r2 monitoring): latency is recorded only while
+            # immediate_create_enabled is on; the probe figures come from its
+            # status file (counts per Singapore day), null when absent.
+            "create_latency_seconds": {"count": len(latencies), "p50": _nearest_rank(latencies, 50), "p95": _nearest_rank(latencies, 95),
+                                       "max": latencies[-1] if latencies else None},
+            "creates": {"ac2_member_created": counts.get("ac2_member_created", 0), "created_immediately": counts.get("created_immediately", 0),
+                        "created_after_wait": counts.get("created_after_wait", 0), "writes_per_hour_max": max(per_hour.values(), default=0),
+                        "writes_per_hour": dict(sorted(per_hour.items()))},
+            "caps": {"create_rate_capped": counts.get("create_rate_capped", 0), "create_rate_capped_alerts": alerts.get("create_rate_capped", 0)},
+            "probe": probe.probe_digest(Path(root), since=now - timedelta(hours=hours)),
         }
     except sqlite3.Error:
         raise dl.DirectLocalError("sync_ledger_unreadable") from None
@@ -2320,7 +2525,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#155 phase 1 two-way member create sync")
-    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link", "digest"))
+    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link", "digest", "probe"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--apply", action="store_true", help="initial-link only: write the links (needs initial_link_enabled); default is a dry run")
     parser.add_argument("--direction", default="both", choices=("both", "shopify_to_ac2", "ac2_to_shopify"))
@@ -2345,6 +2550,16 @@ def main(argv: list[str] | None = None) -> int:
             dl.verify_private_state(root)
             _emit(ledger_digest(root, hours=args.hours, now=dl.utc_now(), config=config))
             return 0
+        if args.command == "probe":
+            # #155 P2: Shopify read only; the ledger read-only with no lock
+            # (as digest); never AutoCount. It may start \XB\XB-MemberSync.
+            import xb_member_sync_probe as probe
+
+            root = dl.validate_state_root(config.state_root)
+            dl.verify_private_state(root)
+            result = probe.run_probe(config, root, environ=os.environ)
+            _emit(result)
+            return 3 if result["decision"] == "wake_failed" else 0  # 3: an operator must look
         if args.command == "initial-link" and args.apply and not config.initial_link_enabled:
             raise dl.DirectLocalError("initial_link_disabled")  # before any login or read
         root = _state_root(config)
