@@ -59,7 +59,7 @@ SHOPIFY_DEADLINE_SECONDS = 40  # well inside the probe task's PT2M limit
 TASK_START_TIMEOUT_SECONDS = 30
 
 PROBE_QUERY = """query XbMemberSyncSignUpProbe($first: Int!, $after: String, $search: String!) {
-  customers(first: $first, after: $after, sortKey: UPDATED_AT, query: $search) {
+  customers(first: $first, after: $after, sortKey: UPDATED_AT, reverse: true, query: $search) {
     pageInfo { hasNextPage endCursor }
     nodes { id tags updatedAt }
   }
@@ -379,6 +379,11 @@ def run_probe(config: sync.SyncConfig, root: Path, *, environ: Mapping[str, str]
             status["last_would_wake_at"] = dl.ts(now)
         if marker is not None and decision in ("wake", "would_wake"):
             status["work_marker"] = marker
+    except sqlite3.Error:
+        # Only the ledger is SQLite in this try; digest gives the same refusal.
+        _record(status, today, now, "refused", "sync_ledger_unreadable", counts)
+        save_status(root, status)
+        raise dl.DirectLocalError("sync_ledger_unreadable") from None
     except dl.DirectLocalError as exc:
         decision, reason = "refused", exc.code if dl.CODE_RE.fullmatch(exc.code or "") else "probe_failed"
         _record(status, today, now, decision, reason, counts)
