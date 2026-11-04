@@ -1,0 +1,463 @@
+{
+ "comment": "#155 P1 defaults-off equivalence: tests/test_member_sync.py defaults_off_trace() run on the 32e9b31 source of directlocal/xb_member_sync.py. sha256 of the full trace; outline = counts, alerts and writes per run. Fake data only.",
+ "outline": {
+  "holds_test_book": [
+   {
+    "alerts": [],
+    "counts": {
+     "changelog_watermark_initialised": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_registration_event_pending": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_registration_event_pending": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_registration_event_pending": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_registration_event_pending": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "waiting_for_staff": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "waiting_for_staff": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_insert_queued": 1,
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "memberno_and_created_time_match": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {},
+    "writes": 0
+   }
+  ],
+  "staff_first_live_book": [
+   {
+    "alerts": [],
+    "counts": {
+     "changelog_watermark_initialised": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "waiting_for_staff": 4
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 1,
+     "memberno_and_created_time_match": 1,
+     "shopify_already_linked": 1,
+     "waiting_for_staff": 3
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "created_after_wait",
+     "no_phone_sign_up_needs_staff"
+    ],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 2,
+     "ac2_member_created": 2,
+     "created_after_wait": 2,
+     "name_fallback_initial": 1,
+     "new_member_phone": 1,
+     "no_phone_sign_up_needs_staff": 1,
+     "shared_phone_name_fallback": 1,
+     "shopify_already_linked": 3
+    },
+    "writes": 2
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_already_linked": 3
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_already_linked": 3
+    },
+    "writes": 0
+   }
+  ],
+  "staff_first_test_book": [
+   {
+    "alerts": [],
+    "counts": {
+     "changelog_watermark_initialised": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "waiting_for_staff": 4
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 1,
+     "memberno_and_created_time_match": 1,
+     "shopify_already_linked": 1,
+     "waiting_for_staff": 3
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "created_after_wait"
+    ],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 3,
+     "ac2_member_created": 3,
+     "created_after_wait": 3,
+     "name_fallback_initial": 1,
+     "new_member_phone": 1,
+     "no_phone_generator_member_no": 1,
+     "shared_phone_name_fallback": 1,
+     "shopify_already_linked": 4
+    },
+    "writes": 3
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_already_linked": 4
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_already_linked": 4
+    },
+    "writes": 0
+   }
+  ],
+  "walk_ins_test_book": [
+   {
+    "alerts": [],
+    "counts": {
+     "changelog_watermark_initialised": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "waiting_for_staff": 5
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_insert_queued": 1,
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_held_for_sign_up"
+    ],
+    "counts": {
+     "ac2_member_held_for_sign_up": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "ac2_member_hold_stuck"
+    ],
+    "counts": {
+     "ac2_member_hold_stuck": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {},
+    "writes": 0
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_member_hold_requeued": 1,
+     "shopify_customer_created": 1
+    },
+    "writes": 1
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_insert_queued": 3,
+     "linked_existing_shopify_customer": 1,
+     "shopify_customer_created": 1,
+     "shopify_phone_owned_by_other_name": 1,
+     "shopify_separate_customer_created_without_phone": 1
+    },
+    "writes": 2
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "waiting_for_staff": 5
+    },
+    "writes": 0
+   }
+  ],
+  "writes_live_book": [
+   {
+    "alerts": [],
+    "counts": {
+     "changelog_watermark_initialised": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "created_after_wait"
+    ],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 3,
+     "ac2_member_created": 3,
+     "created_after_wait": 3,
+     "max_writes_per_run_reached": 5,
+     "new_member_phone": 3
+    },
+    "writes": 3
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_create_uncertain": 1,
+     "ac2_insert_linked_or_own_write": 1,
+     "max_writes_per_run_reached": 4,
+     "shopify_already_linked": 3
+    },
+    "writes": 1
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_create_not_written": 1,
+     "max_writes_per_run_reached": 3,
+     "shopify_already_linked": 4,
+     "uncertain_write_resolved_linked": 1
+    },
+    "writes": 1
+   },
+   {
+    "alerts": [
+     "created_after_wait"
+    ],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 4,
+     "ac2_member_created": 4,
+     "created_after_wait": 4,
+     "new_member_phone": 3,
+     "shared_phone_name_fallback": 1,
+     "shopify_already_linked": 8
+    },
+    "writes": 4
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_already_linked": 8
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "sign_up_past_cutoff_create_disabled"
+    ],
+    "counts": {
+     "ac2_create_disabled": 1,
+     "new_member_phone": 1,
+     "shopify_already_linked": 8,
+     "sign_up_past_cutoff_create_disabled": 1
+    },
+    "writes": 0
+   }
+  ],
+  "writes_test_book": [
+   {
+    "alerts": [],
+    "counts": {
+     "changelog_watermark_initialised": 1
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "created_after_wait"
+    ],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 3,
+     "ac2_member_created": 3,
+     "created_after_wait": 3,
+     "max_writes_per_run_reached": 5,
+     "new_member_phone": 3
+    },
+    "writes": 3
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_create_uncertain": 1,
+     "ac2_insert_linked_or_own_write": 1,
+     "max_writes_per_run_reached": 4,
+     "shopify_already_linked": 3
+    },
+    "writes": 1
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "ac2_create_not_written": 1,
+     "max_writes_per_run_reached": 3,
+     "shopify_already_linked": 4,
+     "uncertain_write_resolved_linked": 1
+    },
+    "writes": 1
+   },
+   {
+    "alerts": [
+     "created_after_wait"
+    ],
+    "counts": {
+     "ac2_insert_linked_or_own_write": 4,
+     "ac2_member_created": 4,
+     "created_after_wait": 4,
+     "new_member_phone": 3,
+     "shared_phone_name_fallback": 1,
+     "shopify_already_linked": 8
+    },
+    "writes": 4
+   },
+   {
+    "alerts": [],
+    "counts": {
+     "shopify_already_linked": 8
+    },
+    "writes": 0
+   },
+   {
+    "alerts": [
+     "sign_up_past_cutoff_create_disabled"
+    ],
+    "counts": {
+     "ac2_create_disabled": 1,
+     "new_member_phone": 1,
+     "shopify_already_linked": 8,
+     "sign_up_past_cutoff_create_disabled": 1
+    },
+    "writes": 0
+   }
+  ]
+ },
+ "sha256": "4bcb98f229cc481c4792326cffb10e1b3d0a1bb39a377242c19a1a8ac2d37ac6",
+ "source_commit": "32e9b31"
+}

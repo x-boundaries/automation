@@ -34,5 +34,11 @@
   "deferred_create_local_time": "06:00",
   "ac2_create_member_type": "Default",
   "memberno_link_window_minutes": 60,
-  "initial_link_enabled": false
+  "initial_link_enabled": false,
+  "immediate_create_enabled": false,
+  "immediate_create_window_local": "all_day",
+  "max_creates_per_hour": 6,
+  "max_creates_per_day": 144,
+  "probe_wake_enabled": false,
+  "probe_max_wakes_per_day": 60
 }

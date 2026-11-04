@@ -3405,5 +3405,969 @@ class GoLiveEngineExtrasTests(GoLiveTestCase):
         self.assertNotEqual(config.state_root, test_example.state_root)
 
 
+# --------------------------------------------------------------------------
+# #155 P1 + P2 (G1 immediate create; G0 r2 #155:6610257893 and the owner
+# decisions #155:6619639133). P1: the immediate-create timing mode, its caps
+# and the wall-clock holds, all off by default. P2: the sign-up probe. Fake
+# data only: reserved phones built at runtime, example.com, fake IDs.
+# --------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+
+IMMEDIATE = {"immediate_create_enabled": True}
+# The new keys written out at their defaults (and other values that must not
+# change a run while the immediate path is off).
+NEW_KEYS_OFF = {"immediate_create_enabled": False, "immediate_create_window_local": "all_day", "max_creates_per_hour": 6,
+                "max_creates_per_day": 144, "probe_wake_enabled": False, "probe_max_wakes_per_day": 60}
+NEW_KEYS_OFF_ODD = {"immediate_create_enabled": False, "immediate_create_window_local": "23:00-01:00", "max_creates_per_hour": 1,
+                    "max_creates_per_day": 1, "probe_wake_enabled": True, "probe_max_wakes_per_day": 1}
+GOLDEN = ROOT / "tests" / "fixtures" / "member_sync_defaults_off_golden.json"
+PROBE_TOKEN_ENV = {"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"}
+
+
+def _probe_module():
+    import xb_member_sync_probe as probe
+
+    return probe
+
+
+# -- defaults-off equivalence: one deterministic trace over the fixtures above --
+
+class _EquivalenceWorld:
+    """One ledger, the in-memory fakes and a fake clock; every run's result
+    is kept. The ledger ref key is fixed so refs and digests repeat."""
+
+    def __init__(self, module, temp: Path, book: str, settings: dict):
+        self.module = module
+        self.book = book
+        self.settings = settings
+        self.now = T0 + timedelta(hours=1)
+        self.ledger = module.SyncLedger(temp, clock=lambda: self.now, check_custody=False)
+        with mock.patch.object(module.secrets, "token_hex", return_value="5a" * 32):
+            self.ledger.init_meta(autocount_book=book, store_gid=STORE, shop_domain=DOMAIN)
+        self.shopify, self.ac2 = FakeShopify(), FakeAc2()
+        self.results: list[dict] = []
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, "initial_link_completed_at", dl.ts(CUTOVER))
+
+    def run(self, direction: str = "both", **overrides) -> dict:
+        settings = {"ac2_create_enabled": True, "shopify_create_enabled": True, "changelog_xml_column": "Content"}
+        if self.book == PROD_BOOK:
+            settings.update(LIVE_KEYS)
+        settings.update(self.settings)
+        settings.update(overrides)
+        config = self.module.parse_config(config_value(**settings))
+        result = self.module.SyncEngine(self.ledger, config, shopify=self.shopify, ac2=self.ac2).run(direction=direction)
+        self.results.append(result)
+        return result
+
+    def dump(self) -> dict:
+        tables = {
+            "links": "SELECT customer_gid, member_no, member_no_key, origin, code, created_at FROM links",
+            "writes": "SELECT direction, customer_gid, member_no, member_no_key, state, code, created_at, updated_at, intent_digest FROM writes",
+            "shopify_pending": "SELECT * FROM shopify_pending", "ac2_pending": "SELECT * FROM ac2_pending", "watermarks": "SELECT * FROM watermarks",
+            "member_snapshots": "SELECT * FROM member_snapshots", "changelog_seen": "SELECT * FROM changelog_seen",
+            "runs": "SELECT started_at, finished_at, summary FROM runs",
+        }
+        return {name: sorted(([*row] for row in self.ledger.conn.execute(sql)), key=json.dumps) for name, sql in tables.items()}
+
+
+def _scenario_staff_first(w: _EquivalenceWorld) -> None:
+    w.run("ac2_to_shopify")  # ChangeLog watermark
+    w.shopify.add(replace(customer(40), created_at=T0))
+    w.shopify.add(replace(customer(41, phone=None), created_at=T0))
+    w.shopify.add(replace(customer(42, first="Mary Ann", last="Lee"), created_at=T0))
+    w.ac2.add(sync.Ac2Member("STAFF43", "Mary A Lee", local(43)))
+    w.shopify.add(replace(customer(43, first="Mary Ann", last="Lee"), created_at=T0))
+    w.run("shopify_to_ac2")
+    w.ac2.add(sync.Ac2Member(sg(42), "MARY A LEE", None, created_at=T0 + timedelta(minutes=4)), log=True)
+    w.now = T0 + timedelta(hours=3)
+    w.run()
+    w.now = T0 + timedelta(days=1)
+    w.run()
+    w.run()
+    w.now = T0 + timedelta(days=2)
+    w.run()
+
+
+def _scenario_holds(w: _EquivalenceWorld) -> None:
+    w.run("ac2_to_shopify")
+    w.shopify.add(replace(customer(60), created_at=T0, registration_at=None, registration_value=None))
+    for minute in (0, 0, 1, 1, 2, 3):
+        w.now = T0 + timedelta(hours=1, minutes=minute)
+        w.run("shopify_to_ac2")
+    w.shopify.add(replace(customer(61), created_at=T0, registration_at=None, registration_value=None))
+    w.ac2.add(sync.Ac2Member(sg(61), "SOMEONE ELSE", None, created_at=T0 + timedelta(minutes=1)), log=True)
+    for minute in (4, 4, 5, 5, 6, 7):
+        w.now = T0 + timedelta(hours=1, minutes=minute)
+        w.run("ac2_to_shopify")
+
+
+def _scenario_walk_ins(w: _EquivalenceWorld) -> None:
+    w.run("ac2_to_shopify")
+    for n in range(75, 80):
+        w.shopify.add(replace(customer(n), created_at=T0))
+    w.run("shopify_to_ac2")
+    w.ac2.add(sync.Ac2Member(sg(30), "Walk In Person", None, created_at=T0 + timedelta(minutes=1)), log=True)
+    for _ in range(6):
+        w.run("ac2_to_shopify", max_pending_rechecks_per_run=3)
+    w.run("ac2_to_shopify")
+    w.ac2.add(sync.Ac2Member("T0099", "Bravo Walker", sg(31)), log=True)
+    w.shopify.add(replace(customer(32, first="Charlie", last="Day"), tags=()))
+    w.ac2.add(sync.Ac2Member("T0100", "Charlie Day", sg(32)), log=True)
+    w.ac2.add(sync.Ac2Member("T0101", "Other Person", sg(32)), log=True)
+    w.run("ac2_to_shopify")
+    w.now += timedelta(minutes=15)
+    w.run()
+
+
+def _scenario_writes(w: _EquivalenceWorld) -> None:
+    w.run("ac2_to_shopify")
+    for n in range(1, 9):
+        w.shopify.add(replace(customer(n), created_at=T0))
+    w.ac2.add(sync.Ac2Member("STAFF05", "Someone Else", local(5)))
+    w.now = T0 + timedelta(days=1)
+    w.run(max_writes_per_run=3)
+    w.ac2.create_result = ("WRITE_OUTCOME_UNCERTAIN", "writer_timeout")
+    w.run(max_writes_per_run=1)
+    w.ac2.create_result = ("NOT_WRITTEN_PROVEN", "member_no_taken")
+    w.run(max_writes_per_run=1)
+    w.ac2.create_result = ("CREATED_VERIFIED", None)
+    w.now += timedelta(minutes=15)
+    w.run()
+    w.run()
+    w.shopify.add(replace(customer(9), created_at=T0))
+    w.now = T0 + timedelta(days=1, hours=1)
+    w.run(ac2_create_enabled=False)
+
+
+EQUIVALENCE_SCENARIOS = (
+    ("staff_first_test_book", TEST_BOOK, _scenario_staff_first), ("staff_first_live_book", PROD_BOOK, _scenario_staff_first),
+    ("holds_test_book", TEST_BOOK, _scenario_holds), ("walk_ins_test_book", TEST_BOOK, _scenario_walk_ins),
+    ("writes_test_book", TEST_BOOK, _scenario_writes), ("writes_live_book", PROD_BOOK, _scenario_writes),
+)
+
+
+def defaults_off_trace(module, settings: dict | None = None) -> dict:
+    """Every run result, the final ledger rows (random IDs left out) and the
+    fakes' writes of each scenario, for ``module`` (this source, or the
+    32e9b31 source when the golden file is made)."""
+
+    trace = {}
+    for name, book, scenario in EQUIVALENCE_SCENARIOS:
+        temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-equivalence-"))
+        try:
+            world = _EquivalenceWorld(module, temp, book, dict(settings or {}))
+            try:
+                scenario(world)
+                trace[name] = {"runs": world.results, "ledger": world.dump(), "ac2_creates": [[m, p] for m, p in world.ac2.creates],
+                               "shopify_created": world.shopify.created, "generator_calls": world.ac2.generator_calls}
+            finally:
+                world.ledger.close()
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+    return trace
+
+
+def trace_digest(trace: dict) -> str:
+    return hashlib.sha256(json.dumps(trace, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+def trace_outline(trace: dict) -> dict:
+    """The readable part of the golden file: counts, alerts and writes per run."""
+
+    return {name: [{"counts": r["counts"], "alerts": r["alerts"], "writes": r["writes"]} for r in item["runs"]] for name, item in trace.items()}
+
+
+class DefaultsOffEquivalenceTests(unittest.TestCase):
+    """Sequencing (owner, 4 Nov 2026): with the new switches off this source
+    decides every run exactly as 32e9b31 did. The golden file was made by
+    running ``defaults_off_trace`` on the 32e9b31 source; it holds the
+    trace's SHA-256 and its counts outline (no phone, name or MemberNo)."""
+
+    def assert_matches_golden(self, settings: dict | None) -> None:
+        golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
+        self.assertEqual(golden["source_commit"], "32e9b31")
+        trace = defaults_off_trace(sync, settings)
+        self.assertEqual(trace_outline(trace), golden["outline"])
+        self.assertEqual(trace_digest(trace), golden["sha256"])
+
+    def test_new_keys_absent(self):
+        self.assert_matches_golden(None)
+
+    def test_new_keys_written_out_at_their_defaults(self):
+        self.assert_matches_golden(NEW_KEYS_OFF)
+
+    def test_other_values_change_nothing_while_the_immediate_path_is_off(self):
+        self.assert_matches_golden(NEW_KEYS_OFF_ODD)
+
+    def test_the_golden_file_holds_no_member_data(self):
+        text = GOLDEN.read_text(encoding="utf-8")
+        for n in range(1, 100):
+            self.assertNotIn(local(n), text)
+        for word in ("Alpha", "Tester", "Mary", "Walker", "example.com", "<Member", "Customer/"):
+            self.assertNotIn(word, text)
+
+
+# -- configuration ---------------------------------------------------------------
+
+class ImmediateCreateConfigTests(unittest.TestCase):
+    def test_defaults_are_off_with_the_owner_caps(self):
+        config = make_config()
+        self.assertEqual(
+            (config.immediate_create_enabled, config.immediate_create_window_local, config.max_creates_per_hour, config.max_creates_per_day,
+             config.probe_wake_enabled, config.probe_max_wakes_per_day),
+            (False, "all_day", 6, 144, False, 60))
+        self.assertFalse(config.immediate_path_active)
+        self.assertFalse(make_config(immediate_create_enabled=True).immediate_path_active)  # creates still off
+        self.assertTrue(make_config(immediate_create_enabled=True, ac2_create_enabled=True).immediate_path_active)
+        summary = make_config(**NEW_KEYS_OFF).summary()
+        for key, value in NEW_KEYS_OFF.items():
+            self.assertEqual(summary[key], value)
+
+    def test_window_values_and_lookalikes(self):
+        for good in ("all_day", "10:00-22:00", "22:00-06:00", "00:00-23:59", "06:00-00:00"):
+            self.assertEqual(make_config(immediate_create_window_local=good).immediate_create_window_local, good)
+        for bad in ("All_Day", "ALL_DAY", "all-day", "allday", "all_day ", " all_day", "10:00-10:00", "00:00-24:00", "24:00-01:00", "10:00 - 22:00",
+                    "10:00-22:00 ", "1000-2200", "10:00–22:00", "10:00-22:0", "9:00-22:00", "10:00-22:00\n", "", None, 1, True, ["10:00", "22:00"]):
+            with self.subTest(window=ascii(bad)), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(immediate_create_window_local=bad)
+            self.assertEqual(caught.exception.code, "sync_config_immediate_create_window_local_invalid")
+
+    def test_switches_are_strict_booleans(self):
+        for key in ("immediate_create_enabled", "probe_wake_enabled"):
+            for bad in (1, 0, "true", "false", None, "True"):
+                with self.subTest(key=key, value=bad), self.assertRaises(dl.DirectLocalError) as caught:
+                    make_config(**{key: bad})
+                self.assertEqual(caught.exception.code, f"sync_config_{key}_invalid")
+
+    def test_caps_and_wake_cap_bounds(self):
+        for key, low, high in (("max_creates_per_hour", 1, 30), ("max_creates_per_day", 1, 720), ("probe_max_wakes_per_day", 1, 240)):
+            for good in (low, high):
+                extra = {"max_creates_per_hour": 1} if key == "max_creates_per_day" else {}
+                self.assertEqual(getattr(make_config(**{key: good}, **extra), key), good)
+            for bad in (low - 1, -1, high + 1, "6", 6.0, True, None):
+                with self.subTest(key=key, value=bad), self.assertRaises(dl.DirectLocalError) as caught:
+                    make_config(**{key: bad})
+                self.assertEqual(caught.exception.code, f"sync_config_{key}_invalid")
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            make_config(max_creates_per_hour=7, max_creates_per_day=6)
+        self.assertEqual(caught.exception.code, "sync_config_max_creates_per_day_invalid")
+        self.assertEqual(make_config(max_creates_per_hour=6, max_creates_per_day=6).max_creates_per_day, 6)
+
+    def test_unknown_and_lookalike_keys_are_refused(self):
+        for key in ("immediate_create", "immediate_create_enabled ", "Immediate_create_enabled", "max_create_per_hour", "probe_enabled", "immediate_create_window"):
+            with self.subTest(key=key), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(**{key: False})
+            self.assertEqual(caught.exception.code, "sync_config_keys_invalid")
+
+    def test_live_example_config_allows_all_hours_with_every_switch_off(self):
+        example = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        example["shopify_cutover_utc"] = dl.ts(CUTOVER)
+        config = sync.parse_config(example)
+        self.assertEqual((config.immediate_create_window_local, config.max_creates_per_hour, config.max_creates_per_day), ("all_day", 6, 144))
+        self.assertFalse(config.immediate_create_enabled or config.probe_wake_enabled or config.ac2_create_enabled)
+        self.assertEqual(config.ac2_create_member_type, "Default")  # owner D2: never a qualified type
+        self.assertEqual({k: example[k] for k in NEW_KEYS_OFF}, NEW_KEYS_OFF)
+
+    def test_check_config_prints_the_new_keys(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(config_value(**IMMEDIATE, immediate_create_window_local="10:00-22:00")), encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = sync.main(["check-config", "--config", str(path)])
+        value = json.loads(out.getvalue())
+        self.assertEqual((code, value["immediate_create_enabled"], value["immediate_create_window_local"], value["max_creates_per_hour"]), (0, True, "10:00-22:00", 6))
+
+
+class CreateWindowTests(unittest.TestCase):
+    def test_all_day_includes_midnight_and_the_last_second(self):
+        for moment in (sgt(21, 0, 0), sgt(21, 23, 59) + timedelta(seconds=59), sgt(21, 6, 0), sgt(21, 12, 0)):
+            self.assertTrue(sync.in_create_window(moment, "all_day"))
+
+    def test_day_window_start_included_end_excluded(self):
+        window = "10:00-22:00"
+        self.assertFalse(sync.in_create_window(sgt(21, 9, 59) + timedelta(seconds=59), window))
+        self.assertTrue(sync.in_create_window(sgt(21, 10, 0), window))
+        self.assertTrue(sync.in_create_window(sgt(21, 21, 59) + timedelta(seconds=59), window))
+        self.assertFalse(sync.in_create_window(sgt(21, 22, 0), window))
+        self.assertFalse(sync.in_create_window(sgt(21, 0, 0), window))
+
+    def test_window_over_midnight(self):
+        window = "22:00-06:00"
+        self.assertTrue(sync.in_create_window(sgt(21, 22, 0), window))
+        self.assertTrue(sync.in_create_window(sgt(21, 23, 59) + timedelta(seconds=59), window))
+        self.assertTrue(sync.in_create_window(sgt(22, 0, 0), window))
+        self.assertTrue(sync.in_create_window(sgt(22, 5, 59) + timedelta(seconds=59), window))
+        self.assertFalse(sync.in_create_window(sgt(22, 6, 0), window))
+        self.assertFalse(sync.in_create_window(sgt(21, 21, 59), window))
+        self.assertFalse(sync.in_create_window(sgt(22, 0, 0), "06:00-00:00"))
+        self.assertTrue(sync.in_create_window(sgt(21, 23, 59), "06:00-00:00"))
+
+    def test_utc_is_read_in_singapore_time(self):
+        # 14:30 UTC is 22:30 in Singapore: outside 10:00-22:00, inside 22:00-06:00.
+        moment = datetime(2026, 10, 21, 14, 30, tzinfo=timezone.utc)
+        self.assertFalse(sync.in_create_window(moment, "10:00-22:00"))
+        self.assertTrue(sync.in_create_window(moment, "22:00-06:00"))
+
+
+# -- the immediate path ------------------------------------------------------------
+
+class ImmediateCreateTests(GoLiveTestCase):
+    """Owner D1 (all hours), D2 (member type Default), D3 (staff keying stays),
+    D4 (no phone unchanged), on the live book (owner_shared, max 1 write)."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = T0 + timedelta(minutes=2)  # 10:02 Singapore time; the 06:00 cutoff is tomorrow
+
+    def immediate(self, direction="shopify_to_ac2", **overrides):
+        return self.run_sync(direction, **{**IMMEDIATE, "max_writes_per_run": 1, **overrides})
+
+    def test_an_unmatched_sign_up_is_created_at_once_with_a_count_not_an_alert(self):
+        self.signup(50)
+        result = self.immediate()
+        self.assertEqual([(m, p["member_type"]) for m, p in self.ac2.creates], [(sg(50), "Default")])
+        self.assertEqual((result["counts"]["ac2_member_created"], result["counts"]["created_immediately"], result["counts"]["new_member_phone"]), (1, 1, 1))
+        self.assertNotIn("created_after_wait", result["counts"])
+        self.assertEqual((result["alerts"], result["status"]), ([], "completed"))
+        self.assertEqual(result["create_latency_seconds"], [120])
+        self.assertEqual((self.links(), self.pending(50)), ({gid(50): sg(50)}, ("DONE", "new_member_phone")))
+        self.assert_no_pii(result)
+
+    def test_at_any_hour_by_default(self):
+        for n, hour in ((51, 0), (52, 3), (53, 23)):
+            at = sgt(21, hour, 1)
+            self.signup(n, at=at.astimezone(timezone.utc))
+            self.now = at + timedelta(minutes=1)
+            self.assertEqual(self.immediate()["counts"]["created_immediately"], 1)
+        self.assertEqual([m for m, _ in self.ac2.creates], [sg(51), sg(52), sg(53)])
+
+    def test_outside_the_window_it_waits_for_six_as_today(self):
+        self.signup(54)
+        result = self.immediate(immediate_create_window_local="11:00-12:00")
+        self.assertEqual((result["counts"]["waiting_for_staff"], self.ac2.creates, self.pending(54)), (1, [], ("PENDING", "waiting_for_staff")))
+        self.now = sgt(21, 11, 0).astimezone(timezone.utc)
+        self.assertEqual(self.immediate(immediate_create_window_local="11:00-12:00")["counts"]["created_immediately"], 1)
+
+    def test_switch_off_or_creates_off_is_todays_rule(self):
+        self.signup(55)
+        for overrides in ({"immediate_create_enabled": False}, {"ac2_create_enabled": False}):
+            with self.subTest(**overrides):
+                result = self.immediate(**overrides)
+                self.assertEqual((result["counts"]["waiting_for_staff"], result["alerts"], self.ac2.creates), (1, [], []))
+                self.assertNotIn("sign_up_past_cutoff_create_disabled", result["counts"])
+
+    def test_created_after_wait_only_on_the_six_oclock_path(self):
+        self.signup(56)
+        self.immediate(immediate_create_window_local="11:00-12:00")  # waits (outside the window)
+        self.now = sgt(22, 6, 0).astimezone(timezone.utc)  # the cutoff, still outside the window
+        result = self.immediate(immediate_create_window_local="11:00-12:00")
+        self.assertEqual((result["counts"]["created_after_wait"], result["alerts"]), (1, ["created_after_wait"]))
+        self.assertNotIn("created_immediately", result["counts"])
+        # Latency is recorded on both paths while the switch is on ...
+        self.assertEqual(result["create_latency_seconds"], [int((sgt(22, 6, 0) - sgt(21, 10, 0)).total_seconds())])
+        # ... and never with it off (today's output, unchanged).
+        self.signup(57)
+        off = self.run_sync("shopify_to_ac2")
+        self.assertEqual(off["counts"]["created_after_wait"], 1)
+        self.assertNotIn("create_latency_seconds", off)
+
+    def test_staff_key_at_hq_before_the_lookup_links_with_no_write(self):
+        # D3: staff keep keying by hand. The member saved at HQ before the
+        # sync looks is linked by MemberNo + CreatedTime; nothing is written.
+        self.ac2.add(sync.Ac2Member(sg(58), "SOMEONE TYPED", None, created_at=T0 + timedelta(minutes=1)))
+        self.signup(58)
+        result = self.immediate()
+        self.assertEqual((self.links(), self.ac2.creates, result["counts"]["memberno_and_created_time_match"]), ({gid(58): sg(58)}, [], 1))
+        self.assertNotIn("created_immediately", result["counts"])
+
+    def test_staff_save_between_lookup_and_save_is_proven_not_written_then_linked(self):
+        # D3 / G0 r2 race 2: staff save the same MemberNo at HQ after the
+        # sync's lookup and before its save. The bridge refuses the save
+        # before the claim (member_no_taken, proven not written); the next
+        # run finds the staff member and links it. Never created twice.
+        class StaffSavesFirst(FakeAc2):
+            def create_member(inner, member_no, payload, *, write_id):
+                inner.creates.append((member_no, dict(payload)))
+                inner.add(sync.Ac2Member(member_no, "SOMEONE TYPED", None, created_at=T0 + timedelta(minutes=1)), log=True)
+                return "NOT_WRITTEN_PROVEN", "member_no_taken"
+
+        self.ac2 = StaffSavesFirst()
+        self.signup(59)
+        first = self.immediate()
+        self.assertEqual((len(self.ac2.creates), first["counts"]["ac2_create_not_written"], self.pending(59)), (1, 1, ("PENDING", "ac2_not_written")))
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM writes").fetchall()[0][:], ("NOT_WRITTEN", "member_no_taken"))
+        self.assertEqual(self.links(), {})
+        self.now += timedelta(minutes=1)
+        second = self.immediate()
+        self.assertEqual((self.links(), len(self.ac2.creates), second["counts"]["memberno_and_created_time_match"]), ({gid(59): sg(59)}, 1, 1))
+        self.assertEqual(self.pending(59), ("DONE", "memberno_and_created_time_match"))
+
+    def test_staff_key_after_the_sync_created_is_a_possible_duplicate_alert(self):
+        self.signup(60, first="Mary Ann", last="Lee")
+        self.immediate()
+        self.ac2.add(sync.Ac2Member("TILL60", "MARY ANN LEE", local(60), created_at=T0 + timedelta(minutes=5)))
+        self.now += timedelta(minutes=10)
+        self.assertIn("possible_duplicate_member", self.immediate()["alerts"])
+        self.assertEqual(len(self.ac2.creates), 1)
+
+    def test_no_phone_sign_up_is_unchanged(self):
+        # D4: never GetNextMemberNo on the live book; with the switch on the
+        # staff alert is raised at once instead of after the cutoff.
+        self.signup(61, phone=None)
+        result = self.immediate()
+        self.assertEqual((result["alerts"], self.ac2.creates, self.ac2.generator_calls), (["no_phone_sign_up_needs_staff"], [], 0))
+        self.assertEqual(self.pending(61), ("SKIPPED", "no_phone_sign_up_needs_staff"))
+        self.signup(62, phone=None)
+        off = self.run_sync("shopify_to_ac2")  # switch off: waits, as today
+        self.assertEqual((off["counts"]["waiting_for_staff"], self.pending(62)), (1, ("PENDING", "waiting_for_staff")))
+
+    def test_ac2_to_shopify_never_sends_the_sync_created_member(self):
+        self.run_sync("ac2_to_shopify")  # ChangeLog watermark
+        self.signup(63)
+        result = self.immediate("both")
+        self.assertEqual((len(self.ac2.creates), self.shopify.created, result["counts"]["ac2_insert_linked_or_own_write"]), (1, [], 1))
+        self.now += timedelta(minutes=1)
+        again = self.immediate("both")
+        self.assertEqual((len(self.ac2.creates), self.shopify.created), (1, []))
+        self.assertNotIn("shopify_customer_created", again["counts"])
+
+    def test_pending_sign_ups_from_before_the_switch_are_created_on_the_next_run(self):
+        for n in (64, 65):
+            self.signup(n)
+        self.run_sync("shopify_to_ac2")  # switch off: both wait
+        result = self.immediate(max_writes_per_run=5)
+        self.assertEqual((result["counts"]["created_immediately"], sorted(m for m, _ in self.ac2.creates)), (2, [sg(64), sg(65)]))
+
+
+class CreateCapTests(GoLiveTestCase):
+    """Owner D5: caps per hour and per day, both directions together, counted
+    from the ledger's writes rows; over a cap the sign-up is held and falls
+    back to the 06:00 rule, with one alert per hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = T0 + timedelta(minutes=2)
+
+    def immediate(self, **overrides):
+        return self.run_sync("shopify_to_ac2", **{**IMMEDIATE, "max_writes_per_run": 5, "max_creates_per_hour": 2, "max_creates_per_day": 3, **overrides})
+
+    def restart(self) -> None:
+        self.ledger.close()
+        self.ledger = sync.SyncLedger(self.temp, clock=lambda: self.now, check_custody=False)
+
+    def test_the_owner_defaults(self):
+        config = live_config(**IMMEDIATE)
+        self.assertEqual((config.max_creates_per_hour, config.max_creates_per_day), (6, 144))
+        for n in range(1, 9):
+            self.signup(n)
+        result = self.run_sync("shopify_to_ac2", **IMMEDIATE, max_writes_per_run=5)
+        self.assertEqual(result["counts"]["created_immediately"], 5)  # the per-run limit first
+        result = self.run_sync("shopify_to_ac2", **IMMEDIATE, max_writes_per_run=5)
+        self.assertEqual((result["counts"]["created_immediately"], result["counts"]["create_rate_capped"]), (1, 2))
+        self.assertIn("create_rate_capped", result["alerts"])
+
+    def test_over_the_hourly_cap_held_then_falls_back_to_six(self):
+        for n in range(1, 5):
+            self.signup(n)
+        result = self.immediate()
+        self.assertEqual((result["counts"]["created_immediately"], result["counts"]["create_rate_capped"]), (2, 2))
+        self.assertEqual(result["alerts"], ["create_rate_capped"])  # once, with the run's first capped ref
+        self.assertEqual([r["code"] for r in result["refs"]].count("create_rate_capped"), 2)
+        self.assertEqual((self.pending(3), self.pending(4)), (("PENDING", "create_rate_capped"),) * 2)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 2)  # no write for the held ones
+        # The 06:00 rule creates them at the cutoff, caps or not.
+        self.now = sgt(22, 6, 0).astimezone(timezone.utc)
+        late = self.immediate(max_creates_per_hour=1, max_creates_per_day=1)
+        self.assertEqual((late["counts"]["created_after_wait"], sorted(m for m, _ in self.ac2.creates)), (2, [sg(n) for n in range(1, 5)]))
+        self.assertNotIn("create_rate_capped", late["counts"])
+
+    def test_caps_survive_a_restart(self):
+        for n in range(1, 4):
+            self.signup(n)
+        self.immediate()
+        self.restart()  # a new process: the counts come from the ledger
+        self.now = T0 + timedelta(minutes=30)
+        result = self.immediate()
+        self.assertEqual((result["counts"]["create_rate_capped"], len(self.ac2.creates)), (1, 2))
+        self.assertEqual(result["alerts"], [])  # alerted 28 minutes ago, in the ledger
+        self.restart()
+        self.now = T0 + timedelta(minutes=63)  # the first writes left the hour
+        result = self.immediate()
+        self.assertEqual((result["counts"]["created_immediately"], len(self.ac2.creates)), (1, 3))
+        self.signup(4)
+        self.restart()
+        self.now = T0 + timedelta(hours=3)  # hour free; the day cap (3) is reached
+        result = self.immediate()
+        self.assertEqual((result["counts"]["create_rate_capped"], len(self.ac2.creates), result["alerts"]), (1, 3, ["create_rate_capped"]))
+        self.now = T0 + timedelta(hours=24, minutes=3)  # the day is rolling 24 hours
+        self.signup(5, at=T0 + timedelta(hours=24))
+        self.restart()
+        self.assertEqual(self.immediate()["counts"]["created_immediately"], 1)
+
+    def test_one_cap_alert_per_hour(self):
+        for n in range(1, 5):
+            self.signup(n)
+        self.assertEqual(self.immediate()["alerts"], ["create_rate_capped"])
+        self.now = T0 + timedelta(minutes=61)
+        self.assertEqual(self.immediate(max_creates_per_hour=1, max_creates_per_day=2)["alerts"], [])  # 59 minutes since the alert
+        self.now = T0 + timedelta(minutes=62)
+        self.assertEqual(self.immediate(max_creates_per_hour=1, max_creates_per_day=2)["alerts"], ["create_rate_capped"])
+        self.assertEqual(self.ledger.watermark("create_rate_capped_alerted_at"), dl.ts(T0 + timedelta(minutes=62)))
+
+    def test_both_directions_count(self):
+        with self.ledger.tx() as conn:
+            for n in (1, 2):
+                conn.execute("INSERT INTO writes(write_id, direction, customer_gid, member_no, member_no_key, state, created_at, updated_at) "
+                             "VALUES (?, 'ac2_to_shopify', ?, ?, ?, 'DONE', ?, ?)", (f"write-{n}", gid(90 + n), f"T{n}", f"t{n}", dl.ts(self.now), dl.ts(self.now)))
+        self.signup(6)
+        result = self.immediate()
+        self.assertEqual((result["counts"]["create_rate_capped"], self.ac2.creates), (1, []))
+
+    def test_a_capped_sign_up_is_created_once_the_hour_frees(self):
+        for n in range(1, 4):
+            self.signup(n)
+        self.immediate()
+        self.now = T0 + timedelta(minutes=63)
+        self.assertEqual(self.immediate()["counts"]["created_immediately"], 1)
+        self.assertEqual(self.pending(3), ("DONE", "new_member_phone"))
+
+
+class WallClockHoldTests(GoLiveTestCase):
+    """G0 r2 section 6: woken runs would shorten run-count holds, so with the
+    switch on they are wall-clock: today's 5 runs at 15 minutes (60 minutes
+    from the first hold). With it off they stay run counts."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = T0 + timedelta(minutes=2)
+
+    def late_metafield(self, n: int) -> None:
+        self.shopify.add(replace(customer(n), created_at=T0, registration_at=None, registration_value=None))
+
+    def test_off_the_sign_up_time_hold_counts_runs_as_today(self):
+        self.late_metafield(70)
+        for _ in range(sync.REGISTRATION_WAIT_MAX_CHECKS - 1):
+            self.assertEqual(self.run_sync("shopify_to_ac2")["counts"]["shopify_registration_event_pending"], 1)
+        result = self.run_sync("shopify_to_ac2")  # 5th run, same minute: the wait is spent
+        self.assertEqual(result["counts"]["waiting_for_staff"], 1)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM watermarks WHERE name LIKE 'hold_since:%'").fetchone()[0], 0)
+
+    def test_on_the_sign_up_time_hold_is_sixty_minutes_whatever_the_run_count(self):
+        self.assertEqual(sync.REGISTRATION_WAIT, timedelta(minutes=60))
+        self.late_metafield(71)
+        for minute in [2] * 8 + [30, 61]:
+            self.now = T0 + timedelta(minutes=minute)
+            self.assertEqual(self.run_sync("shopify_to_ac2", **IMMEDIATE)["counts"]["shopify_registration_event_pending"], 1, minute)
+        self.assertEqual(self.ac2.creates, [])
+        self.now = T0 + timedelta(minutes=62)  # 60 minutes after the first hold
+        result = self.run_sync("shopify_to_ac2", **IMMEDIATE)
+        self.assertEqual((result["counts"]["created_immediately"], [m for m, _ in self.ac2.creates]), (1, [sg(71)]))
+        self.assertIsNone(self.ledger.watermark(f"hold_since:shopify:{gid(71)}"))
+
+    def test_on_the_hold_clock_survives_a_restart(self):
+        self.late_metafield(72)
+        self.run_sync("shopify_to_ac2", **IMMEDIATE)
+        self.ledger.close()
+        self.ledger = sync.SyncLedger(self.temp, clock=lambda: self.now, check_custody=False)
+        self.now = T0 + timedelta(minutes=61)
+        self.assertEqual(self.run_sync("shopify_to_ac2", **IMMEDIATE)["counts"]["shopify_registration_event_pending"], 1)
+        self.now = T0 + timedelta(minutes=62)
+        self.assertEqual(self.run_sync("shopify_to_ac2", **IMMEDIATE)["counts"]["created_immediately"], 1)
+
+    def setup_ac2_hold(self, n: int) -> None:
+        self.run_sync("ac2_to_shopify")  # ChangeLog watermark
+        self.late_metafield(n)
+        self.ac2.add(sync.Ac2Member(sg(n), "SOMEONE TYPED", None, created_at=T0 + timedelta(minutes=1)), log=True)
+
+    def test_off_the_ac2_hold_counts_runs_as_today(self):
+        self.setup_ac2_hold(73)
+        for _ in range(sync.REGISTRATION_WAIT_MAX_CHECKS - 1):
+            self.assertIn("ac2_member_held_for_sign_up", self.run_sync("ac2_to_shopify")["alerts"])
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.links(), {gid(73): sg(73)})  # Customer.createdAt stands in, within the window
+
+    def test_on_the_ac2_hold_is_sixty_minutes_whatever_the_run_count(self):
+        self.setup_ac2_hold(74)
+        for minute in [2] * 8 + [61]:
+            self.now = T0 + timedelta(minutes=minute)
+            self.assertIn("ac2_member_held_for_sign_up", self.run_sync("ac2_to_shopify", **IMMEDIATE)["alerts"])
+        self.assertEqual(self.links(), {})
+        self.now = T0 + timedelta(minutes=62)
+        self.run_sync("ac2_to_shopify", **IMMEDIATE)
+        self.assertEqual((self.links(), self.shopify.created), ({gid(74): sg(74)}, []))
+
+    def test_on_the_stuck_hold_is_sixty_minutes(self):
+        # More sign-ups pending than one run reads (bound 3): the walk-in is
+        # held, then stuck after 60 minutes, never created while stuck.
+        self.run_sync("ac2_to_shopify")
+        for n in range(75, 80):
+            self.signup(n)
+        self.run_sync("shopify_to_ac2", **IMMEDIATE, immediate_create_window_local="23:00-23:30")  # 5 waiting (outside the window)
+        self.ac2.add(sync.Ac2Member(sg(30), "Walk In Person", None, created_at=T0 + timedelta(minutes=1)), log=True)
+        settings = {**IMMEDIATE, "max_pending_rechecks_per_run": 3, "immediate_create_window_local": "23:00-23:30"}
+        for minute in [3] * 8 + [62]:
+            self.now = T0 + timedelta(minutes=minute)
+            self.assertIn("ac2_member_held_for_sign_up", self.run_sync("ac2_to_shopify", **settings)["alerts"])
+        self.now = T0 + timedelta(minutes=63)
+        self.assertIn("ac2_member_hold_stuck", self.run_sync("ac2_to_shopify", **settings)["alerts"])
+        self.assertEqual(self.shopify.created, [])
+
+    def test_hold_clocks_of_items_no_longer_held_are_pruned(self):
+        self.late_metafield(76)
+        self.run_sync("shopify_to_ac2", **IMMEDIATE)
+        self.assertIsNotNone(self.ledger.watermark(f"hold_since:shopify:{gid(76)}"))
+        self.shopify.customers[gid(76)] = replace(self.shopify.customers[gid(76)], registration_at=T0)  # the metafield arrives
+        self.run_sync("shopify_to_ac2", **IMMEDIATE)
+        self.run_sync("shopify_to_ac2", **IMMEDIATE)
+        self.assertIsNone(self.ledger.watermark(f"hold_since:shopify:{gid(76)}"))
+
+
+class DigestImmediateTests(GoLiveTestCase):
+    def test_digest_prints_latency_writes_per_hour_caps_and_probe_days(self):
+        root = self.private_root()
+        self.ledger.close()
+        self.temp, self.ledger = root, sync.SyncLedger(root, clock=lambda: self.now)
+        self.ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN)
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, "initial_link_completed_at", dl.ts(CUTOVER))
+        for n, minutes in ((1, 1), (2, 3), (3, 9)):
+            self.signup(n)
+            self.now = T0 + timedelta(minutes=minutes)
+            self.run_sync("shopify_to_ac2", **IMMEDIATE, max_creates_per_hour=2, max_creates_per_day=2)
+        config = config_value(**LIVE_KEYS, state_root=str(root))
+        with mock.patch.object(dl, "utc_now", return_value=self.now):
+            code, out = self.cli("digest", "--hours", "24", config=config)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["create_latency_seconds"], {"count": 2, "p50": 60, "p95": 180, "max": 180})
+        self.assertEqual((out["creates"]["created_immediately"], out["creates"]["writes_per_hour_max"], out["creates"]["writes_per_hour"]),
+                         (2, 2, {"2026-10-21T10": 2}))
+        self.assertEqual(out["caps"], {"create_rate_capped": 1, "create_rate_capped_alerts": 1})
+        self.assertIsNone(out["probe"])
+        probe = _probe_module()
+        status = probe._default_status()
+        status["days"] = {"2026-10-20": {"checks": 5, "wakes": 9, "would_wakes": 0, "reasons": {}},
+                          "2026-10-21": {"checks": 7, "wakes": 2, "would_wakes": 1, "reasons": {"new_sign_up": 2}}}
+        status["last_check_at"], status["last_decision"], status["last_reason"] = dl.ts(self.now), "no_work", "no_new_sign_up"
+        probe.save_status(root, status)
+        with mock.patch.object(dl, "utc_now", return_value=self.now):
+            _, out = self.cli("digest", "--hours", "6", config=config)
+        self.assertEqual(out["probe"]["days"], {"2026-10-21": {"checks": 7, "wakes": 2, "would_wakes": 1}})
+        (root / probe.PROBE_STATUS_FILE).write_text("{not json", encoding="utf-8")
+        with mock.patch.object(dl, "utc_now", return_value=self.now):
+            _, out = self.cli("digest", "--hours", "6", config=config)
+        self.assertEqual(out["probe"], {"status": "unreadable"})
+        self.assert_no_pii(out)
+
+    def test_nearest_rank_percentiles(self):
+        self.assertEqual([sync._nearest_rank(list(range(1, 101)), p) for p in (50, 95, 100)], [50, 95, 100])
+        self.assertEqual((sync._nearest_rank([7], 95), sync._nearest_rank([], 50)), (7, None))
+
+
+# -- P2: the sign-up probe -----------------------------------------------------------
+
+SESSION_READ = {"shop": {"id": STORE, "myshopifyDomain": DOMAIN}, "currentAppInstallation": {"accessScopes": [{"handle": "read_customers"}]}}
+
+
+def probe_node(n: int, updated: datetime, tags=("member-mg",)) -> dict:
+    return {"id": gid(n), "tags": list(tags), "updatedAt": dl.ts(updated)}
+
+
+class ProbeTestCase(GoLiveTestCase):
+    """The probe against a real (temporary) live-book ledger that a SyncLedger
+    keeps open, so it holds the run's lock the whole time: the probe must
+    work without it."""
+
+    def setUp(self):
+        super().setUp()
+        self.probe = _probe_module()
+        self.now = T0 + timedelta(minutes=2)
+        self.nodes: list[dict] = []
+        self.sent: list[dict] = []
+        self.starts = 0
+        self.start_ok = True
+
+    def transport(self, url, body, headers, timeout):
+        request = json.loads(body)
+        self.sent.append(request)
+        if request["query"] == direct.SESSION_QUERY:
+            return _graphql(SESSION_READ)
+        return _graphql({"customers": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": self.nodes}})
+
+    def starter(self) -> bool:
+        self.starts += 1
+        return self.start_ok
+
+    def tick(self, **overrides) -> dict:
+        config = live_config(**overrides)
+        return self.probe.run_probe(config, self.temp, environ=PROBE_TOKEN_ENV, transport=self.transport, clock=lambda: self.now, starter=self.starter)
+
+    def wake_settings(self, **overrides) -> dict:
+        return {"probe_wake_enabled": True, "immediate_create_enabled": True, "ac2_create_enabled": True, **overrides}
+
+    def add_run(self, started: datetime, finished: datetime | None) -> None:
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, started_at, finished_at) VALUES (?, ?, ?)", (f"run-{started.timestamp()}", dl.ts(started), dl.ts(finished) if finished else None))
+
+    def status(self) -> dict:
+        return json.loads((self.temp / self.probe.PROBE_STATUS_FILE).read_text(encoding="utf-8"))
+
+
+class ProbeDecisionTests(ProbeTestCase):
+    def test_no_work_when_every_sign_up_is_known(self):
+        self.signup(1)
+        self.run_sync("shopify_to_ac2")  # waiting_for_staff: a pending row
+        self.nodes = [probe_node(1, T0), probe_node(2, T0, tags=("other",))]
+        result = self.tick(**self.wake_settings())
+        self.assertEqual((result["decision"], result["reason"], self.starts), ("no_work", "no_new_sign_up", 0))
+        self.assertEqual(result["counts"], {"sign_ups_seen": 2, "new_sign_ups": 0, "known_sign_ups": 1, "search_complete": 1})
+
+    def test_observe_mode_records_would_wake_once_per_piece_of_work(self):
+        self.nodes = [probe_node(3, T0)]
+        result = self.tick()
+        self.assertEqual((result["decision"], result["reason"], self.starts, result["mode"]), ("would_wake", "observe_mode", 0, "observe"))
+        self.now += timedelta(seconds=90)
+        self.assertEqual(self.tick()["reason"], "work_already_woken")
+        self.nodes.append(probe_node(4, T0 + timedelta(minutes=1)))
+        self.assertEqual(self.tick()["decision"], "would_wake")
+        self.assertEqual(self.status()["days"]["2026-10-21"]["would_wakes"], 2)
+
+    def test_wake_starts_the_main_task_once_per_piece_of_work(self):
+        self.nodes = [probe_node(5, T0)]
+        result = self.tick(**self.wake_settings())
+        self.assertEqual((result["decision"], result["reason"], self.starts, result["wakes_today"]), ("wake", "new_sign_up", 1, 1))
+        self.now += timedelta(seconds=90)
+        self.assertEqual((self.tick(**self.wake_settings())["reason"], self.starts), ("work_already_woken", 1))
+
+    def test_debounce_sixty_seconds_after_the_last_start_or_wake(self):
+        self.add_run(self.now - timedelta(seconds=59), self.now - timedelta(seconds=50))
+        self.nodes = [probe_node(6, T0)]
+        self.assertEqual(self.tick(**self.wake_settings())["reason"], "debounce_recent_start")
+        self.now += timedelta(seconds=1)  # 60 s after the run start
+        self.assertEqual(self.tick(**self.wake_settings())["decision"], "wake")
+        self.nodes.append(probe_node(7, T0 + timedelta(minutes=1)))
+        self.now += timedelta(seconds=59)
+        self.assertEqual((self.tick(**self.wake_settings())["reason"], self.starts), ("debounce_recent_start", 1))
+        self.now += timedelta(seconds=1)
+        self.assertEqual((self.tick(**self.wake_settings())["decision"], self.starts), ("wake", 2))
+
+    def test_no_wake_while_a_run_is_unfinished_or_just_hard_stopped(self):
+        self.nodes = [probe_node(8, T0)]
+        started = self.now - timedelta(minutes=9, seconds=59)
+        self.add_run(started, None)
+        self.assertEqual(self.tick(**self.wake_settings())["reason"], "run_unfinished")
+        self.now = started + timedelta(minutes=10)  # Task Scheduler stops it at PT10M
+        self.assertEqual(self.tick(**self.wake_settings())["reason"], "run_hard_stopped_recently")
+        self.now = started + timedelta(minutes=11, seconds=59)
+        self.assertEqual(self.tick(**self.wake_settings())["reason"], "run_hard_stopped_recently")
+        self.now = started + timedelta(minutes=12)  # 120 s after the hard stop
+        self.assertEqual((self.tick(**self.wake_settings())["decision"], self.starts), ("wake", 1))
+
+    def test_daily_wake_cap_per_singapore_day(self):
+        settings = self.wake_settings(probe_max_wakes_per_day=1)
+        self.nodes = [probe_node(9, T0)]
+        self.assertEqual(self.tick(**settings)["decision"], "wake")
+        self.nodes.append(probe_node(10, T0 + timedelta(minutes=1)))
+        self.now += timedelta(minutes=2)
+        self.assertEqual((self.tick(**settings)["reason"], self.starts), ("wake_cap_reached", 1))
+        self.now = sgt(22, 0, 0).astimezone(timezone.utc)  # a new Singapore day
+        self.assertEqual((self.tick(**settings)["decision"], self.starts), ("wake", 2))
+        self.assertEqual({day: entry["wakes"] for day, entry in self.status()["days"].items()}, {"2026-10-21": 1, "2026-10-22": 1})
+
+    def test_wake_needs_the_immediate_path_its_window_and_room_under_the_caps(self):
+        self.nodes = [probe_node(11, T0)]
+        self.assertEqual(self.tick(**self.wake_settings(immediate_create_enabled=False))["reason"], "immediate_create_off")
+        self.nodes = [probe_node(12, T0 + timedelta(minutes=1))]
+        self.now += timedelta(minutes=2)
+        self.assertEqual(self.tick(**self.wake_settings(ac2_create_enabled=False))["reason"], "immediate_create_off")
+        self.nodes = [probe_node(13, T0 + timedelta(minutes=2))]
+        self.now += timedelta(minutes=2)
+        self.assertEqual(self.tick(**self.wake_settings(immediate_create_window_local="22:00-23:00"))["reason"], "outside_create_window")
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) VALUES ('write-x', 'shopify_to_ac2', 'X1', 'x1', 'DONE', ?, ?)",
+                         (dl.ts(self.now), dl.ts(self.now)))
+        self.assertEqual(self.tick(**self.wake_settings(max_creates_per_hour=1, max_creates_per_day=1))["reason"], "create_rate_capped")
+        self.assertEqual(self.starts, 0)
+
+    def test_nothing_before_the_initial_link_completes(self):
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = 'initial_link_completed_at'")
+        self.nodes = [probe_node(14, T0)]
+        self.assertEqual(self.tick(**self.wake_settings())["reason"], "initial_link_not_complete")
+
+    def test_a_failed_task_start_is_recorded_and_exits_three(self):
+        self.start_ok = False
+        self.nodes = [probe_node(15, T0)]
+        result = self.tick(**self.wake_settings())
+        self.assertEqual((result["decision"], result["reason"], result["wakes_today"]), ("wake_failed", "task_start_failed", 0))
+        self.assertIsNone(self.status()["work_marker"])  # tried again on the next tick
+        with mock.patch.object(self.probe, "run_probe", return_value=result):
+            code, out = self.cli("probe", config=config_value(**LIVE_KEYS, **self.wake_settings(), state_root=str(self.private_root())))
+        self.assertEqual((code, out["decision"]), (3, "wake_failed"))
+
+    def test_the_search_starts_at_the_sync_watermark(self):
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, "shopify_updated_at", "2026-10-21T01:45:00Z")
+        self.tick()
+        self.assertEqual([r["query"] for r in self.sent], [direct.SESSION_QUERY, self.probe.PROBE_QUERY])
+        self.assertEqual(self.sent[1]["variables"], {"first": 50, "after": None, "search": "tag:'member-mg' AND updated_at:>='2026-10-21T01:45:00Z'"})
+
+
+class ProbeStatusTests(ProbeTestCase):
+    def test_status_file_holds_counts_times_and_codes_only(self):
+        self.signup(16)
+        self.nodes = [probe_node(16, T0), probe_node(17, T0)]
+        self.tick(**self.wake_settings())
+        status = self.status()
+        self.assertEqual(set(status), {"schema", "mode", "last_check_at", "last_decision", "last_reason", "last_wake_at", "last_would_wake_at", "work_marker", "last_counts", "days"})
+        text = json.dumps(status)
+        self.assertNotIn("Customer/", text)
+        self.assertNotIn(str(700000 + 16), text)
+        self.assert_no_pii(status)
+        self.assertTrue(self.probe._valid_status(status))
+
+    def test_an_unreadable_status_file_fails_closed_for_the_day(self):
+        (self.temp / self.probe.PROBE_STATUS_FILE).write_text("[]", encoding="utf-8")
+        self.nodes = [probe_node(18, T0)]
+        result = self.tick(**self.wake_settings())
+        self.assertEqual((result["reason"], self.starts), ("wake_cap_reached", 0))
+        self.assertEqual(self.status()["days"]["2026-10-21"]["reasons"]["probe_status_reset"], 1)
+        self.now = sgt(22, 0, 1).astimezone(timezone.utc)
+        self.assertEqual(self.tick(**self.wake_settings())["decision"], "wake")
+
+    def test_a_refusal_is_recorded_then_raised(self):
+        def broken(url, body, headers, timeout):
+            return direct.HttpResponse(401, {}, b"")
+
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            self.probe.run_probe(live_config(), self.temp, environ=PROBE_TOKEN_ENV, transport=broken, clock=lambda: self.now, starter=self.starter)
+        status = self.status()
+        self.assertEqual((status["last_decision"], status["last_reason"]), ("refused", caught.exception.code))
+        self.assertEqual(self.starts, 0)
+
+    def test_old_days_are_dropped(self):
+        for day in range(1, 20):
+            self.now = datetime(2026, 10, day, 4, 0, tzinfo=timezone.utc)
+            self.tick()
+        self.assertEqual(len(self.status()["days"]), self.probe.STATUS_DAYS_KEPT)
+
+
+class ProbeSafetyTests(ProbeTestCase):
+    """Pass bar (G0 r2 P2): the probe never starts the bridge, never loads
+    AutoCount, has no write path, takes no ledger lock and reads no name,
+    email or phone field."""
+
+    SOURCE = ROOT / "directlocal" / "xb_member_sync_probe.py"
+
+    def code_only(self) -> str:
+        """The probe's source with every comment and docstring blanked out
+        (everything else, string constants included, kept as written)."""
+
+        import ast
+        import io as _io
+        import tokenize
+
+        source = self.SOURCE.read_text(encoding="utf-8")
+        docstrings = {(node.body[0].value.lineno, node.body[0].value.col_offset) for node in ast.walk(ast.parse(source))
+                      if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)) and node.body and isinstance(node.body[0], ast.Expr)
+                      and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str)}
+        lines = [list(line) for line in source.splitlines(keepends=True)]
+        for token in tokenize.generate_tokens(_io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT or (token.type == tokenize.STRING and token.start in docstrings):
+                (row, col), (end_row, end_col) = token.start, token.end
+                for r in range(row, end_row + 1):
+                    first = col if r == row else 0
+                    last = end_col if r == end_row else len(lines[r - 1])
+                    for c in range(first, last):
+                        if lines[r - 1][c] not in "\r\n":
+                            lines[r - 1][c] = " "
+        return "".join("".join(line) for line in lines)
+
+    def test_static_no_bridge_no_autocount_no_write_no_lock(self):
+        code = self.code_only()
+        forbidden = ("BridgeClient", "default_bridge_command", "write_once", "create_member", "next_member_no", "powershell", ".ps1", "AutoCount",
+                     "sqlcmd", "SyncLedger", "SyncEngine", "_OwnerLock", "member_sync.lock", ".tx(", "BEGIN", "INSERT", "UPDATE ", "DELETE",
+                     "customerCreate", "CUSTOMER_CREATE_MUTATION", "create_customer", "mutation", "build_real_engine", "load_ac2_credential", "Popen")
+        self.assertEqual([word for word in forbidden if word in code], [])
+        self.assertEqual(code.count("sqlite3.connect("), 1)
+        self.assertIn('"?mode=ro"', code)
+        self.assertIn('"PRAGMA query_only=ON"', code)
+        self.assertEqual(code.count("subprocess.run("), 1)
+        self.assertEqual(self.probe.MAIN_TASK, "\\XB\\XB-MemberSync")
+
+    def test_static_reads_no_contact_field(self):
+        import re as _re
+
+        # (The ledger's own watermarks.name column is the only "name" in the code.)
+        self.assertEqual(_re.findall(r"(?i)phone|e-?mail|first_?name|last_?name|display_?name|address|metafield|birthday", self.code_only()), [])
+        selection = _re.search(r"nodes \{ ([^}]*) \}", self.probe.PROBE_QUERY).group(1).split()
+        self.assertEqual(selection, ["id", "tags", "updatedAt"])
+        self.assertEqual(self.probe.PROBE_NODE_KEYS, frozenset(selection))
+
+    def test_static_imports(self):
+        import ast
+
+        tree = ast.parse(self.SOURCE.read_text(encoding="utf-8"))
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+        self.assertEqual(imported, {"__future__", "json", "os", "sqlite3", "subprocess", "time", "dataclasses", "datetime", "pathlib", "typing",
+                                    "xb_directlocal", "xb_member_sync", "xb_shopify_direct", "xb_shopify_poller"})
+
+    def test_client_allows_only_the_session_check_and_the_probe_query(self):
+        client = self.probe.ProbeShopifyClient(create_enabled=True, shop_domain=DOMAIN, api_version="2026-07",
+                                               token_provider=direct.StaticTokenProvider("shpat_synthetic_token_value_0001"), transport=lambda *a: None)
+        self.assertEqual(self.probe.PROBE_QUERIES, frozenset({direct.SESSION_QUERY, self.probe.PROBE_QUERY}))
+        for query in (sync.CUSTOMER_CREATE_MUTATION, sync.REGISTRATIONS_QUERY, sync.CUSTOMER_QUERY, sync.PHONE_LOOKUP_QUERY):
+            with self.subTest(query=query[:40]), self.assertRaises(direct.ShopifyDirectError) as caught:
+                client.execute(query, {})
+            self.assertEqual(caught.exception.code, "shopify_query_not_pinned")
+        self.assertFalse(hasattr(client, "create_customer") or hasattr(client, "registrations") or hasattr(client, "find_by_phone"))
+
+    def test_a_contact_field_in_the_answer_is_refused(self):
+        self.nodes = [{**probe_node(19, T0), "displayName": "Alpha Tester"}]
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            self.tick()
+        self.assertEqual(caught.exception.code, "shopify_response_shape_invalid")
+
+    def test_runtime_no_lock_no_ledger_write_no_bridge_no_process(self):
+        # The SyncLedger of this test holds the run's lock the whole time.
+        self.signup(20)
+        self.run_sync("shopify_to_ac2")
+        self.now += timedelta(minutes=2)  # past the 60 s debounce of that run
+        self.ledger.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        ledger_file = self.temp / sync.LEDGER_FILE
+        before = hashlib.sha256(ledger_file.read_bytes()).hexdigest()
+        self.nodes = [probe_node(20, T0), probe_node(21, T0)]
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("the probe must not reach this")
+
+        with mock.patch.object(dl, "BridgeClient", side_effect=refuse), mock.patch.object(dl, "_OwnerLock", side_effect=refuse), \
+                mock.patch.object(sync, "SyncLedger", side_effect=refuse), mock.patch.object(sync, "SyncEngine", side_effect=refuse), \
+                mock.patch("subprocess.Popen", side_effect=refuse), mock.patch("subprocess.run", side_effect=refuse):
+            result = self.tick(**self.wake_settings())
+        self.assertEqual((result["decision"], self.starts), ("wake", 1))
+        self.assertEqual(hashlib.sha256(ledger_file.read_bytes()).hexdigest(), before)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
+
+    def test_the_task_start_command_is_pinned(self):
+        with tempfile.TemporaryDirectory() as folder:
+            exe = Path(folder) / "System32" / "schtasks.exe"
+            exe.parent.mkdir()
+            exe.write_bytes(b"")
+            self.assertEqual(self.probe.task_start_command({"SystemRoot": folder}), [str(exe), "/Run", "/TN", "\\XB\\XB-MemberSync"])
+            calls = []
+            with mock.patch("subprocess.run", side_effect=lambda argv, **kw: calls.append((argv, kw)) or mock.Mock(returncode=0)):
+                self.assertTrue(self.probe.start_main_task({"SystemRoot": folder}))
+            self.assertEqual(calls[0][0], [str(exe), "/Run", "/TN", "\\XB\\XB-MemberSync"])
+            self.assertEqual((calls[0][1]["capture_output"], calls[0][1]["check"]), (True, False))
+        for environ in ({}, {"SystemRoot": ""}, {"SystemRoot": "relative"}):
+            with self.subTest(environ=environ), self.assertRaises(dl.DirectLocalError) as caught:
+                self.probe.task_start_command(environ)
+            self.assertEqual(caught.exception.code, "probe_task_starter_missing")
+
+
 if __name__ == "__main__":
     unittest.main()
