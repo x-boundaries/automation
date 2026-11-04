@@ -3421,7 +3421,14 @@ NEW_KEYS_OFF = {"immediate_create_enabled": False, "immediate_create_window_loca
                 "max_creates_per_day": 144, "probe_wake_enabled": False, "probe_max_wakes_per_day": 60}
 NEW_KEYS_OFF_ODD = {"immediate_create_enabled": False, "immediate_create_window_local": "23:00-01:00", "max_creates_per_hour": 1,
                     "max_creates_per_day": 1, "probe_wake_enabled": True, "probe_max_wakes_per_day": 1}
-GOLDEN = ROOT / "tests" / "fixtures" / "member_sync_defaults_off_golden.json"
+# The defaults-off golden trace: ``defaults_off_trace(sync)`` run on the
+# 32e9b31 source of directlocal/xb_member_sync.py (that file loaded in place
+# of this one; xb_directlocal and xb_shopify_direct are unchanged since). Only
+# its SHA-256 and run count are kept: no data file (tests/ holds no JSON
+# fixtures, test_member_intake_validate guardrail).
+GOLDEN_SOURCE_COMMIT = "32e9b31"
+GOLDEN_TRACE_SHA256 = "4bcb98f229cc481c4792326cffb10e1b3d0a1bb39a377242c19a1a8ac2d37ac6"
+GOLDEN_TRACE_RUNS = 50
 PROBE_TOKEN_ENV = {"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"}
 
 
@@ -3551,7 +3558,7 @@ EQUIVALENCE_SCENARIOS = (
 def defaults_off_trace(module, settings: dict | None = None) -> dict:
     """Every run result, the final ledger rows (random IDs left out) and the
     fakes' writes of each scenario, for ``module`` (this source, or the
-    32e9b31 source when the golden file is made)."""
+    32e9b31 source when the golden digest is made)."""
 
     trace = {}
     for name, book, scenario in EQUIVALENCE_SCENARIOS:
@@ -3574,23 +3581,21 @@ def trace_digest(trace: dict) -> str:
 
 
 def trace_outline(trace: dict) -> dict:
-    """The readable part of the golden file: counts, alerts and writes per run."""
+    """Counts, alerts and writes per run (printed when the digest differs)."""
 
     return {name: [{"counts": r["counts"], "alerts": r["alerts"], "writes": r["writes"]} for r in item["runs"]] for name, item in trace.items()}
 
 
 class DefaultsOffEquivalenceTests(unittest.TestCase):
     """Sequencing (owner, 4 Nov 2026): with the new switches off this source
-    decides every run exactly as 32e9b31 did. The golden file was made by
-    running ``defaults_off_trace`` on the 32e9b31 source; it holds the
-    trace's SHA-256 and its counts outline (no phone, name or MemberNo)."""
+    decides every run exactly as 32e9b31 did: the trace's SHA-256 equals the
+    one made on the 32e9b31 source (GOLDEN_TRACE_SHA256)."""
 
     def assert_matches_golden(self, settings: dict | None) -> None:
-        golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
-        self.assertEqual(golden["source_commit"], "32e9b31")
+        self.assertEqual(GOLDEN_SOURCE_COMMIT, "32e9b31")
         trace = defaults_off_trace(sync, settings)
-        self.assertEqual(trace_outline(trace), golden["outline"])
-        self.assertEqual(trace_digest(trace), golden["sha256"])
+        self.assertEqual(sum(len(item["runs"]) for item in trace.values()), GOLDEN_TRACE_RUNS)
+        self.assertEqual(trace_digest(trace), GOLDEN_TRACE_SHA256, json.dumps(trace_outline(trace), sort_keys=True))
 
     def test_new_keys_absent(self):
         self.assert_matches_golden(None)
@@ -3601,12 +3606,17 @@ class DefaultsOffEquivalenceTests(unittest.TestCase):
     def test_other_values_change_nothing_while_the_immediate_path_is_off(self):
         self.assert_matches_golden(NEW_KEYS_OFF_ODD)
 
-    def test_the_golden_file_holds_no_member_data(self):
-        text = GOLDEN.read_text(encoding="utf-8")
-        for n in range(1, 100):
-            self.assertNotIn(local(n), text)
-        for word in ("Alpha", "Tester", "Mary", "Walker", "example.com", "<Member", "Customer/"):
-            self.assertNotIn(word, text)
+    def test_the_trace_covers_the_decisions_that_matter(self):
+        # The digest is only as strong as what the scenarios exercise.
+        trace = defaults_off_trace(sync)
+        codes = {code for item in trace.values() for run in item["runs"] for code in run["counts"]}
+        for code in ("waiting_for_staff", "created_after_wait", "memberno_and_created_time_match", "no_phone_sign_up_needs_staff",
+                     "no_phone_generator_member_no", "shopify_registration_event_pending", "ac2_member_held_for_sign_up", "ac2_member_hold_stuck",
+                     "ac2_member_hold_requeued", "ac2_create_not_written", "ac2_create_uncertain", "uncertain_write_resolved_linked",
+                     "max_writes_per_run_reached", "shared_phone_name_fallback", "ac2_insert_linked_or_own_write", "shopify_customer_created",
+                     "linked_existing_shopify_customer", "shopify_separate_customer_created_without_phone", "sign_up_past_cutoff_create_disabled"):
+            self.assertIn(code, codes)
+        self.assertEqual({book for _, book, _ in EQUIVALENCE_SCENARIOS}, {TEST_BOOK, PROD_BOOK})
 
 
 # -- configuration ---------------------------------------------------------------
