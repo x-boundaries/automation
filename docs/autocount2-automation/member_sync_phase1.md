@@ -919,7 +919,7 @@ and `tests/test_member_sync_bridge_ps.py`.
 | S6 | In one sitting: Owner adds `write_customers`; the Q3/Q9 probe through the TEST book (one fake member, real `customerCreate`, deleted straight after); production `shopify_create_enabled` true | OK-5 "SHOPIFY CREATES" (never merged) | Probe customer accepted with first name only; a second customer with the same phone refused by Shopify; first production create checked in admin | `shopify_create_enabled` false AND remove `write_customers` (with only one of them every run refuses on scope, `shopify_token_scope_not_expected`, which is safe but stops the sync) |
 | S7 | Hypercare, 14 days: `digest --hours 24` and `status` daily, masked counts and `runs.duration_seconds_max` to the Controller | none (read-only) | No action-needing alert left open; `duration_seconds_max` stays under about 300 s (else lower `max_pending_rechecks_per_run`) | Disable the task after two non-0/3 results in a row |
 | P3 | Probe in observe mode, after S5 has passed: VM clone to the merged #155 P1+P2 SHA, the probe task registered with `probe_wake_enabled` false, 3 days ("Immediate create (after S5)" below) | "PROBE OBSERVE" | Would-wake times match real sign-ups (one `would_wake` per new sign-up, within about 2 minutes of it); no wake storm (fewer than about 3 per sign-up, digest `probe.days`); the probe finishes in under 10 s; no AutoCount session from the probe in AutoCount's logged-in users list; the main task unchanged | Disable `\XB\XB-MemberSync-Probe` |
-| P4 | Immediate creates: staff briefed on the procedure below first; blocker A6 cleared; `immediate_create_enabled` and `probe_wake_enabled` true, window `all_day`, caps 6 and 144; 7 days | "IMMEDIATE CREATES" (never merged with OK-4 or OK-5) | 7 days: digest `create_latency_seconds.p95` at most 120 (sign-up to HQ create at most 2 minutes); every counter case seen at the till, with its time recorded; 0 till-side duplicate MemberNos; no `uncertain_*`; the Owner's session never signed out; caps never hit by real traffic (`caps.create_rate_capped` 0) | Any of the three off switches below |
+| P4 | Immediate creates: staff briefed on the procedure below first; blocker A6 cleared; the A5 test-book UAT passed (one immediate create, plus a duplicate-MemberNo save in the HQ screen, which AutoCount must refuse); `immediate_create_enabled` and `probe_wake_enabled` true, window `all_day`, caps 6 and 144; 7 days | "IMMEDIATE CREATES" (never merged with OK-4 or OK-5) | 7 days: digest `create_latency_seconds.p95` at most 120 (sign-up to HQ create at most 2 minutes); every counter case seen at the till, with its time recorded; 0 till-side duplicate MemberNos; no `uncertain_*`; the Owner's session never signed out; caps never hit by real traffic (`caps.create_rate_capped` 0) | Any of the three off switches below |
 
 S5 and S6 must stay separate OKs, and never merge with OK-0. P3 and P4 are
 separate OKs too, after S5 (at least 3 clean S5 creates seen at a till and
@@ -1040,12 +1040,17 @@ code change (the execution limit and this floor) and its own review.
   in `owner_shared` mode, where it is a second session of the Owner's user.
   Not two sync sessions at once, except briefly after a run is
   hard-stopped at the execution limit, when an orphan write-once child (at
-  most 120 s) can overlap the next run (above).
+  most 120 s) can overlap the next run (above). Assumed, not VM-checked:
+  that the second session of the same user takes its own licence. S1
+  checked only that the sync's session is released from the logged-in
+  users list after the child exits.
 - Audit fields (`owner_shared` mode, accepted by the Owner on 30 Oct 2026):
   AutoCount records the signed-in user as the creator of a record, so a
   member the sync creates shows the Owner's user as its creator, the same
   as one the Owner keys by hand. The sync's own ledger (`writes`, keyed
-  refs) is the record of which members the sync made.
+  refs) is the record of which members the sync made. Assumed, not
+  VM-checked: that AutoCount records the signed-in user as creator. It is
+  confirmed on the first S5 create.
 
 ### Scheduled task account (VM fact V8, design T1)
 
@@ -1097,6 +1102,9 @@ behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for exampl
   earlier session out when the same user signs in again, every run would
   sign the Owner out on the VM. The S1 Owner session check finds this
   before anything is scheduled; the remedy is `dedicated` mode.
+- The reverse case: the Owner signing in during a run ends the sync's bridge
+  child. That fails safe: a read fails (the run stops, nothing written), or
+  a create in flight is UNCERTAIN and held, never re-sent.
 - Shadow runs exit 3 every run while past-cutoff sign-ups wait for AC2
   creates; the digest groups them.
 - On rollback of Shopify creates the switch and the scope go together, or
@@ -1151,9 +1159,12 @@ and with the new keys absent or false every run decides exactly as before
 **The sign-up probe** (`python directlocal\xb_member_sync.py probe --config
 <config>`, task `\XB\XB-MemberSync-Probe` every minute):
 
-- One Shopify search for `member-mg` customers updated since the sync's own
-  watermark, reading only ID, tags and `updatedAt` (never a name, email or
-  phone; an answer with any other field is refused). It opens the ledger
+- A search for `member-mg` customers updated since the sync's own
+  watermark, newest first. Each tick makes a session check plus up to 2
+  search pages of 50, so at most 3 GraphQL requests over 2 query texts, plus
+  a token exchange on a cold cache. It reads only ID, tags and `updatedAt`
+  (never a name, email or phone; an answer with any other field is
+  refused). It opens the ledger
   read-only with no lock, as `digest` does. It never starts the bridge,
   signs in to AutoCount, or writes to the ledger or to Shopify (static and
   runtime tests).
@@ -1233,11 +1244,20 @@ P3 "PROBE OBSERVE":
    Scheduler, and once in shop hours AutoCount's logged-in users list. Off
    switch: disable `\XB\XB-MemberSync-Probe`.
 
-P4 "IMMEDIATE CREATES" (after P3 passes, A6 cleared, staff briefed):
+P4 "IMMEDIATE CREATES" (after P3 passes, A6 cleared, the A5 test-book UAT
+passed, staff briefed). A5: on the test book, one immediate create, then
+staff save the same MemberNo in the HQ screen, and AutoCount refuses the
+duplicate.
 
 1. Between two main-task runs, set `immediate_create_enabled` true and
    `probe_wake_enabled` true in the live config (window `all_day`, caps 6
    and 144; `ac2_create_enabled` is already true since S5); `check-config`.
+   Then check that the probe's first wake records `wake`, not `wake_failed`
+   (`member_sync_probe_status.json` `last_decision`, or `digest` `probe`).
+   If no wake has happened yet, check it instead with one
+   `schtasks /Run /TN \XB\XB-MemberSync` as the task account between two
+   runs, under the P4 OK. On `wake_failed` (the task account cannot start
+   the main task): stop and report.
 2. For the first counter sign-ups, staff note the form submit time and when
    the member first appears at the till; compare with the digest's latency.
 3. Seven days: `digest --hours 24` daily against the P4 pass bar. Off

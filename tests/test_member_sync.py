@@ -3265,6 +3265,11 @@ class GoLiveMatrixTests(GoLiveTestCase):
             ({"ac2_login_mode": "Owner_Shared"}, "sync_config_ac2_login_mode_invalid"),
             ({"ac2_login_mode": "owner_shared "}, "sync_config_ac2_login_mode_invalid"),
             ({"ac2_login_mode": "shared"}, "sync_config_ac2_login_mode_invalid"),
+            # G2 #283 L2: non-ASCII lookalikes (a Cyrillic letter; fullwidth forms).
+            ({"ac2_login_mode": "owner_\u0455hared"}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": "\u043ewner_shared"}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": "\uff4f\uff57\uff4e\uff45\uff52\uff3f\uff53\uff48\uff41\uff52\uff45\uff44"}, "sync_config_ac2_login_mode_invalid"),
+            ({"ac2_login_mode": "dedicate\uff44"}, "sync_config_ac2_login_mode_invalid"),
             ({"ac2_login_mode": ""}, "sync_config_ac2_login_mode_invalid"),
             ({"ac2_login_mode": True}, "sync_config_ac2_login_mode_invalid"),
             ({"ac2_login_mode": ["owner_shared"]}, "sync_config_ac2_login_mode_invalid"),
@@ -3917,6 +3922,18 @@ class CreateCapTests(GoLiveTestCase):
         self.restart()
         self.assertEqual(self.immediate()["counts"]["created_immediately"], 1)
 
+    def test_the_hourly_cap_is_a_rolling_sixty_minutes(self):
+        # G2 #285 L1: a write 59 minutes old counts, one 61 minutes old does not.
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) "
+                         "VALUES ('write-edge', 'shopify_to_ac2', 'E1', 'e1', 'DONE', ?, ?)", (dl.ts(self.now - timedelta(minutes=59)),) * 2)
+        self.signup(1)
+        result = self.immediate(max_creates_per_hour=1, max_creates_per_day=10)
+        self.assertEqual((result["counts"].get("create_rate_capped"), self.ac2.creates), (1, []))
+        self.now += timedelta(minutes=2)  # the write is now 61 minutes old
+        result = self.immediate(max_creates_per_hour=1, max_creates_per_day=10)
+        self.assertEqual((result["counts"].get("created_immediately"), len(self.ac2.creates)), (1, 1))
+
     def test_one_cap_alert_per_hour(self):
         for n in range(1, 5):
             self.signup(n)
@@ -4201,6 +4218,48 @@ class ProbeDecisionTests(ProbeTestCase):
         self.assertEqual(self.tick(**self.wake_settings(max_creates_per_hour=1, max_creates_per_day=1))["reason"], "create_rate_capped")
         self.assertEqual(self.starts, 0)
 
+    def test_writes_last_hour_is_a_rolling_sixty_minutes(self):
+        # G2 #285 L1: a write 59 minutes old counts, one 61 minutes old does not.
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) "
+                         "VALUES ('write-edge', 'shopify_to_ac2', 'E1', 'e1', 'DONE', ?, ?)", (dl.ts(self.now - timedelta(minutes=59)),) * 2)
+        conn = self.probe._open_read_only(self.temp, live_config())
+        try:
+            facts = self.probe.ledger_facts(conn, live_config(), [], self.now)
+            self.assertEqual((facts.writes_last_hour, facts.writes_last_day), (1, 1))
+            facts = self.probe.ledger_facts(conn, live_config(), [], self.now + timedelta(minutes=2))
+            self.assertEqual((facts.writes_last_hour, facts.writes_last_day), (0, 1))
+        finally:
+            conn.close()
+        settings = self.wake_settings(max_creates_per_hour=1, max_creates_per_day=10)
+        self.nodes = [probe_node(19, T0)]
+        self.assertEqual((self.tick(**settings)["reason"], self.starts), ("create_rate_capped", 0))
+        self.now += timedelta(minutes=2)  # the write is now 61 minutes old
+        self.assertEqual((self.tick(**settings)["decision"], self.starts), ("wake", 1))
+
+    def test_newest_sign_ups_come_first_past_two_pages(self):
+        # G2 #285 L3: 150 sign-ups match (3 pages). A store that honours the
+        # query's order serves them newest first only for reverse: true, so
+        # the newest is seen on page 1; at most 2 pages of 50 are read.
+        signups = [probe_node(n, T0 + timedelta(minutes=n)) for n in range(1, 151)]
+
+        def store(url, body, headers, timeout):
+            request = json.loads(body)
+            self.sent.append(request)
+            if request["query"] == direct.SESSION_QUERY:
+                return _graphql(SESSION_READ)
+            newest_first = re.search(r"customers\([^)]*\breverse: true\b", request["query"]) is not None
+            ordered = sorted(signups, key=lambda node: node["updatedAt"], reverse=newest_first)
+            page = {None: 0, "cursor-1": 1, "cursor-2": 2}[request["variables"]["after"]]
+            first = request["variables"]["first"]
+            nodes = ordered[page * first:(page + 1) * first]
+            return _graphql({"customers": {"pageInfo": {"hasNextPage": (page + 1) * first < len(ordered), "endCursor": f"cursor-{page + 1}"}, "nodes": nodes}})
+
+        result = self.probe.run_probe(live_config(), self.temp, environ=PROBE_TOKEN_ENV, transport=store, clock=lambda: self.now, starter=self.starter)
+        self.assertEqual((result["decision"], result["counts"]["sign_ups_seen"], result["counts"]["search_complete"]), ("would_wake", 100, 0))
+        self.assertEqual(self.status()["work_marker"], dl.ts(T0 + timedelta(minutes=150)))  # the newest sign-up
+        self.assertEqual(len(self.sent), 3)  # the session check and 2 pages of 50, no more
+
     def test_nothing_before_the_initial_link_completes(self):
         with self.ledger.tx() as conn:
             conn.execute("DELETE FROM watermarks WHERE name = 'initial_link_completed_at'")
@@ -4256,6 +4315,20 @@ class ProbeStatusTests(ProbeTestCase):
         status = self.status()
         self.assertEqual((status["last_decision"], status["last_reason"]), ("refused", caught.exception.code))
         self.assertEqual(self.starts, 0)
+
+    def test_a_corrupt_ledger_is_refused_as_digest_refuses_it(self):
+        # G2 #285 L2: exit 2, the status file records the reason, no wake.
+        root = self.private_root()
+        (root / sync.LEDGER_FILE).write_bytes(b"not a sqlite database, synthetic " * 64)
+        config = config_value(**LIVE_KEYS, **self.wake_settings(), state_root=str(root))
+        probe = _probe_module()
+        with mock.patch.object(probe, "start_main_task", side_effect=AssertionError("no wake")), mock.patch.object(dl, "utc_now", return_value=self.now):
+            code, out = self.cli("probe", config=config)
+            digest_code, digest_out = self.cli("digest", "--hours", "24", config=config)
+        self.assertEqual((digest_code, digest_out), (2, {"status": "refused", "code": "sync_ledger_unreadable"}))
+        self.assertEqual((code, out), (digest_code, digest_out))
+        status = json.loads((root / probe.PROBE_STATUS_FILE).read_text(encoding="utf-8"))
+        self.assertEqual((status["last_decision"], status["last_reason"], status["last_wake_at"]), ("refused", "sync_ledger_unreadable", None))
 
     def test_old_days_are_dropped(self):
         for day in range(1, 20):
@@ -4314,6 +4387,9 @@ class ProbeSafetyTests(ProbeTestCase):
         self.assertEqual(_re.findall(r"(?i)phone|e-?mail|first_?name|last_?name|display_?name|address|metafield|birthday", self.code_only()), [])
         selection = _re.search(r"nodes \{ ([^}]*) \}", self.probe.PROBE_QUERY).group(1).split()
         self.assertEqual(selection, ["id", "tags", "updatedAt"])
+        # G2 #285 L3: newest first, the same 2 pages of 50 at most.
+        self.assertIn("customers(first: $first, after: $after, sortKey: UPDATED_AT, reverse: true, query: $search)", self.probe.PROBE_QUERY)
+        self.assertEqual((self.probe.PROBE_PAGE_SIZE, self.probe.PROBE_MAX_PAGES), (50, 2))
         self.assertEqual(self.probe.PROBE_NODE_KEYS, frozenset(selection))
 
     def test_static_imports(self):
