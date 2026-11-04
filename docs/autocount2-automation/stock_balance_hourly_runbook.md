@@ -12,7 +12,7 @@ Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close 
 
 `scripts/autocount_stock_balance_hourly.py` runs once an hour, 24/7. Each run reads the stored on-hand stock balance (`dbo.ItemBatchBalQty`, the table AutoCount itself maintains) and the stock ledger (`dbo.StockDTL`, summed per item, UOM, location and day), checks that the two agree, and writes:
 
-- locally, an immutable hourly folder with `stock_balance.csv` and `manifest.json` (kept 48 hours once pruning is on);
+- locally, an immutable hourly folder with `stock_balance.csv`, `manifest.json` and `alert_record.json` (see [Per-run alert record](#per-run-alert-record); kept 48 hours once pruning is on);
 - a "latest" pair (`stock_balance_latest.csv`, `latest_manifest.json`) that is replaced only after the new hourly CSV re-reads to the hash that was written;
 - the dashboard feed `stock_dashboard_feed.json.gz`, beside the latest pair (see [Dashboard feed](#dashboard-feed-schema-v1));
 - the item index `stock_item_index.json.gz`, beside the feed (see [Item index](#item-index-schema-v1));
@@ -451,7 +451,7 @@ Details: last_run_status.json in the Drive folder; runbook section "Failure clas
 - Fields: `schema` (`xb.ac2.stock_alert_record.v1`), `job`, `run_id`, `started_at`, `finished_at`, `status` and `failure_class` (as in `last_run_status.json`), `alert_status` (values above), `http_status`.
 - `http_status`: the webhook answer's HTTP status as a number (for example `200` with `sent`; `403`, `404`, `500` or `502` with `send_failed`), or `null` when no POST was made (`disabled`, `no_alert`, `suppressed`, `secret_unavailable`, `skipped_config_invalid`) or the POST got no usable answer (`send_failed` after a timeout, network error or malformed answer; `error` before the answer). `error` after an answer keeps that answer's status. `last_run_status.json` carries the same value as `alert_http_status`.
 - **Never** the webhook URL, a header, the secret or the answer's body; no path, message, item or quantity.
-- If the hourly folder cannot be written (the archive disk is full or read-only), there is no record for that run, as there is no manifest; `last_run_status.json` still shows that run until the next one. Writing the record never changes the run's status, exit code or other files.
+- If the hourly folder cannot be written (the archive disk is full or read-only), there is no record for that run, as there is no manifest; `last_run_status.json` still shows that run until the next one. A run whose settings file cannot be read, or that names no usable `archive_root`, also writes no record (and no manifest); A5's missing-hour rule catches it. Writing the record never changes the run's status, exit code or other files.
 
 ### Alert go-live steps (A1-A5)
 
@@ -486,7 +486,7 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
   Get-ChildItem "<archive_root>\hourly" -Recurse -Filter alert_record.json |
     ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } |
     Where-Object { [datetimeoffset]$_.started_at -gt [datetimeoffset]::Now.AddHours(-24) } |
-    Sort-Object started_at |
+    Sort-Object { [datetimeoffset]$_.started_at } |
     Format-Table started_at, status, failure_class, alert_status, http_status -AutoSize
   ```
 
@@ -497,6 +497,7 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
 - **Switch off alerts** (VM settings change, needs owner OK): set `alert.webhook_enabled` to `false`. The next run shows `alert_status: disabled`. Optionally remove the variable: `[Environment]::SetEnvironmentVariable("XB_AC2_STOCK_ALERT_SECRET", $null, "User")`, and delete `alert_state.json` in the archive root.
 - **Deactivate the n8n workflow** (n8n change, needs owner OK): the VM then gets 404 and records `send_failed` every hour that has a problem; runs and exit codes are unchanged.
 - **Rotate the secret**: change the Header Auth credential value in n8n and the VM variable together (A3), then repeat A4.
+- **Code rollback** (to a version before the per-run alert record): the older prune removes only `stock_balance.csv` and `manifest.json`, so it leaves record-only hourly folders (holding `alert_record.json`, counted `kept_unexpected`). Delete them by hand.
 
 ### Not in this round (LATER)
 

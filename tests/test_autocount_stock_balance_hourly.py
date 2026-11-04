@@ -3526,6 +3526,11 @@ class AlertRecordTests(TempDirTestCase):
         path = self.run_dir(manifest) / ALERT_RECORD
         with self.assertRaises(FileExistsError):
             hourly.write_exclusive(path, b"{}")
+        # G2 #284 L2: the record writer itself never replaces a record.
+        written = path.read_bytes()
+        other_status = {**self.status_file(), "status": "failed", "failure_class": "internal_error", "alert_status": "send_failed", "alert_http_status": 502}
+        hourly.write_alert_record(path.parent, other_status)
+        self.assertEqual(path.read_bytes(), written)
 
     def test_record_write_failure_never_changes_the_run(self):
         real = hourly.write_exclusive
