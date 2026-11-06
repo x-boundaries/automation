@@ -6,8 +6,9 @@
 #   - the target book is authorised by this source: AED_TESTINGAPI for every
 #     operation; AED_XBOUNDARIES (go-live, Owner SCOPE-CONFIRMED 29 Oct 2026)
 #     only for the #155 sync's sync-lookup, sync-changelog and write-once
-#     with payload profile sync_p1. Names, operations and profiles compare
-#     ordinally (a lookalike never passes);
+#     with payload profile sync_p1, and (#268) the type move's four
+#     type-move-* operations with payload profile type_move_p1. Names,
+#     operations and profiles compare ordinally (a lookalike never passes);
 #   - host DESKTOP-4I042L6 and no XB_AC2_SESSION_FACTORY override;
 #   - the live AutoCount assemblies equal the pins the outbound qualification
 #     was made against;
@@ -34,6 +35,12 @@ $script:XbDlForbiddenBooks = @("AED_XBOUNDARIES")
 $script:XbDlLiveBook = "AED_XBOUNDARIES"
 $script:XbDlLiveBookOperations = @("sync-lookup", "sync-changelog", "write-once")
 $script:XbDlLiveBookWriteProfile = "sync_p1"
+# #268 (G0 #268 option b): the one-off member type move has its own entry
+# point (ac2_member_type_move_bridge.ps1). Its operations are admitted on the
+# live book only with its own payload profile; the sync's operations never
+# take that profile, and these operations never take sync_p1.
+$script:XbDlTypeMoveOperations = @("type-move-scan", "type-move-counts", "type-move-member", "type-move-save")
+$script:XbDlTypeMoveProfile = "type_move_p1"
 # Must equal QUALIFIED_ASSEMBLIES in ac2_directlocal_e7_isolation_check.py.
 $script:XbDlQualifiedAssemblies = [ordered]@{
     "AutoCount.dll" = "8e86273018c01c715e440c7975f759951f4a0e979fc3edb0c281db6696090f93"
@@ -62,6 +69,11 @@ function Assert-XbDlAuthorisedBook {
     )
     if (Test-XbDlOrdinalIn -Value $Book -Set $script:XbDlAuthorisedBooks) { return }
     if (-not (Test-XbDlLiveBook -Book $Book)) { throw "target_book_not_authorised" }
+    if (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlTypeMoveOperations) {
+        # #268: always with its profile; -ProfileNotYetRead never applies.
+        if (-not [string]::Equals($PayloadProfile, $script:XbDlTypeMoveProfile, [StringComparison]::Ordinal)) { throw "production_book_not_authorised" }
+        return
+    }
     if (-not (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlLiveBookOperations)) { throw "production_book_not_authorised" }
     if ([string]::Equals($Operation, "write-once", [StringComparison]::Ordinal) -and -not $ProfileNotYetRead -and
         -not [string]::Equals($PayloadProfile, $script:XbDlLiveBookWriteProfile, [StringComparison]::Ordinal)) {

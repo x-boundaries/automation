@@ -8,7 +8,11 @@ null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Go-live enablement (29 October 2026, Owner
 SCOPE-CONFIRMED on #155): the production book `AED_XBOUNDARIES` is admitted
 for this sync only (see "Go-live (production)" below); nothing in this
-repository turns it on. Every live step needs its own Owner OK.
+repository turns it on. Every live step needs its own Owner OK. (#268 adds
+one more admission in the same book guard: the one-off member type move's own
+`type-move-*` operations with profile `type_move_p1`, through its own entry
+point; this sync's operations and profile are unchanged. See
+`member_type_move_runbook.md`.)
 
 Code: `directlocal/xb_member_sync.py` (engine, ledger, Shopify client,
 credential loader, CLI), the `sync-lookup` / `sync-changelog` operations and
@@ -894,7 +898,7 @@ the OK.
 | Python config (`parse_config`) | Exact name only; `ac2_credential_target` must be `XB-AC2-MemberSync`; `ac2_login_mode` must be stated: `owner_shared` (the Owner's own user, `ac2_refused_user_ids` empty) or `dedicated` (`ac2_refused_user_ids` lists at least the Owner's AutoCount user ID) | A missing or unknown `ac2_login_mode` (`sync_config_ac2_login_mode_live_required`, `sync_config_ac2_login_mode_invalid`); `owner_shared` with a refused list; any other name or lookalike (`autocount_book_not_authorised`); `ac2_create_without_phone` `true`; `XB-AC2-MemberSync` in a test-book config (`sync_config_ac2_credential_target_live_only`) |
 | Ledger | Schema v3, a fresh ledger in its own state root (example `C:\XB\xb155-member-sync-live`) | A test ledger with the live config and the reverse (`sync_ledger_binding_mismatch`, also for `status` and `digest`) |
 | Engine | Same rules as the test book, plus: a sign-up with no usable phone is never created (R8) | `GetNextMemberNo` (`member_no_generator_not_authorised`) |
-| PowerShell book guard | `sync-lookup`, `sync-changelog`, and `write-once` with payload profile `sync_p1`. The operation is checked before stdin; the profile once the payload is read, before any session, login or claim | Every other operation, `next-member-no` included, any other profile and any caller without an operation (`production_book_not_authorised`) |
+| PowerShell book guard | `sync-lookup`, `sync-changelog`, and `write-once` with payload profile `sync_p1`. The operation is checked before stdin; the profile once the payload is read, before any session, login or claim. Also (#268) the one-off member type move's `type-move-*` operations, only with profile `type_move_p1` and only through their own entry point (`member_type_move_runbook.md`) | Every other operation, `next-member-no` included, any other profile (`type_move_p1` on a sync operation and `sync_p1` on a `type-move-*` operation included) and any caller without an operation (`production_book_not_authorised`) |
 | Write-once `sync_p1` | MemberNo free, then the member type exists (`SELECT COUNT_BIG(*) FROM MemberType WHERE MemberType = ?`, the one new pinned read, one parameter), then the claim | `member_no_taken`, `member_type_unknown`: refused before the claim, proven not written |
 
 Unchanged: the identity proof after login (declared `DBName` = `DB_NAME()` =

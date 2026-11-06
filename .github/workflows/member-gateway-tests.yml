@@ -41,6 +41,13 @@ on:
       - "tests/test_member_directlocal_poller.py"
       - "tests/test_member_sync.py"
       - "tests/test_member_sync_bridge_ps.py"
+      - "tests/test_member_type_move.py"
+      - "tests/test_member_type_move_ps.py"
+      - "scripts/ac2_member_type_move.ps1"
+      - "scripts/ac2_member_type_move_bridge.ps1"
+      - "config/member_type_move.example.json"
+      - "config/member_type_move.live.example.json"
+      - "docs/autocount2-automation/member_type_move_runbook.md"
       - "config/member_sync.example.json"
       - "config/member_sync.live.example.json"
       - "scripts/install_member_sync_task.ps1"
@@ -130,6 +137,13 @@ on:
       - "tests/test_member_directlocal_poller.py"
       - "tests/test_member_sync.py"
       - "tests/test_member_sync_bridge_ps.py"
+      - "tests/test_member_type_move.py"
+      - "tests/test_member_type_move_ps.py"
+      - "scripts/ac2_member_type_move.ps1"
+      - "scripts/ac2_member_type_move_bridge.ps1"
+      - "config/member_type_move.example.json"
+      - "config/member_type_move.live.example.json"
+      - "docs/autocount2-automation/member_type_move_runbook.md"
       - "config/member_sync.example.json"
       - "config/member_sync.live.example.json"
       - "scripts/install_member_sync_task.ps1"
@@ -220,7 +234,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore tests.test_member_directlocal_poller tests.test_member_sync -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore tests.test_member_directlocal_poller tests.test_member_sync tests.test_member_type_move -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD
@@ -260,6 +274,7 @@ jobs:
           tests.test_directlocal_e7_testbook_ps
           tests.test_directlocal_code_custody_ps
           tests.test_member_sync_bridge_ps
+          tests.test_member_type_move_ps
 
   powershell-worker-tooling:
     # The worker tooling module is the largest single module, so it runs in its own

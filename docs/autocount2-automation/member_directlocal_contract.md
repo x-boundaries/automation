@@ -32,7 +32,11 @@ synthetic factory with `-TargetBook` is refused. With `-TargetBook`,
 `ac2_directlocal_book_guard.ps1` runs, in order, before any member operation:
 authorised book (`AED_TESTINGAPI` for every caller; `AED_XBOUNDARIES` only for the
 #155 sync's `sync-lookup`, `sync-changelog` and `write-once` with profile `sync_p1`,
-go-live R3, see [member sync phase 1](member_sync_phase1.md); otherwise
+go-live R3, see [member sync phase 1](member_sync_phase1.md), and for the #268
+member type move's own `type-move-scan`, `type-move-counts`, `type-move-member` and
+`type-move-save` with profile `type_move_p1`, which arrive only through its own
+entry point `ac2_member_type_move_bridge.ps1`, see
+[member type move runbook](member_type_move_runbook.md); otherwise
 `production_book_not_authorised`; ordinal compares), host
 `DESKTOP-4I042L6`, no `XB_AC2_SESSION_FACTORY`, assembly pins equal to the E7
 qualification, book pinned for the process, vendor login, telemetry off,
