@@ -425,7 +425,7 @@ Unknown keys, at the top level or nested, are refused.
 | `shopify_max_pages` | `10` | 1-40 |
 | `http_timeout_seconds` | `30` | 5-60 |
 | `deferred_create_local_time` | `"06:00"` | Round 6: `HH:MM` (00:00-23:59) in Asia/Singapore on the day after sign-up; before it an unmatched sign-up waits for staff |
-| `ac2_create_member_type` | `"REGISTERED"` | Round 6: the AutoCount member type of a member the sync creates (1-20 of `A-Z a-z 0-9 _ -`, starting with a letter or digit). The test book type is `REGISTERED`; production (Owner Q1, VM fact V2): `Default`, the only type there. Go-live R7: the bridge checks the type exists in the book before every create (`member_type_unknown`, not written) |
+| `ac2_create_member_type` | `"REGISTERED"` | Round 6: the AutoCount member type of a member the sync creates (1-20 of `A-Z a-z 0-9 _ -`, starting with a letter or digit). The test book type is `REGISTERED`. Production: `GUEST` since S5 went live (5 November 2026). The live book has three member types, `Default`, `GUEST` and `MEMBER`, all Level 1: website sign-ups the sync creates get `GUEST`; staff-keyed counter members are `MEMBER` (existing members stay on `Default` until #268). Owner Q1 and VM fact V2 first named `Default`, then the only type there. Go-live R7: the bridge checks the type exists in the book before every create (`member_type_unknown`, not written) |
 | `memberno_link_window_minutes` | `60` | Round 7: 1-60. The largest gap, either way, between AC2 `CreatedTime` (when the New Member form was opened) and the sign-up time (round 7c: `registration_at`) for a MemberNo link. Round 10 (Owner, after UAT r4): default 60, was 10 |
 | `initial_link_enabled` | `false` | Round 7c: the Owner's gate for `initial-link --apply`; a dry run needs no gate |
 | `immediate_create_enabled` | `false` | #155 P1, "Immediate create (after S5)": an unmatched sign-up is created before the 06:00 cutoff, inside the window and under the caps. Needs `ac2_create_enabled` too. Off: today's rule, unchanged |
@@ -879,7 +879,8 @@ Per UAT run, before any create switch goes on for good:
 ## Go-live (production)
 
 Spec: the G0 go-live design (private store; public summary on #155) with the
-Owner's SCOPE-CONFIRMED of 29 October 2026 (Q1 type `Default`; Q2 = A no
+Owner's SCOPE-CONFIRMED of 29 October 2026 (Q1 type `Default`, live `GUEST`
+since S5, see `ac2_create_member_type`; Q2 = A no
 create without a phone on the live book; Q3, Q4, Q6, Q8, Q9 as recommended;
 Q5 start at 15 minutes and state the safe minimum; Q7 the member type check
 approved). Nothing in this repository runs any step below. VM Claude runs
@@ -915,7 +916,7 @@ and `tests/test_member_sync_bridge_ps.py`.
 | S1+S2 | Live read-only check: `prepare-state-root` for the new root, the live config (all switches off, cutover = the minute S2 starts), `check-config`, `check-credential`, `init`, initial-link dry runs until `complete: true`, then one `run --direction shopify_to_ac2` | OK-1 "LIVE READ-ONLY" | Book `AED_XBOUNDARIES`; `check-config` shows `ac2_login_mode` `owner_shared` and `ac2_refused_user_ids_count` 0; credential masked (the Owner's user, last 3 characters); the Owner's own AutoCount session on the VM is still signed in after each login of S1 (Owner session check, see "AutoCount sign-in and licence"; recorded yes/no); no `book_*`, `vendor_query_*`, `outbound_*`, `user_script_present` refusal; counts recorded (would link, no phone, no member, conflicts, `initial_link_cursor_stuck` 0); the run returns only `initial_link_not_complete`; 0 writes; after the first initial-link dry run ends, AutoCount's logged-in users list shows the Owner's user only for the Owner's own session (the sync's session released when the bridge child exits; read-only check, see "AutoCount sign-in and licence") | Nothing live to undo; the live ledger may be deleted (no links yet) |
 | S3 | `initial_link_enabled` true, `initial-link --apply` until complete, back to false | OK-2 "INITIAL LINK" (may be merged with OK-3, Q8) | `initial_link_linked` = the last dry run's would-link; one linked member unchanged in AutoCount | Before S5 only: archive the live ledger and redo S1-S3 (no external effect). After S5, never delete the live ledger |
 | S4 | Shadow schedule: `changelog_xml_column` `"Content"`, installer dry run (no `-Register`) output reviewed, one manual `run --direction both` as the task account, then `-Register` | OK-3 "SHADOW SCHEDULE" | 3 scheduled runs with result 0 or 3 and only expected alerts (`waiting_for_staff` counts, `sign_up_past_cutoff_create_disabled`, `no_phone_sign_up_needs_staff`, `memberno_*`, `ac2_pending_would_create_backlog`); 0 writes; `digest` readable and its `runs.duration_seconds_max` well under 600 s (above about 300 s: lower `max_pending_rechecks_per_run` first, "Schedule" below); then at least 2 days in shadow | Disable `\XB\XB-MemberSync` in Task Scheduler |
-| S5 | `max_writes_per_run` 1 and `ac2_create_enabled` true before a 06:00 run; check the first create in AutoCount and at one till; then `max_writes_per_run` 5 | OK-4 "AC2 CREATES" (never merged) | First create correct (MemberNo, type `Default`, name, mobile, DOB, RegisterDate, no ExpiryDate) and seen at a till; no `uncertain` write; `created_after_wait` raised; no duplicate next run | `ac2_create_enabled` false (next run). A wrong record is fixed or deleted by the Owner in AutoCount; the sync has no update or delete |
+| S5 | `max_writes_per_run` 1 and `ac2_create_enabled` true before a 06:00 run; check the first create in AutoCount and at one till; then `max_writes_per_run` 5 | OK-4 "AC2 CREATES" (never merged) | First create correct (MemberNo, type = `ac2_create_member_type`, live `GUEST`, name, mobile, DOB, RegisterDate, no ExpiryDate) and seen at a till; no `uncertain` write; `created_after_wait` raised; no duplicate next run | `ac2_create_enabled` false (next run). A wrong record is fixed or deleted by the Owner in AutoCount; the sync has no update or delete |
 | S6 | In one sitting: Owner adds `write_customers`; the Q3/Q9 probe through the TEST book (one fake member, real `customerCreate`, deleted straight after); production `shopify_create_enabled` true | OK-5 "SHOPIFY CREATES" (never merged) | Probe customer accepted with first name only; a second customer with the same phone refused by Shopify; first production create checked in admin | `shopify_create_enabled` false AND remove `write_customers` (with only one of them every run refuses on scope, `shopify_token_scope_not_expected`, which is safe but stops the sync) |
 | S7 | Hypercare, 14 days: `digest --hours 24` and `status` daily, masked counts and `runs.duration_seconds_max` to the Controller | none (read-only) | No action-needing alert left open; `duration_seconds_max` stays under about 300 s (else lower `max_pending_rechecks_per_run`) | Disable the task after two non-0/3 results in a row |
 | P3 | Probe in observe mode, after S5 has passed: VM clone to the merged #155 P1+P2 SHA, the probe task registered with `probe_wake_enabled` false, 3 days ("Immediate create (after S5)" below) | "PROBE OBSERVE" | Would-wake times match real sign-ups (one `would_wake` per new sign-up, within about 2 minutes of it); no wake storm (fewer than about 3 per sign-up, digest `probe.days`); the probe finishes in under 10 s; no AutoCount session from the probe in AutoCount's logged-in users list; the main task unchanged | Disable `\XB\XB-MemberSync-Probe` |
@@ -1103,7 +1104,8 @@ behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for exampl
   sign the Owner out on the VM. The S1 Owner session check finds this
   before anything is scheduled; the remedy is `dedicated` mode.
 - The reverse case: the Owner signing in during a run ends the sync's bridge
-  child. That fails safe: a read fails (the run stops, nothing written), or
+  child. That fails safe: a read fails (the run stops, nothing more written;
+  a create made earlier in the same run stays complete and recorded), or
   a create in flight is UNCERTAIN and held, never re-sent.
 - Shadow runs exit 3 every run while past-cutoff sign-ups wait for AC2
   creates; the digest groups them.
@@ -1116,7 +1118,7 @@ behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for exampl
 
 Spec: the G0 r2 design (#155, "Shopify form to till in minutes", slices P1
 and P2) with the owner decisions of 4 November 2026 (D1 all hours, D2 type
-`Default`, D3 staff keying stays, D4 unchanged, D5 caps 6 and 144). Nothing
+`Default`, live `GUEST` since S5, D3 staff keying stays, D4 unchanged, D5 caps 6 and 144). Nothing
 here runs on merge: the VM clone stays at its go-live SHA until the P3 OK,
 and with the new keys absent or false every run decides exactly as before
 (pinned by `DefaultsOffEquivalenceTests` against a golden trace made on the
@@ -1130,7 +1132,7 @@ and with the new keys absent or false every run decides exactly as before
   `HH:MM-HH:MM` is possible, and outside it the 06:00 rule applies). The run
   counts `created_immediately` instead of the alert `created_after_wait`,
   which stays for the 06:00 path. Every other rule is the same: link first,
-  MemberNo rules, member type `ac2_create_member_type` (live `Default`, never
+  MemberNo rules, member type `ac2_create_member_type` (live `GUEST`, never
   a qualified type), the write-once fence and `max_writes_per_run`, UNCERTAIN
   holds, and no create without a usable phone on the live book (the alert
   `no_phone_sign_up_needs_staff` now comes at once instead of the next
@@ -1161,8 +1163,9 @@ and with the new keys absent or false every run decides exactly as before
 
 - A search for `member-mg` customers updated since the sync's own
   watermark, newest first. Each tick makes a session check plus up to 2
-  search pages of 50, so at most 3 GraphQL requests over 2 query texts, plus
-  a token exchange on a cold cache. It reads only ID, tags and `updatedAt`
+  search pages of 50, so at most 3 GraphQL queries over 2 query texts, plus
+  bounded retries on throttling or errors, plus a token exchange on a cold
+  cache. It reads only ID, tags and `updatedAt`
   (never a name, email or phone; an answer with any other field is
   refused). It opens the ledger
   read-only with no lock, as `digest` does. It never starts the bridge,
@@ -1257,7 +1260,8 @@ duplicate.
    If no wake has happened yet, check it instead with one
    `schtasks /Run /TN \XB\XB-MemberSync` as the task account between two
    runs, under the P4 OK. On `wake_failed` (the task account cannot start
-   the main task): stop and report.
+   the main task): switch 1 (disable `\XB\XB-MemberSync-Probe`), then
+   report.
 2. For the first counter sign-ups, staff note the form submit time and when
    the member first appears at the till; compare with the digest's latency.
 3. Seven days: `digest --hours 24` daily against the P4 pass bar. Off
@@ -1324,7 +1328,8 @@ writes enabled. The sync ledger is separate from the Core ledger.
 - The online-order path.
 - A lookup by the `custom.ac2_member_no` metafield for unresolved phoneless
   Shopify creates (Q4).
-- Production (`AED_XBOUNDARIES`, member type `Default` only today) and its
+- Production (`AED_XBOUNDARIES`, member types `Default`, `GUEST` and `MEMBER`
+  since 5 November 2026) and its
   POS behaviour; the test book has no POS sync, so till behaviour is never in
   UAT.
 

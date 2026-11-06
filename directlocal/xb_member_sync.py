@@ -8,7 +8,7 @@ Scope (Owner decisions, #155 build step 2)
   (Singapore ``65`` + 8 digits; a foreign number keeps its country code; a
   Singapore 8-digit number starting 3/6/8/9 gets ``65``). Without a usable
   phone the member gets AutoCount's own ``GetNextMemberNo`` number (test book only;
-  go-live R8: never on the live book). MemberType ``REGISTERED`` (live: ``Default``), ExpiryDate NULL, DOB ``2000-MM-01``
+  go-live R8: never on the live book). MemberType ``REGISTERED`` (live: ``GUEST``), ExpiryDate NULL, DOB ``2000-MM-01``
   from the configured birthday-month metafield (NULL when absent), IsActive
   ``T``. The Shopify expiry metafield is ignored.
 * AC2 -> Shopify: a member created in AutoCount (for example at the till)
