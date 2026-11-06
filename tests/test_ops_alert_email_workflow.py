@@ -45,7 +45,6 @@ EXPECTED_EDGES = {
     ("Request Is Valid", 0, "Read Recent Log"),
     ("Request Is Valid", 1, "Return Rejected"),
     ("Read Recent Log", 0, DECIDE),
-    ("Read Recent Log", 1, DECIDE),
     (DECIDE, 0, "Hold Back Alert"),
     (DECIDE, 1, "Return Internal Error"),
     ("Hold Back Alert", 0, "Log Held Back Alert"),
@@ -74,7 +73,7 @@ const codeOf = (name) => wf.nodes.find((n) => n.name === name).parameters.jsCode
 const cases = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
 const realNow = Date.now;
 const results = cases.map((c) => {
-  const $input = { all: () => c.items.map((json) => ({ json })) };
+  const $input = { all: () => c.raw || c.items.map((json) => ({ json })) };
   const $ = (name) => {
     if (!(name in (c.nodes || {}))) throw new Error('unexpected node reference: ' + name);
     return { first: () => ({ json: c.nodes[name] }) };
@@ -191,8 +190,19 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
         # Every path ends in a Return node; nothing stops the caller with an error.
         sinks = working - {e[0] for e in EXPECTED_EDGES}
         self.assertEqual(sinks, set(RETURN_NODES))
-        for name in (VALIDATE, DECIDE, "Read Recent Log", GMAIL):
+        for name in (VALIDATE, DECIDE, GMAIL):
             self.assertEqual(self.nodes[name].get("onError"), "continueErrorOutput", name)
+
+    def test_a_failed_log_read_reaches_decide_once(self):
+        # G2 H1: with an error output wired too, a failed read ran Decide twice (once on the empty
+        # always-output item, once on the error item) and sent two emails. One regular output only.
+        read = self.nodes["Read Recent Log"]
+        self.assertEqual(read.get("onError"), "continueRegularOutput")
+        self.assertIs(read.get("alwaysOutputData"), True)
+        self.assertEqual(self.workflow["connections"]["Read Recent Log"],
+                         {"main": [[{"node": DECIDE, "type": "main", "index": 0}]]})
+        feeding_decide = [(source, index) for source, index, target in edges_of(self.workflow) if target == DECIDE]
+        self.assertEqual(feeding_decide, [("Read Recent Log", 0)])
 
     def test_gmail_is_one_plain_text_send_to_the_placeholder_only(self):
         node = self.nodes[GMAIL]
@@ -238,6 +248,16 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
                          ("get", True, "id", "DESC"))
         self.assertEqual(read["dataTableId"]["value"], TABLE_PLACEHOLDER)
         self.assertIs(self.nodes["Read Recent Log"].get("alwaysOutputData"), True)
+        # G2 L1: the 500-row bound is per system; Decide filters again as a second guard.
+        self.assertEqual(read["matchType"], "allConditions")
+        self.assertEqual(read["filters"], {"conditions": [
+            {"keyName": "system", "condition": "eq", "keyValue": "={{ $json.system }}"}]})
+        self.assertFalse(read["returnAll"])
+        self.assertEqual(read["limit"], 500)
+        # G2 L3: a send_failed row carries the same k as the send it stands for; the doc says so.
+        self.assertEqual(self.nodes["Log Send Failed"]["parameters"]["columns"]["value"]["folded_count"],
+                         "={{ $('Decide Fold Or Send').first().json.mail_row.folded_count }}")
+        self.assertIn("On a `sent` or `send_failed` row of an alert", TABLE_DOC.read_text(encoding="utf-8"))
 
     def test_send_failed_is_returned_never_thrown(self):
         failed = {a["name"]: a["value"] for a in
@@ -299,10 +319,12 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
     def validate(self, *bodies):
         return [out[0]["json"] for out in self.run_cases([{"node": VALIDATE, "items": [b]} for b in bodies])]
 
-    def decide(self, rows, req=None, read_error=False):
+    def decide(self, rows, req=None, read_error=False, raw=None):
         items = [{"error": "Data table not found"}] if read_error else (rows or [{}])
         case = {"node": DECIDE, "items": items, "now_ms": int(NOW.timestamp() * 1000),
                 "nodes": {VALIDATE: req or validated()}}
+        if raw is not None:
+            case["raw"] = raw
         (out,) = self.run_cases([case])
         (item,) = out
         return item["json"]
@@ -503,6 +525,76 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         self.assertIsNotNone(plan["mail"])
         self.assertEqual(plan["mail_row"]["code"], "log_read_failed")
 
+    def test_each_read_shape_gives_one_decision_and_at_most_one_send(self):
+        # The shapes Read Recent Log can hand Decide on n8n 2.39.10 with continueRegularOutput and
+        # alwaysOutputData: rows, the empty item of an empty table, an item carrying `error` (on the
+        # json or on the item), and the bare request echo the Data Table router returns for some
+        # failures (G2 L4). Each is one Decide run; each must give one plan and at most one email.
+        busy_same_key = [row(10)]
+        echo = validated()
+        shapes = {
+            "rows": ({"rows": busy_same_key}, ""),
+            "empty table": ({"rows": [{}]}, ""),
+            "error on json": ({"raw": [{"json": {"error": "Data table with ID x could not be found"}}]}, "log_read_failed"),
+            "error on item": ({"raw": [{"json": {}, "error": {"message": "boom"}}]}, "log_read_failed"),
+            "error with echo": ({"raw": [{"json": {**echo, "error": "boom"}}]}, "log_read_failed"),
+            "bare request echo": ({"raw": [{"json": echo}]}, "log_read_failed"),
+        }
+        for name, (shape, code) in shapes.items():
+            with self.subTest(shape=name):
+                case = {"node": DECIDE, "items": shape.get("rows", []), "now_ms": int(NOW.timestamp() * 1000),
+                        "nodes": {VALIDATE: validated()}}
+                if "raw" in shape:
+                    case["raw"] = shape["raw"]
+                (out,) = self.run_cases([case])
+                self.assertEqual(len(out), 1, "exactly one decision")
+                plan = out[0]["json"]
+                self.assertIsInstance(plan["mail"], (dict, type(None)), "at most one email")
+                row_written = plan["mail_row"] or plan["held_row"]
+                self.assertEqual(row_written["code"], code)
+                if name == "rows":
+                    self.assertEqual(plan["held_outcome"], "folded")
+                else:
+                    # No usable history: decided as new, so exactly one email goes out.
+                    self.assertIsNone(plan["held_outcome"])
+                    self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR run_failed:ledger_mismatch")
+                    self.assertNotIn("folded since", plan["mail"]["text"])
+
+    def test_failed_sends_are_not_counted_in_the_fold_note(self):
+        # G2 L2, mutant M4: a send_failed row is an attempt, not a held-back alert.
+        rows = [row(90, row_id=1), row(70, outcome="folded", row_id=2),
+                row(40, outcome="send_failed", row_id=3), row(30, outcome="send_failed", row_id=4)]
+        plan = self.decide(rows)
+        self.assertIsNone(plan["held_outcome"])
+        self.assertIn("(+1 folded since 13:00)", plan["mail"]["text"])
+        self.assertEqual(plan["mail_row"]["folded_count"], 1)
+        plan = self.decide([row(90, row_id=1), row(30, outcome="send_failed", row_id=2)])
+        self.assertNotIn("folded since", plan["mail"]["text"])
+        self.assertEqual(plan["mail_row"]["folded_count"], 0)
+
+    def test_a_failed_flood_notice_is_retried(self):
+        # G2 L2, mutant M8: only a flood notice that was sent stops the next one.
+        busy = [row(5 * i + 1, key="k%d" % i) for i in range(10)]
+        plan = self.decide(busy + [row(10, key="alert_flood", outcome="send_failed")])
+        self.assertEqual(plan["held_outcome"], "folded_flood")
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK WARN alert_flood")
+
+    def test_future_dated_rows_never_count(self):
+        # G2 L2, mutant M9: a row dated after now (a clock that ran ahead) neither folds nor floods.
+        plan = self.decide([row(-5)])
+        self.assertIsNone(plan["held_outcome"])
+        self.assertIsNotNone(plan["mail"])
+        plan = self.decide([row(-5 - i, key="k%d" % i) for i in range(10)])
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR run_failed:ledger_mismatch")
+        # A future-dated send must not hide a real send 10 minutes ago: still folded.
+        plan = self.decide([row(10, row_id=1), row(-5, row_id=2)])
+        self.assertEqual(plan["held_outcome"], "folded")
+        self.assertIsNone(plan["mail"])
+        # A future-dated fold is not counted in the note either.
+        plan = self.decide([row(90, row_id=1), row(-5, outcome="folded", row_id=2)])
+        self.assertNotIn("folded since", plan["mail"]["text"])
+
     def test_send_error_code_is_closed(self):
         node = next(n for n in load_workflow()["nodes"] if n["name"] == "Classify Send Error")
         (assignment,) = node["parameters"]["assignments"]["assignments"]
@@ -511,15 +603,25 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         body = expression[4:-3]
         script = ("const cases = %s; process.stdout.write(JSON.stringify(cases.map(($json) => (%s))));"
                   % (json.dumps([
-                      {"error": {"message": "Forbidden - perhaps check your credentials?", "httpCode": "403"}},
-                      {"error": {"message": "Request failed with status code 429"}},
+                      # The Gmail 2.1 error item: { json: { error: <message> } } (G2 L6). Its NodeApiError
+                      # messages carry no status number, so these are gmail_error.
+                      {"error": "Forbidden - perhaps check your credentials?"},
+                      {"error": "The resource you are requesting could not be found"},
                       {"error": "Invalid recipient someone@example.com"},
+                      # Only a message that itself carries a 4xx or 5xx status gives http_<status>.
+                      {"error": "Request failed with status code 429"},
+                      # Defensive: an object shape, or nothing at all, still maps to a closed code.
                       {"error": {"message": "socket hang up", "code": "ECONNRESET"}},
+                      {"error": {"message": "Forbidden", "httpCode": "403"}},
                       {},
                   ]), body))
         done = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(json.loads(done.stdout), ["http_403", "http_429", "gmail_error", "gmail_error", "gmail_error"])
+        codes = json.loads(done.stdout)
+        self.assertEqual(codes, ["gmail_error", "gmail_error", "gmail_error", "http_429", "gmail_error", "http_403",
+                                 "gmail_error"])
+        for code in codes:
+            self.assertRegex(code, r"^(gmail_error|http_[45][0-9][0-9])$")
 
 
 if __name__ == "__main__":
