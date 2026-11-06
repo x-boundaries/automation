@@ -59,7 +59,8 @@ EXPECTED_EDGES = {
     ("Classify Send Error", 0, "Log Send Failed"),
     ("Log Send Failed", 0, "Return Send Failed"),
 }
-SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|ENERGYGRID|MEMBER-SYNC|ALL) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
+SYSTEMS = ("AC2-STOCK", "ENERGYGRID", "MEMBER-SYNC")
+SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|ENERGYGRID|MEMBER-SYNC) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 CANARY = "CANARY-NOTE-0001-XYZ"
 # 6 Nov 2026 14:30:00 SGT, a fixed clock for every Decide run.
@@ -250,6 +251,14 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
         types = {n["type"] for n in self.workflow["nodes"]}
         self.assertNotIn("n8n-nodes-base.stopAndError", types)
 
+    def test_no_global_all_system_remains(self):
+        # Owner, 6 Nov 2026: each app's alerts stay separate; there is no cross-app flood mail.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("'ALL'", text)
+        self.assertNotIn("ALL WARN", text)
+        for path in (README, TABLE_DOC):
+            self.assertNotIn("ALL WARN", path.read_text(encoding="utf-8"), path.name)
+
     def test_fold_window_and_flood_cap_are_settings(self):
         code = self.nodes[DECIDE]["parameters"]["jsCode"]
         self.assertIn("const FOLD_MINUTES = 60;", code)
@@ -321,11 +330,18 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
                                 request(lines=["x" * 301]), request(lines=["ok"] * 31), request(lines=["caf\u00e9"]),
                                 request(lines=["x" * 300] * 14)],
             "OPS_ALERT_INPUT": [None, [], "text"],
+            # The flood notice key is reserved, so a caller's alert can never match a flood row.
+            "OPS_ALERT_KEY_RESERVED": [request(key="alert_flood")],
+            # A request belongs to one system: no field may name another one.
+            "OPS_ALERT_OTHER_SYSTEM": [request(lines=["see ENERGYGRID"]), request(key="MEMBER-SYNC:x"),
+                                       request(short="ENERGYGRID"),
+                                       request(system="ENERGYGRID", key="k", short="k", lines=["AC2-STOCK too"])],
         }
         for reason, bodies in cases.items():
             for body, out in zip(bodies, self.validate(*bodies)):
                 with self.subTest(reason=reason, body=str(body)[:60]):
-                    self.assertEqual(out, {"valid": False, "reason": reason})
+                    expected = "OPS_ALERT_KEY" if reason == "OPS_ALERT_KEY_RESERVED" else reason
+                    self.assertEqual(out, {"valid": False, "reason": expected})
         (two,) = self.run_cases([{"node": VALIDATE, "items": [request(), request()]}])
         self.assertEqual(two[0]["json"], {"valid": False, "reason": "OPS_ALERT_ITEM_COUNT"})
 
@@ -390,23 +406,85 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         plan = self.decide(busy)
         self.assertEqual(plan["held_outcome"], "folded_flood")
         self.assertEqual(plan["held_row"]["outcome"], "folded_flood")
-        self.assertEqual(plan["mail"]["subject"], "[XB alert] ALL WARN alert_flood")
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK WARN alert_flood")
         self.assertRegex(plan["mail"]["subject"], SUBJECT_RE)
         self.assertIn("First held back: AC2-STOCK ERROR run_failed:ledger_mismatch", plan["mail"]["text"])
         self.assertEqual({k: plan["mail_row"][k] for k in ("system", "key", "severity")},
-                         {"system": "ALL", "key": "alert_flood", "severity": "WARN"})
+                         {"system": "AC2-STOCK", "key": "alert_flood", "severity": "WARN"})
         # A flood notice already sent in the last 60 minutes: held back, no second notice.
-        plan = self.decide(busy + [row(20, system="ALL", key="alert_flood", row_id=200)])
+        plan = self.decide(busy + [row(20, key="alert_flood", row_id=200)])
         self.assertEqual(plan["held_outcome"], "folded_flood")
         self.assertIsNone(plan["mail"])
         # The previous notice is older than 60 minutes: one new notice.
-        plan = self.decide(busy + [row(61, system="ALL", key="alert_flood", row_id=1)])
-        self.assertEqual(plan["mail"]["subject"], "[XB alert] ALL WARN alert_flood")
+        plan = self.decide(busy + [row(61, key="alert_flood", row_id=1)])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK WARN alert_flood")
+        # Another system's recent flood notice does not stand in for this system's notice.
+        plan = self.decide(busy + [row(20, system="ENERGYGRID", key="alert_flood", row_id=201)])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK WARN alert_flood")
+
+    def test_flood_mail_names_the_flooding_system_never_all(self):
+        for system in SYSTEMS:
+            busy = [row(5 * i + 1, system=system, key="k%d" % i) for i in range(10)]
+            plan = self.decide(busy, validated(system=system, key="k99", short="k99", lines=["fake alert"]))
+            subject = plan["mail"]["subject"]
+            self.assertEqual(subject, "[XB alert] %s WARN alert_flood" % system)
+            self.assertNotIn("ALL", subject.split())
+            self.assertEqual(plan["mail_row"]["system"], system)
+            self.assertEqual(plan["held_row"]["system"], system)
+
+    def test_a_flood_in_one_system_never_holds_back_another(self):
+        # 11 ENERGYGRID sends in the last hour plus its flood notice: an AC2-STOCK alert, even with the
+        # same key as an ENERGYGRID alert sent 5 minutes ago, is sent at once with no fold note.
+        flood = [row(5 * i + 1, system="ENERGYGRID", key="k%d" % i) for i in range(11)]
+        flood += [row(4, system="ENERGYGRID", key="alert_flood"), row(5, system="ENERGYGRID"),
+                  row(3, system="ENERGYGRID", outcome="folded_flood"), row(2, system="ENERGYGRID", outcome="folded")]
+        plan = self.decide(flood)
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR run_failed:ledger_mismatch")
+        self.assertNotIn("folded since", plan["mail"]["text"])
+        self.assertEqual(plan["mail_row"]["folded_count"], 0)
+        # And the other way round: AC2-STOCK at its cap never delays a MEMBER-SYNC alert.
+        ac2 = [row(5 * i + 1, key="k%d" % i) for i in range(11)]
+        plan = self.decide(ac2, validated(system="MEMBER-SYNC", severity="WARN", key="possible_duplicate_member",
+                                          short="possible_duplicate_member", lines=["fake member-sync alert"]))
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] MEMBER-SYNC WARN possible_duplicate_member")
+
+    def test_no_email_ever_names_two_systems(self):
+        others = lambda own: [s for s in SYSTEMS if s != own]
+        for own in SYSTEMS:
+            req = validated(system=own, severity="ERROR", key="shared_key", short="shared_key", lines=["fake line"])
+            noise = []
+            for other in others(own):
+                noise += [row(5 * i + 1, system=other, key="k%d" % i) for i in range(11)]
+                noise += [row(30, system=other, key="shared_key"), row(20, system=other, key="shared_key", outcome="folded"),
+                          row(10, system=other, key="alert_flood")]
+            scenarios = {
+                "send": noise,
+                "send with fold note": noise + [row(90, system=own, key="shared_key", row_id=1),
+                                                row(70, system=own, key="shared_key", outcome="folded", row_id=2)],
+                "fold": noise + [row(10, system=own, key="shared_key")],
+                "flood": noise + [row(5 * i + 1, system=own, key="own%d" % i) for i in range(10)],
+            }
+            for name, rows in scenarios.items():
+                with self.subTest(system=own, scenario=name):
+                    plan = self.decide(rows, req)
+                    for part in ("held_row", "mail_row"):
+                        if plan[part]:
+                            self.assertEqual(plan[part]["system"], own)
+                    if plan["mail"]:
+                        rendered = plan["mail"]["subject"] + "\n" + plan["mail"]["text"]
+                        named = {s for s in SYSTEMS if s in rendered}
+                        self.assertEqual(named, {own}, rendered)
+                    if name == "send with fold note":
+                        # Only its own folded row counts; the other systems' rows add nothing.
+                        self.assertIn("(+1 folded since 13:00)", plan["mail"]["text"])
+                        self.assertEqual(plan["mail_row"]["folded_count"], 1)
 
     def test_below_the_cap_or_outside_the_hour_sends_normally(self):
         nine = [row(5 * i + 1, key="k%d" % i) for i in range(9)]
         for rows in (nine, nine + [row(61, key="k9")], nine + [row(3, key="k9", outcome="send_failed")],
-                     nine + [row(3, system="ALL", key="alert_flood")]):
+                     nine + [row(3, key="alert_flood")], nine + [row(3, system="ENERGYGRID", key="k9")]):
             plan = self.decide(rows)
             self.assertIsNone(plan["held_outcome"])
             self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR run_failed:ledger_mismatch")

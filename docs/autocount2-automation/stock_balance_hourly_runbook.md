@@ -389,7 +389,7 @@ How it works:
 2. It checks that the shared secret is readable (every run, even with no condition; nothing is sent). If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s) per socket operation, no proxy, no redirect, the shared secret in the `alert.auth_header_name` header. Only the answer's status is used; its body is never read.
 3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), and calls the shared sub-workflow `XB Ops Alert Email` ([`n8n-workflows/ops_alert_email.workflow.json`](../../n8n-workflows/ops_alert_email.workflow.json)) with system `AC2-STOCK`. The sub-workflow sends one plain-text email to the operations inbox and logs the outcome in the n8n Data Table `xb_alert_email_log`. The workflow answers 200 when the email was sent (or folded, see below), 502 when the email send failed, and 500 on an unexpected error. The status map (200, 400, 403, 404, 500, 502) is the same as before, so `alert_status` means what it meant.
    - Subject: `[XB alert] AC2-STOCK ERROR run_failed:<failure_class>` for a failed run. Otherwise the active conditions joined by `+`, for example `[XB alert] AC2-STOCK WARN large_balance`. It is `ERROR` unless only `large_balance` and `late_change` are active. The subject has no time in it, so repeats share one Gmail thread.
-   - The sub-workflow folds a repeat of the same subject code within 60 minutes (no email; the next email says "(+k folded since HH:MM)") and sends at most 10 alert emails per 60 minutes across all systems. The VM's own once-a-day repeat rule below is unchanged, so a fold is rare here.
+   - The sub-workflow folds a repeat of the same subject code within 60 minutes (no email; the next email says "(+k folded since HH:MM)") and sends at most 10 `AC2-STOCK` alert emails per 60 minutes (then one `[XB alert] AC2-STOCK WARN alert_flood` email per hour). The cap counts per system, so another app's alerts never hold back or join an AC2 email, and AC2's never affect theirs. The VM's own once-a-day repeat rule below is unchanged, so a fold is rare here.
 4. The exporter writes the outcome as `alert_status`, with the answer's HTTP status, in `last_run_status.json` and in the run's own `alert_record.json` (see [Per-run alert record](#per-run-alert-record)). **An alert, sent or lost, never changes the run's status, exit code or other files.**
 
 The VM reaches n8n through the public `/webhook/` path (n8n sits behind Cloudflare Access, which leaves `/webhook/` open). n8n's `WEBHOOK_URL` is not changed.
@@ -434,7 +434,7 @@ Details: last_run_status.json in the Drive folder; runbook docs/autocount2-autom
 
 --
 System: AC2-STOCK | Severity: ERROR | Key: run_failed:ledger_mismatch
-Times are SGT (UTC+08:00). Repeats of one system:key within 60 minutes are folded; at most 10 alert emails per 60 minutes.
+Times are SGT (UTC+08:00). Repeats of one system:key within 60 minutes are folded; at most 10 alert emails per system per 60 minutes.
 Log: n8n Data Table xb_alert_email_log. Contract: n8n-workflows/README.md, ops_alert_email.workflow.json.
 ```
 
