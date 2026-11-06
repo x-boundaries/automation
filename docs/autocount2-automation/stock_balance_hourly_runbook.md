@@ -4,7 +4,7 @@ Status: **offline build only.** Nothing here has run against SQL Server, the AC2
 
 Dashboard v2 (28 Oct 2026): every successful run also writes the item index `stock_item_index.json.gz` beside the feed, for the dashboard's item search, item detail and data-issues views (see [Item index](#item-index-schema-v1)). The item master read adds `ItemGroup` and `ItemBrand`, and the `dbo.ItemUOM` read adds `BarCode` and `MinQty`. Nothing else changes.
 
-Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one Telegram message to the owner. Off by default and shipped inactive; see [Error alerts](#error-alerts-telegram-through-n8n).
+Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one email to the operations inbox through the shared `XB Ops Alert Email` sub-workflow (6 Nov 2026, #288: email replaces Telegram; no dual-send). Off by default and shipped inactive; see [Error alerts](#error-alerts-email-through-n8n).
 
 Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close rebuilt from the stock ledger, a backfill from 1 Aug 2026, one latest pair in Drive (no hourly folders in Drive), local retention, and a compact dashboard feed. File, setting and task names keep the word "hourly" (the job still runs hourly); only the Drive folder is renamed to "daily".
 
@@ -43,8 +43,9 @@ How it reads:
 | `scripts/install_autocount_stock_balance_hourly_task.ps1` | Task Scheduler installer. Not run by the build; step V7 only. |
 | `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` | Owner-run read-only live check (step V3). Aggregates only. |
 | `tests/test_autocount_stock_balance_hourly.py` | Offline tests with in-memory fakes and temp folders. |
-| `n8n-workflows/ac2_stock_alert.workflow.json` | The inactive n8n workflow that turns an alert event into one Telegram message (see [Error alerts](#error-alerts-telegram-through-n8n)). |
-| `tests/test_ac2_stock_alert_workflow.py` | Offline contract of that workflow; runs its Code node with Node against real events. |
+| `n8n-workflows/ac2_stock_alert.workflow.json` | The inactive n8n workflow that turns an alert event into one alert email (see [Error alerts](#error-alerts-email-through-n8n)). |
+| `n8n-workflows/ops_alert_email.workflow.json` | The inactive shared `XB Ops Alert Email` sub-workflow that sends it (#288): the only Gmail node, the recipient, the subject format, and the fold and flood rules. |
+| `tests/test_ac2_stock_alert_workflow.py` | Offline contract of that workflow; runs its Code node with Node against real events and checks the result against the sub-workflow's input check. |
 
 ## VM prerequisites
 
@@ -74,7 +75,7 @@ Run from the automation clone, always with the task's full-path interpreter (see
 
 `--backfill` is a normal run (same reads, same checks, same latest pair and feed) that also writes **every** daily close from `daily_close.backfill_start` to yesterday again, replacing any that exist (`write_reason: rebuild`, revision + 1). It uses the same code path as the nightly close. Run it once at the VM step (step D2), and again only if the owner wants Drive's older daily files rebuilt from the ledger.
 
-Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code. The run output and `last_run_status.json` carry `alert_status` (see [Error alerts](#error-alerts-telegram-through-n8n)), and `last_run_status.json` and the run's `alert_record.json` also carry the webhook's HTTP status; an alert, sent or lost, never changes an exit code either.
+Exit codes: run `0` success (and delivery verified or not configured, the daily close published or not due, and the feed and the item index published), `1` failed, delivery not verified, daily close failed, feed failed or item index failed. A daily close, feed or item index failure never stops the hourly latest pair: `status` stays `success` and `daily_close_status` / `feed_status` / `item_index_status` say what failed. `--check-latest`: `0` fresh, `2` stale (older than `stale_after_minutes`), `3` missing or invalid; it never exits with anything else, so invalid settings (including a malformed `timezone` such as `Asia/Singapore/`), a missing zone database or a usage error also give `3`. `--dry-run-config`: `0` valid (it also prints `auth_mode`, `scheduled_logon_type` and `run_minute`, which the installer reads), `1` invalid. Console output is a short status JSON; it never prints row data, connection strings, logins, host names or paths. The run output, `--check-latest` and `last_run_status.json` also carry `large_balance_count` (see [Large-balance warning](#large-balance-warning)); it never changes an exit code. The run output and `last_run_status.json` carry `alert_status` (see [Error alerts](#error-alerts-email-through-n8n)), and `last_run_status.json` and the run's `alert_record.json` also carry the webhook's HTTP status; an alert, sent or lost, never changes an exit code either.
 
 ## Settings
 
@@ -119,7 +120,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 | `feed.low_stock_threshold` | `2` | Feed low stock = `0 < quantity <= threshold`, active items (owner, 28 Oct 2026: global 2 units for now). `ItemUOM.ReOLevel` is shown beside each feed low-stock row when set but does not change the feed rule. The dashboard v2 page uses the item index instead: the item's reorder level, else its minimum quantity, else this threshold (see [Item index](#item-index-schema-v1)). |
 | `feed.list_cap` | `200` | Most rows listed in the feed's negatives and low-stock lists; counts are always complete. |
 | `feed.movers_top` | `20` | Biggest risers and fallers listed per period (1, 7, 30 days). |
-| `alert.webhook_enabled` | `false` | Error alerts on or off (see [Error alerts](#error-alerts-telegram-through-n8n)). Switched on only at go-live step A3 with the owner's OK. |
+| `alert.webhook_enabled` | `false` | Error alerts on or off (see [Error alerts](#error-alerts-email-through-n8n)). Switched on only at go-live step A3 with the owner's OK. |
 | `alert.webhook_url` | `null` | The n8n webhook, `https://<n8n host>/webhook/<private path>`. `https` only; no user, password, query or fragment (the secret travels only in the header). Required when enabled. Example placeholder: `https://n8n.example.com/webhook/REPLACE_WITH_ALERT_WEBHOOK_PATH`. |
 | `alert.auth_header_name` | `"X-XB-Alert-Token"` | Header that carries the shared secret; must equal the header name of the n8n Header Auth credential. |
 | `alert.secret_env_var` | `null` | Name of the environment variable (user or machine level, for the task's Windows account) that holds the shared secret. The way for pair (a) S4U. The value is read at runtime and never stored, printed or logged. |
@@ -166,7 +167,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
 - Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, large_balances, uom_guard, pos_sync per Location, delivery, warnings.
   Round 6 adds (schema_version `2`): `ledger` (groups, rows, null_qty_rows, non_empty_batch, future_dated_rows, non_base_uom_groups, non_stock_rows_excluded, non_stock_items_excluded, items_missing_from_master, first_day, last_day), `ledger_check`, `uom_guard.ledger_non_base_uom_groups`, `counts.non_stock_excluded`, `daily_close`, `feed` (status, sha256, byte_size), `retention`, and the extra query hashes (`ledger`, `item_master`, `locations`, `item_uom`; the last was `reorder_levels` before dashboard v2). Dashboard v2 adds `item_index` (status, sha256, byte_size, counts).
-- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local, alert_status and alert_http_status (see [Error alerts](#error-alerts-telegram-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
+- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local, alert_status and alert_http_status (see [Error alerts](#error-alerts-email-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
 - `alert_record.json` fields (one per run, see [Per-run alert record](#per-run-alert-record)): schema `xb.ac2.stock_alert_record.v1`, job, run_id, started_at, finished_at, status, failure_class, alert_status, http_status.
 
 ## Ledger check (every run)
@@ -256,7 +257,7 @@ Added before V5 (owner decision, 27 Oct 2026) after a stock transfer had an item
 
   `rows` lists at most 20 rows, largest `|BalQty|` first; `count` is the full number and `rows_truncated` is `true` when more than 20 rows qualify. When nothing qualifies, `count` is `0` and `rows` is empty. A failed run has `large_balances: null`.
 - When `count` is above 0, `warnings` gets one line: `Large balance: <count> exported row(s) with |BalQty| above <threshold>; ...`. The line names no item. A failed run drops the line, as it has no `large_balances`.
-- `last_run_status.json`, the run's console output and `--check-latest` carry `large_balance_count` (`null` for a failed run, or for a latest manifest written before this check existed). Exit codes do not change. When error alerts are on, a count above 0 raises the `large_balance` alert (count only; see [Error alerts](#error-alerts-telegram-through-n8n)).
+- `last_run_status.json`, the run's console output and `--check-latest` carry `large_balance_count` (`null` for a failed run, or for a latest manifest written before this check existed). Exit codes do not change. When error alerts are on, a count above 0 raises the `large_balance` alert (count only; see [Error alerts](#error-alerts-email-through-n8n)).
 - The CSV is unchanged: the flagged rows are exported as AutoCount holds them.
 
 What to do when `large_balance_count` is above 0:
@@ -378,7 +379,7 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
 - The dashboard page: a private Claude artifact that reads `stock_dashboard_feed.json.gz` and `stock_item_index.json.gz` through the viewer's own Drive connector. Its source lives in the private mailbox, not in this repository. This build only writes the files.
 - Consignment stock, a heartbeat or "still alive" alert (owner decision 29 Oct 2026: errors only), Drive API upload, Drive clean-up, SQL logins and grants.
 
-## Error alerts (Telegram through n8n)
+## Error alerts (email through n8n)
 
 Owner decision (29 Oct 2026): **errors only.** No heartbeat, no "still alive" message, no success or "resolved" message. Built off by default; the n8n workflow ships inactive. Every live step is listed under [Go-live](#alert-go-live-steps-a1-a5) and needs its own owner OK.
 
@@ -386,7 +387,9 @@ How it works:
 
 1. At the end of every run (after the daily close, the feed, the item index and delivery, just before `last_run_status.json` is written) the exporter works out which alert conditions the run raises, from the same values it writes to `last_run_status.json`.
 2. It checks that the shared secret is readable (every run, even with no condition; nothing is sent). If the de-duplication rule says so, it POSTs **one** sanitized event to `alert.webhook_url`: one attempt, `alert.timeout_seconds` (10 s) per socket operation, no proxy, no redirect, the shared secret in the `alert.auth_header_name` header. Only the answer's status is used; its body is never read.
-3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), sends one Telegram message to the owner chat through the existing Telegram credential (HTML parse mode with every value escaped; without a parse mode n8n sends Markdown, which Telegram refused for a value with `_` in go-live A2), and answers 200 (502 when Telegram refuses, 500 on an unexpected error).
+3. The n8n workflow `AC2 Stock Export - Error Alert` ([`n8n-workflows/ac2_stock_alert.workflow.json`](../../n8n-workflows/ac2_stock_alert.workflow.json)) checks the Header Auth secret, rejects any event outside the strict schema (400), and calls the shared sub-workflow `XB Ops Alert Email` ([`n8n-workflows/ops_alert_email.workflow.json`](../../n8n-workflows/ops_alert_email.workflow.json)) with system `AC2-STOCK`. The sub-workflow sends one plain-text email to the operations inbox and logs the outcome in the n8n Data Table `xb_alert_email_log`. The workflow answers 200 when the email was sent (or folded, see below), 502 when the email send failed, and 500 on an unexpected error. The status map (200, 400, 403, 404, 500, 502) is the same as before, so `alert_status` means what it meant.
+   - Subject: `[XB alert] AC2-STOCK ERROR run_failed:<failure_class>` for a failed run. Otherwise the active conditions joined by `+`, for example `[XB alert] AC2-STOCK WARN large_balance`. It is `ERROR` unless only `large_balance` and `late_change` are active. The subject has no time in it, so repeats share one Gmail thread.
+   - The sub-workflow folds a repeat of the same subject code within 60 minutes (no email; the next email says "(+k folded since HH:MM)") and sends at most 10 `AC2-STOCK` alert emails per 60 minutes (then one `[XB alert] AC2-STOCK WARN alert_flood` email per hour). The cap counts per system, so another app's alerts never hold back or join an AC2 email, and AC2's never affect theirs. The VM's own once-a-day repeat rule below is unchanged, so a fold is rare here.
 4. The exporter writes the outcome as `alert_status`, with the answer's HTTP status, in `last_run_status.json` and in the run's own `alert_record.json` (see [Per-run alert record](#per-run-alert-record)). **An alert, sent or lost, never changes the run's status, exit code or other files.**
 
 The VM reaches n8n through the public `/webhook/` path (n8n sits behind Cloudflare Access, which leaves `/webhook/` open). n8n's `WEBHOOK_URL` is not changed.
@@ -416,16 +419,23 @@ Not alerted (accepted gaps): a run that never starts (VM off, task not firing; t
 
 ### Event (schema `xb.ac2.stock_alert.v1`)
 
-Exactly these keys, closed values only: `schema`, `event` (`ac2_stock_alert`), `run_id`, `run_hour_local` (the run's hour, for example `2026-10-29T14:00:00+08:00`), `alert_kind` (`new` or `repeat`), `status`, `failure_class`, `conditions` (names from the table), `daily_close_status`, `delivery_status`, `feed_status`, `item_index_status`, `large_balance_count`, `late_change_day_count`. **No item code, quantity, location, path, message, host or login**, whatever the run found; a value outside its closed set is sent as `null` or `unknown`. Example message (fake values):
+Exactly these keys, closed values only: `schema`, `event` (`ac2_stock_alert`), `run_id`, `run_hour_local` (the run's hour, for example `2026-10-29T14:00:00+08:00`), `alert_kind` (`new` or `repeat`), `status`, `failure_class`, `conditions` (names from the table), `daily_close_status`, `delivery_status`, `feed_status`, `item_index_status`, `large_balance_count`, `late_change_day_count`. **No item code, quantity, location, path, message, host or login**, whatever the run found; a value outside its closed set is sent as `null` or `unknown`. Example email (fake values):
 
 ```text
+Subject: [XB alert] AC2-STOCK ERROR run_failed:ledger_mismatch
+
 AC2 stock export: ERROR
 
 - Hourly export FAILED: ledger_mismatch (nothing new published this hour)
 
 Hour: 2026-10-29 14:00 (UTC+08:00)
 Run: 0123abcd
-Details: last_run_status.json in the Drive folder; runbook section "Failure classes".
+Details: last_run_status.json in the Drive folder; runbook docs/autocount2-automation/stock_balance_hourly_runbook.md, section "Failure classes".
+
+--
+System: AC2-STOCK | Severity: ERROR | Key: run_failed:ledger_mismatch
+Times are SGT (UTC+08:00). Repeats of one system:key within 60 minutes are folded; at most 10 alert emails per system per 60 minutes.
+Log: n8n Data Table xb_alert_email_log. Contract: n8n-workflows/README.md, ops_alert_email.workflow.json.
 ```
 
 ### alert_status values
@@ -436,7 +446,7 @@ Details: last_run_status.json in the Drive folder; runbook section "Failure clas
 | `no_alert` | The run raised no condition and the secret is readable. |
 | `suppressed` | Conditions active, all alerted less than `repeat_hours` ago; the secret is readable. |
 | `sent` | n8n answered 2xx. |
-| `send_failed` | No answer, a timeout, a malformed answer, or a non-2xx answer (400 rejected, 403 missing or wrong secret header, 404 workflow inactive or wrong path, 500 n8n error such as an empty Header Auth credential, 502 Telegram refused). Retried next hour. |
+| `send_failed` | No answer, a timeout, a malformed answer, or a non-2xx answer (400 rejected, 403 missing or wrong secret header, 404 workflow inactive or wrong path, 500 n8n error such as an empty Header Auth credential or a failed sub-workflow call, 502 email send failed). Retried next hour. |
 | `secret_unavailable` | The env var (or Credential Manager target) is missing, empty or not one printable line. Checked on **every** run while alerts are on, with or without a condition, so a clean hour shows it too. Nothing was sent. |
 | `error` | Unexpected error in the alert step. Nothing changes for the run. |
 | `skipped_config_invalid` | Settings invalid; no alert attempted. |
@@ -455,10 +465,14 @@ Details: last_run_status.json in the Drive folder; runbook section "Failure clas
 
 ### Alert go-live steps (A1-A5)
 
-Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run. Results go to the private mailbox only (never the secret, the chat id or the webhook path).
+Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run with email (the 29 Oct A1/A2 attempt was with Telegram, which this route replaces). Results go to the private mailbox only (never the secret, the operations inbox address or the webhook path).
 
-- **A1 n8n import, inactive** (needs owner OK): import `ac2_stock_alert.workflow.json` as a new workflow, inactive, through the local n8n API or editor on the server PC. In the local import copy only: replace `REPLACE_WITH_ALERT_WEBHOOK_PATH` with a private, unguessable path; replace `REPLACE_WITH_TELEGRAM_CHAT_ID` with the owner chat; bind the existing Telegram credential; create a Header Auth credential with header name `X-XB-Alert-Token` and a new random secret that the owner generates and keeps (never pasted into chat, the repo or a mailbox file).
-- **A2 test event** (needs owner OK, sends one Telegram message): in the editor, listen for a test event, then from the server PC POST this fake event to the local test address `http://127.0.0.1:5678/webhook-test/<private path>` with the secret header. Pass: one Telegram message reading "AC2 stock export: ERROR ... Run: 00000000"; a second POST with an extra key answers 400 and sends nothing; a POST without the header answers 403 and sends nothing.
+**Before A1:** the shared sub-workflow `XB Ops Alert Email` must be live first (#288 slice 1, each its own owner OK): the Data Table `xb_alert_email_log` created, the sub-workflow imported inactive through the local API `http://127.0.0.1:5678/api/v1`, its Gmail credential bound, the operations inbox set privately in the local import copy, one test email sent, then published so other workflows can call it. See [n8n-workflows/README.md](../../n8n-workflows/README.md) (ops_alert_email.workflow.json).
+
+**Pasting into the VM PowerShell console:** paste with a **right-click**. Ctrl+V does not paste at a `Read-Host` prompt in Windows PowerShell (it stores a control character instead), and a right-click works at the normal prompt too, so use it for every command block below.
+
+- **A1 n8n import, inactive** (needs owner OK): import `ac2_stock_alert.workflow.json` as a new workflow, inactive, through the local n8n API `http://127.0.0.1:5678/api/v1` on the server PC. In the local import copy only: replace `REPLACE_WITH_ALERT_WEBHOOK_PATH` with a private, unguessable path; replace `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the imported `XB Ops Alert Email` workflow; create a Header Auth credential with header name `X-XB-Alert-Token` and a new random secret that the owner generates and keeps (never pasted into chat, the repo or a mailbox file). If the 29 Oct Telegram version was imported, update that workflow instead of adding a second one.
+- **A2 test event** (needs owner OK, sends one email): in the editor, listen for a test event, then from the server PC POST this fake event to the local test address `http://127.0.0.1:5678/webhook-test/<private path>` with the secret header. Pass: **one email** in the operations inbox with the subject `[XB alert] AC2-STOCK ERROR run_failed:internal_error`, reading "AC2 stock export: ERROR ... Run: 00000000", and one `sent` row in `xb_alert_email_log`; a second POST with an extra key answers 400 and sends nothing; a POST without the header answers 403 and sends nothing. A repeat of the same fake event within 60 minutes answers 200 and sends nothing (logged `folded`).
 
   ```json
   {"schema": "xb.ac2.stock_alert.v1", "event": "ac2_stock_alert", "run_id": "00000000000000000000000000000000", "run_hour_local": "2026-10-29T14:00:00+08:00", "alert_kind": "new", "status": "failed", "failure_class": "internal_error", "conditions": ["run_failed"], "daily_close_status": "skipped_failed_run", "delivery_status": "skipped_failed_run", "feed_status": null, "item_index_status": null, "large_balance_count": 0, "late_change_day_count": 0}
@@ -466,7 +480,7 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
 
   Then **activate** the workflow (the same owner OK covers activation only if it names it).
 
-  A2 re-run (29 Oct): the first A2 answered 502 ("can't parse entities": Markdown and `internal_error`). Re-run A2 with the same fake event after the live copy gets the HTML parse mode change from the fix PR (its own owner OK).
+  History: the 29 Oct A2 ran with Telegram and answered 502 ("can't parse entities"). The email route sends plain text, so that failure cannot recur; A2 runs again with email.
 - **A3 VM settings and secret** (needs owner OK, VM change): signed in as the task's Windows account (pair (a)), store the secret as a user environment variable without echoing it, then add the alert block to the local settings and validate:
 
   ```powershell
@@ -477,9 +491,9 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
   At the `Alert secret` prompt, paste the secret with a **right-click**: Ctrl+V does not paste at this `Read-Host` prompt in Windows PowerShell (it stores a control character instead of the secret). The next run then shows `alert_status: secret_unavailable`, because the value is not one printable line.
 
   Settings: `"alert": {"webhook_enabled": true, "webhook_url": "https://<n8n host>/webhook/<private path>", "secret_env_var": "XB_AC2_STOCK_ALERT_SECRET"}` (other keys default). Open a **new** PowerShell window (the variable reaches new processes only) and run `--dry-run-config`.
-- **A4 one forced-failure test** (needs owner OK, sends one Telegram message): at a quiet minute (not :00), in a new window as the task's account, make one manual run fail safely by giving only that window a wrong expected book: `$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"`, then the normal run command. It stops at the identity check before any business query (`identity_refused`) and writes a failed manifest and `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: one Telegram message "Hourly export FAILED: identity_refused", and `alert_status: sent`. Close that window. The next **scheduled** run must show `status: success` and `alert_status: no_alert`, and `alert_state.json` must be empty again. Because the secret is checked on every run, `no_alert` here proves the scheduled (S4U) task sees the variable; `secret_unavailable` means it does not (A4's own send ran in an interactive window, which proves nothing about the task).
+- **A4 one forced-failure test** (needs owner OK, sends one email): at a quiet minute (not :00), in a new window as the task's account, make one manual run fail safely by giving only that window a wrong expected book: `$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"`, then the normal run command. It stops at the identity check before any business query (`identity_refused`) and writes a failed manifest and `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: **one email** with the subject `[XB alert] AC2-STOCK ERROR run_failed:identity_refused`, reading "Hourly export FAILED: identity_refused", and `alert_status: sent`. Close that window. The next **scheduled** run must show `status: success` and `alert_status: no_alert`, and `alert_state.json` must be empty again. Because the secret is checked on every run, `no_alert` here proves the scheduled (S4U) task sees the variable; `secret_unavailable` means it does not (A4's own send ran in an interactive window, which proves nothing about the task).
 
-  If A4 gives `send_failed`: a 403 from Cloudflare (not n8n) means its bot protection blocked the request (the job sends `User-Agent: xb-ac2-stock-alert/1`); a Cloudflare rule change needs its own owner OK. n8n itself answers 403 for a missing or wrong secret header. `secret_unavailable` means the window or the task does not see the variable.
+  If A4 gives `send_failed`: a 403 from Cloudflare (not n8n) means its bot protection blocked the request (the job sends `User-Agent: xb-ac2-stock-alert/1`); a Cloudflare rule change needs its own owner OK. n8n itself answers 403 for a missing or wrong secret header. A 502 means the email send failed: the `send_failed` row in `xb_alert_email_log` carries the code (`http_<status>` or `gmail_error`). A 500 with no log row means the sub-workflow call itself failed (for example, it is not published). `secret_unavailable` means the window or the task does not see the variable.
 - **A5 first day** (read-only): after 24 hours, read every run's `alert_record.json` from the last 24 hours (see [Per-run alert record](#per-run-alert-record)); `last_run_status.json` shows only the latest run:
 
   ```powershell
@@ -490,12 +504,12 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
     Format-Table started_at, status, failure_class, alert_status, http_status -AutoSize
   ```
 
-  Pass when there is one record per scheduled hour (a missing hour means no run or an unwritable archive), every record reads `no_alert` (or `sent` / `suppressed` for a real problem), none reads `secret_unavailable`, `send_failed` or `error`, and every Telegram message has a record with `alert_status: sent` and a 2xx `http_status` at that hour. Outbound HTTPS from the scheduled (S4U) task is proven by the first scheduled-run record that reads `sent` with a 2xx `http_status` (A4's POST came from an interactive window). Records exist only for runs on a version with this record (3 Nov 2026 follow-up) and are kept 48 h when pruning is on.
+  Pass when there is one record per scheduled hour (a missing hour means no run, an unwritable archive, or unreadable settings (check the task's last result)), every record reads `no_alert` (or `sent` / `suppressed` for a real problem), none reads `secret_unavailable`, `send_failed` or `error`, and every alert email has a record with `alert_status: sent` and a 2xx `http_status` at that hour (and a `sent` row in `xb_alert_email_log`). Outbound HTTPS from the scheduled (S4U) task is proven by the first scheduled-run record that reads `sent` with a 2xx `http_status` (A4's POST came from an interactive window). Records exist only for runs on a version with this record (3 Nov 2026 follow-up) and are kept 48 h when pruning is on.
 
 ### Rollback
 
 - **Switch off alerts** (VM settings change, needs owner OK): set `alert.webhook_enabled` to `false`. The next run shows `alert_status: disabled`. Optionally remove the variable: `[Environment]::SetEnvironmentVariable("XB_AC2_STOCK_ALERT_SECRET", $null, "User")`, and delete `alert_state.json` in the archive root.
-- **Deactivate the n8n workflow** (n8n change, needs owner OK): the VM then gets 404 and records `send_failed` every hour that has a problem; runs and exit codes are unchanged.
+- **Deactivate the n8n workflow** (n8n change, needs owner OK): the VM then gets 404 and records `send_failed` every hour that has a problem; runs and exit codes are unchanged. Unpublishing `XB Ops Alert Email` instead stops every caller's email at once (AC2 then answers 500).
 - **Rotate the secret**: change the Header Auth credential value in n8n and the VM variable together (A3), then repeat A4.
 - **Code rollback** (to a version before the per-run alert record): the older prune removes only `stock_balance.csv` and `manifest.json`, so it leaves record-only hourly folders (holding `alert_record.json`, counted `kept_unexpected`). Delete them by hand.
 
@@ -505,7 +519,7 @@ Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on th
 - A large-balance count that grows while the condition stays active is not re-alerted until the daily repeat.
 - `config_invalid` and `timezone_unavailable` are not alerted (the alert settings themselves may be what is invalid).
 - The daily repeat compares exact times, so start-up jitter can push a reminder to the next hour's run.
-- If Telegram answers slower than the VM's timeout, the message can still arrive after the VM recorded `send_failed`, and the next hour sends it again: one duplicate at worst.
+- If the email send answers slower than the VM's timeout, the email can still arrive after the VM recorded `send_failed`, and the next hour sends it again: one duplicate at worst.
 
 ## Open questions
 

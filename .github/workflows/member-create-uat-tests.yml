@@ -95,6 +95,12 @@ on:
       - "n8n-workflows/ac2_stock_alert.workflow.json"
       - "tests/test_ac2_stock_alert_workflow.py"
       - "n8n-workflows/README.md"
+      # The shared ops alert email sub-workflow that the alert workflow calls (#288), its offline
+      # contract test (run by the Windows job's full-repository suite, `rest` shard) and the
+      # Data Table schema doc that test reads. Exact entries, not globs.
+      - "n8n-workflows/ops_alert_email.workflow.json"
+      - "tests/test_ops_alert_email_workflow.py"
+      - "docs/ops_alert_email_log.md"
       # Weekly read-only Drive mirror of main (#273). The Windows job's full-repository suite
       # exercises tests/test_mirror_main_to_drive.py (offline, temp folders and a local
       # throwaway git repo only), so a pull request confined to the mirror script, its

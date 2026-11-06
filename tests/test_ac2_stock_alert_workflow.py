@@ -1,11 +1,11 @@
-"""Offline contract of the inactive AC2 stock export error-alert n8n export (#245).
+"""Offline contract of the inactive AC2 stock export error-alert n8n export (#245, #288 slice 2).
 
-No n8n instance, Telegram or VM is contacted. The committed Code node is executed with the
-local Node runtime against events built by the real exporter (build_alert_payload).
+No n8n instance, Gmail account or VM is contacted. The committed Code node is executed with the
+local Node runtime against events built by the real exporter (build_alert_payload), and its
+output is checked against the committed Code node of the shared XB Ops Alert Email sub-workflow.
 Every value here is synthetic.
 """
 
-import html
 import json
 import re
 import shutil
@@ -24,13 +24,17 @@ if str(ROOT) not in sys.path:
 from scripts import autocount_stock_balance_hourly as hourly  # noqa: E402
 
 WORKFLOW = ROOT / "n8n-workflows" / "ac2_stock_alert.workflow.json"
+SUB_WORKFLOW = ROOT / "n8n-workflows" / "ops_alert_email.workflow.json"
 README = ROOT / "n8n-workflows" / "README.md"
 CODE_NODE = "Validate Alert Event"
+SUB_VALIDATE_NODE = "Validate Alert Request"
+CALL_NODE = "Send Alert Email"
+CALL_FIELDS = ["system", "severity", "key", "short", "lines"]
 ALLOWED_TYPES = {
     "n8n-nodes-base.webhook",
     "n8n-nodes-base.code",
     "n8n-nodes-base.if",
-    "n8n-nodes-base.telegram",
+    "n8n-nodes-base.executeWorkflow",
     "n8n-nodes-base.respondToWebhook",
     "n8n-nodes-base.stickyNote",
 }
@@ -38,38 +42,47 @@ EXPECTED_EDGES = {
     ("AC2 Stock Alert Webhook", 0, "Validate Alert Event"),
     ("Validate Alert Event", 0, "Event Is Valid"),
     ("Validate Alert Event", 1, "Respond Internal Error"),
-    ("Event Is Valid", 0, "Send Telegram Alert"),
+    ("Event Is Valid", 0, CALL_NODE),
     ("Event Is Valid", 1, "Respond Event Rejected"),
-    ("Send Telegram Alert", 0, "Respond Alert Sent"),
-    ("Send Telegram Alert", 1, "Respond Telegram Failed"),
+    (CALL_NODE, 0, "Email Was Handled"),
+    (CALL_NODE, 1, "Respond Internal Error"),
+    ("Email Was Handled", 0, "Respond Alert Sent"),
+    ("Email Was Handled", 1, "Email Send Failed"),
+    ("Email Send Failed", 0, "Respond Email Failed"),
+    ("Email Send Failed", 1, "Respond Internal Error"),
 }
+# The VM records these as alert_status / http_status; the map must not change (#245).
 RESPONSE_CODES = {
     "Respond Alert Sent": 200,
     "Respond Event Rejected": 400,
     "Respond Internal Error": 500,
-    "Respond Telegram Failed": 502,
+    "Respond Email Failed": 502,
 }
 STARTED = datetime(2026, 10, 29, 14, 0, 5, tzinfo=ZoneInfo("Asia/Singapore"))
 RUN_ID = "0123456789abcdef0123456789abcdef"
 CANARY_ITEM = "CANARY-ITEM-0201"
-# Every character Markdown or HTML treats as markup (go-live A2, 29 Oct: Markdown refused "_").
-HOSTILE = "a_b*c[d]e`f&g<h>i</b>j&amp;k"
-# Tags Telegram's HTML parse mode accepts without attributes; the alert itself uses none.
-TELEGRAM_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "tg-spoiler", "blockquote"}
-TELEGRAM_ENTITY = re.compile(r"&(?:lt|gt|amp|quot|#[0-9]+|#x[0-9a-fA-F]+);")
+LINE_RE = re.compile(r"^[ -~]{0,300}$")
 
+# Runs the AC2 Code node on each event, then hands a valid result to the sub-workflow's own
+# Validate Alert Request Code node exactly as the call node maps it (system pinned to AC2-STOCK).
 HARNESS = r"""
 const fs = require('fs');
-const [workflowPath, casesPath, codePath] = process.argv.slice(2);
-const wf = JSON.parse(fs.readFileSync(workflowPath, 'utf8'));
-const code = codePath
-  ? fs.readFileSync(codePath, 'utf8')
-  : wf.nodes.find((n) => n.name === 'Validate Alert Event').parameters.jsCode;
+const [workflowPath, subPath, casesPath] = process.argv.slice(2);
+const codeOf = (path, name) => JSON.parse(fs.readFileSync(path, 'utf8')).nodes.find((n) => n.name === name).parameters.jsCode;
+const code = codeOf(workflowPath, 'Validate Alert Event');
+const subCode = codeOf(subPath, 'Validate Alert Request');
 const cases = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
 const results = cases.map((body) => {
   const $input = { all: () => [{ json: { body, headers: { 'x-xb-alert-token': 'FAKE-SECRET-NOT-READ' } } }] };
   try {
-    return { ok: true, out: new Function('$input', code)($input) };
+    const out = new Function('$input', code)($input);
+    let sub = null;
+    if (out.length === 1 && out[0].json.valid === true) {
+      const j = out[0].json;
+      const call = { system: 'AC2-STOCK', severity: j.severity, key: j.key, short: j.short, lines: j.lines };
+      sub = new Function('$input', subCode)({ all: () => [{ json: call }] });
+    }
+    return { ok: true, out, sub };
   } catch (error) {
     return { ok: false, error: String(error.message) };
   }
@@ -105,28 +118,6 @@ def failed_event(failure_class="ledger_mismatch"):
         status="failed", failure_class=failure_class, daily_close_status="skipped_failed_run",
         delivery_status="skipped_failed_run", feed_status=None, item_index_status=None, large_balance_count=None,
     )
-
-
-def telegram_html_problems(text):
-    """Return why Telegram's HTML parse mode would refuse text (an empty list: it parses)."""
-    problems, stack = [], []
-    for token in re.split(r"(<[^<>]*>)", text):
-        if len(token) > 1 and token.startswith("<") and token.endswith(">"):
-            tag = re.fullmatch(r"<(/?)([a-z-]+)>", token)
-            if not tag or tag.group(2) not in TELEGRAM_TAGS:
-                problems.append("unsupported tag %r" % token)
-            elif not tag.group(1):
-                stack.append(tag.group(2))
-            elif not stack or stack.pop() != tag.group(2):
-                problems.append("unbalanced tag %r" % token)
-            continue
-        if "<" in token or ">" in token:
-            problems.append("raw angle bracket in %r" % token)
-        for amp in re.finditer("&", token):
-            if not TELEGRAM_ENTITY.match(token, amp.start()):
-                problems.append("bare & in %r" % token)
-    problems.extend("unclosed tag <%s>" % name for name in stack)
-    return problems
 
 
 class WorkflowShapeTests(unittest.TestCase):
@@ -181,21 +172,57 @@ class WorkflowShapeTests(unittest.TestCase):
             if node["type"] not in ("n8n-nodes-base.stickyNote", "n8n-nodes-base.respondToWebhook"):
                 self.assertIn(name, sources, "%s must lead somewhere" % name)
         # Fallible nodes route errors to a response instead of halting the webhook call.
-        for name in ("Validate Alert Event", "Send Telegram Alert"):
+        for name in ("Validate Alert Event", CALL_NODE):
             self.assertEqual(self.nodes[name].get("onError"), "continueErrorOutput", name)
+        self.assertEqual(set(RESPONSE_CODES.values()), {200, 400, 500, 502})
+        self.assertEqual(self.nodes["Respond Email Failed"]["parameters"]["responseBody"],
+                         "={{ { error: 'upstream_error', message: 'email send failed' } }}")
 
-    def test_telegram_is_html_from_validated_text_only(self):
-        node = self.nodes["Send Telegram Alert"]
+    def test_telegram_is_gone(self):
+        text = WORKFLOW.read_text(encoding="utf-8").lower()
+        self.assertNotIn("telegram", text)
+        self.assertNotIn("chat_id", text)
+        self.assertNotIn("chatid", text)
+
+    def test_call_payload_is_closed_and_matches_the_sub_workflow_input(self):
+        node = self.nodes[CALL_NODE]
         params = node["parameters"]
-        self.assertEqual(params["chatId"], "REPLACE_WITH_TELEGRAM_CHAT_ID")
-        self.assertEqual(params["text"], "={{ $json.alert_text }}")
-        # Without a parse mode n8n sends Markdown, and Telegram refuses any "_" in a value
-        # ("can't parse entities", go-live A2). HTML needs only &, < and > escaped.
-        self.assertEqual(params["additionalFields"].get("parse_mode"), "HTML")
-        self.assertIs(params["additionalFields"]["appendAttribution"], False)
-        # No automatic retry: a slow retry would outlive the VM's timeout and duplicate the message.
+        self.assertEqual(node["type"], "n8n-nodes-base.executeWorkflow")
+        self.assertEqual(params["source"], "database")
+        self.assertEqual(params["workflowId"],
+                         {"__rl": True, "value": "REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID", "mode": "id"})
+        self.assertEqual(params["mode"], "once")
+        self.assertIs(params["options"]["waitForSubWorkflow"], True)
+        inputs = params["workflowInputs"]
+        self.assertEqual(inputs["mappingMode"], "defineBelow")
+        self.assertEqual(inputs["value"], {
+            "system": "AC2-STOCK",
+            "severity": "={{ $json.severity }}",
+            "key": "={{ $json.key }}",
+            "short": "={{ $json.short }}",
+            "lines": "={{ $json.lines }}",
+        })
+        self.assertEqual([f["id"] for f in inputs["schema"]], CALL_FIELDS)
+        self.assertFalse(any(f["removed"] for f in inputs["schema"]))
+        self.assertIs(inputs["convertFieldsToString"], False, "lines must stay an array")
+        sub = json.loads(SUB_WORKFLOW.read_text(encoding="utf-8"))
+        trigger = next(n for n in sub["nodes"] if n["type"] == "n8n-nodes-base.executeWorkflowTrigger")
+        declared = [(v["name"], v["type"]) for v in trigger["parameters"]["workflowInputs"]["values"]]
+        self.assertEqual(declared, [(f["id"], f["type"]) for f in inputs["schema"]])
+        # No automatic retry: a retried sub-workflow call could send a second email.
         for key in ("retryOnFail", "maxTries", "waitBetweenTries", "continueOnFail", "alwaysOutputData"):
             self.assertNotIn(key, node)
+
+    def test_only_a_handled_email_answers_200(self):
+        handled = self.nodes["Email Was Handled"]["parameters"]["conditions"]["conditions"]
+        self.assertEqual([c["leftValue"] for c in handled],
+                         ["={{ ['sent', 'folded', 'folded_flood'].includes($json.outcome) }}"])
+        failed = self.nodes["Email Send Failed"]["parameters"]["conditions"]["conditions"]
+        self.assertEqual([c["leftValue"] for c in failed], ["={{ $json.outcome === 'send_failed' }}"])
+        for name in ("Email Was Handled", "Email Send Failed"):
+            (condition,) = self.nodes[name]["parameters"]["conditions"]["conditions"]
+            self.assertIs(condition["rightValue"], True)
+            self.assertEqual(condition["operator"], {"type": "boolean", "operation": "equals"})
 
     def test_rejected_answer_carries_only_the_fixed_reason_code(self):
         body = self.nodes["Respond Event Rejected"]["parameters"]["responseBody"]
@@ -228,90 +255,79 @@ class WorkflowShapeTests(unittest.TestCase):
         )
         self.assertIn("Required manual configuration", notes)
         self.assertIn("REPLACE_WITH_ALERT_WEBHOOK_PATH", notes)
-        self.assertIn("REPLACE_WITH_TELEGRAM_CHAT_ID", notes)
+        self.assertIn("REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID", notes)
+        self.assertIn("XB Ops Alert Email", notes)
         self.assertIn("ac2_stock_alert.workflow.json", README.read_text(encoding="utf-8"))
 
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code node")
 class WorkflowCodeExecutionTests(unittest.TestCase):
-    def run_cases(self, cases, code=None):
+    def run_cases(self, cases):
         with tempfile.TemporaryDirectory() as tmp:
             harness = Path(tmp) / "harness.js"
             harness.write_text(HARNESS, encoding="utf-8")
             cases_path = Path(tmp) / "cases.json"
             cases_path.write_text(json.dumps(cases), encoding="utf-8")
-            args = [shutil.which("node"), str(harness), str(WORKFLOW), str(cases_path)]
-            if code is not None:
-                code_path = Path(tmp) / "code.js"
-                code_path.write_text(code, encoding="utf-8")
-                args.append(str(code_path))
+            args = [shutil.which("node"), str(harness), str(WORKFLOW), str(SUB_WORKFLOW), str(cases_path)]
             done = subprocess.run(args, capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         return json.loads(done.stdout)
 
-    def test_real_exporter_events_render_a_plain_message(self):
+    def assert_accepted_by_sub_workflow(self, result):
+        self.assertIsNotNone(result["sub"])
+        (sub,) = result["sub"]
+        self.assertIs(sub["json"]["valid"], True, sub)
+        self.assertEqual(sub["json"]["system"], "AC2-STOCK")
+
+    def test_real_exporter_events_render_a_closed_email_request(self):
         cases = [
-            (failed_event(), ["Hourly export FAILED: ledger_mismatch", "Run: 01234567", "Hour: 2026-10-29 14:00 (UTC+08:00)"]),
-            (event(large_balance_count=2), ["Large balances: 2 row(s)"]),
-            (event(daily_close_status="failed", late_change_day_count=3), ["Daily close file not written", "Late ledger changes: 3 day(s)"]),
-            (event(delivery_status="copy_failed", feed_status="failed", item_index_status="failed"),
-             ["Drive delivery failed: copy_failed", "Dashboard feed not published", "Item index not published"]),
-            (event("repeat", large_balance_count=1), ["still not resolved (daily reminder)"]),
+            (failed_event(), "ERROR", "run_failed:ledger_mismatch",
+             ["AC2 stock export: ERROR", "- Hourly export FAILED: ledger_mismatch", "Run: 01234567",
+              "Hour: 2026-10-29 14:00 (UTC+08:00)"]),
+            (event(large_balance_count=2), "WARN", "large_balance",
+             ["AC2 stock export: WARN", "- Large balances: 2 row(s)"]),
+            (event(daily_close_status="failed", late_change_day_count=3), "ERROR", "daily_close_failed+late_change",
+             ["- Daily close file not written", "- Late ledger changes: 3 day(s)"]),
+            (event(delivery_status="copy_failed", feed_status="failed", item_index_status="failed"), "ERROR",
+             "delivery_failed+feed_failed+item_index_failed",
+             ["- Drive delivery failed: copy_failed", "- Dashboard feed not published", "- Item index not published"]),
+            (event("repeat", large_balance_count=1), "WARN", "large_balance",
+             ["AC2 stock export: still not resolved (daily reminder)"]),
         ]
-        results = self.run_cases([body for body, _ in cases])
-        for (body, expected), result in zip(cases, results):
+        results = self.run_cases([body for body, *_ in cases])
+        for (body, severity, short, expected), result in zip(cases, results):
             with self.subTest(conditions=body["conditions"]):
                 self.assertTrue(result["ok"], result)
                 (item,) = result["out"]
-                self.assertEqual(set(item["json"]), {"valid", "alert_text"})
+                self.assertEqual(set(item["json"]), {"valid", "severity", "key", "short", "lines"})
                 self.assertIs(item["json"]["valid"], True)
-                for text in expected:
-                    self.assertIn(text, item["json"]["alert_text"])
-                self.assertNotIn("FAKE-SECRET", item["json"]["alert_text"])
-                self.assertEqual(telegram_html_problems(item["json"]["alert_text"]), [])
+                self.assertEqual(item["json"]["severity"], severity)
+                self.assertEqual(item["json"]["short"], short)
+                self.assertEqual(item["json"]["key"], short, "the fold key is stable per condition set")
+                text = "\n".join(item["json"]["lines"])
+                for line in expected:
+                    self.assertIn(line, text)
+                self.assertNotIn("FAKE-SECRET", json.dumps(item))
+                self.assertNotIn("Telegram", text)
+                self.assert_accepted_by_sub_workflow(result)
 
-    def test_every_closed_value_renders_valid_telegram_html(self):
-        # The real values are full of "_" (internal_error, copy_failed, last_run_status.json),
-        # the exact text that Markdown refused in go-live A2.
-        cases = [failed_event(failure_class) for failure_class in hourly.ALERT_FAILURE_CLASSES]
+    def test_every_closed_value_is_accepted_by_the_shared_email_sub_workflow(self):
+        # The sub-workflow refuses anything but printable ASCII lines and subject-safe codes, so
+        # every value the exporter can send must render inside those limits.
+        cases = [failed_event(failure_class) for failure_class in hourly.ALERT_FAILURE_CLASSES + ("unknown",)]
         cases += [event(delivery_status=value, large_balance_count=1) for value in ("verify_failed", "copy_failed")]
-        cases += [event("repeat", daily_close_status="failed", late_change_day_count=2, feed_status="failed")]
+        cases += [event("repeat", daily_close_status="failed", late_change_day_count=2, feed_status="failed",
+                        item_index_status="failed", delivery_status="verify_failed",
+                        large_balance_count=hourly.ALERT_COUNT_MAX)]
         for body, result in zip(cases, self.run_cases(cases)):
             with self.subTest(failure_class=body["failure_class"], delivery=body["delivery_status"]):
                 self.assertTrue(result["ok"], result)
                 (item,) = result["out"]
                 self.assertIs(item["json"]["valid"], True, item)
-                text = item["json"]["alert_text"]
-                self.assertEqual(telegram_html_problems(text), [])
-                # No value needs an entity, so Telegram shows the fixed wording exactly as written.
-                self.assertEqual(html.unescape(text), text)
-
-    def test_markup_in_any_interpolated_value_is_escaped_for_telegram_html(self):
-        # The strict allowlist already refuses these characters (see the rejection test), so the
-        # escaping is defence in depth. To exercise it end to end, run the committed Code node with
-        # its two free-text-shaped allowlists widened by one hostile value; nothing else changes.
-        workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
-        code = next(n for n in workflow["nodes"] if n["name"] == CODE_NODE)["parameters"]["jsCode"]
-        for name in ("FAILURE_CLASSES", "DELIVERY_STATUSES"):
-            marker = "const %s = [" % name
-            self.assertEqual(code.count(marker), 1, name)
-            code = code.replace(marker, marker + json.dumps(HOSTILE) + ", ")
-        cases = [
-            {**failed_event(), "failure_class": HOSTILE},
-            {**event(delivery_status="copy_failed"), "delivery_status": HOSTILE},
-        ]
-        for body, result in zip(cases, self.run_cases(cases, code=code)):
-            with self.subTest(conditions=body["conditions"]):
-                self.assertTrue(result["ok"], result)
-                (item,) = result["out"]
-                self.assertIs(item["json"]["valid"], True, item)
-                text = item["json"]["alert_text"]
-                self.assertIn("a_b*c[d]e`f&amp;g&lt;h&gt;i&lt;/b&gt;j&amp;amp;k", text)
-                self.assertNotIn("<", text)
-                self.assertNotIn(">", text)
-                self.assertEqual(telegram_html_problems(text), [])
-                # What the owner sees once Telegram decodes the entities is the value itself.
-                self.assertIn(HOSTILE, html.unescape(text))
+                for line in item["json"]["lines"]:
+                    self.assertRegex(line, LINE_RE)
+                self.assertRegex(item["json"]["short"], r"^[A-Za-z0-9_:+.-]{1,120}$")
+                self.assert_accepted_by_sub_workflow(result)
 
     def test_every_departure_from_the_contract_is_rejected(self):
         base = event(large_balance_count=2)
@@ -355,7 +371,8 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
                 (item,) = result["out"]
                 self.assertEqual(item["json"]["valid"], False)
                 self.assertRegex(item["json"]["reason"], r"^AC2_ALERT_[A-Z_]+$")
-                self.assertNotIn("alert_text", item["json"])
+                self.assertEqual(set(item["json"]), {"valid", "reason"})
+                self.assertIsNone(result["sub"], "a rejected event never reaches the email sub-workflow")
 
 
 if __name__ == "__main__":
