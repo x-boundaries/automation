@@ -8,7 +8,11 @@ null); turning one on, any AutoCount login and any scheduling each need their
 own Owner approval. Go-live enablement (29 October 2026, Owner
 SCOPE-CONFIRMED on #155): the production book `AED_XBOUNDARIES` is admitted
 for this sync only (see "Go-live (production)" below); nothing in this
-repository turns it on. Every live step needs its own Owner OK.
+repository turns it on. Every live step needs its own Owner OK. (#268 adds
+one more admission in the same book guard: the one-off member type move's own
+`type-move-*` operations with profile `type_move_p1`, through its own entry
+point; this sync's operations and profile are unchanged. See
+`member_type_move_runbook.md`.)
 
 Code: `directlocal/xb_member_sync.py` (engine, ledger, Shopify client,
 credential loader, CLI), the `sync-lookup` / `sync-changelog` operations and
