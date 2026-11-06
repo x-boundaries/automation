@@ -1,0 +1,108 @@
+{
+  "id": "simbaInvoiceErrorAlert01",
+  "name": "SIMBA Invoices - Error Alert",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4244-9000-000000000001",
+      "name": "SIMBA Intake Failed",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "00000000-0000-4244-9000-000000000002",
+      "name": "Build Error Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Builds one short Telegram alert from n8n's error data: which workflow failed, the step it stopped\n// at, the execution number and link, and the time. Nothing from the email or PDF is copied, and the\n// error message itself is left out because it can quote data; open the execution in n8n to see it.\nconst data = $input.first().json || {};\nconst execution = data.execution || {};\nconst workflow = data.workflow || {};\nconst clean = (value, max) => String(value === undefined || value === null ? '' : value)\n  .replace(/[\\u0000-\\u001f\\u007f<>&]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, max);\nconst url = clean(execution.url, 300);\nconst lines = [\n  'SIMBA invoice intake failed',\n  'Workflow: ' + (clean(workflow.name, 120) || 'unknown'),\n  'Stopped at: ' + (clean(execution.lastNodeExecuted, 120) || 'unknown'),\n  'Execution: ' + (clean(execution.id, 40) || 'unknown'),\n];\nif (/^https?:\\/\\//i.test(url)) lines.push('Open: ' + url);\nlines.push('Time: ' + new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' SGT');\nlines.push('Emails in that run may need filing by hand; see the SIMBA runbook, \"Failures\".');\nreturn [{ json: { alert_text: lines.join('\\n') } }];\n"
+      }
+    },
+    {
+      "id": "00000000-0000-4244-9000-000000000003",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.alert_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "00000000-0000-4244-9000-000000000004",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -40
+      ],
+      "parameters": {
+        "width": 760,
+        "height": 340,
+        "content": "# SIMBA invoices: error alert\n\n- Runs when \"SIMBA Invoices - Email To Drive\" fails on its own (not on manual editor runs).\n- Must be published (active): n8n runs only the published version of an error workflow, so publish it with or before the main workflow.\n- Sends one Telegram message: workflow, the step it stopped at, execution number and link, and time. No email, PDF or error text is copied.\n- A failed Telegram send fails this workflow too, so it stays visible in n8n Executions.\n\n## Required manual configuration:\n\n- **Send Error Alert**\n  - `Chat ID`: the Telegram chat for alerts (the same one EnergyGrid alerts use).\n- **SIMBA Invoices - Email To Drive, Workflow settings**\n  - `Error workflow`: this workflow.\n"
+      }
+    }
+  ],
+  "connections": {
+    "SIMBA Intake Failed": {
+      "main": [
+        [
+          {
+            "node": "Build Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Singapore",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {},
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4244-9000-000000000000",
+  "sourceWorkflowId": null
+}
