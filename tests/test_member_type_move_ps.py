@@ -403,6 +403,11 @@ class TypeMoveBridgeTests(unittest.TestCase):
     def client(self, deadline_seconds: int = 60) -> tm.TypeMoveBridgeClient:
         return tm.TypeMoveBridgeClient(self.command(), autocount_book=None, claims=self.claims, deadline_seconds=deadline_seconds)
 
+    @staticmethod
+    def deadline(seconds: int = 60) -> datetime:
+        """The INTENT row's deadline the engine passes to the child."""
+        return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).replace(microsecond=0)
+
     def test_scan_is_parameterised_and_pages_by_member_no(self):
         self.set_state(members=[member(3), member(1), member(2, member_type="GUEST"), member(4, expiry=None)])
         code, out, _ = self.run_bridge("type-move-scan", {"member_type": "Default", "after_member_no": ""})
@@ -565,16 +570,16 @@ class TypeMoveBridgeTests(unittest.TestCase):
         client = self.client()
         moved = {}
         for n, target in ((1, "MEMBER"), (2, "GUEST")):
-            outcome = client.save(self.move_payload(n, target), move_id="move-" + f"{n}" * 32)
+            outcome = client.save(self.move_payload(n, target), move_id="move-" + f"{n}" * 32, deadline=self.deadline())
             self.assertEqual(outcome.state, "DONE")
             moved[n] = outcome.post_last_modified_local
         # A rollback that expects the wrong type or an old LastModified is skipped.
-        self.assertEqual(client.save(self.move_payload(1, "Default", kind="rollback", from_type="GUEST", expected=moved[1]), move_id="move-" + "3" * 32),
+        self.assertEqual(client.save(self.move_payload(1, "Default", kind="rollback", from_type="GUEST", expected=moved[1]), move_id="move-" + "3" * 32, deadline=self.deadline()),
                          tm.SaveOutcome("SKIPPED", "not_moved_type_now"))
-        self.assertEqual(client.save(self.move_payload(1, "Default", kind="rollback", from_type="MEMBER", expected="2026-10-01T09:00:00.000"), move_id="move-" + "4" * 32),
+        self.assertEqual(client.save(self.move_payload(1, "Default", kind="rollback", from_type="MEMBER", expected="2026-10-01T09:00:00.000"), move_id="move-" + "4" * 32, deadline=self.deadline()),
                          tm.SaveOutcome("SKIPPED", "changed_since_move"))
         for n, target in ((1, "MEMBER"), (2, "GUEST")):
-            outcome = client.save(self.move_payload(n, "Default", kind="rollback", from_type=target, expected=moved[n]), move_id="move-" + f"{n + 4}" * 32)
+            outcome = client.save(self.move_payload(n, "Default", kind="rollback", from_type=target, expected=moved[n]), move_id="move-" + f"{n + 4}" * 32, deadline=self.deadline())
             self.assertEqual(outcome.state, "DONE")
         state = self.fake()
         self.assertEqual([m["MemberType"] for m in state["members"]], ["Default", "Default"])
@@ -585,7 +590,7 @@ class TypeMoveBridgeTests(unittest.TestCase):
         self.set_state(members=[member(1)], hang_after_save_ms=60000)
         client = self.client(deadline_seconds=30)
         intent_salt = "c3" * 16
-        outcome = client.save(self.move_payload(1, "MEMBER"), move_id="move-" + "f" * 32)
+        outcome = client.save(self.move_payload(1, "MEMBER"), move_id="move-" + "f" * 32, deadline=self.deadline(30))
         self.assertEqual(outcome.state, "UNCERTAIN")
         self.assertEqual(self.fake()["saves"], 1)
         claim = json.loads((self.claims / ("fence-" + "f" * 32 + ".claim")).read_text(encoding="ascii"))

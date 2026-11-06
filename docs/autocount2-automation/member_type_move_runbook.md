@@ -3,8 +3,8 @@
 Status (2026-11-06): G1 build, draft PR. Source and offline tests only.
 Nothing here has run against any AutoCount book. Nothing runs on merge: the
 tool is attended, has no scheduled task, and every write switch is off by
-default. **Every live step below (L2-L6) needs its own owner OK and is not
-done.**
+default. **Every live step below (L2-L5) needs its own owner OK and is not
+done.** L6 is a read-only `reconcile` and needs no separate OK (as in G0).
 
 Design: G0 on #268 (comment 6659862935, option b), with the owner
 amendments of 6 Nov 2026 (two targets fixed by a pinned rule, re-check at
@@ -62,9 +62,10 @@ the type is never edited or deleted.
 | Re-check at save | The child re-reads the member and saves only if the type is still the expected one, `LastModified` equals the stored value and (move) the active flag and expiry still give the stored target. Otherwise it skips with `not_default_now`, `changed_since_snapshot`, `target_changed` or `member_not_found`, before the claim file (proven not written). A skipped member is not retried. |
 | Only `MemberType` | The child assigns one column. The read-back compares every other column of the master row by salted digest (`LastModified` and `LastModifiedUserID` excepted, as the save itself sets them). A difference stops the run (`readback_fields_changed`) and names the columns, never values. |
 | Write record | Per member: ledger `INTENT` before the child starts; then `DONE`, `SKIPPED`, `NOT_WRITTEN`, `UNCERTAIN` or `HELD`. One child and one `SaveMember` per member, never retried in the same run. The child holds a fence id bound to the payload digest, a deadline watchdog and an exclusive claim file created just before the save. |
-| Caps | `max_moves_per_run` (default 10, hard max 500) counts saves; `--max` may lower it. `max_move_runs_per_day` (default 2, rolling 24 h). Batches may mix targets. |
+| Caps | `max_moves_per_run` (default 10, hard max 500) counts saves; `--max` may lower it. `max_move_runs_per_day` (default 2) counts `move` runs in a rolling 24 hours from each run's start, not per calendar evening. A run that stops at its first member still counts. So the next evening's first batch is refused until 24 h after the previous evening's first run. Batches may mix targets. |
 | Stop | Any refusal, exception, read-back mismatch or unclear outcome ends the run (exit 3). A `STOP` file in the state root is checked before each member. `type_move_enabled` false refuses `move` before any login. |
-| Resume | `move` refuses while any `INTENT` or `UNCERTAIN` row exists. `resolve` settles them by read-back only: no claim file -> `NOT_WRITTEN` (eligible again); on the target with the other columns unchanged -> `DONE`; still on the source type with the old `LastModified` -> `NOT_WRITTEN`; anything else -> `HELD` (alert; owner decides). |
+| Resume | `move` and `rollback` refuse while any `INTENT` or `UNCERTAIN` row exists. `resolve` settles them by read-back only, and only once no save child can still be live: each row records the child's deadline (the same instant the child gets as `-WriteDeadlineUtc`; it kills itself then) and the child's PID. Until deadline + 15 s (the DirectLocal writer grace) has passed, or while the recorded PID still runs, `resolve` refuses with `writer_may_be_live` and changes nothing. A stopped parent does not stop its child: the child `powershell.exe` keeps running and may still save. After stopping the parent, wait at least `write_deadline_seconds` + 15 s (default 135 s), or confirm in Task Manager that no child `powershell.exe` of the tool remains, then run `resolve`. Outcomes: no claim file -> `NOT_WRITTEN` (eligible again); on the target with the other columns unchanged -> `DONE`; still on the source type with the old `LastModified` -> `NOT_WRITTEN`; anything else -> `HELD`. |
+| `HELD` latch | Any `HELD` row (read-back mismatch, unclear resolution) makes `move` refuse with `type_move_held_rows_present`. The owner decides before anything continues. `rollback` is not blocked, so the moves already done can still be undone. To continue after the owner's decision, start a second pass (below). |
 | Rollback | `rollback --max N` (switch `rollback_enabled`, own owner OK): only members with a ledger `DONE` move, latest first, saved back to `Default` only if still on the type the tool set and `LastModified` equals the tool's post-save value. Otherwise skipped (`not_moved_type_now`, `changed_since_move`). Works for both targets. |
 | Final check | `reconcile` (read-only): reads all three types, then lists snapshot members still pending, skipped (by code), held at snapshot, moved members no longer on the type the tool set, members changed after the tool's save, rolled-back members, and new `Default` members keyed after the snapshot. Also: net moves by target split by active flag, type counts before and now, ledger states, and outlets whose last POS sync finished before the last batch end. |
 | Output | Counts, codes and column names. MemberNos appear only masked to the last 3 characters, only with `--show-masked`, on the VM console. Never paste unmasked output anywhere. |
@@ -109,26 +110,70 @@ G0 Q1 (recommended yes): the sync does not need the pause (it reads only
 ChangeLog `I` rows; L0 confirmed an edit writes `U`), but the pause keeps one
 extra AutoCount session at a time and the window clean for the `I` check.
 
-1. Before the window: in Task Scheduler, disable `\XB\XB-MemberSync` and, if
-   registered, `\XB\XB-MemberSync-Probe`. Wait for any running instance to
-   end.
-2. Run the step.
-3. After the batch read-back: enable both again. The sync's next run should
-   return 0 or 3 with no new alert. Shopify -> AC2 resumes from its watermark;
-   sign-up links wait up to about an hour.
+Never unregister either task: disable and enable only.
+
+1. Before the window, in an elevated Windows PowerShell on the VM, disable both
+   tasks:
+
+   ```powershell
+   Disable-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberSync'
+   Disable-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberSync-Probe'
+   ```
+
+   The probe line applies only if the probe task (#155 P2) is registered.
+2. Check that neither task is still running:
+
+   ```powershell
+   Get-ScheduledTask -TaskPath '\XB\' | Select-Object TaskName, State
+   ```
+
+   Both must show `Disabled`, not `Running`. If one shows `Running`, wait for
+   it to finish and check again. Do not start the step until neither runs.
+3. Run the step.
+4. After the batch read-back, enable both tasks again:
+
+   ```powershell
+   Enable-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberSync'
+   Enable-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberSync-Probe'
+   ```
+
+   The sync's next run should return 0 or 3 with no new alert. Shopify -> AC2
+   resumes from its watermark; sign-up links wait up to about an hour.
+
+## Snapshot time and a second pass
+
+- The snapshot time is fixed for the whole ladder. A member whose `ExpiryDate`
+  passes between the snapshot and their batch still moves to `MEMBER`. This is
+  the owner rule as written: the target is decided at snapshot.
+- Staff edits after the snapshot change `LastModified`, so those members are
+  skipped with `changed_since_snapshot`. Changes to the active flag or expiry
+  are skipped with `target_changed`. Neither is retried in the same ledger.
+- Second pass over skipped members (and to continue after a `HELD` stop, once
+  the owner has decided):
+  1. Get an owner OK, as for L3 ("LIVE TYPE-MOVE DRY RUN").
+  2. Keep the old state root unchanged. Its `DONE` moves stay rollback-able
+     from there.
+  3. Create a new state root (`prepare-state-root`) and a new config pointing
+     at it.
+  4. Run `init`, `plan`, then `snapshot`. The new snapshot sees only members
+     still on `Default`. Members the first pass moved are no longer
+     candidates.
+  5. Continue as L4/L5, each batch with its own owner OK.
 
 ## Rollout ladder (L2-L6)
 
-Every row is **owner OK needed, not done**. One owner OK per evening for L5
-(G0 Q5). Run after the last outlet closes.
+Every row except L6 needs its own owner OK and is **not done**. L6 is a
+read-only `reconcile` and needs no separate OK, as in G0 (Controller
+decision). Allow one owner OK per evening for L5 (G0 Q5). Run after the last
+outlet closes.
 
 | Step | What | Owner OK | Pass bar | Undo |
 |---|---|---|---|---|
-| L2 Rehearsal on `AED_TESTINGAPI` | Owner adds types `MEMBER` and `GUEST` to the test book by hand first. Seed about 30 fake `Default` members (fake names, example.com emails, fake 9-digit MemberNos) covering all four kinds: active with future expiry, active with past expiry, active with NULL expiry, inactive (and at least one inactive with a future expiry). Test config with `type_move_enabled` true, `rollback_enabled` true, `max_move_runs_per_day` up to 10. Then: `plan`; `snapshot`; `move --max 10`; kill the child mid-batch (stop the parent while a save child runs) and run `resolve`; owner edits one member after the snapshot (must be skipped `changed_since_snapshot`) and changes one member's expiry or active flag (must be skipped `target_changed`); `move` the rest; `rollback --max 5`; `reconcile`; `move` again | "TEST REHEARSAL" (test-book writes) | Every moved member reads back on its rule target with the other columns unchanged (no `readback_fields_changed`; if it fires, record the column names: the exclusion list may need a G1 amendment); each of the four kinds got its rule target; the killed one resolved without a second save; edited ones skipped with their codes; rollback touched exactly 5 and restored `Default` for both targets; re-run moves 0; `member_change_counter` rose by the number of saves; VM read-only check: 0 new ChangeLog Member `I` rows in the window; seconds per member recorded; LastModified matched between the SQL read and `GetMember` for every member (no false `changed_since_snapshot`) | Test book only; `rollback` |
+| L2 Rehearsal on `AED_TESTINGAPI` | Owner adds types `MEMBER` and `GUEST` to the test book by hand first. Seed about 30 fake `Default` members (fake names, example.com emails, fake 9-digit MemberNos) covering all four kinds: active with future expiry, active with past expiry, active with NULL expiry, inactive (and at least one inactive with a future expiry). Test config with `type_move_enabled` true, `rollback_enabled` true, `max_move_runs_per_day` up to 10. Then: `plan`; `snapshot`; `move --max 10`; stop the parent mid-batch (Ctrl+C while a save child runs); run `resolve` at once and see it refuse `writer_may_be_live` with nothing settled; wait at least `write_deadline_seconds` + 15 s (or confirm no child `powershell.exe` of the tool remains), then run `resolve` again; owner edits one member after the snapshot (must be skipped `changed_since_snapshot`) and changes one member's expiry or active flag (must be skipped `target_changed`); `move` the rest; `rollback --max 5`; `reconcile`; `move` again | "TEST REHEARSAL" (test-book writes) | Every moved member reads back on its rule target with the other columns unchanged (no `readback_fields_changed`; if it fires, record the column names: the exclusion list may need a G1 amendment. A `readback_fields_changed` stop naming `LastUpdate` means a G1 amendment, not a retry); each of the four kinds got its rule target; the killed one resolved without a second save; edited ones skipped with their codes; rollback touched exactly 5 and restored `Default` for both targets; re-run moves 0; `member_change_counter` rose by the number of saves; VM read-only check: 0 new ChangeLog Member `I` rows in the window; seconds per member recorded; LastModified matched between the SQL read and `GetMember` for every member (no false `changed_since_snapshot`) | Test book only; `rollback` |
 | L3 Live dry run and snapshot | Sync paused. Live config, every switch off. `check-config`, `init`, `plan`, then `snapshot` | "LIVE TYPE-MOVE DRY RUN" | `plan` and `snapshot` counts equal the L0 count minus changes since, split by target and active flag; held rows listed for the owner; 0 writes; owner's own AutoCount session still signed in | Delete the new live state root (no moves yet) |
-| L4 Live pilot, 10 members | Sync paused. `type_move_enabled` true, `max_moves_per_run` 10. `move --max 10`, then `reconcile` | "LIVE PILOT 10" | 10 `DONE`, 0 `UNCERTAIN`, 0 `HELD`; the pilot includes both targets if the snapshot has both; owner opens 3 in AutoCount (type as the rule says, nothing else changed); till check after the next outlet cycle (`reconcile` shows no outlet behind the batch end; at one till, look up 3 moved members); VM read-only check: 0 Member `I` rows; sync re-enabled and its next run returns 0 or 3 with no new alert; then 48 h with no staff or till issue | `rollback --max 10` (own OK, `rollback_enabled` true) |
+| L4 Live pilot, 10 members | Sync paused. `type_move_enabled` true, `max_moves_per_run` 10. `move --max 10`, then `reconcile` | "LIVE PILOT 10" | 10 `DONE`, 0 `UNCERTAIN`, 0 `HELD`; the pilot takes the first 10 candidates in MemberNo order, whatever their targets (the tool has no target filter, so the pilot does not promise both targets); owner opens 3 in AutoCount (type as the rule says, nothing else changed); till check after the next outlet cycle (`reconcile` shows no outlet behind the batch end; at one till, look up 3 moved members); VM read-only check: 0 Member `I` rows; sync re-enabled and its next run returns 0 or 3 with no new alert; then 48 h with no staff or till issue | `rollback --max 10` (own OK, `rollback_enabled` true) |
 | L5 Remaining members in batches | Per evening: sync paused; `max_moves_per_run` 250; at most 2 `move` runs (`max_move_runs_per_day` 2); `reconcile` after each | "LIVE BATCHES" per evening, naming the count | Per batch: saves = `DONE` rows, 0 `UNCERTAIN`, 0 `HELD`; outlets synced after the batch end; VM read-only check: 0 Member `I` rows; sync re-enabled clean | `rollback --max N` (own OK) |
-| L6 Final reconciliation | `reconcile --show-masked` on the VM | none (read-only) | `complete` true, or every remaining member listed: pending 0; skipped and held members listed for the owner to decide; new `Default` members listed (moved later only with their own OK); ledger kept 90 days for rollback | n/a |
+| L6 Final reconciliation | `reconcile --show-masked` on the VM | none (read-only; Controller decision, as G0) | `complete` true, or every remaining member listed: pending 0; skipped and held members listed for the owner to decide; new `Default` members listed (moved later only with their own OK); ledger kept 90 days for rollback | n/a |
 
 After L6: set `type_move_enabled` and `rollback_enabled` false in the live
 config. Keep the state root (private, never in Git) for 90 days.
@@ -156,12 +201,14 @@ config. Keep the state root (private, never in Git) for 90 days.
 | `target_changed` | The active flag or expiry now gives the other target | Owner decides |
 | `member_not_found` | The member no longer exists | None |
 | `not_moved_type_now` / `changed_since_move` | Rollback skips: changed after the tool's save | Owner decides |
-| `readback_fields_changed` / `readback_type_mismatch` | Read-back mismatch after a save (`HELD`, run stopped) | Stop the ladder; report the column names |
-| `writer_*`, `save_call_failed`, `fence_already_claimed` | Unclear save outcome (`UNCERTAIN`, run stopped) | `resolve` |
+| `readback_fields_changed` / `readback_type_mismatch` | Read-back mismatch after a save (`HELD`, run stopped) | Stop the ladder; report the column names. `move` now refuses (`type_move_held_rows_present`) |
+| `writer_*`, `save_call_failed`, `fence_already_claimed` | Unclear save outcome (`UNCERTAIN`, run stopped) | `resolve`, once no child can be live |
+| `writer_may_be_live` | `resolve` refused: a save child's deadline + 15 s has not passed, or its recorded PID still runs. Nothing was settled | Wait at least `write_deadline_seconds` + 15 s after the parent stopped, or confirm no child `powershell.exe` of the tool remains, then run `resolve` again |
+| `type_move_held_rows_present` | `move` refused: a `HELD` row exists | The owner decides; `rollback` still works; continue only by a second pass (new state root and snapshot) |
 | `member_type_unknown` | `Default`, `MEMBER` or `GUEST` is missing in the book | Owner adds the type |
 | `type_move_disabled` / `type_move_rollback_disabled` | Switch off | As intended |
 | `type_move_uncertain_unresolved` | Open `INTENT`/`UNCERTAIN` rows | `resolve` first |
-| `type_move_runs_per_day_reached` | Second batch of the evening already ran | Next evening |
+| `type_move_runs_per_day_reached` | `max_move_runs_per_day` `move` runs started in the last rolling 24 hours (counted from each run's start; a run that stopped at its first member still counts) | Wait until 24 h after the earliest of those runs; the next evening's first batch may need to start later than the previous evening's first |
 | `stop_file_present` | `STOP` file in the state root | Remove it to continue |
 
 ## Differences from the G0 design
@@ -181,4 +228,10 @@ config. Keep the state root (private, never in Git) for 90 days.
   table stay byte-for-byte unchanged. The guard gains only the operation and
   profile admission.
 - `max_move_runs_per_day` enforces G0's "at most 2 batches per evening" in
-  the tool, not only in this runbook.
+  the tool, not only in this runbook (rolling 24 hours).
+- G2 fix round (HARDEN-1 and LATER a, c-h, j):
+  - `resolve` holds (`writer_may_be_live`) until each open row's recorded
+    child deadline + 15 s has passed and its recorded PID no longer runs.
+    This reuses the DirectLocal Core's writer grace and process probe.
+  - A `HELD` row latches `move` until the owner decides.
+  - Payloads are built from the stored `INTENT` row.

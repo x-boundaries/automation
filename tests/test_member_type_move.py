@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +31,8 @@ import xb_member_type_move as tm  # noqa: E402
 
 SNAPSHOT_AT = "2026-11-06T20:00:00"
 LM = "2026-10-01T09:00:00.000"
+# write_deadline_seconds (120) + the DirectLocal writer grace, plus one second.
+PAST_DEADLINE = 120 + dl.WRITER_GRACE_SECONDS + 1
 
 
 def fake_no(n: int) -> str:
@@ -70,6 +73,8 @@ class FakeBook:
         self.outlets = [{"location": "OUT1", "sync_name": "POS", "last_finish_sync_local": "2026-11-06T19:45:00", "last_alive_local": SNAPSHOT_AT}]
         self.counter = 100
         self.tick = 0
+        self.payloads: list[tuple[dict, str, object]] = []
+        self.mode_for: dict[str, str] = {}  # one-shot save_mode for one member
 
     def scan(self, member_type, after):
         self.calls.append("scan")
@@ -99,9 +104,13 @@ class FakeBook:
         return {"found": True, "member_type": m["type"], "last_modified_local": m["last_modified"], "is_active": m["active"],
                 "expiry_local": m["expiry"], "fields_digest": self.digest(m, salt)}
 
-    def save(self, payload, *, move_id):
+    def save(self, payload, *, move_id, deadline=None, on_started=None):
         self.calls.append("save")
-        if self.save_mode == "raise":
+        self.payloads.append((dict(payload), move_id, deadline))
+        if on_started is not None:
+            on_started(4242, "fake-created")
+        mode = self.mode_for.pop(payload["member_no"], self.save_mode)
+        if mode == "raise":
             raise RuntimeError("bridge exploded")
         kind, no, src, dst = payload["kind"], payload["member_no"], payload["from_type"], payload["to_type"]
         assert set(payload) == {"kind", "member_no", "from_type", "to_type", "expected_last_modified_local", "snapshot_at_local", "salt"}
@@ -119,19 +128,19 @@ class FakeBook:
             return tm.SaveOutcome("SKIPPED", "target_changed")
         fence = "fence-" + move_id.removeprefix("move-")
         (self.claims / f"{fence}.claim").write_text(json.dumps({"before_digest": self.digest(m, payload["salt"])}), encoding="ascii")
-        if self.save_mode == "uncertain_unsaved":
+        if mode == "uncertain_unsaved":
             return tm.SaveOutcome("UNCERTAIN", "writer_timeout")
         self.saves += 1
         self.counter += 1
         self.tick += 1
-        m["type"] = dst if self.save_mode != "type_mismatch" else "Default"
+        m["type"] = dst if mode != "type_mismatch" else "Default"
         m["last_modified"] = f"2026-11-06T20:{self.tick // 60:02d}:{self.tick % 60:02d}.007"
-        if self.save_mode == "mutate":
+        if mode == "mutate":
             m["name"] = "changed"
             return tm.SaveOutcome("HELD", "readback_fields_changed", m["last_modified"], ("Name",))
-        if self.save_mode == "type_mismatch":
+        if mode == "type_mismatch":
             return tm.SaveOutcome("HELD", "readback_type_mismatch", m["last_modified"])
-        if self.save_mode == "uncertain_saved":
+        if mode == "uncertain_saved":
             return tm.SaveOutcome("UNCERTAIN", "writer_timeout")
         return tm.SaveOutcome("DONE", None, m["last_modified"])
 
@@ -152,13 +161,23 @@ class Base(unittest.TestCase):
         (self.root / "claims").mkdir()
         self.book = FakeBook(FIXTURES, self.root / "claims")
         self.ledger = None
+        self.now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+        self.probe_result = "exited"
+        self.probed: list[tuple] = []
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+    def probe(self, pid, created) -> str:
+        self.probed.append((pid, created))
+        return self.probe_result
 
     def open(self, cfg: tm.MoveConfig | None = None, clock=None) -> tm.TypeMoveEngine:
         if self.ledger is None:
-            self.ledger = tm.MoveLedger(self.root, **({"clock": clock} if clock else {}))
+            self.ledger = tm.MoveLedger(self.root, clock=clock or (lambda: self.now))
             self.addCleanup(self.ledger.close)
             self.ledger.init_meta("AED_TESTINGAPI")
-        return tm.TypeMoveEngine(cfg or config(), self.book, ledger=self.ledger)
+        return tm.TypeMoveEngine(cfg or config(), self.book, ledger=self.ledger, writer_probe=self.probe)
 
     def code(self, call) -> str:
         with self.assertRaises(dl.DirectLocalError) as caught:
@@ -360,9 +379,26 @@ class EngineTests(Base):
         result = engine.move()
         self.assertEqual((result["saves"], result["stopped"], result["changed_fields"]), (0, "held:readback_fields_changed", ["Name"]))
         self.assertEqual(self.book.saves, 1)  # nothing after the first member
+
+    def test_type_mismatch_read_back_is_held_and_stops(self):
+        engine = self.open()
+        engine.snapshot()
         self.book.save_mode = "type_mismatch"
         self.assertEqual(engine.move()["stopped"], "held:readback_type_mismatch")
-        self.assertEqual(self.book.saves, 2)
+        self.assertEqual(self.book.saves, 1)
+
+    def test_held_latches_move_but_not_rollback(self):
+        engine = self.open()
+        engine.snapshot()
+        self.book.mode_for[fake_no(3)] = "mutate"
+        result = engine.move()
+        self.assertEqual((result["saves"], result["stopped"]), (2, "held:readback_fields_changed"))
+        self.book.save_mode = None
+        self.assertEqual(self.code(lambda: engine.move()), "type_move_held_rows_present")
+        self.assertEqual(self.book.saves, 3)  # the refusal touched nothing
+        rolled = engine.rollback(max_moves=10)
+        self.assertEqual((rolled["saves"], rolled["rolled_back"]), (2, {"MEMBER": 1, "GUEST": 1}))
+        self.assertEqual(self.code(lambda: engine.move()), "type_move_held_rows_present")
 
     def test_save_exception_stops_and_blocks_until_resolved(self):
         engine = self.open()
@@ -372,6 +408,7 @@ class EngineTests(Base):
         self.assertEqual(result["stopped"], "uncertain:save_call_failed")
         self.assertEqual(self.code(lambda: engine.move()), "type_move_uncertain_unresolved")
         self.assertEqual(self.code(lambda: engine.rollback(max_moves=1)), "type_move_uncertain_unresolved")
+        self.advance(PAST_DEADLINE)
         resolved = engine.resolve()
         self.assertEqual(resolved["resolved"], {"NOT_WRITTEN:resolved_no_claim": 1})
         self.book.save_mode = None
@@ -384,6 +421,7 @@ class EngineTests(Base):
         result = engine.move()
         self.assertEqual((result["stopped"], self.book.saves), ("uncertain:writer_timeout", 1))
         self.book.save_mode = None
+        self.advance(PAST_DEADLINE)
         resolved = engine.resolve()
         self.assertEqual((resolved["resolved"], resolved["alerts"]), ({"DONE:resolved_saved": 1}, []))
         self.assertEqual(self.book.saves, 1)
@@ -398,6 +436,7 @@ class EngineTests(Base):
         self.book.save_mode = "uncertain_unsaved"
         engine.move()
         self.book.save_mode = None
+        self.advance(PAST_DEADLINE)
         self.assertEqual(engine.resolve()["resolved"], {"NOT_WRITTEN:resolved_not_written": 1})
         self.assertEqual(engine.move()["saves"], 4)
 
@@ -407,10 +446,103 @@ class EngineTests(Base):
         self.book.save_mode = "uncertain_saved"
         engine.move()
         self.book.members[fake_no(1)]["name"] = "edited by staff"
+        self.advance(PAST_DEADLINE)
         resolved = engine.resolve()
         self.assertEqual((resolved["resolved"], resolved["alerts"]), ({"HELD:resolved_unclear": 1}, ["resolved_unclear"]))
         self.book.save_mode = None
-        self.assertEqual(engine.move()["saves"], 3)  # the held member is never moved again
+        self.assertEqual(self.code(lambda: engine.move()), "type_move_held_rows_present")  # the owner decides first
+
+    def open_rows(self) -> list[tuple]:
+        return [tuple(r) for r in self.ledger.conn.execute("SELECT move_id, state, code, post_last_modified_local, updated_at FROM moves ORDER BY rowid")]
+
+    def test_resolve_holds_while_a_move_child_may_be_live(self):
+        # G2 HARDEN-1: the parent stops, the orphan save child may still run.
+        engine = self.open()
+        engine.snapshot()
+        self.book.save_mode = "uncertain_unsaved"
+        engine.move()
+        row = self.ledger.conn.execute("SELECT * FROM moves").fetchone()
+        payload, move_id, deadline = self.book.payloads[-1]
+        self.assertEqual((move_id, dl.ts(deadline)), (row["move_id"], row["deadline_at"]))  # the child got the recorded deadline
+        self.assertEqual(row["deadline_at"], dl.ts(self.now + timedelta(seconds=120)))
+        self.assertEqual((row["child_pid"], row["child_created"]), (4242, "fake-created"))
+        before = self.open_rows()
+        for wait in (0, 120, 120 + dl.WRITER_GRACE_SECONDS - 1):
+            with self.subTest(wait=wait):
+                self.now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=wait)
+                self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+                self.assertEqual(self.open_rows(), before)  # nothing settled
+                self.assertEqual(self.code(lambda: engine.move()), "type_move_uncertain_unresolved")
+                self.assertEqual(self.code(lambda: engine.rollback(max_moves=1)), "type_move_uncertain_unresolved")
+        # The orphan saves after all: the read-back finds it, no second save.
+        self.book.save_mode = None
+        claim_after = self.book.saves
+        member = self.book.members[fake_no(1)]
+        member["type"], member["last_modified"] = "MEMBER", "2026-11-06T20:30:00.007"
+        self.now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc) + timedelta(seconds=120 + dl.WRITER_GRACE_SECONDS)
+        self.assertEqual(engine.resolve()["resolved"], {"DONE:resolved_saved": 1})
+        self.assertEqual(self.book.saves, claim_after)
+
+    def test_resolve_holds_after_the_deadline_while_the_recorded_child_runs(self):
+        engine = self.open()
+        engine.snapshot()
+        self.book.save_mode = "uncertain_unsaved"
+        engine.move()
+        self.advance(PAST_DEADLINE)
+        self.probe_result = "running"
+        self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+        self.assertEqual(self.probed, [(4242, "fake-created")])
+        self.probe_result = "exited"
+        self.assertEqual(engine.resolve()["resolved"], {"NOT_WRITTEN:resolved_not_written": 1})
+
+    def test_resolve_holds_while_a_rollback_child_or_a_bare_intent_may_be_live(self):
+        engine = self.open()
+        engine.snapshot()
+        engine.move(max_moves=1)
+        self.book.save_mode = "uncertain_saved"
+        engine.rollback(max_moves=1)
+        self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+        self.advance(PAST_DEADLINE)
+        self.assertEqual(engine.resolve()["resolved"], {"DONE:resolved_saved": 1})
+        self.assertEqual(self.book.members[fake_no(1)]["type"], "Default")
+        # An INTENT left by a parent that stopped before its child reported.
+        run_id = self.ledger.start_run("move")
+        self.ledger.add_intent(run_id=run_id, kind="move", member_no=fake_no(2), from_type="Default", to_type="GUEST",
+                               expected=LM, deadline=self.now + timedelta(seconds=120))
+        self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM moves ORDER BY rowid DESC").fetchone()[0], "INTENT")
+        self.advance(PAST_DEADLINE)
+        self.assertEqual(engine.resolve()["resolved"], {"NOT_WRITTEN:resolved_no_claim": 1})
+
+    def test_rollback_takes_only_done_moves_and_sends_the_recorded_intent(self):
+        # G2 LATER h (M6, M7): SKIPPED, HELD and NOT_WRITTEN moves are never rolled back.
+        engine = self.open()
+        engine.snapshot()
+        self.book.members[fake_no(1)]["type"] = "GUEST"  # staff: SKIPPED not_default_now
+        self.book.mode_for[fake_no(3)] = "mutate"  # HELD
+        engine.move()
+        self.book.save_mode = None
+        run_id = self.ledger.start_run("move")
+        intent = self.ledger.add_intent(run_id=run_id, kind="move", member_no=fake_no(4), from_type="Default", to_type="GUEST",
+                                        expected=LM, deadline=self.now)
+        self.ledger.set_outcome(intent["move_id"], "NOT_WRITTEN", "writer_failed_before_claim")
+        states = {r["member_no"]: r["state"] for r in self.ledger.conn.execute("SELECT member_no, state FROM moves WHERE kind = 'move'")}
+        self.assertEqual(states, {fake_no(1): "SKIPPED", fake_no(2): "DONE", fake_no(3): "HELD", fake_no(4): "NOT_WRITTEN"})
+        result = engine.rollback(max_moves=10, show_masked=True)
+        self.assertEqual((result["saves"], result["masked"]["rolled_back"], result["skipped"]), (1, [tm.mask(fake_no(2))], {}))
+        self.assertEqual({n: m["type"] for n, m in self.book.members.items()},
+                         {fake_no(1): "GUEST", fake_no(2): "Default", fake_no(3): "GUEST", fake_no(4): "Default"})
+        # Every payload the child got equals its INTENT row.
+        rows = {r["move_id"]: r for r in self.ledger.conn.execute("SELECT * FROM moves")}
+        for payload, move_id, deadline in self.book.payloads:
+            row = rows[move_id]
+            with self.subTest(member=payload["member_no"], kind=payload["kind"]):
+                self.assertEqual({k: payload[k] for k in ("kind", "member_no", "from_type", "to_type", "expected_last_modified_local", "salt")},
+                                 {k: row[k] for k in ("kind", "member_no", "from_type", "to_type", "expected_last_modified_local", "salt")})
+                self.assertEqual(dl.ts(deadline), row["deadline_at"])
+        rollback_row = next(r for r in rows.values() if r["kind"] == "rollback")
+        move_row = next(r for r in rows.values() if r["kind"] == "move" and r["member_no"] == fake_no(2))
+        self.assertEqual(rollback_row["expected_last_modified_local"], move_row["post_last_modified_local"])
 
     def test_stop_file_and_runs_per_day(self):
         engine = self.open(config(max_move_runs_per_day=2))

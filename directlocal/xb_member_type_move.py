@@ -36,7 +36,10 @@ Safety
   child, one ``SaveMember`` and is never retried in the same run. Anything
   but a clean ``DONE`` or a pre-check skip stops the run.
 * ``UNCERTAIN`` is resolved by read-back only (``resolve``), never by a
-  second save.
+  second save, and only once no save child can be live: each row records
+  the child's deadline and PID, and ``resolve`` holds (``writer_may_be_live``)
+  until deadline + the DirectLocal writer grace has passed and the PID no
+  longer runs (G2 HARDEN-1). A ``HELD`` row latches ``move``.
 * The tool refuses the #155 sync's config, state root and ledger.
 * The ledger (``member_type_move.sqlite3``, private state root) keeps
   MemberNos, codes and timestamps. Output carries counts and codes; MemberNos
@@ -72,7 +75,9 @@ LEDGER_FILE = "member_type_move.sqlite3"
 LOCK_FILE = "member_type_move.lock"
 STOP_FILE = "STOP"
 TOOL = "xb268_member_type_move"
-SCHEMA_VERSION = 1
+# v2 (G2 HARDEN-1): moves.deadline_at, child_pid and child_created. No v1
+# ledger was ever initialised outside tests, so v1 is refused, not migrated.
+SCHEMA_VERSION = 2
 
 FROM_TYPE = "Default"
 MEMBER = "MEMBER"
@@ -318,6 +323,7 @@ CREATE TABLE moves(
   expected_last_modified_local TEXT NOT NULL, salt TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('INTENT', 'DONE', 'SKIPPED', 'NOT_WRITTEN', 'UNCERTAIN', 'HELD')),
   code TEXT, post_last_modified_local TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  deadline_at TEXT NOT NULL, child_pid INTEGER, child_created TEXT,
   CHECK ((kind = 'move' AND from_type = 'Default' AND to_type IN ('MEMBER', 'GUEST'))
       OR (kind = 'rollback' AND from_type IN ('MEMBER', 'GUEST') AND to_type = 'Default')),
   CHECK (state <> 'DONE' OR post_last_modified_local IS NOT NULL));
@@ -329,7 +335,7 @@ CREATE TRIGGER snapshot_no_delete BEFORE DELETE ON snapshot BEGIN SELECT RAISE(A
 CREATE TRIGGER snapshot_rows_immutable BEFORE UPDATE ON snapshot_rows BEGIN SELECT RAISE(ABORT, 'snapshot_immutable'); END;
 CREATE TRIGGER snapshot_rows_no_delete BEFORE DELETE ON snapshot_rows BEGIN SELECT RAISE(ABORT, 'snapshot_immutable'); END;
 CREATE TRIGGER moves_no_delete BEFORE DELETE ON moves BEGIN SELECT RAISE(ABORT, 'move_immutable'); END;
-CREATE TRIGGER moves_binding_immutable BEFORE UPDATE OF move_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, salt, created_at ON moves
+CREATE TRIGGER moves_binding_immutable BEFORE UPDATE OF move_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, salt, created_at, deadline_at ON moves
   BEGIN SELECT RAISE(ABORT, 'move_immutable'); END;
 CREATE TRIGGER moves_transition BEFORE UPDATE OF state ON moves
   WHEN NOT ((OLD.state = 'INTENT' AND NEW.state IN ('DONE', 'SKIPPED', 'NOT_WRITTEN', 'UNCERTAIN', 'HELD'))
@@ -421,16 +427,28 @@ class MoveLedger:
     def runs_since(self, command: str, since: datetime) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM runs WHERE command = ? AND started_at >= ?", (command, dl.ts(since))).fetchone()[0]
 
-    def add_intent(self, *, run_id: str, kind: str, member_no: str, from_type: str, to_type: str, expected: str) -> sqlite3.Row:
+    def add_intent(self, *, run_id: str, kind: str, member_no: str, from_type: str, to_type: str, expected: str, deadline: datetime) -> sqlite3.Row:
+        """The record before the child starts. ``deadline`` is the same
+        instant the child gets as -WriteDeadlineUtc (its self-kill time)."""
+
         move_id = f"move-{uuid.uuid4().hex}"
         now = dl.ts(self.now())
         with self.tx() as conn:
             conn.execute(
-                "INSERT INTO moves(move_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, salt, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INTENT', ?, ?)",
-                (move_id, run_id, kind, member_no, from_type, to_type, expected, secrets.token_hex(16), now, now),
+                "INSERT INTO moves(move_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, salt, state, created_at, updated_at, deadline_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INTENT', ?, ?, ?)",
+                (move_id, run_id, kind, member_no, from_type, to_type, expected, secrets.token_hex(16), now, now, dl.ts(deadline)),
             )
         return self.conn.execute("SELECT * FROM moves WHERE move_id = ?", (move_id,)).fetchone()
+
+    def set_child(self, move_id: str, pid: int, created: str | None) -> None:
+        """The save child's identity, recorded as soon as it starts."""
+
+        with self.tx() as conn:
+            conn.execute("UPDATE moves SET child_pid = ?, child_created = ? WHERE move_id = ?", (pid, created, move_id))
+
+    def held_moves(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM moves WHERE state = 'HELD'").fetchone()[0]
 
     def set_outcome(self, move_id: str, state: str, code: str | None, post_last_modified: str | None = None) -> None:
         with self.tx() as conn:
@@ -621,22 +639,32 @@ class TypeMoveBridgeClient(dl.BridgeClient):
             raise dl.BridgeError("bridge_output_invalid")
         return result
 
-    def save(self, payload: Mapping[str, Any], *, move_id: str) -> SaveOutcome:
+    def save(self, payload: Mapping[str, Any], *, move_id: str, deadline: datetime,
+             on_started: Callable[[int, str | None], None] = lambda pid, created: None) -> SaveOutcome:
+        """One fenced save child. ``deadline`` is the instant recorded on the
+        INTENT row (G2 HARDEN-1): the child self-kills at it, and ``resolve``
+        holds until it plus the grace has passed."""
+
         fence_id = "fence-" + move_id.removeprefix("move-")
         salt = secrets.token_hex(16)
         text = dl.canonical_payload(payload)
         stdin = {"fence_id": fence_id, "payload_canonical": text, "payload_digest": dl.payload_digest(salt, text), "digest_salt": salt}
-        deadline = (dl.utc_now() + timedelta(seconds=self.deadline_seconds)).replace(microsecond=0)
         arguments = ["-Operation", "type-move-save", "-EnableProductionAdapter", "-FenceId", fence_id,
-                     "-ClaimDirectory", str(self.claims), "-WriteDeadlineUtc", deadline.strftime("%Y-%m-%dT%H:%M:%SZ")]
-        run = self._write(arguments, stdin, wait_seconds=self.deadline_seconds + dl.WRITER_GRACE_SECONDS)
+                     "-ClaimDirectory", str(self.claims), "-WriteDeadlineUtc", deadline.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")]
+        wait = (deadline - dl.utc_now()).total_seconds() + dl.WRITER_GRACE_SECONDS
+        run = self._write(arguments, stdin, wait_seconds=wait, on_started=on_started)
         return classify_save(run, claim_exists=(self.claims / f"{fence_id}.claim").exists(), kind=str(payload.get("kind")))
 
-    def _write(self, arguments: list[str], stdin: Mapping[str, Any], *, wait_seconds: float) -> dl.WriteRun:
+    def _write(self, arguments: list[str], stdin: Mapping[str, Any], *, wait_seconds: float,
+               on_started: Callable[[int, str | None], None]) -> dl.WriteRun:
         try:
             process = self._start(arguments)
         except OSError:
             return dl.WriteRun(started=False)
+        try:
+            on_started(int(process.pid), dl.child_creation_time(process))
+        except Exception:  # noqa: BLE001 - the deadline hold still covers an unrecorded child
+            pass
         try:
             stdout, _ = process.communicate(self._stdin(stdin), timeout=max(wait_seconds, 1))
         except dl.subprocess.TimeoutExpired:
@@ -662,11 +690,13 @@ def _bump(counter: dict[str, int], key: str) -> None:
 
 
 class TypeMoveEngine:
-    def __init__(self, config: MoveConfig, bridge: Any, *, ledger: MoveLedger | None = None, root: Path | None = None):
+    def __init__(self, config: MoveConfig, bridge: Any, *, ledger: MoveLedger | None = None, root: Path | None = None,
+                 writer_probe: Callable[[int, str | None], str] = dl.probe_writer):
         self.config = config
         self.bridge = bridge
         self.ledger = ledger
         self.root = Path(root) if root is not None else (ledger.root if ledger is not None else None)
+        self.writer_probe = writer_probe
 
     # -- reads ----------------------------------------------------------------
     def scan_all(self, member_type: str) -> list[dict[str, Any]]:
@@ -770,6 +800,14 @@ class TypeMoveEngine:
         if self._ledger().open_moves():
             raise dl.DirectLocalError("type_move_uncertain_unresolved")
 
+    def _refuse_held_moves(self) -> None:
+        """G2 LATER c: a HELD row (read-back mismatch, unclear resolution)
+        latches ``move``; the owner decides before anything continues.
+        ``rollback`` is not blocked."""
+
+        if self._ledger().held_moves():
+            raise dl.DirectLocalError("type_move_held_rows_present")
+
     # -- move -----------------------------------------------------------------
     def move(self, *, max_moves: int | None = None, show_masked: bool = False) -> dict[str, Any]:
         if not self.config.type_move_enabled:
@@ -780,6 +818,9 @@ class TypeMoveEngine:
             raise dl.DirectLocalError("type_move_snapshot_missing")
         cap = self._cap(max_moves)
         self._refuse_open_moves()
+        self._refuse_held_moves()
+        # Rolling 24 hours from each run's start; a run that stops at its
+        # first member still counts (G2 LATER e).
         if ledger.runs_since("move", ledger.now() - timedelta(hours=24)) >= self.config.max_move_runs_per_day:
             raise dl.DirectLocalError("type_move_runs_per_day_reached")
         run_id = ledger.start_run("move")
@@ -796,11 +837,8 @@ class TypeMoveEngine:
                 if self._stop_requested():
                     summary["stopped"] = "stop_file_present"
                     break
-                intent = ledger.add_intent(run_id=run_id, kind="move", member_no=row["member_no"], from_type=FROM_TYPE,
-                                           to_type=row["target"], expected=row["last_modified_local"])
-                payload = {"kind": "move", "member_no": row["member_no"], "from_type": FROM_TYPE, "to_type": row["target"],
-                           "expected_last_modified_local": row["last_modified_local"], "snapshot_at_local": snapshot["snapshot_at_local"], "salt": intent["salt"]}
-                outcome = self._save(intent, payload)
+                outcome = self._record_and_save(run_id, "move", row["member_no"], FROM_TYPE, row["target"], row["last_modified_local"],
+                                                snapshot["snapshot_at_local"])
                 if outcome.state == "DONE":
                     summary["saves"] += 1
                     summary["moved"][row["target"]]["active" if row["is_active"] == "T" else "inactive"] += 1
@@ -831,9 +869,28 @@ class TypeMoveEngine:
             raise dl.DirectLocalError("type_move_max_invalid")
         return max_moves
 
+    def _record_and_save(self, run_id: str, kind: str, member_no: str, from_type: str, to_type: str, expected: str,
+                         snapshot_at_local: str | None) -> SaveOutcome:
+        """INTENT first (with the child's deadline), then the save. The
+        payload is built from the stored row, so the ledger and the child
+        always agree (G2 LATER h)."""
+
+        deadline = (self.ledger.now() + timedelta(seconds=self.config.write_deadline_seconds)).replace(microsecond=0)
+        intent = self.ledger.add_intent(run_id=run_id, kind=kind, member_no=member_no, from_type=from_type, to_type=to_type,
+                                        expected=expected, deadline=deadline)
+        return self._save(intent, self._payload(intent, snapshot_at_local))
+
+    @staticmethod
+    def _payload(intent: sqlite3.Row, snapshot_at_local: str | None) -> dict[str, Any]:
+        return {"kind": intent["kind"], "member_no": intent["member_no"], "from_type": intent["from_type"], "to_type": intent["to_type"],
+                "expected_last_modified_local": intent["expected_last_modified_local"],
+                "snapshot_at_local": snapshot_at_local if intent["kind"] == "move" else None, "salt": intent["salt"]}
+
     def _save(self, intent: sqlite3.Row, payload: Mapping[str, Any]) -> SaveOutcome:
+        move_id = intent["move_id"]
         try:
-            outcome = self.bridge.save(payload, move_id=intent["move_id"])
+            outcome = self.bridge.save(payload, move_id=move_id, deadline=dl.parse_ts(intent["deadline_at"]),
+                                       on_started=lambda pid, created: self.ledger.set_child(move_id, pid, created))
         except Exception:  # noqa: BLE001 - never a blind retry: the child may have saved
             outcome = SaveOutcome("UNCERTAIN", "save_call_failed")
         self.ledger.set_outcome(intent["move_id"], outcome.state, outcome.code, outcome.post_last_modified_local if outcome.state == "DONE" else None)
@@ -854,8 +911,20 @@ class TypeMoveEngine:
     # -- resolve (read-back only) --------------------------------------------
     def resolve(self) -> dict[str, Any]:
         ledger = self._ledger()
+        open_rows = ledger.open_moves()
+        # G2 HARDEN-1 (as the DirectLocal Core's recover): nothing is settled
+        # while any save child may still be live. The child self-kills at its
+        # deadline; until that plus the grace has passed, or while its
+        # recorded PID still runs, every row stays open, so move and rollback
+        # stay refused. Checked for all rows before any change.
+        now = ledger.now()
+        for row in open_rows:
+            if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
+                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
+                raise dl.DirectLocalHold("writer_may_be_live")
         result: dict[str, Any] = {"status": "ok", "command": "resolve", "writes": 0, "resolved": {}, "alerts": []}
-        for row in ledger.open_moves():
+        for row in open_rows:
             if row["state"] == "INTENT":
                 # The parent stopped between the record and the outcome.
                 ledger.set_outcome(row["move_id"], "UNCERTAIN", "parent_interrupted")
@@ -908,11 +977,8 @@ class TypeMoveEngine:
                 if self._stop_requested():
                     summary["stopped"] = "stop_file_present"
                     break
-                intent = ledger.add_intent(run_id=run_id, kind="rollback", member_no=move["member_no"], from_type=move["to_type"],
-                                           to_type=FROM_TYPE, expected=move["post_last_modified_local"])
-                payload = {"kind": "rollback", "member_no": move["member_no"], "from_type": move["to_type"], "to_type": FROM_TYPE,
-                           "expected_last_modified_local": move["post_last_modified_local"], "snapshot_at_local": None, "salt": intent["salt"]}
-                outcome = self._save(intent, payload)
+                outcome = self._record_and_save(run_id, "rollback", move["member_no"], move["to_type"], FROM_TYPE,
+                                                move["post_last_modified_local"], None)
                 if outcome.state == "DONE":
                     summary["saves"] += 1
                     summary["rolled_back"][move["to_type"]] += 1
