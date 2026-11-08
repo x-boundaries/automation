@@ -77,5 +77,56 @@
     "secret_credential_target": null,
     "timeout_seconds": 10,
     "repeat_hours": 24
+  },
+  "analysis": {
+    "enabled": false,
+    "golive_day": "2026-07-31",
+    "stock_take_day": null,
+    "sales_window_days": 400,
+    "doc_types": {
+      "sales": ["OS", "IV", "DO"],
+      "returns": ["CN"],
+      "receipts": ["GR", "PI"]
+    },
+    "channel_by_location": {
+      "LOC-A": {"OS": "outlet"},
+      "LOC-E": {"IV": "marketplace", "CN": "marketplace"}
+    },
+    "channel_by_debtor": {
+      "FAKE-DEBTOR-ONLINE": "shopify"
+    },
+    "debtor_default_channel": "wholesale",
+    "pools": {
+      "retail_network": ["LOC-HQ", "LOC-A", "LOC-E"],
+      "outlets": ["LOC-A"],
+      "esales": ["LOC-E"],
+      "wholesale": ["LOC-W"]
+    },
+    "placement": {
+      "min_hold": 2,
+      "pairs": [
+        {"id": "held_at_wholesale", "label": "Held at wholesale", "zero_locations": ["LOC-A", "LOC-E"], "holder_locations": ["LOC-W"]},
+        {"id": "online_out_shop_has", "label": "Online out, shop has it", "zero_locations": ["LOC-E"], "holder_locations": ["LOC-A", "LOC-HQ"]},
+        {"id": "transfer_from_hq", "label": "Transfer from HQ", "zero_locations": ["LOC-A"], "holder_locations": ["LOC-HQ"]}
+      ]
+    },
+    "highlights": {
+      "pool": "retail_network",
+      "channels": ["outlet", "marketplace", "shopify"],
+      "top_n": 20,
+      "sold_out_days": 28,
+      "sell_through_pct": 80,
+      "drift_pts": 3,
+      "drift_min_units": 100,
+      "slow_days": 60
+    },
+    "attributes": {
+      "kids_categories": ["FAKE-KIDS"],
+      "size_class_by_category": {
+        "FAKE-FOOTWEAR": "footwear",
+        "FAKE-KIDS": "kids",
+        "FAKE-PANTS": "waist"
+      }
+    }
   }
 }

@@ -79,4 +79,42 @@ SELECT
     COL_LENGTH(N'dbo.ItemUOM', N'ReOLevel') AS ReOLevelLength,
     COL_LENGTH(N'dbo.ItemUOM', N'MinQty') AS MinQtyLength;
 
+-- 7. Columns the #292 S2 analysis reads (attribute item master read + analysis read). Run before
+--    setting analysis.enabled to true: a NULL means the column is missing. The item master read
+--    would then fail the hourly run as source_error, and the analysis read would fail as
+--    analysis_read_failed.
+SELECT
+    COL_LENGTH(N'dbo.Item', N'ItemCategory') AS ItemCategoryLength,
+    COL_LENGTH(N'dbo.Item', N'ItemClass') AS ItemClassLength,
+    COL_LENGTH(N'dbo.Item', N'Desc2') AS Desc2Length,
+    COL_LENGTH(N'dbo.Item', N'UDF_StockSize') AS StockSizeLength,
+    COL_LENGTH(N'dbo.Item', N'UDF_StockGender') AS StockGenderLength,
+    COL_LENGTH(N'dbo.Item', N'UDF_StockColour') AS StockColourLength,
+    COL_LENGTH(N'dbo.StockDTL', N'DocType') AS DocTypeLength,
+    COL_LENGTH(N'dbo.StockDTL', N'DocKey') AS DocKeyLength,
+    COL_LENGTH(N'dbo.IV', N'DocKey') AS IVDocKeyLength,
+    COL_LENGTH(N'dbo.IV', N'DebtorCode') AS IVDebtorLength,
+    COL_LENGTH(N'dbo.CN', N'DocKey') AS CNDocKeyLength,
+    COL_LENGTH(N'dbo.CN', N'DebtorCode') AS CNDebtorLength,
+    COL_LENGTH(N'dbo.DO', N'DocKey') AS DODocKeyLength,
+    COL_LENGTH(N'dbo.DO', N'DebtorCode') AS DODebtorLength;
+
+-- 8. #292 S2 AC3 reconciliation: units per DocType, location and month for stock-controlled
+--    items, to compare with the "reconcile" rows of analysis_sales_daily.json.gz
+--    (net_out = -SUM(Qty), qty_in = SUM of positive Qty). Totals only; no item, debtor or
+--    document column. Months before the file's day0 are outside the file's window.
+SELECT
+    d.DocType,
+    d.Location,
+    CONVERT(char(7), d.DocDate, 126) AS DocMonth,
+    -SUM(d.Qty) AS NetOut,
+    SUM(CASE WHEN d.Qty > 0 THEN d.Qty ELSE 0 END) AS QtyIn
+FROM dbo.StockDTL AS d
+JOIN dbo.Item AS i ON i.ItemCode = d.ItemCode
+WHERE d.DocType IN (N'OS', N'IV', N'DO', N'CN', N'GR', N'PI')
+    AND i.StockControl <> N'F'
+    AND d.DocDate < CAST(GETDATE() AS date)
+GROUP BY d.DocType, d.Location, CONVERT(char(7), d.DocDate, 126)
+ORDER BY d.DocType, d.Location, DocMonth;
+
 SET NOEXEC OFF;

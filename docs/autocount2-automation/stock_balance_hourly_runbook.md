@@ -4,6 +4,8 @@ Status: **offline build only.** Nothing here has run against SQL Server, the AC2
 
 Dashboard v2 (28 Oct 2026): every successful run also writes the item index `stock_item_index.json.gz` beside the feed, for the dashboard's item search, item detail and data-issues views (see [Item index](#item-index-schema-v1)). The item master read adds `ItemGroup` and `ItemBrand`, and the `dbo.ItemUOM` read adds `BarCode` and `MinQty`. Nothing else changes.
 
+Buying analysis (#292 slice S2, owner "Yes, accept all", 8 Nov 2026): behind `analysis.enabled` (**default off**), the first successful run after local midnight also builds a small set of nightly buying-analysis files beside the feed (sales by item, location, day and channel; stock-state intervals; placement facts; rule-based highlights; one manifest), and the item index gains structured size, gender, colour, category and style fields (`schema_minor: 2`). Units only. A failure never blocks the hourly files. See [Buying analysis files](#buying-analysis-files-292-s2).
+
 Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one email to the operations inbox through the shared `XB Ops Alert Email` sub-workflow (6 Nov 2026, #288: email replaces Telegram; no dual-send). Off by default and shipped inactive; see [Error alerts](#error-alerts-email-through-n8n).
 
 Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close rebuilt from the stock ledger, a backfill from 1 Aug 2026, one latest pair in Drive (no hourly folders in Drive), local retention, and a compact dashboard feed. File, setting and task names keep the word "hourly" (the job still runs hourly); only the Drive folder is renamed to "daily".
@@ -32,6 +34,7 @@ How it reads:
 - The ledger read (`dbo.StockDTL`: `SUM(Qty)` per ItemCode, UOM, Location and `CAST(DocDate AS date)`, never filtered by date), the item master (`dbo.Item`, including the `ItemGroup` and `ItemBrand` codes), the location list (`dbo.Location`) and the item UOM rows (`dbo.ItemUOM`: `BarCode`, `ReOLevel`, `MinQty`; no `Cost` or `Price`) are read **inside the same ChangeCount window** as the balance read. `dbo.ChangeCount` has no row for `StockDTL` (R1, 28 Oct 2026); a stock posting writes both tables, so it moves the balance counter, and the per-run [ledger check](#ledger-check-every-run) catches anything the counter missed.
 - No cost column is selected. `MostRecentlyCost`, `StockDTL.Cost` / `TotalCost` and every cost table stay out. Consignment (`dbo.CSGNItemBalQty`) is out. `StockDTL.DocInfo` (free text) is never read.
 - `dbo.ChangeLog` is never read.
+- With `analysis.enabled` on: the item master read adds the attribute columns, and the nightly analysis read runs **on its own connection after the hourly files are published** (identity checked again), so it can never fail or delay the hourly snapshot. See [Buying analysis files](#buying-analysis-files-292-s2).
 
 ## Files
 
@@ -42,7 +45,9 @@ How it reads:
 | `config/autocount_stock_balance_hourly.local.json` | The real settings file on the VM. Gitignored by `config/*.local.json`; never commit it. Real location labels live only here. |
 | `scripts/install_autocount_stock_balance_hourly_task.ps1` | Task Scheduler installer. Not run by the build; step V7 only. |
 | `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` | Owner-run read-only live check (step V3). Aggregates only. |
+| `scripts/autocount_stock_analysis.py` | #292 S2: pure builders for the nightly analysis files, the analysis settings check, the size and gender normalisation and the SELECT-only analysis read. No I/O. |
 | `tests/test_autocount_stock_balance_hourly.py` | Offline tests with in-memory fakes and temp folders. |
+| `tests/test_autocount_stock_analysis.py` | Offline tests of the analysis builders on fake rows. |
 | `n8n-workflows/ac2_stock_alert.workflow.json` | The inactive n8n workflow that turns an alert event into one alert email (see [Error alerts](#error-alerts-email-through-n8n)). |
 | `n8n-workflows/ops_alert_email.workflow.json` | The inactive shared `XB Ops Alert Email` sub-workflow that sends it (#288): the only Gmail node, the recipient, the subject format, and the fold and flood rules. |
 | `tests/test_ac2_stock_alert_workflow.py` | Offline contract of that workflow; runs its Code node with Node against real events and checks the result against the sub-workflow's input check. |
@@ -127,6 +132,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 | `alert.secret_credential_target` | `null` | Instead of the env var: a Windows Credential Manager generic credential target holding the secret. Only with `schedule.logon_type: Password` (an S4U task cannot read Credential Manager), so validation refuses it under S4U. Set exactly one of the two when enabled. |
 | `alert.timeout_seconds` | `10` | One POST per run at most, 1 to 30 s. No retry inside the run. |
 | `alert.repeat_hours` | `24` | A problem that is still there is repeated after this many hours (1 to 168). |
+| `analysis.*` | off | #292 S2 nightly buying-analysis files and item attributes. See [Analysis settings](#analysis-settings). The example file holds fake codes only; the real channel, debtor, pool and placement values are filled in the VM's local settings file at VM proof step P1. |
 
 ## Outputs and folder layout
 
@@ -139,6 +145,7 @@ Every business choice is a setting. The owner said answers may still change, so 
   latest_manifest.json                    (latest verified success only)
   stock_dashboard_feed.json.gz            (every successful run)
   stock_item_index.json.gz                (every successful run)
+  analysis_*.json.gz, analysis_manifest.json  (analysis.enabled only: replaced by the first successful run after midnight)
   hourly\<YYYY-MM-DD>\ac2_stockbal_<YYYYMMDDTHHMMSS+0800>_<run_id first 8>\
       stock_balance.csv                   (success only; kept 48 h when pruning is on)
       manifest.json                       (every outcome; kept 48 h when pruning is on)
@@ -152,6 +159,7 @@ Every business choice is a setting. The owner said answers may still change, so 
   latest_manifest.json                    (replaced every run)
   stock_dashboard_feed.json.gz            (replaced every run)
   stock_item_index.json.gz                (replaced every run)
+  analysis_*.json.gz, analysis_manifest.json  (analysis.enabled only: replaced nightly, as one verified set)
   last_run_status.json                    (replaced every run)
   daily\<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv            (one per day, never pruned)
   daily\<YYYY-MM>\stock_close_<YYYY-MM-DD>.manifest.json
@@ -167,7 +175,7 @@ Every business choice is a setting. The owner said answers may still change, so 
 - CSV: UTF-8 without BOM, header row, CRLF line ends via the csv module, fixed column order from `output.columns`, every cell through `safe_csv_row` (formula prefixes neutralised; numbers stay numeric, so negative quantities are not prefixed).
 - Manifest fields: job `ac2_hourly_stock_balance`, schema_version, run_id, status, failure_class, sanitized message, started/finished (+08:00), as_of_local and as_of_sql, timezone, source (surface, database, query_sha256, settings_sha256, git commit), identity flags (never names), attempts, ChangeCount before/after, row_count, CSV sha256/size, counts (zero, negative, no_balance_row, non_empty_batch, inactive_dropped, zero_dropped, null_balqty_rows), per-location rows / non_zero / negative / sum_qty, unmapped_location_codes, large_balances, uom_guard, pos_sync per Location, delivery, warnings.
   Round 6 adds (schema_version `2`): `ledger` (groups, rows, null_qty_rows, non_empty_batch, future_dated_rows, non_base_uom_groups, non_stock_rows_excluded, non_stock_items_excluded, items_missing_from_master, first_day, last_day), `ledger_check`, `uom_guard.ledger_non_base_uom_groups`, `counts.non_stock_excluded`, `daily_close`, `feed` (status, sha256, byte_size), `retention`, and the extra query hashes (`ledger`, `item_master`, `locations`, `item_uom`; the last was `reorder_levels` before dashboard v2). Dashboard v2 adds `item_index` (status, sha256, byte_size, counts).
-- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), next_run_local, alert_status and alert_http_status (see [Error alerts](#error-alerts-email-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
+- `last_run_status.json` fields: job, run_id, status, failure_class, as_of_local, started_at, finished_at, hourly_folder, delivery_status, large_balance_count (`null` for a failed run), daily_close_status (`published`, `not_due`, `failed`, `skipped_failed_run`), daily_close_failure_class, published_close_day, revised_day_count, late_change_day_count, feed_status (`published` = in the archive and, when delivery is set, in Drive; `failed` = not built, not written to the archive, or not delivered to Drive; `null` for a failed run), item_index_status (same values and rules as feed_status), analysis_status (`disabled`, `not_due`, `published`, `failed`, `skipped_failed_run`), analysis_failure_class, analysis_close_day (the close day of the analysis set in the archive), analysis_seconds (build and publish time of a published set), next_run_local, alert_status and alert_http_status (see [Error alerts](#error-alerts-email-through-n8n)). `status` and `failure_class` describe the hourly snapshot as before.
 - `alert_record.json` fields (one per run, see [Per-run alert record](#per-run-alert-record)): schema `xb.ac2.stock_alert_record.v1`, job, run_id, started_at, finished_at, status, failure_class, alert_status, http_status.
 
 ## Ledger check (every run)
@@ -231,10 +239,64 @@ Numbers are JSON numbers (whole quantities as integers). A feed that cannot be b
 | `stock_fields`, `stock` | One array per item and location: `item` (index), `location` (index), `qty` (the latest balance), `last_movement` (the last ledger day up to today with any row for the key, a net-zero day included; `null` when none). Non-zero balances, plus zero balances that ever moved. |
 | `history_fields`, `history` | One array per item and location: `item`, `location`, `changes` = `[[offset, close], ...]`, with offset in days from `history_from`. Offset 0 is the close on `history_from`; later entries are the days the close changed (0 when it went to zero). Closes sum from the first ledger row, exactly like the daily files. A key that is zero all through the window is left out. |
 | `counts` | `items`, `inactive_without_stock_or_movement_excluded`, `non_stock_items_excluded`, `items_without_description`, `items_without_barcode`, `items_with_reorder_level`, `items_with_min_qty`, `stock_keys`, `history_keys`. Also in the run manifest under `item_index.counts`. |
+| `schema_minor` (#292 S2) | Present only when `analysis.enabled` is true: `2`. The major `schema_version` stays `1`. Ten fields are **appended** to `item_fields` (every version-1 field keeps its position, and the page finds fields by name): `category` (`ItemCategory`), `size` (normalised), `size_raw`, `size_order` (sort key), `size_class` (`letter`, `one_size`, `numeric`, `footwear`, `kids`, `waist`, `range`, `other`), `length` (waist-length sizes only), `gender` (`M`, `W`, `U`, `K` or empty), `colour`, `style_code` (`ItemClass`), `style_name` (`Desc2`). `counts` adds `items_sized`, `items_with_gender`, `items_with_category`. With analysis off the file is exactly the version-1 file. |
 
 Failure handling is the feed's: a build or archive write failure keeps the previous file in both places and sets `item_index_status: failed` (`item_index_publish_failed`, exit code `1`); the hourly latest pair is still published. The Drive copy travels in the same verified set as the Drive latest pair and the feed.
 
 Page rules that use it (documented here so the numbers can be checked): low stock = `0 < qty <= level` per outlet for active items, where level is the item's `reorder_level`, else its `min_qty`, else `low_stock_default_threshold`, and the page says which one applied. AutoCount keeps these levels per item, not per outlet, so the page applies the item's level to each outlet's quantity.
+
+## Buying analysis files (#292 S2)
+
+Design: private mailbox `mailbox/292/20261108-1530-g0r2-design.md` sections 3-5 and 9 (S2). Off by default (`analysis.enabled: false`); nothing below happens until the owner switches it on at VM proof step P3.
+
+**When.** The analysis set is due when the archive copy or the Drive copy of `analysis_manifest.json` is missing, unreadable or older than yesterday's close (`built_from_close_day` < yesterday). In practice that is the 00:00 run; a failed build or publish is retried by the next hourly run (the daily close's self-healing rule), and `--backfill` always rebuilds. Every other run records `analysis_status: not_due`. The build runs **after** every hourly file (latest pair, feed, item index, daily files) is published, so it can never delay or block them, and its outcome is recorded only in `last_run_status.json` and the analysis manifest.
+
+**How it reads.** One grouped `SELECT` on its own connection (identity checked again; same isolation and lock timeout): `dbo.StockDTL` summed per ItemCode, Location, day and DocType for the configured sales, returns and receipt DocTypes, `DocDate >= <window start> AND DocDate < <today 00:00>`, with `LEFT JOIN`s to the `IV`, `CN` and `DO` headers on `DocKey`. The debtor code is compared **inside SQL Server** (`CASE <debtor> WHEN ? THEN ? ... END`, parameters from `analysis.channel_by_debtor`), and only the matched channel id and a has-a-debtor flag come back: the code never reaches Python, a file or a log. No cost, price or amount column, no DocNo, no free text. Stock-state and placement come from the hourly ledger read already in memory. The query text depends only on how many debtor rules and DocTypes are set; its hash is in the run manifest (`source.queries_sha256.analysis_sales`). It sits outside the hourly ChangeCount window on purpose; it reads rows dated up to yesterday only, and the next nightly build picks up any later backdated posting.
+
+**Files** (all latest-only; data files gzip with a fixed header time; published to the archive, then to Drive, each as one verified set with the manifest last; a reader never mixes two builds):
+
+| File | Schema | Content |
+| --- | --- | --- |
+| `analysis_sales_daily.json.gz` | `xb.ac2.analysis_sales_daily` v1 | Columnar: `items`, `locations`, `channels` dictionaries; `columns` = `item`, `location`, `day` (offset from `day0`), `channel`, `sold` (units out net of returns), `returned` (units back: CN rows and positive sales rows). Window: from the first ledger row, capped at `sales_window_days` (400). `reconcile` = `[doc_type, location, month, net_out, qty_in]` for the AC3 check. Non-stock items excluded and counted. |
+| `analysis_stock_state.json.gz` | `xb.ac2.analysis_stock_state` v1 | Per item and pool: `first_stock_day`, `zero_intervals` (`[[from, to], ...]`, inclusive day offsets whose pool close was zero or negative after the pool first held stock; closes sum from the first ledger row, like the daily files), `qty_now` (yesterday's close), `opening_at_golive` (close of `golive_day`), `received` per month (receipt DocTypes, net). Lets the page count in-stock and zero days for any window. |
+| `analysis_placement.json.gz` | `xb.ac2.analysis_placement` v1 | Per configured pair, zero location and item, over the last 90 days: `zero_qty_now`, `holder_qty_now`, `zero_days_30`, `zero_days_90`, `open_now`, `sold_at_zero_loc_90`. A day counts when the zero location's close is <= 0 after it first held the item, while the holder locations together hold >= `placement.min_hold`. Rows with no such day are left out. |
+| `analysis_highlights.json.gz` | `xb.ac2.analysis_highlights` v1 | `lines` = `{rule, brand, item, inputs}`, top `highlights.top_n` per rule and brand; `counts` per rule before the cap. Rules: `sold_out_early` (first zero within `sold_out_days` of first stock, or sell-through >= `sell_through_pct`), `open_placement`, `size_drift` (sold vs stocked size share differs by >= `drift_pts` with >= `drift_min_units` sold, per brand, category and gender, since `stock_take_day`), `slow_seller` (pool stock > 0, no sale in `slow_days`, first stock more than `slow_days` ago). stocked = opening at go-live (if positive) + received in the pool. Sales count only `highlights.channels`. |
+| `analysis_manifest.json` | `xb.ac2.analysis_manifest` v1 | `run_id`, `as_of_local`, `built_from_close_day`, `built_at`, `files` (name, schema, version, sha256, bytes, counts), `windows_hint` (go-live, stock take, sales and placement windows), `sold_units_by_channel`, `other` (groups and units the rules put in `other`), `size_coverage` per brand (items, sized items, sold units, sold units of sized items), `attributes` (sized items, unknown gender values, up to 50 unrecognised size values with counts, to complete the size map), `settings_digest` (sha256 of the analysis settings; never the values). |
+
+**Channel rules** (settings, never code), evaluated in order for each grouped row of a sales or returns DocType:
+
+1. an `IV`/`CN`/`DO` row whose debtor is in `channel_by_debtor` -> that channel (matched in SQL);
+2. `channel_by_location[<location>][<DocType>]` -> that channel;
+3. an `IV`/`CN`/`DO` row with any other non-blank debtor -> `debtor_default_channel` (`wholesale`);
+4. anything else -> `other` (shown and counted in the manifest, never folded into a retail channel).
+
+Channel ids are a closed set: `outlet`, `marketplace`, `shopify`, `wholesale`, `other`. A DO later invoiced posts no second stock row (VM data check), so OS, IV and DO all count with no double count. Internal DocTypes (adjustments, transfers, issues, receives) are not listed, so they are never sales.
+
+**Size and gender** (`analysis.attributes`, table-driven, no description parsing): blank or a `blank_values` entry (`DEFAULT`) is "not sized"; `size_map` first (`2XL` -> `XXL`, `O.S`/`OS`/`F`/`FREE` -> `OS`, ...), then `letter_order`, then numbers; a pair `A-B` in a category whose `size_class_by_category` is `waist` becomes size `A` plus length `B`, elsewhere one `range` size; numeric sizes take their class from the category; anything else stays as given with class `other` and is listed in the manifest. Gender: `gender_map` (`M`/`MEN` -> M, `F`/`WOMEN` -> W, `BOTH` -> U); `kids_categories` are always K.
+
+**Failure handling.** `analysis_read_failed` (connection, identity, lock or SQL error), `analysis_build_failed` (a builder error) and `analysis_publish_failed` (an archive or Drive write or verify failure) set `analysis_status: failed` and exit code `1`, like the feed and item index. The hourly latest pair, feed, item index and daily files are already published and are never touched; the previous analysis set stays where it was not replaced; the next run retries. A failed hourly run gives `analysis_status: skipped_failed_run` and no analysis read. Error alerts are unchanged (no analysis condition yet).
+
+**Size and time.** Measured offline on the server PC with a generated fake book (25,000 items, 142,000 ledger keys, 32,600 sales groups, 6 locations, 4 pools, 3 pairs): build 3.3 s; sales 115 KB, stock state 233 KB, placement 47 KB, highlights 24 KB gzipped. Real sizes and the 00:00 run time are measured at VM proof step P4 (target: every file under 1 MB gzipped, the 00:00 run under 15 s).
+
+### Analysis settings
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `analysis.enabled` | `false` | Builds the analysis set nightly and adds the item attributes. Switched on only at VM proof step P3. |
+| `analysis.golive_day` | `"2026-07-31"` | Opening stock day; `opening_at_golive` is the close of this day. |
+| `analysis.stock_take_day` | `null` | The stock-take reset day: the page's default window and the `size_drift` window. Set at P1. |
+| `analysis.sales_window_days` | `400` | Sales window cap, 1 to 400 days back from yesterday. |
+| `analysis.doc_types` | `sales` OS, IV, DO; `returns` CN; `receipts` GR, PI | DocType codes read. A DocType may be listed once. Only `IV`, `CN` and `DO` have a debtor join (fixed in code). |
+| `analysis.channel_by_location` | `{}` | `location -> {DocType -> channel}`. |
+| `analysis.channel_by_debtor` | `{}` | `debtor code -> channel`. Lives only in the VM's local settings file; used only as SQL parameters; never written to any output, log or message. |
+| `analysis.debtor_default_channel` | `"wholesale"` | Channel for a debtor row that matched no other rule; `null` sends it to `other`. |
+| `analysis.pools` | `{}` | `pool id -> locations`. Required when enabled. Locations in no pool (transit, defective) never count. |
+| `analysis.placement.min_hold` | `2` | Holder units needed for a placement day. |
+| `analysis.placement.pairs` | `[]` | Up to 20 `{id, label, zero_locations, holder_locations}`. Each zero location is checked on its own; the holder locations are summed. A location may not be on both sides. |
+| `analysis.highlights.*` | `pool` `retail_network`, `channels` outlet + marketplace + shopify, `top_n` 20, `sold_out_days` 28, `sell_through_pct` 80, `drift_pts` 3, `drift_min_units` 100, `slow_days` 60 | Highlight rules (design 5.3). `pool` must be one of `analysis.pools`. |
+| `analysis.attributes.*` | see the script | `size_map`, `letter_order`, `blank_values`, `gender_map`, `kids_categories`, `size_class_by_category`. Extend the size map from the manifest's unrecognised list. |
+
+Nested blocks are closed sets merged over the defaults; validation messages name the setting path only, never a code or value.
 
 ## Large-balance warning
 
@@ -289,6 +351,7 @@ One exception: a run that fails only at its own manifest write (`write_failed` a
 | `daily_close_write_failed` (in `daily_close_failure_class`; `status` stays `success`) | A daily file could not be written or did not verify, or the close state could not be saved. The hourly latest pair and feed are still published. | Check disk space, permissions and whether the sync client holds a file. The next run retries. |
 | `item_index_publish_failed` (in the manifest `item_index`; `item_index_status: failed`) | The item index could not be built, written to the archive, or delivered to Drive. The previous index stays where it was not replaced (see [Item index](#item-index-schema-v1)). | Report the run reference. |
 | `feed_publish_failed` (in the manifest `feed`; `feed_status: failed`) | The feed could not be built, written to the archive, or delivered to Drive. The previous feed stays where it was not replaced (see [Dashboard feed](#dashboard-feed-schema-v1)). | Report the run reference. |
+| `analysis_read_failed`, `analysis_build_failed`, `analysis_publish_failed` (in `analysis_failure_class`; `status` stays `success`) | The nightly analysis set could not be read, built or published (see [Buying analysis files](#buying-analysis-files-292-s2)). The hourly files are published; the previous analysis set stays. | The next run retries. If it repeats, report the run reference. |
 | `sync_read_failed` | SyncRegistration read failed (for example the wrong time column). | Check `source.sync_registration_time_column`. |
 | `source_error` | Connection or other read failure. | Check SQL Server and the driver. |
 | `write_failed` | The hourly CSV or manifest could not be written or re-read. | Check disk space and folder permissions. |
@@ -308,7 +371,7 @@ One exception: a run that fails only at its own manifest write (`write_failed` a
 
 - `sql_login` under `S4U` is refused at validation: an S4U task cannot read Credential Manager, so every hour would fail as `credential_unavailable`. `windows_integrated` under `Password` is refused too, because it would store a Windows password for no reason.
 - Whatever the pair: the task runs at `RunLevel Limited`. For an admin Windows account that is a filtered token, so membership that comes only through the local Administrators group is not used. The V7 supervised run proves the pair works under the scheduled context; if it does not, do not raise the run level without a separate owner OK.
-- The least-privilege option remains available: a dedicated SQL login with `SELECT` only on the seven tables read (`ItemBatchBalQty`, `StockDTL`, `Item`, `ItemUOM`, `Location`, `ChangeCount`, `SyncRegistration`) and `allow_privileged_identity: false`.
+- The least-privilege option remains available: a dedicated SQL login with `SELECT` only on the seven tables read (`ItemBatchBalQty`, `StockDTL`, `Item`, `ItemUOM`, `Location`, `ChangeCount`, `SyncRegistration`), plus `IV`, `CN` and `DO` when `analysis.enabled` is on, and `allow_privileged_identity: false`.
 - Always: `SUSER_SNAME()='sa'` is refused (case-insensitive), whatever the settings say. The `AUTOCOUNT_EXPECTED_SQL_LOGIN` / `_USER` / `_DATABASE` environment values must be set for the task's account and must match; the run fails closed otherwise.
 
 ## Reconciliation
@@ -362,6 +425,18 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
 - **D7 dashboard v2 update** (needs owner OK, after the dashboard v2 PR is merged): first run step 6 of `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` (column check; all five lengths must be non-NULL), then pull main into the VM clone, run `--dry-run-config`, and one supervised manual run (no `--backfill`). Pass when `status: success`, `item_index_status: published`, `stock_item_index.json.gz` is in Drive beside the feed, and `item_index.counts` look sane. Record the item index size and run time in the private mailbox. No settings change is needed.
 - **D6 first 00:00 close** (needs owner OK to leave it enabled): after the first midnight, check `last_run_status.json` from the 00:00 run: `daily_close_status: published`, `published_close_day` = the day before, exactly one task start at 00:00 (`Get-WinEvent` Task Scheduler history or one 00:xx hourly folder), and the 01:00 run shows `daily_close_status: not_due`.
 
+## #292 S2 VM proof steps (P1-P7)
+
+Each step **needs owner OK**; VM Claude runs them after the S2 PR is merged. None has been run. Results (values, counts, sizes, times) go to the private mailbox only, never to this repository.
+
+- **P1 settings values** (needs owner OK, after the owner's VM data check report): fill the real `analysis` block in the VM's local settings file: `channel_by_location` and `channel_by_debtor` (data check B4), `pools` (B6), the three placement pairs (design Q5), `stock_take_day`, and `attributes` (`size_map` additions, `kids_categories`, `size_class_by_category` from B5). Keep `enabled: false` for now and run `--dry-run-config`.
+- **P2 live check** (needs owner OK): run steps 7 and 8 of `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql`. Step 7: every length must be non-NULL. Keep the step 8 output privately for P5.
+- **P3 switch on** (needs owner OK): pull main into the VM clone, set `analysis.enabled: true`, run `--dry-run-config`.
+- **P4 first build, AC8** (needs owner OK): one supervised manual run (no `--backfill`; the first enabled run is due anyway). Pass when `status: success`, every hourly status as before, `analysis_status: published`, `analysis_close_day` = yesterday, the five analysis files in Drive beside the feed, and `item_index` shows `schema_minor: 2` with sane `items_sized`. Record each file's `bytes` (from `analysis_manifest.json`), `analysis_seconds` and the whole run time; every file must be under 1 MB and the run under 15 s, otherwise G2 decides. Check the manifest's `other` units and `unrecognised_size_values`, and extend the settings if needed.
+- **P5 AC3 reconciliation** (needs owner OK): compare the sales file's `reconcile` rows with live-check step 8 per DocType, location and month (months from `day0` to yesterday); every `net_out` and `qty_in` must match. Then check that the channel units in the manifest add up to the sales and returns DocType totals.
+- **P6 AC4 stock-state check** (needs owner OK): pick 20 item-pool keys (mix of pools, some with zero intervals), and for the last 30 days sum each pool's locations from the daily close CSVs (`stock_close_<day>.csv`, a missing row = 0). The days with a pool total <= 0 after `first_stock_day` must equal the days inside `zero_intervals`, key by key.
+- **P7 first 00:00 build** (needs owner OK to leave it on): after the first midnight, the 00:00 run shows `analysis_status: published` with `analysis_close_day` = the day before, and the 01:00 run shows `not_due`. Rollback at any point: set `analysis.enabled: false` (the hourly files and the item index return to exactly version 1; the last analysis files stay in Drive until removed by hand with the owner's OK).
+
 ## Retention
 
 - Drive keeps one latest pair, the feed, the run status and one daily file pair per day. Nothing in Drive is ever pruned or deleted by the job.
@@ -370,13 +445,13 @@ Each step **needs owner OK**; VM Claude runs them. None has been run. Results (c
   - only inside `archive_root\hourly\` and `archive_root\daily\`, and only names the exporter makes: `<YYYY-MM-DD>\ac2_stockbal_<timestamp>_<8 hex>\` with `stock_balance.csv` / `manifest.json` / `alert_record.json`, and `<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv` / `.manifest.json`;
   - the age comes from the folder or file name, never from file times;
   - anything else (other names, other folders, symlinks or junctions, anything resolving outside the archive) is kept and counted as `kept_unexpected`; a folder is removed only when it is empty;
-  - the current run's folder, `daily\close_state.json.gz`, the latest pair, the feed, the lock and `delivery_root` are never touched.
+  - the current run's folder, `daily\close_state.json.gz`, the latest pair, the feed, the analysis files, the lock and `delivery_root` are never touched.
 - Before round 6 the job also wrote hourly folders into Drive; the owner removed those on 28 Oct 2026. The job does not clean Drive.
 
 ## Out of scope
 
 - **#246** (daily money / buying package): the owner wants AutoCount's Advanced Dimensional report there (most detailed breakdown, for example marketplace shipping fees). New marketplace fee codes can land on a default term (believed to be "Adjustment") until someone adds the term in AC2, so the #246 report should flag unmapped codes. Cost and value belong in #246, not here.
-- The dashboard page: a private Claude artifact that reads `stock_dashboard_feed.json.gz` and `stock_item_index.json.gz` through the viewer's own Drive connector. Its source lives in the private mailbox, not in this repository. This build only writes the files.
+- The dashboard page: a private Claude artifact that reads `stock_dashboard_feed.json.gz` and `stock_item_index.json.gz` (and, from #292 S3, the analysis files) through the viewer's own Drive connector. Its source lives in the private mailbox, not in this repository. This build only writes the files.
 - Consignment stock, a heartbeat or "still alive" alert (owner decision 29 Oct 2026: errors only), Drive API upload, Drive clean-up, SQL logins and grants.
 
 ## Error alerts (email through n8n)

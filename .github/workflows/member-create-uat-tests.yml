@@ -90,6 +90,9 @@ on:
       - "config/autocount_stock_balance_hourly.example.json"
       - "docs/autocount2-automation/stock_balance_hourly_runbook.md"
       - "sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql"
+      # Its nightly buying-analysis builders (#292 S2) and their offline test (`rest` shard).
+      - "scripts/autocount_stock_analysis.py"
+      - "tests/test_autocount_stock_analysis.py"
       # Its error-alert n8n workflow and that workflow's offline contract test, which also reads
       # the n8n-workflows README entry.
       - "n8n-workflows/ac2_stock_alert.workflow.json"
