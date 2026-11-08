@@ -2295,7 +2295,7 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
         if with_attributes:
             attrs = analysis.item_attributes(item, attribute_cfg)
             row.extend(attrs[field] for field in analysis.ATTRIBUTE_FIELDS)
-            counts["items_sized"] = counts.get("items_sized", 0) + (attrs["size"] is not None)
+            counts["items_sized"] = counts.get("items_sized", 0) + analysis.is_sized(attrs)
             counts["items_with_gender"] = counts.get("items_with_gender", 0) + bool(attrs["gender"])
             counts["items_with_category"] = counts.get("items_with_category", 0) + bool(attrs["category"])
         items_out.append(row)
