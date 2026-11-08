@@ -87,9 +87,10 @@ def mv(entries):
 
 
 def item(code, brand="FAKE-BRAND", category="FAKE-JACKET", size="M", gender="M", colour="FAKE-BLUE",
-         style_code="FAKE-STY", style_name="Fake style", stock="T"):
+         style_code="FAKE-STY", style_name="Fake style", stock="T", group="XB"):
     return {
         "ItemCode": code,
+        "ItemGroup": group,
         "ItemDescription": "Fake item",
         "ItemType": brand,
         "ItemBrand": brand,
@@ -491,7 +492,8 @@ class StockStateTests(unittest.TestCase):
         header = {"built_from_close_day": LAST_DAY.isoformat()}
         payload = an.stock_state_payload(state, received, {"outlets": ["LOC-A"]}, header, date(2026, 7, 31), LAST_DAY)
         self.assertEqual(payload["items"], ["FAKE-1"])
-        self.assertEqual(payload["rows"], [[0, 0, 0, [[2, 92]], 0, 2, {"2026-08": 4}]])
+        self.assertEqual(payload["rows"], [[0, 0, 0, [[2, 92]], 0, 2, {"2026-08": 4}, 0]])
+        self.assertEqual((payload["fields"][-1], payload["groups"]), ("group", [""]), "no item master: group blank")
         self.assertEqual(payload["counts"], {"rows": 1, "items": 1, "zero_now": 1})
 
 
@@ -577,7 +579,8 @@ class HighlightsTests(unittest.TestCase):
         self.assertEqual(early["FAKE-3"]["inputs"]["sell_through_pct"], 80.0)
         self.assertIsNone(early["FAKE-3"]["inputs"]["days_to_zero"])
         self.assertEqual(early["FAKE-1"]["brand"], "FAKE-BRAND")
-        self.assertEqual(counts["sold_out_early"], {"lines_before_cap": 2, "brands_truncated": 0})
+        self.assertEqual(counts["sold_out_early"], {"lines_before_cap": 2, "brands_truncated": 0,
+                                                    "lines_by_section": {"main": 2, "other": 0}})
 
     def test_slow_seller(self):
         items = {c: item(c) for c in ("FAKE-1", "FAKE-2", "FAKE-3")}
@@ -627,7 +630,8 @@ class HighlightsTests(unittest.TestCase):
         rows = self.by_rule(lines)["open_placement"]
         self.assertEqual([l["item"] for l in rows], ["FAKE-3", "FAKE-2"], "open only, most zero days first, capped")
         self.assertEqual(rows[0]["inputs"]["pair"], "online_out_shop_has")
-        self.assertEqual(counts["open_placement"], {"lines_before_cap": 3, "brands_truncated": 1, "open_below_min_sold": 0})
+        self.assertEqual(counts["open_placement"], {"lines_before_cap": 3, "brands_truncated": 1, "open_below_min_sold": 0,
+                                                    "lines_by_section": {"main": 2, "other": 0}})
 
     def placement_row(self, code, zero_days, sold):
         return {"item": code, "pair": "online_out_shop_has", "zero_location": "LOC-E", "zero_qty_now": Decimal(0),
@@ -658,6 +662,80 @@ class HighlightsTests(unittest.TestCase):
         lines, _ = self.build([], [], items, cfg(highlights={"placement_min_sold": 0}), placement)
         self.assertEqual([l["item"] for l in self.by_rule(lines)["open_placement"]], ["FAKE-3", "FAKE-2", "FAKE-1"])
 
+    def test_zero_min_sold_lists_every_open_row_including_net_returns(self):
+        """G2 P-L2: placement_min_sold 0 lists every open row, even one whose net sold is negative."""
+        items = {c: item(c) for c in ("FAKE-RET", "FAKE-NONE", "FAKE-SOLD")}
+        placement = [self.placement_row("FAKE-RET", 40, -2), self.placement_row("FAKE-NONE", 30, 0),
+                     self.placement_row("FAKE-SOLD", 1, 2)]
+        lines, counts = self.build([], [], items, cfg(highlights={"placement_min_sold": 0}), placement)
+        got = [l["item"] for l in self.by_rule(lines)["open_placement"]]
+        self.assertEqual(got, ["FAKE-SOLD", "FAKE-RET", "FAKE-NONE"], "every open row; demand first, then most zero days")
+        self.assertEqual(counts["open_placement"]["open_below_min_sold"], 0)
+        lines, counts = self.build([], [], items, cfg(highlights={"placement_min_sold": 1}), placement)
+        self.assertEqual([l["item"] for l in self.by_rule(lines)["open_placement"]], ["FAKE-SOLD"])
+        self.assertEqual(counts["open_placement"]["open_below_min_sold"], 2)
+
+    def test_size_drift_net_returns_count_as_zero_for_shares_only(self):
+        """G2 P-L6: a size whose returns exceed its sales keeps its real net but never a negative share."""
+        items = {"FAKE-S": item("FAKE-S", size="S"), "FAKE-M": item("FAKE-M", size="M"),
+                 "FAKE-L": item("FAKE-L", size="L"), "FAKE-XL": item("FAKE-XL", size="XL")}
+        entries = [(c, "LOC-A", GOLIVE, 10) for c in items]
+        rows = [arow("FAKE-S", "LOC-A", date(2026, 10, 15), "OS", -4),
+                arow("FAKE-M", "LOC-A", date(2026, 10, 15), "OS", -6),
+                arow("FAKE-L", "LOC-A", date(2026, 10, 15), "OS", -10),
+                arow("FAKE-XL", "LOC-A", date(2026, 10, 15), "OS", 3)]   # a return only: net -3
+        lines, _ = self.build(entries, rows, items)
+        drift = {l["inputs"]["size"]: l["inputs"] for l in self.by_rule(lines)["size_drift"]}
+        xl = drift["XL"]
+        self.assertEqual((xl["sold"], xl["sold_for_share"], xl["sold_share_pct"]), (-3, 0, 0.0))
+        self.assertEqual(xl["flags"], ["net returns in window"])
+        self.assertEqual((xl["n_sold"], xl["n_share_units"]), (17, 20))
+        self.assertEqual(drift["L"]["sold_share_pct"], 50.0, "shares of the 20 non-negative units")
+        self.assertEqual(drift["L"]["flags"], [])
+        for inputs in drift.values():
+            self.assertGreaterEqual(inputs["sold_share_pct"], 0)
+        self.assertLessEqual(sum(i["sold_share_pct"] for i in drift.values()), 100.0)
+
+    def test_groups_get_their_own_sections_and_caps(self):
+        """Main (XB) and consignment (CSGN) lines never share a cap; size drift never mixes them."""
+        items = {"FAKE-XB-%d" % n: item("FAKE-XB-%d" % n) for n in range(3)}
+        items.update({"FAKE-CS-%d" % n: item("FAKE-CS-%d" % n, group="CSGN") for n in range(3)})
+        items["FAKE-NOGRP"] = item("FAKE-NOGRP", group="")
+        placement = [self.placement_row(c, 30 if "CS" in c else n, 1) for n, c in enumerate(sorted(items))]
+        lines, counts = self.build([], [], items, cfg(highlights={"top_n": 2}), placement)
+        rows = self.by_rule(lines)["open_placement"]
+        main = [l["item"] for l in rows if l["section"] == "main"]
+        other = [(l["group"], l["item"]) for l in rows if l["section"] == "other"]
+        self.assertEqual(len(main), 2, "CSGN rows with more zero days never take a main slot")
+        self.assertTrue(all(c.startswith("FAKE-XB") for c in main))
+        self.assertEqual([g for g, _ in other], ["", "CSGN", "CSGN"], "each other group capped on its own")
+        self.assertEqual(rows[0]["section"], "main", "main section first")
+        self.assertEqual(counts["open_placement"]["lines_by_section"], {"main": 2, "other": 3})
+        lines, _ = self.build([], [], items, cfg(highlights={"top_n": 2, "main_groups": ["XB", "CSGN"]}), placement)
+        self.assertEqual(sum(1 for l in self.by_rule(lines)["open_placement"] if l["group"] == "CSGN"), 2)
+
+    def test_size_drift_is_computed_per_group_section(self):
+        items = {"FAKE-S": item("FAKE-S", size="S"), "FAKE-L": item("FAKE-L", size="L"),
+                 "FAKE-CS-S": item("FAKE-CS-S", size="S", group="CSGN"), "FAKE-CS-L": item("FAKE-CS-L", size="L", group="CSGN")}
+        entries = [(c, "LOC-A", GOLIVE, 10) for c in items]
+        rows = [arow("FAKE-S", "LOC-A", date(2026, 10, 15), "OS", -5), arow("FAKE-L", "LOC-A", date(2026, 10, 15), "OS", -5),
+                arow("FAKE-CS-S", "LOC-A", date(2026, 10, 15), "OS", -40)]
+        lines, _ = self.build(entries, rows, items)
+        drift = self.by_rule(lines).get("size_drift", [])
+        self.assertTrue(drift)
+        self.assertEqual({l["group"] for l in drift}, {"CSGN"}, "XB alone is 50/50 against 50/50 stocked: no drift")
+
+    def test_main_groups_and_exclusions_are_checked(self):
+        self.assertEqual(an.DEFAULT_ANALYSIS["highlights"]["main_groups"], ["XB"])
+        self.assertEqual(an.DEFAULT_ANALYSIS["exclude_item_codes"], ["Default Item"])
+        self.assertEqual(cfg(highlights={"main_groups": []})["highlights"]["main_groups"], [])
+        for bad in ("XB", [""], ["XB", "XB"], [1]):
+            with self.assertRaises(an.AnalysisSettingsError):
+                cfg(highlights={"main_groups": bad})
+        for bad in ("Default Item", [""], ["A", "a"], [None]):
+            with self.assertRaises(an.AnalysisSettingsError):
+                cfg(exclude_item_codes=bad)
+
     def test_placement_min_sold_is_checked(self):
         for bad in (-1, 1.5, True, 1000001):
             with self.assertRaises(an.AnalysisSettingsError):
@@ -668,7 +746,8 @@ class HighlightsTests(unittest.TestCase):
         lines, _ = self.build([("FAKE-1", "LOC-A", GOLIVE, 6)], [], items)
         self.assertTrue(lines)
         for line in lines:
-            self.assertEqual(set(line), {"rule", "brand", "item", "inputs"})
+            self.assertEqual(set(line), {"rule", "section", "group", "brand", "item", "inputs"})
+            self.assertEqual((line["section"], line["group"]), ("main", "XB"))
             self.assertIn(line["rule"], an.HIGHLIGHT_RULES)
             self.assertIsInstance(line["inputs"], dict)
 
@@ -722,6 +801,51 @@ class BuildAnalysisTests(unittest.TestCase):
         self.assertEqual(len(parts["settings_digest"]), 64)
         manifest = an.manifest_payload(dict(self.header, built_at="x"), [{"name": "f"}], parts)
         self.assertEqual((manifest["schema"], manifest["schema_version"]), (an.MANIFEST_SCHEMA, 1))
+
+    def test_excluded_items_leave_every_file_and_are_counted(self):
+        self.items["Default Item"] = item("Default Item", size="DEFAULT", brand="", group="")
+        self.items["Default Item"]["ItemDescription"] = ""
+        self.moves.setdefault(date(2026, 9, 3), {})[("Default Item", "PCS", "LOC-A")] = Decimal(-7)
+        self.rows.append(arow("Default Item", "LOC-A", date(2026, 9, 3), "OS", -7, rows=3))
+        self.rows.append(arow("DEFAULT ITEM", "LOC-A", date(2026, 9, 4), "OS", -1))   # case does not matter
+        payloads, parts = self.build()
+        text = json.dumps(payloads, default=str).upper()
+        self.assertNotIn("DEFAULT ITEM", text)
+        self.assertEqual(payloads[an.SALES_NAME]["counts"]["excluded_item_rows"], 4)
+        self.assertEqual(parts["excluded_items"], {"codes_configured": 1, "items_in_master": 1,
+                                                   "analysis_rows_excluded": 4, "ledger_movements_excluded": 1})
+        self.assertNotIn("Default Item", json.dumps(parts["excluded_items"]), "counts only, never codes")
+        self.assertNotIn("", parts["size_coverage"], "the placeholder's blank brand never appears")
+        # With the list emptied, the item is analysed like any other.
+        payloads, parts = self.build(cfg(exclude_item_codes=[]))
+        self.assertIn("Default Item", payloads[an.SALES_NAME]["items"])
+        self.assertEqual(parts["excluded_items"]["analysis_rows_excluded"], 0)
+
+    def test_every_row_carries_its_group_and_the_manifest_totals_groups(self):
+        self.items["FAKE-CS"] = item("FAKE-CS", size="S", group="CSGN")
+        self.moves.setdefault(date(2026, 9, 5), {})[("FAKE-CS", "PCS", "LOC-A")] = Decimal(-2)   # no stock take: negative
+        self.rows.append(arow("FAKE-CS", "LOC-A", date(2026, 9, 5), "OS", -3))
+        self.rows.append(arow("FAKE-CS", "LOC-A", date(2026, 9, 6), "OS", 1))
+        payloads, parts = self.build()
+        sales = payloads[an.SALES_NAME]
+        self.assertEqual(sales["fields"][-1], "group")
+        self.assertEqual(len(sales["columns"]["group"]), len(sales["columns"]["item"]))
+        got = {sales["items"][i]: sales["groups"][g] for i, g in zip(sales["columns"]["item"], sales["columns"]["group"])}
+        self.assertEqual(got, {"FAKE-1": "XB", "FAKE-2": "XB", "FAKE-CS": "CSGN"})
+        state = payloads[an.STATE_NAME]
+        gpos = state["fields"].index("group")
+        self.assertEqual({state["items"][r[0]]: state["groups"][r[gpos]] for r in state["rows"]},
+                         {"FAKE-1": "XB", "FAKE-2": "XB"})
+        self.assertEqual(payloads[an.PLACEMENT_NAME]["fields"][-1], "group")
+        self.assertEqual(parts["main_groups"], ["XB"])
+        groups = parts["groups"]
+        self.assertEqual(sorted(groups), ["CSGN", "XB"])
+        self.assertEqual((groups["CSGN"]["main"], groups["CSGN"]["sold_units"], groups["CSGN"]["returned_units"]), (False, 2, 1))
+        self.assertEqual((groups["XB"]["main"], groups["XB"]["items"], groups["XB"]["sold_units"]), (True, 2, 5))
+        self.assertEqual(groups["XB"]["qty_now_by_pool"]["retail"], 2)
+        highlights = payloads[an.HIGHLIGHTS_NAME]
+        self.assertEqual(highlights["main_groups"], ["XB"])
+        self.assertEqual(set(highlights["sections"]), {"main", "other"})
 
     def test_no_debtor_code_cost_or_document_data_in_any_output(self):
         payloads, parts = self.build(cfg(channel_by_debtor={FAKE_DEBTOR: "shopify", FAKE_DEBTOR_MKT: "marketplace"}))
