@@ -75,6 +75,7 @@ from autocount_stock_extract import (  # noqa: E402 - reuse, the daily extractor
     sanitize_error,
 )
 from csv_safety import safe_csv_row  # noqa: E402
+import autocount_stock_analysis as analysis  # noqa: E402 - #292 S2 nightly buying-analysis files.
 
 JOB = "ac2_hourly_stock_balance"
 # 2: round 6 adds the ledger check, the daily close, the feed and retention blocks.
@@ -100,6 +101,8 @@ FEED_SCHEMA_VERSION = 1
 ITEM_INDEX_NAME = "stock_item_index.json.gz"
 ITEM_INDEX_SCHEMA = "xb.ac2.stock_item_index"
 ITEM_INDEX_SCHEMA_VERSION = 1
+# #292 S2: additive attribute fields; the major version stays 1.
+ITEM_INDEX_SCHEMA_MINOR_ATTRIBUTES = 2
 # Close history per item and location kept in the item index (never before backfill_start).
 ITEM_HISTORY_DAYS = 90
 DAILY_JOB = "ac2_daily_stock_close"
@@ -200,6 +203,15 @@ FAILURE_LEDGER_MISMATCH = "ledger_mismatch"
 FAILURE_CLOSE_WRITE = "daily_close_write_failed"
 FAILURE_FEED = "feed_publish_failed"
 FAILURE_ITEM_INDEX = "item_index_publish_failed"
+# #292 S2: the nightly analysis set. Never changes the hourly snapshot's status.
+FAILURE_ANALYSIS_READ = "analysis_read_failed"
+FAILURE_ANALYSIS_BUILD = "analysis_build_failed"
+FAILURE_ANALYSIS_PUBLISH = "analysis_publish_failed"
+ANALYSIS_DISABLED = "disabled"
+ANALYSIS_NOT_DUE = "not_due"
+ANALYSIS_PUBLISHED = "published"
+ANALYSIS_FAILED = "failed"
+ANALYSIS_SKIPPED = "skipped_failed_run"
 
 CLOSE_NOT_DUE = "not_due"
 CLOSE_PUBLISHED = "published"
@@ -366,11 +378,34 @@ ITEM_MASTER_QUERY = """SELECT
     i.ItemGroup,
     i.ItemBrand
 FROM dbo.Item AS i"""
+# #292 S2: the same read plus the structured attribute columns, used only when analysis.enabled
+# is true (run live-check step 7 first: a missing column fails the run as source_error).
+ITEM_MASTER_ATTRIBUTE_QUERY = """SELECT
+    i.ItemCode,
+    i.Description AS ItemDescription,
+    i.ItemType,
+    i.IsActive,
+    i.StockControl,
+    i.BaseUOM,
+    i.ItemGroup,
+    i.ItemBrand,
+    i.ItemCategory,
+    i.ItemClass,
+    i.Desc2,
+    i.UDF_StockSize AS StockSize,
+    i.UDF_StockGender AS StockGender,
+    i.UDF_StockColour AS StockColour
+FROM dbo.Item AS i"""
 LOCATION_QUERY = "SELECT l.Location, l.Description AS LocationDescription FROM dbo.Location AS l"
 # Barcode, reorder level and minimum quantity live in dbo.ItemUOM, one row per item and UOM (R1:
 # no reorder column in dbo.Item). The feed lists ReOLevel beside low-stock rows for information
 # (its rule stays feed.low_stock_threshold); the item index carries all three for the dashboard.
 ITEM_UOM_QUERY = "SELECT u.ItemCode, u.UOM, u.BarCode, u.ReOLevel, u.MinQty FROM dbo.ItemUOM AS u"
+
+
+def item_master_query(settings):
+    """The item master read for these settings (attribute columns only with analysis on)."""
+    return ITEM_MASTER_ATTRIBUTE_QUERY if settings["analysis"]["enabled"] else ITEM_MASTER_QUERY
 
 
 def sync_query(column):
@@ -493,6 +528,9 @@ DEFAULT_SETTINGS = {
         "timeout_seconds": 10,
         "repeat_hours": 24,
     },
+    # #292 S2 nightly buying-analysis files. Off by default; validated by
+    # autocount_stock_analysis.validate_analysis (nested blocks are closed sets too).
+    "analysis": copy.deepcopy(analysis.DEFAULT_ANALYSIS),
 }
 # Sections whose keys are a closed set. location_labels is an open code -> label map.
 CLOSED_SECTIONS = (
@@ -641,6 +679,10 @@ def validate_settings(raw):
     _require_int(feed["list_cap"], "feed.list_cap", 1, 5000)
     _require_int(feed["movers_top"], "feed.movers_top", 1, 200)
     _validate_alert_settings(settings["alert"], schedule["logon_type"])
+    try:
+        settings["analysis"] = analysis.validate_analysis(raw.get("analysis"))
+    except analysis.AnalysisSettingsError as exc:
+        raise ConfigError(str(exc)) from exc
     return settings
 
 
@@ -922,6 +964,7 @@ class SqlServerSession:
         self.connection = connection
         self.error_type = error_type
         self.sync_column = settings["source"]["sync_registration_time_column"]
+        self.item_master_sql = item_master_query(settings)
         read = settings["read"]
         connection.timeout = int(read["query_timeout_seconds"])
         # Validated whole number; SET LOCK_TIMEOUT does not take a parameter marker.
@@ -974,13 +1017,17 @@ class SqlServerSession:
         return self._fetch_dicts(LEDGER_QUERY)
 
     def read_item_master(self):
-        return self._fetch_dicts(ITEM_MASTER_QUERY)
+        return self._fetch_dicts(self.item_master_sql)
 
     def read_locations(self):
         return self._fetch_dicts(LOCATION_QUERY)
 
     def read_item_uoms(self):
         return self._fetch_dicts(ITEM_UOM_QUERY)
+
+    def read_analysis_sales(self, sql, params):
+        """#292 S2: the grouped analysis read (autocount_stock_analysis.sales_query)."""
+        return self._fetch_dicts(sql, params)
 
     def read_sync(self):
         try:
@@ -1006,8 +1053,8 @@ class SqlServerSession:
         except self.error_type as exc:
             raise _classify_sql_error(exc) from exc
 
-    def _fetch_dicts(self, sql):
-        cursor = self._run(sql)
+    def _fetch_dicts(self, sql, params=None):
+        cursor = self._run(sql, params)
         try:
             columns = [c[0] for c in cursor.description or []]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -2208,6 +2255,10 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
         value = to_decimal(value)
         return _num(value) if value > 0 else None
 
+    # #292 S2: structured attributes (schema_minor 2) only when analysis.enabled is true; with it
+    # off the index is exactly the version-1 file, byte for byte.
+    with_attributes = settings["analysis"]["enabled"]
+    attribute_cfg = settings["analysis"]["attributes"]
     counts = {
         "items": len(codes),
         "inactive_without_stock_or_movement_excluded": quiet_inactive,
@@ -2230,19 +2281,24 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
         counts["items_without_barcode"] += not barcode
         counts["items_with_reorder_level"] += reorder_level is not None
         counts["items_with_min_qty"] += min_qty is not None
-        items_out.append(
-            [
-                code,
-                description,
-                barcode,
-                _clean(item.get("ItemGroup")),
-                _clean(item.get("ItemBrand")),
-                uom,
-                _clean(item.get("IsActive")) == "T",
-                reorder_level,
-                min_qty,
-            ]
-        )
+        row = [
+            code,
+            description,
+            barcode,
+            _clean(item.get("ItemGroup")),
+            _clean(item.get("ItemBrand")),
+            uom,
+            _clean(item.get("IsActive")) == "T",
+            reorder_level,
+            min_qty,
+        ]
+        if with_attributes:
+            attrs = analysis.item_attributes(item, attribute_cfg)
+            row.extend(attrs[field] for field in analysis.ATTRIBUTE_FIELDS)
+            counts["items_sized"] = counts.get("items_sized", 0) + (attrs["size"] is not None)
+            counts["items_with_gender"] = counts.get("items_with_gender", 0) + bool(attrs["gender"])
+            counts["items_with_category"] = counts.get("items_with_category", 0) + bool(attrs["category"])
+        items_out.append(row)
 
     # Non-stock keys never reach here: the latest rows and the movements already exclude them.
     locations = sorted({k[2] for k in keys} | {k[2] for k in history})
@@ -2257,7 +2313,16 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
     ]
     counts["stock_keys"] = len(stock_out)
     counts["history_keys"] = len(history_out)
+    item_fields = ["code", "description", "barcode", "group", "brand", "uom", "active", "reorder_level", "min_qty"]
+    extra = {}
+    if with_attributes:
+        for key in ("items_sized", "items_with_gender", "items_with_category"):
+            counts.setdefault(key, 0)
+        # Additive: new fields are appended, so readers that find fields by name keep working.
+        item_fields += list(analysis.ATTRIBUTE_FIELDS)
+        extra["schema_minor"] = ITEM_INDEX_SCHEMA_MINOR_ATTRIBUTES
     return {
+        **extra,
         "schema": ITEM_INDEX_SCHEMA,
         "schema_version": ITEM_INDEX_SCHEMA_VERSION,
         "job": JOB,
@@ -2271,7 +2336,7 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
         "low_stock_default_threshold": settings["feed"]["low_stock_threshold"],
         "large_balance_threshold": settings["output"]["large_balance_threshold"],
         "locations": locations,
-        "item_fields": ["code", "description", "barcode", "group", "brand", "uom", "active", "reorder_level", "min_qty"],
+        "item_fields": item_fields,
         "items": items_out,
         "stock_fields": ["item", "location", "qty", "last_movement"],
         "stock": stock_out,
@@ -2279,6 +2344,130 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
         "history": history_out,
         "counts": counts,
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# #292 S2: nightly buying-analysis set (analysis.enabled, default off)
+# ---------------------------------------------------------------------------------------------
+
+
+def published_analysis_day(root):
+    """built_from_close_day of the analysis manifest in root, or None (missing or unreadable)."""
+    try:
+        data = json.loads((Path(root) / analysis.MANIFEST_NAME).read_text(encoding="utf-8"))
+        day = data["built_from_close_day"]
+        if not isinstance(day, str) or not HOURLY_DATE_DIR_RE.match(day):
+            return None
+        date.fromisoformat(day)
+        return day
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def plan_analysis(archive_root, delivery_root, last_day, force):
+    """(due, archive_day). Due on the first successful run after local midnight: when the archive
+    or the Drive copy has no set for last_day yet. A failed build or publish is retried by the next
+    run, the same self-healing rule as the daily close. --backfill always rebuilds."""
+    roots = [archive_root] + ([delivery_root] if delivery_root else [])
+    days = [published_analysis_day(root) for root in roots]
+    due = force or any(day is None or day < last_day.isoformat() for day in days)
+    return due, days[0]
+
+
+def read_analysis_rows(source, settings, environ, start, last_day):
+    """The analysis read, on its own connection, after the hourly files are safe.
+
+    Identity is checked again before the business read. It sits outside the hourly ChangeCount
+    window on purpose, so its failure can never fail the hourly snapshot; it only reads rows dated
+    up to last_day, and the next nightly build picks up any backdated posting.
+    """
+    cfg = settings["analysis"]
+    with source.open_session() as session:
+        check_identity(session.read_identity(), settings, environ)
+        return session.read_analysis_sales(analysis.sales_query(cfg), analysis.sales_params(cfg, start, last_day))
+
+
+def _analysis_result(status, failure_class=None):
+    return {"status": status, "failure_class": failure_class, "published_close_day": None, "seconds": None}
+
+
+def run_analysis(settings, source, environ, archive_root, delivery_root, work, run_id, written_at, as_of_local,
+                 force, monotonic=time.monotonic):
+    """Build and publish the analysis set when due. Never raises; returns the analysis result.
+
+    Files go to the archive as one verified set (data files first, analysis_manifest.json last),
+    then to the Drive sync folder as the same set. Any failure keeps the previous set in place.
+    """
+    cfg = settings["analysis"]
+    result = _analysis_result(ANALYSIS_DISABLED)
+    if not cfg["enabled"]:
+        return result
+    began = monotonic()
+    last_day = work["today"] - timedelta(days=1)
+    due, archive_day = plan_analysis(archive_root, delivery_root, last_day, force)
+    result["published_close_day"] = archive_day
+    if not due:
+        result["status"] = ANALYSIS_NOT_DUE
+        return result
+    result["status"] = ANALYSIS_FAILED
+    ledger = work["ledger"]
+    first_day = ledger["counts"]["first_day"]
+    first = date.fromisoformat(first_day) if first_day else None
+    try:
+        rows = read_analysis_rows(source, settings, environ, analysis.window_from(first, last_day, cfg), last_day)
+    except Exception:  # noqa: BLE001 - identity, lock, SQL or credential failure: analysis only.
+        result["failure_class"] = FAILURE_ANALYSIS_READ
+        return result
+    tag = run_id[:8]
+    try:
+        items = ledger["items"]
+        rows_cfg = settings["rows"]
+
+        def is_non_stock(code):
+            return code in items and is_non_stock_item(items[code], rows_cfg)
+
+        header = {
+            "job": JOB,
+            "run_id": run_id,
+            "as_of_local": as_of_local,
+            "timezone": settings["timezone"],
+            "built_from_close_day": last_day.isoformat(),
+        }
+        payloads, parts = analysis.build_analysis(
+            cfg, rows, ledger["movements"], items, is_non_stock, first, last_day, header
+        )
+        entries = []
+        files = []
+        for name, schema in analysis.DATA_FILES:
+            data = gzip_json_bytes(payloads[name])
+            entries.append((name, data))
+            files.append({
+                "name": name,
+                "schema": schema,
+                "schema_version": analysis.SCHEMA_VERSION,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data),
+                "counts": payloads[name]["counts"],
+            })
+        manifest = analysis.manifest_payload(dict(header, built_at=written_at), files, parts)
+        entries.append((analysis.MANIFEST_NAME, json_bytes(manifest)))
+    except Exception:  # noqa: BLE001 - a builder bug must not touch the hourly files.
+        result["failure_class"] = FAILURE_ANALYSIS_BUILD
+        return result
+    try:
+        publish_verified_set([(Path(archive_root) / name, data) for name, data in entries], tag)
+        if delivery_root:
+            publish_verified_set([(Path(delivery_root) / name, data) for name, data in entries], tag)
+    except OSError:
+        result["failure_class"] = FAILURE_ANALYSIS_PUBLISH
+        return result
+    result.update(
+        status=ANALYSIS_PUBLISHED,
+        published_close_day=last_day.isoformat(),
+        seconds=round(monotonic() - began, 3),
+        files=[{"name": f["name"], "sha256": f["sha256"], "bytes": f["bytes"]} for f in files],
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2607,12 +2796,16 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
                 "items_without_rows": query_sha256(ITEMS_WITHOUT_ROWS_QUERY),
                 "multi_uom": query_sha256(MULTI_UOM_QUERY),
                 "ledger": query_sha256(LEDGER_QUERY),
-                "item_master": query_sha256(ITEM_MASTER_QUERY),
+                "item_master": query_sha256(item_master_query(settings)),
                 "locations": query_sha256(LOCATION_QUERY),
                 "item_uom": query_sha256(ITEM_UOM_QUERY),
                 "sync": query_sha256(sync_query(settings["source"]["sync_registration_time_column"])),
                 "identity": query_sha256(IDENTITY_QUERY),
                 "change_count": query_sha256(CHANGE_COUNT_QUERY),
+                **(
+                    {"analysis_sales": query_sha256(analysis.sales_query(settings["analysis"]))}
+                    if settings["analysis"]["enabled"] else {}
+                ),
             },
             "settings_sha256": settings_sha256(settings),
             "git_commit": git_commit(),
@@ -2841,6 +3034,22 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
     elif manifest["status"] != "success" and delivery_root and manifest["delivery"]["status"] == DELIVERY_PENDING:
         final_delivery = DELIVERY_SKIPPED
 
+    # #292 S2: last, after every hourly file is in place, so the nightly build can never delay or
+    # block them. Its outcome is recorded only in last_run_status.json and analysis_manifest.json.
+    if not settings["analysis"]["enabled"]:
+        analysis_result = _analysis_result(ANALYSIS_DISABLED)
+    elif manifest["status"] == "success" and work is not None:
+        try:
+            analysis_result = run_analysis(
+                settings, source, environ, archive_root, delivery_root, work, run_id, started.isoformat(),
+                manifest["as_of_local"], force_close,
+            )
+        except Exception:  # noqa: BLE001 - run_analysis never raises; this is a last guard.
+            analysis_result = _analysis_result(ANALYSIS_FAILED, FAILURE_INTERNAL)
+    else:
+        analysis_result = _analysis_result(ANALYSIS_SKIPPED)
+    manifest["_analysis"] = analysis_result
+
     close = manifest["daily_close"]
     status = {
         "job": JOB,
@@ -2862,6 +3071,10 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "late_change_day_count": close.get("late_change_day_count"),
         "feed_status": (manifest["feed"] or {}).get("status"),
         "item_index_status": (manifest["item_index"] or {}).get("status"),
+        "analysis_status": analysis_result["status"],
+        "analysis_failure_class": analysis_result["failure_class"],
+        "analysis_close_day": analysis_result["published_close_day"],
+        "analysis_seconds": analysis_result["seconds"],
         "next_run_local": next_run_local(started, settings["schedule"]["run_minute"]),
     }
     # Last step before the status file: the alert reads the final status, and its own outcome is
@@ -3382,6 +3595,7 @@ def main(argv=None, source=None, environ=None, clock=None, alert_transport=None,
             "published_close_day": status["published_close_day"],
             "feed_status": status["feed_status"],
             "item_index_status": status["item_index_status"],
+            "analysis_status": status["analysis_status"],
             "alert_status": status["alert_status"],
             "message": manifest["message"],
         }
@@ -3393,6 +3607,9 @@ def main(argv=None, source=None, environ=None, clock=None, alert_transport=None,
     if status["daily_close_status"] == CLOSE_FAILED or status["feed_status"] != "published":
         return EXIT_FAILED
     if status["item_index_status"] != "published":
+        return EXIT_FAILED
+    if status["analysis_status"] == ANALYSIS_FAILED:
+        # Same rule as the feed and item index: visible in Task Scheduler, hourly files unaffected.
         return EXIT_FAILED
     # alert_status is deliberately not read: an alert outcome never changes the exit code.
     return EXIT_OK

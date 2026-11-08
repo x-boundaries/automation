@@ -219,12 +219,22 @@ class FakeSession:
             raise hourly.SyncReadError("SyncRegistration read failed")
         return copy.deepcopy(self.source.sync_rows)
 
+    def read_analysis_sales(self, sql, params):
+        self.source.analysis_reads.append((sql, list(params)))
+        if self.source.analysis_error:
+            raise hourly.SourceReadError("SQL read failed")
+        return copy.deepcopy(self.source.analysis_rows)
+
 
 class FakeSource:
     def __init__(self, balances=None, no_row_items=None, sync_rows=None, identity=None,
                  changecounts=None, multi_uom=0, lock_timeouts=None, sync_error=False, ledger=None,
-                 item_master=None, locations=None, item_uoms=None, sql_now=SQL_NOW):
+                 item_master=None, locations=None, item_uoms=None, sql_now=SQL_NOW, analysis_rows=None,
+                 analysis_error=False):
         self.sql_now = sql_now
+        self.analysis_rows = list(analysis_rows or [])
+        self.analysis_error = analysis_error
+        self.analysis_reads = []
         self.balances = default_balances() if balances is None else balances
         self.ledger = ledger
         self.item_master = item_master
@@ -345,6 +355,19 @@ class ConfigValidationTests(TempDirTestCase):
         self.assertEqual(settings["daily_close"], {"backfill_start": "2026-08-01", "restate_days": 7})
         self.assertFalse(settings["retention"]["prune_enabled"], "pruning is switched on at the VM step only")
         self.assertTrue(settings["rows"]["exclude_non_stock_items"])
+        # #292 S2: off by default, fake codes only; the real maps are filled at VM proof.
+        analysis_cfg = settings["analysis"]
+        self.assertFalse(analysis_cfg["enabled"])
+        locations = set(analysis_cfg["channel_by_location"])
+        for pool in analysis_cfg["pools"].values():
+            locations |= set(pool)
+        for pair in analysis_cfg["placement"]["pairs"]:
+            locations |= set(pair["zero_locations"]) | set(pair["holder_locations"])
+        self.assertTrue(locations and all(code.startswith("LOC-") for code in locations))
+        self.assertTrue(all(code.startswith("FAKE-") for code in analysis_cfg["channel_by_debtor"]))
+        self.assertTrue(all(c.startswith("FAKE-") for c in analysis_cfg["attributes"]["size_class_by_category"]))
+        self.assertEqual([p["id"] for p in analysis_cfg["placement"]["pairs"]],
+                         ["held_at_wholesale", "online_out_shop_has", "transfer_from_hq"])
 
     def test_defaults_apply(self):
         settings = settings_for(self.tmp)
@@ -1689,6 +1712,12 @@ class QueryContractTests(unittest.TestCase):
         hourly.LOCATION_QUERY,
         # Dashboard v2: barcode, reorder level and minimum quantity per item and UOM.
         hourly.ITEM_UOM_QUERY,
+        # #292 S2: the attribute item master read and the analysis read for the example settings.
+        hourly.ITEM_MASTER_ATTRIBUTE_QUERY,
+        hourly.analysis.sales_query(
+            hourly.validate_settings(json.loads((ROOT / "config" / "autocount_stock_balance_hourly.example.json")
+                                                .read_text(encoding="utf-8")))["analysis"]
+        ),
     )
 
     def test_no_cost_column(self):
@@ -1703,6 +1732,25 @@ class QueryContractTests(unittest.TestCase):
             self.assertNotIn("NOLOCK", query.upper())
             self.assertNotIn("SNAPSHOT", query.upper())
             self.assertNotIn("CHANGELOG", query.upper().replace("CHANGECOUNT", ""))
+
+    def test_no_money_document_or_party_column(self):
+        for query in self.QUERIES:
+            lowered = query.lower()
+            for word in ("price", "amount", "docno", "creditor"):
+                self.assertNotIn(word, lowered)
+            # The debtor code is only ever compared inside SQL Server, never selected.
+            self.assertNotIn("debtorcode", lowered.split("from", 1)[0])
+
+    def test_attribute_item_master_read_adds_only_the_attribute_columns(self):
+        base = hourly.ITEM_MASTER_QUERY.replace("FROM dbo.Item AS i", "").strip()
+        attr = hourly.ITEM_MASTER_ATTRIBUTE_QUERY
+        self.assertTrue(attr.startswith(base))
+        extra = attr[len(base):].replace("FROM dbo.Item AS i", "")
+        self.assertEqual(
+            [c.strip() for c in extra.split(",") if c.strip()],
+            ["i.ItemCategory", "i.ItemClass", "i.Desc2", "i.UDF_StockSize AS StockSize",
+             "i.UDF_StockGender AS StockGender", "i.UDF_StockColour AS StockColour"],
+        )
 
     def test_balance_query_shape(self):
         q = hourly.BALANCE_QUERY
@@ -1766,6 +1814,16 @@ class LiveCheckSqlTests(unittest.TestCase):
         for table, column in (("Item", "ItemGroup"), ("Item", "ItemBrand"), ("ItemUOM", "BarCode"),
                               ("ItemUOM", "ReOLevel"), ("ItemUOM", "MinQty")):
             self.assertIn("COL_LENGTH(N'dbo.%s', N'%s')" % (table, column), self.code)
+
+    def test_analysis_column_check(self):
+        # #292 S2: every column the attribute item master read and the analysis read select.
+        for table, column in (("Item", "ItemCategory"), ("Item", "ItemClass"), ("Item", "Desc2"),
+                              ("Item", "UDF_StockSize"), ("Item", "UDF_StockGender"), ("Item", "UDF_StockColour"),
+                              ("StockDTL", "DocType"), ("StockDTL", "DocKey"), ("IV", "DocKey"), ("IV", "DebtorCode"),
+                              ("CN", "DocKey"), ("CN", "DebtorCode"), ("DO", "DocKey"), ("DO", "DebtorCode")):
+            self.assertIn("COL_LENGTH(N'dbo.%s', N'%s')" % (table, column), self.code)
+        # Counts per DocType and location only: the debtor code is never selected or grouped.
+        self.assertNotIn("DebtorCode,", self.code.replace("COL_LENGTH(N'dbo.IV', N'DebtorCode')", ""))
 
 
 class InstallerTests(unittest.TestCase):
@@ -3711,6 +3769,246 @@ class CloseStateWarningTests(Round6TestCase):
         )
         self.assertEqual((manifest["daily_close"]["mode"], manifest["daily_close"]["state"]), ("backfill", "missing"))
         self.assertFalse([w for w in manifest["warnings"] if w.startswith("Close state was")])
+
+
+# ---------------------------------------------------------------------------------------------
+# #292 S2: nightly buying-analysis set (AC6, AC7 and the exporter side of AC1)
+# ---------------------------------------------------------------------------------------------
+
+FAKE_DEBTOR = "FAKE-DEBTOR-ONLINE"
+ANALYSIS_ON = {
+    "enabled": True,
+    "channel_by_location": {"LOC-A": {"OS": "outlet"}},
+    "channel_by_debtor": {FAKE_DEBTOR: "shopify"},
+    "pools": {"retail": ["LOC-A", "LOC-B"], "outlets": ["LOC-A"]},
+    "placement": {"pairs": [{"id": "fake_pair", "label": "Fake pair", "zero_locations": ["LOC-B"],
+                             "holder_locations": ["LOC-A"]}]},
+    "highlights": {"pool": "retail"},
+}
+ANALYSIS_FILES = [name for name, _ in hourly.analysis.DATA_FILES] + [hourly.analysis.MANIFEST_NAME]
+# The fields the live dashboard page (Version 6) requires in the item index (its buildIndex).
+PAGE_REQUIRED_ITEM_FIELDS = ["code", "description", "barcode", "group", "brand", "uom", "active"]
+PAGE_REQUIRED_STOCK_FIELDS = ["item", "location", "qty", "last_movement"]
+
+
+def arow(item, loc, day, doc_type, qty, debtor_channel=None, has_debtor=0):
+    qty = Decimal(str(qty))
+    return {"ItemCode": item, "Location": loc, "DocDay": day, "DocType": doc_type, "DebtorChannel": debtor_channel,
+            "HasDebtor": has_debtor, "Qty": qty, "QtyIn": max(qty, Decimal(0)), "LedgerRows": 1}
+
+
+def aug_analysis_rows():
+    return [arow("FAKE-A", "LOC-A", date(2026, 8, 2), "OS", -2)]
+
+
+def attr_master(item, size="M", gender="MEN", category="FAKE-JACKET", **kwargs):
+    row = master(item, **kwargs)
+    row.update({"ItemCategory": category, "ItemClass": "FAKE-STY", "Desc2": "Fake style", "StockSize": size,
+                "StockGender": gender, "StockColour": "FAKE-BLUE"})
+    return row
+
+
+def page_build_index(raw):
+    """The live page's buildIndex shape check, ported: fields found by name, extras ignored."""
+    item_pos = {f: i for i, f in enumerate(raw["item_fields"])}
+    stock_pos = {f: i for i, f in enumerate(raw["stock_fields"])}
+    for key in PAGE_REQUIRED_ITEM_FIELDS:
+        if key not in item_pos:
+            raise ValueError("shape")
+    for key in PAGE_REQUIRED_STOCK_FIELDS:
+        if key not in stock_pos:
+            raise ValueError("shape")
+    return {row[item_pos["code"]]: {k: row[item_pos[k]] for k in PAGE_REQUIRED_ITEM_FIELDS} for row in raw["items"]}
+
+
+class AnalysisRunTests(Round6TestCase):
+    def on(self, **overrides):
+        return self.settings(analysis=copy.deepcopy(ANALYSIS_ON), **overrides)
+
+    def source(self, when, rows=None, items=None, **kwargs):
+        return ledger_source(aug_ledger(), AUG_ITEMS if items is None else items, sql_now=when + timedelta(seconds=1),
+                             analysis_rows=aug_analysis_rows() if rows is None else rows, **kwargs)
+
+    def go(self, settings, when, source=None, force=False):
+        source = source or self.source(when)
+        manifest = hourly.run_hourly(settings, source=source, environ=ENV, clock=clock_at(when),
+                                     sleep=lambda seconds: None, force_close=force)
+        return manifest, source
+
+    def status(self, root=None):
+        return json.loads((Path(root or self.archive) / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+
+    def files(self, root):
+        return {name: (Path(root) / name).read_bytes() for name in ANALYSIS_FILES if (Path(root) / name).exists()}
+
+    def gz(self, root, name):
+        return json.loads(gzip.decompress((Path(root) / name).read_bytes()))
+
+    def test_off_by_default_changes_nothing(self):
+        manifest, source = self.go(self.settings(), at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual(source.analysis_reads, [])
+        status = self.status()
+        self.assertEqual((status["analysis_status"], status["analysis_failure_class"]), ("disabled", None))
+        self.assertEqual(self.files(self.archive), {})
+        index = json.loads(gzip.decompress((self.archive / hourly.ITEM_INDEX_NAME).read_bytes()))
+        self.assertNotIn("schema_minor", index)
+        self.assertEqual(len(index["item_fields"]), 9)
+        self.assertEqual(manifest["source"]["queries_sha256"]["item_master"], hourly.query_sha256(hourly.ITEM_MASTER_QUERY))
+        self.assertNotIn("analysis_sales", manifest["source"]["queries_sha256"])
+
+    def test_nightly_build_publishes_one_verified_set(self):
+        settings = self.on(output={"delivery_root": str(self.delivery)})
+        manifest, source = self.go(settings, at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        status = self.status(self.delivery)
+        self.assertEqual((status["analysis_status"], status["analysis_close_day"]), ("published", "2026-08-03"))
+        self.assertIsInstance(status["analysis_seconds"], float)
+        archive, drive = self.files(self.archive), self.files(self.delivery)
+        self.assertEqual(sorted(archive), sorted(ANALYSIS_FILES))
+        self.assertEqual(archive, drive, "Drive gets the same verified set")
+        meta = json.loads(archive[hourly.analysis.MANIFEST_NAME])
+        self.assertEqual((meta["schema"], meta["schema_version"]), ("xb.ac2.analysis_manifest", 1))
+        self.assertEqual((meta["built_from_close_day"], meta["run_id"]), ("2026-08-03", manifest["run_id"]))
+        self.assertEqual([f["name"] for f in meta["files"]], ANALYSIS_FILES[:-1])
+        for entry in meta["files"]:
+            self.assertEqual(entry["sha256"], hashlib.sha256(archive[entry["name"]]).hexdigest())
+            self.assertEqual(entry["bytes"], len(archive[entry["name"]]))
+            self.assertEqual(archive[entry["name"]][:2], b"\x1f\x8b")
+        sales = self.gz(self.archive, hourly.analysis.SALES_NAME)
+        self.assertEqual((sales["items"], sales["columns"]["sold"]), (["FAKE-A"], [2]))
+        state = self.gz(self.archive, hourly.analysis.STATE_NAME)
+        self.assertEqual(state["day0"], "2026-07-03", "the window starts at the first ledger row")
+        # One extra session for the analysis read, identity checked again before it.
+        self.assertEqual(len(source.analysis_reads), 1)
+        self.assertEqual(source.identity_reads, 2)
+        sql, params = source.analysis_reads[0]
+        self.assertEqual(sql, hourly.analysis.sales_query(settings["analysis"]))
+        self.assertEqual(params[-2:], [date(2026, 7, 3), date(2026, 8, 4)])
+        self.assertEqual(manifest["source"]["queries_sha256"]["analysis_sales"], hourly.query_sha256(sql))
+        self.assertEqual(manifest["source"]["queries_sha256"]["item_master"],
+                         hourly.query_sha256(hourly.ITEM_MASTER_ATTRIBUTE_QUERY))
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [])
+
+    def test_later_runs_the_same_day_are_not_due_and_the_next_day_is(self):
+        settings = self.on()
+        self.go(settings, at(2026, 8, 4))
+        before = self.files(self.archive)
+        _manifest, source = self.go(settings, at(2026, 8, 4, 1))
+        self.assertEqual(source.analysis_reads, [])
+        self.assertEqual((self.status()["analysis_status"], self.status()["analysis_close_day"]), ("not_due", "2026-08-03"))
+        self.assertEqual(self.files(self.archive), before)
+        _manifest, source = self.go(settings, at(2026, 8, 5))
+        self.assertEqual(len(source.analysis_reads), 1)
+        self.assertEqual(self.status()["analysis_close_day"], "2026-08-04")
+
+    def test_backfill_rebuilds(self):
+        settings = self.on()
+        self.go(settings, at(2026, 8, 4))
+        _manifest, source = self.go(settings, at(2026, 8, 4, 2), force=True)
+        self.assertEqual((len(source.analysis_reads), self.status()["analysis_status"]), (1, "published"))
+
+    def test_read_failure_never_blocks_the_hourly_files_and_is_retried(self):
+        settings = self.on(output={"delivery_root": str(self.delivery)})
+        manifest, _source = self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), analysis_error=True))
+        self.assertEqual(manifest["status"], "success")
+        status = self.status(self.delivery)
+        self.assertEqual((status["status"], status["delivery_status"], status["feed_status"], status["item_index_status"]),
+                         ("success", "handed_to_drive_sync_folder", "published", "published"))
+        self.assertEqual((status["analysis_status"], status["analysis_failure_class"]), ("failed", "analysis_read_failed"))
+        for name in (hourly.LATEST_CSV_NAME, hourly.FEED_NAME, hourly.ITEM_INDEX_NAME):
+            self.assertTrue((self.delivery / name).exists(), name)
+        self.assertEqual(self.files(self.archive), {})
+        _manifest, source = self.go(settings, at(2026, 8, 4, 1))
+        self.assertEqual((len(source.analysis_reads), self.status()["analysis_status"]), (1, "published"))
+
+    def test_read_failure_exits_one_and_prints_the_status(self):
+        path = Path(self.tmp) / "settings.local.json"
+        raw = raw_settings(self.tmp, analysis=copy.deepcopy(ANALYSIS_ON))
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=FakeSource(analysis_error=True), environ=ENV, clock=clock_at())
+        printed = json.loads(out.getvalue())
+        self.assertEqual(code, hourly.EXIT_FAILED)
+        self.assertEqual((printed["status"], printed["item_index_status"], printed["analysis_status"]),
+                         ("success", "published", "failed"))
+
+    def test_build_failure_keeps_the_previous_set(self):
+        settings = self.on(output={"delivery_root": str(self.delivery)})
+        self.go(settings, at(2026, 8, 4))
+        before = (self.files(self.archive), self.files(self.delivery))
+        with mock.patch.object(hourly.analysis, "build_analysis", side_effect=RuntimeError("bug")):
+            manifest, _source = self.go(settings, at(2026, 8, 5))
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual((self.status()["analysis_status"], self.status()["analysis_failure_class"]),
+                         ("failed", "analysis_build_failed"))
+        self.assertEqual((self.files(self.archive), self.files(self.delivery)), before)
+
+    def test_bad_drive_copy_keeps_the_previous_drive_set_and_retries(self):
+        settings = self.on(output={"delivery_root": str(self.delivery)})
+        self.go(settings, at(2026, 8, 4))
+        before = self.files(self.delivery)
+        real = hourly.copy_bytes_exclusive
+
+        def bad_copy(path, data):
+            hit = hourly.analysis.MANIFEST_NAME in Path(path).name and Path(path).parent == self.delivery
+            real(path, data + b"x" if hit else data)
+
+        with mock.patch.object(hourly, "copy_bytes_exclusive", side_effect=bad_copy):
+            self.go(settings, at(2026, 8, 5))
+        self.assertEqual(self.files(self.delivery), before, "no new data file sits beside the old manifest")
+        self.assertEqual((self.status()["analysis_status"], self.status()["analysis_failure_class"]),
+                         ("failed", "analysis_publish_failed"))
+        self.assertEqual(self.status(self.delivery)["feed_status"], "published", "the hourly set still advanced")
+        self.assertEqual([p.name for p in self.delivery.rglob("*.tmp")], [])
+        # The archive already has 4 Aug; the Drive copy does not, so the next run is due again.
+        _manifest, source = self.go(settings, at(2026, 8, 5, 1))
+        self.assertEqual((len(source.analysis_reads), self.status()["analysis_status"]), (1, "published"))
+        self.assertEqual(self.files(self.delivery), self.files(self.archive))
+
+    def test_failed_hourly_run_skips_the_analysis(self):
+        settings = self.on()
+        source = self.source(at(2026, 8, 4), identity=observed_identity(login="sa"))
+        manifest, source = self.go(settings, at(2026, 8, 4), source)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(self.status()["analysis_status"], "skipped_failed_run")
+        self.assertEqual(source.analysis_reads, [])
+
+    def test_no_debtor_code_in_any_written_file(self):
+        settings = self.on(output={"delivery_root": str(self.delivery)})
+        rows = aug_analysis_rows() + [arow("FAKE-B", "LOC-B", date(2026, 8, 3), "IV", -1, debtor_channel="shopify", has_debtor=1)]
+        self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), rows=rows))
+        self.assertEqual(self.status()["analysis_status"], "published")
+        for root in (self.archive, self.delivery):
+            for path in Path(root).rglob("*"):
+                if not path.is_file():
+                    continue
+                data = path.read_bytes()
+                if data[:2] == b"\x1f\x8b":
+                    data = gzip.decompress(data)
+                self.assertNotIn(FAKE_DEBTOR.encode(), data, path.name)
+
+    def test_item_index_attributes_are_additive_and_keep_the_page_contract(self):
+        items = [attr_master("FAKE-A", size="2XL"), attr_master("FAKE-B", size="DEFAULT", gender="BOTH"),
+                 attr_master("FAKE-LOW", desc="Fake low item"), master("FAKE-FEE", stock="F", desc="Fake marketplace fee")]
+        self.go(self.settings(), at(2026, 8, 4, 0), self.source(at(2026, 8, 4), items=items))
+        v1 = json.loads(gzip.decompress((self.archive / hourly.ITEM_INDEX_NAME).read_bytes()))
+        manifest, _source = self.go(self.on(), at(2026, 8, 4, 1), self.source(at(2026, 8, 4, 1), items=items))
+        v12 = json.loads(gzip.decompress((self.archive / hourly.ITEM_INDEX_NAME).read_bytes()))
+        self.assertEqual((v12["schema"], v12["schema_version"], v12["schema_minor"]), ("xb.ac2.stock_item_index", 1, 2))
+        self.assertEqual(v12["item_fields"], v1["item_fields"] + list(hourly.analysis.ATTRIBUTE_FIELDS),
+                         "attribute fields are appended; every version-1 field keeps its position")
+        self.assertEqual(set(v12) - set(v1), {"schema_minor"})
+        self.assertEqual(page_build_index(v12), page_build_index(v1), "the live page reads the same items")
+        fields = v12["item_fields"]
+        by_code = {row[0]: dict(zip(fields, row)) for row in v12["items"]}
+        self.assertEqual((by_code["FAKE-A"]["size"], by_code["FAKE-A"]["size_raw"], by_code["FAKE-A"]["gender"]),
+                         ("XXL", "2XL", "M"))
+        self.assertEqual((by_code["FAKE-B"]["size"], by_code["FAKE-B"]["gender"]), (None, "U"))
+        self.assertEqual((by_code["FAKE-A"]["category"], by_code["FAKE-A"]["style_code"], by_code["FAKE-A"]["colour"]),
+                         ("FAKE-JACKET", "FAKE-STY", "FAKE-BLUE"))
+        self.assertEqual((v12["counts"]["items_sized"], v12["counts"]["items_with_gender"]), (2, 3))
+        self.assertEqual(manifest["item_index"]["counts"], v12["counts"])
 
 
 if __name__ == "__main__":
