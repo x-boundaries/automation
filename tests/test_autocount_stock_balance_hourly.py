@@ -3996,7 +3996,7 @@ class AnalysisRunTests(Round6TestCase):
         manifest, _source = self.go(self.on(), at(2026, 8, 4, 1), self.source(at(2026, 8, 4, 1), items=items))
         v12 = json.loads(gzip.decompress((self.archive / hourly.ITEM_INDEX_NAME).read_bytes()))
         self.assertEqual((v12["schema"], v12["schema_version"], v12["schema_minor"]), ("xb.ac2.stock_item_index", 1, 2))
-        self.assertEqual(v12["item_fields"], v1["item_fields"] + list(hourly.analysis.ATTRIBUTE_FIELDS),
+        self.assertEqual(v12["item_fields"], v1["item_fields"] + list(hourly.analysis.ATTRIBUTE_FIELDS) + ["excluded"],
                          "attribute fields are appended; every version-1 field keeps its position")
         self.assertEqual(set(v12) - set(v1), {"schema_minor"})
         self.assertEqual(page_build_index(v12), page_build_index(v1), "the live page reads the same items")
@@ -4008,7 +4008,26 @@ class AnalysisRunTests(Round6TestCase):
         self.assertEqual((by_code["FAKE-A"]["category"], by_code["FAKE-A"]["style_code"], by_code["FAKE-A"]["colour"]),
                          ("FAKE-JACKET", "FAKE-STY", "FAKE-BLUE"))
         self.assertEqual((v12["counts"]["items_sized"], v12["counts"]["items_with_gender"]), (2, 3))
+        self.assertEqual(v12["counts"]["items_excluded"], 0)
+        self.assertFalse(any(by_code[c]["excluded"] for c in by_code))
         self.assertEqual(manifest["item_index"]["counts"], v12["counts"])
+
+    def test_item_index_marks_excluded_items_and_keeps_them(self):
+        """#292 S3b: the placeholder item stays in the index (totals match AutoCount), marked excluded."""
+        items = [attr_master("FAKE-A"), attr_master("FAKE-B"), attr_master("FAKE-LOW", desc="Fake low item"),
+                 master("FAKE-FEE", stock="F", desc="Fake marketplace fee"),
+                 attr_master("Default Item", size="DEFAULT", desc="")]   # active, so listed
+        self.go(self.settings(), at(2026, 8, 4, 0), self.source(at(2026, 8, 4), items=items))
+        v1 = json.loads(gzip.decompress((self.archive / hourly.ITEM_INDEX_NAME).read_bytes()))
+        self.assertNotIn("excluded", v1["item_fields"], "analysis off: the version-1 file, unchanged")
+        self.go(self.on(), at(2026, 8, 4, 1), self.source(at(2026, 8, 4, 1), items=items))
+        v12 = json.loads(gzip.decompress((self.archive / hourly.ITEM_INDEX_NAME).read_bytes()))
+        fields = v12["item_fields"]
+        by_code = {row[0]: dict(zip(fields, row)) for row in v12["items"]}
+        self.assertTrue(by_code["Default Item"]["excluded"])
+        self.assertEqual(v12["counts"]["items_excluded"], 1)
+        self.assertFalse(by_code["FAKE-A"]["excluded"])
+        self.assertEqual([r[0] for r in v12["items"]], [r[0] for r in v1["items"]], "no item is dropped")
 
 
 if __name__ == "__main__":

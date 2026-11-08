@@ -61,6 +61,9 @@ MAX_SALES_WINDOW_DAYS = 400
 UNRECOGNISED_LIST_CAP = 50
 
 HIGHLIGHT_RULES = ("sold_out_early", "open_placement", "size_drift", "slow_seller")
+MAIN_SECTION = "main"
+OTHER_SECTION = "other"
+NET_RETURNS_FLAG = "net returns in window"
 SIZE_CLASSES = ("letter", "one_size", "numeric", "footwear", "footwear_us", "kids", "waist", "range", "volume", "other")
 GENDERS = ("M", "W", "U", "K")
 
@@ -82,6 +85,9 @@ ORDER_OTHER = 9000
 
 DEFAULT_ANALYSIS = {
     "enabled": False,
+    # Item codes left out of every analysis file (counted in the manifest). "Default Item" is
+    # AutoCount's placeholder item (owner, 8 Nov 2026). Matched without regard to case.
+    "exclude_item_codes": ["Default Item"],
     # Opening stock day (go-live) and the stock-take reset day used as the default window.
     "golive_day": "2026-07-31",
     "stock_take_day": None,
@@ -101,6 +107,9 @@ DEFAULT_ANALYSIS = {
     "highlights": {
         "pool": "retail_network",
         "channels": ["outlet", "marketplace", "shopify"],
+        # ItemGroup codes that are main stock. Their lines are the "main" section; every other
+        # group (for example consignment) gets its own section, capped and ranked on its own.
+        "main_groups": ["XB"],
         "top_n": 20,
         # open_placement lines need at least this many units sold at the zero location in the
         # placement window (demand evidence). 0 lists every open row, demand rows still first.
@@ -264,6 +273,9 @@ def validate_analysis(raw):
     if take is not None and take < golive:
         raise AnalysisSettingsError("analysis.stock_take_day must not be before analysis.golive_day")
     _int(cfg["sales_window_days"], "analysis.sales_window_days", 1, MAX_SALES_WINDOW_DAYS)
+    _codes(cfg["exclude_item_codes"], "analysis.exclude_item_codes", allow_empty=True)
+    if len({c.strip().upper() for c in cfg["exclude_item_codes"]}) != len(cfg["exclude_item_codes"]):
+        raise AnalysisSettingsError("analysis.exclude_item_codes has duplicates")
 
     doc_types = cfg["doc_types"]
     seen = set()
@@ -331,6 +343,7 @@ def validate_analysis(raw):
     for channel in hl["channels"]:
         _channel(channel, "analysis.highlights.channels")
     _int(hl["top_n"], "analysis.highlights.top_n", 1, 200)
+    _codes(hl["main_groups"], "analysis.highlights.main_groups", allow_empty=True)
     _int(hl["placement_min_sold"], "analysis.highlights.placement_min_sold", 0, 1000000)
     _int(hl["sold_out_days"], "analysis.highlights.sold_out_days", 1, 365)
     _int(hl["sell_through_pct"], "analysis.highlights.sell_through_pct", 1, 100)
@@ -591,6 +604,30 @@ def brand_of(item):
     return clean(item.get("ItemBrand")) or clean(item.get("ItemType"))
 
 
+def group_of(item):
+    """The item's ItemGroup from the item master ("" when unknown)."""
+    return clean(item.get("ItemGroup"))
+
+
+def excluded_codes(cfg):
+    """The exclude_item_codes setting as an upper-case set (codes match without regard to case)."""
+    return {clean(c).upper() for c in cfg["exclude_item_codes"]}
+
+
+def section_of(group, cfg):
+    """(section, cap key) of a highlight line: main groups share one section; every other group is
+    its own capped section, so consignment lines never crowd out main-stock lines."""
+    if group in set(cfg["highlights"]["main_groups"]):
+        return MAIN_SECTION, MAIN_SECTION
+    return OTHER_SECTION, "group:" + group
+
+
+def share_units(sold):
+    """Units used for a size share: a negative net (returns exceed sales in the window) counts as 0
+    for the share only. The real net is still published beside it (G2 P-L6)."""
+    return sold if sold > 0 else Decimal(0)
+
+
 # ---------------------------------------------------------------------------------------------
 # Channels and the sales file
 # ---------------------------------------------------------------------------------------------
@@ -614,7 +651,7 @@ def resolve_channel(doc_type, location, debtor_channel, has_debtor, cfg):
     return OTHER
 
 
-def build_sales(rows, cfg, is_non_stock, day0, last_day):
+def build_sales(rows, cfg, is_non_stock, day0, last_day, is_excluded_item=None):
     """Aggregate the analysis read. Pure.
 
     Returns (sales, received, reconcile, counts):
@@ -622,7 +659,7 @@ def build_sales(rows, cfg, is_non_stock, day0, last_day):
                 returns (a CN row or a positive sales row is a return), returned = units back;
       received  {(item, location, "YYYY-MM"): qty} from the receipt DocTypes (net);
       reconcile {(doc_type, location, "YYYY-MM"): [net_out, qty_in]} for the VM SQL check (AC3);
-      counts    rows, units per channel, other rows, non-stock rows excluded.
+      counts    rows, units per channel, other rows, non-stock rows excluded, excluded items' rows.
     A DO later invoiced posts no second stock row, so OS, IV and DO all count with no double count.
     """
     sale_types = set(cfg["doc_types"]["sales"]) | set(cfg["doc_types"]["returns"])
@@ -634,6 +671,7 @@ def build_sales(rows, cfg, is_non_stock, day0, last_day):
         "groups_read": 0,
         "ledger_rows": 0,
         "non_stock_rows_excluded": 0,
+        "excluded_item_rows": 0,
         "out_of_window_groups": 0,
         "unclassified_doc_type_groups": 0,
         "sold_units_by_channel": {c: 0 for c in CHANNELS},
@@ -651,6 +689,9 @@ def build_sales(rows, cfg, is_non_stock, day0, last_day):
         item = clean(r.get("ItemCode"))
         if is_non_stock(item):
             counts["non_stock_rows_excluded"] += n_rows
+            continue
+        if is_excluded_item is not None and is_excluded_item(item):
+            counts["excluded_item_rows"] += n_rows
             continue
         day = as_day(r.get("DocDay"))
         if day < day0 or day > last_day:
@@ -688,14 +729,18 @@ def build_sales(rows, cfg, is_non_stock, day0, last_day):
     return sales, received, reconcile, counts
 
 
-def sales_payload(sales, reconcile, counts, header, day0):
-    """The columnar sales file. Days are offsets from day0."""
+def sales_payload(sales, reconcile, counts, header, day0, group_by_item=None):
+    """The columnar sales file. Days are offsets from day0. Every row carries its item's group
+    (an index into "groups")."""
+    group_by_item = group_by_item or {}
     keys = sorted(sales, key=lambda k: (k[0], k[1], k[2], CHANNELS.index(k[3])))
     items = sorted({k[0] for k in keys})
     locations = sorted({k[1] for k in keys})
     item_pos = {c: n for n, c in enumerate(items)}
     loc_pos = {c: n for n, c in enumerate(locations)}
-    columns = {"item": [], "location": [], "day": [], "channel": [], "sold": [], "returned": []}
+    groups = sorted({group_by_item.get(c, "") for c in items})
+    group_pos = {g: n for n, g in enumerate(groups)}
+    columns = {"item": [], "location": [], "day": [], "channel": [], "sold": [], "returned": [], "group": []}
     for key in keys:
         sold, returned = sales[key]
         columns["item"].append(item_pos[key[0]])
@@ -704,6 +749,7 @@ def sales_payload(sales, reconcile, counts, header, day0):
         columns["channel"].append(CHANNELS.index(key[3]))
         columns["sold"].append(num(sold))
         columns["returned"].append(num(returned))
+        columns["group"].append(group_pos[group_by_item.get(key[0], "")])
     payload = dict(header)
     payload.update(
         {
@@ -714,7 +760,8 @@ def sales_payload(sales, reconcile, counts, header, day0):
             "channels": list(CHANNELS),
             "items": items,
             "locations": locations,
-            "fields": ["item", "location", "day", "channel", "sold", "returned"],
+            "groups": groups,
+            "fields": ["item", "location", "day", "channel", "sold", "returned", "group"],
             "columns": columns,
             "reconcile_fields": ["doc_type", "location", "month", "net_out", "qty_in"],
             "reconcile": [
@@ -784,12 +831,16 @@ def walk_groups(movements, last_day, groups, snapshot_day=None):
     return state
 
 
-def stock_state_payload(state, received_by_pool, pools, header, day0, last_day):
-    """The stock-state file: one row per item and pool that ever held stock or received any."""
+def stock_state_payload(state, received_by_pool, pools, header, day0, last_day, group_by_item=None):
+    """The stock-state file: one row per item and pool that ever held stock or received any. Each
+    row carries its item's group (an index into "groups")."""
+    group_by_item = group_by_item or {}
     pool_ids = sorted(pools)
     keys = sorted(set(k for k, st in state.items() if st["first_stock_day"] is not None) | set(received_by_pool))
     items = sorted({k[0] for k in keys})
     item_pos = {c: n for n, c in enumerate(items)}
+    groups = sorted({group_by_item.get(c, "") for c in items})
+    group_pos = {g: n for n, g in enumerate(groups)}
     rows = []
     for item, pool in keys:
         st = state.get((item, pool))
@@ -804,6 +855,7 @@ def stock_state_payload(state, received_by_pool, pools, header, day0, last_day):
                 num(st["qty_now"]) if st else 0,
                 num(st["at_snapshot"]) if st and st["at_snapshot"] is not None else 0,
                 {month: num(q) for month, q in sorted(received.items()) if q != 0},
+                group_pos[group_by_item.get(item, "")],
             ]
         )
     payload = dict(header)
@@ -815,7 +867,8 @@ def stock_state_payload(state, received_by_pool, pools, header, day0, last_day):
             "interval_rule": "Days (offsets from day0, inclusive) whose pool close was zero or negative after the first day the pool held stock; closes sum from the first ledger row",
             "pools": [{"id": p, "locations": list(pools[p])} for p in pool_ids],
             "items": items,
-            "fields": ["item", "pool", "first_stock_day", "zero_intervals", "qty_now", "opening_at_golive", "received"],
+            "groups": groups,
+            "fields": ["item", "pool", "first_stock_day", "zero_intervals", "qty_now", "opening_at_golive", "received", "group"],
             "rows": rows,
             # A closed interval ends the day before stock came back, so only an open one ends on last_day.
             "counts": {"rows": len(rows), "items": len(items), "zero_now": sum(
@@ -944,13 +997,16 @@ def build_placement(movements, cfg, sales, last_day, first_ledger_day):
 
 PLACEMENT_FIELDS = (
     "item", "pair", "zero_location", "zero_qty_now", "holder_qty_now", "zero_days_30", "zero_days_90", "open_now",
-    "sold_at_zero_loc_90",
+    "sold_at_zero_loc_90", "group",
 )
 
 
-def placement_payload(rows, cfg, header, window_from_day):
+def placement_payload(rows, cfg, header, window_from_day, group_by_item=None):
+    group_by_item = group_by_item or {}
     items = sorted({r["item"] for r in rows})
     item_pos = {c: n for n, c in enumerate(items)}
+    groups = sorted({group_by_item.get(c, "") for c in items})
+    group_pos = {g: n for n, g in enumerate(groups)}
     pair_ids = [p["id"] for p in cfg["placement"]["pairs"]]
     out_rows = []
     for r in rows:
@@ -958,7 +1014,7 @@ def placement_payload(rows, cfg, header, window_from_day):
             [
                 item_pos[r["item"]], pair_ids.index(r["pair"]), r["zero_location"], num(r["zero_qty_now"]),
                 num(r["holder_qty_now"]), r["zero_days_30"], r["zero_days_90"], bool(r["open_now"]),
-                num(r["sold_at_zero_loc_90"]),
+                num(r["sold_at_zero_loc_90"]), group_pos[group_by_item.get(r["item"], "")],
             ]
         )
     payload = dict(header)
@@ -977,6 +1033,7 @@ def placement_payload(rows, cfg, header, window_from_day):
                 for p in cfg["placement"]["pairs"]
             ],
             "items": items,
+            "groups": groups,
             "fields": list(PLACEMENT_FIELDS),
             "rows": out_rows,
             "counts": {"rows": len(out_rows), "open_now": sum(1 for r in rows if r["open_now"])},
@@ -1001,12 +1058,18 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
 
     Rules (design section 5.3):
       sold_out_early  first zero within sold_out_days of first stock, or sell-through >= pct;
-      open_placement  a placement row that is open now;
+      open_placement  a placement row that is open now with >= placement_min_sold units sold at
+                      the zero location (0 lists every open row, demand rows first);
       size_drift      sold vs stocked size share differs by >= drift_pts with n >= drift_min_units
                       (per brand, category and gender; sized items only);
       slow_seller     pool stock > 0, no sale in slow_days, first stock more than slow_days ago.
     stocked = opening at go-live (if positive) + received in the pool. Sales count only the
     highlight channels; size drift uses the stock-take window when one is set.
+
+    Every line carries the item's group and a section: "main" for highlights.main_groups, else
+    "other". Each non-main group is capped and ranked on its own, so it never crowds out main
+    stock. Size drift groups by section too. A size whose net sold is negative (returns exceed
+    sales in the window) keeps its real net but counts as 0 for the shares and is flagged.
     """
     hl = cfg["highlights"]
     pool = hl["pool"]
@@ -1033,13 +1096,15 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
 
     lines = {rule: {} for rule in HIGHLIGHT_RULES}
 
-    def add(rule, brand, item, rank, inputs):
-        lines[rule].setdefault(brand, []).append((rank, item or "", inputs))
+    def add(rule, group, brand, item, rank, inputs):
+        section, cap_key = section_of(group, cfg)
+        lines[rule].setdefault((cap_key, brand), []).append((rank, item or "", section, group, inputs))
 
     for (item, gid), st in state.items():
         if gid != pool or st["first_stock_day"] is None:
             continue
         brand = brand_of(items.get(item, {}))
+        group = group_of(items.get(item, {}))
         first = st["first_stock_day"]
         sold = sum((q for d, q in sold_by_item.get(item, []) if d >= first), Decimal(0))
         stock_in = stocked(item)
@@ -1050,7 +1115,7 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
         early = days_to_zero is not None and days_to_zero <= hl["sold_out_days"]
         through = st_pct is not None and sold > 0 and st_pct >= hl["sell_through_pct"]
         if early or through:
-            add("sold_out_early", brand, item, (-sold, item), {
+            add("sold_out_early", group, brand, item, (-sold, item), {
                 "first_stock_day": first.isoformat(),
                 "first_zero_day": first_zero.isoformat() if first_zero else None,
                 "days_to_zero": days_to_zero,
@@ -1062,7 +1127,7 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
             })
         slow_from = last_day - timedelta(days=hl["slow_days"])
         if st["qty_now"] > 0 and first <= slow_from and (item not in last_sale or last_sale[item] <= slow_from):
-            add("slow_seller", brand, item, (-st["qty_now"], item), {
+            add("slow_seller", group, brand, item, (-st["qty_now"], item), {
                 "first_stock_day": first.isoformat(),
                 "last_sale_day": last_sale[item].isoformat() if item in last_sale else None,
                 "qty_now": num(st["qty_now"]),
@@ -1070,18 +1135,20 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
 
     # Demand first (G2 L5): most open rows have no sale at the zero location, and the top_n cap
     # must never drop a row with demand for one without. Rows under placement_min_sold are left
-    # out (counted); with 0, no-demand rows are listed after every demand row.
+    # out (counted). 0 turns the filter off: every open row is listed, including rows whose net
+    # sold is negative (returns exceed sales), after every demand row (G2 P-L2).
     min_sold = Decimal(hl["placement_min_sold"])
     below_min_sold = 0
     for r in placement_rows:
         if r["open_now"]:
             sold_90 = to_dec(r["sold_at_zero_loc_90"])
-            if sold_90 < min_sold:
+            if min_sold > 0 and sold_90 < min_sold:
                 below_min_sold += 1
                 continue
             brand = brand_of(items.get(r["item"], {}))
+            group = group_of(items.get(r["item"], {}))
             rank = (sold_90 <= 0, -r["zero_days_30"], -r["zero_days_90"], -sold_90, r["item"], r["zero_location"])
-            add("open_placement", brand, r["item"], rank, {
+            add("open_placement", group, brand, r["item"], rank, {
                 "pair": r["pair"],
                 "zero_location": r["zero_location"],
                 "holder_qty_now": num(r["holder_qty_now"]),
@@ -1094,47 +1161,61 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
     for item, attr in attrs_by_item.items():
         if not is_sized(attr) or (item, pool) not in state:
             continue
-        key = (brand_of(items.get(item, {})), attr["category"], attr["gender"])
-        sizes = groups.setdefault(key, {})
+        group = group_of(items.get(item, {}))
+        cap_key = section_of(group, cfg)[1]
+        key = (cap_key, brand_of(items.get(item, {})), attr["category"], attr["gender"])
+        sizes = groups.setdefault(key, {"group": group, "sizes": {}})["sizes"]
         entry = sizes.setdefault(attr["size"], {"sold": Decimal(0), "stocked": Decimal(0), "order": attr["size_order"]})
         entry["sold"] += sold_since_take.get(item, Decimal(0))
         entry["stocked"] += stocked(item)
-    for (brand, category, gender), sizes in sorted(groups.items()):
+    for (_cap_key, brand, category, gender), entry in sorted(groups.items()):
+        sizes = entry["sizes"]
+        # Shares use max(net, 0) per size (G2 P-L6): a size whose returns exceed its sales in the
+        # window never gets a negative share or pushes the other sizes above 100%.
         n_sold = sum((e["sold"] for e in sizes.values()), Decimal(0))
+        n_share = sum((share_units(e["sold"]) for e in sizes.values()), Decimal(0))
         n_stocked = sum((e["stocked"] for e in sizes.values()), Decimal(0))
-        if n_sold < hl["drift_min_units"] or n_stocked <= 0:
+        if n_share < hl["drift_min_units"] or n_stocked <= 0:
             continue
         for size, e in sorted(sizes.items(), key=lambda kv: (kv[1]["order"], kv[0])):
-            sold_share = _pct(e["sold"], n_sold)
+            sold_share = _pct(share_units(e["sold"]), n_share)
             stocked_share = _pct(e["stocked"], n_stocked)
             diff = round(sold_share - stocked_share, 1)
             if abs(diff) >= hl["drift_pts"]:
-                add("size_drift", brand, None, (-abs(diff), category, gender, e["order"] or 0), {
+                inputs = {
                     "category": category,
                     "gender": gender,
                     "size": size,
                     "window_from": take,
                     "sold": num(e["sold"]),
+                    "sold_for_share": num(share_units(e["sold"])),
                     "sold_share_pct": sold_share,
                     "stocked": num(e["stocked"]),
                     "stocked_share_pct": stocked_share,
                     "diff_pts": diff,
                     "n_sold": num(n_sold),
-                })
+                    "n_share_units": num(n_share),
+                    "flags": [NET_RETURNS_FLAG] if e["sold"] < 0 else [],
+                }
+                add("size_drift", entry["group"], brand, None, (-abs(diff), category, gender, e["order"] or 0), inputs)
 
     out = []
     counts = {}
     for rule in HIGHLIGHT_RULES:
         total = 0
         truncated_brands = 0
-        for brand in sorted(lines[rule]):
-            entries = sorted(lines[rule][brand], key=lambda e: e[0])
+        by_section = {MAIN_SECTION: 0, OTHER_SECTION: 0}
+        # Main section first, then each other group, then brand: top_n applies per group section.
+        for cap_key, brand in sorted(lines[rule], key=lambda k: (k[0] != MAIN_SECTION, k[0], k[1])):
+            entries = sorted(lines[rule][(cap_key, brand)], key=lambda e: e[0])
             total += len(entries)
             if len(entries) > hl["top_n"]:
                 truncated_brands += 1
-            for _rank, item, inputs in entries[: hl["top_n"]]:
-                out.append({"rule": rule, "brand": brand, "item": item or None, "inputs": inputs})
-        counts[rule] = {"lines_before_cap": total, "brands_truncated": truncated_brands}
+            for _rank, item, section, group, inputs in entries[: hl["top_n"]]:
+                by_section[section] += 1
+                out.append({"rule": rule, "section": section, "group": group, "brand": brand,
+                            "item": item or None, "inputs": inputs})
+        counts[rule] = {"lines_before_cap": total, "brands_truncated": truncated_brands, "lines_by_section": by_section}
     counts["open_placement"]["open_below_min_sold"] = below_min_sold
     return out, counts
 
@@ -1148,13 +1229,22 @@ def highlights_payload(lines, counts, cfg, header):
             "schema_version": SCHEMA_VERSION,
             "pool": hl["pool"],
             "channels": list(hl["channels"]),
+            "main_groups": list(hl["main_groups"]),
+            "sections": {
+                MAIN_SECTION: "items whose group is one of main_groups",
+                OTHER_SECTION: "every other group (for example consignment), capped and ranked per group",
+            },
             "rules": {
                 "sold_out_early": "first zero within %d days of first stock, or sell-through >= %d%%" % (hl["sold_out_days"], hl["sell_through_pct"]),
-                "open_placement": "a placement row that is open now with >= %d sold at the zero location in the placement window; demand rows first" % hl["placement_min_sold"],
-                "size_drift": "sold vs stocked size share differs by >= %d pts with n >= %d sold" % (hl["drift_pts"], hl["drift_min_units"]),
+                "open_placement": (
+                    "a placement row that is open now with >= %d sold at the zero location in the placement window; demand rows first" % hl["placement_min_sold"]
+                    if hl["placement_min_sold"] > 0 else "every placement row that is open now; demand rows first"
+                ),
+                "size_drift": "sold vs stocked size share differs by >= %d pts with n >= %d sold; a size with a negative net (net returns in window) counts as 0 for the shares and is flagged" % (hl["drift_pts"], hl["drift_min_units"]),
                 "slow_seller": "pool stock > 0, no sale in %d days, first stock more than %d days ago" % (hl["slow_days"], hl["slow_days"]),
             },
             "top_n_per_rule_and_brand": hl["top_n"],
+            "top_n_scope": "per rule, brand and group section (main groups together, each other group alone)",
             "lines": lines,
             "counts": dict(counts, lines=len(lines)),
         }
@@ -1165,6 +1255,51 @@ def highlights_payload(lines, counts, cfg, header):
 # ---------------------------------------------------------------------------------------------
 # Coverage and the whole build
 # ---------------------------------------------------------------------------------------------
+
+
+def exclude_movements(movements, is_excluded_item):
+    """(movements without excluded items, number of movement keys left out). Pure; a copy."""
+    kept = {}
+    dropped = 0
+    for day, moves in movements.items():
+        day_kept = {}
+        for key, qty in moves.items():
+            if is_excluded_item(key[0]):
+                dropped += 1
+            else:
+                day_kept[key] = qty
+        if day_kept:
+            kept[day] = day_kept
+    return kept, dropped
+
+
+def group_totals(attrs_by_item, items, sales, state, pools, cfg):
+    """Per ItemGroup (excluded and non-stock items already left out): items, sold and returned
+    units in the sales window (net sold can be negative), and units now per pool. A group with
+    no stock take (consignment) can show a negative pool total; it is reported as it is."""
+    main = set(cfg["highlights"]["main_groups"])
+    out = {}
+
+    def entry(group):
+        return out.setdefault(group, {"main": group in main, "items": 0, "sales_rows": 0,
+                                      "sold_units": Decimal(0), "returned_units": Decimal(0),
+                                      "qty_now_by_pool": {p: Decimal(0) for p in sorted(pools)}})
+
+    for code in attrs_by_item:
+        entry(group_of(items.get(code, {})))["items"] += 1
+    for (code, _loc, _day, _ch), (sold, returned) in sales.items():
+        e = entry(group_of(items.get(code, {})))
+        e["sales_rows"] += 1
+        e["sold_units"] += sold
+        e["returned_units"] += returned
+    for (code, pool), st in state.items():
+        if pool in pools:
+            entry(group_of(items.get(code, {})))["qty_now_by_pool"][pool] += st["qty_now"]
+    return {
+        group: dict(v, sold_units=num(v["sold_units"]), returned_units=num(v["returned_units"]),
+                    qty_now_by_pool={p: num(q) for p, q in v["qty_now_by_pool"].items()})
+        for group, v in sorted(out.items())
+    }
 
 
 def size_coverage(attrs_by_item, items, sales):
@@ -1216,21 +1351,29 @@ def build_analysis(cfg, rows, movements, items, is_non_stock, first_ledger_day, 
     timezone and built_from_close_day for every file.
     """
     day0 = window_from(first_ledger_day, last_day, cfg)
-    sales, received, reconcile, sales_counts = build_sales(rows, cfg, is_non_stock, day0, last_day)
+    excluded = excluded_codes(cfg)
+
+    def is_excluded_item(code):
+        return clean(code).upper() in excluded
+
+    sales, received, reconcile, sales_counts = build_sales(rows, cfg, is_non_stock, day0, last_day, is_excluded_item)
+    # Excluded items (exclude_item_codes) leave the ledger before any state or placement walk.
+    kept_moves, excluded_movements = exclude_movements(movements, is_excluded_item)
     pools = cfg["pools"]
     golive = date.fromisoformat(cfg["golive_day"])
-    state = walk_groups(movements, last_day, pools, snapshot_day=golive)
+    state = walk_groups(kept_moves, last_day, pools, snapshot_day=golive)
     rec_pool = received_by_pool(received, pools)
-    placement_rows, placement_from = build_placement(movements, cfg, sales, last_day, first_ledger_day)
-    stock_codes = [code for code in items if not is_non_stock(code)]
+    placement_rows, placement_from = build_placement(kept_moves, cfg, sales, last_day, first_ledger_day)
+    stock_codes = [code for code in items if not is_non_stock(code) and not is_excluded_item(code)]
     attrs_by_item = {code: item_attributes(items[code], cfg["attributes"]) for code in stock_codes}
     raw_genders = {code: clean(items[code].get("StockGender")) for code in stock_codes}
     lines, hl_counts = build_highlights(cfg, attrs_by_item, items, state, rec_pool, sales, placement_rows, last_day)
+    group_by_item = {code: group_of(row) for code, row in items.items()}
     common = dict(header, quantity_rule=QUANTITY_RULE)
     payloads = {
-        SALES_NAME: sales_payload(sales, reconcile, sales_counts, common, day0),
-        STATE_NAME: stock_state_payload(state, rec_pool, pools, common, day0, last_day),
-        PLACEMENT_NAME: placement_payload(placement_rows, cfg, common, placement_from),
+        SALES_NAME: sales_payload(sales, reconcile, sales_counts, common, day0, group_by_item),
+        STATE_NAME: stock_state_payload(state, rec_pool, pools, common, day0, last_day, group_by_item),
+        PLACEMENT_NAME: placement_payload(placement_rows, cfg, common, placement_from, group_by_item),
         HIGHLIGHTS_NAME: highlights_payload(lines, hl_counts, cfg, common),
     }
     other = {
@@ -1250,6 +1393,15 @@ def build_analysis(cfg, rows, movements, items, is_non_stock, first_ledger_day, 
         "other": other,
         "size_coverage": size_coverage(attrs_by_item, items, sales),
         "attributes": attribute_counts(attrs_by_item, raw_genders),
+        "excluded_items": {
+            # Counts only, never the codes themselves.
+            "codes_configured": len(excluded),
+            "items_in_master": sum(1 for code in items if is_excluded_item(code)),
+            "analysis_rows_excluded": sales_counts["excluded_item_rows"],
+            "ledger_movements_excluded": excluded_movements,
+        },
+        "main_groups": list(cfg["highlights"]["main_groups"]),
+        "groups": group_totals(attrs_by_item, items, sales, state, pools, cfg),
         "settings_digest": settings_digest(cfg),
     }
     return payloads, parts

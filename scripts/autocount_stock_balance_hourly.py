@@ -2259,6 +2259,10 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
     # off the index is exactly the version-1 file, byte for byte.
     with_attributes = settings["analysis"]["enabled"]
     attribute_cfg = settings["analysis"]["attributes"]
+    # #292 S3b: items in analysis.exclude_item_codes (the AutoCount placeholder "Default Item")
+    # stay in the index with excluded = true, so stock totals still match AutoCount; the page
+    # leaves them out of every view. Only with the attribute fields, so analysis off is unchanged.
+    excluded = analysis.excluded_codes(settings["analysis"])
     counts = {
         "items": len(codes),
         "inactive_without_stock_or_movement_excluded": quiet_inactive,
@@ -2298,6 +2302,9 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
             counts["items_sized"] = counts.get("items_sized", 0) + analysis.is_sized(attrs)
             counts["items_with_gender"] = counts.get("items_with_gender", 0) + bool(attrs["gender"])
             counts["items_with_category"] = counts.get("items_with_category", 0) + bool(attrs["category"])
+            is_excluded = code.strip().upper() in excluded
+            row.append(is_excluded)
+            counts["items_excluded"] = counts.get("items_excluded", 0) + is_excluded
         items_out.append(row)
 
     # Non-stock keys never reach here: the latest rows and the movements already exclude them.
@@ -2316,10 +2323,10 @@ def build_item_index(settings, manifest, rows, ledger, snapshot, today):
     item_fields = ["code", "description", "barcode", "group", "brand", "uom", "active", "reorder_level", "min_qty"]
     extra = {}
     if with_attributes:
-        for key in ("items_sized", "items_with_gender", "items_with_category"):
+        for key in ("items_sized", "items_with_gender", "items_with_category", "items_excluded"):
             counts.setdefault(key, 0)
         # Additive: new fields are appended, so readers that find fields by name keep working.
-        item_fields += list(analysis.ATTRIBUTE_FIELDS)
+        item_fields += list(analysis.ATTRIBUTE_FIELDS) + ["excluded"]
         extra["schema_minor"] = ITEM_INDEX_SCHEMA_MINOR_ATTRIBUTES
     return {
         **extra,
