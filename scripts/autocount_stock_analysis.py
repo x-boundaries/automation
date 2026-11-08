@@ -61,7 +61,7 @@ MAX_SALES_WINDOW_DAYS = 400
 UNRECOGNISED_LIST_CAP = 50
 
 HIGHLIGHT_RULES = ("sold_out_early", "open_placement", "size_drift", "slow_seller")
-SIZE_CLASSES = ("letter", "one_size", "numeric", "footwear", "kids", "waist", "range", "other")
+SIZE_CLASSES = ("letter", "one_size", "numeric", "footwear", "footwear_us", "kids", "waist", "range", "volume", "other")
 GENDERS = ("M", "W", "U", "K")
 
 DOC_TYPE_RE = re.compile(r"\A[A-Z]{2,4}\Z")
@@ -69,6 +69,10 @@ ID_RE = re.compile(r"\A[a-z][a-z0-9_]{0,39}\Z")
 DAY_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 NUMERIC_SIZE_RE = re.compile(r"\A\d{1,3}(\.\d{1,2})?\Z")
 PAIR_SIZE_RE = re.compile(r"\A([A-Z0-9.]{1,6})-([A-Z0-9.]{1,6})\Z")
+# A letter prefix then a number (J8, US9.5) or a number then a unit (140CM, 0.5L, 21 OZ).
+PREFIX_SIZE_RE = re.compile(r"\A([A-Z]{1,3}) ?(\d{1,3}(?:\.\d{1,2})?)\Z")
+UNIT_SIZE_RE = re.compile(r"\A(\d{1,4}(?:\.\d{1,2})?) ?([A-Z]{1,3})\Z")
+SIZE_TOKEN_RE = re.compile(r"\A[A-Z]{1,3}\Z")
 
 # Sort keys: letters 100.., one size 200, numeric 1000 + 10 x value, unrecognised 9000.
 ORDER_LETTER_BASE = 100
@@ -98,6 +102,9 @@ DEFAULT_ANALYSIS = {
         "pool": "retail_network",
         "channels": ["outlet", "marketplace", "shopify"],
         "top_n": 20,
+        # open_placement lines need at least this many units sold at the zero location in the
+        # placement window (demand evidence). 0 lists every open row, demand rows still first.
+        "placement_min_sold": 1,
         "sold_out_days": 28,
         "sell_through_pct": 80,
         "drift_pts": 3,
@@ -110,9 +117,22 @@ DEFAULT_ANALYSIS = {
             "2XL": "XXL", "3XL": "XXXL", "2XS": "XXS",
             "O.S": "OS", "O/S": "OS", "OS": "OS", "F": "OS", "FREE": "OS", "FREESIZE": "OS", "ONE SIZE": "OS",
         },
-        "letter_order": ["XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL"],
+        # Combined sizes (S/M, M/L) sit between their neighbours.
+        "letter_order": ["XXS", "XS", "S", "S/M", "M", "M/L", "L", "L/XL", "XL", "XXL", "XXXL"],
         # Values that mean "no value" for size and colour (blank always counts).
         "blank_values": ["DEFAULT"],
+        # Values that mean "no size" for the size only (packaging such as packs); colour is kept.
+        "size_blank_values": ["PACK", "PKG", "BOX", "PEG"],
+        # Letter prefix + number -> size class (kids J8, US shoe US9.5).
+        "size_prefix_class": {"J": "kids", "US": "footwear_us"},
+        # Number + unit -> size class (heights 140CM, volumes 20L/0.5L/21OZ). "numeric" takes
+        # the category's class, as plain numbers do.
+        "size_unit_class": {"CM": "numeric", "L": "volume", "ML": "volume", "OZ": "volume"},
+        # Non-size length codes allowed after a dash (32-R): size 32 with length R.
+        "length_codes": ["R", "REG", "SH", "LG", "T"],
+        # In a footwear category, plain numbers below this are US/UK sizes (class footwear_us);
+        # from it up they are cm (class footwear). 0 turns the split off.
+        "footwear_cm_min": 18,
         "gender_map": {
             "M": "M", "MEN": "M", "MALE": "M",
             "F": "W", "W": "W", "WOMEN": "W", "FEMALE": "W",
@@ -311,6 +331,7 @@ def validate_analysis(raw):
     for channel in hl["channels"]:
         _channel(channel, "analysis.highlights.channels")
     _int(hl["top_n"], "analysis.highlights.top_n", 1, 200)
+    _int(hl["placement_min_sold"], "analysis.highlights.placement_min_sold", 0, 1000000)
     _int(hl["sold_out_days"], "analysis.highlights.sold_out_days", 1, 365)
     _int(hl["sell_through_pct"], "analysis.highlights.sell_through_pct", 1, 100)
     _int(hl["drift_pts"], "analysis.highlights.drift_pts", 1, 100)
@@ -325,6 +346,15 @@ def validate_analysis(raw):
         raise AnalysisSettingsError("analysis.attributes.size_map must map sizes to sizes")
     _codes(attrs["letter_order"], "analysis.attributes.letter_order")
     _codes(attrs["blank_values"], "analysis.attributes.blank_values", allow_empty=True)
+    _codes(attrs["size_blank_values"], "analysis.attributes.size_blank_values", allow_empty=True)
+    _codes(attrs["length_codes"], "analysis.attributes.length_codes", allow_empty=True)
+    for key in ("size_prefix_class", "size_unit_class"):
+        rules = attrs[key]
+        if not isinstance(rules, dict) or not all(
+            isinstance(k, str) and SIZE_TOKEN_RE.match(k) and v in SIZE_CLASSES and v != "other" for k, v in rules.items()
+        ):
+            raise AnalysisSettingsError("analysis.attributes.%s must map 1-3 upper-case letters to size classes" % key)
+    _int(attrs["footwear_cm_min"], "analysis.attributes.footwear_cm_min", 0, 100)
     gender_map = attrs["gender_map"]
     if not isinstance(gender_map, dict) or not all(isinstance(k, str) and k.strip() and v in GENDERS for k, v in gender_map.items()):
         raise AnalysisSettingsError("analysis.attributes.gender_map must map values to M, W, U or K")
@@ -439,7 +469,22 @@ def _upper(value):
     return " ".join(clean(value).upper().split())
 
 
-def _size_part(token, attrs):
+def _number(text):
+    """(canonical text, value, sort key) for a plain number."""
+    value = Decimal(text).normalize()
+    return format(value, "f"), value, ORDER_NUMERIC_BASE + int(value * 10)
+
+
+def _numeric_class(value, cat_class, attrs):
+    """The class of a plain number: the category's class, with footwear split into US and cm."""
+    if not cat_class:
+        return "numeric"
+    if cat_class == "footwear" and attrs["footwear_cm_min"] and value < attrs["footwear_cm_min"]:
+        return "footwear_us"
+    return cat_class
+
+
+def _size_part(token, attrs, cat_class=None):
     """(canonical, class, order) for one size token, or None when it is not a size."""
     token = attrs["size_map"].get(token, token)
     letters = attrs["letter_order"]
@@ -448,39 +493,57 @@ def _size_part(token, attrs):
     if token in letters:
         return token, "letter", ORDER_LETTER_BASE + letters.index(token)
     if NUMERIC_SIZE_RE.match(token):
-        value = Decimal(token).normalize()
-        text = format(value, "f")
-        return text, "numeric", ORDER_NUMERIC_BASE + int(value * 10)
+        text, value, order = _number(token)
+        return text, _numeric_class(value, cat_class, attrs), order
+    prefixed = PREFIX_SIZE_RE.match(token)
+    if prefixed and prefixed.group(1) in attrs["size_prefix_class"]:
+        text, _value, order = _number(prefixed.group(2))
+        return prefixed.group(1) + text, attrs["size_prefix_class"][prefixed.group(1)], order
+    unit = UNIT_SIZE_RE.match(token)
+    if unit and unit.group(2) in attrs["size_unit_class"]:
+        text, value, order = _number(unit.group(1))
+        size_class = attrs["size_unit_class"][unit.group(2)]
+        if size_class == "numeric":
+            size_class = _numeric_class(value, cat_class, attrs)
+        return text + unit.group(2), size_class, order
     return None
 
 
 def normalise_size(raw, category, attrs):
     """{size, size_raw, size_order, size_class, length} for one item. Pure, table-driven.
 
-    * blank or a blank_values entry -> no size (the item is "not sized");
-    * size_map first (2XL -> XXL, O.S -> OS, ...), then the letter order, then numbers;
-    * a pair "A-B" in a category whose size class is "waist" -> size A, length B; in any other
-      category it stays one size token with class "range", ordered by A;
+    * blank, a blank_values entry or a size_blank_values entry (packs) -> no size ("not sized");
+    * size_map first (2XL -> XXL, O.S -> OS, ...), then the letter order (with S/M, M/L), then
+      numbers, prefixed numbers (J8 kids, US9 footwear_us) and numbers with a unit (140CM, 20L);
+    * a pair "A-B" (also when it is a size_map target) in a category whose size class is
+      "waist" -> size A, length B; in any other category it stays one size with class "range",
+      ordered by A. A length code as B (32-R) always gives size A with length B;
     * numeric sizes take their class from size_class_by_category (footwear, kids, waist ...);
-    * anything else is kept as given with class "other" and counted for the size map.
+      in footwear, numbers below footwear_cm_min are US/UK sizes (footwear_us);
+    * anything else is kept as given with class "other": counted for the size map, never
+      counted as sized.
     """
     size_raw = clean(raw)
     token = _upper(raw)
     out = {"size": None, "size_raw": size_raw, "size_order": None, "size_class": None, "length": None}
-    if not token or token in set(attrs["blank_values"]):
+    no_size = set(attrs["blank_values"]) | set(attrs["size_blank_values"])
+    mapped = attrs["size_map"].get(token, token)
+    if not token or token in no_size or mapped in no_size:
         return out
     cat_class = attrs["size_class_by_category"].get(clean(category))
-    part = _size_part(token, attrs)
+    part = _size_part(mapped, attrs, cat_class)
     if part is not None:
         size, size_class, order = part
-        if size_class == "numeric" and cat_class:
-            size_class = cat_class
         out.update(size=size, size_class=size_class, size_order=order)
         return out
-    pair = PAIR_SIZE_RE.match(token)
+    pair = PAIR_SIZE_RE.match(mapped)
     if pair:
-        first = _size_part(pair.group(1), attrs)
-        second = _size_part(pair.group(2), attrs)
+        first = _size_part(pair.group(1), attrs, cat_class)
+        second = _size_part(pair.group(2), attrs, cat_class)
+        if first is not None and second is None and pair.group(2) in attrs["length_codes"]:
+            size_class = "waist" if cat_class == "waist" else first[1]
+            out.update(size=first[0], size_class=size_class, size_order=first[2], length=pair.group(2))
+            return out
         if first is not None and second is not None:
             if cat_class == "waist":
                 out.update(size=first[0], size_class="waist", size_order=first[2], length=second[0])
@@ -489,6 +552,11 @@ def normalise_size(raw, category, attrs):
             return out
     out.update(size=token, size_class="other", size_order=ORDER_OTHER)
     return out
+
+
+def is_sized(attr):
+    """True when the item has a recognised size. Class "other" is not sized (it is listed instead)."""
+    return attr["size"] is not None and attr["size_class"] != "other"
 
 
 def normalise_gender(raw, category, attrs):
@@ -1000,10 +1068,20 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
                 "qty_now": num(st["qty_now"]),
             })
 
+    # Demand first (G2 L5): most open rows have no sale at the zero location, and the top_n cap
+    # must never drop a row with demand for one without. Rows under placement_min_sold are left
+    # out (counted); with 0, no-demand rows are listed after every demand row.
+    min_sold = Decimal(hl["placement_min_sold"])
+    below_min_sold = 0
     for r in placement_rows:
         if r["open_now"]:
+            sold_90 = to_dec(r["sold_at_zero_loc_90"])
+            if sold_90 < min_sold:
+                below_min_sold += 1
+                continue
             brand = brand_of(items.get(r["item"], {}))
-            add("open_placement", brand, r["item"], (-r["zero_days_30"], -r["zero_days_90"], r["item"]), {
+            rank = (sold_90 <= 0, -r["zero_days_30"], -r["zero_days_90"], -sold_90, r["item"], r["zero_location"])
+            add("open_placement", brand, r["item"], rank, {
                 "pair": r["pair"],
                 "zero_location": r["zero_location"],
                 "holder_qty_now": num(r["holder_qty_now"]),
@@ -1014,7 +1092,7 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
 
     groups = {}
     for item, attr in attrs_by_item.items():
-        if attr["size"] is None or attr["size_class"] == "other" or (item, pool) not in state:
+        if not is_sized(attr) or (item, pool) not in state:
             continue
         key = (brand_of(items.get(item, {})), attr["category"], attr["gender"])
         sizes = groups.setdefault(key, {})
@@ -1057,6 +1135,7 @@ def build_highlights(cfg, attrs_by_item, items, state, received_pool, sales, pla
             for _rank, item, inputs in entries[: hl["top_n"]]:
                 out.append({"rule": rule, "brand": brand, "item": item or None, "inputs": inputs})
         counts[rule] = {"lines_before_cap": total, "brands_truncated": truncated_brands}
+    counts["open_placement"]["open_below_min_sold"] = below_min_sold
     return out, counts
 
 
@@ -1071,7 +1150,7 @@ def highlights_payload(lines, counts, cfg, header):
             "channels": list(hl["channels"]),
             "rules": {
                 "sold_out_early": "first zero within %d days of first stock, or sell-through >= %d%%" % (hl["sold_out_days"], hl["sell_through_pct"]),
-                "open_placement": "a placement row that is open now",
+                "open_placement": "a placement row that is open now with >= %d sold at the zero location in the placement window; demand rows first" % hl["placement_min_sold"],
                 "size_drift": "sold vs stocked size share differs by >= %d pts with n >= %d sold" % (hl["drift_pts"], hl["drift_min_units"]),
                 "slow_seller": "pool stock > 0, no sale in %d days, first stock more than %d days ago" % (hl["slow_days"], hl["slow_days"]),
             },
@@ -1089,17 +1168,20 @@ def highlights_payload(lines, counts, cfg, header):
 
 
 def size_coverage(attrs_by_item, items, sales):
-    """Per brand: items, sized items, sold units and sold units of sized items (AC5)."""
+    """Per brand: items, sized items, items with an unrecognised size (class "other", never
+    counted as sized), sold units and sold units of sized items (AC5, G2 L4)."""
     sold = {}
     for (item, _loc, _day, _ch), (s, _r) in sales.items():
         sold[item] = sold.get(item, Decimal(0)) + s
     out = {}
     for item, attr in attrs_by_item.items():
         brand = brand_of(items.get(item, {}))
-        entry = out.setdefault(brand, {"items": 0, "items_sized": 0, "sold_units": Decimal(0), "sold_units_sized": Decimal(0)})
+        entry = out.setdefault(brand, {"items": 0, "items_sized": 0, "items_size_other": 0,
+                                       "sold_units": Decimal(0), "sold_units_sized": Decimal(0)})
         entry["items"] += 1
-        sized = attr["size"] is not None
+        sized = is_sized(attr)
         entry["items_sized"] += sized
+        entry["items_size_other"] += attr["size_class"] == "other"
         entry["sold_units"] += sold.get(item, Decimal(0))
         if sized:
             entry["sold_units_sized"] += sold.get(item, Decimal(0))
@@ -1118,7 +1200,7 @@ def attribute_counts(attrs_by_item, raw_genders):
     top = sorted(unrecognised.items(), key=lambda kv: (-kv[1], kv[0]))
     return {
         "items": len(attrs_by_item),
-        "items_sized": sum(1 for a in attrs_by_item.values() if a["size"] is not None),
+        "items_sized": sum(1 for a in attrs_by_item.values() if is_sized(a)),
         "items_with_gender": sum(1 for a in attrs_by_item.values() if a["gender"]),
         "items_unknown_gender_value": unknown_gender,
         "unrecognised_size_items": sum(unrecognised.values()),

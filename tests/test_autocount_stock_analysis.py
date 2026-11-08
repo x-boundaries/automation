@@ -364,10 +364,85 @@ class SizeNormalisationTests(unittest.TestCase):
         sales = {("FAKE-1", "LOC-A", date(2026, 9, 1), "outlet"): [Decimal(3), Decimal(0)],
                  ("FAKE-2", "LOC-A", date(2026, 9, 1), "outlet"): [Decimal(1), Decimal(0)]}
         coverage = an.size_coverage(attrs, items, sales)
-        self.assertEqual(coverage["FAKE-BRAND"], {"items": 2, "items_sized": 1, "sold_units": 4, "sold_units_sized": 3})
+        self.assertEqual(coverage["FAKE-BRAND"],
+                         {"items": 2, "items_sized": 1, "items_size_other": 0, "sold_units": 4, "sold_units_sized": 3})
         counts = an.attribute_counts(attrs, {c: r["StockGender"] for c, r in items.items()})
         self.assertEqual(counts["unrecognised_size_values"], [["FAKE SIZE", 1]])
         self.assertEqual(counts["items_unknown_gender_value"], 1)
+
+    def test_coverage_never_counts_class_other_as_sized(self):
+        items = {
+            "FAKE-1": item("FAKE-1", size="M"),
+            "FAKE-2": item("FAKE-2", size="FAKE SIZE"),
+            "FAKE-3": item("FAKE-3", size="ZZ9"),
+        }
+        attrs = {code: an.item_attributes(row, self.attrs) for code, row in items.items()}
+        self.assertEqual([attrs[c]["size_class"] for c in sorted(attrs)], ["letter", "other", "other"])
+        sales = {(c, "LOC-A", date(2026, 9, 1), "outlet"): [Decimal(2), Decimal(0)] for c in items}
+        coverage = an.size_coverage(attrs, items, sales)["FAKE-BRAND"]
+        self.assertEqual(coverage, {"items": 3, "items_sized": 1, "items_size_other": 2, "sold_units": 6, "sold_units_sized": 2})
+        counts = an.attribute_counts(attrs, {c: r["StockGender"] for c, r in items.items()})
+        self.assertEqual((counts["items_sized"], counts["unrecognised_size_items"]), (1, 2))
+        self.assertFalse(an.is_sized(attrs["FAKE-2"]))
+
+    # G2 L4 size-map gaps, on fake values of the same shapes.
+
+    def test_kids_prefix_and_cm_heights(self):
+        out = self.size("j8")
+        self.assertEqual((out["size"], out["size_class"]), ("J8", "kids"))
+        self.assertLess(self.size("J6")["size_order"], self.size("J10")["size_order"])
+        self.assertEqual((self.size("140CM", "FAKE-KIDS")["size"], self.size("140CM", "FAKE-KIDS")["size_class"]), ("140CM", "kids"))
+        self.assertEqual(self.size("140 cm", "FAKE-OTHER")["size_class"], "numeric")
+        self.assertEqual(self.size("140", "FAKE-KIDS")["size_class"], "kids")
+
+    def test_volumes(self):
+        for raw, expected in (("20L", "20L"), ("0.5L", "0.5L"), ("21OZ", "21OZ"), ("500 ml", "500ML")):
+            out = self.size(raw, "FAKE-BOTTLE")
+            self.assertEqual((out["size"], out["size_class"]), (expected, "volume"), raw)
+        self.assertLess(self.size("0.5L")["size_order"], self.size("20L")["size_order"])
+
+    def test_packs_are_not_sized_and_keep_their_colour(self):
+        for raw in ("PKG", "box", "PEG", "Pack"):
+            self.assertIsNone(self.size(raw)["size"], raw)
+        row = item("FAKE-1", size="PKG", colour="FAKE-RED")
+        attrs = an.item_attributes(row, self.attrs)
+        self.assertEqual((attrs["size"], attrs["colour"]), (None, "FAKE-RED"))
+
+    def test_us_shoe_sizes_and_cm_split_in_footwear(self):
+        out = self.size("US9.5", "FAKE-FOOTWEAR")
+        self.assertEqual((out["size"], out["size_class"]), ("US9.5", "footwear_us"))
+        self.assertEqual(self.size("US 8")["size"], "US8")
+        self.assertEqual(self.size("7", "FAKE-FOOTWEAR")["size_class"], "footwear_us")
+        self.assertEqual(self.size("23", "FAKE-FOOTWEAR")["size_class"], "footwear")
+        off = cfg(attributes={"footwear_cm_min": 0, "size_class_by_category": {"FAKE-FOOTWEAR": "footwear"}})["attributes"]
+        self.assertEqual(an.normalise_size("7", "FAKE-FOOTWEAR", off)["size_class"], "footwear")
+
+    def test_combined_letter_sizes(self):
+        for raw in ("S/M", "m/l"):
+            self.assertEqual(self.size(raw)["size_class"], "letter", raw)
+        orders = [self.size(s)["size_order"] for s in ("S", "S/M", "M", "M/L", "L")]
+        self.assertEqual(orders, sorted(orders))
+        self.assertEqual(len(set(orders)), 5)
+
+    def test_length_code_after_a_dash(self):
+        out = self.size("32-R", "FAKE-PANTS")
+        self.assertEqual((out["size"], out["length"], out["size_class"]), ("32", "R", "waist"))
+        out = self.size("M-R", "FAKE-JACKET")
+        self.assertEqual((out["size"], out["length"], out["size_class"]), ("M", "R", "letter"))
+        self.assertEqual(self.size("M-ZZ", "FAKE-JACKET")["size_class"], "other")
+
+    def test_size_map_target_is_parsed_as_a_pair(self):
+        attrs = cfg(attributes={"size_map": {"XL/S": "XL-S"},
+                                "size_class_by_category": {"FAKE-PANTS": "waist"}})["attributes"]
+        out = an.normalise_size("XL/S", "FAKE-PANTS", attrs)
+        self.assertEqual((out["size"], out["length"], out["size_class"], out["size_raw"]), ("XL", "S", "waist", "XL/S"))
+
+    def test_new_size_settings_are_checked(self):
+        for bad in ({"size_prefix_class": {"J1": "kids"}}, {"size_prefix_class": {"J": "other"}},
+                    {"size_unit_class": {"L": "fake"}}, {"footwear_cm_min": 101}, {"length_codes": "R"},
+                    {"size_blank_values": [""]}):
+            with self.assertRaises(an.AnalysisSettingsError, msg=str(bad)):
+                cfg(attributes=bad)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -552,7 +627,41 @@ class HighlightsTests(unittest.TestCase):
         rows = self.by_rule(lines)["open_placement"]
         self.assertEqual([l["item"] for l in rows], ["FAKE-3", "FAKE-2"], "open only, most zero days first, capped")
         self.assertEqual(rows[0]["inputs"]["pair"], "online_out_shop_has")
-        self.assertEqual(counts["open_placement"], {"lines_before_cap": 3, "brands_truncated": 1})
+        self.assertEqual(counts["open_placement"], {"lines_before_cap": 3, "brands_truncated": 1, "open_below_min_sold": 0})
+
+    def placement_row(self, code, zero_days, sold):
+        return {"item": code, "pair": "online_out_shop_has", "zero_location": "LOC-E", "zero_qty_now": Decimal(0),
+                "holder_qty_now": Decimal(5), "zero_days_30": zero_days, "zero_days_90": zero_days, "open_now": True,
+                "sold_at_zero_loc_90": Decimal(sold)}
+
+    def test_no_demand_row_cannot_crowd_out_a_demand_row_under_the_cap(self):
+        """G2 L5: the no-demand row has far more zero days, yet the demand row wins the one slot."""
+        items = {"FAKE-NODEMAND": item("FAKE-NODEMAND"), "FAKE-DEMAND": item("FAKE-DEMAND")}
+        placement = [self.placement_row("FAKE-NODEMAND", 30, 0), self.placement_row("FAKE-DEMAND", 2, 1)]
+        for min_sold in (0, 1):
+            config = cfg(highlights={"top_n": 1, "placement_min_sold": min_sold})
+            lines, counts = self.build([], [], items, config, placement)
+            rows = self.by_rule(lines)["open_placement"]
+            self.assertEqual([l["item"] for l in rows], ["FAKE-DEMAND"], "min_sold %d" % min_sold)
+            self.assertEqual(rows[0]["inputs"]["sold_at_zero_loc_90"], 1)
+            self.assertEqual(counts["open_placement"]["open_below_min_sold"], min_sold)
+
+    def test_default_filters_no_demand_rows_and_zero_lists_them_last(self):
+        self.assertEqual(an.DEFAULT_ANALYSIS["highlights"]["placement_min_sold"], 1)
+        items = {c: item(c) for c in ("FAKE-1", "FAKE-2", "FAKE-3")}
+        placement = [self.placement_row("FAKE-1", 30, 0), self.placement_row("FAKE-2", 5, 3),
+                     self.placement_row("FAKE-3", 9, 1)]
+        lines, counts = self.build([], [], items, cfg(), placement)
+        self.assertEqual([l["item"] for l in self.by_rule(lines)["open_placement"]], ["FAKE-3", "FAKE-2"],
+                         "demand rows only, most zero days first")
+        self.assertEqual(counts["open_placement"]["open_below_min_sold"], 1)
+        lines, _ = self.build([], [], items, cfg(highlights={"placement_min_sold": 0}), placement)
+        self.assertEqual([l["item"] for l in self.by_rule(lines)["open_placement"]], ["FAKE-3", "FAKE-2", "FAKE-1"])
+
+    def test_placement_min_sold_is_checked(self):
+        for bad in (-1, 1.5, True, 1000001):
+            with self.assertRaises(an.AnalysisSettingsError):
+                cfg(highlights={"placement_min_sold": bad})
 
     def test_every_line_carries_rule_and_inputs(self):
         items = {"FAKE-1": item("FAKE-1")}
