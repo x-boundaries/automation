@@ -93,6 +93,11 @@ on:
       # Its nightly buying-analysis builders (#292 S2) and their offline test (`rest` shard).
       - "scripts/autocount_stock_analysis.py"
       - "tests/test_autocount_stock_analysis.py"
+      # The one-off AC1 sales history build for the Buying tab (#292), its offline test
+      # (`rest` shard) and its runbook. Exact entries, not globs.
+      - "scripts/ac1_sales_history_build.py"
+      - "tests/test_ac1_sales_history_build.py"
+      - "docs/autocount2-automation/ac1_sales_history_runbook.md"
       # Its error-alert n8n workflow and that workflow's offline contract test, which also reads
       # the n8n-workflows README entry.
       - "n8n-workflows/ac2_stock_alert.workflow.json"
