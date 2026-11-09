@@ -206,6 +206,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [SQL Server local probe runbook](docs/autocount_sql_probe.md)
 - [AutoCount stock extraction runbook](docs/autocount_stock_extraction.md)
 - [AC2 hourly stock balance export runbook](docs/autocount2-automation/stock_balance_hourly_runbook.md) (#245)
+- [AC1 sales history build runbook](docs/autocount2-automation/ac1_sales_history_runbook.md) (#292)
 - [Drive mirror of main runbook](docs/drive_mirror_runbook.md)
 - [AutoCount 2 automation architecture](docs/autocount2-automation/architecture.md)
 - [AutoCount 2 API research](docs/autocount2-automation/api_research.md)

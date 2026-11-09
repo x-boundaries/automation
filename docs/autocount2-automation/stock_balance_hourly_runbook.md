@@ -249,6 +249,8 @@ Page rules that use it (documented here so the numbers can be checked): low stoc
 
 ## Buying analysis files (#292 S2)
 
+Pre-go-live AC1 history (size mix and seasonality only) is a separate one-off file built outside this exporter: see [AC1 sales history build runbook](ac1_sales_history_runbook.md).
+
 Design: private mailbox `mailbox/292/20261108-1530-g0r2-design.md` sections 3-5 and 9 (S2). Off by default (`analysis.enabled: false`); nothing below happens until the owner switches it on at VM proof step P3.
 
 **When.** The analysis set is due when the archive copy or the Drive copy of `analysis_manifest.json` is missing, unreadable or older than yesterday's close (`built_from_close_day` < yesterday). In practice that is the 00:00 run; a failed build or publish is retried by the next hourly run (the daily close's self-healing rule), and `--backfill` always rebuilds. Every other run records `analysis_status: not_due`. The build runs **after** every hourly file (latest pair, feed, item index, daily files) is published, so it can never delay or block them, and its outcome is recorded only in `last_run_status.json` and the analysis manifest.
