@@ -1,0 +1,35 @@
+{
+  "schema": "xb.directlocal.member_benefits.config.v1",
+  "state_root": "C:\\XB\\xb268-member-benefits-live",
+  "autocount_book": "AED_XBOUNDARIES",
+  "member_sync_state_root": "C:\\XB\\xb155-member-sync-live",
+  "orders_start_utc": "2026-12-01T00:00:00Z",
+  "shopify": {
+    "store_gid": "gid://shopify/Shop/48759472277",
+    "shop_domain": "xboundariessg.myshopify.com",
+    "api_version": "2026-10",
+    "auth": {
+      "method": "client_credentials",
+      "client_id_env": "XB_SHOPIFY_BENEFITS_CLIENT_ID",
+      "client_secret_env": "XB_SHOPIFY_BENEFITS_CLIENT_SECRET"
+    },
+    "token_cache": "dpapi_current_user"
+  },
+  "benefits_write_enabled": false,
+  "max_upgrades_per_run": 3,
+  "max_member_reads_per_run": 20,
+  "qualify_threshold_cents": 30000,
+  "amount_before_discounts": true,
+  "amount_include_tax": true,
+  "amount_exclude_shipping": true,
+  "amount_exclude_gift_cards": true,
+  "amount_count_sale_items": true,
+  "same_day_signup_counts": true,
+  "waiting_member_alert_hours": 48,
+  "waiting_member_recheck_hours": 6,
+  "signup_wait_hours": 48,
+  "type_move_state_root": "C:\\XB\\xb268-type-move-live",
+  "ac2_credential_target": "XB-AC2-MemberSync",
+  "ac2_login_mode": "owner_shared",
+  "ac2_refused_user_ids": []
+}
