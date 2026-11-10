@@ -1092,8 +1092,144 @@ fixed), `ac2_pending_would_create_backlog` (expected in shadow; after S6 it
 means the backlog is draining: once `shopify_create_enabled` is true the
 whole AC2 queue is read oldest first by ChangeLog ID, so a new walk-in waits
 behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for example
-`ac2_credential_user_refused`. A Telegram push for these is a later lane
-(Q6); in this round they reach the Owner through the daily digest.
+`ac2_credential_user_refused`. They reach the Owner by email in the daily
+summary at 06:40 (#288 slice 3, below); there is no real-time push for them
+until S6 is reviewed (#288 G0 Q8).
+
+### Daily summary email (#288 slice 3)
+
+A separate read-only task, `\XB\XB-MemberSync-DailySummary`, runs once a day
+at 06:40 SGT (after the 06:00 deferred-create run and the 06:15 and 06:30
+runs) as the sync's own task account, and emails one summary that replaces
+the manual daily check: `[XB daily] MEMBER-SYNC CLEAN <date>` or
+`[XB daily] MEMBER-SYNC STOP <date>`. Design: #288 G0 sections 3, 4 and 6.
+Script `directlocal/xb_member_sync_daily_summary.py`, settings
+`config/member_sync_daily_summary.example.json`, installer
+`scripts/install_member_sync_summary_task.ps1`, n8n workflow
+`n8n-workflows/member_sync_daily_summary.workflow.json` (it calls the shared
+`XB Ops Alert Email` sub-workflow).
+
+**What it reads (each step read-only):**
+
+| Daily-check step | Automated as |
+|---|---|
+| 1 Task state | `Get-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberSync' \| Get-ScheduledTaskInfo` (a PowerShell child that only reads) |
+| 2 Config | `xb_member_sync.py check-config` (child process) |
+| 3 Digest | `xb_member_sync.py digest --hours 24` (child process; no lock, no migration, no login) |
+| 4 `status` | **Never run**: it takes the ledger lock, so a 15-minute run starting meanwhile would refuse. Its counts come from the digest. |
+| 5 Members per type | `SELECT MemberType, COUNT_BIG(*) FROM dbo.Member GROUP BY MemberType` |
+| 6 Creates in 24 h | Digest counts (`ac2_member_created`, `created_immediately`, `created_after_wait`). The digest has no per-create list, so the email has no per-create time or link line; alert refs show `***` plus the last 3 characters. "FIRST CREATE" when no earlier daily record saw a create (settings `first_create_already_seen` covers creates made before the task existed). |
+| 6a New AC2 members | `SELECT COUNT_BIG(*) FROM dbo.ChangeLog WHERE TableName = N'Member' AND ChangeType = N'I' AND ChangeTime >= DATEADD(hour, -24, GETDATE())`, minus the sync's creates; links compared with yesterday's record |
+| 7 Owner session | Not automatable without touching AutoCount: always `owner_session: not_checked` (G0 Q4) |
+
+The two SELECTs use Windows authentication, `ApplicationIntent=ReadOnly`, the
+sync's own book (from `check-config`), and the stock export's identity guard
+on the same connection: never the `sa` login, `DB_NAME()` must be the book,
+and a `sysadmin` or `db_owner` identity is refused unless the settings say
+`allow_privileged_identity: true`. If the account has no `SELECT` right (or
+pyodbc is missing), those two lines say `not available (<reason>)` and the
+summary still sends.
+
+**It never** takes the ledger lock, opens the ledger itself, runs `status`,
+`run`, `init`, `initial-link` or an installer, starts the bridge, signs in
+to AutoCount, uses the `sa` login, writes the ledger or the sync config,
+changes a scheduled task, or prints personal data. Static and runtime tests
+prove each (`tests/test_member_sync_daily_summary.py`).
+
+**STOP codes (closed list, in email order):**
+
+| Code | Meaning |
+|---|---|
+| `task_state_unavailable` | The sync task could not be read |
+| `task_last_result` | `LastTaskResult` is not 0 or 3. Only a run in progress (0x41301) is fine: a run killed by the time limit (0x41306) or a task that has not run yet (0x41303) stops. The task is read once a day, so one bad result stops (the manual check asked for two in a row). |
+| `task_disabled` | The sync task's state is `Disabled`. A dead sync must not read CLEAN, even when its last result was 0. |
+| `check_config_failed` | `check-config` refused or did not answer. This is also what a broken or missing live sync config gives: the summary still records and sends. |
+| `config_unexpected` | `shopify_create_enabled` is not exactly false (missing counts), the member type is not `expected_member_type` (GUEST), or the live config's `state_root` is not the `sync_state_root` in the summary settings (the email line says `state_root_as_in_settings=no`) |
+| `digest_failed` | `digest` refused or did not answer |
+| `no_runs` | No completed run in 24 hours, with the digest readable. A dead sync must not read CLEAN. |
+| `unfinished_runs` | More than 1 unfinished run in 24 hours |
+| `shopify_write` | Any Shopify write: every outcome code of the sync's one Shopify mutation that means a create was sent (`shopify_customer_created`, `shopify_separate_customer_created_without_phone`, `shopify_create_uncertain`). A test reads `xb_member_sync.py` and fails if it counts a create outcome that is not on this list. |
+| `uncertain_writes` | Uncertain writes open |
+| `possible_duplicate_member` | The alert, any count |
+| `member_type_unknown` | The alert, any count |
+| `login_refused` | An `autocount_*` or `bridge_read_failed*` alert (most refusals stop a run before it records; they then show as `unfinished_runs` or `task_last_result`). A single login refusal followed by good runs reads CLEAN (1 unfinished run), as in the manual rule. |
+| `writes_over_cap` | More writes in one Singapore clock hour than `max(max_writes_per_run x 4, max_creates_per_hour)`. The digest has no per-run write count, so this is the per-hour form of "more writes in one run than `max_writes_per_run`". |
+| `alert_unexpected` | Any alert code that is not expected. Expected (not a stop): `waiting_for_staff`, `created_after_wait`, `no_phone_sign_up_needs_staff`, `max_writes_per_run_reached` and every `memberno_*` |
+
+**Auto off: observe mode only.** The task reports `auto_off: would_switch`
+with its reasons for the three clearest conditions (a Shopify write while
+Shopify creates are off, uncertain writes, `possible_duplicate_member`) and
+nothing else. No code path writes the sync config. Switching it on (the
+guarded, hash-pinned restore of G0 6.4) is a later round after 7 observed
+mornings and its own owner OK.
+
+**Email failure never fails the task.** The task writes
+`daily_summary_<YYYY-MM-DD>.json` in its own output folder (never inside the
+sync state root) before the POST (`email_status: pending`) and after it
+(`sent`, `send_failed` with `http_status`, `secret_unavailable`, `disabled`
+or `not_sent_check_only`), and exits 0. A missing morning email is itself
+the signal that the email route is down. Exit 2 (no record, no email) only
+when the summary's own set-up is wrong: its settings file is unreadable or
+refused, its output folder is missing or cannot be written, or its output
+folder sits inside the sync state root (the one in the settings, or the one
+in the live sync config when that can be read). A broken, missing or
+unreadable **live sync config** is not one of these: the summary carries on,
+`check-config` refuses, and the email says STOP `check_config_failed`.
+
+**Settings** (`config/member_sync_daily_summary.example.json`): the sync
+config path, `sync_state_root` (the sync's state folder, the same value as
+`state_root` in the live sync config), the output folder,
+`expected_member_type`, `first_create_already_seen`, the timeouts, the SQL
+server and ODBC driver, and the send block: the webhook URL
+(`https://<n8n host>/webhook/<private path>`), the header name and the
+**name** of the Credential Manager target that holds the webhook secret
+(`XB-MemberSync-DailySummary-Webhook` by default). No secret value is in any
+file. `check-settings` checks the file without any network, child process or
+SQL, and without reading any other file: it refuses an output folder inside
+`sync_state_root`, and timeouts that cannot fit the task's 5-minute limit
+(three children at `child_timeout_seconds`, five SQL waits at
+`sql.timeout_seconds` when SQL is on, and the POST must total 285 seconds
+or less; the example uses 60, 15 and 20). `sql.timeout_seconds` is both the
+login timeout and the query timeout of every statement. `daily --no-send`
+builds and records the summary without posting it.
+
+**Where to install it.** The summary runs the `xb_member_sync.py` that sits
+next to it. Install the summary task from the same deployed clone as the
+live sync task, or from one whose `directlocal/xb_member_sync.py` is
+byte-identical to the live one (compare the file hashes first), so
+`check-config` and `digest` read the config and ledger exactly as the live
+sync does.
+
+**Live steps, in order, each with its own owner OK** (nothing in the repo
+does any of them):
+
+1. n8n PC: import `Member Sync - Daily Summary` inactive through the local
+   API `http://127.0.0.1:5678/api/v1`, set the private webhook path and the
+   sub-workflow ID in the local import copy, bind a new Header Auth
+   credential (OK: n8n import and credential). Requires `XB Ops Alert
+   Email` imported and published first (slice 1 steps).
+2. n8n PC: activate it (OK: activation).
+3. AC2 VM, read-only V-check as the task account: `python -c "import
+   pyodbc"`, then `SELECT SUSER_SNAME()` and the two SELECTs above. If
+   refused, either an owner OK to grant `SELECT` on `Member` and `ChangeLog`,
+   or accept `not available` lines.
+4. AC2 VM: store the webhook secret in the task account's Credential
+   Manager under the target name in the settings (OK: VM secret store).
+5. AC2 VM: write the private settings file; run `check-settings`, then
+   `daily --no-send` once as the task account and read the record (read
+   only). The live settings must set `first_create_already_seen` to `true`
+   (S5 creates have run since 5 Nov 2026, before this task existed;
+   otherwise the first email says "FIRST CREATE: run S5 Part B"), and
+   `sync_state_root` to the `state_root` of the live sync config.
+6. AC2 VM: dry-run the installer, then `-Register` (OK: VM task
+   registration). Then one `Start-ScheduledTask` and check the record and
+   the email.
+7. Observe 3 good mornings; then the Controller and owner retire the
+   server-PC desktop reminder. Auto off ON is a later round after 7
+   mornings (separate OK).
+
+Off switch: `Disable-ScheduledTask -TaskPath '\XB\' -TaskName
+'XB-MemberSync-DailySummary'` (by hand; it touches only the summary task).
 
 ### Known risks
 

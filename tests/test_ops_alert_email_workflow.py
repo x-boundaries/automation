@@ -623,6 +623,67 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         for code in codes:
             self.assertRegex(code, r"^(gmail_error|http_[45][0-9][0-9])$")
 
+    # ---- daily summary path (#288 slice 3) ---- #
+    def daily(self, **overrides):
+        value = {"system": "MEMBER-SYNC", "severity": "INFO", "key": "daily_summary", "short": "CLEAN 2026-11-07",
+                 "lines": ["MEMBER-SYNC daily summary 2026-11-07: CLEAN", "No stop condition found."]}
+        value.update(overrides)
+        return {"valid": True, **value}
+
+    def test_daily_summary_subject_and_body(self):
+        plan = self.decide([], self.daily())
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB daily] MEMBER-SYNC CLEAN 2026-11-07")
+        self.assertEqual(plan["mail_row"]["key"], "daily_summary")
+        self.assertEqual(plan["mail_row"]["folded_count"], 0)
+        text = plan["mail"]["text"]
+        self.assertTrue(text.startswith("MEMBER-SYNC daily summary 2026-11-07: CLEAN\nNo stop condition found.\n\n--\n"), text)
+        self.assertIn("System: MEMBER-SYNC | Daily summary", text)
+        self.assertIn("Daily summaries are never folded", text)
+        self.assertNotIn("folded since", text)
+        plan = self.decide([], self.daily(severity="WARN", short="STOP 2026-11-07"))
+        self.assertEqual(plan["mail"]["subject"], "[XB daily] MEMBER-SYNC STOP 2026-11-07")
+        self.assertEqual(plan["mail_row"]["severity"], "WARN")
+
+    def test_daily_summary_is_never_folded(self):
+        rows = [row(m, system="MEMBER-SYNC", key="daily_summary") for m in (1, 5, 30)]
+        rows.append(row(2, system="MEMBER-SYNC", key="daily_summary", outcome="folded"))
+        plan = self.decide(rows, self.daily())
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB daily] MEMBER-SYNC CLEAN 2026-11-07")
+        self.assertEqual(plan["mail_row"]["folded_count"], 0)
+
+    def test_daily_summary_is_never_held_by_a_flood_and_never_counts_toward_one(self):
+        flood = [row(m, system="MEMBER-SYNC", key="alert_%d" % m) for m in range(1, 12)]
+        for rows in (flood, flood + [row(3, system="MEMBER-SYNC", key="alert_flood")]):
+            plan = self.decide(rows, self.daily())
+            self.assertIsNone(plan["held_outcome"])
+            self.assertEqual(plan["mail"]["subject"], "[XB daily] MEMBER-SYNC CLEAN 2026-11-07")
+        # The flood still holds back this system's alerts: the daily path changes nothing for them.
+        alert = validated(system="MEMBER-SYNC", severity="ERROR", key="uncertain_writes", short="uncertain_writes", lines=["x"])
+        self.assertEqual(self.decide(flood, alert)["held_outcome"], "folded_flood")
+        # Eleven daily rows in the hour (manual re-runs) never make an alert a flood.
+        dailies = [row(m, system="MEMBER-SYNC", key="daily_summary") for m in range(1, 12)]
+        plan = self.decide(dailies, alert)
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] MEMBER-SYNC ERROR uncertain_writes")
+
+    def test_daily_key_and_short_are_closed(self):
+        bad = [request(system="MEMBER-SYNC", key="daily_summary", short=short, lines=["x"])
+               for short in ("CLEAN", "clean 2026-11-07", "CLEAN 2026-11-7", "CLEAN  2026-11-07", "CLEAN 2026-11-07 x",
+                             "CLEAN_2026-11-07", "A 2026-11-07", "CLEAN\n2026-11-07", "run_failed:ledger_mismatch")]
+        # A space is still refused in an alert's short: only the daily key has the status-and-date form.
+        bad.append(request(short="CLEAN 2026-11-07"))
+        for body, out in zip(bad, self.validate(*bad)):
+            with self.subTest(short=body["short"], key=body["key"]):
+                self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_SHORT"})
+        (ok,) = self.validate(request(system="MEMBER-SYNC", key="daily_summary", short="STOP 2026-11-07", lines=["x"]))
+        self.assertIs(ok["valid"], True)
+        # A daily summary is one app's email too.
+        (other,) = self.validate(request(system="MEMBER-SYNC", key="daily_summary", short="CLEAN 2026-11-07",
+                                         lines=["see AC2-STOCK"]))
+        self.assertEqual(other, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"})
+
 
 if __name__ == "__main__":
     unittest.main()
