@@ -1740,9 +1740,14 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
         vendor_items.setdefault(vendor, set()).add(code)
     vendor_out = [[v, sorted(vendor_brands.get(v, ())), len(vendor_items.get(v, ()))] for v in vendors]
 
-    stock_items = sum(1 for c in items if not is_non_stock(c) and c.upper() not in excluded)
-    with_po = {k[0] for k in po}
-    with_gr = {k[0] for k in gr}
+    # The item shares count stock items of the item master only; PO or GR codes the master does not know are
+    # counted apart, so a share can never pass 100%.
+    stock_set = {c for c in items if not is_non_stock(c) and clean(c).upper() not in excluded}
+    stock_items = len(stock_set)
+    all_po = {k[0] for k in po}
+    all_gr = {k[0] for k in gr}
+    with_po = all_po & stock_set
+    with_gr = all_gr & stock_set
     file_counts = {
         "po_rows": len(po_out),
         "po_lines": tot["lines"],
@@ -1822,6 +1827,7 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
         "items_with_po_pct": _pct1(len(with_po), stock_items),
         "items_with_gr": len(with_gr),
         "gr_items_with_po_pct": _pct1(len(with_gr & with_po), len(with_gr)),
+        "codes_not_in_item_master": len((all_po | all_gr) - set(items)),
         "non_stock_lines_excluded": counts["non_stock_lines_excluded"],
         "excluded_item_lines": counts["excluded_item_lines"],
     }

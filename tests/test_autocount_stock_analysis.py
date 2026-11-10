@@ -1080,6 +1080,17 @@ class PurchasingBuildTests(unittest.TestCase):
         for word in ("price", "amount", "cost", "docno", "doc_no", "creditor_code", "debtor"):
             self.assertNotIn(word, lowered, word)
 
+    def test_item_shares_count_master_stock_items_only(self):
+        # A PO or GR code the item master does not know is listed but never pushes a share past 100%.
+        self.po.append(po_row("FAKE-NOT-IN-MASTER", "Vendor B", date(2026, 10, 1), 3, 1))
+        self.gr.append(gr_row("FAKE-NOT-IN-MASTER", "Vendor B", date(2026, 10, 3), 1, lead=2))
+        payload, cov = self.build()
+        self.assertIn("FAKE-NOT-IN-MASTER", payload["items"])
+        self.assertEqual((cov["stock_items"], cov["items_with_po"], cov["items_with_po_pct"]), (3, 3, 100.0))
+        self.assertEqual((cov["items_with_gr"], cov["codes_not_in_item_master"]), (3, 1))
+        rows = self.rows(payload, "po")
+        self.assertEqual(payload["groups"][[r for r in rows if payload["items"][r["item"]] == "FAKE-NOT-IN-MASTER"][0]["group"]], "")
+
     def test_empty_reads_give_an_empty_file(self):
         self.po, self.gr = [], []
         payload, cov = self.build()
