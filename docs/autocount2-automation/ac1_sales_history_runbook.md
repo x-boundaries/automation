@@ -25,7 +25,8 @@ The folder also holds an item list workbook; it does not match `YYYY-MM.xlsx`, s
 
 - Only **column A (Item Code)** and **column G (Sold Qty)** of each data row are read. Description, group, type, money and margin cells are skipped while parsing; the shared-strings table is read in a second pass that resolves only the strings column A and the header row use.
 - The whole header must match the layout above, or the build stops (a different layout could put something other than Sold Qty in column G).
-- The build stops, writing nothing, on: a non-text item code, a blank or repeated code in a month, a non-numeric or fractional Sold Qty, a code-less row that is not the last row, an unreadable workbook, or an unreadable item index. Error messages give the file, row and column, never a cell value.
+- The build stops, writing nothing, on: a non-text item code, a blank or repeated code in a month, a non-numeric, infinite or fractional Sold Qty, a code-less row that is not the last row, item rows that do not add up to the grand-total row's Sold Qty, a file name that looks like a month file but is not `YYYY-MM.xlsx` (for example `2026-05 (1).xlsx`, `2026-05.xls`, `2026-13.xlsx`), two files for the same month, an unreadable workbook (including a row or cell with no reference), or an unreadable item index. Error messages give the file, row and column, never a cell value. Any other unexpected input also exits 2 with a `FAILED:` line.
+- The last row is the grand total when column A is blank or reads `Total` / `Grand Total`; its Sold Qty must equal the sum of the item rows. Month file names match without regard to case (`2026-05.XLSX` is May 2026). Gaps are listed up to `--last-month`, so a missing final month is a marked gap, never a hole before AC2 starts.
 - Codes are trimmed and upper-cased. Mapping flags come from the AC2 exporter's local `stock_item_index.json.gz` (read only, exact code match; AC2 item barcodes are empty, so there is no barcode fallback).
 
 Outputs, in a folder of their own (default `autocount_outputs\ac1_history` in the clone, gitignored). The script refuses a folder inside the AC1 folder and a folder holding the exporter's `last_run_status.json`, so it can never write into the AC2 archive.
@@ -51,10 +52,21 @@ python scripts\ac1_sales_history_build.py --ac1-dir "<AC1 export folder>" --item
 
 Options: `--out-dir` (default above), `--last-month YYYY-MM` (default `2026-07`), `--partial-months` (comma list, default `2025-01`; `""` for none). Exit code 0 = written, 2 = stopped with a `FAILED:` line and nothing new written. The console shows months, gaps, partial months, item and row counts and the data file hash.
 
-Rebuild after a re-export (for example a missing or partial month): drop the new workbook into the AC1 folder and run the command again; both files are replaced together.
+Rebuild after a re-export (for example a missing or partial month): drop the new workbook into the AC1 folder and run the command again. The data file is written first and the manifest last, each replaced atomically and checked after writing.
+
+## Publish to the Drive folder (manual, owner OK each time)
+
+The script refuses to write into the Drive folder by design, so every publish is a manual copy. First publish: 9 Nov 2026, with the owner's OK. Each later publish needs its own owner OK.
+
+1. Check the time: never between :55 and :05 past the hour (the hourly export runs on the hour).
+2. Run the build (above) and keep its console output. It must end with `OK:` and print the data sha256.
+3. Copy `ac1_sales_monthly.json.gz` **first** into the top level of the Drive folder `Report/AC2 Stock Balance (daily)`, replacing the old copy.
+4. Copy `ac1_sales_monthly_manifest.json` **last** into the same place. The page checks the manifest's `data_file.sha256` and `bytes` against the data file, so the manifest must never arrive before its data.
+5. Check: the SHA-256 of the copied gz (`Get-FileHash -Algorithm SHA256 <Drive copy>`) equals the manifest's `data_file.sha256`, and the byte size equals `data_file.bytes`.
+6. Touch nothing else in the folder: no other file is added, renamed or removed, and no `.ac1_*.tmp` file is left behind. The exporter's files keep their normal hourly or nightly modified times.
+7. Record the time, sha256 and bytes in the private mailbox (never in this repository).
 
 ## Not in this step (each needs its own owner OK)
 
-- Copying the two files to the Drive folder `Report/AC2 Stock Balance (daily)`.
-- Changing the dashboard's Buying tab to read the file (where the dashboard source lives is still to be confirmed).
+- The dashboard reads the file in Buying > History (dashboard Version 9 and later; the page source is a claude.ai artifact, with copies in the private mailbox).
 - Re-exporting AC1 months (2024-12 is missing; 2025-01 looks partial), or an AC1 export by location that would settle the channel question.

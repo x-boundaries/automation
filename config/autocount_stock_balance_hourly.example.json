@@ -110,6 +110,10 @@
         {"id": "transfer_from_hq", "label": "Transfer from HQ", "zero_locations": ["LOC-A"], "holder_locations": ["LOC-HQ"]}
       ]
     },
+    "purchasing": {
+      "enabled": false,
+      "stale_days": 60
+    },
     "highlights": {
       "pool": "retail_network",
       "channels": ["outlet", "marketplace", "shopify"],

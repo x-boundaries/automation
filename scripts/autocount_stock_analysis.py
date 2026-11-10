@@ -11,10 +11,15 @@ Files (all units only, latest-only, gzip with a fixed header time, one verified 
                                  opening at go-live, received per month
 * analysis_placement.json.gz     item x placement pair x zero location: zero days 30/90, open now
 * analysis_highlights.json.gz    rule-based lines, each with its rule id and inputs
+* analysis_purchasing.json.gz    (#292 S4, analysis.purchasing.enabled, default off) PO lines,
+                                 goods received, lead days, vendor labels and the ordered vs
+                                 received size split; units only
 * analysis_manifest.json         run, close day, file hashes, counts, settings digest, coverage
 
 Privacy contract: no cost, price or amount column, no document number, no debtor or creditor
-code or name, no personal data. The debtor code is only compared inside SQL Server (a CASE over
+code, no debtor name, no personal data. The purchasing file carries the vendor (creditor) NAME
+only (owner decision Q1, 8 Nov 2026); creditor codes and PO/GR document numbers are only used
+inside SQL Server joins and never come back. The debtor code is only compared inside SQL Server (a CASE over
 parameter markers that returns a channel id), so it never reaches Python, a file or a log.
 Channel, pool, placement and size rules all come from settings (analysis.*).
 """
@@ -24,20 +29,23 @@ import hashlib
 import json
 import re
 from datetime import date, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 SALES_NAME = "analysis_sales_daily.json.gz"
 STATE_NAME = "analysis_stock_state.json.gz"
 PLACEMENT_NAME = "analysis_placement.json.gz"
 HIGHLIGHTS_NAME = "analysis_highlights.json.gz"
+PURCHASING_NAME = "analysis_purchasing.json.gz"
 MANIFEST_NAME = "analysis_manifest.json"
 SALES_SCHEMA = "xb.ac2.analysis_sales_daily"
 STATE_SCHEMA = "xb.ac2.analysis_stock_state"
 PLACEMENT_SCHEMA = "xb.ac2.analysis_placement"
 HIGHLIGHTS_SCHEMA = "xb.ac2.analysis_highlights"
+PURCHASING_SCHEMA = "xb.ac2.analysis_purchasing"
 MANIFEST_SCHEMA = "xb.ac2.analysis_manifest"
 SCHEMA_VERSION = 1
-# Data files in publish order; the manifest is always published last.
+# Data files in publish order; the manifest is always published last. The purchasing file (S4) is
+# published after these, only when analysis.purchasing.enabled is true and its build succeeded.
 DATA_FILES = (
     (SALES_NAME, SALES_SCHEMA),
     (STATE_NAME, STATE_SCHEMA),
@@ -120,6 +128,9 @@ DEFAULT_ANALYSIS = {
         "drift_min_units": 100,
         "slow_days": 60,
     },
+    # #292 S4: purchasing and vendors (analysis_purchasing.json.gz). Off by default; it needs
+    # analysis.enabled too. A PO line is stale when it still has open units after stale_days.
+    "purchasing": {"enabled": False, "stale_days": 60},
     "attributes": {
         # Raw size (upper case, spaces collapsed) -> canonical size. Extend at VM proof.
         "size_map": {
@@ -152,7 +163,7 @@ DEFAULT_ANALYSIS = {
         "size_class_by_category": {},
     },
 }
-NESTED_CLOSED = ("doc_types", "placement", "highlights", "attributes")
+NESTED_CLOSED = ("doc_types", "placement", "highlights", "purchasing", "attributes")
 
 
 class AnalysisSettingsError(ValueError):
@@ -198,7 +209,14 @@ def as_day(value):
 
 
 def settings_digest(cfg):
-    """sha256 of the analysis settings. The digest is published; the values never are."""
+    """sha256 of the analysis settings. The digest is published; the values never are.
+
+    While analysis.purchasing is off its block is left out, so the digest of settings that do not
+    use purchasing is the same as before the block existed (#292 S4: off changes nothing).
+    """
+    purchasing = cfg.get("purchasing") if isinstance(cfg, dict) else None
+    if isinstance(purchasing, dict) and not purchasing.get("enabled"):
+        cfg = {k: v for k, v in cfg.items() if k != "purchasing"}
     raw = json.dumps(cfg, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -350,6 +368,11 @@ def validate_analysis(raw):
     _int(hl["drift_pts"], "analysis.highlights.drift_pts", 1, 100)
     _int(hl["drift_min_units"], "analysis.highlights.drift_min_units", 1, 1000000)
     _int(hl["slow_days"], "analysis.highlights.slow_days", 1, 365)
+
+    purchasing = cfg["purchasing"]
+    if not isinstance(purchasing["enabled"], bool):
+        raise AnalysisSettingsError("analysis.purchasing.enabled must be true or false")
+    _int(purchasing["stale_days"], "analysis.purchasing.stale_days", 1, 365)
 
     attrs = cfg["attributes"]
     size_map = attrs["size_map"]
@@ -1420,3 +1443,386 @@ def manifest_payload(header, files, parts):
     )
     payload.update(parts)
     return payload
+
+
+# ---------------------------------------------------------------------------------------------
+# #292 S4: purchasing and vendors (analysis.purchasing.enabled, default off)
+# ---------------------------------------------------------------------------------------------
+#
+# AutoCount facts this rests on (VM data check, 8 Nov 2026):
+# * a GR line links to its PO through GRDTL.FromDocType = 'PO' and FromDocNo = PO.DocNo
+#   (FromDocDtlKey is empty), so the link is made per document, inside SQL Server;
+# * AutoCount keeps no supplier ETA (PODTL.DeliveryDate copies the PO date) and no PO status, so
+#   "open" is ordered minus transferred on the PO line, with a stale-age flag;
+# * lead days use the document (header) dates: GR date minus linked PO date;
+# * consignment purchases are not stock documents and are not read here.
+# The creditor code and the PO/GR numbers are only compared inside SQL Server; the vendor NAME
+# is the only creditor field that comes back (owner Q1). No price, cost or amount is read.
+
+PURCHASING_FILE = (PURCHASING_NAME, PURCHASING_SCHEMA)
+NO_VENDOR_NAME = "(no vendor name)"
+LEAD_QUANTILES = (("p25", 0.25), ("median", 0.5), ("p75", 0.75))
+
+# One label per creditor: the largest name the creditor carries on its PO and GR headers, so the
+# same supplier never shows as two vendors when its name was typed differently on one document.
+_VENDOR_NAMES_SQL = (
+    "    LEFT JOIN (\n"
+    "        SELECT n.CreditorCode, MAX(n.CreditorName) AS VendorName\n"
+    "        FROM (\n"
+    "            SELECT CreditorCode, CreditorName FROM dbo.PO\n"
+    "            UNION ALL\n"
+    "            SELECT CreditorCode, CreditorName FROM dbo.GR\n"
+    "        ) AS n\n"
+    "        GROUP BY n.CreditorCode\n"
+    "    ) AS vn ON vn.CreditorCode = h.CreditorCode\n"
+)
+_NOT_CANCELLED = "COALESCE(h.Cancelled, N'F') <> N'T'"
+
+PO_LINES_QUERY = (
+    "SELECT s.ItemCode, s.VendorName, s.PoDay,\n"
+    "    SUM(s.Qty) AS Ordered,\n"
+    "    SUM(s.Transferred) AS Transferred,\n"
+    "    SUM(CASE WHEN s.Qty > s.Transferred THEN s.Qty - s.Transferred ELSE 0 END) AS OpenQty,\n"
+    "    SUM(CASE WHEN s.Qty > s.Transferred THEN 1 ELSE 0 END) AS OpenLines,\n"
+    "    SUM(CASE WHEN s.Transferred > s.Qty THEN 1 ELSE 0 END) AS OverLines,\n"
+    "    COUNT_BIG(*) AS PoLines\n"
+    "FROM (\n"
+    "    SELECT l.ItemCode, vn.VendorName, CAST(h.DocDate AS date) AS PoDay,\n"
+    "        COALESCE(l.Qty, 0) AS Qty, COALESCE(l.TransferedQty, 0) AS Transferred\n"
+    "    FROM dbo.PODTL AS l\n"
+    "    JOIN dbo.PO AS h ON h.DocKey = l.DocKey\n"
+    + _VENDOR_NAMES_SQL +
+    "    WHERE l.ItemCode IS NOT NULL AND " + _NOT_CANCELLED + " AND h.DocDate < ?\n"
+    ") AS s\n"
+    "GROUP BY s.ItemCode, s.VendorName, s.PoDay"
+)
+
+GR_LINES_QUERY = (
+    "SELECT s.ItemCode, s.VendorName, s.GrDay, s.Linked, s.LeadDays,\n"
+    "    SUM(s.Qty) AS Received,\n"
+    "    COUNT_BIG(*) AS GrLines\n"
+    "FROM (\n"
+    "    SELECT g.ItemCode, vn.VendorName, CAST(h.DocDate AS date) AS GrDay,\n"
+    "        CASE WHEN po.PoDay IS NULL THEN 0 ELSE 1 END AS Linked,\n"
+    "        DATEDIFF(day, po.PoDay, CAST(h.DocDate AS date)) AS LeadDays,\n"
+    "        COALESCE(g.Qty, 0) AS Qty\n"
+    "    FROM dbo.GRDTL AS g\n"
+    "    JOIN dbo.GR AS h ON h.DocKey = g.DocKey\n"
+    + _VENDOR_NAMES_SQL +
+    "    LEFT JOIN (\n"
+    "        SELECT p.DocNo, MIN(CAST(p.DocDate AS date)) AS PoDay\n"
+    "        FROM dbo.PO AS p\n"
+    "        WHERE COALESCE(p.Cancelled, N'F') <> N'T'\n"
+    "        GROUP BY p.DocNo\n"
+    "    ) AS po ON g.FromDocType = N'PO' AND po.DocNo = g.FromDocNo\n"
+    "    WHERE g.ItemCode IS NOT NULL AND " + _NOT_CANCELLED + " AND h.DocDate < ?\n"
+    ") AS s\n"
+    "GROUP BY s.ItemCode, s.VendorName, s.GrDay, s.Linked, s.LeadDays"
+)
+
+PO_FIELDS = (
+    "item", "vendor", "po_day", "ordered", "transferred", "open", "lines", "open_lines", "over_lines", "age_days",
+    "stale", "group",
+)
+GR_FIELDS = ("item", "vendor", "month", "received", "linked", "lines", "group")
+LEAD_FIELDS = ("group", "vendor", "brand", "lines", "positive_lines", "le0_lines", "p25", "median", "p75", "max", "hist")
+SIZE_FIELDS = ("group", "brand", "category", "gender", "size", "size_order", "size_class", "ordered", "received")
+VENDOR_FIELDS = ("vendor", "brands", "items")
+
+
+def purchasing_enabled(cfg):
+    return bool(cfg["enabled"] and cfg["purchasing"]["enabled"])
+
+
+def purchasing_queries():
+    """{name: sql} for the purchasing read. Fixed text; one parameter each (the next midnight)."""
+    return {"po_lines": PO_LINES_QUERY, "gr_lines": GR_LINES_QUERY}
+
+
+def purchasing_params(last_day):
+    return [last_day + timedelta(days=1)]
+
+
+def lead_quantile(values, q):
+    """Linear interpolation between closest ranks (sorted values, 0 <= q <= 1). The page uses
+    the same rule, so its figures for any group mix match the file's."""
+    if not values:
+        return None
+    pos = (len(values) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(values) - 1)
+    return _round1(values[lo] + (values[hi] - values[lo]) * (pos - lo))
+
+
+def _round1(value):
+    """One decimal, halves away from zero (the page rounds the same way)."""
+    return float(Decimal(repr(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def lead_stats(hist):
+    """{lines, positive_lines, le0_lines, p25, median, p75, max} from {lead_days: lines}.
+    Lines with a lead of 0 or less (GR dated on or before its PO) are counted apart and left out
+    of the spread."""
+    positive = []
+    le0 = 0
+    for lead, lines in sorted(hist.items()):
+        if lead > 0:
+            positive.extend([lead] * lines)
+        else:
+            le0 += lines
+    out = {"lines": len(positive) + le0, "positive_lines": len(positive), "le0_lines": le0}
+    for name, q in LEAD_QUANTILES:
+        out[name] = lead_quantile(positive, q)
+    out["max"] = positive[-1] if positive else None
+    return out
+
+
+def _pct1(part, whole):
+    return round(float(part) * 100.0 / float(whole), 1) if whole else None
+
+
+def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, header):
+    """The purchasing payload and its manifest part from the two purchasing reads. Pure.
+
+    po_rows: ItemCode, VendorName, PoDay, Ordered, Transferred, OpenQty, OpenLines, OverLines,
+    PoLines (grouped per item, vendor and PO day). gr_rows: ItemCode, VendorName, GrDay, Linked,
+    LeadDays, Received, GrLines (grouped per item, vendor, GR day, link flag and lead days).
+    Non-stock items and exclude_item_codes items are left out and counted, as in the other files.
+    """
+    stale_days = cfg["purchasing"]["stale_days"]
+    excluded = excluded_codes(cfg)
+    counts = {"non_stock_lines_excluded": 0, "excluded_item_lines": 0, "rows_after_close_day": 0}
+
+    def keep(code, lines):
+        if is_non_stock(code):
+            counts["non_stock_lines_excluded"] += lines
+            return False
+        if code.upper() in excluded:
+            counts["excluded_item_lines"] += lines
+            return False
+        return True
+
+    po = {}
+    for r in po_rows:
+        code = clean(r.get("ItemCode"))
+        lines = int(r.get("PoLines") or 0)
+        if not code or not keep(code, lines):
+            continue
+        day = as_day(r.get("PoDay"))
+        if day > last_day:
+            counts["rows_after_close_day"] += 1
+            continue
+        key = (code, clean(r.get("VendorName")) or NO_VENDOR_NAME, day)
+        e = po.setdefault(key, {"ordered": Decimal(0), "transferred": Decimal(0), "open": Decimal(0),
+                                "lines": 0, "open_lines": 0, "over_lines": 0})
+        e["ordered"] += to_dec(r.get("Ordered"))
+        e["transferred"] += to_dec(r.get("Transferred"))
+        e["open"] += to_dec(r.get("OpenQty"))
+        e["lines"] += lines
+        e["open_lines"] += int(r.get("OpenLines") or 0)
+        e["over_lines"] += int(r.get("OverLines") or 0)
+
+    gr = {}
+    lead_hist = {}
+    for r in gr_rows:
+        code = clean(r.get("ItemCode"))
+        lines = int(r.get("GrLines") or 0)
+        if not code or not keep(code, lines):
+            continue
+        day = as_day(r.get("GrDay"))
+        if day > last_day:
+            counts["rows_after_close_day"] += 1
+            continue
+        vendor = clean(r.get("VendorName")) or NO_VENDOR_NAME
+        linked = bool(r.get("Linked"))
+        key = (code, vendor, day.strftime("%Y-%m"), linked)
+        e = gr.setdefault(key, {"received": Decimal(0), "lines": 0})
+        e["received"] += to_dec(r.get("Received"))
+        e["lines"] += lines
+        if linked and r.get("LeadDays") is not None:
+            item_row = items.get(code, {})
+            hkey = (group_of(item_row), vendor, brand_of(item_row))
+            hist = lead_hist.setdefault(hkey, {})
+            lead = int(r.get("LeadDays"))
+            hist[lead] = hist.get(lead, 0) + lines
+
+    codes = sorted({k[0] for k in po} | {k[0] for k in gr})
+    item_pos = {c: n for n, c in enumerate(codes)}
+    vendors = sorted({k[1] for k in po} | {k[1] for k in gr} | {k[1] for k in lead_hist})
+    vendor_pos = {v: n for n, v in enumerate(vendors)}
+    group_by_item = {c: group_of(items.get(c, {})) for c in codes}
+    groups = sorted(set(group_by_item.values()) | {k[0] for k in lead_hist})
+    group_pos = {g: n for n, g in enumerate(groups)}
+    brands = sorted({brand_of(items.get(c, {})) for c in codes})
+    brand_pos = {b: n for n, b in enumerate(brands)}
+
+    po_out = []
+    tot = {"ordered": Decimal(0), "transferred": Decimal(0), "open": Decimal(0), "lines": 0, "open_lines": 0,
+           "over_lines": 0, "stale_lines": 0, "stale_units": Decimal(0), "stale_rows": 0}
+    rec_po = {}
+    for (code, vendor, day), e in sorted(po.items(), key=lambda kv: (kv[0][2], kv[0][1], kv[0][0])):
+        age = (last_day - day).days
+        stale = e["open"] > 0 and age > stale_days
+        po_out.append([
+            item_pos[code], vendor_pos[vendor], day.isoformat(), num(e["ordered"]), num(e["transferred"]),
+            num(e["open"]), e["lines"], e["open_lines"], e["over_lines"], age, stale, group_pos[group_by_item[code]],
+        ])
+        for k in ("ordered", "transferred", "open", "lines", "open_lines", "over_lines"):
+            tot[k] += e[k]
+        if stale:
+            tot["stale_lines"] += e["open_lines"]
+            tot["stale_units"] += e["open"]
+            tot["stale_rows"] += 1
+        m = rec_po.setdefault(day.strftime("%Y-%m"), [0, Decimal(0), Decimal(0), Decimal(0), 0])
+        m[0] += e["lines"]
+        m[1] += e["ordered"]
+        m[2] += e["transferred"]
+        m[3] += e["open"]
+        m[4] += e["open_lines"]
+
+    gr_out = []
+    gtot = {"lines": 0, "received": Decimal(0), "linked_lines": 0, "linked_units": Decimal(0)}
+    rec_gr = {}
+    for (code, vendor, month, linked), e in sorted(gr.items(), key=lambda kv: (kv[0][2], kv[0][1], kv[0][0], kv[0][3])):
+        gr_out.append([item_pos[code], vendor_pos[vendor], month, num(e["received"]), linked, e["lines"],
+                       group_pos[group_by_item[code]]])
+        gtot["lines"] += e["lines"]
+        gtot["received"] += e["received"]
+        m = rec_gr.setdefault(month, [0, Decimal(0), 0, Decimal(0)])
+        m[0] += e["lines"]
+        m[1] += e["received"]
+        if linked:
+            gtot["linked_lines"] += e["lines"]
+            gtot["linked_units"] += e["received"]
+            m[2] += e["lines"]
+            m[3] += e["received"]
+
+    lead_out = []
+    all_hist = {}
+    for (group, vendor, brand), hist in sorted(lead_hist.items()):
+        st = lead_stats(hist)
+        lead_out.append([group_pos[group], vendor_pos[vendor], brand, st["lines"], st["positive_lines"],
+                         st["le0_lines"], st["p25"], st["median"], st["p75"], st["max"],
+                         [[lead, n] for lead, n in sorted(hist.items())]])
+        for lead, n in hist.items():
+            all_hist[lead] = all_hist.get(lead, 0) + n
+    lead_all = lead_stats(all_hist)
+
+    # Ordered vs received size split per group, brand, category, gender and size (sized items
+    # only; the page puts sold beside it). Units of items with no recognised size are counted.
+    attrs = cfg["attributes"]
+    size_split = {}
+    not_sized = {"ordered": Decimal(0), "received": Decimal(0)}
+
+    def add_size(code, field, qty):
+        attr = item_attributes(items.get(code, {}), attrs)
+        if not is_sized(attr):
+            not_sized[field] += qty
+            return
+        key = (group_by_item[code], brand_of(items.get(code, {})), attr["category"], attr["gender"], attr["size"])
+        e = size_split.setdefault(key, {"order": attr["size_order"], "class": attr["size_class"],
+                                        "ordered": Decimal(0), "received": Decimal(0)})
+        e[field] += qty
+
+    for (code, _vendor, _day), e in po.items():
+        add_size(code, "ordered", e["ordered"])
+    for (code, _vendor, _month, _linked), e in gr.items():
+        add_size(code, "received", e["received"])
+    size_out = [
+        [group_pos[g], b, c, gen, size, e["order"], e["class"], num(e["ordered"]), num(e["received"])]
+        for (g, b, c, gen, size), e in sorted(size_split.items(), key=lambda kv: (kv[0][:4], kv[1]["order"] or 0, kv[0][4]))
+    ]
+
+    vendor_brands = {}
+    vendor_items = {}
+    for code, vendor, *_rest in list(po) + list(gr):
+        vendor_brands.setdefault(vendor, set()).add(brand_of(items.get(code, {})))
+        vendor_items.setdefault(vendor, set()).add(code)
+    vendor_out = [[v, sorted(vendor_brands.get(v, ())), len(vendor_items.get(v, ()))] for v in vendors]
+
+    stock_items = sum(1 for c in items if not is_non_stock(c) and c.upper() not in excluded)
+    with_po = {k[0] for k in po}
+    with_gr = {k[0] for k in gr}
+    file_counts = {
+        "po_rows": len(po_out),
+        "po_lines": tot["lines"],
+        "gr_rows": len(gr_out),
+        "gr_lines": gtot["lines"],
+        "items": len(codes),
+        "vendors": len(vendors),
+        "lead_rows": len(lead_out),
+        "size_rows": len(size_out),
+        "stale_lines": tot["stale_lines"],
+        "unlinked_gr_lines": gtot["lines"] - gtot["linked_lines"],
+    }
+    file_counts.update(counts)
+    payload = dict(header)
+    payload.update({
+        "schema": PURCHASING_SCHEMA,
+        "schema_version": SCHEMA_VERSION,
+        "quantity_rule": QUANTITY_RULE,
+        "stale_days": stale_days,
+        "rules": {
+            "open": "open = ordered - transferred (received) on each PO line, never below 0; AutoCount keeps no PO status and no supplier ETA",
+            "stale": "a PO line with open units whose PO date is more than %d days before the close day" % stale_days,
+            "received": "goods received (GR lines) by GR month; consignment purchases are not stock documents and are not included",
+            "linked": "a GR line copied from a PO (matched by document inside SQL; no document number is written)",
+            "lead_days": "GR date minus the linked PO date (document dates), per GR line; lines with 0 or fewer days are counted apart and left out of the spread",
+            "quantiles": "linear interpolation between closest ranks over the lines with a lead above 0",
+            "vendor": "the creditor name only; creditor codes, document numbers and money fields are never read into this file",
+        },
+        "vendors": vendors,
+        "items": codes,
+        "item_brand": [brand_pos[brand_of(items.get(c, {}))] for c in codes],
+        "brands": brands,
+        "groups": groups,
+        "po_fields": list(PO_FIELDS),
+        "po_rows": po_out,
+        "gr_fields": list(GR_FIELDS),
+        "gr_rows": gr_out,
+        "lead_fields": list(LEAD_FIELDS),
+        "lead_rows": lead_out,
+        "lead_all": lead_all,
+        "size_fields": list(SIZE_FIELDS),
+        "size_rows": size_out,
+        "not_sized_units": {"ordered": num(not_sized["ordered"]), "received": num(not_sized["received"])},
+        "vendor_fields": list(VENDOR_FIELDS),
+        "vendor_rows": vendor_out,
+        "reconcile_po_fields": ["month", "lines", "ordered", "transferred", "open", "open_lines"],
+        "reconcile_po": [[m, v[0], num(v[1]), num(v[2]), num(v[3]), v[4]] for m, v in sorted(rec_po.items())],
+        "reconcile_gr_fields": ["month", "lines", "received", "linked_lines", "linked_units"],
+        "reconcile_gr": [[m, v[0], num(v[1]), v[2], num(v[3])] for m, v in sorted(rec_gr.items())],
+        "counts": file_counts,
+    })
+    coverage = {
+        "stale_days": stale_days,
+        "vendors": len(vendors),
+        "po_lines": tot["lines"],
+        "ordered_units": num(tot["ordered"]),
+        "transferred_units": num(tot["transferred"]),
+        "open_units": num(tot["open"]),
+        "open_lines": tot["open_lines"],
+        "stale_lines": tot["stale_lines"],
+        "stale_units": num(tot["stale_units"]),
+        "over_received_lines": tot["over_lines"],
+        "gr_lines": gtot["lines"],
+        "received_units": num(gtot["received"]),
+        "gr_linked_lines": gtot["linked_lines"],
+        "gr_linked_units": num(gtot["linked_units"]),
+        "gr_unlinked_lines": gtot["lines"] - gtot["linked_lines"],
+        "gr_unlinked_units": num(gtot["received"] - gtot["linked_units"]),
+        "gr_link_rate_lines_pct": _pct1(gtot["linked_lines"], gtot["lines"]),
+        "gr_link_rate_units_pct": _pct1(gtot["linked_units"], gtot["received"]),
+        "lead_lines": lead_all["lines"],
+        "lead_positive_lines": lead_all["positive_lines"],
+        "lead_le0_lines": lead_all["le0_lines"],
+        "lead_coverage_pct": _pct1(lead_all["lines"], gtot["lines"]),
+        "stock_items": stock_items,
+        "items_with_po": len(with_po),
+        "items_with_po_pct": _pct1(len(with_po), stock_items),
+        "items_with_gr": len(with_gr),
+        "gr_items_with_po_pct": _pct1(len(with_gr & with_po), len(with_gr)),
+        "non_stock_lines_excluded": counts["non_stock_lines_excluded"],
+        "excluded_item_lines": counts["excluded_item_lines"],
+    }
+    return payload, coverage
