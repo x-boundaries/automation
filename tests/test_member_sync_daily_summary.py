@@ -34,6 +34,7 @@ import xb_member_sync_daily_summary as summary  # noqa: E402
 READ_SQL_COUNTS = summary.read_sql_counts  # the real reader, kept for fakes that patch the module
 
 SOURCE = ROOT / "directlocal" / "xb_member_sync_daily_summary.py"
+SYNC_SOURCE = ROOT / "directlocal" / "xb_member_sync.py"
 WORKFLOW = ROOT / "n8n-workflows" / "member_sync_daily_summary.workflow.json"
 INSTALLER = ROOT / "scripts" / "install_member_sync_summary_task.ps1"
 EXAMPLE_SETTINGS = ROOT / "config" / "member_sync_daily_summary.example.json"
@@ -181,6 +182,7 @@ class SummaryTestCase(unittest.TestCase):
     def settings_value(self, **overrides):
         value = json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))
         value["sync_config_path"] = str(self.sync_config)
+        value["sync_state_root"] = str(self.state_root)
         value["output_dir"] = str(self.out)
         value["send"] = {**value["send"], "enabled": True, "webhook_url": "https://n8n.example.com/webhook/example-summary-path"}
         for key, item in overrides.items():
@@ -211,9 +213,11 @@ class SummaryTestCase(unittest.TestCase):
 class DecisionTests(SummaryTestCase):
     def test_stop_code_list_is_closed_and_pinned(self):
         self.assertEqual(summary.STOP_CODES, (
-            "task_state_unavailable", "task_last_result", "check_config_failed", "config_unexpected", "digest_failed",
-            "unfinished_runs", "shopify_write", "uncertain_writes", "possible_duplicate_member", "member_type_unknown",
-            "login_refused", "writes_over_cap", "alert_unexpected"))
+            "task_state_unavailable", "task_last_result", "task_disabled", "check_config_failed", "config_unexpected",
+            "digest_failed", "no_runs", "unfinished_runs", "shopify_write", "uncertain_writes", "possible_duplicate_member",
+            "member_type_unknown", "login_refused", "writes_over_cap", "alert_unexpected"))
+        self.assertEqual(summary.SHOPIFY_WRITE_CODES, ("shopify_customer_created", "shopify_separate_customer_created_without_phone",
+                                                       "shopify_create_uncertain"))
         self.assertEqual(summary.AUTO_OFF_CODES, ("shopify_write_while_disabled", "uncertain_writes", "possible_duplicate_member"))
         self.assertEqual(summary.EXPECTED_ALERTS, ("waiting_for_staff", "created_after_wait", "no_phone_sign_up_needs_staff",
                                                    "max_writes_per_run_reached"))
@@ -258,6 +262,37 @@ class DecisionTests(SummaryTestCase):
         self.assertEqual(self.stops(runner=FakeRunner(task=task_fixture(last_result=2))), ["task_last_result"])
         self.assertEqual(self.stops(runner=FakeRunner(task=task_fixture(last_result=2147942402))), ["task_last_result"])
 
+    def test_stop_task_last_result_for_a_killed_run_and_a_task_that_never_ran(self):
+        # Only 0x41301 (a run in progress) is fine. 0x41306: the run was killed by the time
+        # limit. 0x41303: the task has not run yet. Neither may pass as "running".
+        self.assertEqual(summary.TASK_RESULT_RUNNING, 0x41301)
+        for result in (0x41306, 0x41303, 0x41300, 0x41302):
+            with self.subTest(result=hex(result)):
+                self.assertEqual(self.stops(runner=FakeRunner(task=task_fixture(last_result=result))), ["task_last_result"])
+
+    def test_stop_task_disabled(self):
+        # A dead sync must not read CLEAN: the last result may still be 0.
+        event = self.run_daily(runner=FakeRunner(task=task_fixture(state="Disabled", next_run=None)))
+        self.assertEqual((event["result"], event["stop_reasons"]), ("STOP", ["task_disabled"]))
+        self.assertEqual(event["task"]["state"], "Disabled")
+        self.assertEqual(event["auto_off"], "off")
+        for state in ("Ready", "Running", "Queued"):
+            with self.subTest(state=state):
+                self.assertEqual(self.stops(runner=FakeRunner(task=task_fixture(state=state))), [])
+
+    def test_stop_no_runs(self):
+        # No completed run in 24 hours with a readable digest: STOP, not CLEAN.
+        event = self.run_daily(runner=FakeRunner(digest=digest_fixture(runs={"completed": 0, "unfinished": 0})))
+        self.assertEqual((event["result"], event["stop_reasons"]), ("STOP", ["no_runs"]))
+        self.assertEqual(event["digest"]["runs_completed"], 0)
+        # A run count that cannot be read is treated the same way.
+        self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(runs={"unfinished": 0}))), ["no_runs"])
+        self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(runs={"completed": 1, "unfinished": 0}))), [])
+        # A disabled task with no runs gives both, in the pinned order.
+        self.assertEqual(self.stops(runner=FakeRunner(task=task_fixture(state="Disabled"),
+                                                      digest=digest_fixture(runs={"completed": 0, "unfinished": 0}))),
+                         ["task_disabled", "no_runs"])
+
     def test_stop_check_config_failed(self):
         event = self.run_daily(runner=FakeRunner(config={"status": "refused", "code": "sync_config_invalid"}, codes={"check-config": 2}))
         self.assertEqual(event["stop_reasons"], ["check_config_failed"])
@@ -267,6 +302,68 @@ class DecisionTests(SummaryTestCase):
     def test_stop_config_unexpected(self):
         self.assertEqual(self.stops(runner=FakeRunner(config=config_fixture(shopify_create_enabled=True))), ["config_unexpected"])
         self.assertEqual(self.stops(runner=FakeRunner(config=config_fixture(ac2_create_member_type="Default"))), ["config_unexpected"])
+
+    def test_stop_config_unexpected_when_the_shopify_flag_is_missing_or_not_a_boolean(self):
+        missing = config_fixture()
+        del missing["shopify_create_enabled"]
+        self.assertEqual(self.stops(runner=FakeRunner(config=missing)), ["config_unexpected"])
+        for value in (None, "false", 0, "no"):
+            with self.subTest(value=value):
+                event = self.run_daily(runner=FakeRunner(config=config_fixture(shopify_create_enabled=value)))
+                self.assertEqual(event["stop_reasons"], ["config_unexpected"])
+                self.assertIsNone(event["config"]["shopify_create_enabled"])
+
+    def test_stop_config_unexpected_when_the_live_state_root_is_not_the_one_in_the_settings(self):
+        other_root = self.temp / "another-sync-state"
+        other_root.mkdir()
+        self.sync_config.write_text(json.dumps({"schema": "xb.directlocal.member_sync.config.v1", "state_root": str(other_root)}),
+                                    encoding="utf-8")
+        event = self.run_daily()
+        self.assertEqual((event["result"], event["stop_reasons"]), ("STOP", ["config_unexpected"]))
+        self.assertIs(event["config"]["state_root_ok"], False)
+        self.assertEqual(self.result["email_status"], "sent")
+        # Only the flag is in the event: no path.
+        self.assertNotIn("sync-state", json.dumps(self.record))
+        # The clean case says the root matches.
+        self.sync_config.write_text(self.sync_config_text, encoding="utf-8")
+        self.assertIs(self.run_daily()["config"]["state_root_ok"], True)
+        # check-config answered but the state root could not be read here: not confirmed, so STOP.
+        section = summary.config_section(config_fixture(), None)
+        self.assertEqual(summary.decide(summary.task_section(task_fixture()), section,
+                                        summary.digest_section(digest_fixture(), None), "GUEST")[0], ["config_unexpected"])
+
+    def test_broken_sync_config_still_sends_a_stop_email(self):
+        # G2 B2: truncated JSON in the live sync config. The real check-config and digest children
+        # refuse it; the summary must still record and POST a STOP, not refuse before any read.
+        self.sync_config.write_text(self.sync_config_text[:25], encoding="utf-8")
+        fake = FakeRunner()
+
+        def runner(argv, timeout):
+            if argv[0].lower().endswith("powershell.exe"):
+                return fake(argv, timeout)
+            fake.calls.append(list(argv))
+            return summary.run_child(argv, timeout)
+        event = self.run_daily(runner=runner)
+        self.assertEqual((event["result"], event["stop_reasons"]), ("STOP", ["check_config_failed", "digest_failed"]))
+        self.assertEqual(len(self.poster.calls), 1)
+        self.assertEqual(self.poster.calls[0]["body"]["stop_reasons"], ["check_config_failed", "digest_failed"])
+        self.assertEqual(self.record["email_status"], "sent")
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), [f"daily_summary_{TODAY}.json"])
+        self.assertEqual([call[2] for call in fake.calls[1:]], ["check-config", "digest"])
+        # The same for a missing file and for a config with no state root.
+        for broken in (None, "{}", "[]", json.dumps({"state_root": ""}), json.dumps({"state_root": 5})):
+            with self.subTest(broken=broken):
+                if broken is None:
+                    self.sync_config.unlink()
+                else:
+                    self.sync_config.write_text(broken, encoding="utf-8")
+                refused = FakeRunner(config={"status": "refused", "code": "sync_config_invalid"}, codes={"check-config": 2},
+                                     digest={"status": "refused", "code": "sync_config_invalid"})
+                refused.codes["digest"] = 2
+                event = self.run_daily(runner=refused)
+                self.assertEqual(event["stop_reasons"], ["check_config_failed", "digest_failed"])
+                self.assertEqual(len(self.poster.calls), 1)
+                self.assertIsNone(event["config"]["state_root_ok"])
 
     def test_stop_digest_failed(self):
         self.assertEqual(self.stops(runner=FakeRunner(digest={"status": "refused", "code": "sync_ledger_missing"}, codes={"digest": 2})),
@@ -285,6 +382,45 @@ class DecisionTests(SummaryTestCase):
                                                  digest=digest_fixture(counts={"shopify_create_uncertain": 1})))
         self.assertEqual(event["stop_reasons"], ["config_unexpected", "shopify_write"])
         self.assertEqual(event["auto_off"], "off")
+
+    def test_stop_shopify_write_counts_every_shopify_create_code(self):
+        # G2 B1: a customer created without a phone is counted under its own code.
+        for code in summary.SHOPIFY_WRITE_CODES:
+            with self.subTest(code=code):
+                event = self.run_daily(runner=FakeRunner(digest=digest_fixture(counts={code: 1})))
+                self.assertEqual(event["digest"]["shopify_writes"], 1)
+                self.assertEqual(event["stop_reasons"], ["shopify_write"])
+                self.assertEqual((event["auto_off"], event["auto_off_reasons"]), ("would_switch", ["shopify_write_while_disabled"]))
+        event = self.run_daily(runner=FakeRunner(digest=digest_fixture(counts={code: 2 for code in summary.SHOPIFY_WRITE_CODES})))
+        self.assertEqual(event["digest"]["shopify_writes"], 6)
+        # A create that Shopify rejected wrote nothing.
+        self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(counts={"shopify_create_rejected": 1}))), [])
+
+    def test_shopify_write_codes_cover_every_create_outcome_in_the_sync_source(self):
+        # Reads the sync's own source: every code it counts after the one Shopify mutation is sent
+        # must be a write code here (or the one "Shopify rejected it, nothing created" code). A new
+        # outcome code in the sync fails this test until it is classified.
+        source = SYNC_SOURCE.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        mutations = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                     and node.value.lstrip().startswith("mutation ")]
+        self.assertEqual(len(mutations), 1, "the sync has exactly one Shopify mutation")
+        self.assertIn("customerCreate(", mutations[0])
+        sends = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "create_customer"]
+        self.assertEqual(len(sends), 1, "one call site sends the mutation")
+        method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                      and any(child is sends[0] for child in ast.walk(node)))
+        self.assertEqual(method.name, "_create_in_shopify")
+        counted = set()
+        for node in ast.walk(method):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "count"
+                    and node.lineno > sends[0].lineno):
+                literals = {child.value for child in ast.walk(node.args[0]) if isinstance(child, ast.Constant) and isinstance(child.value, str)}
+                self.assertTrue(literals, "an outcome code that is not a literal")
+                counted |= literals
+        self.assertEqual(counted - {"shopify_create_rejected"}, set(summary.SHOPIFY_WRITE_CODES))
+        self.assertIn("shopify_create_rejected", counted)
 
     def test_stop_uncertain_writes(self):
         event = self.run_daily(runner=FakeRunner(digest=digest_fixture(opened={"uncertain_writes": 1})))
@@ -309,6 +445,14 @@ class DecisionTests(SummaryTestCase):
         self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(creates={"writes_per_hour_max": 6}))), [])
         self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(creates={"writes_per_hour_max": 7}))), ["writes_over_cap"])
 
+    def test_stop_writes_over_cap_when_four_runs_allow_more_than_the_hour_cap(self):
+        # max_writes_per_run 2 x 4 runs (the 15-minute schedule) = 8, above max_creates_per_hour 6.
+        self.assertEqual(summary.RUNS_PER_HOUR, 4)
+        config = config_fixture(max_writes_per_run=2, max_creates_per_hour=6)
+        self.assertEqual(self.stops(runner=FakeRunner(config=config, digest=digest_fixture(creates={"writes_per_hour_max": 8}))), [])
+        self.assertEqual(self.stops(runner=FakeRunner(config=config, digest=digest_fixture(creates={"writes_per_hour_max": 9}))),
+                         ["writes_over_cap"])
+
     def test_stop_alert_unexpected(self):
         self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(alerts={"customer_held_by_open_write": 1}))), ["alert_unexpected"])
         # The expected alerts and the memberno_* family are not a stop.
@@ -317,8 +461,9 @@ class DecisionTests(SummaryTestCase):
         self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(alerts=expected))), [])
 
     def test_every_stop_together_keeps_the_pinned_order(self):
-        task, config, digest = summary.task_section(task_fixture(last_result=1)), summary.config_section(config_fixture(ac2_create_member_type="X")), \
-            summary.digest_section(digest_fixture(runs={"completed": 1, "unfinished": 5}, counts={"shopify_customer_created": 1},
+        task, config, digest = summary.task_section(task_fixture(last_result=1, state="Disabled")), \
+            summary.config_section(config_fixture(ac2_create_member_type="X"), True), \
+            summary.digest_section(digest_fixture(runs={"completed": 0, "unfinished": 5}, counts={"shopify_customer_created": 1},
                                                   opened={"uncertain_writes": 2}, creates={"writes_per_hour_max": 99},
                                                   alerts={"possible_duplicate_member": 1, "member_type_unknown": 1,
                                                           "autocount_x": 1, "zzz_new": 1}), None)
@@ -375,6 +520,45 @@ class EventTests(SummaryTestCase):
         with self.assertRaises(summary.SummaryError) as caught:
             summary.check_event(event)
         self.assertEqual(caught.exception.code, "event_ref_invalid")
+
+    def test_check_event_refuses_a_ref_that_keeps_four_characters(self):
+        # G2 B3 (S4): three stars plus at most 3 characters, on the VM and in n8n alike.
+        event = self.run_daily()
+        for member_no in ("***0042", "****042", "**042", "***", "***04 2"):
+            with self.subTest(member_no=member_no):
+                event["digest"]["alert_refs"] = [{"code": "memberno_conflict", "member_no": member_no}]
+                with self.assertRaises(summary.SummaryError) as caught:
+                    summary.check_event(event)
+                self.assertEqual(caught.exception.code, "event_ref_invalid")
+        self.assertEqual(summary.MASKED_RE.pattern, r"^\*{3}[A-Za-z0-9]{1,3}$")
+
+    def test_check_event_refuses_an_at_sign_in_any_text(self):
+        # G2 B3 (P2): the last guard refuses an @ wherever it is placed, key or value.
+        places = (
+            lambda e: e["digest"].__setitem__("alerts", {"a@b": 1}),
+            lambda e: e["members_per_type"].__setitem__("counts", {"a@b": 1}),
+            lambda e: e["config"].__setitem__("ac2_create_member_type", "a@b"),
+            lambda e: e["task"].__setitem__("state", "Ready@"),
+            lambda e: e["digest"].__setitem__("alert_refs", [{"code": "a@b", "member_no": "***042"}]),
+            lambda e: e.__setitem__("owner_session", "@"),
+        )
+        for index, place in enumerate(places):
+            with self.subTest(place=index):
+                event = self.run_daily()
+                summary.check_event(event)
+                place(event)
+                with self.assertRaises(summary.SummaryError) as caught:
+                    summary.check_event(event)
+                self.assertEqual(caught.exception.code, "event_personal_data_like")
+
+    def test_closed_patterns_are_the_same_on_the_vm_and_in_the_n8n_validator(self):
+        code = next(n for n in json.loads(WORKFLOW.read_text(encoding="utf-8"))["nodes"]
+                    if n["name"] == "Validate Summary Event")["parameters"]["jsCode"]
+        for name, pattern in (("MASKED_RE", summary.MASKED_RE), ("CODE_RE", summary.CODE_RE), ("TYPE_RE", summary.MEMBER_TYPE_RE)):
+            self.assertIn("const %s = /%s/;" % (name, pattern.pattern), code.splitlines(), name)
+        line = next(line for line in code.splitlines() if line.startswith("const CONFIG_KEYS = ["))
+        self.assertEqual(json.loads(line.split("=", 1)[1].strip().rstrip(";").replace("'", '"')),
+                         list(summary.config_section(None, None)))
 
     def test_lists_are_bounded(self):
         alerts = {"memberno_%02d" % n: 1 for n in range(40)}
@@ -444,7 +628,7 @@ class EventTests(SummaryTestCase):
             "shopify_cutover_utc": "2026-11-01T00:00:00Z"}), encoding="utf-8")
         settings = dict(self.settings())
         settings["sync_config_path"] = str(sync_config)
-        section = summary.config_section(summary.run_sync("check-config", settings, summary.run_child))
+        section = summary.config_section(summary.run_sync("check-config", settings, summary.run_child), True)
         self.assertTrue(section["available"])
         self.assertEqual(section["autocount_book"], "AED_TESTINGAPI")
         self.assertIs(section["shopify_create_enabled"], False)
@@ -523,6 +707,28 @@ class SqlTests(SummaryTestCase):
         def refuse(conn_str, timeout):
             raise SqlFailure("login failed")
         self.assertEqual(summary.read_sql_counts(self.sql(), "AED_XBOUNDARIES", connect=refuse)[0]["reason"], "connect_failed")
+
+    def test_the_real_connection_gets_a_login_timeout_and_a_query_timeout(self):
+        # The default connect path, with a stand-in pyodbc module (no driver, no server).
+        connection = FakeConnection()
+        opened = []
+
+        class FakePyodbc:
+            Error = SqlFailure
+
+            @staticmethod
+            def connect(conn_str, **kwargs):
+                opened.append((conn_str, kwargs))
+                return connection
+        with mock.patch.dict(sys.modules, {"pyodbc": FakePyodbc}):
+            members, new = summary.read_sql_counts(self.sql(timeout_seconds=15), "AED_XBOUNDARIES")
+        self.assertTrue(members["available"] and new["available"])
+        ((conn_str, kwargs),) = opened
+        self.assertEqual(kwargs, {"autocommit": True, "timeout": 15})
+        self.assertIn("Trusted_Connection=yes", conn_str.split(";"))
+        # Every statement is bounded: the query timeout is set on the connection before any query.
+        self.assertEqual(connection.timeout, 15)
+        self.assertTrue(connection.closed)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -625,6 +831,53 @@ class SendTests(SummaryTestCase):
         nested.mkdir()
         with self.assertRaises(summary.SummaryError):
             summary.daily(self.settings(output_dir=str(nested)), now=NOW, runner=FakeRunner())
+
+    def test_output_dir_is_checked_against_the_setting_and_against_a_readable_live_config(self):
+        # check-settings refuses it from the settings alone (no file is read).
+        for folder in (self.state_root, self.state_root / "reports"):
+            with self.assertRaises(summary.SummaryError) as caught:
+                summary.parse_settings(self.settings_value(output_dir=str(folder)))
+            self.assertEqual(caught.exception.code, "output_dir_inside_sync_state")
+        for key, code in (("sync_state_root", "settings_sync_state_root_invalid"), ("output_dir", "settings_output_dir_invalid")):
+            for bad in ("relative\\dir", "", 5, str(self.temp / "a" / ".." / "b")):
+                with self.subTest(key=key, bad=bad), self.assertRaises(summary.SummaryError) as caught:
+                    summary.parse_settings(self.settings_value(**{key: bad}))
+                self.assertEqual(caught.exception.code, code)
+        missing = self.settings_value()
+        del missing["sync_state_root"]
+        with self.assertRaises(summary.SummaryError) as caught:
+            summary.parse_settings(missing)
+        self.assertEqual(caught.exception.code, "settings_keys_invalid")
+        # The live config names another state root and the record folder sits inside that one:
+        # the summary still never writes into the sync's state (refused before any child starts).
+        live_root = self.temp / "live-state"
+        (live_root / "reports").mkdir(parents=True)
+        self.sync_config.write_text(json.dumps({"state_root": str(live_root)}), encoding="utf-8")
+        runner = FakeRunner()
+        with self.assertRaises(summary.SummaryError) as caught:
+            summary.daily(self.settings(output_dir=str(live_root / "reports")), now=NOW, runner=runner)
+        self.assertEqual(caught.exception.code, "output_dir_inside_sync_state")
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(list((live_root / "reports").iterdir()), [])
+
+    def test_timeouts_must_fit_inside_the_task_time_limit(self):
+        # Three children, the SQL part and the POST, worst case, inside PT5M with a margin.
+        self.assertEqual((summary.TASK_TIME_LIMIT_SECONDS, summary.TASK_TIME_MARGIN_SECONDS, summary.CHILD_COUNT, summary.SQL_WAITS),
+                         (300, 15, 3, 5))
+        self.assertIn("<ExecutionTimeLimit>PT%dM</ExecutionTimeLimit>" % (summary.TASK_TIME_LIMIT_SECONDS // 60),
+                      INSTALLER.read_text(encoding="utf-8"))
+        example = summary.parse_settings(json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8")))
+        self.assertEqual(example["child_timeout_seconds"], 60)
+        self.assertEqual(summary.worst_case_seconds(example), 3 * 60 + 5 * 15 + 20)
+        self.assertLessEqual(summary.worst_case_seconds(example), 285)
+        for change in ({"child_timeout_seconds": 120}, {"child_timeout_seconds": 64}, {"sql": {"timeout_seconds": 20}},
+                       {"send": {"timeout_seconds": 31}}):
+            with self.subTest(change=change), self.assertRaises(summary.SummaryError) as caught:
+                self.settings(**change)
+            self.assertEqual(caught.exception.code, "settings_timeouts_exceed_task_limit")
+        # At the limit exactly, and with the SQL part switched off, the settings pass.
+        self.assertEqual(summary.worst_case_seconds(self.settings(child_timeout_seconds=63)), 284)
+        self.assertEqual(summary.worst_case_seconds(self.settings(child_timeout_seconds=88, sql={"enabled": False})), 284)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -759,7 +1012,8 @@ class NeverStaticTests(unittest.TestCase):
 
     def test_never_reads_or_prints_contact_fields(self):
         self.assertEqual(re.findall(r"(?i)phone|first_?name|last_?name|display_?name|birthday|\bdob\b|e-?mail_?address|customer_gid",
-                                    self.code.replace('"no_phone_sign_up_needs_staff"', "")), [])
+                                    self.code.replace('"no_phone_sign_up_needs_staff"', "")
+                                    .replace('"shopify_separate_customer_created_without_phone"', "")), [])
         self.assertNotIn("print(", self.code)
         self.assertEqual(self.code.count("sys.stdout.write("), 1)
 
@@ -810,6 +1064,14 @@ class InstallerStaticTests(unittest.TestCase):
         self.assertLess(self.text.index("if ($DryRun -or -not $Register) {"), self.text.index("Register-ScheduledTask -TaskName"))
         self.assertLess(self.text.index("Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath"), self.text.index("Register-ScheduledTask -TaskName"))
         self.assertIn("It is never replaced by this installer.", self.text)
+        # The explicit refusal, exactly: an existing task is looked up and the installer throws.
+        self.assertIn(
+            "$existing = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue\n"
+            "if ($null -ne $existing) {\n"
+            "    throw \"Refusing: a scheduled task with this name already exists in $TaskPath. It is never replaced by this installer.\"\n"
+            "}\n", self.text)
+        self.assertEqual(self.text.count("$existing"), 2)
+        self.assertLess(self.text.index("if ($null -ne $existing) {"), self.text.index("if ($DryRun -or -not $Register) {"))
         # It may print the off switch for the owner, but never runs a task change itself.
         self.assertIsNone(re.search(r"(?m)^\s*(Unregister|Set|Disable|Enable|Start|Stop)-ScheduledTask", self.text))
         for word in ("-Force", "schtasks", "Invoke-Expression", "Start-Process"):

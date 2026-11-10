@@ -33,7 +33,7 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Mapping
 
 SETTINGS_SCHEMA = "xb.member_sync.daily_summary.settings.v1"
@@ -69,6 +69,18 @@ TASK_STATES = ("Ready", "Running", "Disabled", "Queued", "Unknown")
 TASK_RESULTS_OK = (0, 3)  # 3: the run completed with alerts (the sync's own exit code)
 TASK_RESULT_RUNNING = 267009  # 0x41301: a run is in progress right now
 RUNS_PER_HOUR = 4  # the sync's 15-minute schedule
+# The summary task's own ExecutionTimeLimit (PT5M in the installer). The settings are refused
+# when the worst case of every wait (three children, the SQL part, the POST) does not fit inside
+# it with a margin: a run killed by the limit leaves no record and no email.
+TASK_TIME_LIMIT_SECONDS = 300
+TASK_TIME_MARGIN_SECONDS = 15
+CHILD_COUNT = 3  # the task-state read, check-config, digest
+SQL_WAITS = 5  # the connect, then four statements, each bounded by sql.timeout_seconds
+# Every outcome code of the sync's one Shopify mutation (customerCreate) that means a write was
+# sent: created with the phone, created as a separate customer without it, or outcome unknown.
+# Pinned against the sync's own source in a test, so a new code there fails CI.
+SHOPIFY_WRITE_CODES = ("shopify_customer_created", "shopify_separate_customer_created_without_phone",
+                       "shopify_create_uncertain")
 
 # SQL: fixed text, counts only. The identity row comes from the same connection.
 IDENTITY_QUERY = (
@@ -90,11 +102,13 @@ SQL_REASONS = ("disabled", "driver_missing", "connect_failed", "identity_refused
 STOP_CODES = (
     "task_state_unavailable",     # the sync task could not be read
     "task_last_result",           # LastTaskResult not 0 or 3 (and no run in progress)
+    "task_disabled",              # the sync task is Disabled (a dead sync must not read CLEAN)
     "check_config_failed",        # check-config refused or did not answer
-    "config_unexpected",          # shopify creates on, or the member type is not the expected one
+    "config_unexpected",          # shopify creates not off, another member type, or another state root
     "digest_failed",              # digest refused or did not answer
+    "no_runs",                    # no completed run in 24 hours (a dead sync must not read CLEAN)
     "unfinished_runs",            # more than 1 unfinished run in 24 hours
-    "shopify_write",              # any Shopify write
+    "shopify_write",              # any Shopify write (SHOPIFY_WRITE_CODES)
     "uncertain_writes",           # uncertain writes open
     "possible_duplicate_member",  # the alert, any count
     "member_type_unknown",        # the alert, any count
@@ -127,8 +141,8 @@ UNTYPED = "-"
 UNREADABLE_ALERT = "unreadable_alert_code"
 OTHER_ALERTS = "other_alert_codes"
 
-_SETTINGS_KEYS = {"schema", "sync_config_path", "output_dir", "expected_member_type", "first_create_already_seen",
-                  "child_timeout_seconds", "sql", "send"}
+_SETTINGS_KEYS = {"schema", "sync_config_path", "sync_state_root", "output_dir", "expected_member_type",
+                  "first_create_already_seen", "child_timeout_seconds", "sql", "send"}
 _SQL_KEYS = {"enabled", "server", "odbc_driver", "encrypt", "trust_server_certificate", "allow_privileged_identity",
              "timeout_seconds"}
 _SEND_KEYS = {"enabled", "webhook_url", "auth_header_name", "secret_credential_target", "timeout_seconds"}
@@ -167,6 +181,25 @@ def _absolute(value: Any, code: str) -> str:
     return value
 
 
+def _pure(value: str) -> PureWindowsPath | PurePosixPath:
+    """The path as written (no file is touched): a Windows path compares without case."""
+
+    return PureWindowsPath(value) if PureWindowsPath(value).is_absolute() else PurePosixPath(value)
+
+
+def _folder(value: Any, code: str) -> str:
+    """An absolute folder path with no ``..`` part, so it can be compared as written."""
+
+    _absolute(value, code)
+    _require(".." not in _pure(value).parts, code)
+    return value
+
+
+def _written_inside(folder: str, root: str) -> bool:
+    child, parent = _pure(folder), _pure(root)
+    return type(child) is type(parent) and (child == parent or parent in child.parents)
+
+
 def parse_settings(value: Any) -> dict[str, Any]:
     """Structural check of the settings file. No file, network or process is touched."""
 
@@ -174,10 +207,15 @@ def parse_settings(value: Any) -> dict[str, Any]:
     _require(value["schema"] == SETTINGS_SCHEMA, "settings_schema_invalid")
     settings = {
         "sync_config_path": _absolute(value["sync_config_path"], "settings_sync_config_path_invalid"),
-        "output_dir": _absolute(value["output_dir"], "settings_output_dir_invalid"),
+        "sync_state_root": _folder(value["sync_state_root"], "settings_sync_state_root_invalid"),
+        "output_dir": _folder(value["output_dir"], "settings_output_dir_invalid"),
         "first_create_already_seen": _bool(value["first_create_already_seen"], "settings_first_create_invalid"),
         "child_timeout_seconds": _int(value["child_timeout_seconds"], 10, 600, "settings_child_timeout_invalid"),
     }
+    # The summary never writes into the sync's private state: the record folder is checked
+    # against the state root named here, not against the live sync config (a broken live config
+    # must still give a STOP email, not a refusal before anything is read).
+    _require(not _written_inside(settings["output_dir"], settings["sync_state_root"]), "output_dir_inside_sync_state")
     expected = value["expected_member_type"]
     _require(isinstance(expected, str) and MEMBER_TYPE_RE.fullmatch(expected) is not None, "settings_expected_member_type_invalid")
     settings["expected_member_type"] = expected
@@ -212,7 +250,15 @@ def parse_settings(value: Any) -> dict[str, Any]:
         "secret_credential_target": target,
         "timeout_seconds": _int(send["timeout_seconds"], 5, 60, "settings_send_timeout_invalid"),
     }
+    _require(worst_case_seconds(settings) <= TASK_TIME_LIMIT_SECONDS - TASK_TIME_MARGIN_SECONDS, "settings_timeouts_exceed_task_limit")
     return settings
+
+
+def worst_case_seconds(settings: Mapping[str, Any]) -> int:
+    """The longest one run can wait: every child, the SQL part (when enabled) and the POST."""
+
+    sql = settings["sql"]["timeout_seconds"] * SQL_WAITS if settings["sql"]["enabled"] else 0
+    return settings["child_timeout_seconds"] * CHILD_COUNT + sql + settings["send"]["timeout_seconds"]
 
 
 def load_settings(path: str | Path) -> dict[str, Any]:
@@ -223,21 +269,37 @@ def load_settings(path: str | Path) -> dict[str, Any]:
     return parse_settings(raw)
 
 
+def _resolved_inside(folder: Path, root: Path) -> bool:
+    return folder == root or root in folder.parents
+
+
 def check_output_dir(settings: Mapping[str, Any]) -> Path:
-    """The record folder must exist and must not sit inside the sync's state root (the summary
-    never writes into the sync's private state). The sync config is only read here."""
+    """The record folder must exist and must not sit inside the sync's state root named in the
+    settings (links resolved). The live sync config is not read here."""
 
     out = Path(settings["output_dir"])
     _require(out.is_dir(), "output_dir_missing")
-    try:
-        sync_config = json.loads(Path(settings["sync_config_path"]).read_text(encoding="utf-8"))
-        state_root = sync_config["state_root"]
-    except (OSError, ValueError, KeyError, TypeError):
-        raise SummaryError("sync_config_unreadable") from None
-    _require(isinstance(state_root, str) and state_root != "", "sync_config_unreadable")
-    root, resolved = Path(state_root).resolve(), out.resolve()
-    _require(resolved != root and root not in resolved.parents, "output_dir_inside_sync_state")
+    resolved = out.resolve()
+    _require(not _resolved_inside(resolved, Path(settings["sync_state_root"]).resolve()), "output_dir_inside_sync_state")
     return resolved
+
+
+def read_live_state_root(settings: Mapping[str, Any]) -> Path | None:
+    """The ``state_root`` of the live sync config, read the way the sync reads it (read only).
+    None when the file is unreadable, not JSON or has no state root: check-config then refuses
+    and the email says STOP check_config_failed."""
+
+    try:
+        value = json.loads(Path(settings["sync_config_path"]).read_bytes().decode("utf-8"))
+        state_root = value["state_root"]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return None
+    if not isinstance(state_root, str) or state_root == "":
+        return None
+    try:
+        return Path(state_root).resolve()
+    except (OSError, ValueError):
+        return None
 
 
 # --------------------------------------------------------------------------------------------
@@ -345,7 +407,9 @@ def read_sql_counts(sql: Mapping[str, Any], book: str, connect: Callable[[str, i
         error_type = pyodbc.Error
 
         def connect(conn_str: str, timeout: int) -> Any:
-            return pyodbc.connect(conn_str, autocommit=True, timeout=timeout)
+            opened = pyodbc.connect(conn_str, autocommit=True, timeout=timeout)
+            opened.timeout = timeout  # the query timeout of every statement (as the stock export sets it)
+            return opened
     try:
         connection = connect(build_connection_string(sql, book), sql["timeout_seconds"])
     except error_type:
@@ -438,11 +502,14 @@ def task_section(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def config_section(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+def config_section(raw: Mapping[str, Any] | None, state_root_ok: bool | None) -> dict[str, Any]:
+    """``state_root_ok``: whether the live config's state root is the one in the settings (None
+    when it could not be read). Only the flag enters the event, never a path."""
+
     keys = ("ac2_create_enabled", "shopify_create_enabled", "immediate_create_enabled")
     if raw is None:
         return {"available": False, "autocount_book": None, **{k: None for k in keys}, "max_writes_per_run": None,
-                "max_creates_per_hour": None, "ac2_create_member_type": None}
+                "max_creates_per_hour": None, "ac2_create_member_type": None, "state_root_ok": None}
     member_type = raw.get("ac2_create_member_type")
     book = raw.get("autocount_book")
     return {
@@ -452,6 +519,7 @@ def config_section(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         "max_writes_per_run": _count(raw.get("max_writes_per_run")),
         "max_creates_per_hour": _count(raw.get("max_creates_per_hour")),
         "ac2_create_member_type": member_type if _safe_code(member_type, MEMBER_TYPE_RE) else None,
+        "state_root_ok": state_root_ok if isinstance(state_root_ok, bool) else None,
     }
 
 
@@ -510,7 +578,7 @@ def digest_section(raw: Mapping[str, Any] | None, links_yesterday: int | None) -
         "ac2_creates": counted("ac2_member_created"),
         "created_immediately": counted("created_immediately"),
         "created_after_wait": counted("created_after_wait"),
-        "shopify_writes": counted("shopify_customer_created") + counted("shopify_create_uncertain"),
+        "shopify_writes": min(sum(counted(code) for code in SHOPIFY_WRITE_CODES), COUNT_MAX),
         "possible_duplicate_member": alerts.get("possible_duplicate_member", 0),
         "writes_per_hour_max": _count(get("creates", "writes_per_hour_max")),
         "links": _count(get("open", "links")),
@@ -546,15 +614,21 @@ def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[s
     auto_off: set[str] = set()
     if not task["available"]:
         stops.add("task_state_unavailable")
-    elif task["last_result"] not in TASK_RESULTS_OK and task["last_result"] != TASK_RESULT_RUNNING:
-        stops.add("task_last_result")
+    else:
+        if task["last_result"] not in TASK_RESULTS_OK and task["last_result"] != TASK_RESULT_RUNNING:
+            stops.add("task_last_result")
+        if task["state"] == "Disabled":
+            stops.add("task_disabled")
     if not config["available"]:
         stops.add("check_config_failed")
-    elif config["shopify_create_enabled"] is not False or config["ac2_create_member_type"] != expected_member_type:
+    elif (config["shopify_create_enabled"] is not False or config["ac2_create_member_type"] != expected_member_type
+          or config["state_root_ok"] is not True):
         stops.add("config_unexpected")
     if not digest["available"]:
         stops.add("digest_failed")
     else:
+        if (digest["runs_completed"] or 0) < 1:
+            stops.add("no_runs")
         if (digest["runs_unfinished"] or 0) > 1:
             stops.add("unfinished_runs")
         if digest["shopify_writes"] > 0:
@@ -792,11 +866,17 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
     cred_reader = cred_reader or read_credential_secret
     poster = poster or post_event
     out_dir = check_output_dir(settings)
+    # The live config's state root, when it can be read: the record folder is never inside it
+    # either, and a root that is not the one in the settings stops (config_unexpected). An
+    # unreadable live config is not a refusal here: check-config refuses and the email says so.
+    live_root = read_live_state_root(settings)
+    _require(live_root is None or not _resolved_inside(out_dir, live_root), "output_dir_inside_sync_state")
+    state_root_ok = None if live_root is None else live_root == Path(settings["sync_state_root"]).resolve()
     today = now.astimezone(SGT).strftime("%Y-%m-%d")
     links_yesterday, seen_create = read_history(out_dir, today)
 
     task = task_section(read_task_state(settings, runner))
-    config = config_section(run_sync("check-config", settings, runner))
+    config = config_section(run_sync("check-config", settings, runner), state_root_ok)
     digest = digest_section(run_sync("digest", settings, runner), links_yesterday)
     if config["available"] and config["autocount_book"] is not None:
         members, new_members = sql_reader(settings["sql"], config["autocount_book"])

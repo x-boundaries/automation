@@ -106,7 +106,8 @@ def build(task=None, config=None, digest=None, members=None, new_members=None, f
                                  "next_run": "2026-11-07T06:45", "missed_runs": 0} if task is None else task)
     config = summary.config_section({"status": "ok", "autocount_book": "AED_XBOUNDARIES", "ac2_create_enabled": True,
                                      "shopify_create_enabled": False, "max_writes_per_run": 1, "max_creates_per_hour": 6,
-                                     "ac2_create_member_type": "GUEST", "immediate_create_enabled": False} if config is None else config)
+                                     "ac2_create_member_type": "GUEST", "immediate_create_enabled": False} if config is None else config,
+                                    True)
     raw_digest = {"runs": {"completed": 96, "unfinished": 0, "duration_seconds_max": 41, "duration_seconds_median": 12},
                   "counts": {"ac2_member_created": 1, "created_after_wait": 1},
                   "alerts": {"created_after_wait": 1, "waiting_for_staff": 2},
@@ -289,9 +290,11 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
         per_code = {
             "task_state_unavailable": dict(task=summary.task_section(None)),
             "task_last_result": dict(task=summary.task_section({**task_ok, "last_result": 2})),
-            "check_config_failed": dict(config=summary.config_section(None)),
-            "config_unexpected": dict(config=summary.config_section({**config_ok, "shopify_create_enabled": True})),
+            "task_disabled": dict(task=summary.task_section({**task_ok, "state": "Disabled"})),
+            "check_config_failed": dict(config=summary.config_section(None, True)),
+            "config_unexpected": dict(config=summary.config_section({**config_ok, "shopify_create_enabled": True}, True)),
             "digest_failed": dict(digest=None),
+            "no_runs": dict(digest=digest(runs={"completed": 0})),
             "unfinished_runs": dict(digest=digest(runs={"unfinished": 2})),
             "shopify_write": dict(digest=digest(counts={"shopify_customer_created": 1})),
             "uncertain_writes": dict(digest=digest(open={"uncertain_writes": 1})),
@@ -304,7 +307,7 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
         self.assertEqual(tuple(per_code), summary.STOP_CODES)
         for code, parts in per_code.items():
             task = parts.get("task", summary.task_section(task_ok))
-            config = parts.get("config", summary.config_section(config_ok))
+            config = parts.get("config", summary.config_section(config_ok, True))
             raw = parts["digest"] if "digest" in parts else digest()
             dig = summary.digest_section(raw, None)
             members = summary.members_section(None, "permission_denied")
@@ -322,6 +325,31 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
                 self.assertIn(code, text.splitlines()[1])
                 self.assertIn("Members per type: not available (permission_denied)", text)
                 self.assertEqual(result["out"][0]["json"]["severity"], "WARN")
+                # A dead sync: the email also shows why.
+                if code == "task_disabled":
+                    self.assertIn("Sync task: state=Disabled ", text)
+                if code == "no_runs":
+                    self.assertIn("Runs 24h: completed=0 ", text)
+
+    def test_state_root_mismatch_renders_a_stop_email_that_says_so(self):
+        clean = build()
+        self.assertIs(clean["config"]["state_root_ok"], True)
+        body = copy.deepcopy(clean)
+        config = summary.config_section({"status": "ok", "autocount_book": "AED_XBOUNDARIES", "ac2_create_enabled": True,
+                                         "shopify_create_enabled": False, "max_writes_per_run": 1, "max_creates_per_hour": 6,
+                                         "ac2_create_member_type": "GUEST", "immediate_create_enabled": False}, False)
+        event = summary.build_event(now=NOW, task=clean["task"], config=config, digest=summary.digest_section(
+            {"runs": {"completed": 96, "unfinished": 0}, "counts": {}, "alerts": {}, "alert_refs": [],
+             "open": {"uncertain_writes": 0, "links": 10}, "creates": {"writes_per_hour_max": 1}}, None),
+            members=clean["members_per_type"], new_members=summary.new_members_section(3, None, None), first_create=False,
+            expected_member_type="GUEST")
+        summary.check_event(event)
+        self.assertEqual(event["stop_reasons"], ["config_unexpected"])
+        clean_result, stop_result = self.run_cases([body, json.loads(json.dumps(event))])
+        self.assertIn(" state_root_as_in_settings=yes", self.assert_sent(clean_result, "[XB daily] MEMBER-SYNC CLEAN 2026-11-07"))
+        text = self.assert_sent(stop_result, "[XB daily] MEMBER-SYNC STOP 2026-11-07")
+        self.assertIn("STOP reasons: config_unexpected ", text)
+        self.assertIn(" state_root_as_in_settings=no", text)
 
     def test_would_switch_is_reported_and_nothing_else(self):
         body = build(digest={"runs": {"completed": 4, "unfinished": 0}, "counts": {"shopify_customer_created": 1}, "alerts": {"possible_duplicate_member": 1},
@@ -348,12 +376,12 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
         alerts.update({"possible_duplicate_member": 1, "member_type_unknown": 1, "autocount_" + "z" * 54: 1, "q" * 64: 1})
         refs = [{"ref": "m-%02x" % n, "code": "memberno_" + "y" * 55, "member_no_masked": "*******%03d" % n} for n in range(40)]
         # Every stop code that a readable task, config and digest can give, at once.
-        body = build(task={"state": "Ready", "last_run": "2026-11-07T06:30", "last_result": 2147942402, "next_run": "2026-11-07T06:45",
+        body = build(task={"state": "Disabled", "last_run": "2026-11-07T06:30", "last_result": 2147942402, "next_run": "2026-11-07T06:45",
                            "missed_runs": summary.COUNT_MAX},
                      config={"status": "ok", "autocount_book": "AED_XBOUNDARIES", "ac2_create_enabled": True, "shopify_create_enabled": False,
                              "max_writes_per_run": 1, "max_creates_per_hour": 6, "ac2_create_member_type": "X" * 20,
                              "immediate_create_enabled": True},
-                     digest={"runs": {"completed": summary.COUNT_MAX, "unfinished": summary.COUNT_MAX, "duration_seconds_max": summary.COUNT_MAX,
+                     digest={"runs": {"completed": 0, "unfinished": summary.COUNT_MAX, "duration_seconds_max": summary.COUNT_MAX,
                                       "duration_seconds_median": summary.COUNT_MAX},
                              "counts": {"ac2_member_created": summary.COUNT_MAX, "created_immediately": summary.COUNT_MAX,
                                         "created_after_wait": summary.COUNT_MAX, "shopify_customer_created": summary.COUNT_MAX},
@@ -397,12 +425,15 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
             "MS_SUMMARY_TASK": ("task", [{"extra": 1}, {"state": "Gone"}, {"last_result": -1}, {"last_run": "06:30"},
                                          {"available": False}]),
             "MS_SUMMARY_CONFIG": ("config", [{"extra": 1}, {"autocount_book": "OTHER_BOOK"}, {"ac2_create_enabled": "yes"},
-                                             {"ac2_create_member_type": "<b>"}]),
+                                             {"ac2_create_member_type": "<b>"}, {"state_root_ok": "yes"}, {"state_root_ok": 1}]),
             "MS_SUMMARY_DIGEST": ("digest", [{"extra": 1}, {"links": -1}, {"links": "1234"}, {"available": False}]),
             "MS_SUMMARY_ALERTS": ("digest", [{"alerts": {"Bad Code": 1}}, {"alerts": {"x": -1}}, {"alerts": []}]),
             "MS_SUMMARY_ALERT_REFS": ("digest", [{"alert_refs": [{"code": "memberno_conflict", "member_no": "042"}]},
                                                  {"alert_refs": [{"code": "memberno_conflict", "member_no": "***042", "ref": "m-1"}]},
-                                                 {"alert_refs": [{"code": "memberno_conflict", "member_no": "****0042"}]}]),
+                                                 {"alert_refs": [{"code": "memberno_conflict", "member_no": "****0042"}]},
+                                                 # G2 B3 (S4): three stars plus 4 characters is one too many.
+                                                 {"alert_refs": [{"code": "memberno_conflict", "member_no": "***0042"}]},
+                                                 {"alert_refs": [{"code": "memberno_conflict", "member_no": "**042"}]}]),
             "MS_SUMMARY_MEMBERS": ("members_per_type", [{"extra": 1}, {"reason": "disabled"}, {"counts": {"Alpha Tester": 1}},
                                                         {"available": False, "counts": None, "reason": "because"}]),
             "MS_SUMMARY_NEW_MEMBERS": ("new_members_24h", [{"extra": 1}, {"total": None}, {"available": False}]),
