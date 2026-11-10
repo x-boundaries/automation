@@ -947,19 +947,41 @@ class PurchasingQueryContractTests(unittest.TestCase):
             inner = q.split("FROM (", 1)[1].split("FROM dbo.", 1)[0]
             self.assertIn(" vn.VendorName,", inner, "the label comes from the name table only")
 
+    def test_vendor_name_sql_is_pinned_whole(self):
+        # G2 R-M1: the whole name table is pinned, so no UNION branch can be changed or added (for example
+        # COALESCE(CreditorName, CreditorCode), or a branch that feeds codes into MAX) without a failure.
+        self.assertEqual(an._VENDOR_NAMES_SQL, (
+            "    LEFT JOIN (\n"
+            "        SELECT n.CreditorCode, MAX(n.CreditorName) AS VendorName\n"
+            "        FROM (\n"
+            "            SELECT CreditorCode, CreditorName FROM dbo.PO\n"
+            "            UNION ALL\n"
+            "            SELECT CreditorCode, CreditorName FROM dbo.GR\n"
+            "        ) AS n\n"
+            "        GROUP BY n.CreditorCode\n"
+            "    ) AS vn ON vn.CreditorCode = h.CreditorCode\n"
+        ))
+        for name, q in self.queries().items():
+            self.assertEqual(q.count(an._VENDOR_NAMES_SQL), 1, name)
+            self.assertEqual(q.count("UNION"), 1, name)
+
 
 # The two purchasing SELECTs executed on an in-memory SQLite database built from fake raw PO, PODTL,
 # GR and GRDTL tables (G2 A-M1 and L2). The translation is mechanical and strict: if the SQL Server
 # text changes shape, the translation fails loudly rather than testing something else.
+# Adversarial on purpose (G2 R-M1): every fake creditor code sorts ABOVE every fake name, so a code that
+# reaches MAX(...) wins and shows up as a label; one creditor is on a GR only; a PO header and two GR
+# headers have no name. PurchasingSqlFixtureTests keeps these properties from being edited away.
+FAKE_CODE_PREFIX = "ZZ-CR-"
 FAKE_PO = [  # DocKey, DocNo, DocDate, CreditorCode, CreditorName, Cancelled
-    (1, "FAKE-PO-001", "2026-09-01", "FAKE-CR-A", "Vendor A", "F"),
-    (2, "FAKE-PO-002", "2026-09-02", "FAKE-CR-A", "Vendor A", "F"),
-    (3, "FAKE-PO-003", "2026-08-31", "FAKE-CR-B", "Vendor B", "F"),
-    (4, "FAKE-PO-004", "2026-10-01", "FAKE-CR-A", "Vendor A", "T"),   # cancelled header
-    (5, "FAKE-PO-001", "2026-09-10", "FAKE-CR-B", "Vendor B", "F"),   # duplicate PO number, later date
-    (6, "FAKE-PO-006", "2026-11-01", "FAKE-CR-A", "Vendor A", "F"),   # on the window end: out
-    (7, "FAKE-PO-007", "2026-10-15", "FAKE-CR-B", "Vendor B", "T"),   # cancelled; a GR is copied from it
-    (8, "FAKE-PO-008", "2026-10-20", "FAKE-CR-C", None, None),        # no name, NULL Cancelled: kept
+    (1, "FAKE-PO-001", "2026-09-01", "ZZ-CR-A", "Vendor A", "F"),
+    (2, "FAKE-PO-002", "2026-09-02", "ZZ-CR-A", "Vendor A", "F"),
+    (3, "FAKE-PO-003", "2026-08-31", "ZZ-CR-B", "Vendor B", "F"),
+    (4, "FAKE-PO-004", "2026-10-01", "ZZ-CR-A", "Vendor A", "T"),   # cancelled header
+    (5, "FAKE-PO-001", "2026-09-10", "ZZ-CR-B", "Vendor B", "F"),   # duplicate PO number, later date
+    (6, "FAKE-PO-006", "2026-11-01", "ZZ-CR-A", "Vendor A", "F"),   # on the window end: out
+    (7, "FAKE-PO-007", "2026-10-15", "ZZ-CR-B", "Vendor B", "T"),   # cancelled; a GR is copied from it
+    (8, "FAKE-PO-008", "2026-10-20", "ZZ-CR-C", None, None),        # no name, NULL Cancelled: kept
 ]
 FAKE_PODTL = [  # DocKey, ItemCode, Qty, TransferedQty
     (1, "FAKE-X1", 10, 4), (1, "FAKE-X2", 5, 7), (1, "FAKE-X2", 4, 0), (1, None, 1, 0),
@@ -967,10 +989,13 @@ FAKE_PODTL = [  # DocKey, ItemCode, Qty, TransferedQty
     (6, "FAKE-X1", 9, 0), (7, "FAKE-X3", 2, 0), (8, "FAKE-X3", 3, None),
 ]
 FAKE_GR = [  # DocKey, DocNo, DocDate, CreditorCode, CreditorName, Cancelled
-    (1, "FAKE-GR-001", "2026-10-01", "FAKE-CR-A", "Vendor A", "F"),
-    (2, "FAKE-GR-002", "2026-10-05", "FAKE-CR-B", "Vendor B Ltd", "F"),  # retyped name: one label per creditor
-    (3, "FAKE-GR-003", "2026-10-20", "FAKE-CR-B", "Vendor B", "F"),
-    (4, "FAKE-GR-004", "2026-10-10", "FAKE-CR-A", "Vendor A", "T"),      # cancelled GR
+    (1, "FAKE-GR-001", "2026-10-01", "ZZ-CR-A", "Vendor A", "F"),
+    (2, "FAKE-GR-002", "2026-10-05", "ZZ-CR-B", "Vendor B Ltd", "F"),  # retyped name: one label per creditor
+    (3, "FAKE-GR-003", "2026-10-20", "ZZ-CR-B", "Vendor B", "F"),
+    (4, "FAKE-GR-004", "2026-10-10", "ZZ-CR-A", "Vendor A", "T"),      # cancelled GR
+    (5, "FAKE-GR-005", "2026-10-25", "ZZ-CR-D", "Vendor D", "F"),      # creditor on a GR only
+    (6, "FAKE-GR-006", "2026-10-26", "ZZ-CR-A", None, "F"),            # no name on a named creditor's GR
+    (7, "FAKE-GR-007", "2026-10-27", "ZZ-CR-E", None, "F"),            # GR-only creditor with no name at all
 ]
 FAKE_GRDTL = [  # DocKey, ItemCode, Qty, FromDocType, FromDocNo
     (1, "FAKE-X1", 4, "PO", "FAKE-PO-001"),   # duplicate PO number: one link, earliest PO date
@@ -979,6 +1004,9 @@ FAKE_GRDTL = [  # DocKey, ItemCode, Qty, FromDocType, FromDocNo
     (3, "FAKE-X3", 2, "PO", "FAKE-PO-007"),   # copied from a cancelled PO: not linked
     (3, "FAKE-X3", 1, "SO", "FAKE-PO-001"),   # another document type with a PO-like number
     (4, "FAKE-X1", 50, "PO", "FAKE-PO-001"),  # cancelled GR: out
+    (5, "FAKE-X1", 2, None, None),            # GR-only creditor: its name
+    (6, "FAKE-X2", 1, "PO", "FAKE-PO-001"),   # nameless GR of a named creditor: the creditor's name
+    (7, "FAKE-O1", 4, None, None),            # creditor with no name anywhere: NULL
 ]
 
 
@@ -1035,6 +1063,32 @@ def as_read_rows(rows):
     return out
 
 
+class PurchasingSqlFixtureTests(unittest.TestCase):
+    """G2 R-M1: the execution fixture stays adversarial, so a creditor code fed into MAX(...) shows up."""
+
+    def headers(self):
+        return [("PO",) + r for r in FAKE_PO] + [("GR",) + r for r in FAKE_GR]
+
+    def test_every_code_sorts_above_every_name(self):
+        codes = {r[4] for r in self.headers()}
+        names = {r[5] for r in self.headers() if r[5] is not None}
+        self.assertTrue(all(c.startswith(FAKE_CODE_PREFIX) for c in codes), codes)
+        for code in codes:
+            for name in names:
+                self.assertGreater(code, name, "binary order (SQLite)")
+                self.assertGreater(code.casefold(), name.casefold(), "case-insensitive order (SQL Server)")
+
+    def test_a_gr_only_creditor_and_nameless_po_and_gr_headers(self):
+        po_codes = {r[3] for r in FAKE_PO}
+        gr_only = {r[3] for r in FAKE_GR if r[5] != "T"} - po_codes
+        self.assertTrue(any(r[3] in gr_only and r[4] for r in FAKE_GR), "a named creditor on a GR only")
+        self.assertTrue(any(r[4] is None for r in FAKE_PO), "a PO header with no name")
+        named = {r[3] for r in FAKE_PO + FAKE_GR if r[4]}
+        self.assertTrue(any(r[4] is None and r[3] in named and r[5] != "T" for r in FAKE_GR),
+                        "a live GR header with no name, for a creditor named elsewhere")
+        self.assertTrue(any(r[4] is None and r[3] not in named for r in FAKE_GR), "a GR-only creditor with no name")
+
+
 class PurchasingSqlExecutionTests(unittest.TestCase):
     PO_COLS = ("ItemCode", "VendorName", "PoDay", "Ordered", "Transferred", "OpenQty", "OpenLines", "OverLines",
                "PoLines")
@@ -1050,9 +1104,10 @@ class PurchasingSqlExecutionTests(unittest.TestCase):
 
     def test_vendor_labels_are_names_never_codes_or_document_numbers(self):
         labels = {r["VendorName"] for name in self.rows for r in self.rows[name]}
-        self.assertEqual(labels, {"Vendor A", "Vendor B Ltd", None}, "one name per creditor; no name -> NULL")
+        self.assertEqual(labels, {"Vendor A", "Vendor B Ltd", "Vendor D", None},
+                         "one name per creditor; a GR-only creditor has its name; no name anywhere -> NULL")
         flat = json.dumps(self.rows, default=str)
-        for secret in ("FAKE-CR-", "FAKE-PO-", "FAKE-GR-"):
+        for secret in (FAKE_CODE_PREFIX, "FAKE-PO-", "FAKE-GR-"):
             self.assertNotIn(secret, flat, secret)
 
     def test_po_lines(self):
@@ -1074,6 +1129,9 @@ class PurchasingSqlExecutionTests(unittest.TestCase):
             ("FAKE-C1", "Vendor B Ltd", "2026-10-05", 1, 35, 2, 1),
             ("FAKE-C1", "Vendor B Ltd", "2026-10-20", 0, None, 3, 1),  # not copied from a PO
             ("FAKE-X3", "Vendor B Ltd", "2026-10-20", 0, None, 3, 2),  # copy of a cancelled PO + an SO copy
+            ("FAKE-X1", "Vendor D", "2026-10-25", 0, None, 2, 1),      # GR-only creditor: its name
+            ("FAKE-X2", "Vendor A", "2026-10-26", 1, 55, 1, 1),        # nameless GR header: the creditor's name
+            ("FAKE-O1", None, "2026-10-27", 0, None, 4, 1),            # no name anywhere: NULL, never the code
         ], key=repr), "the cancelled GR is out")
 
     def test_builder_on_the_executed_rows_writes_names_and_units_only(self):
@@ -1084,14 +1142,14 @@ class PurchasingSqlExecutionTests(unittest.TestCase):
         payload, cov = an.build_purchasing(cfg(purchasing={"enabled": True}), as_read_rows(self.rows["po_lines"]),
                                            as_read_rows(self.rows["gr_lines"]), items, never_non_stock, LAST_DAY,
                                            header)
-        self.assertEqual(payload["vendors"], [an.NO_VENDOR_NAME, "Vendor A", "Vendor B Ltd"])
+        self.assertEqual(payload["vendors"], [an.NO_VENDOR_NAME, "Vendor A", "Vendor B Ltd", "Vendor D"])
         self.assertEqual((cov["ordered_units"], cov["transferred_units"], cov["open_units"], cov["over_received_lines"]),
                          (39, 19, 22, 1))
         self.assertEqual((cov["gr_lines"], cov["received_units"], cov["gr_linked_lines"], cov["gr_linked_units"]),
-                         (5, 12, 2, 6))
+                         (8, 19, 3, 7))
         self.assertEqual((cov["stale_lines"], cov["stale_units"]), (1, 6), "only the 61-day C1 line is stale")
         text = json.dumps([payload, cov], default=str)
-        for secret in ("FAKE-CR-", "FAKE-PO-", "FAKE-GR-"):
+        for secret in (FAKE_CODE_PREFIX, "FAKE-PO-", "FAKE-GR-"):
             self.assertNotIn(secret, text, secret)
 
 
