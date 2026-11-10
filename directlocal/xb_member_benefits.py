@@ -1537,10 +1537,12 @@ class BenefitsEngine:
                 # refund or a cancellation (nothing was granted), with the
                 # refund_unattributed alert, once, for a refund by money.
                 state, code = self._classify(order, net)
-                if (state, code) == ("held", REFUND_UNATTRIBUTED):
+                # G2 B8: an order that left the receipt's customer settles the hold too.
+                moved = (order.customer.gid if order.customer else None) != existing["customer_gid"]
+                if not moved and (state, code) == ("held", REFUND_UNATTRIBUTED):
                     self.ledger.update_receipt(order.gid, code=REFUND_UNATTRIBUTED, alerted=REFUND_UNATTRIBUTED)
                     summary.alert(REFUND_UNATTRIBUTED, ref)
-                elif state != "ready":
+                elif moved or state != "ready":
                     self.ledger.update_receipt(order.gid, code=ORDER_NO_LONGER_QUALIFIES)
                     summary.count("claim_hold_settled", ref)
                 else:

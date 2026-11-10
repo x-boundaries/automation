@@ -261,6 +261,53 @@ class Base(unittest.TestCase):
         self.links_by_gid: dict[str, str] = {}
         self.ledger = None
         self.probe_result = "exited"
+        # G2 B7: every CLI output of every test is kept for the privacy check.
+        self.emitted: list[dict] = []
+        real_emit = bm._emit
+
+        def tee(value):
+            self.emitted.append(json.loads(json.dumps(value)))
+            real_emit(value)
+        patcher = mock.patch.object(bm, "_emit", tee)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    PRIVATE_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{20}$")
+    PRIVATE_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
+
+    def tearDown(self):
+        self.assert_outputs_private()
+
+    def assert_outputs_private(self) -> None:
+        """G2 B7, after every test: every stored run summary and every CLI
+        output carries keyed refs and masked MemberNos only, and no order
+        ID, customer ID or full MemberNo anywhere."""
+
+        outputs = [("cli", value) for value in self.emitted]
+        private = {m for m in self.book.members}
+        path = self.root / bm.LEDGER_FILE
+        if path.is_file():
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                if "runs" in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}:
+                    outputs += [("run", json.loads(r[0])) for r in conn.execute("SELECT summary FROM runs WHERE summary IS NOT NULL")]
+                    for sql in ("SELECT order_gid FROM receipts", "SELECT customer_gid FROM receipts", "SELECT member_no FROM receipts",
+                                "SELECT customer_gid FROM claim_links", "SELECT member_no FROM claim_links", "SELECT member_no FROM writes"):
+                        private |= {r[0] for r in conn.execute(sql) if r[0]}
+            finally:
+                conn.close()
+        private = {value for value in private if len(value) >= 6}
+        for kind, value in outputs:
+            text = json.dumps(value)
+            self.assertNotIn("gid://", text, kind)
+            for secret in private:
+                self.assertNotIn(secret, text, kind)
+            entries = [e for key in ("refs", "alert_refs") for e in (value.get(key) or [])] if isinstance(value, dict) else []
+            for entry in entries:
+                self.assertLessEqual(set(entry), {"ref", "code", "member_no_masked"}, kind)
+                self.assertRegex(entry["ref"], self.PRIVATE_REF_RE, kind)
+                if "member_no_masked" in entry:
+                    self.assertRegex(entry["member_no_masked"], self.PRIVATE_MASK_RE, kind)
 
     def cfg(self, **overrides) -> bm.BenefitsConfig:
         return bm.parse_config(raw_config(self.root, self.sync_root, **overrides))
@@ -1245,6 +1292,185 @@ class G2FixRound2Tests(Base):
         self.assertEqual((self.receipt(2)["state"], out["saves"]), ("applied", 1))
         self.assertIn("member_reads_capped", out["alerts"])
         self.assertEqual(self.receipt(1)["state"], "waiting_member")
+
+
+# --------------------------------------------------------------------------
+# G2 fix round 3 (recheck 2 at eb1fc8b): B8 and the LATER 6 test gaps
+# (B7 is the privacy check in Base.tearDown, run after every test)
+# --------------------------------------------------------------------------
+
+class G2FixRound3Tests(Base):
+    # The round 2 helpers, without running its tests a second time.
+    claim_held = G2FixRound2Tests.claim_held
+    link_and_run = G2FixRound2Tests.link_and_run
+    assert_never_upgraded = G2FixRound2Tests.assert_never_upgraded
+
+    def settled_and_never_upgraded(self, out: dict, n: int = 1) -> None:
+        self.assert_never_upgraded(out, n)
+        self.assertIsNone(out["counts"].get("would_upgrade"))
+
+    # -- B8: a claim-held receipt must not act for a customer who lost the order
+    def test_b8_p06_an_order_moved_to_another_customer_while_held_never_upgrades_the_first(self):
+        self.claim_held()
+        self.advance(days=1)
+        # Staff move the order to customer 2 (signed up too).
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-19T03:00:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled")), ([], 1))  # silent
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["customer_gid"]), ("held", "order_no_longer_qualifies", customer_gid(1)))
+        # #155 links customer 1: no re-open, no save, the member stays GUEST.
+        self.settled_and_never_upgraded(self.link_and_run())
+        # P06c: customer 2 is linked later: still nothing (handled by hand).
+        self.book.members[sg(2)] = fake_member(sg(2))
+        out = self.link_and_run(2)
+        self.assertEqual((out["saves"], self.book.saves, self.book.members[sg(2)]["type"]), (0, 0, "GUEST"))
+
+    def test_b8_p06d_in_observe_no_would_upgrade_for_the_first_customer(self):
+        self.guest_with_order(1, linked=False, member=fake_member(sg(1), name="Someone Else Entirely"))
+        self.engine().run(apply=False)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_name_mismatch"))
+        self.advance(days=1)
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-19T03:00:00Z"))
+        self.engine().run(apply=False)
+        self.link(1)
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        self.assertIsNone(out["counts"].get("would_upgrade"))
+        self.assertIsNone(out["counts"].get("claim_hold_reopened"))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"], self.receipt(1)["observed"]), ("held", "order_no_longer_qualifies", None))
+        self.assertEqual((self.book.saves, self.book.payloads), (0, []))
+
+    def test_b8_an_order_whose_customer_was_removed_while_held_never_upgrades(self):
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, customer=None, updated="2026-11-19T03:00:00Z"))
+        self.assertEqual(self.engine().run(apply=True)["counts"].get("claim_hold_settled"), 1)
+        self.settled_and_never_upgraded(self.link_and_run())
+
+    def test_b8_an_order_moved_and_refunded_by_money_settles_silently(self):
+        # The order is no longer this customer's: nothing to decide, no alert.
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, customer=customer_node(2), status="REFUNDED", refunded="300.00", updated="2026-11-19T03:00:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled")), ([], 1))
+        self.assertEqual((self.receipt(1)["code"], self.receipt(1)["alerted"]), ("order_no_longer_qualifies", None))
+        self.settled_and_never_upgraded(self.link_and_run())
+
+    # -- LATER 6: test gaps on the round 2 code (tests only) ------------------
+    def test_e07b_any_other_reason_settles_a_claim_hold_for_good(self):
+        # As built (Controller answer 3): a passing state settles it too.
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, status="PARTIALLY_PAID", updated="2026-11-19T03:00:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled"), self.receipt(1)["code"]), ([], 1, "order_no_longer_qualifies"))
+        # Paid again later: the hold stays settled, also after the link.
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, updated="2026-11-19T03:20:00Z"))
+        self.engine().run(apply=True)
+        self.settled_and_never_upgraded(self.link_and_run())
+
+    def test_e26_a_cancelled_order_that_is_still_paid_never_re_opens(self):
+        # Only the settle code keeps it shut: the stored facts still look paid.
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, cancelled="2026-11-19T02:00:00Z", status="PAID", updated="2026-11-19T03:00:00Z"))
+        self.engine().run(apply=True)
+        row = self.receipt(1)
+        self.assertEqual((row["code"], row["financial_status"], row["net_cents"]), ("order_no_longer_qualifies", "PAID", 30000))
+        self.settled_and_never_upgraded(self.link_and_run())
+
+    def test_e09_e10_e11_each_stored_fact_alone_blocks_the_re_open(self):
+        facts = {1: dict(financial_status="REFUNDED"), 2: dict(net_cents=0), 3: dict(financial_status="PENDING")}
+        for n in facts:
+            self.guest_with_order(n, linked=False, member=fake_member(sg(n), name="Someone Else Entirely"))
+        self.engine().run(apply=True)
+        # A newer order moves the watermark on, so the three are not read again.
+        self.advance(hours=2)
+        self.shopify.add(order_node(9, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T05:30:00Z"))
+        self.engine().run(apply=True)
+        for n, change in facts.items():
+            self.assertEqual(self.receipt(n)["code"], "claim_name_mismatch")
+            self.ledger.update_receipt(order_gid(n), **change)
+            self.link(n)
+        self.advance(hours=1)
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("claim_hold_settled"), out["counts"].get("claim_hold_reopened"), out["saves"]), (3, None, 0))
+        for n in facts:
+            with self.subTest(n=n):
+                self.assertEqual((self.receipt(n)["state"], self.receipt(n)["code"], self.book.members[sg(n)]["type"]),
+                                 ("held", "order_no_longer_qualifies", "GUEST"))
+        self.assertEqual(self.book.saves, 0)
+
+    def test_e13_a_replay_after_resolve_left_the_receipt_changes_nothing(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_saved"
+        self.engine().run(apply=True)
+        self.book.mode = None
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-18T04:10:00Z"))
+        self.engine().run(apply=False)
+        self.advance(seconds=PAST_DEADLINE)
+        self.assertEqual(self.engine().resolve()["alerts"], ["receipt_left_decided"])
+        # The order is read again: a held receipt is never repaired to applied.
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-18T04:40:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertIsNone(out["counts"].get("receipt_repaired_applied"))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "refund_unattributed"))
+        self.assertEqual((self.book.saves, len(self.book.payloads)), (1, 1))
+
+    def test_e15_the_repair_also_runs_when_the_order_is_not_read_again(self):
+        self.now = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+        self.guest_with_order(1)
+        # A newer order moves the watermark past order 1 in the crash run itself.
+        self.shopify.add(order_node(9, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T05:30:00Z"))
+        engine = self.engine()
+        real = self.ledger.update_receipt
+
+        def crash_on_applied(order, **values):
+            if values.get("state") == "applied":
+                raise RuntimeError("parent killed after the save")
+            return real(order, **values)
+        with mock.patch.object(self.ledger, "update_receipt", crash_on_applied), self.assertRaises(RuntimeError):
+            engine.run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.book.saves), ("ready", 1))
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual(out["counts"]["orders_read"], 1)  # only the newer order
+        self.assertEqual((out["counts"].get("receipt_repaired_applied"), out["saves"]), (1, 0))
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["basis_expiry_local"]), ("applied", "upgrade", NEW_EXPIRY))
+        self.assertEqual((self.book.saves, len(self.book.payloads)), (1, 1))
+
+    def test_e23_a_settled_code_never_changes_to_another_code(self):
+        self.engine()
+        counter = iter(range(300, 400))
+        cases = [
+            ("refund_unattributed", "order_no_longer_qualifies"), ("order_no_longer_qualifies", "refund_unattributed"),
+            ("link_conflict", "order_no_longer_qualifies"), ("member_inactive", "refund_unattributed"),
+            ("refund_unattributed", "anything_else"),
+        ]
+        for old, new in cases:
+            gid = order_gid(next(counter))
+            with self.ledger.tx() as conn:
+                conn.execute("INSERT INTO receipts(order_gid, order_created_at, order_date_sgt, order_updated_at, state, code, first_seen_at, updated_at) "
+                             "VALUES (?, 't', 'd', 't', 'held', ?, 't', 't')", (gid, old))
+            with self.subTest(old=old, new=new), self.assertRaises(sqlite3.IntegrityError) as caught:
+                self.ledger.update_receipt(gid, code=new)
+            self.assertIn("receipt_decided", str(caught.exception))
+            self.assertEqual(self.ledger.receipt(gid)["code"], old)
+
+    def test_e32_p03_a_refund_and_the_link_read_by_the_same_run_settle_first(self):
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, lines=(("300.00", 1, 0, False, ()),), status="REFUNDED", refunded="300.00", updated="2026-11-19T03:00:00Z"))
+        self.link(1)  # the link appears in the same run that reads the refund
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("claim_hold_settled"), out["counts"].get("claim_hold_reopened")), (1, None))
+        self.settled_and_never_upgraded(out)
 
 
 # --------------------------------------------------------------------------
