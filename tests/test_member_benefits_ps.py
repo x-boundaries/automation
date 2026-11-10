@@ -122,6 +122,7 @@ $command | Add-Member -MemberType ScriptMethod -Name SaveMember -Value {
             $m.LastModifiedUserID = "FAKEUSER"
             if ($s.save_mutates) { $m.($s.save_mutates) = "changed by the fake" }
             if ($s.save_wrong_expiry) { $m.ExpiryDate = "2027-01-01T00:00:00.000" }
+            if ($s.save_wrong_type) { $m.MemberType = "GUEST" }
         }
         $members += $m
     }
@@ -340,7 +341,8 @@ class BenefitsBridgeTests(unittest.TestCase):
 
     def set_state(self, **overrides):
         state = {"members": [], "saves": 0, "gets": 0, "written": [], "sql": [], "params": [], "db_throws": False, "save_throws": False,
-                 "save_mutates": None, "save_wrong_expiry": False, "hang_after_save_ms": 0, "member_types": ["Default", "MEMBER", "GUEST"]}
+                 "save_mutates": None, "save_wrong_expiry": False, "save_wrong_type": False, "hang_after_save_ms": 0,
+                 "member_types": ["Default", "MEMBER", "GUEST"]}
         state.update(overrides)
         self.state.write_text(json.dumps(state), encoding="utf-8")
 
@@ -470,6 +472,45 @@ class BenefitsBridgeTests(unittest.TestCase):
         self.assertEqual(out["readback_expiry_match"], False)
         self.assertEqual(bm.classify_save(dl.WriteRun(started=True, exit_code=code, stdout=proc.stdout.decode()), claim_exists=True).code, "readback_expiry_mismatch")
 
+    def test_b4_s04_a_wrong_type_on_read_back_is_held(self):
+        # MemberType is outside the read-back digest, so this flag is the only proof.
+        self.set_state(members=[member(1)], save_wrong_type=True)
+        code, out, proc, _ = self.save(1, payload(1))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["readback_type_match"], out["readback_expiry_match"], out["fields_unchanged"]), (False, True, True))
+        self.assertEqual(bm.classify_save(dl.WriteRun(started=True, exit_code=code, stdout=proc.stdout.decode()), claim_exists=True),
+                         bm.SaveOutcome("HELD", "readback_type_mismatch", out["post_last_modified_local"]))
+
+    def test_b4_s08_s09_fence_binding_and_payload_digest_are_checked_before_any_session(self):
+        self.set_state(members=[member(1)])
+        fence = "fence-" + "a" * 32
+        request = self.save_request(fence, payload(1))
+        cases = [
+            (dict(request, fence_id="fence-" + "b" * 32), "fence_binding_mismatch"),  # S08
+            (dict(request, payload_digest="sha256:" + "0" * 64), "payload_digest_mismatch"),  # S09
+            (dict(request, payload_canonical=request["payload_canonical"].replace("GUEST", "Default")), "payload_digest_mismatch"),  # S09
+        ]
+        for stdin, error in cases:
+            with self.subTest(error=error):
+                self.assertEqual(self.run_bridge("benefit-save", stdin, *self.save_args(fence))[:2], (1, {"error": error}))
+        state = self.fake()
+        self.assertEqual((state["saves"], state["gets"], state["sql"]), (0, 0, []))
+        self.assertFalse((self.claims / f"{fence}.claim").exists())
+
+    def test_b4_s10_without_the_adapter_switch_nothing_runs(self):
+        self.set_state(members=[member(1)])
+        fence = "fence-" + "c" * 32
+        for operation, stdin, extra in (("benefit-save", self.save_request(fence, payload(1)), self.save_args(fence)),
+                                        ("benefit-member", {"member_no": fake_no(1), "salt": "1" * 32}, []),
+                                        ("benefit-scan", {"member_type": "GUEST", "after_member_no": ""}, [])):
+            with self.subTest(operation=operation):
+                args = self.command() + ["-Operation", operation] + list(extra)
+                proc = subprocess.run(args, input=(json.dumps(stdin) + "\n").encode("ascii"), capture_output=True, timeout=120, check=False)
+                lines = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+                self.assertEqual((proc.returncode, json.loads(lines[-1])), (1, {"error": "autocount_adapter_disabled"}))
+        state = self.fake()
+        self.assertEqual((state["saves"], state["gets"], state["sql"]), (0, 0, []))
+
     def test_save_exception_after_the_claim_is_uncertain_and_vendor_text_never_leaves(self):
         self.set_state(members=[member(1)], save_throws=True)
         code, out, proc, fence = self.save(1, payload(1))
@@ -522,7 +563,7 @@ class BenefitsBridgeTests(unittest.TestCase):
                          (1, {"error": "synthetic_session_marker_missing"}))
 
 
-def run_direct_offline(operation: str, stdin: dict, *extra: str, temp: Path, host: str = "XB-CI-NOT-THE-VM"):
+def run_direct_offline(operation: str, stdin: dict, *extra: str, temp: Path, host: str = "XB-CI-NOT-THE-VM", switch: bool = True):
     """The real entry point, never able to log in: COMPUTERNAME is not the
     pinned host (or -AcRoot holds no assemblies). No credential env."""
 
@@ -533,7 +574,7 @@ def run_direct_offline(operation: str, stdin: dict, *extra: str, temp: Path, hos
     env = {k: v for k, v in os.environ.items() if k not in ("AC2_PROBE_USER_ID", "AC2_PROBE_PASSWORD", "XB_AC2_USER_ID", "XB_AC2_PASSWORD_ENV_VAR", "XB_AC2_SESSION_FACTORY", "XB_AC2_SYNC_PASSWORD")}
     env["COMPUTERNAME"] = host
     command = [powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(BRIDGE),
-               "-Operation", operation, "-EnableProductionAdapter", "-AcRoot", str(ac_root), *extra]
+               "-Operation", operation, *(["-EnableProductionAdapter"] if switch else []), "-AcRoot", str(ac_root), *extra]
     proc = subprocess.run(command, input=(json.dumps(stdin) + "\n").encode("ascii"), capture_output=True, timeout=120, check=False, env=env)
     lines = proc.stdout.decode("utf-8", "replace").strip().splitlines()
     return proc.returncode, (json.loads(lines[-1]) if lines else None)
@@ -548,6 +589,17 @@ class RealEntryOfflineTests(unittest.TestCase):
     def test_without_a_session_source_nothing_runs(self):
         self.assertEqual(run_direct_offline("benefit-member", {}, temp=self.temp), (1, {"error": "autocount_real_bridge_disabled"}))
         self.assertEqual(run_direct_offline("benefit-member", {}, "-TargetBook", "AED_OTHER", temp=self.temp), (1, {"error": "target_book_not_authorised"}))
+
+    def test_b4_s10_the_real_entry_is_inert_without_the_adapter_switch(self):
+        # The real session path switches the adapter on itself, so this check
+        # in the bridge is the only latch there: without it the pinned host
+        # would go on to the assembly pins.
+        request = {"member_no": fake_no(1), "salt": "1" * 32}
+        for operation in ("benefit-member", "benefit-scan"):
+            with self.subTest(operation=operation):
+                self.assertEqual(run_direct_offline(operation, request if operation == "benefit-member" else {"member_type": "GUEST", "after_member_no": ""},
+                                                    "-TargetBook", LIVE_BOOK, temp=self.temp, host=PINNED_HOST, switch=False),
+                                 (1, {"error": "autocount_adapter_disabled"}))
 
     def test_live_book_reaches_the_host_and_assembly_pins_only(self):
         request = {"member_no": fake_no(1), "salt": "1" * 32}

@@ -8,9 +8,9 @@ Tool: `directlocal/xb_member_benefits.py` (working name, kept so later slices ex
 
 Every 15 minutes (about 7 minutes after `\XB\XB-MemberSync`) the tool:
 
-1. Reads paid Shopify orders that changed since its last clean read. Read only, through its **own** Shopify app whose token must hold exactly `read_orders` and `read_customers`.
+1. Reads paid Shopify orders that changed since its last clean read. Read only, through its **own** Shopify app whose token must hold exactly `read_orders` and `read_customers`. A read that ends at the page cap (10 pages x 10 orders) records what it read, keeps Shopify's cursor and alerts `orders_read_incomplete`; the next run continues after that cursor, so a bulk update of many orders delays new orders by a few runs instead of stopping the reader. The watermark (newest `updatedAt`, minus a 15-minute overlap) moves only when a read reaches the end.
 2. Writes one row per order into its own ledger on the VM (`member_benefits.sqlite3`), forever. Reading the same order again updates the same row.
-3. Works out the order's qualifying amount: line prices **before discounts, including GST, excluding shipping and gift-card lines**, less refunded or removed units. Sale items count.
+3. Works out the order's qualifying amount: line prices **before discounts, including GST, excluding shipping and gift-card lines**, less refunded or removed units. Sale items count. **Refunds by money are never netted** (Controller, fix round 1): an order that is fully refunded (`REFUNDED`), or whose refunded money is more than the value of its refunded or removed units (an amount-only refund, a shipping refund or an adjustment), is held before the decision (`refund_unattributed`, one alert) and never decided automatically.
 4. If one order is **S$300.00 or more**, the customer carries the #155 sign-up marker (tag `member-mg` and the `membership.start_date` time) and the order's Singapore date is on or after the sign-up date (or the same Singapore day), it finds the customer's AC2 member through the #155 sync's links (read only) or its own claim links.
 5. Reads that AC2 member. AutoCount decides the type:
    - `GUEST` -> `MEMBER` with `ExpiryDate` = order's Singapore date + 24 months (`would_upgrade`);
@@ -18,7 +18,11 @@ Every 15 minutes (about 7 minutes after `\XB\XB-MemberSync`) the tool:
    - `Default`, held, inactive or any other type -> counted, never written.
 6. **Observe** (the default): records and reports `would_upgrade` / `would_extend`; no AutoCount save is reachable. **Apply** (switch `benefits_write_enabled` on, at most `max_upgrades_per_run`, default 3): one `SaveMember` per decision through `benefit_p1`, with the #268 guard set (book guard, host pin, identity proof, lock, `STOP` file, `INTENT` / `DONE` / `NOT_WRITTEN` / `UNCERTAIN` / `HELD`, read-back of every column, exit 2 with nothing partial).
 
-**Claim links (the owner's "auto linking").** An AC2 `MEMBER` or `GUEST` with no #155 link, **exactly one** Shopify customer whose phone gives that MemberNo under the #155 phone rule, and the #155 two-word name rule matches -> linked in this tool's ledger (`claim_links`). Anything else -> no link and one `claim_needs_review` alert per customer. A customer never maps to two MemberNos across both ledgers (and the reverse); a conflict holds that member (`link_conflict`) and blocks any write for it. The #155 ledger is opened read-only (`mode=ro`, `query_only`) and never copied or written.
+**Claim links (the owner's "auto linking").** An AC2 `MEMBER` or `GUEST` with no #155 link, **exactly one** Shopify customer whose phone gives that MemberNo under the #155 phone rule, and the #155 two-word name rule matches -> linked in this tool's ledger (`claim_links`). Anything else -> no link and one `claim_needs_review` alert per customer: two MemberNo forms of one phone in AC2, more than one customer on the phone (or more candidates than the search returns in one page), a name mismatch, or a link conflict. A customer never maps to two MemberNos across both ledgers (and the reverse); a conflict holds that member (`link_conflict`) and blocks any write for it. The #155 ledger is opened read-only (`mode=ro`, `query_only`) and never copied or written.
+
+**Claim outcomes settle the receipt.** A claim review (`claim_name_mismatch`, `claim_phone_not_unique`, `claim_link_conflict`, `claim_memberno_conflict`), a member out of scope (`claim_member_not_in_scope`, for example still `Default`) or a customer with no phone (`claim_no_phone`, alert `qualified_member_no_phone`) puts the receipt in `held` with that code. It is not re-checked; it re-opens (back to `ready`) only when a #155 link or a claim link for that customer appears (for example after the B3 index). A genuine `waiting_member` receipt (no AC2 member yet) is re-checked at most once per `waiting_member_recheck_hours` (default 6), or at once when a link for the customer appears. Linked `ready` receipts are decided first, then other `ready` ones, then `waiting_member`. Reaching `max_member_reads_per_run` raises the alert `member_reads_capped`.
+
+**Claim links are permanent.** Links written in observe (B1, B2) and by the index (B3) are append-only. The unlink command ships in its own small round **before B4**; until then a wrong link is reported, never edited in the ledger by hand.
 
 ## 2. What it never does
 
@@ -45,6 +49,7 @@ Every 15 minutes (about 7 minutes after `\XB\XB-MemberSync`) the tool:
 | `same_day_signup_counts` | `true` | An order placed before sign-up counts only when both fall on the same Singapore day |
 | `orders_start_utc` | set at install | Orders created before this never count (`before_start`); the first read starts here |
 | `waiting_member_alert_hours` | `48` | A qualifying order with no AC2 member yet alerts `qualified_member_missing` once after this |
+| `waiting_member_recheck_hours` | `6` | A `waiting_member` receipt is re-checked (Shopify customer read, phone search, AutoCount reads) at most once per this many hours, unless a link for its customer appears |
 | `signup_wait_hours` | `48` | How long an order without a seen sign-up is re-checked before it settles as `not_signed_up` |
 | `max_upgrades_per_run` | `3` | Saves per run (hard max 20) |
 | `max_member_reads_per_run` | `20` | AutoCount member reads per run |
@@ -67,11 +72,22 @@ python directlocal\xb_member_benefits.py index       --config <config> --max 200
 
 Exit codes: 0 ok, 3 completed with alerts (an operator looks), 2 refused (nothing written). Output carries codes, counts, keyed refs (`o-`, `c-`, `m-`) and MemberNos masked to the last 3 characters only.
 
-`apply` refuses while any write is `INTENT`/`UNCERTAIN` (`benefit_uncertain_unresolved`: run `resolve` after the writer deadline) or `HELD` (`benefit_held_rows_present`: the owner decides). A `STOP` file in the state root stops writes before the next member.
+`apply` refuses while any write is `INTENT`/`UNCERTAIN` (`benefit_uncertain_unresolved`: run `resolve` after the writer deadline) or `HELD` (`benefit_held_rows_present`: see "When a write is HELD" below). A `STOP` file in the state root stops writes before the next member.
+
+### When a write is HELD (the owner's recovery)
+
+A `HELD` write means the read-back did not prove the save as intended (another column changed, the type or `ExpiryDate` read back wrong, an outbound queue row existed after the save, or `resolve` could not tell). `apply` then refuses every run until the owner decides; `observe` keeps running.
+
+1. Disable the task (`Disable-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits`) and run `status` and `digest` (masked MemberNo, code).
+2. Open that member in AutoCount and compare with what the tool meant to write (`MEMBER`, `ExpiryDate` = order date + 24 months) and with the member's history. Note: `outbound_queue_changed` fires when any `UserScript`, `MailQueue` or `EInvoiceQueue` row exists after the save, not only a new one; check whether that row predates the save.
+3. Fix the member by hand in AutoCount if needed (the tool never downgrades).
+4. The `HELD` row stays in the ledger (rows are immutable). Clearing the latch needs a small code round (a `release-held` command with its own owner OK), the same "second pass" pattern as the type move. Until it ships, a `HELD` row keeps the tool in observe; report it to the Controller.
 
 ### Alert codes
 
-`refund_on_basis` / `late_refund_on_basis` (refund took an applied order below S$300; nothing changes), `qualified_member_missing`, `signup_time_missing`, `claim_needs_review`, `link_conflict`, `member_inactive`, `expiry_unreadable`, `guest_expiry_already_later`, `member_not_found`, `order_amount_unverifiable`, `write_uncertain`, `write_held`.
+`refund_on_basis` / `late_refund_on_basis` (after an upgrade: a unit refund took the order below S$300, the order was cancelled, or any refund by money that no unit explains, including `REFUNDED`; nothing changes), `refund_unattributed` (before the decision: refunded by money, held), `orders_read_incomplete`, `member_reads_capped`, `qualified_member_missing`, `qualified_member_no_phone`, `signup_time_missing`, `claim_needs_review`, `link_conflict`, `member_inactive`, `expiry_unreadable`, `guest_expiry_already_later`, `member_not_found`, `order_amount_unverifiable`, `write_uncertain`, `write_held`.
+
+`late_refund_on_basis` cannot fire live: `read_orders` returns only orders created in the last 60 days, so a refund after day 60 is never read. It exists for completeness and tests only.
 
 ## 5. Owner's Shopify admin step (before B1)
 
@@ -83,20 +99,30 @@ Stop condition: the first run refuses `shopify_token_scope_not_expected` or `sho
 
 ## 6. Keeping the two AutoCount writers apart
 
-- `apply` takes the **#268 type move's own ledger lock** (`member_type_move.lock` in `type_move_state_root`) for the whole run. While it is held, every type move command that opens its ledger (`snapshot`, `move`, `resolve`, `rollback`, `reconcile`, `status`) refuses with `ledger_locked_by_another_owner`; while a type move command holds it, `apply` refuses with `type_move_running`. The lock is an OS lock, released if a process dies. The type move code is unchanged.
-- Runbook rule on top: **no benefits step runs while a `\XB\XB-TypeMove-*` task is running**, and the benefits task is disabled (`Disable-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits`) before an attended type move batch and enabled after it.
-- `observe` and `index` never save, so they do not take the lock.
+- `apply` takes the **#268 type move's own ledger lock** (`member_type_move.lock` in `type_move_state_root`) for the whole run. While it is held, every type move command that opens its ledger (`init`, `snapshot`, `move`, `resolve`, `rollback`, `reconcile`, `status`) refuses with `ledger_locked_by_another_owner`; while a type move command holds it, `apply` refuses with `type_move_running`. The lock is an OS lock, released if a process dies. The type move code is unchanged.
+- The type move is attended (no scheduled task). **Before any type move command** (step S1 below), the benefits task is paused, so no benefits run adds AutoCount sessions during a batch.
+- `observe` and `index` never save, so they do not take the lock (they are still paused by S1).
+- **The type move state root must stay in place** (with its `member_type_move.sqlite3`) while `type_move_state_root` is configured: if it is archived or moved, `apply` refuses every run with `type_move_state_root_invalid`. Change the config in the same sitting as any archive of the type move.
 - The #155 sync only creates members (never edits a type), so it cannot touch the same member edit; it writes ChangeLog `I` rows only.
 
-## 7. VM steps (each its own owner OK; never while `\XB\XB-TypeMove-*` runs)
+### S1. Pause the benefits task around a type move command (from B1 on)
+
+1. `Disable-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits`.
+2. `Get-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits` shows `State` `Disabled`, not `Running`. If it shows `Running`, wait for the run to end (at most 10 minutes) and check again; **stop if it stays `Running`** and report.
+3. Run the type move command and its read-back.
+4. `Enable-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits` after the type move read-back.
+
+Mirroring S1 in the type move runbook (`member_type_move_runbook.md`) is a follow-up docs change, not in this PR.
+
+## 7. VM steps (each its own owner OK; S1 before any type move command)
 
 | Step | What | Owner OK | Stop condition | Rollback |
 |---|---|---|---|---|
 | B0 | Clone at the merged commit; live config from `member_benefits.live.example.json` with `orders_start_utc` = the minute B1 starts; `check-config`; `init` | "BENEFITS INSTALL" | `check-config` refuses | Delete the new state root (no other system touched) |
-| B1 | Install the task in **observe** mode: `install_member_benefits_task.ps1` dry run, then `-Register`. Run once by hand, check exit 0/3 and `digest` | "BENEFITS SHADOW" | Exit 2 twice in a row, or any `link_conflict` you cannot explain | `Disable-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits` |
-| B2 | Review shadow counts for at least 7 days: `digest --hours 168` (`shadow.would_upgrade`, `would_extend`, receipts by state, `claim_needs_review`), against Shopify's own order list (counts only) | (review, no OK) | A `would_upgrade` you would not have upgraded by hand | Stay in observe; report to the Controller |
-| B3 | One-off `index` (read only towards Shopify and AC2): first dry runs (`--max 200` until `index_member_complete` and `index_guest_complete`), then `--apply` to write claim links. **Only after the #268 L5/L6 batches are finished** | "INDEX PASS" | `claim_needs_review` higher than expected, or any `link_conflict` | Claim links are append-only; stop the task and report (a later slice adds an unlink) |
-| B4 | AC2 pilot: config `benefits_write_enabled` true, `max_upgrades_per_run` 3, `type_move_state_root` set; reinstall the task with `-Mode apply` (dry run first). Check every `upgraded`/`extended` member in AC2 by hand (type, `ExpiryDate`) | "BENEFITS AC2 PILOT" | Any `write_held`, `write_uncertain` not resolved to `DONE` by `resolve`, or a member not as expected | Disable the task; set `benefits_write_enabled` false; a wrong member is corrected by hand in AC2 (the tool never downgrades) |
+| B1 | Install the task in **observe** mode: `install_member_benefits_task.ps1` dry run, then `-Register`. Run once by hand, check exit 0/3 and `digest`. **Record the run duration** of the first runs (the task logs in to AutoCount with the #155 sync's own user, up to `max_member_reads_per_run` times a run). Use S1 before any type move command. Observe writes claim links (permanent until the unlink round) | "BENEFITS SHADOW" | Exit 2 twice in a row; any `link_conflict` you cannot explain; **a `\XB\XB-MemberSync` run fails while a benefits run is active** | `Disable-ScheduledTask -TaskPath \XB\ -TaskName XB-MemberBenefits` |
+| B2 | Review shadow counts for at least 7 days: `digest --hours 168` (`shadow.would_upgrade`, `would_extend`, receipts by state, `claim_needs_review`, `refund_unattributed`, `orders_read_incomplete`, `member_reads_capped`), against Shopify's own order list (counts only). Check the open Shopify items of section 9 | "BENEFITS SHADOW REVIEWED" | A `would_upgrade` you would not have upgraded by hand; a claim link you would not have made | Stay in observe; report to the Controller |
+| B3 | One-off `index` (read only towards Shopify and AC2): first dry runs (`--max 200` until `index_member_complete` and `index_guest_complete`), then `--apply` to write claim links. **Only after the #268 L5/L6 batches are finished.** Use S1 before any type move command | "INDEX PASS" | `claim_needs_review` higher than expected, or any `link_conflict` | Claim links are append-only; stop the task and report (the unlink round ships before B4) |
+| B4 | **Needs the unlink round merged first.** AC2 pilot: config `benefits_write_enabled` true, `max_upgrades_per_run` 3, `type_move_state_root` set (and kept in place); reinstall the task with `-Mode apply` (dry run first). S1 before any type move command (from here `apply` also holds the type move lock). Check every `upgraded`/`extended` member in AC2 by hand (type, `ExpiryDate`) | "BENEFITS AC2 PILOT" | Any `write_held` (see "When a write is HELD"), `write_uncertain` not resolved to `DONE` by `resolve`, a member not as expected, or a sync run failing while a benefits run is active | Disable the task; set `benefits_write_enabled` false; a wrong member is corrected by hand in AC2 (the tool never downgrades) |
 | B5 | Normal cap: `max_upgrades_per_run` up to the owner's figure (hard max 20) | "BENEFITS NORMAL CAP" | As B4 | Back to 3, or disable |
 
 `resolve` runs only after the writer deadline (`write_deadline_seconds` + grace); before that it holds with `writer_may_be_live`.
@@ -113,12 +139,12 @@ Pinned `api_version`: **`2026-10`**. Queries are pinned in the module (`ORDERS_Q
 
 | Object | Fields relied on |
 |---|---|
-| `orders` query | `first`, `after`, `sortKey: UPDATED_AT`, `query: "updated_at:>='<UTC>'"`; page size 10 orders x 50 lines; `read_orders` sees orders created in the last 60 days |
+| `orders` query | `first`, `after` (also kept across runs when a read ends at the page cap), `pageInfo { hasNextPage endCursor }`, `sortKey: UPDATED_AT`, `query: "updated_at:>='<UTC>'"`; page size 10 orders x 50 lines; `read_orders` sees orders created in the last 60 days |
 | `Order` | `id`, `createdAt` (the order date; never changes), `updatedAt` (watermark), `cancelledAt`, `test`, `displayFinancialStatus` (`PAID`, `PARTIALLY_REFUNDED`, `REFUNDED` count; `PENDING`, `AUTHORIZED`, `PARTIALLY_PAID`, `VOIDED`, `EXPIRED` do not), `taxesIncluded`, `currencyCode`, `totalRefundedSet`, `customer` (null when the order has no customer), `lineItems`, `shippingLines` |
 | `LineItem` | `id`, `quantity` (incl. refunded and removed units), `currentQuantity` (excl. them), `isGiftCard`, `originalUnitPriceSet` (before discounts), `discountAllocations.allocatedAmountSet` |
 | `ShippingLine` | `originalPriceSet` (only with `amount_exclude_shipping` false) |
 | `Customer` | `id`, `createdAt`, `tags`, `firstName`, `lastName`, `defaultPhoneNumber.phoneNumber`, `metafield(namespace: "membership", key: "start_date").createdAt` |
-| `customers` query | `query: "phone:+<digits>"` (candidate list only; every node is re-checked with the #155 phone rule) |
+| `customers` query | `query: "phone:+<digits>"`, `first: 5`, `pageInfo.hasNextPage` (candidate list only; every node is re-checked with the #155 phone rule; more than one page of candidates is a review) |
 | `MoneyBag` | `shopMoney { amount currencyCode }`; any currency other than SGD makes the order `amount_unverifiable` |
 
 Not verifiable from the docs (check in the first shadow week): whether `updated_at:>=` behaves as documented for the orders search (use the `Shopify-Search-Query-Debug: 1` header once if counts look off); how a `+65` phone is stored for the `phone:` search; which customer fields count as protected customer data for this app.
@@ -152,6 +178,8 @@ Not verifiable from the docs (check in the first shadow week): whether `updated_
 | Q34 | `test_q34_scope_check_fails_before_any_order_read`, `test_q34_an_autocount_guard_failure_refuses_with_nothing_written`; `ShopifyClientTests.test_scopes_must_be_exactly_read_orders_and_read_customers`; PS: `GuardTests.*`, `RealEntryOfflineTests.*` |
 | Q35 | `test_q35_a_second_run_is_refused_by_the_lock`, `TypeMoveLockTests.test_apply_and_the_type_move_never_hold_the_lock_together` |
 
+Fix round 1 (G2 at `ceae854`), `G2FixRound1Tests` unless noted: B1 refunds by money (`test_b1_r1_...`, `test_b1_a_partial_refund_by_money_before_the_decision_is_held`, `test_b1_r1b_...`, `test_b1_a_unit_refund_still_behaves_as_before`); B2 claim outcomes and back-off (`test_b2_r4_...`, `test_b2_a_held_claim_review_reopens_when_a_link_appears`, `test_b2_member_out_of_scope_and_no_phone_settle`, `test_b2_waiting_member_rechecks_back_off_until_a_link_appears`); B3 read resume (`test_b3_r5_...`, `test_b3_a_failed_resume_moves_nothing_and_restarts_from_the_watermark`, `ShopifyClientTests.test_b3_a_read_at_the_page_cap_keeps_the_cursor`); B4 (`test_b4_g16_...`, `test_b4_g17_...`, `CliTests.test_b4_g35_...`; PS `test_b4_s04_...`, `test_b4_s08_s09_...`, `test_b4_s10_...`); LATER 1 (`ClosureRowTests.test_q20_one_write_per_receipt_even_after_a_crash_before_the_receipt_update`), LATER 2 (`IndexTests.test_later2_...`), LATER 6 (`test_later6_...`, `ShopifyClientTests.test_later6_...`), LATER 8 (`test_later8_g09_...`, `test_later8_g28_...`, `SyncLedgerReadOnlyTests.test_later8_g29_...`).
+
 ### Parked (one line each, for the next slice)
 
 - **Q1 tag step**: no Shopify tag or metafield (needs `write_customers` and the I1/I9 tag rules).
@@ -166,4 +194,8 @@ Not verifiable from the docs (check in the first shadow week): whether `updated_
 - **Q30, Q31**: birthday-month tag.
 - **Q32**: `tag_without_basis` reconcile (no tags).
 - **I1, I9**: tag invariants, parked with the Shopify writes.
-- An unlink command for a wrong claim link (claim links are append-only today).
+- **Unlink command** for a wrong claim link (claim links are append-only today): its own small round, **before B4**.
+- **`release-held` command** for a `HELD` write after the owner's check (section 4): before B4.
+- Tips (`Order.totalTipReceivedSet`) are not excluded yet: check in the shadow week whether tipping is on.
+- No ceiling on the new `ExpiryDate` at the child (defence in depth); `resolve` treats a probe result `unknown` as exited, as the type move does.
+- Mirror step S1 (pause `XB-MemberBenefits` around a type move command) in `member_type_move_runbook.md` (docs follow-up).

@@ -102,7 +102,9 @@ class FakeShopify:
         self.calls: list[tuple] = []
         self.scopes = ["read_customers", "read_orders"]
         self.fail_orders: str | None = None
-        self.complete = True
+        self.fail_after_cursor = False
+        self.truncated_phones: set[str] = set()
+        self.last_end_cursor: str | None = None
 
     def add(self, node: dict) -> None:
         self.orders_nodes[node["id"]] = node
@@ -114,12 +116,21 @@ class FakeShopify:
         if frozenset(self.scopes) != bm.REQUIRED_SCOPES:
             raise direct.ShopifyDirectError("shopify_token_scope_not_expected")
 
-    def orders(self, since, max_pages):
+    def orders(self, since, max_pages, after=None):
+        """As Shopify: ascending by updatedAt (ties by id), pages of
+        SHOPIFY_ORDER_PAGE, at most max_pages, an opaque cursor per position."""
         self.calls.append(("orders", since))
         if self.fail_orders:
             raise direct.ShopifyDirectError(self.fail_orders, retryable=True)
-        nodes = sorted((n for n in self.orders_nodes.values() if dl.parse_created_at(n["updatedAt"]) >= since), key=lambda n: n["updatedAt"])
-        return [bm.order_from_node(n) for n in nodes], self.complete
+        if after is not None and self.fail_after_cursor:
+            raise direct.ShopifyDirectError("shopify_graphql_error")
+        nodes = sorted((n for n in self.orders_nodes.values() if dl.parse_created_at(n["updatedAt"]) >= since), key=lambda n: (n["updatedAt"], n["id"]))
+        start = 0 if after is None else int(after.removeprefix("cursor-")) + 1
+        limit = bm.SHOPIFY_ORDER_PAGE * max_pages
+        page = nodes[start:start + limit]
+        complete = start + limit >= len(nodes)
+        self.last_end_cursor = None if complete else f"cursor-{start + limit - 1}"
+        return [bm.order_from_node(n) for n in page], complete
 
     def customer(self, gid):
         self.calls.append(("customer", gid))
@@ -128,6 +139,8 @@ class FakeShopify:
 
     def find_by_phone(self, digits):
         self.calls.append(("phone", digits))
+        if digits in self.truncated_phones:
+            raise bm.PhoneCandidatesTruncated()
         found = [bm.customer_from_node({**c, "tags": []}) for c in self.customers.values()]
         return [c for c in found if sync.phone_member_no(c.phone)[0] == digits]
 
@@ -206,6 +219,9 @@ class FakeBook:
             m["name"] = "changed"
             return bm.SaveOutcome("HELD", "readback_fields_changed", m["last_modified"], ("Name",))
         if self.mode == "uncertain_saved":
+            return bm.SaveOutcome("UNCERTAIN", "writer_timeout")
+        if self.mode == "uncertain_mutated":  # saved, another column changed, outcome lost
+            m["name"] = "changed"
             return bm.SaveOutcome("UNCERTAIN", "writer_timeout")
         return bm.SaveOutcome("DONE", None, m["last_modified"])
 
@@ -507,14 +523,16 @@ class ClosureRowTests(Base):
         self.assertEqual(self.book.saves, 1)
 
     def test_q09_refund_leaving_the_basis_at_300_is_recorded_only(self):
-        self.guest_with_order(1, lines=(("200.00", 2, 2, False, ()),))
+        # A unit refund (one of four units) that leaves the basis at S$300
+        # (G2 B1: a refund by money with no unit now alerts; see below).
+        self.guest_with_order(1, lines=(("100.00", 4, 4, False, ()),))
         engine = self.engine()
         engine.run(apply=True)
         self.advance(days=2)
-        self.shopify.add(order_node(1, lines=(("200.00", 2, 2, False, ()),), refunded="50.00", updated="2026-11-20T03:00:00Z"))
+        self.shopify.add(order_node(1, lines=(("100.00", 4, 3, False, ()),), refunded="100.00", updated="2026-11-20T03:00:00Z"))
         out = engine.run(apply=True)
         self.assertEqual(out["alerts"], [])
-        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["refunded_cents"]), ("applied", 5000))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["refunded_cents"]), ("applied", 10000))
         self.assertEqual(self.book.saves, 1)
 
     def test_q10_q12_refund_taking_the_basis_below_300_alerts_once_and_changes_nothing(self):
@@ -618,8 +636,11 @@ class ClosureRowTests(Base):
         self.book.members[sg(1)].update(type="GUEST", expiry=None, last_modified="2026-11-18T06:00:00.000")
         self.advance(minutes=15)
         out = engine.run(apply=True)
-        self.assertEqual((out["saves"], out["counts"].get("write_already_recorded")), (0, 1))
+        # G2 LATER 1: the DONE write repairs the receipt; still never re-sent.
+        self.assertEqual((out["saves"], out["counts"].get("receipt_repaired_applied")), (0, 1))
         self.assertEqual((self.book.saves, len(self.book.payloads)), (1, 1))
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["basis_expiry_local"]), ("applied", "upgrade", NEW_EXPIRY))
 
     def test_q20_a_crash_inside_the_save_call_is_uncertain(self):
         self.guest_with_order(1)
@@ -789,6 +810,202 @@ class ClosureRowTests(Base):
 
 
 # --------------------------------------------------------------------------
+# G2 fix round 1 (PR #298 at ceae854): B1-B4 and LATER 1, 2, 6, 8
+# --------------------------------------------------------------------------
+
+class G2FixRound1Tests(Base):
+    # -- B1: refunds by money ------------------------------------------------
+    def test_b1_r1_an_order_refunded_by_money_only_is_held_never_upgraded(self):
+        self.guest_with_order(1, status="REFUNDED", refunded="300.00")
+        engine = self.engine()
+        out = engine.run(apply=True)
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"]), ("held", "refund_unattributed"))
+        self.assertEqual(out["alerts"], ["refund_unattributed"])
+        self.assertEqual((self.book.saves, self.book.reads, self.book.members[sg(1)]["type"]), (0, 0, "GUEST"))
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-18T04:05:00Z"))
+        self.assertEqual(engine.run(apply=True)["alerts"], [])  # once; not re-decided
+        self.assertEqual((self.receipt(1)["state"], self.book.saves), ("held", 0))
+
+    def test_b1_a_partial_refund_by_money_before_the_decision_is_held(self):
+        # S$320.00 of lines, S$100.00 refunded with no refunded unit.
+        self.guest_with_order(1, lines=(("320.00", 1, 1, False, ()),), status="PARTIALLY_REFUNDED", refunded="100.00")
+        out = self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "refund_unattributed"))
+        self.assertIn("refund_unattributed", out["alerts"])
+        self.assertEqual(self.book.saves, 0)
+
+    def test_b1_r1b_a_full_refund_by_money_after_the_upgrade_alerts_once_and_changes_nothing(self):
+        self.guest_with_order(1)
+        engine = self.engine()
+        engine.run(apply=True)
+        self.advance(days=2)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-20T03:00:00Z"))
+        self.assertEqual(engine.run(apply=True)["alerts"], ["refund_on_basis"])
+        self.assertEqual((self.receipt(1)["state"], self.book.members[sg(1)]["type"], self.book.saves), ("applied", "MEMBER", 1))
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-20T04:00:00Z"))
+        self.assertEqual(engine.run(apply=True)["alerts"], [])
+
+    def test_b1_a_unit_refund_still_behaves_as_before(self):
+        # One of four units refunded with its own money: net S$300.00, qualifies.
+        self.guest_with_order(1, lines=(("100.00", 4, 3, False, ()),), status="PARTIALLY_REFUNDED", refunded="100.00")
+        # One of three units refunded: net S$200.00, below the threshold (not held).
+        self.guest_with_order(2, lines=(("100.00", 3, 2, False, ()),), status="PARTIALLY_REFUNDED", refunded="100.00")
+        out = self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(2)["state"]), ("applied", "below_threshold"))
+        self.assertNotIn("refund_unattributed", out["alerts"])
+
+    # -- B2: review receipts must not starve the run ---------------------------
+    def test_b2_r4_claim_reviews_do_not_starve_a_linked_receipt(self):
+        for n in range(1, 11):  # signed up, AC2 member by phone, name does not match
+            self.guest_with_order(n, linked=False, member=fake_member(sg(n), name="Someone Else Entirely"))
+        self.guest_with_order(20, created="2026-11-18T03:30:00Z")  # newer, #155-linked GUEST
+        reads, alerts = [], []
+        for _ in range(4):  # a fresh engine per run, as on the VM
+            before = self.book.reads
+            out = self.engine().run(apply=True)
+            reads.append(self.book.reads - before)
+            alerts.append(out["alerts"])
+            if len(reads) == 1:
+                # Decided on the first run: linked ready receipts go first.
+                self.assertEqual((self.receipt(20)["state"], out["saves"]), ("applied", 1))
+            self.advance(minutes=15)
+        self.assertEqual((self.receipt(20)["state"], self.book.members[sg(20)]["type"]), ("applied", "MEMBER"))
+        self.assertIn("member_reads_capped", alerts[0])
+        self.assertEqual([self.receipt(n)["state"] for n in range(1, 11)], ["held"] * 10)
+        self.assertEqual({self.receipt(n)["code"] for n in range(1, 11)}, {"claim_name_mismatch"})
+        self.assertEqual(reads[2:], [0, 0])
+
+    def test_b2_a_held_claim_review_reopens_when_a_link_appears(self):
+        self.guest_with_order(1, linked=False, member=fake_member(sg(1), name="Someone Else Entirely"))
+        engine = self.engine()
+        engine.run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_name_mismatch"))
+        self.link(1)  # #155 links the customer
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual(out["counts"].get("claim_hold_reopened"), 1)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["link_source"]), ("applied", "sync155"))
+
+    def test_b2_member_out_of_scope_and_no_phone_settle(self):
+        self.guest_with_order(1, linked=False, member=fake_member(sg(1), member_type="Default"))
+        self.shopify.add(order_node(2, customer=customer_node(2, phone=None)))
+        out = self.engine().run(apply=True)
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("held", "claim_member_not_in_scope"), ("held", "claim_no_phone")])
+        self.assertIn("qualified_member_no_phone", out["alerts"])
+        self.advance(minutes=15)
+        before = self.book.reads
+        self.assertEqual(self.engine().run(apply=True)["alerts"], [])
+        self.assertEqual(self.book.reads, before)
+
+    def test_b2_waiting_member_rechecks_back_off_until_a_link_appears(self):
+        self.shopify.add(order_node(1))  # signed up, no AC2 member yet
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(1)["state"], "waiting_member")
+        first = self.book.reads
+        for _ in range(3):
+            self.advance(minutes=15)
+            self.assertEqual(self.engine().run(apply=True)["counts"].get("waiting_member_backoff"), 1)
+        self.assertEqual(self.book.reads, first)
+        self.advance(hours=6)
+        self.engine().run(apply=True)
+        self.assertGreater(self.book.reads, first)
+        # A #155 link makes it due at once, inside the back-off.
+        self.book.members[sg(1)] = fake_member(sg(1))
+        self.link(1)
+        self.advance(minutes=15)
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(1)["state"], "applied")
+        self.assertEqual(self.cfg().waiting_member_recheck_hours, 6)
+
+    # -- B3: the order read must not stall ------------------------------------
+    def test_b3_r5_a_bulk_update_does_not_stall_new_orders(self):
+        for n in range(100, 250):  # 150 small orders updated in the same minute
+            self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), updated=f"2026-11-18T03:30:{n % 60:02d}Z"))
+        self.now = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)
+        self.guest_with_order(1, updated="2026-11-18T04:50:00Z")  # 80 minutes later
+        runs = []
+        for _ in range(3):
+            out = self.engine().run(apply=True)
+            runs.append((out["counts"]["orders_read"], "orders_read_incomplete" in out["alerts"]))
+            if self.receipt(1) is not None and self.receipt(1)["state"] == "applied":
+                break
+            self.advance(minutes=15)
+        self.assertEqual(runs[0], (100, True))
+        self.assertEqual((self.receipt(1)["state"], len(runs)), ("applied", 2))
+        self.assertIsNone(self.ledger.watermark(bm.RESUME_MARK))
+        self.assertEqual(self.ledger.watermark(bm.WATERMARK), "2026-11-18T04:50:00Z")
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0], 151)
+
+    def test_b3_a_failed_resume_moves_nothing_and_restarts_from_the_watermark(self):
+        for n in range(100, 250):
+            self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), updated="2026-11-18T03:30:00Z"))
+        engine = self.engine()
+        engine.run(apply=False)
+        self.assertIsNotNone(self.ledger.watermark(bm.RESUME_MARK))
+        self.shopify.fail_after_cursor = True
+        self.assertEqual(self.code(lambda: self.engine().run(apply=False)), "shopify_graphql_error")
+        self.assertIsNone(self.ledger.watermark(bm.RESUME_MARK))
+        self.assertIsNone(self.ledger.watermark(bm.WATERMARK))  # never moved by an incomplete read
+        self.shopify.fail_after_cursor = False
+        self.engine().run(apply=False)
+        self.engine().run(apply=False)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0], 150)
+
+    # -- B4: never twice, resolve path ----------------------------------------
+    def test_b4_g16_resolve_holds_an_uncertain_save_whose_read_back_shows_another_column_changed(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_mutated"
+        engine = self.engine()
+        engine.run(apply=True)
+        self.advance(seconds=PAST_DEADLINE)
+        self.assertEqual(engine.resolve()["resolved"], {"HELD:resolved_unclear": 1})
+        self.assertEqual(self.receipt(1)["state"], "ready")
+        self.book.mode = None
+        self.assertEqual(self.code(lambda: engine.run(apply=True)), "benefit_held_rows_present")
+
+    def test_b4_g17_resolve_holds_while_the_save_child_still_runs(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_unsaved"
+        engine = self.engine()
+        engine.run(apply=True)
+        self.advance(seconds=PAST_DEADLINE)
+        self.probe_result = "running"
+        self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.probe_result = "exited"
+        self.assertEqual(engine.resolve()["resolved"], {"NOT_WRITTEN:resolved_not_written": 1})
+
+    # -- LATER 2, 6, 8 -------------------------------------------------------
+    def test_later6_a_truncated_phone_search_holds_the_claim_for_review(self):
+        self.guest_with_order(1, linked=False)
+        self.shopify.truncated_phones.add(sg(1))
+        out = self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_phone_not_unique"))
+        self.assertIn("claim_needs_review", out["alerts"])
+        self.assertIsNone(self.ledger.claim_for_gid(customer_gid(1)))
+
+    def test_later8_g09_the_sign_up_tag_is_required(self):
+        self.guest_with_order(1, customer=customer_node(1, tags=("newsletter",)))  # metafield, no member-mg tag
+        self.now = datetime(2026, 11, 21, 4, 0, tzinfo=timezone.utc)
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(1)["state"], "not_signed_up")
+        self.assertEqual(self.book.saves, 0)
+
+    def test_later8_g28_a_claim_refuses_a_member_already_linked_by_155(self):
+        self.guest_with_order(1, linked=False)
+        self.link(9, sg(1))  # #155 links that member to another customer
+        out = self.engine().run(apply=True)
+        self.assertIsNone(self.ledger.claim_for_gid(customer_gid(1)))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_link_conflict"))
+        self.assertIn("claim_needs_review", out["alerts"])
+        self.assertEqual(self.book.saves, 0)
+
+
+# --------------------------------------------------------------------------
 # Index (one-off claim links for existing members)
 # --------------------------------------------------------------------------
 
@@ -821,6 +1038,15 @@ class IndexTests(Base):
         self.assertEqual(self.ledger.conn.execute("SELECT code FROM reviews").fetchall()[0][0], "claim_name_mismatch")
         self.assertEqual(self.book.saves, 0)
         self.assertEqual(self.code(lambda: engine.index(apply=True, max_members=1001)), "benefits_index_max_invalid")
+
+    def test_later2_both_member_no_forms_are_reviewed_never_linked(self):
+        self.book.members[local(1)] = fake_member(local(1), member_type="GUEST", name="Fake Member 1")  # the 8-digit form too
+        out = self.engine().index(apply=True, max_members=100)
+        claims = {r["member_no_key"] for r in self.ledger.conn.execute("SELECT * FROM claim_links")}
+        self.assertNotIn(sg(1), claims)
+        self.assertNotIn(local(1), claims)
+        self.assertEqual(out["counts"].get("claim_memberno_conflict"), 2)
+        self.assertIn("claim_needs_review", out["alerts"])
 
 
 # --------------------------------------------------------------------------
@@ -903,6 +1129,20 @@ class SyncLedgerReadOnlyTests(Base):
         self.assertEqual(links.by_gid, {customer_gid(1): sg(1)})
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
 
+    def test_later8_g29_the_sync_ledger_is_opened_read_only(self):
+        self.make_sync_ledger()
+        uris = []
+        real = sqlite3.connect
+
+        def spy(target, *args, **kwargs):
+            uris.append((str(target), kwargs.get("uri")))
+            return real(target, *args, **kwargs)
+        with mock.patch.object(bm.sqlite3, "connect", spy):
+            bm.SyncLinks.load(self.sync_root, self.cfg())
+        self.assertEqual(len(uris), 1)
+        self.assertTrue(uris[0][0].endswith(sync.LEDGER_FILE + "?mode=ro"))
+        self.assertTrue(uris[0][1])
+
     def test_a_sync_ledger_for_another_store_or_book_is_refused(self):
         self.make_sync_ledger(store="gid://shopify/Shop/2")
         self.assertEqual(self.code(lambda: bm.SyncLinks.load(self.sync_root, self.cfg())), "sync_ledger_binding_mismatch")
@@ -976,9 +1216,28 @@ class ShopifyClientTests(unittest.TestCase):
         nodes = [{"id": customer_gid(1), "firstName": "A", "lastName": "B", "defaultPhoneNumber": {"phoneNumber": "+" + sg(1)}},
                  {"id": customer_gid(2), "firstName": "A", "lastName": "B", "defaultPhoneNumber": {"phoneNumber": "+" + sg(2)}},
                  {"id": customer_gid(3), "firstName": "A", "lastName": "B", "defaultPhoneNumber": None}]
-        client, transport = self.client([(200, {"data": {"customers": {"nodes": nodes}}})])
+        client, transport = self.client([(200, {"data": {"customers": {"pageInfo": {"hasNextPage": False}, "nodes": nodes}}})])
         self.assertEqual([c.gid for c in client.find_by_phone(sg(1))], [customer_gid(1)])
         self.assertEqual(transport.bodies[0]["variables"], {"search": "phone:+" + sg(1)})
+
+    def test_later6_a_truncated_phone_search_is_never_exactly_one(self):
+        nodes = [{"id": customer_gid(1), "firstName": "A", "lastName": "B", "defaultPhoneNumber": {"phoneNumber": "+" + sg(1)}}]
+        for page_info in ({"hasNextPage": True}, {}):
+            with self.subTest(page_info=page_info):
+                client, _ = self.client([(200, {"data": {"customers": {"pageInfo": page_info, "nodes": nodes}}})])
+                with self.assertRaises(bm.PhoneCandidatesTruncated):
+                    client.find_by_phone(sg(1))
+        self.assertIn("pageInfo { hasNextPage }", bm.PHONE_LOOKUP_QUERY)
+
+    def test_b3_a_read_at_the_page_cap_keeps_the_cursor(self):
+        page = {"data": {"orders": {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [order_node(1)]}}}
+        client, transport = self.client([(200, page)])
+        orders, complete = client.orders(dl.parse_created_at(START), 1)
+        self.assertEqual((len(orders), complete, client.last_end_cursor), (1, False, "c1"))
+        last = {"data": {"orders": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [order_node(2)]}}}
+        client, transport = self.client([(200, last)])
+        orders, complete = client.orders(dl.parse_created_at(START), 1, after="c1")
+        self.assertEqual((complete, client.last_end_cursor, transport.bodies[0]["variables"]["after"]), (True, None, "c1"))
 
 
 class TokenTests(unittest.TestCase):
@@ -1047,6 +1306,25 @@ class CliTests(Base):
         self.assertIn(bm.mask(sg(1)), joined)
         digest = json.loads(texts[5].strip())
         self.assertEqual(digest["receipts"], {"applied": 2})
+
+    def test_b4_g35_refund_and_unverifiable_paths_carry_keyed_refs_only(self):
+        self.guest_with_order(1)  # applied, then refunded below the threshold
+        self.guest_with_order(2, taxes=False)  # amount_unverifiable
+        self.guest_with_order(3, status="REFUNDED", refunded="300.00")  # refund_unattributed
+        texts = [self.run_main("init")[2], self.run_main("apply")[2]]
+        self.advance(days=2)
+        self.shopify.add(order_node(1, lines=(("300.00", 1, 0, False, ()),), refunded="300.00", updated="2026-11-20T03:00:00Z"))
+        code, out, text = self.run_main("apply")
+        texts.append(text)
+        joined = "".join(texts)
+        for n in (1, 2, 3):
+            self.assertNotIn(order_gid(n), joined)
+            self.assertNotIn(str(5000 + n), joined)
+        self.assertIn("refund_on_basis", out["alerts"])
+        codes = {r["code"] for r in json.loads(texts[1].strip().splitlines()[-1])["refs"]} | {r["code"] for r in out["refs"]}
+        self.assertLessEqual({"refund_on_basis", "order_amount_unverifiable", "refund_unattributed"}, codes)
+        for entry in out["refs"]:
+            self.assertRegex(entry["ref"], r"^[ocm]-[0-9a-f]{20}$")
 
     def test_apply_with_the_switch_off_refuses_before_any_ledger_or_login(self):
         def factory(config, ledger):

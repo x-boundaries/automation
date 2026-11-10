@@ -92,6 +92,7 @@ SHOPIFY_LINE_PAGE = 50
 SHOPIFY_SHIPPING_PAGE = 5
 WATERMARK = "orders_updated_at"
 WATERMARK_MARGIN = timedelta(minutes=15)  # search-index lag overlap, as #155
+RESUME_MARK = "orders_resume"  # G2 B3: {since, cursor} of a read that ended at the page cap
 SHOPIFY_ORDER_WINDOW = timedelta(days=60)  # read_orders sees orders created in the last 60 days
 MAX_UPGRADES_PER_RUN_LIMIT = 20
 OBSERVE_REREAD = timedelta(hours=24)
@@ -107,6 +108,13 @@ RECEIPT_STATES = (
 )
 # Re-checked on every run until they settle or their wait ends.
 PENDING_STATES = ("pending_signup", "waiting_member", "ready")
+# G2 B2: claim outcomes that settle a receipt as ``held`` (terminal, one
+# alert) instead of waiting for ever. Such a receipt is re-opened (back to
+# ``ready``) only when a #155 link or a claim link for its customer appears.
+CLAIM_HOLD_CODES = frozenset({"claim_name_mismatch", "claim_phone_not_unique", "claim_link_conflict", "claim_memberno_conflict",
+                              "claim_member_not_in_scope", "claim_no_phone"})
+# G2 B1: a refund by money that no refunded or removed unit explains.
+REFUND_UNATTRIBUTED = "refund_unattributed"
 
 _LOCAL_STORED_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
 _NEW_EXPIRY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T00:00:00$")
@@ -149,6 +157,9 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "amount_count_sale_items": True,  # only true: an order line records no sale price
     "same_day_signup_counts": True,
     "waiting_member_alert_hours": 48,
+    # G2 B2: a waiting_member receipt (no AC2 member yet) is re-checked at
+    # most once per this many hours, unless a link for its customer appears.
+    "waiting_member_recheck_hours": 6,
     "signup_wait_hours": 48,
     "shopify_max_pages": 10,
     "http_timeout_seconds": 30,
@@ -167,6 +178,7 @@ _BOUNDS = {
     "write_deadline_seconds": (30, 600),
     "qualify_threshold_cents": (100, 10_000_000),
     "waiting_member_alert_hours": (1, 720),
+    "waiting_member_recheck_hours": (1, 72),
     "signup_wait_hours": (1, 720),
     "shopify_max_pages": (1, 40),
     "http_timeout_seconds": (5, 60),
@@ -194,6 +206,7 @@ class BenefitsConfig:
     amount_count_sale_items: bool
     same_day_signup_counts: bool
     waiting_member_alert_hours: int
+    waiting_member_recheck_hours: int
     signup_wait_hours: int
     shopify_max_pages: int
     http_timeout_seconds: int
@@ -468,6 +481,25 @@ def qualifies(net_cents: int, config: BenefitsConfig) -> bool:
     return net_cents >= config.qualify_threshold_cents
 
 
+def refunded_unit_cents(order: Order) -> int:
+    """The before-discount value of every refunded or removed unit
+    (``quantity - currentQuantity``), gift-card lines included."""
+
+    return sum(line.unit_cents * (line.quantity - line.current_quantity) for line in order.lines)
+
+
+def money_refund_unattributed(order: Order) -> bool:
+    """G2 B1: a refund by money that no refunded or removed unit explains:
+    the order is fully refunded (``REFUNDED``), or ``totalRefundedSet`` is
+    more than the value of its refunded or removed units. Such money can be
+    an amount-only refund, a shipping refund or an adjustment, so it is never
+    netted: before the decision the receipt is held, after it one alert."""
+
+    if order.financial_status == "REFUNDED":
+        return True
+    return order.refunded_cents is not None and order.refunded_cents > refunded_unit_cents(order)
+
+
 def signup_status(customer: Customer | None, order: Order, config: BenefitsConfig) -> str:
     """``signed_up``, ``pending`` (marker without its time yet, or sign-up
     not seen yet but the wait is still open) or ``not_signed_up``.
@@ -591,7 +623,7 @@ CREATE TABLE receipts(
   state TEXT NOT NULL CHECK (state IN ('ignored_unpaid', 'ignored_test', 'void', 'before_start', 'no_customer', 'amount_unverifiable',
     'below_threshold', 'not_signed_up', 'pending_signup', 'waiting_member', 'ready', 'applied', 'no_change', 'not_in_scope', 'held')),
   code TEXT, member_no TEXT, link_source TEXT CHECK (link_source IS NULL OR link_source IN ('sync155', 'claim')),
-  basis_expiry_local TEXT, observed TEXT, observed_at TEXT, waiting_since TEXT, alerted TEXT,
+  basis_expiry_local TEXT, observed TEXT, observed_at TEXT, waiting_since TEXT, checked_at TEXT, alerted TEXT,
   first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   CHECK (state <> 'applied' OR (member_no IS NOT NULL AND basis_expiry_local IS NOT NULL)));
 CREATE TABLE claim_links(
@@ -618,6 +650,8 @@ CREATE TRIGGER receipts_binding_immutable BEFORE UPDATE OF order_gid, order_crea
   BEGIN SELECT RAISE(ABORT, 'receipt_immutable'); END;
 CREATE TRIGGER receipts_decided_stay BEFORE UPDATE OF state ON receipts
   WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state <> OLD.state
+   AND NOT (OLD.state = 'held' AND NEW.state = 'ready' AND OLD.code IN ('claim_name_mismatch', 'claim_phone_not_unique',
+            'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
   BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
 CREATE TRIGGER claim_links_immutable BEFORE UPDATE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
 CREATE TRIGGER claim_links_no_delete BEFORE DELETE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
@@ -727,6 +761,10 @@ class BenefitsLedger:
             conn.execute("INSERT INTO watermarks(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value, "
                          "updated_at = excluded.updated_at", (name, value, dl.ts(self.now())))
 
+    def clear_watermark(self, name: str) -> None:
+        with self.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = ?", (name,))
+
     def receipt(self, order_gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM receipts WHERE order_gid = ?", (order_gid,)).fetchone()
 
@@ -762,6 +800,9 @@ class BenefitsLedger:
 
     def held_writes(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0]
+
+    def done_write(self, order_gid: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM writes WHERE order_gid = ? AND state = 'DONE' ORDER BY rowid DESC LIMIT 1", (order_gid,)).fetchone()
 
     def write_landed_or_open(self, order_gid: str) -> bool:
         """A write for this receipt that landed or may have landed."""
@@ -889,8 +930,16 @@ CUSTOMER_QUERY = """query XbMemberBenefitsCustomer($id: ID!) {
   customer(id: $id) { """ + _CUSTOMER_FIELDS + """ }
 }"""
 PHONE_LOOKUP_QUERY = """query XbMemberBenefitsPhoneLookup($search: String!) {
-  customers(first: 5, query: $search) { nodes { id firstName lastName defaultPhoneNumber { phoneNumber } } }
+  customers(first: 5, query: $search) { pageInfo { hasNextPage } nodes { id firstName lastName defaultPhoneNumber { phoneNumber } } }
 }"""
+
+
+class PhoneCandidatesTruncated(dl.DirectLocalError):
+    """G2 LATER 6: the phone search has more candidates than one page, so
+    "exactly one customer" cannot be shown: the claim goes to review."""
+
+    def __init__(self) -> None:
+        super().__init__("claim_phone_not_unique")
 READ_QUERIES = frozenset({direct.SESSION_QUERY, ORDERS_QUERY, CUSTOMER_QUERY, PHONE_LOOKUP_QUERY})
 
 
@@ -991,12 +1040,17 @@ class BenefitsShopifyClient(direct.ShopifyDirectClient):
         if len(set(handles)) != len(handles) or frozenset(handles) != REQUIRED_SCOPES:
             raise direct.ShopifyDirectError("shopify_token_scope_not_expected")
 
-    def orders(self, since: datetime, max_pages: int) -> tuple[list[Order], bool]:
-        """Orders updated at or after ``since``, ascending by updatedAt."""
+    last_end_cursor: str | None = None
+
+    def orders(self, since: datetime, max_pages: int, after: str | None = None) -> tuple[list[Order], bool]:
+        """Orders updated at or after ``since``, ascending by updatedAt,
+        starting after ``after`` (a cursor kept from a read that ended at the
+        page cap, G2 B3). ``last_end_cursor`` is the cursor to continue from
+        when the read ends at the page cap (``complete`` false)."""
 
         search = f"updated_at:>='{since.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}'"
         orders: list[Order] = []
-        after = None
+        self.last_end_cursor = None
         for _ in range(max_pages):
             data = self.execute(ORDERS_QUERY, {"first": SHOPIFY_ORDER_PAGE, "after": after, "search": search})
             page = data.get("orders")
@@ -1006,6 +1060,7 @@ class BenefitsShopifyClient(direct.ShopifyDirectClient):
                 return orders, True
             after = page["pageInfo"].get("endCursor")
             _shape(isinstance(after, str) and bool(after))
+        self.last_end_cursor = after
         return orders, False
 
     def customer(self, gid: str) -> Customer | None:
@@ -1019,7 +1074,9 @@ class BenefitsShopifyClient(direct.ShopifyDirectClient):
 
         data = self.execute(PHONE_LOOKUP_QUERY, {"search": f"phone:{sync.e164(digits)}"})
         page = data.get("customers")
-        _shape(isinstance(page, dict) and isinstance(page.get("nodes"), list))
+        _shape(isinstance(page, dict) and isinstance(page.get("nodes"), list) and isinstance(page.get("pageInfo"), dict))
+        if page["pageInfo"].get("hasNextPage") is not False:
+            raise PhoneCandidatesTruncated()
         found = [customer_from_node({**node, "tags": []}) for node in page["nodes"]]
         return [c for c in found if sync.phone_member_no(c.phone)[0] == digits]
 
@@ -1333,6 +1390,8 @@ class BenefitsEngine:
         self.links: SyncLinks | None = None
         self.conflict_gids: set[str] = set()
         self.conflict_keys: set[str] = set()
+        self.linked_gids: set[str] = set()
+        self._read_state: tuple[datetime, bool, str | None] | None = None
         self.reads = 0
 
     # -- helpers --------------------------------------------------------------
@@ -1352,20 +1411,78 @@ class BenefitsEngine:
         self.links = self._sync_links()
         claims = self.ledger.conn.execute("SELECT * FROM claim_links").fetchall()
         self.conflict_gids, self.conflict_keys = link_conflicts(self.links, claims)
+        self.linked_gids = set(self.links.by_gid) | {row["customer_gid"] for row in claims}
+
+    def _reopen_claim_holds(self, summary: RunSummary) -> None:
+        """G2 B2: a receipt held by a claim outcome goes back to ``ready``
+        once a #155 link or a claim link for its customer exists."""
+
+        marks = ",".join("?" for _ in CLAIM_HOLD_CODES)
+        rows = self.ledger.conn.execute(f"SELECT order_gid, customer_gid FROM receipts WHERE state = 'held' AND code IN ({marks})",
+                                        tuple(sorted(CLAIM_HOLD_CODES))).fetchall()
+        for row in rows:
+            if row["customer_gid"] in self.linked_gids:
+                self.ledger.update_receipt(row["order_gid"], state="ready", code=None, checked_at=None)
+                summary.count("claim_hold_reopened", self.ledger.ref("o", row["order_gid"]))
 
     # -- 1. read and record ---------------------------------------------------
     def read_orders(self, summary: RunSummary) -> list[Order]:
         """Every page first; nothing is recorded and the watermark does not
-        move unless the whole read is clean (Q22)."""
+        move unless the whole read is clean (Q22). G2 B3: a read that ends at
+        the page cap keeps Shopify's cursor (``orders_resume``), and the next
+        run continues after it with the same search, so the tool makes
+        progress run after run until it has caught up."""
 
-        mark = self.ledger.watermark(WATERMARK)
-        since = dl.parse_created_at(mark) if mark else self.config.orders_start_utc
-        since = max(since - WATERMARK_MARGIN, self.config.orders_start_utc - WATERMARK_MARGIN)
-        orders, complete = self.shopify.orders(since, self.config.shopify_max_pages)
+        resume = self._resume()
+        if resume is not None:
+            since, after = resume
+        else:
+            mark = self.ledger.watermark(WATERMARK)
+            since = dl.parse_created_at(mark) if mark else self.config.orders_start_utc
+            since = max(since - WATERMARK_MARGIN, self.config.orders_start_utc - WATERMARK_MARGIN)
+            after = None
+        try:
+            orders, complete = self.shopify.orders(since, self.config.shopify_max_pages, after=after)
+        except dl.DirectLocalError:
+            if resume is not None:
+                # A cursor Shopify no longer accepts must not stall the tool:
+                # the next run starts again from the unmoved watermark.
+                self.ledger.clear_watermark(RESUME_MARK)
+            raise
+        self._read_state = (since, complete, None if complete else getattr(self.shopify, "last_end_cursor", None))
         summary.counts["orders_read"] = len(orders)
-        if not complete:
-            summary.count("orders_more_pages")
+        if resume is not None:
+            summary.count("orders_read_resumed")
         return orders
+
+    def _resume(self) -> tuple[datetime, str] | None:
+        value = self.ledger.watermark(RESUME_MARK)
+        if value is None:
+            return None
+        try:
+            stored = json.loads(value)
+            since, cursor = dl.parse_created_at(stored["since"]), stored["cursor"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            since = cursor = None
+        if since is None or not isinstance(cursor, str) or not cursor:
+            self.ledger.clear_watermark(RESUME_MARK)
+            return None
+        return since, cursor
+
+    def _advance_watermark(self, orders: list[Order], summary: RunSummary) -> None:
+        """After every order of a clean read is recorded: a complete read
+        moves the watermark to the newest ``updatedAt`` and ends any resume;
+        a read that ended at the page cap keeps its cursor and alerts."""
+
+        since, complete, cursor = self._read_state
+        if complete:
+            if orders:
+                self.ledger.set_watermark(WATERMARK, dl.ts(max(o.updated_at for o in orders)))
+            self.ledger.clear_watermark(RESUME_MARK)
+            return
+        if isinstance(cursor, str) and cursor:
+            self.ledger.set_watermark(RESUME_MARK, json.dumps({"since": dl.ts(since), "cursor": cursor}, sort_keys=True))
+        summary.alert("orders_read_incomplete")
 
     def record(self, order: Order, summary: RunSummary) -> None:
         """One receipt per order, forever. A replay updates the same row; a
@@ -1379,7 +1496,9 @@ class BenefitsEngine:
         if existing is not None and existing["state"] in DECIDED_STATES:
             self.ledger.update_receipt(order.gid, order_updated_at=dl.ts(order.updated_at), financial_status=order.financial_status,
                                        refunded_cents=order.refunded_cents, net_cents=net if net is not None else existing["net_cents"])
-            dropped = order.cancelled or (net is not None and not qualifies(net, self.config))
+            # G2 B1: a refund by units below the threshold, a cancellation, or
+            # any refund by money that no unit explains (incl. REFUNDED).
+            dropped = order.cancelled or (net is not None and not qualifies(net, self.config)) or money_refund_unattributed(order)
             if existing["state"] == "applied" and dropped and existing["alerted"] != "refund_on_basis":
                 late = self.now() - order.created_at > SHOPIFY_ORDER_WINDOW
                 self.ledger.update_receipt(order.gid, alerted="refund_on_basis")
@@ -1390,6 +1509,10 @@ class BenefitsEngine:
                 summary.count("receipt_replayed")
             return
         state, code = self._classify(order, net)
+        if existing is not None and state == "ready" and existing["state"] == "waiting_member":
+            # The watermark overlap replays an order every run: a replay that
+            # still qualifies keeps the receipt waiting (and its back-off, G2 B2).
+            state, code = "waiting_member", existing["code"]
         values = dict(customer_gid=order.customer.gid if order.customer else None, order_updated_at=dl.ts(order.updated_at),
                       financial_status=order.financial_status, gross_cents=gross, net_cents=net, refunded_cents=order.refunded_cents,
                       state=state, code=code)
@@ -1405,6 +1528,10 @@ class BenefitsEngine:
             summary.count("receipt_replayed")
         if state == "amount_unverifiable":
             summary.alert("order_amount_unverifiable", ref)
+        if (state, code) == ("held", REFUND_UNATTRIBUTED):
+            # Held is terminal, so this transition (and the alert) happens once.
+            self.ledger.update_receipt(order.gid, alerted=REFUND_UNATTRIBUTED)
+            summary.alert(REFUND_UNATTRIBUTED, ref)
 
     def _classify(self, order: Order, net: int | None) -> tuple[str, str | None]:
         if order.test:
@@ -1421,6 +1548,9 @@ class BenefitsEngine:
             return "amount_unverifiable", ("taxes_not_included" if not order.taxes_included else "currency_or_lines")
         if not qualifies(net, self.config):
             return "below_threshold", None
+        if money_refund_unattributed(order):
+            # G2 B1 (Controller: hold, never net by money): staff decide.
+            return "held", REFUND_UNATTRIBUTED
         status = signup_status(order.customer, order, self.config)
         if status == "signed_up":
             return "ready", None
@@ -1454,12 +1584,12 @@ class BenefitsEngine:
         try:
             for order in orders:
                 self.record(order, summary)
-            if orders:
-                self.ledger.set_watermark(WATERMARK, dl.ts(max(o.updated_at for o in orders)))
+            self._advance_watermark(orders, summary)
+            self._reopen_claim_holds(summary)
             self._recheck_signups(summary)
             self._decide_all(summary, run_id=run_id, apply=apply)
         except _Budget:
-            summary.count("member_reads_capped")
+            summary.alert("member_reads_capped")  # G2 B2: an alert, not only a count
         except dl.DirectLocalError as exc:
             summary.stopped = exc.code
             summary.alert(exc.code)
@@ -1496,7 +1626,14 @@ class BenefitsEngine:
                 summary.count("signup_pending", ref)
 
     def _decide_all(self, summary: RunSummary, *, run_id: str, apply: bool) -> None:
-        for row in self._pending(("waiting_member", "ready")):
+        # G2 B2: linked ready receipts first, then other ready ones, then
+        # waiting_member (each oldest first), so receipts that need a claim
+        # cannot spend the read budget before the ones that can be decided.
+        def rank(row: sqlite3.Row) -> int:
+            if row["state"] == "ready":
+                return 0 if row["customer_gid"] in self.linked_gids else 1
+            return 2
+        for row in sorted(self._pending(("waiting_member", "ready")), key=rank):
             if apply and summary.saves >= self.config.max_upgrades_per_run:
                 summary.count("upgrade_cap_reached")
                 return
@@ -1504,37 +1641,41 @@ class BenefitsEngine:
             if stop:
                 return
 
-    def _link(self, row: sqlite3.Row, summary: RunSummary) -> tuple[str | None, str | None, MemberRead | None]:
-        """``(member_no, source, read)``: the #155 link, a claim link, or a
-        new claim (which needs the AC2 read, returned so it is not repeated)."""
+    def _link(self, row: sqlite3.Row, summary: RunSummary) -> tuple[str | None, str | None, MemberRead | None, str | None]:
+        """``(member_no, source, read, hold_code)``: the #155 link, a claim
+        link, or a new claim (which needs the AC2 read, returned so it is not
+        repeated). ``hold_code`` names a claim outcome that settles the
+        receipt (G2 B2); ``None`` with no MemberNo means no AC2 member yet."""
 
         gid = row["customer_gid"]
         assert self.links is not None
         if gid in self.links.by_gid:
-            return self.links.by_gid[gid], "sync155", None
+            return self.links.by_gid[gid], "sync155", None, None
         claim = self.ledger.claim_for_gid(gid)
         if claim is not None:
-            return claim["member_no"], "claim", None
+            return claim["member_no"], "claim", None, None
         customer = self.shopify.customer(gid)
-        member_no, read = self.claim(customer, summary, source="order")
-        return member_no, ("claim" if member_no else None), read
+        member_no, read, code = self.claim(customer, summary, source="order")
+        return member_no, ("claim" if member_no else None), read, code
 
     def claim(self, customer: Customer | None, summary: RunSummary, *, source: str, member: MemberRead | None = None,
-              member_no: str | None = None, same_phone: list[Customer] | None = None) -> tuple[str | None, MemberRead | None]:
+              member_no: str | None = None, same_phone: list[Customer] | None = None) -> tuple[str | None, MemberRead | None, str | None]:
         """The owner's "auto linking": an AC2 MEMBER or GUEST with no #155
         link, exactly one Shopify customer whose phone gives that MemberNo
         under the #155 phone rule, and the #155 name rule matches -> a claim
         link in this tool's ledger. Anything else: no link, and one
-        ``claim_needs_review`` alert per subject."""
+        ``claim_needs_review`` alert per subject. Returns ``(member_no, read,
+        code)``: ``code`` is the claim outcome (one of ``CLAIM_HOLD_CODES``)
+        when there is no link, ``None`` when linked or no member exists yet."""
 
         assert self.links is not None
         if customer is None:
-            return None, None
+            return None, None, None
         ref = self.ledger.ref("c", customer.gid)
         digits, forms = phone_forms(customer.phone if member_no is None else member_no)
         if digits is None:
             summary.count("claim_no_phone", ref)
-            return None, None
+            return None, None, "claim_no_phone"
         if member is None:
             found = []
             for form in sorted(forms):
@@ -1542,29 +1683,33 @@ class BenefitsEngine:
                 if read.found:
                     found.append((form, read))
             if not found:
-                return None, None
+                return None, None, None
             if len(found) > 1:
                 self._review(customer.gid, "claim_memberno_conflict", summary, ref)
-                return None, None
+                return None, None, "claim_memberno_conflict"
             member_no, member = found[0]
         key = sync.member_no_key(member_no)
         if member.member_type not in SCOPE_TYPES:
             summary.count("claim_member_not_in_scope", ref, member_no)
-            return None, member
+            return None, member, "claim_member_not_in_scope"
         if customer.gid in self.links.by_gid or key in self.links.by_key or self.ledger.claim_for_gid(customer.gid) or self.ledger.claim_for_member(member_no):
             self._review(customer.gid, "claim_link_conflict", summary, ref, member_no)
-            return None, member
+            return None, member, "claim_link_conflict"
         if same_phone is None:
-            same_phone = self.shopify.find_by_phone(digits)
-        if len(same_phone) != 1 or same_phone[0].gid != customer.gid:
+            try:
+                same_phone = self.shopify.find_by_phone(digits)
+            except PhoneCandidatesTruncated:
+                same_phone = None
+        if same_phone is None or len(same_phone) != 1 or same_phone[0].gid != customer.gid:
             self._review(customer.gid, "claim_phone_not_unique", summary, ref, member_no)
-            return None, member
+            return None, member, "claim_phone_not_unique"
         if not sync.full_name_matches(sync.shopify_full_name(customer.first_name, customer.last_name), member.name):
             self._review(customer.gid, "claim_name_mismatch", summary, ref, member_no)
-            return None, member
+            return None, member, "claim_name_mismatch"
         self.ledger.add_claim(customer.gid, member_no, source, "phone_and_name_match")
+        self.linked_gids.add(customer.gid)
         summary.count("claim_linked", ref, member_no)
-        return member_no, member
+        return member_no, member, None
 
     def _review(self, subject: str, code: str, summary: RunSummary, ref: str, member_no: str | None = None) -> None:
         summary.count(code, ref, member_no)
@@ -1576,17 +1721,39 @@ class BenefitsEngine:
 
         gid, order_gid = row["customer_gid"], row["order_gid"]
         ref = self.ledger.ref("o", order_gid)
+        done = self.ledger.done_write(order_gid)
+        if done is not None:
+            # G2 LATER 1: the save landed but the parent stopped before the
+            # receipt update: repair the receipt, never a second send (I4).
+            self.ledger.update_receipt(order_gid, state="applied", code=done["kind"], member_no=done["member_no"],
+                                       basis_expiry_local=done["new_expiry_local"])
+            summary.count("receipt_repaired_applied", ref, done["member_no"])
+            return False
         if self.ledger.write_landed_or_open(order_gid):
             summary.count("write_already_recorded", ref)  # never a second send (I4)
             return False
         if not apply and row["state"] == "ready" and row["observed_at"] and self.now() - dl.parse_created_at(row["observed_at"]) < OBSERVE_REREAD:
             summary.count(row["observed"] or "observed_recently")
             return False
+        if (row["state"] == "waiting_member" and gid not in self.linked_gids and row["checked_at"]
+                and self.now() - dl.parse_created_at(row["checked_at"]) < timedelta(hours=self.config.waiting_member_recheck_hours)):
+            # G2 B2: back off; a #155 link or claim link for the customer
+            # makes it due at once.
+            summary.count("waiting_member_backoff", ref)
+            self._waiting_alert(row, summary, ref)
+            return False
         if gid in self.conflict_gids:
             self.ledger.update_receipt(order_gid, state="held", code="link_conflict")
             summary.alert("link_conflict", ref)
             return False
-        member_no, source, read = self._link(row, summary)
+        member_no, source, read, hold_code = self._link(row, summary)
+        if member_no is None and hold_code is not None:
+            # G2 B2: a claim review, a member out of scope or no phone settles
+            # the receipt; it re-opens only when a link appears.
+            self.ledger.update_receipt(order_gid, state="held", code=hold_code, waiting_since=None)
+            if hold_code == "claim_no_phone":
+                summary.alert("qualified_member_no_phone", ref)
+            return False
         if member_no is None:
             self._waiting(row, summary, ref)
             return False
@@ -1646,8 +1813,12 @@ class BenefitsEngine:
         ``waiting_member_alert_hours``."""
 
         since = row["waiting_since"] or dl.ts(self.now())
-        self.ledger.update_receipt(row["order_gid"], state="waiting_member", waiting_since=since)
-        if self.now() - dl.parse_created_at(since) >= timedelta(hours=self.config.waiting_member_alert_hours):
+        self.ledger.update_receipt(row["order_gid"], state="waiting_member", waiting_since=since, checked_at=dl.ts(self.now()))
+        self._waiting_alert(row, summary, ref, since=since)
+
+    def _waiting_alert(self, row: sqlite3.Row, summary: RunSummary, ref: str, *, since: str | None = None) -> None:
+        since = since or row["waiting_since"]
+        if since and self.now() - dl.parse_created_at(since) >= timedelta(hours=self.config.waiting_member_alert_hours):
             if row["alerted"] != "qualified_member_missing":
                 self.ledger.update_receipt(row["order_gid"], alerted="qualified_member_missing")
                 summary.alert("qualified_member_missing", ref)
@@ -1761,15 +1932,23 @@ class BenefitsEngine:
         if digits is None:
             summary.count("index_member_no_not_phone")
             return 0
-        same_phone = self.shopify.find_by_phone(digits)
+        ref = self.ledger.ref("m", key)
+        # G2 LATER 2: as the order path, both MemberNo forms of one phone in
+        # AC2 (the 10-digit and the 8-digit form) is a review, never a link.
+        for other in sorted(sync.member_no_forms(digits) - {key}):
+            if self.ac2.member(other, secrets.token_hex(16)).found:
+                self._index_review(key, "claim_memberno_conflict", summary, ref, member_no)
+                return 1
+        try:
+            same_phone = self.shopify.find_by_phone(digits)
+        except PhoneCandidatesTruncated:
+            self._index_review(key, "claim_phone_not_unique", summary, ref, member_no)
+            return 1
         if not same_phone:
             summary.count("index_no_shopify_customer")
             return 1
         if len(same_phone) > 1:
-            ref = self.ledger.ref("m", key)
-            summary.count("claim_phone_not_unique", ref, member_no)
-            if self.ledger.review_once("m:" + key, "claim_phone_not_unique"):
-                summary.alert("claim_needs_review", ref, member_no)
+            self._index_review(key, "claim_phone_not_unique", summary, ref, member_no)
             return 1
         customer = same_phone[0]
         read = MemberRead(True, member_no=member_no, member_type=member_type, name=row.get("name"))
@@ -1780,6 +1959,11 @@ class BenefitsEngine:
             return 1
         self.claim(customer, summary, source="index", member=read, member_no=member_no, same_phone=same_phone)
         return 1
+
+    def _index_review(self, key: str, code: str, summary: RunSummary, ref: str, member_no: str) -> None:
+        summary.count(code, ref, member_no)
+        if self.ledger.review_once("m:" + key, code):
+            summary.alert("claim_needs_review", ref, member_no)
 
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:

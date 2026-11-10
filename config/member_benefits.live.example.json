@@ -26,6 +26,7 @@
   "amount_count_sale_items": true,
   "same_day_signup_counts": true,
   "waiting_member_alert_hours": 48,
+  "waiting_member_recheck_hours": 6,
   "signup_wait_hours": 48,
   "type_move_state_root": "C:\\XB\\xb268-type-move-live",
   "ac2_credential_target": "XB-AC2-MemberSync",
