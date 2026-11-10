@@ -627,6 +627,13 @@ def brand_of(item):
     return clean(item.get("ItemBrand")) or clean(item.get("ItemType"))
 
 
+def purchasing_brand_of(item):
+    """#292 S4 (G2 V10-L1): the purchasing file's brand is ItemBrand only (owner rule), blank when the
+    item master has none. The page's Buying brand is ItemBrand too, so an item's ordered, received
+    and sold units sit under one brand. The buying files keep brand_of as they are."""
+    return clean(item.get("ItemBrand"))
+
+
 def group_of(item):
     """The item's ItemGroup from the item master ("" when unknown)."""
     return clean(item.get("ItemGroup"))
@@ -1641,7 +1648,7 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
         e["lines"] += lines
         if linked and r.get("LeadDays") is not None:
             item_row = items.get(code, {})
-            hkey = (group_of(item_row), vendor, brand_of(item_row))
+            hkey = (group_of(item_row), vendor, purchasing_brand_of(item_row))
             hist = lead_hist.setdefault(hkey, {})
             lead = int(r.get("LeadDays"))
             hist[lead] = hist.get(lead, 0) + lines
@@ -1653,7 +1660,7 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
     group_by_item = {c: group_of(items.get(c, {})) for c in codes}
     groups = sorted(set(group_by_item.values()) | {k[0] for k in lead_hist})
     group_pos = {g: n for n, g in enumerate(groups)}
-    brands = sorted({brand_of(items.get(c, {})) for c in codes})
+    brands = sorted({purchasing_brand_of(items.get(c, {})) for c in codes})
     brand_pos = {b: n for n, b in enumerate(brands)}
 
     po_out = []
@@ -1719,7 +1726,8 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
         if not is_sized(attr):
             not_sized[field] += qty
             return
-        key = (group_by_item[code], brand_of(items.get(code, {})), attr["category"], attr["gender"], attr["size"])
+        key = (group_by_item[code], purchasing_brand_of(items.get(code, {})), attr["category"], attr["gender"],
+               attr["size"])
         e = size_split.setdefault(key, {"order": attr["size_order"], "class": attr["size_class"],
                                         "ordered": Decimal(0), "received": Decimal(0)})
         e[field] += qty
@@ -1736,7 +1744,7 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
     vendor_brands = {}
     vendor_items = {}
     for code, vendor, *_rest in list(po) + list(gr):
-        vendor_brands.setdefault(vendor, set()).add(brand_of(items.get(code, {})))
+        vendor_brands.setdefault(vendor, set()).add(purchasing_brand_of(items.get(code, {})))
         vendor_items.setdefault(vendor, set()).add(code)
     vendor_out = [[v, sorted(vendor_brands.get(v, ())), len(vendor_items.get(v, ()))] for v in vendors]
 
@@ -1775,10 +1783,11 @@ def build_purchasing(cfg, po_rows, gr_rows, items, is_non_stock, last_day, heade
             "lead_days": "GR date minus the linked PO date (document dates), per GR line; lines with 0 or fewer days are counted apart and left out of the spread",
             "quantiles": "linear interpolation between closest ranks over the lines with a lead above 0",
             "vendor": "the creditor name only; creditor codes, document numbers and money fields are never read into this file",
+            "brand": "the item master's ItemBrand only (blank when it has none), the same brand as the Buying page",
         },
         "vendors": vendors,
         "items": codes,
-        "item_brand": [brand_pos[brand_of(items.get(c, {}))] for c in codes],
+        "item_brand": [brand_pos[purchasing_brand_of(items.get(c, {}))] for c in codes],
         "brands": brands,
         "groups": groups,
         "po_fields": list(PO_FIELDS),

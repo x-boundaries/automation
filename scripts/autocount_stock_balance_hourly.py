@@ -763,6 +763,16 @@ def timezone_database_available():
 
 
 def settings_sha256(settings):
+    """sha256 of the validated settings (manifest source.settings_sha256 and --dry-run-config).
+
+    #292 S4 (G2 L1): while analysis.purchasing is off, its block (the default one included) is left
+    out, the same rule as the analysis settings_digest. So pulling the purchasing code does not
+    change the hash of settings that do not switch purchasing on.
+    """
+    analysis_cfg = settings.get("analysis") if isinstance(settings, dict) else None
+    purchasing = analysis_cfg.get("purchasing") if isinstance(analysis_cfg, dict) else None
+    if isinstance(purchasing, dict) and not purchasing.get("enabled"):
+        settings = dict(settings, analysis={k: v for k, v in analysis_cfg.items() if k != "purchasing"})
     return hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()
 
 

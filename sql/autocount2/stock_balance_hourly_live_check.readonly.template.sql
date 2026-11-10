@@ -124,7 +124,9 @@ ORDER BY d.DocType, d.Location, DocMonth;
 --    true: a NULL means the column is missing and the purchasing reads would fail as
 --    purchasing_read_failed (the buying files would still publish). The second query must show
 --    a character type (char, nchar, varchar or nvarchar) for both Cancelled columns: the reads
---    compare them with N'T'.
+--    compare them with N'T'. The third query counts documents per Cancelled value in each table
+--    (counts only): expect 'F' and 'T' (NULL is read as not cancelled); any other value means
+--    the 'T' convention does not hold, so stop and do not switch purchasing on.
 SELECT
     COL_LENGTH(N'dbo.PO', N'DocKey') AS PODocKeyLength,
     COL_LENGTH(N'dbo.PO', N'DocNo') AS PODocNoLength,
@@ -151,6 +153,15 @@ SELECT TABLE_NAME, DATA_TYPE
 FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_SCHEMA = N'dbo' AND COLUMN_NAME = N'Cancelled' AND TABLE_NAME IN (N'PO', N'GR')
 ORDER BY TABLE_NAME;
+
+SELECT N'PO' AS TableName, h.Cancelled, COUNT_BIG(*) AS Documents
+FROM dbo.PO AS h
+GROUP BY h.Cancelled
+UNION ALL
+SELECT N'GR' AS TableName, h.Cancelled, COUNT_BIG(*) AS Documents
+FROM dbo.GR AS h
+GROUP BY h.Cancelled
+ORDER BY TableName, Cancelled;
 
 -- 10. #292 S4 AC3 reconciliation: totals per month to compare with "reconcile_po" and
 --     "reconcile_gr" in analysis_purchasing.json.gz, and the stale count with the manifest's

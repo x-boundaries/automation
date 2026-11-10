@@ -936,6 +936,164 @@ class PurchasingQueryContractTests(unittest.TestCase):
             self.assertIn("COALESCE(h.Cancelled, N'F') <> N'T'", q, "cancelled documents are left out")
         self.assertIn("g.FromDocType = N'PO' AND po.DocNo = g.FromDocNo", an.GR_LINES_QUERY)
 
+    def test_vendor_label_is_the_creditor_name_and_nothing_else(self):
+        # G2 A-M1: the exact vendor expression is pinned, so the label can never become the creditor
+        # code (or a document number) while every token check still passes.
+        self.assertEqual(an._VENDOR_NAMES_SQL.count("SELECT n.CreditorCode, MAX(n.CreditorName) AS VendorName\n"), 1)
+        for name, q in self.queries().items():
+            self.assertEqual(re.findall(r"\S+\s+AS VendorName\b", q), ["MAX(n.CreditorName) AS VendorName"], name)
+            self.assertNotRegex(q, r"\(\s*\w*\.?CreditorCode\s*\)|CreditorCode\s+AS\b", name)
+            self.assertNotRegex(q, r"\(\s*\w*\.?\w*DocNo\s*\)|DocNo\s+AS\b|AS\s+\w*DocNo\b", name)
+            inner = q.split("FROM (", 1)[1].split("FROM dbo.", 1)[0]
+            self.assertIn(" vn.VendorName,", inner, "the label comes from the name table only")
+
+
+# The two purchasing SELECTs executed on an in-memory SQLite database built from fake raw PO, PODTL,
+# GR and GRDTL tables (G2 A-M1 and L2). The translation is mechanical and strict: if the SQL Server
+# text changes shape, the translation fails loudly rather than testing something else.
+FAKE_PO = [  # DocKey, DocNo, DocDate, CreditorCode, CreditorName, Cancelled
+    (1, "FAKE-PO-001", "2026-09-01", "FAKE-CR-A", "Vendor A", "F"),
+    (2, "FAKE-PO-002", "2026-09-02", "FAKE-CR-A", "Vendor A", "F"),
+    (3, "FAKE-PO-003", "2026-08-31", "FAKE-CR-B", "Vendor B", "F"),
+    (4, "FAKE-PO-004", "2026-10-01", "FAKE-CR-A", "Vendor A", "T"),   # cancelled header
+    (5, "FAKE-PO-001", "2026-09-10", "FAKE-CR-B", "Vendor B", "F"),   # duplicate PO number, later date
+    (6, "FAKE-PO-006", "2026-11-01", "FAKE-CR-A", "Vendor A", "F"),   # on the window end: out
+    (7, "FAKE-PO-007", "2026-10-15", "FAKE-CR-B", "Vendor B", "T"),   # cancelled; a GR is copied from it
+    (8, "FAKE-PO-008", "2026-10-20", "FAKE-CR-C", None, None),        # no name, NULL Cancelled: kept
+]
+FAKE_PODTL = [  # DocKey, ItemCode, Qty, TransferedQty
+    (1, "FAKE-X1", 10, 4), (1, "FAKE-X2", 5, 7), (1, "FAKE-X2", 4, 0), (1, None, 1, 0),
+    (2, "FAKE-X1", 3, 0), (3, "FAKE-C1", 8, 2), (4, "FAKE-X1", 100, 0), (5, "FAKE-O1", 6, 6),
+    (6, "FAKE-X1", 9, 0), (7, "FAKE-X3", 2, 0), (8, "FAKE-X3", 3, None),
+]
+FAKE_GR = [  # DocKey, DocNo, DocDate, CreditorCode, CreditorName, Cancelled
+    (1, "FAKE-GR-001", "2026-10-01", "FAKE-CR-A", "Vendor A", "F"),
+    (2, "FAKE-GR-002", "2026-10-05", "FAKE-CR-B", "Vendor B Ltd", "F"),  # retyped name: one label per creditor
+    (3, "FAKE-GR-003", "2026-10-20", "FAKE-CR-B", "Vendor B", "F"),
+    (4, "FAKE-GR-004", "2026-10-10", "FAKE-CR-A", "Vendor A", "T"),      # cancelled GR
+]
+FAKE_GRDTL = [  # DocKey, ItemCode, Qty, FromDocType, FromDocNo
+    (1, "FAKE-X1", 4, "PO", "FAKE-PO-001"),   # duplicate PO number: one link, earliest PO date
+    (2, "FAKE-C1", 2, "PO", "FAKE-PO-003"),
+    (3, "FAKE-C1", 3, None, None),            # not copied from a PO
+    (3, "FAKE-X3", 2, "PO", "FAKE-PO-007"),   # copied from a cancelled PO: not linked
+    (3, "FAKE-X3", 1, "SO", "FAKE-PO-001"),   # another document type with a PO-like number
+    (4, "FAKE-X1", 50, "PO", "FAKE-PO-001"),  # cancelled GR: out
+]
+
+
+def sqlite_text(sql):
+    """T-SQL -> SQLite for the two purchasing reads only. Fails when an expected construct is missing."""
+    lead = "DATEDIFF(day, po.PoDay, CAST(h.DocDate AS date))"
+    if "DATEDIFF" in sql and lead not in sql:
+        raise AssertionError("the lead-day expression changed shape")
+    s = sql.replace(lead, "CAST(julianday(date(h.DocDate)) - julianday(po.PoDay) AS INTEGER)")
+    s = s.replace("COUNT_BIG(*)", "COUNT(*)").replace("N'", "'")
+    s = re.sub(r"CAST\((\w+)\.DocDate AS date\)", r"date(\1.DocDate)", s)
+    for left in ("DATEDIFF", "COUNT_BIG", "N'", "AS date)"):
+        if left in s:
+            raise AssertionError("untranslated T-SQL: %s" % left)
+    return s
+
+
+def run_purchasing_sql(queries=None):
+    import sqlite3
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute("ATTACH ':memory:' AS dbo")
+        con.execute("CREATE TABLE dbo.PO (DocKey, DocNo, DocDate, CreditorCode, CreditorName, Cancelled)")
+        con.execute("CREATE TABLE dbo.PODTL (DocKey, ItemCode, Qty, TransferedQty)")
+        con.execute("CREATE TABLE dbo.GR (DocKey, DocNo, DocDate, CreditorCode, CreditorName, Cancelled)")
+        con.execute("CREATE TABLE dbo.GRDTL (DocKey, ItemCode, Qty, FromDocType, FromDocNo)")
+        con.executemany("INSERT INTO dbo.PO VALUES (?, ?, ?, ?, ?, ?)", FAKE_PO)
+        con.executemany("INSERT INTO dbo.PODTL VALUES (?, ?, ?, ?)", FAKE_PODTL)
+        con.executemany("INSERT INTO dbo.GR VALUES (?, ?, ?, ?, ?, ?)", FAKE_GR)
+        con.executemany("INSERT INTO dbo.GRDTL VALUES (?, ?, ?, ?, ?)", FAKE_GRDTL)
+        params = [p.isoformat() for p in an.purchasing_params(LAST_DAY)]
+        out = {}
+        for name, sql in (queries or an.purchasing_queries()).items():
+            cur = con.execute(sqlite_text(sql), params)
+            cols = [d[0] for d in cur.description]
+            out[name] = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return out
+    finally:
+        con.close()
+
+
+def as_read_rows(rows):
+    """SQLite values -> the types the SQL Server driver gives the exporter (date and Decimal)."""
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("PoDay", "GrDay"):
+            if k in d:
+                d[k] = date.fromisoformat(d[k])
+        for k in ("Ordered", "Transferred", "OpenQty", "Received"):
+            if k in d:
+                d[k] = Decimal(str(d[k]))
+        out.append(d)
+    return out
+
+
+class PurchasingSqlExecutionTests(unittest.TestCase):
+    PO_COLS = ("ItemCode", "VendorName", "PoDay", "Ordered", "Transferred", "OpenQty", "OpenLines", "OverLines",
+               "PoLines")
+    GR_COLS = ("ItemCode", "VendorName", "GrDay", "Linked", "LeadDays", "Received", "GrLines")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = run_purchasing_sql()
+
+    def test_outer_columns_are_names_days_flags_and_units_only(self):
+        self.assertEqual(tuple(self.rows["po_lines"][0]), self.PO_COLS)
+        self.assertEqual(tuple(self.rows["gr_lines"][0]), self.GR_COLS)
+
+    def test_vendor_labels_are_names_never_codes_or_document_numbers(self):
+        labels = {r["VendorName"] for name in self.rows for r in self.rows[name]}
+        self.assertEqual(labels, {"Vendor A", "Vendor B Ltd", None}, "one name per creditor; no name -> NULL")
+        flat = json.dumps(self.rows, default=str)
+        for secret in ("FAKE-CR-", "FAKE-PO-", "FAKE-GR-"):
+            self.assertNotIn(secret, flat, secret)
+
+    def test_po_lines(self):
+        got = sorted((tuple(r[c] for c in self.PO_COLS) for r in self.rows["po_lines"]), key=repr)
+        self.assertEqual(got, sorted([
+            ("FAKE-C1", "Vendor B Ltd", "2026-08-31", 8, 2, 6, 1, 0, 1),
+            ("FAKE-O1", "Vendor B Ltd", "2026-09-10", 6, 6, 0, 0, 0, 1),
+            ("FAKE-X1", "Vendor A", "2026-09-01", 10, 4, 6, 1, 0, 1),
+            ("FAKE-X1", "Vendor A", "2026-09-02", 3, 0, 3, 1, 0, 1),
+            # an over-received line (5 ordered, 7 received) beside an open one (4, 0): open is 4, never 4 - 2
+            ("FAKE-X2", "Vendor A", "2026-09-01", 9, 7, 4, 1, 1, 2),
+            ("FAKE-X3", None, "2026-10-20", 3, 0, 3, 1, 0, 1),   # NULL transferred is 0; NULL Cancelled kept
+        ], key=repr), "cancelled headers, NULL items and the window end are out")
+
+    def test_gr_lines_link_and_lead_days(self):
+        got = sorted((tuple(r[c] for c in self.GR_COLS) for r in self.rows["gr_lines"]), key=repr)
+        self.assertEqual(got, sorted([
+            ("FAKE-X1", "Vendor A", "2026-10-01", 1, 30, 4, 1),       # duplicate PO number: once, earliest date
+            ("FAKE-C1", "Vendor B Ltd", "2026-10-05", 1, 35, 2, 1),
+            ("FAKE-C1", "Vendor B Ltd", "2026-10-20", 0, None, 3, 1),  # not copied from a PO
+            ("FAKE-X3", "Vendor B Ltd", "2026-10-20", 0, None, 3, 2),  # copy of a cancelled PO + an SO copy
+        ], key=repr), "the cancelled GR is out")
+
+    def test_builder_on_the_executed_rows_writes_names_and_units_only(self):
+        items = {"FAKE-X1": item("FAKE-X1", size="S"), "FAKE-X2": item("FAKE-X2", size="M"),
+                 "FAKE-X3": item("FAKE-X3", size="L"), "FAKE-C1": item("FAKE-C1", group="CSGN"),
+                 "FAKE-O1": item("FAKE-O1", group="OTHER")}
+        header = {"job": "fake_job", "run_id": "0" * 32, "built_from_close_day": LAST_DAY.isoformat()}
+        payload, cov = an.build_purchasing(cfg(purchasing={"enabled": True}), as_read_rows(self.rows["po_lines"]),
+                                           as_read_rows(self.rows["gr_lines"]), items, never_non_stock, LAST_DAY,
+                                           header)
+        self.assertEqual(payload["vendors"], [an.NO_VENDOR_NAME, "Vendor A", "Vendor B Ltd"])
+        self.assertEqual((cov["ordered_units"], cov["transferred_units"], cov["open_units"], cov["over_received_lines"]),
+                         (39, 19, 22, 1))
+        self.assertEqual((cov["gr_lines"], cov["received_units"], cov["gr_linked_lines"], cov["gr_linked_units"]),
+                         (5, 12, 2, 6))
+        self.assertEqual((cov["stale_lines"], cov["stale_units"]), (1, 6), "only the 61-day C1 line is stale")
+        text = json.dumps([payload, cov], default=str)
+        for secret in ("FAKE-CR-", "FAKE-PO-", "FAKE-GR-"):
+            self.assertNotIn(secret, text, secret)
+
 
 class PurchasingSettingsTests(unittest.TestCase):
     def test_default_off_and_checked(self):
@@ -1090,6 +1248,39 @@ class PurchasingBuildTests(unittest.TestCase):
         self.assertEqual((cov["items_with_gr"], cov["codes_not_in_item_master"]), (3, 1))
         rows = self.rows(payload, "po")
         self.assertEqual(payload["groups"][[r for r in rows if payload["items"][r["item"]] == "FAKE-NOT-IN-MASTER"][0]["group"]], "")
+
+    def test_stale_needs_open_units(self):
+        # G2 L2 (M03): an old PO line with nothing left open is never stale, however old.
+        self.po.append(po_row("FAKE-P2", "Vendor A", date(2026, 7, 1), 4, 4))
+        payload, cov = self.build()
+        row = [r for r in self.rows(payload, "po") if r["po_day"] == "2026-07-01"][0]
+        self.assertEqual((row["open"], row["age_days"], row["stale"]), (0, 122, False))
+        self.assertEqual((cov["stale_lines"], cov["stale_units"]), (1, 6), "unchanged by the fully received line")
+
+    def test_lead_rows_carry_the_item_group(self):
+        # G2 L2 (M11): each lead row is keyed by the item's group, so the page's group switch applies.
+        self.gr.append(gr_row("FAKE-P3", "Vendor B", date(2026, 10, 3), 2, lead=32))
+        payload, _cov = self.build()
+        got = {(payload["groups"][r["group"]], payload["vendors"][r["vendor"]], r["brand"]): r["lines"]
+               for r in self.rows(payload, "lead")}
+        self.assertEqual(got, {("XB", "Vendor A", "FAKE-BRAND-A"): 6, ("CSGN", "Vendor B", "FAKE-BRAND-B"): 1})
+
+    def test_brand_is_item_brand_only(self):
+        # G2 V10-L1, owner rule brand = ItemBrand: an item with a blank ItemBrand has a blank purchasing
+        # brand (the Buying page's brand too), never its ItemType. The buying files keep brand_of.
+        blank = item("FAKE-P1", brand="", size="S")
+        blank["ItemType"] = "FAKE-TYPE"
+        self.items["FAKE-P1"] = blank
+        self.assertEqual((an.purchasing_brand_of(blank), an.brand_of(blank)), ("", "FAKE-TYPE"))
+        payload, _cov = self.build()
+        self.assertNotIn("FAKE-TYPE", json.dumps(payload))
+        self.assertEqual(payload["brands"][payload["item_brand"][payload["items"].index("FAKE-P1")]], "")
+        sizes = {(r["brand"], r["size"]): (r["ordered"], r["received"]) for r in self.rows(payload, "size")}
+        self.assertEqual(sizes, {("", "S"): (12, 4), ("FAKE-BRAND-A", "M"): (11, 15)})
+        leads = {r["brand"]: r["lines"] for r in self.rows(payload, "lead")}
+        self.assertEqual(leads, {"": 2, "FAKE-BRAND-A": 4})
+        vendors = {r[0]: r[1] for r in payload["vendor_rows"]}
+        self.assertEqual(vendors["Vendor A"], ["", "FAKE-BRAND-A"])
 
     def test_empty_reads_give_an_empty_file(self):
         self.po, self.gr = [], []

@@ -1768,6 +1768,13 @@ class QueryContractTests(unittest.TestCase):
             for word in ("docno", "creditorcode", "creditorname", "debtor"):
                 self.assertNotIn(word, select_list, (name, word))
 
+    def test_purchasing_vendor_label_is_pinned_to_the_creditor_name(self):
+        # G2 A-M1: the one vendor expression in each read is the creditor NAME (test_autocount_stock_analysis
+        # also executes both reads on fake tables and checks the labels are names).
+        for name, query in hourly.analysis.purchasing_queries().items():
+            self.assertIn("SELECT n.CreditorCode, MAX(n.CreditorName) AS VendorName\n", query, name)
+            self.assertEqual(re.findall(r"\S+\s+AS VendorName\b", query), ["MAX(n.CreditorName) AS VendorName"], name)
+
     def test_attribute_item_master_read_adds_only_the_attribute_columns(self):
         base = hourly.ITEM_MASTER_QUERY.replace("FROM dbo.Item AS i", "").strip()
         attr = hourly.ITEM_MASTER_ATTRIBUTE_QUERY
@@ -1855,6 +1862,18 @@ class LiveCheckSqlTests(unittest.TestCase):
     def test_step8_leaves_out_the_placeholder_item(self):
         step8 = self.text.split("-- 8.", 1)[1].split("-- 9.", 1)[0]
         self.assertIn("d.ItemCode NOT IN (N'Default Item')", step8)
+
+    def test_step9_counts_documents_by_cancelled_value(self):
+        # G2 L5: step 9 confirms the 'T' convention before switch-on. Counts only, per table and value.
+        step9 = self.text.split("-- 9.", 1)[1].split("-- 10.", 1)[0]
+        code = "\n".join(line.split("--", 1)[0] for line in step9.splitlines())
+        for table in ("PO", "GR"):
+            self.assertIn("SELECT N'%s' AS TableName, h.Cancelled, COUNT_BIG(*) AS Documents\n"
+                          "FROM dbo.%s AS h\nGROUP BY h.Cancelled" % (table, table), code)
+        counts = code.split("COUNT_BIG(*) AS Documents", 1)[0].rsplit(";", 1)[-1]
+        self.assertEqual(counts.split(), ["SELECT", "N'PO'", "AS", "TableName,", "h.Cancelled,"])
+        for word in ("DocNo", "Creditor", "ItemCode", "Qty"):
+            self.assertNotIn(word, code.rsplit("SELECT TABLE_NAME", 1)[1], word)
 
     def test_purchasing_column_check_and_reconcile(self):
         # #292 S4 step 9: every column the purchasing reads use; step 10: totals only.
@@ -4142,6 +4161,43 @@ class AnalysisRunTests(Round6TestCase):
                          ("published", "purchasing_build_failed"))
         meta = json.loads((self.archive / hourly.analysis.MANIFEST_NAME).read_text(encoding="utf-8"))
         self.assertEqual(meta["purchasing"]["status"], "failed")
+
+    def test_purchasing_due_rule_checks_the_archive_and_drive(self):
+        # G2 L2 (M15): with purchasing on, the set is due while EITHER copy lacks a published block.
+        settings = self.purchasing_on(output={"delivery_root": str(self.delivery)})
+        self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), purchasing_rows=self.purchasing_rows()))
+        last = date(2026, 8, 3)
+        plan = lambda purchasing: hourly.plan_analysis(self.archive, self.delivery, last, False, purchasing)  # noqa: E731
+        self.assertEqual(plan(True), (False, "2026-08-03"))
+        for root in (self.delivery, self.archive):
+            path = Path(root) / hourly.analysis.MANIFEST_NAME
+            before = path.read_bytes()
+            meta = json.loads(before)
+            meta["purchasing"] = {"status": "failed", "failure_class": "purchasing_read_failed"}
+            path.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertEqual(plan(True), (True, "2026-08-03"), root.name)
+            self.assertEqual(plan(False), (False, "2026-08-03"), "purchasing off: the block is not looked at")
+            path.write_bytes(before)
+        self.assertEqual(plan(True), (False, "2026-08-03"))
+
+    def test_settings_sha256_leaves_an_inert_purchasing_block_out(self):
+        # G2 L1: pulling the purchasing code leaves the manifest's source.settings_sha256 unchanged for
+        # settings that do not switch purchasing on (main's hash had no purchasing block at all).
+        def legacy(settings):
+            old = dict(settings, analysis={k: v for k, v in settings["analysis"].items() if k != "purchasing"})
+            return hashlib.sha256(json.dumps(old, sort_keys=True).encode("utf-8")).hexdigest()
+
+        inert = copy.deepcopy(ANALYSIS_ON)
+        inert["purchasing"] = {"enabled": False, "stale_days": 30}
+        for settings in (self.settings(), self.on(), self.settings(analysis=inert)):
+            self.assertIn("purchasing", settings["analysis"])
+            self.assertEqual(hourly.settings_sha256(settings), legacy(settings))
+        on = self.purchasing_on()
+        self.assertNotEqual(hourly.settings_sha256(on), legacy(on))
+        self.assertEqual(hourly.settings_sha256(on),
+                         hashlib.sha256(json.dumps(on, sort_keys=True).encode("utf-8")).hexdigest())
+        manifest, _source = self.go(self.on(), at(2026, 8, 4))
+        self.assertEqual(manifest["source"]["settings_sha256"], legacy(self.on()))
 
     def test_purchasing_failure_exits_one(self):
         path = Path(self.tmp) / "settings.local.json"
