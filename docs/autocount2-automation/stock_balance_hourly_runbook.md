@@ -6,6 +6,8 @@ Dashboard v2 (28 Oct 2026): every successful run also writes the item index `sto
 
 Buying analysis (#292 slice S2, owner "Yes, accept all", 8 Nov 2026): behind `analysis.enabled` (**default off**), the first successful run after local midnight also builds a small set of nightly buying-analysis files beside the feed (sales by item, location, day and channel; stock-state intervals; placement facts; rule-based highlights; one manifest), and the item index gains structured size, gender, colour, category and style fields (`schema_minor: 2`). Units only. A failure never blocks the hourly files. See [Buying analysis files](#buying-analysis-files-292-s2).
 
+Purchasing and vendors (#292 slice S4, owner 10 Nov 2026): behind `analysis.purchasing.enabled` (**default off**, and it needs `analysis.enabled` too), the nightly analysis set also carries `analysis_purchasing.json.gz`: open PO units, goods received by month, supplier lead days, vendor names and the ordered vs received size split. Units only; vendor **names** are shown (owner Q1), never creditor codes, PO/GR numbers, prices or amounts. A purchasing failure never blocks the buying files or the hourly files. See [Purchasing file](#purchasing-file-292-s4).
+
 Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one email to the operations inbox through the shared `XB Ops Alert Email` sub-workflow (6 Nov 2026, #288: email replaces Telegram; no dual-send). Off by default and shipped inactive; see [Error alerts](#error-alerts-email-through-n8n).
 
 Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close rebuilt from the stock ledger, a backfill from 1 Aug 2026, one latest pair in Drive (no hourly folders in Drive), local retention, and a compact dashboard feed. File, setting and task names keep the word "hourly" (the job still runs hourly); only the Drive folder is renamed to "daily".
@@ -299,9 +301,31 @@ Channel ids are a closed set: `outlet`, `marketplace`, `shopify`, `wholesale`, `
 | `analysis.placement.min_hold` | `2` | Holder units needed for a placement day. |
 | `analysis.placement.pairs` | `[]` | Up to 20 `{id, label, zero_locations, holder_locations}`. Each zero location is checked on its own; the holder locations are summed. A location may not be on both sides. |
 | `analysis.highlights.*` | `pool` `retail_network`, `channels` outlet + marketplace + shopify, `main_groups` `["XB"]`, `top_n` 20, `placement_min_sold` 1, `sold_out_days` 28, `sell_through_pct` 80, `drift_pts` 3, `drift_min_units` 100, `slow_days` 60 | Highlight rules (design 5.3). `pool` must be one of `analysis.pools`. `main_groups` are the `ItemGroup` codes in the `main` section; every other group gets its own section. `placement_min_sold: 0` lists every open placement row. |
+| `analysis.purchasing.enabled` | `false` | #292 S4. Adds `analysis_purchasing.json.gz` to the nightly set (needs `analysis.enabled` too). Switched on only at VM proof step Q4. |
+| `analysis.purchasing.stale_days` | `60` | A PO line is stale when it still has open units and its PO date is more than this many days before the close day (1-365). |
 | `analysis.attributes.*` | see the script | `size_map`, `letter_order`, `blank_values`, `size_blank_values`, `size_prefix_class`, `size_unit_class`, `length_codes`, `footwear_cm_min`, `gender_map`, `kids_categories`, `size_class_by_category`. Extend the size map from the manifest's unrecognised list. |
 
-Nested blocks are closed sets merged over the defaults; validation messages name the setting path only, never a code or value.
+Nested blocks are closed sets merged over the defaults; validation messages name the setting path only, never a code or value. While `analysis.purchasing.enabled` is `false` its block is left out of the analysis `settings_digest` and of the hourly manifest's `source.settings_sha256` (also printed by `--dry-run-config`), so neither changes when this code is pulled. Both change once purchasing is switched on.
+
+### Purchasing file (#292 S4)
+
+Design: private mailbox `mailbox/292/20261108-1530-g0r2-design.md` sections 3, 6 and 9 (S4), with the VM data check report `mailbox/292/20261108-1640-vm-g0r2-data-check-report.md` (A1-A4, B1-B3). Owner decisions: vendor names shown, units only, no PO numbers or prices (Q1); no money figures anywhere (Q2); brand = `ItemBrand`.
+
+**How it reads.** With `analysis.purchasing.enabled` (and `analysis.enabled`), two more grouped `SELECT`s run on the analysis connection, right after the sales read, with the same window end (`DocDate < <today 00:00>`):
+
+- **PO lines**: `dbo.PODTL` joined to `dbo.PO` on `DocKey`, summed per item, vendor and PO day: ordered (`Qty`), transferred (`TransferedQty`, the units received against the line), open (`Qty - TransferedQty` per line, never below 0), lines, open lines and over-received lines.
+- **GR lines**: `dbo.GRDTL` joined to `dbo.GR` on `DocKey`, summed per item, vendor, GR day, link flag and lead days. A GR line is **linked** when it was copied from a PO: `FromDocType = 'PO'` and `FromDocNo` matches a not-cancelled `PO.DocNo` (`FromDocDtlKey` is empty in this book). Lead days = GR document date minus the linked PO document date.
+- The vendor label is one name per creditor (the largest `CreditorName` the creditor carries on its PO and GR headers), so a supplier never shows as two vendors because of one retyped name. The creditor code and the PO/GR numbers are compared **inside SQL Server only** and never come back to Python, a file or a log. No price, cost, amount, tax or discount column is read. Cancelled documents (`Cancelled = 'T'`) are left out.
+
+AutoCount facts this rests on (VM data check, 8 Nov 2026): no supplier ETA (`PODTL.DeliveryDate` copies the PO date) and no PO status column, so "open" is computed from the line quantities with a stale-age flag; consignment purchases are not stock documents and are not read; a purchase invoice (PI) that carries its own stock row is rare and is not in this file (it stays in the stock-state `received` months).
+
+| File | Schema | Content |
+| --- | --- | --- |
+| `analysis_purchasing.json.gz` | `xb.ac2.analysis_purchasing` v1 | `rules` (plain-language definitions), `stale_days`, dictionaries `vendors` (names), `items` (codes), `item_brand` (index into `brands`), `brands` (the item master's `ItemBrand` only, blank when it has none: the same brand as the page's Buying tab, so an item's ordered, received and sold units sit under one brand; the buying files keep their own brand rule), `groups`. `po_rows` = `item, vendor, po_day, ordered, transferred, open, lines, open_lines, over_lines, age_days, stale, group` (one row per item, vendor and PO day; `age_days` = close day minus PO day; `stale` = open units and age above `stale_days`; the PO month is the first 7 characters of `po_day`). `gr_rows` = `item, vendor, month, received, linked, lines, group`. `lead_rows` = `group, vendor, brand, lines, positive_lines, le0_lines, p25, median, p75, max, hist` per group, vendor and brand (`hist` = `[[lead_days, lines], ...]` so the page can recompute the spread for any group mix; the quantiles use linear interpolation between closest ranks over lines with a lead above 0; lines with 0 or fewer days are counted in `le0_lines` and left out of the spread); `lead_all` = the same for every linked line. `size_rows` = `group, brand, category, gender, size, size_order, size_class, ordered, received` (sized items only; `not_sized_units` counts the rest). `vendor_rows` = `vendor, brands, items`. `reconcile_po` = `month, lines, ordered, transferred, open, open_lines` and `reconcile_gr` = `month, lines, received, linked_lines, linked_units` for the Q5 check. `counts`. |
+
+The analysis manifest gains a `purchasing` block (only while purchasing is on): `status` (`published` or `failed`), `failure_class`, and the coverage figures: vendors, PO lines, ordered / transferred / open units, open and **stale** lines and units, over-received lines, GR lines and units, linked and unlinked GR lines and units, the **GR-to-PO link rate** (by lines and by units), lead-day lines (all, above 0, 0 or less) and `lead_coverage_pct`, stock items, items with a PO (`items_with_po_pct`), items with a GR and the share of those that also have a PO (these count stock items of the item master only; `codes_not_in_item_master` counts PO or GR codes the master does not know), and the non-stock and excluded lines left out. Non-stock items and `exclude_item_codes` items are left out of the purchasing file as they are from the other files.
+
+**Failure handling.** A purchasing read failure (`purchasing_read_failed`: a missing column, a lock or SQL error) or build failure (`purchasing_build_failed`) leaves the purchasing file **out of that night's set**: the buying files and the manifest still publish, the manifest's `purchasing.status` is `failed` with its class, `last_run_status.json` shows `analysis_purchasing_status: failed` and `analysis_purchasing_failure_class`, and the exit code is `1`. The old purchasing file may stay in the folder, but the new manifest does not list it, so the page does not read it. While purchasing is on, the set stays due until a purchasing block is published, so the next hourly run tries again (the same self-healing rule as the rest of the analysis set). With purchasing off, nothing is read, `last_run_status.json` has no purchasing fields, the manifest has no `purchasing` block and the analysis files are byte-for-byte what they were before this change.
 
 ## Large-balance warning
 
@@ -442,6 +466,43 @@ Each step **needs owner OK**; VM Claude runs them after the S2 PR is merged. Non
 - **P6 AC4 stock-state check** (needs owner OK): pick 20 item-pool keys (mix of pools, some with zero intervals), and for the last 30 days sum each pool's locations from the daily close CSVs (`stock_close_<day>.csv`, a missing row = 0). The days with a pool total <= 0 after `first_stock_day` must equal the days inside `zero_intervals`, key by key.
 - **P7 first 00:00 build** (needs owner OK to leave it on): after the first midnight, the 00:00 run shows `analysis_status: published` with `analysis_close_day` = the day before, and the 01:00 run shows `not_due`. Rollback at any point: set `analysis.enabled: false` (the hourly files and the item index return to exactly version 1; the last analysis files stay in Drive until removed by hand with the owner's OK).
 
+## #292 S4 VM proof steps (Q1-Q6)
+
+Each step **needs owner OK**; VM Claude runs them in this order after the S4 PR is merged. None has been run. Results (values, counts, vendor names, sizes, times) go to the private mailbox only, never to this repository. Never edit the settings file, pull or switch branches between :55 and :05. Stop at the first step that does not pass: do its rollback, report, and do not start the next step.
+
+The order matters: the code that knows `analysis.purchasing` is pulled **before** the block is added. Code from before this change rejects the block (`ConfigError: analysis has unknown setting(s)`), so a settings file with the block on old code fails every hourly run until the block is removed. For the same reason, a code rollback (Q1's) is only safe once the settings file has no `purchasing` block again.
+
+- **Q1 pull the code, purchasing absent** (needs owner OK).
+  - Do: run `--dry-run-config` and record its `settings_sha256`; record `git rev-parse HEAD` of the VM clone; pull main into the VM clone (not between :55 and :05). Leave the local settings file as it is (no `purchasing` block). Run `--dry-run-config` again, then let the next scheduled run complete (or one supervised manual run, no `--backfill`).
+  - Pass: `--dry-run-config` prints `status: valid` with the **same** `settings_sha256` as before the pull; the run shows `status: success` and every hourly status as before; `last_run_status.json` has no `analysis_purchasing_*` field; the analysis manifest has no `purchasing` block and lists no `analysis_purchasing.json.gz` (off changes nothing).
+  - Stop if: `--dry-run-config` fails, the hash differs, the run fails, or any purchasing field or file appears.
+  - Rollback: `git checkout <the recorded HEAD>` in the VM clone (not between :55 and :05), run `--dry-run-config` and check the recorded hash. The settings file was not touched.
+- **Q2 live check** (needs owner OK; read-only).
+  - Do: run step 9 of `sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql` (three SELECTs).
+  - Pass: every length is non-NULL; both `Cancelled` columns have a character type (`char`, `nchar`, `varchar` or `nvarchar`); the per-value counts show only `F` and `T` for `PO` and for `GR` (a `NULL` row is allowed: it is read as not cancelled).
+  - Stop if: any length is NULL, a `Cancelled` column is not a character type, or any other `Cancelled` value appears. Report it: do not add the block or switch purchasing on.
+  - Rollback: none needed (SELECT only; nothing changed). The Q1 code may stay: with no `purchasing` block it behaves as before.
+- **Q3 add the block, still off** (needs owner OK).
+  - Do: back up the local settings file (a copy beside it with the date in its name). Add `"purchasing": {"enabled": false, "stale_days": 60}` to the `analysis` block. Run `--dry-run-config`.
+  - Pass: `status: valid`, and `settings_sha256` equal to Q1's (an inert block is left out of the hash).
+  - Stop if: `--dry-run-config` fails or the hash differs.
+  - Rollback: restore the backup **at once** (before the next :00 run), run `--dry-run-config` and check that it prints Q1's hash.
+- **Q4 switch on and first build** (needs owner OK).
+  - Do: set `analysis.purchasing.enabled: true` (not between :55 and :05) and run `--dry-run-config` (`status: valid`; the hash now changes, as expected). Then one supervised manual run, no `--backfill`: with purchasing on, the analysis set is due again while the published manifest has no published `purchasing` block, so this run rebuilds it the same day.
+  - Pass: `status: success`, every hourly status as before, `analysis_status: published`, `analysis_purchasing_status: published`, `analysis_purchasing.json.gz` in Drive beside the other analysis files, and the manifest lists it with a matching `sha256` and `bytes`. Record its `bytes` (under 1 MB), `analysis_seconds` and the whole run time (under 15 s). The manifest's `purchasing` block shows a link rate and stale count close to the data check (B1, B2).
+  - Stop if: `--dry-run-config` fails, or the run shows `analysis_purchasing_status: failed` (report `analysis_purchasing_failure_class`), a file over 1 MB, a run over 15 s, or any hourly status that changed.
+  - Rollback: set `analysis.purchasing.enabled: false` (or restore the Q3 settings) and run `--dry-run-config` (Q1's hash again). The set already published today keeps its purchasing entry until the next 00:00 build, which has no purchasing file in its manifest and leaves every other file unchanged. While it fails, the set is retried every hour (exit 1, no alert; an alert is tracked in #288), so do not leave a failing switch-on in place.
+- **Q5 reconcile, AC3** (needs owner OK; read-only).
+  - Do: run step 10 of the live check **straight after the Q4 build, before new purchase documents are keyed**. `TransferedQty` is live: a GR or PO keyed after the build changes 10a's transferred and open figures, also for older months. If documents were keyed in between, expect differences in the months they touch, and check those months again against the next 00:00 build (Q6).
+  - Pass: every `reconcile_po` row equals 10a month by month (lines, ordered, transferred, open, open lines); every `reconcile_gr` row equals 10b (lines, received, linked lines, linked units); the manifest's `purchasing.stale_lines` and `stale_units` equal 10c (with the same `stale_days`). Then compare each `reconcile_gr` month's `received` with the `GR` rows of step 8 (`qty_in`, all locations): they differ only by GR lines whose unit of measure is not the base unit, and any difference must be reported.
+  - Stop if: a month differs for a reason other than documents keyed after the build, or the step 8 comparison shows a difference. Report it; purchasing stays on only with the owner's OK.
+  - Rollback: as Q4 (set `analysis.purchasing.enabled: false`).
+- **Q6 first 00:00 build** (needs owner OK to leave it on).
+  - Do: after the next midnight, read `last_run_status.json` from the 00:00 and 01:00 runs.
+  - Pass: the 00:00 run shows `analysis_purchasing_status: published` and the 01:00 run `analysis_status: not_due`. Any month Q5 left open now matches step 10 run straight after this build.
+  - Stop if: the 00:00 run shows `analysis_purchasing_status: failed` (report the failure class) or a month still differs.
+  - Rollback at any point: set `analysis.purchasing.enabled: false`; the next nightly set has no purchasing file in its manifest and every other file is unchanged. A code rollback (Q1's) needs the `purchasing` block removed from the settings file first.
+
 ## Retention
 
 - Drive keeps one latest pair, the feed, the run status and one daily file pair per day. Nothing in Drive is ever pruned or deleted by the job.
@@ -450,7 +511,7 @@ Each step **needs owner OK**; VM Claude runs them after the S2 PR is merged. Non
   - only inside `archive_root\hourly\` and `archive_root\daily\`, and only names the exporter makes: `<YYYY-MM-DD>\ac2_stockbal_<timestamp>_<8 hex>\` with `stock_balance.csv` / `manifest.json` / `alert_record.json`, and `<YYYY-MM>\stock_close_<YYYY-MM-DD>.csv` / `.manifest.json`;
   - the age comes from the folder or file name, never from file times;
   - anything else (other names, other folders, symlinks or junctions, anything resolving outside the archive) is kept and counted as `kept_unexpected`; a folder is removed only when it is empty;
-  - the current run's folder, `daily\close_state.json.gz`, the latest pair, the feed, the analysis files, the lock and `delivery_root` are never touched.
+  - the current run's folder, `daily\close_state.json.gz`, the latest pair, the feed, the analysis files (including `analysis_purchasing.json.gz`), the lock and `delivery_root` are never touched.
 - Before round 6 the job also wrote hourly folders into Drive; the owner removed those on 28 Oct 2026. The job does not clean Drive.
 
 ## Out of scope

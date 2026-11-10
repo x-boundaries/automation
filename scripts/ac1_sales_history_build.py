@@ -56,7 +56,13 @@ EXPECTED_HEADER = (
 )
 CODE_COL = 1  # A
 QTY_COL = 7   # G
-MONTH_FILE_RE = re.compile(r"^(\d{4})-(\d{2})\.xlsx$")
+# Month files match without regard to case (2026-05.XLSX is the same month). A name that starts
+# like a month file but is not one (2026-05 (1).xlsx, 2026-05.xls, 2026-13.xlsx) stops the build
+# instead of becoming a silent gap (G2 #296 L3).
+MONTH_FILE_RE = re.compile(r"^(\d{4})-(\d{2})\.xlsx$", re.IGNORECASE)
+NEAR_MISS_RE = re.compile(r"^[0-9]{4}-[0-9]{1,2}(?![0-9])")
+# A last row labelled as a total in column A is the report's grand total, not an item (L1).
+TOTAL_LABEL_RE = re.compile(r"^(GRAND\s+)?TOTAL\s*:?$", re.IGNORECASE)
 MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -143,7 +149,7 @@ def read_month_file(path):
                 for event, elem in ET.iterparse(handle, events=("end",)):
                     if elem.tag != _M + "row":
                         continue
-                    rnum = int(elem.get("r"))
+                    rnum = int(elem.get("r"))  # a row without "r" -> TypeError, handled below
                     keep_all = not raw_rows  # the first row is the header: keep every label
                     cells = {}
                     for c in elem.findall(_M + "c"):
@@ -166,7 +172,9 @@ def read_month_file(path):
                     if cells:
                         raw_rows.append((rnum, cells))
                     elem.clear()
-        except (KeyError, ET.ParseError, ValueError):
+        except BuildError as exc:
+            raise BuildError("%s: %s" % (name, exc))
+        except (KeyError, ET.ParseError, ValueError, TypeError, OverflowError):
             raise BuildError("%s: unreadable workbook structure" % name)
         if not raw_rows:
             raise BuildError("%s: empty sheet" % name)
@@ -197,15 +205,29 @@ def read_month_file(path):
     if hrow != 1 or header != EXPECTED_HEADER:
         raise BuildError("%s: header row is not the AC1 profit-margin layout" % name)
 
+    def sold_qty(cells, where):
+        if QTY_COL not in cells or cells[QTY_COL][0] != "num":
+            raise BuildError("%s: column %s is not a number" % (where, _col_letter(QTY_COL)))
+        try:
+            qty = Decimal(cells[QTY_COL][1])
+        except InvalidOperation:
+            raise BuildError("%s: column %s is not a number" % (where, _col_letter(QTY_COL)))
+        if not qty.is_finite() or qty != qty.to_integral_value():
+            raise BuildError("%s: column %s is not a whole number" % (where, _col_letter(QTY_COL)))
+        return int(qty)
+
     rows, seen = [], set()
     data_rows = raw_rows[1:]
     total_rows = 0
+    total_qty = None
     for pos, (rnum, cells) in enumerate(data_rows):
         where = "%s row %d" % (name, rnum)
+        last = pos == len(data_rows) - 1
         if CODE_COL not in cells:
-            if pos != len(data_rows) - 1:
+            if not last:
                 raise BuildError("%s: row without an item code before the last row" % where)
             total_rows += 1  # the report's grand-total line
+            total_qty = sold_qty(cells, where + " (total row)")
             continue
         kind, raw = cells[CODE_COL]
         if kind not in ("sst", "str"):
@@ -213,19 +235,19 @@ def read_month_file(path):
         code = text(kind, raw).strip().upper()
         if not code:
             raise BuildError("%s: blank item code" % where)
+        if last and TOTAL_LABEL_RE.match(code):
+            total_rows += 1  # a grand-total line labelled in column A (G2 #296 L1)
+            total_qty = sold_qty(cells, where + " (total row)")
+            continue
         if code in seen:
             raise BuildError("%s: item code repeated in the month" % where)
         seen.add(code)
-        if QTY_COL not in cells or cells[QTY_COL][0] != "num":
-            raise BuildError("%s: column %s is not a number" % (where, _col_letter(QTY_COL)))
-        try:
-            qty = Decimal(cells[QTY_COL][1])
-        except InvalidOperation:
-            raise BuildError("%s: column %s is not a number" % (where, _col_letter(QTY_COL)))
-        if qty != qty.to_integral_value():
-            raise BuildError("%s: column %s is not a whole number" % (where, _col_letter(QTY_COL)))
-        rows.append((code, int(qty)))
-    return rows, {"item_rows": len(rows), "total_rows_skipped": total_rows}
+        rows.append((code, sold_qty(cells, where)))
+    # The grand total must equal the sum of the item rows, so a misread row cannot pass (L1).
+    if total_qty is not None and total_qty != sum(q for _, q in rows):
+        raise BuildError("%s: item rows do not add up to the total row (column %s)" % (name, _col_letter(QTY_COL)))
+    return rows, {"item_rows": len(rows), "total_rows_skipped": total_rows,
+                  "total_row_checked": total_qty is not None}
 
 
 def load_item_index(path):
@@ -289,18 +311,25 @@ def build(ac1_dir, item_index_path, last_month=DEFAULT_LAST_MONTH,
             continue
         m = MONTH_FILE_RE.match(entry.name)
         if not m or not 1 <= int(m.group(2)) <= 12:
+            if NEAR_MISS_RE.match(entry.name):
+                # Looks like a month file but is not one: stop rather than leave a silent gap.
+                raise BuildError("%s: looks like a month file but is not named YYYY-MM.xlsx" % entry.name)
             ignored.append(entry.name)
             continue
         month = "%s-%s" % (m.group(1), m.group(2))
         if month > last_month:
             after_cutover.append(entry.name)
             continue
+        if month in month_files:
+            raise BuildError("%s: a second file for the same month" % entry.name)
         month_files[month] = entry
     if not month_files:
         raise BuildError("no YYYY-MM.xlsx month files at or before the last month")
 
     months = sorted(month_files)
-    gaps = [mo for mo in _month_seq(months[0], months[-1]) if mo not in month_files]
+    # Gaps run up to --last-month, so a missing final month is a marked gap before
+    # ac2_from_month, never an unmarked hole (G2 #296 L2).
+    gaps = [mo for mo in _month_seq(months[0], last_month) if mo not in month_files]
     item_ix, items = {}, []
     col_item, col_month, col_sold = [], [], []
     month_units, month_items, sources = [], [], []
@@ -452,6 +481,10 @@ def main(argv=None):
         out_dir, manifest = write_outputs(args.out_dir, args.ac1_dir, data, manifest)
     except BuildError as exc:
         print("FAILED: %s" % exc, file=sys.stderr)
+        return 2
+    except (TypeError, OverflowError, ValueError) as exc:
+        # Last guard (G2 #296 L4): still exit 2 with nothing new written, and no cell value shown.
+        print("FAILED: unexpected input (%s)" % type(exc).__name__, file=sys.stderr)
         return 2
     c = manifest["counts"]
     print("OK: wrote %s and %s to %s" % (DATA_NAME, MANIFEST_NAME, out_dir))

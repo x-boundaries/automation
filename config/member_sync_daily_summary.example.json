@@ -1,0 +1,25 @@
+{
+  "schema": "xb.member_sync.daily_summary.settings.v1",
+  "sync_config_path": "C:\\XB\\example\\member_sync_live.json",
+  "sync_state_root": "C:\\XB\\example\\member_sync_state",
+  "output_dir": "C:\\XB\\example\\member_sync_daily_summary",
+  "expected_member_type": "GUEST",
+  "first_create_already_seen": false,
+  "child_timeout_seconds": 60,
+  "sql": {
+    "enabled": true,
+    "server": "localhost\\EXAMPLE",
+    "odbc_driver": "ODBC Driver 17 for SQL Server",
+    "encrypt": false,
+    "trust_server_certificate": true,
+    "allow_privileged_identity": false,
+    "timeout_seconds": 15
+  },
+  "send": {
+    "enabled": false,
+    "webhook_url": "https://n8n.example.com/webhook/REPLACE_WITH_MEMBER_SYNC_SUMMARY_WEBHOOK_PATH",
+    "auth_header_name": "X-XB-Summary-Token",
+    "secret_credential_target": "XB-MemberSync-DailySummary-Webhook",
+    "timeout_seconds": 20
+  }
+}
