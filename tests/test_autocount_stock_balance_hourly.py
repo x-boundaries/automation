@@ -225,16 +225,26 @@ class FakeSession:
             raise hourly.SourceReadError("SQL read failed")
         return copy.deepcopy(self.source.analysis_rows)
 
+    def read_purchasing(self, sql, params):
+        self.source.purchasing_reads.append((sql, list(params)))
+        if self.source.purchasing_error:
+            raise hourly.SourceReadError("SQL read failed")
+        name = "po_lines" if sql == hourly.analysis.PO_LINES_QUERY else "gr_lines"
+        return copy.deepcopy(self.source.purchasing_rows.get(name, []))
+
 
 class FakeSource:
     def __init__(self, balances=None, no_row_items=None, sync_rows=None, identity=None,
                  changecounts=None, multi_uom=0, lock_timeouts=None, sync_error=False, ledger=None,
                  item_master=None, locations=None, item_uoms=None, sql_now=SQL_NOW, analysis_rows=None,
-                 analysis_error=False):
+                 analysis_error=False, purchasing_rows=None, purchasing_error=False):
         self.sql_now = sql_now
         self.analysis_rows = list(analysis_rows or [])
         self.analysis_error = analysis_error
         self.analysis_reads = []
+        self.purchasing_rows = dict(purchasing_rows or {})
+        self.purchasing_error = purchasing_error
+        self.purchasing_reads = []
         self.balances = default_balances() if balances is None else balances
         self.ledger = ledger
         self.item_master = item_master
@@ -1741,6 +1751,30 @@ class QueryContractTests(unittest.TestCase):
             # The debtor code is only ever compared inside SQL Server, never selected.
             self.assertNotIn("debtorcode", lowered.split("from", 1)[0])
 
+    def test_purchasing_reads_are_read_only_and_return_names_and_units_only(self):
+        # #292 S4: the PO and GR reads. They join on the creditor code and the PO number inside
+        # SQL Server, so those words appear in joins; they never appear in a select list, and no
+        # money column appears anywhere (test_autocount_stock_analysis checks every token).
+        forbidden = re.compile(r"\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|EXEC|EXECUTE|TRUNCATE|GRANT|INTO)\b", re.I)
+        for name, query in hourly.analysis.purchasing_queries().items():
+            self.assertIsNone(forbidden.search(query), name)
+            self.assertTrue(query.lstrip().upper().startswith("SELECT"), name)
+            for word in ("NOLOCK", "SNAPSHOT", "CHANGELOG", ";"):
+                self.assertNotIn(word, query.upper(), name)
+            lowered = query.lower()
+            for word in ("cost", "price", "amount", "subtotal", "discount", "tax"):
+                self.assertNotIn(word, lowered, (name, word))
+            select_list = lowered.split("from (", 1)[0]
+            for word in ("docno", "creditorcode", "creditorname", "debtor"):
+                self.assertNotIn(word, select_list, (name, word))
+
+    def test_purchasing_vendor_label_is_pinned_to_the_creditor_name(self):
+        # G2 A-M1: the one vendor expression in each read is the creditor NAME (test_autocount_stock_analysis
+        # also executes both reads on fake tables and checks the labels are names).
+        for name, query in hourly.analysis.purchasing_queries().items():
+            self.assertIn("SELECT n.CreditorCode, MAX(n.CreditorName) AS VendorName\n", query, name)
+            self.assertEqual(re.findall(r"\S+\s+AS VendorName\b", query), ["MAX(n.CreditorName) AS VendorName"], name)
+
     def test_attribute_item_master_read_adds_only_the_attribute_columns(self):
         base = hourly.ITEM_MASTER_QUERY.replace("FROM dbo.Item AS i", "").strip()
         attr = hourly.ITEM_MASTER_ATTRIBUTE_QUERY
@@ -1824,6 +1858,43 @@ class LiveCheckSqlTests(unittest.TestCase):
             self.assertIn("COL_LENGTH(N'dbo.%s', N'%s')" % (table, column), self.code)
         # Counts per DocType and location only: the debtor code is never selected or grouped.
         self.assertNotIn("DebtorCode,", self.code.replace("COL_LENGTH(N'dbo.IV', N'DebtorCode')", ""))
+
+    def test_step8_leaves_out_the_placeholder_item(self):
+        step8 = self.text.split("-- 8.", 1)[1].split("-- 9.", 1)[0]
+        self.assertIn("d.ItemCode NOT IN (N'Default Item')", step8)
+
+    def test_step9_counts_documents_by_cancelled_value(self):
+        # G2 L5: step 9 confirms the 'T' convention before switch-on. Counts only, per table and value.
+        step9 = self.text.split("-- 9.", 1)[1].split("-- 10.", 1)[0]
+        code = "\n".join(line.split("--", 1)[0] for line in step9.splitlines())
+        for table in ("PO", "GR"):
+            self.assertIn("SELECT N'%s' AS TableName, h.Cancelled, COUNT_BIG(*) AS Documents\n"
+                          "FROM dbo.%s AS h\nGROUP BY h.Cancelled" % (table, table), code)
+        counts = code.split("COUNT_BIG(*) AS Documents", 1)[0].rsplit(";", 1)[-1]
+        self.assertEqual(counts.split(), ["SELECT", "N'PO'", "AS", "TableName,", "h.Cancelled,"])
+        for word in ("DocNo", "Creditor", "ItemCode", "Qty"):
+            self.assertNotIn(word, code.rsplit("SELECT TABLE_NAME", 1)[1], word)
+
+    def test_purchasing_column_check_and_reconcile(self):
+        # #292 S4 step 9: every column the purchasing reads use; step 10: totals only.
+        for table, columns in (("PO", ("DocKey", "DocNo", "DocDate", "CreditorCode", "CreditorName", "Cancelled")),
+                               ("PODTL", ("DocKey", "ItemCode", "Qty", "TransferedQty")),
+                               ("GR", ("DocKey", "DocDate", "CreditorCode", "CreditorName", "Cancelled")),
+                               ("GRDTL", ("DocKey", "ItemCode", "Qty", "FromDocType", "FromDocNo"))):
+            for column in columns:
+                self.assertIn("COL_LENGTH(N'dbo.%s', N'%s')" % (table, column), self.code)
+                if table.endswith("DTL") or column in ("DocKey", "DocDate"):
+                    continue
+                read = hourly.analysis.PO_LINES_QUERY + hourly.analysis.GR_LINES_QUERY
+                self.assertIn(column, read, "a checked column the reads do not use")
+        lines = self.text.split("-- 10.", 1)[1].splitlines()
+        step10 = "\n".join(line.split("--", 1)[0] for line in lines)
+        selects = re.findall(r"SELECT(.*?)FROM", step10, flags=re.S)
+        for select in selects:
+            for word in ("DocNo,", "CreditorCode", "CreditorName", "ItemCode,", "Price", "Amount"):
+                if "DISTINCT p.DocNo" in select:
+                    continue
+                self.assertNotIn(word, select)
 
 
 class InstallerTests(unittest.TestCase):
@@ -3987,6 +4058,157 @@ class AnalysisRunTests(Round6TestCase):
                 if data[:2] == b"\x1f\x8b":
                     data = gzip.decompress(data)
                 self.assertNotIn(FAKE_DEBTOR.encode(), data, path.name)
+
+    # #292 S4: purchasing --------------------------------------------------------------------
+
+    def purchasing_on(self, **overrides):
+        raw = copy.deepcopy(ANALYSIS_ON)
+        raw["purchasing"] = {"enabled": True}
+        return self.settings(analysis=raw, **overrides)
+
+    def purchasing_rows(self):
+        return {
+            "po_lines": [{"ItemCode": "FAKE-A", "VendorName": "Vendor A", "PoDay": date(2026, 7, 20),
+                          "Ordered": Decimal(5), "Transferred": Decimal(2), "OpenQty": Decimal(3),
+                          "OpenLines": 1, "OverLines": 0, "PoLines": 1}],
+            "gr_lines": [{"ItemCode": "FAKE-A", "VendorName": "Vendor A", "GrDay": date(2026, 8, 1), "Linked": 1,
+                          "LeadDays": 12, "Received": Decimal(2), "GrLines": 1},
+                         {"ItemCode": "FAKE-B", "VendorName": "Vendor B", "GrDay": date(2026, 8, 2), "Linked": 0,
+                          "LeadDays": None, "Received": Decimal(1), "GrLines": 1}],
+        }
+
+    def test_purchasing_off_reads_nothing_and_changes_no_output(self):
+        settings = self.on(output={"delivery_root": str(self.delivery)})
+        manifest, source = self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), purchasing_rows=self.purchasing_rows()))
+        self.assertEqual(source.purchasing_reads, [])
+        status = self.status(self.delivery)
+        self.assertNotIn("analysis_purchasing_status", status)
+        self.assertNotIn("analysis_purchasing_failure_class", status)
+        meta = json.loads(self.files(self.archive)[hourly.analysis.MANIFEST_NAME])
+        self.assertNotIn("purchasing", meta)
+        self.assertEqual([f["name"] for f in meta["files"]], ANALYSIS_FILES[:-1])
+        self.assertFalse((self.delivery / hourly.analysis.PURCHASING_NAME).exists())
+        self.assertFalse(any(k.startswith("analysis_purchasing") for k in manifest["source"]["queries_sha256"]))
+        self.assertEqual(meta["settings_digest"], hourly.analysis.settings_digest(
+            {k: v for k, v in settings["analysis"].items() if k != "purchasing"}))
+
+    def test_purchasing_on_publishes_the_file_in_the_same_verified_set(self):
+        settings = self.purchasing_on(output={"delivery_root": str(self.delivery)})
+        manifest, source = self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), purchasing_rows=self.purchasing_rows()))
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual([sql for sql, _ in source.purchasing_reads],
+                         [hourly.analysis.PO_LINES_QUERY, hourly.analysis.GR_LINES_QUERY])
+        self.assertEqual([params for _, params in source.purchasing_reads], [[date(2026, 8, 4)], [date(2026, 8, 4)]])
+        self.assertEqual(source.identity_reads, 2, "same analysis session, identity checked once more")
+        status = self.status(self.delivery)
+        self.assertEqual((status["analysis_status"], status["analysis_purchasing_status"],
+                          status["analysis_purchasing_failure_class"]), ("published", "published", None))
+        names = ANALYSIS_FILES[:-1] + [hourly.analysis.PURCHASING_NAME]
+        archive = {n: (self.archive / n).read_bytes() for n in names + [hourly.analysis.MANIFEST_NAME]}
+        drive = {n: (self.delivery / n).read_bytes() for n in names + [hourly.analysis.MANIFEST_NAME]}
+        self.assertEqual(archive, drive)
+        meta = json.loads(archive[hourly.analysis.MANIFEST_NAME])
+        self.assertEqual([f["name"] for f in meta["files"]], names, "purchasing after the buying files, manifest last")
+        entry = meta["files"][-1]
+        self.assertEqual((entry["schema"], entry["sha256"], entry["bytes"]),
+                         (hourly.analysis.PURCHASING_SCHEMA, hashlib.sha256(archive[entry["name"]]).hexdigest(),
+                          len(archive[entry["name"]])))
+        cov = meta["purchasing"]
+        self.assertEqual((cov["status"], cov["failure_class"], cov["vendors"], cov["open_units"]), ("published", None, 2, 3))
+        self.assertEqual((cov["gr_link_rate_lines_pct"], cov["lead_lines"]), (50.0, 1))
+        payload = self.gz(self.archive, hourly.analysis.PURCHASING_NAME)
+        self.assertEqual((payload["run_id"], payload["built_from_close_day"]), (manifest["run_id"], "2026-08-03"))
+        self.assertEqual(payload["vendors"], ["Vendor A", "Vendor B"])
+        hashes = manifest["source"]["queries_sha256"]
+        self.assertEqual(hashes["analysis_purchasing_po_lines"], hourly.query_sha256(hourly.analysis.PO_LINES_QUERY))
+        self.assertEqual(hashes["analysis_purchasing_gr_lines"], hourly.query_sha256(hourly.analysis.GR_LINES_QUERY))
+
+    def test_switching_purchasing_on_makes_the_set_due_the_same_day(self):
+        self.go(self.on(), at(2026, 8, 4))
+        _manifest, source = self.go(self.purchasing_on(), at(2026, 8, 4, 1),
+                                    self.source(at(2026, 8, 4, 1), purchasing_rows=self.purchasing_rows()))
+        self.assertEqual((len(source.analysis_reads), len(source.purchasing_reads)), (1, 2))
+        self.assertEqual(self.status()["analysis_purchasing_status"], "published")
+        _manifest, source = self.go(self.purchasing_on(), at(2026, 8, 4, 2),
+                                    self.source(at(2026, 8, 4, 2), purchasing_rows=self.purchasing_rows()))
+        self.assertEqual((source.analysis_reads, self.status()["analysis_status"]), ([], "not_due"))
+
+    def test_purchasing_read_failure_keeps_the_buying_files_and_is_retried(self):
+        settings = self.purchasing_on(output={"delivery_root": str(self.delivery)})
+        manifest, _source = self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), purchasing_error=True))
+        self.assertEqual(manifest["status"], "success")
+        status = self.status(self.delivery)
+        self.assertEqual((status["feed_status"], status["analysis_status"], status["analysis_purchasing_status"],
+                          status["analysis_purchasing_failure_class"]),
+                         ("published", "published", "failed", "purchasing_read_failed"))
+        self.assertEqual(sorted(self.files(self.delivery)), sorted(ANALYSIS_FILES), "the buying set still published")
+        self.assertFalse((self.delivery / hourly.analysis.PURCHASING_NAME).exists())
+        meta = json.loads((self.delivery / hourly.analysis.MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(meta["purchasing"], {"status": "failed", "failure_class": "purchasing_read_failed"})
+        self.assertNotIn(hourly.analysis.PURCHASING_NAME, [f["name"] for f in meta["files"]])
+        _manifest, source = self.go(settings, at(2026, 8, 4, 1),
+                                    self.source(at(2026, 8, 4, 1), purchasing_rows=self.purchasing_rows()))
+        self.assertEqual(len(source.purchasing_reads), 2, "retried by the next run")
+        self.assertEqual(self.status()["analysis_purchasing_status"], "published")
+        self.assertTrue((self.delivery / hourly.analysis.PURCHASING_NAME).exists())
+
+    def test_purchasing_build_failure_keeps_the_buying_files(self):
+        settings = self.purchasing_on()
+        with mock.patch.object(hourly.analysis, "build_purchasing", side_effect=RuntimeError("bug")):
+            manifest, _source = self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), purchasing_rows=self.purchasing_rows()))
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual((self.status()["analysis_status"], self.status()["analysis_purchasing_failure_class"]),
+                         ("published", "purchasing_build_failed"))
+        meta = json.loads((self.archive / hourly.analysis.MANIFEST_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(meta["purchasing"]["status"], "failed")
+
+    def test_purchasing_due_rule_checks_the_archive_and_drive(self):
+        # G2 L2 (M15): with purchasing on, the set is due while EITHER copy lacks a published block.
+        settings = self.purchasing_on(output={"delivery_root": str(self.delivery)})
+        self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), purchasing_rows=self.purchasing_rows()))
+        last = date(2026, 8, 3)
+        plan = lambda purchasing: hourly.plan_analysis(self.archive, self.delivery, last, False, purchasing)  # noqa: E731
+        self.assertEqual(plan(True), (False, "2026-08-03"))
+        for root in (self.delivery, self.archive):
+            path = Path(root) / hourly.analysis.MANIFEST_NAME
+            before = path.read_bytes()
+            meta = json.loads(before)
+            meta["purchasing"] = {"status": "failed", "failure_class": "purchasing_read_failed"}
+            path.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertEqual(plan(True), (True, "2026-08-03"), root.name)
+            self.assertEqual(plan(False), (False, "2026-08-03"), "purchasing off: the block is not looked at")
+            path.write_bytes(before)
+        self.assertEqual(plan(True), (False, "2026-08-03"))
+
+    def test_settings_sha256_leaves_an_inert_purchasing_block_out(self):
+        # G2 L1: pulling the purchasing code leaves the manifest's source.settings_sha256 unchanged for
+        # settings that do not switch purchasing on (main's hash had no purchasing block at all).
+        def legacy(settings):
+            old = dict(settings, analysis={k: v for k, v in settings["analysis"].items() if k != "purchasing"})
+            return hashlib.sha256(json.dumps(old, sort_keys=True).encode("utf-8")).hexdigest()
+
+        inert = copy.deepcopy(ANALYSIS_ON)
+        inert["purchasing"] = {"enabled": False, "stale_days": 30}
+        for settings in (self.settings(), self.on(), self.settings(analysis=inert)):
+            self.assertIn("purchasing", settings["analysis"])
+            self.assertEqual(hourly.settings_sha256(settings), legacy(settings))
+        on = self.purchasing_on()
+        self.assertNotEqual(hourly.settings_sha256(on), legacy(on))
+        self.assertEqual(hourly.settings_sha256(on),
+                         hashlib.sha256(json.dumps(on, sort_keys=True).encode("utf-8")).hexdigest())
+        manifest, _source = self.go(self.on(), at(2026, 8, 4))
+        self.assertEqual(manifest["source"]["settings_sha256"], legacy(self.on()))
+
+    def test_purchasing_failure_exits_one(self):
+        path = Path(self.tmp) / "settings.local.json"
+        raw_analysis = copy.deepcopy(ANALYSIS_ON)
+        raw_analysis["purchasing"] = {"enabled": True}
+        path.write_text(json.dumps(raw_settings(self.tmp, analysis=raw_analysis)), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=FakeSource(purchasing_error=True), environ=ENV, clock=clock_at())
+        printed = json.loads(out.getvalue())
+        self.assertEqual(code, hourly.EXIT_FAILED)
+        self.assertEqual((printed["analysis_status"], printed["analysis_purchasing_status"]), ("published", "failed"))
 
     def test_item_index_attributes_are_additive_and_keep_the_page_contract(self):
         items = [attr_master("FAKE-A", size="2XL"), attr_master("FAKE-B", size="DEFAULT", gender="BOTH"),

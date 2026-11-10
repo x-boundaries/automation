@@ -212,6 +212,9 @@ ANALYSIS_NOT_DUE = "not_due"
 ANALYSIS_PUBLISHED = "published"
 ANALYSIS_FAILED = "failed"
 ANALYSIS_SKIPPED = "skipped_failed_run"
+# #292 S4: the purchasing file inside the analysis set. Its failure never stops the buying files.
+FAILURE_PURCHASING_READ = "purchasing_read_failed"
+FAILURE_PURCHASING_BUILD = "purchasing_build_failed"
 
 CLOSE_NOT_DUE = "not_due"
 CLOSE_PUBLISHED = "published"
@@ -760,6 +763,16 @@ def timezone_database_available():
 
 
 def settings_sha256(settings):
+    """sha256 of the validated settings (manifest source.settings_sha256 and --dry-run-config).
+
+    #292 S4 (G2 L1): while analysis.purchasing is off, its block (the default one included) is left
+    out, the same rule as the analysis settings_digest. So pulling the purchasing code does not
+    change the hash of settings that do not switch purchasing on.
+    """
+    analysis_cfg = settings.get("analysis") if isinstance(settings, dict) else None
+    purchasing = analysis_cfg.get("purchasing") if isinstance(analysis_cfg, dict) else None
+    if isinstance(purchasing, dict) and not purchasing.get("enabled"):
+        settings = dict(settings, analysis={k: v for k, v in analysis_cfg.items() if k != "purchasing"})
     return hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -1027,6 +1040,10 @@ class SqlServerSession:
 
     def read_analysis_sales(self, sql, params):
         """#292 S2: the grouped analysis read (autocount_stock_analysis.sales_query)."""
+        return self._fetch_dicts(sql, params)
+
+    def read_purchasing(self, sql, params):
+        """#292 S4: one purchasing read (autocount_stock_analysis.purchasing_queries)."""
         return self._fetch_dicts(sql, params)
 
     def read_sync(self):
@@ -2371,13 +2388,28 @@ def published_analysis_day(root):
         return None
 
 
-def plan_analysis(archive_root, delivery_root, last_day, force):
+def published_purchasing_ok(root):
+    """True when the analysis manifest in root carries a published purchasing block (#292 S4)."""
+    try:
+        data = json.loads((Path(root) / analysis.MANIFEST_NAME).read_text(encoding="utf-8"))
+        return isinstance(data.get("purchasing"), dict) and data["purchasing"].get("status") == ANALYSIS_PUBLISHED
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def plan_analysis(archive_root, delivery_root, last_day, force, purchasing=False):
     """(due, archive_day). Due on the first successful run after local midnight: when the archive
     or the Drive copy has no set for last_day yet. A failed build or publish is retried by the next
-    run, the same self-healing rule as the daily close. --backfill always rebuilds."""
+    run, the same self-healing rule as the daily close. --backfill always rebuilds.
+
+    #292 S4: with analysis.purchasing on, the set is also due while either copy has no published
+    purchasing block, so the first run after switching it on builds the file (no --backfill), and a
+    failed purchasing read or build is retried by the next run like any other analysis failure."""
     roots = [archive_root] + ([delivery_root] if delivery_root else [])
     days = [published_analysis_day(root) for root in roots]
     due = force or any(day is None or day < last_day.isoformat() for day in days)
+    if purchasing and not due:
+        due = not all(published_purchasing_ok(root) for root in roots)
     return due, days[0]
 
 
@@ -2387,15 +2419,30 @@ def read_analysis_rows(source, settings, environ, start, last_day):
     Identity is checked again before the business read. It sits outside the hourly ChangeCount
     window on purpose, so its failure can never fail the hourly snapshot; it only reads rows dated
     up to last_day, and the next nightly build picks up any backdated posting.
+
+    Returns (rows, purchasing). With analysis.purchasing on, the two purchasing reads follow on the
+    same connection: purchasing is {"po_lines": rows, "gr_lines": rows}, or None when they failed
+    (the buying files still build). With it off, purchasing is None and nothing more is read.
     """
     cfg = settings["analysis"]
     with source.open_session() as session:
         check_identity(session.read_identity(), settings, environ)
-        return session.read_analysis_sales(analysis.sales_query(cfg), analysis.sales_params(cfg, start, last_day))
+        rows = session.read_analysis_sales(analysis.sales_query(cfg), analysis.sales_params(cfg, start, last_day))
+        if not analysis.purchasing_enabled(cfg):
+            return rows, None
+        try:
+            purchasing = {
+                name: session.read_purchasing(sql, analysis.purchasing_params(last_day))
+                for name, sql in analysis.purchasing_queries().items()
+            }
+        except Exception:  # noqa: BLE001 - lock, SQL or column failure: purchasing only.
+            purchasing = None
+        return rows, purchasing
 
 
 def _analysis_result(status, failure_class=None):
-    return {"status": status, "failure_class": failure_class, "published_close_day": None, "seconds": None}
+    return {"status": status, "failure_class": failure_class, "published_close_day": None, "seconds": None,
+            "purchasing_status": None, "purchasing_failure_class": None}
 
 
 def run_analysis(settings, source, environ, archive_root, delivery_root, work, run_id, written_at, as_of_local,
@@ -2411,7 +2458,7 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
         return result
     began = monotonic()
     last_day = work["today"] - timedelta(days=1)
-    due, archive_day = plan_analysis(archive_root, delivery_root, last_day, force)
+    due, archive_day = plan_analysis(archive_root, delivery_root, last_day, force, analysis.purchasing_enabled(cfg))
     result["published_close_day"] = archive_day
     if not due:
         result["status"] = ANALYSIS_NOT_DUE
@@ -2420,10 +2467,16 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
     ledger = work["ledger"]
     first_day = ledger["counts"]["first_day"]
     first = date.fromisoformat(first_day) if first_day else None
+    purchasing_on = analysis.purchasing_enabled(cfg)
+    if purchasing_on:
+        result["purchasing_status"] = ANALYSIS_FAILED
     try:
-        rows = read_analysis_rows(source, settings, environ, analysis.window_from(first, last_day, cfg), last_day)
+        rows, purchasing_rows = read_analysis_rows(
+            source, settings, environ, analysis.window_from(first, last_day, cfg), last_day)
     except Exception:  # noqa: BLE001 - identity, lock, SQL or credential failure: analysis only.
         result["failure_class"] = FAILURE_ANALYSIS_READ
+        if purchasing_on:
+            result["purchasing_failure_class"] = FAILURE_PURCHASING_READ
         return result
     tag = run_id[:8]
     try:
@@ -2456,10 +2509,35 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
                 "bytes": len(data),
                 "counts": payloads[name]["counts"],
             })
+        if purchasing_on:
+            # #292 S4: built after the buying files; a read or build failure leaves the purchasing
+            # file out of this set (the manifest says why) and never stops the buying files.
+            purchasing = {"status": ANALYSIS_FAILED, "failure_class": FAILURE_PURCHASING_READ}
+            if purchasing_rows is not None:
+                try:
+                    payload, coverage = analysis.build_purchasing(
+                        cfg, purchasing_rows["po_lines"], purchasing_rows["gr_lines"], items, is_non_stock,
+                        last_day, header)
+                    data = gzip_json_bytes(payload)
+                    entries.append((analysis.PURCHASING_NAME, data))
+                    files.append({
+                        "name": analysis.PURCHASING_NAME,
+                        "schema": analysis.PURCHASING_SCHEMA,
+                        "schema_version": analysis.SCHEMA_VERSION,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "bytes": len(data),
+                        "counts": payload["counts"],
+                    })
+                    purchasing = dict(coverage, status=ANALYSIS_PUBLISHED, failure_class=None)
+                except Exception:  # noqa: BLE001 - a purchasing builder bug must not stop the buying files.
+                    purchasing = {"status": ANALYSIS_FAILED, "failure_class": FAILURE_PURCHASING_BUILD}
+            parts = dict(parts, purchasing=purchasing)
+            result["purchasing_failure_class"] = purchasing["failure_class"]
         manifest = analysis.manifest_payload(dict(header, built_at=written_at), files, parts)
         entries.append((analysis.MANIFEST_NAME, json_bytes(manifest)))
     except Exception:  # noqa: BLE001 - a builder bug must not touch the hourly files.
         result["failure_class"] = FAILURE_ANALYSIS_BUILD
+        result["purchasing_failure_class"] = FAILURE_PURCHASING_BUILD if purchasing_on else None
         return result
     try:
         publish_verified_set([(Path(archive_root) / name, data) for name, data in entries], tag)
@@ -2467,7 +2545,11 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
             publish_verified_set([(Path(delivery_root) / name, data) for name, data in entries], tag)
     except OSError:
         result["failure_class"] = FAILURE_ANALYSIS_PUBLISH
+        if purchasing_on:
+            result["purchasing_failure_class"] = FAILURE_ANALYSIS_PUBLISH
         return result
+    if purchasing_on and result["purchasing_failure_class"] is None:
+        result["purchasing_status"] = ANALYSIS_PUBLISHED
     result.update(
         status=ANALYSIS_PUBLISHED,
         published_close_day=last_day.isoformat(),
@@ -2813,6 +2895,11 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
                     {"analysis_sales": query_sha256(analysis.sales_query(settings["analysis"]))}
                     if settings["analysis"]["enabled"] else {}
                 ),
+                **(
+                    {"analysis_purchasing_" + name: query_sha256(sql)
+                     for name, sql in analysis.purchasing_queries().items()}
+                    if analysis.purchasing_enabled(settings["analysis"]) else {}
+                ),
             },
             "settings_sha256": settings_sha256(settings),
             "git_commit": git_commit(),
@@ -3084,6 +3171,10 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         "analysis_seconds": analysis_result["seconds"],
         "next_run_local": next_run_local(started, settings["schedule"]["run_minute"]),
     }
+    if analysis.purchasing_enabled(settings["analysis"]):
+        # #292 S4: only with purchasing on, so the status file is unchanged while it is off.
+        status["analysis_purchasing_status"] = analysis_result["purchasing_status"]
+        status["analysis_purchasing_failure_class"] = analysis_result["purchasing_failure_class"]
     # Last step before the status file: the alert reads the final status, and its own outcome is
     # recorded beside it. It never changes the status, the exit code or any other file.
     status["alert_status"], status["alert_http_status"] = send_run_alert(
@@ -3605,6 +3696,8 @@ def main(argv=None, source=None, environ=None, clock=None, alert_transport=None,
             "analysis_status": status["analysis_status"],
             "alert_status": status["alert_status"],
             "message": manifest["message"],
+            **({"analysis_purchasing_status": status["analysis_purchasing_status"]}
+               if "analysis_purchasing_status" in status else {}),
         }
     )
     if status["status"] != "success":
@@ -3617,6 +3710,9 @@ def main(argv=None, source=None, environ=None, clock=None, alert_transport=None,
         return EXIT_FAILED
     if status["analysis_status"] == ANALYSIS_FAILED:
         # Same rule as the feed and item index: visible in Task Scheduler, hourly files unaffected.
+        return EXIT_FAILED
+    if status.get("analysis_purchasing_status") == ANALYSIS_FAILED:
+        # #292 S4: a purchasing failure is visible too; the buying files were still published.
         return EXIT_FAILED
     # alert_status is deliberately not read: an alert outcome never changes the exit code.
     return EXIT_OK

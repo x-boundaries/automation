@@ -248,6 +248,69 @@ class Ac1HistoryBuildTests(unittest.TestCase):
         self.assertEqual(manifest["partial_months"], [])
         self.assertEqual(b.main(args[:-4] + ["--last-month", "bad"]), 2)
 
+    # G2 #296 LATER L1-L4 -------------------------------------------------------------------
+
+    def test_total_row_must_equal_the_item_rows(self):
+        rows = [HEADER, item_row("FAKE0001", 2), item_row("FAKE0002", 3), total_row(6)]
+        self.assert_fails(rows, "do not add up to the total row")
+        write_xlsx(self.ac1 / "2026-01.xlsx", month_rows(("FAKE0001", 2), ("FAKE0002", -1)))
+        rows, info = b.read_month_file(self.ac1 / "2026-01.xlsx")
+        self.assertEqual((info["total_rows_skipped"], info["total_row_checked"]), (1, True))
+        self.assert_fails([HEADER, item_row("FAKE0001", 2), total_row("x")], "total row")
+
+    def test_labelled_total_row_is_not_an_item(self):
+        rows = [HEADER, item_row("FAKE0001", 2), item_row("FAKE0002", 3), item_row("Grand Total", 5)]
+        write_xlsx(self.ac1 / "2026-01.xlsx", rows)
+        got, info = b.read_month_file(self.ac1 / "2026-01.xlsx")
+        self.assertEqual(got, [("FAKE0001", 2), ("FAKE0002", 3)])
+        self.assertEqual(info["total_rows_skipped"], 1)
+        self.assert_fails([HEADER, item_row("FAKE0001", 2), item_row("TOTAL", 9)], "do not add up")
+
+    def test_gaps_run_to_the_last_month_setting(self):
+        write_xlsx(self.ac1 / "2026-01.xlsx", month_rows(("FAKE0001", 1)))
+        write_xlsx(self.ac1 / "2026-02.xlsx", month_rows(("FAKE0001", 1)))
+        data, manifest = self.run_build(last_month="2026-04")
+        self.assertEqual(data["gaps"], ["2026-03", "2026-04"])
+        self.assertEqual(manifest["gaps"], ["2026-03", "2026-04"])
+        self.assertEqual(data["ac2_from_month"], "2026-05")
+
+    def test_month_file_names_match_without_case_and_near_misses_fail(self):
+        write_xlsx(self.ac1 / "2026-01.XLSX", month_rows(("FAKE0001", 1)))
+        data, _manifest = self.run_build()
+        self.assertEqual(data["months"], ["2026-01"])
+        for bad in ("2026-02 (1).xlsx", "2026-02.xls", "2026-13.xlsx", "2026-2.xlsx"):
+            write_xlsx(self.ac1 / bad, month_rows(("FAKE0001", 1)))
+            with self.assertRaises(b.BuildError) as ctx:
+                self.run_build()
+            self.assertIn(bad, str(ctx.exception))
+            (self.ac1 / bad).unlink()
+
+    def _rewrite_sheet(self, name, old, new):
+        path = self.ac1 / name
+        with zipfile.ZipFile(path) as z:
+            parts = {n: z.read(n) for n in z.namelist()}
+        parts["xl/worksheets/sheet1.xml"] = parts["xl/worksheets/sheet1.xml"].replace(old, new, 1)
+        with zipfile.ZipFile(path, "w") as z:
+            for n, data in parts.items():
+                z.writestr(n, data)
+
+    def test_type_and_overflow_errors_name_the_file_and_exit_2(self):
+        write_xlsx(self.ac1 / "2026-01.xlsx", month_rows(("FAKE0001", 1)))
+        self._rewrite_sheet("2026-01.xlsx", b'<row r="2">', b"<row>")
+        with self.assertRaises(b.BuildError) as ctx:
+            b.read_month_file(self.ac1 / "2026-01.xlsx")
+        self.assertIn("2026-01.xlsx", str(ctx.exception))
+        self.assert_fails([HEADER, item_row("FAKE0001", float("inf"))], "whole number")
+        write_xlsx(self.ac1 / "2026-02.xlsx", month_rows(("FAKE0001", 1)))
+        self._rewrite_sheet("2026-02.xlsx", b'r="G2"', b'r="2"')
+        with self.assertRaises(b.BuildError) as ctx:
+            b.read_month_file(self.ac1 / "2026-02.xlsx")
+        self.assertIn("2026-02.xlsx", str(ctx.exception))
+        args = ["--ac1-dir", str(self.ac1), "--item-index", str(self.index), "--out-dir", str(self.out),
+                "--last-month", "2026-02"]
+        self.assertEqual(b.main(args), 2)
+        self.assertFalse(self.out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
