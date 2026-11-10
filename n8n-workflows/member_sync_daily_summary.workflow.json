@@ -1,0 +1,441 @@
+{
+  "id": "memberSyncSummary01",
+  "name": "Member Sync - Daily Summary",
+  "active": false,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8288-000000000301",
+      "name": "Member Sync Summary Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "REPLACE_WITH_MEMBER_SYNC_SUMMARY_WEBHOOK_PATH",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000302",
+      "name": "Validate Summary Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "jsCode": "// Strict allowlist for xb.member_sync.daily_summary.v1 from the #155 member sync daily summary task\n// on the AC2 VM (#288 slice 3). Anything outside the closed contract is rejected with a fixed reason\n// code (HTTP 400); nothing unvalidated reaches the email. Request headers are never read or passed on.\n// The output feeds the closed input of the shared XB Ops Alert Email sub-workflow: the call node pins\n// system MEMBER-SYNC and key daily_summary, so the subject is \"[XB daily] MEMBER-SYNC CLEAN|STOP <date>\".\nconst items = $input.all();\nconst reject = (reason) => [{ json: { valid: false, reason } }];\nif (items.length !== 1) return reject('MS_SUMMARY_ITEM_COUNT');\nconst body = items[0].json && items[0].json.body;\nconst isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);\nif (!isObj(body)) return reject('MS_SUMMARY_BODY');\n\nconst KEYS = ['schema', 'event', 'summary_date', 'generated_at', 'result', 'stop_reasons', 'auto_off', 'auto_off_reasons', 'task', 'config', 'digest', 'members_per_type', 'new_members_24h', 'first_create', 'owner_session'];\nconst STOP_CODES = ['task_state_unavailable', 'task_last_result', 'check_config_failed', 'config_unexpected', 'digest_failed', 'unfinished_runs', 'shopify_write', 'uncertain_writes', 'possible_duplicate_member', 'member_type_unknown', 'login_refused', 'writes_over_cap', 'alert_unexpected'];\nconst AUTO_OFF_CODES = ['shopify_write_while_disabled', 'uncertain_writes', 'possible_duplicate_member'];\nconst TASK_STATES = ['Ready', 'Running', 'Disabled', 'Queued', 'Unknown'];\nconst BOOKS = ['AED_TESTINGAPI', 'AED_XBOUNDARIES'];\nconst SQL_REASONS = ['disabled', 'driver_missing', 'connect_failed', 'identity_refused', 'book_mismatch', 'permission_denied', 'query_failed', 'config_unavailable'];\nconst TASK_KEYS = ['available', 'state', 'last_run', 'last_result', 'next_run', 'missed_runs'];\nconst CONFIG_KEYS = ['available', 'autocount_book', 'ac2_create_enabled', 'shopify_create_enabled', 'immediate_create_enabled', 'max_writes_per_run', 'max_creates_per_hour', 'ac2_create_member_type'];\nconst DIGEST_COUNTS = ['runs_completed', 'runs_unfinished', 'duration_max_s', 'duration_median_s', 'ac2_creates', 'created_immediately', 'created_after_wait', 'shopify_writes', 'possible_duplicate_member', 'writes_per_hour_max', 'links', 'links_yesterday', 'ac2_pending', 'ac2_pending_would_create', 'shopify_pending', 'uncertain_writes'];\nconst DIGEST_KEYS = ['available', ...DIGEST_COUNTS, 'alerts', 'alert_refs'];\nconst MEMBERS_KEYS = ['available', 'reason', 'counts'];\nconst NEW_KEYS = ['available', 'reason', 'total', 'by_sync', 'by_staff'];\nconst COUNT_MAX = 1000000000;\nconst RESULT_MAX = 4294967295;\nconst MAX_ALERT_CODES = 20;\nconst MAX_ALERT_REFS = 5;\nconst MAX_MEMBER_TYPES = 12;\nconst CODE_RE = /^[a-z0-9_]{1,64}$/;\nconst TYPE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/;\nconst MASKED_RE = /^\\*{3}[A-Za-z0-9]{1,3}$/;\nconst DATE_RE = /^\\d{4}-\\d{2}-\\d{2}$/;\nconst MINUTE_RE = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}$/;\n\nconst has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);\nconst exact = (obj, keys) => isObj(obj) && Object.keys(obj).length === keys.length && keys.every((k) => has(obj, k));\nconst count = (v) => Number.isInteger(v) && v >= 0 && v <= COUNT_MAX;\nconst countOrNull = (v) => v === null || count(v);\nconst boolOrNull = (v) => v === null || typeof v === 'boolean';\nconst minuteOrNull = (v) => v === null || (typeof v === 'string' && MINUTE_RE.test(v));\nconst allNull = (obj, keys) => keys.every((k) => obj[k] === null);\nconst codeList = (v, allowed) => Array.isArray(v) && v.length <= allowed.length\n  && v.every((c) => allowed.includes(c)) && allowed.filter((c) => v.includes(c)).join('|') === v.join('|');\n\nif (!exact(body, KEYS)) return reject('MS_SUMMARY_KEYS');\n// No key or text value anywhere may look like a phone number (6+ digits in a row) or an email.\nconst texts = (value) => (Array.isArray(value) ? value.flatMap(texts)\n  : isObj(value) ? Object.keys(value).flatMap((k) => [k, ...texts(value[k])])\n    : typeof value === 'string' ? [value] : []);\nif (texts(body).some((t) => /[0-9]{6,}|@/.test(t))) return reject('MS_SUMMARY_PERSONAL_DATA');\nif (body.schema !== 'xb.member_sync.daily_summary.v1') return reject('MS_SUMMARY_SCHEMA');\nif (body.event !== 'member_sync_daily_summary') return reject('MS_SUMMARY_EVENT');\nif (typeof body.summary_date !== 'string' || !DATE_RE.test(body.summary_date)) return reject('MS_SUMMARY_DATE');\nif (typeof body.generated_at !== 'string' || !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}\\+08:00$/.test(body.generated_at)\n  || body.generated_at.slice(0, 10) !== body.summary_date) return reject('MS_SUMMARY_DATE');\nif (body.result !== 'CLEAN' && body.result !== 'STOP') return reject('MS_SUMMARY_RESULT');\nif (!codeList(body.stop_reasons, STOP_CODES) || (body.result === 'STOP') !== (body.stop_reasons.length > 0)) return reject('MS_SUMMARY_STOP_REASONS');\nif (body.auto_off !== 'off' && body.auto_off !== 'would_switch') return reject('MS_SUMMARY_AUTO_OFF');\nif (!codeList(body.auto_off_reasons, AUTO_OFF_CODES) || (body.auto_off === 'would_switch') !== (body.auto_off_reasons.length > 0)) return reject('MS_SUMMARY_AUTO_OFF');\nif (typeof body.first_create !== 'boolean') return reject('MS_SUMMARY_FIRST_CREATE');\nif (body.owner_session !== 'not_checked') return reject('MS_SUMMARY_OWNER_SESSION');\n\nconst task = body.task;\nif (!exact(task, TASK_KEYS) || typeof task.available !== 'boolean') return reject('MS_SUMMARY_TASK');\nif (task.available) {\n  if (!TASK_STATES.includes(task.state) || !minuteOrNull(task.last_run) || !minuteOrNull(task.next_run)\n    || !countOrNull(task.missed_runs)\n    || !(task.last_result === null || (Number.isInteger(task.last_result) && task.last_result >= 0 && task.last_result <= RESULT_MAX))) return reject('MS_SUMMARY_TASK');\n} else if (!allNull(task, TASK_KEYS.slice(1))) return reject('MS_SUMMARY_TASK');\n\nconst config = body.config;\nif (!exact(config, CONFIG_KEYS) || typeof config.available !== 'boolean') return reject('MS_SUMMARY_CONFIG');\nif (config.available) {\n  if (!(config.autocount_book === null || BOOKS.includes(config.autocount_book))\n    || !boolOrNull(config.ac2_create_enabled) || !boolOrNull(config.shopify_create_enabled) || !boolOrNull(config.immediate_create_enabled)\n    || !countOrNull(config.max_writes_per_run) || !countOrNull(config.max_creates_per_hour)\n    || !(config.ac2_create_member_type === null || (typeof config.ac2_create_member_type === 'string' && TYPE_RE.test(config.ac2_create_member_type)))) return reject('MS_SUMMARY_CONFIG');\n} else if (!allNull(config, CONFIG_KEYS.slice(1))) return reject('MS_SUMMARY_CONFIG');\n\nconst digest = body.digest;\nif (!exact(digest, DIGEST_KEYS) || typeof digest.available !== 'boolean') return reject('MS_SUMMARY_DIGEST');\nif (!DIGEST_COUNTS.every((k) => countOrNull(digest[k]))) return reject('MS_SUMMARY_DIGEST');\nif (digest.available) {\n  const alerts = digest.alerts;\n  if (!isObj(alerts) || Object.keys(alerts).length > MAX_ALERT_CODES\n    || !Object.keys(alerts).every((code) => CODE_RE.test(code) && count(alerts[code]))) return reject('MS_SUMMARY_ALERTS');\n  const refs = digest.alert_refs;\n  if (!Array.isArray(refs) || refs.length > MAX_ALERT_REFS\n    || !refs.every((r) => exact(r, ['code', 'member_no']) && typeof r.code === 'string' && CODE_RE.test(r.code)\n      && typeof r.member_no === 'string' && MASKED_RE.test(r.member_no))) return reject('MS_SUMMARY_ALERT_REFS');\n} else if (!allNull(digest, DIGEST_KEYS.slice(1).filter((k) => k !== 'links_yesterday'))) return reject('MS_SUMMARY_DIGEST');\n\nconst members = body.members_per_type;\nif (!exact(members, MEMBERS_KEYS) || typeof members.available !== 'boolean') return reject('MS_SUMMARY_MEMBERS');\nif (members.available) {\n  const counts = members.counts;\n  if (members.reason !== null || !isObj(counts) || Object.keys(counts).length > MAX_MEMBER_TYPES\n    || !Object.keys(counts).every((t) => (t === '-' || TYPE_RE.test(t)) && count(counts[t]))) return reject('MS_SUMMARY_MEMBERS');\n} else if (!SQL_REASONS.includes(members.reason) || members.counts !== null) return reject('MS_SUMMARY_MEMBERS');\n\nconst fresh = body.new_members_24h;\nif (!exact(fresh, NEW_KEYS) || typeof fresh.available !== 'boolean') return reject('MS_SUMMARY_NEW_MEMBERS');\nif (fresh.available) {\n  if (fresh.reason !== null || !count(fresh.total) || !countOrNull(fresh.by_sync) || !countOrNull(fresh.by_staff)) return reject('MS_SUMMARY_NEW_MEMBERS');\n} else if (!SQL_REASONS.includes(fresh.reason) || !allNull(fresh, ['total', 'by_sync', 'by_staff'])) return reject('MS_SUMMARY_NEW_MEMBERS');\n\n// Plain-text email: every value above is a closed code, a bounded count, a masked ref or a fixed\n// date shape, so no escaping is needed. Long lists wrap at 280 characters.\nconst v = (x) => (x === null ? 'n/a' : String(x));\nconst yn = (b) => (b === true ? 'yes' : b === false ? 'no' : 'n/a');\nconst hm = (x) => (x === null ? 'n/a' : x.replace('T', ' '));\nconst wrap = (label, parts) => {\n  if (parts.length === 0) return [label + 'none'];\n  const out = [];\n  let line = label;\n  for (const part of parts) {\n    const piece = (line === label ? '' : ', ') + part;\n    if (line.length + piece.length > 280) { out.push(line + ','); line = '  ' + part; } else line += piece;\n  }\n  out.push(line);\n  return out;\n};\nconst lines = [\n  'MEMBER-SYNC daily summary ' + body.summary_date + ': ' + body.result,\n  body.result === 'STOP' ? 'STOP reasons: ' + body.stop_reasons.join(', ') + ' (check the sync now; the off switch is in the runbook)' : 'No stop condition found.',\n  'Auto off (observe mode, nothing was switched): ' + (body.auto_off === 'would_switch' ? 'would switch creates off (' + body.auto_off_reasons.join(', ') + ')' : 'no action'),\n  '',\n  task.available\n    ? 'Sync task: state=' + task.state + ' last_run=' + hm(task.last_run) + ' last_result=' + v(task.last_result) + ' next_run=' + hm(task.next_run) + ' missed=' + v(task.missed_runs)\n    : 'Sync task: not readable',\n  config.available\n    ? 'Config: book=' + v(config.autocount_book) + ' ac2_create=' + yn(config.ac2_create_enabled) + ' shopify_create=' + yn(config.shopify_create_enabled) + ' immediate=' + yn(config.immediate_create_enabled)\n      + ' max_writes_per_run=' + v(config.max_writes_per_run) + ' max_creates_per_hour=' + v(config.max_creates_per_hour) + ' member_type=' + v(config.ac2_create_member_type)\n    : 'Config: check-config failed',\n];\nif (digest.available) {\n  lines.push(\n    'Runs 24h: completed=' + v(digest.runs_completed) + ' unfinished=' + v(digest.runs_unfinished) + ' duration max=' + v(digest.duration_max_s) + 's median=' + v(digest.duration_median_s) + 's',\n    'Writes 24h: AC2 creates=' + v(digest.ac2_creates) + ' (immediately=' + v(digest.created_immediately) + ', after wait=' + v(digest.created_after_wait) + ') Shopify writes=' + v(digest.shopify_writes) + ' max per hour=' + v(digest.writes_per_hour_max),\n    'Possible duplicates=' + v(digest.possible_duplicate_member) + ' uncertain writes=' + v(digest.uncertain_writes) + ' first create=' + yn(body.first_create) + (body.first_create ? ' (FIRST CREATE: run S5 Part B)' : ''),\n    ...wrap('Alerts 24h (runs): ', Object.keys(digest.alerts).sort().map((c) => c + '=' + digest.alerts[c])),\n    ...wrap('Alert refs: ', digest.alert_refs.map((r) => r.code + ' ' + r.member_no)),\n    'Open: links=' + v(digest.links) + ' (yesterday ' + v(digest.links_yesterday) + ') ac2_pending=' + v(digest.ac2_pending) + ' waiting for S6 (would_create)=' + v(digest.ac2_pending_would_create) + ' shopify_pending=' + v(digest.shopify_pending),\n  );\n} else {\n  lines.push('Digest: failed (no run figures today)');\n}\nlines.push(\n  ...(members.available\n    ? wrap('Members per type: ', Object.keys(members.counts).sort().map((t) => t + '=' + members.counts[t]))\n    : ['Members per type: not available (' + members.reason + ')']),\n  fresh.available\n    ? 'New AC2 members 24h: total=' + fresh.total + ' by sync=' + v(fresh.by_sync) + ' by staff (till/HQ)=' + v(fresh.by_staff)\n    : 'New AC2 members 24h: not available (' + fresh.reason + ')',\n  'Owner AutoCount session: not checked (manual glance)',\n  '',\n  'Generated ' + hm(body.generated_at.slice(0, 16)) + ' SGT. Record: daily_summary_' + body.summary_date + '.json on the VM.',\n  'Runbook: docs/autocount2-automation/member_sync_phase1.md, section \"Daily summary email (#288 slice 3)\".',\n);\nconst severity = body.result === 'STOP' ? 'WARN' : 'INFO';\nreturn [{ json: { valid: true, severity, short: body.result + ' ' + body.summary_date, lines } }];\n"
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000303",
+      "name": "Event Is Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8288-000000000304",
+              "leftValue": "={{ $json.valid === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000305",
+      "name": "Send Summary Email",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        200
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "system": "MEMBER-SYNC",
+            "severity": "={{ $json.severity }}",
+            "key": "daily_summary",
+            "short": "={{ $json.short }}",
+            "lines": "={{ $json.lines }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "system",
+              "displayName": "system",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "key",
+              "displayName": "key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "short",
+              "displayName": "short",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "lines",
+              "displayName": "lines",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "array",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000312",
+      "name": "Email Was Sent",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8288-000000000313",
+              "leftValue": "={{ $json.outcome === 'sent' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000314",
+      "name": "Email Send Failed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8288-000000000315",
+              "leftValue": "={{ $json.outcome === 'send_failed' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000306",
+      "name": "Respond Summary Sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        1200,
+        100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000307",
+      "name": "Respond Email Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'upstream_error', message: 'email send failed' } }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000308",
+      "name": "Respond Event Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        720,
+        420
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'validation_error', message: $json.reason } }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000309",
+      "name": "Respond Internal Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        560
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'internal_error', message: 'Summary event could not be checked' } }}",
+        "options": {
+          "responseCode": 500
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000310",
+      "name": "Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -300
+      ],
+      "parameters": {
+        "content": "# START HERE: Member Sync - Daily Summary\n\n- **When:** the VM task `\\XB\\XB-MemberSync-DailySummary` POSTs one event each morning at 06:40 SGT. It replaces the manual daily check of the #155 member sync.\n- **Input:** `xb.member_sync.daily_summary.v1`: counts, closed codes, booleans and MemberNo refs masked to `***` plus 3 characters. No name, phone, email, full MemberNo or customer ID. The VM decides CLEAN or STOP.\n- **Flow:** Header Auth on the webhook -> strict schema check (any extra or unknown field: 400) -> one call to the shared **XB Ops Alert Email** sub-workflow (system `MEMBER-SYNC`, key `daily_summary`) -> 200 when the email was sent.\n- **Subject:** `[XB daily] MEMBER-SYNC CLEAN <date>` or `... STOP <date>`. Never folded; one email per morning, one app per email.\n- **Failures:** a failed email answers 502 (\"email send failed\"), an unexpected error 500. The VM records it as `send_failed` with the HTTP status and still exits 0; a missing morning email is itself the signal.\n- **Saved data:** no executions are saved (the request headers carry the shared secret).\n- **Auto off:** observe mode only. The email may say \"would switch creates off\"; nothing is switched anywhere.\n- Do not add HTTP Request, Execute Command, file, database or AI nodes. Keep it inactive until the owner approves activation.",
+        "height": 400,
+        "width": 760
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8288-000000000311",
+      "name": "Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        760,
+        -300
+      ],
+      "parameters": {
+        "content": "# Setup (local import copy only)\n\n- Import inactive; activation is a separate owner OK. Import and publish **XB Ops Alert Email** first.\n\n## Required manual configuration:\n\n- **Member Sync Summary Webhook**\n  - `Path`: replace `REPLACE_WITH_MEMBER_SYNC_SUMMARY_WEBHOOK_PATH` with a private, unguessable path under `/webhook/`.\n- **Send Summary Email**\n  - `Workflow`: replace `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the imported XB Ops Alert Email workflow.\n\nThe Header Auth credential is bound on the webhook in n8n only (same header name as the VM setting `send.auth_header_name`). The email recipient and the Gmail credential live only in XB Ops Alert Email.",
+        "height": 400,
+        "width": 520
+      }
+    }
+  ],
+  "connections": {
+    "Member Sync Summary Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Summary Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Summary Event": {
+      "main": [
+        [
+          {
+            "node": "Event Is Valid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Internal Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event Is Valid": {
+      "main": [
+        [
+          {
+            "node": "Send Summary Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Event Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Summary Email": {
+      "main": [
+        [
+          {
+            "node": "Email Was Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Internal Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Was Sent": {
+      "main": [
+        [
+          {
+            "node": "Respond Summary Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email Send Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Send Failed": {
+      "main": [
+        [
+          {
+            "node": "Respond Email Failed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Internal Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "00000000-0000-4000-8288-000000000399",
+  "sourceWorkflowId": null
+}
