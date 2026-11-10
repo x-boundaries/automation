@@ -115,6 +115,9 @@ CLAIM_HOLD_CODES = frozenset({"claim_name_mismatch", "claim_phone_not_unique", "
                               "claim_member_not_in_scope", "claim_no_phone"})
 # G2 B1: a refund by money that no refunded or removed unit explains.
 REFUND_UNATTRIBUTED = "refund_unattributed"
+# G2 B5: a claim-held receipt whose order stopped qualifying while it was
+# held (unit refund, cancellation, any other reason). Never re-opened.
+ORDER_NO_LONGER_QUALIFIES = "order_no_longer_qualifies"
 
 _LOCAL_STORED_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
 _NEW_EXPIRY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T00:00:00$")
@@ -650,8 +653,16 @@ CREATE TRIGGER receipts_binding_immutable BEFORE UPDATE OF order_gid, order_crea
   BEGIN SELECT RAISE(ABORT, 'receipt_immutable'); END;
 CREATE TRIGGER receipts_decided_stay BEFORE UPDATE OF state ON receipts
   WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state <> OLD.state
-   AND NOT (OLD.state = 'held' AND NEW.state = 'ready' AND OLD.code IN ('claim_name_mismatch', 'claim_phone_not_unique',
+   AND NOT (OLD.state = 'held' AND NEW.state = 'ready' AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
             'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+  BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
+CREATE TRIGGER receipts_decided_code BEFORE UPDATE OF code ON receipts
+  WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state = OLD.state AND NEW.code IS NOT OLD.code
+   AND NOT (OLD.state = 'held' AND NEW.code IS NOT NULL
+            AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
+                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone')
+            AND NEW.code NOT IN ('claim_name_mismatch', 'claim_phone_not_unique',
+                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
   BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
 CREATE TRIGGER claim_links_immutable BEFORE UPDATE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
 CREATE TRIGGER claim_links_no_delete BEFORE DELETE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
@@ -1418,12 +1429,29 @@ class BenefitsEngine:
         once a #155 link or a claim link for its customer exists."""
 
         marks = ",".join("?" for _ in CLAIM_HOLD_CODES)
-        rows = self.ledger.conn.execute(f"SELECT order_gid, customer_gid FROM receipts WHERE state = 'held' AND code IN ({marks})",
+        rows = self.ledger.conn.execute(f"SELECT * FROM receipts WHERE state = 'held' AND code IN ({marks})",
                                         tuple(sorted(CLAIM_HOLD_CODES))).fetchall()
         for row in rows:
-            if row["customer_gid"] in self.linked_gids:
-                self.ledger.update_receipt(row["order_gid"], state="ready", code=None, checked_at=None)
-                summary.count("claim_hold_reopened", self.ledger.ref("o", row["order_gid"]))
+            if row["customer_gid"] not in self.linked_gids:
+                continue
+            ref = self.ledger.ref("o", row["order_gid"])
+            if not self._still_qualifies_as_last_read(row):
+                # G2 B5: the decision rests on the order as last read; a
+                # receipt whose stored facts no longer qualify never re-opens.
+                self.ledger.update_receipt(row["order_gid"], code=ORDER_NO_LONGER_QUALIFIES)
+                summary.count("claim_hold_settled", ref)
+                continue
+            self.ledger.update_receipt(row["order_gid"], state="ready", code=None, checked_at=None)
+            summary.count("claim_hold_reopened", ref)
+
+    def _still_qualifies_as_last_read(self, row: sqlite3.Row) -> bool:
+        """The stored facts of the order as last read: a paid status that is
+        not REFUNDED and a net amount at or over the threshold. (``record``
+        already settles a claim hold whose replayed order stops qualifying;
+        this is the same rule on the stored row.)"""
+
+        return (row["financial_status"] in PAID_STATUSES and row["financial_status"] != "REFUNDED"
+                and isinstance(row["net_cents"], int) and qualifies(row["net_cents"], self.config))
 
     # -- 1. read and record ---------------------------------------------------
     def read_orders(self, summary: RunSummary) -> list[Order]:
@@ -1493,9 +1521,31 @@ class BenefitsEngine:
         gross, net = amounts if amounts is not None else (None, None)
         existing = self.ledger.receipt(order.gid)
         now = dl.ts(self.now())
+        if existing is not None and existing["state"] not in DECIDED_STATES:
+            # G2 recheck LATER 2: a save that landed before the parent stopped
+            # is repaired here, before the order is classified again, so a
+            # refund read by the same run still reports refund_on_basis.
+            if self._repair_applied(order.gid, summary, ref):
+                existing = self.ledger.receipt(order.gid)
         if existing is not None and existing["state"] in DECIDED_STATES:
             self.ledger.update_receipt(order.gid, order_updated_at=dl.ts(order.updated_at), financial_status=order.financial_status,
                                        refunded_cents=order.refunded_cents, net_cents=net if net is not None else existing["net_cents"])
+            if existing["state"] == "held" and existing["code"] in CLAIM_HOLD_CODES:
+                # G2 B5: a claim-held receipt is looked at again on every
+                # replay. An order that no longer qualifies settles it for
+                # good (a code that never re-opens): silently for a unit
+                # refund or a cancellation (nothing was granted), with the
+                # refund_unattributed alert, once, for a refund by money.
+                state, code = self._classify(order, net)
+                if (state, code) == ("held", REFUND_UNATTRIBUTED):
+                    self.ledger.update_receipt(order.gid, code=REFUND_UNATTRIBUTED, alerted=REFUND_UNATTRIBUTED)
+                    summary.alert(REFUND_UNATTRIBUTED, ref)
+                elif state != "ready":
+                    self.ledger.update_receipt(order.gid, code=ORDER_NO_LONGER_QUALIFIES)
+                    summary.count("claim_hold_settled", ref)
+                else:
+                    summary.count("receipt_replayed")
+                return
             # G2 B1: a refund by units below the threshold, a cancellation, or
             # any refund by money that no unit explains (incl. REFUNDED).
             dropped = order.cancelled or (net is not None and not qualifies(net, self.config)) or money_refund_unattributed(order)
@@ -1716,18 +1766,26 @@ class BenefitsEngine:
         if self.ledger.review_once(subject, code):
             summary.alert("claim_needs_review", ref, member_no)
 
+    def _repair_applied(self, order_gid: str, summary: RunSummary, ref: str) -> bool:
+        """G2 LATER 1: the save landed (the receipt's own ``DONE`` write) but
+        the parent stopped before the receipt update: set the receipt
+        ``applied`` from that write. Never a second send (I4). True when
+        repaired."""
+
+        done = self.ledger.done_write(order_gid)
+        if done is None:
+            return False
+        self.ledger.update_receipt(order_gid, state="applied", code=done["kind"], member_no=done["member_no"],
+                                   basis_expiry_local=done["new_expiry_local"])
+        summary.count("receipt_repaired_applied", ref, done["member_no"])
+        return True
+
     def _decide_one(self, row: sqlite3.Row, summary: RunSummary, *, run_id: str, apply: bool) -> bool:
         """True stops the run (an unclear write)."""
 
         gid, order_gid = row["customer_gid"], row["order_gid"]
         ref = self.ledger.ref("o", order_gid)
-        done = self.ledger.done_write(order_gid)
-        if done is not None:
-            # G2 LATER 1: the save landed but the parent stopped before the
-            # receipt update: repair the receipt, never a second send (I4).
-            self.ledger.update_receipt(order_gid, state="applied", code=done["kind"], member_no=done["member_no"],
-                                       basis_expiry_local=done["new_expiry_local"])
-            summary.count("receipt_repaired_applied", ref, done["member_no"])
+        if self._repair_applied(order_gid, summary, ref):
             return False
         if self.ledger.write_landed_or_open(order_gid):
             summary.count("write_already_recorded", ref)  # never a second send (I4)
@@ -1858,7 +1916,17 @@ class BenefitsEngine:
                 state, code, post = self._resolve_one(row, claim)
             self.ledger.set_outcome(row["write_id"], state, code, post)
             if state == "DONE":
-                self.ledger.update_receipt(row["order_gid"], state="applied", code=row["kind"], basis_expiry_local=row["new_expiry_local"])
+                receipt = self.ledger.receipt(row["order_gid"])
+                if receipt is not None and receipt["state"] in DECIDED_STATES and receipt["state"] != "applied":
+                    # G2 recheck LATER 1: a run held (or settled) the receipt
+                    # between the save and this resolve. The write is DONE and
+                    # the member is saved; the receipt is left as it is,
+                    # counted and alerted, and the other rows carry on.
+                    result["receipts_left"] = result.get("receipts_left", 0) + 1
+                    if "receipt_left_decided" not in result["alerts"]:
+                        result["alerts"].append("receipt_left_decided")
+                else:
+                    self.ledger.update_receipt(row["order_gid"], state="applied", code=row["kind"], basis_expiry_local=row["new_expiry_local"])
             result["resolved"][f"{state}:{code}"] = result["resolved"].get(f"{state}:{code}", 0) + 1
             if state == "HELD":
                 result["alerts"].append(code)

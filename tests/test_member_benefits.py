@@ -1006,6 +1006,248 @@ class G2FixRound1Tests(Base):
 
 
 # --------------------------------------------------------------------------
+# G2 fix round 2 (recheck 1 at 86b42c1): B5, B6 and new LATER 1, 2, 3, 9
+# --------------------------------------------------------------------------
+
+class G2FixRound2Tests(Base):
+    def claim_held(self, n: int = 1) -> bm.BenefitsEngine:
+        """A signed-up customer whose AC2 GUEST (found by phone) has another
+        name: the S$300 receipt is held by the claim review."""
+        self.guest_with_order(n, linked=False, member=fake_member(sg(n), name="Someone Else Entirely"))
+        self.engine().run(apply=True)
+        self.assertEqual((self.receipt(n)["state"], self.receipt(n)["code"]), ("held", "claim_name_mismatch"))
+        return self.engine()
+
+    def link_and_run(self, n: int = 1) -> dict:
+        self.link(n)
+        self.advance(minutes=15)
+        return self.engine().run(apply=True)
+
+    def assert_never_upgraded(self, out: dict, n: int = 1, code: str = "order_no_longer_qualifies") -> None:
+        self.assertEqual((out["saves"], self.book.saves, self.book.payloads), (0, 0, []))
+        self.assertEqual(self.book.members[sg(n)]["type"], "GUEST")
+        self.assertEqual((self.receipt(n)["state"], self.receipt(n)["code"]), ("held", code))
+        self.assertIsNone(out["counts"].get("claim_hold_reopened"))
+
+    # -- B5: a claim-held receipt is looked at again before it can re-open ----
+    def test_b5_r6a_a_unit_refund_while_claim_held_never_upgrades(self):
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, lines=(("300.00", 1, 0, False, ()),), status="REFUNDED", refunded="300.00", updated="2026-11-19T03:00:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled")), ([], 1))  # silent: nothing was granted
+        self.assertEqual((self.receipt(1)["code"], self.receipt(1)["net_cents"]), ("order_no_longer_qualifies", 0))
+        self.assert_never_upgraded(self.link_and_run())
+
+    def test_b5_r6b_a_cancellation_while_claim_held_never_upgrades(self):
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, cancelled="2026-11-19T02:00:00Z", status="VOIDED", updated="2026-11-19T03:00:00Z"))
+        self.assertEqual(self.engine().run(apply=True)["alerts"], [])
+        self.assert_never_upgraded(self.link_and_run())
+
+    def test_b5_r6c_a_refund_by_money_while_claim_held_alerts_once_and_never_upgrades(self):
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-19T03:00:00Z"))
+        self.assertEqual(self.engine().run(apply=True)["alerts"], ["refund_unattributed"])
+        self.assertEqual(self.receipt(1)["alerted"], "refund_unattributed")
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-19T04:10:00Z"))
+        self.assertEqual(self.engine().run(apply=True)["alerts"], [])  # once
+        self.assert_never_upgraded(self.link_and_run(), code="refund_unattributed")
+
+    def test_b5_r6d_no_phone_then_refunded_then_linked_never_upgrades(self):
+        self.shopify.add(order_node(1, customer=customer_node(1, phone=None)))
+        self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_no_phone"))
+        self.advance(days=1)
+        self.shopify.add(order_node(1, customer=customer_node(1, phone=None), lines=(("300.00", 1, 0, False, ()),), status="REFUNDED",
+                                    refunded="300.00", updated="2026-11-19T03:00:00Z"))
+        self.engine().run(apply=True)
+        # The customer adds a phone; #155 creates and links the GUEST.
+        self.shopify.customers[customer_gid(1)] = customer_node(1)
+        self.book.members[sg(1)] = fake_member(sg(1))
+        self.assert_never_upgraded(self.link_and_run())
+
+    def test_b5_a_claim_hold_whose_order_still_qualifies_re_opens_as_before(self):
+        self.claim_held()
+        self.advance(days=1)
+        # One of four units refunded with its own money: still S$300.00.
+        self.shopify.add(order_node(1, lines=(("100.00", 4, 3, False, ()),), status="PARTIALLY_REFUNDED", refunded="100.00", updated="2026-11-19T03:00:00Z"))
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(1)["code"], "claim_name_mismatch")
+        out = self.link_and_run()
+        self.assertEqual((out["counts"].get("claim_hold_reopened"), self.receipt(1)["state"], self.book.saves), (1, "applied", 1))
+
+    def test_b5_the_re_open_rests_on_the_order_as_last_read(self):
+        # The stored facts decide even when the order is not replayed in the
+        # run that sees the link (a newer order has moved the watermark on).
+        self.claim_held()
+        self.advance(hours=2)
+        self.shopify.add(order_node(9, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T05:30:00Z"))
+        self.engine().run(apply=True)
+        self.ledger.update_receipt(order_gid(1), net_cents=0, financial_status="REFUNDED")
+        self.advance(hours=1)
+        calls = len(self.shopify.calls)
+        out = self.link_and_run()
+        self.assertEqual(out["counts"].get("claim_hold_settled"), 1)
+        self.assertEqual(out["counts"]["orders_read"], 1)  # order 1 itself was not read again
+        self.assertGreater(len(self.shopify.calls), calls)
+        self.assert_never_upgraded(out)
+
+    # -- B6: never twice with an open or held write, also in observe ----------
+    def test_b6_observe_with_an_uncertain_write_neither_reads_nor_marks_the_receipt(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_saved"
+        self.engine().run(apply=True)
+        self.book.mode = None
+        reads = self.book.reads
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["basis_expiry_local"], out["counts"].get("write_already_recorded")), ("ready", None, 1))
+        self.assertIsNone(out["counts"].get("receipt_repaired_applied"))
+        self.assertEqual((self.book.reads, self.book.saves, len(self.book.payloads)), (reads, 1, 1))
+
+    def test_b6_observe_with_a_held_write_neither_reads_nor_marks_the_receipt(self):
+        self.guest_with_order(1)
+        self.book.mode = "mutate"
+        self.engine().run(apply=True)
+        self.book.mode = None
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "HELD")
+        reads = self.book.reads
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["basis_expiry_local"], out["counts"].get("write_already_recorded")), ("ready", None, 1))
+        self.assertIsNone(out["counts"].get("receipt_repaired_applied"))
+        self.assertEqual((self.book.reads, self.book.saves, len(self.book.payloads)), (reads, 1, 1))
+
+    # -- new LATER 1, 2 -------------------------------------------------------
+    def test_later1_resolve_leaves_a_receipt_that_was_held_in_between(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_saved"
+        self.engine().run(apply=True)
+        self.book.mode = None
+        # An observe run reads a refund by money before the resolve.
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, status="REFUNDED", refunded="300.00", updated="2026-11-18T04:10:00Z"))
+        self.assertIn("refund_unattributed", self.engine().run(apply=False)["alerts"])
+        self.advance(seconds=PAST_DEADLINE)
+        result = self.engine().resolve()
+        self.assertEqual((result["resolved"], result.get("receipts_left"), result["alerts"]), ({"DONE:resolved_saved": 1}, 1, ["receipt_left_decided"]))
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "DONE")
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "refund_unattributed"))
+        self.assertEqual(self.ledger.open_writes(), [])
+
+    def test_later2_r2b_a_refund_read_in_the_repair_run_still_alerts_on_the_basis(self):
+        self.guest_with_order(1, lines=(("100.00", 3, 3, False, ()),))
+        engine = self.engine()
+        real = self.ledger.update_receipt
+
+        def crash_on_applied(order, **values):
+            if values.get("state") == "applied":
+                raise RuntimeError("parent killed after the save")
+            return real(order, **values)
+        with mock.patch.object(self.ledger, "update_receipt", crash_on_applied), self.assertRaises(RuntimeError):
+            engine.run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.book.saves), ("ready", 1))
+        # The next run reads the refund of one unit (net S$200.00).
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, lines=(("100.00", 3, 2, False, ()),), status="PARTIALLY_REFUNDED", refunded="100.00", updated="2026-11-18T04:10:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("receipt_repaired_applied")), (["refund_on_basis"], 1))
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["basis_expiry_local"], row["net_cents"]), ("applied", "upgrade", NEW_EXPIRY, 20000))
+        self.assertEqual((self.book.saves, len(self.book.payloads)), (1, 1))
+
+    # -- new LATER 3: the receipts trigger ------------------------------------
+    def test_later3_the_receipts_trigger_pins_code_and_the_one_way_back(self):
+        self.engine()
+        counter = iter(range(100, 200))
+
+        def row(state: str, code: str | None) -> str:
+            gid = order_gid(next(counter))
+            with self.ledger.tx() as conn:
+                conn.execute("INSERT INTO receipts(order_gid, order_created_at, order_date_sgt, order_updated_at, state, code, member_no, "
+                             "basis_expiry_local, first_seen_at, updated_at) VALUES (?, 't', 'd', 't', ?, ?, 'm', 'e', 't', 't')", (gid, state, code))
+            return gid
+
+        def allowed(gid: str, **values) -> bool:
+            try:
+                self.ledger.update_receipt(gid, **values)
+            except sqlite3.IntegrityError as exc:
+                self.assertIn("receipt_decided", str(exc))
+                return False
+            return True
+
+        claim, other = "claim_name_mismatch", "refund_unattributed"
+        cases = [
+            # (state, code, update, allowed)
+            ("held", claim, dict(state="ready", code=None), True),  # the one way back
+            ("held", claim, dict(state="applied"), False),
+            ("held", claim, dict(state="waiting_member"), False),
+            ("held", other, dict(state="ready", code=None), False),
+            ("held", other, dict(state="applied"), False),
+            ("held", other, dict(state="waiting_member"), False),
+            ("held", "link_conflict", dict(state="ready", code=None), False),
+            ("held", "order_no_longer_qualifies", dict(state="ready", code=None), False),
+            ("held", None, dict(state="ready"), False),  # a NULL code never re-opens
+            ("held", claim, dict(code=other), True),  # settled for good
+            ("held", claim, dict(code="order_no_longer_qualifies"), True),
+            ("held", claim, dict(code="claim_no_phone"), False),
+            ("held", claim, dict(code=None), False),
+            ("held", other, dict(code=claim), False),  # never back to a re-openable code
+            ("held", other, dict(code=None), False),
+            ("held", "order_no_longer_qualifies", dict(code=claim), False),
+            ("applied", "upgrade", dict(code=None), False),
+            ("applied", "upgrade", dict(code=claim), False),
+            ("no_change", "expiry_already_later", dict(code=None), False),
+            ("not_in_scope", "member_not_in_scope", dict(code=claim), False),
+            ("applied", "upgrade", dict(state="ready", code=None), False),
+            ("ready", None, dict(state="held", code=claim), True),  # undecided rows move freely
+            ("waiting_member", None, dict(state="ready", code=None), True),
+        ]
+        for state, code, update, want in cases:
+            with self.subTest(state=state, code=code, update=update):
+                self.assertEqual(allowed(row(state, code), **update), want)
+        # Two steps cannot do what one step may not: NULL the code, then re-open.
+        gid = row("held", other)
+        self.assertFalse(allowed(gid, code=None))
+        self.assertFalse(allowed(gid, state="ready"))
+
+    # -- new LATER 9: D12, D25 -------------------------------------------------
+    def test_later9_d12_a_claim_link_re_opens_a_held_receipt_and_ends_a_wait(self):
+        self.claim_held(1)  # held by a name mismatch
+        self.shopify.add(order_node(2))  # signed up, no AC2 member yet
+        self.advance(minutes=15)
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(2)["state"], "waiting_member")
+        # Staff fix the name and the index claims customer 1; member 2 is keyed and claimed.
+        self.ledger.add_claim(customer_gid(1), sg(1), "index", "phone_and_name_match")
+        self.book.members[sg(2)] = fake_member(sg(2))
+        self.ledger.add_claim(customer_gid(2), sg(2), "index", "phone_and_name_match")
+        self.advance(minutes=15)  # inside the 6-hour back-off
+        out = self.engine().run(apply=True)
+        self.assertEqual(out["counts"].get("claim_hold_reopened"), 1)
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["link_source"]) for n in (1, 2)], [("applied", "claim"), ("applied", "claim")])
+        self.assertEqual(self.links_by_gid, {})
+
+    def test_later9_d25_ready_receipts_are_decided_before_waiting_ones(self):
+        self.shopify.add(order_node(1))  # older, no AC2 member: waiting_member (2 reads a check)
+        self.engine(max_member_reads_per_run=2).run(apply=True)
+        self.assertEqual(self.receipt(1)["state"], "waiting_member")
+        self.advance(hours=7)  # the waiting receipt is due again
+        # A newer, unlinked but claimable GUEST (2 reads: both MemberNo forms).
+        self.guest_with_order(2, linked=False, created="2026-11-18T10:30:00Z")
+        out = self.engine(max_member_reads_per_run=2).run(apply=True)
+        self.assertEqual((self.receipt(2)["state"], out["saves"]), ("applied", 1))
+        self.assertIn("member_reads_capped", out["alerts"])
+        self.assertEqual(self.receipt(1)["state"], "waiting_member")
+
+
+# --------------------------------------------------------------------------
 # Index (one-off claim links for existing members)
 # --------------------------------------------------------------------------
 
@@ -1038,6 +1280,15 @@ class IndexTests(Base):
         self.assertEqual(self.ledger.conn.execute("SELECT code FROM reviews").fetchall()[0][0], "claim_name_mismatch")
         self.assertEqual(self.book.saves, 0)
         self.assertEqual(self.code(lambda: engine.index(apply=True, max_members=1001)), "benefits_index_max_invalid")
+
+    def test_later9_d45_a_truncated_phone_search_on_the_index_path_is_a_review(self):
+        self.shopify.truncated_phones.add(sg(1))
+        out = self.engine().index(apply=True, max_members=100)
+        self.assertEqual(out["counts"].get("claim_phone_not_unique"), 1)
+        self.assertIn("claim_needs_review", out["alerts"])
+        self.assertIsNone(out["counts"].get("index_no_shopify_customer"))
+        self.assertIsNone(self.ledger.claim_for_member(sg(1)))
+        self.assertEqual(self.ledger.conn.execute("SELECT code FROM reviews WHERE subject = ?", ("m:" + sg(1),)).fetchone()[0], "claim_phone_not_unique")
 
     def test_later2_both_member_no_forms_are_reviewed_never_linked(self):
         self.book.members[local(1)] = fake_member(local(1), member_type="GUEST", name="Fake Member 1")  # the 8-digit form too
@@ -1325,6 +1576,48 @@ class CliTests(Base):
         self.assertLessEqual({"refund_on_basis", "order_amount_unverifiable", "refund_unattributed"}, codes)
         for entry in out["refs"]:
             self.assertRegex(entry["ref"], r"^[ocm]-[0-9a-f]{20}$")
+
+    def test_b6_re_open_repair_and_index_review_carry_keyed_refs_only(self):
+        # Re-open: order 1 is held by a name mismatch, then #155 links the customer.
+        self.guest_with_order(1, linked=False, member=fake_member(sg(1), name="Someone Else Entirely"))
+        texts = [self.run_main("init")[2], self.run_main("apply")[2]]
+        # Repair: order 2's save lands, the parent stops before the receipt update.
+        self.guest_with_order(2)
+
+        def crashing(config, ledger):
+            real = ledger.update_receipt
+
+            def crash_on_applied(order, **values):
+                if values.get("state") == "applied":
+                    raise RuntimeError("parent killed after the save")
+                return real(order, **values)
+            ledger.update_receipt = crash_on_applied
+            return bm.BenefitsEngine(config, ledger, shopify=self.shopify, ac2=self.book, sync_links=self.sync_links)
+        self.advance(minutes=15)
+        with self.assertRaises(RuntimeError):
+            self.run_main("apply", factory=crashing)
+        self.assertEqual(self.book.saves, 1)
+        self.link(1)
+        self.advance(minutes=15)
+        code, run, text = self.run_main("apply")
+        texts.append(text)
+        # Index review: both MemberNo forms of one phone exist in AC2.
+        self.book.members[sg(3)] = fake_member(sg(3), name="Fake Member 3")
+        self.book.members[local(3)] = fake_member(local(3), name="Fake Member 3")
+        self.shopify.customers[customer_gid(3)] = customer_node(3)
+        code, index, text = self.run_main("index", "--apply")
+        texts.append(text)
+        codes = {r["code"] for r in run["refs"]} | {r["code"] for r in index["refs"]}
+        self.assertLessEqual({"claim_hold_reopened", "receipt_repaired_applied", "claim_memberno_conflict", "claim_needs_review"}, codes)
+        for entry in run["refs"] + index["refs"]:
+            self.assertRegex(entry["ref"], r"^[ocm]-[0-9a-f]{20}$")
+            if "member_no_masked" in entry:
+                self.assertRegex(entry["member_no_masked"], r"^\*{3,}[^*]{1,3}$")
+        joined = "".join(texts)
+        for n in (1, 2, 3):
+            for secret in (order_gid(n), customer_gid(n), str(5000 + n), sg(n), local(n), f"Fake Member {n}"):
+                self.assertNotIn(secret, joined)
+        self.assertEqual((self.book.saves, len(self.book.payloads)), (2, 2))
 
     def test_apply_with_the_switch_off_refuses_before_any_ledger_or_login(self):
         def factory(config, ledger):
