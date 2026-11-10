@@ -17,7 +17,7 @@ Script: `scripts/ac1_sales_history_build.py` (stdlib only). Tests: `tests/test_a
 
 The AC1 monthly profit-margin report exports, one workbook per month named `YYYY-MM.xlsx`, one sheet, header in row 1 with exactly these columns: Item Code, Description, Desc 2, Item Group, Item Type, UOM, Sold Qty, Subtotal, Total Cost, Profit, Margin(%), Markup(%), Average Subtotal, Average Total Cost. One row per item; the last row is the report's grand total (no item code).
 
-The folder also holds an item list workbook; it does not match `YYYY-MM.xlsx`, so it is ignored and listed by name in the manifest. Its balance column is one undated all-location total and is not used.
+The folder also holds an item list workbook; it does not match `YYYY-MM.xlsx`, so it is ignored and listed by name in the manifest. Its balance column is one undated all-location total and is not used. **Its name must not start with a date:** any file whose name starts `YYYY-M` (for example `2026-11-08 item list.xlsx` or `2026-01.csv`) looks like a month file and stops the build. Keep only month workbooks and the item list workbook in the folder.
 
 **Confidential:** the AC1 folder holds cost, price and margin data. It stays on the VM. Never copy the workbooks into the repo, a ticket, Drive or a chat.
 
