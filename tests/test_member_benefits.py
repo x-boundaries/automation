@@ -299,6 +299,8 @@ class Base(unittest.TestCase):
     PRIVATE_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{20}$")
     PRIVATE_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
     PRIVATE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+    PRIVATE_WORD_RE = re.compile(r"^[a-z0-9_:]{1,64}$")  # a count key, an alert code, a ref code, the ``stopped`` text
+    PRIVATE_DIGITS_RE = re.compile(r"[0-9]{4}")  # IDs are shown by their last 3 characters at most
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -309,7 +311,13 @@ class Base(unittest.TestCase):
         ID, customer ID or full MemberNo anywhere. Slice A: a payment gateway
         name leaves the tool only as a checked code word, and a name in the
         ledger that is not one appears in no output. Slice A2: the query
-        cost of a run is a whole number of points or nothing."""
+        cost of a run is a whole number of points or nothing; every count
+        key, alert code, ref code and ``stopped`` text is a code word (lower
+        case letters, digits, ``_`` and ``:``, 1 to 64 characters) with no
+        run of four or more digits, so no part of an order number, customer
+        number or MemberNo and no name can sit there. The rule reads fixed
+        code words only, never the random run ids or keyed refs, so it
+        cannot fail by chance."""
 
         outputs = [("cli", value) for value in self.emitted]
         private = {m for m in self.book.members}
@@ -349,6 +357,14 @@ class Base(unittest.TestCase):
             if isinstance(value, dict) and "orders_query_cost" in value:
                 cost = value["orders_query_cost"]
                 self.assertTrue(cost is None or (type(cost) is int and 0 <= cost <= 1_000_000), kind)
+            if isinstance(value, dict):
+                words = list(value.get("counts") or []) + list(value.get("alerts") or []) + [entry.get("code") for entry in entries]
+                if value.get("stopped") is not None:
+                    words.append(value["stopped"])
+                for word in words:
+                    self.assertIsInstance(word, str, kind)
+                    self.assertRegex(word, self.PRIVATE_WORD_RE, kind)
+                    self.assertNotRegex(word, self.PRIVATE_DIGITS_RE, kind)
 
     def cfg(self, **overrides) -> bm.BenefitsConfig:
         return bm.parse_config(raw_config(self.root, self.sync_root, **overrides))
@@ -2566,6 +2582,84 @@ class OrdersQueryCostTests(Base):
         self.shopify.add(order_node(1, lines=goods_500, transactions=(tx("210.00"), card("290.00")), updated=dl.ts(self.now)))
         engine.run(apply=True)
         self.assertEqual((self.receipt(1)["net_cents"], self.receipt(1)["gift_card_cents"]), (29000, 21000))
+
+
+class OutputShapeRuleTests(Base):
+    """Fix round 1 of slice A2: the check after every test must itself notice
+    part of an ID, or a name, in a place where only a code word belongs."""
+
+    GOOD_RUN = {"status": "ok", "command": "apply", "run_id": "run-" + "0" * 32, "saves": 1, "stopped": None, "orders_query_cost": 847,
+                "counts": {"orders_read": 2, "receipt_ready": 1, "upgraded": 1, "step_155": 1, "a" * 64: 1},
+                "alerts": ["order_amount_unverifiable"],
+                "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded", "member_no_masked": "*******001"}]}
+    GOOD_DIGEST = {"schema": "fake", "status": "ok", "hours": 24, "counts": {"orders_read": 2}, "alerts": {"claim_needs_review": 2},
+                   "alert_refs": [{"ref": "m-" + "b" * 20, "code": "claim_needs_review"}]}
+
+    def checked(self, value: dict, *, stored: bool = False) -> None:
+        """Run the check after every test on one more output: a CLI output,
+        or (``stored``) the summary of a run kept in a ledger."""
+
+        real_root = self.root
+        try:
+            if stored:
+                self.root = Path(tempfile.mkdtemp(prefix="stored-", dir=self.temp))
+                ledger = bm.BenefitsLedger(self.root, clock=lambda: self.now)
+                try:
+                    ledger.init_meta(self.cfg())
+                    ledger.finish_run(ledger.start_run("apply"), value)
+                finally:
+                    ledger.close()
+            else:
+                self.emitted.append(value)
+            self.assert_outputs_private()
+        finally:
+            self.root = real_root
+            if not stored:
+                self.emitted.pop()
+
+    def test_the_check_after_every_test_takes_code_words_only(self):
+        order, customer = str(order_number(1)), str(customer_number(1))
+        for good in (self.GOOD_RUN, self.GOOD_DIGEST, {**self.GOOD_RUN, "stopped": "uncertain:writer_timeout"},
+                     {**self.GOOD_RUN, "stopped": "stop_file_present"}, {"status": "ok", "command": "resolve", "alerts": []}):
+            with self.subTest(good=good):
+                self.checked(good)
+                self.checked(good, stored=True)
+        run = self.GOOD_RUN
+        bad = {
+            # part of an order or customer number where a code word belongs
+            "count_key_with_the_last_8_digits_of_an_order_number": {**run, "counts": {"seen_" + order[-8:]: 1}},
+            "count_key_with_the_last_6_digits_of_an_order_number": {**run, "counts": {"seen_" + order[-6:]: 1}},
+            "count_key_that_is_the_last_8_digits": {**run, "counts": {order[-8:]: 1}},
+            "count_key_with_the_last_8_digits_of_a_customer_number": {**run, "counts": {"seen_" + customer[-8:]: 1}},
+            "count_key_with_an_order_number_less_its_first_digit": {**run, "counts": {"seen_" + order[1:]: 1}},
+            "count_key_with_a_whole_order_number": {**run, "counts": {"seen_" + order: 1}},
+            "count_key_with_a_whole_customer_number": {**run, "counts": {"seen_" + customer: 1}},
+            "count_key_with_four_digits": {**run, "counts": {"seen_2026": 1}},
+            "alert_code_with_part_of_an_order_number": {**run, "alerts": ["alert_" + order[-6:]]},
+            "digest_alert_code_with_part_of_an_order_number": {**self.GOOD_DIGEST, "alerts": {"alert_" + order[-6:]: 1}},
+            "ref_code_with_part_of_an_order_number": {**run, "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded_" + order[-6:]}]},
+            "digest_ref_code_with_part_of_an_order_number": {**self.GOOD_DIGEST, "alert_refs": [{"ref": "m-" + "b" * 20, "code": "x_" + order[-6:]}]},
+            "stopped_with_the_last_6_digits_of_an_order_number": {**run, "stopped": order[-6:]},
+            "stopped_with_a_whole_order_number": {**run, "stopped": order},
+            "stopped_code_with_part_of_an_order_number": {**run, "stopped": "uncertain:" + order[-8:]},
+            # a name, or any other free text
+            "count_key_with_a_name": {**run, "counts": {"seen_Fake Member 1": 1}},
+            "count_key_with_a_capital": {**run, "counts": {"Seen": 1}},
+            "count_key_with_a_dash": {**run, "counts": {"seen-it": 1}},
+            "count_key_with_a_dot": {**run, "counts": {"seen.it": 1}},
+            "count_key_that_is_empty": {**run, "counts": {"": 1}},
+            "count_key_of_65_characters": {**run, "counts": {"a" * 65: 1}},
+            "alert_code_with_a_name": {**run, "alerts": ["Fake Member 1"]},
+            "ref_code_with_a_name": {**run, "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded Fake Member 1"}]},
+            "ref_without_a_code": {**run, "refs": [{"ref": "o-" + "a" * 20}]},
+            "stopped_with_a_name": {**run, "stopped": "uncertain:Fake Member 1"},
+            "stopped_that_is_not_text": {**run, "stopped": 404},
+        }
+        for name, value in bad.items():
+            for stored in (False, True):
+                with self.subTest(name=name, stored=stored):
+                    with self.assertRaises(AssertionError):
+                        self.checked(value, stored=stored)
 
 
 class ClassifySaveTests(unittest.TestCase):
