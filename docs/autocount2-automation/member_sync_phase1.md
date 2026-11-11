@@ -410,7 +410,7 @@ Unknown keys, at the top level or nested, are refused.
 | `autocount_book` | required | `AED_TESTINGAPI` or `AED_XBOUNDARIES` (go-live), compared exactly; anything else is refused. The live book needs `ac2_credential_target` `XB-AC2-MemberSync` and `ac2_login_mode` (in `dedicated` mode also `ac2_refused_user_ids`), and refuses `ac2_create_without_phone` `true` |
 | `state_root` | required | Private root (same custody check as the Core); ledger `member_sync.sqlite3`, `claims\` |
 | `shopify` | required | Store, API version, auth env names, token cache (as the poller) |
-| `shopify_cutover_utc` | required | Registrations before it are skipped by the regular sync; customers made before it are linked once by the initial link (round 7c); creating historic members is phase 2 |
+| `shopify_cutover_utc` | required | Registrations before it are skipped by the regular sync; customers made before it are linked once by the initial link (round 7c); older `member-mg` sign-ups with no member are brought in by the one-off backfill (slice BF1, below) |
 | `ac2_create_enabled` | `false` | Shopify -> AC2 SaveMember |
 | `shopify_create_enabled` | `false` | AC2 -> Shopify `customerCreate`; Q3 gate above. The app also needs `write_customers` (the session check requires exactly `read_customers` while off, and `read_customers` + `write_customers` while on) |
 | `max_writes_per_run` | `5` | 0-5, both directions together |
@@ -438,6 +438,12 @@ Unknown keys, at the top level or nested, are refused.
 | `max_creates_per_day` | `144` | Owner D5: 1-720, at least `max_creates_per_hour`. The same count over the last 24 hours |
 | `probe_wake_enabled` | `false` | #155 P2: the probe starts `\XB\XB-MemberSync` only when true (and the immediate path is on); otherwise it records "would wake" (P3 observe) |
 | `probe_max_wakes_per_day` | `60` | 1-240 task starts per Singapore day by the probe |
+| `backfill_registrations_enabled` | `false` | #155 slice BF1: the gate for `backfill-registrations --apply` (refused with `backfill_registrations_disabled` before any login, read or lock while off); a dry run needs no gate. Gates nothing else: `run`, `initial-link`, `status`, `digest`, `probe` and `check-config` behave exactly as before. Only in the backfill's own config copy, never in the 15-minute task's live config (see the backfill section) |
+| `member_core_state_root` | `null` | #155 slice BF1: the member core's (#268) state root. When set, the backfill and `coverage` read its claim links read-only (its meta must be the member core's, bound to the same book and store); a member is then linked if either ledger says so. `null`: not read, and the output says `"member_core_ledger": "not_configured"`. Must not be this sync's own `state_root` |
+
+Neither BF1 key is printed by `check-config` while it is absent or off, so
+its output is unchanged; when set it adds `backfill_registrations_enabled:
+true` or `member_core_state_root_set: true` (never the path).
 
 ## What stays switched off
 
@@ -787,6 +793,168 @@ Run on the VM before the first Shopify -> AC2 run (that direction alerts
    member already linked to another customer) alerts and is never merged.
    Run until `complete` is true; that pass opens Shopify -> AC2.
 4. Set `initial_link_enabled` back to `false`.
+
+### Backfill of older sign-ups (#155 slice BF1, one-off)
+
+The live sync creates an AutoCount member only for a sign-up made on or
+after `shopify_cutover_utc`; older sign-ups were only linked where a member
+with the same phone already existed (the initial link). The owner decided
+on 11 and 12 November 2026 that both member lists are synced up completely.
+`backfill-registrations` brings in the older `member-mg` sign-ups; the
+read-only `coverage` command proves the result. External effect of an
+applied batch: new `GUEST` members in AutoCount, each visible at the tills.
+Nothing is sent to Shopify and nothing is sent to any customer.
+
+**The rules** (G0 two-way backfill plan, sections 2.1 to 2.4, and the
+Controller's decisions):
+
+| Customer (tagged `member-mg`, signed up before the cutover, not linked) | Result | Code |
+|---|---|---|
+| Phone is in no AutoCount member | Created: MemberNo = the phone (`65` + 8 digits, or a foreign number in full), the configured create type (live: `GUEST`), no expiry, RegisterDate = the sign-up date, DOB from the configured birthday field. Through the unchanged write-once child, profile `sync_p1` | `backfill_ac2_member_created` |
+| One member's MemberNo is exactly the phone (or its 8 digits) | Linked, no time window, no name rule | `backfill_linked` + `backfill_member_no` |
+| One member holds the phone in MobilePhone or inside a longer MemberNo, same name (the 2-word rule) | Linked | `backfill_linked` + `backfill_phone_and_name` |
+| The phone is held under another name (a shared family phone) | Held for a person (never the fallback number) | `backfill_shared_phone` |
+| Two members hold it under the same name | Held | `backfill_phone_on_multiple_records` |
+| Both forms of the number are MemberNos | Held | `backfill_memberno_conflict` |
+| Also tagged `member-legacy`, no member found | Held: never created by a tool | `backfill_legacy_needs_person` |
+| No phone; malformed phone; no name; no sign-up time | Held, before any AutoCount lookup | `backfill_no_phone`, `backfill_phone_invalid`, `backfill_no_name`, `backfill_signup_time_missing` |
+| The member it would link or create is already linked to another customer (this ledger, the member core's claim links, or earlier in the same call) | Held | `backfill_member_linked_elsewhere` |
+| A text field AutoCount cannot store exactly | Held | `backfill_text_unstorable` |
+| Already linked (this ledger, or a claim link) | Skipped, no lookup | `backfill_already_linked`, `backfill_claim_linked` |
+| An open (INTENT or UNCERTAIN) write for the customer, or for the MemberNo | Held, never re-sent | `backfill_held_by_open_write`, `backfill_member_held_by_open_write` |
+| Signed up on or after the cutover | Left to the live sync | `backfill_signed_up_after_cutover` |
+
+The sign-up time is the live rule's: the `membership.start_date` metafield's
+creation time, else Customer.createdAt. That metafield was created at the
+cutover, so for older sign-ups it is Customer.createdAt, which is also the
+RegisterDate (an account made before the sign-up gives an earlier date).
+Customers tagged only `member-legacy` are not read by the backfill; `coverage`
+lists them for a person. Email is never read.
+
+**Bounds, per call.** At most `--max` creates (1 to `max_writes_per_run`,
+default 1; anything else is `backfill_max_invalid`, before any login); never
+a create while the ledger holds 4 x `max_writes_per_run` writes or more in
+the last 60 minutes (the daily summary's hourly allowance; at the live
+`max_writes_per_run` of 5 that is 20, so the email never stops with
+`writes_over_cap`); at most `max_shopify_customers_per_run` customers looked
+up in AutoCount (one sign-in each); creates also need the live
+`ac2_create_enabled`. A call stops (`stopped`) before the next customer when
+`STOP` exists in the sync's state root (`stop_file_present`), when a bound is
+reached (`backfill_max_reached`, `backfill_hour_cap_reached`,
+`backfill_lookup_budget_reached`, `ac2_create_disabled`), and after any
+create that is not verified (`backfill_create_not_written`,
+`backfill_create_uncertain`; exit 3, an operator looks first). A Shopify read
+that does not reach the last page decides nothing
+(`backfill_read_incomplete`, exit 3; raise `shopify_max_pages` in the
+backfill's config copy). The backfill raises no alert: counts only, so the
+daily summary's expected-alert list is unchanged.
+
+**Resumable.** Customers are taken in customer-number order after the mode's
+cursor (`backfill_registrations_cursor`, or `..._dry_run_cursor` for a dry
+run). A call that reaches the end clears its cursor; an applied one also sets
+`backfill_registrations_completed_at`. A customer once linked or created is
+skipped by every later call; an uncertain write is held, never re-sent (the
+15-minute run's existing resolution links it when it is found).
+
+**What it records.** A dry run writes only its cursor. An applied call writes
+its links (origin `matched`, or `created_in_ac2` for a create), its `writes`
+rows, the cursor and one `runs` row of its own kind (`run_id` starting
+`backfill-`, summary `"kind": "backfill_registrations"`, counts, no alerts,
+keyed refs with masked MemberNos), so a later summary can show "backfill: N".
+`digest` already adds its counts (for example `backfill_ac2_member_created`)
+and its writes per hour. No schema change (v3): the ledger still opens under
+the commit the 15-minute task runs.
+
+**Effect on the 15-minute run after creates.** Members the backfill creates
+are `created_in_ac2` links, so the run's possible-duplicate watch checks the
+10 newest of them made in the last 7 days, two lookups each, on every run.
+Until 7 days after the last create, each run may take up to 20 more
+AutoCount sign-ins. Watch the run times in the daily summary.
+
+#### Procedure (attended, owner OK for each step)
+
+Prerequisites: the slice is merged; the birthday field setting on the live
+sync is fixed (G0 step 1); the dry run's counts are reviewed.
+
+1. Clone the merged commit into its own folder on the VM (never the
+   15-minute task's clone). Copy the live config to a private file of the
+   backfill's own; in that copy only, set `backfill_registrations_enabled`
+   (`false` for the dry run), `member_core_state_root` (the member core's
+   root, from 17 November), and if needed `shopify_max_pages` (enough pages
+   for every `member-mg` customer, 50 a page). The state root stays the
+   sync's own (the links must land in its ledger). **Never put either BF1 key
+   into the live config the 15-minute task reads**: a commit older than this
+   slice refuses unknown keys and the task would stop with
+   `sync_config_keys_invalid`. `check-config` on the copy.
+2. Pause the 15-minute task (`\XB\XB-MemberSync`) and, from 17 November,
+   the member tool's task (`\XB\XB-MemberBenefits`, it signs in with the
+   same AutoCount user). Wait until neither is running. The ledger lock
+   refuses a second process anyway.
+3. Dry run: `backfill-registrations --config <copy>` until `complete` is
+   true (each call looks up at most `max_shopify_customers_per_run`
+   customers). The first call's `population` is the exact join: every
+   `member-mg` customer, by class before any lookup (`backfill_needs_lookup`
+   is the gap the batches work on). Read `counts` and `refs` (codes, keyed
+   refs, masked MemberNos). **Live check of the search here:** the backfill
+   searches only `tag:'member-mg'` (no date filter); `population.tagged`
+   must equal the admin's count of customers tagged `member-mg`
+   (Customers, filter by tag). If it does not, stop.
+4. Resume both tasks between sittings.
+5. Pilot: set `backfill_registrations_enabled: true` in the copy, pause the
+   tasks, `backfill-registrations --apply --max 3 --config <copy>`. Check each
+   created member in AutoCount by hand (masked MemberNo in `refs`): type
+   `GUEST`, no expiry, RegisterDate the sign-up date, name and mobile right.
+   Check links count in `status`. Resume the tasks.
+6. Batches: `--apply --max 5`, at most 4 calls in a clock hour (20 creates;
+   the code refuses more in any 60 minutes), tasks paused for each sitting,
+   until `complete` is true. Exit 3 or any `stopped` other than a bound:
+   stop and look before the next call.
+7. To stop at once: create an empty file `STOP` in the sync's state root;
+   the call stops before the next customer. Delete it before the next call.
+8. When done: `backfill_registrations_enabled` back to `false` in the copy;
+   resume both tasks; next morning, read the daily summary.
+
+**A wrong member** (created for the wrong person, or a duplicate staff then
+keyed): staff make the member inactive by hand in AutoCount. The tool never
+deletes or updates a member, and a link can never be removed.
+
+#### Coverage check (read-only, any day)
+
+`coverage --config <config>` reads the customers tagged `member-mg` or
+`member-legacy` (Shopify reads only; the session's one mutation is switched
+off), this sync's ledger read-only (no lock, no migration, no write) and, when
+`member_core_state_root` is set, the member core's claim links read-only. It
+opens no AutoCount session and writes nothing to either ledger, AutoCount or
+Shopify (with `token_cache` `dpapi_current_user` the Shopify token cache in
+the state root may be refreshed, as for every command). It needs no paused
+task.
+
+- `shopify.classes`: every tagged customer in exactly one class, adding up
+  to `tagged_total`: `linked`, `linked_claim_only`, `open_write`,
+  `legacy_not_linked` (only `member-legacy`), `after_cutover_not_linked`
+  (the live sync's own), the person classes of the table above (no phone,
+  malformed phone, no name, no sign-up time, and each customer's latest hold
+  from the applied backfill calls), and `gap` (signed up before the
+  cutover, usable phone, not linked, not held: the backfill's remaining
+  work).
+- `ac2.classes`: every linked member in exactly one class, adding up to
+  `linked_members_total`: `linked_both` (the same customer in both ledgers),
+  `linked_sync_only`, `linked_claim_only`, `linked_conflict` (two
+  customers); plus `customers_linked_to_two_members`. The members the book
+  holds are not read (`members_in_book: "not_read"`): the daily summary
+  email gives the member totals per type.
+- `complete` is true when `gap`, `after_cutover_not_linked` and `open_write`
+  are 0 and there is no conflict on either side. Everyone else is on a named
+  list.
+- `refs`: keyed customer refs and the code for every customer outside the
+  linked, gap and after-cutover classes (at most 200).
+
+**The weekly list for a person.** Run `coverage` once a week and give the
+person classes (counts and refs) to the person who fixes them: for a conflict
+pair, decide in AutoCount which record is real and give the other a new code,
+then the next backfill pass links the customer; for no phone, get the number
+from the customer and key the member (the sync links it); for a legacy member
+or a shared phone, a person decides whether to key or link by hand.
 
 ### Releasing a customer held by an open write
 
@@ -1417,7 +1585,15 @@ python directlocal\xb_member_sync.py status --config <config>
 python directlocal\xb_member_sync.py initial-link --config <config> [--apply]
 python directlocal\xb_member_sync.py digest --config <config> [--hours 24]
 python directlocal\xb_member_sync.py probe --config <config>
+python directlocal\xb_member_sync.py backfill-registrations --config <config> [--apply] [--max N]
+python directlocal\xb_member_sync.py coverage --config <config>
 ```
+
+`backfill-registrations` and `coverage` (#155 slice BF1) are described in
+"Backfill of older sign-ups" above. `backfill-registrations` exits 0, or 3
+when an operator must look before the next call (a create not verified, or a
+Shopify read that did not finish), or 2 when refused. `coverage` exits 0, or
+2 when refused (for example `coverage_read_incomplete`).
 
 `digest` (go-live S7) is read-only: it opens the ledger read-only (no lock,
 no migration, no login, no network) and prints, for the runs of the last
@@ -1642,3 +1818,16 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
    applied pass completes. `initial_link_cursor_stuck` (more than
    `shopify_max_pages` x 50 customers sharing one `updatedAt`) is remedied
    only by raising `shopify_max_pages` (max 40). The UAT dry run shows it.
+10. #155 slice BF1, the customers search filter: `initial-link` searches
+    `created_at:<'...'`. The Admin GraphQL `customers` reference for 2026-07
+    and 2026-10 documents `customer_date` (the createdAt filter), not
+    `created_at`, and the search syntax guide says an invalid field is
+    ignored and all results are returned. So the first link-up read every
+    customer and its own per-customer createdAt check did the work (the
+    3 November run read every older customer). The backfill and
+    `coverage` use only `tag:'...'` and keep their own per-customer checks;
+    the dry run compares `population.tagged` with the admin's tag count.
+11. #155 slice BF1: the backfill's RegisterDate for an older sign-up is
+    Customer.createdAt in Singapore (no `membership.start_date` before the
+    cutover). For a customer whose account is older than the sign-up, that
+    date is earlier than the sign-up.
