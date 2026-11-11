@@ -4534,7 +4534,8 @@ class BackfillTestCase(SyncTestCase):
         self.assert_no_pii(value)
         text = json.dumps(value)
         self.assertNotIn("gid://shopify/Customer", text)
-        self.assertIsNone(re.search(r"7000[0-9]{2}", text))  # no customer ID
+        # No customer ID (not inside a keyed ref's hex, so no chance match).
+        self.assertIsNone(re.search(r"(?<![0-9a-f])7000[0-9]{2}(?![0-9a-f])", text))
         for n in range(1, 100):
             self.assertNotIn(sg(n), text)
 
@@ -4559,6 +4560,16 @@ class BackfillRuleTests(BackfillTestCase):
         self.assertEqual(self.link_rows(), {gid(1): (sg(1), "created_in_ac2", "backfill_new_member_phone")})
         self.assertEqual(result["counts"]["backfill_ac2_member_created"], 1)
         self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM writes").fetchall()[0][:], ("DONE", "created"))
+
+    def test_register_date_prefers_the_start_date_value(self):
+        today = lambda: "2000-01-01"  # noqa: E731
+        item = replace(customer(1), registration_value="2026-10-19")  # signed up on the 21st, the form's date is the 19th
+        self.assertEqual(sync.sync_p1_payload(item, "Alpha Tester", sg(1), GUEST, None, today)["register_date"], "2026-10-19")
+        for bad in ("19/10/2026", "2026-10-19T00:00:00", None, 20261019):
+            self.assertEqual(sync.sync_p1_payload(replace(item, registration_value=bad), "A B", None, GUEST, None, today)["register_date"], "2026-10-21")
+        self.assertEqual(sync.sync_p1_payload(replace(item, registration_value=None, registration_at=None, created_at=None), "A B", None, GUEST, 3, today),
+                         {"profile": "sync_p1", "member_type": GUEST, "name": "A B", "mobile_phone": None, "email_address": None,
+                          "register_date": "2000-01-01", "dob": "2000-03-01"})
 
     def test_foreign_number_is_created_with_the_full_number(self):
         self.shopify.add(old_sign_up(2, phone=plus(FOREIGN_DIGITS)))
@@ -4604,6 +4615,15 @@ class BackfillRuleTests(BackfillTestCase):
         members = [sync.Ac2Member("TILL8A", "Alpha Tester", local(8)), sync.Ac2Member("TILL8B", "Alpha Tester", local(8))]
         self.assertEqual(self.decide(item, members), sync.Decision("HOLD", "backfill_phone_on_multiple_records"))
 
+    def test_rows_that_do_not_hold_the_phone_are_never_used(self):
+        # The lookup is only a candidate list: a row that holds neither the
+        # phone nor its 8 digits never links, holds or blocks a create.
+        item = old_sign_up(26)
+        stranger = sync.Ac2Member("TILL26", "Alpha Tester", plus(sg(27)))
+        self.assertEqual(self.decide(item, [stranger]), sync.Decision("CREATE", "backfill_new_member_phone", sg(26)))
+        other_name = sync.Ac2Member(sg(27), "BRAVO OTHER", None)
+        self.assertEqual(self.decide(item, [other_name]).action, "CREATE")
+
     def test_both_forms_of_the_number_are_held_never_linked_or_created(self):
         self.shopify.add(old_sign_up(9))
         self.member(sg(9))
@@ -4623,6 +4643,13 @@ class BackfillRuleTests(BackfillTestCase):
 
     def test_legacy_only_customers_are_not_read_by_the_backfill(self):
         self.shopify.add(old_sign_up(12, tags=("member-legacy",)))
+        result = self.backfill(apply=True)
+        self.assertEqual((self.ac2.lookups, self.ac2.creates, result["population"]["tagged"]), (0, [], 0))
+
+    def test_a_loose_search_result_without_the_sign_up_tag_is_never_decided(self):
+        self.shopify.loose = True  # the search is only a candidate list
+        self.shopify.add(old_sign_up(27, tags=("member-legacy",)))
+        self.shopify.add(old_sign_up(28, tags=()))
         result = self.backfill(apply=True)
         self.assertEqual((self.ac2.lookups, self.ac2.creates, result["population"]["tagged"]), (0, [], 0))
 
@@ -4710,6 +4737,14 @@ class BackfillSafetyTests(BackfillTestCase):
         self.assertEqual((self.ac2.creates, self.shopify.created), ([], []))
         self.assertIsNone(self.ledger.watermark("backfill_registrations_cursor"))
 
+    def test_a_finished_dry_run_clears_its_cursor_and_marks_nothing_done(self):
+        self.shopify.add(old_sign_up(29))
+        before = self.dump()
+        result = self.backfill(apply=False)
+        self.assertTrue(result["complete"])
+        self.assertEqual(self.dump(), before)  # no cursor left, no done mark, nothing else
+        self.assertIsNone(self.ledger.watermark("backfill_registrations_completed_at"))
+
     def test_apply_is_refused_while_the_switch_is_off(self):
         self.shopify.add(old_sign_up(33))
         with self.assertRaises(dl.DirectLocalError) as caught:
@@ -4751,7 +4786,9 @@ class BackfillSafetyTests(BackfillTestCase):
             engine._intent("ac2_to_shopify", f"HOURCAP{n}", None)
         result = engine.backfill_registrations(apply=True, max_creates=1)
         self.assertEqual((result["stopped"], self.ac2.creates), ("backfill_hour_cap_reached", []))
-        self.now += timedelta(minutes=61)
+        self.now += timedelta(minutes=45)  # still inside the 60 minutes
+        self.assertEqual(self.backfill(apply=True, max_creates=1, max_writes_per_run=2)["stopped"], "backfill_hour_cap_reached")
+        self.now += timedelta(minutes=16)
         self.assertEqual(self.backfill(apply=True, max_creates=1, max_writes_per_run=2)["counts"]["backfill_ac2_member_created"], 1)
 
     def test_seven_writes_in_the_hour_still_allow_the_eighth(self):
@@ -4791,6 +4828,15 @@ class BackfillSafetyTests(BackfillTestCase):
         self.assertEqual((self.ac2.lookups, first["stopped"], len(self.link_rows())), (2, "backfill_lookup_budget_reached", 2))
         second = self.backfill(apply=True, max_shopify_customers_per_run=2)
         self.assertEqual((self.ac2.lookups, second["complete"], len(self.link_rows())), (3, True, 3))
+
+    def test_a_held_customer_at_the_cursor_is_not_looked_up_again(self):
+        self.shopify.add(old_sign_up(72))
+        self.member("TILL72", "BRAVO OTHER", local(72))  # held: shared phone
+        self.shopify.add(old_sign_up(73))
+        first = self.backfill(apply=True, max_shopify_customers_per_run=1)
+        self.assertEqual((first["stopped"], self.ledger.watermark("backfill_registrations_cursor")), ("backfill_lookup_budget_reached", str(700072)))
+        second = self.backfill(apply=True, max_shopify_customers_per_run=1)
+        self.assertEqual((self.ac2.lookups, [m for m, _ in self.ac2.creates], second["complete"]), (2, [sg(73)], True))
 
     def test_a_second_pass_does_not_create_twice(self):
         self.shopify.add(old_sign_up(50))
@@ -4886,8 +4932,16 @@ class BackfillSafetyTests(BackfillTestCase):
         self.shopify.add(old_sign_up(67))
         self.member("TILL67", "BRAVO OTHER", local(67))
         self.shopify.add(old_sign_up(68, phone=None, first="Bravo"))
+        self.shopify.add(old_sign_up(74))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(74), sg(74), "matched", "initial_link_member_no")  # already linked
+        self.shopify.add(customer(75))  # signed up after the cutover
+        self.shopify.add(old_sign_up(76))  # claim-linked in the member core
+        claims = sync.ClaimLinks({gid(76): "claim76"}, {"claim76": gid(76)})
         for apply in (False, True):
-            result = self.backfill(apply=apply)
+            result = self.backfill(apply=apply, claims=claims)
+            for code in ("backfill_already_linked", "backfill_signed_up_after_cutover", "backfill_claim_linked"):
+                self.assertEqual(result["counts"][code], 1)
             self.assert_private(result)
             self.assertTrue(all(set(r) <= {"ref", "action", "code", "member_no_masked"} for r in result["refs"]))
         for (summary,) in self.ledger.conn.execute("SELECT summary FROM runs"):
@@ -5126,6 +5180,49 @@ class CoverageTests(BackfillTestCase):
         self.backfill(apply=True)
         result = self.report(None)
         self.assertEqual((result["shopify"]["classes"], result["complete"]), ({"linked": 1}, True))
+
+    def test_the_read_only_open_refuses_writes_even_without_query_only(self):
+        conn = sync._open_read_only(self.temp / sync.LEDGER_FILE, "missing", "unreadable")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO watermarks(name, value, updated_at) VALUES ('x', 'y', 'z')")
+            conn.execute("PRAGMA query_only=OFF")
+            with self.assertRaises(sqlite3.OperationalError):  # the read-only open itself
+                conn.execute("INSERT INTO watermarks(name, value, updated_at) VALUES ('x', 'y', 'z')")
+        finally:
+            conn.close()
+        self.assertIsNone(self.ledger.watermark("x"))
+
+    def test_an_open_write_alone_is_not_complete(self):
+        self.shopify.add(old_sign_up(25))
+        self.engine()._intent("shopify_to_ac2", sg(25), gid(25))
+        result = self.report(None)
+        self.assertEqual((result["shopify"]["classes"], result["complete"]), ({"open_write": 1}, False))
+
+    def test_only_backfill_runs_of_their_own_kind_give_holds(self):
+        self.shopify.add(old_sign_up(26))
+        ref = self.ledger.ref("c", gid(26))
+        forged = json.dumps({"counts": {}, "alerts": [], "refs": [{"ref": ref, "action": "hold", "code": "backfill_shared_phone"}]})
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('backfill-x', ?, ?, ?)", (dl.ts(T0), dl.ts(T0), forged))
+            conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('run-x', ?, ?, ?)",
+                         (dl.ts(T0), dl.ts(T0), json.dumps({"kind": "backfill_registrations", "refs": json.loads(forged)["refs"]})))
+        self.assertEqual(self.report(None)["shopify"]["classes"], {"gap": 1})
+
+    def test_a_customer_with_both_tags_follows_the_sign_up_path(self):
+        self.shopify.add(old_sign_up(23, tags=("member-mg", "member-legacy")))
+        self.shopify.add(old_sign_up(24, tags=("member-legacy",)))
+        self.assertEqual(self.report(None)["shopify"]["classes"], {"gap": 1, "legacy_not_linked": 1})
+
+    def test_a_later_outcome_that_is_not_a_hold_clears_the_hold(self):
+        self.shopify.add(old_sign_up(22))
+        self.member("TILL22", "BRAVO OTHER", local(22))
+        self.backfill(apply=True)
+        self.assertEqual(self.report(None)["shopify"]["classes"], {"backfill_shared_phone": 1})
+        self.ac2.members = []  # staff fixed the other record; the create is then proven not written
+        self.ac2.create_result = ("NOT_WRITTEN_PROVEN", "member_no_taken")
+        self.backfill(apply=True)
+        self.assertEqual(self.report(None)["shopify"]["classes"], {"gap": 1})
 
     def test_a_partial_read_or_another_ledger_is_refused(self):
         self.shopify.incomplete.add("member-legacy")
