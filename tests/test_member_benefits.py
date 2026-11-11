@@ -301,6 +301,15 @@ class Base(unittest.TestCase):
     PRIVATE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
     PRIVATE_WORD_RE = re.compile(r"^[a-z0-9_:]{1,64}$")  # a count key, an alert code, a ref code, the ``stopped`` text
     PRIVATE_DIGITS_RE = re.compile(r"[0-9]{4}")  # IDs are shown by their last 3 characters at most
+    # The one exception to the digit rule. A generic failure of the AutoCount
+    # child is named by the shared bridge code (xb_directlocal.bridge_failure_code)
+    # ``bridge_read_failed:<shape>:x<exit code as 8 hex characters, or "none">:l<output lines, 0 to 9>``.
+    # That tail is worked out by the tool, never taken from the child's text,
+    # and an exit code is not private. Exactly that tail, at the end of a word
+    # with exactly that prefix, is taken off before the digit-run test; the
+    # rest of the word is checked as any other word.
+    BRIDGE_PREFIX = "bridge_read_failed:"
+    BRIDGE_TAIL_RE = re.compile(r":x(?:[0-9a-f]{8}|none):l[0-9]\Z")
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -315,9 +324,10 @@ class Base(unittest.TestCase):
         key, alert code, ref code and ``stopped`` text is a code word (lower
         case letters, digits, ``_`` and ``:``, 1 to 64 characters) with no
         run of four or more digits, so no part of an order number, customer
-        number or MemberNo and no name can sit there. The rule reads fixed
-        code words only, never the random run ids or keyed refs, so it
-        cannot fail by chance."""
+        number or MemberNo and no name can sit there (one exception, the
+        tail of a generic bridge failure code: see ``BRIDGE_TAIL_RE``). The
+        rule reads fixed code words only, never the random run ids or keyed
+        refs, so it cannot fail by chance."""
 
         outputs = [("cli", value) for value in self.emitted]
         private = {m for m in self.book.members}
@@ -364,7 +374,8 @@ class Base(unittest.TestCase):
                 for word in words:
                     self.assertIsInstance(word, str, kind)
                     self.assertRegex(word, self.PRIVATE_WORD_RE, kind)
-                    self.assertNotRegex(word, self.PRIVATE_DIGITS_RE, kind)
+                    rest = self.BRIDGE_TAIL_RE.sub("", word) if word.startswith(self.BRIDGE_PREFIX) else word
+                    self.assertNotRegex(rest, self.PRIVATE_DIGITS_RE, kind)
 
     def cfg(self, **overrides) -> bm.BenefitsConfig:
         return bm.parse_config(raw_config(self.root, self.sync_root, **overrides))
@@ -2660,6 +2671,100 @@ class OutputShapeRuleTests(Base):
                 with self.subTest(name=name, stored=stored):
                     with self.assertRaises(AssertionError):
                         self.checked(value, stored=stored)
+
+    # -- fix round 2: the one exception, the generic bridge failure code ------
+    def real_generic_bridge_codes(self) -> list[str]:
+        """Real outputs of ``xb_directlocal.bridge_failure_code`` for a
+        generic failure: every shape class, small and large exit codes, a
+        negative one, no exit code, and 0 to 12 non-empty output lines."""
+
+        outputs = [b"", b"not json", b"\xff\xfe", b"[1]", b'{"ok": true}', b'{"error": "fake", "more": 1}', b'{"error": 7}',
+                   b'{"error": "a_code_that_is_not_listed"}']
+        outputs += [b"\n".join([b"line"] * lines) for lines in range(1, 13)]
+        exits = [None, 0, 1, 2, 255, 4242, 0xE0434352, 0xFFFFFFFF, -1, -1073741510]
+        return sorted({dl.bridge_failure_code(stdout, returncode) for stdout in outputs for returncode in exits})
+
+    def test_the_generic_bridge_failure_code_is_the_one_exception(self):
+        codes = self.real_generic_bridge_codes()
+        # The whole shape, as the tool builds it today: if bridge_failure_code
+        # ever produces another part, this line fails first.
+        shape = re.compile(r"^bridge_read_failed:(output_empty|output_not_utf8|output_not_json|result_on_failed_exit|envelope_invalid|code_unlisted)"
+                           r":x([0-9a-f]{8}|none):l[0-9]$")
+        for code in codes:
+            self.assertRegex(code, shape)
+        self.assertEqual({code.rsplit(":l", 1)[1] for code in codes}, set("0123456789"))  # the line count is capped at 9
+        self.assertLessEqual({"x00000001", "xe0434352", "xffffffff", "xc000013a", "x00001092", "xnone"}, {code.split(":")[2] for code in codes})
+        self.assertGreater(len(codes), 100)
+        with_digits = [code for code in codes if self.PRIVATE_DIGITS_RE.search(code)]  # these would fail without the exception
+        self.assertGreater(len(with_digits), 50)
+        self.assertLessEqual({"bridge_read_failed:output_empty:x00000001:l0", "bridge_read_failed:output_empty:xe0434352:l0"}, set(with_digits))
+        run = self.GOOD_RUN
+        for code in codes:
+            with self.subTest(code=code):
+                value = {**run, "counts": {code: 1}, "alerts": [code], "stopped": code, "refs": [{"ref": "o-" + "a" * 20, "code": code}]}
+                self.checked(value)
+        for code in (codes[0], codes[-1], dl.bridge_failure_code(b"", 0xE0434352)):
+            self.checked({**run, "counts": {code: 1}, "alerts": [code], "stopped": code}, stored=True)
+            self.checked({**self.GOOD_DIGEST, "counts": {code: 2}, "alerts": {code: 2}, "alert_refs": [{"ref": "m-" + "b" * 20, "code": code}]})
+        # An allowlisted child code has no tail and passes as any code word.
+        self.checked({**run, "stopped": dl.bridge_failure_code(b'{"error": "bridge_failed"}', 1), "alerts": ["bridge_read_failed:member_no_invalid"]})
+        order = str(order_number(1))
+        tail = ":x00000001:l0"
+        bad = {
+            # the same tail on any other word
+            "the_tail_on_another_word": "write_failed:output_empty" + tail,
+            "the_tail_on_a_look_alike_prefix": "bridge_write_failed:output_empty" + tail,
+            "the_tail_on_a_longer_prefix": "bridge_read_failed_too:output_empty" + tail,
+            "the_tail_after_another_prefix": "uncertain:bridge_read_failed:output_empty" + tail,
+            "the_tail_alone": tail.lstrip(":"),
+            # a bridge_read_failed word with something private outside the tail
+            "part_of_an_order_number_before_the_tail": "bridge_read_failed:seen_" + order[-8:] + tail,
+            "a_whole_order_number_before_the_tail": "bridge_read_failed:" + order + tail,
+            "five_digits_before_the_tail": "bridge_read_failed:output_12345" + tail,
+            "four_digits_before_the_none_tail": "bridge_read_failed:output_2026:xnone:l0",
+            "a_name_before_the_tail": "bridge_read_failed:Fake Member 1" + tail,
+            "part_of_an_order_number_after_the_tail": "bridge_read_failed:output_empty" + tail + "_" + order[-6:],
+            "an_order_number_in_place_of_the_exit_code": "bridge_read_failed:output_empty:x" + order + ":l0",
+            # a tail that is almost the shape
+            "seven_hex_characters": "bridge_read_failed:output_empty:x0000001:l0",
+            "nine_hex_characters": "bridge_read_failed:output_empty:x000000001:l0",
+            "capital_hex_characters": "bridge_read_failed:output_empty:xE0434352:l0",
+            "a_letter_that_is_not_hex": "bridge_read_failed:output_empty:x0000000z:l0",
+            "an_underscore_in_the_exit_part": "bridge_read_failed:output_empty:x0000_001:l0",
+            "eight_digits_without_the_x": "bridge_read_failed:output_empty:00000001:l0",
+            "a_line_count_of_two_digits": "bridge_read_failed:output_empty:x00000001:l10",
+            "no_line_count": "bridge_read_failed:output_empty:x00000001",
+            "a_second_tail": "bridge_read_failed:output_empty" + tail + tail,
+            "the_tail_not_at_the_end": "bridge_read_failed" + tail + ":output_empty",
+            "the_tail_with_a_line_break_after_it": "bridge_read_failed:output_empty" + tail + "\n",
+            "the_two_parts_the_other_way_round": "bridge_read_failed:output_empty:l0:x00000001",
+        }
+        for name, word in bad.items():
+            for place in ("counts", "alerts", "stopped", "ref"):
+                value = {"counts": {**run, "counts": {word: 1}}, "alerts": {**run, "alerts": [word]}, "stopped": {**run, "stopped": word},
+                         "ref": {**run, "refs": [{"ref": "o-" + "a" * 20, "code": word}]}}[place]
+                with self.subTest(name=name, place=place):
+                    with self.assertRaises(AssertionError):
+                        self.checked(value)
+            with self.subTest(name=name, stored=True):
+                with self.assertRaises(AssertionError):
+                    self.checked({**run, "stopped": word}, stored=True)
+
+    def test_a_generic_bridge_failure_in_a_run_passes_the_check(self):
+        """The case that showed the need: an AutoCount read fails in a
+        generic way inside a run; the code reaches the stored run summary as
+        a count key, an alert code and the ``stopped`` text."""
+
+        self.guest_with_order(1)
+        for returncode in (1, 0xE0434352):
+            code = dl.bridge_failure_code(b"", returncode)
+            self.book.fail_read = code
+            self.assertEqual(self.code(lambda: self.engine().run(apply=True)), code)
+            stored = json.loads(self.ledger.conn.execute("SELECT summary FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()[0])
+            self.assertEqual((stored["stopped"], stored["alerts"], stored["counts"].get(code), stored["saves"]), (code, [code], 1, 0))
+            self.assert_outputs_private()
+            self.advance(minutes=15)
+        self.assertEqual((self.book.saves, self.receipt(1)["state"]), (0, "ready"))
 
 
 class ClassifySaveTests(unittest.TestCase):
