@@ -48,6 +48,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -89,12 +90,20 @@ REGISTRATION_TAG = sync.REGISTRATION_TAG  # the #155 sign-up marker
 REQUIRED_SCOPES = frozenset({"read_customers", "read_orders"})
 CURRENCY = "SGD"
 EXPIRY_MONTHS = 24
-SHOPIFY_ORDER_PAGE = 10  # x 50 lines: well inside the 1,000-point query cost
-SHOPIFY_LINE_PAGE = 50
-SHOPIFY_SHIPPING_PAGE = 5
+# Page sizes of ORDERS_QUERY. Shopify refuses a query whose requested cost is
+# over 1,000 points before it runs (shopify.dev, rate limits). On the strict
+# reading (every selected object counted once for each row of every connection
+# and list above it) the query costs
+#     2 + 5 x (10 + 6 x 20 + 3 x 3 + 3 x 10) = 847 points,
+# under the 900 this tool allows itself. The sum is written out line by line
+# in the runbook (section 9) and pinned by OrdersQueryCostTests: work it out
+# again before changing a size or the query text.
+SHOPIFY_ORDER_PAGE = 5
+SHOPIFY_LINE_PAGE = 20  # an order with more line items is amount_unverifiable
+SHOPIFY_SHIPPING_PAGE = 3
 # Order.transactions is a plain list cut to this size (no pageInfo), so a
 # list that comes back full cannot be shown to be complete.
-SHOPIFY_PAYMENT_PAGE = 25
+SHOPIFY_PAYMENT_PAGE = 10
 # The gift-card-paid amount: transactions that took money (a sale, or the
 # capture of an authorisation) and succeeded. A refund back to a gift card is
 # never added back.
@@ -181,7 +190,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # most once per this many hours, unless a link for its customer appears.
     "waiting_member_recheck_hours": 6,
     "signup_wait_hours": 48,
-    "shopify_max_pages": 10,
+    "shopify_max_pages": 20,  # x 5 orders a page: 100 orders a run, as before the page size was lowered
     "http_timeout_seconds": 30,
     # The #268 type move's state root: apply takes its lock, so the two tools
     # never write AutoCount members at the same time. Required for apply on
@@ -1007,13 +1016,13 @@ ORDERS_QUERY = """query XbMemberBenefitsOrders($first: Int!, $after: String, $se
       id createdAt updatedAt cancelledAt test displayFinancialStatus taxesIncluded currencyCode
       totalRefundedSet { """ + _MONEY + """ }
       customer { """ + _CUSTOMER_FIELDS + """ }
-      lineItems(first: 50) {
+      lineItems(first: """ + str(SHOPIFY_LINE_PAGE) + """) {
         pageInfo { hasNextPage }
         nodes { id quantity currentQuantity isGiftCard originalUnitPriceSet { """ + _MONEY + """ }
           discountAllocations { allocatedAmountSet { """ + _MONEY + """ } } }
       }
-      shippingLines(first: 5) { pageInfo { hasNextPage } nodes { originalPriceSet { """ + _MONEY + """ } } }
-      transactions(first: 25) { gateway kind status amountSet { """ + _MONEY + """ } }
+      shippingLines(first: """ + str(SHOPIFY_SHIPPING_PAGE) + """) { pageInfo { hasNextPage } nodes { originalPriceSet { """ + _MONEY + """ } } }
+      transactions(first: """ + str(SHOPIFY_PAYMENT_PAGE) + """) { gateway kind status amountSet { """ + _MONEY + """ } }
     }
   }
 }"""
@@ -1152,18 +1161,26 @@ class BenefitsShopifyClient(direct.ShopifyDirectClient):
             raise direct.ShopifyDirectError("shopify_token_scope_not_expected")
 
     last_end_cursor: str | None = None
+    last_orders_query_cost: float | None = None
 
     def orders(self, since: datetime, max_pages: int, after: str | None = None) -> tuple[list[Order], bool]:
         """Orders updated at or after ``since``, ascending by updatedAt,
         starting after ``after`` (a cursor kept from a read that ended at the
         page cap, G2 B3). ``last_end_cursor`` is the cursor to continue from
-        when the read ends at the page cap (``complete`` false)."""
+        when the read ends at the page cap (``complete`` false).
+        ``last_orders_query_cost`` is the largest requested cost Shopify
+        reported for a page of this read (``extensions.cost
+        .requestedQueryCost``, a number only), or None when it reported none."""
 
         search = f"updated_at:>='{since.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}'"
         orders: list[Order] = []
         self.last_end_cursor = None
+        self.last_orders_query_cost = None
         for _ in range(max_pages):
             data = self.execute(ORDERS_QUERY, {"first": SHOPIFY_ORDER_PAGE, "after": after, "search": search})
+            cost = self._throttle.requested_cost if self._throttle is not None else None
+            if cost is not None and (self.last_orders_query_cost is None or cost > self.last_orders_query_cost):
+                self.last_orders_query_cost = cost
             page = data.get("orders")
             _shape(isinstance(page, dict) and isinstance(page.get("nodes"), list) and isinstance(page.get("pageInfo"), dict))
             orders.extend(order_from_node(node) for node in page["nodes"])
@@ -1461,6 +1478,9 @@ class RunSummary:
     refs: list[dict[str, str]] = field(default_factory=list)
     saves: int = 0
     stopped: str | None = None
+    # Shopify's requested cost of the orders query on this run, in whole
+    # points (to compare with the calculated 847); None when none was reported.
+    orders_query_cost: int | None = None
 
     def count(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
         self.counts[code] = self.counts.get(code, 0) + 1
@@ -1476,8 +1496,20 @@ class RunSummary:
             self.alerts.append(code)
 
     def result(self, run_id: str) -> dict[str, Any]:
-        return {"status": "ok", "command": self.command, "run_id": run_id, "saves": self.saves, "counts": dict(sorted(self.counts.items())),
-                "alerts": list(self.alerts), "refs": list(self.refs), "stopped": self.stopped}
+        result = {"status": "ok", "command": self.command, "run_id": run_id, "saves": self.saves, "counts": dict(sorted(self.counts.items())),
+                  "alerts": list(self.alerts), "refs": list(self.refs), "stopped": self.stopped}
+        if self.command in ("observe", "apply"):  # the commands that read orders
+            result["orders_query_cost"] = self.orders_query_cost
+        return result
+
+
+def whole_points(value: Any) -> int | None:
+    """A query cost as a whole number of points, rounded up; None for
+    anything that is not a plain number from 0 to 1,000,000 (never text)."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1_000_000:  # NaN fails the comparison
+        return None
+    return math.ceil(value)
 
 
 class _Budget(Exception):
@@ -1578,6 +1610,7 @@ class BenefitsEngine:
                 self.ledger.clear_watermark(RESUME_MARK)
             raise
         self._read_state = (since, complete, None if complete else getattr(self.shopify, "last_end_cursor", None))
+        summary.orders_query_cost = whole_points(getattr(self.shopify, "last_orders_query_cost", None))
         summary.counts["orders_read"] = len(orders)
         if resume is not None:
             summary.count("orders_read_resumed")

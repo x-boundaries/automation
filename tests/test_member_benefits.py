@@ -57,12 +57,25 @@ def sg(n: int) -> str:
     return "65" + local(n)
 
 
+def customer_number(n: int) -> int:
+    """A fake customer ID of 16 digits, built in code. The CLI privacy tests
+    look for the bare number in output that also holds random hex (run ids,
+    keyed refs): 16 digits cannot turn up there by chance (odds below 1 in
+    10**15 a run), where the four digits used before did about once in 75."""
+    return 10 ** 15 + n
+
+
+def order_number(n: int) -> int:
+    """A fake order ID of 16 digits, as ``customer_number``."""
+    return 5 * 10 ** 15 + n
+
+
 def customer_gid(n: int) -> str:
-    return f"gid://shopify/Customer/{1000 + n}"
+    return f"gid://shopify/Customer/{customer_number(n)}"
 
 
 def order_gid(n: int) -> str:
-    return f"gid://shopify/Order/{5000 + n}"
+    return f"gid://shopify/Order/{order_number(n)}"
 
 
 def money(amount: str) -> dict:
@@ -295,7 +308,8 @@ class Base(unittest.TestCase):
         output carries keyed refs and masked MemberNos only, and no order
         ID, customer ID or full MemberNo anywhere. Slice A: a payment gateway
         name leaves the tool only as a checked code word, and a name in the
-        ledger that is not one appears in no output."""
+        ledger that is not one appears in no output. Slice A2: the query
+        cost of a run is a whole number of points or nothing."""
 
         outputs = [("cli", value) for value in self.emitted]
         private = {m for m in self.book.members}
@@ -332,6 +346,9 @@ class Base(unittest.TestCase):
                     self.assertIsInstance(number, int, kind)
             for name in (value.get("gift_card_gateways") or []) if isinstance(value, dict) else []:
                 self.assertRegex(name, self.PRIVATE_CODE_RE, kind)
+            if isinstance(value, dict) and "orders_query_cost" in value:
+                cost = value["orders_query_cost"]
+                self.assertTrue(cost is None or (type(cost) is int and 0 <= cost <= 1_000_000), kind)
 
     def cfg(self, **overrides) -> bm.BenefitsConfig:
         return bm.parse_config(raw_config(self.root, self.sync_root, **overrides))
@@ -1822,7 +1839,8 @@ class CliTests(Base):
         joined = "".join(texts)
         for n in (1, 2, 3):
             self.assertNotIn(order_gid(n), joined)
-            self.assertNotIn(str(5000 + n), joined)
+            self.assertNotIn(str(order_number(n)), joined)
+            self.assertNotIn(str(customer_number(n)), joined)
         self.assertIn("refund_on_basis", out["alerts"])
         codes = {r["code"] for r in json.loads(texts[1].strip().splitlines()[-1])["refs"]} | {r["code"] for r in out["refs"]}
         self.assertLessEqual({"refund_on_basis", "order_amount_unverifiable", "refund_unattributed"}, codes)
@@ -1867,7 +1885,7 @@ class CliTests(Base):
                 self.assertRegex(entry["member_no_masked"], r"^\*{3,}[^*]{1,3}$")
         joined = "".join(texts)
         for n in (1, 2, 3):
-            for secret in (order_gid(n), customer_gid(n), str(5000 + n), sg(n), local(n), f"Fake Member {n}"):
+            for secret in (order_gid(n), customer_gid(n), str(order_number(n)), str(customer_number(n)), sg(n), local(n), f"Fake Member {n}"):
                 self.assertNotIn(secret, joined)
         self.assertEqual((self.book.saves, len(self.book.payloads)), (2, 2))
 
@@ -1974,8 +1992,8 @@ class GiftCardRuleTests(Base):
             "unknown": (tx("150.00", status="UNKNOWN"), card("250.00")),
             "a_status_this_tool_does_not_know": (tx("150.00", status="SOMETHING_NEW"), card("250.00")),
             "a_pending_capture": (tx("150.00", kind="CAPTURE", status="PENDING"),),
-            "a_full_list_of_25": tuple(card("16.00") for _ in range(25)),
-            "more_than_25": tuple(card("16.00") for _ in range(26)),
+            "a_full_list_of_10": tuple(card("40.00") for _ in range(10)),
+            "more_than_10": tuple(card("16.00") for _ in range(11)),
             "gift_card_amount_not_sgd": (tx("150.00", currency="USD"), card("250.00")),
             "card_amount_not_sgd": (tx("150.00"), card("250.00", currency="USD")),
             "amount_malformed": (tx("abc"), card("250.00")),
@@ -1988,8 +2006,8 @@ class GiftCardRuleTests(Base):
             with self.subTest(name=name):
                 self.assertEqual(self.measured(goods_400, transactions), (None, None))
         # One short of a full list is read as usual.
-        self.assertEqual(self.measured(goods_400, tuple(card("16.00") for _ in range(23)) + (tx("150.00"),)), (15000, (40000, 25000)))
-        self.assertEqual(bm.SHOPIFY_PAYMENT_PAGE, 25)
+        self.assertEqual(self.measured(goods_400, tuple(card("16.00") for _ in range(8)) + (tx("150.00"),)), (15000, (40000, 25000)))
+        self.assertEqual(bm.SHOPIFY_PAYMENT_PAGE, 10)
 
     def test_a_malformed_transaction_list_fails_the_read(self):
         missing = order_node(1)
@@ -2009,7 +2027,7 @@ class GiftCardRuleTests(Base):
                 self.assertEqual(caught.exception.code, "shopify_response_shape_invalid")
 
     def test_the_orders_query_reads_the_transactions_and_the_scopes_are_unchanged(self):
-        self.assertIn("transactions(first: 25) { gateway kind status amountSet { shopMoney { amount currencyCode } } }", bm.ORDERS_QUERY)
+        self.assertIn("transactions(first: 10) { gateway kind status amountSet { shopMoney { amount currencyCode } } }", bm.ORDERS_QUERY)
         self.assertEqual(bm.REQUIRED_SCOPES, frozenset({"read_orders", "read_customers"}))
         page = {"data": {"orders": {"pageInfo": {"hasNextPage": False, "endCursor": None},
                                     "nodes": [order_node(1, transactions=(tx("150.00", gateway="Gift_Card"), card("150.00", kind="CAPTURE")))]}}}
@@ -2031,7 +2049,8 @@ class GiftCardRuleTests(Base):
         five = ["gift_card", "store_credit", "a", "b_2", "c" * 64]
         self.assertEqual(self.cfg(gift_card_gateways=five).gift_card_gateways, tuple(five))
         self.assertIs(self.cfg(amount_exclude_gift_cards=True).amount_exclude_gift_cards, True)
-        refused = [[], five + ["d"], ["Gift_Card"], ["gift card"], ["gift-card"], [""], ["c" * 65], "gift_card", [7], [None], None, {"gift_card": True}]
+        refused = [[], five + ["d"], ["Gift_Card"], ["gift card"], ["gift-card"], [""], ["c" * 65], "gift_card", "abc", "a", [7], [None], None,
+                   {"gift_card": True}, {"a": 1}]
         for value in refused:
             with self.subTest(value=value):
                 self.assertEqual(self.code(lambda: self.cfg(gift_card_gateways=value)), "benefits_config_gift_card_gateways_invalid")
@@ -2241,6 +2260,312 @@ class B9Tests(Base):
         self.assertEqual((code, result["resolved"], result["alerts"]), (3, {"HELD:resolved_unclear": 1}, ["resolved_unclear"]))
         self.assertNotIn(member_no, text)
         self.assertEqual(stored_receipt(self.root, 1, "state"), "ready")
+
+
+# --------------------------------------------------------------------------
+# #268 slice A2 (11 Nov 2026): the orders query must fit Shopify's query cost
+# limit on the strict reading; the requested cost Shopify reports is kept on
+# the run; a refused query moves nothing; two test gaps of the PR #300 review.
+# --------------------------------------------------------------------------
+
+_QUERY_TOKEN_RE = re.compile(r"\(([^()]*)\)|([{}])|([A-Za-z_][A-Za-z0-9_]*)(:?)")
+
+
+def parse_selection(query: str) -> list:
+    """The fields of one GraphQL operation as ``(name, arguments, children)``.
+    ``children`` is None for a field with no selection (a scalar or an enum);
+    an alias is dropped in favour of the field it names."""
+
+    body = query[query.index("{"):]
+    assert not _QUERY_TOKEN_RE.sub("", body).strip(), "query text this parser does not read"
+    tokens = [match.groups() for match in _QUERY_TOKEN_RE.finditer(body)]
+    position = 1
+
+    def fields() -> list:
+        nonlocal position
+        found = []
+        while position < len(tokens):
+            arguments, brace, name, alias = tokens[position]
+            position += 1
+            if brace == "}":
+                return found
+            assert name, "a field name was expected"
+            if alias:
+                continue
+            arguments = ""
+            if position < len(tokens) and tokens[position][0] is not None:
+                arguments = tokens[position][0]
+                position += 1
+            children = None
+            if position < len(tokens) and tokens[position][1] == "{":
+                position += 1
+                children = fields()
+            found.append((name, arguments, children))
+        raise AssertionError("a selection was not closed")
+
+    assert tokens[0][1] == "{"
+    top = fields()
+    assert position == len(tokens), "text after the operation"
+    return top
+
+
+def strict_cost(fields: list, order_page: int) -> int:
+    """The requested cost on the strict reading of shopify.dev's rate limits
+    page: a scalar or an enum costs 0 and an object 1; every selected object
+    is counted once for each row of every connection and list above it; a
+    connection is its own object, plus what it selects beside ``nodes``, plus
+    ``first`` rows; a plain list with ``first`` is ``first`` rows. A list
+    with no size argument (``discountAllocations``) has no size to count and
+    is taken as one row."""
+
+    total = 0
+    for _name, arguments, children in fields:
+        if children is None:
+            continue
+        size = re.search(r"\bfirst: (\$first|[0-9]+)", arguments)
+        rows = None if size is None else order_page if size.group(1) == "$first" else int(size.group(1))
+        nodes = [child for child in children if child[0] == "nodes"]
+        if rows is not None and nodes:
+            ((_, _, row),) = nodes
+            total += 1 + strict_cost([child for child in children if child[0] != "nodes"], order_page) + rows * (1 + strict_cost(row, order_page))
+        elif rows is not None:
+            total += rows * (1 + strict_cost(children, order_page))
+        else:
+            total += 1 + strict_cost(children, order_page)
+    return total
+
+
+def shopify_cost(requested, actual=12) -> dict:
+    """``extensions.cost`` in the shape shown on shopify.dev (rate limits)."""
+    return {"requestedQueryCost": requested, "actualQueryCost": actual,
+            "throttleStatus": {"maximumAvailable": 2000.0, "currentlyAvailable": 1988, "restoreRate": 100.0}}
+
+
+def orders_page(nodes, *, more: str | None = None, cost: dict | None = None) -> tuple[int, dict]:
+    value: dict = {"data": {"orders": {"pageInfo": {"hasNextPage": more is not None, "endCursor": more}, "nodes": list(nodes)}}}
+    if cost is not None:
+        value["extensions"] = {"cost": cost}
+    return 200, value
+
+
+class OrdersQueryCostTests(Base):
+    run_main = CliTests.run_main
+    SHOPIFY_LIMIT = 1000  # shopify.dev: a single query may not exceed 1,000 points
+    CEILING = 900  # this tool's own ceiling on the strict reading
+    STRICT_COST = 847  # work it out again (runbook section 9) before changing a page size or the query text
+
+    def real_client(self, responses) -> tuple[bm.BenefitsShopifyClient, FakeTransport]:
+        transport = FakeTransport(responses)
+        client = bm.BenefitsShopifyClient(shop_domain=SHOP, api_version="2026-10", token_provider=direct.StaticTokenProvider("t" * 32),
+                                          transport=transport, sleep=lambda s: None)
+        return client, transport
+
+    def factory(self, client):
+        return lambda config, ledger: bm.BenefitsEngine(config, ledger, shopify=client, ac2=self.book, sync_links=self.sync_links,
+                                                        writer_probe=lambda pid, created: "exited")
+
+    def ledger_rows(self) -> dict[str, int]:
+        conn = sqlite3.connect((self.root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("receipts", "watermarks", "runs", "claim_links", "writes")}
+        finally:
+            conn.close()
+
+    # -- the calculated cost ---------------------------------------------------
+    def test_the_page_sizes_and_the_strict_cost_of_the_orders_query_are_pinned(self):
+        self.assertEqual((bm.SHOPIFY_ORDER_PAGE, bm.SHOPIFY_LINE_PAGE, bm.SHOPIFY_SHIPPING_PAGE, bm.SHOPIFY_PAYMENT_PAGE), (5, 20, 3, 10))
+        for text in ("orders(first: $first, after: $after, sortKey: UPDATED_AT, query: $search) {", "lineItems(first: 20) {",
+                     "shippingLines(first: 3) {", "transactions(first: 10) {", "discountAllocations { allocatedAmountSet {"):
+            self.assertIn(text, bm.ORDERS_QUERY)
+        self.assertNotIn("last:", bm.ORDERS_QUERY)  # every size is a ``first``
+        page = bm.SHOPIFY_ORDER_PAGE
+        ((name, _, orders),) = parse_selection(bm.ORDERS_QUERY)
+        self.assertEqual(name, "orders")
+        ((_, _, order_row),) = [child for child in orders if child[0] == "nodes"]
+        # Line by line, as the runbook (section 9). One order row:
+        self.assertEqual({field[0]: strict_cost([field], page) for field in order_row if field[2] is not None},
+                         {"totalRefundedSet": 2,     # MoneyBag + MoneyV2
+                          "customer": 3,             # Customer + CustomerPhoneNumber + Metafield
+                          "lineItems": 122,          # connection 1 + pageInfo 1 + 20 x 6
+                          "shippingLines": 11,       # connection 1 + pageInfo 1 + 3 x 3
+                          "transactions": 30})       # 10 x 3, a plain list
+        by_name = {field[0]: field for field in order_row}
+        ((_, _, line_row),) = [child for child in by_name["lineItems"][2] if child[0] == "nodes"]
+        ((_, _, shipping_row),) = [child for child in by_name["shippingLines"][2] if child[0] == "nodes"]
+        self.assertEqual((1 + strict_cost(line_row, page), 1 + strict_cost(shipping_row, page), 1 + strict_cost(by_name["transactions"][2], page)),
+                         (6, 3, 3))  # LineItem + price 2 + one discount allocation 3; ShippingLine + price 2; OrderTransaction + amount 2
+        self.assertEqual(1 + strict_cost(order_row, page), 169)  # the Order itself + 2 + 3 + 122 + 11 + 30
+        total = strict_cost(parse_selection(bm.ORDERS_QUERY), page)
+        self.assertEqual(total, 2 + 5 * 169)  # the orders connection + its pageInfo + 5 order rows
+        self.assertEqual(total, self.STRICT_COST)
+        self.assertLessEqual(total, self.CEILING)
+        self.assertLess(self.CEILING, self.SHOPIFY_LIMIT)
+        # The same sum for the sizes of PR #300 (10 orders, 50 lines, 5 shipping lines, 25 transactions).
+        before = bm.ORDERS_QUERY.replace("lineItems(first: 20)", "lineItems(first: 50)").replace(
+            "shippingLines(first: 3)", "shippingLines(first: 5)").replace("transactions(first: 10)", "transactions(first: 25)")
+        self.assertEqual(strict_cost(parse_selection(before), 10), 4002)
+        # The two small reads of this tool.
+        self.assertEqual((strict_cost(parse_selection(bm.CUSTOMER_QUERY), page), strict_cost(parse_selection(bm.PHONE_LOOKUP_QUERY), page)), (3, 12))
+
+    def test_one_run_still_reaches_as_many_orders_as_before(self):
+        cfg = self.cfg()
+        self.assertEqual((cfg.shopify_max_pages, bm._CONFIG_DEFAULTS["shopify_max_pages"], bm._BOUNDS["shopify_max_pages"]), (20, 20, (1, 40)))
+        self.assertEqual(bm.SHOPIFY_ORDER_PAGE * cfg.shopify_max_pages, 100)  # 10 pages x 10 orders before
+        self.assertEqual(bm.SHOPIFY_ORDER_PAGE * bm._BOUNDS["shopify_max_pages"][1], 200)  # at the hard maximum (400 before)
+        for n in range(100, 201):  # 101 small orders
+            self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), updated=f"2026-11-18T03:30:{n % 60:02d}Z"))
+        out = self.engine().run(apply=False)
+        self.assertEqual((out["counts"]["orders_read"], out["alerts"]), (100, ["orders_read_incomplete"]))
+        out = self.engine().run(apply=False)
+        self.assertEqual((out["counts"]["orders_read"], out["counts"].get("orders_read_resumed"), out["alerts"]), (1, 1, []))
+
+    def test_an_order_with_more_rows_than_a_page_is_held_for_a_person(self):
+        twenty = tuple(("20.00", 1, 1, False, ()) for _ in range(20))
+        goods_400 = (("400.00", 1, 1, False, ()),)
+        self.guest_with_order(1, lines=twenty)  # 20 line items: read in full, S$400.00
+        self.guest_with_order(2, lines=twenty, more_lines=True)  # a 21st line item was not returned
+        self.guest_with_order(3, lines=goods_400, transactions=tuple(card("50.00") for _ in range(8)) + (tx("0.00"),))  # 9 transactions
+        self.guest_with_order(4, lines=goods_400, transactions=tuple(card("40.00") for _ in range(10)))  # 10: the list may be cut short
+        out = self.engine().run(apply=True)
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2, 3, 4)],
+                         [("applied", "upgrade"), ("amount_unverifiable", "currency_or_lines"), ("applied", "upgrade"),
+                          ("amount_unverifiable", "payments_unreadable")])
+        self.assertEqual((out["alerts"], out["counts"]["order_amount_unverifiable"], out["saves"], self.book.reads), (["order_amount_unverifiable"], 2, 2, 2))
+        self.assertEqual([self.receipt(n)["net_cents"] for n in (1, 2, 3, 4)], [40000, None, 40000, None])
+
+    # -- the measured cost -----------------------------------------------------
+    def test_whole_points(self):
+        cases = [(847, 847), (847.0, 847), (846.5, 847), (0, 0), (0.2, 1), (1_000_000, 1_000_000), (None, None), ("847", None), (True, None),
+                 (False, None), (-1, None), (-0.5, None), (1_000_000.5, None), (float("nan"), None), (float("inf"), None), ([847], None), ({}, None)]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                got = bm.whole_points(value)
+                self.assertEqual(got, expected)
+                self.assertIs(type(got), int if expected is not None else type(None))
+
+    def test_the_client_keeps_the_requested_cost_of_the_orders_read_only(self):
+        session = ShopifyClientTests.session(["read_orders", "read_customers"])
+        session[1]["extensions"] = {"cost": shopify_cost(2, 2)}
+        client, _ = self.real_client([session, orders_page([order_node(1)], more="c1", cost=shopify_cost(412, 30)),
+                                      orders_page([order_node(2)], more="c2", cost=shopify_cost(847, 41)), orders_page([order_node(3)])])
+        self.assertIsNone(client.last_orders_query_cost)
+        client.verify_session(store_gid=STORE_GID)
+        self.assertIsNone(client.last_orders_query_cost)  # the session check is not the orders read
+        orders, complete = client.orders(dl.parse_created_at(START), 5)
+        self.assertEqual((len(orders), complete, client.last_orders_query_cost), (3, True, 847))  # the largest of the pages; not the actual cost
+        # A read whose responses carry no cost reports none (never the figure of an earlier read).
+        client, _ = self.real_client([session, orders_page([order_node(1)], more="c1", cost=shopify_cost(847)), orders_page([order_node(2)])])
+        client.verify_session(store_gid=STORE_GID)
+        client.orders(dl.parse_created_at(START), 1)
+        self.assertEqual(client.last_orders_query_cost, 847)
+        client.orders(dl.parse_created_at(START), 1, after="c1")
+        self.assertIsNone(client.last_orders_query_cost)
+        # A cost that is not a number is no cost.
+        client, _ = self.real_client([orders_page([order_node(1)], cost=shopify_cost("847"))])
+        client.orders(dl.parse_created_at(START), 1)
+        self.assertIsNone(client.last_orders_query_cost)
+
+    def test_the_run_output_and_the_stored_summary_carry_the_cost_as_a_whole_number(self):
+        self.guest_with_order(1)
+        nodes = list(self.shopify.orders_nodes.values())
+        self.run_main("init")
+        for requested, expected in ((846.5, 847), (None, None)):
+            with self.subTest(requested=requested):
+                self.advance(minutes=15)
+                client, transport = self.real_client([ShopifyClientTests.session(["read_orders", "read_customers"]),
+                                                      orders_page(nodes, cost=None if requested is None else shopify_cost(requested))])
+                code, out, text = self.run_main("observe", factory=self.factory(client))
+                self.assertEqual((code, out["status"], out["counts"]["orders_read"]), (0, "ok", 1))
+                self.assertIn("orders_query_cost", out)
+                self.assertEqual(out["orders_query_cost"], expected)
+                self.assertIs(type(out["orders_query_cost"]), int if expected is not None else type(None))
+                self.assertIn('"orders_query_cost":' + ("847," if expected else "null,"), text)  # as printed: digits only, or null
+                conn = sqlite3.connect((self.root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+                try:
+                    stored = json.loads(conn.execute("SELECT summary FROM runs WHERE run_id = ?", (out["run_id"],)).fetchone()[0])
+                finally:
+                    conn.close()
+                self.assertEqual(stored["orders_query_cost"], expected)
+                self.assertEqual(transport.bodies[1]["query"], bm.ORDERS_QUERY)
+
+    def test_the_engine_takes_a_whole_number_only_and_the_index_reports_no_cost(self):
+        self.guest_with_order(1)
+        out = self.engine().run(apply=False)  # a reader that reports no cost at all
+        self.assertEqual((out["orders_query_cost"], "orders_query_cost" in out), (None, True))
+        for value, expected in ((846.5, 847), ("847 points", None), (True, None), (847, 847)):
+            with self.subTest(value=value):
+                self.advance(minutes=15)
+                self.shopify.last_orders_query_cost = value
+                out = self.engine().run(apply=True)
+                self.assertEqual(out["orders_query_cost"], expected)
+                self.assertIs(type(out["orders_query_cost"]), int if expected is not None else type(None))
+        self.assertNotIn("orders_query_cost", self.engine().index(apply=False, max_members=1))
+
+    # -- a refused query -------------------------------------------------------
+    def test_a_query_refused_for_its_cost_moves_nothing_and_ends_with_one_code(self):
+        """shopify.dev does not show what a cost refusal looks like. Whatever
+        its body, an answer with GraphQL ``errors`` (with or without data
+        beside it, with or without a cost) is ``shopify_graphql_error``: not
+        sent again, exit 2, nothing recorded and no watermark moved."""
+
+        self.guest_with_order(1)
+        nodes = list(self.shopify.orders_nodes.values())
+        refusals = {
+            "errors_only": {"errors": [{"message": "fake refusal", "extensions": {"code": "FAKE_QUERY_COST_REFUSAL", "cost": 1002, "maxCost": 1000}}]},
+            "errors_without_a_code": {"errors": [{"message": "fake refusal"}]},
+            "errors_beside_data": {"errors": [{"message": "fake refusal"}], **orders_page(nodes)[1]},
+            "errors_beside_a_cost": {"errors": [{"message": "fake refusal"}], "extensions": {"cost": shopify_cost(1002)}},
+        }
+        self.run_main("init")
+        self.assertEqual(self.ledger_rows(), {"receipts": 0, "watermarks": 0, "runs": 0, "claim_links": 0, "writes": 0})
+        for command in ("observe", "apply"):
+            for name, body in refusals.items():
+                with self.subTest(command=command, name=name):
+                    client, transport = self.real_client([ShopifyClientTests.session(["read_orders", "read_customers"]), (200, body)])
+                    code, out, _ = self.run_main(command, factory=self.factory(client))
+                    self.assertEqual((code, out), (2, {"status": "refused", "code": "shopify_graphql_error"}))
+                    self.assertEqual(len(transport.bodies), 2)  # the session check and one orders query
+                    self.assertEqual(self.ledger_rows(), {"receipts": 0, "watermarks": 0, "runs": 0, "claim_links": 0, "writes": 0})
+                    self.assertEqual((self.book.reads, self.book.saves), (0, 0))
+        # The same order is read and decided once Shopify answers.
+        client, _ = self.real_client([ShopifyClientTests.session(["read_orders", "read_customers"]), orders_page(nodes, cost=shopify_cost(847))])
+        code, out, _ = self.run_main("apply", factory=self.factory(client))
+        self.assertEqual((code, out["saves"], out["orders_query_cost"], self.ledger_rows()["receipts"]), (0, 1, 847, 1))
+
+    # -- test gaps of the PR #300 review (LATER 7: P43, P52; P35 is in test_gift_card_settings) --
+    def test_p43_p52_a_decided_receipt_read_again_with_unreadable_payments_keeps_its_amounts(self):
+        goods_500 = (("500.00", 1, 1, False, ()),)
+        paid = (tx("200.00"), card("300.00"))
+        refund = dict(status="PARTIALLY_REFUNDED", refunded="50.00")  # by money, no unit: held before the decision
+        self.guest_with_order(1, lines=goods_500, transactions=paid)
+        self.guest_with_order(2, lines=goods_500, transactions=paid, **refund)
+        engine = self.engine()
+        engine.run(apply=True)
+
+        def rows():
+            return [(self.receipt(n)["state"], self.receipt(n)["code"], self.receipt(n)["gross_cents"], self.receipt(n)["net_cents"],
+                     self.receipt(n)["gift_card_cents"]) for n in (1, 2)]
+        decided = [("applied", "upgrade", 50000, 30000, 20000), ("held", "refund_unattributed", 50000, 30000, 20000)]
+        self.assertEqual(rows(), decided)
+        unreadable = {
+            "a_pending_gift_card_payment": (tx("200.00", status="PENDING"), card("300.00")),
+            "a_full_transaction_list": tuple(card("50.00") for _ in range(10)),
+            "an_amount_that_is_not_sgd": (tx("200.00", currency="USD"), card("300.00")),
+        }
+        for name, transactions in unreadable.items():
+            with self.subTest(name=name):
+                self.advance(minutes=15)
+                self.shopify.add(order_node(1, lines=goods_500, transactions=transactions, updated=dl.ts(self.now)))
+                self.shopify.add(order_node(2, lines=goods_500, transactions=transactions, updated=dl.ts(self.now), **refund))
+                out = engine.run(apply=True)
+                self.assertEqual((out["alerts"], out["saves"], out["counts"].get("receipt_replayed"), out["counts"].get("refund_recorded")), ([], 0, 1, 1))
+                self.assertEqual(rows(), decided)  # the amounts as last measured, not blanks
+        self.assertEqual((self.book.saves, self.book.members[sg(1)]["type"], self.book.members[sg(2)]["type"]), (1, "MEMBER", "GUEST"))
+        # A readable replay is still taken: the gift card part grows by S$10.00.
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, lines=goods_500, transactions=(tx("210.00"), card("290.00")), updated=dl.ts(self.now)))
+        engine.run(apply=True)
+        self.assertEqual((self.receipt(1)["net_cents"], self.receipt(1)["gift_card_cents"]), (29000, 21000))
 
 
 class ClassifySaveTests(unittest.TestCase):
