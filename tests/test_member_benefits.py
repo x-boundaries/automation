@@ -76,9 +76,19 @@ def customer_node(n: int, *, tags=("member-mg",), registration: str | None = SIG
             "registration": None if registration is None else {"createdAt": registration}}
 
 
+def tx(amount: str, gateway: str | None = "gift_card", kind: str = "SALE", status: str = "SUCCESS", currency: str = "SGD") -> dict:
+    """One ``OrderTransaction`` in the documented 2026-10 shape (a gift card payment unless told otherwise)."""
+    return {"gateway": gateway, "kind": kind, "status": status, "amountSet": {"shopMoney": {"amount": amount, "currencyCode": currency}}}
+
+
+def card(amount: str, **fields) -> dict:
+    """A payment by card (any gateway that is not a gift card)."""
+    return tx(amount, gateway="shopify_payments", **fields)
+
+
 def order_node(n: int, *, customer: dict | None | str = "default", lines=(("300.00", 1, 1, False, ()),), shipping=("15.00",),
                created: str = ORDER_AT, updated: str | None = None, status: str = "PAID", test: bool = False, cancelled: str | None = None,
-               taxes: bool = True, currency: str = "SGD", refunded: str = "0.00", more_lines: bool = False) -> dict:
+               taxes: bool = True, currency: str = "SGD", refunded: str = "0.00", more_lines: bool = False, transactions=()) -> dict:
     nodes = []
     for index, (unit, quantity, current, gift, discounts) in enumerate(lines):
         nodes.append({"id": f"gid://shopify/LineItem/{9000 + n * 10 + index}", "quantity": quantity, "currentQuantity": current, "isGiftCard": gift,
@@ -90,6 +100,7 @@ def order_node(n: int, *, customer: dict | None | str = "default", lines=(("300.
         "customer": customer_node(n) if customer == "default" else customer,
         "lineItems": {"pageInfo": {"hasNextPage": more_lines}, "nodes": nodes},
         "shippingLines": {"pageInfo": {"hasNextPage": False}, "nodes": [{"originalPriceSet": money(s)} for s in shipping]},
+        "transactions": [dict(t) for t in transactions],
     }
 
 
@@ -274,6 +285,7 @@ class Base(unittest.TestCase):
 
     PRIVATE_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{20}$")
     PRIVATE_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
+    PRIVATE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -281,7 +293,9 @@ class Base(unittest.TestCase):
     def assert_outputs_private(self) -> None:
         """G2 B7, after every test: every stored run summary and every CLI
         output carries keyed refs and masked MemberNos only, and no order
-        ID, customer ID or full MemberNo anywhere."""
+        ID, customer ID or full MemberNo anywhere. Slice A: a payment gateway
+        name leaves the tool only as a checked code word, and a name in the
+        ledger that is not one appears in no output."""
 
         outputs = [("cli", value) for value in self.emitted]
         private = {m for m in self.book.members}
@@ -294,6 +308,8 @@ class Base(unittest.TestCase):
                     for sql in ("SELECT order_gid FROM receipts", "SELECT customer_gid FROM receipts", "SELECT member_no FROM receipts",
                                 "SELECT customer_gid FROM claim_links", "SELECT member_no FROM claim_links", "SELECT member_no FROM writes"):
                         private |= {r[0] for r in conn.execute(sql) if r[0]}
+                    for (names,) in conn.execute("SELECT payment_gateways FROM receipts WHERE payment_gateways IS NOT NULL"):
+                        private |= {name for name in json.loads(names) if not self.PRIVATE_CODE_RE.fullmatch(name)}
             finally:
                 conn.close()
         private = {value for value in private if len(value) >= 6}
@@ -308,6 +324,14 @@ class Base(unittest.TestCase):
                 self.assertRegex(entry["ref"], self.PRIVATE_REF_RE, kind)
                 if "member_no_masked" in entry:
                     self.assertRegex(entry["member_no_masked"], self.PRIVATE_MASK_RE, kind)
+            if isinstance(value, dict) and "gift_cards" in value:
+                self.assertEqual(set(value["gift_cards"]), {"receipts_paid_by_gift_card", "gateways_seen"}, kind)
+                self.assertIsInstance(value["gift_cards"]["receipts_paid_by_gift_card"], int, kind)
+                for name, number in value["gift_cards"]["gateways_seen"].items():
+                    self.assertRegex(name, self.PRIVATE_CODE_RE, kind)
+                    self.assertIsInstance(number, int, kind)
+            for name in (value.get("gift_card_gateways") or []) if isinstance(value, dict) else []:
+                self.assertRegex(name, self.PRIVATE_CODE_RE, kind)
 
     def cfg(self, **overrides) -> bm.BenefitsConfig:
         return bm.parse_config(raw_config(self.root, self.sync_root, **overrides))
@@ -366,8 +390,8 @@ class RuleTests(Base):
             ("after_discounts_option", (("300.00", 1, 1, False, ("17.00",)),), (), {"amount_before_discounts": False}, (28300, 28300)),
             ("shipping_excluded", (("295.00", 1, 1, False, ()),), ("15.00",), {}, (29500, 29500)),
             ("shipping_included_option", (("295.00", 1, 1, False, ()),), ("15.00",), {"amount_exclude_shipping": False}, (31000, 31000)),
-            ("gift_card_excluded", (("250.00", 1, 1, False, ()), ("100.00", 1, 1, True, ())), (), {}, (25000, 25000)),
-            ("gift_card_included_option", (("250.00", 1, 1, False, ()), ("100.00", 1, 1, True, ())), (), {"amount_exclude_gift_cards": False}, (35000, 35000)),
+            ("gift_card_excluded_option", (("250.00", 1, 1, False, ()), ("100.00", 1, 1, True, ())), (), {"amount_exclude_gift_cards": True}, (25000, 25000)),
+            ("gift_card_line_counts", (("250.00", 1, 1, False, ()), ("100.00", 1, 1, True, ())), (), {}, (35000, 35000)),
             ("several_lines_and_units", (("100.00", 2, 2, False, ()), ("100.00", 1, 1, False, ())), (), {}, (30000, 30000)),
             ("refunded_unit_netted", (("100.00", 3, 2, False, ()),), (), {}, (30000, 20000)),
             ("sale_item_counts", (("150.00", 2, 2, False, ()),), (), {}, (30000, 30000)),
@@ -1537,7 +1561,9 @@ class ConfigTests(Base):
                 cfg = bm.load_config(ROOT / "config" / name)
                 self.assertFalse(cfg.benefits_write_enabled)
                 self.assertEqual((cfg.max_upgrades_per_run, cfg.qualify_threshold_cents, cfg.shopify.api_version), (3, 30000, "2026-10"))
-                self.assertTrue(cfg.amount_before_discounts and cfg.amount_exclude_shipping and cfg.amount_exclude_gift_cards and cfg.same_day_signup_counts)
+                self.assertTrue(cfg.amount_before_discounts and cfg.amount_exclude_shipping and cfg.same_day_signup_counts)
+                self.assertIs(cfg.amount_exclude_gift_cards, False)
+                self.assertEqual(cfg.gift_card_gateways, ("gift_card",))
 
     def test_other_tools_configs_are_refused_both_ways(self):
         for name in ("member_sync.example.json", "member_type_move.example.json"):
@@ -1857,6 +1883,364 @@ class CliTests(Base):
         other = {"shopify": {"store_gid": "gid://shopify/Shop/2", "shop_domain": SHOP, "api_version": "2026-10",
                              "auth": {"method": "client_credentials", "client_id_env": "XB_SHOPIFY_BENEFITS_CLIENT_ID", "client_secret_env": "XB_SHOPIFY_BENEFITS_CLIENT_SECRET"}}}
         self.assertEqual(self.run_main("status", cfg=other)[:2], (2, {"status": "refused", "code": "benefits_ledger_binding_mismatch"}))
+
+
+# --------------------------------------------------------------------------
+# #268 slice A: the gift card rule (owner, 10 Nov 2026). Buying a gift card
+# counts towards the S$300; the part of an order paid with a gift card does
+# not. Plus the three B9 tests of the last review (G2 recheck 3).
+# --------------------------------------------------------------------------
+
+def stored_receipt(root: Path, n: int, column: str):
+    """One receipt column read straight from the ledger file (for tests that
+    run the CLI, where the ledger is opened and closed by ``main``)."""
+    conn = sqlite3.connect((root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return conn.execute(f"SELECT {column} FROM receipts WHERE order_gid = ?", (order_gid(n),)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+class GiftCardRuleTests(Base):
+    run_main = CliTests.run_main
+
+    def measured(self, lines, transactions, shipping=(), **cfg):
+        order = bm.order_from_node(order_node(1, lines=lines, shipping=shipping, transactions=transactions))
+        config = self.cfg(**cfg)
+        return bm.gift_card_paid(order, config), bm.qualifying_amount(order, config)
+
+    # -- the pure rule ---------------------------------------------------------
+    def test_worked_examples_of_the_design(self):
+        # G0 round 2 plan, 2.2: goods kept, gift card paid, qualifying amount, result.
+        cases = [
+            # (name, lines, transactions, gift card paid, (gross, qualifying), qualifies)
+            ("gift_card_300_bought_and_paid_by_card", (("300.00", 1, 1, True, ()),), (card("300.00"),), 0, (30000, 30000), True),
+            ("goods_500_with_a_17_code_paid_by_card", (("500.00", 1, 1, False, ("17.00",)),), (card("483.00"),), 0, (50000, 50000), True),
+            ("goods_400_with_150_by_gift_card", (("400.00", 1, 1, False, ()),), (tx("150.00"), card("250.00")), 15000, (40000, 25000), False),
+            ("goods_500_with_200_by_gift_card", (("500.00", 1, 1, False, ()),), (tx("200.00"), card("300.00")), 20000, (50000, 30000), True),
+            ("goods_320_all_by_gift_card", (("320.00", 1, 1, False, ()),), (tx("320.00"),), 32000, (32000, 0), False),
+            ("goods_350_with_one_80_item_returned", (("270.00", 1, 1, False, ()), ("80.00", 1, 0, False, ())),
+             (card("350.00"), card("80.00", kind="REFUND")), 0, (35000, 27000), False),
+        ]
+        for name, lines, transactions, paid, amounts, result in cases:
+            with self.subTest(name=name):
+                self.assertEqual(self.measured(lines, transactions), (paid, amounts))
+                self.assertIs(bm.qualifies(amounts[1], self.cfg()), result)
+
+    def test_gift_card_amount_table(self):
+        goods_400 = (("400.00", 1, 1, False, ()),)
+        with_gift_line = (("250.00", 1, 1, False, ()), ("100.00", 1, 1, True, ()))
+        cases = [
+            # (name, lines, shipping, transactions, config, gift card paid, (gross, qualifying))
+            ("gift_card_line_plus_other_goods", with_gift_line, (), (card("350.00"),), {}, 0, (35000, 35000)),
+            ("split_payment_plus_unit_refund_still_300", (("100.00", 6, 5, False, ()),), (),
+             (tx("200.00"), card("400.00"), card("100.00", kind="REFUND")), {}, 20000, (60000, 30000)),
+            ("split_payment_plus_unit_refund_below", (("100.00", 5, 4, False, ()),), (),
+             (tx("150.00"), card("350.00"), card("100.00", kind="REFUND")), {}, 15000, (50000, 25000)),
+            ("gift_card_payment_larger_than_the_goods", (("100.00", 1, 1, False, ()),), ("15.00",), (tx("115.00"),), {}, 11500, (10000, 0)),
+            ("two_gift_cards_are_summed", goods_400, (), (tx("100.00"), tx("50.00"), card("250.00")), {}, 15000, (40000, 25000)),
+            ("a_capture_counts_as_a_sale_does", goods_400, (), (tx("150.00", kind="CAPTURE"), card("250.00")), {}, 15000, (40000, 25000)),
+            ("a_failed_gift_card_payment_is_ignored", goods_400, (), (tx("150.00", status="FAILURE"), card("400.00")), {}, 0, (40000, 40000)),
+            ("an_errored_gift_card_payment_is_ignored", goods_400, (), (tx("150.00", status="ERROR"), card("400.00")), {}, 0, (40000, 40000)),
+            ("a_refund_back_to_a_gift_card_is_not_added_back", goods_400, (), (tx("150.00"), tx("150.00", kind="REFUND"), card("250.00")), {},
+             15000, (40000, 25000)),
+            ("a_pending_refund_to_a_gift_card_is_ignored", goods_400, (), (tx("150.00", kind="REFUND", status="PENDING"), card("400.00")), {},
+             0, (40000, 40000)),
+            ("a_pending_card_payment_is_not_a_gift_card_matter", goods_400, (), (card("400.00", status="PENDING"),), {}, 0, (40000, 40000)),
+            ("the_gateway_is_compared_in_lower_case", goods_400, (), (tx("150.00", gateway="GIFT_CARD"), card("250.00")), {}, 15000, (40000, 25000)),
+            ("the_gateway_in_mixed_case", goods_400, (), (tx("150.00", gateway="Gift_Card"), card("250.00")), {}, 15000, (40000, 25000)),
+            ("another_gateway_is_not_a_gift_card", goods_400, (), (tx("150.00", gateway="store_credit"), card("250.00")), {}, 0, (40000, 40000)),
+            ("a_payment_without_a_gateway_is_not_a_gift_card", goods_400, (), (tx("150.00", gateway=None), card("250.00")), {}, 0, (40000, 40000)),
+            ("a_second_gateway_name_from_the_setting", goods_400, (), (tx("100.00"), tx("50.00", gateway="Store_Credit"), card("250.00")),
+             {"gift_card_gateways": ["gift_card", "store_credit"]}, 15000, (40000, 25000)),
+            ("only_the_names_in_the_setting", goods_400, (), (tx("100.00"), tx("50.00", gateway="store_credit"), card("250.00")),
+             {"gift_card_gateways": ["store_credit"]}, 5000, (40000, 35000)),
+            ("the_exclude_key_still_takes_gift_card_lines_off", with_gift_line, (), (card("350.00"),), {"amount_exclude_gift_cards": True},
+             0, (25000, 25000)),
+            ("the_exclude_key_with_a_gift_card_payment", with_gift_line, (), (tx("50.00"), card("300.00")), {"amount_exclude_gift_cards": True},
+             5000, (25000, 20000)),
+        ]
+        for kind in ("AUTHORIZATION", "VOID", "CHANGE", "EMV_AUTHORIZATION", "SUGGESTED_REFUND"):
+            cases.append((f"kind_{kind.lower()}_is_ignored", goods_400, (), (tx("150.00", kind=kind), card("400.00")), {}, 0, (40000, 40000)))
+        for name, lines, shipping, transactions, cfg, paid, amounts in cases:
+            with self.subTest(name=name):
+                self.assertEqual(self.measured(lines, transactions, shipping, **cfg), (paid, amounts))
+
+    def test_payments_that_cannot_be_read_make_the_order_unmeasurable(self):
+        goods_400 = (("400.00", 1, 1, False, ()),)
+        unreadable = {
+            "pending": (tx("150.00", status="PENDING"), card("250.00")),
+            "awaiting_response": (tx("150.00", status="AWAITING_RESPONSE"), card("250.00")),
+            "unknown": (tx("150.00", status="UNKNOWN"), card("250.00")),
+            "a_status_this_tool_does_not_know": (tx("150.00", status="SOMETHING_NEW"), card("250.00")),
+            "a_pending_capture": (tx("150.00", kind="CAPTURE", status="PENDING"),),
+            "a_full_list_of_25": tuple(card("16.00") for _ in range(25)),
+            "more_than_25": tuple(card("16.00") for _ in range(26)),
+            "gift_card_amount_not_sgd": (tx("150.00", currency="USD"), card("250.00")),
+            "card_amount_not_sgd": (tx("150.00"), card("250.00", currency="USD")),
+            "amount_malformed": (tx("abc"), card("250.00")),
+            "amount_with_three_places": (tx("150.001"), card("250.00")),
+            "amount_negative": (tx("-150.00"), card("250.00")),
+            "amount_set_missing": ({**tx("150.00"), "amountSet": None}, card("250.00")),
+            "shop_money_missing": ({**tx("150.00"), "amountSet": {}}, card("250.00")),
+        }
+        for name, transactions in unreadable.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.measured(goods_400, transactions), (None, None))
+        # One short of a full list is read as usual.
+        self.assertEqual(self.measured(goods_400, tuple(card("16.00") for _ in range(23)) + (tx("150.00"),)), (15000, (40000, 25000)))
+        self.assertEqual(bm.SHOPIFY_PAYMENT_PAGE, 25)
+
+    def test_a_malformed_transaction_list_fails_the_read(self):
+        missing = order_node(1)
+        del missing["transactions"]
+        bad_nodes = [
+            missing,
+            {**order_node(1), "transactions": {"nodes": []}},
+            {**order_node(1), "transactions": ["gift_card"]},
+            {**order_node(1), "transactions": [{**tx("1.00"), "kind": None}]},
+            {**order_node(1), "transactions": [{**tx("1.00"), "status": 7}]},
+            {**order_node(1), "transactions": [{**tx("1.00"), "gateway": 7}]},
+        ]
+        for index, bad in enumerate(bad_nodes):
+            with self.subTest(index=index):
+                with self.assertRaises(direct.ShopifyDirectError) as caught:
+                    bm.order_from_node(bad)
+                self.assertEqual(caught.exception.code, "shopify_response_shape_invalid")
+
+    def test_the_orders_query_reads_the_transactions_and_the_scopes_are_unchanged(self):
+        self.assertIn("transactions(first: 25) { gateway kind status amountSet { shopMoney { amount currencyCode } } }", bm.ORDERS_QUERY)
+        self.assertEqual(bm.REQUIRED_SCOPES, frozenset({"read_orders", "read_customers"}))
+        page = {"data": {"orders": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    "nodes": [order_node(1, transactions=(tx("150.00", gateway="Gift_Card"), card("150.00", kind="CAPTURE")))]}}}
+        transport = FakeTransport([(200, page)])
+        client = bm.BenefitsShopifyClient(shop_domain=SHOP, api_version="2026-10", token_provider=direct.StaticTokenProvider("t" * 32),
+                                          transport=transport, sleep=lambda s: None)
+        orders, complete = client.orders(dl.parse_created_at(START), 1)
+        self.assertEqual(transport.bodies[0]["query"], bm.ORDERS_QUERY)
+        self.assertEqual((orders[0].payments, orders[0].payments_complete, complete),
+                         ((bm.Payment("gift_card", "SALE", "SUCCESS", 15000), bm.Payment("shopify_payments", "CAPTURE", "SUCCESS", 15000)), True, True))
+
+    # -- settings --------------------------------------------------------------
+    def test_gift_card_settings(self):
+        cfg = self.cfg()
+        self.assertIs(cfg.amount_exclude_gift_cards, False)
+        self.assertIs(bm._CONFIG_DEFAULTS["amount_exclude_gift_cards"], False)
+        self.assertEqual((cfg.gift_card_gateways, bm._CONFIG_DEFAULTS["gift_card_gateways"]), (("gift_card",), ["gift_card"]))
+        self.assertEqual((cfg.summary()["amount_exclude_gift_cards"], cfg.summary()["gift_card_gateways"]), (False, ["gift_card"]))
+        five = ["gift_card", "store_credit", "a", "b_2", "c" * 64]
+        self.assertEqual(self.cfg(gift_card_gateways=five).gift_card_gateways, tuple(five))
+        self.assertIs(self.cfg(amount_exclude_gift_cards=True).amount_exclude_gift_cards, True)
+        refused = [[], five + ["d"], ["Gift_Card"], ["gift card"], ["gift-card"], [""], ["c" * 65], "gift_card", [7], [None], None, {"gift_card": True}]
+        for value in refused:
+            with self.subTest(value=value):
+                self.assertEqual(self.code(lambda: self.cfg(gift_card_gateways=value)), "benefits_config_gift_card_gateways_invalid")
+        self.assertEqual(self.code(lambda: self.cfg(amount_exclude_gift_cards="no")), "benefits_config_amount_exclude_gift_cards_invalid")
+
+    # -- through the engine ----------------------------------------------------
+    def test_the_first_decision_uses_the_rule(self):
+        orders = {
+            # n: (lines, transactions, order status, refunded, state, gift card cents, net cents)
+            1: ((("300.00", 1, 1, True, ()),), (card("300.00"),), "PAID", "0.00", "applied", 0, 30000),
+            2: ((("500.00", 1, 1, False, ("17.00",)),), (card("483.00"),), "PAID", "0.00", "applied", 0, 50000),
+            3: ((("400.00", 1, 1, False, ()),), (tx("150.00"), card("250.00")), "PAID", "0.00", "below_threshold", 15000, 25000),
+            4: ((("500.00", 1, 1, False, ()),), (tx("200.00"), card("300.00")), "PAID", "0.00", "applied", 20000, 30000),
+            5: ((("320.00", 1, 1, False, ()),), (tx("320.00"),), "PAID", "0.00", "below_threshold", 32000, 0),
+            6: ((("270.00", 1, 1, False, ()), ("80.00", 1, 0, False, ())), (card("350.00"), card("80.00", kind="REFUND")),
+                "PARTIALLY_REFUNDED", "80.00", "below_threshold", 0, 27000),
+        }
+        for n, (lines, transactions, status, refunded, *_) in orders.items():
+            self.guest_with_order(n, lines=lines, transactions=transactions, status=status, refunded=refunded)
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["saves"], out["alerts"]), (3, []))
+        for n, (*_, state, paid, net) in orders.items():
+            with self.subTest(n=n):
+                row = self.receipt(n)
+                self.assertEqual((row["state"], row["gift_card_cents"], row["net_cents"]), (state, paid, net))
+                self.assertEqual(self.book.members[sg(n)]["type"], "MEMBER" if state == "applied" else "GUEST")
+        self.assertEqual(json.loads(self.receipt(4)["payment_gateways"]), ["gift_card", "shopify_payments"])
+        self.assertEqual(self.book.saves, 3)
+
+    def test_unreadable_payments_hold_the_order_with_the_existing_alert(self):
+        goods_500 = (("500.00", 1, 1, False, ()),)
+        self.guest_with_order(1, lines=goods_500, transactions=(tx("200.00", status="PENDING"), card("300.00")))
+        self.guest_with_order(2, lines=goods_500, transactions=tuple(card("20.00") for _ in range(25)))
+        self.guest_with_order(3, lines=goods_500, transactions=(tx("200.00", currency="USD"), card("300.00")))
+        # The older codes keep their place when the goods cannot be measured either.
+        self.guest_with_order(4, lines=goods_500, taxes=False, transactions=(tx("200.00", status="PENDING"),))
+        self.guest_with_order(5, lines=goods_500, more_lines=True, transactions=(tx("200.00", status="PENDING"),))
+        engine = self.engine()
+        out = engine.run(apply=True)
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in range(1, 6)],
+                         [("amount_unverifiable", "payments_unreadable")] * 3
+                         + [("amount_unverifiable", "taxes_not_included"), ("amount_unverifiable", "currency_or_lines")])
+        self.assertEqual((out["alerts"], out["counts"]["order_amount_unverifiable"]), (["order_amount_unverifiable"], 5))
+        self.assertEqual([(self.receipt(n)["net_cents"], self.receipt(n)["gift_card_cents"]) for n in (1, 2, 3)], [(None, None)] * 3)
+        self.assertEqual((self.book.reads, self.book.saves, out["saves"]), (0, 0, 0))
+        # The pending gift card payment settles: the same receipt is measured and decided.
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, lines=goods_500, transactions=(tx("200.00"), card("300.00")), updated="2026-11-18T04:10:00Z"))
+        engine.run(apply=True)
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["net_cents"], row["gift_card_cents"]), ("applied", 30000, 20000))
+
+    def test_a_held_claim_receipt_whose_order_becomes_gift_card_paid_settles_for_good(self):
+        self.claim_held()
+        self.advance(days=1)
+        # Read again: S$100.00 of the S$300.00 order is now paid by gift card.
+        self.shopify.add(order_node(1, transactions=(tx("100.00"), card("200.00")), updated="2026-11-19T03:00:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled")), ([], 1))  # silent: nothing was granted
+        row = self.receipt(1)
+        self.assertEqual((row["code"], row["net_cents"], row["gift_card_cents"]), ("order_no_longer_qualifies", 20000, 10000))
+        self.assert_never_upgraded(self.link_and_run())
+
+    def test_a_held_claim_receipt_with_a_gift_card_payment_that_still_qualifies_re_opens(self):
+        self.guest_with_order(1, linked=False, member=fake_member(sg(1), name="Someone Else Entirely"), lines=(("500.00", 1, 1, False, ()),),
+                              transactions=(tx("200.00"), card("300.00")))
+        self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_name_mismatch"))
+        out = self.link_and_run()
+        self.assertEqual((out["counts"].get("claim_hold_reopened"), self.receipt(1)["state"], self.book.saves), (1, "applied", 1))
+
+    def test_an_applied_receipt_is_not_alerted_for_a_gift_card_payment_that_was_already_there(self):
+        goods_500 = (("500.00", 1, 1, False, ()),)
+        paid = (tx("200.00"), card("300.00"))
+        self.guest_with_order(1, lines=goods_500, transactions=paid)
+        engine = self.engine()
+        engine.run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["gift_card_cents"]), ("applied", 20000))
+        for _ in range(2):
+            self.advance(minutes=15)
+            self.shopify.add(order_node(1, lines=goods_500, transactions=paid, updated=dl.ts(self.now)))
+            out = engine.run(apply=True)
+            self.assertEqual((out["alerts"], out["counts"].get("receipt_replayed"), out["saves"]), ([], 1, 0))
+        self.assertIsNone(self.receipt(1)["alerted"])
+        # The same amount is used after the upgrade: a larger gift card part,
+        # read later, takes the order below S$300.00 and alerts once.
+        self.advance(days=1)
+        self.shopify.add(order_node(1, lines=goods_500, transactions=(tx("250.00"), card("250.00")), updated="2026-11-19T05:00:00Z"))
+        self.assertEqual(engine.run(apply=True)["alerts"], ["refund_on_basis"])
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["net_cents"], row["gift_card_cents"]), ("applied", 25000, 25000))
+        self.assertEqual((self.book.members[sg(1)]["type"], self.book.saves), ("MEMBER", 1))  # never downgraded
+        self.advance(minutes=15)
+        self.shopify.add(order_node(1, lines=goods_500, transactions=(tx("250.00"), card("250.00")), updated="2026-11-19T05:10:00Z"))
+        self.assertEqual(engine.run(apply=True)["alerts"], [])
+
+    # -- digest ----------------------------------------------------------------
+    def test_the_digest_counts_gift_card_receipts_and_shows_gateway_names_as_code_words_only(self):
+        odd, odder = "Counter Payment (Fake Name)", "Another Odd Name!"
+        self.guest_with_order(1, lines=(("500.00", 1, 1, False, ()),), transactions=(tx("200.00"), card("300.00")))
+        self.guest_with_order(2, transactions=(tx("100.00", status="FAILURE"), card("300.00")))
+        self.guest_with_order(3, transactions=(tx("290.00", gateway=odd), tx("10.00", gateway=odder)))
+        self.guest_with_order(4, transactions=(tx("150.00", gateway=None), tx("150.00", gateway="PayPal")))
+        self.guest_with_order(5)  # no transaction read at all
+        texts = [self.run_main(*args)[2] for args in (("init",), ("observe",), ("check-config",))]
+        code, digest, text = self.run_main("digest")
+        self.assertEqual(code, 0)
+        self.assertEqual(digest["gift_cards"], {"receipts_paid_by_gift_card": 1,
+                                                "gateways_seen": {"gift_card": 2, "other": 2, "paypal": 1, "shopify_payments": 2}})
+        joined = "".join(texts + [text])
+        for raw in (odd, odd.lower(), odder, odder.lower(), "PayPal", "Fake Name", "fake name"):
+            self.assertNotIn(raw, joined)
+        # The names as read stay in the private ledger only.
+        self.assertEqual(json.loads(stored_receipt(self.root, 3, "payment_gateways")), sorted([odd.lower(), odder.lower()]))
+
+
+GiftCardRuleTests.claim_held = G2FixRound2Tests.claim_held
+GiftCardRuleTests.link_and_run = G2FixRound2Tests.link_and_run
+GiftCardRuleTests.assert_never_upgraded = G2FixRound2Tests.assert_never_upgraded
+
+
+class B9Tests(Base):
+    """G2 recheck 3, blocker B9: the engine branches no test reached, so the
+    privacy check after every test never saw their output (tests only)."""
+
+    run_main = CliTests.run_main
+    HELD_VERDICTS = {
+        # n: (code, the linked AC2 member; None: the link points at no member)
+        1: ("member_inactive", dict(active="F")),
+        2: ("guest_expiry_already_later", dict(expiry="2029-01-01T00:00:00.000")),
+        3: ("expiry_unreadable", dict(member_type="MEMBER", expiry="31/01/2028")),
+        4: ("member_not_found", None),
+    }
+
+    def held_verdicts(self, *, apply: bool) -> None:
+        for n, (code, member) in self.HELD_VERDICTS.items():
+            if member is None:
+                self.link(n)
+                self.shopify.add(order_node(n))
+            else:
+                self.guest_with_order(n, member=fake_member(sg(n), name=f"Fake Member {n}", **member))
+        before = {no: dict(m) for no, m in self.book.members.items()}
+        out = self.engine().run(apply=apply)
+        self.assertEqual(out["alerts"], [code for code, _ in self.HELD_VERDICTS.values()])
+        for n, (code, _) in self.HELD_VERDICTS.items():
+            with self.subTest(code=code):
+                row = self.receipt(n)
+                self.assertEqual((row["state"], row["code"], row["member_no"], row["link_source"], row["observed"]),
+                                 ("held", code, sg(n), "sync155", None))
+                self.assertEqual(out["counts"].get(code), 1)
+                entries = [entry for entry in out["refs"] if entry["code"] == code]
+                self.assertEqual(len(entries), 1)
+                self.assertRegex(entries[0]["ref"], self.PRIVATE_REF_RE)
+                self.assertEqual(entries[0]["member_no_masked"], bm.mask(sg(n)))
+        self.assertEqual((out["saves"], self.book.saves, self.book.payloads, self.book.members), (0, 0, [], before))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+        self.assertEqual((out["counts"].get("would_upgrade"), out["counts"].get("would_extend")), (None, None))
+        # Settled: not read or alerted again.
+        reads = self.book.reads
+        self.advance(minutes=15)
+        out = self.engine().run(apply=apply)
+        self.assertEqual((out["alerts"], out["saves"], self.book.reads), ([], 0, reads))
+
+    def test_b9_the_four_held_verdicts_in_apply(self):
+        self.held_verdicts(apply=True)
+
+    def test_b9_the_four_held_verdicts_in_observe(self):
+        self.held_verdicts(apply=False)
+
+    def test_b9_the_sign_up_wait_ends_without_the_orders_being_read_again(self):
+        self.shopify.add(order_node(1, customer=customer_node(1, registration=None)))  # the tag without its time
+        self.shopify.add(order_node(2, customer=customer_node(2, tags=(), registration=None)))  # no marker at all
+        self.engine().run(apply=True)
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("pending_signup", "signup_time_missing"), ("pending_signup", "not_signed_up_yet")])
+        # A newer order moves the watermark on, so the two are not read again.
+        self.advance(hours=2)
+        self.shopify.add(order_node(9, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T05:30:00Z"))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("signup_pending"), out["alerts"]), (2, []))
+        self.advance(hours=49)  # the sign-up wait (48 hours) is over
+        out = self.engine().run(apply=True)
+        self.assertEqual(out["counts"]["orders_read"], 1)  # only the newer order
+        self.assertEqual((out["alerts"], out["counts"].get("signup_time_missing"), out["counts"].get("not_signed_up")), (["signup_time_missing"], 1, 1))
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("not_signed_up", "signup_time_missing"), ("not_signed_up", "not_signed_up_yet")])
+        by_code = {entry["code"]: entry for entry in out["refs"]}
+        self.assertEqual(set(by_code), {"signup_time_missing", "not_signed_up"})
+        for entry in by_code.values():
+            self.assertEqual(set(entry), {"ref", "code"})
+            self.assertRegex(entry["ref"], self.PRIVATE_REF_RE)
+        self.assertNotEqual(by_code["signup_time_missing"]["ref"], by_code["not_signed_up"]["ref"])
+        self.assertEqual((self.book.reads, self.book.saves), (0, 0))
+        # Settled: the next run says nothing more about them.
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("not_signed_up"), out["counts"].get("signup_pending")), ([], None, None))
+
+    def test_b9_resolve_reports_a_held_write_by_its_code_only(self):
+        member_no = self.guest_with_order(1)
+        self.book.mode = "uncertain_mutated"
+        self.run_main("init")
+        self.assertEqual(self.run_main("apply")[1]["alerts"], ["write_uncertain"])
+        self.book.mode = None
+        self.advance(seconds=PAST_DEADLINE)
+        code, result, text = self.run_main("resolve")
+        self.assertEqual((code, result["resolved"], result["alerts"]), (3, {"HELD:resolved_unclear": 1}, ["resolved_unclear"]))
+        self.assertNotIn(member_no, text)
+        self.assertEqual(stored_receipt(self.root, 1, "state"), "ready")
 
 
 class ClassifySaveTests(unittest.TestCase):

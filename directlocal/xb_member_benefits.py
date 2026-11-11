@@ -14,8 +14,9 @@ What one run does (``observe`` or ``apply``)
    ``read_orders``). Bounded pages, backoff on 429, and the watermark moves
    only after a clean read of every page; the overlap is replay-safe.
 2. Records each order as one ``receipts`` row (forever; replay updates the
-   same row): the before-discount line total incl. GST, minus refunded and
-   removed units, excluding shipping and gift-card lines (config).
+   same row): the before-discount line total incl. GST (gift-card purchase
+   lines count, shipping does not), minus refunded and removed units, minus
+   the amount paid by gift card, never below zero (config).
 3. Decides per receipt: the customer carries the #155 sign-up marker (tag
    ``member-mg`` and the ``membership.start_date`` metafield time) and the
    order's Singapore date is on or after the sign-up date (or the same
@@ -36,8 +37,9 @@ discount, a tag, the POS, a refund revoke, an expiry job, any ``MEMBER`` ->
 ``GUEST`` move, an earlier ``ExpiryDate``, a change to the #155 sync.
 
 Privacy: the ledger (private state root on the VM) keeps order and customer
-GIDs and MemberNos. Output carries codes, counts, keyed refs and MemberNos
-masked to the last 3 characters only.
+GIDs, MemberNos and the payment gateway names of each order. Output carries
+codes, counts, keyed refs and MemberNos masked to the last 3 characters only;
+a gateway name is shown only when it is a plain code word, else as "other".
 """
 
 from __future__ import annotations
@@ -90,6 +92,17 @@ EXPIRY_MONTHS = 24
 SHOPIFY_ORDER_PAGE = 10  # x 50 lines: well inside the 1,000-point query cost
 SHOPIFY_LINE_PAGE = 50
 SHOPIFY_SHIPPING_PAGE = 5
+# Order.transactions is a plain list cut to this size (no pageInfo), so a
+# list that comes back full cannot be shown to be complete.
+SHOPIFY_PAYMENT_PAGE = 25
+# The gift-card-paid amount: transactions that took money (a sale, or the
+# capture of an authorisation) and succeeded. A refund back to a gift card is
+# never added back.
+GIFT_CARD_PAYMENT_KINDS = frozenset({"SALE", "CAPTURE"})
+PAYMENT_SUCCESS = "SUCCESS"
+PAYMENT_FAILED_STATUSES = frozenset({"FAILURE", "ERROR"})  # took no money: ignored
+MAX_GIFT_CARD_GATEWAYS = 5
+PAYMENTS_UNREADABLE = "payments_unreadable"
 WATERMARK = "orders_updated_at"
 WATERMARK_MARGIN = timedelta(minutes=15)  # search-index lag overlap, as #155
 RESUME_MARK = "orders_resume"  # G2 B3: {since, cursor} of a read that ended at the page cap
@@ -127,6 +140,7 @@ _ORDER_GID_RE = re.compile(r"^gid://shopify/Order/[1-9][0-9]{0,19}$")
 _CUSTOMER_GID_RE = re.compile(r"^gid://shopify/Customer/[1-9][0-9]{0,19}$")
 _LINE_GID_RE = re.compile(r"^gid://shopify/LineItem/[1-9][0-9]{0,19}$")
 _AMOUNT_RE = re.compile(r"^-?[0-9]{1,12}(?:\.[0-9]{1,6})?$")
+_GATEWAY_RE = re.compile(r"^[a-z0-9_]{1,64}$")  # a gateway name as a plain code word
 
 SAVE_SKIP_CODES = frozenset({"member_not_found", "type_not_in_scope_now", "type_changed_since_read", "changed_since_read", "expiry_not_later_now"})
 BENEFIT_CHILD_CODES = frozenset({
@@ -156,7 +170,10 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "amount_before_discounts": True,
     "amount_include_tax": True,  # only true: line prices are read incl. GST (Order.taxesIncluded)
     "amount_exclude_shipping": True,
-    "amount_exclude_gift_cards": True,
+    # Owner, 10 Nov 2026: buying a gift card counts towards the S$300; the
+    # part of an order paid with a gift card does not.
+    "amount_exclude_gift_cards": False,
+    "gift_card_gateways": ["gift_card"],  # OrderTransaction.gateway names, lower case
     "amount_count_sale_items": True,  # only true: an order line records no sale price
     "same_day_signup_counts": True,
     "waiting_member_alert_hours": 48,
@@ -206,6 +223,7 @@ class BenefitsConfig:
     amount_include_tax: bool
     amount_exclude_shipping: bool
     amount_exclude_gift_cards: bool
+    gift_card_gateways: tuple[str, ...]
     amount_count_sale_items: bool
     same_day_signup_counts: bool
     waiting_member_alert_hours: int
@@ -227,7 +245,8 @@ class BenefitsConfig:
             "max_upgrades_per_run": self.max_upgrades_per_run, "max_member_reads_per_run": self.max_member_reads_per_run,
             "qualify_threshold_cents": self.qualify_threshold_cents, "amount_before_discounts": self.amount_before_discounts,
             "amount_include_tax": self.amount_include_tax, "amount_exclude_shipping": self.amount_exclude_shipping,
-            "amount_exclude_gift_cards": self.amount_exclude_gift_cards, "amount_count_sale_items": self.amount_count_sale_items,
+            "amount_exclude_gift_cards": self.amount_exclude_gift_cards, "gift_card_gateways": list(self.gift_card_gateways),
+            "amount_count_sale_items": self.amount_count_sale_items,
             "same_day_signup_counts": self.same_day_signup_counts, "expiry_months": EXPIRY_MONTHS, "target_type": TARGET_TYPE,
             "type_move_lock": self.type_move_state_root is not None,
             "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
@@ -277,6 +296,10 @@ def parse_config(value: Any) -> BenefitsConfig:
         if not flags[key]:
             # Not computable from an order today; see the runbook.
             raise dl.DirectLocalError(f"benefits_config_{key}_unsupported")
+    gateways = merged["gift_card_gateways"]
+    if (not isinstance(gateways, list) or not 1 <= len(gateways) <= MAX_GIFT_CARD_GATEWAYS
+            or any(not isinstance(name, str) or not _GATEWAY_RE.fullmatch(name) for name in gateways)):
+        raise dl.DirectLocalError("benefits_config_gift_card_gateways_invalid")
     move_root = merged["type_move_state_root"]
     if move_root is not None and (not isinstance(move_root, str) or not move_root):
         raise dl.DirectLocalError("benefits_config_type_move_state_root_invalid")
@@ -304,7 +327,8 @@ def parse_config(value: Any) -> BenefitsConfig:
     return BenefitsConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, orders_start_utc=start,
         member_sync_state_root=merged["member_sync_state_root"], type_move_state_root=move_root,
-        ac2_credential_target=target, ac2_login_mode=login_mode, ac2_refused_user_ids=tuple(refused), **flags, **numbers,
+        ac2_credential_target=target, ac2_login_mode=login_mode, ac2_refused_user_ids=tuple(refused),
+        gift_card_gateways=tuple(gateways), **flags, **numbers,
     )
 
 
@@ -417,6 +441,18 @@ class OrderLine:
 
 
 @dataclass(frozen=True)
+class Payment:
+    """One ``OrderTransaction``. ``gateway`` is lower case ("" when Shopify
+    gives none); ``cents`` is None when the amount is not SGD, negative or
+    malformed."""
+
+    gateway: str
+    kind: str
+    status: str
+    cents: int | None
+
+
+@dataclass(frozen=True)
 class Customer:
     gid: str
     first_name: str | None
@@ -446,17 +482,20 @@ class Order:
     shipping_cents: tuple[int, ...]
     shipping_complete: bool
     refunded_cents: int | None
+    payments: tuple[Payment, ...]
+    payments_complete: bool
 
     def __repr__(self) -> str:
         return "Order()"
 
 
-def qualifying_amount(order: Order, config: BenefitsConfig) -> tuple[int, int] | None:
-    """``(gross, net)`` cents by the rule, or None when the order cannot be
+def goods_amount(order: Order, config: BenefitsConfig) -> tuple[int, int] | None:
+    """``(gross, kept)`` cents of the goods, or None when the order cannot be
     measured (taxes not included in its prices, a currency other than SGD,
-    or more lines than one page). ``net`` takes off refunded and removed
-    units (``LineItem.currentQuantity``), so a refund seen before the upgrade
-    is netted off; a money-only refund with no line is not."""
+    or more lines than one page). Gift-card purchase lines count (config).
+    ``kept`` takes off refunded and removed units
+    (``LineItem.currentQuantity``), so a refund seen before the upgrade is
+    netted off; a money-only refund with no line is not."""
 
     if order.currency != CURRENCY or not order.lines_complete or (not config.amount_exclude_shipping and not order.shipping_complete):
         return None
@@ -476,6 +515,45 @@ def qualifying_amount(order: Order, config: BenefitsConfig) -> tuple[int, int] |
         gross += shipping
         net += shipping
     return gross, net
+
+
+def gift_card_paid(order: Order, config: BenefitsConfig) -> int | None:
+    """Cents paid by gift card: the sum of the successful ``SALE`` and
+    ``CAPTURE`` transactions whose gateway is one of ``gift_card_gateways``.
+    None when the payments cannot be read: the list came back full, an amount
+    is not SGD or is malformed, or a gift card payment has not settled
+    (``PENDING``, ``AWAITING_RESPONSE``, ``UNKNOWN``). A failed one
+    (``FAILURE``, ``ERROR``) took no money and is ignored, as is every other
+    kind: a refund back to a gift card is never added back (the safe side)."""
+
+    if not order.payments_complete:
+        return None
+    paid = 0
+    for payment in order.payments:
+        if payment.cents is None:
+            return None
+        if payment.gateway not in config.gift_card_gateways or payment.kind not in GIFT_CARD_PAYMENT_KINDS:
+            continue
+        if payment.status == PAYMENT_SUCCESS:
+            paid += payment.cents
+        elif payment.status not in PAYMENT_FAILED_STATUSES:
+            return None
+    return paid
+
+
+def qualifying_amount(order: Order, config: BenefitsConfig) -> tuple[int, int] | None:
+    """``(gross, net)`` cents by the rule, or None when the order cannot be
+    measured. ``net`` is the qualifying amount: the goods kept
+    (``goods_amount``) minus everything paid by gift card
+    (``gift_card_paid``), never below zero. A payment cannot be tied to a
+    line, so the gift card amount comes off in full: this can only
+    under-count."""
+
+    goods, paid = goods_amount(order, config), gift_card_paid(order, config)
+    if goods is None or paid is None:
+        return None
+    gross, kept = goods
+    return gross, max(kept - paid, 0)
 
 
 def qualifies(net_cents: int, config: BenefitsConfig) -> bool:
@@ -623,6 +701,7 @@ CREATE TABLE meta(
 CREATE TABLE receipts(
   order_gid TEXT PRIMARY KEY, customer_gid TEXT, order_created_at TEXT NOT NULL, order_date_sgt TEXT NOT NULL,
   order_updated_at TEXT NOT NULL, financial_status TEXT, gross_cents INTEGER, net_cents INTEGER, refunded_cents INTEGER,
+  gift_card_cents INTEGER, payment_gateways TEXT,
   state TEXT NOT NULL CHECK (state IN ('ignored_unpaid', 'ignored_test', 'void', 'before_start', 'no_customer', 'amount_unverifiable',
     'below_threshold', 'not_signed_up', 'pending_signup', 'waiting_member', 'ready', 'applied', 'no_change', 'not_in_scope', 'held')),
   code TEXT, member_no TEXT, link_source TEXT CHECK (link_source IS NULL OR link_source IN ('sync155', 'claim')),
@@ -934,6 +1013,7 @@ ORDERS_QUERY = """query XbMemberBenefitsOrders($first: Int!, $after: String, $se
           discountAllocations { allocatedAmountSet { """ + _MONEY + """ } } }
       }
       shippingLines(first: 5) { pageInfo { hasNextPage } nodes { originalPriceSet { """ + _MONEY + """ } } }
+      transactions(first: 25) { gateway kind status amountSet { """ + _MONEY + """ } }
     }
   }
 }"""
@@ -963,6 +1043,18 @@ def _money(node: Any) -> tuple[int | None, str | None]:
     _shape(isinstance(node, dict) and isinstance(node.get("shopMoney"), dict))
     money = node["shopMoney"]
     return money_cents(money.get("amount")), money.get("currencyCode") if isinstance(money.get("currencyCode"), str) else None
+
+
+def _payment_cents(node: Any) -> int | None:
+    """A transaction's ``amountSet`` in SGD cents, or None when it is not
+    SGD, negative or malformed. Never a failed read: the order is then
+    ``payments_unreadable`` and the other orders of the page carry on."""
+
+    money = node.get("shopMoney") if isinstance(node, dict) else None
+    if not isinstance(money, dict) or money.get("currencyCode") != CURRENCY:
+        return None
+    cents = money_cents(money.get("amount"))
+    return cents if cents is not None and cents >= 0 else None
 
 
 def customer_from_node(node: Any) -> Customer:
@@ -1019,12 +1111,20 @@ def order_from_node(node: Any) -> Order:
         currencies.add(currency)
         _shape(cents is not None and cents >= 0)
         shipping_cents.append(cents)
+    transactions = node.get("transactions")
+    _shape(isinstance(transactions, list))
+    payments = []
+    for item in transactions:
+        _shape(isinstance(item, dict) and isinstance(item.get("kind"), str) and isinstance(item.get("status"), str)
+               and (item.get("gateway") is None or isinstance(item["gateway"], str)))
+        payments.append(Payment((item.get("gateway") or "").lower(), item["kind"], item["status"], _payment_cents(item.get("amountSet"))))
     customer = None if node.get("customer") is None else customer_from_node(node["customer"])
     return Order(
         gid=node["id"], created_at=created, updated_at=updated, cancelled=node.get("cancelledAt") is not None, test=node["test"],
         financial_status=status, taxes_included=node["taxesIncluded"], currency=CURRENCY if currencies == {CURRENCY} else None,
         customer=customer, lines=tuple(lines), lines_complete=items["pageInfo"].get("hasNextPage") is False,
         shipping_cents=tuple(shipping_cents), shipping_complete=shipping["pageInfo"].get("hasNextPage") is False, refunded_cents=refunded,
+        payments=tuple(payments), payments_complete=len(payments) < SHOPIFY_PAYMENT_PAGE,
     )
 
 
@@ -1519,6 +1619,11 @@ class BenefitsEngine:
         ref = self.ledger.ref("o", order.gid)
         amounts = qualifying_amount(order, self.config)
         gross, net = amounts if amounts is not None else (None, None)
+        # The gift-card-paid amount behind ``net`` and the gateway names of
+        # the order's transactions (lower case, for the digest), kept on the
+        # receipt row.
+        paid = gift_card_paid(order, self.config)
+        gateways = json.dumps(sorted({payment.gateway for payment in order.payments}))
         existing = self.ledger.receipt(order.gid)
         now = dl.ts(self.now())
         if existing is not None and existing["state"] not in DECIDED_STATES:
@@ -1529,7 +1634,8 @@ class BenefitsEngine:
                 existing = self.ledger.receipt(order.gid)
         if existing is not None and existing["state"] in DECIDED_STATES:
             self.ledger.update_receipt(order.gid, order_updated_at=dl.ts(order.updated_at), financial_status=order.financial_status,
-                                       refunded_cents=order.refunded_cents, net_cents=net if net is not None else existing["net_cents"])
+                                       refunded_cents=order.refunded_cents, net_cents=net if net is not None else existing["net_cents"],
+                                       gift_card_cents=paid if paid is not None else existing["gift_card_cents"], payment_gateways=gateways)
             if existing["state"] == "held" and existing["code"] in CLAIM_HOLD_CODES:
                 # G2 B5: a claim-held receipt is looked at again on every
                 # replay. An order that no longer qualifies settles it for
@@ -1567,7 +1673,7 @@ class BenefitsEngine:
             state, code = "waiting_member", existing["code"]
         values = dict(customer_gid=order.customer.gid if order.customer else None, order_updated_at=dl.ts(order.updated_at),
                       financial_status=order.financial_status, gross_cents=gross, net_cents=net, refunded_cents=order.refunded_cents,
-                      state=state, code=code)
+                      gift_card_cents=paid, payment_gateways=gateways, state=state, code=code)
         if existing is None:
             with self.ledger.tx() as conn:
                 conn.execute(
@@ -1597,7 +1703,9 @@ class BenefitsEngine:
         if order.customer is None:
             return "no_customer", None
         if net is None:
-            return "amount_unverifiable", ("taxes_not_included" if not order.taxes_included else "currency_or_lines")
+            if not order.taxes_included:
+                return "amount_unverifiable", "taxes_not_included"
+            return "amount_unverifiable", ("currency_or_lines" if goods_amount(order, self.config) is None else PAYMENTS_UNREADABLE)
         if not qualifies(net, self.config):
             return "below_threshold", None
         if money_refund_unattributed(order):
@@ -1662,7 +1770,7 @@ class BenefitsEngine:
         for row in self._pending(("pending_signup",))[: self.config.max_customer_rechecks_per_run]:
             customer = self.shopify.customer(row["customer_gid"]) if row["customer_gid"] else None
             created = dl.parse_created_at(row["order_created_at"])
-            probe = Order(row["order_gid"], created, created, False, False, "PAID", True, CURRENCY, customer, (), True, (), True, 0)
+            probe = Order(row["order_gid"], created, created, False, False, "PAID", True, CURRENCY, customer, (), True, (), True, 0, (), True)
             status = signup_status(customer, probe, self.config)
             ref = self.ledger.ref("o", row["order_gid"])
             if status == "signed_up":
@@ -2086,7 +2194,8 @@ _DIGEST_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{1,64}$")
 
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConfig) -> dict[str, Any]:
     """Read-only daily digest: run counts, counts and alerts per code, alert
-    refs (keyed refs and masked MemberNos only) and open totals."""
+    refs (keyed refs and masked MemberNos only), open totals, and the gift
+    card counts (gateway names as plain code words only)."""
 
     path = Path(root) / LEDGER_FILE
     if not path.is_file():
@@ -2135,11 +2244,27 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
                 refs.append(item)
         receipts = {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM receipts GROUP BY state")}
         observed = {row[0]: row[1] for row in conn.execute("SELECT observed, COUNT(*) FROM receipts WHERE state = 'ready' AND observed IS NOT NULL GROUP BY observed")}
+        # Gift cards (all receipts, not only the last N hours): how many
+        # receipts had an amount paid by gift card, and on how many receipts
+        # each gateway name was seen. A name is shown only as a plain code
+        # word; anything else (a manual payment method's free text) is "other".
+        gateways: dict[str, int] = {}
+        for row in conn.execute("SELECT payment_gateways FROM receipts WHERE payment_gateways IS NOT NULL"):
+            try:
+                names = json.loads(row[0])
+            except (json.JSONDecodeError, RecursionError):
+                names = []
+            for name in {n if isinstance(n, str) and _DIGEST_CODE_RE.fullmatch(n) else "other" for n in (names if isinstance(names, list) else [])}:
+                gateways[name] = gateways.get(name, 0) + 1
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
             "runs": {"completed": completed, "unfinished": unfinished}, "counts": dict(sorted(counts.items())),
             "alerts": dict(sorted(alerts.items())), "alert_refs": refs, "receipts": receipts,
             "shadow": {"would_upgrade": observed.get("would_upgrade", 0), "would_extend": observed.get("would_extend", 0)},
+            "gift_cards": {
+                "receipts_paid_by_gift_card": conn.execute("SELECT COUNT(*) FROM receipts WHERE gift_card_cents > 0").fetchone()[0],
+                "gateways_seen": dict(sorted(gateways.items())),
+            },
             "open": {
                 "uncertain_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state IN ('INTENT', 'UNCERTAIN')").fetchone()[0],
                 "held_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0],
