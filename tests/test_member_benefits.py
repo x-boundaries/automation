@@ -328,8 +328,12 @@ class Base(unittest.TestCase):
         "type_move_lock", "ac2_credential", "ac2_login_mode", "rule_fingerprint"})
     RUN_KEYS = frozenset({"status", "command", "run_id", "saves", "counts", "alerts", "refs", "stopped"})
     OUTPUT_KEYS = {
-        "status": (frozenset({"status", "command", "receipts", "observed", "writes", "claim_links", "claim_links_voided", "reviews",
-                              "watermark_set", "stop_file_present", "rule_settings_match"}), frozenset()),
+        "status": (frozenset({"status", "command", "receipts", "observed", "writes", "held_writes", "claim_links", "claim_links_voided",
+                              "reviews", "watermark_set", "stop_file_present", "rule_settings_match"}), frozenset()),
+        "release_held": (frozenset({"status", "command", "run_id", "finding", "receipt_now", "held_writes_left", "counts", "refs", "alerts"}),
+                         frozenset()),
+        "release_held_dry_run": (frozenset({"status", "command", "run_id", "finding", "receipt_now", "held_writes_left", "counts", "refs", "alerts"}),
+                                 frozenset()),
         "observe": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "apply": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
@@ -2984,13 +2988,13 @@ class OutputShapeRuleTests(Base):
             "digest_open_with_a_new_key": {**self.GOOD_DIGEST, "open": {**self.GOOD_DIGEST["open"], "seen_" + order[-6:]: 1}},
             "digest_receipts_key_with_part_of_an_order_number": {**self.GOOD_DIGEST, "receipts": {"held_" + order[-6:]: 1}},
             "an_unknown_command": {**run, "command": "seen"},
-            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
+            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "held_writes": 0, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
                                       "reviews": 0, "watermark_set": False, "stop_file_present": False, "seen": 1},
             "status_receipts_key_with_part_of_an_order_number": {
-                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
+                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "held_writes": 0, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "status_writes_key_with_part_of_an_order_number": {
-                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
+                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "held_writes": 0, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "check_config_with_a_new_key": {"status": "ok", **{key: None for key in self.CONFIG_KEYS if key != "status"}, "seen": 1},
             "init_with_another_status": {"status": "seen_" + order[-6:]},
@@ -3181,7 +3185,8 @@ def make_v1_ledger(root: Path) -> bytes:
 class LedgerV2Tests(Base):
     run_main = CliTests.run_main
     # Commands that open the ledger; slice B1 adds release-held and unlink.
-    LEDGER_COMMANDS = (("init",), ("status",), ("observe",), ("apply",), ("resolve",), ("index",), ("index", "--apply"), ("digest",))
+    LEDGER_COMMANDS = (("init",), ("status",), ("observe",), ("apply",), ("resolve",), ("index",), ("index", "--apply"), ("digest",),
+                       ("release-held", "--order-ref", "o-" + "a" * 20, "--member-last3", "001", "--finding", "as_intended", "--apply"))
 
     def setUp(self):
         super().setUp()
@@ -3404,6 +3409,221 @@ class LedgerV2Tests(Base):
     # The unlink code (slice B1, 1.6) is the one place outside the schema
     # that reads claim_links itself (a voided pair is history, not active).
     CLAIM_LINKS_READERS: frozenset = frozenset()
+
+
+class ReleaseHeldTests(Base):
+    """Slice B1 (G0 design 1.5): release-held clears the latch of one HELD
+    write after the owner checked the member; one read-only proof read; the
+    write row stays HELD (never sent again) and the release is a new row."""
+
+    run_main = CliTests.run_main
+
+    def held(self, n: int = 1) -> tuple[str, str]:
+        """Order n's save lands with another column changed: HELD, receipt
+        left ready, the member saved as MEMBER with the new expiry."""
+        member_no = self.guest_with_order(n)
+        self.book.mode = "mutate"
+        out = self.engine().run(apply=True)
+        self.book.mode = None
+        self.assertEqual(out["stopped"], "held:readback_fields_changed")
+        self.assertEqual(self.receipt(n)["state"], "ready")
+        self.advance(seconds=PAST_DEADLINE)
+        return self.ledger.ref("o", order_gid(n)), member_no
+
+    def release(self, ref: str, last3: str, finding: str, *, apply: bool = True, **cfg) -> dict:
+        return self.engine(**cfg).release_held(order_ref=ref, member_last3=last3, finding=finding, apply=apply)
+
+    def recorded(self) -> tuple:
+        conn = self.ledger.conn
+        return ([tuple(r) for r in conn.execute("SELECT * FROM write_releases ORDER BY rowid")],
+                [tuple(r) for r in conn.execute("SELECT * FROM runs ORDER BY rowid")],
+                [tuple(r) for r in conn.execute("SELECT * FROM receipts ORDER BY order_gid")],
+                [tuple(r) for r in conn.execute("SELECT * FROM writes ORDER BY rowid")],
+                [tuple(r) for r in conn.execute("SELECT * FROM watermarks ORDER BY name")], self.book.saves)
+
+    def refused(self, call, code: str) -> None:
+        before = self.recorded()
+        self.assertEqual(self.code(call), code)
+        self.assertEqual(self.recorded(), before)
+
+    def test_as_intended_moves_the_ready_receipt_to_applied_and_clears_the_latch(self):
+        ref, member_no = self.held()
+        self.assertEqual(self.code(lambda: self.engine().run(apply=True)), "benefit_held_rows_present")
+        before, reads = self.recorded(), self.book.reads
+        dry = self.release(ref, member_no[-3:], "as_intended", apply=False)
+        self.assertEqual(self.recorded(), before)  # a dry run records nothing
+        self.assertEqual((dry["command"], dry["run_id"], dry["receipt_now"], dry["held_writes_left"], self.book.reads),
+                         ("release_held_dry_run", None, "applied", 0, reads + 1))
+        out = self.release(ref, member_no[-3:], "as_intended")
+        self.assertEqual({k: out[k] for k in ("status", "command", "finding", "receipt_now", "held_writes_left", "counts", "alerts")},
+                         {"status": "ok", "command": "release_held", "finding": "as_intended", "receipt_now": "applied", "held_writes_left": 0,
+                          "counts": {"release_receipt_applied": 1}, "alerts": []})
+        self.assertEqual(out["refs"], [{"ref": ref, "code": "write_released", "member_no_masked": bm.mask(member_no)}])
+        conn = self.ledger.conn
+        write = conn.execute("SELECT * FROM writes").fetchone()
+        release = conn.execute("SELECT * FROM write_releases").fetchone()
+        self.assertEqual((write["state"], release["write_id"], release["finding"], release["run_id"]), ("HELD", write["write_id"], "as_intended", out["run_id"]))
+        self.assertEqual(release["member_read_digest"][:7], "sha256:")
+        run = conn.execute("SELECT * FROM runs WHERE run_id = ?", (out["run_id"],)).fetchone()
+        self.assertEqual((run["command"], json.loads(run["summary"])), ("release_held", out))
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["member_no"], row["basis_expiry_local"]), ("applied", "upgrade", member_no, NEW_EXPIRY))
+        self.assertEqual(self.engine().status()["held_writes"], 0)
+        self.assertEqual(bm.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())["open"]["held_writes"], 0)
+        # The latch is clear: apply runs again and never sends this receipt again.
+        self.advance(minutes=15)
+        again = self.engine().run(apply=True)
+        self.assertEqual((again["saves"], self.book.saves, conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]), (0, 1, 1))
+        self.assertTrue(self.ledger.write_landed_or_open(order_gid(1)))  # HELD stays in the list, released or not
+        # The same write is never released twice.
+        self.refused(lambda: self.release(ref, member_no[-3:], "as_intended"), "release_no_held_write")
+
+    def test_not_as_intended_holds_the_ready_receipt_for_good(self):
+        ref, member_no = self.held()
+        self.book.members[member_no].update(type="GUEST", expiry=None)  # staff put the member back by hand
+        out = self.release(ref, member_no[-3:], "not_as_intended")
+        self.assertEqual((out["receipt_now"], out["counts"]), ("held", {"release_receipt_held": 1}))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "held_write_released"))
+        self.advance(minutes=15)
+        again = self.engine().run(apply=True)
+        self.assertEqual((again["saves"], self.book.saves, self.receipt(1)["state"]), (0, 1, "held"))
+        with self.assertRaises(sqlite3.IntegrityError):  # terminal: never re-opened
+            self.ledger.update_receipt(order_gid(1), state="ready", code=None)
+
+    def test_each_proof_contradiction_refuses_with_nothing_recorded(self):
+        ref, member_no = self.held()
+        m = self.book.members[member_no]
+        saved = dict(m)
+        cases = [
+            ("as_intended", dict(type="GUEST")),
+            ("as_intended", dict(expiry="2028-11-19T00:00:00.000")),
+            ("as_intended", dict(expiry=NEW_EXPIRY)),  # the stored form always has milliseconds
+            ("as_intended", dict(type="VIP")),
+            ("as_intended", None),  # not found
+            ("not_as_intended", {}),  # exactly as the tool meant
+        ]
+        for finding, change in cases:
+            with self.subTest(finding=finding, change=change):
+                self.book.members[member_no] = dict(saved)
+                if change is None:
+                    del self.book.members[member_no]
+                else:
+                    self.book.members[member_no].update(change)
+                self.refused(lambda: self.release(ref, member_no[-3:], finding), "release_finding_not_proven")
+        self.book.members[member_no] = dict(saved)
+        del self.book.members[member_no]
+        self.assertEqual(self.release(ref, member_no[-3:], "not_as_intended", apply=False)["receipt_now"], "held")  # not found proves it
+
+    def test_every_refusal_records_nothing(self):
+        ref, member_no = self.held()
+        last3 = member_no[-3:]
+        for bad in (dict(ref=None), dict(ref="o-" + "a" * 19), dict(ref="c-" + "a" * 20), dict(ref=ref + "\n"), dict(ref=ref.upper()),
+                    dict(last3=None), dict(last3=""), dict(last3="0012"), dict(last3="01 "), dict(last3="00\n"),
+                    dict(finding=None), dict(finding="intended"), dict(finding="AS_INTENDED")):
+            args = {"ref": ref, "last3": last3, "finding": "as_intended", **bad}
+            with self.subTest(bad=bad):
+                self.refused(lambda: self.release(args["ref"], args["last3"], args["finding"]), "release_arguments_invalid")
+        self.refused(lambda: self.release("o-" + "0" * 20, last3, "as_intended"), "release_no_held_write")
+        self.refused(lambda: self.release(ref, "999" if last3 != "999" else "998", "as_intended"), "release_member_mismatch")
+        self.book.fail_read = "bridge_read_failed:benefit_member_read_failed"
+        self.refused(lambda: self.release(ref, last3, "as_intended"), "bridge_read_failed:benefit_member_read_failed")
+        self.book.fail_read = None
+        self.probe_result = "running"
+        self.refused(lambda: self.release(ref, last3, "as_intended"), "writer_may_be_live")
+        self.probe_result = "exited"
+        self.now -= timedelta(seconds=PAST_DEADLINE)  # before the write's deadline and grace
+        self.refused(lambda: self.release(ref, last3, "as_intended"), "writer_may_be_live")
+        self.advance(seconds=PAST_DEADLINE)
+        # An open write anywhere refuses (resolve first).
+        payload = {"kind": "upgrade", "member_no": sg(9), "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                   "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+        intent = self.ledger.add_intent(run_id="run-x", order_gid=order_gid(9), payload=payload, deadline=self.now)
+        self.refused(lambda: self.release(ref, last3, "as_intended"), "benefit_uncertain_unresolved")
+        self.ledger.set_outcome(intent["write_id"], "UNCERTAIN", "writer_timeout")
+        self.refused(lambda: self.release(ref, last3, "as_intended"), "benefit_uncertain_unresolved")
+        self.ledger.set_outcome(intent["write_id"], "NOT_WRITTEN", "resolved_no_claim")
+        self.assertEqual(self.release(ref, last3, "as_intended")["receipt_now"], "applied")
+
+    def test_a_receipt_decided_in_between_is_left_as_it_is(self):
+        ref, member_no = self.held()
+        self.ledger.update_receipt(order_gid(1), state="held", code="link_conflict")
+        out = self.release(ref, member_no[-3:], "as_intended")
+        self.assertEqual((out["receipt_now"], out["counts"]), ("left_decided", {"release_receipt_left_decided": 1}))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "link_conflict"))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM write_releases").fetchone()[0], 1)
+
+    def test_two_held_writes_are_released_one_at_a_time_and_the_latch_stays_until_both(self):
+        ref1, member1 = self.held(1)
+        member2 = self.guest_with_order(2)
+        self.advance(minutes=15)
+        self.engine().run(apply=False)  # order 2 recorded and observed, still ready
+        payload = {"kind": "upgrade", "member_no": member2, "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                   "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+        intent = self.ledger.add_intent(run_id="run-x", order_gid=order_gid(2), payload=payload, deadline=self.now)
+        self.ledger.set_outcome(intent["write_id"], "HELD", "resolved_unclear")
+        self.advance(seconds=PAST_DEADLINE)
+        ref2 = self.ledger.ref("o", order_gid(2))
+        self.assertEqual(self.release(ref1, member1[-3:], "as_intended")["held_writes_left"], 1)
+        self.assertEqual(self.code(lambda: self.engine().run(apply=True)), "benefit_held_rows_present")
+        self.assertEqual(self.engine().status()["held_writes"], 1)
+        out = self.release(ref2, member2[-3:], "not_as_intended")  # the member is still GUEST: not saved
+        self.assertEqual((out["held_writes_left"], out["receipt_now"]), (0, "held"))
+        self.advance(minutes=15)
+        self.assertEqual(self.engine().run(apply=True)["saves"], 0)
+        self.assertEqual(self.book.saves, 1)
+
+    def test_g15_a_released_held_write_whose_receipt_is_still_ready_is_never_sent_again(self):
+        """G15 (R1:41): the per-receipt check is the last guard once a HELD
+        write is released and its receipt is still ready."""
+        ref, member_no = self.held()
+        write_id = self.ledger.conn.execute("SELECT write_id FROM writes").fetchone()[0]
+        with self.ledger.tx() as conn:  # set up through the ledger: released, receipt left ready
+            conn.execute("INSERT INTO write_releases(write_id, finding, member_read_digest, run_id, created_at) VALUES (?, 'as_intended', ?, 'run-x', 't')",
+                         (write_id, "sha256:" + "0" * 64))
+        self.assertEqual((self.ledger.held_writes(), self.receipt(1)["state"]), (0, "ready"))
+        self.book.members[member_no].update(type="GUEST", expiry=None, last_modified=LM)  # would be sent again if anything let it
+        reads, saves = self.book.reads, self.book.saves
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("write_already_recorded"), out["saves"]), (1, 0))
+        self.assertEqual((self.book.reads, self.book.saves, len(self.book.payloads)), (reads, saves, 1))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 1)
+
+    def test_the_cli_command_dry_run_apply_and_refusals(self):
+        member_no = self.guest_with_order(1)
+        self.run_main("init")
+        self.book.mode = "mutate"
+        self.assertEqual(self.run_main("apply")[0], 3)
+        self.book.mode = None
+        self.advance(seconds=PAST_DEADLINE)
+        ref = self.ledger_ref(order_gid(1))
+        args = ("release-held", "--order-ref", ref, "--member-last3", member_no[-3:], "--finding", "as_intended")
+        code, dry, _ = self.run_main(*args)
+        self.assertEqual((code, dry["command"], dry["receipt_now"]), (0, "release_held_dry_run", "applied"))
+        # Not refused by the write switch or a changed amount setting (it measures nothing).
+        code, out, _ = self.run_main(*args, "--apply", cfg={"benefits_write_enabled": False, "qualify_threshold_cents": 25_000})
+        self.assertEqual((code, out["command"], out["held_writes_left"]), (0, "release_held", 0))
+        self.assertEqual(self.run_main("status")[1]["held_writes"], 0)
+        for bad in (("release-held",), ("release-held", "--order-ref", ref), args[:-2] + ("--finding", "seen")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_main(*bad)[:2], (2, {"status": "refused", "code": "release_arguments_invalid"}))
+        self.assertEqual(self.run_main(*args, "--apply")[:2], (2, {"status": "refused", "code": "release_no_held_write"}))
+
+    def ledger_ref(self, value: str) -> str:
+        ledger = bm.BenefitsLedger(self.root, clock=lambda: self.now)
+        try:
+            return ledger.ref("o", value)
+        finally:
+            ledger.close()
+
+    def test_a_locked_ledger_refuses(self):
+        self.run_main("init")
+        ledger = bm.BenefitsLedger(self.root, clock=lambda: self.now)  # a running task holds the ledger
+        try:
+            code, out, _ = self.run_main("release-held", "--order-ref", "o-" + "a" * 20, "--member-last3", "001", "--finding", "as_intended", "--apply")
+        finally:
+            ledger.close()
+        self.assertEqual((code, out), (2, {"status": "refused", "code": "ledger_locked_by_another_owner"}))
 
 
 class RealOutputsReachTheCheckTests(Base):

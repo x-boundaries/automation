@@ -151,6 +151,13 @@ ORDER_NO_LONGER_QUALIFIES = "order_no_longer_qualifies"
 # receipts_decided_code trigger). ``order_past_read_window`` is used from
 # slice B2 on; it is listed now so B2 needs no schema change.
 ORDER_PAST_READ_WINDOW = "order_past_read_window"
+# Slice B1 (G0 1.5): the terminal code of a ready receipt whose HELD write was
+# released with the finding not_as_intended (staff upgrade by hand if due).
+HELD_WRITE_RELEASED = "held_write_released"
+RELEASE_FINDINGS = ("as_intended", "not_as_intended")
+_ORDER_REF_RE = re.compile(r"^o-[0-9a-f]{20}\Z")
+_CUSTOMER_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
+_LAST3_RE = re.compile(r"^[A-Za-z0-9._/-]{1,3}\Z")  # the last 3 characters of a MemberNo (dl.MEMBER_NO_RE)
 CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, ORDER_PAST_READ_WINDOW})
 # Slice B1: the version of the amount rule (goods_amount, gift_card_paid,
 # qualifying_amount, qualifies, money_refund_unattributed and the order
@@ -996,7 +1003,15 @@ class BenefitsLedger:
         return self.conn.execute("SELECT * FROM writes WHERE state IN ('INTENT', 'UNCERTAIN') ORDER BY rowid").fetchall()
 
     def held_writes(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0]
+        """HELD writes not released yet (slice B1): ``apply`` refuses while any
+        exists. A released write stays HELD for ever (write_landed_or_open)."""
+
+        return self.conn.execute("SELECT COUNT(*) FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
+                                 "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id)").fetchone()[0]
+
+    def unreleased_held_writes(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
+                                 "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id) ORDER BY rowid").fetchall()
 
     def done_write(self, order_gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM writes WHERE order_gid = ? AND state = 'DONE' ORDER BY rowid DESC LIMIT 1", (order_gid,)).fetchone()
@@ -2211,6 +2226,71 @@ class BenefitsEngine:
             return "NOT_WRITTEN", "resolved_not_written", None
         return "HELD", "resolved_unclear", None
 
+    # -- release-held (slice B1, G0 1.5) ---------------------------------------
+    def _writers_settled(self, rows: Iterable[sqlite3.Row]) -> None:
+        """As ``resolve``: a write whose deadline (plus grace) has not passed,
+        or whose child still runs, may still be saving."""
+
+        now = self.now()
+        for row in rows:
+            if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
+                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
+                raise dl.DirectLocalHold("writer_may_be_live")
+
+    def release_held(self, *, order_ref: Any, member_last3: Any, finding: Any, apply: bool) -> dict[str, Any]:
+        """Clear the latch of one ``HELD`` write after the owner checked that
+        member in AutoCount. One read-only ``benefit-member`` read proves the
+        finding; nothing is ever sent to AutoCount, the write row stays
+        ``HELD`` (never sent again, I4) and the release is a new row. A dry
+        run unless ``apply``; every refusal records nothing."""
+
+        if (not isinstance(order_ref, str) or not _ORDER_REF_RE.fullmatch(order_ref) or not isinstance(member_last3, str)
+                or not _LAST3_RE.fullmatch(member_last3) or finding not in RELEASE_FINDINGS):
+            raise dl.DirectLocalError("release_arguments_invalid")
+        self.ledger.check_binding(self.config)
+        if self.ledger.open_writes():
+            raise dl.DirectLocalError("benefit_uncertain_unresolved")
+        held = [row for row in self.ledger.unreleased_held_writes() if self.ledger.ref("o", row["order_gid"]) == order_ref]
+        if not held:
+            raise dl.DirectLocalError("release_no_held_write")
+        write = held[0]
+        if write["member_no"][-3:] != member_last3:
+            raise dl.DirectLocalError("release_member_mismatch")
+        self._writers_settled([write])
+        read = self.ac2.member(write["member_no"], secrets.token_hex(16))  # the existing read-only operation, as resolve
+        intended = read.found and read.member_type == TARGET_TYPE and read.expiry_local == write["new_expiry_local"] + ".000"
+        if intended != (finding == "as_intended"):
+            raise dl.DirectLocalError("release_finding_not_proven")
+        proof = read.fields_digest if read.found else "sha256:" + hashlib.sha256(b"benefit_member_not_found").hexdigest()
+        if not isinstance(proof, str) or not _DIGEST_RE.fullmatch(proof):
+            raise dl.BridgeError("bridge_output_invalid")
+        receipt = self.ledger.receipt(write["order_gid"])
+        if receipt is not None and receipt["state"] == "ready":
+            receipt_now = "applied" if finding == "as_intended" else "held"
+        else:
+            receipt_now = "left_decided"
+        count = {"applied": "release_receipt_applied", "held": "release_receipt_held"}.get(receipt_now, "release_receipt_left_decided")
+        run_id = f"run-{uuid.uuid4().hex}" if apply else None
+        result = {"status": "ok", "command": "release_held" if apply else "release_held_dry_run", "run_id": run_id, "finding": finding,
+                  "receipt_now": receipt_now, "held_writes_left": self.ledger.held_writes() - 1, "counts": {count: 1},
+                  "refs": [{"ref": order_ref, "code": "write_released", "member_no_masked": mask(write["member_no"])}], "alerts": []}
+        if not apply:
+            return result
+        now = dl.ts(self.now())
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO write_releases(write_id, finding, member_read_digest, run_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                         (write["write_id"], finding, proof, run_id, now))
+            if receipt_now == "applied":
+                conn.execute("UPDATE receipts SET state = 'applied', code = ?, member_no = ?, basis_expiry_local = ?, updated_at = ? "
+                             "WHERE order_gid = ?", (write["kind"], write["member_no"], write["new_expiry_local"], now, write["order_gid"]))
+            elif receipt_now == "held":
+                conn.execute("UPDATE receipts SET state = 'held', code = ?, updated_at = ? WHERE order_gid = ?",
+                             (HELD_WRITE_RELEASED, now, write["order_gid"]))
+            conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES (?, 'release_held', ?, ?, ?)",
+                         (run_id, now, now, json.dumps(result, sort_keys=True)))
+        return result
+
     # -- index (one-off, read only towards Shopify and AC2) -------------------
     def index(self, *, apply: bool, max_members: int) -> dict[str, Any]:
         """Existing AC2 MEMBER and GUEST members with no #155 link and no
@@ -2303,6 +2383,7 @@ class BenefitsEngine:
         writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT kind, state, COUNT(*) FROM writes GROUP BY kind, state")}
         active, voided = self.ledger.claim_counts()
         return {"status": "ok", "command": "status", "receipts": receipts, "observed": observed, "writes": writes,
+                "held_writes": self.ledger.held_writes(),
                 "claim_links": active, "claim_links_voided": voided, "rule_settings_match": self.ledger.rule_settings_match(self.config),
                 "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
                 "watermark_set": self.ledger.watermark(WATERMARK) is not None, "stop_file_present": self._stop_requested()}
@@ -2422,7 +2503,8 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
             },
             "open": {
                 "uncertain_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state IN ('INTENT', 'UNCERTAIN')").fetchone()[0],
-                "held_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0],
+                "held_writes": conn.execute("SELECT COUNT(*) FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
+                                            "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id)").fetchone()[0],
                 "waiting_member": receipts.get("waiting_member", 0),
                 "claim_links": conn.execute("SELECT COUNT(*) FROM active_claim_links").fetchone()[0],
                 "claim_links_voided": conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0],
@@ -2459,7 +2541,7 @@ def build_real_engine(config: BenefitsConfig, ledger: BenefitsLedger, *, environ
     return BenefitsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest")
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held")
 
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsConfig, BenefitsLedger], BenefitsEngine] | None = None,
@@ -2467,9 +2549,12 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
     parser = argparse.ArgumentParser(description="#268 member core: S$300 online order -> AC2 MEMBER + 2-year expiry; claim links")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--apply", action="store_true", help="index only: write claim links to this tool's ledger (default: dry run)")
+    parser.add_argument("--apply", action="store_true", help="index, release-held: record in this tool's ledger (default: dry run)")
     parser.add_argument("--max", type=int, default=200, help="index only: members examined this run (1-1000)")
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
+    parser.add_argument("--order-ref", help="release-held only: the o- keyed ref of the order whose HELD write is released")
+    parser.add_argument("--member-last3", help="release-held: the last 3 characters of the MemberNo")
+    parser.add_argument("--finding", help="release-held only: as_intended or not_as_intended (what the owner saw in AutoCount)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -2503,6 +2588,8 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
                     result = engine.run(apply=True)
             elif args.command == "resolve":
                 result = engine.resolve()
+            elif args.command == "release-held":
+                result = engine.release_held(order_ref=args.order_ref, member_last3=args.member_last3, finding=args.finding, apply=args.apply)
             else:
                 result = engine.index(apply=args.apply, max_members=args.max)
             _emit(result)
