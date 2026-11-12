@@ -76,7 +76,7 @@ LEDGER_FILE = "member_benefits.sqlite3"
 LOCK_FILE = "member_benefits.lock"
 STOP_FILE = "STOP"
 TOOL = "xb268_member_benefits"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # slice B1: ledger v2 (claim unlinks, write releases, rule fingerprint); no migration
 PROFILE = "benefit_p1"
 BRIDGE_SCRIPT = dl.REPO_ROOT / "scripts" / "ac2_member_benefits_bridge.ps1"
 
@@ -134,12 +134,22 @@ PENDING_STATES = ("pending_signup", "waiting_member", "ready")
 # alert) instead of waiting for ever. Such a receipt is re-opened (back to
 # ``ready``) only when a #155 link or a claim link for its customer appears.
 CLAIM_HOLD_CODES = frozenset({"claim_name_mismatch", "claim_phone_not_unique", "claim_link_conflict", "claim_memberno_conflict",
-                              "claim_member_not_in_scope", "claim_no_phone"})
+                              "claim_member_not_in_scope", "claim_no_phone", "claim_pair_unlinked"})
 # G2 B1: a refund by money that no refunded or removed unit explains.
 REFUND_UNATTRIBUTED = "refund_unattributed"
 # G2 B5: a claim-held receipt whose order stopped qualifying while it was
 # held (unit refund, cancellation, any other reason). Never re-opened.
 ORDER_NO_LONGER_QUALIFIES = "order_no_longer_qualifies"
+# Slice B1: the only codes a held claim receipt may settle to (pinned in the
+# receipts_decided_code trigger). ``order_past_read_window`` is used from
+# slice B2 on; it is listed now so B2 needs no schema change.
+ORDER_PAST_READ_WINDOW = "order_past_read_window"
+CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, ORDER_PAST_READ_WINDOW})
+# Slice B1: the version of the amount rule (goods_amount, gift_card_paid,
+# qualifying_amount, qualifies, money_refund_unattributed and the order
+# parsing of amounts). Any change to one of them raises it; it is part of the
+# rule fingerprint kept in the ledger (BenefitsConfig.rule_fingerprint).
+AMOUNT_RULE_VERSION = 1
 
 _LOCAL_STORED_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
 _NEW_EXPIRY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T00:00:00$")
@@ -244,6 +254,22 @@ class BenefitsConfig:
     ac2_credential_target: str | None
     ac2_login_mode: str | None
     ac2_refused_user_ids: tuple[str, ...]
+
+    def rule_fingerprint(self) -> str:
+        """Slice B1: ``sha256:`` + hex of the canonical JSON of every setting
+        that changes a measured amount or the threshold, plus
+        ``AMOUNT_RULE_VERSION``. Kept in the ledger at ``init``. Not in it, on
+        purpose: the sign-up settings and ``orders_start_utc`` (a replay
+        decides undecided receipts again under them), caps, timeouts, roots."""
+
+        value = {
+            "amount_rule_version": AMOUNT_RULE_VERSION, "qualify_threshold_cents": self.qualify_threshold_cents,
+            "amount_before_discounts": self.amount_before_discounts, "amount_include_tax": self.amount_include_tax,
+            "amount_exclude_shipping": self.amount_exclude_shipping, "amount_exclude_gift_cards": self.amount_exclude_gift_cards,
+            "gift_card_gateways": sorted(self.gift_card_gateways), "amount_count_sale_items": self.amount_count_sale_items,
+        }
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -706,7 +732,8 @@ LEDGER_SCHEMA = """
 CREATE TABLE meta(
   id INTEGER PRIMARY KEY CHECK (id = 1), tool TEXT NOT NULL CHECK (tool = 'xb268_member_benefits'), ledger_id TEXT NOT NULL,
   autocount_book TEXT NOT NULL CHECK (autocount_book IN ('AED_TESTINGAPI', 'AED_XBOUNDARIES')),
-  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL);
+  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL,
+  rule_fingerprint TEXT NOT NULL CHECK (rule_fingerprint GLOB 'sha256:*' AND length(rule_fingerprint) = 71));
 CREATE TABLE receipts(
   order_gid TEXT PRIMARY KEY, customer_gid TEXT, order_created_at TEXT NOT NULL, order_date_sgt TEXT NOT NULL,
   order_updated_at TEXT NOT NULL, financial_status TEXT, gross_cents INTEGER, net_cents INTEGER, refunded_cents INTEGER,
@@ -718,8 +745,14 @@ CREATE TABLE receipts(
   first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   CHECK (state <> 'applied' OR (member_no IS NOT NULL AND basis_expiry_local IS NOT NULL)));
 CREATE TABLE claim_links(
-  customer_gid TEXT NOT NULL UNIQUE, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL UNIQUE,
+  link_id INTEGER PRIMARY KEY, customer_gid TEXT NOT NULL, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL,
   source TEXT NOT NULL CHECK (source IN ('order', 'index')), code TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE claim_unlinks(
+  link_id INTEGER PRIMARY KEY REFERENCES claim_links(link_id),
+  reason TEXT NOT NULL CHECK (reason IN ('wrong_person', 'customers_merged', 'member_renumbered', 'other')),
+  run_id TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE VIEW active_claim_links AS
+  SELECT * FROM claim_links c WHERE NOT EXISTS (SELECT 1 FROM claim_unlinks u WHERE u.link_id = c.link_id);
 CREATE TABLE reviews(subject TEXT PRIMARY KEY, code TEXT NOT NULL, first_seen_at TEXT NOT NULL);
 CREATE TABLE writes(
   write_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, order_gid TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('upgrade', 'extend')),
@@ -732,6 +765,11 @@ CREATE TABLE writes(
   CHECK (new_expiry_local GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T00:00:00'),
   CHECK (expected_expiry_local IS NULL OR substr(new_expiry_local, 1, 10) > substr(expected_expiry_local, 1, 10)),
   CHECK (state <> 'DONE' OR post_last_modified_local IS NOT NULL));
+CREATE TABLE write_releases(
+  write_id TEXT PRIMARY KEY REFERENCES writes(write_id),
+  finding TEXT NOT NULL CHECK (finding IN ('as_intended', 'not_as_intended')),
+  member_read_digest TEXT NOT NULL CHECK (member_read_digest GLOB 'sha256:*' AND length(member_read_digest) = 71),
+  run_id TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE watermarks(name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE runs(run_id TEXT PRIMARY KEY, command TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, summary TEXT);
 CREATE TRIGGER meta_immutable BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
@@ -742,18 +780,31 @@ CREATE TRIGGER receipts_binding_immutable BEFORE UPDATE OF order_gid, order_crea
 CREATE TRIGGER receipts_decided_stay BEFORE UPDATE OF state ON receipts
   WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state <> OLD.state
    AND NOT (OLD.state = 'held' AND NEW.state = 'ready' AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
-            'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+            'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone', 'claim_pair_unlinked'))
   BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
 CREATE TRIGGER receipts_decided_code BEFORE UPDATE OF code ON receipts
   WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state = OLD.state AND NEW.code IS NOT OLD.code
-   AND NOT (OLD.state = 'held' AND NEW.code IS NOT NULL
+   AND NOT (OLD.state = 'held'
             AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
-                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone')
-            AND NEW.code NOT IN ('claim_name_mismatch', 'claim_phone_not_unique',
-                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone', 'claim_pair_unlinked')
+            AND COALESCE(NEW.code, '') IN ('order_no_longer_qualifies', 'refund_unattributed', 'order_past_read_window'))
   BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
+CREATE TRIGGER claim_links_one_active BEFORE INSERT ON claim_links
+  WHEN EXISTS (SELECT 1 FROM active_claim_links a WHERE a.customer_gid = NEW.customer_gid OR a.member_no_key = NEW.member_no_key)
+  BEGIN SELECT RAISE(ABORT, 'claim_link_conflict'); END;
+CREATE TRIGGER claim_links_pair_unlinked BEFORE INSERT ON claim_links
+  WHEN EXISTS (SELECT 1 FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id
+               WHERE c.customer_gid = NEW.customer_gid AND c.member_no_key = NEW.member_no_key)
+  BEGIN SELECT RAISE(ABORT, 'claim_pair_unlinked'); END;
 CREATE TRIGGER claim_links_immutable BEFORE UPDATE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
 CREATE TRIGGER claim_links_no_delete BEFORE DELETE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
+CREATE TRIGGER claim_unlinks_immutable BEFORE UPDATE ON claim_unlinks BEGIN SELECT RAISE(ABORT, 'claim_unlink_immutable'); END;
+CREATE TRIGGER claim_unlinks_no_delete BEFORE DELETE ON claim_unlinks BEGIN SELECT RAISE(ABORT, 'claim_unlink_immutable'); END;
+CREATE TRIGGER write_releases_held_only BEFORE INSERT ON write_releases
+  WHEN NOT EXISTS (SELECT 1 FROM writes w WHERE w.write_id = NEW.write_id AND w.state = 'HELD')
+  BEGIN SELECT RAISE(ABORT, 'release_not_held'); END;
+CREATE TRIGGER write_releases_immutable BEFORE UPDATE ON write_releases BEGIN SELECT RAISE(ABORT, 'write_release_immutable'); END;
+CREATE TRIGGER write_releases_no_delete BEFORE DELETE ON write_releases BEGIN SELECT RAISE(ABORT, 'write_release_immutable'); END;
 CREATE TRIGGER writes_no_delete BEFORE DELETE ON writes BEGIN SELECT RAISE(ABORT, 'write_immutable'); END;
 CREATE TRIGGER writes_binding_immutable BEFORE UPDATE OF write_id, run_id, order_gid, kind, member_no, from_type, to_type,
   expected_last_modified_local, expected_expiry_local, new_expiry_local, salt, created_at, deadline_at ON writes
@@ -772,21 +823,28 @@ class BenefitsLedger:
         self.root = Path(root)
         self.clock = clock
         self._lock = dl._OwnerLock(self.root / LOCK_FILE)
+        self.conn = None
         try:
             self.conn = sqlite3.connect(self.root / LEDGER_FILE, isolation_level=None, timeout=0)
             self.conn.row_factory = sqlite3.Row
-            for pragma in ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON", "trusted_schema=OFF"):
-                self.conn.execute(f"PRAGMA {pragma}")
+            # Slice B1: the version is checked before any pragma that could
+            # change the file, so a ledger made by older code is left as it is.
             version = self.conn.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not (version == 0 and not tables) and (version != SCHEMA_VERSION or "receipts" not in tables):
+                raise dl.DirectLocalError("benefits_ledger_not_recognised")
+            # recursive_triggers: an INSERT OR REPLACE deletes the old row
+            # first; with this on, the no-delete triggers fire and abort it.
+            for pragma in ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON", "trusted_schema=OFF", "recursive_triggers=ON"):
+                self.conn.execute(f"PRAGMA {pragma}")
             if version == 0 and not tables:
                 with self.tx() as conn:
                     for statement in dl._split_sql(LEDGER_SCHEMA):
                         conn.execute(statement)
                     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            elif version != SCHEMA_VERSION or "receipts" not in tables:
-                raise dl.DirectLocalError("benefits_ledger_not_recognised")
         except BaseException:
+            if self.conn is not None:
+                self.conn.close()
             self._lock.release()
             raise
 
@@ -819,9 +877,10 @@ class BenefitsLedger:
                 self._check(row, config)
                 return {"status": "existing"}
             conn.execute(
-                "INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at, rule_fingerprint) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (TOOL, f"mb-{uuid.uuid4().hex}", config.autocount_book, config.shopify.store_gid, config.shopify.shop_domain,
-                 secrets.token_hex(32), dl.ts(self.now())),
+                 secrets.token_hex(32), dl.ts(self.now()), config.rule_fingerprint()),
             )
         return {"status": "initialised"}
 
@@ -874,11 +933,22 @@ class BenefitsLedger:
         with self.tx() as conn:
             conn.execute(f"UPDATE receipts SET {columns}, updated_at = ? WHERE order_gid = ?", (*values.values(), dl.ts(self.now()), order_gid))
 
+    # Slice B1: every reader of claim links reads the active ones only (a
+    # voided link stays in claim_links as history).
     def claim_for_gid(self, gid: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM claim_links WHERE customer_gid = ?", (gid,)).fetchone()
+        return self.conn.execute("SELECT * FROM active_claim_links WHERE customer_gid = ?", (gid,)).fetchone()
 
     def claim_for_member(self, member_no: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM claim_links WHERE member_no_key = ?", (sync.member_no_key(member_no),)).fetchone()
+        return self.conn.execute("SELECT * FROM active_claim_links WHERE member_no_key = ?", (sync.member_no_key(member_no),)).fetchone()
+
+    def active_claims(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM active_claim_links ORDER BY link_id").fetchall()
+
+    def claim_counts(self) -> tuple[int, int]:
+        """``(active, voided)`` claim links."""
+
+        return (self.conn.execute("SELECT COUNT(*) FROM active_claim_links").fetchone()[0],
+                self.conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0])
 
     def add_claim(self, gid: str, member_no: str, source: str, code: str) -> None:
         with self.tx() as conn:
@@ -1552,7 +1622,7 @@ class BenefitsEngine:
 
     def _load_links(self) -> None:
         self.links = self._sync_links()
-        claims = self.ledger.conn.execute("SELECT * FROM claim_links").fetchall()
+        claims = self.ledger.active_claims()
         self.conflict_gids, self.conflict_keys = link_conflicts(self.links, claims)
         self.linked_gids = set(self.links.by_gid) | {row["customer_gid"] for row in claims}
 
@@ -2183,8 +2253,9 @@ class BenefitsEngine:
         receipts = {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM receipts GROUP BY state")}
         observed = {row[0]: row[1] for row in conn.execute("SELECT observed, COUNT(*) FROM receipts WHERE state = 'ready' AND observed IS NOT NULL GROUP BY observed")}
         writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT kind, state, COUNT(*) FROM writes GROUP BY kind, state")}
+        active, voided = self.ledger.claim_counts()
         return {"status": "ok", "command": "status", "receipts": receipts, "observed": observed, "writes": writes,
-                "claim_links": conn.execute("SELECT COUNT(*) FROM claim_links").fetchone()[0],
+                "claim_links": active, "claim_links_voided": voided,
                 "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
                 "watermark_set": self.ledger.watermark(WATERMARK) is not None, "stop_file_present": self._stop_requested()}
 
@@ -2240,6 +2311,8 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise dl.DirectLocalError("benefits_ledger_not_recognised")  # slice B1: a ledger made by older code
         meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
         if meta is None:
             raise dl.DirectLocalError("benefits_ledger_not_initialised")
@@ -2301,7 +2374,9 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
             "open": {
                 "uncertain_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state IN ('INTENT', 'UNCERTAIN')").fetchone()[0],
                 "held_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0],
-                "waiting_member": receipts.get("waiting_member", 0), "claim_links": conn.execute("SELECT COUNT(*) FROM claim_links").fetchone()[0],
+                "waiting_member": receipts.get("waiting_member", 0),
+                "claim_links": conn.execute("SELECT COUNT(*) FROM active_claim_links").fetchone()[0],
+                "claim_links_voided": conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0],
             },
         }
     except sqlite3.Error:

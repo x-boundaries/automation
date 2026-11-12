@@ -14,6 +14,7 @@ Closure rows (G0 design 3.4, as cut by the G1 brief) each have a test named
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -323,8 +324,8 @@ class Base(unittest.TestCase):
         "type_move_lock", "ac2_credential", "ac2_login_mode"})
     RUN_KEYS = frozenset({"status", "command", "run_id", "saves", "counts", "alerts", "refs", "stopped"})
     OUTPUT_KEYS = {
-        "status": (frozenset({"status", "command", "receipts", "observed", "writes", "claim_links", "reviews", "watermark_set",
-                              "stop_file_present"}), frozenset()),
+        "status": (frozenset({"status", "command", "receipts", "observed", "writes", "claim_links", "claim_links_voided", "reviews",
+                              "watermark_set", "stop_file_present"}), frozenset()),
         "observe": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "apply": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
@@ -334,7 +335,7 @@ class Base(unittest.TestCase):
     DIGEST_KEYS = frozenset({"schema", "status", "autocount_book", "hours", "runs", "counts", "alerts", "alert_refs", "receipts", "shadow",
                              "gift_cards", "open"})
     DIGEST_PART_KEYS = {"runs": frozenset({"completed", "unfinished"}), "shadow": frozenset({"would_upgrade", "would_extend"}),
-                        "open": frozenset({"uncertain_writes", "held_writes", "waiting_member", "claim_links"})}
+                        "open": frozenset({"uncertain_writes", "held_writes", "waiting_member", "claim_links", "claim_links_voided"})}
     WRITE_STATES = ("INTENT", "DONE", "SKIPPED", "NOT_WRITTEN", "UNCERTAIN", "HELD")
 
     def tearDown(self):
@@ -2692,7 +2693,7 @@ class OutputShapeRuleTests(Base):
                    "runs": {"completed": 2, "unfinished": 0}, "counts": {"orders_read": 2}, "alerts": {"claim_needs_review": 2},
                    "alert_refs": [{"ref": "m-" + "b" * 20, "code": "claim_needs_review"}], "receipts": {"applied": 1, "held": 1},
                    "shadow": {"would_upgrade": 0, "would_extend": 0}, "gift_cards": {"receipts_paid_by_gift_card": 0, "gateways_seen": {}},
-                   "open": {"uncertain_writes": 0, "held_writes": 0, "waiting_member": 0, "claim_links": 1}}
+                   "open": {"uncertain_writes": 0, "held_writes": 0, "waiting_member": 0, "claim_links": 1, "claim_links_voided": 0}}
     GOOD_RESOLVE = {"status": "ok", "command": "resolve", "writes": 0, "resolved": {"HELD:resolved_unclear": 1}, "alerts": ["resolved_unclear"]}
     GOOD_INDEX = {"status": "ok", "command": "index_apply", "run_id": "run-" + "0" * 32, "saves": 0, "stopped": None,
                   "counts": {"examined": 1}, "alerts": [], "refs": []}
@@ -2797,13 +2798,13 @@ class OutputShapeRuleTests(Base):
             "digest_open_with_a_new_key": {**self.GOOD_DIGEST, "open": {**self.GOOD_DIGEST["open"], "seen_" + order[-6:]: 1}},
             "digest_receipts_key_with_part_of_an_order_number": {**self.GOOD_DIGEST, "receipts": {"held_" + order[-6:]: 1}},
             "an_unknown_command": {**run, "command": "seen"},
-            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "claim_links": 0,
+            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0,
                                       "reviews": 0, "watermark_set": False, "stop_file_present": False, "seen": 1},
             "status_receipts_key_with_part_of_an_order_number": {
-                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "claim_links": 0,
+                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0,
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "status_writes_key_with_part_of_an_order_number": {
-                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "claim_links": 0,
+                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "claim_links": 0, "claim_links_voided": 0,
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "check_config_with_a_new_key": {"status": "ok", **{key: None for key in self.CONFIG_KEYS if key != "status"}, "seen": 1},
             "init_with_another_status": {"status": "seen_" + order[-6:]},
@@ -2907,6 +2908,316 @@ class OutputShapeRuleTests(Base):
             self.assert_outputs_private()
             self.advance(minutes=15)
         self.assertEqual((self.book.saves, self.receipt(1)["state"]), (0, "ready"))
+
+
+# --------------------------------------------------------------------------
+# Slice B1: ledger v2 (G0 design 1.2). The v1 schema text below is main's at
+# ff053a5, kept here only to prove that a ledger made by that code is refused.
+# --------------------------------------------------------------------------
+
+V1_LEDGER_SCHEMA = """
+CREATE TABLE meta(
+  id INTEGER PRIMARY KEY CHECK (id = 1), tool TEXT NOT NULL CHECK (tool = 'xb268_member_benefits'), ledger_id TEXT NOT NULL,
+  autocount_book TEXT NOT NULL CHECK (autocount_book IN ('AED_TESTINGAPI', 'AED_XBOUNDARIES')),
+  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL);
+CREATE TABLE receipts(
+  order_gid TEXT PRIMARY KEY, customer_gid TEXT, order_created_at TEXT NOT NULL, order_date_sgt TEXT NOT NULL,
+  order_updated_at TEXT NOT NULL, financial_status TEXT, gross_cents INTEGER, net_cents INTEGER, refunded_cents INTEGER,
+  gift_card_cents INTEGER, payment_gateways TEXT,
+  state TEXT NOT NULL CHECK (state IN ('ignored_unpaid', 'ignored_test', 'void', 'before_start', 'no_customer', 'amount_unverifiable',
+    'below_threshold', 'not_signed_up', 'pending_signup', 'waiting_member', 'ready', 'applied', 'no_change', 'not_in_scope', 'held')),
+  code TEXT, member_no TEXT, link_source TEXT CHECK (link_source IS NULL OR link_source IN ('sync155', 'claim')),
+  basis_expiry_local TEXT, observed TEXT, observed_at TEXT, waiting_since TEXT, checked_at TEXT, alerted TEXT,
+  first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  CHECK (state <> 'applied' OR (member_no IS NOT NULL AND basis_expiry_local IS NOT NULL)));
+CREATE TABLE claim_links(
+  customer_gid TEXT NOT NULL UNIQUE, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL UNIQUE,
+  source TEXT NOT NULL CHECK (source IN ('order', 'index')), code TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE reviews(subject TEXT PRIMARY KEY, code TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+CREATE TABLE writes(
+  write_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, order_gid TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('upgrade', 'extend')),
+  member_no TEXT NOT NULL, from_type TEXT NOT NULL, to_type TEXT NOT NULL CHECK (to_type = 'MEMBER'),
+  expected_last_modified_local TEXT NOT NULL, expected_expiry_local TEXT, new_expiry_local TEXT NOT NULL, salt TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('INTENT', 'DONE', 'SKIPPED', 'NOT_WRITTEN', 'UNCERTAIN', 'HELD')),
+  code TEXT, post_last_modified_local TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  deadline_at TEXT NOT NULL, child_pid INTEGER, child_created TEXT,
+  CHECK ((kind = 'upgrade' AND from_type = 'GUEST') OR (kind = 'extend' AND from_type = 'MEMBER')),
+  CHECK (new_expiry_local GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T00:00:00'),
+  CHECK (expected_expiry_local IS NULL OR substr(new_expiry_local, 1, 10) > substr(expected_expiry_local, 1, 10)),
+  CHECK (state <> 'DONE' OR post_last_modified_local IS NOT NULL));
+CREATE TABLE watermarks(name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE runs(run_id TEXT PRIMARY KEY, command TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, summary TEXT);
+CREATE TRIGGER meta_immutable BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
+CREATE TRIGGER meta_no_delete BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
+CREATE TRIGGER receipts_no_delete BEFORE DELETE ON receipts BEGIN SELECT RAISE(ABORT, 'receipt_immutable'); END;
+CREATE TRIGGER receipts_binding_immutable BEFORE UPDATE OF order_gid, order_created_at, first_seen_at ON receipts
+  BEGIN SELECT RAISE(ABORT, 'receipt_immutable'); END;
+CREATE TRIGGER receipts_decided_stay BEFORE UPDATE OF state ON receipts
+  WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state <> OLD.state
+   AND NOT (OLD.state = 'held' AND NEW.state = 'ready' AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
+            'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+  BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
+CREATE TRIGGER receipts_decided_code BEFORE UPDATE OF code ON receipts
+  WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state = OLD.state AND NEW.code IS NOT OLD.code
+   AND NOT (OLD.state = 'held' AND NEW.code IS NOT NULL
+            AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
+                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone')
+            AND NEW.code NOT IN ('claim_name_mismatch', 'claim_phone_not_unique',
+                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+  BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
+CREATE TRIGGER claim_links_immutable BEFORE UPDATE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
+CREATE TRIGGER claim_links_no_delete BEFORE DELETE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
+CREATE TRIGGER writes_no_delete BEFORE DELETE ON writes BEGIN SELECT RAISE(ABORT, 'write_immutable'); END;
+CREATE TRIGGER writes_binding_immutable BEFORE UPDATE OF write_id, run_id, order_gid, kind, member_no, from_type, to_type,
+  expected_last_modified_local, expected_expiry_local, new_expiry_local, salt, created_at, deadline_at ON writes
+  BEGIN SELECT RAISE(ABORT, 'write_immutable'); END;
+CREATE TRIGGER writes_transition BEFORE UPDATE OF state ON writes
+  WHEN NOT ((OLD.state = 'INTENT' AND NEW.state IN ('DONE', 'SKIPPED', 'NOT_WRITTEN', 'UNCERTAIN', 'HELD'))
+         OR (OLD.state = 'UNCERTAIN' AND NEW.state IN ('DONE', 'NOT_WRITTEN', 'HELD')))
+  BEGIN SELECT RAISE(ABORT, 'write_transition_invalid'); END;
+"""
+
+def make_v1_ledger(root: Path) -> bytes:
+    """A ledger made by main's code at ff053a5 (schema v1, one meta row);
+    returns the file's bytes."""
+    conn = sqlite3.connect(root / bm.LEDGER_FILE, isolation_level=None)
+    try:
+        for statement in dl._split_sql(V1_LEDGER_SCHEMA):
+            conn.execute(statement)
+        conn.execute("PRAGMA user_version=1")
+        conn.execute("INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES "
+                     "(1, 'xb268_member_benefits', 'mb-1', 'AED_TESTINGAPI', ?, ?, ?, '2026-11-17T00:00:00Z')", (STORE_GID, SHOP, "0" * 64))
+    finally:
+        conn.close()
+    return (root / bm.LEDGER_FILE).read_bytes()
+
+
+class LedgerV2Tests(Base):
+    run_main = CliTests.run_main
+    # Commands that open the ledger; slice B1 adds release-held and unlink.
+    LEDGER_COMMANDS = (("init",), ("status",), ("observe",), ("apply",), ("resolve",), ("index",), ("index", "--apply"), ("digest",))
+
+    def setUp(self):
+        super().setUp()
+        self.counter = iter(range(500, 900))
+
+    def add_receipt(self, state: str, code: str | None = None, **values) -> str:
+        gid = order_gid(next(self.counter))
+        columns = {"order_gid": gid, "order_created_at": "t", "order_date_sgt": "d", "order_updated_at": "t", "state": state, "code": code,
+                   "member_no": "m", "basis_expiry_local": "e", "first_seen_at": "t", "updated_at": "t", **values}
+        with self.ledger.tx() as conn:
+            conn.execute(f"INSERT INTO receipts({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})", tuple(columns.values()))
+        return gid
+
+    def add_write(self, state: str, order: str | None = None, member_no: str | None = None) -> str:
+        payload = {"kind": "upgrade", "member_no": member_no or sg(1), "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                   "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+        row = self.ledger.add_intent(run_id="run-x", order_gid=order or order_gid(next(self.counter)), payload=payload, deadline=self.now)
+        if state != "INTENT":
+            self.ledger.set_outcome(row["write_id"], state, "c", LM if state == "DONE" else None)
+        return row["write_id"]
+
+    def void(self, link_id: int) -> None:
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (?, 'wrong_person', 'run-x', 't')", (link_id,))
+
+    def link_id(self, gid: str) -> int:
+        return self.ledger.conn.execute("SELECT MAX(link_id) FROM claim_links WHERE customer_gid = ?", (gid,)).fetchone()[0]
+
+    def refused(self, sql: str, params=(), message: str | None = None) -> None:
+        with self.assertRaises(sqlite3.IntegrityError) as caught:
+            with self.ledger.tx() as conn:
+                conn.execute(sql, params)
+        if message is not None:
+            self.assertIn(message, str(caught.exception))
+
+    # -- the version step -------------------------------------------------------
+    def test_a_v1_ledger_is_refused_by_every_command_and_left_as_it_is(self):
+        before = make_v1_ledger(self.root)
+        for args in self.LEDGER_COMMANDS:
+            with self.subTest(args=args):
+                code, out, _ = self.run_main(*args)
+                self.assertEqual((code, out), (2, {"status": "refused", "code": "benefits_ledger_not_recognised"}))
+        self.assertEqual((self.root / bm.LEDGER_FILE).read_bytes(), before)
+        self.assertFalse((self.root / (bm.LEDGER_FILE + "-wal")).exists())
+        self.assertEqual(self.code(lambda: bm.BenefitsLedger(self.root)), "benefits_ledger_not_recognised")
+
+    def test_a_new_ledger_is_v2_with_the_rule_fingerprint_and_every_pragma(self):
+        self.engine()
+        conn = self.ledger.conn
+        self.assertEqual(bm.SCHEMA_VERSION, 2)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual([conn.execute(f"PRAGMA {name}").fetchone()[0] for name in ("foreign_keys", "trusted_schema", "recursive_triggers")], [1, 0, 1])
+        self.assertEqual(conn.execute("SELECT rule_fingerprint FROM meta").fetchone()[0], self.cfg().rule_fingerprint())
+        self.assertRegex(self.cfg().rule_fingerprint(), r"^sha256:[0-9a-f]{64}\Z")
+        names = {row[0]: row[1] for row in conn.execute("SELECT name, type FROM sqlite_master")}
+        for table in ("claim_unlinks", "write_releases"):
+            self.assertEqual(names.get(table), "table")
+        self.assertEqual(names.get("active_claim_links"), "view")
+        for trigger in ("claim_links_one_active", "claim_links_pair_unlinked", "write_releases_held_only", "claim_unlinks_immutable",
+                        "claim_unlinks_no_delete", "write_releases_immutable", "write_releases_no_delete"):
+            self.assertEqual(names.get(trigger), "trigger", trigger)
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(claim_links)")}
+        self.assertEqual(columns["link_id"][5], 1)  # the primary key
+        self.assertEqual([row for row in conn.execute("PRAGMA index_list(claim_links)")], [])  # no UNIQUE left on the columns
+        for index, bad in enumerate(("sha256:abc", "md5:" + "0" * 67, None)):
+            with self.subTest(fingerprint=bad):
+                other = self.temp / f"fp-{index}"
+                other.mkdir()
+                ledger = bm.BenefitsLedger(other)
+                try:
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        with ledger.tx() as c:
+                            c.execute("INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at, "
+                                      "rule_fingerprint) VALUES (1, 'xb268_member_benefits', 'x', 'AED_TESTINGAPI', 's', 'd', ?, 't', ?)",
+                                      ("0" * 64, bad))
+                finally:
+                    ledger.close()
+
+    # -- append-only tables -----------------------------------------------------
+    def test_every_append_only_table_refuses_update_delete_and_insert_or_replace(self):
+        self.engine()
+        self.ledger.add_claim(customer_gid(1), sg(1), "order", "phone_and_name_match")
+        link = self.link_id(customer_gid(1))
+        self.void(link)
+        held = self.add_write("HELD")
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO write_releases(write_id, finding, member_read_digest, run_id, created_at) VALUES (?, 'as_intended', ?, 'run-x', 't')",
+                         (held, "sha256:" + "0" * 64))
+        receipt = self.add_receipt("ready")
+        snapshot = {table: [tuple(r) for r in self.ledger.conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                    for table in ("meta", "receipts", "claim_links", "claim_unlinks", "writes", "write_releases")}
+        cases = {
+            "meta": ["UPDATE meta SET shop_domain = 'x'", "DELETE FROM meta",
+                     "INSERT OR REPLACE INTO meta SELECT * FROM meta"],
+            "receipts": ["UPDATE receipts SET order_gid = 'x'", "UPDATE receipts SET first_seen_at = 'x'", "DELETE FROM receipts",
+                         "INSERT OR REPLACE INTO receipts SELECT * FROM receipts"],
+            "claim_links": ["UPDATE claim_links SET member_no = 'x'", "UPDATE claim_links SET link_id = 99", "DELETE FROM claim_links",
+                            "INSERT OR REPLACE INTO claim_links SELECT * FROM claim_links"],
+            "claim_unlinks": ["UPDATE claim_unlinks SET reason = 'other'", "DELETE FROM claim_unlinks",
+                              "INSERT OR REPLACE INTO claim_unlinks SELECT * FROM claim_unlinks"],
+            "writes": ["UPDATE writes SET member_no = 'x'", "UPDATE writes SET state = 'DONE'", "DELETE FROM writes",
+                       "INSERT OR REPLACE INTO writes SELECT * FROM writes"],
+            "write_releases": ["UPDATE write_releases SET finding = 'not_as_intended'", "DELETE FROM write_releases",
+                               "INSERT OR REPLACE INTO write_releases SELECT * FROM write_releases"],
+        }
+        for table, statements in cases.items():
+            for sql in statements:
+                with self.subTest(sql=sql):
+                    self.refused(sql)
+        for table, rows in snapshot.items():
+            self.assertEqual([tuple(r) for r in self.ledger.conn.execute(f"SELECT * FROM {table} ORDER BY rowid")], rows, table)
+        self.assertEqual(receipt, self.ledger.conn.execute("SELECT order_gid FROM receipts").fetchone()[0])
+
+    # -- the two claim triggers -------------------------------------------------
+    def test_the_claim_triggers_keep_one_active_link_and_never_link_a_voided_pair_again(self):
+        self.engine()
+        add = self.ledger.add_claim
+        add(customer_gid(1), sg(1), "order", "phone_and_name_match")
+        for gid, member_no in ((customer_gid(1), sg(2)), (customer_gid(2), sg(1)), (customer_gid(2), sg(1) + " "), (customer_gid(1), sg(1))):
+            with self.subTest(gid=gid, member_no=member_no), self.assertRaises(sqlite3.IntegrityError) as caught:
+                add(gid, member_no, "index", "phone_and_name_match")
+            self.assertIn("claim_link_conflict", str(caught.exception))
+        self.void(self.link_id(customer_gid(1)))
+        for member_no in (sg(1), " " + sg(1) + " "):  # the same pair (AutoCount ignores the spaces)
+            with self.subTest(member_no=member_no), self.assertRaises(sqlite3.IntegrityError) as caught:
+                add(customer_gid(1), member_no, "order", "phone_and_name_match")
+            self.assertIn("claim_pair_unlinked", str(caught.exception))
+        add(customer_gid(1), sg(3), "order", "phone_and_name_match")  # the customer, to another member
+        add(customer_gid(4), sg(1), "index", "phone_and_name_match")  # the member, to another customer
+        with self.assertRaises(sqlite3.IntegrityError) as caught:
+            add(customer_gid(5), sg(3), "order", "phone_and_name_match")
+        self.assertIn("claim_link_conflict", str(caught.exception))
+        self.assertEqual(self.ledger.claim_counts(), (2, 1))
+        self.assertEqual({r["customer_gid"]: r["member_no"] for r in self.ledger.active_claims()}, {customer_gid(1): sg(3), customer_gid(4): sg(1)})
+        self.refused("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (999, 'other', 'r', 't')")  # no such link
+        self.refused("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (?, 'mistake', 'r', 't')",
+                     (self.link_id(customer_gid(4)),))  # reason not listed
+        self.refused("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (?, 'other', 'r', 't')",
+                     (self.ledger.conn.execute("SELECT MIN(link_id) FROM claim_links").fetchone()[0],))  # one void per link
+
+    # -- the code trigger -------------------------------------------------------
+    def test_a_held_claim_receipt_settles_only_to_the_three_settle_codes(self):
+        self.engine()
+        self.assertEqual(bm.CLAIM_SETTLE_CODES, {"order_no_longer_qualifies", "refund_unattributed", "order_past_read_window"})
+        self.assertIn("claim_pair_unlinked", bm.CLAIM_HOLD_CODES)
+        others = sorted(bm.CLAIM_HOLD_CODES) + ["link_conflict", "member_inactive", "held_write_released", "would_upgrade", "anything_else", None]
+        for old in sorted(bm.CLAIM_HOLD_CODES):
+            for new in sorted(bm.CLAIM_SETTLE_CODES):
+                with self.subTest(old=old, new=new):
+                    gid = self.add_receipt("held", old)
+                    self.ledger.update_receipt(gid, code=new)
+                    self.assertEqual(self.ledger.receipt(gid)["code"], new)
+            for new in others:
+                if new == old:
+                    continue
+                with self.subTest(old=old, new=new):
+                    gid = self.add_receipt("held", old)
+                    with self.assertRaises(sqlite3.IntegrityError) as caught:
+                        self.ledger.update_receipt(gid, code=new)
+                    self.assertIn("receipt_decided", str(caught.exception))
+            with self.subTest(old=old, reopen=True):
+                gid = self.add_receipt("held", old)
+                self.ledger.update_receipt(gid, state="ready", code=None)  # the one way back, claim_pair_unlinked included
+        for old in sorted(bm.CLAIM_SETTLE_CODES):  # a settled code never moves again
+            for new in sorted(bm.CLAIM_SETTLE_CODES - {old}):
+                with self.subTest(settled=old, new=new):
+                    gid = self.add_receipt("held", old)
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        self.ledger.update_receipt(gid, code=new)
+
+    # -- write releases ---------------------------------------------------------
+    def test_a_release_row_needs_a_held_write_and_is_one_per_write(self):
+        self.engine()
+        sql = "INSERT INTO write_releases(write_id, finding, member_read_digest, run_id, created_at) VALUES (?, ?, ?, 'run-x', 't')"
+        digest = "sha256:" + "a" * 64
+        for state in ("INTENT", "DONE", "SKIPPED", "NOT_WRITTEN", "UNCERTAIN"):
+            with self.subTest(state=state):
+                self.refused(sql, (self.add_write(state), "as_intended", digest), "release_not_held")
+        self.refused(sql, ("write-none", "as_intended", digest), "release_not_held")
+        held = self.add_write("HELD")
+        for finding, read in (("seen", digest), ("as_intended", "sha256:short"), ("as_intended", "md5:" + "a" * 67)):
+            with self.subTest(finding=finding, read=read):
+                self.refused(sql, (held, finding, read))
+        with self.ledger.tx() as conn:
+            conn.execute(sql, (held, "not_as_intended", digest))
+        self.refused(sql, (held, "as_intended", digest))  # one release per write
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes WHERE write_id = ?", (held,)).fetchone()[0], "HELD")
+
+    # -- every reader reads active links ----------------------------------------
+    def test_a_voided_link_is_read_by_no_reader(self):
+        member_no = self.guest_with_order(1, linked=False)
+        engine = self.engine()
+        self.ledger.add_claim(customer_gid(1), member_no, "order", "phone_and_name_match")
+        self.ledger.add_claim(customer_gid(2), sg(2), "index", "phone_and_name_match")
+        self.void(self.link_id(customer_gid(1)))
+        self.assertIsNone(self.ledger.claim_for_gid(customer_gid(1)))
+        self.assertIsNone(self.ledger.claim_for_member(member_no))
+        self.assertIsNotNone(self.ledger.claim_for_gid(customer_gid(2)))
+        engine._load_links()
+        self.assertEqual(engine.linked_gids, {customer_gid(2)})
+        status = engine.status()
+        self.assertEqual((status["claim_links"], status["claim_links_voided"]), (1, 1))
+        digest = bm.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())
+        self.assertEqual((digest["open"]["claim_links"], digest["open"]["claim_links_voided"]), (1, 1))
+        # A voided claim no longer blocks a #155 link's member (link_conflicts sees active links only).
+        self.link(3, member_no)
+        engine._load_links()
+        self.assertEqual((engine.conflict_gids, engine.conflict_keys), (set(), set()))
+
+    def test_no_sql_outside_the_schema_reads_claim_links_directly(self):
+        source = (ROOT / "directlocal" / "xb_member_benefits.py").read_text(encoding="utf-8")
+        self.assertIn(bm.LEDGER_SCHEMA, source)
+        rest = source.replace(bm.LEDGER_SCHEMA, "")
+        for node in ast.walk(ast.parse(source)):
+            if getattr(node, "name", None) in self.CLAIM_LINKS_READERS:
+                rest = rest.replace(ast.get_source_segment(source, node), "")
+        self.assertNotRegex(rest, r"(?i)\b(FROM|JOIN)\s+claim_links\b")
+        self.assertRegex(source, r"FROM active_claim_links")
+
+    # The unlink code (slice B1, 1.6) is the one place outside the schema
+    # that reads claim_links itself (a voided pair is history, not active).
+    CLAIM_LINKS_READERS: frozenset = frozenset()
 
 
 class RealOutputsReachTheCheckTests(Base):
