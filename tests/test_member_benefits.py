@@ -3000,7 +3000,16 @@ class OutputShapeRuleTests(Base):
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "check_config_with_a_new_key": {"status": "ok", **{key: None for key in self.CONFIG_KEYS if key != "status"}, "seen": 1},
             "init_with_another_status": {"status": "seen_" + order[-6:]},
+            # slice B1: earlier families of the rule re-run (each part of the check on its own)
+            "a_ref_that_is_not_a_keyed_ref": {**run, "refs": [{"ref": "o-" + order[-8:], "code": "upgraded"}]},
+            "a_member_number_unmasked": {**run, "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded", "member_no_masked": "x" + order[-9:-6]}]},
+            "a_ref_entry_with_another_key": {**run, "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded", "name": "x"}]},
+            "a_gid_anywhere": {**run, "run_id": "gid://shopify/Order/x"},
+            "a_private_value_anywhere": {**run, "run_id": "run-" + sg(1)},
+            "a_cost_as_text": {**run, "orders_query_cost": "847"},
+            "a_cost_with_a_fraction": {**run, "orders_query_cost": 846.5},
         }
+        self.book.members[sg(1)] = fake_member(sg(1))  # a private value the check knows
         for name, value in bad.items():
             for stored in (False, True):
                 with self.subTest(name=name, stored=stored):
@@ -3842,6 +3851,39 @@ class UnlinkTests(Base):
         self.assertEqual((code, out["alerts"]), (3, ["claim_needs_review"]))
         for secret in (sg(1), local(1), customer_gid(1), order_gid(1), str(customer_number(1)), str(order_number(1)), "Fake Member 1"):
             self.assertNotIn(secret, text)
+
+
+class ClaimConflictTriggerTests(Base):
+    """Slice B1: the column UNIQUEs of claim_links are now insert triggers.
+    The engine's own checks still turn a conflict into a review before any
+    insert, on the order path and the index path (never a failed run)."""
+
+    def test_a_member_already_claimed_by_another_customer_is_a_review_on_the_order_path(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.engine()
+        self.ledger.add_claim(customer_gid(2), member_no, "index", "phone_and_name_match")
+        out = self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"], out["saves"]), ("held", "claim_link_conflict", 0))
+        self.assertIn("claim_needs_review", out["alerts"])
+        self.assertEqual(self.ledger.claim_counts(), (1, 0))
+
+    def test_a_customer_already_claimed_to_another_member_is_a_review_on_the_index_path(self):
+        self.book.members[sg(1)] = fake_member(sg(1), name="Fake Member 1")
+        self.shopify.customers[customer_gid(1)] = customer_node(1)
+        self.engine()
+        self.ledger.add_claim(customer_gid(1), sg(8), "order", "phone_and_name_match")  # an earlier link to another member
+        out = self.engine().index(apply=True, max_members=10)
+        self.assertEqual((out["stopped"], out["counts"].get("claim_link_conflict"), out["alerts"]), (None, 1, ["claim_needs_review"]))
+        self.assertEqual({r["customer_gid"]: r["member_no"] for r in self.ledger.active_claims()}, {customer_gid(1): sg(8)})
+
+    def test_an_intent_write_keeps_observe_away_from_the_receipt(self):
+        member_no = self.guest_with_order(1)
+        self.engine()
+        payload = {"kind": "upgrade", "member_no": member_no, "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                   "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+        self.ledger.add_intent(run_id="run-x", order_gid=order_gid(1), payload=payload, deadline=self.now)  # the parent died in the save
+        out = self.engine().run(apply=False)
+        self.assertEqual((out["counts"].get("write_already_recorded"), self.book.reads, self.receipt(1)["observed"]), (1, 0, None))
 
 
 class RealOutputsReachTheCheckTests(Base):
