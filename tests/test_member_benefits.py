@@ -347,6 +347,12 @@ class Base(unittest.TestCase):
     DIGEST_PART_KEYS = {"runs": frozenset({"completed", "unfinished"}), "shadow": frozenset({"would_upgrade", "would_extend"}),
                         "open": frozenset({"uncertain_writes", "held_writes", "waiting_member", "claim_links", "claim_links_voided"})}
     WRITE_STATES = ("INTENT", "DONE", "SKIPPED", "NOT_WRITTEN", "UNCERTAIN", "HELD")
+    # Fix round 1 of slice B1 (G2 L2): the values of the keys slice B1 added,
+    # written out here (never taken from the tool): fixed words for the text
+    # keys, whole numbers for the counts, true or false for the match.
+    NEW_KEY_TEXTS = {"finding": ("as_intended", "not_as_intended"), "receipt_now": ("applied", "held", "left_decided"),
+                     "reason": ("wrong_person", "customers_merged", "member_renumbered", "other"), "link_source": ("order", "index")}
+    NEW_KEY_NUMBERS = ("held_writes_left", "held_writes", "claim_links", "claim_links_voided")
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -441,6 +447,8 @@ class Base(unittest.TestCase):
                 self.assertIsInstance(value[part], dict, kind)
                 self.assertTrue(all(whole(n) for n in value[part].values()), kind)
                 words += list(value[part])
+            self.assertIs(type(value["rule_settings_match"]), bool, kind)
+            self.assertTrue(all(whole(n) for n in value["open"].values()), kind)
         elif "command" in value:
             self.assertIn(value["command"], self.OUTPUT_KEYS, kind)
             required, optional = self.OUTPUT_KEYS[value["command"]]
@@ -448,6 +456,14 @@ class Base(unittest.TestCase):
             self.assertLessEqual(keys, set(required) | set(optional), kind)
             if "alerts" in value:
                 self.assertIsInstance(value["alerts"], list, kind)
+            for key, allowed in self.NEW_KEY_TEXTS.items():
+                if key in value:
+                    self.assertIn(value[key], allowed, kind)
+            for key in self.NEW_KEY_NUMBERS:
+                if key in value:
+                    self.assertTrue(whole(value[key]), kind)
+            if "rule_settings_match" in value:
+                self.assertIs(type(value["rule_settings_match"]), bool, kind)
             for part in ("receipts", "observed"):
                 if part in value:
                     self.assertIsInstance(value[part], dict, kind)
@@ -2366,6 +2382,13 @@ class AmountReadingTests(Base):
         self.assertEqual(self.measured((tx("150.00", kind="SALE_LATER"), card("250.00")), gift_card_gateways=["store_credit"])[1:],
                          (0, (40000, 40000)))  # the gateway named in the setting decides
 
+    def test_fix1_n31_an_undocumented_kind_on_a_gift_card_gateway_is_unreadable_whatever_its_status(self):
+        for status in ("SUCCESS", "PENDING", "FAILURE", "ERROR", "AWAITING_RESPONSE", "UNKNOWN"):
+            with self.subTest(status=status):
+                self.assertEqual(self.measured((tx("150.00", kind="SALE_LATER", status=status), card("250.00")))[1:], (None, None))
+        # The same transactions with a documented payment kind: only a failed one is ignored.
+        self.assertEqual(self.measured((tx("150.00", status="FAILURE"), card("250.00")))[1:], (0, (40000, 40000)))
+
     def test_m4_the_gateway_name_is_trimmed(self):
         for gateway in (" gift_card", "gift_card ", "\tGift_Card\n", " GIFT_CARD "):
             with self.subTest(gateway=gateway):
@@ -3016,6 +3039,51 @@ class OutputShapeRuleTests(Base):
                     with self.assertRaises(AssertionError):
                         self.checked(value, stored=stored)
 
+    def test_fix1_l2_the_values_of_the_keys_slice_b1_added_are_checked(self):
+        order = str(order_number(1))
+        release = {"status": "ok", "command": "release_held", "run_id": "run-" + "0" * 32, "finding": "as_intended", "receipt_now": "applied",
+                   "held_writes_left": 0, "counts": {"release_receipt_applied": 1}, "alerts": [],
+                   "refs": [{"ref": "o-" + "a" * 20, "code": "write_released", "member_no_masked": "*******001"}]}
+        unlink = {"status": "ok", "command": "unlink", "run_id": "run-" + "0" * 32, "reason": "wrong_person", "link_source": "index",
+                  "counts": {"claim_unlinked": 1}, "alerts": [], "refs": [{"ref": "c-" + "a" * 20, "code": "claim_unlinked", "member_no_masked": "*******001"}]}
+        status = {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "held_writes": 1, "claim_links": 2,
+                  "claim_links_voided": 1, "rule_settings_match": False, "reviews": 0, "watermark_set": False, "stop_file_present": False}
+        digest = self.GOOD_DIGEST
+        goods = [release, {**release, "command": "release_held_dry_run", "run_id": None, "finding": "not_as_intended", "receipt_now": "held"},
+                 {**release, "receipt_now": "left_decided"}, unlink, {**unlink, "command": "unlink_dry_run", "run_id": None, "link_source": "order"},
+                 *({**unlink, "reason": reason} for reason in ("customers_merged", "member_renumbered", "other")), status,
+                 {**digest, "rule_settings_match": False}]
+        for good in goods:
+            with self.subTest(good=good):
+                self.checked(good)
+                self.checked(good, stored=True)
+        self.book.members[sg(1)] = fake_member(sg(1))
+        bad = {
+            "finding_with_part_of_an_order_number": {**release, "finding": "as_intended_" + order[-6:]},
+            "finding_with_a_name": {**release, "finding": "Fake Member 1"},
+            "receipt_now_with_part_of_an_order_number": {**release, "receipt_now": "held_" + order[-6:]},
+            "receipt_now_with_a_line_break": {**release, "receipt_now": "applied\n"},
+            "held_writes_left_as_text": {**release, "held_writes_left": order[-6:]},
+            "held_writes_left_true": {**release, "held_writes_left": True},
+            "reason_with_part_of_an_order_number": {**unlink, "reason": "other_" + order[-6:]},
+            "reason_in_capitals": {**unlink, "reason": "OTHER"},
+            "link_source_with_a_name": {**unlink, "link_source": "Fake Member 1"},
+            "link_source_sync155": {**unlink, "link_source": "sync155"},
+            "status_held_writes_as_text": {**status, "held_writes": order[-6:]},
+            "status_claim_links_voided_as_a_float": {**status, "claim_links_voided": 1.0},
+            "status_claim_links_as_text": {**status, "claim_links": "2"},
+            "status_rule_settings_match_as_text": {**status, "rule_settings_match": "true"},
+            "status_rule_settings_match_as_a_number": {**status, "rule_settings_match": 1},
+            "digest_rule_settings_match_as_text": {**digest, "rule_settings_match": "yes_" + order[-6:]},
+            "digest_open_claim_links_voided_as_text": {**digest, "open": {**digest["open"], "claim_links_voided": order[-6:]}},
+            "digest_open_held_writes_true": {**digest, "open": {**digest["open"], "held_writes": True}},
+        }
+        for name, value in bad.items():
+            for stored in (False, True):
+                with self.subTest(name=name, stored=stored):
+                    with self.assertRaises(AssertionError):
+                        self.checked(value, stored=stored)
+
     # -- fix round 2: the one exception, the generic bridge failure code ------
     def real_generic_bridge_codes(self) -> list[str]:
         """Real outputs of ``xb_directlocal.bridge_failure_code`` for a
@@ -3556,6 +3624,13 @@ class ReleaseHeldTests(Base):
         self.ledger.set_outcome(intent["write_id"], "NOT_WRITTEN", "resolved_no_claim")
         self.assertEqual(self.release(ref, last3, "as_intended")["receipt_now"], "applied")
 
+    def test_fix1_n12_the_last_3_is_compared_exactly_never_as_a_shorter_suffix(self):
+        ref, member_no = self.held()
+        for short in (member_no[-2:], member_no[-1:]):  # a true suffix of the MemberNo, but not its last 3 characters
+            with self.subTest(short=short):
+                self.refused(lambda: self.release(ref, short, "as_intended"), "release_member_mismatch")
+        self.assertEqual(self.release(ref, member_no[-3:], "as_intended", apply=False)["receipt_now"], "applied")
+
     def test_a_receipt_decided_in_between_is_left_as_it_is(self):
         ref, member_no = self.held()
         self.ledger.update_receipt(order_gid(1), state="held", code="link_conflict")
@@ -3783,6 +3858,86 @@ class UnlinkTests(Base):
         self.ledger.set_outcome(intent["write_id"], "NOT_WRITTEN", "resolved_no_claim")
         self.assertEqual(self.unlink(ref, last3, apply=False)["counts"]["claim_unlinked"], 1)
 
+    # -- fix round 1 (G2 B13): --order-ref, the second selector -------------
+    def by_order(self, order_ref, last3: str, reason: str = "wrong_person", *, apply: bool = True, accept_applied: bool = False) -> dict:
+        return self.engine().unlink(order_ref=order_ref, member_last3=last3, reason=reason, accept_applied=accept_applied, apply=apply)
+
+    def test_fix1_b13_an_order_ref_voids_the_claim_link_of_that_receipts_customer_only(self):
+        # Two customers claim-linked to two members whose MemberNos share their last 3 characters.
+        member_a = self.guest_with_order(1, linked=False)
+        member_b = self.guest_with_order(1001, linked=False)
+        self.shopify.add(order_node(3, customer=customer_node(1001)))  # a second order of customer 1001
+        self.assertEqual((member_a[-3:] == member_b[-3:], member_a == member_b), (True, False))
+        self.assertEqual(self.engine().run(apply=False)["counts"].get("claim_linked"), 2)
+        before = self.recorded()
+        dry = self.by_order(self.ledger.ref("o", order_gid(1001)), member_b[-3:], apply=False)
+        self.assertEqual(self.recorded(), before)  # a dry run records nothing
+        self.assertEqual((dry["command"], dry["run_id"], dry["counts"]), ("unlink_dry_run", None, {"claim_unlinked": 1, "unlink_receipt_reset": 2}))
+        # The other order of the same customer names the same link.
+        out = self.by_order(self.ledger.ref("o", order_gid(3)), member_b[-3:])
+        self.assertEqual({k: out[k] for k in ("status", "command", "reason", "link_source", "counts", "alerts")},
+                         {"status": "ok", "command": "unlink", "reason": "wrong_person", "link_source": "order",
+                          "counts": {"claim_unlinked": 1, "unlink_receipt_reset": 2}, "alerts": []})
+        self.assertEqual(out["refs"], [{"ref": self.ledger.ref("c", customer_gid(1001)), "code": "claim_unlinked", "member_no_masked": bm.mask(member_b)}])
+        self.assertEqual({r["customer_gid"]: r["member_no"] for r in self.ledger.active_claims()}, {customer_gid(1): member_a})
+        self.assertEqual(self.ledger.claim_counts(), (1, 1))
+        self.assertEqual([(self.receipt(n)["member_no"], self.receipt(n)["link_source"]) for n in (1, 1001, 3)],
+                         [(member_a, "claim"), (None, None), (None, None)])
+        # The voided link is no longer a claim link for either selector.
+        self.refused(lambda: self.by_order(self.ledger.ref("o", order_gid(1001)), member_b[-3:]), "unlink_not_a_claim_link")
+        self.refused(lambda: self.unlink(self.ledger.ref("c", customer_gid(1001)), member_b[-3:]), "unlink_not_a_claim_link")
+        # The order of the other customer still names its own link (the shared last 3 picks nothing).
+        out = self.by_order(self.ledger.ref("o", order_gid(1)), member_a[-3:], apply=False)
+        self.assertEqual(out["refs"], [{"ref": self.ledger.ref("c", customer_gid(1)), "code": "claim_unlinked", "member_no_masked": bm.mask(member_a)}])
+
+    def test_fix1_b13_order_ref_refusals_record_nothing(self):
+        ref, member_no = self.claimed()
+        last3 = member_no[-3:]
+        order_ref = self.ledger.ref("o", order_gid(1))
+        # Exactly one selector, and every other argument is checked as before.
+        both = lambda: self.engine().unlink(customer_ref=ref, order_ref=order_ref, member_last3=last3, reason="other", accept_applied=False, apply=True)
+        neither = lambda: self.engine().unlink(member_last3=last3, reason="other", accept_applied=False, apply=True)
+        for call in (both, neither, lambda: self.by_order(5, last3), lambda: self.by_order(order_ref.encode(), last3),
+                     lambda: self.by_order(order_ref, "1234"), lambda: self.by_order(order_ref, last3, "mistake"),
+                     lambda: self.by_order(order_ref, last3, accept_applied="yes")):
+            self.refused(call, "unlink_arguments_invalid")
+        # An unknown or malformed o- ref names no receipt.
+        for bad in ("o-" + "0" * 20, "o-" + order_ref[2:-1], order_ref + "\n", order_ref.upper(), ref, "", "o-"):
+            with self.subTest(bad=bad):
+                self.refused(lambda: self.by_order(bad, last3), "unlink_not_a_claim_link")
+        # The last 3 are compared exactly (G2 N13), and a wrong one refuses.
+        for short in (member_no[-2:], member_no[-1:], "999" if last3 != "999" else "998"):
+            with self.subTest(short=short):
+                self.refused(lambda: self.by_order(order_ref, short), "unlink_member_mismatch")
+        # A receipt whose customer has no claim link: a customer linked by #155 only, and an order with no customer.
+        self.guest_with_order(4)
+        self.shopify.add(order_node(5, customer=None))
+        self.engine().run(apply=False)
+        self.assertEqual((self.receipt(4)["link_source"], self.receipt(5)["state"], self.receipt(5)["customer_gid"]), ("sync155", "no_customer", None))
+        self.refused(lambda: self.by_order(self.ledger.ref("o", order_gid(4)), sg(4)[-3:]), "unlink_not_a_claim_link")
+        self.refused(lambda: self.by_order(self.ledger.ref("o", order_gid(5)), last3), "unlink_not_a_claim_link")
+        self.assertEqual(self.by_order(order_ref, last3, apply=False)["counts"]["claim_unlinked"], 1)
+
+    def test_fix1_n13_the_last_3_is_compared_exactly_never_as_a_shorter_suffix(self):
+        ref, member_no = self.claimed()
+        for short in (member_no[-2:], member_no[-1:]):  # a true suffix of the MemberNo, but not its last 3 characters
+            with self.subTest(short=short):
+                self.refused(lambda: self.unlink(ref, short), "unlink_member_mismatch")
+        self.assertEqual(self.unlink(ref, member_no[-3:], apply=False)["counts"]["claim_unlinked"], 1)
+
+    def test_fix1_n14_a_receipt_of_another_customer_through_the_same_member_is_not_through_the_link(self):
+        ref, member_no = self.claimed()
+        with self.ledger.tx() as conn:
+            for n, state, code, basis in ((16, "ready", None, None), (17, "applied", "upgrade", NEW_EXPIRY)):
+                conn.execute("INSERT INTO receipts(order_gid, customer_gid, order_created_at, order_date_sgt, order_updated_at, state, code, member_no, "
+                             "link_source, basis_expiry_local, observed, observed_at, first_seen_at, updated_at) VALUES (?, ?, 't', 'd', 't', ?, ?, ?, "
+                             "'claim', ?, 'would_upgrade', 't', 't', 't')", (order_gid(n), customer_gid(2), state, code, member_no, basis))
+        before = {n: tuple(self.receipt(n)) for n in (16, 17)}
+        out = self.unlink(ref, member_no[-3:])  # no unlink_has_applied: the applied receipt is another customer's
+        self.assertEqual(out["counts"], {"claim_unlinked": 1, "unlink_receipt_reset": 1})
+        self.assertEqual({n: tuple(self.receipt(n)) for n in before}, before)
+        self.assertEqual((self.receipt(1)["member_no"], self.receipt(1)["state"]), (None, "ready"))
+
     def test_a_held_write_for_the_member_refuses_until_it_is_released(self):
         ref, member_no = self.claimed()
         self.book.mode = "mutate"
@@ -3851,6 +4006,29 @@ class UnlinkTests(Base):
         self.assertEqual((code, out["alerts"]), (3, ["claim_needs_review"]))
         for secret in (sg(1), local(1), customer_gid(1), order_gid(1), str(customer_number(1)), str(order_number(1)), "Fake Member 1"):
             self.assertNotIn(secret, text)
+
+    def test_fix1_the_cli_takes_order_ref_and_passes_accept_applied_only_when_given(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.run_main("init")
+        out = self.run_main("apply")[1]
+        self.assertEqual((out["saves"], out["counts"].get("claim_linked")), (1, 1))
+        ledger = bm.BenefitsLedger(self.root, clock=lambda: self.now)
+        try:
+            order_ref, customer_ref = ledger.ref("o", order_gid(1)), ledger.ref("c", customer_gid(1))
+        finally:
+            ledger.close()
+        args = ("unlink", "--order-ref", order_ref, "--member-last3", member_no[-3:], "--reason", "wrong_person")
+        for extra in ((), ("--apply",)):  # G2 N33: without the flag an applied receipt refuses, dry run or not
+            with self.subTest(extra=extra):
+                self.assertEqual(self.run_main(*args, *extra)[:2], (2, {"status": "refused", "code": "unlink_has_applied"}))
+        self.assertEqual(self.run_main(*args, "--customer-ref", customer_ref, "--accept-applied")[:2],
+                         (2, {"status": "refused", "code": "unlink_arguments_invalid"}))  # both selectors
+        code, dry, _ = self.run_main(*args, "--accept-applied")
+        self.assertEqual((code, dry["command"], dry["counts"]["unlink_receipt_applied"]), (3, "unlink_dry_run", 1))
+        code, out, _ = self.run_main(*args, "--accept-applied", "--apply")
+        self.assertEqual((code, out["command"], out["alerts"]), (3, "unlink", ["unlinked_with_applied"]))
+        self.assertEqual(out["refs"][0], {"ref": customer_ref, "code": "claim_unlinked", "member_no_masked": bm.mask(member_no)})
+        self.assertEqual(self.run_main("status")[1]["claim_links_voided"], 1)
 
 
 class ClaimConflictTriggerTests(Base):

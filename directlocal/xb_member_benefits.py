@@ -2308,7 +2308,8 @@ class BenefitsEngine:
         return result
 
     # -- unlink (slice B1, G0 1.6) -----------------------------------------------
-    def unlink(self, *, customer_ref: Any, member_last3: Any, reason: Any, accept_applied: bool, apply: bool) -> dict[str, Any]:
+    def unlink(self, *, member_last3: Any, reason: Any, accept_applied: bool, apply: bool, customer_ref: Any = None,
+               order_ref: Any = None) -> dict[str, Any]:
         """Void one claim link this tool made (by an order or by the index).
         Never touches the #155 sync's links, AutoCount or Shopify. The link row
         stays (history); the void is a new row. Receipts through the link: a
@@ -2316,16 +2317,33 @@ class BenefitsEngine:
         a decided one is kept; an ``applied`` one only with
         ``accept_applied`` (one alert: the owner checks that member by hand;
         the tool never downgrades). A dry run unless ``apply``; every refusal
-        records nothing."""
+        records nothing.
 
-        if (not isinstance(customer_ref, str) or not _CUSTOMER_REF_RE.fullmatch(customer_ref) or not isinstance(member_last3, str)
+        The link is named by exactly one selector: ``customer_ref`` (the
+        customer's ``c-`` ref) or ``order_ref`` (fix round 1, G2 B13: the
+        ``o-`` ref a ``link_conflict``, ``write_held``, ``would_upgrade`` or
+        ``upgraded`` entry carries; the link is that receipt's customer's
+        active claim link). An ``o-`` ref that names no receipt, a receipt
+        with no customer, or a customer with no active claim link (also one
+        linked by #155 only) is ``unlink_not_a_claim_link``."""
+
+        selectors = [value for value in (customer_ref, order_ref) if value is not None]
+        if (len(selectors) != 1 or not isinstance(selectors[0], str)
+                or (customer_ref is not None and not _CUSTOMER_REF_RE.fullmatch(customer_ref)) or not isinstance(member_last3, str)
                 or not _LAST3_RE.fullmatch(member_last3) or reason not in UNLINK_REASONS or not isinstance(accept_applied, bool)):
             raise dl.DirectLocalError("unlink_arguments_invalid")
         self.ledger.check_binding(self.config)
-        links = [row for row in self.ledger.active_claims() if self.ledger.ref("c", row["customer_gid"]) == customer_ref]
+        if order_ref is not None:
+            # A malformed o- ref names no receipt: the same answer as an unknown one (Controller ruling 2).
+            customers = [row["customer_gid"] for row in self.ledger.conn.execute("SELECT order_gid, customer_gid FROM receipts")
+                         if self.ledger.ref("o", row["order_gid"]) == order_ref]
+            links = [row for row in self.ledger.active_claims() if customers and row["customer_gid"] == customers[0]]
+        else:
+            links = [row for row in self.ledger.active_claims() if self.ledger.ref("c", row["customer_gid"]) == customer_ref]
         if not links:
             raise dl.DirectLocalError("unlink_not_a_claim_link")  # also a customer linked by #155 only
         link = links[0]
+        customer_ref = self.ledger.ref("c", link["customer_gid"])
         if link["member_no"][-3:] != member_last3:
             raise dl.DirectLocalError("unlink_member_mismatch")
         if self.ledger.open_writes():
@@ -2630,9 +2648,11 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
     parser.add_argument("--apply", action="store_true", help="index, release-held, unlink: record in this tool's ledger (default: dry run)")
     parser.add_argument("--max", type=int, default=200, help="index only: members examined this run (1-1000)")
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
-    parser.add_argument("--order-ref", help="release-held only: the o- keyed ref of the order whose HELD write is released")
+    parser.add_argument("--order-ref", help="release-held: the o- keyed ref of the order whose HELD write is released; "
+                                            "unlink: the o- keyed ref of a receipt whose customer's claim link is voided")
     parser.add_argument("--member-last3", help="release-held, unlink: the last 3 characters of the MemberNo")
-    parser.add_argument("--customer-ref", help="unlink only: the c- keyed ref of the customer whose claim link is voided")
+    parser.add_argument("--customer-ref", help="unlink only: the c- keyed ref of the customer whose claim link is voided "
+                                               "(exactly one of --customer-ref and --order-ref)")
     parser.add_argument("--reason", help="unlink only: wrong_person, customers_merged, member_renumbered or other")
     parser.add_argument("--accept-applied", action="store_true", help="unlink only: void even when a receipt through the link is applied")
     parser.add_argument("--finding", help="release-held only: as_intended or not_as_intended (what the owner saw in AutoCount)")
@@ -2672,8 +2692,8 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
             elif args.command == "release-held":
                 result = engine.release_held(order_ref=args.order_ref, member_last3=args.member_last3, finding=args.finding, apply=args.apply)
             elif args.command == "unlink":
-                result = engine.unlink(customer_ref=args.customer_ref, member_last3=args.member_last3, reason=args.reason,
-                                       accept_applied=args.accept_applied, apply=args.apply)
+                result = engine.unlink(customer_ref=args.customer_ref, order_ref=args.order_ref, member_last3=args.member_last3,
+                                       reason=args.reason, accept_applied=args.accept_applied, apply=args.apply)
             else:
                 result = engine.index(apply=args.apply, max_members=args.max)
             _emit(result)
