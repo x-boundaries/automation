@@ -382,6 +382,129 @@ def build_links(sync_links: Iterable[tuple[str, str]], claims: Iterable[tuple[st
 
 
 # --------------------------------------------------------------------------
+# AutoCount: read only, through the type move's guarded reads (design 1.2)
+# --------------------------------------------------------------------------
+
+class TagsReadBridgeClient(tm.TypeMoveBridgeClient):
+    """ac2_member_type_move_bridge.ps1 (profile type_move_p1), two reads only:
+    ``type-move-scan`` and ``type-move-member``. Every child start goes
+    through ``_start``, which admits exactly those two read operations; the
+    save, the fenced write runner and every other operation are refused
+    before any process starts. This tool never writes AutoCount."""
+
+    def __repr__(self) -> str:
+        return "TagsReadBridgeClient()"
+
+    def _start(self, arguments: list[str]):
+        if len(arguments) != 3 or arguments[0] != "-Operation" or arguments[2] != "-EnableProductionAdapter":
+            raise dl.DirectLocalError("tags_autocount_write_refused")
+        if arguments[1] not in READ_OPERATIONS:
+            raise dl.DirectLocalError("tags_operation_not_offered")
+        return super()._start(arguments)
+
+    def save(self, *args: Any, **kwargs: Any) -> Any:
+        raise dl.DirectLocalError("tags_autocount_write_refused")
+
+    def _write(self, *args: Any, **kwargs: Any) -> Any:
+        raise dl.DirectLocalError("tags_autocount_write_refused")
+
+    def write_once(self, *args: Any, **kwargs: Any) -> Any:
+        raise dl.DirectLocalError("tags_autocount_write_refused")
+
+    def counts(self) -> dict[str, Any]:
+        raise dl.DirectLocalError("tags_operation_not_offered")
+
+
+def scan_type(ac2: Any, member_type: str) -> list[dict[str, Any]]:
+    """Every member of one type, in the book's own MemberNo order (the type
+    move's paging rule): a repeated MemberNo or a full page whose last
+    MemberNo does not advance stops; so does a page cap."""
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    after = ""
+    for _ in range(SCAN_MAX_PAGES):
+        page = ac2.scan(member_type, after)
+        for row in page:
+            if row["member_no"] in seen:
+                raise dl.DirectLocalError("tags_scan_order_invalid")
+            seen.add(row["member_no"])
+        rows.extend(page)
+        if len(page) < SCAN_PAGE_SIZE:
+            return rows
+        if page[-1]["member_no"] == after:
+            raise dl.DirectLocalError("tags_scan_order_invalid")
+        after = page[-1]["member_no"]
+    raise dl.DirectLocalError("tags_scan_too_many_pages")
+
+
+def scan_members(ac2: Any) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    """MemberNo key -> every ``(type, row)`` found across the three scans."""
+
+    found: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for member_type in SCAN_TYPES:
+        for row in scan_type(ac2, member_type):
+            found.setdefault(sync.member_no_key(row["member_no"]), []).append((member_type, row))
+    return found
+
+
+def sg_today(moment: datetime) -> date:
+    """Today in Singapore (UTC+8, no DST) for a timezone-aware instant."""
+
+    if moment.tzinfo is None:
+        raise dl.DirectLocalError("clock_must_be_timezone_aware")
+    return moment.astimezone(SGT).date()
+
+
+def expiry_day(expiry_local: Any) -> date | None:
+    """The date part of an ExpiryDate, or None when it is null, unparseable or
+    a placeholder before 2020-01-01 (never read as expired)."""
+
+    parsed = tm.parse_local(expiry_local)
+    if parsed is None or parsed.date() < EXPIRY_FLOOR:
+        return None
+    return parsed.date()
+
+
+ON, OFF, LEAVE = "on", "off", "leave"
+
+
+def member_verdict(entries: list[tuple[str, Mapping[str, Any]]], today: date) -> tuple[str, str] | None:
+    """``(on|off|leave, code)`` for a linked member from the scans (design
+    1.6 rows 4, 6-10, 12), or None when it was found in no scan (the single
+    read decides, rows 11-11c). ``off`` only on a positive fact."""
+
+    if not entries:
+        return None
+    if len(entries) > 1:
+        return LEAVE, "member_reads_conflict"
+    member_type, row = entries[0]
+    if member_type != MEMBER:
+        return OFF, "member_not_member"  # GUEST or Default
+    active = row.get("is_active")
+    if active == "F":
+        return OFF, "member_inactive"
+    if active != "T":
+        return LEAVE, "member_active_unreadable"
+    day = expiry_day(row.get("expiry_local"))
+    if day is None:
+        return LEAVE, "expiry_unreadable"
+    if day < today:
+        return OFF, "member_expired"
+    return ON, "member_active"  # valid through the expiry day
+
+
+def single_read_verdict(result: Mapping[str, Any]) -> tuple[str, str]:
+    """A linked member found in no scan, by its one ``type-move-member`` read."""
+
+    if not result.get("found"):
+        return LEAVE, "member_not_found"
+    if result.get("member_type") == MEMBER:
+        return LEAVE, "member_scan_missed"
+    return OFF, "member_not_member"
+
+
+# --------------------------------------------------------------------------
 # Own ledger (append-only, as the member core's)
 # --------------------------------------------------------------------------
 

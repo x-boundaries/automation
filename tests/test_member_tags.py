@@ -70,6 +70,56 @@ def customer_gid(n: int) -> str:
     return f"gid://shopify/Customer/{customer_number(n)}"
 
 
+class FakeBook:
+    """The type move bridge's two reads on a fake book: ``type-move-scan``
+    (MemberNo, IsActive, ExpiryDate, LastModified; TOP 500 by MemberNo) and
+    ``type-move-member`` (found, member_type). ``hidden`` members are missed
+    by every scan (a member saved between the scans)."""
+
+    def __init__(self):
+        self.members: dict[str, dict] = {}
+        self.hidden: set[str] = set()
+        self.scans: list[tuple[str, str]] = []
+        self.single_reads: list[str] = []
+        self.fail_scan: str | None = None
+        self.fail_member: str | None = None
+
+    def add(self, member_no: str, member_type: str = "MEMBER", active="T", expiry=FUTURE) -> str:
+        self.members[member_no] = {"type": member_type, "active": active, "expiry": expiry}
+        return member_no
+
+    def scan(self, member_type, after):
+        assert member_type in tm.SCAN_TYPES
+        self.scans.append((member_type, after))
+        if self.fail_scan:
+            raise dl.BridgeError(self.fail_scan)
+        rows = sorted((no, m) for no, m in self.members.items() if m["type"] == member_type and no > after and no not in self.hidden)
+        return [{"member_no": no, "is_active": m["active"], "expiry_local": m["expiry"], "last_modified_local": LM}
+                for no, m in rows[:tm.SCAN_PAGE_SIZE]]
+
+    def member(self, member_no, salt):
+        self.single_reads.append(member_no)
+        if self.fail_member:
+            raise dl.BridgeError(self.fail_member)
+        m = self.members.get(member_no)
+        if m is None:
+            return {"found": False}
+        return {"found": True, "member_type": m["type"], "fields_digest": "sha256:" + "0" * 64}
+
+
+class FakeProcess:
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self.stdout_bytes = stdout
+        self.returncode = returncode
+        self.pid = 4242
+
+    def communicate(self, data=None, timeout=None):
+        return self.stdout_bytes, b""
+
+    def kill(self):
+        pass
+
+
 def raw_config(root: Path, sync_root: Path, core_root: Path, **overrides) -> dict:
     value = {
         "schema": mt.CONFIG_SCHEMA, "state_root": str(root), "autocount_book": "AED_TESTINGAPI",
@@ -664,6 +714,121 @@ class InputLedgerTests(Base):
         links = self.links()
         self.assertEqual(links.basis, {customer_gid(1): (sg(2), "claim")})
         self.assertEqual(links.conflicts, {})
+
+
+# --------------------------------------------------------------------------
+# AutoCount read (design 1.2)
+# --------------------------------------------------------------------------
+
+class ReadBridgeClientTests(unittest.TestCase):
+    def client(self, outputs):
+        self.started = []
+        outputs = list(outputs)
+
+        def popen(command, **kwargs):
+            self.started.append(command)
+            return FakeProcess(json.dumps(outputs.pop(0)).encode("utf-8"))
+        return mt.TagsReadBridgeClient(["powershell.exe", "-File", "bridge.ps1"], autocount_book="AED_TESTINGAPI",
+                                       claims=Path(tempfile.gettempdir()) / "xb-tags-unused-claims", popen=popen)
+
+    def test_scan_and_member_are_the_only_reads(self):
+        client = self.client([{"members": [{"member_no": "A1", "is_active": "T", "expiry_local": FUTURE}]},
+                              {"found": True, "member_type": "GUEST", "fields_digest": "sha256:" + "a" * 64}])
+        self.assertEqual(client.scan("MEMBER", "")[0]["member_no"], "A1")
+        self.assertEqual(client.member("A1", "salt")["member_type"], "GUEST")
+        self.assertEqual([c[3:6] for c in self.started], [["-Operation", "type-move-scan", "-EnableProductionAdapter"],
+                                                          ["-Operation", "type-move-member", "-EnableProductionAdapter"]])
+        self.assertEqual(self.started[0][-2:], ["-TargetBook", "AED_TESTINGAPI"])
+
+    def test_every_write_and_every_other_operation_is_refused_before_a_child_starts(self):
+        client = self.client([])
+        refused = {
+            "tags_autocount_write_refused": [
+                lambda: client.save({"kind": "promote"}, move_id="move-1", deadline=NOW),
+                lambda: client._write(["-Operation", "x"], {}, wait_seconds=1, on_started=lambda pid, created: None),
+                lambda: client.write_once(fence_id="f", claim_directory=Path("."), deadline=NOW, stdin_value={}, wait_seconds=1,
+                                          on_started=lambda pid, created: None),
+                lambda: client._start(["-Operation", "type-move-scan", "-EnableProductionAdapter", "-FenceId", "f"]),
+            ],
+            "tags_operation_not_offered": [
+                client.counts, lambda: client.precheck(("x",), None), client.next_member_no, lambda: client.probe("A1"),
+                lambda: client.reconcile("A1", "{}"), client.book_check, client.pos_sync_status,
+                lambda: client._read("benefit-member", {}),
+            ],
+        }
+        for code, calls in refused.items():
+            for call in calls:
+                with self.subTest(code=code):
+                    with self.assertRaises(dl.DirectLocalError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.code, code)
+        self.assertEqual(self.started, [])
+
+    def test_static_no_autocount_save_operation_text_in_the_module(self):
+        source = (ROOT / "directlocal" / "xb_member_tags.py").read_text(encoding="utf-8")
+        for text in ("type-move-save", "benefit-save", "write-once", "SaveMember"):
+            self.assertNotIn(text, source)
+        self.assertEqual(mt.READ_OPERATIONS, ("type-move-scan", "type-move-member"))
+
+
+class ScanTests(unittest.TestCase):
+    def test_each_scan_type_is_read_and_keys_are_normalised(self):
+        book = FakeBook()
+        book.add("M1"), book.add("G1", "GUEST"), book.add("D1", "Default"), book.add("V1", "VIP")
+        found = mt.scan_members(book)
+        self.assertEqual([t for t, _ in book.scans], ["Default", "MEMBER", "GUEST"])
+        self.assertEqual({k: [t for t, _ in v] for k, v in found.items()}, {"m1": ["MEMBER"], "g1": ["GUEST"], "d1": ["Default"]})
+
+    def test_paging_and_the_stops(self):
+        book = FakeBook()
+        for i in range(1001):
+            book.add(f"M{i:05d}")
+        self.assertEqual(len(mt.scan_type(book, "MEMBER")), 1001)
+        self.assertEqual([after for _, after in book.scans], ["", "M00499", "M00999"])
+
+        class Repeating(FakeBook):
+            def scan(self, member_type, after):
+                return [{"member_no": f"R{i:04d}"} for i in range(tm.SCAN_PAGE_SIZE)]
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            mt.scan_type(Repeating(), "MEMBER")
+        self.assertEqual(caught.exception.code, "tags_scan_order_invalid")
+
+        class Endless(FakeBook):
+            def __init__(self):
+                super().__init__()
+                self.page = 0
+
+            def scan(self, member_type, after):
+                self.page += 1
+                return [{"member_no": f"E{self.page:04d}-{i:03d}"} for i in range(tm.SCAN_PAGE_SIZE)]
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            mt.scan_type(Endless(), "MEMBER")
+        self.assertEqual(caught.exception.code, "tags_scan_too_many_pages")
+
+    def test_singapore_today_and_the_expiry_rule(self):
+        day = datetime(2026, 11, 19).date()
+        # 23:59:59 and 00:00:00 Singapore, given as UTC.
+        self.assertEqual(mt.sg_today(datetime(2026, 11, 19, 15, 59, 59, tzinfo=timezone.utc)), day)
+        self.assertEqual(mt.sg_today(datetime(2026, 11, 18, 16, 0, 0, tzinfo=timezone.utc)), day)
+        self.assertEqual(mt.sg_today(datetime(2026, 11, 18, 15, 59, 59, tzinfo=timezone.utc)), day - timedelta(days=1))
+        row = lambda active="T", expiry=FUTURE: [("MEMBER", {"is_active": active, "expiry_local": expiry})]  # noqa: E731
+        self.assertEqual(mt.member_verdict(row(expiry=TODAY), day), ("on", "member_active"))
+        self.assertEqual(mt.member_verdict(row(expiry="2026-11-19T23:59:59.000"), day), ("on", "member_active"))
+        self.assertEqual(mt.member_verdict(row(expiry=PAST), day), ("off", "member_expired"))
+        for unreadable in (None, "", "2000-01-01T00:00:00", "2019-12-31T00:00:00", "19/11/2026", 20271231):
+            self.assertEqual(mt.member_verdict(row(expiry=unreadable), day), ("leave", "expiry_unreadable"), unreadable)
+        self.assertEqual(mt.member_verdict(row(expiry="2020-01-01T00:00:00"), day), ("off", "member_expired"))
+        self.assertEqual(mt.member_verdict(row(active="F", expiry=FUTURE), day), ("off", "member_inactive"))
+        self.assertEqual(mt.member_verdict(row(active="F", expiry=None), day), ("off", "member_inactive"))
+        for active in (None, "", "t", "Y", 1):
+            self.assertEqual(mt.member_verdict(row(active=active), day), ("leave", "member_active_unreadable"), active)
+        for member_type in ("GUEST", "Default"):
+            self.assertEqual(mt.member_verdict([(member_type, {"is_active": "T", "expiry_local": FUTURE})], day), ("off", "member_not_member"))
+        self.assertEqual(mt.member_verdict(row() + [("GUEST", {})], day), ("leave", "member_reads_conflict"))
+        self.assertIsNone(mt.member_verdict([], day))
+        self.assertEqual(mt.single_read_verdict({"found": False}), ("leave", "member_not_found"))
+        self.assertEqual(mt.single_read_verdict({"found": True, "member_type": "MEMBER"}), ("leave", "member_scan_missed"))
+        self.assertEqual(mt.single_read_verdict({"found": True, "member_type": "VIP"}), ("off", "member_not_member"))
 
 
 class LedgerCliTests(Base):
