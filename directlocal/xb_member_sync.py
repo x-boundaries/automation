@@ -874,7 +874,7 @@ BACKFILL_PERSON_CODES = frozenset({
     "backfill_signup_time_missing", "backfill_no_name", "backfill_no_phone", "backfill_phone_invalid",
     "backfill_memberno_conflict", "backfill_shared_phone", "backfill_phone_on_multiple_records",
     "backfill_legacy_needs_person", "backfill_member_linked_elsewhere", "backfill_text_unstorable",
-    "backfill_member_no_phone_differs",
+    "backfill_member_no_phone_differs", "backfill_claim_pair_unlinked",
 })
 
 
@@ -1635,6 +1635,12 @@ class SyncEngine:
             return "done"
         member_no = decision.member_no
         key = member_no_key(member_no)
+        if claims is not None and (gid, key) in claims.voided:
+            # Fix round 2 (Controller ruling 2): staff unlinked exactly this
+            # pair in the member core; a link here is permanent, so a person
+            # decides (the member core refuses the pair too).
+            self._backfill_count("backfill_claim_pair_unlinked", customer, member_no=member_no)
+            return "done"
         if key in claimed or self.ledger.link_for_member(member_no) is not None or (claims is not None and key in claims.by_key):
             # The member already belongs to another customer: never a second link.
             self._backfill_count("backfill_member_linked_elsewhere", customer, member_no=member_no)
@@ -2749,14 +2755,21 @@ MEMBER_CORE_LEDGER_FILE = "member_benefits.sqlite3"
 MEMBER_CORE_TOOL = "xb268_member_benefits"
 COVERAGE_SCHEMA = "xb.directlocal.member_sync.coverage.v1"
 COVERAGE_MAX_REFS = 200
+# Fix round 2 (Controller ruling 2): the one member core ledger version this
+# module reads (xb_member_benefits.SCHEMA_VERSION; a test pins both). Any
+# other version is refused: a later one must be a deliberate change here.
+MEMBER_CORE_LEDGER_VERSION = 2
 
 
 @dataclass(frozen=True)
 class ClaimLinks:
-    """The member core's claim links: customer GID -> MemberNo key, and back."""
+    """The member core's active claim links (customer GID -> MemberNo key,
+    and back), plus the voided pairs ``(customer GID, MemberNo key)`` that
+    staff unlinked there: history, never an active link, never relinked."""
 
     by_gid: Mapping[str, str]
     by_key: Mapping[str, str]
+    voided: frozenset[tuple[str, str]] = frozenset()
 
     def __repr__(self) -> str:  # never render customer or member data
         return "ClaimLinks()"
@@ -2776,21 +2789,26 @@ def _open_read_only(path: Path, missing: str, unreadable: str) -> sqlite3.Connec
 
 def read_claim_links(root: str | Path, config: SyncConfig) -> ClaimLinks:
     """Read-only (no lock, no migration, no write), as the member core
-    reads this sync's links: its meta must be the member core's, bound to the
-    same book, store and domain."""
+    reads this sync's links: its version must be ``MEMBER_CORE_LEDGER_VERSION``
+    and its meta the member core's, bound to the same book, store and domain.
+    Active links come from ``active_claim_links``; voided pairs separately."""
 
     conn = _open_read_only(Path(root) / MEMBER_CORE_LEDGER_FILE, "member_core_ledger_missing", "member_core_ledger_unreadable")
     try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] != MEMBER_CORE_LEDGER_VERSION:
+            raise dl.DirectLocalError("member_core_ledger_version_unknown")
         meta = conn.execute("SELECT tool, autocount_book, store_gid, shop_domain FROM meta WHERE id = 1").fetchone()
         if meta is None or meta["tool"] != MEMBER_CORE_TOOL or (meta["autocount_book"], meta["store_gid"], meta["shop_domain"]) != (
                 config.autocount_book, config.shopify.store_gid, config.shopify.shop_domain):
             raise dl.DirectLocalError("member_core_ledger_binding_mismatch")
         by_gid: dict[str, str] = {}
         by_key: dict[str, str] = {}
-        for row in conn.execute("SELECT customer_gid, member_no_key FROM claim_links"):
+        for row in conn.execute("SELECT customer_gid, member_no_key FROM active_claim_links"):
             by_gid[row["customer_gid"]] = row["member_no_key"]
             by_key[row["member_no_key"]] = row["customer_gid"]
-        return ClaimLinks(by_gid, by_key)
+        voided = frozenset((row["customer_gid"], row["member_no_key"]) for row in conn.execute(
+            "SELECT c.customer_gid, c.member_no_key FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id"))
+        return ClaimLinks(by_gid, by_key, voided)
     except sqlite3.Error:
         raise dl.DirectLocalError("member_core_ledger_unreadable") from None
     finally:
@@ -2870,6 +2888,7 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
         conn.close()
     claim_gids = dict(claims.by_gid) if claims is not None else {}
     claim_keys = dict(claims.by_key) if claims is not None else {}
+    unlinked_gids = {pair[0] for pair in claims.voided} if claims is not None else set()
     classes: dict[str, int] = {}
     refs: list[dict[str, str]] = []
     listed = 0  # customers with a ref-worthy class (refs holds the first COVERAGE_MAX_REFS)
@@ -2881,6 +2900,8 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
             code = "linked_claim_only"
         elif gid_value in open_writes:
             code = "open_write"
+        elif gid_value in unlinked_gids:
+            code = "claim_unlinked_not_linked"  # fix round 2: staff unlinked it in the member core; a person decides
         elif REGISTRATION_TAG not in item.tags:
             code = "legacy_not_linked"  # never created by a tool: a person decides
         else:
@@ -2920,7 +2941,7 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
                 "members_in_book": "not_read"},
         "shopify_pending": dict(sorted(pending.items())),
         "complete": classes.get("gap", 0) == 0 and classes.get("after_cutover_not_linked", 0) == 0 and classes.get("open_write", 0) == 0
-                    and member_classes.get("linked_conflict", 0) == 0 and customer_conflicts == 0,
+                    and classes.get("claim_unlinked_not_linked", 0) == 0 and member_classes.get("linked_conflict", 0) == 0 and customer_conflicts == 0,
         "refs": refs,
         # Fix round 1 (G2 LATER 1): true when more customers have a listed
         # class than refs holds (the person list is then not the whole list).

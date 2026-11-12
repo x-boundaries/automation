@@ -439,7 +439,7 @@ Unknown keys, at the top level or nested, are refused.
 | `probe_wake_enabled` | `false` | #155 P2: the probe starts `\XB\XB-MemberSync` only when true (and the immediate path is on); otherwise it records "would wake" (P3 observe) |
 | `probe_max_wakes_per_day` | `60` | 1-240 task starts per Singapore day by the probe |
 | `backfill_registrations_enabled` | `false` | #155 slice BF1: the gate for `backfill-registrations --apply` (refused with `backfill_registrations_disabled` before any login, read or lock while off); a dry run needs no gate. Gates nothing else: `run`, `initial-link`, `status`, `digest`, `probe` and `check-config` behave exactly as before. Only in the backfill's own config copy, never in the 15-minute task's live config (see the backfill section) |
-| `member_core_state_root` | `null` | #155 slice BF1: the member core's (#268) state root. When set, the backfill and `coverage` read its claim links read-only (its meta must be the member core's, bound to the same book and store); a member is then linked if either ledger says so. `null`: not read, and the output says `"member_core_ledger": "not_configured"`. Must not be this sync's own `state_root` |
+| `member_core_state_root` | `null` | #155 slice BF1: the member core's (#268) state root. When set, the backfill and `coverage` read its active claim links read-only (its ledger version must be 2, the one this module knows, else `member_core_ledger_version_unknown` before any decision; its meta must be the member core's, bound to the same book and store); a member is then linked if either ledger says so. A pair staff unlinked there is never linked by the backfill. `null`: not read, and the output says `"member_core_ledger": "not_configured"`. Must not be this sync's own `state_root` |
 
 Neither BF1 key is printed by `check-config` while it is absent or off, so
 its output is unchanged; when set it adds `backfill_registrations_enabled:
@@ -819,7 +819,8 @@ Controller's decisions):
 | Both forms of the number are MemberNos | Held | `backfill_memberno_conflict` |
 | Also carries a legacy tag (`member-legacy` or `XB Member`, any case, spaces trimmed), no member found | Held: never created by a tool | `backfill_legacy_needs_person` |
 | No phone; malformed phone; no name; no sign-up time | Held, before any AutoCount lookup | `backfill_no_phone`, `backfill_phone_invalid`, `backfill_no_name`, `backfill_signup_time_missing` |
-| The member it would link or create is already linked to another customer (this ledger, the member core's claim links, or earlier in the same call) | Held | `backfill_member_linked_elsewhere` |
+| The member it would link or create is already linked to another customer (this ledger, the member core's active claim links, or earlier in the same call) | Held | `backfill_member_linked_elsewhere` |
+| Staff unlinked exactly this customer and this member in the member core (a voided claim link) | Held for a person: never linked again by a tool (the member core refuses the pair too) | `backfill_claim_pair_unlinked` |
 | A text field AutoCount cannot store exactly | Held | `backfill_text_unstorable` |
 | Already linked (this ledger, or a claim link) | Skipped, no lookup | `backfill_already_linked`, `backfill_claim_linked` |
 | An open (INTENT or UNCERTAIN) write for the customer, or for the MemberNo | Held, never re-sent | `backfill_held_by_open_write`, `backfill_member_held_by_open_write` |
@@ -940,15 +941,19 @@ deletes or updates a member, and a link can never be removed.
 `coverage --config <config>` reads the customers tagged `member-mg` or
 `member-legacy` (Shopify reads only; the session's one mutation is switched
 off), this sync's ledger read-only (no lock, no migration, no write) and, when
-`member_core_state_root` is set, the member core's claim links read-only. It
-opens no AutoCount session and writes nothing to either ledger, AutoCount or
+`member_core_state_root` is set, the member core's claim links read-only
+(active links from its `active_claim_links` view; a voided link is history,
+never a link; a ledger version other than 2 is refused with
+`member_core_ledger_version_unknown`). It opens no AutoCount session and writes nothing to either ledger, AutoCount or
 Shopify (with `token_cache` `dpapi_current_user` the Shopify token cache in
 the state root may be refreshed, as for every command). It needs no paused
 task.
 
 - `shopify.classes`: every tagged customer in exactly one class, adding up
-  to `tagged_total`: `linked`, `linked_claim_only`, `open_write`,
-  `legacy_not_linked` (a legacy tag, no `member-mg`), `after_cutover_not_linked`
+  to `tagged_total`: `linked`, `linked_claim_only` (an active member core
+  claim only), `open_write`, `claim_unlinked_not_linked` (staff unlinked a
+  claim of this customer in the member core and it has no active link
+  anywhere: a person decides), `legacy_not_linked` (a legacy tag, no `member-mg`), `after_cutover_not_linked`
   (the live sync's own), the person classes of the table above (no phone,
   malformed phone, no name, no sign-up time, and each customer's latest hold
   from the applied backfill calls), and `gap` (signed up before the
@@ -960,8 +965,9 @@ task.
   customers); plus `customers_linked_to_two_members`. The members the book
   holds are not read (`members_in_book: "not_read"`): the daily summary
   email gives the member totals per type.
-- `complete` is true when `gap`, `after_cutover_not_linked` and `open_write`
-  are 0 and there is no conflict on either side. Everyone else is on a named
+- `complete` is true when `gap`, `after_cutover_not_linked`, `open_write`
+  and `claim_unlinked_not_linked` are 0 and there is no conflict on either
+  side. Everyone else is on a named
   list.
 - `refs`: keyed customer refs and the code for every customer outside the
   linked, gap and after-cutover classes (at most 200). `refs_truncated` is
@@ -1863,3 +1869,10 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
     characters or fewer is shown whole by the last-3 mask.
 15. #155 BF1 G2 LATER 8 (not changed): `backfill_registrations_completed_at`
     is written but read by nothing yet.
+16. #155 BF1 G2 recheck 1 LATER 1 (not changed in fix round 2): procedure
+    step 6 reads `runs.duration_seconds_max` only. A run that Task Scheduler
+    stops at 600 s has no duration and shows only in `runs.unfinished`; the
+    G2 suggests adding "or `runs.unfinished` above 1". Controller to decide.
+17. #155 BF1 G2 recheck 1 LATER 2 (not changed): `coverage` searches
+    `member-mg` and `member-legacy`, not `XB Member`; a customer tagged only
+    `XB Member` is outside its population.

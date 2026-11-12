@@ -4494,22 +4494,37 @@ def old_sign_up(n: int, *, first="Alpha", last="Tester", phone="sg", tags=("memb
     return replace(item, created_at=made, updated_at=made, registration_at=None, registration_value=None)
 
 
-def make_member_core_ledger(root: Path, *, claims=(), book=TEST_BOOK, tool="xb268_member_benefits", store=STORE) -> None:
-    """A member core ledger with the real #268 schema, written directly."""
+def make_member_core_ledger(root: Path, *, claims=(), book=TEST_BOOK, tool="xb268_member_benefits", store=STORE, voided=()) -> None:
+    """A member core ledger made by the member core's own ledger class (its
+    live schema and version: v2 on main), with meta and claims written
+    directly. ``voided``: (customer GID, MemberNo) pairs linked and then
+    unlinked by staff (claim_unlinks), written before the active ``claims``."""
 
     import xb_member_benefits as mb
 
-    conn = sqlite3.connect(root / mb.LEDGER_FILE)
+    if tool == "xb268_member_benefits":
+        ledger = mb.BenefitsLedger(root, clock=lambda: T0)
+        conn, close = ledger.conn, ledger.close
+    else:  # a ledger of another tool: the live schema without its tool check
+        conn = sqlite3.connect(root / mb.LEDGER_FILE, isolation_level=None)
+        conn.executescript(mb.LEDGER_SCHEMA.replace("CHECK (tool = 'xb268_member_benefits')", ""))
+        conn.execute(f"PRAGMA user_version={mb.SCHEMA_VERSION}")
+        close = conn.close
     try:
-        conn.executescript(mb.LEDGER_SCHEMA.replace("CHECK (tool = 'xb268_member_benefits')", "") if tool != "xb268_member_benefits" else mb.LEDGER_SCHEMA)
-        conn.execute("INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, ?, 'b-1', ?, ?, ?, ?, ?)",
-                     (tool, book, store, DOMAIN, "6b" * 32, dl.ts(T0)))
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at, rule_fingerprint) "
+                     "VALUES (1, ?, 'b-1', ?, ?, ?, ?, ?, ?)", (tool, book, store, DOMAIN, "6b" * 32, dl.ts(T0), "sha256:" + "0" * 64))
+        for customer_gid, member_no in voided:
+            cursor = conn.execute("INSERT INTO claim_links(customer_gid, member_no, member_no_key, source, code, created_at) "
+                                  "VALUES (?, ?, ?, 'order', 'claim_test', ?)", (customer_gid, member_no, sync.member_no_key(member_no), dl.ts(T0)))
+            conn.execute("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (?, 'wrong_person', 'run-unlink', ?)",
+                         (cursor.lastrowid, dl.ts(T0)))
         for customer_gid, member_no in claims:
             conn.execute("INSERT INTO claim_links(customer_gid, member_no, member_no_key, source, code, created_at) VALUES (?, ?, ?, 'order', 'claim_test', ?)",
                          (customer_gid, member_no, sync.member_no_key(member_no), dl.ts(T0)))
-        conn.commit()
+        conn.execute("COMMIT")
     finally:
-        conn.close()
+        close()
 
 
 class BackfillTestCase(SyncTestCase):
@@ -5438,6 +5453,166 @@ class CoverageRefsTruncatedTests(BackfillTestCase):
         self.assertEqual((len(result["refs"]), result["refs_truncated"]), (2, True))
         self.assertEqual(result["shopify"]["classes"], {"backfill_no_phone": 3})  # the counts stay whole
         self.assertEqual(sync.COVERAGE_MAX_REFS, 200)
+
+
+
+# -- #155 slice BF1 fix round 2 (G2 recheck 1: B1, M2, H01/H02/H04/H12) ------------
+
+
+class MemberCoreV2Tests(BackfillTestCase):
+    """Controller ruling 2: the member core's active claim links only; a voided
+    pair is held for a person and never linked; an unknown ledger version is
+    refused. G2 recheck 1 cases P1 to P4."""
+
+    def core(self, *, claims=(), voided=()) -> sync.ClaimLinks:
+        root = self.temp / "core"
+        root.mkdir()
+        make_member_core_ledger(root, claims=claims, voided=voided)
+        return sync.read_claim_links(root, make_config())
+
+    def report(self, claims) -> dict:
+        return sync.coverage_report(self.temp, make_config(**BF_KEYS), shopify=self.shopify, claims=claims)
+
+    def test_the_version_read_is_the_member_core_s_own(self):
+        import xb_member_benefits as mb
+
+        self.assertEqual(sync.MEMBER_CORE_LEDGER_VERSION, mb.SCHEMA_VERSION)
+
+    def test_an_unknown_member_core_ledger_version_is_refused(self):
+        for version in (1, 3):
+            with self.subTest(version=version):
+                root = self.temp / f"core-v{version}"
+                root.mkdir()
+                make_member_core_ledger(root, claims=[(gid(30), "CLAIM30")])
+                conn = sqlite3.connect(root / sync.MEMBER_CORE_LEDGER_FILE)
+                conn.execute(f"PRAGMA user_version={version}")
+                conn.close()
+                with self.assertRaises(dl.DirectLocalError) as caught:
+                    sync.read_claim_links(root, make_config())
+                self.assertEqual(caught.exception.code, "member_core_ledger_version_unknown")
+
+    def test_claims_hold_active_links_and_voided_pairs_apart(self):
+        claims = self.core(claims=[(gid(31), "CLAIM31")], voided=[(gid(32), "CLAIM32")])
+        self.assertEqual((dict(claims.by_gid), dict(claims.by_key)), ({gid(31): "claim31"}, {"claim31": gid(31)}))
+        self.assertEqual(claims.voided, frozenset({(gid(32), "claim32")}))
+        self.assertEqual(repr(claims), "ClaimLinks()")
+
+    def test_P1_a_customer_whose_only_claim_was_voided_follows_the_normal_rules(self):
+        self.shopify.add(old_sign_up(40))
+        claims = self.core(voided=[(gid(40), "ZQ" + local(41) + "X")])
+        before = self.report(claims)
+        self.assertEqual(before["shopify"]["classes"], {"claim_unlinked_not_linked": 1})
+        self.assertEqual((before["shopify"]["needs_person"], before["ac2"]["classes"], before["complete"]), (1, {}, False))
+        self.assertEqual(before["refs"], [{"ref": self.ledger.ref("c", gid(40)), "code": "claim_unlinked_not_linked"}])
+        result = self.backfill(apply=True, claims=claims)
+        self.assertNotIn("backfill_claim_linked", result["counts"])
+        self.assertEqual(self.link_rows(), {gid(40): (sg(40), "created_in_ac2", "backfill_new_member_phone")})
+        after = self.report(claims)
+        self.assertEqual((after["shopify"]["classes"], after["complete"]), ({"linked": 1}, True))
+
+    def test_P2_a_member_freed_by_an_unlink_links_to_its_real_owner(self):
+        self.shopify.add(old_sign_up(42))
+        self.member(sg(42), "Alpha Tester", plus(sg(42)))
+        claims = self.core(voided=[(gid(99), sg(42))])
+        result = self.backfill(apply=True, claims=claims)
+        self.assertNotIn("backfill_member_linked_elsewhere", result["counts"])
+        self.assertEqual(self.link_rows(), {gid(42): (sg(42), "matched", "backfill_member_no")})
+
+    def test_P3_the_voided_pair_itself_is_held_for_a_person_never_linked(self):
+        self.shopify.add(old_sign_up(44))
+        self.member(sg(44), "Alpha Tester", plus(sg(44)))
+        claims = self.core(voided=[(gid(44), sg(44))])
+        dry = self.backfill(apply=False, claims=claims)
+        self.assertEqual((dry["counts"].get("backfill_claim_pair_unlinked"), dry["counts"].get("backfill_would_link")), (1, None))
+        result = self.backfill(apply=True, claims=claims)
+        self.assertEqual((self.link_rows(), self.ac2.creates), ({}, []))
+        self.assertEqual(result["counts"]["backfill_claim_pair_unlinked"], 1)
+        self.assertEqual([(r["code"], r["member_no_masked"][-3:]) for r in result["refs"]], [("backfill_claim_pair_unlinked", sg(44)[-3:])])
+        self.assertIn("backfill_claim_pair_unlinked", sync.BACKFILL_PERSON_CODES)
+        self.assert_private(result)
+        report = self.report(claims)
+        self.assertEqual((report["shopify"]["classes"], report["complete"]), ({"claim_unlinked_not_linked": 1}, False))
+        # Without the member core's view of it the same customer would link.
+        self.assertEqual(self.backfill(apply=False)["counts"].get("backfill_would_link"), 1)
+
+    def test_P3_a_voided_pair_is_held_before_the_member_is_created(self):
+        self.shopify.add(old_sign_up(45))  # no AutoCount member holds the phone: the decision is a create
+        claims = self.core(voided=[(gid(45), sg(45))])
+        result = self.backfill(apply=True, claims=claims)
+        self.assertEqual((self.ac2.creates, result["counts"].get("backfill_claim_pair_unlinked")), ([], 1))
+
+    def test_P4_a_newer_active_claim_wins_and_the_voided_member_is_free(self):
+        self.shopify.add(old_sign_up(46))
+        self.shopify.add(old_sign_up(47))
+        self.member(sg(47), "Alpha Tester", plus(sg(47)))
+        claims = self.core(claims=[(gid(46), sg(46))], voided=[(gid(46), sg(47))])
+        self.assertEqual(dict(claims.by_gid), {gid(46): sg(46)})
+        result = self.backfill(apply=True, claims=claims)
+        self.assertEqual(result["counts"].get("backfill_claim_linked"), 1)  # customer 46: its active claim
+        self.assertEqual(self.link_rows(), {gid(47): (sg(47), "matched", "backfill_member_no")})  # member sg(47) to its owner
+        report = self.report(claims)
+        self.assertEqual(report["shopify"]["classes"], {"linked": 1, "linked_claim_only": 1})
+        self.assertEqual(report["ac2"]["classes"], {"linked_claim_only": 1, "linked_sync_only": 1})
+        self.assertTrue(report["complete"])
+
+    def test_a_voided_member_is_never_counted_as_linked_on_the_member_side(self):
+        claims = self.core(voided=[(gid(48), "CLAIM48")])
+        report = self.report(claims)
+        self.assertEqual((report["ac2"]["linked_members_total"], report["ac2"]["classes"]), (0, {}))
+
+    def test_the_cli_stops_on_an_unknown_version_before_any_decision(self):
+        refused = dl.DirectLocalError("member_core_ledger_version_unknown")
+        cli = BackfillCliTests("test_coverage_opens_no_lock_and_no_autocount_session")
+        cli.setUp()
+        self.addCleanup(cli.doCleanups)
+        with mock.patch.object(sync, "_state_root", return_value=self.temp), mock.patch.object(sync, "SyncLedger"), \
+                mock.patch.object(sync, "load_claim_links", side_effect=refused), \
+                mock.patch.object(sync, "build_real_engine", side_effect=AssertionError("no decision")):
+            code, out = cli.main(["backfill-registrations"])
+        self.assertEqual((code, out.get("code")), (2, "member_core_ledger_version_unknown"))
+        with mock.patch.object(sync.dl, "validate_state_root", return_value=self.temp), mock.patch.object(sync.dl, "verify_private_state"), \
+                mock.patch.object(sync, "load_claim_links", side_effect=refused), \
+                mock.patch.object(sync, "build_read_only_shopify", side_effect=AssertionError("no read")):
+            code, out = cli.main(["coverage"])
+        self.assertEqual((code, out.get("code")), (2, "member_core_ledger_version_unknown"))
+
+
+class BackfillOtherPhoneBoundaryTests(BackfillTestCase):
+    """G2 recheck 1 test gaps H01, H02, H04 (the other-phone rule) and H12
+    (it is the backfill's only)."""
+
+    def decide(self, item, members):
+        return sync.decide_backfill(item, sync.phone_member_no(item.phone)[0], members)
+
+    def test_H01_the_exact_member_s_own_phone_decides_whatever_else_holds_the_phone(self):
+        item = old_sign_up(50)
+        exact = sync.Ac2Member(sg(50), "SOMEONE ELSE", plus(sg(51)))
+        other = sync.Ac2Member("TILL50", "Alpha Tester", plus(sg(50)))  # a second member holding the phone
+        for members in ([exact, other], [other, exact]):
+            with self.subTest(first=members[0].member_no):
+                self.assertEqual(self.decide(item, members), sync.Decision("HOLD", "backfill_member_no_phone_differs", sg(50)))
+
+    def test_H02_the_same_name_with_another_phone_is_still_held(self):
+        item = old_sign_up(52)  # Alpha Tester
+        self.assertEqual(self.decide(item, [sync.Ac2Member(sg(52), "Alpha Tester", plus(sg(53)))]).code, "backfill_member_no_phone_differs")
+
+    def test_H04_a_foreign_number_ending_in_the_same_eight_digits_is_another_number(self):
+        item = old_sign_up(54)
+        self.assertEqual(self.decide(item, [sync.Ac2Member(sg(54), "SOMEONE ELSE", "+852" + local(54))]).code, "backfill_member_no_phone_differs")
+
+
+class LiveRuleOtherPhoneTests(GoLiveTestCase):
+    """H12: the 15-minute run keeps its exact-MemberNo rule."""
+
+    def test_H12_the_live_rule_still_links_a_member_made_in_the_window_with_another_phone(self):
+        self.now = T0 + timedelta(hours=1)
+        self.signup(56)
+        self.run_sync("shopify_to_ac2")
+        self.ac2.add(sync.Ac2Member(sg(56), "SOMEONE ELSE", plus(sg(57)), created_at=T0 + timedelta(minutes=4)))
+        self.now = T0 + timedelta(hours=3)
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual((self.links(), self.ac2.creates), ({gid(56): sg(56)}, []))
+        self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
 
 
 if __name__ == "__main__":
