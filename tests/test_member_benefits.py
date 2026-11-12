@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -324,11 +325,11 @@ class Base(unittest.TestCase):
         "status", "autocount_book", "api_version", "required_scopes", "orders_start_utc", "benefits_write_enabled", "max_upgrades_per_run",
         "max_member_reads_per_run", "qualify_threshold_cents", "amount_before_discounts", "amount_include_tax", "amount_exclude_shipping",
         "amount_exclude_gift_cards", "gift_card_gateways", "amount_count_sale_items", "same_day_signup_counts", "expiry_months", "target_type",
-        "type_move_lock", "ac2_credential", "ac2_login_mode"})
+        "type_move_lock", "ac2_credential", "ac2_login_mode", "rule_fingerprint"})
     RUN_KEYS = frozenset({"status", "command", "run_id", "saves", "counts", "alerts", "refs", "stopped"})
     OUTPUT_KEYS = {
         "status": (frozenset({"status", "command", "receipts", "observed", "writes", "claim_links", "claim_links_voided", "reviews",
-                              "watermark_set", "stop_file_present"}), frozenset()),
+                              "watermark_set", "stop_file_present", "rule_settings_match"}), frozenset()),
         "observe": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "apply": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
@@ -336,7 +337,7 @@ class Base(unittest.TestCase):
         "index_apply": (RUN_KEYS, frozenset()),
     }
     DIGEST_KEYS = frozenset({"schema", "status", "autocount_book", "hours", "runs", "counts", "alerts", "alert_refs", "receipts", "shadow",
-                             "gift_cards", "open"})
+                             "gift_cards", "open", "rule_settings_match"})
     DIGEST_PART_KEYS = {"runs": frozenset({"completed", "unfinished"}), "shadow": frozenset({"would_upgrade", "would_extend"}),
                         "open": frozenset({"uncertain_writes", "held_writes", "waiting_member", "claim_links", "claim_links_voided"})}
     WRITE_STATES = ("INTENT", "DONE", "SKIPPED", "NOT_WRITTEN", "UNCERTAIN", "HELD")
@@ -2378,6 +2379,94 @@ class AmountReadingTests(Base):
         self.assertIn('"amount_rule_version": AMOUNT_RULE_VERSION', source)
 
 
+class RuleFingerprintTests(Base):
+    """Slice B1 (G0 design 1.4): observe and apply refuse
+    benefits_rule_settings_changed when an amount setting or the amount rule
+    changed since init, before anything is read or recorded."""
+
+    run_main = CliTests.run_main
+    # Each of the eight inputs, changed alone (two of them cannot be set in a
+    # config file today, so the config object is changed directly).
+    CHANGES = {
+        "qualify_threshold_cents": {"qualify_threshold_cents": 35_000},
+        "amount_before_discounts": {"amount_before_discounts": False},
+        "amount_include_tax": {"amount_include_tax": False},
+        "amount_exclude_shipping": {"amount_exclude_shipping": False},
+        "amount_exclude_gift_cards": {"amount_exclude_gift_cards": True},
+        "gift_card_gateways": {"gift_card_gateways": ("gift_card", "store_credit")},
+        "amount_count_sale_items": {"amount_count_sale_items": False},
+        "amount_rule_version": {},
+    }
+
+    def recorded(self) -> tuple:
+        conn = self.ledger.conn
+        return (conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], self.ledger.watermark(bm.WATERMARK),
+                [tuple(r) for r in conn.execute("SELECT * FROM receipts ORDER BY order_gid")],
+                conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], len(self.shopify.calls), self.book.reads, self.book.saves)
+
+    def test_each_input_changed_alone_refuses_observe_and_apply_with_nothing_recorded(self):
+        self.guest_with_order(1)
+        self.engine().run(apply=False)
+        base = self.cfg()
+        kept = base.rule_fingerprint()
+        self.advance(minutes=15)
+        before = self.recorded()
+        self.assertEqual(before[0], 1)
+        for name, change in self.CHANGES.items():
+            cfg = dataclasses.replace(base, **change)
+            with contextlib.ExitStack() as stack:
+                if name == "amount_rule_version":
+                    stack.enter_context(mock.patch.object(bm, "AMOUNT_RULE_VERSION", bm.AMOUNT_RULE_VERSION + 1))
+                self.assertNotEqual(cfg.rule_fingerprint(), kept, name)
+                engine = bm.BenefitsEngine(cfg, self.ledger, shopify=self.shopify, ac2=self.book, sync_links=self.sync_links)
+                for apply in (False, True):
+                    with self.subTest(name=name, apply=apply):
+                        self.assertEqual(self.code(lambda: engine.run(apply=apply)), "benefits_rule_settings_changed")
+                        self.assertEqual(self.recorded(), before)
+                self.assertFalse(engine.status()["rule_settings_match"])
+                self.assertFalse(bm.ledger_digest(self.root, hours=24, now=self.now, config=cfg)["rule_settings_match"])
+        # The same settings again: the run goes ahead.
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["saves"], self.recorded()[0]), (1, 2))
+
+    def test_settings_outside_the_rule_and_the_order_of_gateways_change_nothing(self):
+        self.guest_with_order(1)
+        self.engine(gift_card_gateways=["gift_card", "store_credit"])
+        same = {"gift_card_gateways": ["store_credit", "gift_card"], "same_day_signup_counts": False, "signup_wait_hours": 72,
+                "orders_start_utc": "2026-11-16T00:00:00Z", "max_upgrades_per_run": 1, "max_member_reads_per_run": 5,
+                "waiting_member_alert_hours": 24, "shopify_max_pages": 3, "http_timeout_seconds": 10}
+        for key, value in same.items():
+            with self.subTest(key=key):
+                cfg = self.cfg(**{"gift_card_gateways": ["gift_card", "store_credit"], key: value})
+                self.assertTrue(self.ledger.rule_settings_match(cfg))
+        out = self.engine(gift_card_gateways=["store_credit", "gift_card"], same_day_signup_counts=False).run(apply=False)
+        self.assertEqual(out["counts"].get("would_upgrade"), 1)
+
+    def test_the_fingerprint_is_shown_and_the_other_commands_still_run(self):
+        self.guest_with_order(1)
+        code, config, _ = self.run_main("check-config")
+        self.assertEqual((code, config["rule_fingerprint"]), (0, self.cfg().rule_fingerprint()))
+        self.assertRegex(config["rule_fingerprint"], r"^sha256:[0-9a-f]{64}\Z")
+        self.run_main("init")
+        self.assertEqual(self.run_main("observe")[0], 0)
+        changed = {"qualify_threshold_cents": 25_000}
+        self.advance(minutes=15)
+        for command in ("observe", "apply"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_main(command, cfg=changed)[:2], (2, {"status": "refused", "code": "benefits_rule_settings_changed"}))
+        code, status, _ = self.run_main("status", cfg=changed)
+        self.assertEqual((code, status["rule_settings_match"]), (0, False))
+        code, digest, _ = self.run_main("digest", cfg=changed)
+        self.assertEqual((code, digest["rule_settings_match"], digest["runs"]["completed"]), (0, False, 1))
+        for args in (("resolve",), ("index",)):
+            with self.subTest(args=args):
+                self.assertIn(self.run_main(*args, cfg=changed)[0], (0, 3))
+        self.assertTrue(self.run_main("status")[1]["rule_settings_match"])
+        self.assertTrue(self.run_main("digest")[1]["rule_settings_match"])
+        code, out, _ = self.run_main("check-config", cfg=changed)
+        self.assertNotEqual(out["rule_fingerprint"], config["rule_fingerprint"])
+
+
 class B9Tests(Base):
     """G2 recheck 3, blocker B9: the engine branches no test reached, so the
     privacy check after every test never saw their output (tests only)."""
@@ -2786,6 +2875,7 @@ class OutputShapeRuleTests(Base):
                 "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded", "member_no_masked": "*******001"}]}
     # Slice B1 T5: the digest in its full shape (the check now knows every key).
     GOOD_DIGEST = {"schema": "xb.directlocal.member_benefits.digest.v1", "status": "ok", "autocount_book": "AED_TESTINGAPI", "hours": 24,
+                   "rule_settings_match": True,
                    "runs": {"completed": 2, "unfinished": 0}, "counts": {"orders_read": 2}, "alerts": {"claim_needs_review": 2},
                    "alert_refs": [{"ref": "m-" + "b" * 20, "code": "claim_needs_review"}], "receipts": {"applied": 1, "held": 1},
                    "shadow": {"would_upgrade": 0, "would_extend": 0}, "gift_cards": {"receipts_paid_by_gift_card": 0, "gateways_seen": {}},
@@ -2894,13 +2984,13 @@ class OutputShapeRuleTests(Base):
             "digest_open_with_a_new_key": {**self.GOOD_DIGEST, "open": {**self.GOOD_DIGEST["open"], "seen_" + order[-6:]: 1}},
             "digest_receipts_key_with_part_of_an_order_number": {**self.GOOD_DIGEST, "receipts": {"held_" + order[-6:]: 1}},
             "an_unknown_command": {**run, "command": "seen"},
-            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0,
+            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
                                       "reviews": 0, "watermark_set": False, "stop_file_present": False, "seen": 1},
             "status_receipts_key_with_part_of_an_order_number": {
-                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0,
+                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "status_writes_key_with_part_of_an_order_number": {
-                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "claim_links": 0, "claim_links_voided": 0,
+                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "claim_links": 0, "claim_links_voided": 0, "rule_settings_match": True,
                 "reviews": 0, "watermark_set": False, "stop_file_present": False},
             "check_config_with_a_new_key": {"status": "ok", **{key: None for key in self.CONFIG_KEYS if key != "status"}, "seen": 1},
             "init_with_another_status": {"status": "seen_" + order[-6:]},

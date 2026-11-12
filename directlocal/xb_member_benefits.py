@@ -293,6 +293,7 @@ class BenefitsConfig:
             "type_move_lock": self.type_move_state_root is not None,
             "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "ac2_login_mode": self.ac2_login_mode,
+            "rule_fingerprint": self.rule_fingerprint(),  # slice B1: as kept in the ledger at init
         }
 
 
@@ -907,6 +908,21 @@ class BenefitsLedger:
         if row is None:
             raise dl.DirectLocalError("benefits_ledger_not_initialised")
         self._check(row, config)
+
+    def rule_settings_match(self, config: BenefitsConfig) -> bool:
+        """Slice B1: the config's rule fingerprint is the one kept at init."""
+
+        row = self.conn.execute("SELECT rule_fingerprint FROM meta WHERE id = 1").fetchone()
+        return row is not None and hmac.compare_digest(row[0], config.rule_fingerprint())
+
+    def check_rule_settings(self, config: BenefitsConfig) -> None:
+        """Slice B1 (G0 1.4): observe and apply measure amounts, so they
+        refuse when an amount setting or the amount rule changed since the
+        ledger was made (the receipts already recorded keep their old
+        amount). The way on is a new start (runbook)."""
+
+        if not self.rule_settings_match(config):
+            raise dl.DirectLocalError("benefits_rule_settings_changed")
 
     def ref(self, kind: str, value: str) -> str:
         key = self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0]
@@ -1861,6 +1877,9 @@ class BenefitsEngine:
         if apply and not self.config.benefits_write_enabled:
             raise dl.DirectLocalError("benefits_write_disabled")
         self.ledger.check_binding(self.config)
+        # Slice B1: before the Shopify session check, any read, any ledger
+        # write or run row.
+        self.ledger.check_rule_settings(self.config)
         if apply:
             if self.ledger.open_writes():
                 raise dl.DirectLocalError("benefit_uncertain_unresolved")
@@ -2284,7 +2303,7 @@ class BenefitsEngine:
         writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT kind, state, COUNT(*) FROM writes GROUP BY kind, state")}
         active, voided = self.ledger.claim_counts()
         return {"status": "ok", "command": "status", "receipts": receipts, "observed": observed, "writes": writes,
-                "claim_links": active, "claim_links_voided": voided,
+                "claim_links": active, "claim_links_voided": voided, "rule_settings_match": self.ledger.rule_settings_match(self.config),
                 "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
                 "watermark_set": self.ledger.watermark(WATERMARK) is not None, "stop_file_present": self._stop_requested()}
 
@@ -2393,6 +2412,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
                 gateways[name] = gateways.get(name, 0) + 1
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
+            "rule_settings_match": hmac.compare_digest(meta["rule_fingerprint"], config.rule_fingerprint()),
             "runs": {"completed": completed, "unfinished": unfinished}, "counts": dict(sorted(counts.items())),
             "alerts": dict(sorted(alerts.items())), "alert_refs": refs, "receipts": receipts,
             "shadow": {"would_upgrade": observed.get("would_upgrade", 0), "would_extend": observed.get("would_extend", 0)},
