@@ -51,6 +51,7 @@ MEMBER_GATEWAY_TARGETED_JOBS = {
         "test_member_sync_bridge_ps",
         "test_member_type_move_ps",
         "test_member_benefits_ps",
+        "test_member_tags_ps",
     ),
     "powershell-worker-tooling": ("test_member_gateway_worker_deployment",),
     "bounded-import-security": (
