@@ -29,6 +29,12 @@ Scope (Owner decisions, #155 build step 2)
   Shopify customer holding the phone under another name is a different
   person: a separate customer is created without the phone. Every link, skip
   and fallback is counted in the run summary (counts and keyed refs only).
+* #155 slice BF1 (owner, 11 and 12 Nov 2026), one-off and attended:
+  ``backfill-registrations`` brings older ``member-mg`` sign-ups (before the
+  cutover) into AC2 (link, or a create through the same write-once child;
+  doubtful cases held for a person), dry run by default, ``--apply`` only with
+  ``backfill_registrations_enabled``; ``coverage`` is a read-only count of
+  who is linked and who is not. Neither changes ``run``.
 * Loop prevention both ways through the ledger mapping (customer GID <->
   MemberNo, both unique): a member this sync created in AC2 never comes back
   to Shopify as new, and a customer it created in Shopify never goes back to
@@ -246,6 +252,17 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # when this is true; otherwise it records "would wake" (observe).
     "probe_wake_enabled": False,
     "probe_max_wakes_per_day": 60,
+    # #155 slice BF1 (owner, 11 and 12 Nov 2026): the one-off
+    # ``backfill-registrations`` writes (links, and GUEST creates through the
+    # write-once child) only with ``--apply`` AND this on. Off by default.
+    # Never add this key, or the next one, to the 15-minute task's live
+    # config while that task runs an older commit: an older commit refuses
+    # unknown keys (runbook: the backfill uses its own copy of the config).
+    "backfill_registrations_enabled": False,
+    # #155 BF1: the member core's (#268) state root. When set, the backfill
+    # and ``coverage`` read its claim links read-only (a member is linked if
+    # either ledger says so); null: not read, and the output says so.
+    "member_core_state_root": None,
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -311,6 +328,8 @@ class SyncConfig:
     max_creates_per_day: int = 144
     probe_wake_enabled: bool = False
     probe_max_wakes_per_day: int = 60
+    backfill_registrations_enabled: bool = False
+    member_core_state_root: str | None = None
 
     @property
     def immediate_path_active(self) -> bool:
@@ -335,6 +354,10 @@ class SyncConfig:
             "immediate_create_enabled": self.immediate_create_enabled, "immediate_create_window_local": self.immediate_create_window_local,
             "max_creates_per_hour": self.max_creates_per_hour, "max_creates_per_day": self.max_creates_per_day,
             "probe_wake_enabled": self.probe_wake_enabled, "probe_max_wakes_per_day": self.probe_max_wakes_per_day,
+            # #155 BF1: printed only when set, so with both keys absent or
+            # off check-config prints exactly what it printed before.
+            **({"backfill_registrations_enabled": True} if self.backfill_registrations_enabled else {}),
+            **({"member_core_state_root_set": True} if self.member_core_state_root is not None else {}),
         }
 
 
@@ -439,6 +462,10 @@ def parse_config(value: Any) -> SyncConfig:
         raise dl.DirectLocalError("sync_config_immediate_create_window_local_invalid")
     if numbers["max_creates_per_hour"] > numbers["max_creates_per_day"]:
         raise dl.DirectLocalError("sync_config_max_creates_per_day_invalid")
+    core_root = merged["member_core_state_root"]
+    if core_root is not None and (not isinstance(core_root, str) or not core_root or core_root == merged["state_root"]):
+        # #155 BF1: another tool's root, never this sync's own.
+        raise dl.DirectLocalError("sync_config_member_core_state_root_invalid")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
@@ -448,7 +475,9 @@ def parse_config(value: Any) -> SyncConfig:
         changelog_xml_column=column, deferred_create_local_time=local_time, ac2_create_member_type=member_type,
         ac2_create_without_phone=without_phone, ac2_refused_user_ids=tuple(refused_users), ac2_login_mode=login_mode,
         immediate_create_enabled=_bool(merged["immediate_create_enabled"], "immediate_create_enabled"), immediate_create_window_local=window,
-        probe_wake_enabled=_bool(merged["probe_wake_enabled"], "probe_wake_enabled"), **numbers,
+        probe_wake_enabled=_bool(merged["probe_wake_enabled"], "probe_wake_enabled"),
+        backfill_registrations_enabled=_bool(merged["backfill_registrations_enabled"], "backfill_registrations_enabled"),
+        member_core_state_root=core_root, **numbers,
     )
 
 
@@ -810,6 +839,143 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
 
 
 # --------------------------------------------------------------------------
+# #155 slice BF1: the one-off backfill of older sign-ups (pure rules)
+# --------------------------------------------------------------------------
+
+# Owner 11 and 12 Nov 2026 (G0 two-way backfill plan, sections 2.1 to 2.4 and
+# Controller decisions 1 to 3): a ``member-mg`` sign-up from before the
+# cutover with no AutoCount member becomes a member of the configured create
+# type (live: GUEST); a customer with a legacy tag is never created; a
+# shared family phone, both forms of one number, no phone, a malformed phone
+# and no name are held for a person (a link in this ledger can never be
+# removed, so nothing doubtful is linked or created).
+LEGACY_TAG = "member-legacy"
+# Fix round 1 (Controller ruling 3, fail closed): the tags the store treats as
+# legacy (as the superseded member gateway read them), compared trimmed and
+# case-insensitively. A fixed list, not a setting: a link is permanent, so a
+# customer carrying any of them is never created as a new member.
+LEGACY_TAGS = frozenset({"member-legacy", "xb member"})
+BACKFILL_RUN_KIND = "backfill_registrations"
+BACKFILL_RUN_PREFIX = "backfill-"
+# Resumable: the numeric customer ID of the last customer a call finished,
+# one cursor per mode (a dry run never moves the apply cursor).
+BACKFILL_CURSORS = {True: "backfill_registrations_cursor", False: "backfill_registrations_dry_run_cursor"}
+BACKFILL_DONE_MARK = "backfill_registrations_completed_at"
+# The same file name as the type move and the member core use for their stop
+# file, here in the sync's own state root; checked before every customer.
+STOP_FILE = "STOP"
+# The daily summary allows max_writes_per_run writes for each of its 15-minute
+# runs in a clock hour; the backfill keeps every rolling 60 minutes within it.
+RUNS_PER_HOUR = 60 // SCHEDULE_MINUTES
+_CUSTOMER_NUMBER_RE = re.compile(r"^gid://shopify/Customer/([1-9][0-9]{0,19})$")
+# Codes of a customer held for a person (the weekly list). ``coverage`` reads
+# the latest of these per customer from the applied backfill runs.
+BACKFILL_PERSON_CODES = frozenset({
+    "backfill_signup_time_missing", "backfill_no_name", "backfill_no_phone", "backfill_phone_invalid",
+    "backfill_memberno_conflict", "backfill_shared_phone", "backfill_phone_on_multiple_records",
+    "backfill_legacy_needs_person", "backfill_member_linked_elsewhere", "backfill_text_unstorable",
+    "backfill_member_no_phone_differs", "backfill_claim_pair_unlinked",
+})
+
+
+def has_legacy_tag(tags: Iterable[Any]) -> bool:
+    """True when any tag is one of ``LEGACY_TAGS`` (trimmed, any case)."""
+
+    return any(isinstance(tag, str) and tag.strip().casefold() in LEGACY_TAGS for tag in tags)
+
+
+def customer_number(gid: Any) -> int | None:
+    """The numeric part of a customer GID (Shopify numbers customers in the
+    order they were made), or None for any other shape."""
+
+    match = _CUSTOMER_NUMBER_RE.fullmatch(gid) if isinstance(gid, str) else None
+    return int(match.group(1)) if match else None
+
+
+def backfill_precheck(customer: ShopifyCustomer, cutover: datetime) -> str | None:
+    """The reasons a tagged, unlinked customer needs no AutoCount lookup:
+    signed up on or after the cutover (the live sync's own customers), or
+    held for a person before any lookup (no sign-up time, no name, no phone,
+    a malformed phone). None: the customer is looked up. The sign-up time is
+    the live rule's: the ``membership.start_date`` metafield's creation
+    time, else Customer.createdAt."""
+
+    instant = customer.registration_at or customer.created_at
+    if instant is None:
+        return "backfill_signup_time_missing"
+    if instant >= cutover:
+        return "backfill_signed_up_after_cutover"
+    if not name_words(shopify_full_name(customer.first_name, customer.last_name)):
+        return "backfill_no_name"
+    status = phone_member_no(customer.phone)[1]
+    if status == "absent":
+        return "backfill_no_phone"
+    if status == "invalid":
+        return "backfill_phone_invalid"
+    return None
+
+
+def decide_backfill(customer: ShopifyCustomer, phone_digits: str, candidates: Iterable[Ac2Member]) -> Decision:
+    """One older sign-up against the AC2 rows found by its phone. Actions:
+    LINK, CREATE or HOLD (a person decides; never linked, never created).
+
+    * One member whose MemberNo is exactly the phone (``member_no_forms``):
+      linked, with no time window and no name rule (these are old; the first
+      link-up's rule), unless that member's own MobilePhone is a usable
+      number other than the customer's phone (held: fix round 1, Controller
+      ruling 4; the live sync and ``initial-link`` keep their rule). Both
+      forms of the number: held.
+    * Otherwise exactly one member holding the phone (MobilePhone, or the 8
+      digits inside a longer MemberNo) under the same name (the 2-word rule):
+      linked. More than one: held.
+    * The phone held under another name (a shared family phone): held, not
+      created with the fallback number (Controller decision 2).
+    * No member holds the phone: created with MemberNo = the phone (the live
+      rule), unless the customer carries a legacy tag (``LEGACY_TAGS``,
+      held).
+    """
+
+    rows = list(candidates)
+    hits = [r for r in rows if _phone_hit(r, phone_digits)]
+    forms = member_no_forms(phone_digits)
+    exact = [r for r in hits if member_no_key(r.member_no) in forms]
+    if len(exact) > 1:
+        return Decision("HOLD", "backfill_memberno_conflict", exact[0].member_no)
+    if exact:
+        own_phone, status = phone_member_no(exact[0].mobile_phone)
+        if status == "ok" and own_phone != phone_digits:
+            return Decision("HOLD", "backfill_member_no_phone_differs", exact[0].member_no)
+        return Decision("LINK", "backfill_member_no", exact[0].member_no)
+    full_name = shopify_full_name(customer.first_name, customer.last_name)
+    same = [r for r in hits if full_name_matches(full_name, r.name)]
+    if len(same) == 1:
+        return Decision("LINK", "backfill_phone_and_name", same[0].member_no)
+    if len(same) > 1:
+        return Decision("HOLD", "backfill_phone_on_multiple_records")
+    if hits:
+        return Decision("HOLD", "backfill_shared_phone", None, name_fallback_notes(full_name, [r.name for r in hits]))
+    if has_legacy_tag(customer.tags):
+        return Decision("HOLD", "backfill_legacy_needs_person")
+    return Decision("CREATE", "backfill_new_member_phone", phone_digits)
+
+
+def sync_p1_payload(customer: ShopifyCustomer, name: str, digits: str | None, member_type: str, month: int | None, today: Callable[[], str]) -> dict[str, Any]:
+    """The ``sync_p1`` create payload (shared by the live create and the
+    backfill). RegisterDate is the sign-up date: the ``membership.start_date``
+    value when it is a date, else the sign-up time (or Customer.createdAt) in
+    Singapore, else ``today()`` (called only then)."""
+
+    registered = customer.registration_value if isinstance(customer.registration_value, str) and DATE_RE.fullmatch(customer.registration_value) else None
+    if registered is None:
+        instant = customer.registration_at or customer.created_at
+        registered = instant.astimezone(SGT).strftime("%Y-%m-%d") if instant else today()
+    return {
+        "profile": "sync_p1", "member_type": member_type, "name": name, "mobile_phone": digits, "email_address": customer.email or None,
+        "register_date": registered, "dob": dob_from_month(month),
+    }
+
+
+# --------------------------------------------------------------------------
 # ChangeLog insert XML
 # --------------------------------------------------------------------------
 
@@ -1109,6 +1275,9 @@ class SyncEngine:
         self.summary = RunSummary()
         self._pending_sign_ups: tuple[dict[str, list[ShopifyCustomer]], bool] | None = None  # round 8: per run
 
+    def _today_sgt(self) -> str:
+        return self.ledger.now().astimezone(SGT).strftime("%Y-%m-%d")
+
     # -- write budget ----------------------------------------------------------
     def _spend_write(self, switch: bool, disabled_code: str) -> None:
         if not switch:
@@ -1315,6 +1484,226 @@ class SyncEngine:
         with self.ledger.tx() as conn:
             self.ledger.add_link(conn, customer.gid, member_no, "matched", "initial_link_member_no")
         self.summary.count("initial_link_linked", ref, "link", member_no=member_no)
+
+    # -- #155 slice BF1: the one-off backfill of older sign-ups -------------------
+    def backfill_registrations(self, *, apply: bool, max_creates: int, claims: "ClaimLinks | None" = None) -> dict[str, Any]:
+        """Older ``member-mg`` sign-ups (before the cutover) with no link:
+        linked to their AutoCount member, created as the configured member
+        type (live: GUEST) through the unchanged write-once child, or held
+        for a person (``decide_backfill``). A dry run (the default) writes
+        nothing but its own cursor. ``apply`` needs
+        ``backfill_registrations_enabled``; it creates at most
+        ``max_creates`` (1 to ``max_writes_per_run``) members a call, never
+        a write that would put a rolling 60 minutes over the daily summary's
+        hourly allowance, and stops before the next customer when the stop
+        file exists or after a create that is not verified. At most
+        ``max_shopify_customers_per_run`` customers are looked up in AC2 a
+        call. Resumable: customers are taken in customer-number order after
+        the mode's cursor. No Shopify write, no new AutoCount operation, no
+        alert (counts only); an applied call is stored as its own run kind.
+        ``claims``: the member core's claim links (read-only), or None."""
+
+        if apply and not self.config.backfill_registrations_enabled:
+            raise dl.DirectLocalError("backfill_registrations_disabled")
+        if isinstance(max_creates, bool) or not isinstance(max_creates, int) or not 1 <= max_creates <= self.config.max_writes_per_run:
+            raise dl.DirectLocalError("backfill_max_invalid")
+        run_id = f"{BACKFILL_RUN_PREFIX}{uuid.uuid4().hex}"
+        if apply:
+            with self.ledger.tx() as conn:
+                conn.execute("INSERT INTO runs(run_id, started_at) VALUES (?, ?)", (run_id, dl.ts(self.ledger.now())))
+        cursor_name = BACKFILL_CURSORS[apply]
+        floor = self.ledger.watermark(cursor_name)
+        floor_number = int(floor) if floor is not None else 0
+        customers, complete = self.shopify.registrations(f"tag:'{REGISTRATION_TAG}'", self.config.shopify_max_pages, self.config.birthday_month_metafield)
+        stopped = None
+        finished = False
+        last = floor_number
+        population: dict[str, int] = {}
+        if not complete:
+            # Customers come back in updatedAt order, so a partial read is not
+            # a prefix in customer-number order: nothing is decided.
+            stopped = "backfill_read_incomplete"
+        else:
+            ordered = self._backfill_order(customers)
+            population = self._backfill_population(ordered, claims)
+            lookups = creates = 0
+            claimed: set[str] = set()
+            finished = True
+            for number, customer in ordered:
+                if number <= floor_number:
+                    continue
+                if self._backfill_stop_requested():
+                    stopped, finished = "stop_file_present", False
+                    break
+                code = self._backfill_skip(customer, claims)
+                if code is not None:
+                    self._backfill_count(code, customer)
+                    last = number
+                    continue
+                if lookups >= self.config.max_shopify_customers_per_run:
+                    stopped, finished = "backfill_lookup_budget_reached", False
+                    break
+                lookups += 1
+                digits = phone_member_no(customer.phone)[0]
+                decision = decide_backfill(customer, digits, self.ac2.lookup(digits, []))
+                outcome = self._backfill_act(customer, digits, decision, claimed, claims, apply=apply, creates=creates, max_creates=max_creates)
+                if outcome == "created":
+                    creates += 1
+                elif outcome != "done":
+                    stopped, finished = outcome, False
+                    break
+                last = number
+        with self.ledger.tx() as conn:
+            if finished:
+                # A finished pass: the next call in this mode starts again.
+                conn.execute("DELETE FROM watermarks WHERE name = ?", (cursor_name,))
+                if apply:
+                    self.ledger.set_watermark(conn, BACKFILL_DONE_MARK, dl.ts(self.ledger.now()))
+            elif last > floor_number:
+                self.ledger.set_watermark(conn, cursor_name, str(last))
+        result = {
+            "schema": SUMMARY_SCHEMA, "status": "completed", "direction": BACKFILL_RUN_KIND, "mode": "apply" if apply else "dry_run",
+            "complete": finished, "stopped": stopped, "alerts": [], "autocount_book": self.config.autocount_book,
+            "member_type": self.config.ac2_create_member_type, "max_creates": max_creates, "writes": self.summary.writes,
+            "member_core_ledger": "read" if claims is not None else "not_configured",
+            "population": dict(sorted(population.items())), "counts": dict(sorted(self.summary.counts.items())), "refs": self.summary.refs,
+        }
+        if apply:
+            # Its own run kind (a later summary can show "backfill: N"); no
+            # alert is ever stored, so the daily summary's alert list is
+            # unchanged. Counts, codes and keyed refs with masked MemberNos.
+            stored = {"kind": BACKFILL_RUN_KIND, "counts": result["counts"], "alerts": [], "refs": result["refs"], "stopped": stopped}
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
+        return result
+
+    def _backfill_stop_requested(self) -> bool:
+        return (self.ledger.root / STOP_FILE).exists()
+
+    @staticmethod
+    def _backfill_order(customers: Iterable[ShopifyCustomer]) -> list[tuple[int, ShopifyCustomer]]:
+        """Tagged customers once each, in customer-number order. A GID of any
+        other shape is never decided (it cannot hold a cursor place)."""
+
+        unique: dict[int, ShopifyCustomer] = {}
+        for item in customers:
+            number = customer_number(item.gid)
+            if number is not None and REGISTRATION_TAG in item.tags:
+                unique[number] = item
+        return sorted(unique.items())
+
+    def _backfill_skip(self, customer: ShopifyCustomer, claims: "ClaimLinks | None") -> str | None:
+        """Decided without AutoCount: already linked (either ledger), an open
+        write that may still land, or ``backfill_precheck``."""
+
+        if self.ledger.link_for_gid(customer.gid) is not None:
+            return "backfill_already_linked"
+        if claims is not None and customer.gid in claims.by_gid:
+            return "backfill_claim_linked"
+        if self.ledger.open_write_for_customer(customer.gid) is not None:
+            # Never re-sent: the write may still land (as the live G2 H2 rule).
+            return "backfill_held_by_open_write"
+        return backfill_precheck(customer, self.config.shopify_cutover_utc)
+
+    def _backfill_population(self, ordered: list[tuple[int, ShopifyCustomer]], claims: "ClaimLinks | None") -> dict[str, int]:
+        """Every tagged customer read, by the class it has before any lookup
+        (the dry run's first figures: how many need a lookup at all)."""
+
+        population: dict[str, int] = {"tagged": len(ordered)}
+        for _, customer in ordered:
+            code = self._backfill_skip(customer, claims) or "backfill_needs_lookup"
+            population[code] = population.get(code, 0) + 1
+        return population
+
+    def _backfill_count(self, code: str, customer: ShopifyCustomer, action: str | None = None, member_no: str | None = None) -> None:
+        if code in ("backfill_already_linked", "backfill_claim_linked", "backfill_signed_up_after_cutover"):
+            self.summary.count(code)
+        else:
+            self.summary.count(code, self.ledger.ref("c", customer.gid), action or "hold", member_no=member_no)
+
+    def _backfill_act(self, customer: ShopifyCustomer, digits: str, decision: Decision, claimed: set[str], claims: "ClaimLinks | None", *,
+                      apply: bool, creates: int, max_creates: int) -> str:
+        """``done``, ``created``, or the code that stops the call (the cursor
+        then stays before this customer: after an uncertain write the next
+        call finds the open write and holds it, never re-sends)."""
+
+        gid = customer.gid
+        if decision.action == "HOLD":
+            self._backfill_count(decision.code, customer, member_no=decision.member_no)
+            for note in decision.notes:
+                self.summary.count(note)
+            return "done"
+        member_no = decision.member_no
+        key = member_no_key(member_no)
+        if claims is not None and (gid, key) in claims.voided:
+            # Fix round 2 (Controller ruling 2): staff unlinked exactly this
+            # pair in the member core; a link here is permanent, so a person
+            # decides (the member core refuses the pair too).
+            self._backfill_count("backfill_claim_pair_unlinked", customer, member_no=member_no)
+            return "done"
+        if key in claimed or self.ledger.link_for_member(member_no) is not None or (claims is not None and key in claims.by_key):
+            # The member already belongs to another customer: never a second link.
+            self._backfill_count("backfill_member_linked_elsewhere", customer, member_no=member_no)
+            return "done"
+        if self.ledger.open_write_for_member(member_no) is not None:
+            self._backfill_count("backfill_member_held_by_open_write", customer, member_no=member_no)
+            return "done"
+        if decision.action == "LINK":
+            claimed.add(key)
+            if not apply:
+                self._backfill_count("backfill_would_link", customer, "would_link", member_no)
+                self.summary.count(decision.code)
+                return "done"
+            with self.ledger.tx() as conn:
+                self.ledger.add_link(conn, gid, member_no, "matched", decision.code)
+            self._backfill_count("backfill_linked", customer, "link", member_no)
+            self.summary.count(decision.code)
+            return "done"
+        name = " ".join(part.strip() for part in (customer.first_name, customer.last_name) if isinstance(part, str) and part.strip())
+        month = birthday_month(customer.birthday_value)
+        payload = sync_p1_payload(customer, name, digits, self.config.ac2_create_member_type, month, self._today_sgt)
+        issue = dl.autocount_text_issue(payload)
+        if issue or not dl.MEMBER_NO_RE.fullmatch(member_no):
+            self._backfill_count("backfill_text_unstorable", customer, member_no=member_no)
+            self.summary.count(issue or "member_no_invalid")
+            return "done"
+        if customer.birthday_value not in (None, "") and month is None:
+            self.summary.count("birthday_month_unparsed")
+        if not apply:
+            claimed.add(key)
+            self._backfill_count("backfill_would_create", customer, "would_create", member_no)
+            return "done"
+        if not self.config.ac2_create_enabled:
+            return "ac2_create_disabled"  # the live switch stops every create, the backfill's too
+        if creates >= max_creates or self.summary.writes >= self.config.max_writes_per_run:
+            return "backfill_max_reached"
+        hour = int(self.ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE created_at >= ?", (dl.ts(self.ledger.now() - timedelta(hours=1)),)).fetchone()[0])
+        if hour >= RUNS_PER_HOUR * self.config.max_writes_per_run:
+            return "backfill_hour_cap_reached"
+        claimed.add(key)
+        self._spend_write(True, "ac2_create_disabled")
+        write_id = self._intent("shopify_to_ac2", member_no, gid, self.ledger.identity_digest(name, digits))
+        state, code = self.ac2.create_member(member_no, payload, write_id=write_id)
+        with self.ledger.tx() as conn:
+            if state == "CREATED_VERIFIED":
+                self._close_write(conn, write_id, "DONE", "created")
+                self.ledger.add_link(conn, gid, member_no, "created_in_ac2", decision.code)
+            elif state == "NOT_WRITTEN_PROVEN":
+                self._close_write(conn, write_id, "NOT_WRITTEN", code)
+            else:
+                # Looked up by the live run's existing resolution, never re-sent.
+                self._close_write(conn, write_id, "UNCERTAIN", code or state.lower())
+        if state == "CREATED_VERIFIED":
+            self._backfill_count("backfill_ac2_member_created", customer, "create", member_no)
+            self.summary.count(decision.code)
+            return "created"
+        if state == "NOT_WRITTEN_PROVEN":
+            self._backfill_count("backfill_ac2_create_not_written", customer, member_no=member_no)
+            if code and re.fullmatch(r"[a-z0-9_]{1,64}", code):
+                self.summary.count(code)
+            return "backfill_create_not_written"
+        self._backfill_count("backfill_ac2_create_uncertain", customer, member_no=member_no)
+        return "backfill_create_uncertain"
 
     def _recover_crashed_intents(self) -> None:
         """An INTENT left by a crashed run may or may not have been written:
@@ -1612,14 +2001,7 @@ class SyncEngine:
         month = birthday_month(customer.birthday_value)
         if customer.birthday_value not in (None, "") and month is None:
             self.summary.count("birthday_month_unparsed", member_ref)
-        registered = customer.registration_value if isinstance(customer.registration_value, str) and DATE_RE.fullmatch(customer.registration_value) else None
-        if registered is None:
-            instant = customer.registration_at or customer.created_at
-            registered = instant.astimezone(SGT).strftime("%Y-%m-%d") if instant else self.ledger.now().astimezone(SGT).strftime("%Y-%m-%d")
-        payload = {
-            "profile": "sync_p1", "member_type": self.config.ac2_create_member_type, "name": name, "mobile_phone": digits, "email_address": customer.email or None,
-            "register_date": registered, "dob": dob_from_month(month),
-        }
+        payload = sync_p1_payload(customer, name, digits, self.config.ac2_create_member_type, month, self._today_sgt)
         issue = dl.autocount_text_issue(payload)
         if issue or (member_no is not None and not dl.MEMBER_NO_RE.fullmatch(member_no)):
             self._shopify_pending(gid, "SKIPPED", issue or "member_no_invalid")
@@ -2364,6 +2746,228 @@ def _bridge_refusal(stdout: Any) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# #155 slice BF1: the member core's claim links and the coverage check
+# --------------------------------------------------------------------------
+
+# The member core's (#268) ledger file and tool name, as xb_member_benefits
+# defines them (not imported: that module imports this one; a test pins both).
+MEMBER_CORE_LEDGER_FILE = "member_benefits.sqlite3"
+MEMBER_CORE_TOOL = "xb268_member_benefits"
+COVERAGE_SCHEMA = "xb.directlocal.member_sync.coverage.v1"
+COVERAGE_MAX_REFS = 200
+# Fix round 2 (Controller ruling 2): the one member core ledger version this
+# module reads (xb_member_benefits.SCHEMA_VERSION; a test pins both). Any
+# other version is refused: a later one must be a deliberate change here.
+MEMBER_CORE_LEDGER_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ClaimLinks:
+    """The member core's active claim links (customer GID -> MemberNo key,
+    and back), plus the voided pairs ``(customer GID, MemberNo key)`` that
+    staff unlinked there: history, never an active link, never relinked."""
+
+    by_gid: Mapping[str, str]
+    by_key: Mapping[str, str]
+    voided: frozenset[tuple[str, str]] = frozenset()
+
+    def __repr__(self) -> str:  # never render customer or member data
+        return "ClaimLinks()"
+
+
+def _open_read_only(path: Path, missing: str, unreadable: str) -> sqlite3.Connection:
+    if not path.is_file():
+        raise dl.DirectLocalError(missing)
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        raise dl.DirectLocalError(unreadable) from None
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def read_claim_links(root: str | Path, config: SyncConfig) -> ClaimLinks:
+    """Read-only (no lock, no migration, no write), as the member core
+    reads this sync's links: its version must be ``MEMBER_CORE_LEDGER_VERSION``
+    and its meta the member core's, bound to the same book, store and domain.
+    Active links come from ``active_claim_links``; voided pairs separately."""
+
+    conn = _open_read_only(Path(root) / MEMBER_CORE_LEDGER_FILE, "member_core_ledger_missing", "member_core_ledger_unreadable")
+    try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] != MEMBER_CORE_LEDGER_VERSION:
+            raise dl.DirectLocalError("member_core_ledger_version_unknown")
+        meta = conn.execute("SELECT tool, autocount_book, store_gid, shop_domain FROM meta WHERE id = 1").fetchone()
+        if meta is None or meta["tool"] != MEMBER_CORE_TOOL or (meta["autocount_book"], meta["store_gid"], meta["shop_domain"]) != (
+                config.autocount_book, config.shopify.store_gid, config.shopify.shop_domain):
+            raise dl.DirectLocalError("member_core_ledger_binding_mismatch")
+        by_gid: dict[str, str] = {}
+        by_key: dict[str, str] = {}
+        for row in conn.execute("SELECT customer_gid, member_no_key FROM active_claim_links"):
+            by_gid[row["customer_gid"]] = row["member_no_key"]
+            by_key[row["member_no_key"]] = row["customer_gid"]
+        voided = frozenset((row["customer_gid"], row["member_no_key"]) for row in conn.execute(
+            "SELECT c.customer_gid, c.member_no_key FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id"))
+        return ClaimLinks(by_gid, by_key, voided)
+    except sqlite3.Error:
+        raise dl.DirectLocalError("member_core_ledger_unreadable") from None
+    finally:
+        conn.close()
+
+
+def load_claim_links(config: SyncConfig) -> ClaimLinks | None:
+    """The claim links when ``member_core_state_root`` is set, else None."""
+
+    if config.member_core_state_root is None:
+        return None
+    root = dl.validate_state_root(config.member_core_state_root)
+    dl.verify_private_state(root)
+    return read_claim_links(root, config)
+
+
+def _keyed_ref(ref_key: str, kind: str, value: str) -> str:
+    """``SyncLedger.ref`` from a read-only connection (same key, same shape)."""
+
+    digest = hmac.new(bytes.fromhex(ref_key), f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{kind}-{digest[:dl.MEMBER_REF_HEX]}"
+
+
+def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: ClaimLinks | None) -> dict[str, Any]:
+    """#155 BF1 / G0 section 4: the read-only coverage check. Reads the
+    customers tagged ``member-mg`` or ``member-legacy`` (Shopify reads
+    only), this sync's ledger read-only (no lock, no migration, no write)
+    and, when given, the member core's claim links. Writes nothing anywhere
+    and opens no AutoCount session. Every tagged customer falls in exactly
+    one class, and every linked AutoCount member in exactly one class, so
+    each side adds up to its total. Counts, codes and keyed refs (with a
+    masked MemberNo) only."""
+
+    customers: dict[str, ShopifyCustomer] = {}
+    for tag in (REGISTRATION_TAG, LEGACY_TAG):
+        found, complete = shopify.registrations(f"tag:'{tag}'", config.shopify_max_pages, config.birthday_month_metafield)
+        if not complete:
+            raise dl.DirectLocalError("coverage_read_incomplete")
+        for item in found:
+            if REGISTRATION_TAG in item.tags or has_legacy_tag(item.tags):  # the search is only a candidate list
+                customers[item.gid] = item
+    conn = _open_read_only(Path(root) / LEDGER_FILE, "sync_ledger_missing", "sync_ledger_unreadable")
+    try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] not in (2, SCHEMA_VERSION):
+            raise dl.DirectLocalError("sync_ledger_schema_unsupported")
+        meta = conn.execute("SELECT autocount_book, store_gid, shop_domain, ref_key FROM meta WHERE id = 1").fetchone()
+        if meta is None:
+            raise dl.DirectLocalError("sync_ledger_not_initialised")
+        check_binding(meta, config)
+        ref_key = meta["ref_key"]
+        links = {row["customer_gid"]: row["member_no_key"] for row in conn.execute("SELECT customer_gid, member_no_key FROM links")}
+        open_writes = {row[0] for row in conn.execute(
+            "SELECT customer_gid FROM writes WHERE direction = 'shopify_to_ac2' AND state IN ('INTENT', 'UNCERTAIN') AND customer_gid IS NOT NULL")}
+        # The latest person code per customer ref from the applied backfill
+        # runs (a later link or create clears it; a dry run stores nothing).
+        held: dict[str, str] = {}
+        for (summary,) in conn.execute("SELECT summary FROM runs WHERE substr(run_id, 1, ?) = ? AND finished_at IS NOT NULL ORDER BY started_at",
+                                       (len(BACKFILL_RUN_PREFIX), BACKFILL_RUN_PREFIX)):
+            try:
+                stored = json.loads(summary or "{}")
+            except (json.JSONDecodeError, RecursionError):
+                continue
+            if not isinstance(stored, dict) or stored.get("kind") != BACKFILL_RUN_KIND or not isinstance(stored.get("refs"), list):
+                continue
+            for entry in stored["refs"]:
+                if not isinstance(entry, dict) or not isinstance(entry.get("ref"), str):
+                    continue
+                if entry.get("code") in BACKFILL_PERSON_CODES:
+                    held[entry["ref"]] = entry["code"]
+                else:
+                    held.pop(entry["ref"], None)
+        pending = {f"{state}/{code}": number for state, code, number in conn.execute(
+            "SELECT state, COALESCE(code, ''), COUNT(*) FROM shopify_pending GROUP BY state, code")}
+    except sqlite3.Error:
+        raise dl.DirectLocalError("sync_ledger_unreadable") from None
+    finally:
+        conn.close()
+    claim_gids = dict(claims.by_gid) if claims is not None else {}
+    claim_keys = dict(claims.by_key) if claims is not None else {}
+    unlinked_gids = {pair[0] for pair in claims.voided} if claims is not None else set()
+    classes: dict[str, int] = {}
+    refs: list[dict[str, str]] = []
+    listed = 0  # customers with a ref-worthy class (refs holds the first COVERAGE_MAX_REFS)
+    for gid_value, item in sorted(customers.items()):
+        ref = _keyed_ref(ref_key, "c", gid_value)
+        if gid_value in links:
+            code = "linked"
+        elif gid_value in claim_gids:
+            code = "linked_claim_only"
+        elif gid_value in open_writes:
+            code = "open_write"
+        elif gid_value in unlinked_gids:
+            code = "claim_unlinked_not_linked"  # fix round 2: staff unlinked it in the member core; a person decides
+        elif REGISTRATION_TAG not in item.tags:
+            code = "legacy_not_linked"  # never created by a tool: a person decides
+        else:
+            pre = backfill_precheck(item, config.shopify_cutover_utc)
+            if pre == "backfill_signed_up_after_cutover":
+                code = "after_cutover_not_linked"  # the live sync's own (pending or held there)
+            elif pre is not None:
+                code = pre
+            else:
+                code = held.get(ref, "gap")
+        classes[code] = classes.get(code, 0) + 1
+        if code not in ("linked", "linked_claim_only", "gap", "after_cutover_not_linked"):
+            listed += 1
+            if len(refs) < COVERAGE_MAX_REFS:
+                refs.append({"ref": ref, "code": code})
+    member_classes: dict[str, int] = {}
+    sync_by_key = {key: gid_value for gid_value, key in links.items()}
+    for key in set(sync_by_key) | set(claim_keys):
+        if key in sync_by_key and key in claim_keys:
+            code = "linked_both" if sync_by_key[key] == claim_keys[key] else "linked_conflict"
+        elif key in sync_by_key:
+            code = "linked_sync_only"
+        else:
+            code = "linked_claim_only"
+        member_classes[code] = member_classes.get(code, 0) + 1
+    customer_conflicts = sum(1 for gid_value, key in links.items() if gid_value in claim_gids and claim_gids[gid_value] != key)
+    person = sum(n for code, n in classes.items() if code not in ("linked", "linked_claim_only", "gap", "after_cutover_not_linked", "open_write"))
+    return {
+        "schema": COVERAGE_SCHEMA, "status": "ok", "autocount_book": config.autocount_book,
+        "member_core_ledger": "read" if claims is not None else "not_configured",
+        "shopify": {"tagged_total": len(customers), "classes": dict(sorted(classes.items())), "gap": classes.get("gap", 0),
+                    "after_cutover_not_linked": classes.get("after_cutover_not_linked", 0), "needs_person": person},
+        "ac2": {"linked_members_total": len(set(sync_by_key) | set(claim_keys)), "classes": dict(sorted(member_classes.items())),
+                "customers_linked_to_two_members": customer_conflicts,
+                # No AutoCount session: the book's member totals per type are in
+                # the daily summary email (its read-only counts).
+                "members_in_book": "not_read"},
+        "shopify_pending": dict(sorted(pending.items())),
+        "complete": classes.get("gap", 0) == 0 and classes.get("after_cutover_not_linked", 0) == 0 and classes.get("open_write", 0) == 0
+                    and classes.get("claim_unlinked_not_linked", 0) == 0 and member_classes.get("linked_conflict", 0) == 0 and customer_conflicts == 0,
+        "refs": refs,
+        # Fix round 1 (G2 LATER 1): true when more customers have a listed
+        # class than refs holds (the person list is then not the whole list).
+        "refs_truncated": listed > len(refs),
+    }
+
+
+def build_read_only_shopify(config: SyncConfig, root: Path, *, environ: Mapping[str, str]) -> SyncShopifyClient:
+    """The sync's Shopify client with every write refused: the session is
+    checked against the scopes the config expects, then its one mutation is
+    switched off for the rest of the process."""
+
+    import xb_shopify_poller as poller
+
+    transport = direct.UrllibTransport()
+    shopify = SyncShopifyClient(
+        create_enabled=config.shopify_create_enabled, shop_domain=config.shopify.shop_domain, api_version=config.shopify.api_version,
+        token_provider=poller.token_provider(config.shopify, environ, transport, dl.utc_now, root=root), transport=transport,
+        timeout=config.http_timeout_seconds,
+    )
+    shopify.verify_session(store_gid=config.shopify.store_gid)
+    shopify.create_enabled = False
+    return shopify
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -2525,11 +3129,15 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#155 phase 1 two-way member create sync")
-    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link", "digest", "probe"))
+    parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link", "digest", "probe",
+                                            "backfill-registrations", "coverage"))
     parser.add_argument("--config", required=True)
-    parser.add_argument("--apply", action="store_true", help="initial-link only: write the links (needs initial_link_enabled); default is a dry run")
+    parser.add_argument("--apply", action="store_true", help="initial-link (needs initial_link_enabled) or backfill-registrations (needs "
+                        "backfill_registrations_enabled): write; default is a dry run")
     parser.add_argument("--direction", default="both", choices=("both", "shopify_to_ac2", "ac2_to_shopify"))
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
+    parser.add_argument("--max", type=int, default=1, dest="max_creates",
+                        help="backfill-registrations only: members created in this call (1 to max_writes_per_run)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -2562,6 +3170,20 @@ def main(argv: list[str] | None = None) -> int:
             return 3 if result["decision"] == "wake_failed" else 0  # 3: an operator must look
         if args.command == "initial-link" and args.apply and not config.initial_link_enabled:
             raise dl.DirectLocalError("initial_link_disabled")  # before any login or read
+        if args.command == "coverage":
+            # #155 BF1: read-only everywhere, as digest (no lock, no migration,
+            # no AutoCount session); Shopify reads only.
+            root = dl.validate_state_root(config.state_root)
+            dl.verify_private_state(root)
+            claims = load_claim_links(config)
+            _emit(coverage_report(root, config, shopify=build_read_only_shopify(config, root, environ=os.environ), claims=claims))
+            return 0
+        if args.command == "backfill-registrations":
+            # #155 BF1: both refusals before any login, read or lock.
+            if args.apply and not config.backfill_registrations_enabled:
+                raise dl.DirectLocalError("backfill_registrations_disabled")
+            if not 1 <= args.max_creates <= config.max_writes_per_run:
+                raise dl.DirectLocalError("backfill_max_invalid")
         root = _state_root(config)
         ledger = SyncLedger(root)
         try:
@@ -2576,6 +3198,14 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(result)
                 if result["alerts"]:
                     return 3
+            elif args.command == "backfill-registrations":
+                claims = load_claim_links(config)
+                engine = build_real_engine(config, ledger, environ=os.environ)
+                engine.shopify.create_enabled = False  # the backfill never writes to Shopify
+                result = engine.backfill_registrations(apply=args.apply, max_creates=args.max_creates, claims=claims)
+                _emit(result)
+                if result["stopped"] in ("backfill_create_not_written", "backfill_create_uncertain", "backfill_read_incomplete"):
+                    return 3  # an operator must look before the next call
             else:
                 result = build_real_engine(config, ledger, environ=os.environ).run(direction=args.direction)
                 _emit(result)
