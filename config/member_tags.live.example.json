@@ -1,0 +1,27 @@
+{
+  "schema": "xb.directlocal.member_tags.config.v1",
+  "state_root": "C:\\XB\\xb268-member-tags-live",
+  "autocount_book": "AED_XBOUNDARIES",
+  "member_sync_state_root": "C:\\XB\\xb155-member-sync-live",
+  "member_core_state_root": "C:\\XB\\xb268-member-benefits-live",
+  "shopify": {
+    "store_gid": "gid://shopify/Shop/1",
+    "shop_domain": "example.myshopify.com",
+    "api_version": "2026-10",
+    "auth": {
+      "method": "client_credentials",
+      "client_id_env": "XB_SHOPIFY_TAGS_CLIENT_ID",
+      "client_secret_env": "XB_SHOPIFY_TAGS_CLIENT_SECRET"
+    },
+    "token_cache": "dpapi_current_user"
+  },
+  "tags_write_enabled": false,
+  "max_tag_adds_per_run": 10,
+  "max_tag_removes_per_run": 5,
+  "max_member_reads_per_run": 20,
+  "shopify_max_carrier_pages": 60,
+  "http_timeout_seconds": 30,
+  "ac2_credential_target": "XB-AC2-MemberSync",
+  "ac2_login_mode": "owner_shared",
+  "ac2_refused_user_ids": []
+}
