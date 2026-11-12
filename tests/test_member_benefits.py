@@ -334,6 +334,8 @@ class Base(unittest.TestCase):
                          frozenset()),
         "release_held_dry_run": (frozenset({"status", "command", "run_id", "finding", "receipt_now", "held_writes_left", "counts", "refs", "alerts"}),
                                  frozenset()),
+        "unlink": (frozenset({"status", "command", "run_id", "reason", "link_source", "counts", "alerts", "refs"}), frozenset()),
+        "unlink_dry_run": (frozenset({"status", "command", "run_id", "reason", "link_source", "counts", "alerts", "refs"}), frozenset()),
         "observe": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "apply": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
         "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
@@ -3186,7 +3188,8 @@ class LedgerV2Tests(Base):
     run_main = CliTests.run_main
     # Commands that open the ledger; slice B1 adds release-held and unlink.
     LEDGER_COMMANDS = (("init",), ("status",), ("observe",), ("apply",), ("resolve",), ("index",), ("index", "--apply"), ("digest",),
-                       ("release-held", "--order-ref", "o-" + "a" * 20, "--member-last3", "001", "--finding", "as_intended", "--apply"))
+                       ("release-held", "--order-ref", "o-" + "a" * 20, "--member-last3", "001", "--finding", "as_intended", "--apply"),
+                       ("unlink", "--customer-ref", "c-" + "a" * 20, "--member-last3", "001", "--reason", "other", "--apply"))
 
     def setUp(self):
         super().setUp()
@@ -3408,7 +3411,7 @@ class LedgerV2Tests(Base):
 
     # The unlink code (slice B1, 1.6) is the one place outside the schema
     # that reads claim_links itself (a voided pair is history, not active).
-    CLAIM_LINKS_READERS: frozenset = frozenset()
+    CLAIM_LINKS_READERS = frozenset({"pair_unlinked"})
 
 
 class ReleaseHeldTests(Base):
@@ -3624,6 +3627,221 @@ class ReleaseHeldTests(Base):
         finally:
             ledger.close()
         self.assertEqual((code, out), (2, {"status": "refused", "code": "ledger_locked_by_another_owner"}))
+
+
+class UnlinkTests(Base):
+    """Slice B1 (G0 design 1.6): unlink voids one claim link this tool made;
+    the link row stays, the void is a new row; a voided pair is never linked
+    again by the tool."""
+
+    run_main = CliTests.run_main
+
+    def claimed(self, n: int = 1, *, apply: bool = False) -> tuple[str, str]:
+        """Order n's customer is claim-linked to its member by an observe run
+        (receipt ready, observed would_upgrade), or upgraded with ``apply``."""
+        member_no = self.guest_with_order(n, linked=False)
+        out = self.engine().run(apply=apply)
+        self.assertEqual(out["counts"].get("claim_linked"), 1)
+        self.assertEqual(self.receipt(n)["link_source"], "claim")
+        return self.ledger.ref("c", customer_gid(n)), member_no
+
+    def unlink(self, ref: str, last3: str, reason: str = "wrong_person", *, apply: bool = True, accept_applied: bool = False) -> dict:
+        return self.engine().unlink(customer_ref=ref, member_last3=last3, reason=reason, accept_applied=accept_applied, apply=apply)
+
+    def recorded(self) -> tuple:
+        conn = self.ledger.conn
+        return tuple([tuple(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                     for table in ("claim_links", "claim_unlinks", "runs", "receipts", "writes", "watermarks", "reviews")) + (self.book.saves,)
+
+    def refused(self, call, code: str) -> None:
+        before = self.recorded()
+        self.assertEqual(self.code(call), code)
+        self.assertEqual(self.recorded(), before)
+
+    def test_a_ready_receipt_is_reset_and_the_voided_pair_is_held_never_linked_again(self):
+        ref, member_no = self.claimed()
+        before = self.recorded()
+        dry = self.unlink(ref, member_no[-3:], apply=False)
+        self.assertEqual(self.recorded(), before)  # a dry run records nothing
+        self.assertEqual((dry["command"], dry["run_id"], dry["counts"]), ("unlink_dry_run", None, {"claim_unlinked": 1, "unlink_receipt_reset": 1}))
+        out = self.unlink(ref, member_no[-3:])
+        self.assertEqual({k: out[k] for k in ("status", "command", "reason", "link_source", "counts", "alerts")},
+                         {"status": "ok", "command": "unlink", "reason": "wrong_person", "link_source": "order",
+                          "counts": {"claim_unlinked": 1, "unlink_receipt_reset": 1}, "alerts": []})
+        self.assertEqual(out["refs"], [{"ref": ref, "code": "claim_unlinked", "member_no_masked": bm.mask(member_no)}])
+        conn = self.ledger.conn
+        void = conn.execute("SELECT * FROM claim_unlinks").fetchone()
+        self.assertEqual((void["reason"], void["run_id"]), ("wrong_person", out["run_id"]))
+        self.assertEqual(conn.execute("SELECT command FROM runs WHERE run_id = ?", (out["run_id"],)).fetchone()[0], "unlink")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM claim_links").fetchone()[0], 1)  # the link row stays as history
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["member_no"], row["link_source"], row["observed"], row["observed_at"], row["checked_at"]),
+                         ("ready", None, None, None, None, None))
+        status = self.engine().status()
+        self.assertEqual((status["claim_links"], status["claim_links_voided"]), (0, 1))
+        # The next run: the same customer and member again -> held, one review alert, no link.
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"], out["saves"]), ("held", "claim_pair_unlinked", 0))
+        self.assertEqual(out["alerts"], ["claim_needs_review"])
+        self.assertIn({"ref": ref, "code": "claim_pair_unlinked", "member_no_masked": bm.mask(member_no)}, out["refs"])
+        self.assertEqual(self.ledger.claim_counts(), (0, 1))
+        self.assertIn(("unlinked:" + customer_gid(1), "claim_pair_unlinked"), [tuple(r)[:2] for r in conn.execute("SELECT * FROM reviews")])
+        # A #155 link for the customer re-opens the hold and is followed (the #155 sync is the master link).
+        self.link(1, member_no)
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["link_source"], out["saves"]), ("applied", "sync155", 1))
+
+    def test_after_an_unlink_the_customer_and_the_member_may_each_be_claimed_to_another(self):
+        ref, member_no = self.claimed()
+        self.unlink(ref, member_no[-3:], "customers_merged")
+        # The customer's phone is now another member's MemberNo (same name): a new claim to that member.
+        self.book.members[sg(5)] = fake_member(sg(5), name="Fake Member 1")
+        moved = customer_node(1, phone="+" + sg(5))
+        self.shopify.customers[customer_gid(1)] = moved
+        self.shopify.add({**self.shopify.orders_nodes[order_gid(1)], "customer": moved, "updatedAt": "2026-11-18T04:10:00Z"})
+        # Another customer, with the first member's phone and name.
+        self.shopify.add(order_node(6, customer=customer_node(6, phone="+" + sg(1), last="Member 1")))
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        active = {r["customer_gid"]: r["member_no"] for r in self.ledger.active_claims()}
+        self.assertEqual(active, {customer_gid(1): sg(5), customer_gid(6): member_no})
+        self.assertEqual(out["counts"].get("claim_linked"), 2)
+        self.assertEqual(self.ledger.claim_counts(), (2, 1))
+
+    def test_an_applied_receipt_needs_accept_applied_and_is_never_changed(self):
+        ref, member_no = self.claimed(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.book.members[member_no]["type"]), ("applied", "MEMBER"))
+        self.refused(lambda: self.unlink(ref, member_no[-3:]), "unlink_has_applied")
+        row = tuple(self.receipt(1))
+        out = self.unlink(ref, member_no[-3:], accept_applied=True)
+        order_ref = self.ledger.ref("o", order_gid(1))
+        self.assertEqual((out["counts"], out["alerts"]), ({"claim_unlinked": 1, "unlink_receipt_applied": 1, "unlinked_with_applied": 1},
+                                                          ["unlinked_with_applied"]))
+        self.assertIn({"ref": order_ref, "code": "unlinked_with_applied", "member_no_masked": bm.mask(member_no)}, out["refs"])
+        self.assertEqual(tuple(self.receipt(1)), row)  # immutable: the tool never downgrades
+        self.assertEqual((self.book.saves, self.book.members[member_no]["type"]), (1, "MEMBER"))
+
+    def test_decided_receipts_through_the_link_are_kept(self):
+        member_no = self.guest_with_order(1, linked=False, member=fake_member(sg(1), name="Fake Member 1", active="F"))
+        self.guest_with_order(2, linked=False)
+        self.shopify.add(order_node(3, customer=customer_node(1)))  # a second order of customer 1
+        self.engine().run(apply=True)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "member_inactive"))
+        # Receipts of the same customer in every other position, set up through the ledger.
+        extra = {
+            11: ("no_change", "expiry_already_later", member_no, "claim"),
+            12: ("not_in_scope", "member_not_in_scope", member_no, "claim"),
+            13: ("ready", None, sg(7), "claim"),  # through another member (an earlier link)
+            14: ("ready", None, member_no, "sync155"),  # through a #155 link
+            15: ("held", "claim_link_conflict", sg(7), "claim"),
+        }
+        with self.ledger.tx() as conn:
+            for n, (state, code, member, source) in extra.items():
+                conn.execute("INSERT INTO receipts(order_gid, customer_gid, order_created_at, order_date_sgt, order_updated_at, state, code, member_no, "
+                             "link_source, observed, observed_at, first_seen_at, updated_at) VALUES (?, ?, 't', 'd', 't', ?, ?, ?, ?, 'would_upgrade', 't', 't', 't')",
+                             (order_gid(n), customer_gid(1), state, code, member, source))
+        before = {n: tuple(self.receipt(n)) for n in (1, 3, *extra)}
+        out = self.unlink(self.ledger.ref("c", customer_gid(1)), member_no[-3:], "other")
+        self.assertEqual(out["counts"], {"claim_unlinked": 1, "unlink_receipt_kept": 4})
+        self.assertEqual({n: tuple(self.receipt(n)) for n in before}, before)  # none of them touched
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["member_no"]) for n in (1, 3)], [("held", member_no)] * 2)
+        self.assertEqual(self.ledger.claim_counts(), (1, 1))  # customer 2's link stays
+
+    def test_every_refusal_records_nothing(self):
+        ref, member_no = self.claimed()
+        last3 = member_no[-3:]
+        for bad in (dict(ref=None), dict(ref="o-" + "a" * 20), dict(ref="c-" + "a" * 21), dict(ref=ref + "\n"), dict(last3=None),
+                    dict(last3="1234"), dict(last3="1 2"), dict(reason=None), dict(reason="mistake"), dict(reason="OTHER"), dict(accept="yes")):
+            args = {"ref": ref, "last3": last3, "reason": "other", "accept": False, **bad}
+            with self.subTest(bad=bad):
+                self.refused(lambda: self.engine().unlink(customer_ref=args["ref"], member_last3=args["last3"], reason=args["reason"],
+                                                          accept_applied=args["accept"], apply=True), "unlink_arguments_invalid")
+        self.refused(lambda: self.unlink("c-" + "0" * 20, last3), "unlink_not_a_claim_link")
+        self.refused(lambda: self.unlink(ref, "999" if last3 != "999" else "998"), "unlink_member_mismatch")
+        # A customer linked by #155 only is not this tool's to void.
+        self.guest_with_order(4)
+        self.engine().run(apply=False)
+        self.refused(lambda: self.unlink(self.ledger.ref("c", customer_gid(4)), sg(4)[-3:]), "unlink_not_a_claim_link")
+        # An open write anywhere refuses (resolve first).
+        payload = {"kind": "upgrade", "member_no": sg(9), "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                   "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+        intent = self.ledger.add_intent(run_id="run-x", order_gid=order_gid(9), payload=payload, deadline=self.now)
+        self.refused(lambda: self.unlink(ref, last3), "benefit_uncertain_unresolved")
+        self.ledger.set_outcome(intent["write_id"], "UNCERTAIN", "writer_timeout")
+        self.refused(lambda: self.unlink(ref, last3), "benefit_uncertain_unresolved")
+        self.ledger.set_outcome(intent["write_id"], "NOT_WRITTEN", "resolved_no_claim")
+        self.assertEqual(self.unlink(ref, last3, apply=False)["counts"]["claim_unlinked"], 1)
+
+    def test_a_held_write_for_the_member_refuses_until_it_is_released(self):
+        ref, member_no = self.claimed()
+        self.book.mode = "mutate"
+        self.advance(minutes=15)
+        self.engine().run(apply=True)
+        self.book.mode = None
+        self.advance(seconds=PAST_DEADLINE)
+        self.refused(lambda: self.unlink(ref, member_no[-3:]), "unlink_member_write_held")
+        self.engine().release_held(order_ref=self.ledger.ref("o", order_gid(1)), member_last3=member_no[-3:], finding="as_intended", apply=True)
+        self.refused(lambda: self.unlink(ref, member_no[-3:]), "unlink_has_applied")
+        self.assertEqual(self.unlink(ref, member_no[-3:], accept_applied=True)["counts"]["unlink_receipt_applied"], 1)
+
+    def test_a_save_that_landed_but_was_not_repaired_refuses(self):
+        ref, member_no = self.claimed()
+        real = self.ledger.update_receipt
+
+        def crash_on_applied(order, **values):
+            if values.get("state") == "applied":
+                raise RuntimeError("parent killed after the save")
+            return real(order, **values)
+        self.ledger.update_receipt = crash_on_applied
+        self.advance(minutes=15)
+        with self.assertRaises(RuntimeError):
+            self.engine().run(apply=True)
+        self.ledger.update_receipt = real
+        self.assertEqual((self.receipt(1)["state"], self.ledger.done_write(order_gid(1)) is not None), ("ready", True))
+        self.refused(lambda: self.unlink(ref, member_no[-3:]), "unlink_receipt_needs_repair")
+        self.advance(minutes=15)
+        self.engine().run(apply=False)  # observe repairs it
+        self.assertEqual(self.receipt(1)["state"], "applied")
+        self.refused(lambda: self.unlink(ref, member_no[-3:]), "unlink_has_applied")
+
+    def test_the_index_skips_a_voided_pair(self):
+        ref, member_no = self.claimed()
+        self.unlink(ref, member_no[-3:])
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                out = self.engine().index(apply=apply, max_members=10)
+                self.assertEqual((out["counts"].get("index_pair_unlinked"), out["counts"].get("claim_linked")), (1, None))
+        self.assertEqual(self.ledger.claim_counts(), (0, 1))
+
+    def test_the_cli_command_and_its_output(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.run_main("init")
+        self.assertEqual(self.run_main("observe")[1]["counts"]["claim_linked"], 1)
+        ledger = bm.BenefitsLedger(self.root, clock=lambda: self.now)
+        try:
+            ref = ledger.ref("c", customer_gid(1))
+        finally:
+            ledger.close()
+        args = ("unlink", "--customer-ref", ref, "--member-last3", member_no[-3:], "--reason", "member_renumbered")
+        code, dry, _ = self.run_main(*args, cfg={"benefits_write_enabled": False, "qualify_threshold_cents": 25_000})
+        self.assertEqual((code, dry["command"]), (0, "unlink_dry_run"))
+        code, out, _ = self.run_main(*args, "--apply")
+        self.assertEqual((code, out["command"], out["link_source"]), (0, "unlink", "order"))
+        status = self.run_main("status")[1]
+        self.assertEqual((status["claim_links"], status["claim_links_voided"]), (0, 1))
+        digest = self.run_main("digest")[1]
+        self.assertEqual((digest["open"]["claim_links"], digest["open"]["claim_links_voided"], digest["counts"]["claim_unlinked"]), (0, 1, 1))
+        for bad in (("unlink",), args[:-2], args[:-2] + ("--reason", "seen")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_main(*bad)[:2], (2, {"status": "refused", "code": "unlink_arguments_invalid"}))
+        self.assertEqual(self.run_main(*args, "--apply")[:2], (2, {"status": "refused", "code": "unlink_not_a_claim_link"}))
+        self.advance(minutes=15)
+        code, out, text = self.run_main("observe")
+        self.assertEqual((code, out["alerts"]), (3, ["claim_needs_review"]))
+        for secret in (sg(1), local(1), customer_gid(1), order_gid(1), str(customer_number(1)), str(order_number(1)), "Fake Member 1"):
+            self.assertNotIn(secret, text)
 
 
 class RealOutputsReachTheCheckTests(Base):

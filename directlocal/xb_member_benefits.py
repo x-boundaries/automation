@@ -155,6 +155,7 @@ ORDER_PAST_READ_WINDOW = "order_past_read_window"
 # released with the finding not_as_intended (staff upgrade by hand if due).
 HELD_WRITE_RELEASED = "held_write_released"
 RELEASE_FINDINGS = ("as_intended", "not_as_intended")
+UNLINK_REASONS = ("wrong_person", "customers_merged", "member_renumbered", "other")  # as the claim_unlinks CHECK
 _ORDER_REF_RE = re.compile(r"^o-[0-9a-f]{20}\Z")
 _CUSTOMER_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
 _LAST3_RE = re.compile(r"^[A-Za-z0-9._/-]{1,3}\Z")  # the last 3 characters of a MemberNo (dl.MEMBER_NO_RE)
@@ -975,6 +976,15 @@ class BenefitsLedger:
 
     def claim_for_member(self, member_no: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM active_claim_links WHERE member_no_key = ?", (sync.member_no_key(member_no),)).fetchone()
+
+    def pair_unlinked(self, gid: str, member_no: str) -> bool:
+        """Slice B1 (G0 1.6): this customer and this member were linked once
+        and the link was voided. The one reader of ``claim_links`` outside
+        the schema: a voided link is history, never an active link."""
+
+        return self.conn.execute("SELECT 1 FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id "
+                                 "WHERE c.customer_gid = ? AND c.member_no_key = ? LIMIT 1",
+                                 (gid, sync.member_no_key(member_no))).fetchone() is not None
 
     def active_claims(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM active_claim_links ORDER BY link_id").fetchall()
@@ -2018,6 +2028,12 @@ class BenefitsEngine:
         if member.member_type not in SCOPE_TYPES:
             summary.count("claim_member_not_in_scope", ref, member_no)
             return None, member, "claim_member_not_in_scope"
+        if self.ledger.pair_unlinked(customer.gid, member_no):
+            # Slice B1 (G0 1.6): a voided pair is never linked again by the
+            # tool; its own review subject, so an earlier review of the same
+            # customer does not swallow the alert.
+            self._review("unlinked:" + customer.gid, "claim_pair_unlinked", summary, ref, member_no)
+            return None, member, "claim_pair_unlinked"
         if customer.gid in self.links.by_gid or key in self.links.by_key or self.ledger.claim_for_gid(customer.gid) or self.ledger.claim_for_member(member_no):
             self._review(customer.gid, "claim_link_conflict", summary, ref, member_no)
             return None, member, "claim_link_conflict"
@@ -2291,6 +2307,65 @@ class BenefitsEngine:
                          (run_id, now, now, json.dumps(result, sort_keys=True)))
         return result
 
+    # -- unlink (slice B1, G0 1.6) -----------------------------------------------
+    def unlink(self, *, customer_ref: Any, member_last3: Any, reason: Any, accept_applied: bool, apply: bool) -> dict[str, Any]:
+        """Void one claim link this tool made (by an order or by the index).
+        Never touches the #155 sync's links, AutoCount or Shopify. The link row
+        stays (history); the void is a new row. Receipts through the link: a
+        ``ready`` one loses its member and is linked afresh by the next run;
+        a decided one is kept; an ``applied`` one only with
+        ``accept_applied`` (one alert: the owner checks that member by hand;
+        the tool never downgrades). A dry run unless ``apply``; every refusal
+        records nothing."""
+
+        if (not isinstance(customer_ref, str) or not _CUSTOMER_REF_RE.fullmatch(customer_ref) or not isinstance(member_last3, str)
+                or not _LAST3_RE.fullmatch(member_last3) or reason not in UNLINK_REASONS or not isinstance(accept_applied, bool)):
+            raise dl.DirectLocalError("unlink_arguments_invalid")
+        self.ledger.check_binding(self.config)
+        links = [row for row in self.ledger.active_claims() if self.ledger.ref("c", row["customer_gid"]) == customer_ref]
+        if not links:
+            raise dl.DirectLocalError("unlink_not_a_claim_link")  # also a customer linked by #155 only
+        link = links[0]
+        if link["member_no"][-3:] != member_last3:
+            raise dl.DirectLocalError("unlink_member_mismatch")
+        if self.ledger.open_writes():
+            raise dl.DirectLocalError("benefit_uncertain_unresolved")
+        if any(sync.member_no_key(row["member_no"]) == link["member_no_key"] for row in self.ledger.unreleased_held_writes()):
+            raise dl.DirectLocalError("unlink_member_write_held")
+        through = [row for row in self.ledger.conn.execute(
+            "SELECT * FROM receipts WHERE link_source = 'claim' AND customer_gid = ? AND member_no IS NOT NULL ORDER BY order_gid",
+            (link["customer_gid"],)) if sync.member_no_key(row["member_no"]) == link["member_no_key"]]
+        if any(row["state"] == "ready" and self.ledger.done_write(row["order_gid"]) is not None for row in through):
+            raise dl.DirectLocalError("unlink_receipt_needs_repair")
+        if any(row["state"] == "applied" for row in through) and not accept_applied:
+            raise dl.DirectLocalError("unlink_has_applied")
+        summary = RunSummary("unlink" if apply else "unlink_dry_run")
+        summary.count("claim_unlinked", customer_ref, link["member_no"])
+        reset = []
+        for row in through:
+            if row["state"] == "ready":
+                reset.append(row["order_gid"])
+                summary.count("unlink_receipt_reset")
+            elif row["state"] in ("held", "no_change", "not_in_scope"):
+                summary.count("unlink_receipt_kept")
+            elif row["state"] == "applied":
+                summary.count("unlink_receipt_applied")
+                summary.alert("unlinked_with_applied", self.ledger.ref("o", row["order_gid"]), row["member_no"])
+        run_id = f"run-{uuid.uuid4().hex}" if apply else None
+        result = {"status": "ok", "command": summary.command, "run_id": run_id, "reason": reason, "link_source": link["source"],
+                  "counts": dict(sorted(summary.counts.items())), "alerts": list(summary.alerts), "refs": list(summary.refs)}
+        if not apply:
+            return result
+        now = dl.ts(self.now())
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (?, ?, ?, ?)", (link["link_id"], reason, run_id, now))
+            for order_gid in reset:
+                conn.execute("UPDATE receipts SET member_no = NULL, link_source = NULL, observed = NULL, observed_at = NULL, checked_at = NULL, "
+                             "updated_at = ? WHERE order_gid = ? AND state = 'ready'", (now, order_gid))
+            conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES (?, 'unlink', ?, ?, ?)",
+                         (run_id, now, now, json.dumps(result, sort_keys=True)))
+        return result
+
     # -- index (one-off, read only towards Shopify and AC2) -------------------
     def index(self, *, apply: bool, max_members: int) -> dict[str, Any]:
         """Existing AC2 MEMBER and GUEST members with no #155 link and no
@@ -2360,6 +2435,9 @@ class BenefitsEngine:
             self._index_review(key, "claim_phone_not_unique", summary, ref, member_no)
             return 1
         customer = same_phone[0]
+        if self.ledger.pair_unlinked(customer.gid, member_no):
+            summary.count("index_pair_unlinked")  # slice B1: a voided pair is never linked again
+            return 1
         read = MemberRead(True, member_no=member_no, member_type=member_type, name=row.get("name"))
         if not apply:
             name_ok = sync.full_name_matches(sync.shopify_full_name(customer.first_name, customer.last_name), read.name)
@@ -2541,7 +2619,7 @@ def build_real_engine(config: BenefitsConfig, ledger: BenefitsLedger, *, environ
     return BenefitsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held")
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink")
 
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsConfig, BenefitsLedger], BenefitsEngine] | None = None,
@@ -2549,11 +2627,14 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
     parser = argparse.ArgumentParser(description="#268 member core: S$300 online order -> AC2 MEMBER + 2-year expiry; claim links")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--apply", action="store_true", help="index, release-held: record in this tool's ledger (default: dry run)")
+    parser.add_argument("--apply", action="store_true", help="index, release-held, unlink: record in this tool's ledger (default: dry run)")
     parser.add_argument("--max", type=int, default=200, help="index only: members examined this run (1-1000)")
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
     parser.add_argument("--order-ref", help="release-held only: the o- keyed ref of the order whose HELD write is released")
-    parser.add_argument("--member-last3", help="release-held: the last 3 characters of the MemberNo")
+    parser.add_argument("--member-last3", help="release-held, unlink: the last 3 characters of the MemberNo")
+    parser.add_argument("--customer-ref", help="unlink only: the c- keyed ref of the customer whose claim link is voided")
+    parser.add_argument("--reason", help="unlink only: wrong_person, customers_merged, member_renumbered or other")
+    parser.add_argument("--accept-applied", action="store_true", help="unlink only: void even when a receipt through the link is applied")
     parser.add_argument("--finding", help="release-held only: as_intended or not_as_intended (what the owner saw in AutoCount)")
     args = parser.parse_args(argv)
     try:
@@ -2590,6 +2671,9 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
                 result = engine.resolve()
             elif args.command == "release-held":
                 result = engine.release_held(order_ref=args.order_ref, member_last3=args.member_last3, finding=args.finding, apply=args.apply)
+            elif args.command == "unlink":
+                result = engine.unlink(customer_ref=args.customer_ref, member_last3=args.member_last3, reason=args.reason,
+                                       accept_applied=args.accept_applied, apply=args.apply)
             else:
                 result = engine.index(apply=args.apply, max_members=args.max)
             _emit(result)
