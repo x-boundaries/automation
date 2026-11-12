@@ -9,6 +9,7 @@ then 8000, then 0001-0099); emails use example.com.
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import re
@@ -2761,6 +2762,7 @@ class GoLiveTestCase(SyncTestCase):
 
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp(prefix="xb-member-sync-live-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)  # BF1 fix 1: also when a test moves self.temp
         self.now = T0 + timedelta(days=1)
         self.ledger = sync.SyncLedger(self.temp, clock=lambda: self.now, check_custody=False)
         self.ledger.init_meta(autocount_book=PROD_BOOK, store_gid=STORE, shop_domain=DOMAIN)
@@ -2909,6 +2911,7 @@ class GoLiveMatrixTests(GoLiveTestCase):
 
         root = Path(tempfile.mkdtemp(prefix="xb-member-sync-v4-"))
         self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(gc.collect)  # BF1 fix 1: runs first, frees the refused ledger's file
         conn = sqlite3.connect(root / sync.LEDGER_FILE)
         conn.execute("PRAGMA user_version=4")
         conn.close()
@@ -4491,7 +4494,7 @@ def old_sign_up(n: int, *, first="Alpha", last="Tester", phone="sg", tags=("memb
     return replace(item, created_at=made, updated_at=made, registration_at=None, registration_value=None)
 
 
-def make_member_core_ledger(root: Path, *, claims=(), book=TEST_BOOK, tool="xb268_member_benefits") -> None:
+def make_member_core_ledger(root: Path, *, claims=(), book=TEST_BOOK, tool="xb268_member_benefits", store=STORE) -> None:
     """A member core ledger with the real #268 schema, written directly."""
 
     import xb_member_benefits as mb
@@ -4500,7 +4503,7 @@ def make_member_core_ledger(root: Path, *, claims=(), book=TEST_BOOK, tool="xb26
     try:
         conn.executescript(mb.LEDGER_SCHEMA.replace("CHECK (tool = 'xb268_member_benefits')", "") if tool != "xb268_member_benefits" else mb.LEDGER_SCHEMA)
         conn.execute("INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, ?, 'b-1', ?, ?, ?, ?, ?)",
-                     (tool, book, STORE, DOMAIN, "6b" * 32, dl.ts(T0)))
+                     (tool, book, store, DOMAIN, "6b" * 32, dl.ts(T0)))
         for customer_gid, member_no in claims:
             conn.execute("INSERT INTO claim_links(customer_gid, member_no, member_no_key, source, code, created_at) VALUES (?, ?, ?, 'order', 'claim_test', ?)",
                          (customer_gid, member_no, sync.member_no_key(member_no), dl.ts(T0)))
@@ -5252,6 +5255,189 @@ class CoverageTests(BackfillTestCase):
             sync.read_claim_links(wrong_tool, make_config())
         self.assertEqual(caught.exception.code, "member_core_ledger_binding_mismatch")
         self.assertIsNone(sync.load_claim_links(make_config()))
+
+
+
+# -- #155 slice BF1 fix round 1 (G2 M1 and LATER, Controller rulings 2-7) ----------
+
+
+class BackfillFix1Tests(BackfillTestCase):
+    """Rulings 3 (legacy tags) and 4 (exact MemberNo, other phone), and the
+    tests G2 recommended (G01, G03, G05, G09 + G20, G10, G23, G25)."""
+
+    def decide(self, item, members):
+        return sync.decide_backfill(item, sync.phone_member_no(item.phone)[0], members)
+
+    # -- ruling 3: legacy tags, trimmed and case-insensitive ------------------------
+    def test_legacy_tags_are_a_fixed_trimmed_case_insensitive_list(self):
+        self.assertEqual(sync.LEGACY_TAGS, frozenset({"member-legacy", "xb member"}))
+        for tags in (("member-legacy",), ("Member-Legacy",), (" MEMBER-LEGACY ",), ("XB Member",), ("xb member",), ("  XB MEMBER",)):
+            with self.subTest(tags=tags):
+                self.assertTrue(sync.has_legacy_tag(("member-mg",) + tags))
+        for tags in ((), ("member-mg",), ("xb members",), ("member legacy",), ("XBMember",), (None,)):
+            with self.subTest(tags=tags):
+                self.assertFalse(sync.has_legacy_tag(tags))
+
+    def test_each_legacy_tag_and_a_case_variant_is_held_never_created(self):
+        variants = ("member-legacy", "Member-Legacy ", "XB Member", "xb MEMBER")
+        for n, tag in enumerate(variants, start=60):
+            self.shopify.add(old_sign_up(n, tags=("member-mg", tag)))
+        result = self.backfill(apply=True)
+        self.assertEqual((self.ac2.creates, self.link_rows()), ([], {}))
+        self.assertEqual(result["counts"]["backfill_legacy_needs_person"], len(variants))
+        self.assertEqual({r["code"] for r in result["refs"]}, {"backfill_legacy_needs_person"})
+        self.assertIn("backfill_legacy_needs_person", sync.BACKFILL_PERSON_CODES)
+
+    def test_a_legacy_tagged_sign_up_with_a_member_still_links(self):
+        for n, tag in ((64, "XB Member"), (65, "MEMBER-LEGACY")):
+            self.shopify.add(old_sign_up(n, tags=("member-mg", tag)))
+            self.member(sg(n))
+        self.backfill(apply=True)
+        self.assertEqual(self.link_rows(), {gid(64): (sg(64), "matched", "backfill_member_no"), gid(65): (sg(65), "matched", "backfill_member_no")})
+        self.assertEqual(self.ac2.creates, [])
+
+    def test_a_tag_that_only_looks_like_a_legacy_tag_is_created(self):
+        self.shopify.add(old_sign_up(66, tags=("member-mg", "xb members")))
+        self.backfill(apply=True)
+        self.assertEqual([m for m, _ in self.ac2.creates], [sg(66)])
+
+    def test_coverage_counts_a_legacy_tag_in_any_case(self):
+        self.shopify.loose = True  # the search is only a candidate list
+        self.shopify.add(old_sign_up(67, tags=("Member-Legacy",)))
+        self.shopify.add(old_sign_up(68, tags=("other",)))
+        result = sync.coverage_report(self.temp, make_config(**BF_KEYS), shopify=self.shopify, claims=None)
+        self.assertEqual(result["shopify"]["classes"], {"legacy_not_linked": 1})
+
+    # -- ruling 4: exact MemberNo whose own MobilePhone is another number ------------
+    def test_exact_member_no_with_another_usable_mobile_is_held(self):
+        item = old_sign_up(70)
+        for other in (plus(sg(71)), local(71), plus(FOREIGN_DIGITS)):
+            with self.subTest(mobile=other):
+                self.assertEqual(self.decide(item, [sync.Ac2Member(sg(70), "SOMEONE ELSE", other)]),
+                                 sync.Decision("HOLD", "backfill_member_no_phone_differs", sg(70)))
+        self.assertIn("backfill_member_no_phone_differs", sync.BACKFILL_PERSON_CODES)
+
+    def test_exact_member_no_with_a_blank_unusable_or_same_mobile_links(self):
+        item = old_sign_up(72)
+        for mobile in (None, "", "   ", "12345", "not a phone", plus(sg(72)), local(72), sg(72)):
+            with self.subTest(mobile=mobile):
+                self.assertEqual(self.decide(item, [sync.Ac2Member(sg(72), "SOMEONE ELSE", mobile)]),
+                                 sync.Decision("LINK", "backfill_member_no", sg(72)))
+        # The 8-digit MemberNo form follows the same rule.
+        self.assertEqual(self.decide(item, [sync.Ac2Member(local(72), "X Y", plus(sg(73)))]).code, "backfill_member_no_phone_differs")
+
+    def test_apply_holds_the_other_phone_member_and_lists_it_masked(self):
+        self.shopify.add(old_sign_up(74))
+        self.member(sg(74), "SOMEONE ELSE", mobile=plus(sg(75)))
+        result = self.backfill(apply=True)
+        self.assertEqual((self.link_rows(), self.ac2.creates), ({}, []))
+        self.assertEqual(result["counts"]["backfill_member_no_phone_differs"], 1)
+        self.assertEqual([(r["code"], r["member_no_masked"][-3:]) for r in result["refs"]], [("backfill_member_no_phone_differs", sg(74)[-3:])])
+        self.assert_private(result)
+        report = sync.coverage_report(self.temp, make_config(**BF_KEYS), shopify=self.shopify, claims=None)
+        self.assertEqual(report["shopify"]["classes"], {"backfill_member_no_phone_differs": 1})
+
+    def test_initial_link_keeps_its_exact_member_no_rule(self):
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE name = 'initial_link_completed_at'")
+        self.shopify.page_limit = None
+        made = CUTOVER - timedelta(days=30)
+        self.shopify.add(replace(customer(76, tags=()), created_at=made, updated_at=made, registration_at=None, registration_value=None))
+        self.ac2.add(sync.Ac2Member(sg(76), "SOMEONE ELSE", plus(sg(77)), created_at=T0 - timedelta(days=900)))
+        self.engine(initial_link_enabled=True).initial_link(apply=True)
+        self.assertEqual(self.link_rows(), {gid(76): (sg(76), "matched", "initial_link_member_no")})
+
+    # -- G2 recommended tests ------------------------------------------------------
+    def test_G01_a_member_claimed_in_the_member_core_in_another_case_is_held(self):
+        claimed_no = "Zq" + local(80) + "Ab"
+        self.shopify.add(old_sign_up(80))
+        self.member(claimed_no, "Alpha Tester", plus(sg(80)))
+        core = self.temp / "core"
+        core.mkdir()
+        make_member_core_ledger(core, claims=[(gid(90), claimed_no)])
+        result = self.backfill(apply=True, claims=sync.read_claim_links(core, make_config()))
+        self.assertEqual(result["counts"]["backfill_member_linked_elsewhere"], 1)
+        self.assertEqual((self.link_rows(), self.ac2.creates), ({}, []))
+
+    def test_G05_not_written_rows_count_toward_the_hourly_allowance(self):
+        engine = self.engine(**BF_KEYS)
+        for i in range(19):
+            write_id = engine._intent("shopify_to_ac2", f"OLD{i:03d}", None)
+            with self.ledger.tx() as conn:
+                engine._close_write(conn, write_id, "NOT_WRITTEN" if i % 2 else "DONE", "test")
+        for n in (81, 82, 83):
+            self.shopify.add(old_sign_up(n))
+        result = self.backfill(apply=True, max_creates=5)
+        self.assertEqual((len(self.ac2.creates), result["stopped"]), (1, "backfill_hour_cap_reached"))
+
+    def test_G09_G20_padded_member_no_forms(self):
+        item = old_sign_up(84)
+        # A trailing space is the same MemberNo: linked.
+        self.assertEqual(self.decide(item, [sync.Ac2Member(sg(84) + " ", "SOMEONE ELSE", None)]),
+                         sync.Decision("LINK", "backfill_member_no", sg(84) + " "))
+        # A leading-space twin of the same number, or a padded 8-digit form: held.
+        for twin in (" " + sg(84), local(84) + " "):
+            with self.subTest(twin=twin):
+                self.assertEqual(self.decide(item, [sync.Ac2Member(sg(84), "A B", None), sync.Ac2Member(twin, "A B", None)]).code,
+                                 "backfill_memberno_conflict")
+
+    def test_G10_a_shared_phone_under_the_same_surname_is_held(self):
+        item = old_sign_up(85)  # Alpha Tester
+        for member in (sync.Ac2Member("FAM" + local(85), "Bravo Tester", plus(sg(85))), sync.Ac2Member("Q7", "Charlie Tester", plus(sg(85)))):
+            with self.subTest(name=member.name):
+                self.assertEqual(self.decide(item, [member]).code, "backfill_shared_phone")
+
+    def test_G25_an_uncertain_backfill_create_is_resolved_by_the_regular_run(self):
+        self.shopify.add(old_sign_up(86))
+        self.ac2.create_result = ("WRITE_OUTCOME_UNCERTAIN", "writer_timeout")  # the fake saves the member anyway
+        self.backfill(apply=True)
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.assertIsNotNone(self.ledger.conn.execute("SELECT intent_digest FROM writes").fetchone()[0])
+        result = self.run_sync("shopify_to_ac2")
+        self.assertEqual(result["counts"].get("uncertain_write_resolved_linked"), 1)
+        self.assertEqual(self.links(), {gid(86): sg(86)})
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "RESOLVED")
+        self.assertEqual(len(self.ac2.creates), 1)  # never sent again
+
+    def test_G03_two_would_links_to_one_member_in_a_dry_run(self):
+        for n in (87, 88):
+            self.shopify.add(old_sign_up(n, phone=plus(sg(87))))
+        self.member(sg(87))
+        result = self.backfill(apply=False)
+        self.assertEqual(result["counts"].get("backfill_would_link"), 1)
+        self.assertEqual(result["counts"].get("backfill_member_linked_elsewhere"), 1)
+
+    def test_G23_a_member_core_ledger_of_another_store_is_refused(self):
+        other = self.temp / "core-other-store"
+        other.mkdir()
+        make_member_core_ledger(other, store="gid://shopify/Shop/900000002")
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            sync.read_claim_links(other, make_config())
+        self.assertEqual(caught.exception.code, "member_core_ledger_binding_mismatch")
+
+
+class CoverageRefsTruncatedTests(BackfillTestCase):
+    """Ruling 5 (G2 LATER 1): the person list says when it is cut."""
+
+    def report(self) -> dict:
+        return sync.coverage_report(self.temp, make_config(**BF_KEYS), shopify=self.shopify, claims=None)
+
+    def test_refs_truncated_is_false_when_every_listed_customer_fits(self):
+        for n in (1, 2):
+            self.shopify.add(old_sign_up(n, phone=None))
+        self.shopify.add(old_sign_up(3))  # gap: never listed
+        with mock.patch.object(sync, "COVERAGE_MAX_REFS", 2):
+            result = self.report()
+        self.assertEqual((len(result["refs"]), result["refs_truncated"]), (2, False))
+
+    def test_refs_truncated_is_true_when_the_list_is_cut(self):
+        for n in (1, 2, 3):
+            self.shopify.add(old_sign_up(n, phone=None))
+        with mock.patch.object(sync, "COVERAGE_MAX_REFS", 2):
+            result = self.report()
+        self.assertEqual((len(result["refs"]), result["refs_truncated"]), (2, True))
+        self.assertEqual(result["shopify"]["classes"], {"backfill_no_phone": 3})  # the counts stay whole
+        self.assertEqual(sync.COVERAGE_MAX_REFS, 200)
 
 
 if __name__ == "__main__":

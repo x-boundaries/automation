@@ -845,11 +845,16 @@ def decide_shopify_to_ac2(customer: ShopifyCustomer, phone_digits: str | None, c
 # Owner 11 and 12 Nov 2026 (G0 two-way backfill plan, sections 2.1 to 2.4 and
 # Controller decisions 1 to 3): a ``member-mg`` sign-up from before the
 # cutover with no AutoCount member becomes a member of the configured create
-# type (live: GUEST); a ``member-legacy`` customer is never created; a
+# type (live: GUEST); a customer with a legacy tag is never created; a
 # shared family phone, both forms of one number, no phone, a malformed phone
 # and no name are held for a person (a link in this ledger can never be
 # removed, so nothing doubtful is linked or created).
 LEGACY_TAG = "member-legacy"
+# Fix round 1 (Controller ruling 3, fail closed): the tags the store treats as
+# legacy (as the superseded member gateway read them), compared trimmed and
+# case-insensitively. A fixed list, not a setting: a link is permanent, so a
+# customer carrying any of them is never created as a new member.
+LEGACY_TAGS = frozenset({"member-legacy", "xb member"})
 BACKFILL_RUN_KIND = "backfill_registrations"
 BACKFILL_RUN_PREFIX = "backfill-"
 # Resumable: the numeric customer ID of the last customer a call finished,
@@ -869,7 +874,14 @@ BACKFILL_PERSON_CODES = frozenset({
     "backfill_signup_time_missing", "backfill_no_name", "backfill_no_phone", "backfill_phone_invalid",
     "backfill_memberno_conflict", "backfill_shared_phone", "backfill_phone_on_multiple_records",
     "backfill_legacy_needs_person", "backfill_member_linked_elsewhere", "backfill_text_unstorable",
+    "backfill_member_no_phone_differs",
 })
+
+
+def has_legacy_tag(tags: Iterable[Any]) -> bool:
+    """True when any tag is one of ``LEGACY_TAGS`` (trimmed, any case)."""
+
+    return any(isinstance(tag, str) and tag.strip().casefold() in LEGACY_TAGS for tag in tags)
 
 
 def customer_number(gid: Any) -> int | None:
@@ -909,14 +921,18 @@ def decide_backfill(customer: ShopifyCustomer, phone_digits: str, candidates: It
 
     * One member whose MemberNo is exactly the phone (``member_no_forms``):
       linked, with no time window and no name rule (these are old; the first
-      link-up's rule). Both forms of the number: held.
+      link-up's rule), unless that member's own MobilePhone is a usable
+      number other than the customer's phone (held: fix round 1, Controller
+      ruling 4; the live sync and ``initial-link`` keep their rule). Both
+      forms of the number: held.
     * Otherwise exactly one member holding the phone (MobilePhone, or the 8
       digits inside a longer MemberNo) under the same name (the 2-word rule):
       linked. More than one: held.
     * The phone held under another name (a shared family phone): held, not
       created with the fallback number (Controller decision 2).
     * No member holds the phone: created with MemberNo = the phone (the live
-      rule), unless the customer is tagged ``member-legacy`` (held).
+      rule), unless the customer carries a legacy tag (``LEGACY_TAGS``,
+      held).
     """
 
     rows = list(candidates)
@@ -926,6 +942,9 @@ def decide_backfill(customer: ShopifyCustomer, phone_digits: str, candidates: It
     if len(exact) > 1:
         return Decision("HOLD", "backfill_memberno_conflict", exact[0].member_no)
     if exact:
+        own_phone, status = phone_member_no(exact[0].mobile_phone)
+        if status == "ok" and own_phone != phone_digits:
+            return Decision("HOLD", "backfill_member_no_phone_differs", exact[0].member_no)
         return Decision("LINK", "backfill_member_no", exact[0].member_no)
     full_name = shopify_full_name(customer.first_name, customer.last_name)
     same = [r for r in hits if full_name_matches(full_name, r.name)]
@@ -935,7 +954,7 @@ def decide_backfill(customer: ShopifyCustomer, phone_digits: str, candidates: It
         return Decision("HOLD", "backfill_phone_on_multiple_records")
     if hits:
         return Decision("HOLD", "backfill_shared_phone", None, name_fallback_notes(full_name, [r.name for r in hits]))
-    if LEGACY_TAG in customer.tags:
+    if has_legacy_tag(customer.tags):
         return Decision("HOLD", "backfill_legacy_needs_person")
     return Decision("CREATE", "backfill_new_member_phone", phone_digits)
 
@@ -2811,7 +2830,7 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
         if not complete:
             raise dl.DirectLocalError("coverage_read_incomplete")
         for item in found:
-            if REGISTRATION_TAG in item.tags or LEGACY_TAG in item.tags:  # the search is only a candidate list
+            if REGISTRATION_TAG in item.tags or has_legacy_tag(item.tags):  # the search is only a candidate list
                 customers[item.gid] = item
     conn = _open_read_only(Path(root) / LEDGER_FILE, "sync_ledger_missing", "sync_ledger_unreadable")
     try:
@@ -2853,6 +2872,7 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
     claim_keys = dict(claims.by_key) if claims is not None else {}
     classes: dict[str, int] = {}
     refs: list[dict[str, str]] = []
+    listed = 0  # customers with a ref-worthy class (refs holds the first COVERAGE_MAX_REFS)
     for gid_value, item in sorted(customers.items()):
         ref = _keyed_ref(ref_key, "c", gid_value)
         if gid_value in links:
@@ -2872,8 +2892,10 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
             else:
                 code = held.get(ref, "gap")
         classes[code] = classes.get(code, 0) + 1
-        if code not in ("linked", "linked_claim_only", "gap", "after_cutover_not_linked") and len(refs) < COVERAGE_MAX_REFS:
-            refs.append({"ref": ref, "code": code})
+        if code not in ("linked", "linked_claim_only", "gap", "after_cutover_not_linked"):
+            listed += 1
+            if len(refs) < COVERAGE_MAX_REFS:
+                refs.append({"ref": ref, "code": code})
     member_classes: dict[str, int] = {}
     sync_by_key = {key: gid_value for gid_value, key in links.items()}
     for key in set(sync_by_key) | set(claim_keys):
@@ -2900,6 +2922,9 @@ def coverage_report(root: Path, config: SyncConfig, *, shopify: Any, claims: Cla
         "complete": classes.get("gap", 0) == 0 and classes.get("after_cutover_not_linked", 0) == 0 and classes.get("open_write", 0) == 0
                     and member_classes.get("linked_conflict", 0) == 0 and customer_conflicts == 0,
         "refs": refs,
+        # Fix round 1 (G2 LATER 1): true when more customers have a listed
+        # class than refs holds (the person list is then not the whole list).
+        "refs_truncated": listed > len(refs),
     }
 
 

@@ -811,12 +811,13 @@ Controller's decisions):
 | Customer (tagged `member-mg`, signed up before the cutover, not linked) | Result | Code |
 |---|---|---|
 | Phone is in no AutoCount member | Created: MemberNo = the phone (`65` + 8 digits, or a foreign number in full), the configured create type (live: `GUEST`), no expiry, RegisterDate = the sign-up date, DOB from the configured birthday field. Through the unchanged write-once child, profile `sync_p1` | `backfill_ac2_member_created` |
-| One member's MemberNo is exactly the phone (or its 8 digits) | Linked, no time window, no name rule | `backfill_linked` + `backfill_member_no` |
+| One member's MemberNo is exactly the phone (or its 8 digits), and its MobilePhone is blank, unusable or the same number | Linked, no time window, no name rule | `backfill_linked` + `backfill_member_no` |
+| One member's MemberNo is exactly the phone, but its own MobilePhone is a usable, different number | Held for a person (backfill only; the 15-minute run and `initial-link` keep their rule) | `backfill_member_no_phone_differs` |
 | One member holds the phone in MobilePhone or inside a longer MemberNo, same name (the 2-word rule) | Linked | `backfill_linked` + `backfill_phone_and_name` |
 | The phone is held under another name (a shared family phone) | Held for a person (never the fallback number) | `backfill_shared_phone` |
 | Two members hold it under the same name | Held | `backfill_phone_on_multiple_records` |
 | Both forms of the number are MemberNos | Held | `backfill_memberno_conflict` |
-| Also tagged `member-legacy`, no member found | Held: never created by a tool | `backfill_legacy_needs_person` |
+| Also carries a legacy tag (`member-legacy` or `XB Member`, any case, spaces trimmed), no member found | Held: never created by a tool | `backfill_legacy_needs_person` |
 | No phone; malformed phone; no name; no sign-up time | Held, before any AutoCount lookup | `backfill_no_phone`, `backfill_phone_invalid`, `backfill_no_name`, `backfill_signup_time_missing` |
 | The member it would link or create is already linked to another customer (this ledger, the member core's claim links, or earlier in the same call) | Held | `backfill_member_linked_elsewhere` |
 | A text field AutoCount cannot store exactly | Held | `backfill_text_unstorable` |
@@ -828,8 +829,11 @@ The sign-up time is the live rule's: the `membership.start_date` metafield's
 creation time, else Customer.createdAt. That metafield was created at the
 cutover, so for older sign-ups it is Customer.createdAt, which is also the
 RegisterDate (an account made before the sign-up gives an earlier date).
-Customers tagged only `member-legacy` are not read by the backfill; `coverage`
-lists them for a person. Email is never read.
+Customers with a legacy tag but no `member-mg` tag are not read by the
+backfill; `coverage` lists those tagged `member-legacy` for a person. The
+legacy tags are a fixed list in the code (no setting): a link can never be
+removed, so a customer the store treats as legacy is never created as a new
+member. Email is never read.
 
 **Bounds, per call.** At most `--max` creates (1 to `max_writes_per_run`,
 default 1; anything else is `backfill_max_invalid`, before any login); never
@@ -869,7 +873,8 @@ the commit the 15-minute task runs.
 are `created_in_ac2` links, so the run's possible-duplicate watch checks the
 10 newest of them made in the last 7 days, two lookups each, on every run.
 Until 7 days after the last create, each run may take up to 20 more
-AutoCount sign-ins. Watch the run times in the daily summary.
+AutoCount sign-ins. Step 6 of the procedure checks the run times after the
+pilot and after each sitting, and says when to stop batching.
 
 #### Procedure (attended, owner OK for each step)
 
@@ -898,20 +903,32 @@ sync is fixed (G0 step 1); the dry run's counts are reviewed.
    refs, masked MemberNos). **Live check of the search here:** the backfill
    searches only `tag:'member-mg'` (no date filter); `population.tagged`
    must equal the admin's count of customers tagged `member-mg`
-   (Customers, filter by tag). If it does not, stop.
+   (Customers, filter by tag). If it does not, stop. From 17 November the
+   output must say `"member_core_ledger": "read"`; `"not_configured"` is a
+   stop (set `member_core_state_root` in the copy).
 4. Resume both tasks between sittings.
 5. Pilot: set `backfill_registrations_enabled: true` in the copy, pause the
    tasks, `backfill-registrations --apply --max 3 --config <copy>`. Check each
    created member in AutoCount by hand (masked MemberNo in `refs`): type
    `GUEST`, no expiry, RegisterDate the sign-up date, name and mobile right.
    Check links count in `status`. Resume the tasks.
-6. Batches: `--apply --max 5`, at most 4 calls in a clock hour (20 creates;
+6. **Run-time check, after the pilot and after each sitting.** With both
+   tasks resumed, wait about an hour, then run
+   `digest --hours 1 --config <live config>`: that window holds only
+   15-minute runs. If `runs.duration_seconds_max` is above about 300 s (the
+   task is stopped at 600 s), stop batching until 7 days after the last
+   create, then check again. Do not use the daily summary for this check:
+   its run durations include the backfill's own calls.
+7. Batches: `--apply --max 5`, at most 4 calls in a clock hour (20 creates;
    the code refuses more in any 60 minutes), tasks paused for each sitting,
-   until `complete` is true. Exit 3 or any `stopped` other than a bound:
-   stop and look before the next call.
-7. To stop at once: create an empty file `STOP` in the sync's state root;
+   until `complete` is true. End each sitting with headroom for the
+   15-minute run's own writes: keep the sitting's last hour at 15 creates or
+   fewer (the daily summary counts both in the same clock hour). Exit 3 or
+   any `stopped` other than a bound: stop and look before the next call.
+   After each sitting, step 6.
+8. To stop at once: create an empty file `STOP` in the sync's state root;
    the call stops before the next customer. Delete it before the next call.
-8. When done: `backfill_registrations_enabled` back to `false` in the copy;
+9. When done: `backfill_registrations_enabled` back to `false` in the copy;
    resume both tasks; next morning, read the daily summary.
 
 **A wrong member** (created for the wrong person, or a duplicate staff then
@@ -931,7 +948,7 @@ task.
 
 - `shopify.classes`: every tagged customer in exactly one class, adding up
   to `tagged_total`: `linked`, `linked_claim_only`, `open_write`,
-  `legacy_not_linked` (only `member-legacy`), `after_cutover_not_linked`
+  `legacy_not_linked` (a legacy tag, no `member-mg`), `after_cutover_not_linked`
   (the live sync's own), the person classes of the table above (no phone,
   malformed phone, no name, no sign-up time, and each customer's latest hold
   from the applied backfill calls), and `gap` (signed up before the
@@ -947,7 +964,10 @@ task.
   are 0 and there is no conflict on either side. Everyone else is on a named
   list.
 - `refs`: keyed customer refs and the code for every customer outside the
-  linked, gap and after-cutover classes (at most 200).
+  linked, gap and after-cutover classes (at most 200). `refs_truncated` is
+  true when more customers than that are listed in those classes: the counts
+  in `shopify.classes` are still whole, but the list is not; work through
+  the listed ones and run `coverage` again.
 
 **The weekly list for a person.** Run `coverage` once a week and give the
 person classes (counts and refs) to the person who fixes them: for a conflict
@@ -1831,3 +1851,15 @@ Closed in fix round 3: the name rule (Q1, r3a) and the SQL login (always
     Customer.createdAt in Singapore (no `membership.start_date` before the
     cutover). For a customer whose account is older than the sign-up, that
     date is earlier than the sign-up.
+12. #155 BF1 G2 LATER 2 (not changed): `coverage` reads the ledger in
+    several statements, not one read transaction. While the 15-minute run
+    writes, a customer can be read in an older class for that moment; the
+    totals still add up. Run it again if a figure looks off.
+13. #155 BF1 G2 LATER 5 (not changed): `member_core_state_root` left unset
+    after the member core goes live is not refused; the output says
+    `"member_core_ledger": "not_configured"`. The procedure treats that as a
+    stop from 17 November.
+14. #155 BF1 G2 LATER 7 (not changed, existing helper): a MemberNo of 3
+    characters or fewer is shown whole by the last-3 mask.
+15. #155 BF1 G2 LATER 8 (not changed): `backfill_registrations_completed_at`
+    is written but read by nothing yet.
