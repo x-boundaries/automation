@@ -505,6 +505,321 @@ def single_read_verdict(result: Mapping[str, Any]) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------
+# Shopify (design 1.3): pinned texts, Admin GraphQL 2026-10
+# --------------------------------------------------------------------------
+
+CUSTOMERS_QUERY = """query XbMemberTagsCustomers($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on Customer { id tags
+    registration: metafield(namespace: "membership", key: "start_date") { id } } }
+}"""
+CARRIERS_QUERY = """query XbMemberTagsCarriers($first: Int!, $after: String, $search: String!) {
+  customers(first: $first, after: $after, query: $search) { nodes { id tags } pageInfo { hasNextPage endCursor } }
+}"""
+TAGS_ADD_MUTATION = """mutation XbMemberTagsAdd($id: ID!, $tags: [String!]!) {
+  tagsAdd(id: $id, tags: $tags) { node { ... on Customer { id tags } } userErrors { field message } }
+}"""
+TAGS_REMOVE_MUTATION = """mutation XbMemberTagsRemove($id: ID!, $tags: [String!]!) {
+  tagsRemove(id: $id, tags: $tags) { node { ... on Customer { id tags } } userErrors { field message } }
+}"""
+READ_QUERIES = frozenset({direct.SESSION_QUERY, CUSTOMERS_QUERY, CARRIERS_QUERY})
+MUTATIONS = {"add": (TAGS_ADD_MUTATION, "tagsAdd"), "remove": (TAGS_REMOVE_MUTATION, "tagsRemove")}
+MUTATION_TEXTS = frozenset(text for text, _field in MUTATIONS.values())
+QUERY_NAMES = {CUSTOMERS_QUERY: "XbMemberTagsCustomers", CARRIERS_QUERY: "XbMemberTagsCarriers"}
+CARRIER_SEARCH = f"tag:'{TAG}'"  # built from the pinned tag only
+# Page sizes. Shopify refuses a query whose requested cost is over 1,000
+# points before it runs (shopify.dev rate limits). On the strict reading used
+# by the member core (an object costs 1, a scalar 0, every selected object is
+# counted once per row of the list or connection above it, a list of IDs has
+# one row per ID):
+#     customers by ID: 100 x (Customer 1 + metafield 1)            = 200
+#     carriers: connection 1 + pageInfo 1 + 100 x (Customer 1)     = 102
+# Both under the 500 the design allows before the nodes page is lowered to 50.
+# Pinned by CostTests; the runbook (section 8) writes the sums out.
+NODES_PAGE = 100
+CARRIER_PAGE = 100
+CUSTOMERS_QUERY_COST = 200
+CARRIERS_QUERY_COST = 102
+MUTATION_COST = 10
+COST_CEILING = 500
+
+# Write answers (design 1.4).
+DONE, REJECTED, NOT_WRITTEN, UNCERTAIN = "DONE", "REJECTED", "NOT_WRITTEN", "UNCERTAIN"
+THROTTLED = "shopify_graphql_throttled"
+BUDGET_CODES = frozenset({"shopify_retry_budget_exhausted", "shopify_query_cost_exceeds_bucket"})
+
+
+@dataclass(frozen=True)
+class CustomerState:
+    """One customer as read by ID: its tags and whether the
+    ``membership.start_date`` metafield exists (its value is never read)."""
+
+    gid: str
+    tags: tuple[str, ...]
+    has_registration: bool
+
+    def __repr__(self) -> str:  # never render customer data
+        return "CustomerState()"
+
+
+def _shape(ok: bool) -> None:
+    if not ok:
+        raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+
+
+def _tags(value: Any) -> tuple[str, ...]:
+    _shape(isinstance(value, list) and all(isinstance(t, str) for t in value))
+    return tuple(value)
+
+
+def customer_state(node: Any, gid: str) -> CustomerState | None:
+    """A ``nodes`` entry for ``gid``: None (customer_not_found) for null or a
+    non-Customer entry (an empty object); a Customer must carry exactly this ID."""
+
+    if node is None or node == {}:
+        return None
+    _shape(isinstance(node, dict) and node.get("id") == gid)
+    registration = node.get("registration")
+    _shape(registration is None or (isinstance(registration, dict) and isinstance(registration.get("id"), str)))
+    return CustomerState(gid, _tags(node.get("tags")), registration is not None)
+
+
+def check_tag_variables(gid: Any, tags: Any) -> None:
+    """The one place a mutation's variables are checked: a customer GID and
+    exactly ``[TAG]`` with the tag in ``ACTIVE_TAGS``."""
+
+    if not isinstance(tags, list) or len(tags) != 1 or not isinstance(tags[0], str) or tags[0] not in ACTIVE_TAGS:
+        raise dl.DirectLocalError("tags_tag_not_allowed")
+    if not isinstance(gid, str) or not _CUSTOMER_GID_RE.fullmatch(gid):
+        raise dl.DirectLocalError("tags_customer_gid_invalid")
+
+
+def whole_points(value: Any) -> int | None:
+    """A query cost as whole points (rounded up); None for anything that is
+    not a plain number from 0 to 1,000,000."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1_000_000:
+        return None
+    return math.ceil(value)
+
+
+class TagsShopifyClient(direct.ShopifyDirectClient):
+    """Admin GraphQL client of the tagging app: three pinned reads and, only
+    when ``mutations_enabled`` (``apply`` with ``tags_write_enabled``), the two
+    pinned tag mutations. A mutation is retried only on a throttled GraphQL
+    answer (not executed), never on a transport failure, timeout or 5xx."""
+
+    def __init__(self, *, mutations_enabled: bool, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.mutations_enabled = bool(mutations_enabled)
+        self.query_costs: dict[str, int | None] = {name: None for name in QUERY_NAMES.values()}
+        self._mutation_errors: list[str] = []
+
+    def __repr__(self) -> str:
+        return "TagsShopifyClient()"
+
+    def _query_allowed(self, query: str) -> bool:
+        return query in READ_QUERIES or (query in MUTATION_TEXTS and self.mutations_enabled)
+
+    def _retry_allowed(self, query: str, error: direct.ShopifyDirectError) -> bool:
+        if query in MUTATION_TEXTS:
+            self._mutation_errors.append(error.code)
+            return error.code == THROTTLED
+        return True
+
+    def _run(self, query: str, variables: Mapping[str, Any]) -> dict[str, Any]:
+        data = self.execute(query, variables)
+        cost = whole_points(self._throttle.requested_cost) if self._throttle is not None else None
+        name = QUERY_NAMES[query]
+        if cost is not None and (self.query_costs[name] is None or cost > self.query_costs[name]):
+            self.query_costs[name] = cost
+        return data
+
+    def verify_session(self, *, store_gid: str) -> str:
+        """Store and domain equal the config; the scope handles are exactly one
+        of the two pinned sets. Returns ``write_only`` or ``read_write``."""
+
+        data = self.execute(direct.SESSION_QUERY, {})
+        if set(data) != {"shop", "currentAppInstallation"} or data.get("shop") != {"id": store_gid, "myshopifyDomain": self.shop_domain}:
+            raise direct.ShopifyDirectError("shopify_store_identity_mismatch")
+        installation = data["currentAppInstallation"]
+        scopes = installation.get("accessScopes") if isinstance(installation, dict) else None
+        if not isinstance(scopes, list) or any(not isinstance(item, dict) or set(item) != {"handle"} or not isinstance(item["handle"], str) for item in scopes):
+            raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+        handles = [item["handle"] for item in scopes]
+        if len(set(handles)) != len(handles) or frozenset(handles) not in SCOPE_SETS:
+            raise direct.ShopifyDirectError("shopify_token_scope_not_expected")
+        return SCOPE_SETS[frozenset(handles)]
+
+    def customers(self, gids: Iterable[str]) -> dict[str, CustomerState | None]:
+        """Each customer by ID (the authoritative tag state), pages of ``NODES_PAGE``."""
+
+        wanted = sorted(set(gids), key=customer_number)
+        found: dict[str, CustomerState | None] = {}
+        for start in range(0, len(wanted), NODES_PAGE):
+            page = wanted[start:start + NODES_PAGE]
+            nodes = self._run(CUSTOMERS_QUERY, {"ids": page}).get("nodes")
+            _shape(isinstance(nodes, list) and len(nodes) == len(page))
+            for gid, node in zip(page, nodes):
+                found[gid] = customer_state(node, gid)
+        return found
+
+    def carriers(self, max_pages: int) -> tuple[set[str], bool]:
+        """Customers the search index lists as carrying the tag: a candidate
+        list only (each is then read by ID). ``complete`` is false at the cap."""
+
+        gids: set[str] = set()
+        after = None
+        for _ in range(max_pages):
+            page = self._run(CARRIERS_QUERY, {"first": CARRIER_PAGE, "after": after, "search": CARRIER_SEARCH}).get("customers")
+            _shape(isinstance(page, dict) and isinstance(page.get("nodes"), list) and isinstance(page.get("pageInfo"), dict))
+            for node in page["nodes"]:
+                _shape(isinstance(node, dict) and isinstance(node.get("id"), str) and bool(_CUSTOMER_GID_RE.fullmatch(node["id"])))
+                _tags(node.get("tags"))
+                gids.add(node["id"])
+            if page["pageInfo"].get("hasNextPage") is False:
+                return gids, True
+            after = page["pageInfo"].get("endCursor")
+            _shape(isinstance(after, str) and bool(after))
+        return gids, False
+
+    def set_tag(self, op: str, gid: str, tags: Any) -> tuple[str, str | None]:
+        """One tag mutation; ``(state, code)`` as design 1.4. Refusals (a tag
+        or ID not allowed, mutations off) raise before any HTTP call."""
+
+        check_tag_variables(gid, tags)
+        if op not in MUTATIONS:
+            raise dl.DirectLocalError("tags_operation_not_offered")
+        query, payload_field = MUTATIONS[op]
+        if not self._query_allowed(query):
+            raise direct.ShopifyDirectError("shopify_query_not_pinned")
+        sent_before = self.stats.requests
+        self._mutation_errors = []
+        try:
+            data = self.execute(query, {"id": gid, "tags": [tags[0]]})
+        except direct.ShopifyDirectError as exc:
+            if self.stats.requests == sent_before:
+                return NOT_WRITTEN, exc.code  # never sent
+            if exc.code in BUDGET_CODES and self._mutation_errors and all(code == THROTTLED for code in self._mutation_errors):
+                return NOT_WRITTEN, "shopify_retry_budget_exhausted"  # every answer said: not executed
+            return UNCERTAIN, exc.code
+        payload = data.get(payload_field)
+        if set(data) != {payload_field} or not isinstance(payload, dict) or not isinstance(payload.get("userErrors"), list):
+            return UNCERTAIN, "tag_response_unproven"
+        if payload["userErrors"]:
+            return REJECTED, "shopify_user_error"  # no message is stored or printed
+        node = payload.get("node")
+        if not isinstance(node, dict) or node.get("id") != gid or not isinstance(node.get("tags"), list):
+            return UNCERTAIN, "tag_response_unproven"
+        present = tags[0] in node["tags"]
+        if present != (op == "add"):
+            return UNCERTAIN, "tag_response_unproven"
+        return DONE, None
+
+
+class TagsTokenCache(direct.TokenCache):
+    """The #155 DPAPI token cache, checking this app's two scope sets."""
+
+    def load(self, now: datetime) -> tuple[str, datetime] | None:
+        try:
+            if not self.path.exists():
+                return None
+            raw = self.path.read_bytes()
+        except OSError:
+            self.note = "token_cache_unreadable"
+            return None
+        try:
+            if len(raw) > direct.TOKEN_CACHE_MAX_BYTES:
+                raise direct.ShopifyDirectError("token_cache_unreadable")
+            value = json.loads(self.protector.unprotect(raw, self._entropy).decode("utf-8"))
+            if not isinstance(value, dict) or set(value) != {"schema", "shop_domain", "expires_at", "scope", "access_token"}:
+                raise direct.ShopifyDirectError("token_cache_unreadable")
+            if value["schema"] != direct.TOKEN_CACHE_SCHEMA or value["shop_domain"] != self.shop_domain:
+                raise direct.ShopifyDirectError("token_cache_unreadable")
+            expires_at = dl.parse_created_at(value["expires_at"])
+            token = direct._secret(value["access_token"], "token_cache_unreadable")
+            if direct._scopes(value["scope"]) not in SCOPE_SETS or expires_at is None:
+                raise direct.ShopifyDirectError("token_cache_unreadable")
+        except (direct.ShopifyDirectError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            self.note = "token_cache_unreadable"
+            self.clear()
+            return None
+        if now >= expires_at - timedelta(seconds=direct.TOKEN_REFRESH_MARGIN_SECONDS):
+            self.note = "token_cache_expired"
+            self.clear()
+            return None
+        return token, expires_at
+
+
+class TagsTokenProvider(direct.ClientCredentialsTokenProvider):
+    """The #155 client-credentials grant, for this app's two scope sets."""
+
+    def __init__(self, shop_domain: str, client_id: Any, client_secret: Any, **kwargs: Any):
+        protector = kwargs.pop("cache_protector", None)
+        path = kwargs.pop("cache_path", None)
+        super().__init__(shop_domain, client_id, client_secret, **kwargs)
+        self.cache = None if protector is None else TagsTokenCache(path, protector, shop_domain=shop_domain, client_id=self._client_id)
+
+    def __repr__(self) -> str:
+        return "TagsTokenProvider()"
+
+    def token(self) -> str:
+        now = self._clock()
+        if self._token is not None and self._expires_at is not None and now < self._expires_at - timedelta(seconds=direct.TOKEN_REFRESH_MARGIN_SECONDS):
+            return self._token
+        self._token = self._expires_at = None
+        cached = self.cache.load(now) if self.cache is not None else None
+        if cached is not None:
+            self._token, self._expires_at = cached
+            self.cache_hits += 1
+            return self._token
+        import urllib.parse
+
+        body = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": self._client_id, "client_secret": self._client_secret}).encode("ascii")
+        self.requests += 1
+        response = self._transport(self._url, body, {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, self._timeout)
+        if response.status in (400, 401, 403):
+            raise direct.ShopifyDirectError("shopify_client_credentials_rejected")
+        if response.status != 200:
+            error = direct.http_error(response)
+            raise direct.ShopifyDirectError("shopify_token_request_failed", retryable=error.retryable, retry_after_seconds=error.retry_after_seconds)
+        try:
+            value = json.loads(response.body.decode("utf-8")) if len(response.body) <= 65_536 else None
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            value = None
+        if not isinstance(value, dict):
+            raise direct.ShopifyDirectError("shopify_token_response_invalid")
+        token = direct._secret(value.get("access_token"), "shopify_token_response_invalid")
+        expires_in = value.get("expires_in")
+        if isinstance(expires_in, bool) or not isinstance(expires_in, int) or not direct.TOKEN_MIN_LIFETIME_SECONDS <= expires_in <= direct.TOKEN_MAX_LIFETIME_SECONDS:
+            raise direct.ShopifyDirectError("shopify_token_response_invalid")
+        scopes = direct._scopes(value.get("scope"))
+        if scopes not in SCOPE_SETS:
+            raise direct.ShopifyDirectError("shopify_token_scope_not_expected")
+        self._token, self._expires_at = token, now + timedelta(seconds=expires_in)
+        if self.cache is not None:
+            self.cache.save(token, self._expires_at, scopes)
+        return token
+
+
+def token_provider(connection: sync.ShopifyConnection, environ: Mapping[str, str], transport: Any, clock: Callable[[], datetime], *,
+                   root: Path, protector: Any = None) -> Any:
+    """As the #155 sync: app values from the named environment variables of
+    the task account, the access token reused through a DPAPI cache (its own
+    file in this tool's state root)."""
+
+    if connection.auth_method == "admin_api_access_token":
+        return direct.StaticTokenProvider(environ.get(connection.auth_env["token_env"]))
+    cache_protector = None
+    if connection.token_cache == "dpapi_current_user":
+        cache_protector = protector if protector is not None else direct.DpapiProtector()
+    return TagsTokenProvider(
+        connection.shop_domain, environ.get(connection.auth_env["client_id_env"]), environ.get(connection.auth_env["client_secret_env"]),
+        transport=transport, clock=clock, timeout=connection.http_timeout_seconds, cache_protector=cache_protector,
+        cache_path=root / TOKEN_CACHE_FILE,
+    )
+
+
+# --------------------------------------------------------------------------
 # Own ledger (append-only, as the member core's)
 # --------------------------------------------------------------------------
 

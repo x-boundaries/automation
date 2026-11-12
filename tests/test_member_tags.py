@@ -831,6 +831,335 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(mt.single_read_verdict({"found": True, "member_type": "VIP"}), ("off", "member_not_member"))
 
 
+# --------------------------------------------------------------------------
+# Shopify client (design 1.3, 1.4 answers, 1.5 tag set)
+# --------------------------------------------------------------------------
+
+class FakeTransport:
+    """``responses``: ``(status, value)`` pairs, or an exception to raise."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.bodies: list[dict] = []
+
+    def __call__(self, url, body, headers, timeout):
+        self.bodies.append(json.loads(body.decode("utf-8")) if url.endswith("graphql.json") else {"token": True})
+        item = self.responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        status, value = item
+        return direct.HttpResponse(status, {}, json.dumps(value).encode("utf-8"))
+
+
+def session(scopes, store=STORE_GID, shop=SHOP):
+    return 200, {"data": {"shop": {"id": store, "myshopifyDomain": shop},
+                          "currentAppInstallation": {"accessScopes": [{"handle": s} for s in scopes]}}}
+
+
+def cost(requested, available=1990.0):
+    return {"cost": {"requestedQueryCost": requested, "actualQueryCost": 4,
+                     "throttleStatus": {"maximumAvailable": 2000.0, "currentlyAvailable": available, "restoreRate": 100.0}}}
+
+
+def node(n, tags=(), registration=True):
+    return {"id": customer_gid(n), "tags": list(tags), "registration": {"id": f"gid://shopify/Metafield/{n}"} if registration else None}
+
+
+def nodes_answer(nodes, requested=None):
+    value = {"data": {"nodes": list(nodes)}}
+    if requested is not None:
+        value["extensions"] = cost(requested)
+    return 200, value
+
+
+def mutation_answer(field, n, tags, errors=()):
+    return 200, {"data": {field: {"node": {"id": customer_gid(n), "tags": list(tags)}, "userErrors": list(errors)}}}
+
+
+THROTTLED_ANSWER = (200, {"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
+                          "extensions": cost(10, available=0.0)})
+FORBIDDEN_TAGS = [["member"], ["member-mg"], ["member-legacy"], ["ac2-member"], ["ac2-backfill"], ["shopify-forms-1178308"], ["newsletter"],
+                  ["prospect"], ["Member-Qualified"], ["member-qualified "], ["member-qualified,member"], [TAG, "member"], ["member-bday-month"],
+                  [], TAG, (TAG,), [None], [1]]
+
+
+class ShopifyClientTests(unittest.TestCase):
+    def client(self, responses, *, mutations=True) -> tuple[mt.TagsShopifyClient, FakeTransport]:
+        transport = FakeTransport(responses)
+        client = mt.TagsShopifyClient(mutations_enabled=mutations, shop_domain=SHOP, api_version="2026-10",
+                                      token_provider=direct.StaticTokenProvider("t" * 32), transport=transport, sleep=lambda s: None)
+        return client, transport
+
+    def code(self, call) -> str:
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            call()
+        return caught.exception.code
+
+    def test_the_allowlist_is_exactly_the_five_texts(self):
+        self.assertEqual(mt.READ_QUERIES | mt.MUTATION_TEXTS,
+                         {direct.SESSION_QUERY, mt.CUSTOMERS_QUERY, mt.CARRIERS_QUERY, mt.TAGS_ADD_MUTATION, mt.TAGS_REMOVE_MUTATION})
+        on, _ = self.client([], mutations=True)
+        off, _ = self.client([], mutations=False)
+        for text in mt.READ_QUERIES:
+            self.assertTrue(on._query_allowed(text) and off._query_allowed(text))
+        for text in mt.MUTATION_TEXTS:
+            self.assertTrue(on._query_allowed(text))
+            self.assertFalse(off._query_allowed(text))
+        for other in (sync.CUSTOMER_CREATE_MUTATION, bm.CUSTOMER_QUERY, mt.TAGS_ADD_MUTATION + " ", ""):
+            self.assertFalse(on._query_allowed(other))
+
+    def test_static_exactly_two_mutation_texts_and_no_other_write(self):
+        import ast
+        source = (ROOT / "directlocal" / "xb_member_tags.py").read_text(encoding="utf-8")
+        texts = [n.value for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        mutations = [t for t in texts if t.lstrip().startswith("mutation")]
+        self.assertEqual(mutations, [mt.TAGS_ADD_MUTATION, mt.TAGS_REMOVE_MUTATION])
+        for word in ("customerCreate", "customerUpdate", "customerDelete", "metafieldsSet", "metafieldDelete", "customerSet",
+                     "tagsAdd(id: $id, tags: $tags) { node { ... on Order"):
+            self.assertNotIn(word, source)
+        self.assertEqual(source.count("tagsAdd("), 1)
+        self.assertEqual(source.count("tagsRemove("), 1)
+
+    def test_mutations_refused_before_http_when_off(self):
+        client, transport = self.client([], mutations=False)
+        for op in ("add", "remove"):
+            self.assertEqual(self.code(lambda: client.set_tag(op, customer_gid(1), [TAG])), "shopify_query_not_pinned")
+        self.assertEqual(transport.bodies, [])
+
+    def test_every_forbidden_tag_and_bad_id_is_refused_before_http(self):
+        client, transport = self.client([])
+        for tags in FORBIDDEN_TAGS:
+            for op in ("add", "remove"):
+                with self.subTest(tags=tags, op=op):
+                    self.assertEqual(self.code(lambda: client.set_tag(op, customer_gid(1), tags)), "tags_tag_not_allowed")
+        for gid in ("gid://shopify/Order/1", "gid://shopify/Customer/0", customer_gid(1) + " ", None):
+            self.assertEqual(self.code(lambda: client.set_tag("add", gid, [TAG])), "tags_customer_gid_invalid")
+        self.assertEqual(self.code(lambda: client.set_tag("replace", customer_gid(1), [TAG])), "tags_operation_not_offered")
+        self.assertEqual(transport.bodies, [])
+
+    def test_scope_sets(self):
+        for scopes, name in ((["write_customers"], "write_only"), (["read_customers", "write_customers"], "read_write"),
+                             (["write_customers", "read_customers"], "read_write")):
+            client, _ = self.client([session(scopes)])
+            self.assertEqual(client.verify_session(store_gid=STORE_GID), name)
+        for scopes in ([], ["read_customers"], ["write_customers", "read_orders"], ["read_customers", "write_customers", "write_orders"],
+                       ["write_customers", "write_customers"], ["read_customers", "read_orders"], ["write_customers", "read_customers", "read_customers"]):
+            with self.subTest(scopes=scopes):
+                client, _ = self.client([session(scopes)])
+                self.assertEqual(self.code(lambda: client.verify_session(store_gid=STORE_GID)), "shopify_token_scope_not_expected")
+        client, _ = self.client([session(["write_customers"], store="gid://shopify/Shop/2")])
+        self.assertEqual(self.code(lambda: client.verify_session(store_gid=STORE_GID)), "shopify_store_identity_mismatch")
+
+    def test_token_response_and_cache_scope_sets(self):
+        class Protector:
+            def protect(self, data, entropy):
+                return b"P" + data
+
+            def unprotect(self, blob, entropy):
+                return blob[1:]
+
+        temp = Path(tempfile.mkdtemp(prefix="xb-tags-token-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+
+        def provider(scope, cache=None):
+            transport = FakeTransport([(200, {"access_token": "a" * 32, "expires_in": 3600, "scope": scope})])
+            return mt.TagsTokenProvider(SHOP, "c" * 20, "s" * 20, transport=transport, clock=lambda: NOW, cache_protector=cache,
+                                        cache_path=temp / mt.TOKEN_CACHE_FILE), transport
+        for scope in ("write_customers", "read_customers,write_customers"):
+            self.assertEqual(provider(scope)[0].token(), "a" * 32)
+        for scope in ("read_customers", "write_customers,read_orders", "read_customers,write_customers,write_orders"):
+            with self.subTest(scope=scope):
+                self.assertEqual(self.code(lambda: provider(scope)[0].token()), "shopify_token_scope_not_expected")
+        # The cache: a token with a pinned set is reused; one with any other set is discarded.
+        first, _ = provider("write_customers", Protector())
+        first.token()
+        again, transport = provider("write_customers", Protector())
+        again.token()
+        self.assertEqual((again.cache_hits, transport.bodies), (1, []))
+        cache = mt.TagsTokenCache(temp / mt.TOKEN_CACHE_FILE, Protector(), shop_domain=SHOP, client_id="c" * 20)
+        cache.save("b" * 32, NOW + timedelta(hours=1), frozenset({"write_customers", "read_orders"}))
+        self.assertIsNone(cache.load(NOW))
+        self.assertEqual(cache.note, "token_cache_unreadable")
+        self.assertFalse((temp / mt.TOKEN_CACHE_FILE).exists())
+
+    def test_customers_by_id(self):
+        client, transport = self.client([nodes_answer([node(1, [TAG, "member-mg"]), None, {}, node(4, registration=False)], requested=200)])
+        found = client.customers([customer_gid(4), customer_gid(1), customer_gid(2), customer_gid(3), customer_gid(1)])
+        self.assertEqual(transport.bodies[0]["variables"], {"ids": [customer_gid(1), customer_gid(2), customer_gid(3), customer_gid(4)]})
+        self.assertEqual((found[customer_gid(1)].tags, found[customer_gid(1)].has_registration), ((TAG, "member-mg"), True))
+        self.assertIsNone(found[customer_gid(2)])
+        self.assertIsNone(found[customer_gid(3)])
+        self.assertFalse(found[customer_gid(4)].has_registration)
+        self.assertEqual(client.query_costs, {"XbMemberTagsCustomers": 200, "XbMemberTagsCarriers": None})
+        for bad in ([node(2)], [node(1), node(2)][:1] * 2, [{"id": customer_gid(1), "tags": "x"}], [{"id": customer_gid(1), "tags": [], "registration": "x"}]):
+            client, _ = self.client([nodes_answer(bad if len(bad) == 1 else bad)])
+            with self.subTest(bad=bad):
+                self.assertEqual(self.code(lambda: client.customers([customer_gid(1)] if len(bad) == 1 else [customer_gid(1), customer_gid(2)])),
+                                 "shopify_response_shape_invalid")
+
+    def test_customers_are_read_in_pages_of_the_nodes_page(self):
+        gids = [customer_gid(n) for n in range(1, mt.NODES_PAGE + 2)]
+        client, transport = self.client([nodes_answer([node(n) for n in range(1, mt.NODES_PAGE + 1)]), nodes_answer([node(mt.NODES_PAGE + 1)])])
+        self.assertEqual(len(client.customers(gids)), mt.NODES_PAGE + 1)
+        self.assertEqual([len(b["variables"]["ids"]) for b in transport.bodies], [mt.NODES_PAGE, 1])
+
+    def test_carriers_search_and_cap(self):
+        page = lambda ns, more: (200, {"data": {"customers": {"nodes": [{"id": customer_gid(n), "tags": [TAG]} for n in ns],  # noqa: E731
+                                                              "pageInfo": {"hasNextPage": more is not None, "endCursor": more}}},
+                                       "extensions": cost(102)})
+        client, transport = self.client([page([1, 2], "c1"), page([3], None)])
+        self.assertEqual(client.carriers(5), ({customer_gid(1), customer_gid(2), customer_gid(3)}, True))
+        self.assertEqual(transport.bodies[0]["variables"], {"first": 100, "after": None, "search": "tag:'member-qualified'"})
+        self.assertEqual(transport.bodies[1]["variables"]["after"], "c1")
+        self.assertEqual(client.query_costs["XbMemberTagsCarriers"], 102)
+        client, _ = self.client([page([1], "c1"), page([2], "c2")])
+        self.assertEqual(client.carriers(2), ({customer_gid(1), customer_gid(2)}, False))
+
+    def test_answer_classes(self):
+        cases = [
+            ("add", [mutation_answer("tagsAdd", 1, ["x", TAG])], ("DONE", None), 1),
+            ("remove", [mutation_answer("tagsRemove", 1, ["x"])], ("DONE", None), 1),
+            ("add", [mutation_answer("tagsAdd", 1, [TAG], errors=[{"field": ["tags"], "message": "fake"}])], ("REJECTED", "shopify_user_error"), 1),
+            ("add", [mutation_answer("tagsAdd", 1, ["x"])], ("UNCERTAIN", "tag_response_unproven"), 1),
+            ("remove", [mutation_answer("tagsRemove", 1, [TAG])], ("UNCERTAIN", "tag_response_unproven"), 1),
+            ("add", [mutation_answer("tagsAdd", 2, [TAG])], ("UNCERTAIN", "tag_response_unproven"), 1),
+            ("add", [(200, {"data": {"tagsAdd": {"node": None, "userErrors": []}}})], ("UNCERTAIN", "tag_response_unproven"), 1),
+            ("add", [(200, {"data": {"tagsAdd": {"userErrors": []}}})], ("UNCERTAIN", "tag_response_unproven"), 1),
+            ("add", [(200, {"data": {"tagsRemove": {"node": None, "userErrors": []}}})], ("UNCERTAIN", "tag_response_unproven"), 1),
+            ("add", [(503, {})], ("UNCERTAIN", "shopify_http_server_error"), 1),
+            ("add", [(500, {})], ("UNCERTAIN", "shopify_http_server_error"), 1),
+            ("add", [(429, {})], ("UNCERTAIN", "shopify_http_throttled"), 1),
+            ("add", [direct.ShopifyDirectError("shopify_transport_failed", retryable=True)], ("UNCERTAIN", "shopify_transport_failed"), 1),
+            ("add", [TimeoutError("timed out")], None, 1),
+            ("add", [(200, {"errors": [{"message": "x"}]})], ("UNCERTAIN", "shopify_graphql_error"), 1),
+            ("add", [THROTTLED_ANSWER, mutation_answer("tagsAdd", 1, [TAG])], ("DONE", None), 2),
+            ("add", [THROTTLED_ANSWER] * 4, ("NOT_WRITTEN", "shopify_retry_budget_exhausted"), 4),
+            ("add", [THROTTLED_ANSWER, (503, {})], ("UNCERTAIN", "shopify_http_server_error"), 2),
+        ]
+        for op, responses, expected, requests in cases:
+            with self.subTest(op=op, responses=responses):
+                client, transport = self.client(list(responses))
+                if expected is None:  # a raw transport exception is not a ShopifyDirectError: never swallowed
+                    with self.assertRaises(TimeoutError):
+                        client.set_tag(op, customer_gid(1), [TAG])
+                else:
+                    self.assertEqual(client.set_tag(op, customer_gid(1), [TAG]), expected)
+                self.assertEqual(len(transport.bodies), requests)
+                self.assertEqual(transport.bodies[0]["variables"], {"id": customer_gid(1), "tags": [TAG]})
+
+    def test_a_token_failure_before_sending_is_not_written(self):
+        class Failing:
+            def token(self):
+                raise direct.ShopifyDirectError("shopify_token_request_failed")
+
+            def invalidate(self):
+                return False
+        transport = FakeTransport([])
+        client = mt.TagsShopifyClient(mutations_enabled=True, shop_domain=SHOP, api_version="2026-10", token_provider=Failing(),
+                                      transport=transport, sleep=lambda s: None)
+        self.assertEqual(client.set_tag("add", customer_gid(1), [TAG]), ("NOT_WRITTEN", "shopify_token_request_failed"))
+        self.assertEqual(transport.bodies, [])
+
+    def test_reads_retry_on_a_server_error(self):
+        client, transport = self.client([(503, {}), nodes_answer([node(1)])])
+        self.assertEqual(set(client.customers([customer_gid(1)])), {customer_gid(1)})
+        self.assertEqual(len(transport.bodies), 2)
+
+
+# --------------------------------------------------------------------------
+# The calculated requested cost (design 1.3, shopify.dev rate limits)
+# --------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"\.\.\.\s*on\s+[A-Za-z_]+|\(([^()]*)\)|([{}])|([A-Za-z_][A-Za-z0-9_]*)(:?)")
+
+
+def selection(query: str) -> list:
+    """The fields of one operation as ``(name, arguments, children)``; an
+    inline fragment (``... on Customer``) is transparent; an alias names its field."""
+
+    body = query[query.index("{"):]
+    assert not _TOKEN_RE.sub("", body).strip(), "query text this parser does not read"
+    tokens = [m.groups() for m in _TOKEN_RE.finditer(body) if not m.group(0).startswith("...")]
+    position = 1
+
+    def fields() -> list:
+        nonlocal position
+        found = []
+        while position < len(tokens):
+            arguments, brace, name, alias = tokens[position]
+            position += 1
+            if brace == "}":
+                return found
+            if brace == "{":  # the fragment's own selection: merge it in
+                found += fields()
+                continue
+            if alias:
+                continue
+            arguments = ""
+            if position < len(tokens) and tokens[position][0] is not None:
+                arguments = tokens[position][0]
+                position += 1
+            children = None
+            if position < len(tokens) and tokens[position][1] == "{":
+                position += 1
+                children = fields()
+            found.append((name, arguments, children))
+        raise AssertionError("a selection was not closed")
+
+    top = fields()
+    assert position == len(tokens)
+    return top
+
+
+def strict_cost(fields: list, sizes: dict) -> int:
+    """The member core's strict reading: a scalar 0, an object 1, every
+    selected object counted once per row of the list or connection above it;
+    a connection is 1 + its other selections + ``first`` rows; a list of IDs
+    has one row per ID (``sizes``: argument -> rows)."""
+
+    total = 0
+    for name, arguments, children in fields:
+        if children is None:
+            continue
+        rows = None
+        for argument, size in sizes.items():
+            if re.search(rf"\b{argument}: \$", arguments):
+                rows = size
+        inner = [child for child in children if child[0] == "nodes"]
+        if rows is not None and inner:
+            ((_, _, row),) = inner
+            total += 1 + strict_cost([c for c in children if c[0] != "nodes"], sizes) + rows * (1 + strict_cost(row, sizes))
+        elif rows is not None:
+            total += rows * strict_cost(children, sizes) + rows  # each listed node is an object
+        else:
+            total += 1 + strict_cost(children, sizes)
+    return total
+
+
+class CostTests(unittest.TestCase):
+    def test_the_page_sizes_and_the_strict_cost_of_both_queries_are_pinned(self):
+        self.assertEqual((mt.NODES_PAGE, mt.CARRIER_PAGE), (100, 100))
+        customers = strict_cost(selection(mt.CUSTOMERS_QUERY), {"ids": mt.NODES_PAGE})
+        carriers = strict_cost(selection(mt.CARRIERS_QUERY), {"first": mt.CARRIER_PAGE})
+        self.assertEqual((customers, carriers), (200, 102))
+        self.assertEqual((mt.CUSTOMERS_QUERY_COST, mt.CARRIERS_QUERY_COST), (customers, carriers))
+        self.assertLessEqual(max(customers, carriers), mt.COST_CEILING)
+        self.assertEqual(mt.MUTATION_COST, 10)
+        # 100 IDs is also under Shopify's array input limit of 250.
+        self.assertLessEqual(mt.NODES_PAGE, 250)
+
+    def test_the_parser_reads_the_pinned_texts(self):
+        self.assertEqual(selection(mt.CUSTOMERS_QUERY),
+                         [("nodes", "ids: $ids", [("id", "", None), ("tags", "", None),
+                                                  ("metafield", 'namespace: "membership", key: "start_date"', [("id", "", None)])])])
+        self.assertEqual([f[0] for f in selection(mt.CARRIERS_QUERY)[0][2]], ["nodes", "pageInfo"])
+
+    def test_whole_points(self):
+        self.assertEqual([mt.whole_points(v) for v in (0, 1.2, 200, 1_000_000)], [0, 2, 200, 1_000_000])
+        for bad in (None, True, "200", -1, 1_000_001, float("nan")):
+            self.assertIsNone(mt.whole_points(bad))
+
+
 class LedgerCliTests(Base):
     def run_main(self, *args, **overrides) -> int:
         with private_root_allowed(self.temp / "elsewhere"):
