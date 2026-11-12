@@ -1005,6 +1005,354 @@ class TagsLedger:
 
 
 # --------------------------------------------------------------------------
+# Engine (design 1.4 to 1.7, 1.10)
+# --------------------------------------------------------------------------
+
+MAX_REFS = 200
+FLAP_WINDOW = timedelta(hours=24)
+FLAP_DONE_ADDS = 2
+
+
+@dataclass
+class RunSummary:
+    command: str
+    counts: dict[str, int] = field(default_factory=dict)
+    alerts: list[str] = field(default_factory=list)
+    refs: list[dict[str, str]] = field(default_factory=list)
+    stopped: str | None = None
+
+    def count(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
+        self.counts[code] = self.counts.get(code, 0) + 1
+        if ref is not None:
+            self.add_ref(code, ref, member_no)
+
+    def add_ref(self, code: str, ref: str, member_no: str | None = None) -> None:
+        if len(self.refs) < MAX_REFS:
+            entry = {"ref": ref, "code": code}
+            if member_no:
+                entry["member_no_masked"] = mask(member_no)
+            self.refs.append(entry)
+
+    def alert(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
+        """A run-level alert: counted, listed, every run it happens."""
+
+        self.count(code, ref, member_no)
+        if code not in self.alerts:
+            self.alerts.append(code)
+
+    def flag(self, code: str) -> None:
+        if code not in self.alerts:
+            self.alerts.append(code)
+
+
+@dataclass(frozen=True)
+class PlannedWrite:
+    gid: str
+    op: str  # add or remove
+    reason: str
+    member_no: str | None
+    basis: str | None  # sync155, claim or voided
+
+
+class TagsEngine:
+    """One bounded run. ``shopify`` provides ``verify_session``, ``customers``,
+    ``carriers`` and ``set_tag``; ``ac2`` provides ``scan`` and ``member``;
+    ``inputs`` returns ``(sync_links, active_claims, voided_pairs)``."""
+
+    def __init__(self, config: TagsConfig, ledger: TagsLedger, *, shopify: Any, ac2: Any,
+                 inputs: Callable[[], tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]] | None = None):
+        self.config = config
+        self.ledger = ledger
+        self.shopify = shopify
+        self.ac2 = ac2
+        self._inputs = inputs or (lambda: (read_sync_links(config), *read_member_core(config)))
+        self.reads = 0
+
+    def now(self) -> datetime:
+        return self.ledger.now()
+
+    def _stop_requested(self) -> bool:
+        return (self.ledger.root / STOP_FILE).exists()
+
+    def _alert_once(self, summary: RunSummary, code: str, ref: str, member_no: str | None = None) -> None:
+        """Counted every run; raised as an alert (with its ref) only the first
+        time for this subject (design 1.6: alert once per subject)."""
+
+        summary.count(code)
+        if self.ledger.review_once(f"{code}:{ref}", code):
+            summary.flag(code)
+            summary.add_ref(code, ref, member_no)
+
+    # -- the run ----------------------------------------------------------
+    def run(self, *, apply: bool) -> dict[str, Any]:
+        command = "apply" if apply else "observe"
+        if apply and not self.config.tags_write_enabled:
+            raise dl.DirectLocalError("tags_write_disabled")
+        self.ledger.check_binding(self.config)
+        # Local inputs first (each refusal records nothing and needs no HTTP call).
+        sync_links, claims, voided = self._inputs()
+        links = build_links(sync_links, claims, voided)
+        scope_set = self.shopify.verify_session(store_gid=self.config.shopify.store_gid)
+        open_rows = self.ledger.open_writes()
+        settle_reads: dict[str, CustomerState | None] | None = {}
+        if open_rows:
+            try:
+                settle_reads = self.shopify.customers({row["customer_gid"] for row in open_rows})
+            except dl.DirectLocalError:
+                if apply:
+                    raise dl.DirectLocalError("tags_uncertain_unresolved") from None
+                settle_reads = None  # observe goes on; those customers are left alone (row 16)
+        run_id = self.ledger.start_run(command)
+        summary = RunSummary(command)
+        states: dict[str, CustomerState | None] = {}
+        carriers_total: int | None = None
+        try:
+            unresolved = self._settle(open_rows, settle_reads, summary)
+            facts = scan_members(self.ac2)
+            today = sg_today(self.now())
+            wanted = set(links.basis) | set(links.conflicts) | links.voided | {row["customer_gid"] for row in open_rows}
+            states = self.shopify.customers(wanted)
+            carriers, complete = self.shopify.carriers(self.config.shopify_max_carrier_pages)
+            if complete:
+                carriers_total = len(carriers)
+            else:
+                summary.alert("tag_search_incomplete")
+            extra = carriers - set(states)
+            if extra:
+                states.update(self.shopify.customers(extra))
+            plans = []
+            for gid in sorted(set(states), key=customer_number):
+                plan = self._decide(gid, links, states.get(gid), facts, today, unresolved, summary)
+                if plan is not None:
+                    plans.append(plan)
+            self._write(plans, states, summary, run_id=run_id, apply=apply)
+        except dl.DirectLocalError as exc:
+            summary.stopped = exc.code
+            summary.alert(exc.code)
+        tagged_now = sum(1 for gid in set(links.basis) | set(links.conflicts) if states.get(gid) is not None and TAG in states[gid].tags)
+        costs = dict(getattr(self.shopify, "query_costs", {}) or {})
+        result = {"status": "ok", "command": command, "run_id": run_id, "counts": dict(sorted(summary.counts.items())),
+                  "alerts": list(summary.alerts), "refs": list(summary.refs), "stopped": summary.stopped, "scope_set": scope_set,
+                  "query_costs": {name: costs.get(name) for name in QUERY_NAMES.values()}, "tagged_now": tagged_now,
+                  "carriers_total": carriers_total}
+        self.ledger.finish_run(run_id, result)
+        return result
+
+    def _settle(self, open_rows: list[sqlite3.Row], reads: dict[str, CustomerState | None] | None, summary: RunSummary) -> set[str]:
+        """Design 1.4: every INTENT or UNCERTAIN row is settled by this run's
+        by-ID read before planning. Returns the customers left unresolved."""
+
+        if reads is None:
+            return {row["customer_gid"] for row in open_rows}
+        for row in open_rows:
+            state = reads.get(row["customer_gid"])
+            if state is None:
+                self.ledger.set_outcome(row["write_id"], NOT_WRITTEN, "customer_not_found")
+                summary.count("write_settled_not_found")
+            elif (row["tag"] in state.tags) == (row["op"] == "add"):
+                self.ledger.set_outcome(row["write_id"], DONE, "resolved_by_read")
+                summary.count("write_settled_done")
+            else:
+                self.ledger.set_outcome(row["write_id"], NOT_WRITTEN, "resolved_by_read")
+                summary.count("write_settled_not_written")
+        return set()
+
+    def _single_read(self, member_no: str) -> tuple[str, str]:
+        if self.reads >= self.config.max_member_reads_per_run:
+            return LEAVE, "member_reads_capped"
+        self.reads += 1
+        return single_read_verdict(self.ac2.member(member_no, secrets.token_hex(16)))
+
+    def _decide(self, gid: str, links: LinkSet, state: CustomerState | None, facts: Mapping[str, list[tuple[str, dict[str, Any]]]],
+                today: date, unresolved: set[str], summary: RunSummary) -> PlannedWrite | None:
+        """Design 1.6, one customer. Returns the write it needs, or None."""
+
+        ref = self.ledger.ref("c", gid)
+        if gid in unresolved:  # row 16
+            self._alert_once(summary, "write_unresolved", ref)
+            return None
+        if gid in links.conflicts:  # row 1
+            self._alert_once(summary, links.conflicts[gid], ref)
+            return None
+        if state is None:  # row 2
+            self._alert_once(summary, "customer_not_found", ref)
+            return None
+        if any(tag != TAG and tag.strip().casefold() == TAG for tag in state.tags):  # row 3
+            self._alert_once(summary, "tag_case_variant", ref)
+            return None
+        tagged = TAG in state.tags
+        if gid in links.basis:
+            member_no, basis = links.basis[gid]
+            verdict = member_verdict(facts.get(sync.member_no_key(member_no), []), today)
+            if verdict is None:  # rows 11 to 11c
+                verdict = self._single_read(member_no)
+                if verdict[1] == "member_reads_capped":
+                    summary.alert("member_reads_capped")
+                    return None
+            desired, code = verdict
+            if desired == LEAVE:  # rows 9, 10, 11a, 11b, 12
+                self._alert_once(summary, code, ref, member_no)
+                return None
+            if desired == ON:  # row 4
+                if tagged:
+                    summary.count("kept_tagged")
+                    return None
+                if any(tag.strip().casefold() == REGISTRATION_TAG for tag in state.tags) and not state.has_registration:  # row 5
+                    self._alert_once(summary, "flow_dates_guard", ref, member_no)
+                    return None
+                if self.ledger.done_adds_since(gid, self.now() - FLAP_WINDOW) >= FLAP_DONE_ADDS:
+                    self._alert_once(summary, "tag_keeps_disappearing", ref, member_no)
+                    return None
+                return PlannedWrite(gid, "add", code, member_no, basis)
+            if not tagged:  # rows 6, 7, 8, 11 with no tag: row 15
+                summary.count("no_change_untagged")
+                return None
+            return PlannedWrite(gid, "remove", code, member_no, basis)
+        if not tagged:
+            summary.count("no_change_untagged")
+            return None
+        if gid in links.voided:  # row 13
+            return PlannedWrite(gid, "remove", "link_voided", None, "voided")
+        self._alert_once(summary, "tag_without_basis", ref)  # row 14 (removal only with the C2 switch)
+        return None
+
+    def _write(self, plans: list[PlannedWrite], states: dict[str, CustomerState | None], summary: RunSummary, *, run_id: str,
+               apply: bool) -> None:
+        adds = [p for p in plans if p.op == "add"]
+        removes = [p for p in plans if p.op == "remove"]
+        for plan in plans:
+            word = "would_tag" if plan.op == "add" else "would_untag"
+            summary.count(word, self.ledger.ref("c", plan.gid), plan.member_no)
+            if plan.op == "remove":
+                summary.count(f"untag_reason:{plan.reason}")
+        # Volume guard (design 1.7): a systematic misread cannot trickle removals out.
+        tagged = sum(1 for state in states.values() if state is not None and TAG in state.tags)
+        if len(removes) > max(5, tagged // 10):
+            summary.alert("untag_volume_unexpected")
+            summary.counts["untag_withheld"] = len(removes)
+            removes = []
+        if not apply:
+            return
+        if len(adds) > self.config.max_tag_adds_per_run:
+            summary.counts["tag_adds_capped"] = len(adds) - self.config.max_tag_adds_per_run
+            adds = adds[:self.config.max_tag_adds_per_run]
+        if len(removes) > self.config.max_tag_removes_per_run:
+            summary.alert("tag_removes_capped")
+            summary.counts["tag_removes_capped"] = len(removes) - self.config.max_tag_removes_per_run
+            removes = removes[:self.config.max_tag_removes_per_run]
+        for plan in adds + removes:
+            if self._stop_requested():
+                summary.stopped = "stop_file_present"
+                summary.alert("stop_file_present")
+                return
+            if plan.gid not in states or states[plan.gid] is None:
+                raise dl.DirectLocalError("tags_customer_not_read")
+            check_tag_variables(plan.gid, [TAG])  # before the INTENT row
+            write_id = self.ledger.add_intent(run_id=run_id, customer_gid=plan.gid, tag=TAG, op=plan.op, reason=plan.reason,
+                                              member_no=plan.member_no, basis=plan.basis)
+            state, code = self.shopify.set_tag(plan.op, plan.gid, [TAG])
+            self.ledger.set_outcome(write_id, state, code)
+            ref = self.ledger.ref("c", plan.gid)
+            if state == DONE:
+                summary.count("tagged" if plan.op == "add" else "untagged", ref, plan.member_no)
+                old = states[plan.gid]
+                tags = old.tags + (TAG,) if plan.op == "add" else tuple(t for t in old.tags if t != TAG)
+                states[plan.gid] = CustomerState(plan.gid, tags, old.has_registration)
+            elif state == REJECTED:
+                summary.alert(code, ref, plan.member_no)
+            elif state == NOT_WRITTEN:
+                summary.alert("tag_not_written", ref, plan.member_no)
+                if code in BUDGET_CODES:
+                    summary.stopped = code
+                    summary.alert(code)
+                    return
+            else:
+                summary.alert("write_uncertain", ref, plan.member_no)
+                summary.stopped = "write_uncertain"
+                return
+
+
+# --------------------------------------------------------------------------
+# Digest (read only)
+# --------------------------------------------------------------------------
+
+_DIGEST_CODE_RE = re.compile(r"^[a-z0-9_:]{1,64}$")
+_DIGEST_REF_RE = re.compile(r"^[cm]-[0-9a-f]{20}$")
+_DIGEST_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
+
+
+def ledger_digest(root: Path, *, hours: int, now: datetime, config: TagsConfig) -> dict[str, Any]:
+    """Read-only: runs, counts and alerts per code over the last ``hours``,
+    alert refs (keyed refs and masked MemberNos only), open writes, and the
+    latest run's shadow counts, ``tagged_now`` and ``carriers_total``."""
+
+    path = Path(root) / LEDGER_FILE
+    if not path.is_file():
+        raise dl.DirectLocalError("tags_ledger_missing")
+    try:
+        conn = open_read_only(path)
+    except sqlite3.Error:
+        raise dl.DirectLocalError("tags_ledger_unreadable") from None
+    try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise dl.DirectLocalError("tags_ledger_not_recognised")
+        meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        if meta is None:
+            raise dl.DirectLocalError("tags_ledger_not_initialised")
+        TagsLedger._check(meta, config)
+        since = dl.ts(now - timedelta(hours=hours))
+        counts: dict[str, int] = {}
+        alerts: dict[str, int] = {}
+        refs: list[dict[str, str]] = []
+        completed = unfinished = 0
+        latest: dict[str, Any] = {}
+        for row in conn.execute("SELECT finished_at, summary FROM runs WHERE started_at >= ? ORDER BY started_at", (since,)):
+            if row["finished_at"] is None:
+                unfinished += 1
+                continue
+            completed += 1
+            try:
+                stored = json.loads(row["summary"] or "{}")
+            except (json.JSONDecodeError, RecursionError):
+                stored = {}
+            stored = stored if isinstance(stored, dict) else {}
+            latest = stored
+            for code, number in (stored.get("counts") or {}).items():
+                if isinstance(code, str) and _DIGEST_CODE_RE.fullmatch(code) and type(number) is int:
+                    counts[code] = counts.get(code, 0) + number
+            run_alerts = [c for c in stored.get("alerts") or [] if isinstance(c, str) and _DIGEST_CODE_RE.fullmatch(c)]
+            for code in run_alerts:
+                alerts[code] = alerts.get(code, 0) + 1
+            for entry in stored.get("refs") or []:
+                if not isinstance(entry, dict) or entry.get("code") not in run_alerts or len(refs) >= MAX_REFS:
+                    continue
+                if not isinstance(entry.get("ref"), str) or not _DIGEST_REF_RE.fullmatch(entry["ref"]):
+                    continue
+                item = {"ref": entry["ref"], "code": entry["code"]}
+                masked = entry.get("member_no_masked")
+                if isinstance(masked, str) and _DIGEST_MASK_RE.fullmatch(masked):
+                    item["member_no_masked"] = masked
+                refs.append(item)
+        last_counts = latest.get("counts") if isinstance(latest.get("counts"), dict) else {}
+
+        def number(value: Any) -> int | None:
+            return value if type(value) is int else None
+
+        return {
+            "status": "ok", "command": "digest", "hours": hours, "runs": {"completed": completed, "unfinished": unfinished},
+            "counts": dict(sorted(counts.items())), "alerts": dict(sorted(alerts.items())), "alert_refs": refs,
+            "open": {"uncertain_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'UNCERTAIN'").fetchone()[0],
+                     "intent_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'INTENT'").fetchone()[0]},
+            "shadow": {"would_tag": number(last_counts.get("would_tag")) or 0, "would_untag": number(last_counts.get("would_untag")) or 0},
+            "tagged_now": number(latest.get("tagged_now")), "carriers_total": number(latest.get("carriers_total")),
+        }
+    except sqlite3.Error:
+        raise dl.DirectLocalError("tags_ledger_unreadable") from None
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1012,27 +1360,63 @@ def _emit(value: Mapping[str, Any]) -> None:
     sys.stdout.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-COMMANDS = ("check-config", "init", "status")
+def build_real_engine(config: TagsConfig, ledger: TagsLedger, *, environ: Mapping[str, str], apply: bool) -> TagsEngine:
+    transport = direct.UrllibTransport()
+    shopify = TagsShopifyClient(
+        mutations_enabled=apply and config.tags_write_enabled, shop_domain=config.shopify.shop_domain,
+        api_version=config.shopify.api_version, token_provider=token_provider(config.shopify, environ, transport, dl.utc_now, root=ledger.root),
+        transport=transport, timeout=config.http_timeout_seconds,
+    )
+    env = None
+    if config.ac2_credential_target is not None:
+        env = sync.load_ac2_credential(config.ac2_credential_target, refused_user_ids=config.ac2_refused_user_ids).child_environment(environ)
+    elif config.autocount_book == sync.LIVE_BOOK:
+        raise dl.DirectLocalError("ac2_credential_target_unconfigured")  # parse_config refuses this first
+    # The claims folder is required by the type move client and never used:
+    # this client refuses every write before a child starts.
+    ac2 = TagsReadBridgeClient(dl.default_bridge_command(BRIDGE_SCRIPT), autocount_book=config.autocount_book,
+                               claims=ledger.root / "claims-unused", env=env)
+    return TagsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-def main(argv: list[str] | None = None, *, clock: Callable[[], datetime] = dl.utc_now) -> int:
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "digest")
+
+
+def main(argv: list[str] | None = None, *, engine_factory: Callable[[TagsConfig, TagsLedger, bool], TagsEngine] | None = None,
+         clock: Callable[[], datetime] = dl.utc_now) -> int:
     parser = argparse.ArgumentParser(description="#268 slice C1: the Shopify tag member-qualified, kept right from AutoCount")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
         if args.command == "check-config":
             _emit(config.summary())
             return 0
+        # The write switch is refused before any login, read or ledger write.
+        if args.command == "apply" and not config.tags_write_enabled:
+            raise dl.DirectLocalError("tags_write_disabled")
         root = state_root(config)
+        if args.command == "digest":
+            if not 1 <= args.hours <= 720:
+                raise dl.DirectLocalError("digest_hours_invalid")
+            _emit(ledger_digest(root, hours=args.hours, now=clock(), config=config))
+            return 0
         ledger = TagsLedger(root, clock=clock)
         try:
             if args.command == "init":
                 _emit(ledger.init_meta(config))
                 return 0
-            _emit(ledger.status(config))
-            return 0
+            if args.command == "status":
+                _emit(ledger.status(config))
+                return 0
+            ledger.check_binding(config)
+            apply = args.command == "apply"
+            factory = engine_factory or (lambda cfg, led, write: build_real_engine(cfg, led, environ=os.environ, apply=write))
+            result = factory(config, ledger, apply).run(apply=apply)
+            _emit(result)
+            return 3 if result["alerts"] or result["stopped"] else 0
         finally:
             ledger.close()
     except dl.DirectLocalError as exc:

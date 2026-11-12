@@ -107,6 +107,85 @@ class FakeBook:
         return {"found": True, "member_type": m["type"], "fields_digest": "sha256:" + "0" * 64}
 
 
+class FakeShopify:
+    """The tagging app over customer fixtures: session, by-ID reads, the tag
+    search and the two mutations. ``answers[gid]`` scripts a mutation answer:
+    ``done`` (default), ``rejected``, ``budget`` (throttled, not executed),
+    ``uncertain_applied``, ``uncertain_unapplied`` or ``crash_applied`` (the
+    process dies after Shopify applied it)."""
+
+    def __init__(self):
+        self.customers_by_gid: dict[str, dict] = {}
+        self.scopes = ["write_customers"]
+        self.calls: list[tuple] = []
+        self.writes: list[tuple[str, str, list]] = []
+        self.answers: dict[str, list[str]] = {}
+        self.fail_customers: list[str | None] = []
+        self.carrier_cap = False
+        self.search_lag: set[str] = set()
+        self.after_write = None
+        self.query_costs = {"XbMemberTagsCustomers": 200, "XbMemberTagsCarriers": 102}
+
+    def add(self, n: int, tags=(), registration: bool = True) -> str:
+        self.customers_by_gid[customer_gid(n)] = {"tags": list(tags), "registration": registration}
+        return customer_gid(n)
+
+    def tags(self, n: int) -> list:
+        return self.customers_by_gid[customer_gid(n)]["tags"]
+
+    def verify_session(self, *, store_gid):
+        self.calls.append(("session",))
+        if frozenset(self.scopes) not in mt.SCOPE_SETS:
+            raise direct.ShopifyDirectError("shopify_token_scope_not_expected")
+        return mt.SCOPE_SETS[frozenset(self.scopes)]
+
+    def customers(self, gids):
+        self.calls.append(("customers", tuple(sorted(gids))))
+        if self.fail_customers:
+            code = self.fail_customers.pop(0)
+            if code:
+                raise direct.ShopifyDirectError(code)
+        found = {}
+        for gid in gids:
+            c = self.customers_by_gid.get(gid)
+            found[gid] = None if c is None else mt.CustomerState(gid, tuple(c["tags"]), c["registration"])
+        return found
+
+    def carriers(self, max_pages):
+        self.calls.append(("carriers",))
+        return {g for g, c in self.customers_by_gid.items() if TAG in c["tags"] and g not in self.search_lag}, not self.carrier_cap
+
+    def set_tag(self, op, gid, tags):
+        mt.check_tag_variables(gid, tags)  # as the real client, before any HTTP call
+        self.writes.append((op, gid, list(tags)))
+        answer = (self.answers.get(gid) or ["done"]).pop(0) if self.answers.get(gid) else "done"
+        customer = self.customers_by_gid.get(gid)
+
+        def effect():
+            if op == "add" and TAG not in customer["tags"]:
+                customer["tags"].append(TAG)
+            if op == "remove" and TAG in customer["tags"]:
+                customer["tags"].remove(TAG)
+        if self.after_write is not None:
+            self.after_write()
+        if answer == "done":
+            effect()
+            return "DONE", None
+        if answer == "rejected":
+            return "REJECTED", "shopify_user_error"
+        if answer == "budget":
+            return "NOT_WRITTEN", "shopify_retry_budget_exhausted"
+        if answer == "uncertain_applied":
+            effect()
+            return "UNCERTAIN", "shopify_transport_failed"
+        if answer == "uncertain_unapplied":
+            return "UNCERTAIN", "shopify_http_server_error"
+        if answer == "crash_applied":
+            effect()
+            raise KeyboardInterrupt  # the process dies after INTENT, before the answer is recorded
+        raise AssertionError(answer)
+
+
 class FakeProcess:
     def __init__(self, stdout: bytes, returncode: int = 0):
         self.stdout_bytes = stdout
@@ -1158,6 +1237,564 @@ class CostTests(unittest.TestCase):
         self.assertEqual([mt.whole_points(v) for v in (0, 1.2, 200, 1_000_000)], [0, 2, 200, 1_000_000])
         for bad in (None, True, "200", -1, 1_000_001, float("nan")):
             self.assertIsNone(mt.whole_points(bad))
+
+
+# --------------------------------------------------------------------------
+# Engine (design 1.4 to 1.7, 1.10)
+# --------------------------------------------------------------------------
+
+class EngineBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.shopify = FakeShopify()
+        self.book = FakeBook()
+        self.ledger = None
+        self.sync_links: list = []
+        self.make_sync()
+        self.make_core()
+
+    def engine(self, **overrides) -> mt.TagsEngine:
+        config = self.cfg(**overrides)
+        if self.ledger is None:
+            self.ledger = mt.TagsLedger(self.root, clock=lambda: self.now)
+            self.addCleanup(self.ledger.close)
+            self.ledger.init_meta(config)
+        return mt.TagsEngine(config, self.ledger, shopify=self.shopify, ac2=self.book)
+
+    def run_tool(self, apply: bool = True, **overrides) -> dict:
+        return self.engine(**overrides).run(apply=apply)
+
+    def member(self, n: int, *, member_type="MEMBER", active="T", expiry=FUTURE, tags=(), registration=True, link="sync",
+               in_book=True) -> str:
+        """Customer n linked to member sg(n) (by the sync, or by a member core claim)."""
+        member_no = sg(n)
+        if in_book:
+            self.book.add(member_no, member_type, active, expiry)
+        if link == "sync":
+            self.make_sync([(n, member_no)])
+        elif link == "claim":
+            self.make_core([(n, member_no)])
+        self.shopify.add(n, tags, registration)
+        self.private |= {member_no, customer_gid(n)}
+        return member_no
+
+    def rows(self, sql="SELECT * FROM tag_writes ORDER BY rowid") -> list:
+        conn = sqlite3.connect((self.root / mt.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(sql).fetchall()
+        finally:
+            conn.close()
+
+    def counts_of(self, table: str) -> int:
+        if not (self.root / mt.LEDGER_FILE).exists():
+            return 0
+        return self.rows(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+
+    def assert_refused(self, call, code: str, *, http_calls: int = 0) -> None:
+        self.assertEqual(self.code(call), code)
+        self.assertEqual(self.counts_of("runs"), 0, "no runs row")
+        self.assertEqual(self.counts_of("tag_writes"), 0, "no tag_writes row")
+        self.assertEqual(len(self.shopify.calls), http_calls, self.shopify.calls)
+        self.assertEqual(self.shopify.writes, [])
+
+
+class DecisionTableTests(EngineBase):
+    """Design 1.6: one test per row 1 to 16."""
+
+    def test_row01_conflict_left_alone_alert_once(self):
+        self.member(1, tags=[TAG])
+        self.make_core([(1, sg(9))])  # the same customer, another member
+        self.book.add(sg(9), "GUEST")
+        first = self.run_tool()
+        self.assertEqual((self.shopify.writes, first["alerts"]), ([], ["link_conflict_customer"]))
+        self.assertEqual(first["refs"], [{"ref": self.ledger.ref("c", customer_gid(1)), "code": "link_conflict_customer"}])
+        second = self.run_tool()
+        self.assertEqual((second["alerts"], second["counts"]["link_conflict_customer"]), ([], 1))
+
+    def test_row01_every_customer_of_a_conflicted_member_is_left_alone(self):
+        self.member(1, member_type="GUEST", tags=[TAG])
+        self.make_core([(2, sg(1))])
+        self.shopify.add(2, [TAG])
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual(result["counts"]["link_conflict_member"], 2)
+
+    def test_row01_voided_pair_active_in_sync(self):
+        self.make_core([(1, sg(1))], unlinks=[1])
+        self.member(1, member_type="GUEST", tags=[TAG])
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["alerts"]), ([], ["link_voided_pair_active_in_sync"]))
+
+    def test_row02_customer_not_found(self):
+        self.member(1)
+        del self.shopify.customers_by_gid[customer_gid(1)]
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["alerts"]), ([], ["customer_not_found"]))
+
+    def test_row03_tag_case_variant(self):
+        for n, variant in ((1, "Member-Qualified"), (2, " member-qualified"), (3, "MEMBER-QUALIFIED")):
+            self.member(n, tags=[variant])
+        self.member(4, member_type="GUEST", tags=[TAG, "Member-Qualified"])
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["counts"]["tag_case_variant"]), ([], 4))
+
+    def test_row04_on_add_then_kept(self):
+        self.member(1)
+        self.member(2, tags=[TAG, "newsletter"])
+        observed = self.run_tool(apply=False)
+        self.assertEqual((self.shopify.writes, observed["counts"]["would_tag"], observed["counts"]["kept_tagged"]), ([], 1, 1))
+        self.assertEqual([r["code"] for r in observed["refs"]], ["would_tag"])
+        self.assertEqual(observed["refs"][0]["member_no_masked"], mt.mask(sg(1)))
+        applied = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG])])
+        self.assertEqual((applied["counts"]["tagged"], applied["tagged_now"], applied["stopped"]), (1, 2, None))
+        row = self.rows()[0]
+        self.assertEqual((row["op"], row["state"], row["reason"], row["basis"], row["member_no"]), ("add", "DONE", "member_active", "sync155", sg(1)))
+        again = self.run_tool()
+        self.assertEqual((len(self.shopify.writes), again["counts"]["kept_tagged"]), (1, 2))
+
+    def test_row04_a_claim_link_is_a_basis(self):
+        self.member(1, link="claim")
+        self.run_tool()
+        self.assertEqual(self.rows()[0]["basis"], "claim")
+
+    def test_row05_flow_dates_guard(self):
+        self.member(1, tags=["member-mg"], registration=False)
+        self.member(2, tags=["member-mg"], registration=True)
+        self.member(3, tags=["Member-MG "], registration=False)
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(2), [TAG])])
+        self.assertEqual(result["counts"]["flow_dates_guard"], 2)
+        self.assertIn("flow_dates_guard", result["alerts"])
+
+    def test_row06_inactive_off(self):
+        self.member(1, active="F", tags=[TAG])
+        self.member(2, active="F", expiry=None, tags=[TAG])
+        self.member(3, active="F")
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG]), ("remove", customer_gid(2), [TAG])])
+        self.assertEqual((result["counts"]["untag_reason:member_inactive"], result["counts"]["no_change_untagged"]), (2, 1))
+        self.assertEqual([r["reason"] for r in self.rows()], ["member_inactive", "member_inactive"])
+
+    def test_row07_expired_off_today_keeps(self):
+        self.member(1, expiry=PAST, tags=[TAG])
+        self.member(2, expiry=TODAY, tags=[TAG])
+        self.member(3, expiry="2020-01-01T00:00:00", tags=[TAG])
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG]), ("remove", customer_gid(3), [TAG])])
+        self.assertEqual(result["counts"]["untag_reason:member_expired"], 2)
+
+    def test_row07_singapore_midnight_given_as_utc(self):
+        self.member(1, expiry="2026-11-19T00:00:00", tags=[TAG])
+        self.now = datetime(2026, 11, 19, 15, 59, 59, tzinfo=timezone.utc)  # 23:59:59 Singapore, 19 Nov
+        self.run_tool()
+        self.assertEqual(self.shopify.writes, [])
+        self.now = datetime(2026, 11, 19, 16, 0, 0, tzinfo=timezone.utc)  # 00:00:00 Singapore, 20 Nov
+        self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG])])
+
+    def test_row08_guest_or_default_off(self):
+        self.member(1, member_type="GUEST", tags=[TAG])
+        self.member(2, member_type="Default", tags=[TAG])
+        result = self.run_tool()
+        self.assertEqual([w[0] for w in self.shopify.writes], ["remove", "remove"])
+        self.assertEqual(result["counts"]["untag_reason:member_not_member"], 2)
+
+    def test_row09_active_flag_unreadable_left_alone(self):
+        self.member(1, active=None, tags=[TAG])
+        self.member(2, active="X")
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["counts"]["member_active_unreadable"]), ([], 2))
+
+    def test_row10_expiry_unreadable_left_alone_both_ways(self):
+        self.member(1, expiry=None, tags=[TAG])
+        self.member(2, expiry="2000-01-01T00:00:00")
+        self.member(3, expiry="not a date", tags=[TAG])
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["counts"]["expiry_unreadable"]), ([], 3))
+        self.assertEqual(self.shopify.tags(1), [TAG])
+
+    def test_row11_in_no_scan_single_read_not_member_off(self):
+        self.member(1, member_type="VIP", tags=[TAG])
+        result = self.run_tool()
+        self.assertEqual(self.book.single_reads, [sg(1)])
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG])])
+        self.assertEqual(result["counts"]["untag_reason:member_not_member"], 1)
+
+    def test_row11a_scan_missed_left_alone(self):
+        self.member(1, tags=[TAG])
+        self.member(2)
+        self.book.hidden |= {sg(1), sg(2)}
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["counts"]["member_scan_missed"]), ([], 2))
+
+    def test_row11b_member_not_found_left_alone(self):
+        self.member(1, tags=[TAG], in_book=False)
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["alerts"]), ([], ["member_not_found"]))
+
+    def test_row11c_single_reads_capped(self):
+        self.member(1, member_type="VIP", tags=[TAG])
+        self.member(2, member_type="VIP", tags=[TAG])
+        result = self.run_tool(max_member_reads_per_run=1)
+        self.assertEqual(self.book.single_reads, [sg(1)])
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG])])
+        self.assertIn("member_reads_capped", result["alerts"])
+
+    def test_row12_member_in_two_scans_left_alone(self):
+        member_no = self.member(1, tags=[TAG])
+        self.book.add(member_no.lower() + " ", "GUEST")
+        self.book.members[member_no.lower() + " "]["type"] = "GUEST"
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["alerts"]), ([], ["member_reads_conflict"]))
+
+    def test_row13_voided_link_carrier_off_m2_p1(self):
+        self.make_core([(1, sg(1)), (2, sg(2))], unlinks=[1, 2])
+        self.shopify.add(1, [TAG])
+        self.shopify.add(2, [])  # not tagged: never tagged
+        self.book.add(sg(1)), self.book.add(sg(2))
+        self.shopify.search_lag.add(customer_gid(1))  # the decision rests on the by-ID read, not the search
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG])])
+        row = self.rows()[0]
+        self.assertEqual((row["reason"], row["basis"], row["member_no"]), ("link_voided", "voided", None))
+        self.assertEqual(result["counts"]["no_change_untagged"], 1)
+
+    def test_row14_tag_without_basis_left_alone(self):
+        self.shopify.add(1, [TAG])
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["alerts"], result["carriers_total"]), ([], ["tag_without_basis"], 1))
+        self.assertEqual(result["tagged_now"], 0)
+
+    def test_row15_no_change(self):
+        self.member(1, tags=[TAG])
+        self.member(2, member_type="GUEST")
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual((result["counts"]["kept_tagged"], result["counts"]["no_change_untagged"], result["alerts"]), (1, 1, []))
+
+    def test_row16_open_write_that_cannot_be_settled(self):
+        self.member(1, member_type="GUEST", tags=[TAG])
+        self.engine()
+        self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(1), tag=TAG, op="add", reason="member_active",
+                               member_no=sg(1), basis="sync155")
+        self.shopify.fail_customers = ["shopify_http_server_error"]
+        observed = self.run_tool(apply=False)
+        self.assertEqual(observed["alerts"], ["write_unresolved"])
+        self.assertEqual(self.rows()[0]["state"], "INTENT")
+        runs = self.counts_of("runs")
+        self.shopify.fail_customers = ["shopify_http_server_error"]
+        self.shopify.calls.clear()
+        self.assertEqual(self.code(lambda: self.run_tool()), "tags_uncertain_unresolved")
+        self.assertEqual((self.counts_of("runs"), self.shopify.writes, self.rows()[0]["state"]), (runs, [], "INTENT"))
+
+
+class GuardTests(EngineBase):
+    def test_m2_p2_a_freed_member_tags_its_sync_customer(self):
+        self.make_core([(1, sg(5))], unlinks=[1])
+        self.book.add(sg(5))
+        self.make_sync([(2, sg(5))])
+        self.shopify.add(1, [])
+        self.shopify.add(2, [])
+        self.private |= {sg(5)}
+        self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(2), [TAG])])
+
+    def test_m2_p4_voided_then_newer_active_claim_is_the_basis(self):
+        self.make_core([(1, sg(1))], unlinks=[1])
+        self.make_core([(1, sg(2))])
+        self.book.add(sg(1), "GUEST")
+        self.book.add(sg(2))
+        self.shopify.add(1, [])
+        self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG])])
+        self.assertEqual(self.rows()[0]["member_no"], sg(2))
+
+    def test_observe_never_sends_even_with_the_switch_on(self):
+        self.member(1)
+        self.member(2, member_type="GUEST", tags=[TAG])
+        result = self.run_tool(apply=False, tags_write_enabled=True)
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual((result["counts"]["would_tag"], result["counts"]["would_untag"]), (1, 1))
+        self.assertEqual(self.counts_of("tag_writes"), 0)
+
+    def test_apply_with_the_switch_off_is_refused_before_anything(self):
+        self.member(1)
+        self.engine()
+        self.assert_refused(lambda: self.run_tool(tags_write_enabled=False), "tags_write_disabled")
+
+    def test_adds_cap_pilot_of_ten_in_customer_order(self):
+        for n in range(12, 0, -1):
+            self.member(n)
+        result = self.run_tool()
+        self.assertEqual([w[1] for w in self.shopify.writes], [customer_gid(n) for n in range(1, 11)])
+        self.assertEqual((result["counts"]["tagged"], result["counts"]["tag_adds_capped"]), (10, 2))
+        self.run_tool()
+        self.assertEqual(len(self.shopify.writes), 12)
+
+    def test_removes_cap(self):
+        for n in range(1, 8):
+            self.member(n, member_type="GUEST", tags=[TAG])
+        for n in range(20, 100):
+            self.member(n, tags=[TAG])  # 87 tagged: the volume guard allows 8
+        result = self.run_tool()
+        self.assertEqual([w[0] for w in self.shopify.writes], ["remove"] * 5)
+        self.assertEqual(result["counts"]["tag_removes_capped"], 2)
+        self.assertIn("tag_removes_capped", result["alerts"])
+
+    def test_volume_guard_withholds_removals_adds_go_on(self):
+        for n in range(1, 7):
+            self.member(n, member_type="GUEST", tags=[TAG])
+        for n in range(10, 20):
+            self.member(n, tags=[TAG])
+        self.member(30)
+        result = self.run_tool(max_tag_removes_per_run=50)
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(30), [TAG])])
+        self.assertEqual((result["counts"]["untag_withheld"], result["alerts"]), (6, ["untag_volume_unexpected"]))
+        observed = self.run_tool(apply=False)
+        self.assertIn("untag_volume_unexpected", observed["alerts"])
+        # Five or fewer removals are never withheld.
+        for n in range(2, 7):
+            self.book.members[sg(n)]["type"] = "MEMBER"
+        self.run_tool()
+        self.assertEqual(self.shopify.writes[-1], ("remove", customer_gid(1), [TAG]))
+
+    def test_stop_file_before_the_next_mutation(self):
+        self.member(1)
+        self.member(2)
+        (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["stopped"], self.counts_of("runs")), ([], "stop_file_present", 1))
+        self.assertEqual(result["counts"]["would_tag"], 2)  # reads and the record still ran
+        (self.root / mt.STOP_FILE).unlink()
+        self.shopify.after_write = lambda: (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
+        result = self.run_tool()
+        self.assertEqual((len(self.shopify.writes), result["stopped"]), (1, "stop_file_present"))
+
+    def test_flapping_guard(self):
+        self.member(1)
+        self.run_tool()
+        self.shopify.tags(1).remove(TAG)  # another writer removes it
+        self.now += timedelta(hours=1)
+        self.run_tool()
+        self.shopify.tags(1).remove(TAG)
+        self.now += timedelta(hours=1)
+        result = self.run_tool()
+        self.assertEqual(len(self.shopify.writes), 2)
+        self.assertIn("tag_keeps_disappearing", result["alerts"])
+        self.now += timedelta(hours=25)
+        self.run_tool()
+        self.assertEqual(len(self.shopify.writes), 3)
+
+    def test_a_bridge_failure_stops_before_any_shopify_write(self):
+        self.member(1)
+        self.book.fail_scan = "bridge_read_failed:json:x0a0b0c0d:l1"
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["stopped"]), ([], "bridge_read_failed:json:x0a0b0c0d:l1"))
+        self.book.fail_scan = None
+        self.member(2, member_type="VIP", tags=[TAG])
+        self.book.fail_member = "bridge_read_timeout"
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["stopped"]), ([], "bridge_read_timeout"))
+
+    def test_a_shopify_read_failure_stops_before_any_write(self):
+        self.member(1)
+        self.shopify.fail_customers = ["shopify_http_server_error"]
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["stopped"], self.counts_of("runs")), ([], "shopify_http_server_error", 1))
+
+    def test_a_capped_search_decides_nothing(self):
+        self.shopify.add(1, [TAG])
+        self.shopify.carrier_cap = True
+        result = self.run_tool()
+        self.assertEqual((result["carriers_total"], result["alerts"]), (None, ["tag_search_incomplete", "tag_without_basis"]))
+        self.assertEqual(self.shopify.writes, [])
+
+
+class WriteStateTests(EngineBase):
+    def test_rejected_goes_on_uncertain_stops(self):
+        for n in (1, 2, 3):
+            self.member(n)
+        self.shopify.answers = {customer_gid(1): ["rejected"], customer_gid(2): ["uncertain_unapplied"]}
+        result = self.run_tool()
+        self.assertEqual([w[1] for w in self.shopify.writes], [customer_gid(1), customer_gid(2)])
+        self.assertEqual([(r["state"], r["code"]) for r in self.rows()],
+                         [("REJECTED", "shopify_user_error"), ("UNCERTAIN", "shopify_http_server_error")])
+        self.assertEqual(result["stopped"], "write_uncertain")
+        self.assertEqual(set(result["alerts"]), {"shopify_user_error", "write_uncertain"})
+
+    def test_throttled_budget_is_not_written_and_stops(self):
+        self.member(1)
+        self.member(2)
+        self.shopify.answers = {customer_gid(1): ["budget"]}
+        result = self.run_tool()
+        self.assertEqual(len(self.shopify.writes), 1)
+        self.assertEqual((self.rows()[0]["state"], result["stopped"]), ("NOT_WRITTEN", "shopify_retry_budget_exhausted"))
+
+    def test_next_run_settles_uncertain_by_read_both_ways(self):
+        self.member(1)
+        self.member(2)
+        self.shopify.answers = {customer_gid(1): ["uncertain_applied"]}
+        self.run_tool()
+        result = self.run_tool()
+        self.assertEqual(self.rows()[0]["state"], "DONE")
+        self.assertEqual(self.rows()[0]["code"], "resolved_by_read")
+        self.assertEqual(result["counts"]["write_settled_done"], 1)
+        self.assertEqual([w[1] for w in self.shopify.writes], [customer_gid(1), customer_gid(2)])  # never sent twice
+        self.shopify.answers = {customer_gid(3): ["uncertain_unapplied"]}
+        self.member(3)
+        self.run_tool()
+        result = self.run_tool()
+        third = [r for r in self.rows() if r["customer_gid"] == customer_gid(3)]
+        self.assertEqual([(r["state"], r["code"]) for r in third], [("NOT_WRITTEN", "resolved_by_read"), ("DONE", None)])
+        self.assertEqual(result["counts"]["write_settled_not_written"], 1)
+
+    def test_a_customer_gone_settles_not_written(self):
+        self.member(1)
+        self.shopify.answers = {customer_gid(1): ["uncertain_unapplied"]}
+        self.run_tool()
+        del self.shopify.customers_by_gid[customer_gid(1)]
+        self.run_tool()
+        self.assertEqual((self.rows()[0]["state"], self.rows()[0]["code"]), ("NOT_WRITTEN", "customer_not_found"))
+
+    def test_a_crash_after_intent_does_not_double_send(self):
+        self.member(1)
+        self.shopify.answers = {customer_gid(1): ["crash_applied"]}
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_tool()
+        self.assertEqual(self.rows()[0]["state"], "INTENT")
+        self.run_tool()
+        self.assertEqual(len(self.shopify.writes), 1)
+        self.assertEqual((self.rows()[0]["state"], self.rows()[0]["code"]), ("DONE", "resolved_by_read"))
+
+    def test_a_remove_settles_by_read_too(self):
+        self.member(1, member_type="GUEST", tags=[TAG])
+        self.shopify.answers = {customer_gid(1): ["uncertain_applied"]}
+        self.run_tool()
+        self.run_tool()
+        self.assertEqual((self.rows()[0]["state"], len(self.shopify.writes)), ("DONE", 1))
+
+    def test_no_mutation_when_the_state_already_matches(self):
+        self.member(1, tags=[TAG])
+        self.member(2, member_type="GUEST")
+        self.run_tool()
+        self.assertEqual(self.shopify.writes, [])
+
+
+class RefusalTests(EngineBase):
+    """Every refusal records nothing (no runs row, no tag_writes row) and
+    makes no HTTP call where it comes before one."""
+
+    def test_input_ledger_refusals(self):
+        self.member(1)
+        self.engine()
+        for path, prefix in ((self.sync_root / sync.LEDGER_FILE, "sync_ledger"), (self.core_root / bm.LEDGER_FILE, "member_core_ledger")):
+            with self.subTest(prefix=prefix):
+                saved = path.read_bytes()
+                set_user_version(path, 9)
+                self.assert_refused(lambda: self.run_tool(), f"{prefix}_version_unknown")
+                path.write_bytes(b"not sqlite" * 50)
+                self.assert_refused(lambda: self.run_tool(), f"{prefix}_unreadable")
+                path.unlink()
+                self.assert_refused(lambda: self.run_tool(), f"{prefix}_missing")
+                path.write_bytes(saved)
+        for name in os.listdir(self.core_root):
+            os.remove(self.core_root / name)
+        self.make_core(store="gid://shopify/Shop/2")
+        self.assert_refused(lambda: self.run_tool(), "member_core_ledger_binding_mismatch")
+        for name in os.listdir(self.core_root):
+            os.remove(self.core_root / name)
+        self.make_core()
+        for name in os.listdir(self.sync_root):
+            os.remove(self.sync_root / name)
+        self.make_sync(store="gid://shopify/Shop/2")
+        self.assert_refused(lambda: self.run_tool(), "sync_ledger_binding_mismatch")
+
+    def test_scope_and_store_refusals_after_the_session_call_only(self):
+        self.member(1)
+        self.engine()
+        for scopes in (["read_customers"], ["write_customers", "read_orders"]):
+            self.shopify.scopes = scopes
+            self.shopify.calls.clear()
+            self.assert_refused(lambda: self.run_tool(), "shopify_token_scope_not_expected", http_calls=1)
+
+    def test_ledger_binding_refusal(self):
+        self.member(1)
+        self.engine()
+        other = raw_config(self.root, self.sync_root, self.core_root)
+        other["shopify"] = {**other["shopify"], "store_gid": "gid://shopify/Shop/2"}
+        engine = mt.TagsEngine(mt.parse_config(other), self.ledger, shopify=self.shopify, ac2=self.book)
+        self.assert_refused(lambda: engine.run(apply=True), "tags_ledger_binding_mismatch")
+
+
+class CliTests(EngineBase):
+    def run_main(self, *args, factory=True, **overrides) -> int:
+        with private_root_allowed(self.temp / "elsewhere"):
+            engine_factory = (lambda cfg, led, write: mt.TagsEngine(cfg, led, shopify=self.shopify, ac2=self.book)) if factory else None
+            return mt.main([*args, "--config", str(self.write_config(**overrides))], engine_factory=engine_factory, clock=lambda: self.now)
+
+    def test_observe_apply_digest(self):
+        self.member(1)
+        self.member(2, member_type="GUEST", tags=[TAG])
+        self.member(3, tags=["member-mg"], registration=False)
+        self.assertEqual(self.run_main("init"), 0)
+        self.assertEqual(self.run_main("observe"), 3)  # flow_dates_guard is an alert
+        observed = self.emitted[-1]
+        self.assertEqual((observed["command"], observed["scope_set"], observed["counts"]["would_tag"]), ("observe", "write_only", 1))
+        self.assertEqual(observed["query_costs"], {"XbMemberTagsCustomers": 200, "XbMemberTagsCarriers": 102})
+        self.assertEqual(self.run_main("observe"), 0)  # alert once per subject
+        self.assertEqual(self.run_main("apply"), 0)
+        self.assertEqual(self.emitted[-1]["counts"]["tagged"], 1)
+        self.assertEqual(self.run_main("digest", "--hours", "24"), 0)
+        digest = self.emitted[-1]
+        self.assertEqual((digest["runs"], digest["shadow"], digest["open"]),
+                         ({"completed": 3, "unfinished": 0}, {"would_tag": 1, "would_untag": 1}, {"uncertain_writes": 0, "intent_writes": 0}))
+        self.assertEqual(digest["alerts"], {"flow_dates_guard": 1})
+        self.assertEqual(digest["alert_refs"][0]["code"], "flow_dates_guard")
+        self.assertEqual(digest["tagged_now"], 1)
+        self.assertEqual(self.run_main("digest", "--hours", "0"), 2)
+        self.assertEqual(self.run_main("status"), 0)
+        self.assertEqual(self.emitted[-1]["tag_writes"], {"add:DONE": 1, "remove:DONE": 1})
+
+    def test_apply_with_the_switch_off_creates_nothing(self):
+        self.member(1)
+        self.assertEqual(self.run_main("apply", tags_write_enabled=False), 2)
+        self.assertEqual(self.emitted[-1], {"status": "refused", "code": "tags_write_disabled"})
+        self.assertFalse((self.root / mt.LEDGER_FILE).exists())
+        self.assertEqual(self.shopify.calls, [])
+
+    def test_state_root_refusals_create_nothing(self):
+        self.assertEqual(self.run_main("observe", member_core_state_root=str(self.root)), 2)
+        self.assertEqual(self.emitted[-1]["code"], "tags_state_root_shared")
+        self.assertFalse((self.root / mt.LEDGER_FILE).exists())
+        self.assertEqual(self.run_main("observe"), 2)
+        self.assertEqual(self.emitted[-1]["code"], "tags_ledger_not_initialised")
+        self.assertEqual(self.shopify.calls, [])
+
+    def test_a_second_runner_is_refused(self):
+        self.run_main("init")
+        holder = mt.TagsLedger(self.root)
+        try:
+            self.assertEqual(self.run_main("observe"), 2)
+            self.assertEqual(self.emitted[-1]["code"], "ledger_locked_by_another_owner")
+        finally:
+            holder.close()
+        self.assertEqual(self.shopify.calls, [])
+
+    def test_build_real_engine_mutations_follow_the_command(self):
+        self.run_main("init")
+        environ = {"XB_SHOPIFY_TAGS_CLIENT_ID": "i" * 20, "XB_SHOPIFY_TAGS_CLIENT_SECRET": "s" * 20}
+        ledger = mt.TagsLedger(self.root)
+        try:
+            observe = mt.build_real_engine(self.cfg(), ledger, environ=environ, apply=False)
+            apply = mt.build_real_engine(self.cfg(), ledger, environ=environ, apply=True)
+            off = mt.build_real_engine(self.cfg(tags_write_enabled=False), ledger, environ=environ, apply=True)
+            self.assertEqual((observe.shopify.mutations_enabled, apply.shopify.mutations_enabled, off.shopify.mutations_enabled), (False, True, False))
+            self.assertIsInstance(apply.ac2, mt.TagsReadBridgeClient)
+            self.assertEqual(apply.ac2.command[-1], str(mt.BRIDGE_SCRIPT))
+        finally:
+            ledger.close()
 
 
 class LedgerCliTests(Base):
