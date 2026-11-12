@@ -296,10 +296,12 @@ class Base(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    PRIVATE_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{20}$")
-    PRIVATE_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
-    PRIVATE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
-    PRIVATE_WORD_RE = re.compile(r"^[a-z0-9_:]{1,64}$")  # a count key, an alert code, a ref code, the ``stopped`` text
+    # Slice B1 T2: every pattern ends with \Z ("$" also matches before one
+    # line break at the end, so "upgraded\n" passed).
+    PRIVATE_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{20}\Z")
+    PRIVATE_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}\Z")
+    PRIVATE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}\Z")
+    PRIVATE_WORD_RE = re.compile(r"^[a-z0-9_:]{1,64}\Z")  # a count key, an alert code, a ref code, the ``stopped`` text
     PRIVATE_DIGITS_RE = re.compile(r"[0-9]{4}")  # IDs are shown by their last 3 characters at most
     # The one exception to the digit rule. A generic failure of the AutoCount
     # child is named by the shared bridge code (xb_directlocal.bridge_failure_code)
@@ -310,6 +312,30 @@ class Base(unittest.TestCase):
     # rest of the word is checked as any other word.
     BRIDGE_PREFIX = "bridge_read_failed:"
     BRIDGE_TAIL_RE = re.compile(r":x(?:[0-9a-f]{8}|none):l[0-9]\Z")
+    # Slice B1 T5: the allowed top-level keys of every output, per command
+    # (required, optional). Written out here, never taken from the tool, so a
+    # new key in any output fails the check until it is added on purpose.
+    DIGEST_SCHEMA = "xb.directlocal.member_benefits.digest.v1"
+    CONFIG_KEYS = frozenset({
+        "status", "autocount_book", "api_version", "required_scopes", "orders_start_utc", "benefits_write_enabled", "max_upgrades_per_run",
+        "max_member_reads_per_run", "qualify_threshold_cents", "amount_before_discounts", "amount_include_tax", "amount_exclude_shipping",
+        "amount_exclude_gift_cards", "gift_card_gateways", "amount_count_sale_items", "same_day_signup_counts", "expiry_months", "target_type",
+        "type_move_lock", "ac2_credential", "ac2_login_mode"})
+    RUN_KEYS = frozenset({"status", "command", "run_id", "saves", "counts", "alerts", "refs", "stopped"})
+    OUTPUT_KEYS = {
+        "status": (frozenset({"status", "command", "receipts", "observed", "writes", "claim_links", "reviews", "watermark_set",
+                              "stop_file_present"}), frozenset()),
+        "observe": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
+        "apply": (RUN_KEYS | {"orders_query_cost"}, frozenset()),
+        "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
+        "index_dry_run": (RUN_KEYS, frozenset()),
+        "index_apply": (RUN_KEYS, frozenset()),
+    }
+    DIGEST_KEYS = frozenset({"schema", "status", "autocount_book", "hours", "runs", "counts", "alerts", "alert_refs", "receipts", "shadow",
+                             "gift_cards", "open"})
+    DIGEST_PART_KEYS = {"runs": frozenset({"completed", "unfinished"}), "shadow": frozenset({"would_upgrade", "would_extend"}),
+                        "open": frozenset({"uncertain_writes", "held_writes", "waiting_member", "claim_links"})}
+    WRITE_STATES = ("INTENT", "DONE", "SKIPPED", "NOT_WRITTEN", "UNCERTAIN", "HELD")
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -367,8 +393,10 @@ class Base(unittest.TestCase):
             if isinstance(value, dict) and "orders_query_cost" in value:
                 cost = value["orders_query_cost"]
                 self.assertTrue(cost is None or (type(cost) is int and 0 <= cost <= 1_000_000), kind)
+            self.assertIsInstance(value, dict, kind)
             if isinstance(value, dict):
-                words = list(value.get("counts") or []) + list(value.get("alerts") or []) + [entry.get("code") for entry in entries]
+                words = self.output_shape_words(value, kind)
+                words += list(value.get("counts") or []) + list(value.get("alerts") or []) + [entry.get("code") for entry in entries]
                 if value.get("stopped") is not None:
                     words.append(value["stopped"])
                 for word in words:
@@ -376,6 +404,62 @@ class Base(unittest.TestCase):
                     self.assertRegex(word, self.PRIVATE_WORD_RE, kind)
                     rest = self.BRIDGE_TAIL_RE.sub("", word) if word.startswith(self.BRIDGE_PREFIX) else word
                     self.assertNotRegex(rest, self.PRIVATE_DIGITS_RE, kind)
+
+    def output_shape_words(self, value: dict, kind: str) -> list:
+        """Slice B1 T3-T5: the top-level keys of the output are exactly the
+        ones its command allows; ``counts`` (where present) is an object of
+        whole numbers and ``alerts`` a list (a run) or an object of whole
+        numbers (the digest); the ``code`` of a refused output and the keys of
+        ``resolved``, ``receipts``, ``observed`` and ``writes`` are code words.
+        Returns the extra words for the word rule."""
+
+        def whole(number) -> bool:
+            return type(number) is int
+
+        keys = set(value)
+        words: list = []
+        if value.get("status") == "refused":
+            self.assertEqual(keys, {"status", "code"}, kind)
+            words.append(value["code"])
+        elif value.get("schema") == self.DIGEST_SCHEMA:
+            self.assertEqual(keys, set(self.DIGEST_KEYS), kind)
+            for part, allowed in self.DIGEST_PART_KEYS.items():
+                self.assertIsInstance(value[part], dict, kind)
+                self.assertEqual(set(value[part]), set(allowed), kind)
+            for part in ("alerts", "receipts"):
+                self.assertIsInstance(value[part], dict, kind)
+                self.assertTrue(all(whole(n) for n in value[part].values()), kind)
+                words += list(value[part])
+        elif "command" in value:
+            self.assertIn(value["command"], self.OUTPUT_KEYS, kind)
+            required, optional = self.OUTPUT_KEYS[value["command"]]
+            self.assertLessEqual(set(required), keys, kind)
+            self.assertLessEqual(keys, set(required) | set(optional), kind)
+            if "alerts" in value:
+                self.assertIsInstance(value["alerts"], list, kind)
+            for part in ("receipts", "observed"):
+                if part in value:
+                    self.assertIsInstance(value[part], dict, kind)
+                    words += list(value[part])
+            if value["command"] == "status":
+                self.assertIsInstance(value["writes"], dict, kind)
+                for key in value["writes"]:
+                    self.assertRegex(key, r"^(upgrade|extend):(" + "|".join(self.WRITE_STATES) + r")\Z", kind)
+            if value["command"] == "resolve":
+                self.assertIsInstance(value["resolved"], dict, kind)
+                for key in value["resolved"]:
+                    state, _, code = key.partition(":")
+                    self.assertIn(state, self.WRITE_STATES, kind)
+                    words.append(code)
+        elif keys == {"status"}:
+            self.assertIn(value["status"], ("initialised", "existing"), kind)
+        else:
+            self.assertEqual(keys, set(self.CONFIG_KEYS), kind)
+            self.assertEqual(value["status"], "ok", kind)
+        if "counts" in value:
+            self.assertIsInstance(value["counts"], dict, kind)
+            self.assertTrue(all(whole(n) for n in value["counts"].values()), kind)
+        return words
 
     def cfg(self, **overrides) -> bm.BenefitsConfig:
         return bm.parse_config(raw_config(self.root, self.sync_root, **overrides))
@@ -2603,8 +2687,15 @@ class OutputShapeRuleTests(Base):
                 "counts": {"orders_read": 2, "receipt_ready": 1, "upgraded": 1, "step_155": 1, "a" * 64: 1},
                 "alerts": ["order_amount_unverifiable"],
                 "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded", "member_no_masked": "*******001"}]}
-    GOOD_DIGEST = {"schema": "fake", "status": "ok", "hours": 24, "counts": {"orders_read": 2}, "alerts": {"claim_needs_review": 2},
-                   "alert_refs": [{"ref": "m-" + "b" * 20, "code": "claim_needs_review"}]}
+    # Slice B1 T5: the digest in its full shape (the check now knows every key).
+    GOOD_DIGEST = {"schema": "xb.directlocal.member_benefits.digest.v1", "status": "ok", "autocount_book": "AED_TESTINGAPI", "hours": 24,
+                   "runs": {"completed": 2, "unfinished": 0}, "counts": {"orders_read": 2}, "alerts": {"claim_needs_review": 2},
+                   "alert_refs": [{"ref": "m-" + "b" * 20, "code": "claim_needs_review"}], "receipts": {"applied": 1, "held": 1},
+                   "shadow": {"would_upgrade": 0, "would_extend": 0}, "gift_cards": {"receipts_paid_by_gift_card": 0, "gateways_seen": {}},
+                   "open": {"uncertain_writes": 0, "held_writes": 0, "waiting_member": 0, "claim_links": 1}}
+    GOOD_RESOLVE = {"status": "ok", "command": "resolve", "writes": 0, "resolved": {"HELD:resolved_unclear": 1}, "alerts": ["resolved_unclear"]}
+    GOOD_INDEX = {"status": "ok", "command": "index_apply", "run_id": "run-" + "0" * 32, "saves": 0, "stopped": None,
+                  "counts": {"examined": 1}, "alerts": [], "refs": []}
 
     def checked(self, value: dict, *, stored: bool = False) -> None:
         """Run the check after every test on one more output: a CLI output,
@@ -2631,7 +2722,9 @@ class OutputShapeRuleTests(Base):
     def test_the_check_after_every_test_takes_code_words_only(self):
         order, customer = str(order_number(1)), str(customer_number(1))
         for good in (self.GOOD_RUN, self.GOOD_DIGEST, {**self.GOOD_RUN, "stopped": "uncertain:writer_timeout"},
-                     {**self.GOOD_RUN, "stopped": "stop_file_present"}, {"status": "ok", "command": "resolve", "alerts": []}):
+                     {**self.GOOD_RUN, "stopped": "stop_file_present"}, {**self.GOOD_RESOLVE, "resolved": {}, "alerts": []}, self.GOOD_RESOLVE,
+                     {**self.GOOD_RESOLVE, "receipts_left": 1}, self.GOOD_INDEX, {**self.GOOD_INDEX, "stopped": "bridge_read_failed:member_no_invalid"},
+                     {"status": "refused", "code": "benefits_ledger_not_recognised"}, {"status": "initialised"}):
             with self.subTest(good=good):
                 self.checked(good)
                 self.checked(good, stored=True)
@@ -2665,6 +2758,55 @@ class OutputShapeRuleTests(Base):
             "ref_without_a_code": {**run, "refs": [{"ref": "o-" + "a" * 20}]},
             "stopped_with_a_name": {**run, "stopped": "uncertain:Fake Member 1"},
             "stopped_that_is_not_text": {**run, "stopped": 404},
+            # slice B1 T1 (B11): the places no bad case reached before
+            "digest_count_key_with_part_of_an_order_number": {**self.GOOD_DIGEST, "counts": {"seen_" + order[-6:]: 1}},
+            "resolve_alert_code_with_part_of_an_order_number": {**self.GOOD_RESOLVE, "alerts": ["held_" + order[-6:]]},
+            "index_stopped_with_part_of_an_order_number": {**self.GOOD_INDEX, "stopped": "bridge_read_failed:x_" + order[-6:]},
+            "count_key_with_part_of_an_order_number_and_a_text_value": {**run, "counts": {"seen_" + order[-6:]: "1"}},
+            # T2: a line break after a word, a ref, a masked MemberNo or a gateway name
+            "count_key_with_a_line_break_after_it": {**run, "counts": {"upgraded\n": 1}},
+            "alert_code_with_a_line_break_after_it": {**run, "alerts": ["upgraded\n"]},
+            "ref_with_a_line_break_after_it": {**run, "refs": [{"ref": "o-" + "a" * 20 + "\n", "code": "upgraded"}]},
+            "masked_member_no_with_a_line_break_after_it": {**run, "refs": [{"ref": "o-" + "a" * 20, "code": "upgraded",
+                                                                            "member_no_masked": "*******001\n"}]},
+            "gateway_name_with_a_line_break_after_it": {**self.GOOD_DIGEST, "gift_cards": {"receipts_paid_by_gift_card": 1,
+                                                                                        "gateways_seen": {"gift_card\n": 1}}},
+            # T3: counts as an object of whole numbers, alerts as a list (a run) or an object of whole numbers (the digest)
+            "count_value_as_text": {**run, "counts": {"upgraded": "1"}},
+            "count_value_as_a_float": {**run, "counts": {"upgraded": 1.0}},
+            "count_value_true": {**run, "counts": {"upgraded": True}},
+            "counts_as_a_list": {**run, "counts": ["upgraded"]},
+            "counts_as_one_string": {**run, "counts": "seen_" + order[-6:]},
+            "alerts_as_one_string": {**run, "alerts": "alert_" + order[-6:]},
+            "digest_counts_as_a_list": {**self.GOOD_DIGEST, "counts": ["orders_read"]},
+            "digest_count_value_as_text": {**self.GOOD_DIGEST, "counts": {"orders_read": "2"}},
+            "digest_alerts_as_a_list": {**self.GOOD_DIGEST, "alerts": ["claim_needs_review"]},
+            # T4: the code of a refused output
+            "refused_code_with_part_of_an_order_number": {"status": "refused", "code": "refused_" + order[-6:]},
+            "refused_code_with_a_name": {"status": "refused", "code": "Fake Member 1"},
+            "refused_code_that_is_not_text": {"status": "refused", "code": 2},
+            "refused_with_another_key": {"status": "refused", "code": "benefits_config_invalid", "detail": "x"},
+            # T5: a new key in any output, and the keys of resolved, receipts and writes
+            "run_with_a_new_key": {**run, "seen": "seen_" + order[-6:]},
+            "run_without_a_key": {key: v for key, v in run.items() if key != "orders_query_cost"},
+            "index_with_the_cost_key": {**self.GOOD_INDEX, "orders_query_cost": 847},
+            "resolve_with_a_new_key": {**self.GOOD_RESOLVE, "seen": 1},
+            "resolved_key_with_part_of_an_order_number": {**self.GOOD_RESOLVE, "resolved": {"HELD:held_" + order[-6:]: 1}},
+            "resolved_key_with_another_state": {**self.GOOD_RESOLVE, "resolved": {"SEEN:resolved_unclear": 1}},
+            "digest_with_a_new_key": {**self.GOOD_DIGEST, "seen": 1},
+            "digest_open_with_a_new_key": {**self.GOOD_DIGEST, "open": {**self.GOOD_DIGEST["open"], "seen_" + order[-6:]: 1}},
+            "digest_receipts_key_with_part_of_an_order_number": {**self.GOOD_DIGEST, "receipts": {"held_" + order[-6:]: 1}},
+            "an_unknown_command": {**run, "command": "seen"},
+            "status_with_a_new_key": {"status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {}, "claim_links": 0,
+                                      "reviews": 0, "watermark_set": False, "stop_file_present": False, "seen": 1},
+            "status_receipts_key_with_part_of_an_order_number": {
+                "status": "ok", "command": "status", "receipts": {"held_" + order[-6:]: 1}, "observed": {}, "writes": {}, "claim_links": 0,
+                "reviews": 0, "watermark_set": False, "stop_file_present": False},
+            "status_writes_key_with_part_of_an_order_number": {
+                "status": "ok", "command": "status", "receipts": {}, "observed": {}, "writes": {"upgrade:" + order[-6:]: 1}, "claim_links": 0,
+                "reviews": 0, "watermark_set": False, "stop_file_present": False},
+            "check_config_with_a_new_key": {"status": "ok", **{key: None for key in self.CONFIG_KEYS if key != "status"}, "seen": 1},
+            "init_with_another_status": {"status": "seen_" + order[-6:]},
         }
         for name, value in bad.items():
             for stored in (False, True):
@@ -2765,6 +2907,52 @@ class OutputShapeRuleTests(Base):
             self.assert_outputs_private()
             self.advance(minutes=15)
         self.assertEqual((self.book.saves, self.receipt(1)["state"]), (0, "ready"))
+
+
+class RealOutputsReachTheCheckTests(Base):
+    """Slice B1 T6 (B12, H07): the digest alert codes and refs, and the
+    ``stopped`` text of an index run that stops, reach the check after every
+    test with real data."""
+
+    run_main = CliTests.run_main
+
+    def test_b12_a_real_digest_with_an_alert_and_the_ref_filter(self):
+        twenty = tuple(("20.00", 1, 1, False, ()) for _ in range(20))
+        self.guest_with_order(1, lines=twenty, more_lines=True)  # a 21st line item was not returned
+        self.assertEqual(self.run_main("init")[0], 0)
+        code, first, _ = self.run_main("observe")
+        self.assertEqual((code, first["alerts"]), (3, ["order_amount_unverifiable"]))
+        ref = first["refs"][0]["ref"]
+        self.assertEqual(first["refs"], [{"ref": ref, "code": "order_amount_unverifiable"}])
+        # H07: a second run whose ref's code is not one of that run's alerts.
+        self.shopify.orders_nodes.clear()
+        self.guest_with_order(2)
+        self.advance(minutes=15)
+        code, second, _ = self.run_main("observe")
+        self.assertEqual((code, second["alerts"], [r["code"] for r in second["refs"]]), (0, [], ["would_upgrade"]))
+        self.assertNotEqual(second["refs"][0]["ref"], ref)
+        code, digest, _ = self.run_main("digest", "--hours", "24")
+        self.assertEqual(code, 0)
+        self.assertEqual(digest["alerts"], {"order_amount_unverifiable": 1})
+        self.assertEqual(digest["alert_refs"], [{"ref": ref, "code": "order_amount_unverifiable"}])
+        self.assertEqual((digest["counts"]["order_amount_unverifiable"], digest["counts"]["would_upgrade"]), (1, 1))
+
+    def test_b12_an_index_run_that_stops_on_a_failed_read(self):
+        self.book.members[sg(1)] = fake_member(sg(1), name="Fake Member 1")  # an unlinked GUEST whose MemberNo is a phone
+        self.shopify.customers[customer_gid(1)] = customer_node(1)
+        self.book.fail_read = "bridge_read_failed:member_no_invalid"
+        self.assertEqual(self.run_main("init")[0], 0)
+        code, out, _ = self.run_main("index", "--max", "5", "--apply")
+        self.assertEqual(code, 3)
+        self.assertEqual((out["command"], out["stopped"], out["alerts"], out["counts"]),
+                         ("index_apply", "bridge_read_failed:member_no_invalid", ["bridge_read_failed:member_no_invalid"],
+                          {"bridge_read_failed:member_no_invalid": 1, "examined": 0, "index_member_complete": 1}))  # MEMBER pages first, none
+        conn = sqlite3.connect((self.root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            stored = json.loads(conn.execute("SELECT summary FROM runs WHERE run_id = ?", (out["run_id"],)).fetchone()[0])
+        finally:
+            conn.close()
+        self.assertEqual(stored, out)
 
 
 class ClassifySaveTests(unittest.TestCase):
