@@ -140,6 +140,32 @@ Never unregister either task: disable and enable only.
    The sync's next run should return 0 or 3 with no new alert. Shopify -> AC2
    resumes from its watermark; sign-up links wait up to about an hour.
 
+### Also pause the member benefits task (step S1 of `member_benefits_runbook.md`)
+
+Once the member benefits task `XB-MemberBenefits` is installed (its step B1
+on), pause it too around **every** type move command (`init`, `snapshot`,
+`move`, `resolve`, `rollback`, `reconcile`, `status`), so no benefits run adds
+AutoCount sessions during a batch. Its `apply` also takes this tool's ledger
+lock, so a type move command refuses `ledger_locked_by_another_owner` while a
+benefits `apply` runs.
+
+1. Disable it:
+
+   ```powershell
+   Disable-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberBenefits'
+   ```
+
+2. `Get-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberBenefits'` must
+   show `State` `Disabled`, not `Running`. If it shows `Running`, wait for the
+   run to end (at most 10 minutes) and check again. **Stop if it stays
+   `Running`** and report; do not start the type move command.
+3. Run the type move command and its read-back.
+4. Enable it again after the read-back:
+
+   ```powershell
+   Enable-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-MemberBenefits'
+   ```
+
 ## Snapshot time and a second pass
 
 - The snapshot time is fixed for the whole ladder. A member whose `ExpiryDate`

@@ -76,7 +76,7 @@ LEDGER_FILE = "member_benefits.sqlite3"
 LOCK_FILE = "member_benefits.lock"
 STOP_FILE = "STOP"
 TOOL = "xb268_member_benefits"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # slice B1: ledger v2 (claim unlinks, write releases, rule fingerprint); no migration
 PROFILE = "benefit_p1"
 BRIDGE_SCRIPT = dl.REPO_ROOT / "scripts" / "ac2_member_benefits_bridge.ps1"
 
@@ -94,7 +94,8 @@ EXPIRY_MONTHS = 24
 # over 1,000 points before it runs (shopify.dev, rate limits). On the strict
 # reading (every selected object counted once for each row of every connection
 # and list above it) the query costs
-#     2 + 5 x (10 + 6 x 20 + 3 x 3 + 3 x 10) = 847 points,
+#     2 + 5 x (11 + 6 x 20 + 3 x 3 + 3 x 10) = 852 points
+# (slice B1: + 1 per order for the transactionsCount object),
 # under the 900 this tool allows itself. The sum is written out line by line
 # in the runbook (section 9) and pinned by OrdersQueryCostTests: work it out
 # again before changing a size or the query text.
@@ -102,8 +103,14 @@ SHOPIFY_ORDER_PAGE = 5
 SHOPIFY_LINE_PAGE = 20  # an order with more line items is amount_unverifiable
 SHOPIFY_SHIPPING_PAGE = 3
 # Order.transactions is a plain list cut to this size (no pageInfo), so a
-# list that comes back full cannot be shown to be complete.
+# list that comes back full cannot be shown to be complete. Slice B1 (M1):
+# Order.transactionsCount (a Count: count Int!, precision CountPrecision!,
+# shopify.dev 2026-10) must be EXACT and equal to the list's length.
 SHOPIFY_PAYMENT_PAGE = 10
+COUNT_EXACT = "EXACT"  # CountPrecision: AT_LEAST or EXACT (shopify.dev 2026-10)
+# OrderTransactionKind, all eight values (shopify.dev 2026-10). Slice B1 (M3):
+# any other kind on a gift card gateway makes the payments unreadable.
+PAYMENT_KINDS = frozenset({"AUTHORIZATION", "CAPTURE", "CHANGE", "EMV_AUTHORIZATION", "REFUND", "SALE", "SUGGESTED_REFUND", "VOID"})
 # The gift-card-paid amount: transactions that took money (a sale, or the
 # capture of an authorisation) and succeeded. A refund back to a gift card is
 # never added back.
@@ -134,12 +141,30 @@ PENDING_STATES = ("pending_signup", "waiting_member", "ready")
 # alert) instead of waiting for ever. Such a receipt is re-opened (back to
 # ``ready``) only when a #155 link or a claim link for its customer appears.
 CLAIM_HOLD_CODES = frozenset({"claim_name_mismatch", "claim_phone_not_unique", "claim_link_conflict", "claim_memberno_conflict",
-                              "claim_member_not_in_scope", "claim_no_phone"})
+                              "claim_member_not_in_scope", "claim_no_phone", "claim_pair_unlinked"})
 # G2 B1: a refund by money that no refunded or removed unit explains.
 REFUND_UNATTRIBUTED = "refund_unattributed"
 # G2 B5: a claim-held receipt whose order stopped qualifying while it was
 # held (unit refund, cancellation, any other reason). Never re-opened.
 ORDER_NO_LONGER_QUALIFIES = "order_no_longer_qualifies"
+# Slice B1: the only codes a held claim receipt may settle to (pinned in the
+# receipts_decided_code trigger). ``order_past_read_window`` is used from
+# slice B2 on; it is listed now so B2 needs no schema change.
+ORDER_PAST_READ_WINDOW = "order_past_read_window"
+# Slice B1 (G0 1.5): the terminal code of a ready receipt whose HELD write was
+# released with the finding not_as_intended (staff upgrade by hand if due).
+HELD_WRITE_RELEASED = "held_write_released"
+RELEASE_FINDINGS = ("as_intended", "not_as_intended")
+UNLINK_REASONS = ("wrong_person", "customers_merged", "member_renumbered", "other")  # as the claim_unlinks CHECK
+_ORDER_REF_RE = re.compile(r"^o-[0-9a-f]{20}\Z")
+_CUSTOMER_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
+_LAST3_RE = re.compile(r"^[A-Za-z0-9._/-]{1,3}\Z")  # the last 3 characters of a MemberNo (dl.MEMBER_NO_RE)
+CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, ORDER_PAST_READ_WINDOW})
+# Slice B1: the version of the amount rule (goods_amount, gift_card_paid,
+# qualifying_amount, qualifies, money_refund_unattributed and the order
+# parsing of amounts). Any change to one of them raises it; it is part of the
+# rule fingerprint kept in the ledger (BenefitsConfig.rule_fingerprint).
+AMOUNT_RULE_VERSION = 2  # 2: slice B1 (M1 transactionsCount, M3 unknown kind, M4 gateway trimmed)
 
 _LOCAL_STORED_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
 _NEW_EXPIRY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T00:00:00$")
@@ -245,6 +270,22 @@ class BenefitsConfig:
     ac2_login_mode: str | None
     ac2_refused_user_ids: tuple[str, ...]
 
+    def rule_fingerprint(self) -> str:
+        """Slice B1: ``sha256:`` + hex of the canonical JSON of every setting
+        that changes a measured amount or the threshold, plus
+        ``AMOUNT_RULE_VERSION``. Kept in the ledger at ``init``. Not in it, on
+        purpose: the sign-up settings and ``orders_start_utc`` (a replay
+        decides undecided receipts again under them), caps, timeouts, roots."""
+
+        value = {
+            "amount_rule_version": AMOUNT_RULE_VERSION, "qualify_threshold_cents": self.qualify_threshold_cents,
+            "amount_before_discounts": self.amount_before_discounts, "amount_include_tax": self.amount_include_tax,
+            "amount_exclude_shipping": self.amount_exclude_shipping, "amount_exclude_gift_cards": self.amount_exclude_gift_cards,
+            "gift_card_gateways": sorted(self.gift_card_gateways), "amount_count_sale_items": self.amount_count_sale_items,
+        }
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
 
@@ -260,6 +301,7 @@ class BenefitsConfig:
             "type_move_lock": self.type_move_state_root is not None,
             "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "ac2_login_mode": self.ac2_login_mode,
+            "rule_fingerprint": self.rule_fingerprint(),  # slice B1: as kept in the ledger at init
         }
 
 
@@ -529,9 +571,10 @@ def goods_amount(order: Order, config: BenefitsConfig) -> tuple[int, int] | None
 def gift_card_paid(order: Order, config: BenefitsConfig) -> int | None:
     """Cents paid by gift card: the sum of the successful ``SALE`` and
     ``CAPTURE`` transactions whose gateway is one of ``gift_card_gateways``.
-    None when the payments cannot be read: the list came back full, an amount
-    is not SGD or is malformed, or a gift card payment has not settled
-    (``PENDING``, ``AWAITING_RESPONSE``, ``UNKNOWN``). A failed one
+    None when the payments cannot be read: the list is not shown complete
+    (``payments_complete``), an amount is not SGD or is malformed, a gift
+    card payment has a kind Shopify does not document, or a gift card payment
+    has not settled (``PENDING``, ``AWAITING_RESPONSE``, ``UNKNOWN``). A failed one
     (``FAILURE``, ``ERROR``) took no money and is ignored, as is every other
     kind: a refund back to a gift card is never added back (the safe side)."""
 
@@ -541,7 +584,11 @@ def gift_card_paid(order: Order, config: BenefitsConfig) -> int | None:
     for payment in order.payments:
         if payment.cents is None:
             return None
-        if payment.gateway not in config.gift_card_gateways or payment.kind not in GIFT_CARD_PAYMENT_KINDS:
+        if payment.gateway not in config.gift_card_gateways:
+            continue
+        if payment.kind not in PAYMENT_KINDS:
+            return None  # slice B1 (M3): a kind Shopify does not document; never guessed
+        if payment.kind not in GIFT_CARD_PAYMENT_KINDS:
             continue
         if payment.status == PAYMENT_SUCCESS:
             paid += payment.cents
@@ -706,7 +753,8 @@ LEDGER_SCHEMA = """
 CREATE TABLE meta(
   id INTEGER PRIMARY KEY CHECK (id = 1), tool TEXT NOT NULL CHECK (tool = 'xb268_member_benefits'), ledger_id TEXT NOT NULL,
   autocount_book TEXT NOT NULL CHECK (autocount_book IN ('AED_TESTINGAPI', 'AED_XBOUNDARIES')),
-  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL);
+  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL,
+  rule_fingerprint TEXT NOT NULL CHECK (rule_fingerprint GLOB 'sha256:*' AND length(rule_fingerprint) = 71));
 CREATE TABLE receipts(
   order_gid TEXT PRIMARY KEY, customer_gid TEXT, order_created_at TEXT NOT NULL, order_date_sgt TEXT NOT NULL,
   order_updated_at TEXT NOT NULL, financial_status TEXT, gross_cents INTEGER, net_cents INTEGER, refunded_cents INTEGER,
@@ -718,8 +766,14 @@ CREATE TABLE receipts(
   first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   CHECK (state <> 'applied' OR (member_no IS NOT NULL AND basis_expiry_local IS NOT NULL)));
 CREATE TABLE claim_links(
-  customer_gid TEXT NOT NULL UNIQUE, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL UNIQUE,
+  link_id INTEGER PRIMARY KEY, customer_gid TEXT NOT NULL, member_no TEXT NOT NULL, member_no_key TEXT NOT NULL,
   source TEXT NOT NULL CHECK (source IN ('order', 'index')), code TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE claim_unlinks(
+  link_id INTEGER PRIMARY KEY REFERENCES claim_links(link_id),
+  reason TEXT NOT NULL CHECK (reason IN ('wrong_person', 'customers_merged', 'member_renumbered', 'other')),
+  run_id TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE VIEW active_claim_links AS
+  SELECT * FROM claim_links c WHERE NOT EXISTS (SELECT 1 FROM claim_unlinks u WHERE u.link_id = c.link_id);
 CREATE TABLE reviews(subject TEXT PRIMARY KEY, code TEXT NOT NULL, first_seen_at TEXT NOT NULL);
 CREATE TABLE writes(
   write_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, order_gid TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('upgrade', 'extend')),
@@ -732,6 +786,11 @@ CREATE TABLE writes(
   CHECK (new_expiry_local GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T00:00:00'),
   CHECK (expected_expiry_local IS NULL OR substr(new_expiry_local, 1, 10) > substr(expected_expiry_local, 1, 10)),
   CHECK (state <> 'DONE' OR post_last_modified_local IS NOT NULL));
+CREATE TABLE write_releases(
+  write_id TEXT PRIMARY KEY REFERENCES writes(write_id),
+  finding TEXT NOT NULL CHECK (finding IN ('as_intended', 'not_as_intended')),
+  member_read_digest TEXT NOT NULL CHECK (member_read_digest GLOB 'sha256:*' AND length(member_read_digest) = 71),
+  run_id TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE watermarks(name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE runs(run_id TEXT PRIMARY KEY, command TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, summary TEXT);
 CREATE TRIGGER meta_immutable BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
@@ -742,18 +801,31 @@ CREATE TRIGGER receipts_binding_immutable BEFORE UPDATE OF order_gid, order_crea
 CREATE TRIGGER receipts_decided_stay BEFORE UPDATE OF state ON receipts
   WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state <> OLD.state
    AND NOT (OLD.state = 'held' AND NEW.state = 'ready' AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
-            'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+            'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone', 'claim_pair_unlinked'))
   BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
 CREATE TRIGGER receipts_decided_code BEFORE UPDATE OF code ON receipts
   WHEN OLD.state IN ('applied', 'no_change', 'not_in_scope', 'held') AND NEW.state = OLD.state AND NEW.code IS NOT OLD.code
-   AND NOT (OLD.state = 'held' AND NEW.code IS NOT NULL
+   AND NOT (OLD.state = 'held'
             AND COALESCE(OLD.code, '') IN ('claim_name_mismatch', 'claim_phone_not_unique',
-                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone')
-            AND NEW.code NOT IN ('claim_name_mismatch', 'claim_phone_not_unique',
-                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone'))
+                'claim_link_conflict', 'claim_memberno_conflict', 'claim_member_not_in_scope', 'claim_no_phone', 'claim_pair_unlinked')
+            AND COALESCE(NEW.code, '') IN ('order_no_longer_qualifies', 'refund_unattributed', 'order_past_read_window'))
   BEGIN SELECT RAISE(ABORT, 'receipt_decided'); END;
+CREATE TRIGGER claim_links_one_active BEFORE INSERT ON claim_links
+  WHEN EXISTS (SELECT 1 FROM active_claim_links a WHERE a.customer_gid = NEW.customer_gid OR a.member_no_key = NEW.member_no_key)
+  BEGIN SELECT RAISE(ABORT, 'claim_link_conflict'); END;
+CREATE TRIGGER claim_links_pair_unlinked BEFORE INSERT ON claim_links
+  WHEN EXISTS (SELECT 1 FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id
+               WHERE c.customer_gid = NEW.customer_gid AND c.member_no_key = NEW.member_no_key)
+  BEGIN SELECT RAISE(ABORT, 'claim_pair_unlinked'); END;
 CREATE TRIGGER claim_links_immutable BEFORE UPDATE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
 CREATE TRIGGER claim_links_no_delete BEFORE DELETE ON claim_links BEGIN SELECT RAISE(ABORT, 'claim_link_immutable'); END;
+CREATE TRIGGER claim_unlinks_immutable BEFORE UPDATE ON claim_unlinks BEGIN SELECT RAISE(ABORT, 'claim_unlink_immutable'); END;
+CREATE TRIGGER claim_unlinks_no_delete BEFORE DELETE ON claim_unlinks BEGIN SELECT RAISE(ABORT, 'claim_unlink_immutable'); END;
+CREATE TRIGGER write_releases_held_only BEFORE INSERT ON write_releases
+  WHEN NOT EXISTS (SELECT 1 FROM writes w WHERE w.write_id = NEW.write_id AND w.state = 'HELD')
+  BEGIN SELECT RAISE(ABORT, 'release_not_held'); END;
+CREATE TRIGGER write_releases_immutable BEFORE UPDATE ON write_releases BEGIN SELECT RAISE(ABORT, 'write_release_immutable'); END;
+CREATE TRIGGER write_releases_no_delete BEFORE DELETE ON write_releases BEGIN SELECT RAISE(ABORT, 'write_release_immutable'); END;
 CREATE TRIGGER writes_no_delete BEFORE DELETE ON writes BEGIN SELECT RAISE(ABORT, 'write_immutable'); END;
 CREATE TRIGGER writes_binding_immutable BEFORE UPDATE OF write_id, run_id, order_gid, kind, member_no, from_type, to_type,
   expected_last_modified_local, expected_expiry_local, new_expiry_local, salt, created_at, deadline_at ON writes
@@ -772,21 +844,28 @@ class BenefitsLedger:
         self.root = Path(root)
         self.clock = clock
         self._lock = dl._OwnerLock(self.root / LOCK_FILE)
+        self.conn = None
         try:
             self.conn = sqlite3.connect(self.root / LEDGER_FILE, isolation_level=None, timeout=0)
             self.conn.row_factory = sqlite3.Row
-            for pragma in ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON", "trusted_schema=OFF"):
-                self.conn.execute(f"PRAGMA {pragma}")
+            # Slice B1: the version is checked before any pragma that could
+            # change the file, so a ledger made by older code is left as it is.
             version = self.conn.execute("PRAGMA user_version").fetchone()[0]
             tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not (version == 0 and not tables) and (version != SCHEMA_VERSION or "receipts" not in tables):
+                raise dl.DirectLocalError("benefits_ledger_not_recognised")
+            # recursive_triggers: an INSERT OR REPLACE deletes the old row
+            # first; with this on, the no-delete triggers fire and abort it.
+            for pragma in ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON", "trusted_schema=OFF", "recursive_triggers=ON"):
+                self.conn.execute(f"PRAGMA {pragma}")
             if version == 0 and not tables:
                 with self.tx() as conn:
                     for statement in dl._split_sql(LEDGER_SCHEMA):
                         conn.execute(statement)
                     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            elif version != SCHEMA_VERSION or "receipts" not in tables:
-                raise dl.DirectLocalError("benefits_ledger_not_recognised")
         except BaseException:
+            if self.conn is not None:
+                self.conn.close()
             self._lock.release()
             raise
 
@@ -819,9 +898,10 @@ class BenefitsLedger:
                 self._check(row, config)
                 return {"status": "existing"}
             conn.execute(
-                "INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at, rule_fingerprint) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (TOOL, f"mb-{uuid.uuid4().hex}", config.autocount_book, config.shopify.store_gid, config.shopify.shop_domain,
-                 secrets.token_hex(32), dl.ts(self.now())),
+                 secrets.token_hex(32), dl.ts(self.now()), config.rule_fingerprint()),
             )
         return {"status": "initialised"}
 
@@ -836,6 +916,21 @@ class BenefitsLedger:
         if row is None:
             raise dl.DirectLocalError("benefits_ledger_not_initialised")
         self._check(row, config)
+
+    def rule_settings_match(self, config: BenefitsConfig) -> bool:
+        """Slice B1: the config's rule fingerprint is the one kept at init."""
+
+        row = self.conn.execute("SELECT rule_fingerprint FROM meta WHERE id = 1").fetchone()
+        return row is not None and hmac.compare_digest(row[0], config.rule_fingerprint())
+
+    def check_rule_settings(self, config: BenefitsConfig) -> None:
+        """Slice B1 (G0 1.4): observe and apply measure amounts, so they
+        refuse when an amount setting or the amount rule changed since the
+        ledger was made (the receipts already recorded keep their old
+        amount). The way on is a new start (runbook)."""
+
+        if not self.rule_settings_match(config):
+            raise dl.DirectLocalError("benefits_rule_settings_changed")
 
     def ref(self, kind: str, value: str) -> str:
         key = self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0]
@@ -874,11 +969,31 @@ class BenefitsLedger:
         with self.tx() as conn:
             conn.execute(f"UPDATE receipts SET {columns}, updated_at = ? WHERE order_gid = ?", (*values.values(), dl.ts(self.now()), order_gid))
 
+    # Slice B1: every reader of claim links reads the active ones only (a
+    # voided link stays in claim_links as history).
     def claim_for_gid(self, gid: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM claim_links WHERE customer_gid = ?", (gid,)).fetchone()
+        return self.conn.execute("SELECT * FROM active_claim_links WHERE customer_gid = ?", (gid,)).fetchone()
 
     def claim_for_member(self, member_no: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM claim_links WHERE member_no_key = ?", (sync.member_no_key(member_no),)).fetchone()
+        return self.conn.execute("SELECT * FROM active_claim_links WHERE member_no_key = ?", (sync.member_no_key(member_no),)).fetchone()
+
+    def pair_unlinked(self, gid: str, member_no: str) -> bool:
+        """Slice B1 (G0 1.6): this customer and this member were linked once
+        and the link was voided. The one reader of ``claim_links`` outside
+        the schema: a voided link is history, never an active link."""
+
+        return self.conn.execute("SELECT 1 FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id "
+                                 "WHERE c.customer_gid = ? AND c.member_no_key = ? LIMIT 1",
+                                 (gid, sync.member_no_key(member_no))).fetchone() is not None
+
+    def active_claims(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM active_claim_links ORDER BY link_id").fetchall()
+
+    def claim_counts(self) -> tuple[int, int]:
+        """``(active, voided)`` claim links."""
+
+        return (self.conn.execute("SELECT COUNT(*) FROM active_claim_links").fetchone()[0],
+                self.conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0])
 
     def add_claim(self, gid: str, member_no: str, source: str, code: str) -> None:
         with self.tx() as conn:
@@ -898,7 +1013,15 @@ class BenefitsLedger:
         return self.conn.execute("SELECT * FROM writes WHERE state IN ('INTENT', 'UNCERTAIN') ORDER BY rowid").fetchall()
 
     def held_writes(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0]
+        """HELD writes not released yet (slice B1): ``apply`` refuses while any
+        exists. A released write stays HELD for ever (write_landed_or_open)."""
+
+        return self.conn.execute("SELECT COUNT(*) FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
+                                 "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id)").fetchone()[0]
+
+    def unreleased_held_writes(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
+                                 "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id) ORDER BY rowid").fetchall()
 
     def done_write(self, order_gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM writes WHERE order_gid = ? AND state = 'DONE' ORDER BY rowid DESC LIMIT 1", (order_gid,)).fetchone()
@@ -1023,6 +1146,7 @@ ORDERS_QUERY = """query XbMemberBenefitsOrders($first: Int!, $after: String, $se
       }
       shippingLines(first: """ + str(SHOPIFY_SHIPPING_PAGE) + """) { pageInfo { hasNextPage } nodes { originalPriceSet { """ + _MONEY + """ } } }
       transactions(first: """ + str(SHOPIFY_PAYMENT_PAGE) + """) { gateway kind status amountSet { """ + _MONEY + """ } }
+      transactionsCount { count precision }
     }
   }
 }"""
@@ -1126,15 +1250,31 @@ def order_from_node(node: Any) -> Order:
     for item in transactions:
         _shape(isinstance(item, dict) and isinstance(item.get("kind"), str) and isinstance(item.get("status"), str)
                and (item.get("gateway") is None or isinstance(item["gateway"], str)))
-        payments.append(Payment((item.get("gateway") or "").lower(), item["kind"], item["status"], _payment_cents(item.get("amountSet"))))
+        payments.append(Payment((item.get("gateway") or "").strip().lower(), item["kind"], item["status"], _payment_cents(item.get("amountSet"))))
     customer = None if node.get("customer") is None else customer_from_node(node["customer"])
     return Order(
         gid=node["id"], created_at=created, updated_at=updated, cancelled=node.get("cancelledAt") is not None, test=node["test"],
         financial_status=status, taxes_included=node["taxesIncluded"], currency=CURRENCY if currencies == {CURRENCY} else None,
         customer=customer, lines=tuple(lines), lines_complete=items["pageInfo"].get("hasNextPage") is False,
         shipping_cents=tuple(shipping_cents), shipping_complete=shipping["pageInfo"].get("hasNextPage") is False, refunded_cents=refunded,
-        payments=tuple(payments), payments_complete=len(payments) < SHOPIFY_PAYMENT_PAGE,
+        payments=tuple(payments), payments_complete=payments_complete(node.get("transactionsCount"), len(payments)),
     )
+
+
+def payments_complete(count_node: Any, listed: int) -> bool:
+    """Slice B1 (M1): the transaction list is complete only when
+    ``transactionsCount`` is an object whose ``count`` is a whole number equal
+    to the number listed and whose ``precision`` is ``EXACT``, and the list
+    is shorter than its page. Anything else (null, missing, ``AT_LEAST``, a
+    mismatch, a malformed value) is not complete: the order is
+    ``payments_unreadable``, never a failed read (one odd order must not stop
+    the reader). An empty list with a count of 0, exact, is proven empty."""
+
+    if not isinstance(count_node, dict):
+        return False
+    count = count_node.get("count")
+    return (type(count) is int and count == listed and count_node.get("precision") == COUNT_EXACT
+            and listed < SHOPIFY_PAYMENT_PAGE)
 
 
 class BenefitsShopifyClient(direct.ShopifyDirectClient):
@@ -1479,7 +1619,7 @@ class RunSummary:
     saves: int = 0
     stopped: str | None = None
     # Shopify's requested cost of the orders query on this run, in whole
-    # points (to compare with the calculated 847); None when none was reported.
+    # points (to compare with the calculated 852); None when none was reported.
     orders_query_cost: int | None = None
 
     def count(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
@@ -1552,7 +1692,7 @@ class BenefitsEngine:
 
     def _load_links(self) -> None:
         self.links = self._sync_links()
-        claims = self.ledger.conn.execute("SELECT * FROM claim_links").fetchall()
+        claims = self.ledger.active_claims()
         self.conflict_gids, self.conflict_keys = link_conflicts(self.links, claims)
         self.linked_gids = set(self.links.by_gid) | {row["customer_gid"] for row in claims}
 
@@ -1762,6 +1902,9 @@ class BenefitsEngine:
         if apply and not self.config.benefits_write_enabled:
             raise dl.DirectLocalError("benefits_write_disabled")
         self.ledger.check_binding(self.config)
+        # Slice B1: before the Shopify session check, any read, any ledger
+        # write or run row.
+        self.ledger.check_rule_settings(self.config)
         if apply:
             if self.ledger.open_writes():
                 raise dl.DirectLocalError("benefit_uncertain_unresolved")
@@ -1885,6 +2028,12 @@ class BenefitsEngine:
         if member.member_type not in SCOPE_TYPES:
             summary.count("claim_member_not_in_scope", ref, member_no)
             return None, member, "claim_member_not_in_scope"
+        if self.ledger.pair_unlinked(customer.gid, member_no):
+            # Slice B1 (G0 1.6): a voided pair is never linked again by the
+            # tool; its own review subject, so an earlier review of the same
+            # customer does not swallow the alert.
+            self._review("unlinked:" + customer.gid, "claim_pair_unlinked", summary, ref, member_no)
+            return None, member, "claim_pair_unlinked"
         if customer.gid in self.links.by_gid or key in self.links.by_key or self.ledger.claim_for_gid(customer.gid) or self.ledger.claim_for_member(member_no):
             self._review(customer.gid, "claim_link_conflict", summary, ref, member_no)
             return None, member, "claim_link_conflict"
@@ -2093,6 +2242,148 @@ class BenefitsEngine:
             return "NOT_WRITTEN", "resolved_not_written", None
         return "HELD", "resolved_unclear", None
 
+    # -- release-held (slice B1, G0 1.5) ---------------------------------------
+    def _writers_settled(self, rows: Iterable[sqlite3.Row]) -> None:
+        """As ``resolve``: a write whose deadline (plus grace) has not passed,
+        or whose child still runs, may still be saving."""
+
+        now = self.now()
+        for row in rows:
+            if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
+                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
+                raise dl.DirectLocalHold("writer_may_be_live")
+
+    def release_held(self, *, order_ref: Any, member_last3: Any, finding: Any, apply: bool) -> dict[str, Any]:
+        """Clear the latch of one ``HELD`` write after the owner checked that
+        member in AutoCount. One read-only ``benefit-member`` read proves the
+        finding; nothing is ever sent to AutoCount, the write row stays
+        ``HELD`` (never sent again, I4) and the release is a new row. A dry
+        run unless ``apply``; every refusal records nothing."""
+
+        if (not isinstance(order_ref, str) or not _ORDER_REF_RE.fullmatch(order_ref) or not isinstance(member_last3, str)
+                or not _LAST3_RE.fullmatch(member_last3) or finding not in RELEASE_FINDINGS):
+            raise dl.DirectLocalError("release_arguments_invalid")
+        self.ledger.check_binding(self.config)
+        if self.ledger.open_writes():
+            raise dl.DirectLocalError("benefit_uncertain_unresolved")
+        held = [row for row in self.ledger.unreleased_held_writes() if self.ledger.ref("o", row["order_gid"]) == order_ref]
+        if not held:
+            raise dl.DirectLocalError("release_no_held_write")
+        write = held[0]
+        if write["member_no"][-3:] != member_last3:
+            raise dl.DirectLocalError("release_member_mismatch")
+        self._writers_settled([write])
+        read = self.ac2.member(write["member_no"], secrets.token_hex(16))  # the existing read-only operation, as resolve
+        intended = read.found and read.member_type == TARGET_TYPE and read.expiry_local == write["new_expiry_local"] + ".000"
+        if intended != (finding == "as_intended"):
+            raise dl.DirectLocalError("release_finding_not_proven")
+        proof = read.fields_digest if read.found else "sha256:" + hashlib.sha256(b"benefit_member_not_found").hexdigest()
+        if not isinstance(proof, str) or not _DIGEST_RE.fullmatch(proof):
+            raise dl.BridgeError("bridge_output_invalid")
+        receipt = self.ledger.receipt(write["order_gid"])
+        if receipt is not None and receipt["state"] == "ready":
+            receipt_now = "applied" if finding == "as_intended" else "held"
+        else:
+            receipt_now = "left_decided"
+        count = {"applied": "release_receipt_applied", "held": "release_receipt_held"}.get(receipt_now, "release_receipt_left_decided")
+        run_id = f"run-{uuid.uuid4().hex}" if apply else None
+        result = {"status": "ok", "command": "release_held" if apply else "release_held_dry_run", "run_id": run_id, "finding": finding,
+                  "receipt_now": receipt_now, "held_writes_left": self.ledger.held_writes() - 1, "counts": {count: 1},
+                  "refs": [{"ref": order_ref, "code": "write_released", "member_no_masked": mask(write["member_no"])}], "alerts": []}
+        if not apply:
+            return result
+        now = dl.ts(self.now())
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO write_releases(write_id, finding, member_read_digest, run_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                         (write["write_id"], finding, proof, run_id, now))
+            if receipt_now == "applied":
+                conn.execute("UPDATE receipts SET state = 'applied', code = ?, member_no = ?, basis_expiry_local = ?, updated_at = ? "
+                             "WHERE order_gid = ?", (write["kind"], write["member_no"], write["new_expiry_local"], now, write["order_gid"]))
+            elif receipt_now == "held":
+                conn.execute("UPDATE receipts SET state = 'held', code = ?, updated_at = ? WHERE order_gid = ?",
+                             (HELD_WRITE_RELEASED, now, write["order_gid"]))
+            conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES (?, 'release_held', ?, ?, ?)",
+                         (run_id, now, now, json.dumps(result, sort_keys=True)))
+        return result
+
+    # -- unlink (slice B1, G0 1.6) -----------------------------------------------
+    def unlink(self, *, member_last3: Any, reason: Any, accept_applied: bool, apply: bool, customer_ref: Any = None,
+               order_ref: Any = None) -> dict[str, Any]:
+        """Void one claim link this tool made (by an order or by the index).
+        Never touches the #155 sync's links, AutoCount or Shopify. The link row
+        stays (history); the void is a new row. Receipts through the link: a
+        ``ready`` one loses its member and is linked afresh by the next run;
+        a decided one is kept; an ``applied`` one only with
+        ``accept_applied`` (one alert: the owner checks that member by hand;
+        the tool never downgrades). A dry run unless ``apply``; every refusal
+        records nothing.
+
+        The link is named by exactly one selector: ``customer_ref`` (the
+        customer's ``c-`` ref) or ``order_ref`` (fix round 1, G2 B13: the
+        ``o-`` ref a ``link_conflict``, ``write_held``, ``would_upgrade`` or
+        ``upgraded`` entry carries; the link is that receipt's customer's
+        active claim link). An ``o-`` ref that names no receipt, a receipt
+        with no customer, or a customer with no active claim link (also one
+        linked by #155 only) is ``unlink_not_a_claim_link``."""
+
+        selectors = [value for value in (customer_ref, order_ref) if value is not None]
+        if (len(selectors) != 1 or not isinstance(selectors[0], str)
+                or (customer_ref is not None and not _CUSTOMER_REF_RE.fullmatch(customer_ref)) or not isinstance(member_last3, str)
+                or not _LAST3_RE.fullmatch(member_last3) or reason not in UNLINK_REASONS or not isinstance(accept_applied, bool)):
+            raise dl.DirectLocalError("unlink_arguments_invalid")
+        self.ledger.check_binding(self.config)
+        if order_ref is not None:
+            # A malformed o- ref names no receipt: the same answer as an unknown one (Controller ruling 2).
+            customers = [row["customer_gid"] for row in self.ledger.conn.execute("SELECT order_gid, customer_gid FROM receipts")
+                         if self.ledger.ref("o", row["order_gid"]) == order_ref]
+            links = [row for row in self.ledger.active_claims() if customers and row["customer_gid"] == customers[0]]
+        else:
+            links = [row for row in self.ledger.active_claims() if self.ledger.ref("c", row["customer_gid"]) == customer_ref]
+        if not links:
+            raise dl.DirectLocalError("unlink_not_a_claim_link")  # also a customer linked by #155 only
+        link = links[0]
+        customer_ref = self.ledger.ref("c", link["customer_gid"])
+        if link["member_no"][-3:] != member_last3:
+            raise dl.DirectLocalError("unlink_member_mismatch")
+        if self.ledger.open_writes():
+            raise dl.DirectLocalError("benefit_uncertain_unresolved")
+        if any(sync.member_no_key(row["member_no"]) == link["member_no_key"] for row in self.ledger.unreleased_held_writes()):
+            raise dl.DirectLocalError("unlink_member_write_held")
+        through = [row for row in self.ledger.conn.execute(
+            "SELECT * FROM receipts WHERE link_source = 'claim' AND customer_gid = ? AND member_no IS NOT NULL ORDER BY order_gid",
+            (link["customer_gid"],)) if sync.member_no_key(row["member_no"]) == link["member_no_key"]]
+        if any(row["state"] == "ready" and self.ledger.done_write(row["order_gid"]) is not None for row in through):
+            raise dl.DirectLocalError("unlink_receipt_needs_repair")
+        if any(row["state"] == "applied" for row in through) and not accept_applied:
+            raise dl.DirectLocalError("unlink_has_applied")
+        summary = RunSummary("unlink" if apply else "unlink_dry_run")
+        summary.count("claim_unlinked", customer_ref, link["member_no"])
+        reset = []
+        for row in through:
+            if row["state"] == "ready":
+                reset.append(row["order_gid"])
+                summary.count("unlink_receipt_reset")
+            elif row["state"] in ("held", "no_change", "not_in_scope"):
+                summary.count("unlink_receipt_kept")
+            elif row["state"] == "applied":
+                summary.count("unlink_receipt_applied")
+                summary.alert("unlinked_with_applied", self.ledger.ref("o", row["order_gid"]), row["member_no"])
+        run_id = f"run-{uuid.uuid4().hex}" if apply else None
+        result = {"status": "ok", "command": summary.command, "run_id": run_id, "reason": reason, "link_source": link["source"],
+                  "counts": dict(sorted(summary.counts.items())), "alerts": list(summary.alerts), "refs": list(summary.refs)}
+        if not apply:
+            return result
+        now = dl.ts(self.now())
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES (?, ?, ?, ?)", (link["link_id"], reason, run_id, now))
+            for order_gid in reset:
+                conn.execute("UPDATE receipts SET member_no = NULL, link_source = NULL, observed = NULL, observed_at = NULL, checked_at = NULL, "
+                             "updated_at = ? WHERE order_gid = ? AND state = 'ready'", (now, order_gid))
+            conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES (?, 'unlink', ?, ?, ?)",
+                         (run_id, now, now, json.dumps(result, sort_keys=True)))
+        return result
+
     # -- index (one-off, read only towards Shopify and AC2) -------------------
     def index(self, *, apply: bool, max_members: int) -> dict[str, Any]:
         """Existing AC2 MEMBER and GUEST members with no #155 link and no
@@ -2162,6 +2453,9 @@ class BenefitsEngine:
             self._index_review(key, "claim_phone_not_unique", summary, ref, member_no)
             return 1
         customer = same_phone[0]
+        if self.ledger.pair_unlinked(customer.gid, member_no):
+            summary.count("index_pair_unlinked")  # slice B1: a voided pair is never linked again
+            return 1
         read = MemberRead(True, member_no=member_no, member_type=member_type, name=row.get("name"))
         if not apply:
             name_ok = sync.full_name_matches(sync.shopify_full_name(customer.first_name, customer.last_name), read.name)
@@ -2183,8 +2477,10 @@ class BenefitsEngine:
         receipts = {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM receipts GROUP BY state")}
         observed = {row[0]: row[1] for row in conn.execute("SELECT observed, COUNT(*) FROM receipts WHERE state = 'ready' AND observed IS NOT NULL GROUP BY observed")}
         writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT kind, state, COUNT(*) FROM writes GROUP BY kind, state")}
+        active, voided = self.ledger.claim_counts()
         return {"status": "ok", "command": "status", "receipts": receipts, "observed": observed, "writes": writes,
-                "claim_links": conn.execute("SELECT COUNT(*) FROM claim_links").fetchone()[0],
+                "held_writes": self.ledger.held_writes(),
+                "claim_links": active, "claim_links_voided": voided, "rule_settings_match": self.ledger.rule_settings_match(self.config),
                 "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
                 "watermark_set": self.ledger.watermark(WATERMARK) is not None, "stop_file_present": self._stop_requested()}
 
@@ -2240,6 +2536,8 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise dl.DirectLocalError("benefits_ledger_not_recognised")  # slice B1: a ledger made by older code
         meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
         if meta is None:
             raise dl.DirectLocalError("benefits_ledger_not_initialised")
@@ -2291,6 +2589,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
                 gateways[name] = gateways.get(name, 0) + 1
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
+            "rule_settings_match": hmac.compare_digest(meta["rule_fingerprint"], config.rule_fingerprint()),
             "runs": {"completed": completed, "unfinished": unfinished}, "counts": dict(sorted(counts.items())),
             "alerts": dict(sorted(alerts.items())), "alert_refs": refs, "receipts": receipts,
             "shadow": {"would_upgrade": observed.get("would_upgrade", 0), "would_extend": observed.get("would_extend", 0)},
@@ -2300,8 +2599,11 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
             },
             "open": {
                 "uncertain_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state IN ('INTENT', 'UNCERTAIN')").fetchone()[0],
-                "held_writes": conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'HELD'").fetchone()[0],
-                "waiting_member": receipts.get("waiting_member", 0), "claim_links": conn.execute("SELECT COUNT(*) FROM claim_links").fetchone()[0],
+                "held_writes": conn.execute("SELECT COUNT(*) FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
+                                            "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id)").fetchone()[0],
+                "waiting_member": receipts.get("waiting_member", 0),
+                "claim_links": conn.execute("SELECT COUNT(*) FROM active_claim_links").fetchone()[0],
+                "claim_links_voided": conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0],
             },
         }
     except sqlite3.Error:
@@ -2335,7 +2637,7 @@ def build_real_engine(config: BenefitsConfig, ledger: BenefitsLedger, *, environ
     return BenefitsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest")
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink")
 
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsConfig, BenefitsLedger], BenefitsEngine] | None = None,
@@ -2343,9 +2645,17 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
     parser = argparse.ArgumentParser(description="#268 member core: S$300 online order -> AC2 MEMBER + 2-year expiry; claim links")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--apply", action="store_true", help="index only: write claim links to this tool's ledger (default: dry run)")
+    parser.add_argument("--apply", action="store_true", help="index, release-held, unlink: record in this tool's ledger (default: dry run)")
     parser.add_argument("--max", type=int, default=200, help="index only: members examined this run (1-1000)")
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
+    parser.add_argument("--order-ref", help="release-held: the o- keyed ref of the order whose HELD write is released; "
+                                            "unlink: the o- keyed ref of a receipt whose customer's claim link is voided")
+    parser.add_argument("--member-last3", help="release-held, unlink: the last 3 characters of the MemberNo")
+    parser.add_argument("--customer-ref", help="unlink only: the c- keyed ref of the customer whose claim link is voided "
+                                               "(exactly one of --customer-ref and --order-ref)")
+    parser.add_argument("--reason", help="unlink only: wrong_person, customers_merged, member_renumbered or other")
+    parser.add_argument("--accept-applied", action="store_true", help="unlink only: void even when a receipt through the link is applied")
+    parser.add_argument("--finding", help="release-held only: as_intended or not_as_intended (what the owner saw in AutoCount)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -2379,6 +2689,11 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
                     result = engine.run(apply=True)
             elif args.command == "resolve":
                 result = engine.resolve()
+            elif args.command == "release-held":
+                result = engine.release_held(order_ref=args.order_ref, member_last3=args.member_last3, finding=args.finding, apply=args.apply)
+            elif args.command == "unlink":
+                result = engine.unlink(customer_ref=args.customer_ref, order_ref=args.order_ref, member_last3=args.member_last3,
+                                       reason=args.reason, accept_applied=args.accept_applied, apply=args.apply)
             else:
                 result = engine.index(apply=args.apply, max_members=args.max)
             _emit(result)
