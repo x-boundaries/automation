@@ -255,6 +255,55 @@ class Base(unittest.TestCase):
         path.write_text(json.dumps(raw_config(self.root, self.sync_root, self.core_root, **overrides)), encoding="utf-8")
         return path
 
+    # -- the two input ledgers, made by the tools' own code (fake data) -----
+    def make_sync(self, links=(), *, book="AED_TESTINGAPI", store=STORE_GID, shop=SHOP) -> Path:
+        """The #155 sync ledger (sync.SyncLedger, schema v3) with ``links``
+        of ``(n, member_no)``."""
+        ledger = sync.SyncLedger(self.sync_root, check_custody=False)
+        try:
+            if ledger.conn.execute("SELECT 1 FROM meta").fetchone() is None:
+                ledger.init_meta(autocount_book=book, store_gid=store, shop_domain=shop)
+            with ledger.tx() as conn:
+                for n, member_no in links:
+                    ledger.add_link(conn, customer_gid(n), member_no, "matched", "test")
+                    self.private |= {customer_gid(n), member_no}
+        finally:
+            ledger.close()
+        return self.sync_root / sync.LEDGER_FILE
+
+    def core_config(self, store=STORE_GID) -> bm.BenefitsConfig:
+        return bm.parse_config({
+            "schema": bm.CONFIG_SCHEMA, "state_root": str(self.core_root), "autocount_book": "AED_TESTINGAPI",
+            "orders_start_utc": "2026-11-15T00:00:00Z", "member_sync_state_root": str(self.sync_root),
+            "shopify": {"store_gid": store, "shop_domain": SHOP, "api_version": "2026-10",
+                        "auth": {"method": "client_credentials", "client_id_env": "XB_SHOPIFY_BENEFITS_CLIENT_ID",
+                                 "client_secret_env": "XB_SHOPIFY_BENEFITS_CLIENT_SECRET"}}})
+
+    def make_core(self, claims=(), unlinks=(), *, store=STORE_GID) -> Path:
+        """The member core ledger v2 (bm.BenefitsLedger) with active claim
+        links ``(n, member_no)``, then the claim links of customers ``unlinks``
+        voided through the member core's own unlink (reason wrong_person)."""
+        ledger = bm.BenefitsLedger(self.core_root, clock=lambda: self.now)
+        try:
+            config = self.core_config(store)
+            ledger.init_meta(config)
+            for n, member_no in claims:
+                ledger.add_claim(customer_gid(n), member_no, "index", "test")
+                self.private |= {customer_gid(n), member_no}
+            engine = bm.BenefitsEngine(config, ledger, shopify=None, ac2=None)
+            for n in unlinks:
+                link = ledger.claim_for_gid(customer_gid(n))
+                result = engine.unlink(customer_ref=ledger.ref("c", customer_gid(n)), member_last3=link["member_no"][-3:],
+                                       reason="wrong_person", accept_applied=False, apply=True)
+                self.assertEqual(result["counts"], {"claim_unlinked": 1})
+        finally:
+            ledger.close()
+        return self.core_root / bm.LEDGER_FILE
+
+    def links(self) -> mt.LinkSet:
+        config = self.cfg()
+        return mt.build_links(mt.read_sync_links(config), *mt.read_member_core(config))
+
 
 # --------------------------------------------------------------------------
 # Constants, pinned literals, config
@@ -502,6 +551,119 @@ class StateRootTests(Base):
             self.assertEqual(self.code(lambda: mt.state_root(self.cfg(member_sync_state_root=str(self.root)))), "tags_state_root_shared")
             self.assertEqual(self.code(lambda: mt.state_root(self.cfg(member_core_state_root=str(self.root)))), "tags_state_root_shared")
             self.assertEqual(self.code(lambda: mt.state_root(self.cfg(member_core_state_root=str(self.sync_root)))), "tags_state_root_shared")
+
+
+# --------------------------------------------------------------------------
+# Inputs (design 1.1) and the G2 M2 rule
+# --------------------------------------------------------------------------
+
+def set_user_version(path: Path, version: int) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute(f"PRAGMA user_version={version}")
+    conn.close()
+
+
+class InputLedgerTests(Base):
+    def test_the_eight_refusals(self):
+        readers = {"sync_ledger": (lambda: mt.read_sync_links(self.cfg()), self.make_sync, self.sync_root / sync.LEDGER_FILE),
+                   "member_core_ledger": (lambda: mt.read_member_core(self.cfg()), self.make_core, self.core_root / bm.LEDGER_FILE)}
+        for prefix, (read, make, path) in readers.items():
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.code(read), f"{prefix}_missing")
+                path.write_bytes(b"this is not an SQLite database file" * 20)
+                self.assertEqual(self.code(read), f"{prefix}_unreadable")
+                path.unlink()
+                make(store="gid://shopify/Shop/2")
+                self.assertEqual(self.code(read), f"{prefix}_binding_mismatch")
+                for name in os.listdir(path.parent):
+                    os.remove(path.parent / name)
+                make()
+                read()
+                for version in (0, 1, 2, 3, 4):
+                    expected = (version in mt.SYNC_LEDGER_VERSIONS) if prefix == "sync_ledger" else (version in mt.MEMBER_CORE_LEDGER_VERSIONS)
+                    set_user_version(path, version)
+                    if expected:
+                        read()
+                    else:
+                        self.assertEqual(self.code(read), f"{prefix}_version_unknown", version)
+
+    def test_member_core_ledger_of_another_tool_is_refused(self):
+        # A sync ledger copied into the member core root under the member core's name.
+        self.make_sync([(1, sg(1))])
+        shutil.copyfile(self.sync_root / sync.LEDGER_FILE, self.core_root / bm.LEDGER_FILE)
+        set_user_version(self.core_root / bm.LEDGER_FILE, 2)
+        # Its meta has no tool column: the read fails closed.
+        self.assertEqual(self.code(lambda: mt.read_member_core(self.cfg())), "member_core_ledger_unreadable")
+
+    def test_both_ledgers_unchanged_after_a_read_and_writes_through_the_reader_fail(self):
+        sync_path = self.make_sync([(1, sg(1))])
+        core_path = self.make_core([(2, sg(2)), (3, sg(3))], unlinks=[3])
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (sync_path, core_path)}
+        links = self.links()
+        self.assertEqual(set(links.basis), {customer_gid(1), customer_gid(2)})
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (sync_path, core_path)}, before)
+        for path, sql in ((sync_path, "DELETE FROM links"), (core_path, "INSERT INTO claim_unlinks VALUES (1, 'other', 'r', 't')")):
+            conn = mt.open_read_only(path)
+            try:
+                with self.assertRaises(sqlite3.Error):
+                    conn.execute(sql)
+            finally:
+                conn.close()
+        self.assertEqual({p: p.read_bytes() for p in (sync_path, core_path)}, {p: v[0] for p, v in before.items()})
+
+    def test_static_only_the_voided_pairs_join_reads_raw_claim_links(self):
+        source = (ROOT / "directlocal" / "xb_member_tags.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("FROM claim_links"), 1)
+        self.assertIn("FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id", mt.VOIDED_PAIRS_SQL)
+        self.assertIn("FROM active_claim_links", mt.ACTIVE_CLAIMS_SQL)
+        self.assertEqual(source.count("FROM active_claim_links"), 1)
+
+    def test_a_pair_in_both_sources_is_one_clean_link(self):
+        self.make_sync([(1, sg(1)), (2, sg(2))])
+        self.make_core([(1, " " + sg(1).upper()), (3, sg(3))])
+        links = self.links()
+        self.assertEqual(links.conflicts, {})
+        self.assertEqual(links.basis, {customer_gid(1): (sg(1), "sync155"), customer_gid(2): (sg(2), "sync155"),
+                                       customer_gid(3): (sg(3), "claim")})
+
+    def test_the_three_conflict_codes(self):
+        # 1 -> two members (sync and claim): customer conflict. 2 and 3 -> one member: member conflict, both left alone.
+        self.make_sync([(1, sg(1)), (2, sg(20))])
+        self.make_core([(1, sg(11)), (3, sg(20))])
+        links = self.links()
+        self.assertEqual(links.conflicts, {customer_gid(1): "link_conflict_customer", customer_gid(2): "link_conflict_member",
+                                           customer_gid(3): "link_conflict_member"})
+        self.assertEqual(links.basis, {})
+
+    def test_m2_p1_a_customer_whose_only_claim_was_voided_has_no_basis(self):
+        self.make_core([(1, sg(1))], unlinks=[1])
+        self.make_sync()
+        links = self.links()
+        self.assertEqual(links.basis, {})
+        self.assertEqual(links.voided, {customer_gid(1)})
+        self.assertEqual(links.conflicts, {})
+
+    def test_m2_p2_a_member_freed_by_an_unlink_is_a_clean_basis_for_its_sync_customer(self):
+        self.make_core([(1, sg(5))], unlinks=[1])
+        self.make_sync([(2, sg(5))])
+        links = self.links()
+        self.assertEqual(links.basis, {customer_gid(2): (sg(5), "sync155")})
+        self.assertEqual(links.conflicts, {})
+
+    def test_m2_p3_the_voided_pair_reappearing_in_the_sync_is_left_alone(self):
+        self.make_core([(1, sg(1))], unlinks=[1])
+        self.make_sync([(1, sg(1))])
+        links = self.links()
+        self.assertEqual(links.conflicts, {customer_gid(1): "link_voided_pair_active_in_sync"})
+        self.assertEqual(links.basis, {})
+
+    def test_m2_p4_voided_then_a_newer_active_claim_the_active_one_is_the_basis(self):
+        self.make_core([(1, sg(1))], unlinks=[1])
+        self.make_core([(1, sg(2))])
+        self.make_sync()
+        links = self.links()
+        self.assertEqual(links.basis, {customer_gid(1): (sg(2), "claim")})
+        self.assertEqual(links.conflicts, {})
 
 
 class LedgerCliTests(Base):

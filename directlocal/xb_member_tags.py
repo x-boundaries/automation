@@ -271,6 +271,117 @@ def customer_number(gid: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# Inputs: the two link ledgers (read only, design 1.1)
+# --------------------------------------------------------------------------
+
+LINK_CONFLICT_CODES = ("link_conflict_customer", "link_conflict_member", "link_voided_pair_active_in_sync")
+SYNC_LINKS_SQL = "SELECT customer_gid, member_no, member_no_key FROM links"
+ACTIVE_CLAIMS_SQL = "SELECT customer_gid, member_no, member_no_key FROM active_claim_links"
+# G2 M2 (#155 recheck 1): the one text in this module that reads the member
+# core's raw claim_links. A voided pair is history, never a basis.
+VOIDED_PAIRS_SQL = "SELECT c.customer_gid, c.member_no_key FROM claim_links c JOIN claim_unlinks u ON u.link_id = c.link_id"
+
+
+def open_read_only(path: Path) -> sqlite3.Connection:
+    """Another tool's ledger: SQLite ``mode=ro`` plus ``query_only``, never
+    copied, never written; the caller closes it after the read."""
+
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def _read_input(path: Path, prefix: str, versions: tuple[int, ...], config: TagsConfig, tool: str | None,
+                read: Callable[[sqlite3.Connection], Any]) -> Any:
+    """The four checks before any read (file, open, version, binding), then
+    ``read``; each failure is one refusal code with ``prefix``."""
+
+    if not path.is_file():
+        raise dl.DirectLocalError(f"{prefix}_missing")
+    try:
+        conn = open_read_only(path)
+    except sqlite3.Error:
+        raise dl.DirectLocalError(f"{prefix}_unreadable") from None
+    try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] not in versions:
+            raise dl.DirectLocalError(f"{prefix}_version_unknown")
+        columns = "tool, autocount_book, store_gid, shop_domain" if tool is not None else "autocount_book, store_gid, shop_domain"
+        meta = conn.execute(f"SELECT {columns} FROM meta WHERE id = 1").fetchone()
+        expected = (config.autocount_book, config.shopify.store_gid, config.shopify.shop_domain)
+        if meta is None or tuple(meta) != ((tool,) if tool is not None else ()) + expected:
+            raise dl.DirectLocalError(f"{prefix}_binding_mismatch")
+        return read(conn)
+    except sqlite3.Error:
+        raise dl.DirectLocalError(f"{prefix}_unreadable") from None
+    finally:
+        conn.close()
+
+
+def read_sync_links(config: TagsConfig) -> list[tuple[str, str]]:
+    """The #155 sync ledger's links ``(customer_gid, member_no)``."""
+
+    return _read_input(Path(config.member_sync_state_root) / SYNC_LEDGER_FILE, "sync_ledger", SYNC_LEDGER_VERSIONS, config, None,
+                       lambda conn: [(row["customer_gid"], row["member_no"]) for row in conn.execute(SYNC_LINKS_SQL)])
+
+
+def read_member_core(config: TagsConfig) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The member core v2 ledger: active claims ``(customer_gid, member_no)``
+    and voided pairs ``(customer_gid, member_no_key)``."""
+
+    def read(conn: sqlite3.Connection) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        active = [(row["customer_gid"], row["member_no"]) for row in conn.execute(ACTIVE_CLAIMS_SQL)]
+        voided = [(row["customer_gid"], row["member_no_key"]) for row in conn.execute(VOIDED_PAIRS_SQL)]
+        return active, voided
+
+    return _read_input(Path(config.member_core_state_root) / MEMBER_CORE_LEDGER_FILE, "member_core_ledger", MEMBER_CORE_LEDGER_VERSIONS,
+                       config, MEMBER_CORE_TOOL, read)
+
+
+@dataclass
+class LinkSet:
+    """``basis``: customer -> (MemberNo, ``sync155`` or ``claim``) for one
+    clean link; ``conflicts``: customer -> conflict code (left alone);
+    ``voided``: customers that hold a pair the member core voided."""
+
+    basis: dict[str, tuple[str, str]]
+    conflicts: dict[str, str]
+    voided: set[str]
+
+
+def build_links(sync_links: Iterable[tuple[str, str]], claims: Iterable[tuple[str, str]], voided: Iterable[tuple[str, str]]) -> LinkSet:
+    """``basis = sync links + active claims`` (keys normalised with
+    ``sync.member_no_key``); a pair in both is one clean link. A voided pair
+    is never a basis."""
+
+    voided_pairs = {(gid, sync.member_no_key(key)) for gid, key in voided}
+    pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    for source, rows in (("sync155", sync_links), ("claim", claims)):
+        for gid, member_no in rows:
+            entry = pairs.setdefault((gid, sync.member_no_key(member_no)), {"member_no": member_no, "sources": set()})
+            entry["sources"].add(source)
+    gid_keys: dict[str, set[str]] = {}
+    key_gids: dict[str, set[str]] = {}
+    for gid, key in pairs:
+        gid_keys.setdefault(gid, set()).add(key)
+        key_gids.setdefault(key, set()).add(gid)
+    conflicts: dict[str, str] = {}
+    for (gid, key), entry in pairs.items():
+        if "sync155" in entry["sources"] and (gid, key) in voided_pairs:
+            conflicts[gid] = "link_voided_pair_active_in_sync"  # staff said wrong; the sync cannot void
+    for gid, keys in gid_keys.items():
+        if len(keys) > 1:
+            conflicts.setdefault(gid, "link_conflict_customer")
+    for key, gids in key_gids.items():
+        if len(gids) > 1:
+            for gid in gids:
+                conflicts.setdefault(gid, "link_conflict_member")
+    basis = {gid: (entry["member_no"], "sync155" if "sync155" in entry["sources"] else "claim")
+             for (gid, _key), entry in pairs.items() if gid not in conflicts}
+    return LinkSet(basis, conflicts, {gid for gid, _key in voided_pairs})
+
+
+# --------------------------------------------------------------------------
 # Own ledger (append-only, as the member core's)
 # --------------------------------------------------------------------------
 
