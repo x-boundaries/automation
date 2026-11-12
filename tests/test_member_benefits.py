@@ -102,7 +102,8 @@ def card(amount: str, **fields) -> dict:
 
 def order_node(n: int, *, customer: dict | None | str = "default", lines=(("300.00", 1, 1, False, ()),), shipping=("15.00",),
                created: str = ORDER_AT, updated: str | None = None, status: str = "PAID", test: bool = False, cancelled: str | None = None,
-               taxes: bool = True, currency: str = "SGD", refunded: str = "0.00", more_lines: bool = False, transactions=()) -> dict:
+               taxes: bool = True, currency: str = "SGD", refunded: str = "0.00", more_lines: bool = False, transactions=(),
+               tx_count="exact") -> dict:
     nodes = []
     for index, (unit, quantity, current, gift, discounts) in enumerate(lines):
         nodes.append({"id": f"gid://shopify/LineItem/{9000 + n * 10 + index}", "quantity": quantity, "currentQuantity": current, "isGiftCard": gift,
@@ -115,6 +116,8 @@ def order_node(n: int, *, customer: dict | None | str = "default", lines=(("300.
         "lineItems": {"pageInfo": {"hasNextPage": more_lines}, "nodes": nodes},
         "shippingLines": {"pageInfo": {"hasNextPage": False}, "nodes": [{"originalPriceSet": money(s)} for s in shipping]},
         "transactions": [dict(t) for t in transactions],
+        # Slice B1 (M1): Order.transactionsCount, exact and equal to the list unless a test says otherwise.
+        "transactionsCount": {"count": len(transactions), "precision": "EXACT"} if tx_count == "exact" else tx_count,
     }
 
 
@@ -2140,6 +2143,7 @@ class GiftCardRuleTests(Base):
 
     def test_the_orders_query_reads_the_transactions_and_the_scopes_are_unchanged(self):
         self.assertIn("transactions(first: 10) { gateway kind status amountSet { shopMoney { amount currencyCode } } }", bm.ORDERS_QUERY)
+        self.assertIn("transactionsCount { count precision }", bm.ORDERS_QUERY)  # slice B1 (M1)
         self.assertEqual(bm.REQUIRED_SCOPES, frozenset({"read_orders", "read_customers"}))
         page = {"data": {"orders": {"pageInfo": {"hasNextPage": False, "endCursor": None},
                                     "nodes": [order_node(1, transactions=(tx("150.00", gateway="Gift_Card"), card("150.00", kind="CAPTURE")))]}}}
@@ -2282,6 +2286,96 @@ class GiftCardRuleTests(Base):
 GiftCardRuleTests.claim_held = G2FixRound2Tests.claim_held
 GiftCardRuleTests.link_and_run = G2FixRound2Tests.link_and_run
 GiftCardRuleTests.assert_never_upgraded = G2FixRound2Tests.assert_never_upgraded
+
+
+class AmountReadingTests(Base):
+    """Slice B1 (G0 design 1.3): M1 Order.transactionsCount, M3 a kind Shopify
+    does not document on a gift card gateway, M4 the gateway name trimmed, M5
+    AMOUNT_RULE_VERSION."""
+
+    GOODS_400 = (("400.00", 1, 1, False, ()),)
+
+    def measured(self, transactions, tx_count="exact", **cfg):
+        order = bm.order_from_node(order_node(1, lines=self.GOODS_400, shipping=(), transactions=transactions, tx_count=tx_count))
+        config = self.cfg(**cfg)
+        return order.payments_complete, bm.gift_card_paid(order, config), bm.qualifying_amount(order, config)
+
+    def test_m1_the_list_is_complete_only_with_an_exact_count_equal_to_it(self):
+        three = (tx("100.00"), card("150.00"), card("150.00"))
+        cases = [
+            # (name, transactions, transactionsCount, complete)
+            ("empty_with_an_exact_zero", (), {"count": 0, "precision": "EXACT"}, True),
+            ("three_with_an_exact_three", three, {"count": 3, "precision": "EXACT"}, True),
+            ("nine_with_an_exact_nine", tuple(card("10.00") for _ in range(8)) + (tx("100.00"),), {"count": 9, "precision": "EXACT"}, True),
+            ("empty_with_a_null_count", (), None, False),
+            ("three_with_a_null_count", three, None, False),
+            ("three_listed_four_counted", three, {"count": 4, "precision": "EXACT"}, False),
+            ("three_listed_two_counted", three, {"count": 2, "precision": "EXACT"}, False),
+            ("three_at_least_three", three, {"count": 3, "precision": "AT_LEAST"}, False),
+            ("three_with_another_precision", three, {"count": 3, "precision": "exact"}, False),
+            ("three_without_a_precision", three, {"count": 3}, False),
+            ("three_without_a_count", three, {"precision": "EXACT"}, False),
+            ("a_count_as_text", three, {"count": "3", "precision": "EXACT"}, False),
+            ("a_count_true", (tx("100.00"),), {"count": True, "precision": "EXACT"}, False),
+            ("a_count_as_a_float", three, {"count": 3.0, "precision": "EXACT"}, False),
+            ("a_count_object_as_a_list", three, [3, "EXACT"], False),
+            ("a_count_object_as_a_number", three, 3, False),
+            ("ten_with_an_exact_ten", tuple(card("40.00") for _ in range(10)), {"count": 10, "precision": "EXACT"}, False),
+        ]
+        for name, transactions, count, complete in cases:
+            with self.subTest(name=name):
+                got = self.measured(transactions, tx_count=count)
+                self.assertEqual(got[0], complete)
+                if complete:
+                    self.assertIsNotNone(got[2])
+                else:
+                    self.assertEqual(got[1:], (None, None))
+        # The key missing altogether is not complete, and never a failed read.
+        node = order_node(1, lines=self.GOODS_400, transactions=three)
+        del node["transactionsCount"]
+        self.assertFalse(bm.order_from_node(node).payments_complete)
+        self.assertEqual(self.measured((), tx_count={"count": 0, "precision": "EXACT"})[1:], (0, (40000, 40000)))  # proven: no gift card
+
+    def test_m1_an_order_with_an_unproven_list_is_held_for_a_person_and_the_others_carry_on(self):
+        self.guest_with_order(1, lines=self.GOODS_400, transactions=(card("400.00"),), tx_count={"count": 2, "precision": "EXACT"})
+        self.guest_with_order(2, lines=self.GOODS_400, transactions=(card("400.00"),), tx_count=None)
+        self.guest_with_order(3, lines=self.GOODS_400, transactions=(card("400.00"),), tx_count={"count": 1, "precision": "AT_LEAST"})
+        self.guest_with_order(4, lines=self.GOODS_400, transactions=(card("400.00"),))
+        out = self.engine().run(apply=True)
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2, 3, 4)],
+                         [("amount_unverifiable", "payments_unreadable")] * 3 + [("applied", "upgrade")])
+        self.assertEqual((out["alerts"], out["counts"]["order_amount_unverifiable"], out["saves"]), (["order_amount_unverifiable"], 3, 1))
+
+    def test_m3_a_kind_shopify_does_not_document_on_a_gift_card_gateway_is_unreadable(self):
+        self.assertEqual(bm.PAYMENT_KINDS, {"AUTHORIZATION", "CAPTURE", "CHANGE", "EMV_AUTHORIZATION", "REFUND", "SALE", "SUGGESTED_REFUND", "VOID"})
+        for kind in ("SALE_LATER", "sale", "", "PAYOUT"):
+            with self.subTest(kind=kind, gateway="gift_card"):
+                self.assertEqual(self.measured((tx("150.00", kind=kind), card("250.00")))[1:], (None, None))
+            with self.subTest(kind=kind, gateway="card"):  # not a gift card gateway: ignored as before
+                self.assertEqual(self.measured((tx("150.00"), card("250.00", kind=kind)))[1:], (15000, (40000, 25000)))
+        for kind in sorted(bm.PAYMENT_KINDS - bm.GIFT_CARD_PAYMENT_KINDS):  # documented, not a payment: ignored
+            with self.subTest(kind=kind):
+                self.assertEqual(self.measured((tx("150.00", kind=kind), card("400.00")))[1:], (0, (40000, 40000)))
+        self.assertEqual(self.measured((tx("150.00", kind="SALE_LATER"), card("250.00")), gift_card_gateways=["store_credit"])[1:],
+                         (0, (40000, 40000)))  # the gateway named in the setting decides
+
+    def test_m4_the_gateway_name_is_trimmed(self):
+        for gateway in (" gift_card", "gift_card ", "\tGift_Card\n", " GIFT_CARD "):
+            with self.subTest(gateway=gateway):
+                order = bm.order_from_node(order_node(1, lines=self.GOODS_400, transactions=(tx("150.00", gateway=gateway), card("250.00"))))
+                self.assertEqual(order.payments[0].gateway, "gift_card")
+                self.assertEqual(bm.gift_card_paid(order, self.cfg()), 15000)
+        self.assertEqual(self.measured((tx("150.00", gateway="gift card"), card("250.00")))[1], 0)  # a space inside is another name
+
+    def test_m5_the_amount_rule_version_is_in_the_fingerprint(self):
+        self.assertEqual(bm.AMOUNT_RULE_VERSION, 2)
+        cfg = self.cfg()
+        now = cfg.rule_fingerprint()
+        with mock.patch.object(bm, "AMOUNT_RULE_VERSION", 3):
+            self.assertNotEqual(cfg.rule_fingerprint(), now)
+        self.assertEqual(cfg.rule_fingerprint(), now)
+        source = (ROOT / "directlocal" / "xb_member_benefits.py").read_text(encoding="utf-8")
+        self.assertIn('"amount_rule_version": AMOUNT_RULE_VERSION', source)
 
 
 class B9Tests(Base):
@@ -2464,7 +2558,7 @@ class OrdersQueryCostTests(Base):
     run_main = CliTests.run_main
     SHOPIFY_LIMIT = 1000  # shopify.dev: a single query may not exceed 1,000 points
     CEILING = 900  # this tool's own ceiling on the strict reading
-    STRICT_COST = 847  # work it out again (runbook section 9) before changing a page size or the query text
+    STRICT_COST = 852  # slice B1: 847 + 5 (transactionsCount); work it out again (runbook section 9) before changing a page size or the query text
 
     def real_client(self, responses) -> tuple[bm.BenefitsShopifyClient, FakeTransport]:
         transport = FakeTransport(responses)
@@ -2500,21 +2594,23 @@ class OrdersQueryCostTests(Base):
                           "customer": 3,             # Customer + CustomerPhoneNumber + Metafield
                           "lineItems": 122,          # connection 1 + pageInfo 1 + 20 x 6
                           "shippingLines": 11,       # connection 1 + pageInfo 1 + 3 x 3
-                          "transactions": 30})       # 10 x 3, a plain list
+                          "transactions": 30,        # 10 x 3, a plain list
+                          "transactionsCount": 1})   # slice B1: one Count object
         by_name = {field[0]: field for field in order_row}
         ((_, _, line_row),) = [child for child in by_name["lineItems"][2] if child[0] == "nodes"]
         ((_, _, shipping_row),) = [child for child in by_name["shippingLines"][2] if child[0] == "nodes"]
         self.assertEqual((1 + strict_cost(line_row, page), 1 + strict_cost(shipping_row, page), 1 + strict_cost(by_name["transactions"][2], page)),
                          (6, 3, 3))  # LineItem + price 2 + one discount allocation 3; ShippingLine + price 2; OrderTransaction + amount 2
-        self.assertEqual(1 + strict_cost(order_row, page), 169)  # the Order itself + 2 + 3 + 122 + 11 + 30
+        self.assertEqual(1 + strict_cost(order_row, page), 170)  # the Order itself + 2 + 3 + 122 + 11 + 30 + 1
         total = strict_cost(parse_selection(bm.ORDERS_QUERY), page)
-        self.assertEqual(total, 2 + 5 * 169)  # the orders connection + its pageInfo + 5 order rows
+        self.assertEqual(total, 2 + 5 * 170)  # the orders connection + its pageInfo + 5 order rows
         self.assertEqual(total, self.STRICT_COST)
         self.assertLessEqual(total, self.CEILING)
         self.assertLess(self.CEILING, self.SHOPIFY_LIMIT)
         # The same sum for the sizes of PR #300 (10 orders, 50 lines, 5 shipping lines, 25 transactions).
         before = bm.ORDERS_QUERY.replace("lineItems(first: 20)", "lineItems(first: 50)").replace(
-            "shippingLines(first: 3)", "shippingLines(first: 5)").replace("transactions(first: 10)", "transactions(first: 25)")
+            "shippingLines(first: 3)", "shippingLines(first: 5)").replace("transactions(first: 10)", "transactions(first: 25)").replace(
+            "transactionsCount { count precision }", "")  # slice B1: the query of PR #300 had no transactionsCount
         self.assertEqual(strict_cost(parse_selection(before), 10), 4002)
         # The two small reads of this tool.
         self.assertEqual((strict_cost(parse_selection(bm.CUSTOMER_QUERY), page), strict_cost(parse_selection(bm.PHONE_LOOKUP_QUERY), page)), (3, 12))

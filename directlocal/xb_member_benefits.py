@@ -94,7 +94,8 @@ EXPIRY_MONTHS = 24
 # over 1,000 points before it runs (shopify.dev, rate limits). On the strict
 # reading (every selected object counted once for each row of every connection
 # and list above it) the query costs
-#     2 + 5 x (10 + 6 x 20 + 3 x 3 + 3 x 10) = 847 points,
+#     2 + 5 x (11 + 6 x 20 + 3 x 3 + 3 x 10) = 852 points
+# (slice B1: + 1 per order for the transactionsCount object),
 # under the 900 this tool allows itself. The sum is written out line by line
 # in the runbook (section 9) and pinned by OrdersQueryCostTests: work it out
 # again before changing a size or the query text.
@@ -102,8 +103,14 @@ SHOPIFY_ORDER_PAGE = 5
 SHOPIFY_LINE_PAGE = 20  # an order with more line items is amount_unverifiable
 SHOPIFY_SHIPPING_PAGE = 3
 # Order.transactions is a plain list cut to this size (no pageInfo), so a
-# list that comes back full cannot be shown to be complete.
+# list that comes back full cannot be shown to be complete. Slice B1 (M1):
+# Order.transactionsCount (a Count: count Int!, precision CountPrecision!,
+# shopify.dev 2026-10) must be EXACT and equal to the list's length.
 SHOPIFY_PAYMENT_PAGE = 10
+COUNT_EXACT = "EXACT"  # CountPrecision: AT_LEAST or EXACT (shopify.dev 2026-10)
+# OrderTransactionKind, all eight values (shopify.dev 2026-10). Slice B1 (M3):
+# any other kind on a gift card gateway makes the payments unreadable.
+PAYMENT_KINDS = frozenset({"AUTHORIZATION", "CAPTURE", "CHANGE", "EMV_AUTHORIZATION", "REFUND", "SALE", "SUGGESTED_REFUND", "VOID"})
 # The gift-card-paid amount: transactions that took money (a sale, or the
 # capture of an authorisation) and succeeded. A refund back to a gift card is
 # never added back.
@@ -149,7 +156,7 @@ CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, 
 # qualifying_amount, qualifies, money_refund_unattributed and the order
 # parsing of amounts). Any change to one of them raises it; it is part of the
 # rule fingerprint kept in the ledger (BenefitsConfig.rule_fingerprint).
-AMOUNT_RULE_VERSION = 1
+AMOUNT_RULE_VERSION = 2  # 2: slice B1 (M1 transactionsCount, M3 unknown kind, M4 gateway trimmed)
 
 _LOCAL_STORED_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
 _NEW_EXPIRY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T00:00:00$")
@@ -555,9 +562,10 @@ def goods_amount(order: Order, config: BenefitsConfig) -> tuple[int, int] | None
 def gift_card_paid(order: Order, config: BenefitsConfig) -> int | None:
     """Cents paid by gift card: the sum of the successful ``SALE`` and
     ``CAPTURE`` transactions whose gateway is one of ``gift_card_gateways``.
-    None when the payments cannot be read: the list came back full, an amount
-    is not SGD or is malformed, or a gift card payment has not settled
-    (``PENDING``, ``AWAITING_RESPONSE``, ``UNKNOWN``). A failed one
+    None when the payments cannot be read: the list is not shown complete
+    (``payments_complete``), an amount is not SGD or is malformed, a gift
+    card payment has a kind Shopify does not document, or a gift card payment
+    has not settled (``PENDING``, ``AWAITING_RESPONSE``, ``UNKNOWN``). A failed one
     (``FAILURE``, ``ERROR``) took no money and is ignored, as is every other
     kind: a refund back to a gift card is never added back (the safe side)."""
 
@@ -567,7 +575,11 @@ def gift_card_paid(order: Order, config: BenefitsConfig) -> int | None:
     for payment in order.payments:
         if payment.cents is None:
             return None
-        if payment.gateway not in config.gift_card_gateways or payment.kind not in GIFT_CARD_PAYMENT_KINDS:
+        if payment.gateway not in config.gift_card_gateways:
+            continue
+        if payment.kind not in PAYMENT_KINDS:
+            return None  # slice B1 (M3): a kind Shopify does not document; never guessed
+        if payment.kind not in GIFT_CARD_PAYMENT_KINDS:
             continue
         if payment.status == PAYMENT_SUCCESS:
             paid += payment.cents
@@ -1093,6 +1105,7 @@ ORDERS_QUERY = """query XbMemberBenefitsOrders($first: Int!, $after: String, $se
       }
       shippingLines(first: """ + str(SHOPIFY_SHIPPING_PAGE) + """) { pageInfo { hasNextPage } nodes { originalPriceSet { """ + _MONEY + """ } } }
       transactions(first: """ + str(SHOPIFY_PAYMENT_PAGE) + """) { gateway kind status amountSet { """ + _MONEY + """ } }
+      transactionsCount { count precision }
     }
   }
 }"""
@@ -1196,15 +1209,31 @@ def order_from_node(node: Any) -> Order:
     for item in transactions:
         _shape(isinstance(item, dict) and isinstance(item.get("kind"), str) and isinstance(item.get("status"), str)
                and (item.get("gateway") is None or isinstance(item["gateway"], str)))
-        payments.append(Payment((item.get("gateway") or "").lower(), item["kind"], item["status"], _payment_cents(item.get("amountSet"))))
+        payments.append(Payment((item.get("gateway") or "").strip().lower(), item["kind"], item["status"], _payment_cents(item.get("amountSet"))))
     customer = None if node.get("customer") is None else customer_from_node(node["customer"])
     return Order(
         gid=node["id"], created_at=created, updated_at=updated, cancelled=node.get("cancelledAt") is not None, test=node["test"],
         financial_status=status, taxes_included=node["taxesIncluded"], currency=CURRENCY if currencies == {CURRENCY} else None,
         customer=customer, lines=tuple(lines), lines_complete=items["pageInfo"].get("hasNextPage") is False,
         shipping_cents=tuple(shipping_cents), shipping_complete=shipping["pageInfo"].get("hasNextPage") is False, refunded_cents=refunded,
-        payments=tuple(payments), payments_complete=len(payments) < SHOPIFY_PAYMENT_PAGE,
+        payments=tuple(payments), payments_complete=payments_complete(node.get("transactionsCount"), len(payments)),
     )
+
+
+def payments_complete(count_node: Any, listed: int) -> bool:
+    """Slice B1 (M1): the transaction list is complete only when
+    ``transactionsCount`` is an object whose ``count`` is a whole number equal
+    to the number listed and whose ``precision`` is ``EXACT``, and the list
+    is shorter than its page. Anything else (null, missing, ``AT_LEAST``, a
+    mismatch, a malformed value) is not complete: the order is
+    ``payments_unreadable``, never a failed read (one odd order must not stop
+    the reader). An empty list with a count of 0, exact, is proven empty."""
+
+    if not isinstance(count_node, dict):
+        return False
+    count = count_node.get("count")
+    return (type(count) is int and count == listed and count_node.get("precision") == COUNT_EXACT
+            and listed < SHOPIFY_PAYMENT_PAGE)
 
 
 class BenefitsShopifyClient(direct.ShopifyDirectClient):
@@ -1549,7 +1578,7 @@ class RunSummary:
     saves: int = 0
     stopped: str | None = None
     # Shopify's requested cost of the orders query on this run, in whole
-    # points (to compare with the calculated 847); None when none was reported.
+    # points (to compare with the calculated 852); None when none was reported.
     orders_query_cost: int | None = None
 
     def count(self, code: str, ref: str | None = None, member_no: str | None = None) -> None:
