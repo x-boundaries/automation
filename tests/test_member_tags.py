@@ -364,5 +364,165 @@ class ConfigTests(Base):
         self.assertFalse((self.root / mt.LEDGER_FILE).exists())
 
 
+# --------------------------------------------------------------------------
+# Own ledger (design 1.8)
+# --------------------------------------------------------------------------
+
+LEDGER_SCHEMA_SHA256 = "62eb3c7fc0c6005169db32ad658a18a3507f13a6f999ef9da4889221ca1628b6"
+
+
+class LedgerTests(Base):
+    def ledger(self) -> mt.TagsLedger:
+        ledger = mt.TagsLedger(self.root, clock=lambda: self.now)
+        self.addCleanup(ledger.close)
+        ledger.init_meta(self.cfg())
+        return ledger
+
+    def intent(self, ledger, n=1, op="add") -> str:
+        return ledger.add_intent(run_id="run-x", customer_gid=customer_gid(n), tag=TAG, op=op, reason="member_active",
+                                 member_no=sg(n), basis="sync155")
+
+    def test_v1_schema_text_is_pinned(self):
+        import hashlib
+        self.assertEqual(mt.SCHEMA_VERSION, 1)
+        self.assertEqual(hashlib.sha256(mt.LEDGER_SCHEMA.encode("utf-8")).hexdigest(), LEDGER_SCHEMA_SHA256)
+        ledger = self.ledger()
+        self.assertEqual(ledger.conn.execute("PRAGMA user_version").fetchone()[0], 1)
+        tables = {r[0] for r in ledger.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertEqual(tables, {"meta", "tag_writes", "runs", "reviews"})
+        self.assertEqual(ledger.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertEqual(ledger.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(ledger.conn.execute("PRAGMA recursive_triggers").fetchone()[0], 1)
+        self.assertEqual(ledger.conn.execute("PRAGMA trusted_schema").fetchone()[0], 0)
+        meta = ledger.conn.execute("SELECT * FROM meta").fetchone()
+        self.assertEqual((meta["tool"], meta["tag_set"], meta["autocount_book"]), ("xb268_member_tags", "member-qualified,member-bday-month", "AED_TESTINGAPI"))
+        self.assertRegex(meta["ref_key"], r"^[0-9a-f]{64}\Z")
+
+    def test_meta_and_tag_writes_refuse_update_delete_and_replace(self):
+        ledger = self.ledger()
+        write_id = self.intent(ledger)
+        ledger.start_run("observe")
+        attempts = [
+            "UPDATE meta SET store_gid = 'gid://shopify/Shop/2'", "DELETE FROM meta",
+            "INSERT OR REPLACE INTO meta SELECT * FROM meta",
+            "DELETE FROM tag_writes",
+            f"UPDATE tag_writes SET customer_gid = '{customer_gid(2)}'", "UPDATE tag_writes SET op = 'remove'",
+            "UPDATE tag_writes SET tag = 'member-bday-month'", "UPDATE tag_writes SET member_no = 'x'", "UPDATE tag_writes SET basis = 'claim'",
+            "UPDATE tag_writes SET reason = 'other'", "UPDATE tag_writes SET run_id = 'run-y'", "UPDATE tag_writes SET created_at = 'x'",
+            "INSERT OR REPLACE INTO tag_writes SELECT * FROM tag_writes",
+            "DELETE FROM runs", "UPDATE runs SET command = 'apply'",
+            "INSERT INTO reviews VALUES ('s', 'c', 't')",
+        ]
+        for sql in attempts[:-1]:
+            with self.subTest(sql=sql):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    ledger.conn.execute(sql)
+        ledger.conn.execute(attempts[-1])
+        for sql in ("UPDATE reviews SET code = 'x'", "DELETE FROM reviews"):
+            with self.assertRaises(sqlite3.DatabaseError):
+                ledger.conn.execute(sql)
+        self.assertEqual(ledger.conn.execute("SELECT state FROM tag_writes WHERE write_id = ?", (write_id,)).fetchone()[0], "INTENT")
+
+    def test_checks_on_new_rows(self):
+        ledger = self.ledger()
+        bad = [
+            ("customer_gid", "gid://shopify/Order/1"), ("tag", "member-mg"), ("op", "set"), ("basis", "other"), ("state", "DONE"),
+        ]
+        for column, value in bad:
+            with self.subTest(column=column):
+                row = {"write_id": "w", "run_id": "r", "customer_gid": customer_gid(1), "tag": TAG, "op": "add", "reason": "x",
+                       "member_no": None, "basis": None, "state": "INTENT", "created_at": "t", "updated_at": "t", column: value}
+                with self.assertRaises(sqlite3.DatabaseError):
+                    ledger.conn.execute(f"INSERT INTO tag_writes({', '.join(row)}) VALUES ({', '.join('?' for _ in row)})", tuple(row.values()))
+        self.assertEqual(ledger.conn.execute("SELECT COUNT(*) FROM tag_writes").fetchone()[0], 0)
+
+    def test_transitions(self):
+        ledger = self.ledger()
+        allowed = {"INTENT": ("DONE", "REJECTED", "NOT_WRITTEN", "UNCERTAIN"), "UNCERTAIN": ("DONE", "NOT_WRITTEN")}
+        for start in mt.WRITE_STATES:
+            for end in mt.WRITE_STATES:
+                with self.subTest(start=start, end=end):
+                    write_id = self.intent(ledger)
+                    path = {"INTENT": [], "UNCERTAIN": ["UNCERTAIN"], "DONE": ["DONE"], "REJECTED": ["REJECTED"], "NOT_WRITTEN": ["NOT_WRITTEN"]}[start]
+                    for state in path:
+                        ledger.set_outcome(write_id, state, None)
+                    if end in allowed.get(start, ()):
+                        ledger.set_outcome(write_id, end, "resolved_by_read")
+                    else:
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            ledger.set_outcome(write_id, end, "x")
+        # A settled row stays as it is, code included.
+        write_id = self.intent(ledger)
+        ledger.set_outcome(write_id, "DONE", None)
+        with self.assertRaises(sqlite3.DatabaseError):
+            ledger.conn.execute("UPDATE tag_writes SET code = 'x' WHERE write_id = ?", (write_id,))
+
+    def test_another_tools_or_versions_ledger_is_refused(self):
+        conn = sqlite3.connect(self.root / mt.LEDGER_FILE)
+        conn.execute("CREATE TABLE receipts(x)")
+        conn.execute("PRAGMA user_version=2")
+        conn.close()
+        self.assertEqual(self.code(lambda: mt.TagsLedger(self.root)), "tags_ledger_not_recognised")
+        (self.root / mt.LEDGER_FILE).write_bytes(b"not a database at all, just text" * 10)
+        self.assertEqual(self.code(lambda: mt.TagsLedger(self.root)), "tags_ledger_not_recognised")
+        # The lock was released after each refusal.
+        (self.root / mt.LEDGER_FILE).unlink()
+        ledger = mt.TagsLedger(self.root)
+        ledger.close()
+
+    def test_binding_is_checked_at_every_open(self):
+        ledger = self.ledger()
+        other = raw_config(self.root, self.sync_root, self.core_root)
+        other["shopify"] = {**other["shopify"], "store_gid": "gid://shopify/Shop/2"}
+        self.assertEqual(self.code(lambda: ledger.check_binding(mt.parse_config(other))), "tags_ledger_binding_mismatch")
+        self.assertEqual(self.code(lambda: ledger.init_meta(mt.parse_config(other))), "tags_ledger_binding_mismatch")
+        self.assertEqual(self.code(lambda: ledger.check_binding(self.cfg(autocount_book="AED_XBOUNDARIES", ac2_credential_target=sync.LIVE_CREDENTIAL_TARGET,
+                                                                        ac2_login_mode="owner_shared"))), "tags_ledger_binding_mismatch")
+        self.assertEqual(ledger.init_meta(self.cfg()), {"status": "existing"})
+
+    def test_a_second_runner_is_refused(self):
+        self.ledger()
+        self.assertEqual(self.code(lambda: mt.TagsLedger(self.root)), "ledger_locked_by_another_owner")
+
+    def test_review_once(self):
+        ledger = self.ledger()
+        self.assertTrue(ledger.review_once("s1", "flow_dates_guard"))
+        self.assertFalse(ledger.review_once("s1", "flow_dates_guard"))
+
+
+class StateRootTests(Base):
+    def test_own_root_never_another_tools_or_an_input_root(self):
+        with private_root_allowed(self.temp / "elsewhere"):
+            self.assertEqual(mt.state_root(self.cfg()), self.root.resolve())
+            for name in (sync.LEDGER_FILE, bm.LEDGER_FILE, tm.LEDGER_FILE, "ledger.sqlite3"):
+                with self.subTest(name=name):
+                    (self.root / name).write_bytes(b"")
+                    self.assertEqual(self.code(lambda: mt.state_root(self.cfg())), "tags_state_root_shared")
+                    (self.root / name).unlink()
+            self.assertEqual(self.code(lambda: mt.state_root(self.cfg(member_sync_state_root=str(self.root)))), "tags_state_root_shared")
+            self.assertEqual(self.code(lambda: mt.state_root(self.cfg(member_core_state_root=str(self.root)))), "tags_state_root_shared")
+            self.assertEqual(self.code(lambda: mt.state_root(self.cfg(member_core_state_root=str(self.sync_root)))), "tags_state_root_shared")
+
+
+class LedgerCliTests(Base):
+    def run_main(self, *args, **overrides) -> int:
+        with private_root_allowed(self.temp / "elsewhere"):
+            return mt.main([*args, "--config", str(self.write_config(**overrides))], clock=lambda: self.now)
+
+    def test_init_then_status(self):
+        self.assertEqual(self.run_main("status"), 2)
+        self.assertEqual(self.emitted[-1], {"status": "refused", "code": "tags_ledger_not_initialised"})
+        self.assertEqual(self.run_main("init"), 0)
+        self.assertEqual(self.emitted[-1], {"status": "initialised"})
+        self.assertEqual(self.run_main("init"), 0)
+        self.assertEqual(self.emitted[-1], {"status": "existing"})
+        self.assertEqual(self.run_main("status"), 0)
+        self.assertEqual(self.emitted[-1]["tag_writes"], {})
+        self.assertFalse(self.emitted[-1]["stop_file_present"])
+        (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
+        self.run_main("status")
+        self.assertTrue(self.emitted[-1]["stop_file_present"])
+
+
 if __name__ == "__main__":
     unittest.main()

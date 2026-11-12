@@ -242,6 +242,21 @@ def load_config(path: str | Path) -> TagsConfig:
     return parse_config(value)
 
 
+def state_root(config: TagsConfig) -> Path:
+    """The tool's own private root: never another tool's, and never one of
+    its two input roots (and those two differ from each other)."""
+
+    root = dl.validate_state_root(config.state_root)
+    for other in (SYNC_LEDGER_FILE, MEMBER_CORE_LEDGER_FILE, TYPE_MOVE_LEDGER_FILE, CORE_LEDGER_FILE):
+        if (root / other).exists():
+            raise dl.DirectLocalError("tags_state_root_shared")
+    roots = [root.resolve(), Path(config.member_sync_state_root).resolve(), Path(config.member_core_state_root).resolve()]
+    if len(set(roots)) != len(roots):
+        raise dl.DirectLocalError("tags_state_root_shared")
+    dl.verify_private_state(root)
+    return root
+
+
 def mask(member_no: str | None) -> str:
     return sync.mask_last3(member_no)
 
@@ -256,6 +271,191 @@ def customer_number(gid: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# Own ledger (append-only, as the member core's)
+# --------------------------------------------------------------------------
+
+WRITE_STATES = ("INTENT", "DONE", "REJECTED", "NOT_WRITTEN", "UNCERTAIN")
+OPEN_STATES = ("INTENT", "UNCERTAIN")
+LEDGER_SCHEMA = """
+CREATE TABLE meta(
+  id INTEGER PRIMARY KEY CHECK (id = 1), tool TEXT NOT NULL CHECK (tool = 'xb268_member_tags'), ledger_id TEXT NOT NULL,
+  autocount_book TEXT NOT NULL CHECK (autocount_book IN ('AED_TESTINGAPI', 'AED_XBOUNDARIES')),
+  store_gid TEXT NOT NULL, shop_domain TEXT NOT NULL, ref_key TEXT NOT NULL CHECK (length(ref_key) = 64), created_at TEXT NOT NULL,
+  tag_set TEXT NOT NULL CHECK (tag_set = 'member-qualified,member-bday-month'));
+CREATE TABLE tag_writes(
+  write_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, customer_gid TEXT NOT NULL CHECK (customer_gid GLOB 'gid://shopify/Customer/[1-9]*'),
+  tag TEXT NOT NULL CHECK (tag IN ('member-qualified', 'member-bday-month')), op TEXT NOT NULL CHECK (op IN ('add', 'remove')),
+  reason TEXT NOT NULL, member_no TEXT, basis TEXT CHECK (basis IS NULL OR basis IN ('sync155', 'claim', 'voided')),
+  state TEXT NOT NULL CHECK (state IN ('INTENT', 'DONE', 'REJECTED', 'NOT_WRITTEN', 'UNCERTAIN')),
+  code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE runs(run_id TEXT PRIMARY KEY, command TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, summary TEXT);
+CREATE TABLE reviews(subject TEXT PRIMARY KEY, code TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+CREATE TRIGGER meta_immutable BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
+CREATE TRIGGER meta_no_delete BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
+CREATE TRIGGER tag_writes_no_delete BEFORE DELETE ON tag_writes BEGIN SELECT RAISE(ABORT, 'tag_write_immutable'); END;
+CREATE TRIGGER tag_writes_binding_immutable BEFORE UPDATE OF write_id, run_id, customer_gid, tag, op, reason, member_no, basis, created_at
+  ON tag_writes BEGIN SELECT RAISE(ABORT, 'tag_write_immutable'); END;
+CREATE TRIGGER tag_writes_settled_stay BEFORE UPDATE ON tag_writes
+  WHEN OLD.state IN ('DONE', 'REJECTED', 'NOT_WRITTEN') BEGIN SELECT RAISE(ABORT, 'tag_write_settled'); END;
+CREATE TRIGGER tag_writes_transition BEFORE UPDATE OF state ON tag_writes
+  WHEN NOT ((OLD.state = 'INTENT' AND NEW.state IN ('DONE', 'REJECTED', 'NOT_WRITTEN', 'UNCERTAIN'))
+         OR (OLD.state = 'UNCERTAIN' AND NEW.state IN ('DONE', 'NOT_WRITTEN')))
+  BEGIN SELECT RAISE(ABORT, 'tag_write_transition_invalid'); END;
+CREATE TRIGGER tag_writes_new_is_intent BEFORE INSERT ON tag_writes
+  WHEN NEW.state <> 'INTENT' BEGIN SELECT RAISE(ABORT, 'tag_write_must_start_intent'); END;
+CREATE TRIGGER runs_no_delete BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT, 'run_immutable'); END;
+CREATE TRIGGER runs_binding_immutable BEFORE UPDATE OF run_id, command, started_at ON runs BEGIN SELECT RAISE(ABORT, 'run_immutable'); END;
+CREATE TRIGGER reviews_immutable BEFORE UPDATE ON reviews BEGIN SELECT RAISE(ABORT, 'review_immutable'); END;
+CREATE TRIGGER reviews_no_delete BEFORE DELETE ON reviews BEGIN SELECT RAISE(ABORT, 'review_immutable'); END;
+"""
+
+
+class TagsLedger:
+    """Single-owner SQLite ledger in the tool's own private root."""
+
+    def __init__(self, root: Path, *, clock: Callable[[], datetime] = dl.utc_now):
+        self.root = Path(root)
+        self.clock = clock
+        self._lock = dl._OwnerLock(self.root / LOCK_FILE)
+        self.conn = None
+        try:
+            self.conn = sqlite3.connect(self.root / LEDGER_FILE, isolation_level=None, timeout=0)
+            self.conn.row_factory = sqlite3.Row
+            # The version is checked before any pragma that could change the file.
+            version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+            tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not (version == 0 and not tables) and (version != SCHEMA_VERSION or "tag_writes" not in tables):
+                raise dl.DirectLocalError("tags_ledger_not_recognised")
+            # recursive_triggers: an INSERT OR REPLACE deletes the old row
+            # first; with this on, the no-delete triggers fire and abort it.
+            for pragma in ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON", "trusted_schema=OFF", "recursive_triggers=ON"):
+                self.conn.execute(f"PRAGMA {pragma}")
+            if version == 0 and not tables:
+                with self.tx() as conn:
+                    for statement in dl._split_sql(LEDGER_SCHEMA):
+                        conn.execute(statement)
+                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except sqlite3.DatabaseError:
+            if self.conn is not None:
+                self.conn.close()
+            self._lock.release()
+            raise dl.DirectLocalError("tags_ledger_not_recognised") from None
+        except BaseException:
+            if self.conn is not None:
+                self.conn.close()
+            self._lock.release()
+            raise
+
+    def now(self) -> datetime:
+        value = self.clock()
+        if value.tzinfo is None:
+            raise dl.DirectLocalError("clock_must_be_timezone_aware")
+        return value.astimezone(timezone.utc)
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self.conn
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def init_meta(self, config: TagsConfig) -> dict[str, Any]:
+        with self.tx() as conn:
+            row = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+            if row is not None:
+                self._check(row, config)
+                return {"status": "existing"}
+            conn.execute(
+                "INSERT INTO meta(id, tool, ledger_id, autocount_book, store_gid, shop_domain, ref_key, created_at, tag_set) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (TOOL, f"mt-{uuid.uuid4().hex}", config.autocount_book, config.shopify.store_gid, config.shopify.shop_domain,
+                 secrets.token_hex(32), dl.ts(self.now()), ",".join(TAG_SET)),
+            )
+        return {"status": "initialised"}
+
+    @staticmethod
+    def _check(row: sqlite3.Row, config: TagsConfig) -> None:
+        if (row["tool"], row["autocount_book"], row["store_gid"], row["shop_domain"], row["tag_set"]) != (
+                TOOL, sync.check_book(config.autocount_book), config.shopify.store_gid, config.shopify.shop_domain, ",".join(TAG_SET)):
+            raise dl.DirectLocalError("tags_ledger_binding_mismatch")
+
+    def check_binding(self, config: TagsConfig) -> None:
+        row = self.conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        if row is None:
+            raise dl.DirectLocalError("tags_ledger_not_initialised")
+        self._check(row, config)
+
+    def ref(self, kind: str, value: str) -> str:
+        key = self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0]
+        return f"{kind}-" + hmac.new(bytes.fromhex(key), f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:dl.MEMBER_REF_HEX]
+
+    def start_run(self, command: str) -> str:
+        run_id = f"run-{uuid.uuid4().hex}"
+        with self.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, command, started_at) VALUES (?, ?, ?)", (run_id, command, dl.ts(self.now())))
+        return run_id
+
+    def finish_run(self, run_id: str, summary: Mapping[str, Any]) -> None:
+        with self.tx() as conn:
+            conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?",
+                         (dl.ts(self.now()), json.dumps(summary, sort_keys=True), run_id))
+
+    def review_once(self, subject: str, code: str) -> bool:
+        """True the first time a subject needs review (alert once)."""
+
+        with self.tx() as conn:
+            if conn.execute("SELECT 1 FROM reviews WHERE subject = ?", (subject,)).fetchone() is not None:
+                return False
+            conn.execute("INSERT INTO reviews(subject, code, first_seen_at) VALUES (?, ?, ?)", (subject, code, dl.ts(self.now())))
+        return True
+
+    def open_writes(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM tag_writes WHERE state IN ('INTENT', 'UNCERTAIN') ORDER BY rowid").fetchall()
+
+    def add_intent(self, *, run_id: str, customer_gid: str, tag: str, op: str, reason: str, member_no: str | None,
+                   basis: str | None) -> str:
+        write_id = f"tagw-{uuid.uuid4().hex}"
+        now = dl.ts(self.now())
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO tag_writes(write_id, run_id, customer_gid, tag, op, reason, member_no, basis, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INTENT', ?, ?)",
+                (write_id, run_id, customer_gid, tag, op, reason, member_no, basis, now, now),
+            )
+        return write_id
+
+    def set_outcome(self, write_id: str, state: str, code: str | None) -> None:
+        with self.tx() as conn:
+            conn.execute("UPDATE tag_writes SET state = ?, code = ?, updated_at = ? WHERE write_id = ?",
+                         (state, code, dl.ts(self.now()), write_id))
+
+    def done_adds_since(self, customer_gid: str, since: datetime) -> int:
+        """DONE adds of our tag for this customer settled at or after ``since``
+        (the flapping guard)."""
+
+        return self.conn.execute("SELECT COUNT(*) FROM tag_writes WHERE customer_gid = ? AND tag = ? AND op = 'add' AND state = 'DONE' "
+                                 "AND updated_at >= ?", (customer_gid, TAG, dl.ts(since))).fetchone()[0]
+
+    def status(self, config: TagsConfig) -> dict[str, Any]:
+        self.check_binding(config)
+        conn = self.conn
+        writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT op, state, COUNT(*) FROM tag_writes GROUP BY op, state")}
+        return {"status": "ok", "command": "status", "tag_writes": writes, "open_writes": len(self.open_writes()),
+                "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
+                "runs": conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
+                "stop_file_present": (self.root / STOP_FILE).exists(), "tag_set": ",".join(TAG_SET)}
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -263,18 +463,29 @@ def _emit(value: Mapping[str, Any]) -> None:
     sys.stdout.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-COMMANDS = ("check-config",)
+COMMANDS = ("check-config", "init", "status")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, clock: Callable[[], datetime] = dl.utc_now) -> int:
     parser = argparse.ArgumentParser(description="#268 slice C1: the Shopify tag member-qualified, kept right from AutoCount")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-        _emit(config.summary())
-        return 0
+        if args.command == "check-config":
+            _emit(config.summary())
+            return 0
+        root = state_root(config)
+        ledger = TagsLedger(root, clock=clock)
+        try:
+            if args.command == "init":
+                _emit(ledger.init_meta(config))
+                return 0
+            _emit(ledger.status(config))
+            return 0
+        finally:
+            ledger.close()
     except dl.DirectLocalError as exc:
         _emit({"status": "refused", "code": exc.code})
         return 2
