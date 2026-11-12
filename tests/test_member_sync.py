@@ -5615,5 +5615,55 @@ class LiveRuleOtherPhoneTests(GoLiveTestCase):
         self.assertEqual(result["counts"]["memberno_and_created_time_match"], 1)
 
 
+class VoidedPairFollowUpTests(BackfillTestCase):
+    """#155 BF1 G2 recheck 2 LATER 1: tests T5 (M04), T6 (M15, M19) and
+    T7 (M06), before the first applied backfill call. Tests only."""
+
+    def core(self, *, claims=(), voided=()) -> sync.ClaimLinks:
+        root = self.temp / "core"
+        root.mkdir()
+        make_member_core_ledger(root, claims=claims, voided=voided)
+        return sync.read_claim_links(root, make_config())
+
+    def test_T5_a_voided_pair_whose_member_no_is_not_its_key_is_held_never_linked(self):
+        # 60: a MemberNo with letters, linked by phone and name.
+        # 61: a MemberNo with a leading space, linked by exact MemberNo.
+        self.shopify.add(old_sign_up(60))
+        self.shopify.add(old_sign_up(61))
+        self.member("TILL60", "Alpha Tester", plus(sg(60)))
+        self.member(" " + sg(61), "Alpha Tester", plus(sg(61)))
+        self.assertNotEqual(sync.member_no_key("TILL60"), "TILL60")
+        self.assertNotEqual(sync.member_no_key(" " + sg(61)), " " + sg(61))
+        # Without the member core's view of them both customers would link.
+        self.assertEqual(self.backfill(apply=False)["counts"].get("backfill_would_link"), 2)
+        claims = self.core(voided=[(gid(60), "TILL60"), (gid(61), " " + sg(61))])
+        dry = self.backfill(apply=False, claims=claims)
+        self.assertEqual((dry["counts"].get("backfill_claim_pair_unlinked"), dry["counts"].get("backfill_would_link")), (2, None))
+        result = self.backfill(apply=True, claims=claims)
+        self.assertEqual(result["counts"].get("backfill_claim_pair_unlinked"), 2)
+        self.assertEqual((self.link_rows(), self.ac2.creates), ({}, []))
+        self.assertEqual(sorted(r["code"] for r in result["refs"]), ["backfill_claim_pair_unlinked"] * 2)
+        self.assert_private(result)
+
+    def test_T6_a_legacy_only_customer_whose_only_claim_was_voided_keeps_coverage_incomplete(self):
+        self.shopify.add(old_sign_up(62, tags=("member-legacy",)))  # no member-mg
+        claims = self.core(voided=[(gid(62), "CLAIM62")])
+        report = sync.coverage_report(self.temp, make_config(**BF_KEYS), shopify=self.shopify, claims=claims)
+        self.assertEqual(report["shopify"]["classes"], {"claim_unlinked_not_linked": 1})
+        self.assertFalse(report["complete"])
+
+    def test_T7_the_real_owner_later_in_the_same_call_still_links_after_a_pair_hold(self):
+        # 63 (earlier) and 64 (later) share a phone and a name; staff unlinked 63 and TILL63.
+        self.shopify.add(old_sign_up(63, first="Bravo", last="Owner", phone=plus(sg(63))))
+        self.shopify.add(old_sign_up(64, first="Bravo", last="Owner", phone=plus(sg(63)), made=BF_OLD + timedelta(minutes=1)))
+        self.member("TILL63", "Bravo Owner", plus(sg(63)))
+        claims = self.core(voided=[(gid(63), "TILL63")])
+        result = self.backfill(apply=True, claims=claims)
+        self.assertEqual(result["counts"].get("backfill_claim_pair_unlinked"), 1)
+        self.assertNotIn("backfill_member_linked_elsewhere", result["counts"])
+        self.assertEqual(set(self.link_rows()), {gid(64)})
+        self.assertEqual(self.link_rows()[gid(64)][0], "TILL63")
+
+
 if __name__ == "__main__":
     unittest.main()
