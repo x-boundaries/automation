@@ -85,6 +85,8 @@ python directlocal\xb_member_benefits.py claim-links --config <config>   # read 
 
 `claim-links` (slice B2) lists the active claim links, read only (opened as the digest is: no lock, no write, no `runs` row; it also runs while the task holds the ledger): `{"status", "command": "claim_links", "links": [{"ref": "c-...", "member_no_masked": "*******001", "source": "order" | "index", "created_day": "YYYY-MM-DD"}], "active", "voided", "truncated"}`. Entries are sorted by ref, at most 500 (`truncated` true when there are more); `created_day` is the Singapore day the link was made; voided links are counted, never listed. Each `ref` is the `c-` ref `unlink --customer-ref` takes.
 
+`claim-links` and `digest` open the ledger read-only; SQLite may leave `-wal`/`-shm` side files next to it. The main file is unchanged: leave them.
+
 Exit codes: 0 ok, 3 completed with alerts (an operator looks), 2 refused (nothing written). A refused query to Shopify ends with one of `shopify_graphql_error`, `shopify_retry_budget_exhausted`, `shopify_query_cost_exceeds_bucket` or `shopify_access_denied`, with nothing read, recorded or moved. Output carries codes, counts, keyed refs (`o-`, `c-`, `m-`) and MemberNos masked to the last 3 characters only. `observe` and `apply` also print `orders_query_cost`: Shopify's requested cost of the orders query on that run, in whole points, or `null` (section 9).
 
 `apply` refuses while any write is `INTENT`/`UNCERTAIN` (`benefit_uncertain_unresolved`: run `resolve` after the writer deadline) or `HELD` and not released (`benefit_held_rows_present`: see "When a write is HELD" below). A `STOP` file in the state root stops writes before the next member.
@@ -304,6 +306,7 @@ Slice B2 (member core tidy round, 13 Nov 2026; no schema, `SCHEMA_VERSION`, `AMO
 - Alerts (`B2AlertTests`): `order_customer_changed_after_upgrade` (B2-1); `claim_hold_settled_unclear` on both settle paths (B2-2).
 - Windows (`B2WindowTests`): no re-open after a capped read (B2-3); the 60-day age limit, exactly 60 days settles (B2-4).
 - Record (`B2RecordTests`): carry-over resets of an undecided receipt that follows its order (B2-5); goods measured first (B2-7).
+- Fix round 1 (G2 F1, F2, L2, L3): the B2-5 reset keeps `member_no` and `link_source` while a write for the receipt is open or landed (`INTENT`, `UNCERTAIN`, `HELD`, `DONE`), so `resolve` after an `observe` that moved the order settles `DONE` cleanly; the age limit also runs after a capped read; the no-re-init guard also pins `refunded_unit_cents` and the order amount parsing; the read-only side files line above.
 - Digest and probe (`B2DigestProbeTests`): gateway names with 4 digits in a row shown as `other`, `Payment`/`OrderLine` reprs (B2-6); a probe `unknown` holds in `resolve` and `release-held` (B2-8).
 - Release and unlink (`B2ReleaseUnlinkTests`): `left_open` and the late settle (B2-9, L5); malformed refs give `unlink_arguments_invalid` (B2-10).
 - `claim-links` (`B2ClaimLinksTests`, B2-11, N1).
@@ -323,6 +326,7 @@ Slice B2 (member core tidy round, 13 Nov 2026; no schema, `SCHEMA_VERSION`, `AMO
 - **Q32**: `tag_without_basis` reconcile (no tags).
 - **I1, I9**: tag invariants, parked with the Shopify writes.
 - Tips (`Order.totalTipReceivedSet`) are not excluded yet: check in the shadow week whether tipping is on.
+- **B2 L1**: an order that moves to another customer between its write and the receipt becoming `applied` is not alerted (B2-1 compares at `applied` only); later: alert when the customer at `applied` differs from the customer at the write.
 - No ceiling on the new `ExpiryDate` at the child (defence in depth; slice E).
 - A refused open of a real (WAL) ledger made by older code leaves `-wal`/`-shm` side files next to it; keep them with the folder (the main file is left as it is; slice B2 test).
 - A refund by money hidden inside the discount of a refunded unit is not caught (the check compares refunded money with the before-discount value of refunded units); rare.
