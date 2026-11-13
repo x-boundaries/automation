@@ -618,6 +618,12 @@ class ConfigTests(Base):
         config = mt.parse_config(live)
         self.assertEqual((config.autocount_book, config.ac2_credential_target), ("AED_XBOUNDARIES", sync.LIVE_CREDENTIAL_TARGET))
         self.assertEqual(config.max_tag_adds_per_run, 10)
+        # Slice D: both examples carry the new keys at their defaults (no GID in the pilot list).
+        for value in (example, live):
+            self.assertEqual({k: value[k] for k in ("bday_tag_enabled", "max_bday_adds_per_run", "max_bday_removes_per_run",
+                                                    "bday_only_customers", "remove_unbased_tags_enabled")},
+                             {"bday_tag_enabled": False, "max_bday_adds_per_run": 10, "max_bday_removes_per_run": 10,
+                              "bday_only_customers": [], "remove_unbased_tags_enabled": False})
 
     def test_check_config_prints_the_summary_only(self):
         self.assertEqual(mt.main(["check-config", "--config", str(self.write_config())]), 0)
