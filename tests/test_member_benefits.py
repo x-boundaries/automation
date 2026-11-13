@@ -4535,6 +4535,70 @@ class B2RecordTests(Base):
         self.assertIn({"ref": self.ledger.ref("o", order_gid(1)), "code": "would_upgrade", "member_no_masked": bm.mask(sg(2))}, out["refs"])
         self.assertEqual((self.receipt(1)["member_no"], self.receipt(1)["customer_gid"]), (sg(2), customer_gid(2)))
 
+    # -- B2 fix round 1 (G2 F1) ----------------------------------------------
+    run_main = CliTests.run_main
+    WRITE_KEEPS = {"INTENT": True, "UNCERTAIN": True, "HELD": True, "DONE": True, "SKIPPED": False, "NOT_WRITTEN": False, None: False}
+
+    def cli_receipt(self, n: int = 1) -> tuple:
+        return tuple(stored_receipt(self.root, n, name) for name in ("state", "code", "customer_gid", "member_no", "link_source", "basis_expiry_local"))
+
+    def test_b2_5_fix1_an_open_or_landed_write_keeps_member_no_and_link_source(self):
+        cases = dict(enumerate(self.WRITE_KEEPS, start=1))  # order n: its write state (None: no write)
+        members = {n: self.guest_with_order(n) for n in cases}
+        engine = self.engine()
+        engine.run(apply=False)
+        for n, state in cases.items():
+            self.assertEqual((self.receipt(n)["state"], self.receipt(n)["member_no"], self.receipt(n)["link_source"]), ("ready", members[n], "sync155"))
+            if state is not None:
+                payload = {"kind": "upgrade", "member_no": members[n], "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                           "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+                write = self.ledger.add_intent(run_id="run-x", order_gid=order_gid(n), payload=payload, deadline=self.now)
+                if state != "INTENT":
+                    self.ledger.set_outcome(write["write_id"], state, "c", LM if state == "DONE" else None)
+        for n, state in cases.items():
+            with self.subTest(write=state):
+                engine.record(bm.order_from_node(order_node(n, customer=customer_node(n + 20), updated="2026-11-18T04:06:00Z")), bm.RunSummary("observe"))
+                row = self.receipt(n)
+                if state == "DONE":  # the landed save is repaired first (G2 LATER 1): applied, nothing moves
+                    self.assertEqual((row["state"], row["customer_gid"], row["member_no"]), ("applied", customer_gid(n), members[n]))
+                    continue
+                self.assertEqual((row["state"], row["customer_gid"]), ("ready", customer_gid(n + 20)))
+                kept = (members[n], "sync155") if self.WRITE_KEEPS[state] else (None, None)
+                self.assertEqual((row["member_no"], row["link_source"]), kept)
+                for name in self.RESET[:5]:  # the rest of the carry-over is reset either way
+                    self.assertIsNone(row[name], name)
+
+    def test_b2_5_fix1_resolve_after_an_observe_that_moved_the_order_settles_done(self):
+        """G2 F1 (P1/P2): an UNCERTAIN save that landed; an observe replays the
+        order with another customer; ``resolve`` reads the save back as DONE
+        and sets the receipt applied: coded, exit 0, as on main."""
+        member_no = self.guest_with_order(1)
+        self.run_main("init")
+        self.book.mode = "uncertain_saved"
+        self.assertEqual(self.run_main("apply", cfg={"benefits_write_enabled": True})[1]["alerts"], ["write_uncertain"])
+        self.book.mode = None
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-18T04:10:00Z"))
+        self.advance(minutes=15)
+        self.assertEqual(self.run_main("observe")[0], 0)
+        self.assertEqual(self.cli_receipt(), ("ready", None, customer_gid(2), member_no, "sync155", None))
+        self.advance(seconds=PAST_DEADLINE)
+        code, out, _ = self.run_main("resolve")
+        self.assertEqual((code, out["status"], out["resolved"], out["alerts"]), (0, "ok", {"DONE:resolved_saved": 1}, []))
+        self.assertEqual(self.cli_receipt(), ("applied", "upgrade", customer_gid(2), member_no, "sync155", NEW_EXPIRY))
+        self.advance(minutes=15)
+        out = self.run_main("apply", cfg={"benefits_write_enabled": True})[1]
+        self.assertEqual((out["counts"].get("receipt_repaired_applied"), out["saves"], self.book.saves), (None, 0, 1))
+
+    def test_b2_5_fix1_a_held_write_keeps_the_member_through_a_move_and_release_applies(self):
+        ref, member_no = ReleaseHeldTests.held(self)
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-18T04:10:00Z"))
+        self.advance(minutes=15)
+        self.engine().run(apply=False)
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["customer_gid"], row["member_no"], row["link_source"]), ("ready", customer_gid(2), member_no, "sync155"))
+        self.assertEqual(ReleaseHeldTests.release(self, ref, member_no[-3:], "as_intended")["receipt_now"], "applied")
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["member_no"]), ("applied", member_no))
+
     # -- B2-7 ----------------------------------------------------------------
     def test_b2_7_goods_below_the_threshold_with_unread_payments_are_below_threshold_with_no_alert(self):
         twenty = tuple(("10.00", 1, 1, False, ()) for _ in range(20))

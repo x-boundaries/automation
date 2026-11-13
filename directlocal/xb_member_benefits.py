@@ -1932,7 +1932,11 @@ class BenefitsEngine:
         if existing is not None and existing["customer_gid"] != customer:
             # Slice B2 (B2-5): an undecided receipt follows its order to another
             # customer (or none); nothing found for the old customer carries over.
-            values.update(waiting_since=None, alerted=None, observed=None, observed_at=None, checked_at=None, member_no=None, link_source=None)
+            values.update(waiting_since=None, alerted=None, observed=None, observed_at=None, checked_at=None)
+            if not self.ledger.write_landed_or_open(order.gid):
+                # B2 fix round 1 (F1): a write that is open or landed belongs to
+                # that member; resolve, release-held and the repair need it.
+                values.update(member_no=None, link_source=None)
         if existing is None:
             with self.ledger.tx() as conn:
                 conn.execute(
