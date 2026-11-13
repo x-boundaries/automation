@@ -6262,6 +6262,8 @@ class Bf2S6Tests(SyncTestCase):
         self.walk_in("TILLS10", phone=local(10), email=em(10), member_type="MEMBER", active="T", no_shopify=True)
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual((result["counts"]["ac2_member_declined_not_created"], self.shopify.created), (1, []))
+        self.assertEqual(self.pending("TILLS10"), ("SKIPPED", "ac2_member_declined_not_created"))  # never waits for the switch
+        self.assertEqual(self.run_sync("ac2_to_shopify", shopify_create_enabled=False)["counts"], {})
 
     def test_with_creates_off_only_a_real_candidate_waits(self):
         self.walk_in("TILLS11", phone=local(11), email=em(11))
@@ -6364,6 +6366,26 @@ class Bf2IdempotenceTests(Bf2TestCase):
         self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
         self.assertEqual(self.bf2(apply=True)["counts"].get("bf2_created"), None)
 
+    def test_found_with_the_same_identity_but_linked_elsewhere_stays_uncertain(self):
+        self.make_uncertain()
+        self.shopify.add(customer(2, email=em(2), tags=()))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(2), "OTHER02", "matched", "test")
+        result = self.bf2(apply=True)
+        self.assertEqual(result["counts"]["uncertain_write_unresolved"], 1)
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.assertNotIn("BF2I02", self.link_rows())
+
+    def test_the_create_refuses_a_missing_email_before_anything_is_written(self):
+        # Defence in depth: the callers never pass a member without an email.
+        engine = self.engine(**BF2_KEYS)
+        member = ac2m("BF2I08", phone=plus(sg(8)), email=None)
+        self.assertEqual(engine._create_in_shopify(member, sg(8), None, "bf2i08", "m-x", backfill=True), "invalid")
+        self.assertEqual(engine._create_in_shopify(member, sg(8), "not an email", "bf2i08", "m-x"), "invalid")
+        self.assertEqual((self.shopify.created, engine.summary.writes), ([], 0))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+        self.assertEqual(engine.summary.counts["shopify_customer_input_invalid"], 2)
+
     def test_a_second_call_never_creates_twice(self):
         self.add("BF2I06", phone=plus(sg(6)), email=em(6))
         self.bf2(apply=True)
@@ -6395,6 +6417,15 @@ class Bf2SwitchCapTests(Bf2TestCase):
             self.assertEqual(caught.exception.code, code)
         self.assertEqual((self.ac2.scans, self.shopify.created), ([], []))
         self.assertEqual(self.bf2(backfill_members_enabled=False, shopify_create_enabled=False)["mode"], "dry_run")  # a dry run needs neither
+
+    def test_the_create_switch_is_checked_again_at_the_create(self):
+        # Defence in depth behind the refusal before login: a backfill call
+        # whose config has creates off never sends, even with apply set.
+        self.add("BF2W30", phone=plus(sg(30)), email=em(30))
+        engine = self.engine(**BF2_KEYS, shopify_create_enabled=False)
+        member = self.ac2.members[-1]
+        self.assertEqual(engine._bf2_one(member, None, set(), apply=True, creates=0, max_creates=1), "shopify_create_disabled")
+        self.assertEqual((self.shopify.created, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]), ([], 0))
 
     def test_max_bounds(self):
         for bad in (0, 6, -1, True, "1"):
