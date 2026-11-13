@@ -5,8 +5,9 @@
 # real bridge child proves, before any member lookup, numbering or write:
 #   - the target book is authorised by this source: AED_TESTINGAPI for every
 #     operation; AED_XBOUNDARIES (go-live, Owner SCOPE-CONFIRMED 29 Oct 2026)
-#     only for the #155 sync's sync-lookup, sync-changelog and write-once
-#     with payload profile sync_p1, and (#268) the type move's four
+#     only for the #155 sync's sync-lookup, sync-changelog, (BF2a)
+#     sync-member-scan and write-once with payload profile sync_p1, and
+#     (#268) the type move's four
 #     type-move-* operations with payload profile type_move_p1, and (#268
 #     member core) the benefits tool's three benefit-* operations with
 #     payload profile benefit_p1. Names,
@@ -33,9 +34,9 @@ $script:XbDlForbiddenBooks = @("AED_XBOUNDARIES")
 # Go-live R3: the production book is not in $XbDlAuthorisedBooks (that list
 # serves every caller: Core, owner console, E7). It is admitted only for these
 # sync operations, and write-once only with the sync_p1 profile. Q2 = A:
-# next-member-no is not admitted.
+# next-member-no is not admitted. #155 BF2a: sync-member-scan is a read.
 $script:XbDlLiveBook = "AED_XBOUNDARIES"
-$script:XbDlLiveBookOperations = @("sync-lookup", "sync-changelog", "write-once")
+$script:XbDlLiveBookOperations = @("sync-lookup", "sync-changelog", "write-once", "sync-member-scan")
 $script:XbDlLiveBookWriteProfile = "sync_p1"
 # #268 (G0 #268 option b): the one-off member type move has its own entry
 # point (ac2_member_type_move_bridge.ps1). Its operations are admitted on the
@@ -137,6 +138,12 @@ $script:XbDlSqlText = [ordered]@{
     changelog_max_id = "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog"
     # Go-live R7 (Owner Q7, SCOPE-CONFIRMED 29 Oct 2026): exactly one parameter.
     member_type_exists = "SELECT COUNT_BIG(*) FROM MemberType WHERE MemberType = ?"
+    # #155 BF2a sync-member-scan: exactly one parameter (the MemberNo cursor).
+    # The decline marker is read only as 0/1; Note is never selected.
+    sync_member_scan = ("SELECT (SELECT TOP 1000 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, " +
+        "CONVERT(varchar(10), DOB, 23) AS dob, MemberType AS member_type, IsActive AS is_active, CONVERT(varchar(10), ExpiryDate, 23) AS expiry_date, " +
+        "CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify " +
+        "FROM Member WHERE MemberNo > ? ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)")
 }
 # Refused in any text: statement separators, comments, every non-read verb,
 # xp_/sp_ procedures, the production book, and 3- or 4-part object names
@@ -145,13 +152,16 @@ $script:XbDlDeniedSqlPattern = '(?i);|--|/\*|\*/|\b(?:EXEC|EXECUTE|TRUNCATE|INSE
 # sync-changelog: only TOP (1-1000) and the regex-checked column vary.
 $script:XbDlChangeLogSqlPattern = '^SELECT \(SELECT TOP \(([1-9][0-9]{0,3})\) ID AS id, CAST\(\[[A-Za-z][A-Za-z0-9_]{0,63}\] AS nvarchar\(max\)\) AS xml FROM ChangeLog WHERE TableName = ''Member'' AND ChangeType = ''I'' AND ID > \? ORDER BY ID FOR JSON PATH\)\z'
 # sync-lookup: only the condition list varies (phone block, Singapore block,
-# then up to 20 MemberNo conditions; at most 25 parameters).
-$script:XbDlLookupSqlPrefix = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE "
+# then up to 20 MemberNo conditions; at most 25 parameters; or, #155 BF2a,
+# the one email condition alone). BF2a adds the scope columns and the 0/1
+# decline flag (the Note text is never selected).
+$script:XbDlLookupSqlPrefix = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time, MemberType AS member_type, IsActive AS is_active, CONVERT(varchar(10), ExpiryDate, 23) AS expiry_date, CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify FROM Member WHERE "
 $script:XbDlLookupSqlSuffix = " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
 $script:XbDlLookupKey = "UPPER(LTRIM(RTRIM(MemberNo))) = ?"
 $script:XbDlLookupMobile = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '') = ?"
 $script:XbDlLookupEmbedded = "CHARINDEX(?, MemberNo) > 0"
 $script:XbDlLookupNumber = "UPPER(LTRIM(RTRIM(MemberNo))) = UPPER(LTRIM(RTRIM(?)))"
+$script:XbDlLookupEmail = "LOWER(LTRIM(RTRIM(EmailAddress))) = LOWER(?)"
 
 function Test-XbDlLookupSql {
     param([Parameter(Mandatory)][string]$Sql)
@@ -159,6 +169,8 @@ function Test-XbDlLookupSql {
     $suffix = $script:XbDlLookupSqlSuffix
     if ($Sql.Length -le ($prefix.Length + $suffix.Length) -or -not $Sql.StartsWith($prefix, [StringComparison]::Ordinal) -or -not $Sql.EndsWith($suffix, [StringComparison]::Ordinal)) { return $false }
     $parts = @($Sql.Substring($prefix.Length, $Sql.Length - $prefix.Length - $suffix.Length) -csplit " OR ", 0, "SimpleMatch")
+    # #155 BF2a: the email condition only ever stands alone.
+    if ($parts.Count -eq 1 -and [string]::Equals($parts[0], $script:XbDlLookupEmail, [StringComparison]::Ordinal)) { return $true }
     $end = $parts.Count
     $numbers = 0
     while ($end -gt 0 -and [string]::Equals($parts[$end - 1], $script:XbDlLookupNumber, [StringComparison]::Ordinal)) { $end--; $numbers++ }
