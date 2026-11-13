@@ -341,6 +341,8 @@ class Base(unittest.TestCase):
         "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
         "index_dry_run": (RUN_KEYS, frozenset()),
         "index_apply": (RUN_KEYS, frozenset()),
+        # Slice B2 (B2-11): the read-only claim links listing.
+        "claim_links": (frozenset({"status", "command", "links", "active", "voided", "truncated"}), frozenset()),
     }
     DIGEST_KEYS = frozenset({"schema", "status", "autocount_book", "hours", "runs", "counts", "alerts", "alert_refs", "receipts", "shadow",
                              "gift_cards", "open", "rule_settings_match"})
@@ -352,7 +354,12 @@ class Base(unittest.TestCase):
     # keys, whole numbers for the counts, true or false for the match.
     NEW_KEY_TEXTS = {"finding": ("as_intended", "not_as_intended"), "receipt_now": ("applied", "held", "left_decided", "left_open"),
                      "reason": ("wrong_person", "customers_merged", "member_renumbered", "other"), "link_source": ("order", "index")}
-    NEW_KEY_NUMBERS = ("held_writes_left", "held_writes", "claim_links", "claim_links_voided")
+    NEW_KEY_NUMBERS = ("held_writes_left", "held_writes", "claim_links", "claim_links_voided", "active", "voided")
+    # Slice B2 (B2-11): the keys and values of one claim-links entry, written out here.
+    CLAIM_LINK_KEYS = frozenset({"ref", "member_no_masked", "source", "created_day"})
+    CLAIM_LINK_SOURCES = ("order", "index")
+    CLAIM_LINK_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
+    CLAIM_LINK_DAY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -472,6 +479,16 @@ class Base(unittest.TestCase):
                 self.assertIsInstance(value["writes"], dict, kind)
                 for key in value["writes"]:
                     self.assertRegex(key, r"^(upgrade|extend):(" + "|".join(self.WRITE_STATES) + r")\Z", kind)
+            if value["command"] == "claim_links":
+                self.assertIs(type(value["truncated"]), bool, kind)
+                self.assertIsInstance(value["links"], list, kind)
+                self.assertLessEqual(len(value["links"]), 500, kind)
+                for entry in value["links"]:
+                    self.assertEqual(set(entry), set(self.CLAIM_LINK_KEYS), kind)
+                    self.assertRegex(entry["ref"], self.CLAIM_LINK_REF_RE, kind)
+                    self.assertRegex(entry["member_no_masked"], self.PRIVATE_MASK_RE, kind)
+                    self.assertIn(entry["source"], self.CLAIM_LINK_SOURCES, kind)
+                    self.assertRegex(entry["created_day"], self.CLAIM_LINK_DAY_RE, kind)
             if value["command"] == "resolve":
                 self.assertIsInstance(value["resolved"], dict, kind)
                 for key in value["resolved"]:
@@ -4141,7 +4158,7 @@ class B2TestGapTests(Base):
         self.assertTrue((self.root / (bm.LEDGER_FILE + "-wal")).exists())  # the side files stay (runbook)
         self.assertEqual(reader.execute("SELECT value FROM watermarks WHERE name = 'w'").fetchone()[0], "v")
 
-    COMMANDS = (("init",), ("observe",), ("status",), ("digest",))
+    COMMANDS = (("init",), ("observe",), ("status",), ("digest",), ("claim-links",))
 
     # -- B2-13 A21, A23: the line and shipping pages ---------------------------
     def test_b2_13_a21_a_line_item_page_without_has_next_page_is_not_complete(self):
@@ -4688,6 +4705,81 @@ class B2ReleaseUnlinkTests(Base):
                                  (2, {"status": "refused", "code": "unlink_arguments_invalid"}))
         self.assertEqual(self.run_main("unlink", "--order-ref", "o-" + "0" * 20, "--member-last3", member_no[-3:], "--reason", "other")[:2],
                          (2, {"status": "refused", "code": "unlink_not_a_claim_link"}))
+
+
+class B2ClaimLinksTests(Base):
+    """Slice B2 (G0 B2-11, PR #303 N1): ``claim-links``, a read-only listing
+    of the active claim links."""
+
+    run_main = CliTests.run_main
+
+    def listing(self) -> dict:
+        return bm.claim_links_listing(self.root, config=self.cfg())
+
+    def tables(self) -> dict:
+        conn = self.ledger.conn
+        return {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid")]
+                for t in ("meta", "receipts", "claim_links", "claim_unlinks", "reviews", "writes", "write_releases", "watermarks", "runs")}
+
+    def test_b2_11_active_links_keyed_masked_sorted_and_voided_links_counted_only(self):
+        self.engine()
+        self.now = datetime(2026, 11, 18, 17, 30, tzinfo=timezone.utc)  # 01:30 on 19 Nov in Singapore
+        for n, source in ((1, "order"), (2, "index"), (3, "order"), (4, "index")):
+            self.ledger.add_claim(customer_gid(n), sg(n), source, "phone_and_name_match")
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES "
+                         "((SELECT link_id FROM claim_links WHERE customer_gid = ?), 'other', 'run-x', 't')", (customer_gid(3),))
+        before = self.tables()
+        out = self.listing()
+        self.assertEqual(self.tables(), before)  # read only: no run row, nothing written
+        expected = sorted(({"ref": self.ledger.ref("c", customer_gid(n)), "member_no_masked": bm.mask(sg(n)), "source": source,
+                            "created_day": "2026-11-19"} for n, source in ((1, "order"), (2, "index"), (4, "index"))), key=lambda e: e["ref"])
+        self.assertEqual(out, {"status": "ok", "command": "claim_links", "links": expected, "active": 3, "voided": 1, "truncated": False})
+        text = json.dumps(out)
+        for secret in [customer_gid(n) for n in range(1, 5)] + [sg(n) for n in range(1, 5)] + [local(n) for n in range(1, 5)]:
+            self.assertNotIn(secret, text)
+        self.assertNotIn(self.ledger.ref("c", customer_gid(3)), text)  # the voided link is not listed
+        self.emitted.append(out)  # through the check after every test as well
+
+    def test_b2_11_at_most_500_entries_then_truncated(self):
+        self.engine()
+        with self.ledger.tx() as conn:
+            for n in range(501):
+                conn.execute("INSERT INTO claim_links(customer_gid, member_no, member_no_key, source, code, created_at) VALUES (?, ?, ?, 'index', "
+                             "'phone_and_name_match', '2026-11-18T04:00:00Z')", (customer_gid(n), sg(n), sync.member_no_key(sg(n))))
+        out = self.listing()
+        self.assertEqual((len(out["links"]), out["active"], out["truncated"]), (500, 501, True))
+        refs = sorted(self.ledger.ref("c", customer_gid(n)) for n in range(501))
+        self.assertEqual([e["ref"] for e in out["links"]], refs[:500])
+        self.emitted.append(out)
+
+    def test_b2_11_the_cli_command_needs_no_lock_and_refuses_as_the_digest(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.assertEqual(self.run_main("claim-links")[:2], (2, {"status": "refused", "code": "benefits_ledger_missing"}))
+        self.run_main("init")
+        self.run_main("observe")
+        holder = bm.BenefitsLedger(self.root, clock=lambda: self.now)  # a running task holds the ledger
+        try:
+            code, out, text = self.run_main("claim-links")
+        finally:
+            holder.close()
+        self.assertEqual((code, out["command"], out["active"], out["voided"], [e["source"] for e in out["links"]]), (0, "claim_links", 1, 0, ["order"]))
+        self.assertEqual(out["links"][0]["member_no_masked"], bm.mask(member_no))
+        for secret in (member_no, local(1), customer_gid(1), str(customer_number(1)), order_gid(1), "Fake Member 1"):
+            self.assertNotIn(secret, text)
+        # Its c- ref is the one unlink takes.
+        code, dry, _ = self.run_main("unlink", "--customer-ref", out["links"][0]["ref"], "--member-last3", member_no[-3:], "--reason", "other")
+        self.assertEqual((code, dry["command"], dry["counts"]["claim_unlinked"]), (0, "unlink_dry_run", 1))
+        # Bound to the store and the book, as every command.
+        self.assertEqual(self.run_main("claim-links", cfg={"shopify": {**raw_config(self.root, self.sync_root)["shopify"],
+                                                                         "store_gid": "gid://shopify/Shop/2"}})[:2],
+                         (2, {"status": "refused", "code": "benefits_ledger_binding_mismatch"}))
+
+    def test_b2_11_a_v1_ledger_is_refused_and_left_as_it_is(self):
+        before = make_v1_ledger(self.root)
+        self.assertEqual(CliTests.run_main(self, "claim-links")[:2], (2, {"status": "refused", "code": "benefits_ledger_not_recognised"}))
+        self.assertEqual((self.root / bm.LEDGER_FILE).read_bytes(), before)
+        self.assertFalse((self.root / (bm.LEDGER_FILE + "-wal")).exists())
 
 
 class B2TokenCacheScopeTests(unittest.TestCase):

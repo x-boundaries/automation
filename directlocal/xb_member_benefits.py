@@ -852,6 +852,13 @@ CREATE TRIGGER writes_transition BEFORE UPDATE OF state ON writes
 """
 
 
+def keyed_ref(ref_key: str, kind: str, value: str) -> str:
+    """The keyed ref of a GID or MemberNo key (``o-``, ``c-``, ``m-`` + 20 hex):
+    HMAC-SHA256 under the ledger's own ``ref_key``, never the value itself."""
+
+    return f"{kind}-" + hmac.new(bytes.fromhex(ref_key), f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:dl.MEMBER_REF_HEX]
+
+
 class BenefitsLedger:
     """Single-owner SQLite ledger in the tool's own private root."""
 
@@ -948,8 +955,7 @@ class BenefitsLedger:
             raise dl.DirectLocalError("benefits_rule_settings_changed")
 
     def ref(self, kind: str, value: str) -> str:
-        key = self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0]
-        return f"{kind}-" + hmac.new(bytes.fromhex(key), f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:dl.MEMBER_REF_HEX]
+        return keyed_ref(self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0], kind, value)
 
     def start_run(self, command: str) -> str:
         run_id = f"run-{uuid.uuid4().hex}"
@@ -2737,6 +2743,54 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
 
 
 # --------------------------------------------------------------------------
+# Claim links listing (read only; slice B2)
+# --------------------------------------------------------------------------
+
+CLAIM_LINKS_LIST_MAX = 500
+
+
+def claim_links_listing(root: Path, *, config: BenefitsConfig) -> dict[str, Any]:
+    """Slice B2 (B2-11, PR #303 N1): the active claim links, so the owner can
+    name a link (also one the index made for a customer with no order) to
+    ``unlink --customer-ref``. Opened as the digest is (SQLite ``mode=ro``
+    and ``query_only``): no lock, no write, no run row. Keyed ``c-`` refs,
+    MemberNos masked to the last 3, the source and the Singapore day the
+    link was made; sorted by ref, at most ``CLAIM_LINKS_LIST_MAX``. Voided
+    links are counted, never listed."""
+
+    path = Path(root) / LEDGER_FILE
+    if not path.is_file():
+        raise dl.DirectLocalError("benefits_ledger_missing")
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        raise dl.DirectLocalError("benefits_ledger_unreadable") from None
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise dl.DirectLocalError("benefits_ledger_not_recognised")
+        meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        if meta is None:
+            raise dl.DirectLocalError("benefits_ledger_not_initialised")
+        BenefitsLedger._check(meta, config)
+        links = []
+        for row in conn.execute("SELECT customer_gid, member_no, source, created_at FROM active_claim_links"):
+            created = dl.parse_created_at(row["created_at"])
+            if created is None:
+                raise dl.DirectLocalError("benefits_ledger_unreadable")
+            links.append({"ref": keyed_ref(meta["ref_key"], "c", row["customer_gid"]), "member_no_masked": mask(row["member_no"]),
+                          "source": row["source"], "created_day": sg_date(created).isoformat()})
+        links.sort(key=lambda entry: entry["ref"])
+        return {"status": "ok", "command": "claim_links", "links": links[:CLAIM_LINKS_LIST_MAX], "active": len(links),
+                "voided": conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0], "truncated": len(links) > CLAIM_LINKS_LIST_MAX}
+    except sqlite3.Error:
+        raise dl.DirectLocalError("benefits_ledger_unreadable") from None
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -2761,7 +2815,7 @@ def build_real_engine(config: BenefitsConfig, ledger: BenefitsLedger, *, environ
     return BenefitsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink")
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink", "claim-links")
 
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsConfig, BenefitsLedger], BenefitsEngine] | None = None,
@@ -2794,6 +2848,9 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
             if not 1 <= args.hours <= 720:
                 raise dl.DirectLocalError("digest_hours_invalid")
             _emit(ledger_digest(root, hours=args.hours, now=clock(), config=config))
+            return 0
+        if args.command == "claim-links":  # slice B2 (B2-11): read only, as the digest
+            _emit(claim_links_listing(root, config=config))
             return 0
         ledger = BenefitsLedger(root, clock=clock)
         try:
