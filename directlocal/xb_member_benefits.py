@@ -1741,8 +1741,9 @@ class BenefitsEngine:
                 self.ledger.update_receipt(row["order_gid"], code=ORDER_NO_LONGER_QUALIFIES)
                 summary.count("claim_hold_settled", ref)
                 # Slice B2 (B2-2): silent only for a paid order whose stored
-                # amount is measured below the threshold (a unit refund).
-                if not (row["financial_status"] in PAID_STATUSES and row["financial_status"] != "REFUNDED"
+                # amount is measured below the threshold (a unit refund, also
+                # a full one: REFUNDED), as the replay path; anything else alerts.
+                if not (row["financial_status"] in PAID_STATUSES
                         and isinstance(row["net_cents"], int) and not qualifies(row["net_cents"], self.config)):
                     self._settled_unclear(row["order_gid"], summary, ref)
                 continue

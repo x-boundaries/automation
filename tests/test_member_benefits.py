@@ -4398,7 +4398,8 @@ class B2AlertTests(Base):
     # -- B2-2: the stored-facts path (_reopen_claim_holds) ----------------------
     def test_b2_2_the_stored_facts_path_alerts_unless_a_paid_amount_is_below_the_threshold(self):
         facts = {1: (dict(financial_status="REFUNDED"), True), 2: (dict(net_cents=0), False), 3: (dict(financial_status="PENDING"), True),
-                 4: (dict(net_cents=None), True), 5: (dict(financial_status=None), True), 6: (dict(net_cents=29_999, financial_status="PARTIALLY_REFUNDED"), False)}
+                 4: (dict(net_cents=None), True), 5: (dict(financial_status=None), True), 6: (dict(net_cents=29_999, financial_status="PARTIALLY_REFUNDED"), False),
+                 7: (dict(net_cents=0, financial_status="REFUNDED"), False)}
         for n in facts:
             self.guest_with_order(n, linked=False, member=fake_member(sg(n), name="Someone Else Entirely"))
         self.engine().run(apply=True)
@@ -4413,7 +4414,7 @@ class B2AlertTests(Base):
         out = self.engine().run(apply=True)
         alerted = {r["ref"] for r in out["refs"] if r["code"] == self.UNCLEAR}
         self.assertEqual(alerted, {self.ledger.ref("o", order_gid(n)) for n, (_, alert) in facts.items() if alert})
-        self.assertEqual((out["counts"].get("claim_hold_settled"), out["counts"].get(self.UNCLEAR), out["saves"]), (6, 4, 0))
+        self.assertEqual((out["counts"].get("claim_hold_settled"), out["counts"].get(self.UNCLEAR), out["saves"]), (7, 4, 0))
         self.advance(hours=1)
         self.assertIsNone(self.engine().run(apply=True)["counts"].get(self.UNCLEAR))  # once
 
