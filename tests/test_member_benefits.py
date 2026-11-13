@@ -4917,6 +4917,11 @@ class B2NoReinitGuardTests(unittest.TestCase):
     AMOUNT_FUNCTIONS = ("goods_amount", "gift_card_paid", "qualifying_amount", "qualifies", "money_refund_unattributed")
     AMOUNT_SOURCE_SHA256 = "67f7f494a268f8314d908151f4472ffa4e7318eedc5c4e0582786131440a672d"
     EXAMPLE_FINGERPRINT = "sha256:964788c0b03682173413a8cc7e290a5f4126ad1ba70d0ae061e92c6e66c08463"
+    # B2 fix round 1 (G2 L2): the refunded-unit value and the order amount parsing.
+    MORE_SOURCES = {
+        ("refunded_unit_cents",): "9bebeca606e55d96269f21343f7fe7c54ac7f190eb77965976c6e13e2679061a",
+        ("order_from_node", "_money", "_payment_cents", "payments_complete"): "d4ef8532c73a124a80e45229a3eea32e46f88e27ae1a3f9db1c417715258c670",
+    }
 
     def test_b2_schema_amount_rule_and_fingerprint_are_unchanged_since_a6e7142(self):
         import inspect
@@ -4925,6 +4930,10 @@ class B2NoReinitGuardTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(bm.LEDGER_SCHEMA.encode("utf-8")).hexdigest(), self.SCHEMA_SHA256)
         source = "".join(inspect.getsource(getattr(bm, name)) for name in self.AMOUNT_FUNCTIONS)
         self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), self.AMOUNT_SOURCE_SHA256)
+        for names, digest in self.MORE_SOURCES.items():
+            with self.subTest(names=names):
+                source = "".join(inspect.getsource(getattr(bm, name)) for name in names)
+                self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), digest)
         for name in ("member_benefits.example.json", "member_benefits.live.example.json"):
             with self.subTest(name=name):
                 value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
