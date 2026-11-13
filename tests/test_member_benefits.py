@@ -341,6 +341,8 @@ class Base(unittest.TestCase):
         "resolve": (frozenset({"status", "command", "writes", "resolved", "alerts"}), frozenset({"receipts_left"})),
         "index_dry_run": (RUN_KEYS, frozenset()),
         "index_apply": (RUN_KEYS, frozenset()),
+        # Slice B2 (B2-11): the read-only claim links listing.
+        "claim_links": (frozenset({"status", "command", "links", "active", "voided", "truncated"}), frozenset()),
     }
     DIGEST_KEYS = frozenset({"schema", "status", "autocount_book", "hours", "runs", "counts", "alerts", "alert_refs", "receipts", "shadow",
                              "gift_cards", "open", "rule_settings_match"})
@@ -350,9 +352,14 @@ class Base(unittest.TestCase):
     # Fix round 1 of slice B1 (G2 L2): the values of the keys slice B1 added,
     # written out here (never taken from the tool): fixed words for the text
     # keys, whole numbers for the counts, true or false for the match.
-    NEW_KEY_TEXTS = {"finding": ("as_intended", "not_as_intended"), "receipt_now": ("applied", "held", "left_decided"),
+    NEW_KEY_TEXTS = {"finding": ("as_intended", "not_as_intended"), "receipt_now": ("applied", "held", "left_decided", "left_open"),
                      "reason": ("wrong_person", "customers_merged", "member_renumbered", "other"), "link_source": ("order", "index")}
-    NEW_KEY_NUMBERS = ("held_writes_left", "held_writes", "claim_links", "claim_links_voided")
+    NEW_KEY_NUMBERS = ("held_writes_left", "held_writes", "claim_links", "claim_links_voided", "active", "voided")
+    # Slice B2 (B2-11): the keys and values of one claim-links entry, written out here.
+    CLAIM_LINK_KEYS = frozenset({"ref", "member_no_masked", "source", "created_day"})
+    CLAIM_LINK_SOURCES = ("order", "index")
+    CLAIM_LINK_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
+    CLAIM_LINK_DAY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 
     def tearDown(self):
         self.assert_outputs_private()
@@ -472,6 +479,16 @@ class Base(unittest.TestCase):
                 self.assertIsInstance(value["writes"], dict, kind)
                 for key in value["writes"]:
                     self.assertRegex(key, r"^(upgrade|extend):(" + "|".join(self.WRITE_STATES) + r")\Z", kind)
+            if value["command"] == "claim_links":
+                self.assertIs(type(value["truncated"]), bool, kind)
+                self.assertIsInstance(value["links"], list, kind)
+                self.assertLessEqual(len(value["links"]), 500, kind)
+                for entry in value["links"]:
+                    self.assertEqual(set(entry), set(self.CLAIM_LINK_KEYS), kind)
+                    self.assertRegex(entry["ref"], self.CLAIM_LINK_REF_RE, kind)
+                    self.assertRegex(entry["member_no_masked"], self.PRIVATE_MASK_RE, kind)
+                    self.assertIn(entry["source"], self.CLAIM_LINK_SOURCES, kind)
+                    self.assertRegex(entry["created_day"], self.CLAIM_LINK_DAY_RE, kind)
             if value["command"] == "resolve":
                 self.assertIsInstance(value["resolved"], dict, kind)
                 for key in value["resolved"]:
@@ -1544,7 +1561,9 @@ class G2FixRound3Tests(Base):
         self.advance(days=1)
         self.shopify.add(order_node(1, status="PARTIALLY_PAID", updated="2026-11-19T03:00:00Z"))
         out = self.engine().run(apply=True)
-        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled"), self.receipt(1)["code"]), ([], 1, "order_no_longer_qualifies"))
+        # Slice B2 (B2-2): an unpaid status is not a positive fact, so the settle now also alerts once.
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled"), self.receipt(1)["code"]),
+                         (["claim_hold_settled_unclear"], 1, "order_no_longer_qualifies"))
         # Paid again later: the hold stays settled, also after the link.
         self.advance(minutes=15)
         self.shopify.add(order_node(1, updated="2026-11-19T03:20:00Z"))
@@ -3901,10 +3920,12 @@ class UnlinkTests(Base):
                      lambda: self.by_order(order_ref, "1234"), lambda: self.by_order(order_ref, last3, "mistake"),
                      lambda: self.by_order(order_ref, last3, accept_applied="yes")):
             self.refused(call, "unlink_arguments_invalid")
-        # An unknown or malformed o- ref names no receipt.
-        for bad in ("o-" + "0" * 20, "o-" + order_ref[2:-1], order_ref + "\n", order_ref.upper(), ref, "", "o-"):
+        # A well-formed unknown o- ref names no receipt.
+        self.refused(lambda: self.by_order("o-" + "0" * 20, last3), "unlink_not_a_claim_link")
+        # Slice B2 (B2-10, Controller answer Q4): a malformed o- ref is refused as an argument, as a malformed c- ref is.
+        for bad in ("o-" + order_ref[2:-1], order_ref + "\n", order_ref.upper(), ref, "", "o-"):
             with self.subTest(bad=bad):
-                self.refused(lambda: self.by_order(bad, last3), "unlink_not_a_claim_link")
+                self.refused(lambda: self.by_order(bad, last3), "unlink_arguments_invalid")
         # The last 3 are compared exactly (G2 N13), and a wrong one refuses.
         for short in (member_no[-2:], member_no[-1:], "999" if last3 != "999" else "998"):
             with self.subTest(short=short):
@@ -4108,6 +4129,815 @@ class RealOutputsReachTheCheckTests(Base):
         finally:
             conn.close()
         self.assertEqual(stored, out)
+
+
+class B2TestGapTests(Base):
+    """Slice B2, tests only (G0 B2-12, B2-13): gaps left open by earlier
+    rounds, each named after the mutation it now catches."""
+
+    run_main = CliTests.run_main
+    real_client = OrdersQueryCostTests.real_client
+    factory = OrdersQueryCostTests.factory
+
+    # -- B2-12 (PR #303 L6): a real WAL v1 ledger with a reader open ----------
+    def test_b2_12_a_wal_v1_ledger_with_a_reader_open_is_refused_and_its_main_file_left_as_it_is(self):
+        make_v1_ledger(self.root)
+        path = self.root / bm.LEDGER_FILE
+        reader = sqlite3.connect(path, isolation_level=None)
+        self.addCleanup(reader.close)
+        self.assertEqual(reader.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        reader.execute("INSERT INTO watermarks(name, value, updated_at) VALUES ('w', 'v', 't')")  # a page in the -wal file
+        reader.execute("BEGIN")
+        self.assertEqual(reader.execute("SELECT COUNT(*) FROM watermarks").fetchone()[0], 1)  # a read transaction held open
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        for args in self.COMMANDS:
+            with self.subTest(args=args):
+                self.assertEqual(self.run_main(*args)[:2], (2, {"status": "refused", "code": "benefits_ledger_not_recognised"}))
+        self.assertEqual(self.code(lambda: bm.BenefitsLedger(self.root)), "benefits_ledger_not_recognised")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertTrue((self.root / (bm.LEDGER_FILE + "-wal")).exists())  # the side files stay (runbook)
+        self.assertEqual(reader.execute("SELECT value FROM watermarks WHERE name = 'w'").fetchone()[0], "v")
+
+    COMMANDS = (("init",), ("observe",), ("status",), ("digest",), ("claim-links",))
+
+    # -- B2-13 A21, A23: the line and shipping pages ---------------------------
+    def test_b2_13_a21_a_line_item_page_without_has_next_page_is_not_complete(self):
+        for info, complete in (({"hasNextPage": False}, True), ({}, False), ({"hasNextPage": None}, False), ({"hasNextPage": True}, False)):
+            with self.subTest(info=info):
+                node = order_node(1)
+                node["lineItems"]["pageInfo"] = info
+                order = bm.order_from_node(node)
+                self.assertIs(order.lines_complete, complete)
+                self.assertEqual(bm.goods_amount(order, self.cfg()) is not None, complete)
+
+    def test_b2_13_a23_a_shipping_list_not_shown_complete_is_not_measured_when_shipping_counts(self):
+        for info, exclude, measured in (({"hasNextPage": True}, True, True), ({"hasNextPage": True}, False, False), ({}, False, False),
+                                        ({"hasNextPage": False}, False, True)):
+            with self.subTest(info=info, exclude=exclude):
+                node = order_node(1)
+                node["shippingLines"]["pageInfo"] = info
+                order = bm.order_from_node(node)
+                self.assertIs(order.shipping_complete, info.get("hasNextPage") is False)
+                self.assertEqual(bm.goods_amount(order, self.cfg(amount_exclude_shipping=exclude)) is not None, measured)
+        # In a run: the order is held for a person, never measured without its shipping.
+        self.shopify.add({**order_node(1), "shippingLines": {"pageInfo": {"hasNextPage": True}, "nodes": [{"originalPriceSet": money("15.00")}]}})
+        out = self.engine(amount_exclude_shipping=False).run(apply=False)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"], out["alerts"]),
+                         ("amount_unverifiable", "currency_or_lines", ["order_amount_unverifiable"]))
+
+    # -- B2-13 A33, A34, A36, A37: the query cost ------------------------------
+    def stored_summary(self, run_id: str) -> dict:
+        conn = sqlite3.connect((self.root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return json.loads(conn.execute("SELECT summary FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0])
+        finally:
+            conn.close()
+
+    def test_b2_13_a33_a34_a36_a37_the_cost_of_a_capped_and_a_resumed_read_is_recorded_never_counted_or_added_up(self):
+        self.guest_with_order(1)
+        self.guest_with_order(2, updated="2026-11-18T03:05:00Z")
+        first, second = (self.shopify.orders_nodes[order_gid(n)] for n in (1, 2))
+        self.run_main("init")
+        session = ShopifyClientTests.session(["read_orders", "read_customers"])
+        client, _ = self.real_client([session, orders_page([first], more="cursor-a", cost=shopify_cost(846.5))])
+        code, capped, _ = self.run_main("observe", cfg={"shopify_max_pages": 1}, factory=self.factory(client))
+        self.assertEqual((code, capped["alerts"], capped["orders_query_cost"]), (3, ["orders_read_incomplete"], 847))  # A33
+        self.advance(minutes=15)
+        client, transport = self.real_client([session, orders_page([second], cost=shopify_cost(500))])
+        code, resumed, _ = self.run_main("observe", cfg={"shopify_max_pages": 1}, factory=self.factory(client))
+        self.assertEqual(transport.bodies[1]["variables"]["after"], "cursor-a")
+        self.assertEqual((code, resumed["counts"].get("orders_read_resumed"), resumed["orders_query_cost"]), (0, 1, 500))  # A34
+        for out in (capped, resumed):
+            stored = self.stored_summary(out["run_id"])
+            self.assertEqual(stored["orders_query_cost"], out["orders_query_cost"])
+            for value in (out, stored):  # A36: never a count
+                self.assertEqual([key for key in value["counts"] if "cost" in key], [])
+                self.assertNotIn(out["orders_query_cost"], [n for k, n in value["counts"].items() if k not in ("orders_read",)])
+        digest = self.run_main("digest", "--hours", "24")[1]
+        self.assertEqual([key for key in digest["counts"] if "cost" in key], [])  # A37: never added up
+        self.assertNotIn(1347, digest["counts"].values())
+        self.assertEqual(digest["runs"], {"completed": 2, "unfinished": 0})
+
+    # -- B2-13 G32: the digest's masked-MemberNo filter -------------------------
+    def test_b2_13_g32_the_digest_keeps_a_masked_member_number_only(self):
+        other = self.temp / "g32"
+        other.mkdir()
+        ledger = bm.BenefitsLedger(other, clock=lambda: self.now)
+        try:
+            ledger.init_meta(self.cfg())
+            refs = [{"ref": "o-" + "a" * 20, "code": "write_held", "member_no_masked": sg(1)},
+                    {"ref": "o-" + "b" * 20, "code": "write_held", "member_no_masked": "*******001"},
+                    {"ref": "o-" + "c" * 20, "code": "write_held", "member_no_masked": "**1234"},
+                    {"ref": "o-" + "d" * 20, "code": "write_held", "member_no_masked": "*" * 10}]
+            summary = {"counts": {"write_held": 4}, "alerts": ["write_held"], "refs": refs}
+            with ledger.tx() as conn:  # a stored summary injected through the ledger (the tool itself always masks)
+                conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES ('run-g32', 'apply', ?, ?, ?)",
+                             (dl.ts(self.now), dl.ts(self.now), json.dumps(summary)))
+        finally:
+            ledger.close()
+        digest = bm.ledger_digest(other, hours=24, now=self.now, config=self.cfg())
+        self.assertEqual(digest["alert_refs"], [{"ref": "o-" + "a" * 20, "code": "write_held"},
+                                                {"ref": "o-" + "b" * 20, "code": "write_held", "member_no_masked": "*******001"},
+                                                {"ref": "o-" + "c" * 20, "code": "write_held"},
+                                                {"ref": "o-" + "d" * 20, "code": "write_held"}])
+        self.assertNotIn(sg(1), json.dumps(digest))
+
+    # -- B2-13 D01: the REFUNDED branch ----------------------------------------
+    def test_b2_13_d01_a_refunded_status_decides_when_the_money_check_alone_would_not(self):
+        lines = (("300.00", 1, 0, False, ()),)  # the one unit refunded: the money is explained by it
+        for status, unattributed in (("REFUNDED", True), ("PARTIALLY_REFUNDED", False), ("PAID", False)):
+            with self.subTest(status=status):
+                order = bm.order_from_node(order_node(1, lines=lines, status=status, refunded="300.00"))
+                self.assertEqual(order.refunded_cents, bm.refunded_unit_cents(order))
+                self.assertIs(bm.money_refund_unattributed(order), unattributed)
+        # An applied receipt read again as REFUNDED with no money left unexplained still alerts.
+        self.guest_with_order(1)
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(1)["state"], "applied")
+        self.shopify.add(order_node(1, status="REFUNDED", updated="2026-11-18T03:30:00Z"))
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        self.assertEqual(out["alerts"], ["refund_on_basis"])
+
+    # -- B2-13 D32: a malformed stored resume cursor ----------------------------
+    def test_b2_13_d32_a_malformed_stored_resume_cursor_is_cleared_and_the_read_restarts_from_the_watermark(self):
+        self.guest_with_order(1)
+        engine = self.engine()
+        good_since = "2026-11-18T01:00:00Z"
+        for value in ("not json", "[1]", json.dumps({"since": "x", "cursor": "cursor-0"}), json.dumps({"since": good_since, "cursor": ""}),
+                      json.dumps({"since": good_since, "cursor": 5}), json.dumps({"since": good_since}), json.dumps({"cursor": "cursor-0"})):
+            with self.subTest(value=value):
+                self.ledger.set_watermark(bm.WATERMARK, "2026-11-18T02:00:00Z")
+                self.ledger.set_watermark(bm.RESUME_MARK, value)
+                self.shopify.calls.clear()
+                self.advance(minutes=15)
+                out = engine.run(apply=False)
+                self.assertNotIn("orders_read_resumed", out["counts"])
+                self.assertEqual([c for c in self.shopify.calls if c[0] == "orders"],
+                                 [("orders", datetime(2026, 11, 18, 1, 45, tzinfo=timezone.utc))])  # the watermark less the margin
+                self.assertIsNone(self.ledger.watermark(bm.RESUME_MARK))
+
+
+class B2AlertTests(Base):
+    """Slice B2 (G0 B2-1, B2-2): an order seen with another customer after
+    its upgrade, and a claim hold settled for a reason that is not a
+    positive fact. Each alerts once per order; nothing else changes."""
+
+    claim_held = G2FixRound2Tests.claim_held
+    link_and_run = G2FixRound2Tests.link_and_run
+    MOVED = "order_customer_changed_after_upgrade"
+    UNCLEAR = "claim_hold_settled_unclear"
+
+    def upgraded(self, n: int = 1) -> str:
+        member_no = self.guest_with_order(n)
+        self.assertEqual(self.engine().run(apply=True)["saves"], 1)
+        self.assertEqual(self.receipt(n)["state"], "applied")
+        return member_no
+
+    def replay(self, n: int = 1, minute: int = 10, **order) -> dict:
+        self.shopify.add(order_node(n, updated=f"2026-11-18T04:{minute:02d}:00Z", **order))
+        self.advance(minutes=15)
+        return self.engine().run(apply=False)
+
+    # -- B2-1 -----------------------------------------------------------------
+    def test_b2_1_an_order_moved_after_its_upgrade_alerts_once_and_the_receipt_keeps_its_customer(self):
+        member_no = self.upgraded()
+        before = tuple(self.receipt(1))
+        out = self.replay(customer=customer_node(2))
+        ref = self.ledger.ref("o", order_gid(1))
+        self.assertEqual(out["alerts"], [self.MOVED])
+        self.assertIn({"ref": ref, "code": self.MOVED, "member_no_masked": bm.mask(member_no)}, out["refs"])
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["customer_gid"], row["member_no"], row["code"], row["basis_expiry_local"]),
+                         ("applied", customer_gid(1), member_no, "upgrade", NEW_EXPIRY))
+        self.assertEqual({k: row[k] for k in row.keys() if k not in ("order_updated_at", "updated_at", "payment_gateways")},
+                         {k: dict(zip(row.keys(), before))[k] for k in row.keys() if k not in ("order_updated_at", "updated_at", "payment_gateways")})
+        self.assertIn(("moved:" + order_gid(1), self.MOVED), [tuple(r)[:2] for r in self.ledger.conn.execute("SELECT * FROM reviews")])
+        # Seen again, moved back, moved on: never a second alert.
+        for minute, customer in ((20, customer_node(2)), (30, customer_node(1)), (40, customer_node(3)), (50, None)):
+            with self.subTest(minute=minute):
+                out = self.replay(minute=minute, customer=customer)
+                self.assertEqual((out["alerts"], out["counts"].get(self.MOVED)), ([], None))
+        self.assertEqual((self.book.saves, self.receipt(1)["customer_gid"]), (1, customer_gid(1)))
+
+    def test_b2_1_a_removed_customer_alerts_and_a_refund_on_the_same_read_alerts_too(self):
+        member_no = self.guest_with_order(1)
+        self.guest_with_order(2)
+        self.assertEqual(self.engine().run(apply=True)["saves"], 2)
+        out = self.replay(customer=None)
+        self.assertEqual(out["alerts"], [self.MOVED])
+        out = self.replay(2, minute=20, customer=customer_node(5), status="REFUNDED")
+        self.assertEqual(sorted(out["alerts"]), sorted([self.MOVED, "refund_on_basis"]))
+        self.assertEqual(self.receipt(2)["alerted"], "refund_on_basis")
+        self.assertEqual(self.book.members[member_no]["type"], "MEMBER")  # never downgraded
+
+    def test_b2_1_a_receipt_that_is_not_applied_never_alerts_for_a_move(self):
+        self.guest_with_order(1, member=fake_member(sg(1), name="Fake Member 1", active="F"))  # held: member_inactive
+        self.guest_with_order(2, member=fake_member(sg(2), name="Fake Member 2", member_type="MEMBER", expiry="2030-01-01T00:00:00.000"))
+        self.guest_with_order(3, member=fake_member(sg(3), name="Fake Member 3", member_type="VIP"))
+        self.guest_with_order(4)
+        self.engine().run(apply=False)  # 4 stays ready (observed)
+        self.assertEqual([self.receipt(n)["state"] for n in (1, 2, 3, 4)], ["held", "no_change", "not_in_scope", "ready"])
+        for n in (1, 2, 3, 4):
+            self.shopify.add(order_node(n, customer=customer_node(n + 10), updated="2026-11-18T04:10:00Z"))
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        self.assertNotIn(self.MOVED, out["alerts"])
+        self.assertIsNone(out["counts"].get(self.MOVED))
+
+    # -- B2-2: the replay path -------------------------------------------------
+    def settle(self, **order) -> dict:
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, updated="2026-11-19T03:00:00Z", **order))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("claim_hold_settled"), self.receipt(1)["state"], self.receipt(1)["code"]),
+                         (1, "held", "order_no_longer_qualifies"))
+        return out
+
+    def test_b2_2_a_positive_fact_settles_a_claim_hold_silently(self):
+        cases = {"cancelled": dict(cancelled="2026-11-19T02:00:00Z"),
+                 "unit_refund": dict(lines=(("300.00", 1, 0, False, ()),), status="PARTIALLY_REFUNDED", refunded="300.00"),
+                 "unit_refund_below": dict(lines=(("300.00", 1, 1, False, ()), ("50.00", 1, 1, False, ())), refunded="0.00", transactions=(tx("60.00"),)),
+                 "moved": dict(customer=customer_node(2)), "no_customer": dict(customer=None)}
+        for name, order in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                try:
+                    out = self.settle(**order)
+                    self.assertNotIn(self.UNCLEAR, out["alerts"])
+                    self.assertIsNone(out["counts"].get(self.UNCLEAR))
+                finally:
+                    self.doCleanups()
+
+    def test_b2_2_any_other_reason_settles_and_alerts_once(self):
+        twenty = tuple(("20.00", 1, 1, False, ()) for _ in range(20))
+        cases = {"unpaid": dict(status="PENDING"), "partly_paid": dict(status="PARTIALLY_PAID"),
+                 "signup_marker_gone": dict(customer=customer_node(1, tags=())),
+                 "a_21st_line": dict(lines=twenty, more_lines=True),
+                 "a_10th_transaction": dict(transactions=tuple(card("1.00") for _ in range(10))),
+                 "test_order": dict(test=True)}
+        for name, order in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                try:
+                    out = self.settle(**order)
+                    ref = self.ledger.ref("o", order_gid(1))
+                    self.assertEqual((out["counts"].get(self.UNCLEAR), out["saves"]), (1, 0))
+                    self.assertIn(self.UNCLEAR, out["alerts"])
+                    self.assertIn({"ref": ref, "code": self.UNCLEAR}, out["refs"])
+                    self.assertIn(("settled:" + order_gid(1), self.UNCLEAR), [tuple(r)[:2] for r in self.ledger.conn.execute("SELECT * FROM reviews")])
+                    # Once: seen again (and linked), the settled hold stays shut and quiet.
+                    self.advance(minutes=15)
+                    again = self.link_and_run()
+                    self.assertEqual((again["counts"].get(self.UNCLEAR), self.receipt(1)["code"], self.book.saves),
+                                     (None, "order_no_longer_qualifies", 0))
+                finally:
+                    self.doCleanups()
+
+    # -- B2-2: the stored-facts path (_reopen_claim_holds) ----------------------
+    def test_b2_2_the_stored_facts_path_alerts_unless_a_paid_amount_is_below_the_threshold(self):
+        facts = {1: (dict(financial_status="REFUNDED"), True), 2: (dict(net_cents=0), False), 3: (dict(financial_status="PENDING"), True),
+                 4: (dict(net_cents=None), True), 5: (dict(financial_status=None), True), 6: (dict(net_cents=29_999, financial_status="PARTIALLY_REFUNDED"), False),
+                 7: (dict(net_cents=0, financial_status="REFUNDED"), False), 8: (dict(net_cents=0, financial_status="PENDING"), True)}
+        for n in facts:
+            self.guest_with_order(n, linked=False, member=fake_member(sg(n), name="Someone Else Entirely"))
+        self.engine().run(apply=True)
+        self.advance(hours=2)
+        self.shopify.add(order_node(9, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T05:30:00Z"))
+        self.engine().run(apply=True)  # a newer order moves the watermark on: the six are not read again
+        for n, (change, _) in facts.items():
+            self.assertEqual(self.receipt(n)["code"], "claim_name_mismatch")
+            self.ledger.update_receipt(order_gid(n), **change)
+            self.link(n)
+        self.advance(hours=1)
+        out = self.engine().run(apply=True)
+        alerted = {r["ref"] for r in out["refs"] if r["code"] == self.UNCLEAR}
+        self.assertEqual(alerted, {self.ledger.ref("o", order_gid(n)) for n, (_, alert) in facts.items() if alert})
+        self.assertEqual((out["counts"].get("claim_hold_settled"), out["counts"].get(self.UNCLEAR), out["saves"]), (8, 5, 0))
+        self.advance(hours=1)
+        self.assertIsNone(self.engine().run(apply=True)["counts"].get(self.UNCLEAR))  # once
+
+
+class B2WindowTests(Base):
+    """Slice B2 (G0 B2-3, B2-4): no re-open after a read that ended at the
+    page cap; the 60-day age limit (exactly 60 days settles: ``>=``)."""
+
+    claim_held = G2FixRound2Tests.claim_held
+    AGED = "receipt_past_read_window"
+    CREATED = datetime(2026, 11, 18, 3, 0, tzinfo=timezone.utc)  # ORDER_AT
+
+    # -- B2-3 ----------------------------------------------------------------
+    def test_b2_3_a_capped_read_defers_the_re_open_and_the_next_complete_read_re_opens(self):
+        self.claim_held()
+        self.link(1)
+        for n in range(20, 26):  # six newer orders: more than one page of five
+            self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T04:0%d:00Z" % (n - 20)))
+        self.advance(minutes=15)
+        out = self.engine(shopify_max_pages=1).run(apply=True)
+        self.assertIn("orders_read_incomplete", out["alerts"])
+        self.assertEqual((out["counts"].get("claim_reopen_deferred"), out["counts"].get("claim_hold_reopened"), out["saves"]), (1, None, 0))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_name_mismatch"))
+        self.advance(minutes=15)
+        out = self.engine(shopify_max_pages=1).run(apply=True)
+        self.assertNotIn("orders_read_incomplete", out["alerts"])
+        self.assertEqual((out["counts"].get("claim_reopen_deferred"), out["counts"].get("claim_hold_reopened")), (None, 1))
+        self.assertEqual(self.receipt(1)["state"], "applied")
+
+    # -- B2-4 ----------------------------------------------------------------
+    def at(self, delta: timedelta) -> dict:
+        self.now = self.CREATED + delta
+        return self.engine().run(apply=True)
+
+    def test_b2_4_the_age_limit_comes_before_the_re_open_in_the_same_run(self):
+        self.claim_held()  # order 1, created at ORDER_AT
+        self.guest_with_order(2, linked=False, member=fake_member(sg(2), name="Someone Else Entirely"), created="2026-11-18T03:01:00Z")
+        self.engine().run(apply=True)
+        self.assertEqual([self.receipt(n)["code"] for n in (1, 2)], ["claim_name_mismatch"] * 2)
+        self.link(1)
+        self.link(2)
+        out = self.at(timedelta(days=60))  # order 1 exactly 60 days old, order 2 one minute younger
+        self.assertEqual((out["counts"].get(self.AGED), out["counts"].get("claim_hold_reopened"), out["saves"]), (1, 1, 1))
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("held", "order_past_read_window"), ("applied", "upgrade")])
+        self.assertEqual((self.book.members[sg(1)]["type"], self.book.members[sg(2)]["type"]), ("GUEST", "MEMBER"))
+
+    def test_b2_4_the_limit_is_exactly_60_days_for_both_receipt_kinds(self):
+        self.claim_held()
+        self.shopify.add(order_node(2))  # signed up, no member yet: waits
+        self.engine().run(apply=True)
+        self.assertEqual((self.receipt(2)["state"], self.receipt(1)["state"]), ("waiting_member", "held"))
+        out = self.at(timedelta(days=60) - timedelta(minutes=1))
+        self.assertNotIn(self.AGED, out["alerts"])
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("held", "claim_name_mismatch"), ("waiting_member", None)])
+        out = self.at(timedelta(days=60))  # exactly 60 days: settles
+        self.assertEqual((out["alerts"].count(self.AGED), out["counts"].get(self.AGED)), (1, 2))
+        self.assertEqual({r["ref"] for r in out["refs"] if r["code"] == self.AGED}, {self.ledger.ref("o", order_gid(n)) for n in (1, 2)})
+        reviews = [tuple(r)[:2] for r in self.ledger.conn.execute("SELECT * FROM reviews")]
+        self.assertTrue(all(("aged:" + order_gid(n), self.AGED) in reviews for n in (1, 2)))
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"], self.receipt(n)["waiting_since"]) for n in (1, 2)],
+                         [("held", "order_past_read_window", None), ("held", "order_past_read_window", None)])
+        # Once, and never re-opened or waited on: a link appears and a member is made.
+        self.link(1)
+        self.link(2)
+        self.book.members[sg(2)] = fake_member(sg(2), name="Fake Member 2")
+        out = self.at(timedelta(days=61))
+        self.assertEqual((out["counts"].get(self.AGED), out["counts"].get("claim_hold_reopened"), out["saves"]), (None, None, 0))
+        self.assertEqual([self.receipt(n)["code"] for n in (1, 2)], ["order_past_read_window"] * 2)
+        self.assertEqual(self.book.saves, 0)
+
+    def test_b2_4_fix1_the_age_limit_also_runs_after_a_capped_read(self):
+        """G2 F2 (P5): a 61-day-old ``waiting_member`` receipt whose member then
+        appears is settled, never upgraded, in a run whose read hit the page cap."""
+        self.shopify.add(order_node(2))  # signed up, no member yet: waits
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(2)["state"], "waiting_member")
+        self.book.members[sg(2)] = fake_member(sg(2), name="Fake Member 2")  # the member appears
+        self.link(2)
+        for days, alerted in ((61, 1), (62, 0)):
+            with self.subTest(days=days):
+                for n in range(days * 10, days * 10 + 6):  # six more: this read is capped too
+                    self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T0%d:0%d:00Z" % (days - 56, n % 10)))
+                self.now = self.CREATED + timedelta(days=days)
+                out = self.engine(shopify_max_pages=1).run(apply=True)
+                self.assertIn("orders_read_incomplete", out["alerts"])
+                self.assertEqual((out["alerts"].count(self.AGED), out["counts"].get(self.AGED), out["saves"], self.book.saves),
+                                 (alerted, alerted or None, 0, 0))
+                self.assertEqual((self.receipt(2)["state"], self.receipt(2)["code"]), ("held", "order_past_read_window"))
+        self.assertEqual(self.book.members[sg(2)]["type"], "GUEST")
+
+    def test_b2_4_applied_and_other_receipts_are_never_touched(self):
+        self.guest_with_order(1)
+        self.guest_with_order(2, member=fake_member(sg(2), name="Fake Member 2", active="F"))
+        self.engine().run(apply=True)
+        self.shopify.add(order_node(3, status="PENDING"))
+        self.engine().run(apply=True)
+        before = {n: tuple(self.receipt(n)) for n in (1, 2, 3)}
+        self.assertEqual([r[0] for r in [(self.receipt(n)["state"],) for n in (1, 2, 3)]], ["applied", "held", "ignored_unpaid"])
+        out = self.at(timedelta(days=90))
+        self.assertNotIn(self.AGED, out["alerts"])
+        self.assertEqual({n: tuple(self.receipt(n))[:-1] for n in before}, {n: row[:-1] for n, row in before.items()})
+
+
+class B2RecordTests(Base):
+    """Slice B2 (G0 B2-5, B2-7): carry-over when an undecided receipt
+    follows its order; the goods measured first."""
+
+    RESET = ("waiting_since", "alerted", "observed", "observed_at", "checked_at", "member_no", "link_source")
+
+    # -- B2-5 ----------------------------------------------------------------
+    def test_b2_5_an_undecided_receipt_that_follows_its_order_keeps_nothing_of_the_old_customer(self):
+        self.guest_with_order(1)
+        engine = self.engine()
+        engine.run(apply=False)
+        self.ledger.update_receipt(order_gid(1), waiting_since="2026-11-18T03:30:00Z", alerted="qualified_member_missing", checked_at="2026-11-18T03:40:00Z")
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["observed"], row["link_source"]), ("ready", "would_upgrade", "sync155"))
+        self.assertTrue(all(row[name] is not None for name in self.RESET))
+        # The same customer again: everything kept.
+        engine.record(bm.order_from_node(order_node(1, updated="2026-11-18T04:05:00Z")), bm.RunSummary("observe"))
+        self.assertEqual({name: self.receipt(1)[name] for name in self.RESET}, {name: row[name] for name in self.RESET})
+        for n, customer in ((2, customer_node(2)), (None, None)):
+            with self.subTest(customer=n):
+                self.ledger.update_receipt(order_gid(1), **{name: row[name] for name in self.RESET})
+                engine.record(bm.order_from_node(order_node(1, customer=customer, updated="2026-11-18T04:06:00Z")), bm.RunSummary("observe"))
+                moved = self.receipt(1)
+                self.assertEqual(moved["customer_gid"], customer_gid(n) if n else None)
+                for name in self.RESET:
+                    self.assertIsNone(moved[name], name)
+        # In a run: the receipt is linked afresh through the new customer's own link.
+        self.link(2)
+        self.book.members[sg(2)] = fake_member(sg(2), name="Fake Member 2")
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-18T04:20:00Z"))
+        self.advance(minutes=30)
+        out = self.engine().run(apply=False)
+        self.assertIn({"ref": self.ledger.ref("o", order_gid(1)), "code": "would_upgrade", "member_no_masked": bm.mask(sg(2))}, out["refs"])
+        self.assertEqual((self.receipt(1)["member_no"], self.receipt(1)["customer_gid"]), (sg(2), customer_gid(2)))
+
+    # -- B2 fix round 1 (G2 F1) ----------------------------------------------
+    run_main = CliTests.run_main
+    WRITE_KEEPS = {"INTENT": True, "UNCERTAIN": True, "HELD": True, "DONE": True, "SKIPPED": False, "NOT_WRITTEN": False, None: False}
+
+    def cli_receipt(self, n: int = 1) -> tuple:
+        return tuple(stored_receipt(self.root, n, name) for name in ("state", "code", "customer_gid", "member_no", "link_source", "basis_expiry_local"))
+
+    def test_b2_5_fix1_an_open_or_landed_write_keeps_member_no_and_link_source(self):
+        cases = dict(enumerate(self.WRITE_KEEPS, start=1))  # order n: its write state (None: no write)
+        members = {n: self.guest_with_order(n) for n in cases}
+        engine = self.engine()
+        engine.run(apply=False)
+        for n, state in cases.items():
+            self.assertEqual((self.receipt(n)["state"], self.receipt(n)["member_no"], self.receipt(n)["link_source"]), ("ready", members[n], "sync155"))
+            if state is not None:
+                payload = {"kind": "upgrade", "member_no": members[n], "from_type": "GUEST", "to_type": "MEMBER", "expected_last_modified_local": LM,
+                           "expected_expiry_local": None, "new_expiry_local": NEW_EXPIRY, "salt": "s"}
+                write = self.ledger.add_intent(run_id="run-x", order_gid=order_gid(n), payload=payload, deadline=self.now)
+                if state != "INTENT":
+                    self.ledger.set_outcome(write["write_id"], state, "c", LM if state == "DONE" else None)
+        for n, state in cases.items():
+            with self.subTest(write=state):
+                engine.record(bm.order_from_node(order_node(n, customer=customer_node(n + 20), updated="2026-11-18T04:06:00Z")), bm.RunSummary("observe"))
+                row = self.receipt(n)
+                if state == "DONE":  # the landed save is repaired first (G2 LATER 1): applied, nothing moves
+                    self.assertEqual((row["state"], row["customer_gid"], row["member_no"]), ("applied", customer_gid(n), members[n]))
+                    continue
+                self.assertEqual((row["state"], row["customer_gid"]), ("ready", customer_gid(n + 20)))
+                kept = (members[n], "sync155") if self.WRITE_KEEPS[state] else (None, None)
+                self.assertEqual((row["member_no"], row["link_source"]), kept)
+                for name in self.RESET[:5]:  # the rest of the carry-over is reset either way
+                    self.assertIsNone(row[name], name)
+
+    def test_b2_5_fix1_resolve_after_an_observe_that_moved_the_order_settles_done(self):
+        """G2 F1 (P1/P2): an UNCERTAIN save that landed; an observe replays the
+        order with another customer; ``resolve`` reads the save back as DONE
+        and sets the receipt applied: coded, exit 0, as on main."""
+        member_no = self.guest_with_order(1)
+        self.run_main("init")
+        self.book.mode = "uncertain_saved"
+        self.assertEqual(self.run_main("apply", cfg={"benefits_write_enabled": True})[1]["alerts"], ["write_uncertain"])
+        self.book.mode = None
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-18T04:10:00Z"))
+        self.advance(minutes=15)
+        self.assertEqual(self.run_main("observe")[0], 0)
+        self.assertEqual(self.cli_receipt(), ("ready", None, customer_gid(2), member_no, "sync155", None))
+        self.advance(seconds=PAST_DEADLINE)
+        code, out, _ = self.run_main("resolve")
+        self.assertEqual((code, out["status"], out["resolved"], out["alerts"]), (0, "ok", {"DONE:resolved_saved": 1}, []))
+        self.assertEqual(self.cli_receipt(), ("applied", "upgrade", customer_gid(2), member_no, "sync155", NEW_EXPIRY))
+        self.advance(minutes=15)
+        out = self.run_main("apply", cfg={"benefits_write_enabled": True})[1]
+        self.assertEqual((out["counts"].get("receipt_repaired_applied"), out["saves"], self.book.saves), (None, 0, 1))
+
+    def test_b2_5_fix1_a_held_write_keeps_the_member_through_a_move_and_release_applies(self):
+        ref, member_no = ReleaseHeldTests.held(self)
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-18T04:10:00Z"))
+        self.advance(minutes=15)
+        self.engine().run(apply=False)
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["customer_gid"], row["member_no"], row["link_source"]), ("ready", customer_gid(2), member_no, "sync155"))
+        self.assertEqual(ReleaseHeldTests.release(self, ref, member_no[-3:], "as_intended")["receipt_now"], "applied")
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["member_no"]), ("applied", member_no))
+
+    # -- B2-7 ----------------------------------------------------------------
+    def test_b2_7_goods_below_the_threshold_with_unread_payments_are_below_threshold_with_no_alert(self):
+        twenty = tuple(("10.00", 1, 1, False, ()) for _ in range(20))
+        cases = {
+            1: (dict(lines=(("299.99", 1, 1, False, ()),), tx_count=None), "below_threshold", None, False),
+            2: (dict(lines=(("300.00", 1, 1, False, ()),), tx_count=None), "amount_unverifiable", "payments_unreadable", True),
+            3: (dict(lines=(("450.00", 1, 1, False, ()),), transactions=tuple(card("1.00") for _ in range(10))),
+                "amount_unverifiable", "payments_unreadable", True),
+            4: (dict(lines=twenty, more_lines=True, tx_count=None), "amount_unverifiable", "currency_or_lines", True),  # goods unreadable
+            5: (dict(lines=(("400.00", 1, 0, False, ()),), status="PARTIALLY_REFUNDED", refunded="400.00", tx_count=None), "below_threshold", None, False),
+        }
+        for n, (order, *_rest) in cases.items():
+            self.guest_with_order(n, **order)
+        out = self.engine().run(apply=False)
+        for n, (_, state, code, alert) in cases.items():
+            with self.subTest(n=n):
+                self.assertEqual((self.receipt(n)["state"], self.receipt(n)["code"]), (state, code))
+                self.assertEqual({"ref": self.ledger.ref("o", order_gid(n)), "code": "order_amount_unverifiable"} in out["refs"], alert)
+        self.assertEqual((out["counts"].get("below_threshold_payments_unread"), out["counts"].get("order_amount_unverifiable")), (2, 3))
+        self.assertEqual(self.book.reads, 0)
+
+
+class B2DigestProbeTests(Base):
+    """Slice B2 (G0 B2-6, B2-8): digest gateway names with a run of digits;
+    reprs; a writer probe of ``unknown`` counts as possibly live."""
+
+    release = ReleaseHeldTests.release
+    held = ReleaseHeldTests.held
+    NOT_EXITED = ("running", "unknown", "", "RUNNING", "exited ", "Exited")
+
+    # -- B2-6 ----------------------------------------------------------------
+    def test_b2_6_the_digest_shows_a_gateway_name_with_four_digits_in_a_row_as_other(self):
+        names = {1: "gift_card_1234", 2: "gift_card_123", 3: "x9999y", 4: "gift_card", 5: "pay_12_34_56"}
+        for n, gateway in names.items():
+            self.guest_with_order(n, transactions=(tx("1.00", gateway=gateway),))
+        self.engine().run(apply=False)
+        seen = bm.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())["gift_cards"]["gateways_seen"]
+        self.assertEqual(seen, {"other": 2, "gift_card_123": 1, "gift_card": 1, "pay_12_34_56": 1})
+
+    def test_b2_6_payment_and_order_line_reprs_print_no_field(self):
+        order = bm.order_from_node(order_node(1, lines=(("123.45", 7, 6, True, ("9.87",)),), transactions=(tx("54.32", gateway="gift_card_7777"),)))
+        payment, line = order.payments[0], order.lines[0]
+        self.assertEqual((repr(payment), repr(line), str(payment), str(line)), ("Payment()", "OrderLine()", "Payment()", "OrderLine()"))
+        for text in (repr(order.payments), repr(order.lines), repr(order), repr(order.customer)):
+            for value in ("gift_card", "7777", "5432", "12345", "987", "SUCCESS", "SALE", "True"):
+                self.assertNotIn(value, text)
+
+    # -- B2-8 ----------------------------------------------------------------
+    def test_b2_8_resolve_holds_unless_the_probe_says_exited(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_unsaved"
+        engine = self.engine()
+        engine.run(apply=True)
+        self.advance(seconds=PAST_DEADLINE)
+        for result in self.NOT_EXITED:
+            with self.subTest(result=result):
+                self.probe_result = result
+                self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+                self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.probe_result = "exited"
+        self.assertEqual(engine.resolve()["resolved"], {"NOT_WRITTEN:resolved_not_written": 1})
+
+    def test_b2_8_release_held_holds_unless_the_probe_says_exited(self):
+        ref, member_no = self.held()
+        before = ReleaseHeldTests.recorded(self)
+        for result in self.NOT_EXITED:
+            with self.subTest(result=result):
+                self.probe_result = result
+                self.assertEqual(self.code(lambda: self.release(ref, member_no[-3:], "as_intended")), "writer_may_be_live")
+                self.assertEqual(ReleaseHeldTests.recorded(self), before)
+        self.probe_result = "exited"
+        self.assertEqual(self.release(ref, member_no[-3:], "as_intended")["receipt_now"], "applied")
+
+
+class B2ReleaseUnlinkTests(Base):
+    """Slice B2 (G0 B2-9, B2-10): ``left_open`` and the late settle of a
+    ready receipt behind a released HELD write; malformed refs."""
+
+    run_main = CliTests.run_main
+    held = ReleaseHeldTests.held
+    release = ReleaseHeldTests.release
+    claimed = UnlinkTests.claimed
+    by_order = UnlinkTests.by_order
+    unlink = UnlinkTests.unlink
+
+    def recorded(self) -> tuple:
+        return UnlinkTests.recorded(self) + ReleaseHeldTests.recorded(self)
+
+    def refused(self, call, code: str) -> None:
+        before = self.recorded()
+        self.assertEqual(self.code(call), code)
+        self.assertEqual(self.recorded(), before)
+
+    # -- B2-9 ----------------------------------------------------------------
+    def released_while_open(self, finding: str) -> tuple[str, str]:
+        ref, member_no = self.held()
+        self.ledger.update_receipt(order_gid(1), state="waiting_member", code=None)  # neither ready nor decided
+        if finding == "not_as_intended":
+            self.book.members[member_no].update(type="GUEST", expiry=None)
+        row = tuple(self.receipt(1))
+        dry = self.release(ref, member_no[-3:], finding, apply=False)
+        out = self.release(ref, member_no[-3:], finding)
+        for value in (dry, out):
+            self.assertEqual((value["receipt_now"], value["counts"]), ("left_open", {"release_receipt_left_open": 1}))
+        self.assertEqual(tuple(self.receipt(1)), row)  # left as it is
+        self.assertEqual(self.ledger.held_writes(), 0)
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)  # not ready: the run settles nothing late
+        self.assertEqual((out["counts"].get("release_receipt_settled_late"), self.receipt(1)["state"]), (None, "waiting_member"))
+        return ref, member_no
+
+    def late(self) -> dict:
+        self.ledger.update_receipt(order_gid(1), state="ready")  # ready again
+        reads, saves, writes = self.book.reads, self.book.saves, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+        payloads = len(self.book.payloads)
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual(len(self.book.payloads), payloads)  # nothing sent, not even a save that would be skipped
+        self.assertEqual((out["counts"].get("write_already_recorded"), out["counts"].get("release_receipt_settled_late"), out["saves"]), (1, 1, 0))
+        self.assertEqual((self.book.reads, self.book.saves, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]),
+                         (reads, saves, writes))
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "HELD")
+        return out
+
+    def test_b2_9_as_intended_a_receipt_ready_again_is_applied_late_and_a_later_refund_alerts(self):
+        ref, member_no = self.released_while_open("as_intended")
+        out = self.late()
+        self.assertIn({"ref": ref, "code": "release_receipt_settled_late", "member_no_masked": bm.mask(member_no)}, out["refs"])
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["member_no"], row["basis_expiry_local"]), ("applied", "upgrade", member_no, NEW_EXPIRY))
+        self.advance(minutes=15)  # settled once: the next run leaves it
+        self.assertIsNone(self.engine().run(apply=True)["counts"].get("release_receipt_settled_late"))
+        self.shopify.add(order_node(1, status="REFUNDED", updated="2026-11-18T05:00:00Z"))
+        self.advance(minutes=15)
+        self.assertEqual(self.engine().run(apply=False)["alerts"], ["refund_on_basis"])
+
+    def test_b2_9_not_as_intended_a_receipt_ready_again_is_held_late(self):
+        self.released_while_open("not_as_intended")
+        self.late()
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "held_write_released"))
+        self.assertEqual(self.book.members[sg(1)]["type"], "GUEST")
+
+    def test_b2_9_an_unreleased_held_write_settles_nothing_and_left_decided_stays_for_decided_receipts(self):
+        ref, member_no = self.held()
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)  # observe: the HELD write is not released yet
+        self.assertEqual((out["counts"].get("write_already_recorded"), out["counts"].get("release_receipt_settled_late")), (1, None))
+        self.assertEqual(self.receipt(1)["state"], "ready")
+        self.ledger.update_receipt(order_gid(1), state="no_change", code="expiry_already_later", member_no=member_no)
+        self.assertEqual(self.release(ref, member_no[-3:], "as_intended")["receipt_now"], "left_decided")
+
+    # -- B2-10 ---------------------------------------------------------------
+    def test_b2_10_a_malformed_ref_of_either_kind_is_an_argument_refusal_and_records_nothing(self):
+        ref, member_no = self.claimed()
+        last3 = member_no[-3:]
+        order_ref = self.ledger.ref("o", order_gid(1))
+        bad_orders = ("o-" + "a" * 19, "o-" + "a" * 21, "o-" + "g" * 20, order_ref.upper(), " " + order_ref, order_ref + "\n", order_ref + " ",
+                      "x-" + order_ref[2:], ref, "", "o-", "o_" + order_ref[2:])
+        bad_customers = ("c-" + "a" * 19, "c-" + "a" * 21, ref.upper(), ref + "\n", " " + ref, order_ref, "", "c-")
+        for bad in bad_orders:
+            with self.subTest(order_ref=bad):
+                self.refused(lambda: self.by_order(bad, last3), "unlink_arguments_invalid")
+        for bad in bad_customers:
+            with self.subTest(customer_ref=bad):
+                self.refused(lambda: self.unlink(bad, last3), "unlink_arguments_invalid")
+        self.refused(lambda: self.by_order("o-" + "0" * 20, last3), "unlink_not_a_claim_link")  # well-formed, unknown
+        self.refused(lambda: self.unlink("c-" + "0" * 20, last3), "unlink_not_a_claim_link")
+        self.assertEqual(self.by_order(order_ref, last3, apply=False)["counts"]["claim_unlinked"], 1)
+
+    def test_b2_10_the_cli_refuses_a_malformed_order_ref_as_an_argument(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.run_main("init")
+        self.run_main("observe")
+        for bad in ("o-" + "a" * 19, "O-" + "A" * 20, "c-" + "a" * 20):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_main("unlink", "--order-ref", bad, "--member-last3", member_no[-3:], "--reason", "other", "--apply")[:2],
+                                 (2, {"status": "refused", "code": "unlink_arguments_invalid"}))
+        self.assertEqual(self.run_main("unlink", "--order-ref", "o-" + "0" * 20, "--member-last3", member_no[-3:], "--reason", "other")[:2],
+                         (2, {"status": "refused", "code": "unlink_not_a_claim_link"}))
+
+
+class B2ClaimLinksTests(Base):
+    """Slice B2 (G0 B2-11, PR #303 N1): ``claim-links``, a read-only listing
+    of the active claim links."""
+
+    run_main = CliTests.run_main
+
+    def listing(self) -> dict:
+        return bm.claim_links_listing(self.root, config=self.cfg())
+
+    def tables(self) -> dict:
+        conn = self.ledger.conn
+        return {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid")]
+                for t in ("meta", "receipts", "claim_links", "claim_unlinks", "reviews", "writes", "write_releases", "watermarks", "runs")}
+
+    def test_b2_11_active_links_keyed_masked_sorted_and_voided_links_counted_only(self):
+        self.engine()
+        self.now = datetime(2026, 11, 18, 17, 30, tzinfo=timezone.utc)  # 01:30 on 19 Nov in Singapore
+        for n, source in ((1, "order"), (2, "index"), (3, "order"), (4, "index")):
+            self.ledger.add_claim(customer_gid(n), sg(n), source, "phone_and_name_match")
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO claim_unlinks(link_id, reason, run_id, created_at) VALUES "
+                         "((SELECT link_id FROM claim_links WHERE customer_gid = ?), 'other', 'run-x', 't')", (customer_gid(3),))
+        before = self.tables()
+        out = self.listing()
+        self.assertEqual(self.tables(), before)  # read only: no run row, nothing written
+        expected = sorted(({"ref": self.ledger.ref("c", customer_gid(n)), "member_no_masked": bm.mask(sg(n)), "source": source,
+                            "created_day": "2026-11-19"} for n, source in ((1, "order"), (2, "index"), (4, "index"))), key=lambda e: e["ref"])
+        self.assertEqual(out, {"status": "ok", "command": "claim_links", "links": expected, "active": 3, "voided": 1, "truncated": False})
+        text = json.dumps(out)
+        for secret in [customer_gid(n) for n in range(1, 5)] + [sg(n) for n in range(1, 5)] + [local(n) for n in range(1, 5)]:
+            self.assertNotIn(secret, text)
+        self.assertNotIn(self.ledger.ref("c", customer_gid(3)), text)  # the voided link is not listed
+        self.emitted.append(out)  # through the check after every test as well
+
+    def test_b2_11_at_most_500_entries_then_truncated(self):
+        self.engine()
+        with self.ledger.tx() as conn:
+            for n in range(500):
+                conn.execute("INSERT INTO claim_links(customer_gid, member_no, member_no_key, source, code, created_at) VALUES (?, ?, ?, 'index', "
+                             "'phone_and_name_match', '2026-11-18T04:00:00Z')", (customer_gid(n), sg(n), sync.member_no_key(sg(n))))
+        out = self.listing()
+        self.assertEqual((len(out["links"]), out["active"], out["truncated"]), (500, 500, False))
+        self.ledger.add_claim(customer_gid(500), sg(500), "index", "phone_and_name_match")
+        out = self.listing()
+        self.assertEqual((len(out["links"]), out["active"], out["truncated"]), (500, 501, True))
+        refs = sorted(self.ledger.ref("c", customer_gid(n)) for n in range(501))
+        self.assertEqual([e["ref"] for e in out["links"]], refs[:500])
+        self.emitted.append(out)
+
+    def test_b2_11_the_cli_command_needs_no_lock_and_refuses_as_the_digest(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.assertEqual(self.run_main("claim-links")[:2], (2, {"status": "refused", "code": "benefits_ledger_missing"}))
+        self.run_main("init")
+        self.run_main("observe")
+        holder = bm.BenefitsLedger(self.root, clock=lambda: self.now)  # a running task holds the ledger
+        try:
+            code, out, text = self.run_main("claim-links")
+        finally:
+            holder.close()
+        self.assertEqual((code, out["command"], out["active"], out["voided"], [e["source"] for e in out["links"]]), (0, "claim_links", 1, 0, ["order"]))
+        self.assertEqual(out["links"][0]["member_no_masked"], bm.mask(member_no))
+        for secret in (member_no, local(1), customer_gid(1), str(customer_number(1)), order_gid(1), "Fake Member 1"):
+            self.assertNotIn(secret, text)
+        # Its c- ref is the one unlink takes.
+        code, dry, _ = self.run_main("unlink", "--customer-ref", out["links"][0]["ref"], "--member-last3", member_no[-3:], "--reason", "other")
+        self.assertEqual((code, dry["command"], dry["counts"]["claim_unlinked"]), (0, "unlink_dry_run", 1))
+        # Bound to the store and the book, as every command.
+        self.assertEqual(self.run_main("claim-links", cfg={"shopify": {**raw_config(self.root, self.sync_root)["shopify"],
+                                                                         "store_gid": "gid://shopify/Shop/2"}})[:2],
+                         (2, {"status": "refused", "code": "benefits_ledger_binding_mismatch"}))
+
+    def test_b2_11_a_v1_ledger_is_refused_and_left_as_it_is(self):
+        before = make_v1_ledger(self.root)
+        self.assertEqual(CliTests.run_main(self, "claim-links")[:2], (2, {"status": "refused", "code": "benefits_ledger_not_recognised"}))
+        self.assertEqual((self.root / bm.LEDGER_FILE).read_bytes(), before)
+        self.assertFalse((self.root / (bm.LEDGER_FILE + "-wal")).exists())
+
+
+class B2TokenCacheScopeTests(unittest.TestCase):
+    """Slice B2, tests only (G0 B2-13 G25): the cached token's scope check."""
+
+    class Plain:
+        def protect(self, data, entropy):
+            return data
+
+        def unprotect(self, data, entropy):
+            return data
+
+    def test_b2_13_g25_a_cached_token_with_any_other_scope_set_is_refused_and_cleared(self):
+        temp = Path(tempfile.mkdtemp(prefix="xb-benefits-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        for scope, kept in (("read_customers,read_orders", True), ("read_orders, read_customers", True),
+                            ("read_customers,read_orders,write_customers", False), ("read_customers", False),
+                            ("read_customers,read_orders,read_products", False)):
+            with self.subTest(scope=scope):
+                path = temp / "token.bin"
+                path.write_bytes(json.dumps({"schema": direct.TOKEN_CACHE_SCHEMA, "shop_domain": SHOP, "expires_at": "2026-11-19T00:00:00Z",
+                                             "scope": scope, "access_token": "t" * 32}).encode("utf-8"))
+                cache = bm.BenefitsTokenCache(path, self.Plain(), shop_domain=SHOP, client_id="client-id-0000000")
+                loaded = cache.load(now)
+                if kept:
+                    self.assertEqual((loaded[0], cache.note), ("t" * 32, None))
+                else:
+                    self.assertEqual((loaded, cache.note, path.exists()), (None, "token_cache_unreadable", False))
+
+
+class B2NoReinitGuardTests(unittest.TestCase):
+    """Slice B2 pass bar 2 (G0 1): the VM never needs a re-init for B2. The
+    ledger schema, its version, the amount rule (its version and the source
+    of the five amount functions) and the example config's rule fingerprint
+    are the values at main a6e7142 (slice B1 + C1)."""
+
+    SCHEMA_SHA256 = "d3b426a76493d09d0aefdc3b70a1085a63f4d654d4cc4d5dc0ecb8acef2e3e60"
+    AMOUNT_FUNCTIONS = ("goods_amount", "gift_card_paid", "qualifying_amount", "qualifies", "money_refund_unattributed")
+    AMOUNT_SOURCE_SHA256 = "67f7f494a268f8314d908151f4472ffa4e7318eedc5c4e0582786131440a672d"
+    EXAMPLE_FINGERPRINT = "sha256:964788c0b03682173413a8cc7e290a5f4126ad1ba70d0ae061e92c6e66c08463"
+    # B2 fix round 1 (G2 L2): the refunded-unit value and the order amount parsing.
+    MORE_SOURCES = {
+        ("refunded_unit_cents",): "9bebeca606e55d96269f21343f7fe7c54ac7f190eb77965976c6e13e2679061a",
+        ("order_from_node", "_money", "_payment_cents", "payments_complete"): "d4ef8532c73a124a80e45229a3eea32e46f88e27ae1a3f9db1c417715258c670",
+    }
+
+    def test_b2_schema_amount_rule_and_fingerprint_are_unchanged_since_a6e7142(self):
+        import inspect
+
+        self.assertEqual((bm.SCHEMA_VERSION, bm.AMOUNT_RULE_VERSION), (2, 2))
+        self.assertEqual(hashlib.sha256(bm.LEDGER_SCHEMA.encode("utf-8")).hexdigest(), self.SCHEMA_SHA256)
+        source = "".join(inspect.getsource(getattr(bm, name)) for name in self.AMOUNT_FUNCTIONS)
+        self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), self.AMOUNT_SOURCE_SHA256)
+        for names, digest in self.MORE_SOURCES.items():
+            with self.subTest(names=names):
+                source = "".join(inspect.getsource(getattr(bm, name)) for name in names)
+                self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), digest)
+        for name in ("member_benefits.example.json", "member_benefits.live.example.json"):
+            with self.subTest(name=name):
+                value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+                self.assertEqual(bm.parse_config(value).rule_fingerprint(), self.EXAMPLE_FINGERPRINT)
 
 
 class ClassifySaveTests(unittest.TestCase):
