@@ -499,6 +499,9 @@ class OrderLine:
     unit_cents: int
     discount_cents: int
 
+    def __repr__(self) -> str:  # slice B2 (B2-6): never render order data
+        return "OrderLine()"
+
 
 @dataclass(frozen=True)
 class Payment:
@@ -510,6 +513,9 @@ class Payment:
     kind: str
     status: str
     cents: int | None
+
+    def __repr__(self) -> str:  # slice B2 (B2-6): never render the gateway or an amount
+        return "Payment()"
 
 
 @dataclass(frozen=True)
@@ -2276,8 +2282,8 @@ class BenefitsEngine:
         for row in open_rows:
             if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
                 raise dl.DirectLocalHold("writer_may_be_live")
-            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
-                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) != "exited":
+                raise dl.DirectLocalHold("writer_may_be_live")  # slice B2 (B2-8): "unknown" may be live
         result: dict[str, Any] = {"status": "ok", "command": "resolve", "writes": 0, "resolved": {}, "alerts": []}
         for row in open_rows:
             if row["state"] == "INTENT":
@@ -2332,8 +2338,8 @@ class BenefitsEngine:
         for row in rows:
             if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
                 raise dl.DirectLocalHold("writer_may_be_live")
-            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
-                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) != "exited":
+                raise dl.DirectLocalHold("writer_may_be_live")  # slice B2 (B2-8): "unknown" may be live
 
     def release_held(self, *, order_ref: Any, member_last3: Any, finding: Any, apply: bool) -> dict[str, Any]:
         """Clear the latch of one ``HELD`` write after the owner checked that
@@ -2600,6 +2606,7 @@ def type_move_lock(config: BenefitsConfig) -> Iterator[None]:
 DIGEST_SCHEMA = "xb.directlocal.member_benefits.digest.v1"
 _DIGEST_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 _DIGEST_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{1,64}$")
+_DIGEST_DIGITS_RE = re.compile(r"[0-9]{4}")  # slice B2 (B2-6): a gateway name with a run of 4 digits is shown as "other"
 
 
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConfig) -> dict[str, Any]:
@@ -2666,7 +2673,8 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
                 names = json.loads(row[0])
             except (json.JSONDecodeError, RecursionError):
                 names = []
-            for name in {n if isinstance(n, str) and _DIGEST_CODE_RE.fullmatch(n) else "other" for n in (names if isinstance(names, list) else [])}:
+            for name in {n if isinstance(n, str) and _DIGEST_CODE_RE.fullmatch(n) and not _DIGEST_DIGITS_RE.search(n) else "other"
+                         for n in (names if isinstance(names, list) else [])}:
                 gateways[name] = gateways.get(name, 0) + 1
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,

@@ -4534,6 +4534,58 @@ class B2RecordTests(Base):
         self.assertEqual(self.book.reads, 0)
 
 
+class B2DigestProbeTests(Base):
+    """Slice B2 (G0 B2-6, B2-8): digest gateway names with a run of digits;
+    reprs; a writer probe of ``unknown`` counts as possibly live."""
+
+    release = ReleaseHeldTests.release
+    held = ReleaseHeldTests.held
+    NOT_EXITED = ("running", "unknown", "", "RUNNING", "exited ", "Exited")
+
+    # -- B2-6 ----------------------------------------------------------------
+    def test_b2_6_the_digest_shows_a_gateway_name_with_four_digits_in_a_row_as_other(self):
+        names = {1: "gift_card_1234", 2: "gift_card_123", 3: "x9999y", 4: "gift_card", 5: "pay_12_34_56"}
+        for n, gateway in names.items():
+            self.guest_with_order(n, transactions=(tx("1.00", gateway=gateway),))
+        self.engine().run(apply=False)
+        seen = bm.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())["gift_cards"]["gateways_seen"]
+        self.assertEqual(seen, {"other": 2, "gift_card_123": 1, "gift_card": 1, "pay_12_34_56": 1})
+
+    def test_b2_6_payment_and_order_line_reprs_print_no_field(self):
+        order = bm.order_from_node(order_node(1, lines=(("123.45", 7, 6, True, ("9.87",)),), transactions=(tx("54.32", gateway="gift_card_7777"),)))
+        payment, line = order.payments[0], order.lines[0]
+        self.assertEqual((repr(payment), repr(line), str(payment), str(line)), ("Payment()", "OrderLine()", "Payment()", "OrderLine()"))
+        for text in (repr(order.payments), repr(order.lines), repr(order), repr(order.customer)):
+            for value in ("gift_card", "7777", "5432", "12345", "987", "SUCCESS", "SALE", "True"):
+                self.assertNotIn(value, text)
+
+    # -- B2-8 ----------------------------------------------------------------
+    def test_b2_8_resolve_holds_unless_the_probe_says_exited(self):
+        self.guest_with_order(1)
+        self.book.mode = "uncertain_unsaved"
+        engine = self.engine()
+        engine.run(apply=True)
+        self.advance(seconds=PAST_DEADLINE)
+        for result in self.NOT_EXITED:
+            with self.subTest(result=result):
+                self.probe_result = result
+                self.assertEqual(self.code(lambda: engine.resolve()), "writer_may_be_live")
+                self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.probe_result = "exited"
+        self.assertEqual(engine.resolve()["resolved"], {"NOT_WRITTEN:resolved_not_written": 1})
+
+    def test_b2_8_release_held_holds_unless_the_probe_says_exited(self):
+        ref, member_no = self.held()
+        before = ReleaseHeldTests.recorded(self)
+        for result in self.NOT_EXITED:
+            with self.subTest(result=result):
+                self.probe_result = result
+                self.assertEqual(self.code(lambda: self.release(ref, member_no[-3:], "as_intended")), "writer_may_be_live")
+                self.assertEqual(ReleaseHeldTests.recorded(self), before)
+        self.probe_result = "exited"
+        self.assertEqual(self.release(ref, member_no[-3:], "as_intended")["receipt_now"], "applied")
+
+
 class B2TokenCacheScopeTests(unittest.TestCase):
     """Slice B2, tests only (G0 B2-13 G25): the cached token's scope check."""
 
