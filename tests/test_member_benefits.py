@@ -4487,6 +4487,26 @@ class B2WindowTests(Base):
         self.assertEqual([self.receipt(n)["code"] for n in (1, 2)], ["order_past_read_window"] * 2)
         self.assertEqual(self.book.saves, 0)
 
+    def test_b2_4_fix1_the_age_limit_also_runs_after_a_capped_read(self):
+        """G2 F2 (P5): a 61-day-old ``waiting_member`` receipt whose member then
+        appears is settled, never upgraded, in a run whose read hit the page cap."""
+        self.shopify.add(order_node(2))  # signed up, no member yet: waits
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(2)["state"], "waiting_member")
+        self.book.members[sg(2)] = fake_member(sg(2), name="Fake Member 2")  # the member appears
+        self.link(2)
+        for days, alerted in ((61, 1), (62, 0)):
+            with self.subTest(days=days):
+                for n in range(days * 10, days * 10 + 6):  # six more: this read is capped too
+                    self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T0%d:0%d:00Z" % (days - 56, n % 10)))
+                self.now = self.CREATED + timedelta(days=days)
+                out = self.engine(shopify_max_pages=1).run(apply=True)
+                self.assertIn("orders_read_incomplete", out["alerts"])
+                self.assertEqual((out["alerts"].count(self.AGED), out["counts"].get(self.AGED), out["saves"], self.book.saves),
+                                 (alerted, alerted or None, 0, 0))
+                self.assertEqual((self.receipt(2)["state"], self.receipt(2)["code"]), ("held", "order_past_read_window"))
+        self.assertEqual(self.book.members[sg(2)]["type"], "GUEST")
+
     def test_b2_4_applied_and_other_receipts_are_never_touched(self):
         self.guest_with_order(1)
         self.guest_with_order(2, member=fake_member(sg(2), name="Fake Member 2", active="F"))
