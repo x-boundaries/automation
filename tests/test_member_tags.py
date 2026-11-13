@@ -19,6 +19,10 @@ allows.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
+import hmac
+import http.client
 import json
 import os
 import re
@@ -400,21 +404,23 @@ class Base(unittest.TestCase):
             ledger.close()
         return self.sync_root / sync.LEDGER_FILE
 
-    def core_config(self, store=STORE_GID) -> bm.BenefitsConfig:
-        return bm.parse_config({
+    def core_config(self, store=STORE_GID, *, book="AED_TESTINGAPI", shop=SHOP) -> bm.BenefitsConfig:
+        config = bm.parse_config({
             "schema": bm.CONFIG_SCHEMA, "state_root": str(self.core_root), "autocount_book": "AED_TESTINGAPI",
             "orders_start_utc": "2026-11-15T00:00:00Z", "member_sync_state_root": str(self.sync_root),
-            "shopify": {"store_gid": store, "shop_domain": SHOP, "api_version": "2026-10",
+            "shopify": {"store_gid": store, "shop_domain": shop, "api_version": "2026-10",
                         "auth": {"method": "client_credentials", "client_id_env": "XB_SHOPIFY_BENEFITS_CLIENT_ID",
                                  "client_secret_env": "XB_SHOPIFY_BENEFITS_CLIENT_SECRET"}}})
+        # The other book's config needs the live credential; only its meta row matters here.
+        return config if book == "AED_TESTINGAPI" else dataclasses.replace(config, autocount_book=book)
 
-    def make_core(self, claims=(), unlinks=(), *, store=STORE_GID) -> Path:
+    def make_core(self, claims=(), unlinks=(), *, store=STORE_GID, book="AED_TESTINGAPI", shop=SHOP) -> Path:
         """The member core ledger v2 (bm.BenefitsLedger) with active claim
         links ``(n, member_no)``, then the claim links of customers ``unlinks``
         voided through the member core's own unlink (reason wrong_person)."""
         ledger = bm.BenefitsLedger(self.core_root, clock=lambda: self.now)
         try:
-            config = self.core_config(store)
+            config = self.core_config(store, book=book, shop=shop)
             ledger.init_meta(config)
             for n, member_no in claims:
                 ledger.add_claim(customer_gid(n), member_no, "index", "test")
@@ -589,6 +595,7 @@ class LedgerTests(Base):
             "UPDATE tag_writes SET reason = 'other'", "UPDATE tag_writes SET run_id = 'run-y'", "UPDATE tag_writes SET created_at = 'x'",
             "INSERT OR REPLACE INTO tag_writes SELECT * FROM tag_writes",
             "DELETE FROM runs", "UPDATE runs SET command = 'apply'",
+            "INSERT OR REPLACE INTO runs SELECT * FROM runs",  # G2 L3
             "INSERT INTO reviews VALUES ('s', 'c', 't')",
         ]
         for sql in attempts[:-1]:
@@ -596,7 +603,7 @@ class LedgerTests(Base):
                 with self.assertRaises(sqlite3.DatabaseError):
                     ledger.conn.execute(sql)
         ledger.conn.execute(attempts[-1])
-        for sql in ("UPDATE reviews SET code = 'x'", "DELETE FROM reviews"):
+        for sql in ("UPDATE reviews SET code = 'x'", "DELETE FROM reviews", "INSERT OR REPLACE INTO reviews SELECT * FROM reviews"):
             with self.assertRaises(sqlite3.DatabaseError):
                 ledger.conn.execute(sql)
         self.assertEqual(ledger.conn.execute("SELECT state FROM tag_writes WHERE write_id = ?", (write_id,)).fetchone()[0], "INTENT")
@@ -647,6 +654,13 @@ class LedgerTests(Base):
         (self.root / mt.LEDGER_FILE).unlink()
         ledger = mt.TagsLedger(self.root)
         ledger.close()
+        # G2 L2 (G38): this tool's own tables at any other version are refused (versions written out here).
+        for version in (0, 2, 3, 9):
+            with self.subTest(version=version):
+                set_user_version(self.root / mt.LEDGER_FILE, version)
+                self.assertEqual(self.code(lambda: mt.TagsLedger(self.root)), "tags_ledger_not_recognised")
+        set_user_version(self.root / mt.LEDGER_FILE, 1)
+        mt.TagsLedger(self.root).close()
 
     def test_binding_is_checked_at_every_open(self):
         ledger = self.ledger()
@@ -661,6 +675,25 @@ class LedgerTests(Base):
     def test_a_second_runner_is_refused(self):
         self.ledger()
         self.assertEqual(self.code(lambda: mt.TagsLedger(self.root)), "ledger_locked_by_another_owner")
+
+    def test_refs_are_keyed_by_the_ledgers_own_key(self):
+        # G2 F4: HMAC-SHA256 with the ledger's ref_key, written out here; two ledgers give two refs.
+        gid = customer_gid(1)
+        refs = []
+        for name in ("a", "b"):
+            root = self.temp / name
+            root.mkdir()
+            ledger = mt.TagsLedger(root, clock=lambda: self.now)
+            try:
+                ledger.init_meta(self.cfg())
+                key = ledger.conn.execute("SELECT ref_key FROM meta").fetchone()[0]
+                expected = "c-" + hmac.new(bytes.fromhex(key), f"c:{gid}".encode("utf-8"), hashlib.sha256).hexdigest()[:20]
+                self.assertEqual(ledger.ref("c", gid), expected)
+                refs.append(ledger.ref("c", gid))
+            finally:
+                ledger.close()
+        self.assertNotEqual(refs[0], refs[1])
+        self.assertNotEqual(refs[0], "c-" + hashlib.sha256(f"c:{gid}".encode("utf-8")).hexdigest()[:20])
 
     def test_review_once(self):
         ledger = self.ledger()
@@ -704,6 +737,13 @@ class InputLedgerTests(Base):
                 path.unlink()
                 make(store="gid://shopify/Shop/2")
                 self.assertEqual(self.code(read), f"{prefix}_binding_mismatch")
+                # G2 F2: the book and the shop domain are each part of the binding
+                # (the real store is valid with either book).
+                for other in ({"book": "AED_XBOUNDARIES"}, {"shop": "other-store.synthetic.invalid"}):
+                    for name in os.listdir(path.parent):
+                        os.remove(path.parent / name)
+                    make(**other)
+                    self.assertEqual(self.code(read), f"{prefix}_binding_mismatch", other)
                 for name in os.listdir(path.parent):
                     os.remove(path.parent / name)
                 make()
@@ -794,6 +834,69 @@ class InputLedgerTests(Base):
         self.assertEqual(links.basis, {customer_gid(1): (sg(2), "claim")})
         self.assertEqual(links.conflicts, {})
 
+    def test_the_member_core_is_read_in_one_snapshot(self):
+        # G2 L1: an unlink committed by another process between the two reads
+        # is seen by neither, so a pair is never in both lists.
+        self.make_core([(1, sg(1)), (2, sg(2))])
+        real_open = mt.open_read_only
+        seen: list[str] = []
+        test = self
+
+        class Interleaved:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def execute(self, sql, *args):
+                seen.append(sql)
+                cursor = self.conn.execute(sql, *args)
+                if sql == mt.ACTIVE_CLAIMS_SQL:
+                    rows = cursor.fetchall()
+                    test.make_core(unlinks=[1])  # a second connection voids a pair and commits
+                    return rows
+                return cursor
+
+            def close(self):
+                self.conn.close()
+
+        with mock.patch.object(mt, "open_read_only", lambda path: Interleaved(real_open(path))):
+            active, voided = mt.read_member_core(self.cfg())
+        self.assertEqual(sorted(active), [(customer_gid(1), sg(1)), (customer_gid(2), sg(2))])
+        self.assertEqual(voided, [])
+        self.assertEqual(seen[-4:], ["BEGIN", mt.ACTIVE_CLAIMS_SQL, mt.VOIDED_PAIRS_SQL, "ROLLBACK"])
+        # The next read sees the unlink in both places.
+        active, voided = mt.read_member_core(self.cfg())
+        self.assertEqual((active, [gid for gid, _key in voided]), ([(customer_gid(2), sg(2))], [customer_gid(1)]))
+
+    def test_only_sync_v3_and_member_core_v2_are_read(self):
+        # G2 L2: the versions are written out here, never read from the tool.
+        self.make_sync()
+        self.make_core()
+        for prefix, path, good, read in (("sync_ledger", self.sync_root / sync.LEDGER_FILE, 3, lambda: mt.read_sync_links(self.cfg())),
+                                         ("member_core_ledger", self.core_root / bm.LEDGER_FILE, 2, lambda: mt.read_member_core(self.cfg()))):
+            for version in range(0, 10):
+                with self.subTest(prefix=prefix, version=version):
+                    set_user_version(path, version)
+                    if version == good:
+                        read()
+                    else:
+                        self.assertEqual(self.code(read), f"{prefix}_version_unknown")
+            set_user_version(path, good)
+
+    def test_the_input_reader_is_read_only_in_both_layers(self):
+        # G2 L3 (G14, G15): query_only is on, and the file is opened mode=ro,
+        # each proven on its own.
+        path = self.make_sync([(1, sg(1))])
+        conn = mt.open_read_only(path)
+        try:
+            self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 1)
+            conn.execute("PRAGMA query_only=OFF")  # only this connection; mode=ro still refuses
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                conn.execute("DELETE FROM links")
+            self.assertIn("readonly", str(caught.exception))
+        finally:
+            conn.close()
+        self.assertEqual(mt.read_sync_links(self.cfg()), [(customer_gid(1), sg(1))])
+
 
 # --------------------------------------------------------------------------
 # AutoCount read (design 1.2)
@@ -828,6 +931,9 @@ class ReadBridgeClientTests(unittest.TestCase):
                 lambda: client.write_once(fence_id="f", claim_directory=Path("."), deadline=NOW, stdin_value={}, wait_seconds=1,
                                           on_started=lambda pid, created: None),
                 lambda: client._start(["-Operation", "type-move-scan", "-EnableProductionAdapter", "-FenceId", "f"]),
+                # G2 L3 (G10): the third argument is pinned too.
+                lambda: client._start(["-Operation", "type-move-scan", "-FenceId"]),
+                lambda: client._start(["-Operation", "type-move-member", "-EnableProductionAdapterX"]),
             ],
             "tags_operation_not_offered": [
                 client.counts, lambda: client.precheck(("x",), None), client.next_member_no, lambda: client.probe("A1"),
@@ -1363,8 +1469,9 @@ class DecisionTableTests(EngineBase):
         self.member(1, tags=["member-mg"], registration=False)
         self.member(2, tags=["member-mg"], registration=True)
         self.member(3, tags=["Member-MG "], registration=False)
+        self.member(4, tags=["newsletter"], registration=False)  # G2 F3: no member-mg, no start date: the Flow never acts
         result = self.run_tool()
-        self.assertEqual(self.shopify.writes, [("add", customer_gid(2), [TAG])])
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(2), [TAG]), ("add", customer_gid(4), [TAG])])
         self.assertEqual(result["counts"]["flow_dates_guard"], 2)
         self.assertIn("flow_dates_guard", result["alerts"])
 
@@ -1510,6 +1617,37 @@ class GuardTests(EngineBase):
         self.run_tool()
         self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG])])
         self.assertEqual(self.rows()[0]["member_no"], sg(2))
+
+    def test_m2_p4_voided_then_newer_active_claim_already_tagged_is_kept(self):
+        # G2 F1: the old voided pair is history; the new clean claim keeps the tag (no removal).
+        self.make_core([(1, sg(1))], unlinks=[1])
+        self.make_core([(1, sg(2))])
+        self.book.add(sg(1), "GUEST")
+        self.book.add(sg(2))
+        self.shopify.add(1, [TAG])
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result = self.run_tool(apply=apply)
+                self.assertEqual(self.shopify.writes, [])
+                self.assertEqual(result["counts"]["kept_tagged"], 1)
+                self.assertNotIn("would_untag", result["counts"])
+
+    def test_volume_guard_at_exactly_five_sends_all(self):
+        # G2 L3 (G32): exactly at the limit is not over it.
+        for n in range(1, 6):
+            self.member(n, member_type="GUEST", tags=[TAG])
+        result = self.run_tool(max_tag_removes_per_run=50)
+        self.assertEqual([w[0] for w in self.shopify.writes], ["remove"] * 5)
+        self.assertNotIn("untag_volume_unexpected", result["alerts"])
+
+    def test_volume_guard_at_exactly_ten_percent_sends_all(self):
+        for n in range(1, 7):
+            self.member(n, member_type="GUEST", tags=[TAG])
+        for n in range(10, 64):
+            self.member(n, tags=[TAG])  # 60 tagged: the limit is 6
+        result = self.run_tool(max_tag_removes_per_run=50)
+        self.assertEqual([w[0] for w in self.shopify.writes], ["remove"] * 6)
+        self.assertNotIn("untag_volume_unexpected", result["alerts"])
 
     def test_observe_never_sends_even_with_the_switch_on(self):
         self.member(1)
@@ -1728,6 +1866,82 @@ class RefusalTests(EngineBase):
         self.assert_refused(lambda: engine.run(apply=True), "tags_ledger_binding_mismatch")
 
 
+class StoreTransport:
+    """A scripted store behind the REAL TagsShopifyClient (G2 probe): answers
+    the pinned texts from FakeShopify's customers. ``mutation_script``: per
+    mutation, ``"ok"`` or an exception the transport raises before any answer."""
+
+    def __init__(self, fake: FakeShopify):
+        self.fake = fake
+        self.bodies: list[dict] = []
+        self.mutation_script: list = []
+
+    def mutations(self) -> list[dict]:
+        return [b for b in self.bodies if b["query"].lstrip().startswith("mutation")]
+
+    def __call__(self, url, body, headers, timeout):
+        value = json.loads(body.decode("utf-8"))
+        self.bodies.append(value)
+        query = value["query"]
+
+        def ok(data):
+            return direct.HttpResponse(200, {}, json.dumps({"data": data}).encode("utf-8"))
+        if "XbDirectLocalSessionCheck" in query:
+            return ok({"shop": {"id": STORE_GID, "myshopifyDomain": SHOP},
+                       "currentAppInstallation": {"accessScopes": [{"handle": "write_customers"}]}})
+        customers = self.fake.customers_by_gid
+        if "XbMemberTagsCustomers" in query:
+            return ok({"nodes": [None if customers.get(gid) is None else
+                                 {"id": gid, "tags": list(customers[gid]["tags"]),
+                                  "registration": {"id": "gid://shopify/Metafield/9"} if customers[gid]["registration"] else None}
+                                 for gid in value["variables"]["ids"]]})
+        if "XbMemberTagsCarriers" in query:
+            return ok({"customers": {"nodes": [{"id": g, "tags": list(c["tags"])} for g, c in customers.items() if TAG in c["tags"]],
+                                     "pageInfo": {"hasNextPage": False, "endCursor": None}}})
+        assert query in (mt.TAGS_ADD_MUTATION, mt.TAGS_REMOVE_MUTATION), query[:40]
+        step = self.mutation_script.pop(0) if self.mutation_script else "ok"
+        if isinstance(step, BaseException):
+            raise step
+        gid, add = value["variables"]["id"], query == mt.TAGS_ADD_MUTATION
+        tags = customers[gid]["tags"]
+        if add and TAG not in tags:
+            tags.append(TAG)
+        if not add and TAG in tags:
+            tags.remove(TAG)
+        return ok({"tagsAdd" if add else "tagsRemove": {"node": {"id": gid, "tags": list(tags)}, "userErrors": []}})
+
+
+class UnmappedTransportErrorTests(EngineBase):
+    """G2 L6: an exception the shared transport does not map (an
+    ``http.client`` error, a raw socket error) during a mutation is recorded
+    UNCERTAIN and stops the run; the next run settles it by read."""
+
+    def real_run(self, script) -> tuple[dict, StoreTransport]:
+        transport = StoreTransport(self.shopify)
+        transport.mutation_script = list(script)
+        engine = self.engine()
+        engine.shopify = mt.TagsShopifyClient(mutations_enabled=True, shop_domain=SHOP, api_version="2026-10",
+                                              token_provider=direct.StaticTokenProvider("t" * 32), transport=transport, sleep=lambda s: None)
+        return engine.run(apply=True), transport
+
+    def test_an_unmapped_transport_error_is_uncertain_and_stops(self):
+        self.member(1)
+        self.member(2)
+        for error in (http.client.IncompleteRead(b"partial"), ConnectionResetError("reset")):
+            with self.subTest(error=type(error).__name__):
+                result, transport = self.real_run([error])
+                self.assertEqual((result["stopped"], result["alerts"]), ("write_uncertain", ["write_uncertain"]))
+                self.assertEqual(len(transport.mutations()), 1)  # the second customer is not sent
+                last = self.rows()[-1]
+                self.assertEqual((last["customer_gid"], last["state"], last["code"]), (customer_gid(1), "UNCERTAIN", "shopify_transport_unmapped"))
+                self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM runs WHERE finished_at IS NULL")[0]["n"], 0)
+        result, transport = self.real_run([])
+        self.assertEqual([b["variables"]["id"] for b in transport.mutations()], [customer_gid(1), customer_gid(2)])
+        self.assertEqual(result["counts"]["write_settled_not_written"], 1)
+        self.assertEqual([(r["state"], r["code"]) for r in self.rows()],
+                         [("NOT_WRITTEN", "resolved_by_read"), ("NOT_WRITTEN", "resolved_by_read"), ("DONE", None), ("DONE", None)])
+
+
 class CliTests(EngineBase):
     def run_main(self, *args, factory=True, **overrides) -> int:
         with private_root_allowed(self.temp / "elsewhere"):
@@ -1815,6 +2029,36 @@ class LedgerCliTests(Base):
         (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
         self.run_main("status")
         self.assertTrue(self.emitted[-1]["stop_file_present"])
+
+    def test_digest_refilters_an_injected_stored_summary(self):
+        # G2 L3 (G64): the digest keeps only keyed refs and masked MemberNos even
+        # if a stored summary held more (a second layer; the tool stores masked
+        # values only). A separate root, so the base check reads only real runs.
+        other = self.temp / "injected"
+        other.mkdir()
+        ledger = mt.TagsLedger(other, clock=lambda: self.now)
+        try:
+            ledger.init_meta(self.cfg())
+        finally:
+            ledger.close()
+        full = sg(7)
+        good_ref, bad_ref = "c-" + "a" * 20, "c-" + "b" * 20
+        summary = {"alerts": ["write_uncertain"], "counts": {"tagged": 1},
+                   "refs": [{"ref": good_ref, "code": "write_uncertain", "member_no_masked": "*******" + full[-3:]},
+                            {"ref": bad_ref, "code": "write_uncertain", "member_no_masked": full},
+                            {"ref": customer_gid(7), "code": "write_uncertain"}]}
+        conn = sqlite3.connect(other / mt.LEDGER_FILE)
+        try:
+            conn.execute("INSERT INTO runs VALUES ('run-x', 'apply', ?, ?, ?)", (dl.ts(self.now), dl.ts(self.now), json.dumps(summary)))
+            conn.commit()
+        finally:
+            conn.close()
+        digest = mt.ledger_digest(other, hours=24, now=self.now + timedelta(minutes=1), config=self.cfg())
+        self.assertEqual(digest["alert_refs"], [{"ref": good_ref, "code": "write_uncertain", "member_no_masked": "*******" + full[-3:]},
+                                               {"ref": bad_ref, "code": "write_uncertain"}])
+        text = json.dumps(digest)
+        self.assertNotIn(full, text)
+        self.assertNotIn("gid://", text)
 
 
 if __name__ == "__main__":

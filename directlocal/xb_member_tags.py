@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import http.client
 import json
 import math
 import os
@@ -330,8 +331,14 @@ def read_member_core(config: TagsConfig) -> tuple[list[tuple[str, str]], list[tu
     and voided pairs ``(customer_gid, member_no_key)``."""
 
     def read(conn: sqlite3.Connection) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        active = [(row["customer_gid"], row["member_no"]) for row in conn.execute(ACTIVE_CLAIMS_SQL)]
-        voided = [(row["customer_gid"], row["member_no_key"]) for row in conn.execute(VOIDED_PAIRS_SQL)]
+        # One read transaction (G2 L1): both SELECTs see one snapshot, so an
+        # unlink that commits between them cannot put a pair in both lists.
+        conn.execute("BEGIN")
+        try:
+            active = [(row["customer_gid"], row["member_no"]) for row in conn.execute(ACTIVE_CLAIMS_SQL)]
+            voided = [(row["customer_gid"], row["member_no_key"]) for row in conn.execute(VOIDED_PAIRS_SQL)]
+        finally:
+            conn.execute("ROLLBACK")
         return active, voided
 
     return _read_input(Path(config.member_core_state_root) / MEMBER_CORE_LEDGER_FILE, "member_core_ledger", MEMBER_CORE_LEDGER_VERSIONS,
@@ -1250,7 +1257,12 @@ class TagsEngine:
             check_tag_variables(plan.gid, [TAG])  # before the INTENT row
             write_id = self.ledger.add_intent(run_id=run_id, customer_gid=plan.gid, tag=TAG, op=plan.op, reason=plan.reason,
                                               member_no=plan.member_no, basis=plan.basis)
-            state, code = self.shopify.set_tag(plan.op, plan.gid, [TAG])
+            try:
+                state, code = self.shopify.set_tag(plan.op, plan.gid, [TAG])
+            except (http.client.HTTPException, OSError):
+                # G2 L6: a transport error the shared transport does not map
+                # (IncompleteRead, a raw socket error): it may have landed.
+                state, code = UNCERTAIN, "shopify_transport_unmapped"
             self.ledger.set_outcome(write_id, state, code)
             ref = self.ledger.ref("c", plan.gid)
             if state == DONE:
