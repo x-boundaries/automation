@@ -1089,11 +1089,17 @@ NOT_READ = object()  # decide_ac2_to_shopify: the email read has not happened
 
 def usable_email(value: Any) -> str | None:
     """The trimmed email when usable (``USABLE_EMAIL_RE``, at most 254
-    characters), else None. Compared elsewhere only after casefold."""
+    characters), else None. Compared elsewhere only after casefold.
+    Fix round 1 (G2 B1): printable ASCII only, the bridge's own set
+    (``[!-~]``), so no email Python calls usable is refused there;
+    any other character (accented, full-width, zero-width, BOM, control)
+    counts as no usable email, everywhere."""
 
     if not isinstance(value, str):
         return None
     text = value.strip()
+    if not (text.isascii() and text.isprintable()):
+        return None
     return text if len(text) <= EMAIL_MAX_LENGTH and USABLE_EMAIL_RE.fullmatch(text) else None
 
 
@@ -2231,6 +2237,10 @@ class SyncEngine:
                 decision = decide_ac2_to_shopify(member, phone_customers, self.shopify.find_by_email(email), ctx)
         except dl.DirectLocalError:
             return "bf2_read_incomplete"
+        if decision.action == "LINK" and self.ledger.open_write_for_customer(decision.gid) is not None:
+            # Fix round 1 (G2 LATER 2): as initial-link and BF1, never linked
+            # while a write for that customer may still land.
+            decision = Bf2Decision("HOLD", "bf2_customer_held_by_open_write")
         if decision.action in ("COUNT", "HOLD"):
             self._bf2_count(decision.code, member)
             return "done"
@@ -2943,6 +2953,11 @@ class SyncEngine:
                     shopify_full_name(found.first_name, found.last_name), member.name):
                 self._ac2_done(key, "SKIPPED", "ac2_email_on_other_customer")
                 self.summary.count("ac2_email_on_other_customer", ref)
+            elif self.ledger.open_write_for_customer(found.gid) is not None:
+                # Fix round 1 (G2 LATER 2): a write for that customer may
+                # still land; never linked meanwhile (a count, not an alert).
+                self._ac2_done(key, "SKIPPED", "ac2_customer_held_by_open_write")
+                self.summary.count("ac2_customer_held_by_open_write", ref)
             else:
                 with self.ledger.tx() as conn:
                     self.ledger.add_link(conn, found.gid, member.member_no, "matched", "linked_existing_shopify_customer_by_email")

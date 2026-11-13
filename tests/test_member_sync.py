@@ -5789,6 +5789,7 @@ class Bf2TestCase(SyncTestCase):
         for n in range(1, 100):
             self.assertNotIn(local(n), text)
         self.assertIsNone(re.search(r"BF2[A-Z]*[0-9]{2,}", text))  # no full fake MemberNo
+        self.assertIsNone(re.search(r"(?<![0-9a-f])bf2[a-z]*[0-9]{2,}(?![0-9a-f])", text))  # nor its key (fix round 1, G2 X22)
         self.assertIsNone(re.search(r"(?<![0-9a-f])7000[0-9]{2}(?![0-9a-f])", text))
 
 
@@ -6619,6 +6620,249 @@ class Bf2PrivacyTests(Bf2TestCase):
         self.assertEqual(repr(ac2m("BF2V09", phone=plus(sg(9)), email=em(9))), "Ac2Member()")
         self.assertEqual(repr(sync.Bf2Index([ac2m("BF2V09")])), "Bf2Index()")
         self.assertEqual(repr(sync.Bf2Context(customer_linked=lambda g: False)), "Bf2Context()")
+
+
+class Bf2Fix1EmailTests(Bf2TestCase):
+    """Fix round 1, G2 B1: an email the bridge would refuse (any character
+    outside printable ASCII) is no usable email everywhere; the live run
+    (S6) never raises on it, with creates off and on."""
+
+    ODD = ("é", "＿", "​", "﻿", "\x01", "\x7f")
+
+    @staticmethod
+    def odd(n: int, ch: str, where: str = "local") -> str:
+        return f"m{n:02d}{ch}x@example.com" if where == "local" else f"m{n:02d}@exa{ch}mple.com"
+
+    def strict_ac2(self) -> None:
+        """The fake AutoCount refuses as the real bridge does (G2 probe P1)."""
+
+        real = self.ac2.lookup
+
+        def lookup(phone_digits, member_nos, *, email=None):
+            if email is not None and any(not "\x21" <= ch <= "\x7e" for ch in email):
+                raise dl.BridgeError("bridge_read_failed:phone_keys_invalid")
+            return real(phone_digits, member_nos, email=email)
+
+        self.ac2.lookup = lookup
+
+    def test_usable_email_is_printable_ascii_only(self):
+        for ch in self.ODD:
+            for where in ("local", "domain"):
+                with self.subTest(ch=ascii(ch), where=where):
+                    self.assertIsNone(sync.usable_email(self.odd(1, ch, where)))
+                    self.assertIsNone(sync.email_key(self.odd(1, ch, where)))
+        for good in ("a.b+c_d'e@example.com", "M01@Example.com", " \tm01@example.com\n"):
+            with self.subTest(good=good):
+                self.assertEqual(sync.usable_email(good), good.strip())
+
+    def s6_odd_members(self, creates: bool) -> dict:
+        self.run_sync("ac2_to_shopify")  # ChangeLog watermark
+        self.strict_ac2()
+        for i, ch in enumerate(self.ODD):
+            for member in (ac2m(f"TILLO{i}P", phone=local(40 + i), email=self.odd(40 + i, ch)), ac2m(f"TILLO{i}N", email=self.odd(50 + i, ch))):
+                self.ac2.add(member)
+                self.ac2.log_insert(replace(member, email_address=None))  # S6 reads the email from sync-lookup, not the XML
+        self.ac2.add(ac2m("TILLOK", email=em(60)), log=True)  # queued behind them: still reached
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=creates)
+        self.assertEqual(self.shopify.email_reads, [em(60)])  # never an odd email: only the good member is read
+        return result
+
+    def assert_odd_rows_skipped(self, result: dict) -> None:
+        rows = {r[0]: (r[1], r[2]) for r in self.ledger.conn.execute("SELECT member_no, state, code FROM ac2_pending")}
+        for i in range(len(self.ODD)):
+            self.assertEqual(rows[f"TILLO{i}P"], ("SKIPPED", "ac2_member_phone_only_not_created"))
+            self.assertEqual(rows[f"TILLO{i}N"], ("SKIPPED", "ac2_member_without_phone"))
+        self.assertEqual((result["counts"]["ac2_member_phone_only_not_created"], result["counts"]["ac2_member_without_phone"]), (6, 6))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM runs WHERE finished_at IS NULL").fetchone()[0], 0)
+        self.assertEqual(result["alerts"], [])
+        return rows
+
+    def test_s6_odd_email_is_skipped_never_raises_creates_off(self):
+        result = self.s6_odd_members(creates=False)
+        rows = self.assert_odd_rows_skipped(result)
+        self.assertEqual(rows["TILLOK"], ("PENDING", "would_create"))
+
+    def test_s6_odd_email_is_skipped_never_raises_creates_on(self):
+        result = self.s6_odd_members(creates=True)
+        rows = self.assert_odd_rows_skipped(result)
+        self.assertEqual(rows["TILLOK"], ("DONE", "shopify_customer_created"))
+        self.assertEqual([c["email"] for c in self.shopify.created], [em(60)])
+
+    def test_backfill_odd_email_is_counted_never_read_or_created(self):
+        for i, ch in enumerate(self.ODD):
+            self.add(f"BF2E{i}P", phone=plus(sg(40 + i)), email=self.odd(40 + i, ch))
+            self.add(f"BF2E{i}N", phone=None, email=self.odd(50 + i, ch))
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.ledger.conn.execute("DELETE FROM watermarks")
+                self.ledger.conn.commit()
+                result = self.bf2(apply=apply)
+                self.assertEqual(result["counts"]["bf2_email_unusable"], 12)
+                self.assertEqual((result["counts"]["bf2_phone_only_not_created"], result["counts"]["bf2_no_contact"]), (6, 6))
+                self.assertEqual((self.shopify.email_reads, self.shopify.created), ([], []))
+
+    def test_create_and_both_reads_refuse_an_odd_email_before_any_send(self):
+        sent = []
+        client = sync.SyncShopifyClient(create_enabled=True, shop_domain=DOMAIN, api_version="2026-07",
+                                        token_provider=direct.StaticTokenProvider("shpat_synthetic_token_value_0001"),
+                                        transport=lambda *a: sent.append(a), sleep=lambda s: None)
+        bridge = sync.SyncBridgeClient(["powershell.exe", "-NoProfile", "-File", "never-run.ps1"], autocount_book="AED_TESTINGAPI",
+                                       claims=self.temp / "claims.json", deadline_seconds=60)
+        for ch in self.ODD:
+            email = self.odd(1, ch)
+            with self.subTest(ch=ascii(ch)):
+                with self.assertRaises(dl.DirectLocalError) as caught:
+                    sync.build_customer_input(name="Alpha Tester", email=email, phone_digits=sg(1), member_no="BF2E01", dob=None, tags=["ac2-member"],
+                                              member_no_field=Bf2CreateInputTests.NUMBER, birthday_field=Bf2CreateInputTests.TEXT)
+                self.assertEqual(caught.exception.code, "shopify_customer_input_invalid")
+                with self.assertRaises(dl.DirectLocalError):
+                    client.create_customer({"firstName": "Alpha Tester", "email": email, "tags": ["ac2-member"]})
+                with self.assertRaises(dl.DirectLocalError) as caught:
+                    client.find_by_email(email)
+                self.assertEqual(caught.exception.code, "email_lookup_input_invalid")
+                with self.assertRaises(dl.DirectLocalError) as caught:
+                    bridge.lookup(None, [], email=email)
+                self.assertEqual(caught.exception.code, "sync_lookup_request_invalid")
+        self.assertEqual(sent, [])
+
+    def test_settle_read_skips_an_odd_email(self):
+        self.add("BF2E20", phone=plus(sg(20)), email=em(20))
+        self.shopify.create_mode = "uncertain"
+        self.bf2(apply=True)
+        self.shopify.create_mode = "ok"
+        self.ac2.members = [ac2m("BF2E20", phone=plus(sg(20)), email=self.odd(20, "​"))]
+        self.now += timedelta(hours=2)
+        self.shopify.email_reads.clear()
+        result = self.bf2(apply=True)
+        self.assertEqual(result["counts"].get("uncertain_write_unresolved"), 1)
+        self.assertEqual(self.shopify.email_reads, [])
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+
+
+class Bf2Fix1SurvivorTests(Bf2TestCase):
+    """Fix round 1, G2 B2 (SP1-SP4) and LATER 1 (SP5-SP8): the G2's probes
+    as tests, each failing under its surviving mutant."""
+
+    def test_hour_cap_counts_the_backfills_own_creates(self):  # SP1, BF1x-G04
+        self.add("BF2S01", phone=plus(sg(1)), email=em(1))
+        with self.ledger.tx() as conn:
+            for i in range(sync.RUNS_PER_HOUR * 5):
+                conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) VALUES (?, 'ac2_to_shopify', ?, ?, 'DONE', ?, ?)",
+                             (f"write-s{i}", f"S{i}", f"s{i}", dl.ts(self.now - timedelta(minutes=30)), dl.ts(self.now)))
+        result = self.bf2(apply=True)
+        self.assertEqual((result["stopped"], self.shopify.created), ("backfill_hour_cap_reached", []))
+
+    def test_s6_never_creates_a_member_whose_flag_is_unknown(self):  # SP2, X03
+        self.run_sync("ac2_to_shopify")
+        self.ac2.add(ac2m("TILLS2", email=em(2), no_shopify=None), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.shopify.created, result["counts"].get("ac2_member_declined_not_created")), ([], 1))
+
+    def test_dry_run_never_settles_or_links_an_uncertain_create(self):  # SP3, X14
+        self.add("BF2S03", phone=plus(sg(3)), email=em(3))
+        self.add("BF2S04", phone=plus(sg(4)), email=em(4))
+        self.shopify.create_mode = "uncertain"
+        self.bf2(apply=True, max_creates=2)
+        self.shopify.create_mode = "ok"
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE state = 'UNCERTAIN'").fetchone()[0], 1)
+        self.shopify.add(customer(3, email=em(3), tags=()))  # the uncertain create had landed
+        self.now += timedelta(hours=2)
+        before = self.dump()
+        result = self.bf2(apply=False)
+        after = self.dump()
+        after["watermarks"] = before["watermarks"] = []  # the dry-run cursor may move
+        self.assertEqual(after, before)
+        self.assertNotIn("uncertain_write_resolved_linked", result["counts"])
+
+    def test_output_never_holds_a_member_key_in_any_case(self):  # SP4, X22
+        for n in range(1, 4):
+            self.add(f"BF2S1{n}", phone=plus(sg(10 + n)), email=em(10 + n))
+        result = self.bf2(backfill_members_lookups_per_call=2)
+        self.assert_private(result)
+        text = json.dumps(result).casefold()
+        for n in range(1, 4):
+            self.assertNotIn(f"bf2s1{n}", text)
+
+    def test_s6_email_customer_linked_elsewhere_alerts_and_skips(self):  # SP5, X05
+        self.run_sync("ac2_to_shopify")
+        self.shopify.add(customer(5, phone=None, email=em(5), tags=()))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(5), "OTHER05", "created_in_ac2", "test")
+        self.ac2.add(ac2m("TILLS5", email=em(5)), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertIn("possible_duplicate_member", result["alerts"])
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM ac2_pending").fetchone()[:], ("SKIPPED", "possible_duplicate_member"))
+
+    def test_settle_with_the_same_name_and_email_but_another_phone_stays_uncertain(self):  # SP6, X13
+        self.add("BF2S06", phone=plus(sg(6)), email=em(6))
+        self.shopify.create_mode = "uncertain"
+        self.bf2(apply=True)
+        self.shopify.create_mode = "ok"
+        self.shopify.add(customer(7, email=em(6), tags=()))  # same name and email, another phone
+        result = self.bf2(apply=True)
+        self.assertEqual(result["counts"].get("uncertain_write_identity_mismatch"), 1)
+        self.assertEqual(self.link_rows(), {})
+
+    def test_stop_file_is_not_a_finished_pass(self):  # SP7, BF1x-G18
+        self.add("BF2S08", phone=plus(sg(8)), email=em(8))
+        (self.temp / sync.BF2_STOP_FILE).write_text("", encoding="utf-8")
+        result = self.bf2(apply=True)
+        self.assertEqual((result["stopped"], result["complete"]), ("stop_file_present", False))
+        self.assertIsNone(self.ledger.watermark(sync.BF2_DONE_MARK))
+
+    def test_cli_refuses_max_above_the_configured_run_cap_before_login(self):  # SP8, BF1x-G07
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(config_value(max_writes_per_run=1)), encoding="utf-8")
+            out = io.StringIO()
+            with mock.patch.object(sync, "build_real_engine", side_effect=AssertionError("login")), \
+                    mock.patch.object(sync, "SyncLedger", side_effect=AssertionError("lock")), redirect_stdout(out):
+                code = sync.main(["backfill-members", "--config", str(path), "--max", "2"])
+        self.assertEqual((code, json.loads(out.getvalue())), (2, {"status": "refused", "code": "backfill_members_max_invalid"}))
+
+
+class Bf2Fix1OpenWriteTests(Bf2TestCase):
+    """Fix round 1, G2 LATER 2: a found customer with an open Shopify -> AC2
+    write (INTENT or UNCERTAIN) is never linked meanwhile, as initial-link
+    and BF1; the backfill (phone and email paths) and the S6 email path."""
+
+    def open_write(self, n: int, state: str = "INTENT") -> None:
+        engine = self.engine(**BF2_KEYS)
+        write_id = engine._intent("shopify_to_ac2", f"SHOP{n:02d}", gid(n))
+        if state != "INTENT":
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE writes SET state = ? WHERE write_id = ?", (state, write_id))
+
+    def test_backfill_holds_by_phone_and_by_email(self):
+        self.add("BF2H01", phone=plus(sg(1)), email=em(1))
+        self.add("BF2H02", phone=None, email=em(2))
+        self.shop(1)
+        self.shop(2, phone=None, email=em(2))
+        self.open_write(1)
+        self.open_write(2, "UNCERTAIN")
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.ledger.conn.execute("DELETE FROM watermarks")
+                self.ledger.conn.commit()
+                result = self.bf2(apply=apply)
+                self.assertEqual(result["counts"]["bf2_customer_held_by_open_write"], 2)
+                self.assertEqual(self.codes_for(result, "BF2H01"), ["bf2_customer_held_by_open_write"])
+                self.assertEqual((self.link_rows(), self.shopify.created), ({}, []))
+        with self.ledger.tx() as conn:
+            conn.execute("UPDATE writes SET state = CASE state WHEN 'INTENT' THEN 'DONE' ELSE 'RESOLVED' END")
+        self.ledger.conn.execute("DELETE FROM watermarks")
+        self.ledger.conn.commit()
+        self.bf2(apply=True)
+        self.assertEqual(set(self.link_rows()), {"BF2H01", "BF2H02"})  # linked once the write is closed
+
+    def test_s6_email_path_holds_without_an_alert(self):
+        self.run_sync("ac2_to_shopify")
+        self.shopify.add(customer(5, phone=None, email=em(5), tags=()))
+        self.open_write(5, "UNCERTAIN")  # an INTENT would be a crashed run's, with its own alert
+        self.ac2.add(ac2m("TILLH5", email=em(5)), log=True)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM ac2_pending").fetchone()[:], ("SKIPPED", "ac2_customer_held_by_open_write"))
+        self.assertEqual((result["counts"]["ac2_customer_held_by_open_write"], result["alerts"], self.link_rows(), self.shopify.created), (1, [], {}, []))
 
 
 class Bf2BridgeRowTests(unittest.TestCase):

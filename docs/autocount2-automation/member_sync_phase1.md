@@ -373,6 +373,11 @@ against Shopify split and whole (stayed separate).
 8. **#155 BF2a (design 2.3.3), the S6 rules.** Before the phone, a member
    out of scope (type not in `shopify_create_member_types`, `IsActive` not
    `T`, or expired; see BF2a below) is `SKIPPED` (`ac2_member_out_of_scope`).
+   A usable email is printable ASCII only (the bridge's own character
+   set) with one `@` and a dot after it, at most 254 characters; an email
+   with any other character (accented, full-width, zero-width, a byte order
+   mark, a control character) counts as no usable email, here and in the
+   backfill, the create and the settle read (fix round 1, G2 B1).
    A member with neither a usable phone nor a usable email is skipped as
    before (`ac2_member_without_phone`). When no Shopify customer holds the
    phone (or the member has none):
@@ -384,7 +389,9 @@ against Shopify split and whole (stayed separate).
      (`linked_existing_shopify_customer_by_email`, origin `matched`);
      otherwise `ac2_email_on_other_customer`; already linked to another
      member: the existing alerts `shopify_customer_linked_to_other_member` /
-     `possible_duplicate_member`;
+     `possible_duplicate_member`; a Shopify -> AC2 write for that customer
+     still open (INTENT or UNCERTAIN): never linked meanwhile
+     (`ac2_customer_held_by_open_write`);
    - the decline marker (`XB-NO-SHOPIFY` in Note, or a row that does not
      say): not created (`ac2_member_declined_not_created`);
    - otherwise `customerCreate` (below), tag `ac2-member` only.
@@ -1053,6 +1060,7 @@ created, a link is permanent):
 | B1 | Phone on more than one customer | person | `bf2_phone_on_multiple_customers` |
 | B2/C1 | The customer found is linked to someone else (either ledger, or used earlier in this call) | person | `bf2_customer_linked_elsewhere` |
 | B3/C1 | Staff unlinked exactly this pair in the member core | person | `bf2_claim_pair_unlinked` |
+| B4/C3 | The customer to link has an open Shopify -> AC2 write (INTENT or UNCERTAIN), as `initial-link` and BF1 | hold, never linked meanwhile | `bf2_customer_held_by_open_write` |
 | B4 | One customer by phone, the two-word name rule matches | **link** | `bf2_linked` + `bf2_phone_and_name` (note `bf2_link_email_differs`) |
 | B5 | One customer by phone, another name | person; the email is not tried | `bf2_phone_other_name` |
 | C2 | Nobody by phone; the email customer has another phone | person | `bf2_email_customer_other_phone` |
