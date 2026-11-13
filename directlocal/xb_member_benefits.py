@@ -1903,9 +1903,16 @@ class BenefitsEngine:
             # The watermark overlap replays an order every run: a replay that
             # still qualifies keeps the receipt waiting (and its back-off, G2 B2).
             state, code = "waiting_member", existing["code"]
-        values = dict(customer_gid=order.customer.gid if order.customer else None, order_updated_at=dl.ts(order.updated_at),
+        if state == "below_threshold" and net is None:
+            summary.count("below_threshold_payments_unread")  # slice B2 (B2-7): the goods alone are below the threshold
+        customer = order.customer.gid if order.customer else None
+        values = dict(customer_gid=customer, order_updated_at=dl.ts(order.updated_at),
                       financial_status=order.financial_status, gross_cents=gross, net_cents=net, refunded_cents=order.refunded_cents,
                       gift_card_cents=paid, payment_gateways=gateways, state=state, code=code)
+        if existing is not None and existing["customer_gid"] != customer:
+            # Slice B2 (B2-5): an undecided receipt follows its order to another
+            # customer (or none); nothing found for the old customer carries over.
+            values.update(waiting_since=None, alerted=None, observed=None, observed_at=None, checked_at=None, member_no=None, link_source=None)
         if existing is None:
             with self.ledger.tx() as conn:
                 conn.execute(
@@ -1937,7 +1944,16 @@ class BenefitsEngine:
         if net is None:
             if not order.taxes_included:
                 return "amount_unverifiable", "taxes_not_included"
-            return "amount_unverifiable", ("currency_or_lines" if goods_amount(order, self.config) is None else PAYMENTS_UNREADABLE)
+            goods = goods_amount(order, self.config)
+            if goods is None:
+                return "amount_unverifiable", "currency_or_lines"
+            if not qualifies(goods[1], self.config):
+                # Slice B2 (B2-7): the goods kept are below the threshold and a
+                # gift card can only lower the amount, so the unread payments
+                # cannot make it qualify (no alert). The amount functions are
+                # unchanged: this only orders the checks.
+                return "below_threshold", None
+            return "amount_unverifiable", PAYMENTS_UNREADABLE
         if not qualifies(net, self.config):
             return "below_threshold", None
         if money_refund_unattributed(order):

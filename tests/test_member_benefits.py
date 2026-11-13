@@ -4477,6 +4477,63 @@ class B2WindowTests(Base):
         self.assertEqual({n: tuple(self.receipt(n))[:-1] for n in before}, {n: row[:-1] for n, row in before.items()})
 
 
+class B2RecordTests(Base):
+    """Slice B2 (G0 B2-5, B2-7): carry-over when an undecided receipt
+    follows its order; the goods measured first."""
+
+    RESET = ("waiting_since", "alerted", "observed", "observed_at", "checked_at", "member_no", "link_source")
+
+    # -- B2-5 ----------------------------------------------------------------
+    def test_b2_5_an_undecided_receipt_that_follows_its_order_keeps_nothing_of_the_old_customer(self):
+        self.guest_with_order(1)
+        engine = self.engine()
+        engine.run(apply=False)
+        self.ledger.update_receipt(order_gid(1), waiting_since="2026-11-18T03:30:00Z", alerted="qualified_member_missing", checked_at="2026-11-18T03:40:00Z")
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["observed"], row["link_source"]), ("ready", "would_upgrade", "sync155"))
+        self.assertTrue(all(row[name] is not None for name in self.RESET))
+        # The same customer again: everything kept.
+        engine.record(bm.order_from_node(order_node(1, updated="2026-11-18T04:05:00Z")), bm.RunSummary("observe"))
+        self.assertEqual({name: self.receipt(1)[name] for name in self.RESET}, {name: row[name] for name in self.RESET})
+        for n, customer in ((2, customer_node(2)), (None, None)):
+            with self.subTest(customer=n):
+                self.ledger.update_receipt(order_gid(1), **{name: row[name] for name in self.RESET})
+                engine.record(bm.order_from_node(order_node(1, customer=customer, updated="2026-11-18T04:06:00Z")), bm.RunSummary("observe"))
+                moved = self.receipt(1)
+                self.assertEqual(moved["customer_gid"], customer_gid(n) if n else None)
+                for name in self.RESET:
+                    self.assertIsNone(moved[name], name)
+        # In a run: the receipt is linked afresh through the new customer's own link.
+        self.link(2)
+        self.book.members[sg(2)] = fake_member(sg(2), name="Fake Member 2")
+        self.shopify.add(order_node(1, customer=customer_node(2), updated="2026-11-18T04:20:00Z"))
+        self.advance(minutes=30)
+        out = self.engine().run(apply=False)
+        self.assertIn({"ref": self.ledger.ref("o", order_gid(1)), "code": "would_upgrade", "member_no_masked": bm.mask(sg(2))}, out["refs"])
+        self.assertEqual((self.receipt(1)["member_no"], self.receipt(1)["customer_gid"]), (sg(2), customer_gid(2)))
+
+    # -- B2-7 ----------------------------------------------------------------
+    def test_b2_7_goods_below_the_threshold_with_unread_payments_are_below_threshold_with_no_alert(self):
+        twenty = tuple(("10.00", 1, 1, False, ()) for _ in range(20))
+        cases = {
+            1: (dict(lines=(("299.99", 1, 1, False, ()),), tx_count=None), "below_threshold", None, False),
+            2: (dict(lines=(("300.00", 1, 1, False, ()),), tx_count=None), "amount_unverifiable", "payments_unreadable", True),
+            3: (dict(lines=(("450.00", 1, 1, False, ()),), transactions=tuple(card("1.00") for _ in range(10))),
+                "amount_unverifiable", "payments_unreadable", True),
+            4: (dict(lines=twenty, more_lines=True, tx_count=None), "amount_unverifiable", "currency_or_lines", True),  # goods unreadable
+            5: (dict(lines=(("400.00", 1, 0, False, ()),), status="PARTIALLY_REFUNDED", refunded="400.00", tx_count=None), "below_threshold", None, False),
+        }
+        for n, (order, *_rest) in cases.items():
+            self.guest_with_order(n, **order)
+        out = self.engine().run(apply=False)
+        for n, (_, state, code, alert) in cases.items():
+            with self.subTest(n=n):
+                self.assertEqual((self.receipt(n)["state"], self.receipt(n)["code"]), (state, code))
+                self.assertEqual({"ref": self.ledger.ref("o", order_gid(n)), "code": "order_amount_unverifiable"} in out["refs"], alert)
+        self.assertEqual((out["counts"].get("below_threshold_payments_unread"), out["counts"].get("order_amount_unverifiable")), (2, 3))
+        self.assertEqual(self.book.reads, 0)
+
+
 class B2TokenCacheScopeTests(unittest.TestCase):
     """Slice B2, tests only (G0 B2-13 G25): the cached token's scope check."""
 
