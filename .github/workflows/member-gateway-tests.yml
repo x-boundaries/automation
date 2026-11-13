@@ -56,6 +56,13 @@ on:
       - "config/member_benefits.example.json"
       - "config/member_benefits.live.example.json"
       - "docs/autocount2-automation/member_benefits_runbook.md"
+      - "directlocal/xb_member_tags.py"
+      - "tests/test_member_tags.py"
+      - "tests/test_member_tags_ps.py"
+      - "scripts/install_member_tags_task.ps1"
+      - "config/member_tags.example.json"
+      - "config/member_tags.live.example.json"
+      - "docs/autocount2-automation/member_tags_runbook.md"
       - "config/member_sync.example.json"
       - "config/member_sync.live.example.json"
       - "scripts/install_member_sync_task.ps1"
@@ -166,6 +173,13 @@ on:
       - "config/member_benefits.example.json"
       - "config/member_benefits.live.example.json"
       - "docs/autocount2-automation/member_benefits_runbook.md"
+      - "directlocal/xb_member_tags.py"
+      - "tests/test_member_tags.py"
+      - "tests/test_member_tags_ps.py"
+      - "scripts/install_member_tags_task.ps1"
+      - "config/member_tags.example.json"
+      - "config/member_tags.live.example.json"
+      - "docs/autocount2-automation/member_tags_runbook.md"
       - "config/member_sync.example.json"
       - "config/member_sync.live.example.json"
       - "scripts/install_member_sync_task.ps1"
@@ -262,7 +276,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore tests.test_member_directlocal_poller tests.test_member_sync tests.test_member_type_move tests.test_member_benefits -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_directlocal tests.test_member_directlocal_realcore tests.test_member_directlocal_poller tests.test_member_sync tests.test_member_type_move tests.test_member_benefits tests.test_member_tags -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD
@@ -304,6 +318,7 @@ jobs:
           tests.test_member_sync_bridge_ps
           tests.test_member_type_move_ps
           tests.test_member_benefits_ps
+          tests.test_member_tags_ps
 
   powershell-worker-tooling:
     # The worker tooling module is the largest single module, so it runs in its own
