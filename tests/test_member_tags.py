@@ -294,18 +294,30 @@ class Base(unittest.TestCase):
     # optional). Written out here, never taken from the tool.
     CONFIG_KEYS = frozenset({
         "status", "autocount_book", "api_version", "scope_sets", "tag", "tags_write_enabled", "max_tag_adds_per_run",
-        "max_tag_removes_per_run", "max_member_reads_per_run", "shopify_max_carrier_pages", "ac2_credential", "ac2_login_mode"})
+        "max_tag_removes_per_run", "max_member_reads_per_run", "shopify_max_carrier_pages", "ac2_credential", "ac2_login_mode",
+        # slice D
+        "bday_tag", "bday_tag_enabled", "max_bday_adds_per_run", "max_bday_removes_per_run", "bday_only_customers",
+        "remove_unbased_tags_enabled"})
     RUN_KEYS = frozenset({"status", "command", "run_id", "counts", "alerts", "refs", "stopped", "scope_set", "query_costs",
-                          "tagged_now", "carriers_total"})
+                          "tagged_now", "carriers_total",
+                          # slice D
+                          "bday_tagged_now", "bday_month_now", "bday_carriers_total", "bday_tagged_other_month"})
     OUTPUT_KEYS = {
         "observe": RUN_KEYS,
         "apply": RUN_KEYS,
         "status": frozenset({"status", "command", "tag_writes", "open_writes", "reviews", "runs", "stop_file_present", "tag_set"}),
         "digest": frozenset({"status", "command", "hours", "runs", "counts", "alerts", "alert_refs", "open", "shadow",
-                             "tagged_now", "carriers_total"}),
+                             "tagged_now", "carriers_total",
+                             # slice D
+                             "bday_tagged_now", "bday_carriers_total", "stale_month", "email"}),
     }
     DIGEST_PART_KEYS = {"runs": frozenset({"completed", "unfinished"}), "open": frozenset({"uncertain_writes", "intent_writes"}),
-                        "shadow": frozenset({"would_tag", "would_untag"})}
+                        "shadow": frozenset({"would_tag", "would_untag", "would_bday_tag", "would_bday_untag"})}
+    # Slice D design 2.8: the #288 email block, keys and types pinned.
+    EMAIL_KEYS = {"runs_completed": int, "runs_unfinished": int, "tagged_now": int, "bday_tagged_now": int, "would_tag": int,
+                  "would_untag": int, "would_bday_tag": int, "would_bday_untag": int, "alerts": list, "stale_month": bool,
+                  "open_writes": int}
+    MONTH_WORD_RE = re.compile(r"(?i)\b(january|february|march|april|may|june|july|august|september|october|november|december)\b")
     QUERY_NAMES = frozenset({"XbMemberTagsCustomers", "XbMemberTagsCarriers"})
     SCOPE_SET_NAMES = ("write_only", "read_write")
     WRITE_STATES = ("INTENT", "DONE", "REJECTED", "NOT_WRITTEN", "UNCERTAIN")
@@ -338,6 +350,11 @@ class Base(unittest.TestCase):
         for kind, value in outputs:
             text = json.dumps(value)
             self.assertNotIn("gid://", text, kind)
+            # Slice D: a month name only as today's month in bday_month_now (never a customer's month).
+            if isinstance(value, dict) and "bday_month_now" in value:
+                self.assertTrue(value["bday_month_now"] is None or value["bday_month_now"] in mt.MONTH_NAMES, kind)
+            rest = json.dumps({k: v for k, v in value.items() if k != "bday_month_now"} if isinstance(value, dict) else value)
+            self.assertNotRegex(rest, self.MONTH_WORD_RE, kind)
             for secret in private:
                 self.assertNotIn(secret, text, kind)
                 self.assertNotIn(secret[-7:], text, kind)  # no tail longer than 3 either
@@ -378,12 +395,22 @@ class Base(unittest.TestCase):
                 for cost in value["query_costs"].values():
                     self.assertTrue(cost is None or (whole(cost) and 0 <= cost <= 1_000_000), kind)
             if value["command"] in ("observe", "apply", "digest"):
-                self.assertTrue(whole(value["tagged_now"]) or value["tagged_now"] is None, kind)
-                self.assertTrue(whole(value["carriers_total"]) or value["carriers_total"] is None, kind)
+                for key in ("tagged_now", "carriers_total", "bday_tagged_now", "bday_carriers_total"):
+                    self.assertTrue(whole(value[key]) or value[key] is None, kind)
+            if value["command"] in ("observe", "apply"):
+                self.assertTrue(whole(value["bday_tagged_other_month"]) or value["bday_tagged_other_month"] is None, kind)
             if value["command"] == "digest":
                 for part, allowed in self.DIGEST_PART_KEYS.items():
                     self.assertEqual(set(value[part]), set(allowed), kind)
                     self.assertTrue(all(whole(n) for n in value[part].values()), kind)
+                self.assertIs(type(value["stale_month"]), bool, kind)
+                email = value["email"]
+                self.assertEqual(set(email), set(self.EMAIL_KEYS), kind)
+                for key, kind_of in self.EMAIL_KEYS.items():
+                    self.assertIs(type(email[key]), kind_of, (kind, key))
+                self.assertLessEqual(len(email["alerts"]), 20, kind)
+                self.assertEqual(email["stale_month"], value["stale_month"], kind)
+                words += list(email["alerts"])
                 self.assertIsInstance(value["alerts"], dict, kind)
                 self.assertTrue(all(whole(n) for n in value["alerts"].values()), kind)
                 words += list(value["alerts"])
@@ -391,7 +418,8 @@ class Base(unittest.TestCase):
             if value["command"] == "status":
                 self.assertEqual(value["tag_set"], ",".join(mt.TAG_SET), kind)
                 for key, number in value["tag_writes"].items():
-                    self.assertRegex(key, r"^(add|remove):(" + "|".join(self.WRITE_STATES) + r")\Z", kind)
+                    # Slice D: birthday rows carry a "bday:" prefix; member-qualified keys are as in C1.
+                    self.assertRegex(key, r"^(bday:)?(add|remove):(" + "|".join(self.WRITE_STATES) + r")\Z", kind)
                     self.assertTrue(whole(number), kind)
                 for key in ("open_writes", "reviews", "runs"):
                     self.assertTrue(whole(value[key]), kind)
@@ -2577,7 +2605,9 @@ class UnmappedTransportErrorTests(EngineBase):
     def test_an_unmapped_transport_error_is_uncertain_and_stops(self):
         self.member(1)
         self.member(2)
-        for error in (http.client.IncompleteRead(b"partial"), ConnectionResetError("reset")):
+        # R6d (PR 305 recheck 1): two more unmapped classes, so a catch narrowed to the first two fails.
+        errors = (http.client.IncompleteRead(b"partial"), ConnectionResetError("reset"), http.client.BadStatusLine("x"), OSError("x"))
+        for error in errors:
             with self.subTest(error=type(error).__name__):
                 result, transport = self.real_run([error])
                 self.assertEqual((result["stopped"], result["alerts"]), ("write_uncertain", ["write_uncertain"]))
@@ -2589,7 +2619,7 @@ class UnmappedTransportErrorTests(EngineBase):
         self.assertEqual([b["variables"]["id"] for b in transport.mutations()], [customer_gid(1), customer_gid(2)])
         self.assertEqual(result["counts"]["write_settled_not_written"], 1)
         self.assertEqual([(r["state"], r["code"]) for r in self.rows()],
-                         [("NOT_WRITTEN", "resolved_by_read"), ("NOT_WRITTEN", "resolved_by_read"), ("DONE", None), ("DONE", None)])
+                         [("NOT_WRITTEN", "resolved_by_read")] * len(errors) + [("DONE", None), ("DONE", None)])
 
 
 class BirthdayReadEngineTests(UnmappedTransportErrorTests):
@@ -2643,7 +2673,8 @@ class CliTests(EngineBase):
         self.assertEqual(self.run_main("digest", "--hours", "24"), 0)
         digest = self.emitted[-1]
         self.assertEqual((digest["runs"], digest["shadow"], digest["open"]),
-                         ({"completed": 3, "unfinished": 0}, {"would_tag": 1, "would_untag": 1}, {"uncertain_writes": 0, "intent_writes": 0}))
+                         ({"completed": 3, "unfinished": 0}, {"would_tag": 1, "would_untag": 1, "would_bday_tag": 0, "would_bday_untag": 0},
+                          {"uncertain_writes": 0, "intent_writes": 0}))  # slice D: shadow gains the two birthday counts
         self.assertEqual(digest["alerts"], {"flow_dates_guard": 1})
         self.assertEqual(digest["alert_refs"][0]["code"], "flow_dates_guard")
         self.assertEqual(digest["tagged_now"], 1)
@@ -2689,6 +2720,113 @@ class CliTests(EngineBase):
             self.assertEqual(apply.ac2.command[-1], str(mt.BRIDGE_SCRIPT))
         finally:
             ledger.close()
+
+
+class BirthdayOutputTests(CliTests):
+    """Slice D design 2.8: run keys, check-config, status, digest (stale_month,
+    the email block) and the month value never stored or printed."""
+
+    test_observe_apply_digest = test_apply_with_the_switch_off_creates_nothing = None
+    test_state_root_refusals_create_nothing = test_a_second_runner_is_refused = test_build_real_engine_mutations_follow_the_command = None
+
+    def test_run_keys(self):
+        self.member(1, birthday=NOV)
+        self.member(2, tags=[TAG, BDAY], birthday=MAR)
+        self.member(3, tags=[TAG, BDAY], birthday=month("October"))
+        self.member(4, tags=[TAG, BDAY], birthday=NOV)
+        self.shopify.add(5, [BDAY])  # a carrier with no basis: counted in the search, not in bday_tagged_now
+        self.run_main("init")
+        self.assertEqual(self.run_main("observe", bday_tag_enabled=True), 3)
+        observed = self.emitted[-1]
+        self.assertEqual((observed["bday_month_now"], observed["bday_tagged_now"], observed["bday_carriers_total"],
+                          observed["bday_tagged_other_month"]), ("November", 3, 4, 2))
+        self.run_main("apply", bday_tag_enabled=True, max_bday_removes_per_run=1)
+        applied = self.emitted[-1]
+        self.assertEqual((applied["bday_tagged_now"], applied["bday_tagged_other_month"], applied["tagged_now"]), (3, 1, 4))
+        self.run_main("apply", bday_tag_enabled=True)
+        self.assertEqual((self.emitted[-1]["bday_tagged_now"], self.emitted[-1]["bday_tagged_other_month"]), (2, 0))
+        self.shopify.bday_carrier_cap = True
+        self.run_main("observe")
+        self.assertIsNone(self.emitted[-1]["bday_carriers_total"])
+        self.assertIn("bday_tag_search_incomplete", self.emitted[-1]["alerts"])
+
+    def test_check_config_and_status(self):
+        self.assertEqual(self.run_main("check-config", bday_only_customers=[customer_gid(1), customer_gid(2)]), 0)
+        summary = self.emitted[-1]
+        self.assertEqual({k: summary[k] for k in ("bday_tag", "bday_tag_enabled", "max_bday_adds_per_run", "max_bday_removes_per_run",
+                                                  "bday_only_customers", "remove_unbased_tags_enabled")},
+                         {"bday_tag": BDAY, "bday_tag_enabled": False, "max_bday_adds_per_run": 10, "max_bday_removes_per_run": 10,
+                          "bday_only_customers": 2, "remove_unbased_tags_enabled": False})
+        self.member(1, birthday=NOV)
+        self.member(2, member_type="GUEST", tags=[TAG, BDAY])
+        self.run_main("init")
+        self.run_main("apply", bday_tag_enabled=True)
+        self.assertEqual(self.run_main("status"), 0)
+        self.assertEqual(self.emitted[-1]["tag_writes"], {"add:DONE": 1, "remove:DONE": 1, "bday:add:DONE": 1, "bday:remove:DONE": 1})
+
+    def test_digest_birthday_counts_stale_month_and_the_email_block(self):
+        self.member(1, birthday=NOV)
+        self.member(2, tags=[TAG, BDAY], birthday=MAR)
+        self.member(3, tags=[TAG, BDAY])  # month missing with the tag: an alert
+        self.now = datetime(2026, 11, 30, 4, 0, tzinfo=timezone.utc)  # 12:00 SGT 30 Nov
+        self.run_main("init")
+        self.assertEqual(self.run_main("digest"), 0)
+        self.assertEqual((self.emitted[-1]["stale_month"], self.emitted[-1]["email"]["runs_completed"]), (False, 0))  # no run: not stale
+        self.run_main("observe")
+        self.run_main("digest")
+        digest = self.emitted[-1]
+        self.assertEqual(digest["shadow"], {"would_tag": 1, "would_untag": 0, "would_bday_tag": 1, "would_bday_untag": 1})
+        self.assertEqual((digest["bday_tagged_now"], digest["bday_carriers_total"], digest["stale_month"]), (2, 2, False))
+        self.assertEqual(digest["email"], {"runs_completed": 1, "runs_unfinished": 0, "tagged_now": 2, "bday_tagged_now": 2,
+                                           "would_tag": 1, "would_untag": 0, "would_bday_tag": 1, "would_bday_untag": 1,
+                                           "alerts": ["bday_month_missing"], "stale_month": False, "open_writes": 0})
+        self.now = datetime(2026, 11, 30, 16, 30, tzinfo=timezone.utc)  # 00:30 SGT 1 Dec: the month changed, no run since
+        self.run_main("digest", "--hours", "48")
+        self.assertTrue(self.emitted[-1]["stale_month"])
+        self.assertTrue(self.emitted[-1]["email"]["stale_month"])
+        self.run_main("observe")
+        self.run_main("digest", "--hours", "48")
+        self.assertFalse(self.emitted[-1]["stale_month"])
+        self.assertEqual(self.emitted[-1]["shadow"]["would_bday_untag"], 1)  # November's month is now another month
+
+    def test_the_email_alerts_are_codes_and_at_most_twenty(self):
+        other = self.temp / "injected"
+        other.mkdir()
+        ledger = mt.TagsLedger(other, clock=lambda: self.now)
+        try:
+            ledger.init_meta(self.cfg())
+        finally:
+            ledger.close()
+        codes = [f"code_{chr(97 + i)}" for i in range(25)] + ["Bad Code", "gid://shopify/Customer/1"]
+        conn = sqlite3.connect(other / mt.LEDGER_FILE)
+        try:
+            conn.execute("INSERT INTO runs VALUES ('run-x', 'observe', ?, ?, ?)",
+                         (dl.ts(self.now), dl.ts(self.now), json.dumps({"alerts": codes, "counts": {}, "bday_month_now": "November"})))
+            conn.commit()
+        finally:
+            conn.close()
+        digest = mt.ledger_digest(other, hours=24, now=self.now + timedelta(minutes=1), config=self.cfg())
+        self.assertEqual(digest["email"]["alerts"], sorted(codes[:25])[:20])
+        self.assertEqual(len(digest["alerts"]), 25)
+
+    def test_the_month_value_is_never_stored_or_printed(self):
+        for n, name in enumerate(mt.MONTH_NAMES, start=1):
+            self.member(n, tags=[TAG, BDAY] if n % 2 else [TAG], birthday=month(name))
+        self.member(20, tags=[TAG, BDAY], birthday=month("march"))
+        self.run_main("init")
+        self.run_main("apply", bday_tag_enabled=True, max_bday_removes_per_run=100)
+        self.run_main("digest")
+        self.run_main("status")
+        conn = sqlite3.connect((self.root / mt.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = "\n".join(conn.iterdump())
+        finally:
+            conn.close()
+        for name in mt.MONTH_NAMES:
+            if name != "November":  # this run's own month, in the run summary's bday_month_now only
+                self.assertNotIn(name, tables)
+                self.assertNotIn(name.lower(), tables.replace("bday_month_other", ""))
+        self.assertEqual(tables.count('\\"bday_month_now\\": \\"November\\"') + tables.count('"bday_month_now": "November"'), 1)
 
 
 class LedgerCliTests(Base):

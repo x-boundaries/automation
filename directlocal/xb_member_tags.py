@@ -223,6 +223,10 @@ class TagsConfig:
             "max_member_reads_per_run": self.max_member_reads_per_run, "shopify_max_carrier_pages": self.shopify_max_carrier_pages,
             "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "ac2_login_mode": self.ac2_login_mode,
+            # Slice D: the birthday settings and the C2 switch (the pilot list as a count: never a GID).
+            "bday_tag": BDAY_TAG, "bday_tag_enabled": self.bday_tag_enabled, "max_bday_adds_per_run": self.max_bday_adds_per_run,
+            "max_bday_removes_per_run": self.max_bday_removes_per_run, "bday_only_customers": len(self.bday_only_customers),
+            "remove_unbased_tags_enabled": self.remove_unbased_tags_enabled,
         }
 
 
@@ -1135,7 +1139,9 @@ class TagsLedger:
     def status(self, config: TagsConfig) -> dict[str, Any]:
         self.check_binding(config)
         conn = self.conn
-        writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT op, state, COUNT(*) FROM tag_writes GROUP BY op, state")}
+        # Keys as in C1 (op:state) for member-qualified; bday:op:state for the birthday tag (slice D).
+        writes = {("bday:" if row[0] == BDAY_TAG else "") + f"{row[1]}:{row[2]}": row[3]
+                  for row in conn.execute("SELECT tag, op, state, COUNT(*) FROM tag_writes GROUP BY tag, op, state")}
         return {"status": "ok", "command": "status", "tag_writes": writes, "open_writes": len(self.open_writes()),
                 "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
                 "runs": conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
@@ -1301,12 +1307,21 @@ class TagsEngine:
         except dl.DirectLocalError as exc:
             summary.stopped = exc.code
             summary.alert(exc.code)
-        tagged_now = sum(1 for gid in set(links.basis) | set(links.conflicts) if states.get(gid) is not None and TAG in states[gid].tags)
+        linked = [states[gid] for gid in set(links.basis) | set(links.conflicts) if states.get(gid) is not None]
+        tagged_now = sum(1 for state in linked if TAG in state.tags)
+        # Slice D (design 2.8): the birthday tag on linked customers, and those
+        # still carrying it whose valid month is not this month (0 after a run
+        # that was not capped or withheld). The month value is never printed;
+        # bday_month_now names today's month only.
+        bday_tagged = [state for state in linked if BDAY_TAG in state.tags]
+        other_month = None if self.month_now is None else sum(
+            1 for state in bday_tagged if state.bday_state == BDAY_MONTH and state.bday_month != self.month_now)
         costs = dict(getattr(self.shopify, "query_costs", {}) or {})
         result = {"status": "ok", "command": command, "run_id": run_id, "counts": dict(sorted(summary.counts.items())),
                   "alerts": list(summary.alerts), "refs": list(summary.refs), "stopped": summary.stopped, "scope_set": scope_set,
                   "query_costs": {name: costs.get(name) for name in QUERY_NAMES.values()}, "tagged_now": tagged_now,
-                  "carriers_total": carriers_total}
+                  "carriers_total": carriers_total, "bday_tagged_now": len(bday_tagged), "bday_month_now": self.month_now,
+                  "bday_carriers_total": bday_carriers_total, "bday_tagged_other_month": other_month}
         self.ledger.finish_run(run_id, result)
         return result
 
@@ -1604,6 +1619,7 @@ class TagsEngine:
 _DIGEST_CODE_RE = re.compile(r"^[a-z0-9_:]{1,64}$")
 _DIGEST_REF_RE = re.compile(r"^[cm]-[0-9a-f]{20}$")
 _DIGEST_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
+EMAIL_MAX_ALERTS = 20
 
 
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: TagsConfig) -> dict[str, Any]:
@@ -1663,13 +1679,27 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: TagsConfig) 
         def number(value: Any) -> int | None:
             return value if type(value) is int else None
 
+        shadow = {word: number(last_counts.get(word)) or 0 for word in ("would_tag", "would_untag", "would_bday_tag", "would_bday_untag")}
+        open_writes = {"uncertain_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'UNCERTAIN'").fetchone()[0],
+                       "intent_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'INTENT'").fetchone()[0]}
+        # Slice D (design 2.8): the month changed and the tags have not. True
+        # when the latest completed run's month is not the digest's own
+        # Singapore month (a run with no month counts as not this month);
+        # false when no run completed in the window (runs_completed says so).
+        stale_month = completed > 0 and latest.get("bday_month_now") != month_name(sg_today(now))
+        # The fixed, flat block for the #288 daily email: whole numbers, codes
+        # and booleans only (0 for a figure when no run completed).
+        email = {"runs_completed": completed, "runs_unfinished": unfinished,
+                 "tagged_now": number(latest.get("tagged_now")) or 0, "bday_tagged_now": number(latest.get("bday_tagged_now")) or 0,
+                 **shadow, "alerts": sorted(alerts)[:EMAIL_MAX_ALERTS], "stale_month": stale_month,
+                 "open_writes": open_writes["uncertain_writes"] + open_writes["intent_writes"]}
         return {
             "status": "ok", "command": "digest", "hours": hours, "runs": {"completed": completed, "unfinished": unfinished},
             "counts": dict(sorted(counts.items())), "alerts": dict(sorted(alerts.items())), "alert_refs": refs,
-            "open": {"uncertain_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'UNCERTAIN'").fetchone()[0],
-                     "intent_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'INTENT'").fetchone()[0]},
-            "shadow": {"would_tag": number(last_counts.get("would_tag")) or 0, "would_untag": number(last_counts.get("would_untag")) or 0},
+            "open": open_writes, "shadow": shadow,
             "tagged_now": number(latest.get("tagged_now")), "carriers_total": number(latest.get("carriers_total")),
+            "bday_tagged_now": number(latest.get("bday_tagged_now")), "bday_carriers_total": number(latest.get("bday_carriers_total")),
+            "stale_month": stale_month, "email": email,
         }
     except sqlite3.Error:
         raise dl.DirectLocalError("tags_ledger_unreadable") from None
