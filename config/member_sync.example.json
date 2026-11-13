@@ -37,5 +37,8 @@
   "max_creates_per_hour": 6,
   "max_creates_per_day": 144,
   "probe_wake_enabled": false,
-  "probe_max_wakes_per_day": 60
+  "probe_max_wakes_per_day": 60,
+  "backfill_members_enabled": false,
+  "shopify_create_member_types": ["MEMBER", "GUEST"],
+  "backfill_members_lookups_per_call": 50
 }

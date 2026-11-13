@@ -77,10 +77,9 @@ TASK_TIME_MARGIN_SECONDS = 15
 CHILD_COUNT = 3  # the task-state read, check-config, digest
 SQL_WAITS = 5  # the connect, then four statements, each bounded by sql.timeout_seconds
 # Every outcome code of the sync's one Shopify mutation (customerCreate) that means a write was
-# sent: created with the phone, created as a separate customer without it, or outcome unknown.
-# Pinned against the sync's own source in a test, so a new code there fails CI.
-SHOPIFY_WRITE_CODES = ("shopify_customer_created", "shopify_separate_customer_created_without_phone",
-                       "shopify_create_uncertain")
+# sent: created, or outcome unknown (#155 BF2a: the "separate customer without the phone" path
+# is gone). Pinned against the sync's own source in a test, so a new code there fails CI.
+SHOPIFY_WRITE_CODES = ("shopify_customer_created", "shopify_create_uncertain")
 
 # SQL: fixed text, counts only. The identity row comes from the same connection.
 IDENTITY_QUERY = (

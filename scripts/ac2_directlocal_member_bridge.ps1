@@ -21,6 +21,9 @@
 #
 # #155 phase 1 sync adds two read-only operations, sync-lookup and
 # sync-changelog (parameterised SELECTs through the guarded DBSetting), and
+# (#155 BF2a) a third, sync-member-scan (one keyset page of every member with
+# the scope columns and the 0/1 decline flag; the Note text is never read
+# out), and
 # a sync_p1 payload profile for write-once (ac2_member_sync_member.ps1; the
 # pinned gateway adapter is unchanged). Their stdout carries member rows for
 # the parent process only; the parent never prints them.
@@ -32,7 +35,7 @@
 # without SaveMember. Claim and outcome files are never deleted here.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog")][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog", "sync-member-scan")][string]$Operation,
     [switch]$EnableProductionAdapter,
     [string]$FenceId,
     [string]$ClaimDirectory,
@@ -160,11 +163,18 @@ function ConvertFrom-XbDirectLocalJsonRows {
 function Invoke-XbDirectLocalSyncLookup {
     # Read-only: members whose MemberNo or MobilePhone is the phone, whose
     # MemberNo embeds the Singapore 8 digits, or whose MemberNo equals one of
-    # the given numbers (trimmed, case-insensitive). Email is never searched.
+    # the given numbers (trimmed, case-insensitive). #155 BF2a: or, alone,
+    # whose EmailAddress is exactly one email (trimmed, case-insensitive),
+    # for S6's AutoCount-side shared-email check; never mixed with the others.
     param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
     $phone = $Request.phone_digits
     $local = $Request.sg_local
     $numbers = @($Request.member_nos | Where-Object { $null -ne $_ })
+    $email = if ($null -ne $Request.PSObject.Properties["email_address"]) { $Request.email_address } else { $null }
+    if ($null -ne $email) {
+        if ($email -isnot [string] -or $email.Length -gt 254 -or $email -cnotmatch '\A[^@\s]+@[^@\s]+\.[^@\s]+\z' -or $email -cmatch '[^\x21-\x7E]' -or
+            $null -ne $phone -or $null -ne $local -or $numbers.Count -gt 0) { throw "phone_keys_invalid" }  # the lookup's key-shape code (existing)
+    }
     if ($null -ne $phone -and [string]$phone -cnotmatch '^[0-9]{8,15}$') { throw "phone_keys_invalid" }
     if ($null -ne $local -and [string]$local -cnotmatch '^[0-9]{8}$') { throw "phone_keys_invalid" }
     if ($numbers.Count -gt 20) { throw "member_no_invalid" }
@@ -187,10 +197,30 @@ function Invoke-XbDirectLocalSyncLookup {
     foreach ($number in $numbers) {
         $conditions += "$keyExpr = UPPER(LTRIM(RTRIM(?)))"; $params += [string]$number
     }
+    if ($null -ne $email) { $conditions += "LOWER(LTRIM(RTRIM(EmailAddress))) = LOWER(?)"; $params += [string]$email }
     if ($conditions.Count -eq 0) { return [ordered]@{ members = @() } }
+    # BF2a: MemberType, IsActive, ExpiryDate and the decline flag (computed
+    # here; the Note text itself is never selected).
     $sql = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, " +
-        "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE " + ($conditions -join " OR ") + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
+        "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time, " +
+        "MemberType AS member_type, IsActive AS is_active, CONVERT(varchar(10), ExpiryDate, 23) AS expiry_date, " +
+        "CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify FROM Member WHERE " +
+        ($conditions -join " OR ") + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
     try { $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params $params) } catch { throw "sync_lookup_failed" }
+    return [ordered]@{ members = (ConvertFrom-XbDirectLocalJsonRows -Json $json) }
+}
+
+function Invoke-XbDirectLocalSyncMemberScan {
+    # #155 BF2a, read-only: one page (TOP 1000) of every member after a
+    # MemberNo cursor ("" for the first page), in MemberNo order, with the
+    # scope columns and the decline flag computed in the pinned SQL (the
+    # Note text is never selected). The only variable is the cursor, a
+    # parameter.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
+    $after = if ($null -ne $Request.PSObject.Properties["after_member_no"]) { $Request.after_member_no } else { $null }
+    if ($after -isnot [string] -or $after.Length -gt 40 -or $after -cmatch '[\x00-\x1F\x7F]') { throw "member_no_invalid" }  # the cursor is a MemberNo (existing code)
+    try { $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.sync_member_scan -Params @($after)) }
+    catch { throw "sync_lookup_failed" }  # existing code: BRIDGE_CHILD_ERROR_CODES is not in this slice
     return [ordered]@{ members = (ConvertFrom-XbDirectLocalJsonRows -Json $json) }
 }
 
@@ -349,6 +379,7 @@ try {
             "legacy-precheck" { $result = Invoke-XbDirectLocalLegacyPrecheck -Session $session -Request $request }
             "sync-lookup" { $result = Invoke-XbDirectLocalSyncLookup -DBSetting $session.DBSetting -Request $request }
             "sync-changelog" { $result = Invoke-XbDirectLocalSyncChangeLog -DBSetting $session.DBSetting -Request $request }
+            "sync-member-scan" { $result = Invoke-XbDirectLocalSyncMemberScan -DBSetting $session.DBSetting -Request $request }
             "next-member-no" { $result = [ordered]@{ member_no = (Get-XbAutoCountNextMemberNo -Session $session) } }
             "probe" {
                 Assert-XbDirectLocalMemberNo -MemberNo ([string]$request.member_no)

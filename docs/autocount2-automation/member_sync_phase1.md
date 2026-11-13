@@ -199,8 +199,9 @@ is a different person and takes the no-link path of that direction:
 
 - Shopify -> AC2: the shared-phone MemberNo (phone + name letters, a digit
   2-9 when taken; phone + digit 2-9 when the name has no Latin letters).
-- AC2 -> Shopify: a separate customer without the phone, created only while
-  `shopify_create_enabled` is on (counted and kept pending while it is off).
+- AC2 -> Shopify (#155 BF2a): held for a person (`ac2_phone_on_other_customer`),
+  never a second customer; the "separate customer without the phone" path
+  is gone.
 
 Details:
 
@@ -361,27 +362,57 @@ against Shopify split and whole (stayed separate).
      Shopify then finds the member linked (`ac2_already_linked`).
 
    Otherwise (a MemberNo that is not the phone, for example a till number
-   with the phone in MobilePhone), unchanged:
+   with the phone in MobilePhone):
    - one customer, name rule matches: link (`shopify_phone_and_name_match`);
    - one customer, name rule does not match: a different person (Owner,
-     21 October 2026). Never linked. A separate customer is created
-     **without the phone** (Shopify phones are unique), with the AC2 `Name`,
-     email if AC2 has one, the tags and the metafields below
-     (`shopify_phone_owned_by_other_name`,
-     `shopify_separate_customer_created_without_phone`);
+     21 October 2026). Never linked. **#155 BF2a:** held for a person
+     (`SKIPPED`, count `ac2_phone_on_other_customer`); no second customer is
+     made (the "separate customer without the phone" path is gone);
    - several customers: skip;
-   - none: `customerCreate` with first name = the AC2 `Name`, phone in E.164,
-     email if present, the configured tags and the metafields below.
-8. A member without a phone is skipped and counted (there is no safe
-   duplicate key; email never links).
+   - none: the email rule below.
+8. **#155 BF2a (design 2.3.3), the S6 rules.** Before the phone, a member
+   out of scope (type not in `shopify_create_member_types`, `IsActive` not
+   `T`, or expired; see BF2a below) is `SKIPPED` (`ac2_member_out_of_scope`).
+   A usable email is printable ASCII only (the bridge's own character
+   set) with one `@` and a dot after it, at most 254 characters; an email
+   with any other character (accented, full-width, zero-width, a byte order
+   mark, a control character) counts as no usable email, here and in the
+   backfill, the create and the settle read (fix round 1, G2 B1).
+   A member with neither a usable phone nor a usable email is skipped as
+   before (`ac2_member_without_phone`). When no Shopify customer holds the
+   phone (or the member has none):
+   - no usable email: not created (`ac2_member_phone_only_not_created`);
+   - the email is held by another AutoCount member (an email-only
+     `sync-lookup`, trimmed and case-insensitive): `ac2_email_shared_in_ac2`;
+   - `customerByIdentifier` finds one customer with that email: linked when
+     the name rule matches and it holds no other phone
+     (`linked_existing_shopify_customer_by_email`, origin `matched`);
+     otherwise `ac2_email_on_other_customer`; already linked to another
+     member: the existing alerts `shopify_customer_linked_to_other_member` /
+     `possible_duplicate_member`; a Shopify -> AC2 write for that customer
+     still open (INTENT or UNCERTAIN): never linked meanwhile
+     (`ac2_customer_held_by_open_write`);
+   - the decline marker (`XB-NO-SHOPIFY` in Note, or a row that does not
+     say): not created (`ac2_member_declined_not_created`);
+   - otherwise `customerCreate` (below), tag `ac2-member` only.
+   Every new code is a count, never an alert. With `shopify_create_enabled`
+   false only a real create candidate stays `PENDING would_create`; the
+   others end `SKIPPED` with their code (ledger rows only).
 
-Every `customerCreate` (with or without a phone) sends the tags
-(`ac2-member`) and the `custom.ac2_member_no` metafield holding the AC2
-MemberNo (Owner round 2, Q2), plus `custom.birthday_month` when AC2 has a
-DOB. Shopify requires a name, phone number or email address on
-`customerCreate` (shopify.dev, `customerCreate`, API 2026-10, read 21 October
-2026); the AC2 `Name` is always present (a member without a name is skipped
-and counted).
+Every `customerCreate` (S6 and `backfill-members`) sends exactly
+`firstName` (the whole AC2 `Name`), `email` (**required**: a usable email,
+trimmed; refused before the send without one), `phone` (E.164, only when the
+member has a usable phone), the tags (`ac2-member`, plus `ac2-backfill` in
+the backfill only) and the metafields: `custom.ac2_member_no` holding the
+AC2 MemberNo (Owner round 2, Q2), plus the birthday month when AC2 has a DOB.
+#155 BF2a: the birthday month is the English month NAME (`January` ..
+`December`, the store's choice list) when the configured type is
+`single_line_text_field` (live: `membership.birthday_month`), the number for
+`number_integer`. No consent, note, locale, address or tax key can be sent
+(the client refuses any other key), and the sync has no invite or any other
+mutation. A rejected create keeps only a classified code from the error's
+field path (`shopify_user_errors_email`, `_phone`, `_metafield`, `_other`),
+never the message.
 
 Till-created members reach the HQ ChangeLog about 15 minutes after creation
 (observed 1-72 minutes), so AC2 -> Shopify lags by at least that much.
@@ -439,11 +470,22 @@ Unknown keys, at the top level or nested, are refused.
 | `probe_wake_enabled` | `false` | #155 P2: the probe starts `\XB\XB-MemberSync` only when true (and the immediate path is on); otherwise it records "would wake" (P3 observe) |
 | `probe_max_wakes_per_day` | `60` | 1-240 task starts per Singapore day by the probe |
 | `backfill_registrations_enabled` | `false` | #155 slice BF1: the gate for `backfill-registrations --apply` (refused with `backfill_registrations_disabled` before any login, read or lock while off); a dry run needs no gate. Gates nothing else: `run`, `initial-link`, `status`, `digest`, `probe` and `check-config` behave exactly as before. Only in the backfill's own config copy, never in the 15-minute task's live config (see the backfill section) |
+| `backfill_members_enabled` | `false` | #155 slice BF2a: with `shopify_create_enabled`, the gate for `backfill-members --apply` (refused with `backfill_members_disabled` or `shopify_create_disabled` before any login, read or lock); a dry run needs neither. Gates nothing else. Only in the backfill's own config copy |
+| `shopify_create_member_types` | `["MEMBER", "GUEST"]` | #155 BF2a: the AutoCount member types linked to or created in Shopify (S6 and the backfill); 1-10 distinct type codes. Any other type, or a row with no type, is out of scope |
+| `backfill_members_lookups_per_call` | `50` | #155 BF2a: 1-200 members read in Shopify per `backfill-members` call (at most 2 reads each) |
 | `member_core_state_root` | `null` | #155 slice BF1: the member core's (#268) state root. When set, the backfill and `coverage` read its active claim links read-only (its ledger version must be 2, the one this module knows, else `member_core_ledger_version_unknown` before any decision; its meta must be the member core's, bound to the same book and store); a member is then linked if either ledger says so. A pair staff unlinked there is never linked by the backfill. `null`: not read, and the output says `"member_core_ledger": "not_configured"`. Must not be this sync's own `state_root` |
 
 Neither BF1 key is printed by `check-config` while it is absent or off, so
 its output is unchanged; when set it adds `backfill_registrations_enabled:
-true` or `member_core_state_root_set: true` (never the path).
+true` or `member_core_state_root_set: true` (never the path). The three BF2a
+keys likewise appear only when set to something other than their default.
+None of them is needed in the 15-minute task's live config (an older commit
+refuses unknown keys).
+
+`birthday_month_metafield`: the code default stays
+`custom.birthday_month` / `number_integer`; the live config (and the live
+example) is `membership.birthday_month` / `single_line_text_field` (13 Nov
+2026 fix), so creates send the month NAME.
 
 ## What stays switched off
 
@@ -455,6 +497,11 @@ true` or `member_core_state_root_set: true` (never the path).
   a dry run unless `-Register`), and no production run until step S1; no n8n.
 - The immediate path (`immediate_create_enabled`), probe wakes
   (`probe_wake_enabled`), and the probe task until step P3.
+- #155 BF2a: `backfill_members_enabled` and the `write_customers` scope.
+  S6 goes on only at the attended S6 sitting (design 6.4), and stays on
+  overnight only after BF2b (the daily summary then knows creates are on;
+  Controller Q2). The Forms "attached but not applied" alert Flow is a
+  separate owner-approved item (Controller Q3).
 
 ## Write safety
 
@@ -982,6 +1029,142 @@ then the next backfill pass links the customer; for no phone, get the number
 from the customer and key the member (the sync links it); for a legacy member
 or a shared phone, a person decides whether to key or link by hand.
 
+### Backfill of AutoCount members to Shopify (#155 slice BF2a, one-off)
+
+`backfill-members` brings every in-scope AutoCount member to Shopify: linked
+to the customer they already are, created (only with an email), or held for
+a person. It is attended and one-off; S6 (the live 15-minute run) uses the
+same create rules for new till members. BF2b (later) gives the daily summary
+"creates are on" and the backfill its own larger caps.
+
+**Who is in scope** (`shopify_create_member_types`, default `MEMBER` and
+`GUEST`): `IsActive` = `T`, and ExpiryDate blank, before 2001-01-01 (a
+placeholder) or today (Singapore date) or later. `Default`, any other type,
+inactive, expired, or a row without a type: counted only (the next pass
+picks a `Default` member up after the type move).
+
+**Rules, in order** (counts and masked refs; nothing doubtful is linked or
+created, a link is permanent):
+
+| # | Case | Result | Code |
+|---|---|---|---|
+| A1 | Linked in this ledger | count | `bf2_already_linked` |
+| A2 | Active member core claim | count | `bf2_claim_linked` |
+| A3 | Open write (INTENT, UNCERTAIN, DONE) | hold, never re-sent | `bf2_member_held_by_open_write` |
+| A4 | Out of scope | count | `bf2_out_of_scope_type`, `_inactive`, `_expired` |
+| A5 | No usable phone and no usable email | person | `bf2_no_contact` |
+| A6 | Email shared with another member (trim + casefold) | person | `bf2_email_shared_in_ac2` |
+| A8 | Both forms of the number are MemberNos (or two MemberNos with the same key) | person | `bf2_memberno_conflict` |
+| A7 | Phone shared with another member (the sync's phone rule) | person | `bf2_phone_shared_in_ac2` |
+| A9 | Name blank, over 255 characters or with a control character | person | `bf2_no_name` |
+| B1 | Phone on more than one customer | person | `bf2_phone_on_multiple_customers` |
+| B2/C1 | The customer found is linked to someone else (either ledger, or used earlier in this call) | person | `bf2_customer_linked_elsewhere` |
+| B3/C1 | Staff unlinked exactly this pair in the member core | person | `bf2_claim_pair_unlinked` |
+| B4/C3 | The customer to link has an open Shopify -> AC2 write (INTENT or UNCERTAIN), as `initial-link` and BF1 | hold, never linked meanwhile | `bf2_customer_held_by_open_write` |
+| B4 | One customer by phone, the two-word name rule matches | **link** | `bf2_linked` + `bf2_phone_and_name` (note `bf2_link_email_differs`) |
+| B5 | One customer by phone, another name | person; the email is not tried | `bf2_phone_other_name` |
+| C2 | Nobody by phone; the email customer has another phone | person | `bf2_email_customer_other_phone` |
+| C3 | Nobody by phone; one customer by email, the name rule matches | **link** | `bf2_linked` + `bf2_email_and_name` |
+| C4 | ... another name | person | `bf2_email_other_name` |
+| D1 | Nobody found, no usable email | count, never created (owner 12 Nov) | `bf2_phone_only_not_created` |
+| D2 | Nobody found, decline marker (or the row did not say) | never created | `bf2_declined_not_created` |
+| D3 | Nobody found, the member's uncertain create was settled in this call | wait for the next call | `bf2_member_linked_elsewhere` |
+| D4 | Nobody found, usable email | **create** | dry run `bf2_would_create`, apply `bf2_created` |
+| D5 | Shopify refused the create (nothing made) | hold, the call stops (exit 3) | `bf2_create_rejected` |
+| D6 | Outcome unknown | UNCERTAIN, never re-sent, the call stops (exit 3) | `bf2_create_uncertain` |
+
+A member with the decline marker found by B4 or C3 **is linked** (Controller
+Q1, 13 Nov 2026: the link writes nothing to Shopify; counted
+`bf2_declined_linked`). One rule in the code, `DECLINED_MEMBER_LINK_ALLOWED`.
+
+**Uncertain creates (design 2.8).** Before the send an INTENT row holds a
+salted digest of the name, email and phone. At the start of every applied
+call (and every live run) an UNCERTAIN create is read by the member's
+current email: found with the same digest and not linked: linked
+(`uncertain_write_found`); found with another identity: stays UNCERTAIN
+(`uncertain_write_identity_mismatch`); not found: stays UNCERTAIN for 60
+minutes, then settled as not made (`uncertain_write_settled_not_found`), and
+the member is created again only from the **next** call or run. Shopify
+keeps emails unique, so a retry after a wrong settle is refused
+(`bf2_create_rejected`), never a second customer.
+
+**Caps and stops.** `--max` 1 to `max_writes_per_run` creates a call; never
+more than 20 writes (all kinds) in any 60 minutes; at most
+`backfill_members_lookups_per_call` members read in Shopify a call. A file
+`STOP-backfill-members` (or BF1's `STOP`) in the sync's state root stops the
+call before the next member. Bounds and stop files exit 0 with `stopped`
+set; the cursor stays before the member. The run is stored as kind
+`backfill_members` with run id `bf2-...` (`coverage` reads only BF1's
+`backfill-` runs). No alert, counts only.
+
+**Dry run** (the default) writes nothing but its cursor. Its first call of a
+pass prints `population`: every member scanned, by class before any read;
+the classes add up to `scanned`. Resumable by MemberNo (trimmed,
+case-insensitive), one cursor per mode; a finished applied pass sets
+`backfill_members_completed_at`.
+
+#### The decline marker (for staff)
+
+When a member says they do not want to be in the online shop (or declined
+marketing), staff open the member in AutoCount (HQ Member maintenance) and
+**add** `XB-NO-SHOPIFY` at the end of the Note, after a space or a new line.
+Never clear or edit the existing Note text. Any case is read. The tools read
+only a 0/1 flag computed inside AutoCount's own SQL; the Note text never
+leaves AutoCount. A marked member is never created in Shopify (backfill or
+S6); one who already made their own Shopify account may still be linked to
+it. Marked after a create: the owner deletes the customer by hand in the
+Shopify admin (possible while it has no orders); the link row stays.
+Unverified (VM read-only check, design 6.1): that Note is editable where
+staff work and that a till-typed Note reaches HQ.
+
+#### Procedure (attended, owner OK for each step; design section 6)
+
+Before any create (no build needed): the read-only webhook check, the
+decline-marker check and staff briefing, and the owner's test mailbox and
+phone for the probe (design 6.1).
+
+1. **Dry run** (after this slice is merged): a fresh VM clone at the merged
+   commit, its own config copy (the live config plus
+   `member_core_state_root`; `backfill_members_enabled` false), both tasks
+   paused, BF1's batches finished first (its links change these answers).
+   `backfill-members --config <copy>` until `complete` is true. Check that
+   `population` adds up to the member count; read the would-link,
+   would-create and hold counts; masked refs on the VM screen only.
+2. **Move the live task** to the merged BF2b commit (its own VM step; all
+   switches as now): backup config, `check-config`, one run by hand, two
+   scheduled runs clean, digest.
+3. **S6 sitting, owner present** (after BF2b): pause `XB-MemberSync`,
+   `XB-MemberBenefits` and the tagging task; re-check the Flow list has
+   nothing on "Customer created"; add `write_customers` to **XB AutoCount
+   Member Sync** (new app version, approve); live config
+   `shopify_create_enabled: true` (backup first); `check-config`.
+4. **P0 probe:** the test-book config (its own ledger, same store), one
+   fake test-book member with the owner's test email and phone:
+   `backfill-members --apply --max 1`. In the admin within 5 minutes: first
+   name, email, phone, tags `ac2-member` + `ac2-backfill`, MemberNo
+   metafield, birthday month shown as a month NAME, email and SMS "not
+   subscribed", not invited, timeline with no email sent, one "MG member
+   dates" Flow run ending "None", nothing in the test mailbox after 30
+   minutes. Delete the probe customer by hand. Pass needed before step 5.
+5. **P1 pilot of 3:** the backfill copy with `backfill_members_enabled:
+   true` and `shopify_create_enabled: true`, `--apply --max 1`, three calls
+   (the first three would-creates in MemberNo order, not hand-picked). Each
+   checked in the admin as P0 (timeline and Flow runs).
+6. Resume the three tasks (S6 is live). Watch the next run, then
+   `digest --hours 1` after about an hour.
+7. **Batches:** tasks paused, `--apply --max 5`, at most 4 calls in a clock
+   hour (BF2a caps; BF2b raises them), stop file ready; any exit 3: stop and
+   look. End each sitting with headroom (the live run's own creates count in
+   the same hour). Digest after each sitting.
+8. **Done:** `backfill_members_enabled` false in the copy; one more dry run
+   shows only named exceptions; the person list goes to the owner weekly.
+
+**Rollback at any point:** `shopify_create_enabled` false AND remove
+`write_customers` together (one alone makes every run refuse on scope,
+`shopify_token_scope_not_expected`: safe but stopped). Customers the
+backfill made carry the tag `ac2-backfill` and can be deleted by hand while
+they have no orders.
+
 ### Releasing a customer held by an open write
 
 There is no release command (checked at `017ec98`): the CLI has only
@@ -1115,7 +1298,7 @@ and `tests/test_member_sync_bridge_ps.py`.
 | S3 | `initial_link_enabled` true, `initial-link --apply` until complete, back to false | OK-2 "INITIAL LINK" (may be merged with OK-3, Q8) | `initial_link_linked` = the last dry run's would-link; one linked member unchanged in AutoCount | Before S5 only: archive the live ledger and redo S1-S3 (no external effect). After S5, never delete the live ledger |
 | S4 | Shadow schedule: `changelog_xml_column` `"Content"`, installer dry run (no `-Register`) output reviewed, one manual `run --direction both` as the task account, then `-Register` | OK-3 "SHADOW SCHEDULE" | 3 scheduled runs with result 0 or 3 and only expected alerts (`waiting_for_staff` counts, `sign_up_past_cutoff_create_disabled`, `no_phone_sign_up_needs_staff`, `memberno_*`, `ac2_pending_would_create_backlog`); 0 writes; `digest` readable and its `runs.duration_seconds_max` well under 600 s (above about 300 s: lower `max_pending_rechecks_per_run` first, "Schedule" below); then at least 2 days in shadow | Disable `\XB\XB-MemberSync` in Task Scheduler |
 | S5 | `max_writes_per_run` 1 and `ac2_create_enabled` true before a 06:00 run; check the first create in AutoCount and at one till; then `max_writes_per_run` 5 | OK-4 "AC2 CREATES" (never merged) | First create correct (MemberNo, type = `ac2_create_member_type`, live `GUEST`, name, mobile, DOB, RegisterDate, no ExpiryDate) and seen at a till; no `uncertain` write; `created_after_wait` raised; no duplicate next run | `ac2_create_enabled` false (next run). A wrong record is fixed or deleted by the Owner in AutoCount; the sync has no update or delete |
-| S6 | In one sitting: Owner adds `write_customers`; the Q3/Q9 probe through the TEST book (one fake member, real `customerCreate`, deleted straight after); production `shopify_create_enabled` true | OK-5 "SHOPIFY CREATES" (never merged) | Probe customer accepted with first name only; a second customer with the same phone refused by Shopify; first production create checked in admin | `shopify_create_enabled` false AND remove `write_customers` (with only one of them every run refuses on scope, `shopify_token_scope_not_expected`, which is safe but stops the sync) |
+| S6 | (#155 BF2a: superseded by the BF2a procedure, P0/P1, after BF2b; this row is rewritten in BF2b.) In one sitting: Owner adds `write_customers`; the Q3/Q9 probe through the TEST book (one fake member, real `customerCreate`, deleted straight after); production `shopify_create_enabled` true | OK-5 "SHOPIFY CREATES" (never merged) | Probe customer accepted with first name only; a second customer with the same phone refused by Shopify; first production create checked in admin | `shopify_create_enabled` false AND remove `write_customers` (with only one of them every run refuses on scope, `shopify_token_scope_not_expected`, which is safe but stops the sync) |
 | S7 | Hypercare, 14 days: `digest --hours 24` and `status` daily, masked counts and `runs.duration_seconds_max` to the Controller | none (read-only) | No action-needing alert left open; `duration_seconds_max` stays under about 300 s (else lower `max_pending_rechecks_per_run`) | Disable the task after two non-0/3 results in a row |
 | P3 | Probe in observe mode, after S5 has passed: VM clone to the merged #155 P1+P2 SHA, the probe task registered with `probe_wake_enabled` false, 3 days ("Immediate create (after S5)" below) | "PROBE OBSERVE" | Would-wake times match real sign-ups (one `would_wake` per new sign-up, within about 2 minutes of it); no wake storm (fewer than about 3 per sign-up, digest `probe.days`); the probe finishes in under 10 s; no AutoCount session from the probe in AutoCount's logged-in users list; the main task unchanged | Disable `\XB\XB-MemberSync-Probe` |
 | P4 | Immediate creates: staff briefed on the procedure below first; blocker A6 cleared; the A5 test-book UAT passed (one immediate create, plus a duplicate-MemberNo save in the HQ screen, which AutoCount must refuse); `immediate_create_enabled` and `probe_wake_enabled` true, window `all_day`, caps 6 and 144; 7 days | "IMMEDIATE CREATES" (never merged with OK-4 or OK-5) | 7 days: digest `create_latency_seconds.p95` at most 120 (sign-up to HQ create at most 2 minutes); every counter case seen at the till, with its time recorded; 0 till-side duplicate MemberNos; no `uncertain_*`; the Owner's session never signed out; caps never hit by real traffic (`caps.create_rate_capped` 0) | Any of the three off switches below |
@@ -1342,7 +1525,7 @@ prove each (`tests/test_member_sync_daily_summary.py`).
 | `digest_failed` | `digest` refused or did not answer |
 | `no_runs` | No completed run in 24 hours, with the digest readable. A dead sync must not read CLEAN. |
 | `unfinished_runs` | More than 1 unfinished run in 24 hours |
-| `shopify_write` | Any Shopify write: every outcome code of the sync's one Shopify mutation that means a create was sent (`shopify_customer_created`, `shopify_separate_customer_created_without_phone`, `shopify_create_uncertain`). A test reads `xb_member_sync.py` and fails if it counts a create outcome that is not on this list. |
+| `shopify_write` | Any Shopify write: every outcome code of the sync's one Shopify mutation that means a create was sent (`shopify_customer_created`, `shopify_create_uncertain`; #155 BF2a removed the "without phone" code with its path). A test reads `xb_member_sync.py` and fails if it counts a create outcome that is not on this list. |
 | `uncertain_writes` | Uncertain writes open |
 | `possible_duplicate_member` | The alert, any count |
 | `member_type_unknown` | The alert, any count |
@@ -1613,7 +1796,13 @@ python directlocal\xb_member_sync.py digest --config <config> [--hours 24]
 python directlocal\xb_member_sync.py probe --config <config>
 python directlocal\xb_member_sync.py backfill-registrations --config <config> [--apply] [--max N]
 python directlocal\xb_member_sync.py coverage --config <config>
+python directlocal\xb_member_sync.py backfill-members --config <config> [--apply] [--max N]
 ```
+
+`backfill-members` (#155 slice BF2a) is described in "Backfill of AutoCount
+members to Shopify" above. It exits 0, or 3 when an operator must look
+before the next call (`bf2_create_uncertain`, `bf2_create_rejected`,
+`bf2_read_incomplete`), or 2 when refused.
 
 `backfill-registrations` and `coverage` (#155 slice BF1) are described in
 "Backfill of older sign-ups" above. `backfill-registrations` exits 0, or 3

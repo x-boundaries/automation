@@ -94,7 +94,7 @@ class SqlPlaceholderStaticTests(unittest.TestCase):
         bridge = BRIDGE.read_text(encoding="utf-8")
         # sync-lookup: each condition adds exactly as many parameters as "?".
         lines = [line for line in bridge.splitlines() if "$conditions +=" in line]
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), 7)  # BF2a: + the email condition
         for line in lines:
             with self.subTest(line=line.strip()):
                 literal = _PS_STRING_RE.search(line).group(0)
@@ -139,7 +139,42 @@ ALLOWED_SQL_TEXTS = {
     "changelog_max_id": "SELECT ISNULL(MAX(ID), 0) FROM ChangeLog",
     # Go-live R7 (Owner Q7, SCOPE-CONFIRMED 29 Oct 2026): exactly one parameter.
     "member_type_exists": "SELECT COUNT_BIG(*) FROM MemberType WHERE MemberType = ?",
+    # #155 BF2a sync-member-scan: one parameter (the MemberNo cursor); Note
+    # only inside the 0/1 decline flag.
+    "sync_member_scan": (
+        "SELECT (SELECT TOP 1000 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
+        "CONVERT(varchar(10), DOB, 23) AS dob, MemberType AS member_type, IsActive AS is_active, CONVERT(varchar(10), ExpiryDate, 23) AS expiry_date, "
+        "CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify "
+        "FROM Member WHERE MemberNo > ? ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
+    ),
 }
+NO_SHOPIFY_FLAG = "CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify"
+
+
+_SCAN = None  # filled below from ALLOWED_SQL_TEXTS
+
+
+def scan_variants() -> list[str]:
+    """#155 BF2a T8 / M22: every way the scan text could be widened or read
+    Note out: another column, Note selected, another TOP, another WHERE, a
+    second condition, the flag without the CAST, trailing space."""
+
+    scan = ALLOWED_SQL_TEXTS["sync_member_scan"]
+    return [
+        scan.replace("AS no_shopify ", "AS no_shopify, Note AS note "),
+        scan.replace("Name AS name, ", "Name AS name, Note AS note, "),
+        scan.replace("Name AS name, ", "Name AS name, CAST(Note AS nvarchar(max)) AS note, "),
+        scan.replace("TOP 1000", "TOP 1001"),
+        scan.replace("TOP 1000", "TOP 100000"),
+        scan.replace("WHERE MemberNo > ?", "WHERE MemberNo >= ?"),
+        scan.replace("WHERE MemberNo > ?", "WHERE MemberNo > ? OR 1 = 1"),
+        scan.replace("WHERE MemberNo > ?", "WHERE MemberNo > ? AND MemberType = 'MEMBER'"),
+        scan.replace("CAST(Note AS nvarchar(max))", "Note"),
+        scan.replace("THEN 1 ELSE 0", "THEN Note ELSE 0"),
+        scan.replace("ORDER BY MemberNo", "ORDER BY Name"),
+        scan + " ",
+        scan.replace("Name AS name, ", "Name AS name, Password AS password, "),
+    ]
 
 
 def changelog_sql(limit, column: str = "Content") -> str:
@@ -151,14 +186,23 @@ LOOKUP_KEY = "UPPER(LTRIM(RTRIM(MemberNo))) = ?"
 LOOKUP_MOBILE = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '') = ?"
 LOOKUP_EMBEDDED = "CHARINDEX(?, MemberNo) > 0"
 LOOKUP_NUMBER = "UPPER(LTRIM(RTRIM(MemberNo))) = UPPER(LTRIM(RTRIM(?)))"
+LOOKUP_EMAIL = "LOWER(LTRIM(RTRIM(EmailAddress))) = LOWER(?)"  # #155 BF2a, alone only
 
 
 # Round 7 (Owner-approved, 22 Oct 2026): the one change to the book guard is
 # CreatedTime in this lookup (Singapore local time, no offset, VM fact G0).
+# #155 BF2a: + MemberType, IsActive, ExpiryDate and the 0/1 decline flag.
 LOOKUP_PREFIX = ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
-                 "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE ")
+                 "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time, "
+                 "MemberType AS member_type, IsActive AS is_active, CONVERT(varchar(10), ExpiryDate, 23) AS expiry_date, "
+                 "CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify FROM Member WHERE ")
+LOOKUP_PREFIX_BEFORE_BF2A = ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
+                             "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time FROM Member WHERE ")
 LOOKUP_PREFIX_BEFORE_R7 = ("SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, "
                            "CONVERT(varchar(10), DOB, 23) AS dob FROM Member WHERE ")
+
+
+SCAN_VARIANTS = scan_variants()
 
 
 def lookup_sql(conditions, prefix: str = LOOKUP_PREFIX) -> str:
@@ -291,6 +335,16 @@ class SqlAllowlistGuardTests(unittest.TestCase):
             # Round 7: the lookup without CreatedTime is no longer allowlisted.
             (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE], LOOKUP_PREFIX_BEFORE_R7), ("1", "2")),
             (lookup_sql([LOOKUP_NUMBER], LOOKUP_PREFIX_BEFORE_R7), ("1",)),
+            # #155 BF2a: the lookup without the scope columns is no longer allowlisted;
+            # the email condition only alone; the scan text only exactly.
+            (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE], LOOKUP_PREFIX_BEFORE_BF2A), ("1", "2")),
+            (lookup_sql([LOOKUP_EMAIL], LOOKUP_PREFIX_BEFORE_BF2A), ("1",)),
+            (lookup_sql([LOOKUP_EMAIL, LOOKUP_NUMBER]), ("1", "2")),
+            (lookup_sql([LOOKUP_NUMBER, LOOKUP_EMAIL]), ("1", "2")),
+            (lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_EMAIL]), ("1", "2", "3")),
+            (lookup_sql([LOOKUP_EMAIL, LOOKUP_EMAIL]), ("1", "2")),
+            (lookup_sql([LOOKUP_EMAIL.replace("LOWER(?)", "?")]), ("1",)),
+            *[(text, ("1",)) for text in SCAN_VARIANTS],
         ], "vendor_query_not_allowlisted")
 
     def test_every_allowlisted_text_runs(self):
@@ -299,6 +353,7 @@ class SqlAllowlistGuardTests(unittest.TestCase):
         cases += [(changelog_sql(limit, column), ("1",)) for limit in (1, 200, 1000) for column in ("Content", "XmlData")]
         cases += [(lookup_sql(conditions), ("1",) * sum(c.count("?") for c in conditions)) for conditions in (
             phone, sg_local, phone + sg_local, [LOOKUP_NUMBER], [LOOKUP_NUMBER] * 20, phone + sg_local + [LOOKUP_NUMBER] * 20,
+            [LOOKUP_EMAIL],  # #155 BF2a
         )]
         out = self.run_guard(cases)
         for (sql, _params), result in zip(cases, out["results"]):
@@ -372,9 +427,34 @@ class LookupCreatedTimeStaticTests(unittest.TestCase):
         self.assertNotIn(LOOKUP_PREFIX_BEFORE_R7, guard)
         bridge = BRIDGE.read_text(encoding="utf-8")
         body = bridge.split("function Invoke-XbDirectLocalSyncLookup", 1)[1].split("\nfunction ", 1)[0]
-        self.assertEqual("".join(literal[1:-1] for literal in _PS_STRING_RE.findall(body) if "AS member_no" in literal or "AS dob" in literal), LOOKUP_PREFIX)
+        self.assertEqual("".join(literal[1:-1] for literal in _PS_STRING_RE.findall(body)
+                                 if "AS member_no" in literal or "AS dob" in literal or "AS member_type" in literal or "AS no_shopify" in literal), LOOKUP_PREFIX)
         self.assertEqual(guard.count("CreatedTime"), 1)
         self.assertEqual(guard.count(CHANGELOG_PATTERN_LINE + "\n"), 1)  # the ChangeLog read is unchanged
+
+
+class DeclineMarkerStaticTests(unittest.TestCase):
+    """#155 BF2a T8: AutoCount's Note column is read only inside the pinned
+    0/1 decline flag, in both the guard and the bridge; no output field
+    carries it."""
+
+    def test_note_is_only_read_inside_the_flag(self):
+        for path in (GUARD, BRIDGE):
+            code = "\n".join(line for line in path.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#"))
+            literals = "".join(literal[1:-1] for literal in _PS_STRING_RE.findall(code))
+            with self.subTest(path=path.name):
+                self.assertEqual(len(re.findall(r"\bNote\b", literals)), literals.count("CAST(Note AS nvarchar(max))"))
+                self.assertEqual(literals.count("CAST(Note AS nvarchar(max))"), literals.count(NO_SHOPIFY_FLAG.split(" THEN")[0]))
+                self.assertNotRegex(literals, r"(?i)\bAS note\b")
+        self.assertEqual(ALLOWED_SQL_TEXTS["sync_member_scan"].count("Note"), 1)
+        self.assertIn(NO_SHOPIFY_FLAG, ALLOWED_SQL_TEXTS["sync_member_scan"])
+        self.assertIn(NO_SHOPIFY_FLAG, LOOKUP_PREFIX)
+        self.assertEqual(LOOKUP_PREFIX.count("Note"), 1)
+
+    def test_the_marker_word_is_sql_safe(self):
+        # No "?" (AutoCount's parameter rewrite), "[", "%" or quote in the marker.
+        self.assertIsNone(re.search(r"[?\[%'\"]", "XB-NO-SHOPIFY"))
+        self.assertEqual(sync.BF2_BACKFILL_TAG, "ac2-backfill")
 
 
 class SqlAllowlistAsciiStaticTests(unittest.TestCase):
@@ -383,6 +463,7 @@ class SqlAllowlistAsciiStaticTests(unittest.TestCase):
         # only U+0020-U+007E, so U+0020 is the only whitespace (no tab, CR or LF).
         texts = list(ALLOWED_SQL_TEXTS.values()) + [changelog_sql(1000, "Content")]
         texts.append(lookup_sql([LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_KEY, LOOKUP_MOBILE, LOOKUP_EMBEDDED] + [LOOKUP_NUMBER] * 20))
+        texts.append(lookup_sql([LOOKUP_EMAIL]))  # #155 BF2a
         for text in texts:
             with self.subTest(text=text[:60]):
                 self.assertRegex(text, r"\A[\x20-\x7E]+\Z")
@@ -584,6 +665,81 @@ class SyncBridgeTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 self.assertEqual(run_direct_offline(operation, request, "-TargetBook", "AED_XBOUNDARIES", temp=self.temp), (1, {"error": error}))
 
+    # -- #155 BF2a: sync-member-scan and the email-only lookup ----------------------
+    SCAN_ROWS = [
+        {"member_no": "A0001", "name": "Alpha Tester", "mobile_phone": None, "email_address": "a1@example.com", "dob": "1990-03-04",
+         "member_type": "MEMBER", "is_active": "T", "expiry_date": None, "no_shopify": 0},
+        {"member_no": "A0002", "name": "Bravo Tester", "mobile_phone": None, "email_address": None, "dob": None,
+         "member_type": "GUEST", "is_active": "F", "expiry_date": "2026-12-31", "no_shopify": 1},
+    ]
+
+    def test_member_scan_is_one_pinned_parameterised_read(self):
+        self.set_state(lookup_json=json.dumps(self.SCAN_ROWS))
+        code, out, proc = self.run_bridge("sync-member-scan", {"after_member_no": "A0000"})
+        self.assertEqual((code, out), (0, {"members": self.SCAN_ROWS}))
+        state = self.fake()
+        self.assertEqual(state["sql"], [ALLOWED_SQL_TEXTS["sync_member_scan"]])
+        params = state["params"][0]
+        self.assertEqual(params if isinstance(params, list) else [params], ["A0000"])
+        self.assertNotIn(b"note", proc.stdout.lower().replace(b"no_shopify", b""))  # the Note text never leaves
+        self.assertEqual(state["saves"], 0)
+        # The first page: an empty cursor.
+        self.set_state(lookup_json="")
+        self.assertEqual(self.run_bridge("sync-member-scan", {"after_member_no": ""})[:2], (0, {"members": []}))
+
+    def test_member_scan_refusals(self):
+        for request in ({"after_member_no": None}, {"after_member_no": 1}, {"after_member_no": "x" * 41}, {"after_member_no": "A\u0001"}, {}):
+            with self.subTest(request=ascii(request)):
+                self.assertEqual(self.run_bridge("sync-member-scan", request)[:2], (1, {"error": "member_no_invalid"}))
+        self.assertEqual(self.fake()["sql"], [])
+        self.set_state(db_throws=True)
+        code, out, proc = self.run_bridge("sync-member-scan", {"after_member_no": ""})
+        self.assertEqual((code, out), (1, {"error": "sync_lookup_failed"}))
+        self.assertNotIn(b"vendor sql failure", proc.stdout)
+
+    def test_lookup_returns_the_scope_columns_and_the_flag(self):
+        rows = [dict(self.SCAN_ROWS[0], member_no=sg(9), created_time=None)]
+        self.set_state(lookup_json=json.dumps(rows))
+        code, out, _ = self.run_bridge("sync-lookup", {"phone_digits": sg(9), "sg_local": None, "member_nos": []})
+        self.assertEqual((code, out), (0, {"members": rows}))
+        self.assertTrue(self.fake()["sql"][0].startswith(LOOKUP_PREFIX))
+
+    def test_lookup_by_email_alone(self):
+        self.set_state(lookup_json="")
+        code, out, _ = self.run_bridge("sync-lookup", {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": "Alpha@Example.com"})
+        self.assertEqual((code, out), (0, {"members": []}))
+        state = self.fake()
+        self.assertEqual(state["sql"], [lookup_sql([LOOKUP_EMAIL])])
+        params = state["params"][0]
+        self.assertEqual(params if isinstance(params, list) else [params], ["Alpha@Example.com"])
+        for request in (
+            {"phone_digits": sg(9), "sg_local": None, "member_nos": [], "email_address": "a@example.com"},
+            {"phone_digits": None, "sg_local": None, "member_nos": ["A1"], "email_address": "a@example.com"},
+            {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": "not-an-email"},
+            {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": "a b@example.com"},
+            {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": "a@b@example.com"},
+            {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": "x" * 250 + "@example.com"},
+            {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": 5},
+        ):
+            with self.subTest(request=ascii(request)):
+                self.assertEqual(self.run_bridge("sync-lookup", request)[:2], (1, {"error": "phone_keys_invalid"}))
+
+    def test_python_client_member_scan_and_email_lookup(self):
+        self.set_state(lookup_json=json.dumps(self.SCAN_ROWS))
+        client = sync.SyncBridgeClient(self.command(), autocount_book="AED_TESTINGAPI", claims=self.claims, deadline_seconds=60)
+        client.autocount_book = None  # the marked fake host takes no -TargetBook (test-only)
+        members = client.member_scan("")
+        self.assertEqual([(m.member_no, m.member_type, m.is_active, m.expiry_date, m.no_shopify) for m in members],
+                         [("A0001", "MEMBER", "T", None, False), ("A0002", "GUEST", "F", "2026-12-31", True)])
+        self.assertEqual(len(client.lookup(None, [], email="a1@example.com")), 2)
+        with self.assertRaises(dl.DirectLocalError):
+            client.lookup(sg(9), [], email="a1@example.com")
+
+    def test_live_book_member_scan_passes_the_book_guard(self):
+        # Go-live: admitted on the live book, then stopped at the host pin (never the VM here).
+        self.assertEqual(run_direct_offline("sync-member-scan", {"after_member_no": ""}, "-TargetBook", "AED_XBOUNDARIES", temp=self.temp),
+                         (1, {"error": "host_not_authorised"}))
+
     def test_python_client_end_to_end(self):
         rows = [{"member_no": sg(6), "name": "Alpha Tester", "mobile_phone": sg(6), "email_address": None, "dob": None}]
         self.set_state(lookup_json=json.dumps(rows), changelog_json=json.dumps([{"id": 5, "xml": "<Member/>"}]), max_id=9)
@@ -608,7 +764,8 @@ LIVE_BOOK = "AED_XBOUNDARIES"
 TEST_BOOK = "AED_TESTINGAPI"
 PINNED_HOST = "DESKTOP-4I042L6"
 ADAPTER = ROOT / "scripts" / "ac2_member_gateway_autocount_adapter.ps1"
-ALL_OPERATIONS = ("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog")
+ALL_OPERATIONS = ("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog",
+                  "sync-member-scan")
 
 
 def lookalikes(name: str) -> list[str]:
@@ -711,6 +868,12 @@ class GoLivePsMatrixTests(unittest.TestCase):
 
     def test_row_B2_live_book_sync_lookup_is_admitted(self):
         self.assert_codes([self.book(LIVE_BOOK, "sync-lookup")], ["ok"])
+
+    def test_bf2a_live_book_sync_member_scan_is_admitted_as_a_read(self):
+        # #155 BF2a: admitted like sync-lookup (no profile); never with a write profile's meaning.
+        self.assert_codes([self.book(LIVE_BOOK, "sync-member-scan"), self.book(LIVE_BOOK, "sync-member-scan", "sync_p1"),
+                           self.book(LIVE_BOOK, "Sync-Member-Scan"), self.book(LIVE_BOOK, "sync-member-scan ")],
+                          ["ok", "ok", "production_book_not_authorised", "production_book_not_authorised"])
 
     def test_row_B3_live_book_sync_changelog_is_admitted(self):
         self.assert_codes([self.book(LIVE_BOOK, "sync-changelog")], ["ok"])
