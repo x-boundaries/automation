@@ -7107,6 +7107,7 @@ class Bf2bCapTests(Bf2TestCase):
         engine.summary.writes = 8
         self.assertEqual(engine._bf2_one(self.ac2.members[0], None, set(), apply=True, creates=0, max_creates=8), "backfill_max_reached")
         self.assertEqual(self.shopify.created, [])
+        self.assertNotIn("max_writes_per_run_reached", engine.summary.counts)  # stopped before the create path
 
     def test_the_spend_check_uses_the_call_cap_in_backfill_mode_only(self):
         engine = self.engine(**BF2_KEYS, max_writes_per_run=2, **BF2B_CAPS)
@@ -7400,6 +7401,19 @@ class Bf2bS6Tests(SyncTestCase):
         self.run_sync("ac2_to_shopify")
         self.assertEqual(self.pending("TILLP7"), ("SKIPPED", "ac2_phone_shared_in_ac2"))
 
+    def test_a_lookup_row_that_is_not_a_phone_hit_is_not_shared(self):
+        # The bridge's phone lookup may return more rows than the sync's phone rule accepts.
+        self.walk_in("TILLP11", phone=local(11), email=em(11))
+        real = self.ac2.lookup
+
+        def lookup(phone_digits, member_nos, *, email=None):
+            rows = real(phone_digits, member_nos, email=email)
+            return rows + [ac2m("OTHER11", phone=local(12))] if phone_digits else rows
+
+        self.ac2.lookup = lookup
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.pending("TILLP11"), ("DONE", "shopify_customer_created"))
+
     def test_an_unshared_phone_and_an_email_only_member_are_created(self):
         self.walk_in("TILLP8", phone=local(8), email=em(8))
         self.walk_in("TILLP9", email=em(9))
@@ -7500,6 +7514,18 @@ class Bf2bDigestTests(SyncTestCase):
                                 "writes_per_hour_max": 6, "live_writes_per_hour_max": 2})
         self.assertEqual(self.digest()["creates"]["writes_per_hour_max"], 8)  # the total is unchanged
         self.assert_no_pii(part)
+
+    def test_only_bf2_runs_count_and_hours_are_kept_apart(self):
+        hour = self.now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=6)
+        self.stored_run("backfill-x", hour, hour + timedelta(minutes=2), {"ac2_member_created": 1})  # BF1's run kind: not a BF2 call
+        _insert_writes(self.ledger, 1, hour + timedelta(minutes=1), prefix="bf1")
+        self.stored_run("bf2-a", hour + timedelta(minutes=10), hour + timedelta(minutes=12), {"shopify_customer_created": 3})
+        _insert_writes(self.ledger, 3, hour + timedelta(minutes=11), prefix="a")
+        self.stored_run("bf2-b", hour + timedelta(hours=1, minutes=10), hour + timedelta(hours=1, minutes=12), {"shopify_customer_created": 2})
+        _insert_writes(self.ledger, 2, hour + timedelta(hours=1, minutes=11), prefix="b")
+        part = self.digest()["backfill_members"]
+        self.assertEqual((part["calls"], part["creates"], part["writes"]), (2, 5, 5))
+        self.assertEqual((part["writes_per_call_max"], part["writes_per_hour_max"], part["live_writes_per_hour_max"]), (3, 3, 1))
 
     def test_a_call_that_has_not_finished_owns_the_writes_until_now(self):
         self.stored_run("bf2-c", self.now - timedelta(minutes=10), None, {})

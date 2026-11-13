@@ -1260,6 +1260,15 @@ class Bf2bDecisionTests(SummaryTestCase):
         event = self.run_with(creates_digest(created=41, backfill=backfill_part(), hour_max=41), expected=False, window=dict(WINDOW))
         self.assertEqual((event["stop_reasons"], event["auto_off_reasons"]), (["shopify_write"], ["shopify_write_while_disabled"]))
 
+    def test_a_live_create_while_not_expected_stops_even_with_the_switch_on(self):
+        event = self.run_with(creates_digest(created=41, backfill=backfill_part(), hour_max=41), expected=False, window=dict(WINDOW),
+                              config=config_fixture(shopify_create_enabled=True))
+        self.assertEqual((event["stop_reasons"], event["auto_off"]), (["config_unexpected", "shopify_write"], "off"))
+
+    def test_outside_a_window_the_live_hours_include_the_backfill(self):
+        digest = creates_digest(created=41, backfill=backfill_part(live_writes_per_hour_max=1), hour_max=41)
+        self.assertEqual(self.run_with(digest, expected=True)["stop_reasons"], ["shopify_write", "writes_over_cap"])
+
     def test_backfill_outside_a_declared_window_stops(self):
         digest = creates_digest(created=41, backfill=backfill_part(), hour_max=41)
         for window in (None, {**WINDOW, "from": "2026-11-08", "to": "2026-11-10"}, {**WINDOW, "from": "2026-10-30", "to": "2026-11-05"}):
@@ -1285,6 +1294,8 @@ class Bf2bDecisionTests(SummaryTestCase):
                 part = backfill_part(**change)
                 digest = creates_digest(created=41, rejected=part["rejected"], uncertain=part["uncertain"], backfill=part, hour_max=41)
                 self.assertEqual(self.run_with(digest, expected=True, window=dict(WINDOW))["stop_reasons"], ["shopify_write"])
+                # The backfill's own outcome, not a live one.
+                self.assertEqual(self.record["creates"]["live"], {"created": 1, "uncertain": 0, "rejected": 0})
 
     def test_backfill_over_its_declared_caps_stops(self):
         window = {**WINDOW, "max_per_call": 20, "max_per_hour": 40}
