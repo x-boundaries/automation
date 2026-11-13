@@ -350,7 +350,7 @@ class Base(unittest.TestCase):
     # Fix round 1 of slice B1 (G2 L2): the values of the keys slice B1 added,
     # written out here (never taken from the tool): fixed words for the text
     # keys, whole numbers for the counts, true or false for the match.
-    NEW_KEY_TEXTS = {"finding": ("as_intended", "not_as_intended"), "receipt_now": ("applied", "held", "left_decided"),
+    NEW_KEY_TEXTS = {"finding": ("as_intended", "not_as_intended"), "receipt_now": ("applied", "held", "left_decided", "left_open"),
                      "reason": ("wrong_person", "customers_merged", "member_renumbered", "other"), "link_source": ("order", "index")}
     NEW_KEY_NUMBERS = ("held_writes_left", "held_writes", "claim_links", "claim_links_voided")
 
@@ -3903,10 +3903,12 @@ class UnlinkTests(Base):
                      lambda: self.by_order(order_ref, "1234"), lambda: self.by_order(order_ref, last3, "mistake"),
                      lambda: self.by_order(order_ref, last3, accept_applied="yes")):
             self.refused(call, "unlink_arguments_invalid")
-        # An unknown or malformed o- ref names no receipt.
-        for bad in ("o-" + "0" * 20, "o-" + order_ref[2:-1], order_ref + "\n", order_ref.upper(), ref, "", "o-"):
+        # A well-formed unknown o- ref names no receipt.
+        self.refused(lambda: self.by_order("o-" + "0" * 20, last3), "unlink_not_a_claim_link")
+        # Slice B2 (B2-10, Controller answer Q4): a malformed o- ref is refused as an argument, as a malformed c- ref is.
+        for bad in ("o-" + order_ref[2:-1], order_ref + "\n", order_ref.upper(), ref, "", "o-"):
             with self.subTest(bad=bad):
-                self.refused(lambda: self.by_order(bad, last3), "unlink_not_a_claim_link")
+                self.refused(lambda: self.by_order(bad, last3), "unlink_arguments_invalid")
         # The last 3 are compared exactly (G2 N13), and a wrong one refuses.
         for short in (member_no[-2:], member_no[-1:], "999" if last3 != "999" else "998"):
             with self.subTest(short=short):
@@ -4584,6 +4586,108 @@ class B2DigestProbeTests(Base):
                 self.assertEqual(ReleaseHeldTests.recorded(self), before)
         self.probe_result = "exited"
         self.assertEqual(self.release(ref, member_no[-3:], "as_intended")["receipt_now"], "applied")
+
+
+class B2ReleaseUnlinkTests(Base):
+    """Slice B2 (G0 B2-9, B2-10): ``left_open`` and the late settle of a
+    ready receipt behind a released HELD write; malformed refs."""
+
+    run_main = CliTests.run_main
+    held = ReleaseHeldTests.held
+    release = ReleaseHeldTests.release
+    claimed = UnlinkTests.claimed
+    by_order = UnlinkTests.by_order
+    unlink = UnlinkTests.unlink
+
+    def recorded(self) -> tuple:
+        return UnlinkTests.recorded(self) + ReleaseHeldTests.recorded(self)
+
+    def refused(self, call, code: str) -> None:
+        before = self.recorded()
+        self.assertEqual(self.code(call), code)
+        self.assertEqual(self.recorded(), before)
+
+    # -- B2-9 ----------------------------------------------------------------
+    def released_while_open(self, finding: str) -> tuple[str, str]:
+        ref, member_no = self.held()
+        self.ledger.update_receipt(order_gid(1), state="waiting_member", code=None)  # neither ready nor decided
+        if finding == "not_as_intended":
+            self.book.members[member_no].update(type="GUEST", expiry=None)
+        row = tuple(self.receipt(1))
+        dry = self.release(ref, member_no[-3:], finding, apply=False)
+        out = self.release(ref, member_no[-3:], finding)
+        for value in (dry, out):
+            self.assertEqual((value["receipt_now"], value["counts"]), ("left_open", {"release_receipt_left_open": 1}))
+        self.assertEqual(tuple(self.receipt(1)), row)  # left as it is
+        self.assertEqual(self.ledger.held_writes(), 0)
+        return ref, member_no
+
+    def late(self) -> dict:
+        self.ledger.update_receipt(order_gid(1), state="ready")  # ready again
+        reads, saves, writes = self.book.reads, self.book.saves, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("write_already_recorded"), out["counts"].get("release_receipt_settled_late"), out["saves"]), (1, 1, 0))
+        self.assertEqual((self.book.reads, self.book.saves, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]),
+                         (reads, saves, writes))
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "HELD")
+        return out
+
+    def test_b2_9_as_intended_a_receipt_ready_again_is_applied_late_and_a_later_refund_alerts(self):
+        ref, member_no = self.released_while_open("as_intended")
+        out = self.late()
+        self.assertIn({"ref": ref, "code": "release_receipt_settled_late", "member_no_masked": bm.mask(member_no)}, out["refs"])
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["code"], row["member_no"], row["basis_expiry_local"]), ("applied", "upgrade", member_no, NEW_EXPIRY))
+        self.advance(minutes=15)  # settled once: the next run leaves it
+        self.assertIsNone(self.engine().run(apply=True)["counts"].get("release_receipt_settled_late"))
+        self.shopify.add(order_node(1, status="REFUNDED", updated="2026-11-18T05:00:00Z"))
+        self.advance(minutes=15)
+        self.assertEqual(self.engine().run(apply=False)["alerts"], ["refund_on_basis"])
+
+    def test_b2_9_not_as_intended_a_receipt_ready_again_is_held_late(self):
+        self.released_while_open("not_as_intended")
+        self.late()
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "held_write_released"))
+        self.assertEqual(self.book.members[sg(1)]["type"], "GUEST")
+
+    def test_b2_9_an_unreleased_held_write_settles_nothing_and_left_decided_stays_for_decided_receipts(self):
+        ref, member_no = self.held()
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)  # observe: the HELD write is not released yet
+        self.assertEqual((out["counts"].get("write_already_recorded"), out["counts"].get("release_receipt_settled_late")), (1, None))
+        self.assertEqual(self.receipt(1)["state"], "ready")
+        self.ledger.update_receipt(order_gid(1), state="no_change", code="expiry_already_later", member_no=member_no)
+        self.assertEqual(self.release(ref, member_no[-3:], "as_intended")["receipt_now"], "left_decided")
+
+    # -- B2-10 ---------------------------------------------------------------
+    def test_b2_10_a_malformed_ref_of_either_kind_is_an_argument_refusal_and_records_nothing(self):
+        ref, member_no = self.claimed()
+        last3 = member_no[-3:]
+        order_ref = self.ledger.ref("o", order_gid(1))
+        bad_orders = ("o-" + "a" * 19, "o-" + "a" * 21, "o-" + "g" * 20, order_ref.upper(), " " + order_ref, order_ref + "\n", order_ref + " ",
+                      "x-" + order_ref[2:], ref, "", "o-", "o_" + order_ref[2:])
+        bad_customers = ("c-" + "a" * 19, "c-" + "a" * 21, ref.upper(), ref + "\n", " " + ref, order_ref, "", "c-")
+        for bad in bad_orders:
+            with self.subTest(order_ref=bad):
+                self.refused(lambda: self.by_order(bad, last3), "unlink_arguments_invalid")
+        for bad in bad_customers:
+            with self.subTest(customer_ref=bad):
+                self.refused(lambda: self.unlink(bad, last3), "unlink_arguments_invalid")
+        self.refused(lambda: self.by_order("o-" + "0" * 20, last3), "unlink_not_a_claim_link")  # well-formed, unknown
+        self.refused(lambda: self.unlink("c-" + "0" * 20, last3), "unlink_not_a_claim_link")
+        self.assertEqual(self.by_order(order_ref, last3, apply=False)["counts"]["claim_unlinked"], 1)
+
+    def test_b2_10_the_cli_refuses_a_malformed_order_ref_as_an_argument(self):
+        member_no = self.guest_with_order(1, linked=False)
+        self.run_main("init")
+        self.run_main("observe")
+        for bad in ("o-" + "a" * 19, "O-" + "A" * 20, "c-" + "a" * 20):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_main("unlink", "--order-ref", bad, "--member-last3", member_no[-3:], "--reason", "other", "--apply")[:2],
+                                 (2, {"status": "refused", "code": "unlink_arguments_invalid"}))
+        self.assertEqual(self.run_main("unlink", "--order-ref", "o-" + "0" * 20, "--member-last3", member_no[-3:], "--reason", "other")[:2],
+                         (2, {"status": "refused", "code": "unlink_not_a_claim_link"}))
 
 
 class B2TokenCacheScopeTests(unittest.TestCase):

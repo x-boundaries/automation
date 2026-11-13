@@ -1038,6 +1038,13 @@ class BenefitsLedger:
         return self.conn.execute("SELECT * FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
                                  "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id) ORDER BY rowid").fetchall()
 
+    def released_held_write(self, order_gid: str) -> sqlite3.Row | None:
+        """Slice B2 (B2-9): this receipt's HELD write and its release
+        finding, once it is released; None while none is released."""
+
+        return self.conn.execute("SELECT w.*, r.finding FROM writes w JOIN write_releases r ON r.write_id = w.write_id "
+                                 "WHERE w.order_gid = ? AND w.state = 'HELD' ORDER BY w.rowid DESC LIMIT 1", (order_gid,)).fetchone()
+
     def done_write(self, order_gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM writes WHERE order_gid = ? AND state = 'DONE' ORDER BY rowid DESC LIMIT 1", (order_gid,)).fetchone()
 
@@ -2159,6 +2166,23 @@ class BenefitsEngine:
         summary.count("receipt_repaired_applied", ref, done["member_no"])
         return True
 
+    def _settle_released(self, row: sqlite3.Row, summary: RunSummary, ref: str) -> None:
+        """Slice B2 (B2-9, PR #303 L5): a ``ready`` receipt whose HELD write
+        was released (``release-held`` left it, as it was not ``ready`` then)
+        is set as ``release-held`` would have set it: ``as_intended`` ->
+        ``applied`` from the write, ``not_as_intended`` -> ``held``
+        ``held_write_released``. No AutoCount read, no save, no write row."""
+
+        released = self.ledger.released_held_write(row["order_gid"])
+        if released is None:
+            return
+        if released["finding"] == "as_intended":
+            self.ledger.update_receipt(row["order_gid"], state="applied", code=released["kind"], member_no=released["member_no"],
+                                       basis_expiry_local=released["new_expiry_local"])
+        else:
+            self.ledger.update_receipt(row["order_gid"], state="held", code=HELD_WRITE_RELEASED)
+        summary.count("release_receipt_settled_late", ref, released["member_no"])
+
     def _decide_one(self, row: sqlite3.Row, summary: RunSummary, *, run_id: str, apply: bool) -> bool:
         """True stops the run (an unclear write)."""
 
@@ -2168,6 +2192,8 @@ class BenefitsEngine:
             return False
         if self.ledger.write_landed_or_open(order_gid):
             summary.count("write_already_recorded", ref)  # never a second send (I4)
+            if row["state"] == "ready":
+                self._settle_released(row, summary, ref)
             return False
         if not apply and row["state"] == "ready" and row["observed_at"] and self.now() - dl.parse_created_at(row["observed_at"]) < OBSERVE_REREAD:
             summary.count(row["observed"] or "observed_recently")
@@ -2371,9 +2397,14 @@ class BenefitsEngine:
         receipt = self.ledger.receipt(write["order_gid"])
         if receipt is not None and receipt["state"] == "ready":
             receipt_now = "applied" if finding == "as_intended" else "held"
-        else:
+        elif receipt is not None and receipt["state"] in DECIDED_STATES:
             receipt_now = "left_decided"
-        count = {"applied": "release_receipt_applied", "held": "release_receipt_held"}.get(receipt_now, "release_receipt_left_decided")
+        else:
+            # Slice B2 (B2-9): an undecided receipt is left open; if it is
+            # ready again later, the next run settles it (_settle_released).
+            receipt_now = "left_open"
+        count = {"applied": "release_receipt_applied", "held": "release_receipt_held",
+                 "left_decided": "release_receipt_left_decided"}.get(receipt_now, "release_receipt_left_open")
         run_id = f"run-{uuid.uuid4().hex}" if apply else None
         result = {"status": "ok", "command": "release_held" if apply else "release_held_dry_run", "run_id": run_id, "finding": finding,
                   "receipt_now": receipt_now, "held_writes_left": self.ledger.held_writes() - 1, "counts": {count: 1},
@@ -2410,18 +2441,22 @@ class BenefitsEngine:
         customer's ``c-`` ref) or ``order_ref`` (fix round 1, G2 B13: the
         ``o-`` ref a ``link_conflict``, ``write_held``, ``would_upgrade`` or
         ``upgraded`` entry carries; the link is that receipt's customer's
-        active claim link). An ``o-`` ref that names no receipt, a receipt
-        with no customer, or a customer with no active claim link (also one
-        linked by #155 only) is ``unlink_not_a_claim_link``."""
+        active claim link). A malformed ref of either kind is
+        ``unlink_arguments_invalid`` (slice B2); a well-formed ``o-`` ref
+        that names no receipt, a receipt with no customer, or a customer with
+        no active claim link (also one linked by #155 only) is
+        ``unlink_not_a_claim_link``."""
 
         selectors = [value for value in (customer_ref, order_ref) if value is not None]
         if (len(selectors) != 1 or not isinstance(selectors[0], str)
-                or (customer_ref is not None and not _CUSTOMER_REF_RE.fullmatch(customer_ref)) or not isinstance(member_last3, str)
+                or (customer_ref is not None and not _CUSTOMER_REF_RE.fullmatch(customer_ref))
+                or (order_ref is not None and not _ORDER_REF_RE.fullmatch(order_ref)) or not isinstance(member_last3, str)
                 or not _LAST3_RE.fullmatch(member_last3) or reason not in UNLINK_REASONS or not isinstance(accept_applied, bool)):
             raise dl.DirectLocalError("unlink_arguments_invalid")
         self.ledger.check_binding(self.config)
         if order_ref is not None:
-            # A malformed o- ref names no receipt: the same answer as an unknown one (Controller ruling 2).
+            # Slice B2 (B2-10): a malformed o- ref is refused above (unlink_arguments_invalid);
+            # a well-formed one that names no receipt is unlink_not_a_claim_link.
             customers = [row["customer_gid"] for row in self.ledger.conn.execute("SELECT order_gid, customer_gid FROM receipts")
                          if self.ledger.ref("o", row["order_gid"]) == order_ref]
             links = [row for row in self.ledger.active_claims() if customers and row["customer_gid"] == customers[0]]
