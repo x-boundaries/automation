@@ -2456,6 +2456,63 @@ class BirthdayGuardTests(BirthdayBase):
         self.assertEqual(self.bday_writes(), [])
 
 
+class UnbasedRemovalTests(BirthdayBase):
+    """C2 (slice D design 2.6): ``remove_unbased_tags_enabled``."""
+
+    def test_off_by_default_alert_only_for_both_tags(self):
+        self.assertFalse(self.cfg().remove_unbased_tags_enabled)
+        for bad in ("yes", 1, None):
+            self.assertEqual(self.code(lambda: self.cfg(remove_unbased_tags_enabled=bad)), "tags_config_remove_unbased_tags_enabled_invalid")
+        self.member(9)  # a link set that is not empty
+        self.shopify.add(1, [TAG, BDAY], birthday=NOV)
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(9), [TAG])])
+        self.assertEqual(set(result["alerts"]), {"tag_without_basis", "bday_tag_without_basis"})
+
+    def test_on_removes_both_tags_within_caps_and_guards(self):
+        self.member(9, tags=[TAG])
+        self.shopify.add(1, [TAG, BDAY], birthday=NOV)
+        self.shopify.add(2, [BDAY])
+        self.shopify.add(3, [TAG])
+        result = self.run_tool(remove_unbased_tags_enabled=True, max_tag_removes_per_run=1)
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG]),
+                                               ("remove", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+        self.assertEqual((result["counts"]["untag_reason:tag_without_basis"], result["counts"]["bday_untag_reason:tag_without_basis"]), (2, 2))
+        self.assertEqual(result["counts"]["tag_removes_capped"], 1)
+        self.assertEqual([(r["reason"], r["basis"], r["member_no"]) for r in self.rows()], [("tag_without_basis", None, None)] * 3)
+        self.assertNotIn("tag_without_basis", result["alerts"])
+
+    def test_on_never_exempt_from_the_volume_guards(self):
+        self.member(9, tags=[TAG, BDAY], birthday=NOV)
+        for n in range(1, 7):
+            self.shopify.add(n, [TAG, BDAY], birthday=MAR)
+            self.done_add(n, BDAY, datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc))  # an earlier-month add is no exemption here
+        result = self.run_tool(remove_unbased_tags_enabled=True, max_tag_removes_per_run=50, max_bday_removes_per_run=50)
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual((result["counts"]["untag_withheld"], result["counts"]["bday_untag_withheld"]), (6, 6))
+
+    def test_withheld_on_an_empty_link_set(self):
+        self.shopify.add(1, [TAG, BDAY], birthday=NOV)
+        result = self.run_tool(remove_unbased_tags_enabled=True)
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual(set(result["alerts"]), {"tags_basis_empty", "tag_without_basis", "bday_tag_without_basis"})
+        self.assertNotIn("would_untag", result["counts"])
+
+    def test_withheld_per_tag_on_an_incomplete_search(self):
+        self.member(9)
+        self.shopify.add(1, [TAG, BDAY], birthday=NOV)
+        self.shopify.bday_carrier_cap = True
+        result = self.run_tool(remove_unbased_tags_enabled=True)
+        self.assertEqual([w for w in self.shopify.writes if w[1] == customer_gid(1)], [("remove", customer_gid(1), [TAG])])
+        self.assertIn("bday_tag_search_incomplete", result["alerts"])
+        self.assertIsNone(result["counts"].get("bday_untag_reason:tag_without_basis"))
+        self.shopify.add(2, [TAG, BDAY], birthday=NOV)
+        self.shopify.bday_carrier_cap, self.shopify.carrier_cap = False, True
+        result = self.run_tool(remove_unbased_tags_enabled=True)
+        self.assertEqual([w for w in self.shopify.writes if w[1] == customer_gid(2)], [("remove", customer_gid(2), [BDAY])])
+        self.assertIn("tag_search_incomplete", result["alerts"])
+
+
 class StoreTransport:
     """A scripted store behind the REAL TagsShopifyClient (G2 probe): answers
     the pinned texts from FakeShopify's customers. ``mutation_script``: per

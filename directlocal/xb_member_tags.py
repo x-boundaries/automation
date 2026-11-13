@@ -171,6 +171,9 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "max_bday_adds_per_run": 10,
     "max_bday_removes_per_run": 10,
     "bday_only_customers": [],
+    # C2 (slice D design 2.6): take off a tag that has no basis (row 14, D13),
+    # for both tags, under each tag's cap and volume guard. Off until U6/U7.
+    "remove_unbased_tags_enabled": False,
 }
 _BOUNDS = {
     "max_tag_adds_per_run": (1, 250),
@@ -205,6 +208,7 @@ class TagsConfig:
     max_bday_adds_per_run: int
     max_bday_removes_per_run: int
     bday_only_customers: tuple[str, ...]
+    remove_unbased_tags_enabled: bool
 
     def __repr__(self) -> str:  # the pilot list holds customer GIDs
         return "TagsConfig()"
@@ -269,8 +273,9 @@ def parse_config(value: Any) -> TagsConfig:
         raise dl.DirectLocalError("tags_config_ac2_refused_user_ids_owner_shared_refused")
     if live and login_mode == "dedicated" and not refused:
         raise dl.DirectLocalError("tags_config_ac2_refused_user_ids_live_required")
-    if not isinstance(merged["bday_tag_enabled"], bool):
-        raise dl.DirectLocalError("tags_config_bday_tag_enabled_invalid")
+    for key in ("bday_tag_enabled", "remove_unbased_tags_enabled"):
+        if not isinstance(merged[key], bool):
+            raise dl.DirectLocalError(f"tags_config_{key}_invalid")
     pilot = merged["bday_only_customers"]
     if (not isinstance(pilot, list) or len(pilot) > BDAY_PILOT_MAX or len(set(map(str, pilot))) != len(pilot)
             or any(not isinstance(gid, str) or not _CUSTOMER_GID_RE.fullmatch(gid) for gid in pilot)):
@@ -279,7 +284,8 @@ def parse_config(value: Any) -> TagsConfig:
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, member_sync_state_root=merged["member_sync_state_root"],
         member_core_state_root=merged["member_core_state_root"], tags_write_enabled=merged["tags_write_enabled"],
         ac2_credential_target=target, ac2_login_mode=login_mode, ac2_refused_user_ids=tuple(refused),
-        bday_tag_enabled=merged["bday_tag_enabled"], bday_only_customers=tuple(pilot), **numbers,
+        bday_tag_enabled=merged["bday_tag_enabled"], bday_only_customers=tuple(pilot),
+        remove_unbased_tags_enabled=merged["remove_unbased_tags_enabled"], **numbers,
     )
 
 
@@ -1202,6 +1208,7 @@ class TagsEngine:
         self.reads = 0
         self.month_now: str | None = None
         self.today: date | None = None
+        self.unbased_ok = {TAG: False, BDAY_TAG: False}
         self.clock_ok = False  # set by each run from the counts read; nothing is sent before
         self.counts_ok = False
 
@@ -1242,6 +1249,7 @@ class TagsEngine:
         run_id = self.ledger.start_run(command)
         summary = RunSummary(command)
         self.month_now, self.today, self.clock_ok, self.counts_ok = None, None, False, False
+        self.unbased_ok = {TAG: False, BDAY_TAG: False}
         states: dict[str, CustomerState | None] = {}
         carriers_total: int | None = None
         bday_carriers_total: int | None = None
@@ -1275,6 +1283,14 @@ class TagsEngine:
                 bday_carriers_total = len(bday_carriers)
             else:
                 summary.alert("bday_tag_search_incomplete")
+            # C2 (design 2.6): a tag with no basis comes off only with the
+            # switch on, never on an empty link set (a replaced ledger) and
+            # never on that tag's incomplete search.
+            links_empty = not sync_links and not claims
+            if self.config.remove_unbased_tags_enabled and links_empty:
+                summary.alert("tags_basis_empty")
+            unbased = self.config.remove_unbased_tags_enabled and not links_empty
+            self.unbased_ok = {TAG: unbased and complete, BDAY_TAG: unbased and bday_complete}
             extra = (carriers | bday_carriers) - set(states)
             if extra:
                 states.update(self.shopify.customers(extra))
@@ -1382,6 +1398,8 @@ class TagsEngine:
             return None, None
         if gid in links.voided:  # row 13
             return PlannedWrite(gid, "remove", "link_voided", None, "voided"), None
+        if self.unbased_ok[TAG]:  # row 14 with the C2 switch (design 2.6)
+            return PlannedWrite(gid, "remove", "tag_without_basis", None, None), None
         self._alert_once(summary, "tag_without_basis", ref)  # row 14 (removal only with the C2 switch)
         return None, None
 
@@ -1436,6 +1454,8 @@ class TagsEngine:
             return None
         if gid in links.voided:  # D12
             return PlannedWrite(gid, "remove", "link_voided", None, "voided", BDAY_TAG)
+        if self.unbased_ok[BDAY_TAG]:  # D13 with the C2 switch (design 2.6)
+            return PlannedWrite(gid, "remove", "tag_without_basis", None, None, BDAY_TAG)
         self._alert_once(summary, "bday_tag_without_basis", ref)  # D13 (removal only with the C2 switch)
         return None
 
