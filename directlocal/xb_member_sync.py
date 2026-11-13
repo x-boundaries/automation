@@ -25,16 +25,28 @@ Scope (Owner decisions, #155 build step 2)
   means every word of the shorter full name is a word of the longer one
   (Owner Q1, ``full_name_matches``); same phone + another name creates
   ``phone + name letters`` (fits nvarchar(20), a digit 2-9 when taken); no
-  phone uses ``GetNextMemberNo``; email never links. In AC2 -> Shopify, a
-  Shopify customer holding the phone under another name is a different
-  person: a separate customer is created without the phone. Every link, skip
-  and fallback is counted in the run summary (counts and keyed refs only).
+  phone uses ``GetNextMemberNo``; email never links Shopify -> AC2. In AC2 ->
+  Shopify (BF2a), a Shopify customer holding the phone under another name is
+  a different person: the member is held for a person (never a second
+  customer). Every link, skip and fallback is counted in the run summary
+  (counts and keyed refs only).
 * #155 slice BF1 (owner, 11 and 12 Nov 2026), one-off and attended:
   ``backfill-registrations`` brings older ``member-mg`` sign-ups (before the
   cutover) into AC2 (link, or a create through the same write-once child;
   doubtful cases held for a person), dry run by default, ``--apply`` only with
   ``backfill_registrations_enabled``; ``coverage`` is a read-only count of
   who is linked and who is not. Neither changes ``run``.
+* #155 slice BF2a (owner, 11 and 12 Nov 2026; G0 BF2 design), one-off and
+  attended: ``backfill-members`` links every in-scope AutoCount member to a
+  Shopify customer (by phone, then by email; the two-word name rule) or
+  creates one, only with a usable email and only when no Shopify customer
+  holds that phone or email; doubtful cases are held for a person. Dry run
+  by default; ``--apply`` only with ``backfill_members_enabled`` AND
+  ``shopify_create_enabled``. A member whose AutoCount Note holds
+  ``XB-NO-SHOPIFY`` is never created (read only as a 0/1 flag). The live
+  AC2 -> Shopify path (S6) uses the same create rules: the "separate
+  customer without the phone" path is gone (held), phone-only members are
+  not created, and email-only members are linked or created by email.
 * Loop prevention both ways through the ledger mapping (customer GID <->
   MemberNo, both unique): a member this sync created in AC2 never comes back
   to Shopify as new, and a customer it created in Shopify never goes back to
@@ -169,6 +181,18 @@ _MONTHS = {name: index for index, names in enumerate(
     (("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"), ("may",), ("jun", "june"),
      ("jul", "july"), ("aug", "august"), ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"), ("dec", "december")),
     start=1) for name in names}
+# #155 BF2a (13 Nov fix, live field membership.birthday_month): a
+# single_line_text_field birthday month is written as one of these names
+# (the store's choice list); a number_integer field keeps the number.
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+# #155 BF2a: a usable email (design 2.3.1): trimmed, at most 254 characters,
+# no whitespace, exactly one "@", a non-empty local part, a dotted domain.
+USABLE_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+EMAIL_MAX_LENGTH = 254
+# #155 BF2a (design 2.4): create tags that could start a membership, a
+# marketing list or the Forms flow are refused in config (casefold).
+_REFUSED_CREATE_TAG_PREFIXES = ("member", "shopify-forms")
+_REFUSED_CREATE_TAGS = frozenset({"xb member", "newsletter", "prospect"})
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -263,6 +287,19 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # and ``coverage`` read its claim links read-only (a member is linked if
     # either ledger says so); null: not read, and the output says so.
     "member_core_state_root": None,
+    # #155 slice BF2a (owner 11 and 12 Nov 2026): the one-off
+    # ``backfill-members`` creates Shopify customers only with ``--apply``
+    # AND this AND ``shopify_create_enabled``. Off by default; like the BF1
+    # keys, never added to the live task's config while it runs an older
+    # commit (the backfill uses its own copy).
+    "backfill_members_enabled": False,
+    # #155 BF2a (design 2.2): the AutoCount member types that are linked to,
+    # or created in, Shopify (backfill and S6). Any other type, or a member
+    # with no type, is out of scope.
+    "shopify_create_member_types": ["MEMBER", "GUEST"],
+    # #155 BF2a (design 2.7): members that need a Shopify read (at most two
+    # reads each) per backfill-members call.
+    "backfill_members_lookups_per_call": 50,
 }
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
@@ -278,6 +315,7 @@ _BOUNDS = {
     "max_creates_per_hour": (1, 30),
     "max_creates_per_day": (1, 720),
     "probe_max_wakes_per_day": (1, 240),
+    "backfill_members_lookups_per_call": (1, 200),
 }
 
 
@@ -330,6 +368,9 @@ class SyncConfig:
     probe_max_wakes_per_day: int = 60
     backfill_registrations_enabled: bool = False
     member_core_state_root: str | None = None
+    backfill_members_enabled: bool = False
+    shopify_create_member_types: tuple[str, ...] = ("MEMBER", "GUEST")
+    backfill_members_lookups_per_call: int = 50
 
     @property
     def immediate_path_active(self) -> bool:
@@ -358,6 +399,12 @@ class SyncConfig:
             # off check-config prints exactly what it printed before.
             **({"backfill_registrations_enabled": True} if self.backfill_registrations_enabled else {}),
             **({"member_core_state_root_set": True} if self.member_core_state_root is not None else {}),
+            # #155 BF2a: likewise printed only when not the default.
+            **({"backfill_members_enabled": True} if self.backfill_members_enabled else {}),
+            **({"shopify_create_member_types": list(self.shopify_create_member_types)}
+               if self.shopify_create_member_types != tuple(_CONFIG_DEFAULTS["shopify_create_member_types"]) else {}),
+            **({"backfill_members_lookups_per_call": self.backfill_members_lookups_per_call}
+               if self.backfill_members_lookups_per_call != _CONFIG_DEFAULTS["backfill_members_lookups_per_call"] else {}),
         }
 
 
@@ -409,9 +456,14 @@ def parse_config(value: Any) -> SyncConfig:
     ) or member_no_field["type"] != "single_line_text_field" or (member_no_field["namespace"], member_no_field["key"]) == (birthday["namespace"], birthday["key"]):
         raise dl.DirectLocalError("sync_config_ac2_member_no_metafield_invalid")
     tags = merged["shopify_create_tags"]
-    if not isinstance(tags, list) or len(tags) > 10 or any(not isinstance(t, str) or not TAG_RE.fullmatch(t) for t in tags) or REGISTRATION_TAG in tags:
-        # The registration tag would send the customer straight back to AC2.
+    if not isinstance(tags, list) or len(tags) > 10 or any(not isinstance(t, str) or not TAG_RE.fullmatch(t) or create_tag_refused(t) for t in tags):
+        # The registration tag would send the customer straight back to AC2;
+        # BF2a: no membership, marketing or Forms tag at all (design 2.4).
         raise dl.DirectLocalError("sync_config_shopify_create_tags_invalid")
+    member_types = merged["shopify_create_member_types"]
+    if (not isinstance(member_types, list) or not 1 <= len(member_types) <= 10 or len(set(member_types)) != len(member_types)
+            or any(not isinstance(t, str) or not MEMBER_TYPE_RE.fullmatch(t) for t in member_types)):
+        raise dl.DirectLocalError("sync_config_shopify_create_member_types_invalid")
     target = merged["ac2_credential_target"]
     if target is not None and (not isinstance(target, str) or not CREDENTIAL_TARGET_RE.fullmatch(target)):
         raise dl.DirectLocalError("sync_config_ac2_credential_target_invalid")
@@ -477,8 +529,21 @@ def parse_config(value: Any) -> SyncConfig:
         immediate_create_enabled=_bool(merged["immediate_create_enabled"], "immediate_create_enabled"), immediate_create_window_local=window,
         probe_wake_enabled=_bool(merged["probe_wake_enabled"], "probe_wake_enabled"),
         backfill_registrations_enabled=_bool(merged["backfill_registrations_enabled"], "backfill_registrations_enabled"),
-        member_core_state_root=core_root, **numbers,
+        member_core_state_root=core_root,
+        backfill_members_enabled=_bool(merged["backfill_members_enabled"], "backfill_members_enabled"),
+        shopify_create_member_types=tuple(member_types), **numbers,
     )
+
+
+def create_tag_refused(tag: str) -> bool:
+    """#155 BF2a (design 2.4): a create tag that is the registration tag, any
+    ``member*`` tag (``member``, ``member-mg``, ``member-legacy``,
+    ``member-qualified``, ``member-bday-month``), ``xb member``,
+    ``newsletter``, ``prospect`` or any ``shopify-forms*`` tag, compared
+    trimmed and case-insensitively, is refused."""
+
+    folded = tag.strip().casefold()
+    return folded.startswith(_REFUSED_CREATE_TAG_PREFIXES) or folded in _REFUSED_CREATE_TAGS
 
 
 def _parse_shopify(value: Any, timeout: int) -> ShopifyConnection:
@@ -698,6 +763,13 @@ class Ac2Member:
     email_address: str | None = None
     dob: str | None = None
     created_at: datetime | None = None  # round 7: CreatedTime (form open), in UTC
+    # #155 BF2a (design 2.1): the scope columns of sync-lookup and
+    # sync-member-scan, and the decline marker as the bridge computes it
+    # (True/False; None when the row did not say: never created).
+    member_type: str | None = None
+    is_active: str | None = None
+    expiry_date: str | None = None
+    no_shopify: bool | None = None
 
     def __repr__(self) -> str:  # never render member data
         return "Ac2Member()"
@@ -976,6 +1048,269 @@ def sync_p1_payload(customer: ShopifyCustomer, name: str, digits: str | None, me
 
 
 # --------------------------------------------------------------------------
+# #155 slice BF2a: AutoCount members -> Shopify (pure rules)
+# --------------------------------------------------------------------------
+
+# Owner 11 and 12 Nov 2026 and the Controller's BF2a brief: link by phone,
+# then by email (the two-word name rule, never a merge); create only with a
+# usable email and only when no Shopify customer holds that phone or email;
+# the decline marker in AutoCount's Note stops a create; anything doubtful is
+# held for a person. A link in this ledger is permanent.
+BF2_RUN_KIND = "backfill_members"
+BF2_RUN_PREFIX = "bf2-"  # not "backfill-": coverage reads that prefix as BF1
+BF2_CURSORS = {True: "backfill_members_cursor", False: "backfill_members_dry_run_cursor"}
+BF2_DONE_MARK = "backfill_members_completed_at"
+BF2_STOP_FILE = "STOP-backfill-members"  # BF1's STOP stops it too
+BF2_BACKFILL_TAG = "ac2-backfill"  # fixed, added in backfill mode only
+BF2_SCAN_PAGE = 1000  # sync-member-scan TOP
+BF2_SCAN_MAX_PAGES = 20  # a longer list is a read failure, never a partial pass
+# An expiry before this date is a placeholder (as the 12 Nov VM count reads it).
+EXPIRY_PLACEHOLDER_BEFORE = "2001-01-01"
+# design 2.8: an uncertain create not found by email after this long is
+# settled as not made; its member is eligible again from the next call or run.
+UNCERTAIN_SETTLE_AFTER = timedelta(minutes=60)
+# Controller Q1 (13 Nov 2026) = YES: a member with the decline marker is
+# never created, but MAY be linked to a Shopify customer they made
+# themselves (ledger only, no Shopify write). One rule; a test pins it.
+DECLINED_MEMBER_LINK_ALLOWED = True
+# Codes counted without a ref (not a person's case). Every other bf2_ hold
+# carries a keyed ref and the masked MemberNo (the person list).
+BF2_COUNT_ONLY = frozenset({
+    "bf2_already_linked", "bf2_claim_linked", "bf2_out_of_scope_type", "bf2_out_of_scope_inactive",
+    "bf2_out_of_scope_expired", "bf2_phone_only_not_created",
+})
+# Calls stopped for an operator (exit 3).
+BF2_OPERATOR_STOPS = ("bf2_create_uncertain", "bf2_create_rejected", "bf2_read_incomplete")
+# A Shopify create can carry the AutoCount Name only within these bounds.
+SHOPIFY_NAME_MAX = 255
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+NOT_READ = object()  # decide_ac2_to_shopify: the email read has not happened
+
+
+def usable_email(value: Any) -> str | None:
+    """The trimmed email when usable (``USABLE_EMAIL_RE``, at most 254
+    characters), else None. Compared elsewhere only after casefold."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if len(text) <= EMAIL_MAX_LENGTH and USABLE_EMAIL_RE.fullmatch(text) else None
+
+
+def email_key(value: Any) -> str | None:
+    """Trim + casefold of a usable email (the only way two emails compare)."""
+
+    text = usable_email(value)
+    return None if text is None else text.casefold()
+
+
+def member_scope_code(member: Ac2Member, member_types: Iterable[str], today_sgt: str) -> str | None:
+    """None when the member is in scope (design 2.2), else the count code.
+    Fail closed: a missing or unknown type, a flag other than ``T`` and an
+    unreadable expiry are out of scope. Expiry: blank, before 2001-01-01 (a
+    placeholder) or today (Singapore date) or later is in scope."""
+
+    kind = member.member_type.strip() if isinstance(member.member_type, str) else None
+    if kind is None or kind not in tuple(member_types):
+        return "bf2_out_of_scope_type"
+    if not isinstance(member.is_active, str) or member.is_active.strip() != "T":
+        return "bf2_out_of_scope_inactive"
+    expiry = member.expiry_date
+    if expiry is None or (isinstance(expiry, str) and not expiry.strip()):
+        return None
+    if not isinstance(expiry, str) or not DATE_RE.fullmatch(expiry.strip()):
+        return "bf2_out_of_scope_expired"
+    expiry = expiry.strip()
+    if expiry < EXPIRY_PLACEHOLDER_BEFORE or expiry >= today_sgt:
+        return None
+    return "bf2_out_of_scope_expired"
+
+
+def shopify_name_issue(name: Any) -> bool:
+    """True when the AutoCount Name cannot become the customer's first name:
+    blank (no word), longer than Shopify's 255, or holding a control
+    character."""
+
+    return (not isinstance(name, str) or not name_words(name) or len(name.strip()) > SHOPIFY_NAME_MAX
+            or bool(_CONTROL_RE.search(name)))
+
+
+def birthday_metafield_value(dob: Any, field_type: str) -> str | None:
+    """The birthday month metafield value from AutoCount's DOB
+    (``YYYY-MM-DD``): the English month NAME for ``single_line_text_field``
+    (the store's choice list), the number for ``number_integer``; None when
+    there is no usable month."""
+
+    if not isinstance(dob, str) or not DATE_RE.fullmatch(dob[:10]):
+        return None
+    month = int(dob[5:7])
+    if not 1 <= month <= 12:
+        return None
+    return MONTH_NAMES[month - 1] if field_type == "single_line_text_field" else str(month)
+
+
+def build_customer_input(*, name: str, email: str, phone_digits: str | None, member_no: str, dob: Any, tags: Iterable[str],
+                         member_no_field: Mapping[str, str], birthday_field: Mapping[str, str]) -> dict[str, Any]:
+    """The one ``CustomerInput`` the sync sends (design 2.4): ``firstName``
+    (the whole AutoCount Name), ``email`` (required), ``phone`` only when
+    the member has a usable phone, ``tags`` and ``metafields`` (MemberNo,
+    and the birthday month when the DOB has one). Nothing else: no consent,
+    note, locale, address or tax key can be sent."""
+
+    if usable_email(email) is None:
+        raise dl.DirectLocalError("shopify_customer_input_invalid")
+    customer_input: dict[str, Any] = {"firstName": name, "email": usable_email(email), "tags": list(dict.fromkeys(tags))}
+    if phone_digits is not None:
+        customer_input["phone"] = e164(phone_digits)
+    metafields = [{"namespace": member_no_field["namespace"], "key": member_no_field["key"], "type": member_no_field["type"], "value": member_no.strip()}]
+    value = birthday_metafield_value(dob, birthday_field["type"])
+    if value is not None:
+        metafields.append({"namespace": birthday_field["namespace"], "key": birthday_field["key"], "type": birthday_field["type"], "value": value})
+    customer_input["metafields"] = metafields
+    return customer_input
+
+
+@dataclass(frozen=True)
+class Bf2Context:
+    """What ``decide_ac2_to_shopify`` needs beyond the member and the reads:
+    ``customer_linked(gid)`` (sync ledger or active member core claim, or
+    already used in this call), the member core's voided pairs, and the
+    members settled as "not created" earlier in this call."""
+
+    customer_linked: Callable[[str], bool]
+    voided: frozenset[tuple[str, str]] = frozenset()
+    settled_keys: frozenset[str] = frozenset()
+
+    def __repr__(self) -> str:
+        return "Bf2Context()"
+
+
+@dataclass(frozen=True)
+class Bf2Decision:
+    """One member's BF2a decision: ``gid`` is the customer a LINK is made
+    to (None for every other action)."""
+
+    action: str  # LINK | CREATE | HOLD | COUNT | READ_EMAIL
+    code: str
+    gid: str | None = None
+    notes: tuple[str, ...] = ()
+
+
+# Classes decided before the contact checks: no "unusable email" note.
+BF2_PRE_SCOPE_CODES = frozenset({"bf2_already_linked", "bf2_claim_linked", "bf2_member_held_by_open_write",
+                                 "bf2_out_of_scope_type", "bf2_out_of_scope_inactive", "bf2_out_of_scope_expired"})
+_SG_WINDOW_RE = re.compile(r"(?=([3689][0-9]{7}))")
+
+
+class Bf2Index:
+    """The scanned member list, ordered by MemberNo key (trim + casefold,
+    the cursor's order), with the AutoCount-side sharing checks: members per
+    MemberNo key, per email (trim + casefold), and per phone the sync's own
+    rule (``_phone_hit``) would see."""
+
+    def __init__(self, members: Iterable[Ac2Member]):
+        self.ordered = sorted(members, key=lambda m: (member_no_key(m.member_no), m.member_no))
+        self.by_key: dict[str, list[Ac2Member]] = {}
+        self.by_email: dict[str, set[str]] = {}
+        self._by_phone: dict[str, set[int]] = {}
+        for position, member in enumerate(self.ordered):
+            key = member_no_key(member.member_no)
+            self.by_key.setdefault(key, []).append(member)
+            mail = email_key(member.email_address)
+            if mail is not None:
+                self.by_email.setdefault(mail, set()).add(key)
+            for digits in self._phone_candidates(member):
+                self._by_phone.setdefault(digits, set()).add(position)
+
+    def __repr__(self) -> str:
+        return "Bf2Index()"
+
+    @staticmethod
+    def _phone_candidates(member: Ac2Member) -> set[str]:
+        """Every phone ``_phone_hit`` could match for this member: its
+        MobilePhone, its MemberNo as a phone, and every Singapore 8 digits
+        inside its MemberNo (each checked again with ``_phone_hit``)."""
+
+        found = {phone_member_no(member.mobile_phone)[0]}
+        key = member_no_key(member.member_no)
+        if key.isdigit() and key.isascii():
+            found.add(key)
+            if _SG_LOCAL_RE.fullmatch(key):
+                found.add("65" + key)
+        found |= {"65" + window for window in _SG_WINDOW_RE.findall(member.member_no)}
+        found.discard(None)
+        return found
+
+    def phone_shared(self, member: Ac2Member, digits: str) -> bool:
+        """Another member (another MemberNo key) holds this phone."""
+
+        own = member_no_key(member.member_no)
+        return any(member_no_key(self.ordered[p].member_no) != own and _phone_hit(self.ordered[p], digits) for p in self._by_phone.get(digits, ()))
+
+
+def _bf2_customer_rules(member: Ac2Member, found: ShopifyCustomer, ctx: Bf2Context) -> Bf2Decision | None:
+    """B2/B3: the found customer belongs to someone else, or staff unlinked
+    exactly this pair in the member core."""
+
+    if ctx.customer_linked(found.gid):
+        return Bf2Decision("HOLD", "bf2_customer_linked_elsewhere")
+    if (found.gid, member_no_key(member.member_no)) in ctx.voided:
+        return Bf2Decision("HOLD", "bf2_claim_pair_unlinked")
+    return None
+
+
+def _bf2_link(member: Ac2Member, found: ShopifyCustomer, code: str, notes: tuple[str, ...] = ()) -> Bf2Decision:
+    if member.no_shopify is not False:
+        if not DECLINED_MEMBER_LINK_ALLOWED:
+            return Bf2Decision("HOLD", "bf2_declined_not_linked")
+        notes = notes + ("bf2_declined_linked",)
+    return Bf2Decision("LINK", code, found.gid, notes)
+
+
+def decide_ac2_to_shopify(member: Ac2Member, phone_customers: list[ShopifyCustomer], email_customer: Any, ctx: Bf2Context) -> Bf2Decision:
+    """Design 2.3.2 for one member that passed the 2.3.1 checks. Actions:
+    LINK, CREATE, HOLD (a person decides), COUNT (counted only), or
+    READ_EMAIL (call again with ``email_customer`` read; ``NOT_READ`` until
+    then). ``phone_customers``: the customers whose own phone is the
+    member's (empty without a usable phone). ``email_customer``: the one
+    customer holding the member's email, or None."""
+
+    digits = _ac2_phone(member)
+    email = usable_email(member.email_address)
+    if len(phone_customers) > 1:
+        return Bf2Decision("HOLD", "bf2_phone_on_multiple_customers")  # B1
+    if len(phone_customers) == 1:
+        found = phone_customers[0]
+        held = _bf2_customer_rules(member, found, ctx)  # B2, B3
+        if held is not None:
+            return held
+        if full_name_matches(shopify_full_name(found.first_name, found.last_name), member.name):  # B4
+            notes = ("bf2_link_email_differs",) if email and email_key(found.email) and email_key(found.email) != email.casefold() else ()
+            return _bf2_link(member, found, "bf2_phone_and_name", notes)
+        return Bf2Decision("HOLD", "bf2_phone_other_name")  # B5: the email is not tried
+    if email is not None and email_customer is NOT_READ:
+        return Bf2Decision("READ_EMAIL", "bf2_read_email")
+    if email is not None and email_customer is not None:  # C1
+        found = email_customer
+        held = _bf2_customer_rules(member, found, ctx)
+        if held is not None:
+            return held
+        theirs = phone_member_no(found.phone)[0]
+        if digits is not None and theirs is not None and theirs != digits:  # C2
+            return Bf2Decision("HOLD", "bf2_email_customer_other_phone")
+        if full_name_matches(shopify_full_name(found.first_name, found.last_name), member.name):  # C3
+            return _bf2_link(member, found, "bf2_email_and_name")
+        return Bf2Decision("HOLD", "bf2_email_other_name")  # C4
+    if email is None:
+        return Bf2Decision("COUNT", "bf2_phone_only_not_created")  # D1 (owner, 12 Nov)
+    if member.no_shopify is not False:
+        return Bf2Decision("HOLD", "bf2_declined_not_created")  # D2 (unknown flag: never created)
+    if member_no_key(member.member_no) in ctx.settled_keys:
+        return Bf2Decision("HOLD", "bf2_member_linked_elsewhere")  # D3: settled in this call
+    return Bf2Decision("CREATE", "bf2_created")  # D4
+
+
+# --------------------------------------------------------------------------
 # ChangeLog insert XML
 # --------------------------------------------------------------------------
 
@@ -1176,6 +1511,14 @@ class SyncLedger:
         body = json.dumps(["identity", normalised_name(name), phone_member_no(mobile_phone)[0]], ensure_ascii=True)
         return "sha256:" + hmac.new(bytes.fromhex(self.meta()["ref_key"]), body.encode("ascii"), hashlib.sha256).hexdigest()
 
+    def customer_identity_digest(self, name: Any, email: Any, phone: Any) -> str:
+        """#155 BF2a (design 2.8): salted digest of the normalised name, the
+        casefold email and the phone digits of a Shopify customer the sync
+        creates. Its own prefix, so it never equals an AC2 identity digest."""
+
+        body = json.dumps(["customer_identity", normalised_name(name), email_key(email), phone_member_no(phone)[0]], ensure_ascii=True)
+        return "sha256:" + hmac.new(bytes.fromhex(self.meta()["ref_key"]), body.encode("ascii"), hashlib.sha256).hexdigest()
+
     # -- mapping ------------------------------------------------------------
     def link_for_gid(self, gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM links WHERE customer_gid = ?", (gid,)).fetchone()
@@ -1274,6 +1617,9 @@ class SyncEngine:
         check_binding(ledger.meta(), config)
         self.summary = RunSummary()
         self._pending_sign_ups: tuple[dict[str, list[ShopifyCustomer]], bool] | None = None  # round 8: per run
+        # #155 BF2a (design 2.8): members whose uncertain create was settled
+        # as "not made" in this run or call: eligible again only next time.
+        self._settled_keys: set[str] = set()
 
     def _today_sgt(self) -> str:
         return self.ledger.now().astimezone(SGT).strftime("%Y-%m-%d")
@@ -1705,6 +2051,224 @@ class SyncEngine:
         self._backfill_count("backfill_ac2_create_uncertain", customer, member_no=member_no)
         return "backfill_create_uncertain"
 
+    # -- #155 slice BF2a: AutoCount members -> Shopify (one-off) ------------------
+    def backfill_members(self, *, apply: bool, max_creates: int, claims: "ClaimLinks | None" = None) -> dict[str, Any]:
+        """Every AutoCount member (``sync-member-scan``) with no link: linked
+        to its Shopify customer (phone, then email, the name rule), created
+        in Shopify (only with a usable email, no customer holding the phone
+        or email, no decline marker), or held for a person (design 2.3). A
+        dry run (the default) writes nothing but its own cursor. ``apply``
+        needs ``backfill_members_enabled`` AND ``shopify_create_enabled``;
+        it settles earlier uncertain creates first, creates at most
+        ``max_creates`` (1 to ``max_writes_per_run``) customers a call, never
+        over the rolling-hour cap, stops before the next member when a stop
+        file exists, and stops for an operator after a create that is
+        rejected or uncertain, or a read that fails. At most
+        ``backfill_members_lookups_per_call`` members are read in Shopify a
+        call. Resumable by a MemberNo cursor per mode. No alert (counts
+        only); an applied call is stored as run kind ``backfill_members``."""
+
+        if apply and not self.config.backfill_members_enabled:
+            raise dl.DirectLocalError("backfill_members_disabled")
+        if apply and not self.config.shopify_create_enabled:
+            raise dl.DirectLocalError("shopify_create_disabled")
+        if isinstance(max_creates, bool) or not isinstance(max_creates, int) or not 1 <= max_creates <= self.config.max_writes_per_run:
+            raise dl.DirectLocalError("backfill_members_max_invalid")
+        run_id = f"{BF2_RUN_PREFIX}{uuid.uuid4().hex}"
+        stopped = None
+        if apply:
+            with self.ledger.tx() as conn:
+                conn.execute("INSERT INTO runs(run_id, started_at) VALUES (?, ?)", (run_id, dl.ts(self.ledger.now())))
+            try:
+                self._resolve_uncertain("ac2_to_shopify")  # design 2.8: settle before any decision
+            except dl.DirectLocalError:
+                stopped = "bf2_read_incomplete"
+        cursor_name = BF2_CURSORS[apply]
+        floor = self.ledger.watermark(cursor_name)
+        finished = False
+        last: str | None = None
+        population: dict[str, int] = {}
+        members = None
+        if stopped is None:
+            try:
+                members = self._bf2_scan()
+            except dl.DirectLocalError:
+                stopped = "bf2_read_incomplete"  # nothing decided on a partial list
+        if members is not None:
+            index = Bf2Index(members)
+            if floor is None:
+                population = self._bf2_population(index, claims)
+            lookups = creates = 0
+            claimed_gids: set[str] = set()
+            finished = True
+            for member in index.ordered:
+                key = member_no_key(member.member_no)
+                if floor is not None and key <= floor:
+                    continue
+                if self._bf2_stop_requested():
+                    stopped, finished = "stop_file_present", False
+                    break
+                code = self._bf2_precheck(member, index, claims)
+                if code not in BF2_PRE_SCOPE_CODES and isinstance(member.email_address, str) and member.email_address.strip() and usable_email(member.email_address) is None:
+                    self.summary.count("bf2_email_unusable")  # counted as no email (design 2.3.1)
+                if code is not None:
+                    self._bf2_count(code, member)
+                    last = key
+                    continue
+                if lookups >= self.config.backfill_members_lookups_per_call:
+                    stopped, finished = "backfill_lookup_budget_reached", False
+                    break
+                lookups += 1
+                outcome = self._bf2_one(member, claims, claimed_gids, apply=apply, creates=creates, max_creates=max_creates)
+                if outcome == "created":
+                    creates += 1
+                elif outcome != "done":
+                    stopped, finished = outcome, False
+                    break
+                last = key
+        with self.ledger.tx() as conn:
+            if finished:
+                # A finished pass: the next call in this mode starts again.
+                conn.execute("DELETE FROM watermarks WHERE name = ?", (cursor_name,))
+                if apply:
+                    self.ledger.set_watermark(conn, BF2_DONE_MARK, dl.ts(self.ledger.now()))
+            elif last is not None and (floor is None or last > floor):
+                self.ledger.set_watermark(conn, cursor_name, last)
+        result = {
+            "schema": SUMMARY_SCHEMA, "status": "completed", "direction": BF2_RUN_KIND, "mode": "apply" if apply else "dry_run",
+            "complete": finished, "stopped": stopped, "alerts": [], "autocount_book": self.config.autocount_book,
+            "max_creates": max_creates, "writes": self.summary.writes,
+            "member_core_ledger": "read" if claims is not None else "not_configured",
+            "population": dict(sorted(population.items())), "counts": dict(sorted(self.summary.counts.items())), "refs": self.summary.refs,
+        }
+        if apply:
+            # Its own run kind; no alert is ever stored. Counts, codes and
+            # keyed refs with masked MemberNos only.
+            stored = {"kind": BF2_RUN_KIND, "counts": result["counts"], "alerts": [], "refs": result["refs"], "stopped": stopped}
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
+        return result
+
+    def _bf2_stop_requested(self) -> bool:
+        return (self.ledger.root / STOP_FILE).exists() or (self.ledger.root / BF2_STOP_FILE).exists()
+
+    def _bf2_scan(self) -> list[Ac2Member]:
+        """The whole member list, page by page (keyset on MemberNo). A list
+        longer than the page bound, or a page that does not advance, is a
+        read failure: nothing is decided on part of the list."""
+
+        members: list[Ac2Member] = []
+        after = ""
+        for _ in range(BF2_SCAN_MAX_PAGES):
+            page = self.ac2.member_scan(after)
+            members.extend(page)
+            if len(page) < BF2_SCAN_PAGE:
+                return members
+            if page[-1].member_no == after:
+                break
+            after = page[-1].member_no
+        raise dl.DirectLocalError("bf2_scan_incomplete")
+
+    def _bf2_precheck(self, member: Ac2Member, index: "Bf2Index", claims: "ClaimLinks | None") -> str | None:
+        """Design 2.3.1, before any Shopify read. None: the member is read."""
+
+        key = member_no_key(member.member_no)
+        if self.ledger.link_for_member(member.member_no) is not None:
+            return "bf2_already_linked"  # A1
+        if claims is not None and key in claims.by_key:
+            return "bf2_claim_linked"  # A2
+        if self.ledger.open_write_for_member(member.member_no) is not None:
+            return "bf2_member_held_by_open_write"  # A3: never re-sent
+        scope = member_scope_code(member, self.config.shopify_create_member_types, self._today_sgt())
+        if scope is not None:
+            return scope  # A4
+        digits = _ac2_phone(member)
+        email = email_key(member.email_address)
+        if digits is None and email is None:
+            return "bf2_no_contact"  # A5
+        if email is not None and len(index.by_email.get(email, ())) > 1:
+            return "bf2_email_shared_in_ac2"  # A6
+        if len(index.by_key.get(key, ())) > 1 or (digits is not None and len({k for k in member_no_forms(digits) if k in index.by_key}) > 1):
+            return "bf2_memberno_conflict"  # A8 (checked before A7, which it is a case of)
+        if digits is not None and index.phone_shared(member, digits):
+            return "bf2_phone_shared_in_ac2"  # A7
+        if shopify_name_issue(member.name):
+            return "bf2_no_name"  # A9
+        return None
+
+    def _bf2_population(self, index: "Bf2Index", claims: "ClaimLinks | None") -> dict[str, int]:
+        """Every member scanned, by its class before any read (the first
+        call of a pass); the classes add up to ``scanned``."""
+
+        population: dict[str, int] = {"scanned": len(index.ordered)}
+        for member in index.ordered:
+            code = self._bf2_precheck(member, index, claims) or "bf2_needs_lookup"
+            population[code] = population.get(code, 0) + 1
+        return population
+
+    def _bf2_count(self, code: str, member: Ac2Member, action: str | None = None) -> None:
+        if code in BF2_COUNT_ONLY:
+            self.summary.count(code)
+        else:
+            self.summary.count(code, self.ledger.ref("m", member_no_key(member.member_no)), action or "hold", member_no=member.member_no)
+
+    def _bf2_one(self, member: Ac2Member, claims: "ClaimLinks | None", claimed_gids: set[str], *, apply: bool, creates: int, max_creates: int) -> str:
+        """``done``, ``created``, or the code that stops the call (the cursor
+        then stays before this member)."""
+
+        key = member_no_key(member.member_no)
+        digits = _ac2_phone(member)
+        email = usable_email(member.email_address)
+
+        def linked(gid: str) -> bool:
+            return gid in claimed_gids or self.ledger.link_for_gid(gid) is not None or (claims is not None and gid in claims.by_gid)
+
+        ctx = Bf2Context(customer_linked=linked, voided=claims.voided if claims is not None else frozenset(), settled_keys=frozenset(self._settled_keys))
+        try:
+            phone_customers = self.shopify.find_by_phone(e164(digits)) if digits is not None else []
+            decision = decide_ac2_to_shopify(member, phone_customers, NOT_READ, ctx)
+            if decision.action == "READ_EMAIL":
+                decision = decide_ac2_to_shopify(member, phone_customers, self.shopify.find_by_email(email), ctx)
+        except dl.DirectLocalError:
+            return "bf2_read_incomplete"
+        if decision.action in ("COUNT", "HOLD"):
+            self._bf2_count(decision.code, member)
+            return "done"
+        ref = self.ledger.ref("m", key)
+        if decision.action == "LINK":
+            claimed_gids.add(decision.gid)
+            if apply:
+                with self.ledger.tx() as conn:
+                    self.ledger.add_link(conn, decision.gid, member.member_no, "matched", decision.code)
+            self._bf2_count("bf2_linked" if apply else "bf2_would_link", member, "link" if apply else "would_link")
+            for code in (decision.code, *decision.notes):
+                self.summary.count(code)
+            return "done"
+        if not apply:
+            self._bf2_count("bf2_would_create", member, "would_create")
+            return "done"
+        if not self.config.shopify_create_enabled:
+            return "shopify_create_disabled"  # refused before any login too
+        if creates >= max_creates or self.summary.writes >= self.config.max_writes_per_run:
+            return "backfill_max_reached"
+        hour = int(self.ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE created_at >= ?", (dl.ts(self.ledger.now() - timedelta(hours=1)),)).fetchone()[0])
+        if hour >= RUNS_PER_HOUR * self.config.max_writes_per_run:
+            return "backfill_hour_cap_reached"
+        outcome = self._create_in_shopify(member, digits, email, key, ref, backfill=True)
+        if outcome == "created":
+            self._bf2_count("bf2_created", member, "create")
+            return "created"
+        if outcome == "rejected":
+            self._bf2_count("bf2_create_rejected", member)
+            return "bf2_create_rejected"
+        if outcome == "uncertain":
+            self._bf2_count("bf2_create_uncertain", member)
+            return "bf2_create_uncertain"
+        if outcome == "refused":
+            return "backfill_max_reached"
+        self._bf2_count("bf2_no_name", member)  # "invalid": nothing sent (the prechecks make this unreachable)
+        return "done"
+
     def _recover_crashed_intents(self) -> None:
         """An INTENT left by a crashed run may or may not have been written:
         it becomes UNCERTAIN and is only ever looked up, never re-sent. Its
@@ -1747,18 +2311,51 @@ class SyncEngine:
                 else:
                     self.summary.count("uncertain_write_unresolved", self.ledger.ref("m", row["member_no_key"]))
             else:
-                members = [m for m in self.ac2.lookup(None, [row["member_no"]]) if member_no_key(m.member_no) == row["member_no_key"]]
-                digits = _ac2_phone(members[0]) if len(members) == 1 else None
-                customers = self.shopify.find_by_phone(e164(digits)) if digits else []
-                if (len(members) == 1 and len(customers) == 1 and self.ledger.link_for_gid(customers[0].gid) is None
-                        and full_name_matches(shopify_full_name(customers[0].first_name, customers[0].last_name), members[0].name)):
-                    with self.ledger.tx() as conn:
-                        self.ledger.add_link(conn, customers[0].gid, members[0].member_no, "created_in_shopify", "uncertain_write_found")
-                        self._close_write(conn, row["write_id"], "RESOLVED", "uncertain_write_found", customers[0].gid)
-                        conn.execute("UPDATE ac2_pending SET state = 'DONE', code = 'uncertain_write_found', updated_at = ? WHERE member_no_key = ?", (dl.ts(self.ledger.now()), row["member_no_key"]))
-                    self.summary.count("uncertain_write_resolved_linked", self.ledger.ref("m", row["member_no_key"]), "link")
-                else:
-                    self.summary.count("uncertain_write_unresolved", self.ledger.ref("m", row["member_no_key"]))
+                self._resolve_uncertain_shopify_create(row)
+
+    def _resolve_uncertain_shopify_create(self, row: sqlite3.Row) -> None:
+        """#155 BF2a (design 2.8): an AC2 -> Shopify create whose outcome is
+        unknown is settled by reading the member's current email
+        (``customerByIdentifier``), never re-sent. Found with the INTENT's
+        identity digest and not linked: linked. Found with another identity:
+        stays UNCERTAIN. Not found: stays UNCERTAIN under 60 minutes, then
+        settled as not made; the member is eligible again only from the next
+        call or run. A row without a digest is never linked automatically."""
+
+        ref = self.ledger.ref("m", row["member_no_key"])
+        members = [m for m in self.ac2.lookup(None, [row["member_no"]]) if member_no_key(m.member_no) == row["member_no_key"]]
+        email = usable_email(members[0].email_address) if len(members) == 1 else None
+        if row["intent_digest"] is None:
+            self.summary.count("uncertain_write_identity_unverifiable", ref)
+            return
+        if email is None:
+            self.summary.count("uncertain_write_unresolved", ref)
+            return
+        found = self.shopify.find_by_email(email)
+        if found is not None:
+            if not hmac.compare_digest(self.ledger.customer_identity_digest(shopify_full_name(found.first_name, found.last_name), found.email, found.phone),
+                                       row["intent_digest"]):
+                self.summary.count("uncertain_write_identity_mismatch", ref)  # someone else holds the email
+            elif self.ledger.link_for_gid(found.gid) is not None:
+                self.summary.count("uncertain_write_unresolved", ref)
+            else:
+                with self.ledger.tx() as conn:
+                    self.ledger.add_link(conn, found.gid, members[0].member_no, "created_in_shopify", "uncertain_write_found")
+                    self._close_write(conn, row["write_id"], "RESOLVED", "uncertain_write_found", found.gid)
+                    conn.execute("UPDATE ac2_pending SET state = 'DONE', code = 'uncertain_write_found', updated_at = ? WHERE member_no_key = ?",
+                                 (dl.ts(self.ledger.now()), row["member_no_key"]))
+                self.summary.count("uncertain_write_resolved_linked", ref, "link")
+            return
+        if self.ledger.now() - dl.parse_ts(row["created_at"]) < UNCERTAIN_SETTLE_AFTER:
+            self.summary.count("uncertain_write_unresolved", ref)
+            return
+        with self.ledger.tx() as conn:
+            self._close_write(conn, row["write_id"], "RESOLVED", "uncertain_write_settled_not_found")
+            # S6: decided again from the next run (this run skips it).
+            conn.execute("UPDATE ac2_pending SET state = 'PENDING', code = 'uncertain_write_settled', checks = 0, updated_at = ? WHERE member_no_key = ?",
+                         (dl.ts(self.ledger.now()), row["member_no_key"]))
+        self._settled_keys.add(row["member_no_key"])
+        self.summary.count("uncertain_write_settled_not_found", ref)
 
     # -- Shopify -> AC2 ----------------------------------------------------------
     def shopify_to_ac2(self, started: datetime) -> None:
@@ -2242,10 +2839,21 @@ class SyncEngine:
                 self._ac2_done(key, "SKIPPED", "ac2_member_not_found")  # deleted or renumbered since the insert
                 self.summary.count("ac2_member_not_found", ref)
                 continue
+            if key in self._settled_keys:
+                continue  # BF2a (design 2.8): settled in this run, decided again next run
+            if member_scope_code(member, self.config.shopify_create_member_types, self._today_sgt()) is not None:
+                # BF2a (design 2.2, 2.3.3): another type, inactive or expired.
+                self._ac2_done(key, "SKIPPED", "ac2_member_out_of_scope")
+                self.summary.count("ac2_member_out_of_scope", ref)
+                continue
             digits = _ac2_phone(member)
-            if digits is None:
+            email = usable_email(member.email_address)
+            if digits is None and email is None:
                 self._ac2_done(key, "SKIPPED", "ac2_member_without_phone")
                 self.summary.count("ac2_member_without_phone", ref)
+                continue
+            if digits is None:
+                self._s6_by_email(member, None, email, key, ref)  # BF2a: email-only member
                 continue
             forms = member_no_forms(digits)
             phone_form = member_no_key(member.member_no) in forms
@@ -2282,12 +2890,13 @@ class SyncEngine:
                 customer = customers[0]
                 if not full_name_matches(shopify_full_name(customer.first_name, customer.last_name), member.name):
                     # Owner (2026-10-21): another name (Q1 word rule) is
-                    # another person. Shopify phones are unique, so the
-                    # separate customer is created without the phone; never linked.
-                    self.summary.count("shopify_phone_owned_by_other_name")
+                    # another person; never linked. BF2a (design 2.3.3,
+                    # Controller decision 2): held for a person, never a
+                    # second customer without the phone.
+                    self._ac2_done(key, "SKIPPED", "ac2_phone_on_other_customer")
+                    self.summary.count("ac2_phone_on_other_customer", ref)
                     for note in name_fallback_notes(member.name, [shopify_full_name(customer.first_name, customer.last_name)]):
                         self.summary.count(note)
-                    self._create_in_shopify(member, None, key, ref)
                 elif (link := self.ledger.link_for_gid(customer.gid)) is not None:
                     if link["origin"] == "created_in_ac2":
                         # Round 6: staff made a member for a person the sync
@@ -2303,7 +2912,49 @@ class SyncEngine:
                     self._ac2_done(key, "DONE", "linked_existing_shopify_customer")
                     self.summary.count("linked_existing_shopify_customer", ref, "link")
                 continue
-            self._create_in_shopify(member, digits, key, ref)
+            self._s6_by_email(member, digits, email, key, ref)
+
+    def _s6_by_email(self, member: Ac2Member, digits: str | None, email: str | None, key: str, ref: str) -> None:
+        """#155 BF2a (design 2.3.3): no Shopify customer holds the member's
+        phone (or the member has none). Without a usable email: not created.
+        With one: held when another AutoCount member has it; linked when one
+        customer holds it under the same name (and no other phone); held when
+        that customer is someone else; never created with the decline
+        marker; otherwise created. New codes are counts, never alerts."""
+
+        if email is None:
+            self._ac2_done(key, "SKIPPED", "ac2_member_phone_only_not_created")
+            self.summary.count("ac2_member_phone_only_not_created", ref)
+            return
+        mine = email.casefold()
+        if any(email_key(m.email_address) == mine and member_no_key(m.member_no) != key for m in self.ac2.lookup(None, [], email=email)):
+            self._ac2_done(key, "SKIPPED", "ac2_email_shared_in_ac2")
+            self.summary.count("ac2_email_shared_in_ac2", ref)
+            return
+        found = self.shopify.find_by_email(email)
+        if found is not None:
+            theirs = phone_member_no(found.phone)[0]
+            if (link := self.ledger.link_for_gid(found.gid)) is not None:
+                # The same existing alerts as the phone path.
+                code = "possible_duplicate_member" if link["origin"] == "created_in_ac2" else "shopify_customer_linked_to_other_member"
+                self._ac2_done(key, "SKIPPED", code)
+                self.summary.alert(code, ref, member_no=member.member_no)
+            elif (digits is not None and theirs is not None and theirs != digits) or not full_name_matches(
+                    shopify_full_name(found.first_name, found.last_name), member.name):
+                self._ac2_done(key, "SKIPPED", "ac2_email_on_other_customer")
+                self.summary.count("ac2_email_on_other_customer", ref)
+            else:
+                with self.ledger.tx() as conn:
+                    self.ledger.add_link(conn, found.gid, member.member_no, "matched", "linked_existing_shopify_customer_by_email")
+                self._ac2_done(key, "DONE", "linked_existing_shopify_customer_by_email")
+                self.summary.count("linked_existing_shopify_customer_by_email", ref, "link")
+            return
+        if member.no_shopify is not False:
+            # The decline marker (or a row that did not say): never created.
+            self._ac2_done(key, "SKIPPED", "ac2_member_declined_not_created")
+            self.summary.count("ac2_member_declined_not_created", ref)
+            return
+        self._create_in_shopify(member, digits, email, key, ref)
 
     def _ac2_member_by_time(self, row: sqlite3.Row, member: Ac2Member, customer: ShopifyCustomer, key: str, ref: str) -> None:
         """Round 8 (G2 H1): an AC2 member whose MemberNo is exactly the phone
@@ -2359,57 +3010,65 @@ class SyncEngine:
         found, sure = self._pending_sign_ups
         return list(found.get(digits, [])), sure
 
-    def _create_in_shopify(self, member: Ac2Member, digits: str | None, key: str, ref: str) -> None:
-        """``digits`` None: a separate customer without the phone (it belongs
-        to another Shopify customer). Shopify requires a name, phone or email
-        (customerCreate, API 2026-10); the AC2 Name is always present here."""
+    def _create_in_shopify(self, member: Ac2Member, digits: str | None, email: str | None, key: str, ref: str, *, backfill: bool = False) -> str:
+        """The sync's only Shopify write (S6 and ``backfill-members``; design
+        2.4). ``email`` is required (a usable email; Shopify keeps it unique,
+        which makes a retry after a wrong settle a refusal, never a second
+        customer); ``digits`` None: an email-only member, created without a
+        phone. The ac2_pending row is updated on the S6 path only. Returns
+        ``created``, ``rejected``, ``uncertain``, ``refused`` (switch off or
+        write budget spent; nothing sent) or ``invalid`` (nothing sent)."""
 
         name = (member.name or "").strip()
         if not name:
-            self._ac2_done(key, "SKIPPED", "ac2_member_without_name")
+            if not backfill:
+                self._ac2_done(key, "SKIPPED", "ac2_member_without_name")
             self.summary.count("ac2_member_without_name", ref)
-            return
+            return "invalid"
+        if usable_email(email) is None:
+            if not backfill:
+                self._ac2_done(key, "SKIPPED", "shopify_customer_input_invalid")
+            self.summary.count("shopify_customer_input_invalid", ref)
+            return "invalid"
         try:
             self._spend_write(self.config.shopify_create_enabled, "shopify_create_disabled")
         except WriteRefused as refused:
             self.summary.count(refused.code, ref, "would_create")  # stays PENDING
-            if refused.code == "shopify_create_disabled":
+            if refused.code == "shopify_create_disabled" and not backfill:
                 # Go-live L10: read after every decidable row (see above).
                 self._ac2_done(key, "PENDING", "would_create")
-            return
-        customer_input: dict[str, Any] = {"firstName": name, "tags": list(self.config.shopify_create_tags)}
-        if digits is not None:
-            customer_input["phone"] = e164(digits)
-        email = (member.email_address or "").strip()
-        if email:
-            customer_input["email"] = email
-        number_field = self.config.ac2_member_no_metafield
-        metafields = [{"namespace": number_field["namespace"], "key": number_field["key"], "type": number_field["type"], "value": member.member_no.strip()}]
-        month = int(member.dob[5:7]) if isinstance(member.dob, str) and DATE_RE.fullmatch(member.dob[:10]) else None
-        if month:
-            meta = self.config.birthday_month_metafield
-            metafields.append({"namespace": meta["namespace"], "key": meta["key"], "type": meta["type"], "value": str(month)})
-        customer_input["metafields"] = metafields
-        write_id = self._intent("ac2_to_shopify", member.member_no, None)
+            return "refused"
+        tags = list(self.config.shopify_create_tags) + ([BF2_BACKFILL_TAG] if backfill else [])
+        customer_input = build_customer_input(
+            name=name, email=email, phone_digits=digits, member_no=member.member_no, dob=member.dob, tags=tags,
+            member_no_field=self.config.ac2_member_no_metafield, birthday_field=self.config.birthday_month_metafield,
+        )
+        # INTENT before the send, with the identity a settle read must find.
+        write_id = self._intent("ac2_to_shopify", member.member_no, None, self.ledger.customer_identity_digest(name, email, digits))
         try:
             gid = self.shopify.create_customer(customer_input)
-        except ShopifyCreateRejected:
+        except ShopifyCreateRejected as rejected:
             with self.ledger.tx() as conn:
-                self._close_write(conn, write_id, "REJECTED", "shopify_user_errors")
-            self._ac2_done(key, "SKIPPED", "shopify_create_rejected")
+                # Only a classified code from the field path; never the message.
+                self._close_write(conn, write_id, "REJECTED", rejected.field_class)
+            if not backfill:
+                self._ac2_done(key, "SKIPPED", "shopify_create_rejected")
             self.summary.count("shopify_create_rejected", ref)
-            return
+            return "rejected"
         except dl.DirectLocalError:
             with self.ledger.tx() as conn:
                 self._close_write(conn, write_id, "UNCERTAIN", "shopify_create_outcome_unknown")
-            self._ac2_done(key, "SKIPPED", "shopify_create_uncertain")
+            if not backfill:
+                self._ac2_done(key, "SKIPPED", "shopify_create_uncertain")
             self.summary.count("shopify_create_uncertain", ref)
-            return
+            return "uncertain"
         with self.ledger.tx() as conn:
             self._close_write(conn, write_id, "DONE", "created", gid)
-            self.ledger.add_link(conn, gid, member.member_no, "created_in_shopify", "created_from_ac2")
-        self._ac2_done(key, "DONE", "shopify_customer_created" if digits is not None else "shopify_separate_customer_created")
-        self.summary.count("shopify_customer_created" if digits is not None else "shopify_separate_customer_created_without_phone", ref, "create")
+            self.ledger.add_link(conn, gid, member.member_no, "created_in_shopify", "bf2_created" if backfill else "created_from_ac2")
+        if not backfill:
+            self._ac2_done(key, "DONE", "shopify_customer_created")
+        self.summary.count("shopify_customer_created", ref, "create")
+        return "created"
 
 
 _SG_MEMBER_NO_RE = re.compile(r"65[3689][0-9]{7}|[3689][0-9]{7}")
@@ -2431,7 +3090,27 @@ def _ac2_phone(member: Ac2Member) -> str | None:
 
 
 class ShopifyCreateRejected(dl.DirectLocalError):
-    """customerCreate answered with userErrors (nothing was created)."""
+    """customerCreate answered with userErrors (nothing was created).
+    ``field_class`` is the classified field path of the first error
+    (``shopify_user_errors_email``, ``_phone``, ``_metafield``, ``_other``);
+    the message text is never kept."""
+
+    def __init__(self, code: str = "shopify_create_rejected", field_class: str = "shopify_user_errors_other"):
+        super().__init__(code)
+        self.field_class = field_class
+
+
+def classify_user_errors(errors: Any) -> str:
+    """#155 BF2a (design 2.8.6): the first userError's ``field`` path read
+    only for the words ``email``, ``phone`` or ``metafields``."""
+
+    first = errors[0] if isinstance(errors, list) and errors and isinstance(errors[0], dict) else {}
+    path = first.get("field")
+    words = {str(part).casefold() for part in path} if isinstance(path, list) else set()
+    for word, code in (("email", "shopify_user_errors_email"), ("phone", "shopify_user_errors_phone"), ("metafields", "shopify_user_errors_metafield")):
+        if word in words:
+            return code
+    return "shopify_user_errors_other"
 
 
 # --------------------------------------------------------------------------
@@ -2455,10 +3134,15 @@ CUSTOMER_QUERY = """query XbMemberSyncCustomer($id: ID!, $birthdayNamespace: Str
 PHONE_LOOKUP_QUERY = """query XbMemberSyncPhoneLookup($search: String!) {
   customers(first: 5, query: $search) { nodes { id firstName lastName defaultPhoneNumber { phoneNumber } } }
 }"""
+# #155 BF2a (design 2.1): a direct lookup by email (read_customers). The
+# answer is kept only when its own email equals ours after trim + casefold.
+EMAIL_LOOKUP_QUERY = """query XbMemberSyncEmailLookup($email: String!) {
+  customerByIdentifier(identifier: {emailAddress: $email}) { id firstName lastName defaultEmailAddress { emailAddress } defaultPhoneNumber { phoneNumber } }
+}"""
 CUSTOMER_CREATE_MUTATION = """mutation XbMemberSyncCustomerCreate($input: CustomerInput!) {
   customerCreate(input: $input) { customer { id } userErrors { field message } }
 }"""
-SYNC_READ_QUERIES = frozenset({direct.SESSION_QUERY, REGISTRATIONS_QUERY, CUSTOMER_QUERY, PHONE_LOOKUP_QUERY})
+SYNC_READ_QUERIES = frozenset({direct.SESSION_QUERY, REGISTRATIONS_QUERY, CUSTOMER_QUERY, PHONE_LOOKUP_QUERY, EMAIL_LOOKUP_QUERY})
 CUSTOMER_INPUT_KEYS = frozenset({"firstName", "phone", "email", "tags", "metafields"})
 
 
@@ -2551,17 +3235,36 @@ class SyncShopifyClient(direct.ShopifyDirectClient):
         customers = [_customer_from_node({**node, "tags": []}) for node in page["nodes"]]
         return [c for c in customers if phone_member_no(c.phone)[0] == digits]
 
+    def find_by_email(self, email: str) -> ShopifyCustomer | None:
+        """#155 BF2a: the one customer holding this email, or None. A null
+        answer is "none"; any GraphQL error is a read failure (raised, so
+        the caller stops; shopify.dev documents no not-found error form).
+        An answer whose own email differs after trim + casefold is dropped."""
+
+        wanted = email_key(email)
+        if wanted is None:
+            raise dl.DirectLocalError("email_lookup_input_invalid")
+        data = self.execute(EMAIL_LOOKUP_QUERY, {"email": usable_email(email)})
+        if "customerByIdentifier" not in data:
+            raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+        node = data["customerByIdentifier"]
+        if node is None:
+            return None
+        found = _customer_from_node({**node, "tags": []})
+        return found if email_key(found.email) == wanted else None
+
     def create_customer(self, customer_input: Mapping[str, Any]) -> str:
         if not self.create_enabled:
             raise WriteRefused("shopify_create_disabled")
-        if not set(customer_input) <= CUSTOMER_INPUT_KEYS:
+        if not set(customer_input) <= CUSTOMER_INPUT_KEYS or usable_email(customer_input.get("email")) is None:
+            # BF2a: every create carries a usable email (design 2.4).
             raise dl.DirectLocalError("shopify_customer_input_invalid")
         data = self.execute(CUSTOMER_CREATE_MUTATION, {"input": dict(customer_input)})
         result = data.get("customerCreate")
         if not isinstance(result, dict):
             raise direct.ShopifyDirectError("shopify_response_shape_invalid")
         if result.get("userErrors"):
-            raise ShopifyCreateRejected("shopify_create_rejected")
+            raise ShopifyCreateRejected("shopify_create_rejected", classify_user_errors(result.get("userErrors")))
         customer = result.get("customer")
         if not isinstance(customer, dict) or not isinstance(customer.get("id"), str) or not dl.GID_RE.fullmatch(customer["id"]):
             raise direct.ShopifyDirectError("shopify_response_shape_invalid")
@@ -2679,18 +3382,34 @@ class SyncBridgeClient(dl.BridgeClient):
             creationflags=getattr(dl.subprocess, "CREATE_NO_WINDOW", 0), env=self._env,
         )
 
-    def lookup(self, phone_digits: str | None, member_nos: list[str]) -> list[Ac2Member]:
-        request = {"phone_digits": phone_digits, "sg_local": sg_local(phone_digits), "member_nos": [m for m in member_nos if m][:PENDING_LOOKUP_BATCH]}
+    def lookup(self, phone_digits: str | None, member_nos: list[str], *, email: str | None = None) -> list[Ac2Member]:
+        """``email`` (BF2a, S6's AutoCount-side shared-email check): the
+        members holding exactly this email, alone (no phone or number)."""
+
+        if email is not None:
+            if usable_email(email) is None or phone_digits is not None or member_nos:
+                raise dl.DirectLocalError("sync_lookup_request_invalid")
+            request: dict[str, Any] = {"phone_digits": None, "sg_local": None, "member_nos": [], "email_address": usable_email(email)}
+        else:
+            request = {"phone_digits": phone_digits, "sg_local": sg_local(phone_digits), "member_nos": [m for m in member_nos if m][:PENDING_LOOKUP_BATCH]}
         result = self._read("sync-lookup", request)
         rows = result.get("members")
         if not isinstance(rows, list) or len(rows) > LOOKUP_MAX_ROWS:
             raise dl.BridgeError("bridge_output_invalid")
-        members = []
-        for row in rows:
-            if not isinstance(row, dict) or not isinstance(row.get("member_no"), str):
-                raise dl.BridgeError("bridge_output_invalid")
-            members.append(Ac2Member(row["member_no"], row.get("name"), row.get("mobile_phone"), row.get("email_address"), row.get("dob"), ac2_created_time(row.get("created_time"))))
-        return members
+        return [_member_from_row(row) for row in rows]
+
+    def member_scan(self, after_member_no: str) -> list[Ac2Member]:
+        """#155 BF2a: one page (at most ``BF2_SCAN_PAGE``) of every member
+        after a MemberNo (keyset; "" for the first page), in AutoCount's
+        MemberNo order, with the scope columns and the decline flag."""
+
+        if not isinstance(after_member_no, str) or len(after_member_no) > 40 or _CONTROL_RE.search(after_member_no):
+            raise dl.DirectLocalError("sync_member_scan_request_invalid")
+        result = self._read("sync-member-scan", {"after_member_no": after_member_no})
+        rows = result.get("members")
+        if not isinstance(rows, list) or len(rows) > BF2_SCAN_PAGE:
+            raise dl.BridgeError("bridge_output_invalid")
+        return [_member_from_row(row) for row in rows]
 
     def changelog_inserts(self, after_id: int | None, limit: int, column: str) -> tuple[list[tuple[int, str]], int]:
         result = self._read("sync-changelog", {"after_id": after_id if after_id is not None else -1, "limit": limit, "xml_column": column})
@@ -2723,6 +3442,24 @@ class SyncBridgeClient(dl.BridgeClient):
             if refusal in BRIDGE_REFUSALS_BEFORE_CLAIM:
                 code = refusal
         return state, code
+
+
+def _member_from_row(row: Any) -> Ac2Member:
+    """One bridge member row. The decline flag is True only for 1, False
+    only for 0; anything else (absent, another value) is None, which never
+    creates."""
+
+    if not isinstance(row, dict) or not isinstance(row.get("member_no"), str):
+        raise dl.BridgeError("bridge_output_invalid")
+    flag = row.get("no_shopify")
+    no_shopify = None if isinstance(flag, bool) else {1: True, 0: False}.get(flag) if isinstance(flag, int) else None
+    return Ac2Member(
+        row["member_no"], row.get("name"), row.get("mobile_phone"), row.get("email_address"), row.get("dob"), ac2_created_time(row.get("created_time")),
+        member_type=row.get("member_type") if isinstance(row.get("member_type"), str) else None,
+        is_active=row.get("is_active") if isinstance(row.get("is_active"), str) else None,
+        expiry_date=row.get("expiry_date") if isinstance(row.get("expiry_date"), str) else None,
+        no_shopify=no_shopify,
+    )
 
 
 # Child refusals before the claim that the engine reports by name.
@@ -3130,14 +3867,15 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#155 phase 1 two-way member create sync")
     parser.add_argument("command", choices=("check-config", "init", "run", "status", "check-credential", "initial-link", "digest", "probe",
-                                            "backfill-registrations", "coverage"))
+                                            "backfill-registrations", "coverage", "backfill-members"))
     parser.add_argument("--config", required=True)
-    parser.add_argument("--apply", action="store_true", help="initial-link (needs initial_link_enabled) or backfill-registrations (needs "
-                        "backfill_registrations_enabled): write; default is a dry run")
+    parser.add_argument("--apply", action="store_true", help="initial-link (needs initial_link_enabled), backfill-registrations (needs "
+                        "backfill_registrations_enabled) or backfill-members (needs backfill_members_enabled and "
+                        "shopify_create_enabled): write; default is a dry run")
     parser.add_argument("--direction", default="both", choices=("both", "shopify_to_ac2", "ac2_to_shopify"))
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")
     parser.add_argument("--max", type=int, default=1, dest="max_creates",
-                        help="backfill-registrations only: members created in this call (1 to max_writes_per_run)")
+                        help="backfill-registrations / backfill-members only: members or customers created in this call (1 to max_writes_per_run)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -3184,6 +3922,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise dl.DirectLocalError("backfill_registrations_disabled")
             if not 1 <= args.max_creates <= config.max_writes_per_run:
                 raise dl.DirectLocalError("backfill_max_invalid")
+        if args.command == "backfill-members":
+            # #155 BF2a: every refusal before any login, read or lock.
+            if args.apply and not config.backfill_members_enabled:
+                raise dl.DirectLocalError("backfill_members_disabled")
+            if args.apply and not config.shopify_create_enabled:
+                raise dl.DirectLocalError("shopify_create_disabled")
+            if not 1 <= args.max_creates <= config.max_writes_per_run:
+                raise dl.DirectLocalError("backfill_members_max_invalid")
         root = _state_root(config)
         ledger = SyncLedger(root)
         try:
@@ -3205,6 +3951,15 @@ def main(argv: list[str] | None = None) -> int:
                 result = engine.backfill_registrations(apply=args.apply, max_creates=args.max_creates, claims=claims)
                 _emit(result)
                 if result["stopped"] in ("backfill_create_not_written", "backfill_create_uncertain", "backfill_read_incomplete"):
+                    return 3  # an operator must look before the next call
+            elif args.command == "backfill-members":
+                claims = load_claim_links(config)
+                engine = build_real_engine(config, ledger, environ=os.environ)
+                if not args.apply:
+                    engine.shopify.create_enabled = False  # a dry run never writes to Shopify
+                result = engine.backfill_members(apply=args.apply, max_creates=args.max_creates, claims=claims)
+                _emit(result)
+                if result["stopped"] in BF2_OPERATOR_STOPS:
                     return 3  # an operator must look before the next call
             else:
                 result = build_real_engine(config, ledger, environ=os.environ).run(direction=args.direction)

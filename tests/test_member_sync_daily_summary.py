@@ -216,8 +216,7 @@ class DecisionTests(SummaryTestCase):
             "task_state_unavailable", "task_last_result", "task_disabled", "check_config_failed", "config_unexpected",
             "digest_failed", "no_runs", "unfinished_runs", "shopify_write", "uncertain_writes", "possible_duplicate_member",
             "member_type_unknown", "login_refused", "writes_over_cap", "alert_unexpected"))
-        self.assertEqual(summary.SHOPIFY_WRITE_CODES, ("shopify_customer_created", "shopify_separate_customer_created_without_phone",
-                                                       "shopify_create_uncertain"))
+        self.assertEqual(summary.SHOPIFY_WRITE_CODES, ("shopify_customer_created", "shopify_create_uncertain"))
         self.assertEqual(summary.AUTO_OFF_CODES, ("shopify_write_while_disabled", "uncertain_writes", "possible_duplicate_member"))
         self.assertEqual(summary.EXPECTED_ALERTS, ("waiting_for_staff", "created_after_wait", "no_phone_sign_up_needs_staff",
                                                    "max_writes_per_run_reached"))
@@ -392,7 +391,7 @@ class DecisionTests(SummaryTestCase):
                 self.assertEqual(event["stop_reasons"], ["shopify_write"])
                 self.assertEqual((event["auto_off"], event["auto_off_reasons"]), ("would_switch", ["shopify_write_while_disabled"]))
         event = self.run_daily(runner=FakeRunner(digest=digest_fixture(counts={code: 2 for code in summary.SHOPIFY_WRITE_CODES})))
-        self.assertEqual(event["digest"]["shopify_writes"], 6)
+        self.assertEqual(event["digest"]["shopify_writes"], 4)
         # A create that Shopify rejected wrote nothing.
         self.assertEqual(self.stops(runner=FakeRunner(digest=digest_fixture(counts={"shopify_create_rejected": 1}))), [])
 

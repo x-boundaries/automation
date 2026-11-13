@@ -17,7 +17,7 @@
   "ac2_create_enabled": false,
   "shopify_create_enabled": false,
   "max_writes_per_run": 1,
-  "birthday_month_metafield": {"namespace": "custom", "key": "birthday_month", "type": "number_integer"},
+  "birthday_month_metafield": {"namespace": "membership", "key": "birthday_month", "type": "single_line_text_field"},
   "ac2_member_no_metafield": {"namespace": "custom", "key": "ac2_member_no", "type": "single_line_text_field"},
   "shopify_create_tags": ["ac2-member"],
   "ac2_credential_target": "XB-AC2-MemberSync",
