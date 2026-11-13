@@ -1373,6 +1373,21 @@ class ChangeLogCursorTests(SyncTestCase):
         self.assertEqual(self.pending_numbers(), [sg(63), sg(62)])
         self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(watermark))
 
+    def test_a_late_unparseable_row_inside_the_overlap_is_skipped_and_the_watermark_stays(self):
+        # BF2b fix round 1 (G2 Y22): the N2 skip never moves the watermark back to a late row.
+        self.initialise()
+        self.ac2.add(sync.Ac2Member(sg(62), "Member", sg(62)), log=True)
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        watermark = int(self.ledger.watermark("ac2_changelog_id"))
+        self.ac2.changelog.append((watermark - 3, "<Member Name=" + chr(34) + "x"))  # committed late
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(result["counts"]["changelog_row_unparsed_skipped"], 1)
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(watermark))
+        self.assertNotIn("changelog_row_replayed", result["counts"])  # the seen row above it is no replay
+        again = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((again["counts"], again["alerts"]), ({}, []))
+        self.assertEqual(self.pending_numbers(), [sg(62)])
+
     def test_overlap_zero_behaves_as_before(self):
         self.run_sync("ac2_to_shopify", changelog_overlap=0)
         self.ac2.add(sync.Ac2Member(sg(64), "Member", sg(64)), log=True)
@@ -7230,7 +7245,22 @@ class Bf2bRejectedHoldTests(Bf2TestCase):
         self.assertEqual(self.shopify.created, [])
 
 
-class Bf2bSettleTests(Bf2TestCase):
+class Bf2bRefMixin:
+    """BF2b fix round 1 (G2 B1): a BF2b count's refs are the member's keyed ref, in the run
+    output and in the stored run summary, never the MemberNo or its key."""
+
+    def assert_keyed_refs(self, result: dict, code: str, member_no: str) -> None:
+        expected = self.ledger.ref("m", sync.member_no_key(member_no))
+        self.assertRegex(expected, r"^m-[0-9a-f]+$")
+        shown = [r["ref"] for r in result["refs"] if r["code"] == code]
+        (summary,) = self.ledger.conn.execute("SELECT summary FROM runs WHERE summary IS NOT NULL ORDER BY rowid DESC LIMIT 1").fetchone()
+        stored = [r["ref"] for r in json.loads(summary)["refs"] if r["code"] == code]
+        self.assertTrue(shown)
+        self.assertEqual(shown, [expected] * len(shown))
+        self.assertEqual(stored, shown)
+
+
+class Bf2bSettleTests(Bf2bRefMixin, Bf2TestCase):
     """BF2b (G2 LATER 6): an uncertain create is never settled after the member's details changed."""
 
     def test_email_only_member_whose_email_changed_stays_uncertain(self):
@@ -7243,6 +7273,7 @@ class Bf2bSettleTests(Bf2TestCase):
         self.now += timedelta(minutes=61)
         result = self.bf2(apply=True)
         self.assertEqual(result["counts"]["uncertain_write_identity_changed"], 1)
+        self.assert_keyed_refs(result, "uncertain_write_identity_changed", "BF2E01")
         self.assertEqual(self.codes_for(result, "BF2E01")[-1], "bf2_member_held_by_open_write")
         self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
         self.now += timedelta(hours=5)
@@ -7271,6 +7302,7 @@ class Bf2bSettleTests(Bf2TestCase):
         self.now += timedelta(minutes=61)
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual(result["counts"]["uncertain_write_identity_changed"], 1)
+        self.assert_keyed_refs(result, "uncertain_write_identity_changed", "TILLE3")
         self.run_sync("ac2_to_shopify")
         self.assertEqual(self.shopify.created, [])
 
@@ -7291,7 +7323,7 @@ class Bf2bEmailTrimTests(Bf2TestCase):
         self.assertEqual(sync.email_key("  " + em(1).upper() + " "), em(1))
 
 
-class Bf2bS6Tests(SyncTestCase):
+class Bf2bS6Tests(Bf2bRefMixin, SyncTestCase):
     """BF2b S6 lines: out-of-scope re-queue (Controller ruling), the AutoCount-side shared-phone
     hold (G2 LATER 8), the AutoCount email check deferred while creates are off (G2 LATER 5),
     and possible_duplicate_member on the email path (G2 LATER 12)."""
@@ -7324,6 +7356,7 @@ class Bf2bS6Tests(SyncTestCase):
         self.now += timedelta(minutes=1)
         result = self.run_sync("ac2_to_shopify")
         self.assertEqual(result["counts"]["ac2_member_out_of_scope_rechecked"], 1)
+        self.assert_keyed_refs(result, "ac2_member_out_of_scope_rechecked", "TILLQ1")
         self.assertEqual((self.pending("TILLQ1"), len(self.shopify.created)), (("DONE", "shopify_customer_created"), 1))
         self.assertEqual(result["alerts"], [])
 
@@ -7394,6 +7427,7 @@ class Bf2bS6Tests(SyncTestCase):
         self.assertEqual((self.pending("TILLP6"), self.shopify.created), (("SKIPPED", "ac2_phone_shared_in_ac2"), []))
         self.assertEqual((result["counts"]["ac2_phone_shared_in_ac2"], result["alerts"]), (1, []))  # a count, not an alert
         self.assert_no_pii(result)
+        self.assert_keyed_refs(result, "ac2_phone_shared_in_ac2", "TILLP6")
 
     def test_a_phone_embedded_in_another_member_no_counts_as_shared(self):
         self.ac2.add(sync.Ac2Member(sg(7) + "1", "Other Person", None))  # the sync's phone rule (embedded digits)
@@ -7468,8 +7502,9 @@ class Bf2bS6Tests(SyncTestCase):
     def test_with_creates_on_the_order_is_as_before(self):
         self.ac2.add(sync.Ac2Member("OLD16", "Other Person", None, em(16)))
         self.walk_in("TILLE16", email=em(16))
-        self.run_sync("ac2_to_shopify")
+        result = self.run_sync("ac2_to_shopify")
         self.assertEqual((self.pending("TILLE16"), self.shopify.email_reads), (("SKIPPED", "ac2_email_shared_in_ac2"), []))
+        self.assert_keyed_refs(result, "ac2_email_shared_in_ac2", "TILLE16")
 
     # -- possible_duplicate_member on the email path -------------------------------------------
     def test_email_customer_the_sync_created_in_ac2_is_a_possible_duplicate(self):
