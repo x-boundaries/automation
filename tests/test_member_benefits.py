@@ -4110,6 +4110,206 @@ class RealOutputsReachTheCheckTests(Base):
         self.assertEqual(stored, out)
 
 
+class B2TestGapTests(Base):
+    """Slice B2, tests only (G0 B2-12, B2-13): gaps left open by earlier
+    rounds, each named after the mutation it now catches."""
+
+    run_main = CliTests.run_main
+    real_client = OrdersQueryCostTests.real_client
+    factory = OrdersQueryCostTests.factory
+
+    # -- B2-12 (PR #303 L6): a real WAL v1 ledger with a reader open ----------
+    def test_b2_12_a_wal_v1_ledger_with_a_reader_open_is_refused_and_its_main_file_left_as_it_is(self):
+        make_v1_ledger(self.root)
+        path = self.root / bm.LEDGER_FILE
+        reader = sqlite3.connect(path, isolation_level=None)
+        self.addCleanup(reader.close)
+        self.assertEqual(reader.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        reader.execute("INSERT INTO watermarks(name, value, updated_at) VALUES ('w', 'v', 't')")  # a page in the -wal file
+        reader.execute("BEGIN")
+        self.assertEqual(reader.execute("SELECT COUNT(*) FROM watermarks").fetchone()[0], 1)  # a read transaction held open
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        for args in self.COMMANDS:
+            with self.subTest(args=args):
+                self.assertEqual(self.run_main(*args)[:2], (2, {"status": "refused", "code": "benefits_ledger_not_recognised"}))
+        self.assertEqual(self.code(lambda: bm.BenefitsLedger(self.root)), "benefits_ledger_not_recognised")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertTrue((self.root / (bm.LEDGER_FILE + "-wal")).exists())  # the side files stay (runbook)
+        self.assertEqual(reader.execute("SELECT value FROM watermarks WHERE name = 'w'").fetchone()[0], "v")
+
+    COMMANDS = (("init",), ("observe",), ("status",), ("digest",))
+
+    # -- B2-13 A21, A23: the line and shipping pages ---------------------------
+    def test_b2_13_a21_a_line_item_page_without_has_next_page_is_not_complete(self):
+        for info, complete in (({"hasNextPage": False}, True), ({}, False), ({"hasNextPage": None}, False), ({"hasNextPage": True}, False)):
+            with self.subTest(info=info):
+                node = order_node(1)
+                node["lineItems"]["pageInfo"] = info
+                order = bm.order_from_node(node)
+                self.assertIs(order.lines_complete, complete)
+                self.assertEqual(bm.goods_amount(order, self.cfg()) is not None, complete)
+
+    def test_b2_13_a23_a_shipping_list_not_shown_complete_is_not_measured_when_shipping_counts(self):
+        for info, exclude, measured in (({"hasNextPage": True}, True, True), ({"hasNextPage": True}, False, False), ({}, False, False),
+                                        ({"hasNextPage": False}, False, True)):
+            with self.subTest(info=info, exclude=exclude):
+                node = order_node(1)
+                node["shippingLines"]["pageInfo"] = info
+                order = bm.order_from_node(node)
+                self.assertIs(order.shipping_complete, info.get("hasNextPage") is False)
+                self.assertEqual(bm.goods_amount(order, self.cfg(amount_exclude_shipping=exclude)) is not None, measured)
+        # In a run: the order is held for a person, never measured without its shipping.
+        self.shopify.add({**order_node(1), "shippingLines": {"pageInfo": {"hasNextPage": True}, "nodes": [{"originalPriceSet": money("15.00")}]}})
+        out = self.engine(amount_exclude_shipping=False).run(apply=False)
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"], out["alerts"]),
+                         ("amount_unverifiable", "currency_or_lines", ["order_amount_unverifiable"]))
+
+    # -- B2-13 A33, A34, A36, A37: the query cost ------------------------------
+    def stored_summary(self, run_id: str) -> dict:
+        conn = sqlite3.connect((self.root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return json.loads(conn.execute("SELECT summary FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0])
+        finally:
+            conn.close()
+
+    def test_b2_13_a33_a34_a36_a37_the_cost_of_a_capped_and_a_resumed_read_is_recorded_never_counted_or_added_up(self):
+        self.guest_with_order(1)
+        self.guest_with_order(2, updated="2026-11-18T03:05:00Z")
+        first, second = (self.shopify.orders_nodes[order_gid(n)] for n in (1, 2))
+        self.run_main("init")
+        session = ShopifyClientTests.session(["read_orders", "read_customers"])
+        client, _ = self.real_client([session, orders_page([first], more="cursor-a", cost=shopify_cost(846.5))])
+        code, capped, _ = self.run_main("observe", cfg={"shopify_max_pages": 1}, factory=self.factory(client))
+        self.assertEqual((code, capped["alerts"], capped["orders_query_cost"]), (3, ["orders_read_incomplete"], 847))  # A33
+        self.advance(minutes=15)
+        client, transport = self.real_client([session, orders_page([second], cost=shopify_cost(500))])
+        code, resumed, _ = self.run_main("observe", cfg={"shopify_max_pages": 1}, factory=self.factory(client))
+        self.assertEqual(transport.bodies[1]["variables"]["after"], "cursor-a")
+        self.assertEqual((code, resumed["counts"].get("orders_read_resumed"), resumed["orders_query_cost"]), (0, 1, 500))  # A34
+        for out in (capped, resumed):
+            stored = self.stored_summary(out["run_id"])
+            self.assertEqual(stored["orders_query_cost"], out["orders_query_cost"])
+            for value in (out, stored):  # A36: never a count
+                self.assertEqual([key for key in value["counts"] if "cost" in key], [])
+                self.assertNotIn(out["orders_query_cost"], [n for k, n in value["counts"].items() if k not in ("orders_read",)])
+        digest = self.run_main("digest", "--hours", "24")[1]
+        self.assertEqual([key for key in digest["counts"] if "cost" in key], [])  # A37: never added up
+        self.assertNotIn(1347, digest["counts"].values())
+        self.assertEqual(digest["runs"], {"completed": 2, "unfinished": 0})
+
+    # -- B2-13 G32: the digest's masked-MemberNo filter -------------------------
+    def test_b2_13_g32_the_digest_keeps_a_masked_member_number_only(self):
+        other = self.temp / "g32"
+        other.mkdir()
+        ledger = bm.BenefitsLedger(other, clock=lambda: self.now)
+        try:
+            ledger.init_meta(self.cfg())
+            refs = [{"ref": "o-" + "a" * 20, "code": "write_held", "member_no_masked": sg(1)},
+                    {"ref": "o-" + "b" * 20, "code": "write_held", "member_no_masked": "*******001"},
+                    {"ref": "o-" + "c" * 20, "code": "write_held", "member_no_masked": "**1234"},
+                    {"ref": "o-" + "d" * 20, "code": "write_held", "member_no_masked": "*" * 10}]
+            summary = {"counts": {"write_held": 4}, "alerts": ["write_held"], "refs": refs}
+            with ledger.tx() as conn:  # a stored summary injected through the ledger (the tool itself always masks)
+                conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES ('run-g32', 'apply', ?, ?, ?)",
+                             (dl.ts(self.now), dl.ts(self.now), json.dumps(summary)))
+        finally:
+            ledger.close()
+        digest = bm.ledger_digest(other, hours=24, now=self.now, config=self.cfg())
+        self.assertEqual(digest["alert_refs"], [{"ref": "o-" + "a" * 20, "code": "write_held"},
+                                                {"ref": "o-" + "b" * 20, "code": "write_held", "member_no_masked": "*******001"},
+                                                {"ref": "o-" + "c" * 20, "code": "write_held"},
+                                                {"ref": "o-" + "d" * 20, "code": "write_held"}])
+        self.assertNotIn(sg(1), json.dumps(digest))
+
+    # -- B2-13 D01: the REFUNDED branch ----------------------------------------
+    def test_b2_13_d01_a_refunded_status_decides_when_the_money_check_alone_would_not(self):
+        lines = (("300.00", 1, 0, False, ()),)  # the one unit refunded: the money is explained by it
+        for status, unattributed in (("REFUNDED", True), ("PARTIALLY_REFUNDED", False), ("PAID", False)):
+            with self.subTest(status=status):
+                order = bm.order_from_node(order_node(1, lines=lines, status=status, refunded="300.00"))
+                self.assertEqual(order.refunded_cents, bm.refunded_unit_cents(order))
+                self.assertIs(bm.money_refund_unattributed(order), unattributed)
+        # An applied receipt read again as REFUNDED with no money left unexplained still alerts.
+        self.guest_with_order(1)
+        self.engine().run(apply=True)
+        self.assertEqual(self.receipt(1)["state"], "applied")
+        self.shopify.add(order_node(1, status="REFUNDED", updated="2026-11-18T03:30:00Z"))
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        self.assertEqual(out["alerts"], ["refund_on_basis"])
+
+    # -- B2-13 D32: a malformed stored resume cursor ----------------------------
+    def test_b2_13_d32_a_malformed_stored_resume_cursor_is_cleared_and_the_read_restarts_from_the_watermark(self):
+        self.guest_with_order(1)
+        engine = self.engine()
+        good_since = "2026-11-18T01:00:00Z"
+        for value in ("not json", "[1]", json.dumps({"since": "x", "cursor": "cursor-0"}), json.dumps({"since": good_since, "cursor": ""}),
+                      json.dumps({"since": good_since, "cursor": 5}), json.dumps({"since": good_since}), json.dumps({"cursor": "cursor-0"})):
+            with self.subTest(value=value):
+                self.ledger.set_watermark(bm.WATERMARK, "2026-11-18T02:00:00Z")
+                self.ledger.set_watermark(bm.RESUME_MARK, value)
+                self.shopify.calls.clear()
+                self.advance(minutes=15)
+                out = engine.run(apply=False)
+                self.assertNotIn("orders_read_resumed", out["counts"])
+                self.assertEqual([c for c in self.shopify.calls if c[0] == "orders"],
+                                 [("orders", datetime(2026, 11, 18, 1, 45, tzinfo=timezone.utc))])  # the watermark less the margin
+                self.assertIsNone(self.ledger.watermark(bm.RESUME_MARK))
+
+
+class B2TokenCacheScopeTests(unittest.TestCase):
+    """Slice B2, tests only (G0 B2-13 G25): the cached token's scope check."""
+
+    class Plain:
+        def protect(self, data, entropy):
+            return data
+
+        def unprotect(self, data, entropy):
+            return data
+
+    def test_b2_13_g25_a_cached_token_with_any_other_scope_set_is_refused_and_cleared(self):
+        temp = Path(tempfile.mkdtemp(prefix="xb-benefits-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        for scope, kept in (("read_customers,read_orders", True), ("read_orders, read_customers", True),
+                            ("read_customers,read_orders,write_customers", False), ("read_customers", False),
+                            ("read_customers,read_orders,read_products", False)):
+            with self.subTest(scope=scope):
+                path = temp / "token.bin"
+                path.write_bytes(json.dumps({"schema": direct.TOKEN_CACHE_SCHEMA, "shop_domain": SHOP, "expires_at": "2026-11-19T00:00:00Z",
+                                             "scope": scope, "access_token": "t" * 32}).encode("utf-8"))
+                cache = bm.BenefitsTokenCache(path, self.Plain(), shop_domain=SHOP, client_id="client-id-0000000")
+                loaded = cache.load(now)
+                if kept:
+                    self.assertEqual((loaded[0], cache.note), ("t" * 32, None))
+                else:
+                    self.assertEqual((loaded, cache.note, path.exists()), (None, "token_cache_unreadable", False))
+
+
+class B2NoReinitGuardTests(unittest.TestCase):
+    """Slice B2 pass bar 2 (G0 1): the VM never needs a re-init for B2. The
+    ledger schema, its version, the amount rule (its version and the source
+    of the five amount functions) and the example config's rule fingerprint
+    are the values at main a6e7142 (slice B1 + C1)."""
+
+    SCHEMA_SHA256 = "d3b426a76493d09d0aefdc3b70a1085a63f4d654d4cc4d5dc0ecb8acef2e3e60"
+    AMOUNT_FUNCTIONS = ("goods_amount", "gift_card_paid", "qualifying_amount", "qualifies", "money_refund_unattributed")
+    AMOUNT_SOURCE_SHA256 = "67f7f494a268f8314d908151f4472ffa4e7318eedc5c4e0582786131440a672d"
+    EXAMPLE_FINGERPRINT = "sha256:964788c0b03682173413a8cc7e290a5f4126ad1ba70d0ae061e92c6e66c08463"
+
+    def test_b2_schema_amount_rule_and_fingerprint_are_unchanged_since_a6e7142(self):
+        import inspect
+
+        self.assertEqual((bm.SCHEMA_VERSION, bm.AMOUNT_RULE_VERSION), (2, 2))
+        self.assertEqual(hashlib.sha256(bm.LEDGER_SCHEMA.encode("utf-8")).hexdigest(), self.SCHEMA_SHA256)
+        source = "".join(inspect.getsource(getattr(bm, name)) for name in self.AMOUNT_FUNCTIONS)
+        self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), self.AMOUNT_SOURCE_SHA256)
+        for name in ("member_benefits.example.json", "member_benefits.live.example.json"):
+            with self.subTest(name=name):
+                value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+                self.assertEqual(bm.parse_config(value).rule_fingerprint(), self.EXAMPLE_FINGERPRINT)
+
+
 class ClassifySaveTests(unittest.TestCase):
     @staticmethod
     def run_of(value, code=0) -> dl.WriteRun:
