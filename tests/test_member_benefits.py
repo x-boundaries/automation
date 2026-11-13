@@ -1544,7 +1544,9 @@ class G2FixRound3Tests(Base):
         self.advance(days=1)
         self.shopify.add(order_node(1, status="PARTIALLY_PAID", updated="2026-11-19T03:00:00Z"))
         out = self.engine().run(apply=True)
-        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled"), self.receipt(1)["code"]), ([], 1, "order_no_longer_qualifies"))
+        # Slice B2 (B2-2): an unpaid status is not a positive fact, so the settle now also alerts once.
+        self.assertEqual((out["alerts"], out["counts"].get("claim_hold_settled"), self.receipt(1)["code"]),
+                         (["claim_hold_settled_unclear"], 1, "order_no_longer_qualifies"))
         # Paid again later: the hold stays settled, also after the link.
         self.advance(minutes=15)
         self.shopify.add(order_node(1, updated="2026-11-19T03:20:00Z"))
@@ -4255,6 +4257,145 @@ class B2TestGapTests(Base):
                 self.assertEqual([c for c in self.shopify.calls if c[0] == "orders"],
                                  [("orders", datetime(2026, 11, 18, 1, 45, tzinfo=timezone.utc))])  # the watermark less the margin
                 self.assertIsNone(self.ledger.watermark(bm.RESUME_MARK))
+
+
+class B2AlertTests(Base):
+    """Slice B2 (G0 B2-1, B2-2): an order seen with another customer after
+    its upgrade, and a claim hold settled for a reason that is not a
+    positive fact. Each alerts once per order; nothing else changes."""
+
+    claim_held = G2FixRound2Tests.claim_held
+    link_and_run = G2FixRound2Tests.link_and_run
+    MOVED = "order_customer_changed_after_upgrade"
+    UNCLEAR = "claim_hold_settled_unclear"
+
+    def upgraded(self, n: int = 1) -> str:
+        member_no = self.guest_with_order(n)
+        self.assertEqual(self.engine().run(apply=True)["saves"], 1)
+        self.assertEqual(self.receipt(n)["state"], "applied")
+        return member_no
+
+    def replay(self, n: int = 1, minute: int = 10, **order) -> dict:
+        self.shopify.add(order_node(n, updated=f"2026-11-18T04:{minute:02d}:00Z", **order))
+        self.advance(minutes=15)
+        return self.engine().run(apply=False)
+
+    # -- B2-1 -----------------------------------------------------------------
+    def test_b2_1_an_order_moved_after_its_upgrade_alerts_once_and_the_receipt_keeps_its_customer(self):
+        member_no = self.upgraded()
+        before = tuple(self.receipt(1))
+        out = self.replay(customer=customer_node(2))
+        ref = self.ledger.ref("o", order_gid(1))
+        self.assertEqual(out["alerts"], [self.MOVED])
+        self.assertIn({"ref": ref, "code": self.MOVED, "member_no_masked": bm.mask(member_no)}, out["refs"])
+        row = self.receipt(1)
+        self.assertEqual((row["state"], row["customer_gid"], row["member_no"], row["code"], row["basis_expiry_local"]),
+                         ("applied", customer_gid(1), member_no, "upgrade", NEW_EXPIRY))
+        self.assertEqual({k: row[k] for k in row.keys() if k not in ("order_updated_at", "updated_at", "payment_gateways")},
+                         {k: dict(zip(row.keys(), before))[k] for k in row.keys() if k not in ("order_updated_at", "updated_at", "payment_gateways")})
+        self.assertIn(("moved:" + order_gid(1), self.MOVED), [tuple(r)[:2] for r in self.ledger.conn.execute("SELECT * FROM reviews")])
+        # Seen again, moved back, moved on: never a second alert.
+        for minute, customer in ((20, customer_node(2)), (30, customer_node(1)), (40, customer_node(3)), (50, None)):
+            with self.subTest(minute=minute):
+                out = self.replay(minute=minute, customer=customer)
+                self.assertEqual((out["alerts"], out["counts"].get(self.MOVED)), ([], None))
+        self.assertEqual((self.book.saves, self.receipt(1)["customer_gid"]), (1, customer_gid(1)))
+
+    def test_b2_1_a_removed_customer_alerts_and_a_refund_on_the_same_read_alerts_too(self):
+        member_no = self.guest_with_order(1)
+        self.guest_with_order(2)
+        self.assertEqual(self.engine().run(apply=True)["saves"], 2)
+        out = self.replay(customer=None)
+        self.assertEqual(out["alerts"], [self.MOVED])
+        out = self.replay(2, minute=20, customer=customer_node(5), status="REFUNDED")
+        self.assertEqual(sorted(out["alerts"]), sorted([self.MOVED, "refund_on_basis"]))
+        self.assertEqual(self.receipt(2)["alerted"], "refund_on_basis")
+        self.assertEqual(self.book.members[member_no]["type"], "MEMBER")  # never downgraded
+
+    def test_b2_1_a_receipt_that_is_not_applied_never_alerts_for_a_move(self):
+        self.guest_with_order(1, member=fake_member(sg(1), name="Fake Member 1", active="F"))  # held: member_inactive
+        self.guest_with_order(2, member=fake_member(sg(2), name="Fake Member 2", member_type="MEMBER", expiry="2030-01-01T00:00:00.000"))
+        self.guest_with_order(3, member=fake_member(sg(3), name="Fake Member 3", member_type="VIP"))
+        self.guest_with_order(4)
+        self.engine().run(apply=False)  # 4 stays ready (observed)
+        self.assertEqual([self.receipt(n)["state"] for n in (1, 2, 3, 4)], ["held", "no_change", "not_in_scope", "ready"])
+        for n in (1, 2, 3, 4):
+            self.shopify.add(order_node(n, customer=customer_node(n + 10), updated="2026-11-18T04:10:00Z"))
+        self.advance(minutes=15)
+        out = self.engine().run(apply=False)
+        self.assertNotIn(self.MOVED, out["alerts"])
+        self.assertIsNone(out["counts"].get(self.MOVED))
+
+    # -- B2-2: the replay path -------------------------------------------------
+    def settle(self, **order) -> dict:
+        self.claim_held()
+        self.advance(days=1)
+        self.shopify.add(order_node(1, updated="2026-11-19T03:00:00Z", **order))
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["counts"].get("claim_hold_settled"), self.receipt(1)["state"], self.receipt(1)["code"]),
+                         (1, "held", "order_no_longer_qualifies"))
+        return out
+
+    def test_b2_2_a_positive_fact_settles_a_claim_hold_silently(self):
+        cases = {"cancelled": dict(cancelled="2026-11-19T02:00:00Z"),
+                 "unit_refund": dict(lines=(("300.00", 1, 0, False, ()),), status="PARTIALLY_REFUNDED", refunded="300.00"),
+                 "unit_refund_below": dict(lines=(("300.00", 1, 1, False, ()), ("50.00", 1, 1, False, ())), refunded="0.00", transactions=(tx("60.00"),)),
+                 "moved": dict(customer=customer_node(2)), "no_customer": dict(customer=None)}
+        for name, order in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                try:
+                    out = self.settle(**order)
+                    self.assertNotIn(self.UNCLEAR, out["alerts"])
+                    self.assertIsNone(out["counts"].get(self.UNCLEAR))
+                finally:
+                    self.doCleanups()
+
+    def test_b2_2_any_other_reason_settles_and_alerts_once(self):
+        twenty = tuple(("20.00", 1, 1, False, ()) for _ in range(20))
+        cases = {"unpaid": dict(status="PENDING"), "partly_paid": dict(status="PARTIALLY_PAID"),
+                 "signup_marker_gone": dict(customer=customer_node(1, tags=())),
+                 "a_21st_line": dict(lines=twenty, more_lines=True),
+                 "a_10th_transaction": dict(transactions=tuple(card("1.00") for _ in range(10))),
+                 "test_order": dict(test=True)}
+        for name, order in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                try:
+                    out = self.settle(**order)
+                    ref = self.ledger.ref("o", order_gid(1))
+                    self.assertEqual((out["counts"].get(self.UNCLEAR), out["saves"]), (1, 0))
+                    self.assertIn(self.UNCLEAR, out["alerts"])
+                    self.assertIn({"ref": ref, "code": self.UNCLEAR}, out["refs"])
+                    # Once: seen again (and linked), the settled hold stays shut and quiet.
+                    self.advance(minutes=15)
+                    again = self.link_and_run()
+                    self.assertEqual((again["counts"].get(self.UNCLEAR), self.receipt(1)["code"], self.book.saves),
+                                     (None, "order_no_longer_qualifies", 0))
+                finally:
+                    self.doCleanups()
+
+    # -- B2-2: the stored-facts path (_reopen_claim_holds) ----------------------
+    def test_b2_2_the_stored_facts_path_alerts_unless_a_paid_amount_is_below_the_threshold(self):
+        facts = {1: (dict(financial_status="REFUNDED"), True), 2: (dict(net_cents=0), False), 3: (dict(financial_status="PENDING"), True),
+                 4: (dict(net_cents=None), True), 5: (dict(financial_status=None), True), 6: (dict(net_cents=29_999, financial_status="PARTIALLY_REFUNDED"), False)}
+        for n in facts:
+            self.guest_with_order(n, linked=False, member=fake_member(sg(n), name="Someone Else Entirely"))
+        self.engine().run(apply=True)
+        self.advance(hours=2)
+        self.shopify.add(order_node(9, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T05:30:00Z"))
+        self.engine().run(apply=True)  # a newer order moves the watermark on: the six are not read again
+        for n, (change, _) in facts.items():
+            self.assertEqual(self.receipt(n)["code"], "claim_name_mismatch")
+            self.ledger.update_receipt(order_gid(n), **change)
+            self.link(n)
+        self.advance(hours=1)
+        out = self.engine().run(apply=True)
+        alerted = {r["ref"] for r in out["refs"] if r["code"] == self.UNCLEAR}
+        self.assertEqual(alerted, {self.ledger.ref("o", order_gid(n)) for n, (_, alert) in facts.items() if alert})
+        self.assertEqual((out["counts"].get("claim_hold_settled"), out["counts"].get(self.UNCLEAR), out["saves"]), (6, 4, 0))
+        self.advance(hours=1)
+        self.assertIsNone(self.engine().run(apply=True)["counts"].get(self.UNCLEAR))  # once
 
 
 class B2TokenCacheScopeTests(unittest.TestCase):

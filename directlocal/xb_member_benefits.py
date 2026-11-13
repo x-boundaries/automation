@@ -160,6 +160,14 @@ _ORDER_REF_RE = re.compile(r"^o-[0-9a-f]{20}\Z")
 _CUSTOMER_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
 _LAST3_RE = re.compile(r"^[A-Za-z0-9._/-]{1,3}\Z")  # the last 3 characters of a MemberNo (dl.MEMBER_NO_RE)
 CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, ORDER_PAST_READ_WINDOW})
+# Slice B2 (B2-1, B2-2): alerts, each once per order (review subjects
+# ``moved:<order>`` and ``settled:<order>``; no schema change).
+ORDER_CUSTOMER_CHANGED = "order_customer_changed_after_upgrade"
+CLAIM_HOLD_SETTLED_UNCLEAR = "claim_hold_settled_unclear"
+# The replayed states that settle a claim hold silently: positive facts only
+# (a cancellation; an amount measured below the threshold). A move or a
+# removed customer is the other positive fact (checked apart).
+CLAIM_SETTLE_POSITIVE_STATES = frozenset({"void", "below_threshold"})
 # Slice B1: the version of the amount rule (goods_amount, gift_card_paid,
 # qualifying_amount, qualifies, money_refund_unattributed and the order
 # parsing of amounts). Any change to one of them raises it; it is part of the
@@ -1712,9 +1720,22 @@ class BenefitsEngine:
                 # receipt whose stored facts no longer qualify never re-opens.
                 self.ledger.update_receipt(row["order_gid"], code=ORDER_NO_LONGER_QUALIFIES)
                 summary.count("claim_hold_settled", ref)
+                # Slice B2 (B2-2): silent only for a paid order whose stored
+                # amount is measured below the threshold (a unit refund).
+                if not (row["financial_status"] in PAID_STATUSES and row["financial_status"] != "REFUNDED"
+                        and isinstance(row["net_cents"], int) and not qualifies(row["net_cents"], self.config)):
+                    self._settled_unclear(row["order_gid"], summary, ref)
                 continue
             self.ledger.update_receipt(row["order_gid"], state="ready", code=None, checked_at=None)
             summary.count("claim_hold_reopened", ref)
+
+    def _settled_unclear(self, order_gid: str, summary: RunSummary, ref: str) -> None:
+        """Slice B2 (B2-2): a claim hold settled for a reason that is not a
+        positive fact: one alert per order, so staff can upgrade by hand. The
+        settle itself is unchanged (it denies only, never grants)."""
+
+        if self.ledger.review_once("settled:" + order_gid, CLAIM_HOLD_SETTLED_UNCLEAR):
+            summary.alert(CLAIM_HOLD_SETTLED_UNCLEAR, ref)
 
     def _still_qualifies_as_last_read(self, row: sqlite3.Row) -> bool:
         """The stored facts of the order as last read: a paid status that is
@@ -1824,9 +1845,21 @@ class BenefitsEngine:
                 elif moved or state != "ready":
                     self.ledger.update_receipt(order.gid, code=ORDER_NO_LONGER_QUALIFIES)
                     summary.count("claim_hold_settled", ref)
+                    # Slice B2 (B2-2): silent for a positive fact (moved or no
+                    # customer, a cancellation, an amount measured below the
+                    # threshold); any other reason (unpaid, sign-up marker gone,
+                    # amount unreadable, a test order) alerts once.
+                    if not moved and state not in CLAIM_SETTLE_POSITIVE_STATES:
+                        self._settled_unclear(order.gid, summary, ref)
                 else:
                     summary.count("receipt_replayed")
                 return
+            if existing["state"] == "applied" and (order.customer.gid if order.customer else None) != existing["customer_gid"]:
+                # Slice B2 (B2-1): the order now shows another customer, or
+                # none. The receipt keeps its customer; one alert per order
+                # (the owner checks the upgrade went to the right member).
+                if self.ledger.review_once("moved:" + order.gid, ORDER_CUSTOMER_CHANGED):
+                    summary.alert(ORDER_CUSTOMER_CHANGED, ref, existing["member_no"])
             # G2 B1: a refund by units below the threshold, a cancellation, or
             # any refund by money that no unit explains (incl. REFUNDED).
             dropped = order.cancelled or (net is not None and not qualifies(net, self.config)) or money_refund_unattributed(order)
