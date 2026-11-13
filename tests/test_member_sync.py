@@ -6590,6 +6590,34 @@ class Bf2PrivacyTests(Bf2TestCase):
         self.assertEqual(repr(sync.Bf2Context(customer_linked=lambda g: False)), "Bf2Context()")
 
 
+class Bf2BridgeRowTests(unittest.TestCase):
+    """T8 (Python side): the decline flag is True only for 1 and False only
+    for 0; anything else (absent, null, text, a boolean, 2) never creates."""
+
+    def test_decline_flag_parsing(self):
+        for value, expected in ((1, True), (0, False), (None, None), ("1", None), ("0", None), (True, None), (False, None), (2, None), (-1, None)):
+            with self.subTest(value=value):
+                self.assertIs(sync._member_from_row({"member_no": "BF2B01", "no_shopify": value}).no_shopify, expected)
+        self.assertIsNone(sync._member_from_row({"member_no": "BF2B01"}).no_shopify)
+        row = sync._member_from_row({"member_no": "BF2B01", "member_type": "GUEST", "is_active": "T", "expiry_date": "2027-01-31", "no_shopify": 0})
+        self.assertEqual((row.member_type, row.is_active, row.expiry_date), ("GUEST", "T", "2027-01-31"))
+        for bad in ({"member_no": 5}, {}, "x"):
+            with self.assertRaises(dl.BridgeError):
+                sync._member_from_row(bad)
+
+    def test_scan_page_bound_and_cursor_checked_before_the_bridge(self):
+        client = sync.SyncBridgeClient(["x"], autocount_book="AED_TESTINGAPI", claims=Path("."))
+        client._read = mock.Mock(return_value={"members": [{"member_no": "A"}] * (sync.BF2_SCAN_PAGE + 1)})
+        with self.assertRaises(dl.BridgeError):
+            client.member_scan("")
+        client._read = mock.Mock(side_effect=AssertionError("sent"))
+        for bad in (None, "x" * 41, "A"):
+            with self.assertRaises(dl.DirectLocalError):
+                client.member_scan(bad)
+        with self.assertRaises(dl.DirectLocalError):
+            client.lookup(None, [], email="not an email")
+
+
 class Bf2ShopifyClientTests(unittest.TestCase):
     """T11: customerByIdentifier, pinned and checked."""
 
