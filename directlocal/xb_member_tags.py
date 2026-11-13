@@ -1,9 +1,20 @@
-"""#268 slice C1: the Shopify customer tag ``member-qualified``, kept right
-from AutoCount (the member 15% discount points at a segment of that tag).
+"""#268 slices C1 and D: the Shopify customer tags ``member-qualified`` and
+``member-bday-month``, kept right from AutoCount (the member 15% discount
+points at a segment of the first; the birthday 20% at a segment of both).
 
-Scope: the G0 slice C design (Controller brief, 12 Nov 2026), cut C1. Runs on
-the AutoCount VM from its own clone, state root, config and Shopify app (one
-scope, ``write_customers``). Nothing runs on merge; the default is ``observe``.
+Scope: the G0 slice C design (Controller brief, 12 Nov 2026), cut C1, and the
+G0 slice D design (13 Nov 2026, section 2, with the C2 items). Runs on the
+AutoCount VM from its own clone, state root, config and Shopify app (one
+scope, ``write_customers``). Nothing runs on merge; the default is ``observe``
+and both write switches (``tags_write_enabled``, ``bday_tag_enabled``) are off.
+
+Slice D in one line: ``member-bday-month`` is on only when the customer
+qualifies for ``member-qualified`` (the same verdict) and the Shopify field
+``membership.birthday_month`` is exactly this Singapore month's English name;
+it comes off when the field names another month, or on C1's positive facts;
+everything unreadable or conflicting is left alone with an alert. One counts
+read per run checks the scans against the book (no removal on a mismatch) and
+the VM clock against the AutoCount server (no mutation on a mismatch).
 
 What one run does (``observe`` or ``apply``)
 --------------------------------------------
@@ -25,14 +36,16 @@ What one run does (``observe`` or ``apply``)
    the customer's only link was voided by the member core). Everything else is
    left alone with an alert.
 6. ``apply`` only (switch ``tags_write_enabled``, per-run caps, volume guard,
-   ``STOP`` file): ``tagsAdd`` / ``tagsRemove`` with exactly
-   ``["member-qualified"]`` on a customer this run read by ID. An INTENT row is
-   committed before each mutation; an unproven answer stops the run and is
-   settled by the next run's read, never by sending again.
+   ``STOP`` file; for the birthday tag also ``bday_tag_enabled``, its own caps,
+   pilot list and volume guard): ``tagsAdd`` / ``tagsRemove`` with exactly one
+   tag, ``["member-qualified"]`` or ``["member-bday-month"]``, on a customer
+   this run read by ID. An INTENT row is committed before each mutation; an
+   unproven answer stops the run and is settled by the next run's read, never
+   by sending again.
 
 Never: any other Shopify mutation (no customer create, update or delete, no
-metafield), any AutoCount write (no save child is ever started), the birthday
-tag (slice D), the removal of a tag that has no basis (slice C2).
+metafield), any AutoCount write (no save child is ever started), the removal
+of a tag that has no basis unless ``remove_unbased_tags_enabled`` is on.
 
 Privacy: the ledger (private state root on the VM) keeps customer GIDs,
 MemberNos, this tool's tag operations, codes and counts. Output carries codes,
@@ -43,6 +56,7 @@ last 3 characters only.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import hmac
 import http.client
@@ -77,11 +91,22 @@ TOOL = "xb268_member_tags"
 SCHEMA_VERSION = 1
 TOKEN_CACHE_FILE = "tags_token_cache.bin"
 
-# Every tag this tool may ever send, and the ones it sends in this slice.
-# member-bday-month is slice D: in the set (the ledger CHECK), never sent now.
-TAG = "member-qualified"
+# Every tag this tool may ever send (the ledger CHECK), and the ones it sends.
+# member-bday-month is sent only with bday_tag_enabled (slice D).
+TAG ="member-qualified"
 TAG_SET = ("member-qualified", "member-bday-month")
-ACTIVE_TAGS = ("member-qualified",)
+# Slice D: both tags are active. A mutation still carries exactly one of them.
+ACTIVE_TAGS = ("member-qualified", "member-bday-month")
+BDAY_TAG = "member-bday-month"
+
+# Slice D: the Shopify field membership.birthday_month is a choice list of
+# these exact English names (written by the MG Member Sign-up form). A literal
+# tuple on purpose: names from the calendar module or a date format follow
+# the machine's locale.
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+               "November", "December")
+BDAY_FIELD_TYPE = "single_line_text_field"
+BDAY_MISSING, BDAY_MONTH, BDAY_UNREADABLE = "missing", "month", "unreadable"
 
 # The two input ledgers, pinned as literals (this module does not import the
 # member core). tests/test_member_tags.py proves they equal the tools' own
@@ -100,7 +125,13 @@ MEMBER = tm.MEMBER
 SCAN_TYPES = tm.SCAN_TYPES  # Default, MEMBER, GUEST
 SCAN_PAGE_SIZE = tm.SCAN_PAGE_SIZE
 SCAN_MAX_PAGES = tm.SCAN_MAX_PAGES
-READ_OPERATIONS = ("type-move-scan", "type-move-member")
+# Slice D (Controller answer Q3): type-move-counts is the third read, already in
+# the bridge and admitted by the book guard's type_move_p1 profile (no
+# PowerShell or book guard change). It feeds the type-count and clock checks.
+READ_OPERATIONS = ("type-move-scan", "type-move-member", "type-move-counts")
+# The VM clock (Singapore time) against the AutoCount server's local time from
+# the same counts read (design 2.2): more than this apart, no mutation is sent.
+CLOCK_TOLERANCE = timedelta(minutes=10)
 BRIDGE_SCRIPT = tm.BRIDGE_SCRIPT
 SGT = sync.SGT
 # An ExpiryDate before this day is a placeholder (R2 3.1 stage 2: 2000-01-01),
@@ -134,6 +165,15 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "ac2_credential_target": None,
     "ac2_login_mode": None,
     "ac2_refused_user_ids": [],
+    # Slice D: the birthday tag has its own switch, caps and pilot allow-list.
+    # With the switch off its decisions are counted (would_bday_*), never sent.
+    "bday_tag_enabled": False,
+    "max_bday_adds_per_run": 10,
+    "max_bday_removes_per_run": 10,
+    "bday_only_customers": [],
+    # C2 (slice D design 2.6): take off a tag that has no basis (row 14, D13),
+    # for both tags, under each tag's cap and volume guard. Off until U6/U7.
+    "remove_unbased_tags_enabled": False,
 }
 _BOUNDS = {
     "max_tag_adds_per_run": (1, 250),
@@ -141,7 +181,10 @@ _BOUNDS = {
     "max_member_reads_per_run": (1, 100),
     "shopify_max_carrier_pages": (1, 100),
     "http_timeout_seconds": (5, 60),
+    "max_bday_adds_per_run": (1, 250),
+    "max_bday_removes_per_run": (1, 250),
 }
+BDAY_PILOT_MAX = 5
 OTHER_TOOL_SCHEMAS = (sync.CONFIG_SCHEMA, tm.CONFIG_SCHEMA, MEMBER_CORE_CONFIG_SCHEMA)
 
 
@@ -161,6 +204,14 @@ class TagsConfig:
     ac2_credential_target: str | None
     ac2_login_mode: str | None
     ac2_refused_user_ids: tuple[str, ...]
+    bday_tag_enabled: bool
+    max_bday_adds_per_run: int
+    max_bday_removes_per_run: int
+    bday_only_customers: tuple[str, ...]
+    remove_unbased_tags_enabled: bool
+
+    def __repr__(self) -> str:  # the pilot list holds customer GIDs
+        return "TagsConfig()"
 
     def summary(self) -> dict[str, Any]:
         """PII-free view for ``check-config``."""
@@ -172,6 +223,10 @@ class TagsConfig:
             "max_member_reads_per_run": self.max_member_reads_per_run, "shopify_max_carrier_pages": self.shopify_max_carrier_pages,
             "ac2_credential": "credential_manager" if self.ac2_credential_target else "owner_console_environment",
             "ac2_login_mode": self.ac2_login_mode,
+            # Slice D: the birthday settings and the C2 switch (the pilot list as a count: never a GID).
+            "bday_tag": BDAY_TAG, "bday_tag_enabled": self.bday_tag_enabled, "max_bday_adds_per_run": self.max_bday_adds_per_run,
+            "max_bday_removes_per_run": self.max_bday_removes_per_run, "bday_only_customers": len(self.bday_only_customers),
+            "remove_unbased_tags_enabled": self.remove_unbased_tags_enabled,
         }
 
 
@@ -222,10 +277,19 @@ def parse_config(value: Any) -> TagsConfig:
         raise dl.DirectLocalError("tags_config_ac2_refused_user_ids_owner_shared_refused")
     if live and login_mode == "dedicated" and not refused:
         raise dl.DirectLocalError("tags_config_ac2_refused_user_ids_live_required")
+    for key in ("bday_tag_enabled", "remove_unbased_tags_enabled"):
+        if not isinstance(merged[key], bool):
+            raise dl.DirectLocalError(f"tags_config_{key}_invalid")
+    pilot = merged["bday_only_customers"]
+    if (not isinstance(pilot, list) or len(pilot) > BDAY_PILOT_MAX or len(set(map(str, pilot))) != len(pilot)
+            or any(not isinstance(gid, str) or not _CUSTOMER_GID_RE.fullmatch(gid) for gid in pilot)):
+        raise dl.DirectLocalError("tags_config_bday_only_customers_invalid")
     return TagsConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, member_sync_state_root=merged["member_sync_state_root"],
         member_core_state_root=merged["member_core_state_root"], tags_write_enabled=merged["tags_write_enabled"],
-        ac2_credential_target=target, ac2_login_mode=login_mode, ac2_refused_user_ids=tuple(refused), **numbers,
+        ac2_credential_target=target, ac2_login_mode=login_mode, ac2_refused_user_ids=tuple(refused),
+        bday_tag_enabled=merged["bday_tag_enabled"], bday_only_customers=tuple(pilot),
+        remove_unbased_tags_enabled=merged["remove_unbased_tags_enabled"], **numbers,
     )
 
 
@@ -393,11 +457,12 @@ def build_links(sync_links: Iterable[tuple[str, str]], claims: Iterable[tuple[st
 # --------------------------------------------------------------------------
 
 class TagsReadBridgeClient(tm.TypeMoveBridgeClient):
-    """ac2_member_type_move_bridge.ps1 (profile type_move_p1), two reads only:
-    ``type-move-scan`` and ``type-move-member``. Every child start goes
-    through ``_start``, which admits exactly those two read operations; the
-    save, the fenced write runner and every other operation are refused
-    before any process starts. This tool never writes AutoCount."""
+    """ac2_member_type_move_bridge.ps1 (profile type_move_p1), three reads
+    only: ``type-move-scan``, ``type-move-member`` and ``type-move-counts``
+    (the type move client's own ``counts``). Every child start goes through
+    ``_start``, which admits exactly those three read operations; the save,
+    the fenced write runner and every other operation are refused before any
+    process starts. This tool never writes AutoCount."""
 
     def __repr__(self) -> str:
         return "TagsReadBridgeClient()"
@@ -417,9 +482,6 @@ class TagsReadBridgeClient(tm.TypeMoveBridgeClient):
 
     def write_once(self, *args: Any, **kwargs: Any) -> Any:
         raise dl.DirectLocalError("tags_autocount_write_refused")
-
-    def counts(self) -> dict[str, Any]:
-        raise dl.DirectLocalError("tags_operation_not_offered")
 
 
 def scan_type(ac2: Any, member_type: str) -> list[dict[str, Any]]:
@@ -445,14 +507,45 @@ def scan_type(ac2: Any, member_type: str) -> list[dict[str, Any]]:
     raise dl.DirectLocalError("tags_scan_too_many_pages")
 
 
-def scan_members(ac2: Any) -> dict[str, list[tuple[str, dict[str, Any]]]]:
-    """MemberNo key -> every ``(type, row)`` found across the three scans."""
+def scan_members(ac2: Any, sizes: dict[str, int] | None = None) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    """MemberNo key -> every ``(type, row)`` found across the three scans;
+    ``sizes`` (when given) receives each scan's row count."""
 
     found: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for member_type in SCAN_TYPES:
-        for row in scan_type(ac2, member_type):
+        rows = scan_type(ac2, member_type)
+        if sizes is not None:
+            sizes[member_type] = len(rows)
+        for row in rows:
             found.setdefault(sync.member_no_key(row["member_no"]), []).append((member_type, row))
     return found
+
+
+def type_counts_match(counts: Mapping[str, Any], sizes: Mapping[str, int]) -> bool:
+    """Design 2.7: for each of ``Default``, ``MEMBER`` and ``GUEST`` the
+    scan's row count equals that type's count from ``type-move-counts``
+    (rows grouped by type and active flag; the type compared exactly, as the
+    scan's own parameter). A malformed count row is a read failure."""
+
+    totals = {member_type: 0 for member_type in SCAN_TYPES}
+    for row in counts.get("counts") or []:
+        if (not isinstance(row, dict) or not (row.get("member_type") is None or isinstance(row.get("member_type"), str))
+                or isinstance(row.get("members"), bool) or not isinstance(row.get("members"), int) or row["members"] < 0):
+            raise dl.BridgeError("bridge_output_invalid")
+        if row["member_type"] in totals:
+            totals[row["member_type"]] += row["members"]
+    return all(totals[member_type] == sizes.get(member_type) for member_type in SCAN_TYPES)
+
+
+def clock_matches(server_now_local: Any, now: datetime) -> bool:
+    """Design 2.2: the VM clock in Singapore time is within
+    ``CLOCK_TOLERANCE`` of the AutoCount server's local time."""
+
+    server = tm.parse_local(server_now_local)
+    if server is None:
+        raise dl.BridgeError("bridge_output_invalid")
+    local = now.astimezone(SGT).replace(tzinfo=None)
+    return abs(local - server) <= CLOCK_TOLERANCE
 
 
 def sg_today(moment: datetime) -> date:
@@ -461,6 +554,12 @@ def sg_today(moment: datetime) -> date:
     if moment.tzinfo is None:
         raise dl.DirectLocalError("clock_must_be_timezone_aware")
     return moment.astimezone(SGT).date()
+
+
+def month_name(day: date) -> str:
+    """The English month name of a Singapore date, from the literal tuple."""
+
+    return MONTH_NAMES[day.month - 1]
 
 
 def expiry_day(expiry_local: Any) -> date | None:
@@ -517,7 +616,8 @@ def single_read_verdict(result: Mapping[str, Any]) -> tuple[str, str]:
 
 CUSTOMERS_QUERY = """query XbMemberTagsCustomers($ids: [ID!]!) {
   nodes(ids: $ids) { ... on Customer { id tags
-    registration: metafield(namespace: "membership", key: "start_date") { id } } }
+    registration: metafield(namespace: "membership", key: "start_date") { id }
+    birthday: metafield(namespace: "membership", key: "birthday_month") { value type } } }
 }"""
 CARRIERS_QUERY = """query XbMemberTagsCarriers($first: Int!, $after: String, $search: String!) {
   customers(first: $first, after: $after, query: $search) { nodes { id tags } pageInfo { hasNextPage endCursor } }
@@ -532,19 +632,21 @@ READ_QUERIES = frozenset({direct.SESSION_QUERY, CUSTOMERS_QUERY, CARRIERS_QUERY}
 MUTATIONS = {"add": (TAGS_ADD_MUTATION, "tagsAdd"), "remove": (TAGS_REMOVE_MUTATION, "tagsRemove")}
 MUTATION_TEXTS = frozenset(text for text, _field in MUTATIONS.values())
 QUERY_NAMES = {CUSTOMERS_QUERY: "XbMemberTagsCustomers", CARRIERS_QUERY: "XbMemberTagsCarriers"}
-CARRIER_SEARCH = f"tag:'{TAG}'"  # built from the pinned tag only
+# One search per active tag, each built from the pinned tag only (design 2.5).
+CARRIER_SEARCHES = {tag: f"tag:'{tag}'" for tag in ACTIVE_TAGS}
 # Page sizes. Shopify refuses a query whose requested cost is over 1,000
 # points before it runs (shopify.dev rate limits). On the strict reading used
 # by the member core (an object costs 1, a scalar 0, every selected object is
 # counted once per row of the list or connection above it, a list of IDs has
 # one row per ID):
-#     customers by ID: 100 x (Customer 1 + metafield 1)            = 200
+#     customers by ID: 100 x (Customer 1 + 2 metafields 1 each)    = 300
 #     carriers: connection 1 + pageInfo 1 + 100 x (Customer 1)     = 102
-# Both under the 500 the design allows before the nodes page is lowered to 50.
+# Both under the 500 the design allows before the nodes page is lowered to 50
+# (slice D design 2.9: the birthday metafield took the by-ID query from 200).
 # Pinned by CostTests; the runbook (section 8) writes the sums out.
 NODES_PAGE = 100
 CARRIER_PAGE = 100
-CUSTOMERS_QUERY_COST = 200
+CUSTOMERS_QUERY_COST = 300
 CARRIERS_QUERY_COST = 102
 MUTATION_COST = 10
 COST_CEILING = 500
@@ -557,12 +659,17 @@ BUDGET_CODES = frozenset({"shopify_retry_budget_exhausted", "shopify_query_cost_
 
 @dataclass(frozen=True)
 class CustomerState:
-    """One customer as read by ID: its tags and whether the
-    ``membership.start_date`` metafield exists (its value is never read)."""
+    """One customer as read by ID: its tags, whether the
+    ``membership.start_date`` metafield exists (its value is never read), and
+    the ``membership.birthday_month`` reading (slice D design 2.1):
+    ``bday_state`` is ``missing``, ``month`` (``bday_month`` is then exactly
+    one of ``MONTH_NAMES``) or ``unreadable``. Never stored or printed."""
 
     gid: str
     tags: tuple[str, ...]
     has_registration: bool
+    bday_state: str = BDAY_MISSING
+    bday_month: str | None = None
 
     def __repr__(self) -> str:  # never render customer data
         return "CustomerState()"
@@ -587,7 +694,22 @@ def customer_state(node: Any, gid: str) -> CustomerState | None:
     _shape(isinstance(node, dict) and node.get("id") == gid)
     registration = node.get("registration")
     _shape(registration is None or (isinstance(registration, dict) and isinstance(registration.get("id"), str)))
-    return CustomerState(gid, _tags(node.get("tags")), registration is not None)
+    bday_state, bday_month = birthday_reading(node.get("birthday"))
+    return CustomerState(gid, _tags(node.get("tags")), registration is not None, bday_state, bday_month)
+
+
+def birthday_reading(birthday: Any) -> tuple[str, str | None]:
+    """``membership.birthday_month`` (design 2.1): null is ``missing``; a
+    single line text whose value is exactly one of ``MONTH_NAMES`` (no strip,
+    no casefold) is ``month``; any other type (a list included) or value is
+    ``unreadable`` and is never guessed. A wrong shape stops the read."""
+
+    if birthday is None:
+        return BDAY_MISSING, None
+    _shape(isinstance(birthday, dict) and isinstance(birthday.get("value"), str) and isinstance(birthday.get("type"), str))
+    if birthday["type"] == BDAY_FIELD_TYPE and birthday["value"] in MONTH_NAMES:
+        return BDAY_MONTH, birthday["value"]
+    return BDAY_UNREADABLE, None
 
 
 def check_tag_variables(gid: Any, tags: Any) -> None:
@@ -670,14 +792,19 @@ class TagsShopifyClient(direct.ShopifyDirectClient):
                 found[gid] = customer_state(node, gid)
         return found
 
-    def carriers(self, max_pages: int) -> tuple[set[str], bool]:
-        """Customers the search index lists as carrying the tag: a candidate
-        list only (each is then read by ID). ``complete`` is false at the cap."""
+    def carriers(self, tag: str, max_pages: int) -> tuple[set[str], bool]:
+        """Customers the search index lists as carrying ``tag`` (one of the
+        active tags; anything else is refused before any HTTP call): a
+        candidate list only (each is then read by ID). ``complete`` is false
+        at the cap."""
 
+        if not isinstance(tag, str) or tag not in CARRIER_SEARCHES:
+            raise dl.DirectLocalError("tags_tag_not_allowed")
+        search = CARRIER_SEARCHES[tag]
         gids: set[str] = set()
         after = None
         for _ in range(max_pages):
-            page = self._run(CARRIERS_QUERY, {"first": CARRIER_PAGE, "after": after, "search": CARRIER_SEARCH}).get("customers")
+            page = self._run(CARRIERS_QUERY, {"first": CARRIER_PAGE, "after": after, "search": search}).get("customers")
             _shape(isinstance(page, dict) and isinstance(page.get("nodes"), list) and isinstance(page.get("pageInfo"), dict))
             for node in page["nodes"]:
                 _shape(isinstance(node, dict) and isinstance(node.get("id"), str) and bool(_CUSTOMER_GID_RE.fullmatch(node["id"])))
@@ -994,17 +1121,27 @@ class TagsLedger:
             conn.execute("UPDATE tag_writes SET state = ?, code = ?, updated_at = ? WHERE write_id = ?",
                          (state, code, dl.ts(self.now()), write_id))
 
-    def done_adds_since(self, customer_gid: str, since: datetime) -> int:
-        """DONE adds of our tag for this customer settled at or after ``since``
-        (the flapping guard)."""
+    def done_adds_since(self, customer_gid: str, since: datetime, tag: str) -> int:
+        """DONE adds of ``tag`` for this customer settled at or after ``since``
+        (the flapping guard, per tag)."""
 
         return self.conn.execute("SELECT COUNT(*) FROM tag_writes WHERE customer_gid = ? AND tag = ? AND op = 'add' AND state = 'DONE' "
-                                 "AND updated_at >= ?", (customer_gid, TAG, dl.ts(since))).fetchone()[0]
+                                 "AND updated_at >= ?", (customer_gid, tag, dl.ts(since))).fetchone()[0]
+
+    def last_done_add_at(self, customer_gid: str, tag: str) -> datetime | None:
+        """When this tool's last DONE add of ``tag`` for this customer was
+        recorded (the month-change exemption), or None if it never added it."""
+
+        value = self.conn.execute("SELECT MAX(updated_at) FROM tag_writes WHERE customer_gid = ? AND tag = ? AND op = 'add' "
+                                  "AND state = 'DONE'", (customer_gid, tag)).fetchone()[0]
+        return None if value is None else dl.parse_ts(value)
 
     def status(self, config: TagsConfig) -> dict[str, Any]:
         self.check_binding(config)
         conn = self.conn
-        writes = {f"{row[0]}:{row[1]}": row[2] for row in conn.execute("SELECT op, state, COUNT(*) FROM tag_writes GROUP BY op, state")}
+        # Keys as in C1 (op:state) for member-qualified; bday:op:state for the birthday tag (slice D).
+        writes = {("bday:" if row[0] == BDAY_TAG else "") + f"{row[1]}:{row[2]}": row[3]
+                  for row in conn.execute("SELECT tag, op, state, COUNT(*) FROM tag_writes GROUP BY tag, op, state")}
         return {"status": "ok", "command": "status", "tag_writes": writes, "open_writes": len(self.open_writes()),
                 "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
                 "runs": conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
@@ -1059,6 +1196,7 @@ class PlannedWrite:
     reason: str
     member_no: str | None
     basis: str | None  # sync155, claim or voided
+    tag: str = TAG  # exactly one of ACTIVE_TAGS (slice D: one tag per write)
 
 
 class TagsEngine:
@@ -1074,6 +1212,11 @@ class TagsEngine:
         self.ac2 = ac2
         self._inputs = inputs or (lambda: (read_sync_links(config), *read_member_core(config)))
         self.reads = 0
+        self.month_now: str | None = None
+        self.today: date | None = None
+        self.unbased_ok = {TAG: False, BDAY_TAG: False}
+        self.clock_ok = False  # set by each run from the counts read; nothing is sent before
+        self.counts_ok = False
 
     def now(self) -> datetime:
         return self.ledger.now()
@@ -1111,37 +1254,74 @@ class TagsEngine:
                 settle_reads = None  # observe goes on; those customers are left alone (row 16)
         run_id = self.ledger.start_run(command)
         summary = RunSummary(command)
+        self.month_now, self.today, self.clock_ok, self.counts_ok = None, None, False, False
+        self.unbased_ok = {TAG: False, BDAY_TAG: False}
         states: dict[str, CustomerState | None] = {}
         carriers_total: int | None = None
+        bday_carriers_total: int | None = None
         try:
             unresolved = self._settle(open_rows, settle_reads, summary)
-            facts = scan_members(self.ac2)
-            today = sg_today(self.now())
+            sizes: dict[str, int] = {}
+            facts = scan_members(self.ac2, sizes)
+            # Design 2.7: one counts read after the scans (a failure stops the
+            # run here, before any write, as a scan failure does).
+            type_counts = self.ac2.counts()
+            now = self.now()
+            today = sg_today(now)
+            # Once per run (design 2.2): a run that starts at 23:59 on the
+            # last day uses that month for every customer.
+            self.month_now = month_name(today)
+            self.today = today
+            self.clock_ok = clock_matches(type_counts.get("server_now_local"), now)
+            self.counts_ok = type_counts_match(type_counts, sizes)
+            if not self.counts_ok:
+                summary.alert("scan_count_mismatch")  # no removal of either tag this run
             wanted = set(links.basis) | set(links.conflicts) | links.voided | {row["customer_gid"] for row in open_rows}
             states = self.shopify.customers(wanted)
-            carriers, complete = self.shopify.carriers(self.config.shopify_max_carrier_pages)
+            carriers, complete = self.shopify.carriers(TAG, self.config.shopify_max_carrier_pages)
             if complete:
                 carriers_total = len(carriers)
             else:
                 summary.alert("tag_search_incomplete")
-            extra = carriers - set(states)
+            # Slice D: the second search, for the birthday tag (design 2.5).
+            bday_carriers, bday_complete = self.shopify.carriers(BDAY_TAG, self.config.shopify_max_carrier_pages)
+            if bday_complete:
+                bday_carriers_total = len(bday_carriers)
+            else:
+                summary.alert("bday_tag_search_incomplete")
+            # C2 (design 2.6): a tag with no basis comes off only with the
+            # switch on, never on an empty link set (a replaced ledger) and
+            # never on that tag's incomplete search.
+            links_empty = not sync_links and not claims
+            if self.config.remove_unbased_tags_enabled and links_empty:
+                summary.alert("tags_basis_empty")
+            unbased = self.config.remove_unbased_tags_enabled and not links_empty
+            self.unbased_ok = {TAG: unbased and complete, BDAY_TAG: unbased and bday_complete}
+            extra = (carriers | bday_carriers) - set(states)
             if extra:
                 states.update(self.shopify.customers(extra))
             plans = []
             for gid in sorted(set(states), key=customer_number):
-                plan = self._decide(gid, links, states.get(gid), facts, today, unresolved, summary)
-                if plan is not None:
-                    plans.append(plan)
+                plans.extend(self._decide(gid, links, states.get(gid), facts, today, unresolved, summary))
             self._write(plans, states, summary, run_id=run_id, apply=apply)
         except dl.DirectLocalError as exc:
             summary.stopped = exc.code
             summary.alert(exc.code)
-        tagged_now = sum(1 for gid in set(links.basis) | set(links.conflicts) if states.get(gid) is not None and TAG in states[gid].tags)
+        linked = [states[gid] for gid in set(links.basis) | set(links.conflicts) if states.get(gid) is not None]
+        tagged_now = sum(1 for state in linked if TAG in state.tags)
+        # Slice D (design 2.8): the birthday tag on linked customers, and those
+        # still carrying it whose valid month is not this month (0 after a run
+        # that was not capped or withheld). The month value is never printed;
+        # bday_month_now names today's month only.
+        bday_tagged = [state for state in linked if BDAY_TAG in state.tags]
+        other_month = None if self.month_now is None else sum(
+            1 for state in bday_tagged if state.bday_state == BDAY_MONTH and state.bday_month != self.month_now)
         costs = dict(getattr(self.shopify, "query_costs", {}) or {})
         result = {"status": "ok", "command": command, "run_id": run_id, "counts": dict(sorted(summary.counts.items())),
                   "alerts": list(summary.alerts), "refs": list(summary.refs), "stopped": summary.stopped, "scope_set": scope_set,
                   "query_costs": {name: costs.get(name) for name in QUERY_NAMES.values()}, "tagged_now": tagged_now,
-                  "carriers_total": carriers_total}
+                  "carriers_total": carriers_total, "bday_tagged_now": len(bday_tagged), "bday_month_now": self.month_now,
+                  "bday_carriers_total": bday_carriers_total, "bday_tagged_other_month": other_month}
         self.ledger.finish_run(run_id, result)
         return result
 
@@ -1171,22 +1351,35 @@ class TagsEngine:
         return single_read_verdict(self.ac2.member(member_no, secrets.token_hex(16)))
 
     def _decide(self, gid: str, links: LinkSet, state: CustomerState | None, facts: Mapping[str, list[tuple[str, dict[str, Any]]]],
-                today: date, unresolved: set[str], summary: RunSummary) -> PlannedWrite | None:
-        """Design 1.6, one customer. Returns the write it needs, or None."""
+                today: date, unresolved: set[str], summary: RunSummary) -> list[PlannedWrite]:
+        """Design 1.6 and slice D 2.3, one customer: 0, 1 or 2 writes. The
+        ``member-qualified`` plan is computed exactly as in C1 (D-P4); the
+        birthday plan follows from its verdict Q."""
 
         ref = self.ledger.ref("c", gid)
-        if gid in unresolved:  # row 16
+        if gid in unresolved:  # row 16 (D1: both tags left alone)
             self._alert_once(summary, "write_unresolved", ref)
-            return None
-        if gid in links.conflicts:  # row 1
+            return []
+        if gid in links.conflicts:  # row 1 (D1)
             self._alert_once(summary, links.conflicts[gid], ref)
-            return None
-        if state is None:  # row 2
+            return []
+        if state is None:  # row 2 (D1)
             self._alert_once(summary, "customer_not_found", ref)
-            return None
+            return []
+        plan, verdict = self._decide_qualified(gid, links, state, facts, today, summary, ref)
+        bday = self._decide_bday(gid, links, state, verdict, summary, ref)
+        return [p for p in (plan, bday) if p is not None]
+
+    def _decide_qualified(self, gid: str, links: LinkSet, state: CustomerState, facts: Mapping[str, list[tuple[str, dict[str, Any]]]],
+                          today: date, summary: RunSummary, ref: str) -> tuple[PlannedWrite | None, tuple[str, str] | None]:
+        """Design 1.6 rows 3 to 15 for ``member-qualified``, unchanged. Also
+        returns Q, the verdict the birthday tag follows: ``(on|off|leave,
+        code)`` for a customer with a basis (``leave`` for a row 3 case
+        variant, so no extra AutoCount read is made), None for one without."""
+
         if any(tag != TAG and tag.strip().casefold() == TAG for tag in state.tags):  # row 3
             self._alert_once(summary, "tag_case_variant", ref)
-            return None
+            return None, (LEAVE, "tag_case_variant")
         tagged = TAG in state.tags
         if gid in links.basis:
             member_no, basis = links.basis[gid]
@@ -1195,36 +1388,171 @@ class TagsEngine:
                 verdict = self._single_read(member_no)
                 if verdict[1] == "member_reads_capped":
                     summary.alert("member_reads_capped")
-                    return None
+                    return None, verdict
             desired, code = verdict
             if desired == LEAVE:  # rows 9, 10, 11a, 11b, 12
                 self._alert_once(summary, code, ref, member_no)
-                return None
+                return None, verdict
             if desired == ON:  # row 4
                 if tagged:
                     summary.count("kept_tagged")
-                    return None
+                    return None, verdict
                 if any(tag.strip().casefold() == REGISTRATION_TAG for tag in state.tags) and not state.has_registration:  # row 5
                     self._alert_once(summary, "flow_dates_guard", ref, member_no)
-                    return None
-                if self.ledger.done_adds_since(gid, self.now() - FLAP_WINDOW) >= FLAP_DONE_ADDS:
+                    return None, verdict
+                if self.ledger.done_adds_since(gid, self.now() - FLAP_WINDOW, TAG) >= FLAP_DONE_ADDS:
                     self._alert_once(summary, "tag_keeps_disappearing", ref, member_no)
-                    return None
-                return PlannedWrite(gid, "add", code, member_no, basis)
+                    return None, verdict
+                return PlannedWrite(gid, "add", code, member_no, basis), verdict
             if not tagged:  # rows 6, 7, 8, 11 with no tag: row 15
                 summary.count("no_change_untagged")
-                return None
-            return PlannedWrite(gid, "remove", code, member_no, basis)
+                return None, verdict
+            return PlannedWrite(gid, "remove", code, member_no, basis), verdict
         if not tagged:
             summary.count("no_change_untagged")
-            return None
+            return None, None
         if gid in links.voided:  # row 13
-            return PlannedWrite(gid, "remove", "link_voided", None, "voided")
+            return PlannedWrite(gid, "remove", "link_voided", None, "voided"), None
+        if self.unbased_ok[TAG]:  # row 14 with the C2 switch (design 2.6)
+            return PlannedWrite(gid, "remove", "tag_without_basis", None, None), None
         self._alert_once(summary, "tag_without_basis", ref)  # row 14 (removal only with the C2 switch)
+        return None, None
+
+    def _decide_bday(self, gid: str, links: LinkSet, state: CustomerState, verdict: tuple[str, str] | None, summary: RunSummary,
+                     ref: str) -> PlannedWrite | None:
+        """Slice D design 2.3, rows D2 to D13 (D1 is handled by the caller,
+        D14 and D15 at the send). On only when Q is ``on`` and the month field
+        is exactly this Singapore month; off only on a positive fact (another
+        valid month whatever Q is, Q ``off``, a voided pair, or this tool's
+        own add made in an earlier month); everything else is left alone."""
+
+        if any(tag != BDAY_TAG and tag.strip().casefold() == BDAY_TAG for tag in state.tags):  # D2
+            self._alert_once(summary, "bday_tag_case_variant", ref)
+            return None
+        tagged = BDAY_TAG in state.tags
+        # Fix round 1 (G2 section 9): a valid month that is not this month is
+        # a positive fact on its own, so the birthday tag comes off whatever
+        # Q is (D4, D9, D13); only D1 and D2 leave it alone.
+        other_month = tagged and state.bday_state == BDAY_MONTH and state.bday_month != self.month_now
+        if gid in links.basis:
+            member_no, basis = links.basis[gid]
+            desired, code = verdict
+            if desired == OFF:  # D8: the same positive fact
+                if not tagged:
+                    summary.count("bday_no_change_untagged")
+                    return None
+                return PlannedWrite(gid, "remove", code, member_no, basis, BDAY_TAG)
+            if other_month:  # D4 (and D9 with another valid month)
+                return PlannedWrite(gid, "remove", "bday_month_other", member_no, basis, BDAY_TAG)
+            if desired == LEAVE:  # D9: the C1 alert is already raised
+                summary.count("bday_left_with_member")
+                return None
+            if state.bday_state == BDAY_UNREADABLE:  # D7
+                if tagged:
+                    return self._bday_no_month_tagged(gid, "bday_month_unreadable", summary, ref, member_no, basis)
+                self._alert_once(summary, "bday_month_unreadable", ref, member_no)
+                return None
+            if state.bday_state != BDAY_MONTH:  # no month on record
+                if tagged:  # D6: a cleared field is not taken as a fact
+                    return self._bday_no_month_tagged(gid, "bday_month_missing", summary, ref, member_no, basis)
+                summary.count("bday_no_month")  # D5: no alert
+                return None
+            if state.bday_month != self.month_now:  # D4, not tagged
+                summary.count("bday_no_change_untagged")
+                return None
+            if tagged:  # D3
+                summary.count("bday_kept")
+                return None
+            if any(tag.strip().casefold() == REGISTRATION_TAG for tag in state.tags) and not state.has_registration:  # D10
+                self._alert_once(summary, "flow_dates_guard", ref, member_no)
+                return None
+            if self.ledger.done_adds_since(gid, self.now() - FLAP_WINDOW, BDAY_TAG) >= FLAP_DONE_ADDS:  # D11
+                self._alert_once(summary, "bday_tag_keeps_disappearing", ref, member_no)
+                return None
+            return PlannedWrite(gid, "add", "bday_month_current", member_no, basis, BDAY_TAG)
+        if not tagged:
+            return None
+        if gid in links.voided:  # D12
+            return PlannedWrite(gid, "remove", "link_voided", None, "voided", BDAY_TAG)
+        if other_month:  # D13 with another valid month (fix round 1)
+            return PlannedWrite(gid, "remove", "bday_month_other", None, None, BDAY_TAG)
+        if self.unbased_ok[BDAY_TAG]:  # D13 with the C2 switch (design 2.6)
+            return PlannedWrite(gid, "remove", "tag_without_basis", None, None, BDAY_TAG)
+        self._alert_once(summary, "bday_tag_without_basis", ref)  # D13 (removal only with the C2 switch)
         return None
+
+    def _bday_no_month_tagged(self, gid: str, code: str, summary: RunSummary, ref: str, member_no: str,
+                              basis: str) -> PlannedWrite | None:
+        """Fix round 1 (G2 section 9), D6 and D7 with the birthday tag on: off
+        when this tool's last DONE birthday add for the customer was in an
+        earlier Singapore month (its month has passed); otherwise left alone
+        and alerted every run, not once, so the digest shows it daily."""
+
+        if self._month_change(gid):
+            return PlannedWrite(gid, "remove", "bday_added_earlier_month", member_no, basis, BDAY_TAG)
+        summary.alert(code, ref, member_no)
+        return None
+
+    def _month_change(self, gid: str) -> bool:
+        """Design 2.4: this tool's last DONE birthday add for the customer was
+        recorded in an earlier Singapore month. It makes a ``bday_month_other``
+        removal a month-change removal (exempt from the volume guard), and
+        takes the tag off in D6 and D7 (fix round 1; not exempt)."""
+
+        added = self.ledger.last_done_add_at(gid, BDAY_TAG)
+        if added is None or self.today is None:
+            return False
+        added_day = added.astimezone(SGT).date()
+        return (added_day.year, added_day.month) < (self.today.year, self.today.month)
+
+    def _bday_volume_guard(self, removes: list[PlannedWrite], states: Mapping[str, CustomerState | None],
+                           summary: RunSummary) -> list[PlannedWrite]:
+        """Design 2.4: month-change removals are exempt; every other birthday
+        removal is withheld as a whole when there are more than
+        ``max(5, birthday-tagged // 10)`` of them."""
+
+        exempt = [p for p in removes if p.reason == "bday_month_other" and self._month_change(p.gid)]
+        other = [p for p in removes if p not in exempt]
+        if exempt:
+            summary.counts["bday_month_change_removals"] = len(exempt)
+        bday_tagged = sum(1 for state in states.values() if state is not None and BDAY_TAG in state.tags)
+        if len(other) > max(5, bday_tagged // 10):
+            summary.alert("bday_untag_volume_unexpected")
+            summary.counts["bday_untag_withheld"] = len(other)
+            other = []
+        return sorted(exempt + other, key=lambda p: customer_number(p.gid))
+
+    def _bday_sendable(self, adds: list[PlannedWrite], removes: list[PlannedWrite],
+                       summary: RunSummary) -> tuple[list[PlannedWrite], list[PlannedWrite]]:
+        """The birthday writes ``apply`` may send (design 2.3 D14, D15 and
+        2.4): none while ``bday_tag_enabled`` is false; only the pilot's
+        customers while ``bday_only_customers`` is not empty; then the
+        birthday caps."""
+
+        if not self.config.bday_tag_enabled:  # D14
+            if adds or removes:
+                summary.counts["bday_writes_disabled"] = len(adds) + len(removes)
+            return [], []
+        if self.config.bday_only_customers:  # D15
+            pilot = set(self.config.bday_only_customers)
+            outside = [p for p in adds + removes if p.gid not in pilot]
+            if outside:
+                summary.counts["bday_not_in_pilot"] = len(outside)
+            adds = [p for p in adds if p.gid in pilot]
+            removes = [p for p in removes if p.gid in pilot]
+        if len(adds) > self.config.max_bday_adds_per_run:
+            summary.counts["bday_tag_adds_capped"] = len(adds) - self.config.max_bday_adds_per_run
+            adds = adds[:self.config.max_bday_adds_per_run]
+        if len(removes) > self.config.max_bday_removes_per_run:
+            summary.alert("bday_tag_removes_capped")
+            summary.counts["bday_tag_removes_capped"] = len(removes) - self.config.max_bday_removes_per_run
+            removes = removes[:self.config.max_bday_removes_per_run]
+        return adds, removes
 
     def _write(self, plans: list[PlannedWrite], states: dict[str, CustomerState | None], summary: RunSummary, *, run_id: str,
                apply: bool) -> None:
+        bday_plans = [p for p in plans if p.tag == BDAY_TAG]
+        plans = [p for p in plans if p.tag == TAG]
         adds = [p for p in plans if p.op == "add"]
         removes = [p for p in plans if p.op == "remove"]
         for plan in plans:
@@ -1232,12 +1560,28 @@ class TagsEngine:
             summary.count(word, self.ledger.ref("c", plan.gid), plan.member_no)
             if plan.op == "remove":
                 summary.count(f"untag_reason:{plan.reason}")
+        for plan in bday_plans:
+            summary.count("would_bday_tag" if plan.op == "add" else "would_bday_untag", self.ledger.ref("c", plan.gid), plan.member_no)
+            if plan.op == "remove":
+                summary.count(f"bday_untag_reason:{plan.reason}")
         # Volume guard (design 1.7): a systematic misread cannot trickle removals out.
         tagged = sum(1 for state in states.values() if state is not None and TAG in state.tags)
         if len(removes) > max(5, tagged // 10):
             summary.alert("untag_volume_unexpected")
             summary.counts["untag_withheld"] = len(removes)
             removes = []
+        bday_adds = [p for p in bday_plans if p.op == "add"]
+        bday_removes = self._bday_volume_guard([p for p in bday_plans if p.op == "remove"], states, summary)
+        # Type-count check (design 2.7): a scan that does not add up to the
+        # book's own counts takes neither tag off (adds go on).
+        if not self.counts_ok and (removes or bday_removes):
+            summary.counts["untag_withheld_scan_count"] = len(removes) + len(bday_removes)
+            removes, bday_removes = [], []
+        # Clock guard (design 2.2): no mutation at all; reads and the record still run.
+        if not self.clock_ok:
+            summary.stopped = "clock_mismatch"
+            summary.alert("clock_mismatch")
+            return
         if not apply:
             return
         if len(adds) > self.config.max_tag_adds_per_run:
@@ -1247,18 +1591,21 @@ class TagsEngine:
             summary.alert("tag_removes_capped")
             summary.counts["tag_removes_capped"] = len(removes) - self.config.max_tag_removes_per_run
             removes = removes[:self.config.max_tag_removes_per_run]
-        for plan in adds + removes:
+        bday_adds, bday_removes = self._bday_sendable(bday_adds, bday_removes, summary)
+        # Design 2.3: every member-qualified write first, then the birthday
+        # writes, each by customer GID ascending.
+        for plan in adds + removes + bday_adds + bday_removes:
             if self._stop_requested():
                 summary.stopped = "stop_file_present"
                 summary.alert("stop_file_present")
                 return
             if plan.gid not in states or states[plan.gid] is None:
                 raise dl.DirectLocalError("tags_customer_not_read")
-            check_tag_variables(plan.gid, [TAG])  # before the INTENT row
-            write_id = self.ledger.add_intent(run_id=run_id, customer_gid=plan.gid, tag=TAG, op=plan.op, reason=plan.reason,
+            check_tag_variables(plan.gid, [plan.tag])  # before the INTENT row
+            write_id = self.ledger.add_intent(run_id=run_id, customer_gid=plan.gid, tag=plan.tag, op=plan.op, reason=plan.reason,
                                               member_no=plan.member_no, basis=plan.basis)
             try:
-                state, code = self.shopify.set_tag(plan.op, plan.gid, [TAG])
+                state, code = self.shopify.set_tag(plan.op, plan.gid, [plan.tag])
             except (http.client.HTTPException, OSError):
                 # G2 L6: a transport error the shared transport does not map
                 # (IncompleteRead, a raw socket error): it may have landed.
@@ -1266,10 +1613,11 @@ class TagsEngine:
             self.ledger.set_outcome(write_id, state, code)
             ref = self.ledger.ref("c", plan.gid)
             if state == DONE:
-                summary.count("tagged" if plan.op == "add" else "untagged", ref, plan.member_no)
-                old = states[plan.gid]
-                tags = old.tags + (TAG,) if plan.op == "add" else tuple(t for t in old.tags if t != TAG)
-                states[plan.gid] = CustomerState(plan.gid, tags, old.has_registration)
+                words = ("tagged", "untagged") if plan.tag == TAG else ("bday_tagged", "bday_untagged")
+                summary.count(words[0] if plan.op == "add" else words[1], ref, plan.member_no)
+                old = states[plan.gid]  # only this write's tag changes
+                tags = old.tags + (plan.tag,) if plan.op == "add" else tuple(t for t in old.tags if t != plan.tag)
+                states[plan.gid] = dataclasses.replace(old, tags=tags)
             elif state == REJECTED:
                 summary.alert(code, ref, plan.member_no)
             elif state == NOT_WRITTEN:
@@ -1291,6 +1639,7 @@ class TagsEngine:
 _DIGEST_CODE_RE = re.compile(r"^[a-z0-9_:]{1,64}$")
 _DIGEST_REF_RE = re.compile(r"^[cm]-[0-9a-f]{20}$")
 _DIGEST_MASK_RE = re.compile(r"^\*{3,}[^*]{1,3}$")
+EMAIL_MAX_ALERTS = 20
 
 
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: TagsConfig) -> dict[str, Any]:
@@ -1350,13 +1699,27 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: TagsConfig) 
         def number(value: Any) -> int | None:
             return value if type(value) is int else None
 
+        shadow = {word: number(last_counts.get(word)) or 0 for word in ("would_tag", "would_untag", "would_bday_tag", "would_bday_untag")}
+        open_writes = {"uncertain_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'UNCERTAIN'").fetchone()[0],
+                       "intent_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'INTENT'").fetchone()[0]}
+        # Slice D (design 2.8): the month changed and the tags have not. True
+        # when the latest completed run's month is not the digest's own
+        # Singapore month (a run with no month counts as not this month);
+        # false when no run completed in the window (runs_completed says so).
+        stale_month = completed > 0 and latest.get("bday_month_now") != month_name(sg_today(now))
+        # The fixed, flat block for the #288 daily email: whole numbers, codes
+        # and booleans only (0 for a figure when no run completed).
+        email = {"runs_completed": completed, "runs_unfinished": unfinished,
+                 "tagged_now": number(latest.get("tagged_now")) or 0, "bday_tagged_now": number(latest.get("bday_tagged_now")) or 0,
+                 **shadow, "alerts": sorted(alerts)[:EMAIL_MAX_ALERTS], "stale_month": stale_month,
+                 "open_writes": open_writes["uncertain_writes"] + open_writes["intent_writes"]}
         return {
             "status": "ok", "command": "digest", "hours": hours, "runs": {"completed": completed, "unfinished": unfinished},
             "counts": dict(sorted(counts.items())), "alerts": dict(sorted(alerts.items())), "alert_refs": refs,
-            "open": {"uncertain_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'UNCERTAIN'").fetchone()[0],
-                     "intent_writes": conn.execute("SELECT COUNT(*) FROM tag_writes WHERE state = 'INTENT'").fetchone()[0]},
-            "shadow": {"would_tag": number(last_counts.get("would_tag")) or 0, "would_untag": number(last_counts.get("would_untag")) or 0},
+            "open": open_writes, "shadow": shadow,
             "tagged_now": number(latest.get("tagged_now")), "carriers_total": number(latest.get("carriers_total")),
+            "bday_tagged_now": number(latest.get("bday_tagged_now")), "bday_carriers_total": number(latest.get("bday_carriers_total")),
+            "stale_month": stale_month, "email": email,
         }
     except sqlite3.Error:
         raise dl.DirectLocalError("tags_ledger_unreadable") from None
@@ -1396,7 +1759,7 @@ COMMANDS = ("check-config", "init", "status", "observe", "apply", "digest")
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[TagsConfig, TagsLedger, bool], TagsEngine] | None = None,
          clock: Callable[[], datetime] = dl.utc_now) -> int:
-    parser = argparse.ArgumentParser(description="#268 slice C1: the Shopify tag member-qualified, kept right from AutoCount")
+    parser = argparse.ArgumentParser(description="#268: the Shopify tags member-qualified and member-bday-month, kept right from AutoCount")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")

@@ -23,5 +23,10 @@
   "http_timeout_seconds": 30,
   "ac2_credential_target": "XB-AC2-MemberSync",
   "ac2_login_mode": "owner_shared",
-  "ac2_refused_user_ids": []
+  "ac2_refused_user_ids": [],
+  "bday_tag_enabled": false,
+  "max_bday_adds_per_run": 10,
+  "max_bday_removes_per_run": 10,
+  "bday_only_customers": [],
+  "remove_unbased_tags_enabled": false
 }
