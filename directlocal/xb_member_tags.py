@@ -91,9 +91,9 @@ TOOL = "xb268_member_tags"
 SCHEMA_VERSION = 1
 TOKEN_CACHE_FILE = "tags_token_cache.bin"
 
-# Every tag this tool may ever send, and the ones it sends in this slice.
-# member-bday-month is slice D: in the set (the ledger CHECK), never sent now.
-TAG = "member-qualified"
+# Every tag this tool may ever send (the ledger CHECK), and the ones it sends.
+# member-bday-month is sent only with bday_tag_enabled (slice D).
+TAG ="member-qualified"
 TAG_SET = ("member-qualified", "member-bday-month")
 # Slice D: both tags are active. A mutation still carries exactly one of them.
 ACTIVE_TAGS = ("member-qualified", "member-bday-month")
@@ -1423,38 +1423,43 @@ class TagsEngine:
         """Slice D design 2.3, rows D2 to D13 (D1 is handled by the caller,
         D14 and D15 at the send). On only when Q is ``on`` and the month field
         is exactly this Singapore month; off only on a positive fact (another
-        valid month, or Q ``off``, or a voided pair); everything else is left
-        alone."""
+        valid month whatever Q is, Q ``off``, a voided pair, or this tool's
+        own add made in an earlier month); everything else is left alone."""
 
         if any(tag != BDAY_TAG and tag.strip().casefold() == BDAY_TAG for tag in state.tags):  # D2
             self._alert_once(summary, "bday_tag_case_variant", ref)
             return None
         tagged = BDAY_TAG in state.tags
+        # Fix round 1 (G2 section 9): a valid month that is not this month is
+        # a positive fact on its own, so the birthday tag comes off whatever
+        # Q is (D4, D9, D13); only D1 and D2 leave it alone.
+        other_month = tagged and state.bday_state == BDAY_MONTH and state.bday_month != self.month_now
         if gid in links.basis:
             member_no, basis = links.basis[gid]
             desired, code = verdict
-            if desired == LEAVE:  # D9: the C1 alert is already raised
-                summary.count("bday_left_with_member")
-                return None
             if desired == OFF:  # D8: the same positive fact
                 if not tagged:
                     summary.count("bday_no_change_untagged")
                     return None
                 return PlannedWrite(gid, "remove", code, member_no, basis, BDAY_TAG)
+            if other_month:  # D4 (and D9 with another valid month)
+                return PlannedWrite(gid, "remove", "bday_month_other", member_no, basis, BDAY_TAG)
+            if desired == LEAVE:  # D9: the C1 alert is already raised
+                summary.count("bday_left_with_member")
+                return None
             if state.bday_state == BDAY_UNREADABLE:  # D7
+                if tagged:
+                    return self._bday_no_month_tagged(gid, "bday_month_unreadable", summary, ref, member_no, basis)
                 self._alert_once(summary, "bday_month_unreadable", ref, member_no)
                 return None
             if state.bday_state != BDAY_MONTH:  # no month on record
                 if tagged:  # D6: a cleared field is not taken as a fact
-                    self._alert_once(summary, "bday_month_missing", ref, member_no)
-                    return None
+                    return self._bday_no_month_tagged(gid, "bday_month_missing", summary, ref, member_no, basis)
                 summary.count("bday_no_month")  # D5: no alert
                 return None
-            if state.bday_month != self.month_now:  # D4
-                if not tagged:
-                    summary.count("bday_no_change_untagged")
-                    return None
-                return PlannedWrite(gid, "remove", "bday_month_other", member_no, basis, BDAY_TAG)
+            if state.bday_month != self.month_now:  # D4, not tagged
+                summary.count("bday_no_change_untagged")
+                return None
             if tagged:  # D3
                 summary.count("bday_kept")
                 return None
@@ -1469,15 +1474,30 @@ class TagsEngine:
             return None
         if gid in links.voided:  # D12
             return PlannedWrite(gid, "remove", "link_voided", None, "voided", BDAY_TAG)
+        if other_month:  # D13 with another valid month (fix round 1)
+            return PlannedWrite(gid, "remove", "bday_month_other", None, None, BDAY_TAG)
         if self.unbased_ok[BDAY_TAG]:  # D13 with the C2 switch (design 2.6)
             return PlannedWrite(gid, "remove", "tag_without_basis", None, None, BDAY_TAG)
         self._alert_once(summary, "bday_tag_without_basis", ref)  # D13 (removal only with the C2 switch)
         return None
 
+    def _bday_no_month_tagged(self, gid: str, code: str, summary: RunSummary, ref: str, member_no: str,
+                              basis: str) -> PlannedWrite | None:
+        """Fix round 1 (G2 section 9), D6 and D7 with the birthday tag on: off
+        when this tool's last DONE birthday add for the customer was in an
+        earlier Singapore month (its month has passed); otherwise left alone
+        and alerted every run, not once, so the digest shows it daily."""
+
+        if self._month_change(gid):
+            return PlannedWrite(gid, "remove", "bday_added_earlier_month", member_no, basis, BDAY_TAG)
+        summary.alert(code, ref, member_no)
+        return None
+
     def _month_change(self, gid: str) -> bool:
-        """Design 2.4: a ``bday_month_other`` removal is a month-change
-        removal when this tool's last DONE birthday add for the customer was
-        recorded in an earlier Singapore month."""
+        """Design 2.4: this tool's last DONE birthday add for the customer was
+        recorded in an earlier Singapore month. It makes a ``bday_month_other``
+        removal a month-change removal (exempt from the volume guard), and
+        takes the tag off in D6 and D7 (fix round 1; not exempt)."""
 
         added = self.ledger.last_done_add_at(gid, BDAY_TAG)
         if added is None or self.today is None:
@@ -1739,7 +1759,7 @@ COMMANDS = ("check-config", "init", "status", "observe", "apply", "digest")
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[TagsConfig, TagsLedger, bool], TagsEngine] | None = None,
          clock: Callable[[], datetime] = dl.utc_now) -> int:
-    parser = argparse.ArgumentParser(description="#268 slice C1: the Shopify tag member-qualified, kept right from AutoCount")
+    parser = argparse.ArgumentParser(description="#268: the Shopify tags member-qualified and member-bday-month, kept right from AutoCount")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--config", required=True)
     parser.add_argument("--hours", type=int, default=24, help="digest only: the last N hours of runs (1-720)")

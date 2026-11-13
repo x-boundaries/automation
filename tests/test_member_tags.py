@@ -317,7 +317,8 @@ class Base(unittest.TestCase):
     EMAIL_KEYS = {"runs_completed": int, "runs_unfinished": int, "tagged_now": int, "bday_tagged_now": int, "would_tag": int,
                   "would_untag": int, "would_bday_tag": int, "would_bday_untag": int, "alerts": list, "stale_month": bool,
                   "open_writes": int}
-    MONTH_WORD_RE = re.compile(r"(?i)\b(january|february|march|april|may|june|july|august|september|october|november|december)\b")
+    # No word boundary (G2 F2): a month inside a code word such as bday_off_march must be caught too.
+    MONTH_WORD_RE = re.compile(r"(?i)(january|february|march|april|may|june|july|august|september|october|november|december)")
     QUERY_NAMES = frozenset({"XbMemberTagsCustomers", "XbMemberTagsCarriers"})
     SCOPE_SET_NAMES = ("write_only", "read_write")
     WRITE_STATES = ("INTENT", "DONE", "REJECTED", "NOT_WRITTEN", "UNCERTAIN")
@@ -2250,26 +2251,30 @@ class BirthdayDecisionTests(BirthdayBase):
         self.member(3, expiry=PAST, tags=[BDAY])
         self.member(4, member_type="VIP", tags=[BDAY], birthday=NOV)  # row 11: the single read
         self.member(5, member_type="Default", birthday=NOV)  # not tagged: nothing
+        self.member(6, member_type="GUEST", tags=[BDAY], birthday=MAR)  # fix round 1: Q off keeps its own reason, not the month's
+        self.done_add(6, BDAY, datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc))
         result = self.run_tool()
-        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3, 4)])
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3, 4, 6)])
         self.assertEqual({k: v for k, v in result["counts"].items() if k.startswith("bday_untag_reason:")},
-                         {"bday_untag_reason:member_not_member": 2, "bday_untag_reason:member_inactive": 1,
+                         {"bday_untag_reason:member_not_member": 3, "bday_untag_reason:member_inactive": 1,
                           "bday_untag_reason:member_expired": 1})
-        self.assertEqual([r["reason"] for r in self.rows() if r["tag"] == BDAY],
-                         ["member_not_member", "member_inactive", "member_expired", "member_not_member"])
+        self.assertNotIn("bday_month_change_removals", result["counts"])
+        self.assertEqual([r["reason"] for r in self.rows() if r["tag"] == BDAY][-5:],
+                         ["member_not_member", "member_inactive", "member_expired", "member_not_member", "member_not_member"])
 
     def test_d09_leave_for_the_member_leaves_both_ways(self):
-        self.member(1, active=None, tags=[TAG, BDAY], birthday=MAR)        # row 9
+        # Fix round 1: the tagged customers carry this month (another valid month comes off whatever Q is: SectionNineTests).
+        self.member(1, active=None, tags=[TAG, BDAY], birthday=NOV)        # row 9
         self.member(2, expiry=None, birthday=NOV)                          # row 10
-        self.member(3, tags=[BDAY], birthday=MAR)
+        self.member(3, tags=[BDAY], birthday=NOV)
         self.book.hidden.add(sg(3))                                        # row 11a
         self.book.count_extra = {"MEMBER": -1}                              # (the counts agree with the scans here)
-        self.member(4, tags=[BDAY], birthday=MAR, in_book=False)           # row 11b
-        self.member(5, tags=[BDAY], birthday=MAR)
+        self.member(4, tags=[BDAY], in_book=False)                         # row 11b (no month on record)
+        self.member(5, tags=[BDAY], birthday=month("march"))               # (an unreadable month)
         self.book.add(sg(5) + " ", "GUEST")                                 # row 12
-        self.member(6, tags=["Member-Qualified", BDAY], birthday=MAR)      # row 3: the qualified tag left alone
-        self.member(7, member_type="VIP", tags=[BDAY], birthday=MAR)
-        self.member(8, member_type="VIP", tags=[BDAY], birthday=MAR)       # row 11c (cap 3)
+        self.member(6, tags=["Member-Qualified", BDAY], birthday=NOV)      # row 3: the qualified tag left alone
+        self.member(7, member_type="VIP", tags=[BDAY], birthday=NOV)
+        self.member(8, member_type="VIP", tags=[BDAY], birthday=NOV)       # row 11c (cap 3)
         result = self.run_tool(max_member_reads_per_run=3)
         self.assertEqual(self.bday_writes(), [("remove", customer_gid(7), [BDAY])])
         self.assertEqual(result["counts"]["bday_left_with_member"], 7)
@@ -2313,7 +2318,7 @@ class BirthdayDecisionTests(BirthdayBase):
 
     def test_d13_a_tag_with_no_basis_is_left_with_an_alert(self):
         self.shopify.add(1, [BDAY], birthday=NOV)
-        self.shopify.add(2, [TAG, BDAY], birthday=MAR)
+        self.shopify.add(2, [TAG, BDAY])  # fix round 1: no month on record (another valid month comes off: SectionNineTests)
         result = self.run_tool()
         self.assertEqual(self.shopify.writes, [])
         self.assertEqual((result["counts"]["bday_tag_without_basis"], result["counts"]["tag_without_basis"]), (2, 1))
@@ -2331,6 +2336,22 @@ class BirthdayDecisionTests(BirthdayBase):
         self.assertFalse(mt.parse_config(value).bday_tag_enabled)  # default off
         self.run_tool(bday_tag_enabled=True)
         self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+
+    def test_d14_a_pilot_list_never_overrides_the_switch(self):
+        # G2 F1: the D3 rollback state (switch off, the test GID still in the list) sends no birthday tag.
+        self.member(1, birthday=NOV)                                      # qualified add + birthday add
+        self.member(2, tags=[TAG, BDAY], birthday=MAR)                    # birthday removal (another month)
+        self.member(3, member_type="GUEST", tags=[TAG, BDAY], birthday=NOV)  # both off (positive fact)
+        self.member(4, tags=[TAG], birthday=NOV)                          # birthday add only
+        pilot = [customer_gid(n) for n in (1, 2, 3, 4)]
+        result = self.run_tool(bday_tag_enabled=False, bday_only_customers=pilot)
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG]), ("remove", customer_gid(3), [TAG])])
+        self.assertEqual(result["counts"]["bday_writes_disabled"], 4)
+        self.assertNotIn("bday_not_in_pilot", result["counts"])
+        self.assertEqual([r["tag"] for r in self.rows()], [TAG, TAG])  # no INTENT row for the birthday tag
+        self.run_tool(bday_tag_enabled=True, bday_only_customers=pilot)
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY]), ("add", customer_gid(4), [BDAY]),
+                                              ("remove", customer_gid(2), [BDAY]), ("remove", customer_gid(3), [BDAY])])
 
     def test_d15_the_pilot_list_limits_what_is_sent(self):
         for n in (1, 2, 3):
@@ -2534,6 +2555,223 @@ class BirthdayGuardTests(BirthdayBase):
         self.assertEqual(self.bday_writes(), [])
 
 
+class SectionNineTests(BirthdayBase):
+    """Fix round 1 (G2 section 9): a birthday tag cannot outlive its month.
+    Another valid month comes off whatever Q is (not D1, D2); D6 and D7 with
+    the tag on come off when this tool's last DONE birthday add was in an
+    earlier Singapore month, else they are alerted every run."""
+
+    EARLIER = datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc)  # 20 Oct (Singapore): a month before NOW
+
+    def other_month_rows(self, birthday) -> list[int]:
+        """Q ``leave`` for C1 rows 9, 10, 11a, 11b, 12, 3 and 11c, a customer
+        with no basis (D13) and one with Q ``on`` (D4), each birthday-tagged;
+        plus D1 (row 1) and D2, which keep the tag. Returns the D4/D9/D13 ones."""
+
+        self.member(1, active=None, tags=[TAG, BDAY], birthday=birthday)    # row 9
+        self.member(2, expiry=None, tags=[BDAY], birthday=birthday)         # row 10
+        self.member(3, tags=[BDAY], birthday=birthday)
+        self.book.hidden.add(sg(3))                                         # row 11a
+        self.book.count_extra = {"MEMBER": -1}
+        self.member(4, tags=[BDAY], birthday=birthday, in_book=False)       # row 11b
+        self.member(5, tags=[BDAY], birthday=birthday)
+        self.book.add(sg(5) + " ", "GUEST")                                  # row 12
+        self.member(6, tags=["Member-Qualified", BDAY], birthday=birthday)  # row 3
+        self.member(7, member_type="VIP", tags=[TAG])                       # row 11: the third single read (qualified off)
+        self.member(8, member_type="VIP", tags=[BDAY], birthday=birthday)   # row 11c (reads capped)
+        self.member(10, tags=[TAG, BDAY], birthday=birthday)
+        self.make_core([(10, sg(90))])
+        self.book.add(sg(90), "GUEST")                                       # row 1 (D1): left
+        self.member(11, tags=[TAG, BDAY, "Member-Bday-Month"], birthday=birthday)  # D2: left
+        self.shopify.add(12, [BDAY], birthday=birthday)                     # no basis (D13)
+        self.member(13, tags=[TAG, BDAY], birthday=birthday)                # Q on (D4)
+        return [1, 2, 3, 4, 5, 6, 8, 12, 13]
+
+    def test_another_valid_month_comes_off_whatever_q_but_d1_and_d2(self):
+        gone = self.other_month_rows(MAR)
+        for n in gone + [10, 11]:
+            self.done_add(n, BDAY, self.EARLIER)  # this tool's add in an earlier month: month-change removals
+        result = self.run_tool(max_member_reads_per_run=3, max_bday_removes_per_run=50)
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in gone])
+        self.assertEqual([w for w in self.shopify.writes if w[2] == [TAG]], [("remove", customer_gid(7), [TAG])])  # Q unchanged
+        self.assertEqual((result["counts"]["bday_untag_reason:bday_month_other"], result["counts"]["bday_month_change_removals"]),
+                         (9, 9))
+        self.assertNotIn("bday_left_with_member", result["counts"])
+        self.assertEqual([r["reason"] for r in self.rows() if r["tag"] == BDAY][-9:], ["bday_month_other"] * 9)
+        for n in (10, 11):
+            self.assertIn(BDAY, self.shopify.tags(n))
+        self.assertTrue({"link_conflict_customer", "bday_tag_case_variant"} <= set(result["alerts"]))
+        self.assertEqual(result["bday_tagged_other_month"], 2)  # D1 and D2 only, each explained by its alert
+
+    def test_this_month_with_q_leave_is_still_left(self):
+        self.other_month_rows(NOV)
+        result = self.run_tool(max_member_reads_per_run=3)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_left_with_member"], 7)
+        self.assertEqual(result["bday_tagged_other_month"], 0)
+
+    def test_other_month_removals_keep_the_switch_the_caps_the_stop_file_and_the_volume_guard(self):
+        for n in (1, 2, 5, 6):
+            self.member(n, active=None, tags=[BDAY], birthday=MAR)  # row 9: Q leave
+        result = self.run_tool(bday_tag_enabled=False)
+        self.assertEqual((self.shopify.writes, result["counts"]["bday_writes_disabled"]), ([], 4))
+        self.assertEqual(result["counts"]["would_bday_untag"], 4)
+        self.shopify.after_write = lambda: (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
+        result = self.run_tool()
+        self.assertEqual((self.bday_writes(), result["stopped"]), ([("remove", customer_gid(1), [BDAY])], "stop_file_present"))
+        self.shopify.after_write = None
+        (self.root / mt.STOP_FILE).unlink()
+        result = self.run_tool(max_bday_removes_per_run=2)
+        self.assertEqual(self.bday_writes()[1:], [("remove", customer_gid(2), [BDAY]), ("remove", customer_gid(5), [BDAY])])
+        self.assertEqual(result["counts"]["bday_tag_removes_capped"], 1)
+
+    def test_other_month_removals_whatever_q_meet_the_volume_guard(self):
+        self.other_month_rows(MAR)  # no add by this tool: none is a month-change removal
+        result = self.run_tool(max_member_reads_per_run=3, max_bday_removes_per_run=50)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 9)
+        self.assertIn("bday_untag_volume_unexpected", result["alerts"])
+
+    def test_d06_d07_tagged_come_off_when_this_tools_add_was_in_an_earlier_month(self):
+        self.member(1, tags=[TAG, BDAY])                                       # D6, added in October
+        self.member(2, tags=[TAG, BDAY], birthday=month("march"))             # D7, added in October
+        self.member(3, tags=[TAG, BDAY])                                       # D6, added this month: left
+        self.member(4, tags=[TAG, BDAY], birthday=month("Nov"))               # D7, never added by this tool: left
+        self.member(5, tags=[TAG, BDAY])                                       # D6, only the qualified tag added in October: left
+        self.member(6, tags=[TAG], birthday=month("Nov"))                     # D7 untagged: alert once
+        for n in (1, 2):
+            self.done_add(n, BDAY, self.EARLIER)
+        self.done_add(3, BDAY, self.now - timedelta(days=2))
+        self.done_add(5, TAG, self.EARLIER)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+        self.assertEqual(result["counts"]["bday_untag_reason:bday_added_earlier_month"], 2)
+        self.assertNotIn("bday_month_change_removals", result["counts"])  # not exempt from the volume guard
+        self.assertEqual([(r["reason"], r["basis"]) for r in self.rows() if r["tag"] == BDAY][-2:],
+                         [("bday_added_earlier_month", "sync155")] * 2)
+        self.assertEqual((result["counts"]["bday_month_missing"], result["counts"]["bday_month_unreadable"]), (2, 2))
+        for run in range(2):  # the tagged ones are alerted every run, with their refs; the untagged one once
+            self.now += timedelta(hours=1)
+            again = self.run_tool()
+            self.assertEqual(set(again["alerts"]), {"bday_month_missing", "bday_month_unreadable"})
+            refs = {(r["code"], r["ref"]) for r in again["refs"]}
+            expected = {("bday_month_missing", self.ledger.ref("c", customer_gid(3))),
+                        ("bday_month_unreadable", self.ledger.ref("c", customer_gid(4))),
+                        ("bday_month_missing", self.ledger.ref("c", customer_gid(5)))}
+            if run == 0:  # customer 2 is untagged now: its unreadable month is alerted once, here
+                expected.add(("bday_month_unreadable", self.ledger.ref("c", customer_gid(2))))
+            self.assertEqual(refs, expected)
+            self.assertEqual((again["counts"]["bday_month_missing"], again["counts"]["bday_month_unreadable"]), (2, 3))  # 2, 4, 6
+        digest = mt.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())
+        self.assertEqual(digest["alerts"]["bday_month_missing"], 3)  # every run
+        self.assertIn("bday_month_missing", digest["email"]["alerts"])
+
+    def test_d06_d07_removals_meet_the_volume_guard(self):
+        for n in range(1, 7):
+            self.member(n, tags=[TAG, BDAY])
+            self.done_add(n, BDAY, self.EARLIER)
+        result = self.run_tool(max_bday_removes_per_run=50)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 6)
+
+    def test_d06_d07_at_singapore_midnight_on_the_first_given_in_utc(self):
+        self.member(1, tags=[TAG, BDAY])                            # D6
+        self.member(2, tags=[TAG, BDAY], birthday=month("march"))  # D7
+        self.member(3, tags=[TAG, BDAY], birthday=NOV)              # D4 at the flip
+        for n in (1, 3):
+            self.done_add(n, BDAY, datetime(2026, 11, 30, 15, 59, 58, tzinfo=timezone.utc))  # 23:59:58 SGT 30 Nov
+        self.now = datetime(2026, 11, 30, 15, 59, 59, tzinfo=timezone.utc)  # 23:59:59 SGT 30 Nov
+        result = self.run_tool()
+        self.assertEqual((self.bday_writes(), result["bday_month_now"]), ([], "November"))
+        self.done_add(2, BDAY, datetime(2026, 11, 30, 16, 0, 0, tzinfo=timezone.utc))  # 00:00:00 SGT 1 Dec
+        self.now = datetime(2026, 11, 30, 16, 0, 1, tzinfo=timezone.utc)  # 00:00:01 SGT 1 Dec
+        result = self.run_tool()
+        self.assertEqual(result["bday_month_now"], "December")
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY]), ("remove", customer_gid(3), [BDAY])])
+        self.assertEqual((result["counts"]["bday_untag_reason:bday_added_earlier_month"], result["counts"]["bday_month_change_removals"]),
+                         (1, 1))
+        self.assertEqual(result["alerts"], ["bday_month_unreadable"])  # customer 2: added this month, left
+
+    def test_a_qualified_only_add_in_an_earlier_month_is_no_exemption(self):
+        # G2 L1 (Z05): last_done_add_at reads the birthday tag's own adds only
+        for n in range(1, 7):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)  # the birthday tag set by hand, never by this tool
+            self.done_add(n, TAG, self.EARLIER)             # the qualified tag added in October
+        result = self.run_tool(max_bday_removes_per_run=250)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 6)
+        self.assertNotIn("bday_month_change_removals", result["counts"])
+
+
+class BirthdayLaterTests(BirthdayBase):
+    """G2 L2 and L3 (fix round 1)."""
+
+    def test_an_impossible_server_time_is_a_read_failure(self):
+        # Z08: an impossible date never passes the clock guard
+        with self.assertRaises(dl.BridgeError):
+            mt.clock_matches("2026-13-45T00:00:00", self.now)
+
+    def test_email_open_writes_counts_intent_rows_too(self):
+        # Z17
+        self.member(1)
+        self.engine()
+        self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(1), tag=TAG, op="add", reason="x", member_no=sg(1),
+                               basis="sync155")
+        digest = mt.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())
+        self.assertEqual((digest["open"]["intent_writes"], digest["email"]["open_writes"]), (1, 1))
+
+    def test_a_run_that_recorded_no_month_is_stale(self):
+        # Z18: the latest completed run stopped before the month was taken
+        self.member(1)
+        self.book.fail_scan = "bridge_read_timeout"
+        result = self.run_tool(apply=False)
+        self.assertIsNone(result["bday_month_now"])
+        digest = mt.ledger_digest(self.root, hours=24, now=self.now + timedelta(minutes=1), config=self.cfg())
+        self.assertTrue(digest["stale_month"])
+        self.assertTrue(digest["email"]["stale_month"])
+
+
+class BirthdayPrivacyEveryPathTests(BirthdayBase):
+    def test_no_month_name_anywhere_but_bday_month_now(self):
+        # G2 F2: every birthday path with every month; no month name (substring, any case) in any output or the ledger dump
+        months = mt.MONTH_NAMES
+        n = 0
+        for i, name in enumerate(months):
+            other = months[(i + 3) % 12]
+            n += 1; self.member(n, birthday=month(name))                                        # noqa: E702 D3/D4/D5
+            n += 1; self.member(n, tags=[TAG, BDAY], birthday=month(name))                      # noqa: E702 D3 kept / D4
+            n += 1; self.member(n, member_type="GUEST", tags=[TAG, BDAY], birthday=month(name))  # noqa: E702 D8
+            n += 1; self.member(n, active=None, tags=[BDAY], birthday=month(name))               # noqa: E702 D9
+            n += 1; self.member(n, active=None, birthday=month(name))                            # noqa: E702 D9 untagged
+            n += 1; self.member(n, tags=[BDAY, "Member-Bday-Month"], birthday=month(name))       # noqa: E702 D2
+            n += 1; self.member(n, tags=[BDAY], birthday=month(other.lower()))                   # noqa: E702 D7
+        voided = list(range(200, 212))
+        self.make_core([(v, sg(v)) for v in voided], unlinks=voided)
+        for i, v in enumerate(voided):
+            self.shopify.add(v, [BDAY], birthday=month(months[i]))  # D12
+            self.book.add(sg(v))
+        for i in range(12):
+            self.shopify.add(300 + i, [BDAY, TAG], birthday=month(months[i]))  # D13 / row 14
+        self.shopify.add(320, [BDAY])                                          # D13, no month on record
+        self.run_tool(apply=False)
+        self.run_tool(max_bday_removes_per_run=250, max_bday_adds_per_run=250, max_tag_removes_per_run=50, max_tag_adds_per_run=250)
+        self.run_tool(remove_unbased_tags_enabled=True, max_bday_removes_per_run=250, max_tag_removes_per_run=50)
+        self.engine()
+        texts = [json.dumps(v) for v in self.emitted]
+        conn = sqlite3.connect((self.root / mt.LEDGER_FILE).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            texts.append("\n".join(conn.iterdump()))
+            texts += [r[0] for r in conn.execute("SELECT summary FROM runs WHERE summary IS NOT NULL")]
+        finally:
+            conn.close()
+        texts.append(json.dumps(mt.ledger_digest(self.root, hours=24, now=self.now, config=self.cfg())))
+        texts.append(json.dumps(self.ledger.status(self.cfg())))
+        texts.append(json.dumps(self.cfg().summary()))
+        for text in texts:
+            cleaned = re.sub(r'\\?"bday_month_now\\?": \\?"November\\?"', "", text)
+            self.assertNotRegex(cleaned, self.MONTH_WORD_RE)
+
+
 class UnbasedRemovalTests(BirthdayBase):
     """C2 (slice D design 2.6): ``remove_unbased_tags_enabled``."""
 
@@ -2563,7 +2801,8 @@ class UnbasedRemovalTests(BirthdayBase):
     def test_on_never_exempt_from_the_volume_guards(self):
         self.member(9, tags=[TAG, BDAY], birthday=NOV)
         for n in range(1, 7):
-            self.shopify.add(n, [TAG, BDAY], birthday=MAR)
+            # this month (fix round 1: another valid month would come off as bday_month_other, which can be exempt)
+            self.shopify.add(n, [TAG, BDAY], birthday=NOV)
             self.done_add(n, BDAY, datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc))  # an earlier-month add is no exemption here
         result = self.run_tool(remove_unbased_tags_enabled=True, max_tag_removes_per_run=50, max_bday_removes_per_run=50)
         self.assertEqual(self.shopify.writes, [])
