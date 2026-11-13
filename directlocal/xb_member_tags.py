@@ -82,6 +82,16 @@ TOKEN_CACHE_FILE = "tags_token_cache.bin"
 TAG = "member-qualified"
 TAG_SET = ("member-qualified", "member-bday-month")
 ACTIVE_TAGS = ("member-qualified",)
+BDAY_TAG = "member-bday-month"
+
+# Slice D: the Shopify field membership.birthday_month is a choice list of
+# these exact English names (written by the MG Member Sign-up form). A literal
+# tuple on purpose: names from the calendar module or a date format follow
+# the machine's locale.
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+               "November", "December")
+BDAY_FIELD_TYPE = "single_line_text_field"
+BDAY_MISSING, BDAY_MONTH, BDAY_UNREADABLE = "missing", "month", "unreadable"
 
 # The two input ledgers, pinned as literals (this module does not import the
 # member core). tests/test_member_tags.py proves they equal the tools' own
@@ -463,6 +473,12 @@ def sg_today(moment: datetime) -> date:
     return moment.astimezone(SGT).date()
 
 
+def month_name(day: date) -> str:
+    """The English month name of a Singapore date, from the literal tuple."""
+
+    return MONTH_NAMES[day.month - 1]
+
+
 def expiry_day(expiry_local: Any) -> date | None:
     """The date part of an ExpiryDate, or None when it is null, unparseable or
     a placeholder before 2020-01-01 (never read as expired)."""
@@ -517,7 +533,8 @@ def single_read_verdict(result: Mapping[str, Any]) -> tuple[str, str]:
 
 CUSTOMERS_QUERY = """query XbMemberTagsCustomers($ids: [ID!]!) {
   nodes(ids: $ids) { ... on Customer { id tags
-    registration: metafield(namespace: "membership", key: "start_date") { id } } }
+    registration: metafield(namespace: "membership", key: "start_date") { id }
+    birthday: metafield(namespace: "membership", key: "birthday_month") { value type } } }
 }"""
 CARRIERS_QUERY = """query XbMemberTagsCarriers($first: Int!, $after: String, $search: String!) {
   customers(first: $first, after: $after, query: $search) { nodes { id tags } pageInfo { hasNextPage endCursor } }
@@ -538,13 +555,14 @@ CARRIER_SEARCH = f"tag:'{TAG}'"  # built from the pinned tag only
 # by the member core (an object costs 1, a scalar 0, every selected object is
 # counted once per row of the list or connection above it, a list of IDs has
 # one row per ID):
-#     customers by ID: 100 x (Customer 1 + metafield 1)            = 200
+#     customers by ID: 100 x (Customer 1 + 2 metafields 1 each)    = 300
 #     carriers: connection 1 + pageInfo 1 + 100 x (Customer 1)     = 102
-# Both under the 500 the design allows before the nodes page is lowered to 50.
+# Both under the 500 the design allows before the nodes page is lowered to 50
+# (slice D design 2.9: the birthday metafield took the by-ID query from 200).
 # Pinned by CostTests; the runbook (section 8) writes the sums out.
 NODES_PAGE = 100
 CARRIER_PAGE = 100
-CUSTOMERS_QUERY_COST = 200
+CUSTOMERS_QUERY_COST = 300
 CARRIERS_QUERY_COST = 102
 MUTATION_COST = 10
 COST_CEILING = 500
@@ -557,12 +575,17 @@ BUDGET_CODES = frozenset({"shopify_retry_budget_exhausted", "shopify_query_cost_
 
 @dataclass(frozen=True)
 class CustomerState:
-    """One customer as read by ID: its tags and whether the
-    ``membership.start_date`` metafield exists (its value is never read)."""
+    """One customer as read by ID: its tags, whether the
+    ``membership.start_date`` metafield exists (its value is never read), and
+    the ``membership.birthday_month`` reading (slice D design 2.1):
+    ``bday_state`` is ``missing``, ``month`` (``bday_month`` is then exactly
+    one of ``MONTH_NAMES``) or ``unreadable``. Never stored or printed."""
 
     gid: str
     tags: tuple[str, ...]
     has_registration: bool
+    bday_state: str = BDAY_MISSING
+    bday_month: str | None = None
 
     def __repr__(self) -> str:  # never render customer data
         return "CustomerState()"
@@ -587,7 +610,22 @@ def customer_state(node: Any, gid: str) -> CustomerState | None:
     _shape(isinstance(node, dict) and node.get("id") == gid)
     registration = node.get("registration")
     _shape(registration is None or (isinstance(registration, dict) and isinstance(registration.get("id"), str)))
-    return CustomerState(gid, _tags(node.get("tags")), registration is not None)
+    bday_state, bday_month = birthday_reading(node.get("birthday"))
+    return CustomerState(gid, _tags(node.get("tags")), registration is not None, bday_state, bday_month)
+
+
+def birthday_reading(birthday: Any) -> tuple[str, str | None]:
+    """``membership.birthday_month`` (design 2.1): null is ``missing``; a
+    single line text whose value is exactly one of ``MONTH_NAMES`` (no strip,
+    no casefold) is ``month``; any other type (a list included) or value is
+    ``unreadable`` and is never guessed. A wrong shape stops the read."""
+
+    if birthday is None:
+        return BDAY_MISSING, None
+    _shape(isinstance(birthday, dict) and isinstance(birthday.get("value"), str) and isinstance(birthday.get("type"), str))
+    if birthday["type"] == BDAY_FIELD_TYPE and birthday["value"] in MONTH_NAMES:
+        return BDAY_MONTH, birthday["value"]
+    return BDAY_UNREADABLE, None
 
 
 def check_tag_variables(gid: Any, tags: Any) -> None:
@@ -1074,6 +1112,7 @@ class TagsEngine:
         self.ac2 = ac2
         self._inputs = inputs or (lambda: (read_sync_links(config), *read_member_core(config)))
         self.reads = 0
+        self.month_now: str | None = None
 
     def now(self) -> datetime:
         return self.ledger.now()
@@ -1117,6 +1156,9 @@ class TagsEngine:
             unresolved = self._settle(open_rows, settle_reads, summary)
             facts = scan_members(self.ac2)
             today = sg_today(self.now())
+            # Once per run (design 2.2): a run that starts at 23:59 on the
+            # last day uses that month for every customer.
+            self.month_now = month_name(today)
             wanted = set(links.basis) | set(links.conflicts) | links.voided | {row["customer_gid"] for row in open_rows}
             states = self.shopify.customers(wanted)
             carriers, complete = self.shopify.carriers(self.config.shopify_max_carrier_pages)

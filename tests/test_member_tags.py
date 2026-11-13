@@ -74,6 +74,14 @@ def customer_gid(n: int) -> str:
     return f"gid://shopify/Customer/{customer_number(n)}"
 
 
+BDAY = "member-bday-month"
+
+
+def month(value: str, kind: str = "single_line_text_field") -> dict:
+    """A ``membership.birthday_month`` metafield node as Shopify returns it."""
+    return {"value": value, "type": kind}
+
+
 class FakeBook:
     """The type move bridge's two reads on a fake book: ``type-move-scan``
     (MemberNo, IsActive, ExpiryDate, LastModified; TOP 500 by MemberNo) and
@@ -130,8 +138,9 @@ class FakeShopify:
         self.after_write = None
         self.query_costs = {"XbMemberTagsCustomers": 200, "XbMemberTagsCarriers": 102}
 
-    def add(self, n: int, tags=(), registration: bool = True) -> str:
-        self.customers_by_gid[customer_gid(n)] = {"tags": list(tags), "registration": registration}
+    def add(self, n: int, tags=(), registration: bool = True, birthday=None) -> str:
+        """``birthday``: the raw ``membership.birthday_month`` node (``month(...)``) or None."""
+        self.customers_by_gid[customer_gid(n)] = {"tags": list(tags), "registration": registration, "birthday": birthday}
         return customer_gid(n)
 
     def tags(self, n: int) -> list:
@@ -152,7 +161,8 @@ class FakeShopify:
         found = {}
         for gid in gids:
             c = self.customers_by_gid.get(gid)
-            found[gid] = None if c is None else mt.CustomerState(gid, tuple(c["tags"]), c["registration"])
+            found[gid] = None if c is None else mt.CustomerState(gid, tuple(c["tags"]), c["registration"],
+                                                                 *mt.birthday_reading(c.get("birthday")))
         return found
 
     def carriers(self, max_pages):
@@ -1046,8 +1056,9 @@ def cost(requested, available=1990.0):
                      "throttleStatus": {"maximumAvailable": 2000.0, "currentlyAvailable": available, "restoreRate": 100.0}}}
 
 
-def node(n, tags=(), registration=True):
-    return {"id": customer_gid(n), "tags": list(tags), "registration": {"id": f"gid://shopify/Metafield/{n}"} if registration else None}
+def node(n, tags=(), registration=True, birthday=None):
+    return {"id": customer_gid(n), "tags": list(tags), "registration": {"id": f"gid://shopify/Metafield/{n}"} if registration else None,
+            "birthday": birthday}
 
 
 def nodes_answer(nodes, requested=None):
@@ -1326,7 +1337,7 @@ class CostTests(unittest.TestCase):
         self.assertEqual((mt.NODES_PAGE, mt.CARRIER_PAGE), (100, 100))
         customers = strict_cost(selection(mt.CUSTOMERS_QUERY), {"ids": mt.NODES_PAGE})
         carriers = strict_cost(selection(mt.CARRIERS_QUERY), {"first": mt.CARRIER_PAGE})
-        self.assertEqual((customers, carriers), (200, 102))
+        self.assertEqual((customers, carriers), (300, 102))  # slice D: + the birthday metafield (was 200)
         self.assertEqual((mt.CUSTOMERS_QUERY_COST, mt.CARRIERS_QUERY_COST), (customers, carriers))
         self.assertLessEqual(max(customers, carriers), mt.COST_CEILING)
         self.assertEqual(mt.MUTATION_COST, 10)
@@ -1336,13 +1347,88 @@ class CostTests(unittest.TestCase):
     def test_the_parser_reads_the_pinned_texts(self):
         self.assertEqual(selection(mt.CUSTOMERS_QUERY),
                          [("nodes", "ids: $ids", [("id", "", None), ("tags", "", None),
-                                                  ("metafield", 'namespace: "membership", key: "start_date"', [("id", "", None)])])])
+                                                  ("metafield", 'namespace: "membership", key: "start_date"', [("id", "", None)]),
+                                                  ("metafield", 'namespace: "membership", key: "birthday_month"',
+                                                   [("value", "", None), ("type", "", None)])])])
+        # Slice D: nothing else in the text changed (design 2.1).
+        self.assertEqual(mt.CUSTOMERS_QUERY, 'query XbMemberTagsCustomers($ids: [ID!]!) {\n'
+                         '  nodes(ids: $ids) { ... on Customer { id tags\n'
+                         '    registration: metafield(namespace: "membership", key: "start_date") { id }\n'
+                         '    birthday: metafield(namespace: "membership", key: "birthday_month") { value type } } }\n}')
         self.assertEqual([f[0] for f in selection(mt.CARRIERS_QUERY)[0][2]], ["nodes", "pageInfo"])
 
     def test_whole_points(self):
         self.assertEqual([mt.whole_points(v) for v in (0, 1.2, 200, 1_000_000)], [0, 2, 200, 1_000_000])
         for bad in (None, True, "200", -1, 1_000_001, float("nan")):
             self.assertIsNone(mt.whole_points(bad))
+
+
+# --------------------------------------------------------------------------
+# Slice D: the birthday month field and the current month (design 2.1, 2.2)
+# --------------------------------------------------------------------------
+
+BAD_MONTH_VALUES = ("march", "MARCH", " March", "March ", "Mar", "3", "03", "", "2000-03-01", '["March"]', "Marc h", "March\n",
+                    "Ｍarch", "Novembre")
+
+
+class BirthdayFieldTests(unittest.TestCase):
+    def test_month_names_are_a_literal_tuple_and_no_locale_call(self):
+        self.assertEqual(mt.MONTH_NAMES, ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+                                          "October", "November", "December"))
+        self.assertIs(type(mt.MONTH_NAMES), tuple)
+        source = (ROOT / "directlocal" / "xb_member_tags.py").read_text(encoding="utf-8")
+        self.assertNotRegex(source, r"(?m)^\s*(import|from)\s+(calendar|locale)\b")
+        self.assertNotRegex(source, r"\b(calendar|locale)\.[A-Za-z_]")
+        for text in ("month_name[", "%B", "%b", "strftime", "setlocale", "getlocale"):
+            self.assertNotIn(text, source)
+        self.assertEqual(mt.BDAY_TAG, "member-bday-month")
+
+    def test_every_reading_row(self):
+        self.assertEqual(mt.birthday_reading(None), ("missing", None))
+        for name in mt.MONTH_NAMES:
+            self.assertEqual(mt.birthday_reading(month(name)), ("month", name))
+        for bad in BAD_MONTH_VALUES:
+            with self.subTest(value=bad):
+                self.assertEqual(mt.birthday_reading(month(bad)), ("unreadable", None))
+        for kind in ("list.single_line_text_field", "multi_line_text_field", "date", "number_integer", "Single_Line_Text_Field", ""):
+            with self.subTest(kind=kind):
+                self.assertEqual(mt.birthday_reading(month("March", kind)), ("unreadable", None))
+        self.assertEqual(mt.birthday_reading(month('["March"]', "list.single_line_text_field")), ("unreadable", None))
+
+    def test_a_wrong_shape_is_a_read_failure(self):
+        for bad in ("March", 3, [], {}, {"value": "March"}, {"type": "single_line_text_field"}, {"value": 3, "type": "single_line_text_field"},
+                    {"value": "March", "type": None}, {"value": None, "type": "single_line_text_field"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(direct.ShopifyDirectError) as caught:
+                    mt.birthday_reading(bad)
+                self.assertEqual(caught.exception.code, "shopify_response_shape_invalid")
+
+    def test_the_by_id_read_carries_the_reading_and_never_renders_it(self):
+        transport = FakeTransport([nodes_answer([node(1, birthday=month("March")), node(2), node(3, birthday=month("march")),
+                                                 node(4, birthday=month("March", "list.single_line_text_field"))])])
+        client = mt.TagsShopifyClient(mutations_enabled=False, shop_domain=SHOP, api_version="2026-10",
+                                      token_provider=direct.StaticTokenProvider("t" * 32), transport=transport, sleep=lambda s: None)
+        found = client.customers([customer_gid(n) for n in (1, 2, 3, 4)])
+        self.assertEqual([(found[customer_gid(n)].bday_state, found[customer_gid(n)].bday_month) for n in (1, 2, 3, 4)],
+                         [("month", "March"), ("missing", None), ("unreadable", None), ("unreadable", None)])
+        self.assertEqual(repr(found[customer_gid(1)]), "CustomerState()")
+        self.assertNotIn("March", repr(found))
+        transport = FakeTransport([nodes_answer([node(1, birthday="March")])])
+        client = mt.TagsShopifyClient(mutations_enabled=False, shop_domain=SHOP, api_version="2026-10",
+                                      token_provider=direct.StaticTokenProvider("t" * 32), transport=transport, sleep=lambda s: None)
+        with self.assertRaises(direct.ShopifyDirectError) as caught:
+            client.customers([customer_gid(1)])
+        self.assertEqual(caught.exception.code, "shopify_response_shape_invalid")
+
+    def test_the_singapore_month_at_midnight_and_year_end(self):
+        at = lambda *a: mt.month_name(mt.sg_today(datetime(*a, tzinfo=timezone.utc)))  # noqa: E731
+        self.assertEqual(at(2026, 11, 30, 15, 59, 59), "November")  # 23:59:59 SGT 30 Nov
+        self.assertEqual(at(2026, 11, 30, 16, 0, 0), "December")    # 00:00:00 SGT 1 Dec
+        self.assertEqual(at(2026, 12, 31, 15, 59, 59), "December")  # 23:59:59 SGT 31 Dec
+        self.assertEqual(at(2026, 12, 31, 16, 0, 0), "January")     # 00:00:00 SGT 1 Jan
+        self.assertEqual(at(2026, 11, 30, 23, 0, 0), "December")    # UTC still says November
+        with self.assertRaises(dl.DirectLocalError):
+            mt.sg_today(datetime(2026, 11, 30, 16, 0, 0))  # a naive clock refuses
 
 
 # --------------------------------------------------------------------------
@@ -1371,7 +1457,7 @@ class EngineBase(Base):
         return self.engine(**overrides).run(apply=apply)
 
     def member(self, n: int, *, member_type="MEMBER", active="T", expiry=FUTURE, tags=(), registration=True, link="sync",
-               in_book=True) -> str:
+               in_book=True, birthday=None) -> str:
         """Customer n linked to member sg(n) (by the sync, or by a member core claim)."""
         member_no = sg(n)
         if in_book:
@@ -1380,7 +1466,7 @@ class EngineBase(Base):
             self.make_sync([(n, member_no)])
         elif link == "claim":
             self.make_core([(n, member_no)])
-        self.shopify.add(n, tags, registration)
+        self.shopify.add(n, tags, registration, birthday)
         self.private |= {member_no, customer_gid(n)}
         return member_no
 
@@ -1893,7 +1979,8 @@ class StoreTransport:
         if "XbMemberTagsCustomers" in query:
             return ok({"nodes": [None if customers.get(gid) is None else
                                  {"id": gid, "tags": list(customers[gid]["tags"]),
-                                  "registration": {"id": "gid://shopify/Metafield/9"} if customers[gid]["registration"] else None}
+                                  "registration": {"id": "gid://shopify/Metafield/9"} if customers[gid]["registration"] else None,
+                                  "birthday": customers[gid].get("birthday")}
                                  for gid in value["variables"]["ids"]]})
         if "XbMemberTagsCarriers" in query:
             return ok({"customers": {"nodes": [{"id": g, "tags": list(c["tags"])} for g, c in customers.items() if TAG in c["tags"]],
@@ -1940,6 +2027,36 @@ class UnmappedTransportErrorTests(EngineBase):
         self.assertEqual(result["counts"]["write_settled_not_written"], 1)
         self.assertEqual([(r["state"], r["code"]) for r in self.rows()],
                          [("NOT_WRITTEN", "resolved_by_read"), ("NOT_WRITTEN", "resolved_by_read"), ("DONE", None), ("DONE", None)])
+
+
+class BirthdayReadEngineTests(UnmappedTransportErrorTests):
+    """Slice D design 2.1/2.2 through the real client: a wrong birthday shape
+    stops the run before any write; the month is taken once per run."""
+
+    test_an_unmapped_transport_error_is_uncertain_and_stops = None
+
+    def test_a_wrong_birthday_shape_stops_before_any_write(self):
+        self.member(1)
+        self.member(2, birthday="March")  # a bare string, not a metafield object
+        result, transport = self.real_run([])
+        self.assertEqual((result["stopped"], transport.mutations()), ("shopify_response_shape_invalid", []))
+        self.assertEqual(self.counts_of("tag_writes"), 0)
+
+    def test_one_month_per_run_even_across_midnight(self):
+        self.member(1, birthday=month("November"))
+        self.now = datetime(2026, 11, 30, 15, 59, 59, tzinfo=timezone.utc)  # 23:59:59 SGT 30 Nov
+        engine = self.engine()
+        real_customers = self.shopify.customers
+
+        def late(gids):  # the clock passes midnight after the month was taken
+            self.now = datetime(2026, 11, 30, 16, 0, 5, tzinfo=timezone.utc)
+            return real_customers(gids)
+        self.shopify.customers = late
+        engine.run(apply=False)
+        self.assertEqual(engine.month_now, "November")
+        later = self.engine()
+        later.run(apply=False)
+        self.assertEqual(later.month_now, "December")
 
 
 class CliTests(EngineBase):
