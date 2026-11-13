@@ -2336,9 +2336,10 @@ class BirthdayDecisionTests(BirthdayBase):
         for n in (1, 2, 3):
             self.member(n, birthday=NOV)
         self.member(4, tags=[TAG, BDAY], birthday=MAR)
+        self.member(5, tags=[TAG, BDAY], birthday=MAR)  # a removal outside the pilot is not sent either
         result = self.run_tool(bday_only_customers=[customer_gid(2), customer_gid(4)])
         self.assertEqual(self.bday_writes(), [("add", customer_gid(2), [BDAY]), ("remove", customer_gid(4), [BDAY])])
-        self.assertEqual((result["counts"]["would_bday_tag"], result["counts"]["bday_not_in_pilot"]), (3, 2))
+        self.assertEqual((result["counts"]["would_bday_tag"], result["counts"]["bday_not_in_pilot"]), (3, 3))
         self.assertEqual(result["counts"]["tagged"], 3)  # the qualified tag is not limited by the pilot
 
     def test_dp4_the_qualified_plan_is_unchanged_for_every_c1_row_and_birthday_state(self):
@@ -2478,6 +2479,49 @@ class BirthdayGuardTests(BirthdayBase):
         self.assertEqual([(r["tag"], r["state"], r["code"]) for r in self.rows()],
                          [(BDAY, "DONE", "resolved_by_read"), (BDAY, "DONE", None)])
         self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+
+    def test_settle_by_read_reads_the_rows_own_tag(self):
+        # The customer carries member-qualified; the birthday add did not land: NOT_WRITTEN (mutation D32).
+        self.member(1, tags=[TAG], birthday=NOV)
+        self.shopify.answers = {customer_gid(1): ["uncertain_unapplied"]}
+        self.run_tool()
+        result = self.run_tool()
+        self.assertEqual(result["counts"]["write_settled_not_written"], 1)
+        self.assertEqual([(r["tag"], r["state"], r["code"]) for r in self.rows()],
+                         [(BDAY, "NOT_WRITTEN", "resolved_by_read"), (BDAY, "DONE", None)])
+        # And a birthday removal that landed, on a customer without member-qualified: DONE.
+        self.member(2, active=None, tags=[BDAY], birthday=MAR)
+        self.member(3, member_type="GUEST", tags=[BDAY], birthday=NOV)
+        self.shopify.answers = {customer_gid(3): ["uncertain_applied"]}
+        self.run_tool()
+        result = self.run_tool()
+        self.assertEqual(result["counts"]["write_settled_done"], 1)
+        self.assertEqual([(r["state"], r["code"]) for r in self.rows() if r["customer_gid"] == customer_gid(3)], [("DONE", "resolved_by_read")])
+
+    def test_the_two_tags_are_counted_apart(self):
+        # Mutation D33: the birthday tag is never counted in tagged_now (nor the other way round).
+        self.member(1, active=None, tags=[BDAY], birthday=NOV)  # row 9: both left alone
+        self.member(2, tags=[TAG])
+        self.member(3, active=None, tags=[TAG, BDAY], birthday=NOV)
+        result = self.run_tool(apply=False)
+        self.assertEqual((result["tagged_now"], result["bday_tagged_now"]), (2, 2))
+
+    def test_the_exemption_needs_an_add_not_a_removal(self):
+        # Mutation D36b: an earlier-month birthday removal by this tool (a hand-set tag it took off once) is not an add.
+        self.engine()
+        for n in range(1, 7):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)
+            saved, self.now = self.now, self.OCTOBER
+            try:
+                write_id = self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(n), tag=BDAY, op="remove", reason="x",
+                                                  member_no=sg(n), basis="sync155")
+                self.ledger.set_outcome(write_id, "DONE", None)
+            finally:
+                self.now = saved
+        result = self.run_tool(max_bday_removes_per_run=100)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 6)
+        self.assertNotIn("bday_month_change_removals", result["counts"])
 
     def test_the_stop_file_and_uncertain_stop_the_birthday_writes_too(self):
         self.member(1, birthday=NOV)
@@ -2651,8 +2695,10 @@ class BirthdayReadEngineTests(UnmappedTransportErrorTests):
             self.now = datetime(2026, 11, 30, 16, 0, 5, tzinfo=timezone.utc)
             return real_customers(gids)
         self.shopify.customers = late
-        engine.run(apply=False)
+        result = engine.run(apply=False)
         self.assertEqual(engine.month_now, "November")
+        # Every customer is decided with the run's month, not the clock at its turn (mutation D08d).
+        self.assertEqual((result["bday_month_now"], result["counts"].get("would_bday_tag")), ("November", 1))
         later = self.engine()
         later.run(apply=False)
         self.assertEqual(later.month_now, "December")
