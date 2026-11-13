@@ -160,6 +160,15 @@ _ORDER_REF_RE = re.compile(r"^o-[0-9a-f]{20}\Z")
 _CUSTOMER_REF_RE = re.compile(r"^c-[0-9a-f]{20}\Z")
 _LAST3_RE = re.compile(r"^[A-Za-z0-9._/-]{1,3}\Z")  # the last 3 characters of a MemberNo (dl.MEMBER_NO_RE)
 CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, ORDER_PAST_READ_WINDOW})
+# Slice B2 (B2-1, B2-2): alerts, each once per order (review subjects
+# ``moved:<order>`` and ``settled:<order>``; no schema change).
+ORDER_CUSTOMER_CHANGED = "order_customer_changed_after_upgrade"
+CLAIM_HOLD_SETTLED_UNCLEAR = "claim_hold_settled_unclear"
+RECEIPT_PAST_READ_WINDOW = "receipt_past_read_window"  # B2-4: review subject aged:<order>
+# The replayed states that settle a claim hold silently: positive facts only
+# (a cancellation; an amount measured below the threshold). A move or a
+# removed customer is the other positive fact (checked apart).
+CLAIM_SETTLE_POSITIVE_STATES = frozenset({"void", "below_threshold"})
 # Slice B1: the version of the amount rule (goods_amount, gift_card_paid,
 # qualifying_amount, qualifies, money_refund_unattributed and the order
 # parsing of amounts). Any change to one of them raises it; it is part of the
@@ -490,6 +499,9 @@ class OrderLine:
     unit_cents: int
     discount_cents: int
 
+    def __repr__(self) -> str:  # slice B2 (B2-6): never render order data
+        return "OrderLine()"
+
 
 @dataclass(frozen=True)
 class Payment:
@@ -501,6 +513,9 @@ class Payment:
     kind: str
     status: str
     cents: int | None
+
+    def __repr__(self) -> str:  # slice B2 (B2-6): never render the gateway or an amount
+        return "Payment()"
 
 
 @dataclass(frozen=True)
@@ -837,6 +852,13 @@ CREATE TRIGGER writes_transition BEFORE UPDATE OF state ON writes
 """
 
 
+def keyed_ref(ref_key: str, kind: str, value: str) -> str:
+    """The keyed ref of a GID or MemberNo key (``o-``, ``c-``, ``m-`` + 20 hex):
+    HMAC-SHA256 under the ledger's own ``ref_key``, never the value itself."""
+
+    return f"{kind}-" + hmac.new(bytes.fromhex(ref_key), f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:dl.MEMBER_REF_HEX]
+
+
 class BenefitsLedger:
     """Single-owner SQLite ledger in the tool's own private root."""
 
@@ -933,8 +955,7 @@ class BenefitsLedger:
             raise dl.DirectLocalError("benefits_rule_settings_changed")
 
     def ref(self, kind: str, value: str) -> str:
-        key = self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0]
-        return f"{kind}-" + hmac.new(bytes.fromhex(key), f"{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:dl.MEMBER_REF_HEX]
+        return keyed_ref(self.conn.execute("SELECT ref_key FROM meta WHERE id = 1").fetchone()[0], kind, value)
 
     def start_run(self, command: str) -> str:
         run_id = f"run-{uuid.uuid4().hex}"
@@ -1022,6 +1043,13 @@ class BenefitsLedger:
     def unreleased_held_writes(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM writes w WHERE w.state = 'HELD' AND NOT EXISTS "
                                  "(SELECT 1 FROM write_releases r WHERE r.write_id = w.write_id) ORDER BY rowid").fetchall()
+
+    def released_held_write(self, order_gid: str) -> sqlite3.Row | None:
+        """Slice B2 (B2-9): this receipt's HELD write and its release
+        finding, once it is released; None while none is released."""
+
+        return self.conn.execute("SELECT w.*, r.finding FROM writes w JOIN write_releases r ON r.write_id = w.write_id "
+                                 "WHERE w.order_gid = ? AND w.state = 'HELD' ORDER BY w.rowid DESC LIMIT 1", (order_gid,)).fetchone()
 
     def done_write(self, order_gid: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM writes WHERE order_gid = ? AND state = 'DONE' ORDER BY rowid DESC LIMIT 1", (order_gid,)).fetchone()
@@ -1712,9 +1740,48 @@ class BenefitsEngine:
                 # receipt whose stored facts no longer qualify never re-opens.
                 self.ledger.update_receipt(row["order_gid"], code=ORDER_NO_LONGER_QUALIFIES)
                 summary.count("claim_hold_settled", ref)
+                # Slice B2 (B2-2): silent only for a paid order whose stored
+                # amount is measured below the threshold (a unit refund, also
+                # a full one: REFUNDED), as the replay path; anything else alerts.
+                if not (row["financial_status"] in PAID_STATUSES
+                        and isinstance(row["net_cents"], int) and not qualifies(row["net_cents"], self.config)):
+                    self._settled_unclear(row["order_gid"], summary, ref)
                 continue
             self.ledger.update_receipt(row["order_gid"], state="ready", code=None, checked_at=None)
             summary.count("claim_hold_reopened", ref)
+
+    def _age_limit(self, summary: RunSummary) -> None:
+        """Slice B2 (B2-4): ``read_orders`` sees orders created in the last
+        60 days only, so a receipt whose order is that old (or older) can
+        never be read again: a held claim receipt settles to
+        ``order_past_read_window`` (never re-opened) and a ``waiting_member``
+        one is held with that code (never waits). One alert per order.
+        Every other receipt (``applied`` and the other decided ones) is
+        never touched."""
+
+        marks = ",".join("?" for _ in CLAIM_HOLD_CODES)
+        rows = self.ledger.conn.execute(
+            f"SELECT * FROM receipts WHERE (state = 'held' AND code IN ({marks})) OR state = 'waiting_member' ORDER BY order_created_at, order_gid",
+            tuple(sorted(CLAIM_HOLD_CODES))).fetchall()
+        now = self.now()
+        for row in rows:
+            created = dl.parse_created_at(row["order_created_at"])
+            if created is None or now - created < SHOPIFY_ORDER_WINDOW:
+                continue
+            if row["state"] == "waiting_member":
+                self.ledger.update_receipt(row["order_gid"], state="held", code=ORDER_PAST_READ_WINDOW, waiting_since=None)
+            else:
+                self.ledger.update_receipt(row["order_gid"], code=ORDER_PAST_READ_WINDOW)
+            if self.ledger.review_once("aged:" + row["order_gid"], RECEIPT_PAST_READ_WINDOW):
+                summary.alert(RECEIPT_PAST_READ_WINDOW, self.ledger.ref("o", row["order_gid"]), row["member_no"])
+
+    def _settled_unclear(self, order_gid: str, summary: RunSummary, ref: str) -> None:
+        """Slice B2 (B2-2): a claim hold settled for a reason that is not a
+        positive fact: one alert per order, so staff can upgrade by hand. The
+        settle itself is unchanged (it denies only, never grants)."""
+
+        if self.ledger.review_once("settled:" + order_gid, CLAIM_HOLD_SETTLED_UNCLEAR):
+            summary.alert(CLAIM_HOLD_SETTLED_UNCLEAR, ref)
 
     def _still_qualifies_as_last_read(self, row: sqlite3.Row) -> bool:
         """The stored facts of the order as last read: a paid status that is
@@ -1824,9 +1891,21 @@ class BenefitsEngine:
                 elif moved or state != "ready":
                     self.ledger.update_receipt(order.gid, code=ORDER_NO_LONGER_QUALIFIES)
                     summary.count("claim_hold_settled", ref)
+                    # Slice B2 (B2-2): silent for a positive fact (moved or no
+                    # customer, a cancellation, an amount measured below the
+                    # threshold); any other reason (unpaid, sign-up marker gone,
+                    # amount unreadable, a test order) alerts once.
+                    if not moved and state not in CLAIM_SETTLE_POSITIVE_STATES:
+                        self._settled_unclear(order.gid, summary, ref)
                 else:
                     summary.count("receipt_replayed")
                 return
+            if existing["state"] == "applied" and (order.customer.gid if order.customer else None) != existing["customer_gid"]:
+                # Slice B2 (B2-1): the order now shows another customer, or
+                # none. The receipt keeps its customer; one alert per order
+                # (the owner checks the upgrade went to the right member).
+                if self.ledger.review_once("moved:" + order.gid, ORDER_CUSTOMER_CHANGED):
+                    summary.alert(ORDER_CUSTOMER_CHANGED, ref, existing["member_no"])
             # G2 B1: a refund by units below the threshold, a cancellation, or
             # any refund by money that no unit explains (incl. REFUNDED).
             dropped = order.cancelled or (net is not None and not qualifies(net, self.config)) or money_refund_unattributed(order)
@@ -1844,9 +1923,20 @@ class BenefitsEngine:
             # The watermark overlap replays an order every run: a replay that
             # still qualifies keeps the receipt waiting (and its back-off, G2 B2).
             state, code = "waiting_member", existing["code"]
-        values = dict(customer_gid=order.customer.gid if order.customer else None, order_updated_at=dl.ts(order.updated_at),
+        if state == "below_threshold" and net is None:
+            summary.count("below_threshold_payments_unread")  # slice B2 (B2-7): the goods alone are below the threshold
+        customer = order.customer.gid if order.customer else None
+        values = dict(customer_gid=customer, order_updated_at=dl.ts(order.updated_at),
                       financial_status=order.financial_status, gross_cents=gross, net_cents=net, refunded_cents=order.refunded_cents,
                       gift_card_cents=paid, payment_gateways=gateways, state=state, code=code)
+        if existing is not None and existing["customer_gid"] != customer:
+            # Slice B2 (B2-5): an undecided receipt follows its order to another
+            # customer (or none); nothing found for the old customer carries over.
+            values.update(waiting_since=None, alerted=None, observed=None, observed_at=None, checked_at=None)
+            if not self.ledger.write_landed_or_open(order.gid):
+                # B2 fix round 1 (F1): a write that is open or landed belongs to
+                # that member; resolve, release-held and the repair need it.
+                values.update(member_no=None, link_source=None)
         if existing is None:
             with self.ledger.tx() as conn:
                 conn.execute(
@@ -1878,7 +1968,16 @@ class BenefitsEngine:
         if net is None:
             if not order.taxes_included:
                 return "amount_unverifiable", "taxes_not_included"
-            return "amount_unverifiable", ("currency_or_lines" if goods_amount(order, self.config) is None else PAYMENTS_UNREADABLE)
+            goods = goods_amount(order, self.config)
+            if goods is None:
+                return "amount_unverifiable", "currency_or_lines"
+            if not qualifies(goods[1], self.config):
+                # Slice B2 (B2-7): the goods kept are below the threshold and a
+                # gift card can only lower the amount, so the unread payments
+                # cannot make it qualify (no alert). The amount functions are
+                # unchanged: this only orders the checks.
+                return "below_threshold", None
+            return "amount_unverifiable", PAYMENTS_UNREADABLE
         if not qualifies(net, self.config):
             return "below_threshold", None
         if money_refund_unattributed(order):
@@ -1921,7 +2020,13 @@ class BenefitsEngine:
             for order in orders:
                 self.record(order, summary)
             self._advance_watermark(orders, summary)
-            self._reopen_claim_holds(summary)
+            self._age_limit(summary)
+            if self._read_state[1]:
+                self._reopen_claim_holds(summary)
+            else:
+                # Slice B2 (B2-3): a read that ended at the page cap may not
+                # have reached this order's newest facts; re-open next time.
+                summary.count("claim_reopen_deferred")
             self._recheck_signups(summary)
             self._decide_all(summary, run_id=run_id, apply=apply)
         except _Budget:
@@ -2072,6 +2177,23 @@ class BenefitsEngine:
         summary.count("receipt_repaired_applied", ref, done["member_no"])
         return True
 
+    def _settle_released(self, row: sqlite3.Row, summary: RunSummary, ref: str) -> None:
+        """Slice B2 (B2-9, PR #303 L5): a ``ready`` receipt whose HELD write
+        was released (``release-held`` left it, as it was not ``ready`` then)
+        is set as ``release-held`` would have set it: ``as_intended`` ->
+        ``applied`` from the write, ``not_as_intended`` -> ``held``
+        ``held_write_released``. No AutoCount read, no save, no write row."""
+
+        released = self.ledger.released_held_write(row["order_gid"])
+        if released is None:
+            return
+        if released["finding"] == "as_intended":
+            self.ledger.update_receipt(row["order_gid"], state="applied", code=released["kind"], member_no=released["member_no"],
+                                       basis_expiry_local=released["new_expiry_local"])
+        else:
+            self.ledger.update_receipt(row["order_gid"], state="held", code=HELD_WRITE_RELEASED)
+        summary.count("release_receipt_settled_late", ref, released["member_no"])
+
     def _decide_one(self, row: sqlite3.Row, summary: RunSummary, *, run_id: str, apply: bool) -> bool:
         """True stops the run (an unclear write)."""
 
@@ -2081,6 +2203,8 @@ class BenefitsEngine:
             return False
         if self.ledger.write_landed_or_open(order_gid):
             summary.count("write_already_recorded", ref)  # never a second send (I4)
+            if row["state"] == "ready":
+                self._settle_released(row, summary, ref)
             return False
         if not apply and row["state"] == "ready" and row["observed_at"] and self.now() - dl.parse_created_at(row["observed_at"]) < OBSERVE_REREAD:
             summary.count(row["observed"] or "observed_recently")
@@ -2195,8 +2319,8 @@ class BenefitsEngine:
         for row in open_rows:
             if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
                 raise dl.DirectLocalHold("writer_may_be_live")
-            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
-                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) != "exited":
+                raise dl.DirectLocalHold("writer_may_be_live")  # slice B2 (B2-8): "unknown" may be live
         result: dict[str, Any] = {"status": "ok", "command": "resolve", "writes": 0, "resolved": {}, "alerts": []}
         for row in open_rows:
             if row["state"] == "INTENT":
@@ -2251,8 +2375,8 @@ class BenefitsEngine:
         for row in rows:
             if now < dl.parse_ts(row["deadline_at"]) + timedelta(seconds=dl.WRITER_GRACE_SECONDS):
                 raise dl.DirectLocalHold("writer_may_be_live")
-            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) == "running":
-                raise dl.DirectLocalHold("writer_may_be_live")
+            if row["child_pid"] is not None and self.writer_probe(row["child_pid"], row["child_created"]) != "exited":
+                raise dl.DirectLocalHold("writer_may_be_live")  # slice B2 (B2-8): "unknown" may be live
 
     def release_held(self, *, order_ref: Any, member_last3: Any, finding: Any, apply: bool) -> dict[str, Any]:
         """Clear the latch of one ``HELD`` write after the owner checked that
@@ -2284,9 +2408,14 @@ class BenefitsEngine:
         receipt = self.ledger.receipt(write["order_gid"])
         if receipt is not None and receipt["state"] == "ready":
             receipt_now = "applied" if finding == "as_intended" else "held"
-        else:
+        elif receipt is not None and receipt["state"] in DECIDED_STATES:
             receipt_now = "left_decided"
-        count = {"applied": "release_receipt_applied", "held": "release_receipt_held"}.get(receipt_now, "release_receipt_left_decided")
+        else:
+            # Slice B2 (B2-9): an undecided receipt is left open; if it is
+            # ready again later, the next run settles it (_settle_released).
+            receipt_now = "left_open"
+        count = {"applied": "release_receipt_applied", "held": "release_receipt_held",
+                 "left_decided": "release_receipt_left_decided"}.get(receipt_now, "release_receipt_left_open")
         run_id = f"run-{uuid.uuid4().hex}" if apply else None
         result = {"status": "ok", "command": "release_held" if apply else "release_held_dry_run", "run_id": run_id, "finding": finding,
                   "receipt_now": receipt_now, "held_writes_left": self.ledger.held_writes() - 1, "counts": {count: 1},
@@ -2323,18 +2452,22 @@ class BenefitsEngine:
         customer's ``c-`` ref) or ``order_ref`` (fix round 1, G2 B13: the
         ``o-`` ref a ``link_conflict``, ``write_held``, ``would_upgrade`` or
         ``upgraded`` entry carries; the link is that receipt's customer's
-        active claim link). An ``o-`` ref that names no receipt, a receipt
-        with no customer, or a customer with no active claim link (also one
-        linked by #155 only) is ``unlink_not_a_claim_link``."""
+        active claim link). A malformed ref of either kind is
+        ``unlink_arguments_invalid`` (slice B2); a well-formed ``o-`` ref
+        that names no receipt, a receipt with no customer, or a customer with
+        no active claim link (also one linked by #155 only) is
+        ``unlink_not_a_claim_link``."""
 
         selectors = [value for value in (customer_ref, order_ref) if value is not None]
         if (len(selectors) != 1 or not isinstance(selectors[0], str)
-                or (customer_ref is not None and not _CUSTOMER_REF_RE.fullmatch(customer_ref)) or not isinstance(member_last3, str)
+                or (customer_ref is not None and not _CUSTOMER_REF_RE.fullmatch(customer_ref))
+                or (order_ref is not None and not _ORDER_REF_RE.fullmatch(order_ref)) or not isinstance(member_last3, str)
                 or not _LAST3_RE.fullmatch(member_last3) or reason not in UNLINK_REASONS or not isinstance(accept_applied, bool)):
             raise dl.DirectLocalError("unlink_arguments_invalid")
         self.ledger.check_binding(self.config)
         if order_ref is not None:
-            # A malformed o- ref names no receipt: the same answer as an unknown one (Controller ruling 2).
+            # Slice B2 (B2-10): a malformed o- ref is refused above (unlink_arguments_invalid);
+            # a well-formed one that names no receipt is unlink_not_a_claim_link.
             customers = [row["customer_gid"] for row in self.ledger.conn.execute("SELECT order_gid, customer_gid FROM receipts")
                          if self.ledger.ref("o", row["order_gid"]) == order_ref]
             links = [row for row in self.ledger.active_claims() if customers and row["customer_gid"] == customers[0]]
@@ -2519,6 +2652,7 @@ def type_move_lock(config: BenefitsConfig) -> Iterator[None]:
 DIGEST_SCHEMA = "xb.directlocal.member_benefits.digest.v1"
 _DIGEST_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 _DIGEST_REF_RE = re.compile(r"^[ocm]-[0-9a-f]{1,64}$")
+_DIGEST_DIGITS_RE = re.compile(r"[0-9]{4}")  # slice B2 (B2-6): a gateway name with a run of 4 digits is shown as "other"
 
 
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConfig) -> dict[str, Any]:
@@ -2585,7 +2719,8 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
                 names = json.loads(row[0])
             except (json.JSONDecodeError, RecursionError):
                 names = []
-            for name in {n if isinstance(n, str) and _DIGEST_CODE_RE.fullmatch(n) else "other" for n in (names if isinstance(names, list) else [])}:
+            for name in {n if isinstance(n, str) and _DIGEST_CODE_RE.fullmatch(n) and not _DIGEST_DIGITS_RE.search(n) else "other"
+                         for n in (names if isinstance(names, list) else [])}:
                 gateways[name] = gateways.get(name, 0) + 1
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
@@ -2606,6 +2741,54 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
                 "claim_links_voided": conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0],
             },
         }
+    except sqlite3.Error:
+        raise dl.DirectLocalError("benefits_ledger_unreadable") from None
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Claim links listing (read only; slice B2)
+# --------------------------------------------------------------------------
+
+CLAIM_LINKS_LIST_MAX = 500
+
+
+def claim_links_listing(root: Path, *, config: BenefitsConfig) -> dict[str, Any]:
+    """Slice B2 (B2-11, PR #303 N1): the active claim links, so the owner can
+    name a link (also one the index made for a customer with no order) to
+    ``unlink --customer-ref``. Opened as the digest is (SQLite ``mode=ro``
+    and ``query_only``): no lock, no write, no run row. Keyed ``c-`` refs,
+    MemberNos masked to the last 3, the source and the Singapore day the
+    link was made; sorted by ref, at most ``CLAIM_LINKS_LIST_MAX``. Voided
+    links are counted, never listed."""
+
+    path = Path(root) / LEDGER_FILE
+    if not path.is_file():
+        raise dl.DirectLocalError("benefits_ledger_missing")
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        raise dl.DirectLocalError("benefits_ledger_unreadable") from None
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise dl.DirectLocalError("benefits_ledger_not_recognised")
+        meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        if meta is None:
+            raise dl.DirectLocalError("benefits_ledger_not_initialised")
+        BenefitsLedger._check(meta, config)
+        links = []
+        for row in conn.execute("SELECT customer_gid, member_no, source, created_at FROM active_claim_links"):
+            created = dl.parse_created_at(row["created_at"])
+            if created is None:
+                raise dl.DirectLocalError("benefits_ledger_unreadable")
+            links.append({"ref": keyed_ref(meta["ref_key"], "c", row["customer_gid"]), "member_no_masked": mask(row["member_no"]),
+                          "source": row["source"], "created_day": sg_date(created).isoformat()})
+        links.sort(key=lambda entry: entry["ref"])
+        return {"status": "ok", "command": "claim_links", "links": links[:CLAIM_LINKS_LIST_MAX], "active": len(links),
+                "voided": conn.execute("SELECT COUNT(*) FROM claim_unlinks").fetchone()[0], "truncated": len(links) > CLAIM_LINKS_LIST_MAX}
     except sqlite3.Error:
         raise dl.DirectLocalError("benefits_ledger_unreadable") from None
     finally:
@@ -2637,7 +2820,7 @@ def build_real_engine(config: BenefitsConfig, ledger: BenefitsLedger, *, environ
     return BenefitsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink")
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink", "claim-links")
 
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsConfig, BenefitsLedger], BenefitsEngine] | None = None,
@@ -2670,6 +2853,9 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
             if not 1 <= args.hours <= 720:
                 raise dl.DirectLocalError("digest_hours_invalid")
             _emit(ledger_digest(root, hours=args.hours, now=clock(), config=config))
+            return 0
+        if args.command == "claim-links":  # slice B2 (B2-11): read only, as the digest
+            _emit(claim_links_listing(root, config=config))
             return 0
         ledger = BenefitsLedger(root, clock=clock)
         try:
