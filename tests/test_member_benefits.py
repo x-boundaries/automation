@@ -4386,6 +4386,7 @@ class B2AlertTests(Base):
                     self.assertEqual((out["counts"].get(self.UNCLEAR), out["saves"]), (1, 0))
                     self.assertIn(self.UNCLEAR, out["alerts"])
                     self.assertIn({"ref": ref, "code": self.UNCLEAR}, out["refs"])
+                    self.assertIn(("settled:" + order_gid(1), self.UNCLEAR), [tuple(r)[:2] for r in self.ledger.conn.execute("SELECT * FROM reviews")])
                     # Once: seen again (and linked), the settled hold stays shut and quiet.
                     self.advance(minutes=15)
                     again = self.link_and_run()
@@ -4472,6 +4473,8 @@ class B2WindowTests(Base):
         out = self.at(timedelta(days=60))  # exactly 60 days: settles
         self.assertEqual((out["alerts"].count(self.AGED), out["counts"].get(self.AGED)), (1, 2))
         self.assertEqual({r["ref"] for r in out["refs"] if r["code"] == self.AGED}, {self.ledger.ref("o", order_gid(n)) for n in (1, 2)})
+        reviews = [tuple(r)[:2] for r in self.ledger.conn.execute("SELECT * FROM reviews")]
+        self.assertTrue(all(("aged:" + order_gid(n), self.AGED) in reviews for n in (1, 2)))
         self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"], self.receipt(n)["waiting_since"]) for n in (1, 2)],
                          [("held", "order_past_read_window", None), ("held", "order_past_read_window", None)])
         # Once, and never re-opened or waited on: a link appears and a member is made.
@@ -4637,13 +4640,18 @@ class B2ReleaseUnlinkTests(Base):
             self.assertEqual((value["receipt_now"], value["counts"]), ("left_open", {"release_receipt_left_open": 1}))
         self.assertEqual(tuple(self.receipt(1)), row)  # left as it is
         self.assertEqual(self.ledger.held_writes(), 0)
+        self.advance(minutes=15)
+        out = self.engine().run(apply=True)  # not ready: the run settles nothing late
+        self.assertEqual((out["counts"].get("release_receipt_settled_late"), self.receipt(1)["state"]), (None, "waiting_member"))
         return ref, member_no
 
     def late(self) -> dict:
         self.ledger.update_receipt(order_gid(1), state="ready")  # ready again
         reads, saves, writes = self.book.reads, self.book.saves, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+        payloads = len(self.book.payloads)
         self.advance(minutes=15)
         out = self.engine().run(apply=True)
+        self.assertEqual(len(self.book.payloads), payloads)  # nothing sent, not even a save that would be skipped
         self.assertEqual((out["counts"].get("write_already_recorded"), out["counts"].get("release_receipt_settled_late"), out["saves"]), (1, 1, 0))
         self.assertEqual((self.book.reads, self.book.saves, self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]),
                          (reads, saves, writes))
@@ -4744,9 +4752,12 @@ class B2ClaimLinksTests(Base):
     def test_b2_11_at_most_500_entries_then_truncated(self):
         self.engine()
         with self.ledger.tx() as conn:
-            for n in range(501):
+            for n in range(500):
                 conn.execute("INSERT INTO claim_links(customer_gid, member_no, member_no_key, source, code, created_at) VALUES (?, ?, ?, 'index', "
                              "'phone_and_name_match', '2026-11-18T04:00:00Z')", (customer_gid(n), sg(n), sync.member_no_key(sg(n))))
+        out = self.listing()
+        self.assertEqual((len(out["links"]), out["active"], out["truncated"]), (500, 500, False))
+        self.ledger.add_claim(customer_gid(500), sg(500), "index", "phone_and_name_match")
         out = self.listing()
         self.assertEqual((len(out["links"]), out["active"], out["truncated"]), (500, 501, True))
         refs = sorted(self.ledger.ref("c", customer_gid(n)) for n in range(501))
