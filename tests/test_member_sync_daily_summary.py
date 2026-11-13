@@ -1120,5 +1120,305 @@ class InstallerPowerShell51Tests(unittest.TestCase):
                 self.assertNotIn("would register", out)
 
 
+# ------------------------------------------------------------------------------------------------
+# #155 slice BF2b (design 2.12): creates expected, the backfill window, the backfill shown apart
+# ------------------------------------------------------------------------------------------------
+
+WINDOW = {"from": "2026-11-06", "to": "2026-11-08", "max_per_call": 25, "max_per_hour": 60}
+
+
+def backfill_part(**overrides):
+    value = {"calls": 3, "creates": 40, "uncertain": 0, "rejected": 0, "writes": 40, "writes_per_call_max": 20,
+             "writes_per_hour_max": 40, "live_writes_per_hour_max": 1}
+    value.update(overrides)
+    return value
+
+
+def creates_digest(created=0, uncertain=0, rejected=0, backfill=None, hour_max=1, **extra):
+    """A digest with these create outcome totals (live plus backfill) and, optionally, the
+    backfill-members part the sync adds when a call ran."""
+
+    counts = {code: n for code, n in (("shopify_customer_created", created), ("shopify_create_uncertain", uncertain),
+                                      ("shopify_create_rejected", rejected)) if n}
+    value = digest_fixture(counts=counts, creates={"ac2_member_created": 1, "created_immediately": 0, "created_after_wait": 1,
+                                                   "writes_per_hour_max": hour_max, "writes_per_hour": {}}, **extra)
+    if backfill is not None:
+        value["backfill_members"] = backfill
+    return value
+
+
+class Bf2bSettingsTests(SummaryTestCase):
+    def bf2b_value(self, **keys):
+        value = self.settings_value()
+        value.update(keys)
+        return value
+
+    def test_new_keys_are_optional_and_default_off(self):
+        value = self.settings_value()
+        for key in ("shopify_creates_expected", "backfill_members_window"):
+            value.pop(key, None)
+        settings = summary.parse_settings(value)
+        self.assertEqual((settings["shopify_creates_expected"], settings["backfill_members_window"]), (False, None))
+        example = json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))
+        self.assertEqual((example["shopify_creates_expected"], example["backfill_members_window"]), (False, None))
+        self.assertEqual(summary.parse_settings(self.bf2b_value(backfill_members_window=dict(WINDOW)))["backfill_members_window"], WINDOW)
+
+    def test_bad_values_refuse(self):
+        for key, bad, code in (
+            ("shopify_creates_expected", "true", "settings_shopify_creates_expected_invalid"),
+            ("shopify_creates_expected", None, "settings_shopify_creates_expected_invalid"),
+            ("shopify_creates_expected", 1, "settings_shopify_creates_expected_invalid"),
+            ("backfill_members_window", {}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", "2026-11-06", "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "extra": 1}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "from": "2026-11-09"}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "to": "2026-11-20"}, "settings_backfill_members_window_invalid"),  # 15 days
+            ("backfill_members_window", {**WINDOW, "from": "2026-02-30"}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "to": "6 Nov 2026"}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "max_per_call": 26}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "max_per_call": 0}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "max_per_hour": 61}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "max_per_call": 30, "max_per_hour": 20}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "max_per_call": 21, "max_per_hour": 20}, "settings_backfill_members_window_invalid"),
+            ("backfill_members_window", {**WINDOW, "max_per_hour": True}, "settings_backfill_members_window_invalid"),
+            ("other_new_key", False, "settings_keys_invalid"),
+        ):
+            with self.subTest(key=key, bad=bad), self.assertRaises(summary.SummaryError) as caught:
+                summary.parse_settings(self.bf2b_value(**{key: bad}))
+            self.assertEqual(caught.exception.code, code)
+        longest = {**WINDOW, "from": "2026-11-01", "to": "2026-11-14", "max_per_call": 20, "max_per_hour": 20}  # 14 days, equal caps
+        self.assertEqual(summary.parse_settings(self.bf2b_value(backfill_members_window=longest))["backfill_members_window"], longest)
+
+    def test_window_in_effect_covers_the_24_hours_before_the_summary(self):
+        window = summary._window(dict(WINDOW))
+        for today, expected in (("2026-11-05", False), ("2026-11-06", True), ("2026-11-08", True), ("2026-11-09", True), ("2026-11-10", False)):
+            with self.subTest(today=today):
+                self.assertIs(summary.window_in_effect(window, today), expected)
+        self.assertIs(summary.window_in_effect(None, "2026-11-07"), False)
+
+
+class Bf2bDecisionTests(SummaryTestCase):
+    def run_with(self, digest, *, expected=False, window=None, config=None, **kwargs):
+        value = self.settings_value()
+        value["shopify_creates_expected"] = expected
+        value["backfill_members_window"] = window
+        return self.run_daily(runner=FakeRunner(config=config or config_fixture(shopify_create_enabled=expected), digest=digest),
+                              settings=summary.parse_settings(value), **kwargs)
+
+    # -- creates expected, no backfill --------------------------------------------------------
+    def test_creates_on_and_expected_is_clean_and_live_creates_are_counted(self):
+        event = self.run_with(creates_digest(created=3, hour_max=3), expected=True)
+        self.assertEqual((event["result"], event["auto_off"]), ("CLEAN", "off"))
+        self.assertEqual(event["digest"]["shopify_writes"], 3)
+        self.assertIs(event["config"]["shopify_create_enabled"], True)
+        self.assertNotIn(summary.BACKFILL_SHOWN, event["digest"]["alerts"])
+        self.assertEqual(self.record["creates"]["live"], {"created": 3, "uncertain": 0, "rejected": 0})
+
+    def test_expected_but_switched_off_is_not_unexpected(self):
+        self.assertEqual(self.run_with(creates_digest(), expected=True, config=config_fixture(shopify_create_enabled=False))["stop_reasons"], [])
+        self.assertEqual(self.run_with(creates_digest(), expected=True, config=config_fixture(shopify_create_enabled=None))["stop_reasons"],
+                         ["config_unexpected"])
+
+    def test_creates_while_the_config_says_off_still_stop_with_the_auto_off_reason(self):
+        event = self.run_with(creates_digest(created=1), expected=True, config=config_fixture(shopify_create_enabled=False))
+        self.assertEqual((event["stop_reasons"], event["auto_off_reasons"]), (["shopify_write"], ["shopify_write_while_disabled"]))
+
+    def test_uncertain_and_rejected_live_creates_still_stop(self):
+        for counts in ({"uncertain": 1}, {"rejected": 1}, {"created": 5, "rejected": 1}):
+            with self.subTest(counts=counts):
+                event = self.run_with(creates_digest(**counts), expected=True)
+                self.assertEqual(event["stop_reasons"], ["shopify_write"])
+                self.assertEqual(event["auto_off"], "off")  # creates are on: not the write-while-off reason
+
+    def test_writes_over_the_live_cap_still_stop(self):
+        self.assertEqual(self.run_with(creates_digest(created=6, hour_max=6), expected=True)["stop_reasons"], [])
+        self.assertEqual(self.run_with(creates_digest(created=7, hour_max=7), expected=True)["stop_reasons"], ["writes_over_cap"])
+
+    def test_without_the_setting_the_bf2a_rules_stay(self):
+        event = self.run_with(creates_digest(created=1), expected=False, config=config_fixture(shopify_create_enabled=True))
+        self.assertEqual(event["stop_reasons"], ["config_unexpected", "shopify_write"])
+        self.assertNotIn("creates", self.record)
+        self.assertEqual(self.run_with(creates_digest(rejected=1))["stop_reasons"], [])  # as before: nothing created
+
+    # -- the backfill -------------------------------------------------------------------------
+    def test_backfill_inside_the_declared_window_is_counted_and_shown_apart(self):
+        digest = creates_digest(created=41, backfill=backfill_part(), hour_max=41)
+        event = self.run_with(digest, expected=True, window=dict(WINDOW))
+        self.assertEqual(event["stop_reasons"], [])
+        self.assertEqual(event["digest"]["alerts"][summary.BACKFILL_SHOWN], 40)
+        self.assertEqual(self.record["creates"]["live"]["created"], 1)
+        self.assertEqual(self.record["creates"]["backfill"]["calls"], 3)
+        self.assertEqual(self.record["creates"]["window"], WINDOW)
+        # The n8n validator's closed contract still holds (no new event key).
+        summary.check_event(event)
+        self.assertEqual(tuple(event), summary.EVENT_KEYS)
+
+    def test_backfill_inside_the_window_with_creates_not_yet_expected(self):
+        # The sitting before S6 is left on overnight: the backfill counts, a live create stops.
+        event = self.run_with(creates_digest(created=40, backfill=backfill_part(), hour_max=40), expected=False, window=dict(WINDOW))
+        self.assertEqual((event["stop_reasons"], event["digest"]["alerts"][summary.BACKFILL_SHOWN]), ([], 40))
+        event = self.run_with(creates_digest(created=41, backfill=backfill_part(), hour_max=41), expected=False, window=dict(WINDOW))
+        self.assertEqual((event["stop_reasons"], event["auto_off_reasons"]), (["shopify_write"], ["shopify_write_while_disabled"]))
+
+    def test_backfill_outside_a_declared_window_stops(self):
+        digest = creates_digest(created=41, backfill=backfill_part(), hour_max=41)
+        for window in (None, {**WINDOW, "from": "2026-11-08", "to": "2026-11-10"}, {**WINDOW, "from": "2026-10-30", "to": "2026-11-05"}):
+            with self.subTest(window=window):
+                event = self.run_with(digest, expected=True, window=window)
+                self.assertIn("shopify_write", event["stop_reasons"])
+                self.assertEqual(event["digest"]["alerts"][summary.BACKFILL_SHOWN], 40)  # still shown
+
+    def test_any_backfill_write_outside_a_window_stops_even_with_no_create(self):
+        for part in (backfill_part(creates=0, rejected=1, writes=1, writes_per_call_max=1, writes_per_hour_max=1),
+                     backfill_part(creates=0, uncertain=1, writes=1, writes_per_call_max=1, writes_per_hour_max=1),
+                     backfill_part(creates=0, writes=1, writes_per_call_max=1, writes_per_hour_max=1)):
+            with self.subTest(part=part):
+                self.assertEqual(self.run_with(creates_digest(created=1, backfill=part), expected=True)["stop_reasons"], ["shopify_write"])
+
+    def test_a_backfill_call_that_wrote_nothing_is_no_stop_outside_a_window(self):
+        part = backfill_part(creates=0, writes=0, writes_per_call_max=0, writes_per_hour_max=0)
+        self.assertEqual(self.run_with(creates_digest(created=1, backfill=part), expected=True)["stop_reasons"], [])
+
+    def test_backfill_rejected_or_uncertain_stops_inside_the_window(self):
+        for change in ({"rejected": 1}, {"uncertain": 1}):
+            with self.subTest(change=change):
+                part = backfill_part(**change)
+                digest = creates_digest(created=41, rejected=part["rejected"], uncertain=part["uncertain"], backfill=part, hour_max=41)
+                self.assertEqual(self.run_with(digest, expected=True, window=dict(WINDOW))["stop_reasons"], ["shopify_write"])
+
+    def test_backfill_over_its_declared_caps_stops(self):
+        window = {**WINDOW, "max_per_call": 20, "max_per_hour": 40}
+        for part, stops in ((backfill_part(), []), (backfill_part(writes_per_call_max=21), ["writes_over_cap"]),
+                            (backfill_part(writes_per_hour_max=41), ["writes_over_cap"])):
+            with self.subTest(part=part):
+                self.assertEqual(self.run_with(creates_digest(created=41, backfill=part, hour_max=41), expected=True, window=window)["stop_reasons"], stops)
+
+    def test_live_hours_are_judged_apart_inside_the_window_only(self):
+        # 41 writes in one hour: 40 the backfill's, 1 live: under the live cap of 6.
+        digest = creates_digest(created=41, backfill=backfill_part(live_writes_per_hour_max=7), hour_max=47)
+        self.assertEqual(self.run_with(digest, expected=True, window=dict(WINDOW))["stop_reasons"], ["writes_over_cap"])
+        digest = creates_digest(created=41, backfill=backfill_part(live_writes_per_hour_max=6), hour_max=46)
+        self.assertEqual(self.run_with(digest, expected=True, window=dict(WINDOW))["stop_reasons"], [])
+
+    def test_keys_absent_ignore_the_backfill_part(self):
+        digest = creates_digest(created=40, backfill=backfill_part(), hour_max=40)
+        plain = self.run_daily(runner=FakeRunner(digest=digest))
+        self.assertEqual(plain["stop_reasons"], ["shopify_write", "writes_over_cap"])
+        self.assertNotIn(summary.BACKFILL_SHOWN, plain["digest"]["alerts"])
+        self.assertNotIn("creates", self.record)
+
+    def test_the_shown_count_is_never_an_unexpected_alert_and_is_bounded_with_the_rest(self):
+        alerts = {f"memberno_x{n:02d}": 1 for n in range(summary.MAX_ALERT_CODES)}
+        event = self.run_with(creates_digest(created=40, backfill=backfill_part(), hour_max=40, alerts=alerts), expected=True, window=dict(WINDOW))
+        self.assertEqual(event["stop_reasons"], [])
+        self.assertEqual(len(event["digest"]["alerts"]), summary.MAX_ALERT_CODES)
+
+    def test_creates_section_is_none_without_settings_or_digest(self):
+        self.assertIsNone(summary.creates_section(creates_digest(created=1), expected=False, window=None))
+        self.assertIsNone(summary.creates_section(None, expected=True, window=None))
+        section = summary.creates_section(creates_digest(created=1, backfill=backfill_part(creates=5)), expected=True, window=None)
+        self.assertEqual((section["live"]["created"], section["backfill"]["creates"]), (1, 5))  # outside a window: all live
+        bad = summary.creates_section(creates_digest(created=1, backfill={"calls": "3", "creates": -1}), expected=True, window=dict(WINDOW))
+        self.assertEqual((bad["backfill"]["calls"], bad["backfill"]["creates"]), (0, 0))
+
+    def test_real_digest_with_a_backfill_call_end_to_end(self):
+        import xb_member_sync as sync
+        import xb_directlocal as dl
+
+        ledger_root = self.temp / "ledger"
+        ledger_root.mkdir()
+        cfg = sync.parse_config({"schema": sync.CONFIG_SCHEMA, "state_root": str(ledger_root), "autocount_book": "AED_TESTINGAPI",
+                                 "shopify": {"store_gid": "gid://shopify/Shop/900000001", "shop_domain": "xb-sync-test.synthetic.invalid",
+                                             "api_version": "2026-07", "auth": {"method": "admin_api_access_token", "token_env": "XB_SHOPIFY_SYNC_TOKEN"}},
+                                 "shopify_cutover_utc": "2026-11-01T00:00:00Z"})
+        ledger = sync.SyncLedger(ledger_root, clock=lambda: NOW, check_custody=False)
+        start = NOW - timedelta(hours=2)
+        try:
+            ledger.init_meta(autocount_book="AED_TESTINGAPI", store_gid=cfg.shopify.store_gid, shop_domain=cfg.shopify.shop_domain)
+            with ledger.tx() as conn:
+                conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('run-1', ?, ?, ?)",
+                             (dl.ts(start), dl.ts(start + timedelta(seconds=30)), json.dumps({"counts": {"shopify_customer_created": 1}, "alerts": [], "refs": []})))
+                conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('bf2-1', ?, ?, ?)",
+                             (dl.ts(start + timedelta(minutes=2)), dl.ts(start + timedelta(minutes=4)),
+                              json.dumps({"kind": "backfill_members", "counts": {"shopify_customer_created": 3, "bf2_created": 3}, "alerts": [], "refs": []})))
+                for i, at in enumerate([start + timedelta(seconds=10)] + [start + timedelta(minutes=3)] * 3):
+                    conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) "
+                                 "VALUES (?, 'ac2_to_shopify', ?, ?, 'DONE', ?, ?)", (f"write-{i}", f"M{i}", f"m{i}", dl.ts(at), dl.ts(at)))
+        finally:
+            ledger.close()
+        real = json.loads(json.dumps(sync.ledger_digest(ledger_root, hours=24, now=NOW, config=cfg)))
+        section = summary.creates_section(real, expected=True, window=summary._window(dict(WINDOW)))
+        self.assertEqual(section["live"], {"created": 1, "uncertain": 0, "rejected": 0})
+        self.assertEqual((section["backfill"]["creates"], section["backfill"]["writes"], section["backfill"]["live_writes_per_hour_max"]), (3, 3, 1))
+        stops, _ = summary.decide(summary.task_section(task_fixture()), summary.config_section(config_fixture(shopify_create_enabled=True), True),
+                                  summary.digest_section(real, None), "GUEST", section)
+        self.assertEqual(stops, [])
+
+
+# The summary's own golden output (pass bar: with the BF2b keys absent, unchanged). One trace of
+# every case below through daily(): the result line and the whole record. Its SHA-256 was made on
+# the main 3340b03 source of xb_member_sync_daily_summary.py (loaded in place of this one, same
+# cases and fixtures; scripted, BF2b G1) and is equal for this source with the keys absent and
+# with them written at their defaults.
+SUMMARY_GOLDEN_SHA256 = "72b3b53bdc8084f7d12964dda26ed8ed1c832dab66c1e0d80b07b5c0e49b2bb0"
+
+
+def summary_golden_cases():
+    return (
+        ("clean", {}),
+        ("created", {"digest": creates_digest(created=2, hour_max=2)}),
+        ("uncertain", {"digest": creates_digest(uncertain=1, opened={"uncertain_writes": 1})}),
+        ("rejected", {"digest": creates_digest(rejected=1)}),
+        ("creates_on", {"config": config_fixture(shopify_create_enabled=True), "digest": creates_digest(created=1)}),
+        ("backfill_part", {"digest": creates_digest(created=41, backfill=backfill_part(), hour_max=41)}),
+        ("backfill_part_quiet", {"digest": creates_digest(backfill=backfill_part(creates=0, writes=0, writes_per_call_max=0, writes_per_hour_max=0))}),
+        ("over_cap", {"digest": creates_digest(hour_max=7)}),
+        ("alerts", {"digest": digest_fixture(alerts={"possible_duplicate_member": 1, "changelog_row_unparsed": 1, "autocount_x": 1})}),
+        ("bad_task", {"task": task_fixture(last_result=1, state="Disabled")}),
+        ("no_runs", {"digest": digest_fixture(runs={"completed": 0, "unfinished": 3})}),
+        ("check_config_fails", {"codes": {"check-config": 2}}),
+        ("digest_fails", {"codes": {"digest": 2}}),
+    )
+
+
+def summary_golden_trace(module, settings_value: dict, out_dir: Path) -> list:
+    trace = []
+    for name, case in summary_golden_cases():
+        for path in out_dir.glob("*.json"):
+            path.unlink()
+        runner = FakeRunner(task=case.get("task"), config=case.get("config"), digest=case.get("digest"), codes=case.get("codes"))
+        posted = Poster()
+        result = module.daily(module.parse_settings(settings_value), now=NOW, runner=runner,
+                              sql_reader=sql_reader_for(FakeConnection()), cred_reader=lambda target: "FAKE-SECRET-0001", poster=posted)
+        record = json.loads((out_dir / f"daily_summary_{TODAY}.json").read_text(encoding="utf-8"))
+        trace.append({"name": name, "result": result, "record": record, "posted": [call["body"] for call in posted.calls]})
+    return trace
+
+
+def summary_trace_digest(trace: list) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(trace, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+class SummaryGoldenTests(SummaryTestCase):
+    def base_value(self):
+        value = self.settings_value()
+        for key in ("shopify_creates_expected", "backfill_members_window"):
+            value.pop(key, None)
+        return value
+
+    def test_keys_absent_match_the_main_output(self):
+        trace = summary_golden_trace(summary, self.base_value(), self.out)
+        self.assertEqual(summary_trace_digest(trace), SUMMARY_GOLDEN_SHA256, json.dumps([(t["name"], t["result"]["stop_reasons"]) for t in trace]))
+
+    def test_keys_at_their_defaults_match_too(self):
+        value = {**self.base_value(), "shopify_creates_expected": False, "backfill_members_window": None}
+        self.assertEqual(summary_trace_digest(summary_golden_trace(summary, value, self.out)), SUMMARY_GOLDEN_SHA256)
+
+    def test_a_window_that_is_not_in_effect_changes_nothing_while_creates_are_not_expected(self):
+        value = {**self.base_value(), "backfill_members_window": {**WINDOW, "from": "2026-11-20", "to": "2026-11-21"}}
+        self.assertEqual(summary_trace_digest(summary_golden_trace(summary, value, self.out)), SUMMARY_GOLDEN_SHA256)
+
+
 if __name__ == "__main__":
     unittest.main()

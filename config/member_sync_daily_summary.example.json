@@ -6,6 +6,8 @@
   "expected_member_type": "GUEST",
   "first_create_already_seen": false,
   "child_timeout_seconds": 60,
+  "shopify_creates_expected": false,
+  "backfill_members_window": null,
   "sql": {
     "enabled": true,
     "server": "localhost\\EXAMPLE",

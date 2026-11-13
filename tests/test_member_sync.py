@@ -1303,14 +1303,46 @@ class ChangeLogCursorTests(SyncTestCase):
     def pending_numbers(self) -> list[str]:
         return [row[0] for row in self.ledger.conn.execute("SELECT member_no FROM ac2_pending ORDER BY changelog_id")]
 
-    def test_unparseable_row_stops_and_keeps_the_watermark(self):
+    def test_unparseable_row_is_skipped_with_an_alert_and_the_read_goes_on(self):
+        # BF2b (Controller answer N2; was "stops and keeps the watermark"): the row is counted and
+        # skipped, the alert is raised, and the rows after it are processed in the same run.
         self.initialise()  # empty ChangeLog: watermark 0
         self.ac2.changelog += [(1, self.member_xml(57)), (2, "<Member Name=" + chr(34) + "x"), (3, self.member_xml(58))]
         result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
-        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), "1")
-        self.assertEqual(self.pending_numbers(), [sg(57)])  # row 3 not processed in this run
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), "3")
+        self.assertEqual(self.pending_numbers(), [sg(57), sg(58)])  # row 3 processed in this run
         self.assertEqual((result["status"], result["alerts"]), ("completed_with_alerts", ["changelog_row_unparsed"]))
-        self.assertEqual(result["counts"]["changelog_row_unparsed"], 1)
+        self.assertEqual((result["counts"]["changelog_row_unparsed"], result["counts"]["changelog_row_unparsed_skipped"]), (1, 1))
+        self.assertEqual([row[0] for row in self.ledger.conn.execute("SELECT id FROM changelog_seen ORDER BY id")], [1, 2, 3])
+        # The next run does not see it again (marked seen; inside the overlap window too).
+        again = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((again["alerts"], again["counts"].get("changelog_row_unparsed_skipped")), ([], None))
+
+    def test_a_control_character_entity_row_is_skipped_not_a_stop(self):
+        # The G2's N2 case: a control-character entity in the insert XML (any field).
+        self.initialise()
+        bad = '<Member MemberNo="TILLN2" Name="Alpha&#x1;Tester" MobilePhone="%s"/>' % local(59)  # as FOR XML writes it
+        self.assertIsNone(sync.parse_changelog_member(bad))
+        self.ac2.changelog += [(1, bad), (2, self.member_xml(58))]
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((self.ledger.watermark("ac2_changelog_id"), self.pending_numbers()), ("2", [sg(58)]))
+        self.assertEqual(result["counts"]["changelog_row_unparsed_skipped"], 1)
+
+    def test_more_unparseable_rows_than_the_bound_stop_the_read_as_before(self):
+        self.initialise()
+        bound = sync.CHANGELOG_UNPARSED_SKIP_MAX
+        self.assertEqual(bound, 5)
+        self.ac2.changelog += [(n, "<Member Name=" + chr(34) + "x") for n in range(1, bound + 2)] + [(bound + 2, self.member_xml(58))]
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        # Five skipped (watermark at the fifth), the sixth stops the read; nothing after it.
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(bound))
+        self.assertEqual(self.pending_numbers(), [])
+        self.assertEqual((result["counts"]["changelog_row_unparsed_skipped"], result["counts"]["changelog_row_unparsed"]), (bound, bound + 1))
+        self.assertEqual(result["alerts"], ["changelog_row_unparsed"])
+        # The next run meets the sixth again: skipped then (a fresh bound), and the read goes on.
+        again = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((again["counts"]["changelog_row_unparsed_skipped"], self.pending_numbers()), (1, [sg(58)]))
+        self.assertEqual(again["alerts"], ["changelog_row_unparsed"])
 
     def test_numbering_reset_is_refused_with_an_alert(self):
         self.ac2.add(sync.Ac2Member(sg(59), "Member", sg(59)), log=True)
@@ -3472,9 +3504,15 @@ NEW_KEYS_OFF_ODD = {"immediate_create_enabled": False, "immediate_create_window_
 # holds under another name is held (ac2_phone_on_other_customer), not
 # created without the phone; no Shopify create, write row or link for the
 # three. Every other run, row and write is identical (scripted, BF2a G1).
-GOLDEN_SOURCE_COMMIT = "bf2a"
+# #155 BF2b re-baseline (G2 LATER 9, scenario only): walk_ins_test_book gains a walk-in with a
+# phone and an email, one with an email only (both created in Shopify) and one linked by email.
+# The trace of main 3340b03 (the BF2a source, its module loaded in place of this one with these
+# scenarios) and of the BF2b source are identical, with the keys absent and with creates off
+# (scripted, BF2b G1): BF2b changes no line the defaults-off trace walks.
+GOLDEN_SOURCE_COMMIT = "bf2b"
 GOLDEN_TRACE_SHA256_32E9B31 = "4bcb98f229cc481c4792326cffb10e1b3d0a1bb39a377242c19a1a8ac2d37ac6"
-GOLDEN_TRACE_SHA256 = "3a89f13b412477ffdcc8358c94ba53092c768719ba190ee04753052e945efc12"
+GOLDEN_TRACE_SHA256 = "8e322822bc9684b79ff456116334b5215418f60da3d1e1cf7c4268fa397eb240"
+GOLDEN_TRACE_SHA256_CREATES_OFF = "f75aecb0e6984f6d995afda79a1bcad15665efc6b02f9d4ce96fbf6d6ad6d82c"
 GOLDEN_TRACE_RUNS = 50
 PROBE_TOKEN_ENV = {"XB_SHOPIFY_SYNC_TOKEN": "shpat_synthetic_token_value_0001"}
 
@@ -3570,6 +3608,12 @@ def _scenario_walk_ins(w: _EquivalenceWorld) -> None:
     w.shopify.add(replace(customer(32, first="Charlie", last="Day"), tags=()))
     w.ac2.add(sync.Ac2Member("T0100", "Charlie Day", sg(32)), log=True)
     w.ac2.add(sync.Ac2Member("T0101", "Other Person", sg(32)), log=True)
+    # #155 BF2b (G2 LATER 9): the trace keeps a Shopify create and the email path: a walk-in
+    # with a phone and an email, one with an email only, and one whose email a customer holds.
+    w.ac2.add(sync.Ac2Member("T0102", "Delta Walker", sg(33), em(33)), log=True)
+    w.ac2.add(sync.Ac2Member("T0103", "Echo Walker", None, em(34)), log=True)
+    w.shopify.add(replace(customer(35, first="Foxtrot", last="Walker", phone=None, email=em(35)), tags=()))
+    w.ac2.add(sync.Ac2Member("T0104", "Foxtrot Walker", None, em(35)), log=True)
     w.run("ac2_to_shopify")
     w.now += timedelta(minutes=15)
     w.run()
@@ -3639,14 +3683,22 @@ class DefaultsOffEquivalenceTests(unittest.TestCase):
     one made on the 32e9b31 source, except the intended BF2a S6 rows
     (GOLDEN_TRACE_SHA256, re-baselined on the BF2a source)."""
 
-    def assert_matches_golden(self, settings: dict | None) -> None:
-        self.assertEqual(GOLDEN_SOURCE_COMMIT, "bf2a")
+    def assert_matches_golden(self, settings: dict | None, digest: str = GOLDEN_TRACE_SHA256) -> None:
+        self.assertEqual(GOLDEN_SOURCE_COMMIT, "bf2b")
         trace = defaults_off_trace(sync, settings)
         self.assertEqual(sum(len(item["runs"]) for item in trace.values()), GOLDEN_TRACE_RUNS)
-        self.assertEqual(trace_digest(trace), GOLDEN_TRACE_SHA256, json.dumps(trace_outline(trace), sort_keys=True))
+        self.assertEqual(trace_digest(trace), digest, json.dumps(trace_outline(trace), sort_keys=True))
 
     def test_new_keys_absent(self):
         self.assert_matches_golden(None)
+
+    def test_creates_off_as_on_the_live_task(self):
+        # #155 BF2b: the live task runs with shopify_create_enabled false until the S6 sitting.
+        self.assert_matches_golden({"shopify_create_enabled": False}, GOLDEN_TRACE_SHA256_CREATES_OFF)
+
+    def test_bf2b_caps_change_no_live_run(self):
+        self.assert_matches_golden({"backfill_members_max_per_call": None, "backfill_members_max_per_hour": None})
+        self.assert_matches_golden({"backfill_members_max_per_call": 25, "backfill_members_max_per_hour": 60})
 
     def test_new_keys_written_out_at_their_defaults(self):
         self.assert_matches_golden(NEW_KEYS_OFF)
@@ -3664,8 +3716,12 @@ class DefaultsOffEquivalenceTests(unittest.TestCase):
                      "max_writes_per_run_reached", "shared_phone_name_fallback", "ac2_insert_linked_or_own_write",
                      "linked_existing_shopify_customer", "sign_up_past_cutoff_create_disabled",
                      # BF2a: the intended S6 rows (the trace's creates in Shopify were these).
-                     "ac2_member_phone_only_not_created", "ac2_phone_on_other_customer"):
+                     "ac2_member_phone_only_not_created", "ac2_phone_on_other_customer",
+                     # BF2b (G2 LATER 9): a Shopify create and the email path stay in the trace.
+                     "shopify_customer_created", "linked_existing_shopify_customer_by_email"):
             self.assertIn(code, codes)
+        self.assertEqual(sum(len(item["shopify_created"]) for item in trace.values()), 2)
+        self.assertEqual(sorted("phone" in item for scenario in trace.values() for item in scenario["shopify_created"]), [False, True])
         self.assertEqual({book for _, book, _ in EQUIVALENCE_SCENARIOS}, {TEST_BOOK, PROD_BOOK})
 
 
@@ -6651,9 +6707,14 @@ class Bf2Fix1EmailTests(Bf2TestCase):
                 with self.subTest(ch=ascii(ch), where=where):
                     self.assertIsNone(sync.usable_email(self.odd(1, ch, where)))
                     self.assertIsNone(sync.email_key(self.odd(1, ch, where)))
-        for good in ("a.b+c_d'e@example.com", "M01@Example.com", " \tm01@example.com\n"):
+        for good in ("a.b+c_d'e@example.com", "M01@Example.com", "  m01@example.com  "):
             with self.subTest(good=good):
                 self.assertEqual(sync.usable_email(good), good.strip())
+        # BF2b (G2 LATER 7): only spaces are trimmed (the bridge's LTRIM/RTRIM);
+        # a tab or line break around the email makes it unusable (fail closed).
+        for bad in (" \tm01@example.com\n", "m01@example.com\t", "\nm01@example.com", "m01@example.com\r\n"):
+            with self.subTest(bad=ascii(bad)):
+                self.assertIsNone(sync.usable_email(bad))
 
     def s6_odd_members(self, creates: bool) -> dict:
         self.run_sync("ac2_to_shopify")  # ChangeLog watermark
@@ -6963,6 +7024,494 @@ class Bf2ConfigTests(unittest.TestCase):
         self.assertEqual(example["birthday_month_metafield"], {"namespace": "membership", "key": "birthday_month", "type": "single_line_text_field"})
         self.assertNotIn("backfill_members_enabled", example)  # not needed in the live config
         self.assertEqual(sync._CONFIG_DEFAULTS["birthday_month_metafield"], {"namespace": "custom", "key": "birthday_month", "type": "number_integer"})
+
+
+# --------------------------------------------------------------------------------------------
+# #155 slice BF2b (fake data only)
+# --------------------------------------------------------------------------------------------
+
+BF2B_CAPS = {"backfill_members_max_per_call": 8, "backfill_members_max_per_hour": 12}
+
+
+def _insert_writes(ledger, count: int, at: datetime, prefix: str = "w") -> None:
+    with ledger.tx() as conn:
+        for i in range(count):
+            conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) VALUES (?, 'shopify_to_ac2', ?, ?, 'DONE', ?, ?)",
+                         (f"write-{prefix}{i}", f"H{prefix}{i}", f"h{prefix}{i}", dl.ts(at), dl.ts(at)))
+
+
+class Bf2bConfigTests(unittest.TestCase):
+    """BF2b design 2.7: the backfill's own caps (config)."""
+
+    def test_caps_default_to_the_bf2a_caps_and_are_printed_only_when_set(self):
+        config = make_config(max_writes_per_run=3)
+        self.assertEqual((config.backfill_members_max_per_call, config.backfill_members_max_per_hour), (None, None))
+        self.assertEqual((config.backfill_members_call_cap, config.backfill_members_hour_cap), (3, sync.RUNS_PER_HOUR * 3))
+        self.assertEqual(sync.RUNS_PER_HOUR, 4)
+        self.assertNotIn("backfill_members_max_per_call", config.summary())
+        self.assertNotIn("backfill_members_max_per_hour", config.summary())
+        self.assertEqual(make_config(max_writes_per_run=3, backfill_members_max_per_call=None, backfill_members_max_per_hour=None).summary(), config.summary())
+        on = make_config(max_writes_per_run=3, **BF2B_CAPS)
+        self.assertEqual((on.backfill_members_call_cap, on.backfill_members_hour_cap), (8, 12))
+        self.assertEqual((on.summary()["backfill_members_max_per_call"], on.summary()["backfill_members_max_per_hour"]), (8, 12))
+        self.assertEqual(make_config(backfill_members_max_per_call=25, backfill_members_max_per_hour=60).backfill_members_call_cap, 25)
+        self.assertEqual(make_config(backfill_members_max_per_hour=1).backfill_members_hour_cap, 1)  # the per-call cap alone may stay null
+        self.assertEqual(make_config(backfill_members_max_per_call=1).backfill_members_call_cap, 1)
+        self.assertEqual(make_config(backfill_members_max_per_call=12, backfill_members_max_per_hour=12).backfill_members_call_cap, 12)
+
+    def test_cap_bounds(self):
+        for key, bad in (("backfill_members_max_per_call", 0), ("backfill_members_max_per_call", 26), ("backfill_members_max_per_call", True),
+                         ("backfill_members_max_per_call", "5"), ("backfill_members_max_per_call", 5.0), ("backfill_members_max_per_hour", 0),
+                         ("backfill_members_max_per_hour", 61), ("backfill_members_max_per_hour", False), ("backfill_members_max_per_hour", [60])):
+            with self.subTest(key=key, bad=bad), self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(**{key: bad})
+            self.assertEqual(caught.exception.code, f"sync_config_{key}_invalid")
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            make_config(backfill_members_max_per_call=13, backfill_members_max_per_hour=12)  # more a call than an hour
+        self.assertEqual(caught.exception.code, "sync_config_backfill_members_max_per_call_invalid")
+
+    def test_sync_example_carries_the_caps_at_null_and_the_live_example_never(self):
+        example = json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8"))
+        self.assertEqual((example["backfill_members_max_per_call"], example["backfill_members_max_per_hour"]), (None, None))
+        live = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        self.assertNotIn("backfill_members_max_per_call", live)
+        self.assertNotIn("backfill_members_max_per_hour", live)
+
+
+class Bf2bCapTests(Bf2TestCase):
+    """BF2b design 2.7: the backfill's own caps in the engine and the CLI."""
+
+    def members(self, count: int) -> None:
+        for n in range(1, count + 1):
+            self.add(f"BF2C{n:02d}", phone=plus(sg(n)), email=em(n))
+
+    def test_a_call_may_create_up_to_its_own_cap_above_max_writes_per_run(self):
+        self.members(9)
+        result = self.bf2(apply=True, max_creates=8, max_writes_per_run=5, **BF2B_CAPS)
+        self.assertEqual((len(self.shopify.created), result["writes"], result["stopped"]), (8, 8, "backfill_max_reached"))
+        self.assertEqual(result["counts"].get("max_writes_per_run_reached"), None)  # not the live run's budget
+
+    def test_the_call_cap_bounds_max(self):
+        for bad in (0, 9):
+            with self.subTest(max=bad), self.assertRaises(dl.DirectLocalError) as caught:
+                self.engine(**BF2_KEYS, **BF2B_CAPS).backfill_members(apply=False, max_creates=bad)
+            self.assertEqual(caught.exception.code, "backfill_members_max_invalid")
+        self.assertEqual(self.bf2(max_creates=8, **BF2B_CAPS)["mode"], "dry_run")
+        with self.assertRaises(dl.DirectLocalError):
+            self.bf2(max_creates=6)  # without the key: max_writes_per_run (5), as BF2a
+
+    def test_the_call_cap_also_bounds_the_writes_of_one_call(self):
+        # Defence in depth: the write budget of the call is its own cap, never more.
+        self.members(4)
+        engine = self.engine(**BF2_KEYS, **BF2B_CAPS)
+        engine.summary.writes = 8
+        self.assertEqual(engine._bf2_one(self.ac2.members[0], None, set(), apply=True, creates=0, max_creates=8), "backfill_max_reached")
+        self.assertEqual(self.shopify.created, [])
+
+    def test_the_spend_check_uses_the_call_cap_in_backfill_mode_only(self):
+        engine = self.engine(**BF2_KEYS, max_writes_per_run=2, **BF2B_CAPS)
+        engine.summary.writes = 2
+        with self.assertRaises(sync.WriteRefused):
+            engine._spend_write(True, "x")  # the live budget
+        engine._spend_write(True, "x", 8)
+        self.assertEqual(engine.summary.writes, 3)
+        engine.summary.writes = 8
+        with self.assertRaises(sync.WriteRefused):
+            engine._spend_write(True, "x", 8)
+
+    def test_own_hour_cap(self):
+        self.members(1)
+        _insert_writes(self.ledger, 12, self.now - timedelta(minutes=59))
+        result = self.bf2(apply=True, **BF2B_CAPS)
+        self.assertEqual((result["stopped"], self.shopify.created), ("backfill_hour_cap_reached", []))
+        # Two minutes later those 12 are out of the 60 minutes; 11 newer writes leave room for one.
+        self.now += timedelta(minutes=2)
+        _insert_writes(self.ledger, 11, self.now - timedelta(minutes=30), prefix="b")
+        self.assertEqual(self.bf2(apply=True, **BF2B_CAPS)["counts"]["bf2_created"], 1)
+        self.assertEqual(len(self.shopify.created), 1)
+
+    def test_own_hour_cap_above_the_bf2a_hour_cap(self):
+        self.members(1)
+        _insert_writes(self.ledger, 20, self.now - timedelta(minutes=30))
+        self.assertEqual(self.bf2(apply=True)["stopped"], "backfill_hour_cap_reached")  # BF2a: 4 x 5
+        result = self.bf2(apply=True, backfill_members_max_per_call=5, backfill_members_max_per_hour=21)
+        self.assertEqual((result["counts"]["bf2_created"], len(self.shopify.created)), (1, 1))
+
+    def cli(self, *args, config=None):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(config_value(**(config or {}))), encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = sync.main(["backfill-members", "--config", str(path), *args])
+        return code, json.loads(out.getvalue())
+
+    def test_cli_max_is_bounded_by_the_call_cap_before_any_login(self):
+        with mock.patch.object(sync, "build_real_engine", side_effect=AssertionError("login")), \
+                mock.patch.object(sync, "SyncLedger", side_effect=AssertionError("lock")):
+            self.assertEqual(self.cli("--max", "9", config=BF2B_CAPS), (2, {"status": "refused", "code": "backfill_members_max_invalid"}))
+            self.assertEqual(self.cli("--max", "6"), (2, {"status": "refused", "code": "backfill_members_max_invalid"}))
+        engine = mock.MagicMock()
+        engine.backfill_members.return_value = {"stopped": None}
+        with mock.patch.object(sync, "build_real_engine", return_value=engine), mock.patch.object(sync, "SyncLedger"), \
+                mock.patch.object(sync, "_state_root", return_value=self.temp), mock.patch.object(sync, "load_claim_links", return_value=None):
+            self.assertEqual(self.cli("--max", "8", config=BF2B_CAPS)[0], 0)
+        self.assertEqual(engine.backfill_members.call_args.kwargs["max_creates"], 8)
+
+    def test_s6_keeps_max_writes_per_run(self):
+        self.run_sync("ac2_to_shopify")
+        for n in range(1, 4):
+            self.ac2.add(ac2m(f"TILLC{n}", phone=local(n), email=em(n)), log=True)
+        result = self.run_sync("ac2_to_shopify", max_writes_per_run=2, **BF2B_CAPS)
+        self.assertEqual((len(self.shopify.created), result["counts"]["max_writes_per_run_reached"]), (2, 1))
+
+
+class Bf2bRejectedHoldTests(Bf2TestCase):
+    """BF2b (G2 LATER 3): a rejected backfill create is held, not retried by every call."""
+
+    def reject_with(self, field_class: str):
+        def create(customer_input):
+            raise sync.ShopifyCreateRejected("shopify_create_rejected", field_class)
+        return create
+
+    def test_held_after_the_first_rejection_until_the_details_change(self):
+        self.add("BF2R01", phone=plus(sg(1)), email=em(1))
+        self.add("BF2R02", phone=plus(sg(2)), email=em(2))
+        real = self.shopify.create_customer
+        self.shopify.create_customer = self.reject_with("shopify_user_errors_email")
+        first = self.bf2(apply=True)
+        self.assertEqual(first["stopped"], "bf2_create_rejected")  # the first rejection still stops (exit 3)
+        self.assertEqual(self.ledger.conn.execute("SELECT state, code FROM writes").fetchone()[:], ("REJECTED", "shopify_user_errors_email"))
+        self.shopify.create_customer = real
+        second = self.bf2(apply=True)
+        self.assertEqual(self.codes_for(second, "BF2R01"), ["bf2_create_rejected_held"])
+        self.assertEqual((second["counts"]["bf2_create_rejected_held"], second["counts"]["shopify_user_errors_email"]), (1, 1))
+        self.assertEqual((second["stopped"], [c["email"] for c in self.shopify.created]), (None, [em(2)]))  # the call goes on
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE member_no = 'BF2R01'").fetchone()[0], 1)  # never re-sent
+        self.assert_private(second)
+        # Staff fix the email in AutoCount: the hold no longer applies, the next call tries once more.
+        self.ac2.members[0] = replace(self.ac2.members[0], email_address=em(51))
+        third = self.bf2(apply=True)
+        self.assertEqual([c["email"] for c in self.shopify.created], [em(2), em(51)])
+        self.assertEqual(third["counts"]["bf2_created"], 1)
+
+    def test_a_phone_or_name_change_releases_it_too_and_a_dry_run_shows_it(self):
+        self.add("BF2R03", phone=plus(sg(3)), email=em(3))
+        self.shopify.create_customer = self.reject_with("shopify_user_errors_phone")
+        self.bf2(apply=True)
+        dry = self.bf2()
+        self.assertEqual((dry["population"]["bf2_create_rejected_held"], dry["counts"]["shopify_user_errors_phone"]), (1, 1))
+        self.assertEqual(dry["counts"].get("bf2_would_create"), None)
+        for change in ({"mobile_phone": plus(sg(33))}, {"name": "Alpha B Tester"}):
+            with self.subTest(change=change):
+                engine = self.engine(**BF2_KEYS)
+                self.assertIsNone(engine._bf2_precheck(replace(self.ac2.members[0], **change), sync.Bf2Index(self.ac2.members), None))
+        self.assertEqual(self.engine(**BF2_KEYS)._bf2_precheck(self.ac2.members[0], sync.Bf2Index(self.ac2.members), None), "bf2_create_rejected_held")
+
+    def test_only_a_rejected_create_of_this_member_holds(self):
+        self.add("BF2R04", phone=plus(sg(4)), email=em(4))
+        digest = self.ledger.customer_identity_digest("Alpha Tester", em(4), sg(4))
+        with self.ledger.tx() as conn:
+            for write_id, member_no, state, direction in (("write-r1", "OTHER04", "REJECTED", "ac2_to_shopify"), ("write-r2", "BF2R04", "RESOLVED", "ac2_to_shopify"),
+                                                          ("write-r3", "BF2R04", "REJECTED", "shopify_to_ac2")):
+                conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, code, created_at, updated_at, intent_digest) "
+                             "VALUES (?, ?, ?, ?, ?, 'shopify_user_errors_other', ?, ?, ?)",
+                             (write_id, direction, member_no, sync.member_no_key(member_no), state, dl.ts(self.now), dl.ts(self.now), digest))
+        self.assertEqual(self.bf2(apply=True)["counts"]["bf2_created"], 1)
+
+    def test_an_s6_rejection_holds_the_member_in_the_backfill_too(self):
+        self.run_sync("ac2_to_shopify")
+        self.ac2.add(ac2m("TILLR5", phone=local(5), email=em(5)), log=True)
+        self.shopify.create_mode = "rejected"
+        self.run_sync("ac2_to_shopify")
+        self.shopify.create_mode = "ok"
+        self.assertEqual(self.codes_for(self.bf2(apply=True), "TILLR5"), ["bf2_create_rejected_held"])
+        self.assertEqual(self.shopify.created, [])
+
+
+class Bf2bSettleTests(Bf2TestCase):
+    """BF2b (G2 LATER 6): an uncertain create is never settled after the member's details changed."""
+
+    def test_email_only_member_whose_email_changed_stays_uncertain(self):
+        self.add("BF2E01", phone=None, email=em(1))
+        self.shopify.create_mode = "uncertain"
+        self.assertEqual(self.bf2(apply=True)["stopped"], "bf2_create_uncertain")
+        self.shopify.create_mode = "ok"
+        self.shopify.add(customer(1, phone=None, email=em(1), tags=()))  # it had landed, under the old email
+        self.ac2.members[0] = replace(self.ac2.members[0], email_address=em(61))  # staff edited the email meanwhile
+        self.now += timedelta(minutes=61)
+        result = self.bf2(apply=True)
+        self.assertEqual(result["counts"]["uncertain_write_identity_changed"], 1)
+        self.assertEqual(self.codes_for(result, "BF2E01")[-1], "bf2_member_held_by_open_write")
+        self.assertEqual(self.ledger.conn.execute("SELECT state FROM writes").fetchone()[0], "UNCERTAIN")
+        self.now += timedelta(hours=5)
+        self.bf2(apply=True)
+        self.assertEqual((self.shopify.created, self.link_rows()), ([], {}))  # never a second customer
+
+    def test_put_back_the_email_and_it_settles_or_links_as_before(self):
+        self.add("BF2E02", phone=None, email=em(2))
+        self.shopify.create_mode = "uncertain"
+        self.bf2(apply=True)
+        self.shopify.create_mode = "ok"
+        self.ac2.members[0] = replace(self.ac2.members[0], email_address=em(62))
+        self.now += timedelta(minutes=61)
+        self.assertEqual(self.bf2(apply=True)["counts"]["uncertain_write_identity_changed"], 1)
+        self.ac2.members[0] = replace(self.ac2.members[0], email_address=" " + em(2).upper())  # trim and case do not change the identity
+        settled = self.bf2(apply=True)
+        self.assertEqual(settled["counts"]["uncertain_write_settled_not_found"], 1)
+
+    def test_live_run_s6_settle_is_guarded_too(self):
+        self.run_sync("ac2_to_shopify")
+        self.ac2.add(ac2m("TILLE3", phone=None, email=em(3)), log=True)
+        self.shopify.create_mode = "uncertain"
+        self.run_sync("ac2_to_shopify")
+        self.shopify.create_mode = "ok"
+        self.ac2.members[-1] = replace(self.ac2.members[-1], email_address=em(63))
+        self.now += timedelta(minutes=61)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["counts"]["uncertain_write_identity_changed"], 1)
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.shopify.created, [])
+
+
+class Bf2bEmailTrimTests(Bf2TestCase):
+    """BF2b (G2 LATER 7): Python trims spaces only, as the bridge's SQL does."""
+
+    def test_a_tab_wrapped_email_is_not_an_email_for_s6_or_the_backfill(self):
+        self.add("BF2T01", phone=plus(sg(1)), email=em(1))
+        self.add("BF2T02", phone=None, email=em(1).upper() + "\t")
+        result = self.bf2()
+        # Both sides agree: the tab-wrapped copy is no email, so the clean one is not "shared".
+        self.assertEqual(self.codes_for(result, "BF2T01"), ["bf2_would_create"])
+        self.assertEqual(self.codes_for(result, "BF2T02"), ["bf2_no_contact"])
+        self.assertEqual(result["counts"]["bf2_email_unusable"], 1)
+        self.assertEqual([m.member_no for m in self.ac2.lookup(None, [], email=em(1))], ["BF2T01"])  # the fake: as the SQL condition
+        self.assertIsNone(sync.email_key(" " + em(1) + "\n"))
+        self.assertEqual(sync.email_key("  " + em(1).upper() + " "), em(1))
+
+
+class Bf2bS6Tests(SyncTestCase):
+    """BF2b S6 lines: out-of-scope re-queue (Controller ruling), the AutoCount-side shared-phone
+    hold (G2 LATER 8), the AutoCount email check deferred while creates are off (G2 LATER 5),
+    and possible_duplicate_member on the email path (G2 LATER 12)."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_sync("ac2_to_shopify")  # ChangeLog watermark
+
+    def walk_in(self, member_no, phone=None, email=None, **scope):
+        member = ac2m(member_no, "Alpha Tester", phone, email, **scope)
+        self.ac2.add(member, log=True)
+        return member
+
+    def move(self, member_no, **changes):
+        index = next(i for i, m in enumerate(self.ac2.members) if m.member_no == member_no)
+        self.ac2.members[index] = replace(self.ac2.members[index], **changes)
+
+    def pending(self, member_no):
+        return self.ledger.conn.execute("SELECT state, code FROM ac2_pending WHERE member_no = ?", (member_no,)).fetchone()[:]
+
+    # -- out-of-scope re-queue ---------------------------------------------------------------
+    def test_a_default_member_moved_to_member_is_requeued_after_a_day_and_created(self):
+        self.walk_in("TILLQ1", phone=local(1), email=em(1), member_type="Default")
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.pending("TILLQ1"), ("SKIPPED", "ac2_member_out_of_scope"))
+        self.move("TILLQ1", member_type="MEMBER")
+        self.now += timedelta(hours=23, minutes=59)
+        early = self.run_sync("ac2_to_shopify")
+        self.assertEqual((early["counts"].get("ac2_member_out_of_scope_rechecked"), self.shopify.created), (None, []))
+        self.now += timedelta(minutes=1)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(result["counts"]["ac2_member_out_of_scope_rechecked"], 1)
+        self.assertEqual((self.pending("TILLQ1"), len(self.shopify.created)), (("DONE", "shopify_customer_created"), 1))
+        self.assertEqual(result["alerts"], [])
+
+    def test_still_out_of_scope_is_skipped_again_and_waits_another_day(self):
+        self.walk_in("TILLQ2", phone=local(2), email=em(2), member_type="Default")
+        self.run_sync("ac2_to_shopify")
+        self.now += timedelta(days=1)
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((result["counts"]["ac2_member_out_of_scope_rechecked"], result["counts"]["ac2_member_out_of_scope"]), (1, 1))
+        self.assertEqual(self.pending("TILLQ2"), ("SKIPPED", "ac2_member_out_of_scope"))
+        self.now += timedelta(hours=12)
+        self.assertNotIn("ac2_member_out_of_scope_rechecked", self.run_sync("ac2_to_shopify")["counts"])
+        self.move("TILLQ2", member_type="GUEST")
+        self.now += timedelta(hours=12)
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.pending("TILLQ2"), ("DONE", "shopify_customer_created"))
+
+    def test_an_expired_member_renewed_and_an_inactive_one_reactivated_come_back(self):
+        self.walk_in("TILLQ3", phone=local(3), email=em(3), expiry="2026-01-01")
+        self.walk_in("TILLQ4", phone=local(4), email=em(4), active="F")
+        self.run_sync("ac2_to_shopify")
+        self.move("TILLQ3", expiry_date="2099-12-31")
+        self.move("TILLQ4", is_active="T")
+        self.now += timedelta(days=1)
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((self.pending("TILLQ3"), self.pending("TILLQ4")), (("PENDING", "would_create"), ("PENDING", "would_create")))
+
+    def test_requeue_is_bounded_per_run_and_by_the_room_in_the_batch(self):
+        for n in range(1, 13):
+            self.walk_in(f"TILLR{n:02d}", phone=local(n), email=em(n), member_type="Default")
+        self.run_sync("ac2_to_shopify")
+        self.now += timedelta(days=1)
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(sync.OUT_OF_SCOPE_REQUEUE_PER_RUN, 10)
+        self.assertEqual(result["counts"]["ac2_member_out_of_scope_rechecked"], 10)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM ac2_pending WHERE updated_at < ?", (dl.ts(self.now),)).fetchone()[0], 2)
+        # A full queue leaves no room: 18 rows waiting, so 2 more at most.
+        for n in range(13, 31):
+            self.walk_in(f"TILLW{n:02d}", phone=local(n), email=em(n))
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)  # 18 new would_create rows
+        self.now += timedelta(days=1)
+        again = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(again["counts"]["ac2_member_out_of_scope_rechecked"], 2)
+
+    def test_an_over_full_queue_requeues_nothing(self):
+        self.walk_in("TILLQ6", phone=local(60), email=em(60), member_type="Default")
+        self.run_sync("ac2_to_shopify")
+        for n in range(1, 24):  # 23 would_create rows: more than the batch of 20
+            self.walk_in(f"TILLV{n:02d}", phone=local(n), email=em(n))
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.now += timedelta(days=2)
+        result = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertNotIn("ac2_member_out_of_scope_rechecked", result["counts"])
+        self.assertEqual(self.pending("TILLQ6"), ("SKIPPED", "ac2_member_out_of_scope"))
+
+    def test_only_out_of_scope_rows_are_requeued(self):
+        self.walk_in("TILLQ5", phone=local(5))  # phone only: SKIPPED for good
+        self.run_sync("ac2_to_shopify")
+        self.now += timedelta(days=2)
+        self.assertNotIn("ac2_member_out_of_scope_rechecked", self.run_sync("ac2_to_shopify")["counts"])
+        self.assertEqual(self.pending("TILLQ5"), ("SKIPPED", "ac2_member_phone_only_not_created"))
+
+    # -- AutoCount-side shared phone before a create ------------------------------------------
+    def test_a_phone_another_member_holds_is_never_created(self):
+        self.ac2.add(sync.Ac2Member("OLDP06", "Other Person", local(6)))
+        self.walk_in("TILLP6", phone=local(6), email=em(6))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.pending("TILLP6"), self.shopify.created), (("SKIPPED", "ac2_phone_shared_in_ac2"), []))
+        self.assertEqual((result["counts"]["ac2_phone_shared_in_ac2"], result["alerts"]), (1, []))  # a count, not an alert
+        self.assert_no_pii(result)
+
+    def test_a_phone_embedded_in_another_member_no_counts_as_shared(self):
+        self.ac2.add(sync.Ac2Member(sg(7) + "1", "Other Person", None))  # the sync's phone rule (embedded digits)
+        self.walk_in("TILLP7", phone=local(7), email=em(7))
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.pending("TILLP7"), ("SKIPPED", "ac2_phone_shared_in_ac2"))
+
+    def test_an_unshared_phone_and_an_email_only_member_are_created(self):
+        self.walk_in("TILLP8", phone=local(8), email=em(8))
+        self.walk_in("TILLP9", email=em(9))
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual(len(self.shopify.created), 2)
+
+    def test_the_shared_phone_check_waits_while_creates_are_off(self):
+        self.ac2.add(sync.Ac2Member("OLDP10", "Other Person", local(10)))
+        self.walk_in("TILLP10", phone=local(10), email=em(10))
+        before = self.ac2.lookups
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(self.pending("TILLP10"), ("PENDING", "would_create"))
+        self.assertEqual(self.ac2.lookups - before, 1)  # the batch lookup only (no email or phone lookup)
+        self.run_sync("ac2_to_shopify")  # creates on: decided in full
+        self.assertEqual((self.pending("TILLP10"), self.shopify.created), (("SKIPPED", "ac2_phone_shared_in_ac2"), []))
+
+    # -- AutoCount email check deferred while creates are off ----------------------------------
+    def test_with_creates_off_a_would_create_row_costs_one_lookup_a_run(self):
+        self.walk_in("TILLE11", phone=local(11), email=em(11))
+        for _ in range(3):
+            before = self.ac2.lookups
+            self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+            self.assertEqual(self.ac2.lookups - before, 1)
+        self.assertEqual(self.pending("TILLE11"), ("PENDING", "would_create"))
+        self.assertEqual(len(self.shopify.email_reads), 3)  # Shopify is still read: a customer may appear and link
+
+    def test_with_creates_off_a_shared_email_is_still_never_linked(self):
+        self.ac2.add(sync.Ac2Member("OLD12", "Other Person", None, em(12)))
+        self.shopify.add(customer(12, phone=None, email=em(12), tags=()))
+        self.walk_in("TILLE12", email=em(12))
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((self.pending("TILLE12"), self.links()), (("SKIPPED", "ac2_email_shared_in_ac2"), {}))
+
+    def test_with_creates_off_a_shared_email_waits_and_is_skipped_once_creates_are_on(self):
+        self.ac2.add(sync.Ac2Member("OLD13", "Other Person", None, em(13)))
+        self.walk_in("TILLE13", email=em(13))
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(self.pending("TILLE13"), ("PENDING", "would_create"))
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.pending("TILLE13"), self.shopify.created), (("SKIPPED", "ac2_email_shared_in_ac2"), []))
+
+    def test_with_creates_off_a_declined_or_unknown_flag_member_still_gets_the_email_check_first(self):
+        self.ac2.add(sync.Ac2Member("OLD14", "Other Person", None, em(14)))
+        self.walk_in("TILLE14", email=em(14), no_shopify=True)
+        self.ac2.add(sync.Ac2Member("OLD15", "Other Person", None, em(15)))
+        self.walk_in("TILLE15", email=em(15), no_shopify=None)
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual(self.pending("TILLE14"), ("SKIPPED", "ac2_email_shared_in_ac2"))  # as before BF2b
+        self.assertEqual(self.pending("TILLE15"), ("SKIPPED", "ac2_email_shared_in_ac2"))
+        self.assertEqual(self.shopify.email_reads, [])
+
+    def test_with_creates_on_the_order_is_as_before(self):
+        self.ac2.add(sync.Ac2Member("OLD16", "Other Person", None, em(16)))
+        self.walk_in("TILLE16", email=em(16))
+        self.run_sync("ac2_to_shopify")
+        self.assertEqual((self.pending("TILLE16"), self.shopify.email_reads), (("SKIPPED", "ac2_email_shared_in_ac2"), []))
+
+    # -- possible_duplicate_member on the email path -------------------------------------------
+    def test_email_customer_the_sync_created_in_ac2_is_a_possible_duplicate(self):
+        self.shopify.add(customer(17, phone=None, email=em(17), tags=()))
+        with self.ledger.tx() as conn:
+            self.ledger.add_link(conn, gid(17), "M000117", "created_in_ac2", "test")
+        self.walk_in("TILLD17", email=em(17))
+        result = self.run_sync("ac2_to_shopify")
+        self.assertEqual(self.pending("TILLD17"), ("SKIPPED", "possible_duplicate_member"))
+        self.assertEqual((result["alerts"], self.shopify.created), (["possible_duplicate_member"], []))
+        self.assertEqual(self.links(), {gid(17): "M000117"})  # never linked to the till member
+
+
+class Bf2bDigestTests(SyncTestCase):
+    """BF2b design 2.12: the digest's backfill-members part (counts only)."""
+
+    def stored_run(self, run_id: str, start: datetime, end: datetime | None, counts: dict) -> None:
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES (?, ?, ?, ?)",
+                         (run_id, dl.ts(start), dl.ts(end) if end else None, json.dumps({"counts": counts, "alerts": [], "refs": []})))
+
+    def digest(self) -> dict:
+        return sync.ledger_digest(self.temp, hours=24, now=self.now, config=make_config())
+
+    def test_absent_without_a_backfill_call(self):
+        self.stored_run("run-a", self.now - timedelta(hours=3), self.now - timedelta(hours=3) + timedelta(seconds=20), {"shopify_customer_created": 1})
+        _insert_writes(self.ledger, 1, self.now - timedelta(hours=3) + timedelta(seconds=10))
+        self.assertNotIn("backfill_members", self.digest())
+
+    def test_calls_outcomes_and_writes_apart_from_the_live_runs(self):
+        hour = self.now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=5)
+        self.stored_run("run-a", hour, hour + timedelta(seconds=30), {"shopify_customer_created": 1})
+        _insert_writes(self.ledger, 1, hour + timedelta(seconds=10), prefix="live")
+        self.stored_run("bf2-a", hour + timedelta(minutes=5), hour + timedelta(minutes=9), {"shopify_customer_created": 3, "shopify_create_rejected": 1, "bf2_created": 3})
+        _insert_writes(self.ledger, 4, hour + timedelta(minutes=6), prefix="a")
+        self.stored_run("bf2-b", hour + timedelta(minutes=20), None, {})  # killed: its span runs to the next run
+        _insert_writes(self.ledger, 2, hour + timedelta(minutes=21), prefix="b")
+        self.stored_run("run-b", hour + timedelta(minutes=30), hour + timedelta(minutes=31), {"shopify_create_uncertain": 1})
+        _insert_writes(self.ledger, 1, hour + timedelta(minutes=30, seconds=20), prefix="live2")
+        part = self.digest()["backfill_members"]
+        self.assertEqual(part, {"calls": 2, "creates": 3, "uncertain": 0, "rejected": 1, "writes": 6, "writes_per_call_max": 4,
+                                "writes_per_hour_max": 6, "live_writes_per_hour_max": 2})
+        self.assertEqual(self.digest()["creates"]["writes_per_hour_max"], 8)  # the total is unchanged
+        self.assert_no_pii(part)
+
+    def test_a_call_that_has_not_finished_owns_the_writes_until_now(self):
+        self.stored_run("bf2-c", self.now - timedelta(minutes=10), None, {})
+        _insert_writes(self.ledger, 3, self.now - timedelta(minutes=5))
+        self.assertEqual(self.digest()["backfill_members"]["writes"], 3)
+
+    def test_a_real_applied_call_is_read(self):
+        self.ac2 = Bf2Ac2()
+        self.ac2.add(ac2m("BF2G01", phone=plus(sg(1)), email=em(1)))
+        self.ac2.add(ac2m("BF2G02", phone=plus(sg(2)), email=em(2)))
+        self.engine(**BF2_KEYS).backfill_members(apply=True, max_creates=2)
+        self.assertEqual({k: v for k, v in self.digest()["backfill_members"].items() if k in ("calls", "creates", "writes")}, {"calls": 1, "creates": 2, "writes": 2})
 
 
 if __name__ == "__main__":

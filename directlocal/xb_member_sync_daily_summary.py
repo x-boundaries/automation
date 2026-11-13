@@ -142,6 +142,25 @@ OTHER_ALERTS = "other_alert_codes"
 
 _SETTINGS_KEYS = {"schema", "sync_config_path", "sync_state_root", "output_dir", "expected_member_type",
                   "first_create_already_seen", "child_timeout_seconds", "sql", "send"}
+# #155 BF2b (design 2.12): optional, so a settings file without them reads exactly as before.
+# shopify_creates_expected (default false): S6 creates are on (the sitting is done), so
+# shopify_create_enabled true is not config_unexpected and a live create is counted, not a stop.
+# backfill_members_window (default null): the dates (Singapore, inclusive) of the attended
+# backfill-members sittings and the caps declared for them; backfill creates are judged against
+# it, and are a stop outside it.
+_SETTINGS_OPTIONAL = {"shopify_creates_expected", "backfill_members_window"}
+_WINDOW_KEYS = {"from", "to", "max_per_call", "max_per_hour"}
+BACKFILL_WINDOW_MAX_DAYS = 14
+BACKFILL_MAX_PER_CALL = 25  # the sync's own bounds (design 2.7)
+BACKFILL_MAX_PER_HOUR = 60
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The outcome codes of the sync's one Shopify mutation that the creates-on rules read: a create
+# that landed (counted), and the two a person must look at (a stop).
+SHOPIFY_CREATED = "shopify_customer_created"
+SHOPIFY_UNCERTAIN = "shopify_create_uncertain"
+SHOPIFY_REJECTED = "shopify_create_rejected"
+# Shown in the email's alert line (the n8n event is closed: no new key) when a backfill call ran.
+BACKFILL_SHOWN = "backfill_members_creates"
 _SQL_KEYS = {"enabled", "server", "odbc_driver", "encrypt", "trust_server_certificate", "allow_privileged_identity",
              "timeout_seconds"}
 _SEND_KEYS = {"enabled", "webhook_url", "auth_header_name", "secret_credential_target", "timeout_seconds"}
@@ -202,7 +221,7 @@ def _written_inside(folder: str, root: str) -> bool:
 def parse_settings(value: Any) -> dict[str, Any]:
     """Structural check of the settings file. No file, network or process is touched."""
 
-    _require(isinstance(value, dict) and set(value) == _SETTINGS_KEYS, "settings_keys_invalid")
+    _require(isinstance(value, dict) and _SETTINGS_KEYS <= set(value) <= _SETTINGS_KEYS | _SETTINGS_OPTIONAL, "settings_keys_invalid")
     _require(value["schema"] == SETTINGS_SCHEMA, "settings_schema_invalid")
     settings = {
         "sync_config_path": _absolute(value["sync_config_path"], "settings_sync_config_path_invalid"),
@@ -210,6 +229,8 @@ def parse_settings(value: Any) -> dict[str, Any]:
         "output_dir": _folder(value["output_dir"], "settings_output_dir_invalid"),
         "first_create_already_seen": _bool(value["first_create_already_seen"], "settings_first_create_invalid"),
         "child_timeout_seconds": _int(value["child_timeout_seconds"], 10, 600, "settings_child_timeout_invalid"),
+        "shopify_creates_expected": _bool(value.get("shopify_creates_expected", False), "settings_shopify_creates_expected_invalid"),
+        "backfill_members_window": _window(value.get("backfill_members_window")),
     }
     # The summary never writes into the sync's private state: the record folder is checked
     # against the state root named here, not against the live sync config (a broken live config
@@ -251,6 +272,39 @@ def parse_settings(value: Any) -> dict[str, Any]:
     }
     _require(worst_case_seconds(settings) <= TASK_TIME_LIMIT_SECONDS - TASK_TIME_MARGIN_SECONDS, "settings_timeouts_exceed_task_limit")
     return settings
+
+
+def _window(value: Any) -> dict[str, Any] | None:
+    """#155 BF2b: null, or the declared backfill window: ``from`` and ``to`` (Singapore dates,
+    inclusive, at most BACKFILL_WINDOW_MAX_DAYS days) and the caps declared for it (as the
+    backfill config copy's ``backfill_members_max_per_call`` / ``_per_hour``)."""
+
+    code = "settings_backfill_members_window_invalid"
+    if value is None:
+        return None
+    _require(isinstance(value, dict) and set(value) == _WINDOW_KEYS, code)
+    days = []
+    for key in ("from", "to"):
+        _require(isinstance(value[key], str) and DATE_RE.fullmatch(value[key]) is not None, code)
+        try:
+            days.append(date.fromisoformat(value[key]))
+        except ValueError:
+            raise SummaryError(code) from None
+    _require(days[0] <= days[1] and (days[1] - days[0]).days < BACKFILL_WINDOW_MAX_DAYS, code)
+    per_call = _int(value["max_per_call"], 1, BACKFILL_MAX_PER_CALL, code)
+    per_hour = _int(value["max_per_hour"], 1, BACKFILL_MAX_PER_HOUR, code)
+    _require(per_call <= per_hour, code)
+    return {"from": days[0].isoformat(), "to": days[1].isoformat(), "max_per_call": per_call, "max_per_hour": per_hour}
+
+
+def window_in_effect(window: Mapping[str, Any] | None, today: str) -> bool:
+    """The 24 hours before this morning's summary (yesterday and today, Singapore) touch the
+    declared window."""
+
+    if window is None:
+        return False
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    return window["from"] <= today and yesterday <= window["to"]
 
 
 def worst_case_seconds(settings: Mapping[str, Any]) -> int:
@@ -591,6 +645,32 @@ def digest_section(raw: Mapping[str, Any] | None, links_yesterday: int | None) -
     }
 
 
+def creates_section(raw: Mapping[str, Any] | None, *, expected: bool, window: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """#155 BF2b (design 2.12): the Shopify create outcomes split into the live runs' and the
+    backfill calls' (the digest's ``backfill_members`` part, present only when a call ran).
+    ``window``: the declared backfill window when it is in effect for this summary, else None.
+    None (the BF2a rules, unchanged) when creates are not expected and no window is in effect,
+    or when the digest could not be read. Never enters the event (its shape is closed)."""
+
+    if (not expected and window is None) or not isinstance(raw, dict):
+        return None
+    counts = raw.get("counts") if isinstance(raw.get("counts"), dict) else {}
+    total = {code: _count(counts.get(code)) or 0 for code in (SHOPIFY_CREATED, SHOPIFY_UNCERTAIN, SHOPIFY_REJECTED)}
+    part = raw.get("backfill_members")
+    backfill = None
+    if isinstance(part, dict):
+        backfill = {key: _count(part.get(key)) or 0 for key in ("calls", "creates", "uncertain", "rejected", "writes",
+                                                                 "writes_per_call_max", "writes_per_hour_max", "live_writes_per_hour_max")}
+    # Inside a window the backfill's outcomes are judged apart; outside one they count as live.
+    apart = backfill if window is not None else None
+    live = {
+        "created": max(total[SHOPIFY_CREATED] - (apart["creates"] if apart else 0), 0),
+        "uncertain": max(total[SHOPIFY_UNCERTAIN] - (apart["uncertain"] if apart else 0), 0),
+        "rejected": max(total[SHOPIFY_REJECTED] - (apart["rejected"] if apart else 0), 0),
+    }
+    return {"expected": expected, "window": dict(window) if window is not None else None, "live": live, "backfill": backfill}
+
+
 def _bounded(alerts: Mapping[str, int] | None) -> dict[str, int] | None:
     """At most MAX_ALERT_CODES entries in the email; the rest are summed as other_alert_codes."""
 
@@ -606,11 +686,14 @@ def _alert_is_expected(code: str) -> bool:
     return code in EXPECTED_ALERTS or code.startswith(EXPECTED_ALERT_PREFIXES)
 
 
-def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any], expected_member_type: str) -> tuple[list[str], list[str]]:
-    """Returns (stop_reasons, auto_off_reasons), each in the pinned order of its closed list."""
+def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any], expected_member_type: str,
+           creates: Mapping[str, Any] | None = None) -> tuple[list[str], list[str]]:
+    """Returns (stop_reasons, auto_off_reasons), each in the pinned order of its closed list.
+    ``creates`` (#155 BF2b, ``creates_section``): None keeps the BF2a rules exactly."""
 
     stops: set[str] = set()
     auto_off: set[str] = set()
+    expected = creates is not None and creates["expected"]
     if not task["available"]:
         stops.add("task_state_unavailable")
     else:
@@ -620,8 +703,9 @@ def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[s
             stops.add("task_disabled")
     if not config["available"]:
         stops.add("check_config_failed")
-    elif (config["shopify_create_enabled"] is not False or config["ac2_create_member_type"] != expected_member_type
-          or config["state_root_ok"] is not True):
+    elif (not (config["shopify_create_enabled"] is False or (expected and config["shopify_create_enabled"] is True))
+          or config["ac2_create_member_type"] != expected_member_type or config["state_root_ok"] is not True):
+        # BF2b: with shopify_creates_expected, true is expected too (false is the rollback).
         stops.add("config_unexpected")
     if not digest["available"]:
         stops.add("digest_failed")
@@ -630,10 +714,13 @@ def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[s
             stops.add("no_runs")
         if (digest["runs_unfinished"] or 0) > 1:
             stops.add("unfinished_runs")
-        if digest["shopify_writes"] > 0:
-            stops.add("shopify_write")
-            if config["shopify_create_enabled"] is False:
-                auto_off.add("shopify_write_while_disabled")
+        if creates is None:
+            if digest["shopify_writes"] > 0:
+                stops.add("shopify_write")
+                if config["shopify_create_enabled"] is False:
+                    auto_off.add("shopify_write_while_disabled")
+        else:
+            stops |= _create_stops(creates, config, auto_off)
         if (digest["uncertain_writes"] or 0) > 0:
             stops.add("uncertain_writes")
             auto_off.add("uncertain_writes")
@@ -648,24 +735,62 @@ def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[s
             elif not _alert_is_expected(code):
                 stops.add("alert_unexpected")
         per_run = config["max_writes_per_run"] if config["available"] else None
-        if per_run is not None and digest["writes_per_hour_max"] is not None:
+        live_hour_max = digest["writes_per_hour_max"]
+        if creates is not None and creates["window"] is not None and creates["backfill"] is not None:
+            live_hour_max = creates["backfill"]["live_writes_per_hour_max"]  # BF2b: the backfill's hours apart
+        if per_run is not None and live_hour_max is not None:
             # The digest has no per-run write count; a clock hour holds at most RUNS_PER_HOUR
             # scheduled runs (more only on the capped immediate path).
             hour_cap = max(per_run * RUNS_PER_HOUR, config["max_creates_per_hour"] or 0)
-            if digest["writes_per_hour_max"] > hour_cap:
+            if live_hour_max > hour_cap:
                 stops.add("writes_over_cap")
     return [c for c in STOP_CODES if c in stops], [c for c in AUTO_OFF_CODES if c in auto_off]
 
 
+def _create_stops(creates: Mapping[str, Any], config: Mapping[str, Any], auto_off: set[str]) -> set[str]:
+    """#155 BF2b (design 2.12), with creates expected or a backfill window in effect:
+    - live S6 creates are counted, not a stop, only when creates are expected; an uncertain or
+      rejected live create always stops (shopify_write), and so does any live create while the
+      config says creates are off (and the auto-off reason, as before);
+    - backfill calls' creates are counted inside the declared window; outside one any backfill
+      write stops; an uncertain or rejected one stops; more writes in one call or one clock hour
+      than the window declares is writes_over_cap."""
+
+    stops: set[str] = set()
+    live, backfill, window = creates["live"], creates["backfill"], creates["window"]
+    if live["created"] + live["uncertain"] > 0 and (not creates["expected"] or config["shopify_create_enabled"] is False):
+        stops.add("shopify_write")
+        if config["shopify_create_enabled"] is False:
+            auto_off.add("shopify_write_while_disabled")
+    if live["uncertain"] > 0 or live["rejected"] > 0:
+        stops.add("shopify_write")
+    if backfill is not None:
+        sent = backfill["creates"] + backfill["uncertain"] + backfill["rejected"] + backfill["writes"]
+        if window is None:
+            if sent > 0:
+                stops.add("shopify_write")  # a backfill write outside a declared window
+        else:
+            if backfill["uncertain"] > 0 or backfill["rejected"] > 0:
+                stops.add("shopify_write")
+            if backfill["writes_per_call_max"] > window["max_per_call"] or backfill["writes_per_hour_max"] > window["max_per_hour"]:
+                stops.add("writes_over_cap")
+    return stops
+
+
 def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any],
                 members: Mapping[str, Any], new_members: Mapping[str, Any], first_create: bool,
-                expected_member_type: str) -> dict[str, Any]:
-    stops, auto_off = decide(task, config, digest, expected_member_type)
+                expected_member_type: str, creates: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    stops, auto_off = decide(task, config, digest, expected_member_type, creates)
     local = now.astimezone(SGT)
     new_members = dict(new_members)
     if new_members["available"] and digest["available"]:
         new_members["by_sync"] = digest["ac2_creates"]
         new_members["by_staff"] = max(new_members["total"] - digest["ac2_creates"], 0)
+    alerts = digest["alerts"]
+    if creates is not None and creates["backfill"] is not None and alerts is not None:
+        # BF2b: the backfill's creates shown apart in the email (its alert line; the event's
+        # shape and the n8n validator are unchanged). Added after the decision: not an alert.
+        alerts = {**alerts, BACKFILL_SHOWN: creates["backfill"]["creates"]}
     return {
         "schema": EVENT_SCHEMA,
         "event": EVENT_NAME,
@@ -677,7 +802,7 @@ def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, 
         "auto_off_reasons": auto_off,
         "task": dict(task),
         "config": dict(config),
-        "digest": {**digest, "alerts": _bounded(digest["alerts"])},
+        "digest": {**digest, "alerts": _bounded(alerts)},
         "members_per_type": dict(members),
         "new_members_24h": new_members,
         "first_create": first_create,
@@ -742,15 +867,18 @@ def read_history(out_dir: Path, today: str) -> tuple[int | None, bool]:
     return links_yesterday, seen_create
 
 
-def write_record(out_dir: Path, event: Mapping[str, Any], send_status: str, http_status: int | None, send_error: str | None) -> None:
-    """Writes daily_summary_<date>.json inside the output folder only (temp file, then replace)."""
+def write_record(out_dir: Path, event: Mapping[str, Any], send_status: str, http_status: int | None, send_error: str | None,
+                 creates: Mapping[str, Any] | None = None) -> None:
+    """Writes daily_summary_<date>.json inside the output folder only (temp file, then replace).
+    #155 BF2b: with creates expected or a backfill window in effect, the split the decision used
+    (counts, dates and caps only) is kept as ``creates``; otherwise the record is as before."""
 
     _require(send_status in SEND_STATUSES, "record_status_invalid")
     target = record_path(out_dir, event["summary_date"])
     _require(target.parent == out_dir, "record_path_invalid")
     temp = target.with_name(target.name + ".tmp")
     record = {"schema": RECORD_SCHEMA, "email_status": send_status, "http_status": http_status, "send_error": send_error,
-              "event": event}
+              "event": event, **({"creates": dict(creates)} if creates is not None else {})}
     try:
         temp.unlink(missing_ok=True)
         with open(temp, "x", encoding="utf-8") as handle:
@@ -876,22 +1004,25 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
 
     task = task_section(read_task_state(settings, runner))
     config = config_section(run_sync("check-config", settings, runner), state_root_ok)
-    digest = digest_section(run_sync("digest", settings, runner), links_yesterday)
+    raw_digest = run_sync("digest", settings, runner)
+    digest = digest_section(raw_digest, links_yesterday)
+    window = settings["backfill_members_window"] if window_in_effect(settings["backfill_members_window"], today) else None
+    creates = creates_section(raw_digest, expected=settings["shopify_creates_expected"], window=window)
     if config["available"] and config["autocount_book"] is not None:
         members, new_members = sql_reader(settings["sql"], config["autocount_book"])
     else:
         members, new_members = members_section(None, "config_unavailable"), new_members_section(None, None, "config_unavailable")
     first_create = bool(digest["available"] and digest["ac2_creates"] > 0 and not seen_create and not settings["first_create_already_seen"])
     event = build_event(now=now, task=task, config=config, digest=digest, members=members, new_members=new_members,
-                        first_create=first_create, expected_member_type=settings["expected_member_type"])
+                        first_create=first_create, expected_member_type=settings["expected_member_type"], creates=creates)
     check_event(event)
 
-    write_record(out_dir, event, "pending", None, None)
+    write_record(out_dir, event, "pending", None, None, creates)
     if no_send:
         status, http_status, error = "not_sent_check_only", None, None
     else:
         status, http_status, error = send_event(event, settings["send"], cred_reader=cred_reader, poster=poster)
-    write_record(out_dir, event, status, http_status, error)
+    write_record(out_dir, event, status, http_status, error, creates)
     return {"status": "ok", "result": event["result"], "stop_reasons": event["stop_reasons"], "auto_off": event["auto_off"],
             "email_status": status, "http_status": http_status, "record": record_path(out_dir, today).name}
 
