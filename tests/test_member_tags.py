@@ -154,6 +154,7 @@ class FakeShopify:
         self.answers: dict[str, list[str]] = {}
         self.fail_customers: list[str | None] = []
         self.carrier_cap = False
+        self.bday_carrier_cap = False
         self.search_lag: set[str] = set()
         self.after_write = None
         self.query_costs = {"XbMemberTagsCustomers": 200, "XbMemberTagsCarriers": 102}
@@ -185,9 +186,10 @@ class FakeShopify:
                                                                  *mt.birthday_reading(c.get("birthday")))
         return found
 
-    def carriers(self, max_pages):
-        self.calls.append(("carriers",))
-        return {g for g, c in self.customers_by_gid.items() if TAG in c["tags"] and g not in self.search_lag}, not self.carrier_cap
+    def carriers(self, tag, max_pages):
+        self.calls.append(("carriers", tag))
+        complete = not (self.carrier_cap if tag == TAG else self.bday_carrier_cap)
+        return {g for g, c in self.customers_by_gid.items() if tag in c["tags"] and g not in self.search_lag}, complete
 
     def set_tag(self, op, gid, tags):
         mt.check_tag_variables(gid, tags)  # as the real client, before any HTTP call
@@ -196,10 +198,10 @@ class FakeShopify:
         customer = self.customers_by_gid.get(gid)
 
         def effect():
-            if op == "add" and TAG not in customer["tags"]:
-                customer["tags"].append(TAG)
-            if op == "remove" and TAG in customer["tags"]:
-                customer["tags"].remove(TAG)
+            if op == "add" and tags[0] not in customer["tags"]:
+                customer["tags"].append(tags[0])
+            if op == "remove" and tags[0] in customer["tags"]:
+                customer["tags"].remove(tags[0])
         if self.after_write is not None:
             self.after_write()
         if answer == "done":
@@ -477,7 +479,7 @@ class Base(unittest.TestCase):
 class ConstantTests(Base):
     def test_tag_set_and_active_tags_are_pinned_exactly(self):
         self.assertEqual(mt.TAG_SET, ("member-qualified", "member-bday-month"))
-        self.assertEqual(mt.ACTIVE_TAGS, ("member-qualified",))
+        self.assertEqual(mt.ACTIVE_TAGS, ("member-qualified", "member-bday-month"))  # slice D (was the first only)
         self.assertEqual(mt.TAG, "member-qualified")
         self.assertLessEqual(set(mt.ACTIVE_TAGS), set(mt.TAG_SET))
 
@@ -527,6 +529,26 @@ class ConfigTests(Base):
         del value["member_core_state_root"]
         self.assertEqual(self.code(lambda: mt.parse_config(value)), "tags_config_keys_invalid")
         self.assertEqual(self.code(lambda: self.cfg(schema="xb.directlocal.member_tags.config.v2")), "tags_config_schema_invalid")
+
+    def test_the_birthday_settings(self):
+        # Slice D design 2.4: defaults, bounds and the pilot list (0 to 5 customer GIDs, no duplicates).
+        config = self.cfg()
+        self.assertEqual((config.bday_tag_enabled, config.max_bday_adds_per_run, config.max_bday_removes_per_run, config.bday_only_customers),
+                         (False, 10, 10, ()))
+        for key in ("max_bday_adds_per_run", "max_bday_removes_per_run"):
+            for bad in (0, 251, True, "10", 1.5, None):
+                with self.subTest(key=key, value=bad):
+                    self.assertEqual(self.code(lambda: self.cfg(**{key: bad})), f"tags_config_{key}_invalid")
+            self.assertEqual((getattr(self.cfg(**{key: 1}), key), getattr(self.cfg(**{key: 250}), key)), (1, 250))
+        for bad in ("yes", 1, None):
+            self.assertEqual(self.code(lambda: self.cfg(bday_tag_enabled=bad)), "tags_config_bday_tag_enabled_invalid")
+        pilot = [customer_gid(n) for n in range(1, 6)]
+        self.assertEqual(self.cfg(bday_only_customers=pilot).bday_only_customers, tuple(pilot))
+        for bad in (pilot + [customer_gid(6)], [customer_gid(1), customer_gid(1)], ["gid://shopify/Customer/0"], ["gid://shopify/Order/1"],
+                    [customer_gid(1) + " "], [str(customer_number(1))], [None], customer_gid(1), {customer_gid(1): 1}):
+            with self.subTest(pilot=bad):
+                self.assertEqual(self.code(lambda: self.cfg(bday_only_customers=bad)), "tags_config_bday_only_customers_invalid")
+        self.assertEqual(repr(self.cfg(bday_only_customers=pilot)), "TagsConfig()")
 
     def test_another_tools_config_is_refused(self):
         for schema in (sync.CONFIG_SCHEMA, tm.CONFIG_SCHEMA, bm.CONFIG_SCHEMA):
@@ -1112,8 +1134,11 @@ def mutation_answer(field, n, tags, errors=()):
 THROTTLED_ANSWER = (200, {"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
                           "extensions": cost(10, available=0.0)})
 FORBIDDEN_TAGS = [["member"], ["member-mg"], ["member-legacy"], ["ac2-member"], ["ac2-backfill"], ["shopify-forms-1178308"], ["newsletter"],
-                  ["prospect"], ["Member-Qualified"], ["member-qualified "], ["member-qualified,member"], [TAG, "member"], ["member-bday-month"],
-                  [], TAG, (TAG,), [None], [1]]
+                  ["prospect"], ["Member-Qualified"], ["member-qualified "], ["member-qualified,member"], [TAG, "member"],
+                  # Slice D: member-bday-month is now allowed alone (its own test); its look-alikes and two-tag lists are not.
+                  ["Member-Bday-Month"], ["member-bday-month "], ["member-bday-month,member"], [" member-bday-month"], ["MEMBER-BDAY-MONTH"],
+                  ["member-bday-months"], ["member_bday_month"], [TAG, BDAY], [BDAY, TAG], [BDAY, BDAY], [BDAY, "member"],
+                  [], TAG, BDAY, (TAG,), (BDAY,), [None], [1]]
 
 
 class ShopifyClientTests(unittest.TestCase):
@@ -1241,12 +1266,35 @@ class ShopifyClientTests(unittest.TestCase):
                                                               "pageInfo": {"hasNextPage": more is not None, "endCursor": more}}},
                                        "extensions": cost(102)})
         client, transport = self.client([page([1, 2], "c1"), page([3], None)])
-        self.assertEqual(client.carriers(5), ({customer_gid(1), customer_gid(2), customer_gid(3)}, True))
+        self.assertEqual(client.carriers(TAG, 5), ({customer_gid(1), customer_gid(2), customer_gid(3)}, True))
         self.assertEqual(transport.bodies[0]["variables"], {"first": 100, "after": None, "search": "tag:'member-qualified'"})
         self.assertEqual(transport.bodies[1]["variables"]["after"], "c1")
         self.assertEqual(client.query_costs["XbMemberTagsCarriers"], 102)
         client, _ = self.client([page([1], "c1"), page([2], "c2")])
-        self.assertEqual(client.carriers(2), ({customer_gid(1), customer_gid(2)}, False))
+        self.assertEqual(client.carriers(TAG, 2), ({customer_gid(1), customer_gid(2)}, False))
+
+    def test_the_birthday_search_and_its_refusals(self):
+        # Slice D design 2.5: two pinned search strings, built from the pinned tags only.
+        self.assertEqual(mt.CARRIER_SEARCHES, {"member-qualified": "tag:'member-qualified'", "member-bday-month": "tag:'member-bday-month'"})
+        page = (200, {"data": {"customers": {"nodes": [{"id": customer_gid(4), "tags": [BDAY]}],
+                                             "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+        client, transport = self.client([page])
+        self.assertEqual(client.carriers(BDAY, 5), ({customer_gid(4)}, True))
+        self.assertEqual(transport.bodies[0]["variables"], {"first": 100, "after": None, "search": "tag:'member-bday-month'"})
+        self.assertEqual(transport.bodies[0]["query"], mt.CARRIERS_QUERY)
+        client, transport = self.client([])
+        for bad in ("member", "Member-Bday-Month", "member-bday-month ", "tag:'x'", "member-bday-month' OR tag:'x", None, [BDAY]):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.code(lambda: client.carriers(bad, 5)), "tags_tag_not_allowed")
+        self.assertEqual(transport.bodies, [])
+
+    def test_the_birthday_tag_alone_is_allowed_one_at_a_time(self):
+        for op, field, tags in (("add", "tagsAdd", ["x", BDAY]), ("remove", "tagsRemove", ["x"])):
+            client, transport = self.client([mutation_answer(field, 1, tags)])
+            self.assertEqual(client.set_tag(op, customer_gid(1), [BDAY]), ("DONE", None))
+            self.assertEqual(transport.bodies[0]["variables"], {"id": customer_gid(1), "tags": [BDAY]})
+        client, _ = self.client([mutation_answer("tagsAdd", 1, ["x", TAG])])
+        self.assertEqual(client.set_tag("add", customer_gid(1), [BDAY]), ("UNCERTAIN", "tag_response_unproven"))  # the other tag is no proof
 
     def test_answer_classes(self):
         cases = [
@@ -2054,6 +2102,360 @@ class RefusalTests(EngineBase):
         self.assert_refused(lambda: engine.run(apply=True), "tags_ledger_binding_mismatch")
 
 
+# --------------------------------------------------------------------------
+# Slice D: the birthday tag member-bday-month (design 2.3 to 2.5)
+# --------------------------------------------------------------------------
+
+NOV, MAR = month("November"), month("March")  # NOW is 19 Nov 2026 (Singapore): November is this month
+
+
+class BirthdayBase(EngineBase):
+    def run_tool(self, apply: bool = True, **overrides) -> dict:
+        overrides.setdefault("bday_tag_enabled", True)
+        return self.engine(**overrides).run(apply=apply)
+
+    def bday_writes(self) -> list:
+        return [w for w in self.shopify.writes if w[2] == [BDAY]]
+
+    def done_add(self, n: int, tag: str, at: datetime) -> None:
+        """A DONE add of ``tag`` for customer n recorded at ``at`` (the ledger's clock)."""
+        self.engine()
+        saved, self.now = self.now, at
+        try:
+            write_id = self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(n), tag=tag, op="add", reason="x",
+                                              member_no=sg(n), basis="sync155")
+            self.ledger.set_outcome(write_id, "DONE", None)
+        finally:
+            self.now = saved
+
+
+class BirthdayDecisionTests(BirthdayBase):
+    """Design 2.3: one test per row D1 to D15."""
+
+    def test_d01_conflict_not_found_and_open_write_leave_both_tags(self):
+        self.member(1, member_type="GUEST", tags=[TAG, BDAY], birthday=MAR)
+        self.make_core([(1, sg(9))])  # the same customer, another member: row 1
+        self.book.add(sg(9), "GUEST")
+        self.member(2, tags=[BDAY], birthday=MAR)
+        del self.shopify.customers_by_gid[customer_gid(2)]  # row 2
+        self.member(3, member_type="GUEST", tags=[TAG, BDAY], birthday=MAR)
+        self.engine()
+        self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(3), tag=BDAY, op="add", reason="x", member_no=sg(3),
+                               basis="sync155")
+        self.shopify.fail_customers = ["shopify_http_server_error"]  # row 16: the settle read fails (observe goes on)
+        result = self.run_tool(apply=False)
+        self.assertEqual(self.shopify.writes, [])
+        for word in ("would_bday_tag", "would_bday_untag", "would_untag", "bday_left_with_member"):
+            self.assertNotIn(word, result["counts"])
+        self.assertEqual(set(result["alerts"]), {"link_conflict_customer", "customer_not_found", "write_unresolved"})
+
+    def test_d02_a_birthday_case_variant_is_left_alone_and_the_qualified_tag_goes_on(self):
+        self.member(1, tags=["Member-Bday-Month"], birthday=NOV)
+        self.member(2, tags=[TAG, BDAY, " member-bday-month"], birthday=MAR)
+        self.member(3, member_type="GUEST", tags=[TAG, "MEMBER-BDAY-MONTH"], birthday=NOV)
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG]), ("remove", customer_gid(3), [TAG])])
+        self.assertEqual(result["counts"]["bday_tag_case_variant"], 3)
+        self.assertIn("bday_tag_case_variant", result["alerts"])
+        self.assertEqual(self.run_tool()["alerts"], [])  # alert once per subject
+
+    def test_d03_on_adds_after_every_qualified_write_then_kept(self):
+        self.member(1, birthday=NOV)
+        self.member(2, birthday=NOV)
+        self.member(3, tags=[TAG, BDAY], birthday=NOV)
+        self.member(4, member_type="GUEST", tags=[TAG], birthday=NOV)
+        observed = self.run_tool(apply=False)
+        self.assertEqual((observed["counts"]["would_bday_tag"], observed["counts"]["bday_kept"]), (2, 1))
+        self.assertEqual([r["code"] for r in observed["refs"]], ["would_tag", "would_tag", "would_untag", "would_bday_tag", "would_bday_tag"])
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG]), ("add", customer_gid(2), [TAG]),
+                                               ("remove", customer_gid(4), [TAG]),
+                                               ("add", customer_gid(1), [BDAY]), ("add", customer_gid(2), [BDAY])])
+        self.assertEqual((result["counts"]["bday_tagged"], result["counts"]["tagged"]), (2, 2))
+        rows = [(r["customer_gid"], r["tag"], r["op"], r["state"], r["reason"], r["basis"]) for r in self.rows()]
+        self.assertEqual(rows[3:], [(customer_gid(1), BDAY, "add", "DONE", "bday_month_current", "sync155"),
+                                    (customer_gid(2), BDAY, "add", "DONE", "bday_month_current", "sync155")])
+        self.assertEqual(self.run_tool()["counts"]["bday_kept"], 3)
+        self.assertEqual(len(self.shopify.writes), 5)
+
+    def test_d04_another_valid_month_takes_it_off(self):
+        self.member(1, tags=[TAG, BDAY], birthday=MAR)
+        self.member(2, tags=[TAG], birthday=MAR)
+        self.member(3, tags=[TAG, BDAY], birthday=month("October"))
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [BDAY]), ("remove", customer_gid(3), [BDAY])])
+        self.assertEqual((result["counts"]["bday_untag_reason:bday_month_other"], result["counts"]["bday_no_change_untagged"]), (2, 1))
+        self.assertEqual(result["counts"]["bday_untagged"], 2)
+        self.assertEqual(self.shopify.tags(1), [TAG])  # only the birthday tag came off
+
+    def test_d05_no_month_on_record_no_add_no_alert(self):
+        self.member(1, tags=[TAG])
+        self.member(2)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual((result["counts"]["bday_no_month"], result["alerts"]), (2, []))
+
+    def test_d06_a_missing_month_with_the_tag_is_left_with_an_alert(self):
+        self.member(1, tags=[TAG, BDAY])
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["alerts"]), ([], ["bday_month_missing"]))
+        self.assertEqual(result["refs"][0]["member_no_masked"], mt.mask(sg(1)))
+
+    def test_d07_an_unreadable_month_is_left_both_ways(self):
+        self.member(1, tags=[TAG, BDAY], birthday=month("march"))
+        self.member(2, tags=[TAG], birthday=month("November", "list.single_line_text_field"))
+        self.member(3, tags=[TAG, BDAY], birthday=month(" November"))
+        self.member(4, tags=[TAG], birthday=month("Nov"))
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["counts"]["bday_month_unreadable"]), ([], 4))
+        self.assertEqual(result["alerts"], ["bday_month_unreadable"])
+
+    def test_d08_a_positive_fact_takes_it_off_with_the_same_reason(self):
+        self.member(1, member_type="GUEST", tags=[TAG, BDAY], birthday=NOV)
+        self.member(2, active="F", tags=[BDAY], birthday=month("march"))  # an unreadable month does not hold off a positive fact
+        self.member(3, expiry=PAST, tags=[BDAY])
+        self.member(4, member_type="VIP", tags=[BDAY], birthday=NOV)  # row 11: the single read
+        self.member(5, member_type="Default", birthday=NOV)  # not tagged: nothing
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3, 4)])
+        self.assertEqual({k: v for k, v in result["counts"].items() if k.startswith("bday_untag_reason:")},
+                         {"bday_untag_reason:member_not_member": 2, "bday_untag_reason:member_inactive": 1,
+                          "bday_untag_reason:member_expired": 1})
+        self.assertEqual([r["reason"] for r in self.rows() if r["tag"] == BDAY],
+                         ["member_not_member", "member_inactive", "member_expired", "member_not_member"])
+
+    def test_d09_leave_for_the_member_leaves_both_ways(self):
+        self.member(1, active=None, tags=[TAG, BDAY], birthday=MAR)        # row 9
+        self.member(2, expiry=None, birthday=NOV)                          # row 10
+        self.member(3, tags=[BDAY], birthday=MAR)
+        self.book.hidden.add(sg(3))                                        # row 11a
+        self.book.count_extra = {"MEMBER": -1}                              # (the counts agree with the scans here)
+        self.member(4, tags=[BDAY], birthday=MAR, in_book=False)           # row 11b
+        self.member(5, tags=[BDAY], birthday=MAR)
+        self.book.add(sg(5) + " ", "GUEST")                                 # row 12
+        self.member(6, tags=["Member-Qualified", BDAY], birthday=MAR)      # row 3: the qualified tag left alone
+        self.member(7, member_type="VIP", tags=[BDAY], birthday=MAR)
+        self.member(8, member_type="VIP", tags=[BDAY], birthday=MAR)       # row 11c (cap 3)
+        result = self.run_tool(max_member_reads_per_run=3)
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(7), [BDAY])])
+        self.assertEqual(result["counts"]["bday_left_with_member"], 7)
+        self.assertEqual(self.book.single_reads, [sg(3), sg(4), sg(7)])  # the birthday tag makes no extra read
+
+    def test_d10_the_flow_guard_on_every_birthday_add(self):
+        self.member(1, tags=[TAG, "member-mg"], registration=False, birthday=NOV)
+        self.member(2, tags=[TAG, "Member-MG "], registration=False, birthday=NOV)
+        self.member(3, tags=[TAG, "member-mg"], registration=True, birthday=NOV)
+        self.member(4, tags=[TAG, "newsletter"], registration=False, birthday=NOV)
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(3), [BDAY]), ("add", customer_gid(4), [BDAY])])
+        self.assertEqual(result["counts"]["flow_dates_guard"], 2)
+        self.assertIn("flow_dates_guard", result["alerts"])
+
+    def test_d11_the_flapping_guard_is_per_tag(self):
+        self.member(1, tags=[TAG], birthday=NOV)
+        self.member(2, birthday=NOV)
+        for hours in (3, 2):
+            self.done_add(1, BDAY, self.now - timedelta(hours=hours))  # added twice, gone again
+            self.done_add(2, TAG, self.now - timedelta(hours=hours))   # the other tag flapping does not count
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(2), [BDAY])])
+        self.assertIn("bday_tag_keeps_disappearing", result["alerts"])
+        self.assertIn("tag_keeps_disappearing", result["alerts"])
+        self.assertNotIn(("add", customer_gid(2), [TAG]), self.shopify.writes)
+        self.now += timedelta(hours=25)
+        self.run_tool()
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(2), [BDAY]), ("add", customer_gid(1), [BDAY])])
+
+    def test_d12_a_voided_pair_takes_it_off(self):
+        self.make_core([(1, sg(1)), (2, sg(2))], unlinks=[1, 2])
+        self.shopify.add(1, [BDAY], birthday=NOV)
+        self.shopify.add(2, [], birthday=NOV)
+        self.book.add(sg(1)), self.book.add(sg(2))
+        self.shopify.search_lag.add(customer_gid(1))  # the by-ID read decides, not the search
+        self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [BDAY])])
+        row = self.rows()[0]
+        self.assertEqual((row["tag"], row["reason"], row["basis"], row["member_no"]), (BDAY, "link_voided", "voided", None))
+
+    def test_d13_a_tag_with_no_basis_is_left_with_an_alert(self):
+        self.shopify.add(1, [BDAY], birthday=NOV)
+        self.shopify.add(2, [TAG, BDAY], birthday=MAR)
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual((result["counts"]["bday_tag_without_basis"], result["counts"]["tag_without_basis"]), (2, 1))
+        self.assertEqual(set(result["alerts"]), {"bday_tag_without_basis", "tag_without_basis"})
+
+    def test_d14_the_switch_off_decides_and_counts_and_sends_nothing(self):
+        self.member(1, birthday=NOV)
+        self.member(2, tags=[TAG, BDAY], birthday=MAR)
+        result = self.run_tool(bday_tag_enabled=False)
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(1), [TAG])])
+        self.assertEqual((result["counts"]["would_bday_tag"], result["counts"]["would_bday_untag"], result["counts"]["bday_writes_disabled"]),
+                         (1, 1, 2))
+        self.assertEqual([r["tag"] for r in self.rows()], [TAG])  # no INTENT row for the birthday tag
+        value = raw_config(self.root, self.sync_root, self.core_root)
+        self.assertFalse(mt.parse_config(value).bday_tag_enabled)  # default off
+        self.run_tool(bday_tag_enabled=True)
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+
+    def test_d15_the_pilot_list_limits_what_is_sent(self):
+        for n in (1, 2, 3):
+            self.member(n, birthday=NOV)
+        self.member(4, tags=[TAG, BDAY], birthday=MAR)
+        result = self.run_tool(bday_only_customers=[customer_gid(2), customer_gid(4)])
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(2), [BDAY]), ("remove", customer_gid(4), [BDAY])])
+        self.assertEqual((result["counts"]["would_bday_tag"], result["counts"]["bday_not_in_pilot"]), (3, 2))
+        self.assertEqual(result["counts"]["tagged"], 3)  # the qualified tag is not limited by the pilot
+
+    def test_dp4_the_qualified_plan_is_unchanged_for_every_c1_row_and_birthday_state(self):
+        # D-P4: every C1 row 1-16 (plus the flapping guard) crossed with each birthday state, tagged or not.
+        self.member(1, tags=[TAG]); self.make_core([(1, sg(91))]); self.book.add(sg(91), "GUEST")  # noqa: E702 row 1
+        self.member(2); del self.shopify.customers_by_gid[customer_gid(2)]  # noqa: E702 row 2
+        self.member(3, tags=["Member-Qualified"])  # row 3
+        self.member(4)  # row 4 add
+        self.member(5, tags=[TAG])  # row 4 kept
+        self.member(6, tags=["member-mg"], registration=False)  # row 5
+        self.member(7, active="F", tags=[TAG])  # row 6
+        self.member(8, expiry=PAST, tags=[TAG])  # row 7
+        self.member(9, member_type="GUEST", tags=[TAG])  # row 8
+        self.member(10, active=None, tags=[TAG])  # row 9
+        self.member(11, expiry=None)  # row 10
+        self.member(12, member_type="VIP", tags=[TAG])  # row 11
+        self.member(13, tags=[TAG]); self.book.hidden.add(sg(13))  # noqa: E702 row 11a
+        self.member(14, tags=[TAG], in_book=False)  # row 11b
+        self.member(15, member_type="VIP", tags=[TAG])  # row 11c (cap 3)
+        self.member(16, tags=[TAG]); self.book.add(sg(16) + " ", "GUEST")  # noqa: E702 row 12
+        self.make_core([(17, sg(17))], unlinks=[17]); self.shopify.add(17, [TAG]); self.book.add(sg(17))  # noqa: E702 row 13
+        self.shopify.add(18, [TAG])  # row 14
+        self.member(19, member_type="GUEST")  # row 15
+        self.member(20, tags=[TAG])  # row 16 (open write, settle read fails)
+        self.member(21)  # flapping guard
+        self.engine()
+        self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(20), tag=TAG, op="add", reason="x", member_no=sg(20),
+                               basis="sync155")
+        for hours in (3, 2):
+            self.done_add(21, TAG, self.now - timedelta(hours=hours))
+
+        def qualified_plan() -> tuple:
+            self.shopify.fail_customers = ["shopify_http_server_error"]
+            result = self.run_tool(apply=False, max_member_reads_per_run=3)
+            plan = sorted((r["ref"], r["code"]) for r in result["refs"] if r["code"] in ("would_tag", "would_untag"))
+            reasons = {k: v for k, v in result["counts"].items() if k.startswith("untag_reason:")}
+            return plan, reasons, result["counts"].get("would_tag"), result["counts"].get("would_untag")
+        baseline = qualified_plan()
+        ref = lambda n: self.ledger.ref("c", customer_gid(n))  # noqa: E731
+        self.assertEqual(baseline[0], sorted([(ref(4), "would_tag")] + [(ref(n), "would_untag") for n in (7, 8, 9, 12, 17)]))
+        for state in (None, NOV, MAR, month("march"), month("November", "list.single_line_text_field")):
+            for bday_tagged in (False, True):
+                with self.subTest(state=state, bday_tagged=bday_tagged):
+                    for customer in self.shopify.customers_by_gid.values():
+                        customer["birthday"] = state
+                        if bday_tagged and BDAY not in customer["tags"]:
+                            customer["tags"].append(BDAY)
+                        if not bday_tagged and BDAY in customer["tags"]:
+                            customer["tags"].remove(BDAY)
+                    self.assertEqual(qualified_plan(), baseline)
+
+
+class BirthdayGuardTests(BirthdayBase):
+    """Design 2.4: caps, the month-change exemption and the birthday volume guard."""
+
+    OCTOBER = datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc)
+
+    def test_month_change_removals_are_exempt_from_the_volume_guard(self):
+        for n in range(1, 9):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)
+            self.done_add(n, BDAY, self.OCTOBER)  # added by this tool in an earlier Singapore month
+        result = self.run_tool(max_bday_removes_per_run=100)
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in range(1, 9)])
+        self.assertEqual(result["counts"]["bday_month_change_removals"], 8)
+        self.assertNotIn("bday_untag_volume_unexpected", result["alerts"])
+
+    def test_the_exemption_needs_an_add_in_an_earlier_month_and_the_month_reason(self):
+        for n in range(1, 4):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)
+            self.done_add(n, BDAY, self.OCTOBER)
+        for n in range(4, 6):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)
+            self.done_add(n, BDAY, datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc))  # 00:00 SGT 1 Nov: this month
+        self.member(6, tags=[TAG, BDAY], birthday=MAR)  # never added by this tool
+        self.member(7, tags=[TAG, BDAY], birthday=MAR)
+        self.done_add(7, BDAY, datetime(2025, 11, 30, 4, 0, tzinfo=timezone.utc))  # November a year ago: earlier
+        for n in (8, 9, 10):
+            self.member(n, member_type="GUEST", tags=[TAG, BDAY], birthday=NOV)
+            self.done_add(n, BDAY, self.OCTOBER)  # another reason: never exempt
+        result = self.run_tool(max_bday_removes_per_run=100, max_tag_removes_per_run=50)
+        # 6 non-exempt removals (4, 5, 6, 8, 9, 10) over max(5, 10 // 10): all withheld; the exempt 1, 2, 3 and 7 go.
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3, 7)])
+        self.assertEqual((result["counts"]["bday_untag_withheld"], result["counts"]["bday_month_change_removals"]), (6, 4))
+        self.assertIn("bday_untag_volume_unexpected", result["alerts"])
+
+    def test_the_birthday_volume_guard_at_exactly_its_limit_sends_and_one_over_withholds(self):
+        for n in range(1, 6):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)
+        result = self.run_tool(max_bday_removes_per_run=100)
+        self.assertEqual(len(self.bday_writes()), 5)
+        self.assertNotIn("bday_untag_volume_unexpected", result["alerts"])
+        for n in range(1, 7):
+            self.member(n + 10, tags=[TAG, BDAY], birthday=MAR)
+        for n in range(30, 84):
+            self.member(n, tags=[TAG, BDAY], birthday=NOV)  # 60 birthday-tagged: the limit is 6
+        result = self.run_tool(max_bday_removes_per_run=100)
+        self.assertEqual(len(self.bday_writes()), 11)
+        self.assertNotIn("bday_untag_volume_unexpected", result["alerts"])
+        self.member(90, tags=[TAG, BDAY], birthday=MAR)
+        for n in range(91, 98):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)  # 7 now, 61 tagged: over 6
+        result = self.run_tool(max_bday_removes_per_run=100)
+        self.assertEqual(len(self.bday_writes()), 11)
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 8)
+        self.assertEqual(result["counts"].get("untag_withheld"), None)  # the qualified guard counts its own tag only
+
+    def test_the_birthday_caps_are_their_own(self):
+        for n in range(1, 5):
+            self.member(n, birthday=NOV)
+        for n in range(10, 14):
+            self.member(n, tags=[TAG, BDAY], birthday=MAR)
+            self.done_add(n, BDAY, self.OCTOBER)
+        result = self.run_tool(max_tag_adds_per_run=4, max_bday_adds_per_run=2, max_bday_removes_per_run=3)
+        self.assertEqual([w for w in self.shopify.writes if w[2] == [TAG]], [("add", customer_gid(n), [TAG]) for n in range(1, 5)])
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY]), ("add", customer_gid(2), [BDAY])]
+                         + [("remove", customer_gid(n), [BDAY]) for n in (10, 11, 12)])
+        self.assertEqual((result["counts"]["bday_tag_adds_capped"], result["counts"]["bday_tag_removes_capped"]), (2, 1))
+        self.assertIn("bday_tag_removes_capped", result["alerts"])
+        self.assertNotIn("tag_adds_capped", result["counts"])
+
+    def test_a_count_mismatch_withholds_birthday_removals_too(self):
+        self.member(1, tags=[TAG, BDAY], birthday=MAR)
+        self.member(2, tags=[TAG], birthday=NOV)
+        self.book.count_extra = {"GUEST": 1}
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("add", customer_gid(2), [BDAY])])
+        self.assertEqual(result["counts"]["untag_withheld_scan_count"], 1)
+
+    def test_settle_by_read_is_per_tag(self):
+        self.member(1, tags=[TAG], birthday=NOV)
+        self.member(2, tags=[TAG, BDAY], birthday=MAR)
+        self.shopify.answers = {customer_gid(1): ["uncertain_applied"]}
+        self.assertEqual(self.run_tool()["stopped"], "write_uncertain")
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY])])  # the run stopped before customer 2
+        result = self.run_tool()
+        self.assertEqual(result["counts"]["write_settled_done"], 1)
+        self.assertEqual([(r["tag"], r["state"], r["code"]) for r in self.rows()],
+                         [(BDAY, "DONE", "resolved_by_read"), (BDAY, "DONE", None)])
+        self.assertEqual(self.bday_writes(), [("add", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+
+    def test_the_stop_file_and_uncertain_stop_the_birthday_writes_too(self):
+        self.member(1, birthday=NOV)
+        self.shopify.answers = {customer_gid(1): ["uncertain_unapplied"]}
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["stopped"]), ([("add", customer_gid(1), [TAG])], "write_uncertain"))
+        self.shopify.after_write = lambda: (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes[-1], result["stopped"]), (("add", customer_gid(1), [TAG]), "stop_file_present"))
+        self.assertEqual(self.bday_writes(), [])
+
+
 class StoreTransport:
     """A scripted store behind the REAL TagsShopifyClient (G2 probe): answers
     the pinned texts from FakeShopify's customers. ``mutation_script``: per
@@ -2085,18 +2487,20 @@ class StoreTransport:
                                   "birthday": customers[gid].get("birthday")}
                                  for gid in value["variables"]["ids"]]})
         if "XbMemberTagsCarriers" in query:
-            return ok({"customers": {"nodes": [{"id": g, "tags": list(c["tags"])} for g, c in customers.items() if TAG in c["tags"]],
+            searched = {f"tag:'{t}'": t for t in (TAG, BDAY)}[value["variables"]["search"]]
+            return ok({"customers": {"nodes": [{"id": g, "tags": list(c["tags"])} for g, c in customers.items() if searched in c["tags"]],
                                      "pageInfo": {"hasNextPage": False, "endCursor": None}}})
         assert query in (mt.TAGS_ADD_MUTATION, mt.TAGS_REMOVE_MUTATION), query[:40]
         step = self.mutation_script.pop(0) if self.mutation_script else "ok"
         if isinstance(step, BaseException):
             raise step
         gid, add = value["variables"]["id"], query == mt.TAGS_ADD_MUTATION
+        (tag,) = value["variables"]["tags"]
         tags = customers[gid]["tags"]
-        if add and TAG not in tags:
-            tags.append(TAG)
-        if not add and TAG in tags:
-            tags.remove(TAG)
+        if add and tag not in tags:
+            tags.append(tag)
+        if not add and tag in tags:
+            tags.remove(tag)
         return ok({"tagsAdd" if add else "tagsRemove": {"node": {"id": gid, "tags": list(tags)}, "userErrors": []}})
 
 
