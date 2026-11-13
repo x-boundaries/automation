@@ -110,7 +110,13 @@ MEMBER = tm.MEMBER
 SCAN_TYPES = tm.SCAN_TYPES  # Default, MEMBER, GUEST
 SCAN_PAGE_SIZE = tm.SCAN_PAGE_SIZE
 SCAN_MAX_PAGES = tm.SCAN_MAX_PAGES
-READ_OPERATIONS = ("type-move-scan", "type-move-member")
+# Slice D (Controller answer Q3): type-move-counts is the third read, already in
+# the bridge and admitted by the book guard's type_move_p1 profile (no
+# PowerShell or book guard change). It feeds the type-count and clock checks.
+READ_OPERATIONS = ("type-move-scan", "type-move-member", "type-move-counts")
+# The VM clock (Singapore time) against the AutoCount server's local time from
+# the same counts read (design 2.2): more than this apart, no mutation is sent.
+CLOCK_TOLERANCE = timedelta(minutes=10)
 BRIDGE_SCRIPT = tm.BRIDGE_SCRIPT
 SGT = sync.SGT
 # An ExpiryDate before this day is a placeholder (R2 3.1 stage 2: 2000-01-01),
@@ -403,11 +409,12 @@ def build_links(sync_links: Iterable[tuple[str, str]], claims: Iterable[tuple[st
 # --------------------------------------------------------------------------
 
 class TagsReadBridgeClient(tm.TypeMoveBridgeClient):
-    """ac2_member_type_move_bridge.ps1 (profile type_move_p1), two reads only:
-    ``type-move-scan`` and ``type-move-member``. Every child start goes
-    through ``_start``, which admits exactly those two read operations; the
-    save, the fenced write runner and every other operation are refused
-    before any process starts. This tool never writes AutoCount."""
+    """ac2_member_type_move_bridge.ps1 (profile type_move_p1), three reads
+    only: ``type-move-scan``, ``type-move-member`` and ``type-move-counts``
+    (the type move client's own ``counts``). Every child start goes through
+    ``_start``, which admits exactly those three read operations; the save,
+    the fenced write runner and every other operation are refused before any
+    process starts. This tool never writes AutoCount."""
 
     def __repr__(self) -> str:
         return "TagsReadBridgeClient()"
@@ -427,9 +434,6 @@ class TagsReadBridgeClient(tm.TypeMoveBridgeClient):
 
     def write_once(self, *args: Any, **kwargs: Any) -> Any:
         raise dl.DirectLocalError("tags_autocount_write_refused")
-
-    def counts(self) -> dict[str, Any]:
-        raise dl.DirectLocalError("tags_operation_not_offered")
 
 
 def scan_type(ac2: Any, member_type: str) -> list[dict[str, Any]]:
@@ -455,14 +459,45 @@ def scan_type(ac2: Any, member_type: str) -> list[dict[str, Any]]:
     raise dl.DirectLocalError("tags_scan_too_many_pages")
 
 
-def scan_members(ac2: Any) -> dict[str, list[tuple[str, dict[str, Any]]]]:
-    """MemberNo key -> every ``(type, row)`` found across the three scans."""
+def scan_members(ac2: Any, sizes: dict[str, int] | None = None) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    """MemberNo key -> every ``(type, row)`` found across the three scans;
+    ``sizes`` (when given) receives each scan's row count."""
 
     found: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for member_type in SCAN_TYPES:
-        for row in scan_type(ac2, member_type):
+        rows = scan_type(ac2, member_type)
+        if sizes is not None:
+            sizes[member_type] = len(rows)
+        for row in rows:
             found.setdefault(sync.member_no_key(row["member_no"]), []).append((member_type, row))
     return found
+
+
+def type_counts_match(counts: Mapping[str, Any], sizes: Mapping[str, int]) -> bool:
+    """Design 2.7: for each of ``Default``, ``MEMBER`` and ``GUEST`` the
+    scan's row count equals that type's count from ``type-move-counts``
+    (rows grouped by type and active flag; the type compared exactly, as the
+    scan's own parameter). A malformed count row is a read failure."""
+
+    totals = {member_type: 0 for member_type in SCAN_TYPES}
+    for row in counts.get("counts") or []:
+        if (not isinstance(row, dict) or not (row.get("member_type") is None or isinstance(row.get("member_type"), str))
+                or isinstance(row.get("members"), bool) or not isinstance(row.get("members"), int) or row["members"] < 0):
+            raise dl.BridgeError("bridge_output_invalid")
+        if row["member_type"] in totals:
+            totals[row["member_type"]] += row["members"]
+    return all(totals[member_type] == sizes.get(member_type) for member_type in SCAN_TYPES)
+
+
+def clock_matches(server_now_local: Any, now: datetime) -> bool:
+    """Design 2.2: the VM clock in Singapore time is within
+    ``CLOCK_TOLERANCE`` of the AutoCount server's local time."""
+
+    server = tm.parse_local(server_now_local)
+    if server is None:
+        raise dl.BridgeError("bridge_output_invalid")
+    local = now.astimezone(SGT).replace(tzinfo=None)
+    return abs(local - server) <= CLOCK_TOLERANCE
 
 
 def sg_today(moment: datetime) -> date:
@@ -1113,6 +1148,8 @@ class TagsEngine:
         self._inputs = inputs or (lambda: (read_sync_links(config), *read_member_core(config)))
         self.reads = 0
         self.month_now: str | None = None
+        self.clock_ok = False  # set by each run from the counts read; nothing is sent before
+        self.counts_ok = False
 
     def now(self) -> datetime:
         return self.ledger.now()
@@ -1150,15 +1187,25 @@ class TagsEngine:
                 settle_reads = None  # observe goes on; those customers are left alone (row 16)
         run_id = self.ledger.start_run(command)
         summary = RunSummary(command)
+        self.month_now, self.clock_ok, self.counts_ok = None, False, False
         states: dict[str, CustomerState | None] = {}
         carriers_total: int | None = None
         try:
             unresolved = self._settle(open_rows, settle_reads, summary)
-            facts = scan_members(self.ac2)
-            today = sg_today(self.now())
+            sizes: dict[str, int] = {}
+            facts = scan_members(self.ac2, sizes)
+            # Design 2.7: one counts read after the scans (a failure stops the
+            # run here, before any write, as a scan failure does).
+            type_counts = self.ac2.counts()
+            now = self.now()
+            today = sg_today(now)
             # Once per run (design 2.2): a run that starts at 23:59 on the
             # last day uses that month for every customer.
             self.month_now = month_name(today)
+            self.clock_ok = clock_matches(type_counts.get("server_now_local"), now)
+            self.counts_ok = type_counts_match(type_counts, sizes)
+            if not self.counts_ok:
+                summary.alert("scan_count_mismatch")  # no removal of either tag this run
             wanted = set(links.basis) | set(links.conflicts) | links.voided | {row["customer_gid"] for row in open_rows}
             states = self.shopify.customers(wanted)
             carriers, complete = self.shopify.carriers(self.config.shopify_max_carrier_pages)
@@ -1280,6 +1327,16 @@ class TagsEngine:
             summary.alert("untag_volume_unexpected")
             summary.counts["untag_withheld"] = len(removes)
             removes = []
+        # Type-count check (design 2.7): a scan that does not add up to the
+        # book's own counts takes no tag off (adds go on).
+        if not self.counts_ok and removes:
+            summary.counts["untag_withheld_scan_count"] = len(removes)
+            removes = []
+        # Clock guard (design 2.2): no mutation at all; reads and the record still run.
+        if not self.clock_ok:
+            summary.stopped = "clock_mismatch"
+            summary.alert("clock_mismatch")
+            return
         if not apply:
             return
         if len(adds) > self.config.max_tag_adds_per_run:

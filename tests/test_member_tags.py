@@ -95,6 +95,26 @@ class FakeBook:
         self.single_reads: list[str] = []
         self.fail_scan: str | None = None
         self.fail_member: str | None = None
+        # type-move-counts (slice D): the book's own counts by type and active
+        # flag (hidden members included) and the server's local time.
+        self.clock = lambda: NOW
+        self.skew = timedelta(0)
+        self.fail_counts: str | None = None
+        self.count_extra: dict[str, int] = {}
+        self.counts_calls = 0
+
+    def counts(self):
+        self.counts_calls += 1
+        if self.fail_counts:
+            raise dl.BridgeError(self.fail_counts)
+        groups: dict[tuple, int] = {}
+        for m in self.members.values():
+            groups[(m["type"], m["active"])] = groups.get((m["type"], m["active"]), 0) + 1
+        for member_type, extra in self.count_extra.items():
+            groups[(member_type, "T")] = groups.get((member_type, "T"), 0) + extra
+        server = (self.clock() + self.skew).astimezone(mt.SGT).replace(tzinfo=None)
+        return {"counts": [{"member_type": t, "is_active": a, "members": n} for (t, a), n in groups.items()],
+                "types_exist": {t: True for t in tm.SCAN_TYPES}, "server_now_local": server.strftime("%Y-%m-%dT%H:%M:%S"), "outlets": []}
 
     def add(self, member_no: str, member_type: str = "MEMBER", active="T", expiry=FUTURE) -> str:
         self.members[member_no] = {"type": member_type, "active": active, "expiry": expiry}
@@ -944,9 +964,11 @@ class ReadBridgeClientTests(unittest.TestCase):
                 # G2 L3 (G10): the third argument is pinned too.
                 lambda: client._start(["-Operation", "type-move-scan", "-FenceId"]),
                 lambda: client._start(["-Operation", "type-move-member", "-EnableProductionAdapterX"]),
+                lambda: client._start(["-Operation", "type-move-counts", "-EnableProductionAdapter", "-FenceId", "f"]),
             ],
             "tags_operation_not_offered": [
-                client.counts, lambda: client.precheck(("x",), None), client.next_member_no, lambda: client.probe("A1"),
+                # Slice D: client.counts now reads (type-move-counts, the third read); see test_counts_is_the_third_read.
+                lambda: client.precheck(("x",), None), client.next_member_no, lambda: client.probe("A1"),
                 lambda: client.reconcile("A1", "{}"), client.book_check, client.pos_sync_status,
                 lambda: client._read("benefit-member", {}),
             ],
@@ -963,7 +985,22 @@ class ReadBridgeClientTests(unittest.TestCase):
         source = (ROOT / "directlocal" / "xb_member_tags.py").read_text(encoding="utf-8")
         for text in ("type-move-save", "benefit-save", "write-once", "SaveMember"):
             self.assertNotIn(text, source)
-        self.assertEqual(mt.READ_OPERATIONS, ("type-move-scan", "type-move-member"))
+        # Slice D (design 2.7): exactly the three reads.
+        self.assertEqual(mt.READ_OPERATIONS, ("type-move-scan", "type-move-member", "type-move-counts"))
+
+    def test_counts_is_the_third_read(self):
+        answer = {"counts": [{"member_type": "MEMBER", "is_active": "T", "members": 2}],
+                  "types_exist": {"Default": True, "MEMBER": True, "GUEST": True}, "server_now_local": "2026-11-19T12:00:00", "outlets": []}
+        client = self.client([answer])
+        self.assertEqual(client.counts()["server_now_local"], "2026-11-19T12:00:00")
+        self.assertEqual([c[3:6] for c in self.started], [["-Operation", "type-move-counts", "-EnableProductionAdapter"]])
+        self.assertEqual(self.started[0][-2:], ["-TargetBook", "AED_TESTINGAPI"])
+        for op in ("type-move-save", "benefit-save", "benefit-member", "type-move-precheck", "x"):
+            with self.subTest(op=op):
+                with self.assertRaises(dl.DirectLocalError) as caught:
+                    client._start(["-Operation", op, "-EnableProductionAdapter"])
+                self.assertEqual(caught.exception.code, "tags_operation_not_offered")
+        self.assertEqual(len(self.started), 1)
 
 
 class ScanTests(unittest.TestCase):
@@ -1440,6 +1477,7 @@ class EngineBase(Base):
         super().setUp()
         self.shopify = FakeShopify()
         self.book = FakeBook()
+        self.book.clock = lambda: self.now
         self.ledger = None
         self.sync_links: list = []
         self.make_sync()
@@ -1821,6 +1859,70 @@ class GuardTests(EngineBase):
         self.book.fail_member = "bridge_read_timeout"
         result = self.run_tool()
         self.assertEqual((self.shopify.writes, result["stopped"]), ([], "bridge_read_timeout"))
+
+    def test_a_count_mismatch_withholds_removals_adds_go_on(self):
+        # Slice D design 2.7: a member saved during the scans (or a paging fault).
+        self.member(1, member_type="GUEST", tags=[TAG])
+        self.member(2)
+        for member_type in ("MEMBER", "GUEST", "Default"):
+            with self.subTest(member_type=member_type):
+                self.book.count_extra = {member_type: 1}
+                self.shopify.writes.clear()
+                result = self.run_tool()
+                self.assertEqual(self.shopify.writes, [("add", customer_gid(2), [TAG])] if member_type == "MEMBER" else [])
+                self.assertIn("scan_count_mismatch", result["alerts"])
+                self.assertEqual(result["counts"]["untag_withheld_scan_count"], 1)
+                self.assertEqual(result["counts"]["would_untag"], 1)
+        self.book.count_extra = {"VIP": 3}  # a type the tool never scans does not count
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [("remove", customer_gid(1), [TAG])])
+        self.assertNotIn("scan_count_mismatch", result["alerts"])
+
+    def test_a_counts_read_failure_stops_before_any_write(self):
+        self.member(1)
+        self.member(2, member_type="GUEST", tags=[TAG])
+        self.book.fail_counts = "bridge_read_timeout"
+        result = self.run_tool()
+        self.assertEqual((self.shopify.writes, result["stopped"], self.counts_of("runs")), ([], "bridge_read_timeout", 1))
+        self.assertEqual(self.book.counts_calls, 1)
+        self.book.fail_counts = None
+        bad_rows = ([{"member_type": "MEMBER", "is_active": "T", "members": "2"}], [{"member_type": "MEMBER", "members": True}],
+                    [{"member_type": 3, "members": 1}], [{"member_type": "MEMBER", "members": -1}], ["x"])
+        real_counts = self.book.counts
+        for rows in bad_rows:
+            with self.subTest(rows=rows):
+                self.book.counts = lambda rows=rows: {**real_counts(), "counts": rows}
+                result = self.run_tool()
+                self.assertEqual((self.shopify.writes, result["stopped"]), ([], "bridge_output_invalid"))
+
+    def test_the_clock_guard(self):
+        # Slice D design 2.2 (C1 G2 L7): the VM clock against the AutoCount server's local time.
+        self.member(1)
+        for minutes, sends in ((9, True), (-9, True), (10, True), (-10, True), (11, False), (-11, False), (24 * 60, False)):
+            with self.subTest(minutes=minutes):
+                self.shopify.writes.clear()
+                self.shopify.tags(1).clear()
+                self.now += timedelta(hours=25)  # past the flapping guard's window
+                self.book.skew = timedelta(minutes=minutes)
+                result = self.run_tool()
+                self.assertEqual(bool(self.shopify.writes), sends)
+                self.assertEqual(result["stopped"], None if sends else "clock_mismatch")
+                self.assertEqual("clock_mismatch" in result["alerts"], not sends)
+                self.assertEqual(result["counts"]["would_tag"], 1)  # reads and the record still ran
+        self.book.skew = timedelta(minutes=11)
+        self.shopify.tags(1).clear()
+        self.assertEqual(self.run_tool(apply=False)["stopped"], "clock_mismatch")  # observe shows it too
+
+    def test_the_clock_guard_across_a_date_change(self):
+        self.member(1)
+        self.now = datetime(2026, 11, 30, 16, 4, 0, tzinfo=timezone.utc)  # 00:04 SGT 1 Dec
+        self.book.skew = timedelta(minutes=-7)                              # server 23:57 30 Nov
+        self.assertIsNone(self.run_tool()["stopped"])
+        self.assertEqual(len(self.shopify.writes), 1)
+        self.shopify.tags(1).clear()
+        self.book.skew = timedelta(minutes=-11)                             # server 23:53 30 Nov
+        self.assertEqual(self.run_tool()["stopped"], "clock_mismatch")
+        self.assertEqual(len(self.shopify.writes), 1)
 
     def test_a_shopify_read_failure_stops_before_any_write(self):
         self.member(1)
