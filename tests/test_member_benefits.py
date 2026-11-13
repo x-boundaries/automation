@@ -4398,6 +4398,85 @@ class B2AlertTests(Base):
         self.assertIsNone(self.engine().run(apply=True)["counts"].get(self.UNCLEAR))  # once
 
 
+class B2WindowTests(Base):
+    """Slice B2 (G0 B2-3, B2-4): no re-open after a read that ended at the
+    page cap; the 60-day age limit (exactly 60 days settles: ``>=``)."""
+
+    claim_held = G2FixRound2Tests.claim_held
+    AGED = "receipt_past_read_window"
+    CREATED = datetime(2026, 11, 18, 3, 0, tzinfo=timezone.utc)  # ORDER_AT
+
+    # -- B2-3 ----------------------------------------------------------------
+    def test_b2_3_a_capped_read_defers_the_re_open_and_the_next_complete_read_re_opens(self):
+        self.claim_held()
+        self.link(1)
+        for n in range(20, 26):  # six newer orders: more than one page of five
+            self.shopify.add(order_node(n, customer=None, lines=(("10.00", 1, 1, False, ()),), created="2026-11-18T04:0%d:00Z" % (n - 20)))
+        self.advance(minutes=15)
+        out = self.engine(shopify_max_pages=1).run(apply=True)
+        self.assertIn("orders_read_incomplete", out["alerts"])
+        self.assertEqual((out["counts"].get("claim_reopen_deferred"), out["counts"].get("claim_hold_reopened"), out["saves"]), (1, None, 0))
+        self.assertEqual((self.receipt(1)["state"], self.receipt(1)["code"]), ("held", "claim_name_mismatch"))
+        self.advance(minutes=15)
+        out = self.engine(shopify_max_pages=1).run(apply=True)
+        self.assertNotIn("orders_read_incomplete", out["alerts"])
+        self.assertEqual((out["counts"].get("claim_reopen_deferred"), out["counts"].get("claim_hold_reopened")), (None, 1))
+        self.assertEqual(self.receipt(1)["state"], "applied")
+
+    # -- B2-4 ----------------------------------------------------------------
+    def at(self, delta: timedelta) -> dict:
+        self.now = self.CREATED + delta
+        return self.engine().run(apply=True)
+
+    def test_b2_4_the_age_limit_comes_before_the_re_open_in_the_same_run(self):
+        self.claim_held()  # order 1, created at ORDER_AT
+        self.guest_with_order(2, linked=False, member=fake_member(sg(2), name="Someone Else Entirely"), created="2026-11-18T03:01:00Z")
+        self.engine().run(apply=True)
+        self.assertEqual([self.receipt(n)["code"] for n in (1, 2)], ["claim_name_mismatch"] * 2)
+        self.link(1)
+        self.link(2)
+        out = self.at(timedelta(days=60))  # order 1 exactly 60 days old, order 2 one minute younger
+        self.assertEqual((out["counts"].get(self.AGED), out["counts"].get("claim_hold_reopened"), out["saves"]), (1, 1, 1))
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("held", "order_past_read_window"), ("applied", "upgrade")])
+        self.assertEqual((self.book.members[sg(1)]["type"], self.book.members[sg(2)]["type"]), ("GUEST", "MEMBER"))
+
+    def test_b2_4_the_limit_is_exactly_60_days_for_both_receipt_kinds(self):
+        self.claim_held()
+        self.shopify.add(order_node(2))  # signed up, no member yet: waits
+        self.engine().run(apply=True)
+        self.assertEqual((self.receipt(2)["state"], self.receipt(1)["state"]), ("waiting_member", "held"))
+        out = self.at(timedelta(days=60) - timedelta(minutes=1))
+        self.assertNotIn(self.AGED, out["alerts"])
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"]) for n in (1, 2)],
+                         [("held", "claim_name_mismatch"), ("waiting_member", None)])
+        out = self.at(timedelta(days=60))  # exactly 60 days: settles
+        self.assertEqual((out["alerts"].count(self.AGED), out["counts"].get(self.AGED)), (1, 2))
+        self.assertEqual({r["ref"] for r in out["refs"] if r["code"] == self.AGED}, {self.ledger.ref("o", order_gid(n)) for n in (1, 2)})
+        self.assertEqual([(self.receipt(n)["state"], self.receipt(n)["code"], self.receipt(n)["waiting_since"]) for n in (1, 2)],
+                         [("held", "order_past_read_window", None), ("held", "order_past_read_window", None)])
+        # Once, and never re-opened or waited on: a link appears and a member is made.
+        self.link(1)
+        self.link(2)
+        self.book.members[sg(2)] = fake_member(sg(2), name="Fake Member 2")
+        out = self.at(timedelta(days=61))
+        self.assertEqual((out["counts"].get(self.AGED), out["counts"].get("claim_hold_reopened"), out["saves"]), (None, None, 0))
+        self.assertEqual([self.receipt(n)["code"] for n in (1, 2)], ["order_past_read_window"] * 2)
+        self.assertEqual(self.book.saves, 0)
+
+    def test_b2_4_applied_and_other_receipts_are_never_touched(self):
+        self.guest_with_order(1)
+        self.guest_with_order(2, member=fake_member(sg(2), name="Fake Member 2", active="F"))
+        self.engine().run(apply=True)
+        self.shopify.add(order_node(3, status="PENDING"))
+        self.engine().run(apply=True)
+        before = {n: tuple(self.receipt(n)) for n in (1, 2, 3)}
+        self.assertEqual([r[0] for r in [(self.receipt(n)["state"],) for n in (1, 2, 3)]], ["applied", "held", "ignored_unpaid"])
+        out = self.at(timedelta(days=90))
+        self.assertNotIn(self.AGED, out["alerts"])
+        self.assertEqual({n: tuple(self.receipt(n))[:-1] for n in before}, {n: row[:-1] for n, row in before.items()})
+
+
 class B2TokenCacheScopeTests(unittest.TestCase):
     """Slice B2, tests only (G0 B2-13 G25): the cached token's scope check."""
 

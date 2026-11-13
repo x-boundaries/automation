@@ -164,6 +164,7 @@ CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, 
 # ``moved:<order>`` and ``settled:<order>``; no schema change).
 ORDER_CUSTOMER_CHANGED = "order_customer_changed_after_upgrade"
 CLAIM_HOLD_SETTLED_UNCLEAR = "claim_hold_settled_unclear"
+RECEIPT_PAST_READ_WINDOW = "receipt_past_read_window"  # B2-4: review subject aged:<order>
 # The replayed states that settle a claim hold silently: positive facts only
 # (a cancellation; an amount measured below the threshold). A move or a
 # removed customer is the other positive fact (checked apart).
@@ -1729,6 +1730,31 @@ class BenefitsEngine:
             self.ledger.update_receipt(row["order_gid"], state="ready", code=None, checked_at=None)
             summary.count("claim_hold_reopened", ref)
 
+    def _age_limit(self, summary: RunSummary) -> None:
+        """Slice B2 (B2-4): ``read_orders`` sees orders created in the last
+        60 days only, so a receipt whose order is that old (or older) can
+        never be read again: a held claim receipt settles to
+        ``order_past_read_window`` (never re-opened) and a ``waiting_member``
+        one is held with that code (never waits). One alert per order.
+        Every other receipt (``applied`` and the other decided ones) is
+        never touched."""
+
+        marks = ",".join("?" for _ in CLAIM_HOLD_CODES)
+        rows = self.ledger.conn.execute(
+            f"SELECT * FROM receipts WHERE (state = 'held' AND code IN ({marks})) OR state = 'waiting_member' ORDER BY order_created_at, order_gid",
+            tuple(sorted(CLAIM_HOLD_CODES))).fetchall()
+        now = self.now()
+        for row in rows:
+            created = dl.parse_created_at(row["order_created_at"])
+            if created is None or now - created < SHOPIFY_ORDER_WINDOW:
+                continue
+            if row["state"] == "waiting_member":
+                self.ledger.update_receipt(row["order_gid"], state="held", code=ORDER_PAST_READ_WINDOW, waiting_since=None)
+            else:
+                self.ledger.update_receipt(row["order_gid"], code=ORDER_PAST_READ_WINDOW)
+            if self.ledger.review_once("aged:" + row["order_gid"], RECEIPT_PAST_READ_WINDOW):
+                summary.alert(RECEIPT_PAST_READ_WINDOW, self.ledger.ref("o", row["order_gid"]), row["member_no"])
+
     def _settled_unclear(self, order_gid: str, summary: RunSummary, ref: str) -> None:
         """Slice B2 (B2-2): a claim hold settled for a reason that is not a
         positive fact: one alert per order, so staff can upgrade by hand. The
@@ -1954,7 +1980,13 @@ class BenefitsEngine:
             for order in orders:
                 self.record(order, summary)
             self._advance_watermark(orders, summary)
-            self._reopen_claim_holds(summary)
+            self._age_limit(summary)
+            if self._read_state[1]:
+                self._reopen_claim_holds(summary)
+            else:
+                # Slice B2 (B2-3): a read that ended at the page cap may not
+                # have reached this order's newest facts; re-open next time.
+                summary.count("claim_reopen_deferred")
             self._recheck_signups(summary)
             self._decide_all(summary, run_id=run_id, apply=apply)
         except _Budget:
