@@ -1339,10 +1339,17 @@ class ChangeLogCursorTests(SyncTestCase):
         self.assertEqual(self.pending_numbers(), [])
         self.assertEqual((result["counts"]["changelog_row_unparsed_skipped"], result["counts"]["changelog_row_unparsed"]), (bound, bound + 1))
         self.assertEqual(result["alerts"], ["changelog_row_unparsed"])
-        # The next run meets the sixth again: skipped then (a fresh bound), and the read goes on.
+        # BF2c (F4; was "skipped then, a fresh bound"): the next run within 24 hours meets the
+        # sixth again and stops again (the rolling 24-hour bound), with the alert.
+        self.now += timedelta(minutes=15)
         again = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
-        self.assertEqual((again["counts"]["changelog_row_unparsed_skipped"], self.pending_numbers()), (1, [sg(58)]))
-        self.assertEqual(again["alerts"], ["changelog_row_unparsed"])
+        self.assertEqual((again["counts"].get("changelog_row_unparsed_skipped"), again["counts"]["changelog_row_unparsed"]), (None, 1))
+        self.assertEqual((self.ledger.watermark("ac2_changelog_id"), self.pending_numbers(), again["alerts"]), (str(bound), [], ["changelog_row_unparsed"]))
+        # Once the first skips are 24 hours old: skipped then, and the read goes on.
+        self.now += sync.CHANGELOG_UNPARSED_SKIP_WINDOW
+        later = self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+        self.assertEqual((later["counts"]["changelog_row_unparsed_skipped"], self.pending_numbers()), (1, [sg(58)]))
+        self.assertEqual(later["alerts"], ["changelog_row_unparsed"])
 
     def test_numbering_reset_is_refused_with_an_alert(self):
         self.ac2.add(sync.Ac2Member(sg(59), "Member", sg(59)), log=True)
@@ -7545,8 +7552,8 @@ class Bf2bDigestTests(SyncTestCase):
         self.stored_run("run-b", hour + timedelta(minutes=30), hour + timedelta(minutes=31), {"shopify_create_uncertain": 1})
         _insert_writes(self.ledger, 1, hour + timedelta(minutes=30, seconds=20), prefix="live2")
         part = self.digest()["backfill_members"]
-        self.assertEqual(part, {"calls": 2, "creates": 3, "uncertain": 0, "rejected": 1, "writes": 6, "writes_per_call_max": 4,
-                                "writes_per_hour_max": 6, "live_writes_per_hour_max": 2})
+        self.assertEqual(part, {"calls": 2, "creates": 3, "unfinished": 1, "uncertain": 0, "rejected": 1, "writes": 6, "writes_per_call_max": 4,
+                                "writes_per_hour_max": 6, "live_writes_per_hour_max": 2})  # BF2c: + unfinished (bf2-b killed)
         self.assertEqual(self.digest()["creates"]["writes_per_hour_max"], 8)  # the total is unchanged
         self.assert_no_pii(part)
 
@@ -7572,7 +7579,319 @@ class Bf2bDigestTests(SyncTestCase):
         self.ac2.add(ac2m("BF2G01", phone=plus(sg(1)), email=em(1)))
         self.ac2.add(ac2m("BF2G02", phone=plus(sg(2)), email=em(2)))
         self.engine(**BF2_KEYS).backfill_members(apply=True, max_creates=2)
-        self.assertEqual({k: v for k, v in self.digest()["backfill_members"].items() if k in ("calls", "creates", "writes")}, {"calls": 1, "creates": 2, "writes": 2})
+        self.assertEqual({k: v for k, v in self.digest()["backfill_members"].items() if k in ("calls", "creates", "unfinished", "writes")},
+                         {"calls": 1, "creates": 2, "unfinished": 0, "writes": 2})
+
+
+# ------------------------------------------------------------------------------------------------
+# #155 slice BF2c (G2 #310 F2 and F4)
+# ------------------------------------------------------------------------------------------------
+
+class KillOnSecondCreate(FakeShopify):
+    """The G2's probe P1: the second create of a call is interrupted (Ctrl+C, a VM restart) after
+    its INTENT is written; the first create landed."""
+
+    def __init__(self, error: BaseException | None = None):
+        super().__init__()
+        self.error = error if error is not None else KeyboardInterrupt()
+
+    def create_customer(self, customer_input):
+        if self.created:
+            raise self.error
+        return super().create_customer(customer_input)
+
+
+def _summary_module():
+    import xb_member_sync_daily_summary as summary  # directlocal is on the path
+    return summary
+
+
+def _judge(raw: dict, *, expected: bool, window: dict | None, today: str) -> tuple[list[str], dict | None, int | None]:
+    """What the morning summary decides from this digest (the calls daily() makes): stops, the
+    event's alert line, and the backfill creates it shows."""
+
+    summary = _summary_module()
+    task = summary.task_section({"state": "Ready", "last_run": "2026-10-23T06:30", "last_result": 0, "next_run": "2026-10-23T06:45", "missed_runs": 0})
+    config = summary.config_section({"status": "ok", "autocount_book": "AED_XBOUNDARIES", "ac2_create_enabled": True, "shopify_create_enabled": True,
+                                     "max_writes_per_run": 1, "max_creates_per_hour": 6, "ac2_create_member_type": "GUEST",
+                                     "immediate_create_enabled": False, "deferred_create_local_time": "06:00", "ac2_credential": "credential_manager"}, True)
+    in_effect = summary._window(window) if window is not None else None
+    in_effect = in_effect if summary.window_in_effect(in_effect, today) else None
+    creates = summary.creates_section(raw, expected=expected, window=in_effect)
+    digest = summary.digest_section(raw, None)
+    event = summary.build_event(now=datetime(2026, 10, 22, 22, 40, tzinfo=timezone.utc), task=task, config=config, digest=digest,
+                                members=summary.members_section(None, "disabled"), new_members=summary.new_members_section(None, None, "disabled"),
+                                first_create=False, expected_member_type="GUEST", creates=creates, unfinished_backfill=summary.backfill_unfinished(raw))
+    summary.check_event(event)
+    shown = creates["backfill"]["creates"] if creates is not None and creates["backfill"] is not None else None
+    return event["stop_reasons"], event["digest"]["alerts"], shown
+
+
+class Bf2cKilledCallTests(Bf2TestCase):
+    """F2: a killed or failing ``backfill-members --apply`` call never hides a create."""
+
+    def digest(self, hours: int = 24) -> dict:
+        return json.loads(json.dumps(sync.ledger_digest(self.temp, hours=hours, now=self.now, config=make_config())))
+
+    def three_members(self) -> None:
+        for n in range(1, 4):
+            self.add(f"KILL{n:02d}", phone=local(10 + n), email=em(10 + n))
+
+    def call_row(self) -> tuple:
+        rows = self.ledger.conn.execute("SELECT run_id, finished_at, summary FROM runs").fetchall()
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_p1_killed_during_the_second_create_the_summary_shows_the_create_and_stops(self):
+        self.shopify = KillOnSecondCreate()
+        self.three_members()
+        with self.assertRaises(KeyboardInterrupt):  # the interrupt is raised again: the exit code stays non-zero
+            self.bf2(apply=True, max_creates=3)
+        self.assertEqual(len(self.shopify.created), 1)
+        self.assertEqual([tuple(r) for r in self.ledger.conn.execute("SELECT state, code FROM writes ORDER BY created_at, state")],
+                         [("DONE", "created"), ("INTENT", None)])
+        run_id, finished_at, stored = self.call_row()
+        self.assertTrue(run_id.startswith(sync.BF2_RUN_PREFIX))
+        self.assertIsNotNone(finished_at)  # stored on the way out
+        stored = json.loads(stored)
+        self.assertEqual((stored["kind"], stored["stopped"], stored["alerts"]), (sync.BF2_RUN_KIND, sync.BF2_CALL_INTERRUPTED, []))
+        self.assertEqual((stored["counts"]["shopify_customer_created"], stored["counts"]["bf2_created"]), (1, 1))
+        self.assert_private(stored)
+        self.now += timedelta(hours=3)
+        raw = self.digest()
+        self.assertEqual((raw["runs"]["completed"], raw["runs"]["unfinished"], raw["counts"]["shopify_customer_created"]), (1, 0, 1))
+        part = raw["backfill_members"]
+        self.assertEqual({k: part[k] for k in ("calls", "creates", "unfinished", "writes")}, {"calls": 1, "creates": 1, "unfinished": 1, "writes": 2})
+        self.assert_private(raw)
+        today = self.today()
+        window = {"from": today, "to": today, "max_per_call": 5, "max_per_hour": 20}
+        # Inside a window (was: no stop, and backfill_members_creates=0).
+        stops, alerts, shown = _judge(raw, expected=True, window=window, today=today)
+        self.assertEqual((stops, alerts["backfill_members_creates"], shown), (["unfinished_runs"], 1, 1))
+        # Creates expected, no window: the write outside a window still stops, and so does the call.
+        self.assertEqual(_judge(raw, expected=True, window=None, today=today)[0], ["unfinished_runs", "shopify_write"])
+        # Without the BF2b settings (the BF2a rules): the create is counted now, and the call stops.
+        stops, alerts, shown = _judge(raw, expected=False, window=None, today=today)
+        self.assertEqual((stops, shown), (["config_unexpected", "unfinished_runs", "shopify_write"], None))
+
+    def test_a_killed_process_that_stored_nothing_still_shows_its_creates_and_stops(self):
+        # A process kill (VM restart, task end) runs no finally: the call has no end and no counts.
+        self.shopify = KillOnSecondCreate()
+        self.three_members()
+        with self.assertRaises(KeyboardInterrupt):
+            self.bf2(apply=True, max_creates=3)
+        with self.ledger.tx() as conn:
+            conn.execute("UPDATE runs SET finished_at = NULL, summary = NULL")
+        self.now += timedelta(hours=3)
+        raw = self.digest()
+        self.assertEqual((raw["runs"]["completed"], raw["runs"]["unfinished"], raw["counts"].get("shopify_customer_created")), (0, 1, None))
+        part = raw["backfill_members"]
+        self.assertEqual({k: part[k] for k in ("calls", "creates", "unfinished", "writes")}, {"calls": 1, "creates": 1, "unfinished": 1, "writes": 2})
+        today = self.today()
+        stops, alerts, shown = _judge(raw, expected=True, window={"from": today, "to": today, "max_per_call": 5, "max_per_hour": 20}, today=today)
+        self.assertEqual((stops, alerts["backfill_members_creates"], shown), (["no_runs", "unfinished_runs"], 1, 1))
+        # The one unfinished run alone was never a stop before; it is now (a bf2- call).
+        self.assertIn("unfinished_runs", _judge(raw, expected=False, window=None, today=today)[0])
+
+    def test_an_uncaught_error_after_a_create_is_stored_and_raised_again(self):
+        self.shopify = KillOnSecondCreate(RuntimeError("boom"))
+        self.three_members()
+        with self.assertRaises(RuntimeError):
+            self.bf2(apply=True, max_creates=3)
+        stored = json.loads(self.call_row()[2])
+        self.assertEqual((stored["stopped"], stored["counts"]["shopify_customer_created"]), (sync.BF2_CALL_INTERRUPTED, 1))
+        self.assertEqual(self.digest()["backfill_members"]["unfinished"], 1)
+
+    def test_an_error_before_any_create_is_stored_too(self):
+        self.three_members()
+        with mock.patch.object(sync.SyncEngine, "_bf2_scan", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.bf2(apply=True, max_creates=3)
+        run_id, finished_at, stored = self.call_row()
+        self.assertIsNotNone(finished_at)
+        self.assertEqual((json.loads(stored)["stopped"], json.loads(stored)["counts"]), (sync.BF2_CALL_INTERRUPTED, {}))
+        part = self.digest()["backfill_members"]
+        self.assertEqual((part["creates"], part["unfinished"], part["writes"]), (0, 1, 0))
+
+    def test_a_normal_call_is_stored_as_before_and_is_not_unfinished(self):
+        self.three_members()
+        result = self.bf2(apply=True, max_creates=2)
+        self.assertEqual(result["stopped"], "backfill_max_reached")
+        stored = json.loads(self.call_row()[2])
+        self.assertEqual(stored, {"kind": sync.BF2_RUN_KIND, "counts": result["counts"], "alerts": [], "refs": result["refs"], "stopped": "backfill_max_reached"})
+        part = self.digest()["backfill_members"]
+        self.assertEqual((part["creates"], part["unfinished"]), (2, 0))
+        today = self.today()
+        self.assertEqual(_judge(self.digest(), expected=True, window={"from": today, "to": today, "max_per_call": 5, "max_per_hour": 20}, today=today)[0], [])
+
+    def test_a_dry_run_that_is_interrupted_stores_no_run(self):
+        self.three_members()
+        with mock.patch.object(sync.SyncEngine, "_bf2_scan", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.bf2(apply=False, max_creates=3)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
+    def test_cli_exit_code_stays_non_zero(self):
+        engine = mock.MagicMock()
+        engine.shopify.create_enabled = True
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(config_value(backfill_members_enabled=True, shopify_create_enabled=True)), encoding="utf-8")
+            with mock.patch.object(sync, "build_real_engine", return_value=engine), mock.patch.object(sync, "SyncLedger"), \
+                    mock.patch.object(sync, "_state_root", return_value=self.temp), mock.patch.object(sync, "load_claim_links", return_value=None):
+                engine.backfill_members.side_effect = KeyboardInterrupt
+                with redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                    sync.main(["backfill-members", "--config", str(path), "--apply"])
+                engine.backfill_members.side_effect = dl.DirectLocalError("bridge_read_timeout")
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(sync.main(["backfill-members", "--config", str(path), "--apply"]), 2)
+
+
+class Bf2cDigestCreatesTests(SyncTestCase):
+    """F2: a call's creates are never fewer than its landed Shopify create rows."""
+
+    stored_run = Bf2bDigestTests.stored_run
+    digest = Bf2bDigestTests.digest
+
+    def writes(self, count: int, at: datetime, *, prefix: str, direction: str = "ac2_to_shopify", state: str = "DONE") -> None:
+        with self.ledger.tx() as conn:
+            for i in range(count):
+                conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (f"write-{prefix}{i}", direction, f"H{prefix}{i}", f"h{prefix}{i}", state, dl.ts(at), dl.ts(at)))
+
+    def stored_call(self, run_id: str, start: datetime, end: datetime | None, counts: dict, stopped=None) -> None:
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES (?, ?, ?, ?)",
+                         (run_id, dl.ts(start), dl.ts(end) if end else None,
+                          json.dumps({"kind": "backfill_members", "counts": counts, "alerts": [], "refs": [], "stopped": stopped}) if end else None))
+
+    def test_per_call_the_larger_of_stored_creates_and_landed_rows(self):
+        hour = self.now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=5)
+        # a: stored 3, two landed rows in its span (the third settled an earlier create): 3.
+        self.stored_call("bf2-a", hour, hour + timedelta(minutes=4), {"shopify_customer_created": 3})
+        self.writes(2, hour + timedelta(minutes=1), prefix="a")
+        # b: killed, nothing stored; two landed, one open INTENT, one REJECTED, one AutoCount write: 2.
+        self.stored_call("bf2-b", hour + timedelta(minutes=10), None, {})
+        self.writes(2, hour + timedelta(minutes=11), prefix="b")
+        self.writes(1, hour + timedelta(minutes=12), prefix="bi", state="INTENT")
+        self.writes(1, hour + timedelta(minutes=12), prefix="br", state="REJECTED")
+        self.writes(1, hour + timedelta(minutes=12), prefix="bs", direction="shopify_to_ac2")
+        self.stored_run("run-c", hour + timedelta(minutes=20), hour + timedelta(minutes=21), {})
+        # d: interrupted, stored 1, one landed: 1.
+        self.stored_call("bf2-d", hour + timedelta(minutes=30), hour + timedelta(minutes=31), {"shopify_customer_created": 1}, sync.BF2_CALL_INTERRUPTED)
+        self.writes(1, hour + timedelta(minutes=30, seconds=30), prefix="d")
+        # A live create row outside every call's span is never a backfill create.
+        self.writes(1, hour + timedelta(minutes=20, seconds=10), prefix="live")
+        part = self.digest()["backfill_members"]
+        self.assertEqual((part["calls"], part["creates"], part["unfinished"], part["writes"]), (3, 6, 2, 8))
+
+    def test_a_stored_stop_other_than_interrupted_is_finished(self):
+        start = self.now - timedelta(hours=2)
+        for n, stopped in enumerate(("bf2_create_rejected", "stop_file_present", None, "bf2_call_interrupted_x")):
+            self.stored_call(f"bf2-{n}", start + timedelta(minutes=10 * n), start + timedelta(minutes=10 * n + 1), {}, stopped)
+        self.assertEqual(self.digest()["backfill_members"]["unfinished"], 0)
+
+    def test_an_unreadable_stored_summary_counts_the_landed_rows(self):
+        start = self.now - timedelta(hours=2)
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('bf2-x', ?, ?, '{not json')",
+                         (dl.ts(start), dl.ts(start + timedelta(minutes=5))))
+        self.writes(2, start + timedelta(minutes=1), prefix="x")
+        part = self.digest()["backfill_members"]
+        self.assertEqual((part["creates"], part["unfinished"]), (2, 0))
+
+
+class Bf2cUnparsedWindowTests(SyncTestCase):
+    """F4: at most 5 unparsable ChangeLog rows skipped in any 24 hours; the 6th stops the read
+    (the watermark before it) and alerts, every run."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_sync("ac2_to_shopify", shopify_create_enabled=False)  # empty ChangeLog: watermark 0
+
+    def bad_rows(self, count: int, tag: str = "BAD") -> list[int]:
+        ids = []
+        for n in range(count):
+            self.ac2.next_id += 3
+            self.ac2.changelog.append((self.ac2.next_id, f'<Member MemberNo="{tag}{n:02d}" Name="X&#x1;Y"/>'))
+            ids.append(self.ac2.next_id)
+        return ids
+
+    def run15(self) -> dict:
+        self.now += timedelta(minutes=15)
+        return self.run_sync("ac2_to_shopify", shopify_create_enabled=False)
+
+    def queued(self, member_no: str) -> int:
+        return self.ledger.conn.execute("SELECT COUNT(*) FROM ac2_pending WHERE member_no = ?", (member_no,)).fetchone()[0]
+
+    def test_p5_thirty_bad_rows_at_most_five_skipped_in_24_hours_and_the_good_row_waits(self):
+        ids = self.bad_rows(30)
+        self.ac2.add(sync.Ac2Member(sg(90), "Member", sg(90), em(90)), log=True)
+        per_run = []
+        for _ in range(8):  # two hours of 15-minute runs (was: 5 a run, the good row queued in run 6)
+            result = self.run15()
+            per_run.append((result["counts"].get("changelog_row_unparsed_skipped", 0), result["alerts"], self.queued(sg(90))))
+        self.assertEqual(per_run, [(5, ["changelog_row_unparsed"], 0)] + [(0, ["changelog_row_unparsed"], 0)] * 7)
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(ids[4]))  # before the 6th
+        self.assertEqual(len(json.loads(self.ledger.watermark(sync.CHANGELOG_UNPARSED_SKIPS))), 5)
+        # A day later the next five are skipped; the good row still waits behind the rest.
+        self.now += timedelta(hours=22)
+        result = self.run15()
+        self.assertEqual((result["counts"].get("changelog_row_unparsed_skipped"), self.queued(sg(90))), (5, 0))
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(ids[9]))
+        self.assertEqual(len(json.loads(self.ledger.watermark(sync.CHANGELOG_UNPARSED_SKIPS))), 5)  # the old ones dropped
+
+    def test_skips_spread_over_runs_count_together(self):
+        self.bad_rows(3, "BADA")
+        self.assertEqual(self.run15()["counts"]["changelog_row_unparsed_skipped"], 3)
+        self.now += timedelta(hours=6)
+        ids = self.bad_rows(3, "BADB")
+        self.ac2.add(sync.Ac2Member(sg(91), "Member", sg(91), em(91)), log=True)
+        result = self.run15()
+        self.assertEqual((result["counts"]["changelog_row_unparsed_skipped"], result["counts"]["changelog_row_unparsed"]), (2, 3))
+        self.assertEqual((self.ledger.watermark("ac2_changelog_id"), self.queued(sg(91)), result["alerts"]), (str(ids[1]), 0, ["changelog_row_unparsed"]))
+        # 23 hours after the first three: still five in the last 24 hours.
+        self.now += timedelta(hours=16, minutes=30)
+        self.assertEqual(self.run15()["counts"].get("changelog_row_unparsed_skipped"), None)
+        # Just over 24 hours after them: three more may go; the last bad row and the good one follow.
+        self.now += timedelta(hours=1)
+        result = self.run15()
+        self.assertEqual((result["counts"]["changelog_row_unparsed_skipped"], self.queued(sg(91))), (1, 1))
+
+    def test_exactly_24_hours_old_no_longer_counts(self):
+        self.bad_rows(5, "BADA")
+        self.run15()
+        ids = self.bad_rows(1, "BADB")
+        self.now += sync.CHANGELOG_UNPARSED_SKIP_WINDOW - timedelta(minutes=15, seconds=1)
+        self.assertEqual(self.run15()["counts"].get("changelog_row_unparsed_skipped"), None)  # 1 second inside
+        self.now += timedelta(seconds=1) - timedelta(minutes=15)
+        self.assertEqual(self.run15()["counts"].get("changelog_row_unparsed_skipped"), 1)  # exactly 24 hours: out
+        self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(ids[0]))
+
+    def test_an_unreadable_stored_value_skips_nothing(self):
+        for bad in ("not json", "{}", '["2026-10-22T02:00:00Z", 5]', '["yesterday"]'):
+            with self.subTest(bad=bad):
+                with self.ledger.tx() as conn:
+                    self.ledger.set_watermark(conn, sync.CHANGELOG_UNPARSED_SKIPS, bad)
+                before = self.ledger.watermark("ac2_changelog_id")
+                self.bad_rows(1, "BADU")
+                result = self.run15()
+                self.assertEqual((result["counts"].get("changelog_row_unparsed_skipped"), result["alerts"]), (None, ["changelog_row_unparsed"]))
+                self.assertEqual(self.ledger.watermark("ac2_changelog_id"), before)
+                self.ac2.changelog.pop()
+
+    def test_no_bad_row_writes_nothing_new(self):
+        self.ac2.add(sync.Ac2Member(sg(92), "Member", sg(92), em(92)), log=True)
+        self.run15()
+        self.assertIsNone(self.ledger.watermark(sync.CHANGELOG_UNPARSED_SKIPS))
+        self.assertEqual(self.queued(sg(92)), 1)
+
+    def test_the_stored_times_hold_no_member_data(self):
+        self.bad_rows(2)
+        self.run15()
+        stamps = json.loads(self.ledger.watermark(sync.CHANGELOG_UNPARSED_SKIPS))
+        self.assertEqual(stamps, [dl.ts(self.now)] * 2)
 
 
 if __name__ == "__main__":

@@ -80,7 +80,7 @@ python directlocal/xb_directlocal.py  (one OS-locked owner process)
 | `scripts/directlocal_connector_hook.py` | `guard` (PreToolUse default-deny for MCP) and `capture` (PostToolUse inbox writer) |
 | `config/directlocal_claude_settings.template.json` | Dedicated-session settings template (deny list + hooks) |
 | `directlocal/xb_shopify_direct.py`, `directlocal/xb_shopify_poller.py` | Claude-free read-only Shopify poller (E8 source; no AutoCount route): [poller contract](member_directlocal_shopify_poller.md) |
-| `directlocal/xb_member_sync.py`, `scripts/ac2_member_sync_member.ps1` | #155 phase 1 two-way member create sync (own ledger; bridge `sync-lookup`, `sync-changelog`, `sync-member-scan`, write-once profile `sync_p1`; the gateway adapter stays unchanged): [member sync phase 1](member_sync_phase1.md) |
+| `directlocal/xb_member_sync.py`, `scripts/ac2_member_sync_member.ps1` | #155 phase 1 two-way member create sync (own ledger; bridge `sync-lookup`, `sync-changelog`, `sync-member-scan`, write-once profile `sync_p1`; the gateway adapter stays unchanged). Run summaries (stored per run: counts, alert codes, keyed refs only; #155 BF2c: a `backfill-members --apply` call stores its own on every way out, an interrupted one as `bf2_call_interrupted`), the digest and the ChangeLog rules (an unparsable row skipped at most 5 a run and 5 in any 24 hours, #155 BF2b N2 and BF2c) are in [member sync phase 1](member_sync_phase1.md) |
 | `tests/test_member_directlocal*.py`, `tests/test_directlocal_*_ps.py`, `tests/test_member_sync*.py` | Offline tests |
 
 ## Capture provenance and shapes

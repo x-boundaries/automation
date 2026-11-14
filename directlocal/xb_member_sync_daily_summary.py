@@ -106,7 +106,7 @@ STOP_CODES = (
     "config_unexpected",          # shopify creates not off, another member type, or another state root
     "digest_failed",              # digest refused or did not answer
     "no_runs",                    # no completed run in 24 hours (a dead sync must not read CLEAN)
-    "unfinished_runs",            # more than 1 unfinished run in 24 hours
+    "unfinished_runs",            # more than 1 unfinished run in 24 hours, or any unfinished backfill-members call
     "shopify_write",              # any Shopify write (SHOPIFY_WRITE_CODES)
     "uncertain_writes",           # uncertain writes open
     "possible_duplicate_member",  # the alert, any count
@@ -671,6 +671,16 @@ def creates_section(raw: Mapping[str, Any] | None, *, expected: bool, window: Ma
     return {"expected": expected, "window": dict(window) if window is not None else None, "live": live, "backfill": backfill}
 
 
+def backfill_unfinished(raw: Mapping[str, Any] | None) -> int:
+    """#155 BF2c (F2): the backfill-members calls of the period that did not end normally (killed
+    before they stored their counts, or ended by an error or an interrupt): the digest's
+    ``backfill_members.unfinished`` (0 when absent or unreadable). Any such call is a stop,
+    with or without the BF2b settings: its creates may not all be in the counts."""
+
+    part = raw.get("backfill_members") if isinstance(raw, dict) else None
+    return (_count(part.get("unfinished")) or 0) if isinstance(part, dict) else 0
+
+
 def _bounded(alerts: Mapping[str, int] | None) -> dict[str, int] | None:
     """At most MAX_ALERT_CODES entries in the email; the rest are summed as other_alert_codes."""
 
@@ -687,9 +697,10 @@ def _alert_is_expected(code: str) -> bool:
 
 
 def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any], expected_member_type: str,
-           creates: Mapping[str, Any] | None = None) -> tuple[list[str], list[str]]:
+           creates: Mapping[str, Any] | None = None, unfinished_backfill: int = 0) -> tuple[list[str], list[str]]:
     """Returns (stop_reasons, auto_off_reasons), each in the pinned order of its closed list.
-    ``creates`` (#155 BF2b, ``creates_section``): None keeps the BF2a rules exactly."""
+    ``creates`` (#155 BF2b, ``creates_section``): None keeps the BF2a rules exactly.
+    ``unfinished_backfill`` (#155 BF2c, ``backfill_unfinished``): more than 0 stops."""
 
     stops: set[str] = set()
     auto_off: set[str] = set()
@@ -712,8 +723,8 @@ def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[s
     else:
         if (digest["runs_completed"] or 0) < 1:
             stops.add("no_runs")
-        if (digest["runs_unfinished"] or 0) > 1:
-            stops.add("unfinished_runs")
+        if (digest["runs_unfinished"] or 0) > 1 or unfinished_backfill > 0:
+            stops.add("unfinished_runs")  # BF2c: an unfinished backfill call is never a pass
         if creates is None:
             if digest["shopify_writes"] > 0:
                 stops.add("shopify_write")
@@ -779,8 +790,8 @@ def _create_stops(creates: Mapping[str, Any], config: Mapping[str, Any], auto_of
 
 def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any],
                 members: Mapping[str, Any], new_members: Mapping[str, Any], first_create: bool,
-                expected_member_type: str, creates: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    stops, auto_off = decide(task, config, digest, expected_member_type, creates)
+                expected_member_type: str, creates: Mapping[str, Any] | None = None, unfinished_backfill: int = 0) -> dict[str, Any]:
+    stops, auto_off = decide(task, config, digest, expected_member_type, creates, unfinished_backfill)
     local = now.astimezone(SGT)
     new_members = dict(new_members)
     if new_members["available"] and digest["available"]:
@@ -1014,7 +1025,8 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
         members, new_members = members_section(None, "config_unavailable"), new_members_section(None, None, "config_unavailable")
     first_create = bool(digest["available"] and digest["ac2_creates"] > 0 and not seen_create and not settings["first_create_already_seen"])
     event = build_event(now=now, task=task, config=config, digest=digest, members=members, new_members=new_members,
-                        first_create=first_create, expected_member_type=settings["expected_member_type"], creates=creates)
+                        first_create=first_create, expected_member_type=settings["expected_member_type"], creates=creates,
+                        unfinished_backfill=backfill_unfinished(raw_digest))
     check_event(event)
 
     write_record(out_dir, event, "pending", None, None, creates)

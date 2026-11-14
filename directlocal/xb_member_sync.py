@@ -1100,6 +1100,9 @@ BF2_RUN_PREFIX = "bf2-"  # not "backfill-": coverage reads that prefix as BF1
 BF2_CURSORS = {True: "backfill_members_cursor", False: "backfill_members_dry_run_cursor"}
 BF2_DONE_MARK = "backfill_members_completed_at"
 BF2_STOP_FILE = "STOP-backfill-members"  # BF1's STOP stops it too
+# #155 BF2c (F2): the stored ``stopped`` of an applied call that an uncaught
+# error or an interrupt ended; the digest counts it as an unfinished call.
+BF2_CALL_INTERRUPTED = "bf2_call_interrupted"
 BF2_BACKFILL_TAG = "ac2-backfill"  # fixed, added in backfill mode only
 BF2_SCAN_PAGE = 1000  # sync-member-scan TOP
 BF2_SCAN_MAX_PAGES = 20  # a longer list is a read failure, never a partial pass
@@ -1133,6 +1136,12 @@ OUT_OF_SCOPE_REQUEUE_PER_RUN = 10
 # #155 BF2b (Controller answer N2): unparsable ChangeLog Member rows skipped
 # (counted, alerted) in one run; one more stops the read as before.
 CHANGELOG_UNPARSED_SKIP_MAX = 5
+# #155 BF2c (F4): the same bound over a rolling 24 hours. The watermark
+# CHANGELOG_UNPARSED_SKIPS holds the times of the skips of the last 24 hours
+# (a JSON list, at most CHANGELOG_UNPARSED_SKIP_MAX), written in the same
+# transaction as the skip.
+CHANGELOG_UNPARSED_SKIP_WINDOW = timedelta(hours=24)
+CHANGELOG_UNPARSED_SKIPS = "changelog_unparsed_skipped_at"
 
 
 def usable_email(value: Any) -> str | None:
@@ -2130,7 +2139,11 @@ class SyncEngine:
         rejected or uncertain, or a read that fails. At most
         ``backfill_members_lookups_per_call`` members are read in Shopify a
         call. Resumable by a MemberNo cursor per mode. No alert (counts
-        only); an applied call is stored as run kind ``backfill_members``."""
+        only); an applied call is stored as run kind ``backfill_members``.
+        BF2c (F2): an applied call that an uncaught error or an interrupt
+        (Ctrl+C) ends still stores its end and its counts so far, with
+        ``stopped`` = ``bf2_call_interrupted``; the error is raised again
+        (the exit code stays non-zero)."""
 
         if apply and not self.config.backfill_members_enabled:
             raise dl.DirectLocalError("backfill_members_disabled")
@@ -2138,11 +2151,31 @@ class SyncEngine:
             raise dl.DirectLocalError("shopify_create_disabled")
         if isinstance(max_creates, bool) or not isinstance(max_creates, int) or not 1 <= max_creates <= self.config.backfill_members_call_cap:
             raise dl.DirectLocalError("backfill_members_max_invalid")
+        if not apply:
+            return self._bf2_call(apply=False, max_creates=max_creates, claims=claims)
         run_id = f"{BF2_RUN_PREFIX}{uuid.uuid4().hex}"
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO runs(run_id, started_at) VALUES (?, ?)", (run_id, dl.ts(self.ledger.now())))
+        result = None
+        try:
+            result = self._bf2_call(apply=True, max_creates=max_creates, claims=claims)
+        finally:
+            # Its own run kind; no alert is ever stored. Counts, codes and
+            # keyed refs with masked MemberNos only. BF2c (F2): written on
+            # every way out, so a create that landed before an error or an
+            # interrupt is never missing from the digest.
+            stored = {"kind": BF2_RUN_KIND, "counts": dict(sorted(self.summary.counts.items())), "alerts": [], "refs": self.summary.refs,
+                      "stopped": result["stopped"] if result is not None else BF2_CALL_INTERRUPTED}
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
+        return result
+
+    def _bf2_call(self, *, apply: bool, max_creates: int, claims: "ClaimLinks | None") -> dict[str, Any]:
+        """The body of one ``backfill_members`` call (checks done, the run
+        row of an applied call written by the caller)."""
+
         stopped = None
         if apply:
-            with self.ledger.tx() as conn:
-                conn.execute("INSERT INTO runs(run_id, started_at) VALUES (?, ?)", (run_id, dl.ts(self.ledger.now())))
             try:
                 self._resolve_uncertain("ac2_to_shopify")  # design 2.8: settle before any decision
             except dl.DirectLocalError:
@@ -2207,12 +2240,6 @@ class SyncEngine:
             "member_core_ledger": "read" if claims is not None else "not_configured",
             "population": dict(sorted(population.items())), "counts": dict(sorted(self.summary.counts.items())), "refs": self.summary.refs,
         }
-        if apply:
-            # Its own run kind; no alert is ever stored. Counts, codes and
-            # keyed refs with masked MemberNos only.
-            stored = {"kind": BF2_RUN_KIND, "counts": result["counts"], "alerts": [], "refs": result["refs"], "stopped": stopped}
-            with self.ledger.tx() as conn:
-                conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
         return result
 
     def _bf2_stop_requested(self) -> bool:
@@ -2770,6 +2797,23 @@ class SyncEngine:
         for note in decision.notes:
             self.summary.count(note)
 
+    def _unparsed_skips_recent(self) -> list[str] | None:
+        """BF2c (F4): the times of the unparsable-row skips of the last 24
+        hours (oldest first). None when the stored value cannot be read: no
+        more row is skipped then (fails closed; the read stops and alerts)."""
+
+        value = self.ledger.watermark(CHANGELOG_UNPARSED_SKIPS)
+        if value is None:
+            return []
+        try:
+            stamps = json.loads(value)
+        except (json.JSONDecodeError, RecursionError):
+            return None
+        if not isinstance(stamps, list) or not all(isinstance(s, str) and dl.parse_created_at(s) is not None for s in stamps):
+            return None
+        since = self.ledger.now() - CHANGELOG_UNPARSED_SKIP_WINDOW
+        return sorted(s for s in stamps if dl.parse_created_at(s) > since)
+
     # -- AC2 -> Shopify ----------------------------------------------------------
     def ac2_to_shopify(self) -> None:
         column = self.config.changelog_xml_column
@@ -2800,10 +2844,12 @@ class SyncEngine:
             if member is None:
                 # Every run that meets one alerts (a person looks).
                 self.summary.alert("changelog_row_unparsed")
-                if unparsed >= CHANGELOG_UNPARSED_SKIP_MAX:
-                    # Too many in one run: stop here as before; the watermark
-                    # stays at the last good ID, so this row and everything
-                    # after it are read again next run.
+                recent = self._unparsed_skips_recent()
+                if unparsed >= CHANGELOG_UNPARSED_SKIP_MAX or recent is None or len(recent) >= CHANGELOG_UNPARSED_SKIP_MAX:
+                    # Too many in one run, or (BF2c, F4) in the last 24 hours:
+                    # stop here as before; the watermark stays at the last good
+                    # ID, so this row and everything after it are read again
+                    # next run.
                     break
                 # BF2b (Controller answer N2): counted and skipped (marked
                 # seen, the watermark moves past it), so one bad row no longer
@@ -2811,6 +2857,7 @@ class SyncEngine:
                 # member.
                 unparsed += 1
                 with self.ledger.tx() as conn:
+                    self.ledger.set_watermark(conn, CHANGELOG_UNPARSED_SKIPS, json.dumps(sorted([*recent, dl.ts(self.ledger.now())])))
                     conn.execute("INSERT INTO changelog_seen(id, seen_at) VALUES (?, ?)", (row_id, dl.ts(self.ledger.now())))
                     if row_id > current:
                         self.ledger.set_watermark(conn, "ac2_changelog_id", str(row_id))
@@ -3930,10 +3977,16 @@ def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str
     to the call whose time span holds its ``created_at`` (from the call's
     start to its end, or to the next run's start, or now, for a call that
     did not finish): runs never overlap (they share the ledger lock). None
-    when no call ran in the period."""
+    when no call ran in the period.
+    BF2c (F2): a call's creates are never fewer than the Shopify create
+    rows (``ac2_to_shopify``, DONE) in its span, so a call killed before it
+    stored its counts still shows them; ``unfinished``: the calls with no
+    stored end (killed) or that an error or an interrupt ended."""
 
     starts = [dl.parse_created_at(row["started_at"]) for row in runs]
     spans = []
+    stored_creates: list[int] = []
+    unfinished = 0
     outcomes = {code: 0 for code in BF2_DIGEST_CODES}
     for index, row in enumerate(runs):
         if not str(row["run_id"]).startswith(BF2_RUN_PREFIX) or starts[index] is None:
@@ -3945,27 +3998,36 @@ def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str
             stored = json.loads(row["summary"] or "{}")
         except (json.JSONDecodeError, RecursionError):
             stored = {}
+        if finished is None or (isinstance(stored, dict) and stored.get("stopped") == BF2_CALL_INTERRUPTED):
+            unfinished += 1
         counts = stored.get("counts") if isinstance(stored, dict) and isinstance(stored.get("counts"), dict) else {}
+        stored_creates.append(0)
         for code in BF2_DIGEST_CODES:
             number = counts.get(code)
             if isinstance(number, int) and not isinstance(number, bool) and number > 0:
                 outcomes[code] += number
+                if code == "shopify_customer_created":
+                    stored_creates[-1] = number
     if not spans:
         return None
     per_call = [0] * len(spans)
+    landed = [0] * len(spans)
     backfill_hour: dict[str, int] = {}
-    for (created,) in conn.execute("SELECT created_at FROM writes WHERE created_at >= ?", (since,)):
+    for created, direction, state in conn.execute("SELECT created_at, direction, state FROM writes WHERE created_at >= ?", (since,)):
         moment = dl.parse_created_at(created)
         if moment is None:
             continue
         for position, (start, end) in enumerate(spans):
             if start <= moment <= end:
                 per_call[position] += 1
+                if direction == "ac2_to_shopify" and state == "DONE":
+                    landed[position] += 1
                 hour = moment.astimezone(SGT).strftime("%Y-%m-%dT%H")
                 backfill_hour[hour] = backfill_hour.get(hour, 0) + 1
                 break
     return {
-        "calls": len(spans), "creates": outcomes["shopify_customer_created"], "uncertain": outcomes["shopify_create_uncertain"],
+        "calls": len(spans), "creates": sum(max(n, m) for n, m in zip(stored_creates, landed)), "unfinished": unfinished,
+        "uncertain": outcomes["shopify_create_uncertain"],
         "rejected": outcomes["shopify_create_rejected"], "writes": sum(per_call), "writes_per_call_max": max(per_call),
         "writes_per_hour_max": max(backfill_hour.values(), default=0),
         "live_writes_per_hour_max": max((n - backfill_hour.get(hour, 0) for hour, n in per_hour.items()), default=0),
