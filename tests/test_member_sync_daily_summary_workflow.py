@@ -457,5 +457,38 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
                 self.assertIsNone(result["sub"], "a rejected event never reaches the email sub-workflow")
 
 
+@unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code nodes")
+class Bf2bWorkflowTests(unittest.TestCase):
+    """#155 BF2b: the unchanged n8n validator accepts the BF2b event (creates expected, a backfill
+    window in effect) and the email shows the backfill's creates apart, in the alert line."""
+
+    run_cases = WorkflowCodeExecutionTests.run_cases
+    assert_sent = WorkflowCodeExecutionTests.assert_sent
+
+    def test_backfill_creates_are_shown_in_a_clean_email_with_creates_on(self):
+        raw = {"runs": {"completed": 96, "unfinished": 0, "duration_seconds_max": 41, "duration_seconds_median": 12},
+               "counts": {"ac2_member_created": 1, "shopify_customer_created": 41},
+               "alerts": {"waiting_for_staff": 2},
+               "alert_refs": [],
+               "open": {"shopify_pending": 0, "ac2_pending": 5, "ac2_pending_would_create": 0, "uncertain_writes": 0, "links": 1300},
+               "creates": {"writes_per_hour_max": 41},
+               "backfill_members": {"calls": 3, "creates": 40, "uncertain": 0, "rejected": 0, "writes": 40, "writes_per_call_max": 20,
+                                    "writes_per_hour_max": 40, "live_writes_per_hour_max": 1}}
+        window = summary._window({"from": "2026-11-06", "to": "2026-11-07", "max_per_call": 25, "max_per_hour": 60})
+        creates = summary.creates_section(raw, expected=True, window=window)
+        config = summary.config_section({"status": "ok", "autocount_book": "AED_XBOUNDARIES", "ac2_create_enabled": True,
+                                         "shopify_create_enabled": True, "max_writes_per_run": 1, "max_creates_per_hour": 6,
+                                         "ac2_create_member_type": "GUEST", "immediate_create_enabled": False}, True)
+        task = summary.task_section({"state": "Ready", "last_run": "2026-11-07T06:30", "last_result": 0, "next_run": "2026-11-07T06:45", "missed_runs": 0})
+        event = summary.build_event(now=NOW, task=task, config=config, digest=summary.digest_section(raw, 1230),
+                                    members=summary.members_section([("MEMBER", 2000)], None), new_members=summary.new_members_section(3, None, None),
+                                    first_create=False, expected_member_type="GUEST", creates=creates)
+        summary.check_event(event)
+        (result,) = self.run_cases([json.loads(json.dumps(event))])
+        text = self.assert_sent(result, "[XB daily] MEMBER-SYNC CLEAN 2026-11-07")
+        for line in ("shopify_create=yes", "Shopify writes=41", "backfill_members_creates=40", "No stop condition found."):
+            self.assertIn(line, text)
+
+
 if __name__ == "__main__":
     unittest.main()

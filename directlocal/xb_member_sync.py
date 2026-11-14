@@ -300,7 +300,18 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # #155 BF2a (design 2.7): members that need a Shopify read (at most two
     # reads each) per backfill-members call.
     "backfill_members_lookups_per_call": 50,
+    # #155 BF2b (design 2.7): the backfill's own caps, used only by
+    # ``backfill-members`` (S6 keeps max_writes_per_run). null: the BF2a caps
+    # (max_writes_per_run a call, RUNS_PER_HOUR x max_writes_per_run in any 60
+    # minutes). Set in the backfill's own config copy for a sitting, together
+    # with the daily summary's ``backfill_members_window``: a backfill create
+    # outside a declared window, or over its caps, stops the next summary.
+    "backfill_members_max_per_call": None,
+    "backfill_members_max_per_hour": None,
 }
+# #155 BF2b: the bounds of the backfill's own caps (design 2.7).
+BACKFILL_MEMBERS_MAX_PER_CALL_LIMIT = 25
+BACKFILL_MEMBERS_MAX_PER_HOUR_LIMIT = 60
 _SHOPIFY_KEYS_REQUIRED = {"store_gid", "shop_domain", "api_version", "auth"}
 _SHOPIFY_KEYS_OPTIONAL = {"token_cache"}
 _BOUNDS = {
@@ -371,6 +382,21 @@ class SyncConfig:
     backfill_members_enabled: bool = False
     shopify_create_member_types: tuple[str, ...] = ("MEMBER", "GUEST")
     backfill_members_lookups_per_call: int = 50
+    backfill_members_max_per_call: int | None = None
+    backfill_members_max_per_hour: int | None = None
+
+    @property
+    def backfill_members_call_cap(self) -> int:
+        """#155 BF2b: creates in one ``backfill-members`` call (BF2a: max_writes_per_run)."""
+
+        return self.max_writes_per_run if self.backfill_members_max_per_call is None else self.backfill_members_max_per_call
+
+    @property
+    def backfill_members_hour_cap(self) -> int:
+        """#155 BF2b: writes (all kinds) in any 60 minutes that a backfill call
+        may reach (BF2a: RUNS_PER_HOUR x max_writes_per_run)."""
+
+        return RUNS_PER_HOUR * self.max_writes_per_run if self.backfill_members_max_per_hour is None else self.backfill_members_max_per_hour
 
     @property
     def immediate_path_active(self) -> bool:
@@ -405,6 +431,9 @@ class SyncConfig:
                if self.shopify_create_member_types != tuple(_CONFIG_DEFAULTS["shopify_create_member_types"]) else {}),
             **({"backfill_members_lookups_per_call": self.backfill_members_lookups_per_call}
                if self.backfill_members_lookups_per_call != _CONFIG_DEFAULTS["backfill_members_lookups_per_call"] else {}),
+            # #155 BF2b: likewise printed only when set.
+            **({"backfill_members_max_per_call": self.backfill_members_max_per_call} if self.backfill_members_max_per_call is not None else {}),
+            **({"backfill_members_max_per_hour": self.backfill_members_max_per_hour} if self.backfill_members_max_per_hour is not None else {}),
         }
 
 
@@ -518,6 +547,16 @@ def parse_config(value: Any) -> SyncConfig:
     if core_root is not None and (not isinstance(core_root, str) or not core_root or core_root == merged["state_root"]):
         # #155 BF1: another tool's root, never this sync's own.
         raise dl.DirectLocalError("sync_config_member_core_state_root_invalid")
+    caps = {}
+    for key, high in (("backfill_members_max_per_call", BACKFILL_MEMBERS_MAX_PER_CALL_LIMIT),
+                      ("backfill_members_max_per_hour", BACKFILL_MEMBERS_MAX_PER_HOUR_LIMIT)):
+        # #155 BF2b (design 2.7): null (the BF2a caps) or 1..high.
+        number = merged[key]
+        if number is not None and (isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= high):
+            raise dl.DirectLocalError(f"sync_config_{key}_invalid")
+        caps[key] = number
+    if None not in caps.values() and caps["backfill_members_max_per_call"] > caps["backfill_members_max_per_hour"]:
+        raise dl.DirectLocalError("sync_config_backfill_members_max_per_call_invalid")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
@@ -531,7 +570,7 @@ def parse_config(value: Any) -> SyncConfig:
         backfill_registrations_enabled=_bool(merged["backfill_registrations_enabled"], "backfill_registrations_enabled"),
         member_core_state_root=core_root,
         backfill_members_enabled=_bool(merged["backfill_members_enabled"], "backfill_members_enabled"),
-        shopify_create_member_types=tuple(member_types), **numbers,
+        shopify_create_member_types=tuple(member_types), **numbers, **caps,
     )
 
 
@@ -1085,6 +1124,15 @@ BF2_OPERATOR_STOPS = ("bf2_create_uncertain", "bf2_create_rejected", "bf2_read_i
 SHOPIFY_NAME_MAX = 255
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 NOT_READ = object()  # decide_ac2_to_shopify: the email read has not happened
+# #155 BF2b (Controller ruling on BF2a Q4): an S6 row SKIPPED as out of scope
+# is read again once this long has passed, at most this many a run (and only
+# while the run's lookup batch has room), so a till member whose type moves
+# to an in-scope type later is not skipped for good.
+OUT_OF_SCOPE_RECHECK_AFTER = timedelta(hours=24)
+OUT_OF_SCOPE_REQUEUE_PER_RUN = 10
+# #155 BF2b (Controller answer N2): unparsable ChangeLog Member rows skipped
+# (counted, alerted) in one run; one more stops the read as before.
+CHANGELOG_UNPARSED_SKIP_MAX = 5
 
 
 def usable_email(value: Any) -> str | None:
@@ -1093,11 +1141,15 @@ def usable_email(value: Any) -> str | None:
     Fix round 1 (G2 B1): printable ASCII only, the bridge's own set
     (``[!-~]``), so no email Python calls usable is refused there;
     any other character (accented, full-width, zero-width, BOM, control)
-    counts as no usable email, everywhere."""
+    counts as no usable email, everywhere.
+    BF2b (G2 LATER 7): only spaces are trimmed, as the bridge's SQL
+    ``LTRIM/RTRIM`` trims; a tab or line break around the email is kept, so
+    the email is unusable here too (fail closed: Python and AutoCount see the
+    same set of emails)."""
 
     if not isinstance(value, str):
         return None
-    text = value.strip()
+    text = value.strip(" ")
     if not (text.isascii() and text.isprintable()):
         return None
     return text if len(text) <= EMAIL_MAX_LENGTH and USABLE_EMAIL_RE.fullmatch(text) else None
@@ -1631,10 +1683,13 @@ class SyncEngine:
         return self.ledger.now().astimezone(SGT).strftime("%Y-%m-%d")
 
     # -- write budget ----------------------------------------------------------
-    def _spend_write(self, switch: bool, disabled_code: str) -> None:
+    def _spend_write(self, switch: bool, disabled_code: str, limit: int | None = None) -> None:
+        """``limit``: the call's own write budget (#155 BF2b: the backfill's
+        ``backfill_members_call_cap``); None: ``max_writes_per_run``."""
+
         if not switch:
             raise WriteRefused(disabled_code)
-        if self.summary.writes >= self.config.max_writes_per_run:
+        if self.summary.writes >= (self.config.max_writes_per_run if limit is None else limit):
             raise WriteRefused("max_writes_per_run_reached")
         self.summary.writes += 1
 
@@ -2066,8 +2121,11 @@ class SyncEngine:
         dry run (the default) writes nothing but its own cursor. ``apply``
         needs ``backfill_members_enabled`` AND ``shopify_create_enabled``;
         it settles earlier uncertain creates first, creates at most
-        ``max_creates`` (1 to ``max_writes_per_run``) customers a call, never
-        over the rolling-hour cap, stops before the next member when a stop
+        ``max_creates`` (1 to ``backfill_members_call_cap``: BF2a
+        ``max_writes_per_run``, BF2b ``backfill_members_max_per_call``)
+        customers a call, never over the rolling-hour cap
+        (``backfill_members_hour_cap``), holds a member whose create Shopify
+        refused for the same details, stops before the next member when a stop
         file exists, and stops for an operator after a create that is
         rejected or uncertain, or a read that fails. At most
         ``backfill_members_lookups_per_call`` members are read in Shopify a
@@ -2078,7 +2136,7 @@ class SyncEngine:
             raise dl.DirectLocalError("backfill_members_disabled")
         if apply and not self.config.shopify_create_enabled:
             raise dl.DirectLocalError("shopify_create_disabled")
-        if isinstance(max_creates, bool) or not isinstance(max_creates, int) or not 1 <= max_creates <= self.config.max_writes_per_run:
+        if isinstance(max_creates, bool) or not isinstance(max_creates, int) or not 1 <= max_creates <= self.config.backfill_members_call_cap:
             raise dl.DirectLocalError("backfill_members_max_invalid")
         run_id = f"{BF2_RUN_PREFIX}{uuid.uuid4().hex}"
         stopped = None
@@ -2119,6 +2177,8 @@ class SyncEngine:
                     self.summary.count("bf2_email_unusable")  # counted as no email (design 2.3.1)
                 if code is not None:
                     self._bf2_count(code, member)
+                    if code == "bf2_create_rejected_held":
+                        self.summary.count(self._rejected_create_class(member))  # the class only (runbook)
                     last = key
                     continue
                 if lookups >= self.config.backfill_members_lookups_per_call:
@@ -2200,7 +2260,25 @@ class SyncEngine:
             return "bf2_phone_shared_in_ac2"  # A7
         if shopify_name_issue(member.name):
             return "bf2_no_name"  # A9
+        if self._rejected_create_class(member) is not None:
+            # BF2b (G2 LATER 3): Shopify refused a create for exactly these
+            # details; held until staff change the email, phone or name.
+            return "bf2_create_rejected_held"
         return None
+
+    def _rejected_create_class(self, member: Ac2Member) -> str | None:
+        """#155 BF2b: the classified code of a REJECTED create sent for this
+        member with its current name, email and phone (the INTENT's identity
+        digest), or None. Any change to those details releases the hold."""
+
+        email = usable_email(member.email_address)
+        if email is None:
+            return None
+        digest = self.ledger.customer_identity_digest((member.name or "").strip(), email, _ac2_phone(member))
+        row = self.ledger.conn.execute(
+            "SELECT code FROM writes WHERE member_no_key = ? AND direction = 'ac2_to_shopify' AND state = 'REJECTED' AND intent_digest = ? "
+            "ORDER BY created_at DESC LIMIT 1", (member_no_key(member.member_no), digest)).fetchone()
+        return None if row is None else (row["code"] or "shopify_user_errors_other")
 
     def _bf2_population(self, index: "Bf2Index", claims: "ClaimLinks | None") -> dict[str, int]:
         """Every member scanned, by its class before any read (the first
@@ -2259,10 +2337,10 @@ class SyncEngine:
             return "done"
         if not self.config.shopify_create_enabled:
             return "shopify_create_disabled"  # refused before any login too
-        if creates >= max_creates or self.summary.writes >= self.config.max_writes_per_run:
+        if creates >= max_creates or self.summary.writes >= self.config.backfill_members_call_cap:
             return "backfill_max_reached"
         hour = int(self.ledger.conn.execute("SELECT COUNT(*) FROM writes WHERE created_at >= ?", (dl.ts(self.ledger.now() - timedelta(hours=1)),)).fetchone()[0])
-        if hour >= RUNS_PER_HOUR * self.config.max_writes_per_run:
+        if hour >= self.config.backfill_members_hour_cap:  # BF2b: the backfill's own hour cap (design 2.7)
             return "backfill_hour_cap_reached"
         outcome = self._create_in_shopify(member, digits, email, key, ref, backfill=True)
         if outcome == "created":
@@ -2355,6 +2433,14 @@ class SyncEngine:
                     conn.execute("UPDATE ac2_pending SET state = 'DONE', code = 'uncertain_write_found', updated_at = ? WHERE member_no_key = ?",
                                  (dl.ts(self.ledger.now()), row["member_no_key"]))
                 self.summary.count("uncertain_write_resolved_linked", ref, "link")
+            return
+        if not hmac.compare_digest(self.ledger.customer_identity_digest((members[0].name or "").strip(), email, _ac2_phone(members[0])),
+                                   row["intent_digest"]):
+            # BF2b (G2 LATER 6): the member's name, email or phone changed
+            # since the INTENT, so "not found by the current email" proves
+            # nothing (the create may have landed under the old email): never
+            # settled automatically; it stays UNCERTAIN for a person.
+            self.summary.count("uncertain_write_identity_changed", ref)
             return
         if self.ledger.now() - dl.parse_ts(row["created_at"]) < UNCERTAIN_SETTLE_AFTER:
             self.summary.count("uncertain_write_unresolved", ref)
@@ -2704,6 +2790,7 @@ class SyncEngine:
             # never reset the watermark automatically.
             self.summary.alert("changelog_id_reset_detected")
             return
+        unparsed = 0
         for row_id, xml_text in sorted(rows, key=lambda item: item[0]):
             if self.ledger.conn.execute("SELECT 1 FROM changelog_seen WHERE id = ?", (row_id,)).fetchone() is not None:
                 if row_id > current:
@@ -2711,10 +2798,25 @@ class SyncEngine:
                 continue  # an overlap re-read of a processed row: nothing to do
             member = parse_changelog_member(xml_text)
             if member is None:
-                # Stop here: the watermark stays at the last good ID, so this
-                # row and everything after it are read again next run.
+                # Every run that meets one alerts (a person looks).
                 self.summary.alert("changelog_row_unparsed")
-                break
+                if unparsed >= CHANGELOG_UNPARSED_SKIP_MAX:
+                    # Too many in one run: stop here as before; the watermark
+                    # stays at the last good ID, so this row and everything
+                    # after it are read again next run.
+                    break
+                # BF2b (Controller answer N2): counted and skipped (marked
+                # seen, the watermark moves past it), so one bad row no longer
+                # blocks every later insert. The backfill re-sweep finds the
+                # member.
+                unparsed += 1
+                with self.ledger.tx() as conn:
+                    conn.execute("INSERT INTO changelog_seen(id, seen_at) VALUES (?, ?)", (row_id, dl.ts(self.ledger.now())))
+                    if row_id > current:
+                        self.ledger.set_watermark(conn, "ac2_changelog_id", str(row_id))
+                        current = row_id
+                self.summary.count("changelog_row_unparsed_skipped")
+                continue
             with self.ledger.tx() as conn:
                 key = member_no_key(member.member_no)
                 conn.execute(
@@ -2818,8 +2920,33 @@ class SyncEngine:
                 )
             self.summary.count("ac2_member_hold_requeued", self.ledger.ref("m", key))
 
+    def _requeue_out_of_scope(self) -> None:
+        """#155 BF2b (Controller ruling on BF2a Q4): a row SKIPPED as
+        ``ac2_member_out_of_scope`` (for example a ``Default`` till member)
+        is PENDING again once OUT_OF_SCOPE_RECHECK_AFTER has passed since it
+        was decided, oldest first, at most OUT_OF_SCOPE_REQUEUE_PER_RUN a run
+        and only while this run's lookup batch has room. It is then decided
+        like any other row: still out of scope, SKIPPED again (read again a
+        day later); in scope (the type moved, active, expiry ok), linked or
+        created. No lookup of its own: it rides in the run's one lookup."""
+
+        queued = self.ledger.conn.execute("SELECT COUNT(*) FROM ac2_pending WHERE state = 'PENDING'").fetchone()[0]
+        room = min(OUT_OF_SCOPE_REQUEUE_PER_RUN, PENDING_LOOKUP_BATCH - queued)
+        if room <= 0:
+            return
+        due = dl.ts(self.ledger.now() - OUT_OF_SCOPE_RECHECK_AFTER)
+        keys = [row["member_no_key"] for row in self.ledger.conn.execute(
+            "SELECT member_no_key FROM ac2_pending WHERE state = 'SKIPPED' AND code = 'ac2_member_out_of_scope' AND updated_at <= ? "
+            "ORDER BY updated_at, member_no_key LIMIT ?", (due, room))]
+        for key in keys:
+            with self.ledger.tx() as conn:
+                conn.execute("UPDATE ac2_pending SET state = 'PENDING', code = 'out_of_scope_recheck', checks = 0, updated_at = ? WHERE member_no_key = ?",
+                             (dl.ts(self.ledger.now()), key))
+            self.summary.count("ac2_member_out_of_scope_rechecked", self.ledger.ref("m", key))
+
     def _process_ac2_pending(self) -> None:
         self._requeue_stuck_holds()
+        self._requeue_out_of_scope()
         # Go-live L10 (G2 r10): a row waiting only for shopify_create_enabled
         # (code would_create) must not hold a batch slot while creates are
         # off, so every other PENDING row is read first, oldest first; the
@@ -2930,19 +3057,26 @@ class SyncEngine:
         With one: held when another AutoCount member has it; linked when one
         customer holds it under the same name (and no other phone); held when
         that customer is someone else; never created with the decline
-        marker; otherwise created. New codes are counts, never alerts."""
+        marker; otherwise created. New codes are counts, never alerts.
+        BF2b (G2 LATER 5): with ``shopify_create_enabled`` false, a member
+        that could only end ``would_create`` skips the AutoCount email check
+        (one AutoCount sign-in a row a run) unless the email read finds a
+        customer; the row is decided in full once creates are on. BF2b (G2
+        LATER 8): before a create, a member whose phone another AutoCount
+        member holds is SKIPPED (``ac2_phone_shared_in_ac2``, a count), as
+        the backfill's A7."""
 
         if email is None:
             self._ac2_done(key, "SKIPPED", "ac2_member_phone_only_not_created")
             self.summary.count("ac2_member_phone_only_not_created", ref)
             return
-        mine = email.casefold()
-        if any(email_key(m.email_address) == mine and member_no_key(m.member_no) != key for m in self.ac2.lookup(None, [], email=email)):
-            self._ac2_done(key, "SKIPPED", "ac2_email_shared_in_ac2")
-            self.summary.count("ac2_email_shared_in_ac2", ref)
+        deferred = not self.config.shopify_create_enabled and member.no_shopify is False
+        if not deferred and self._s6_email_shared(member, email, key, ref):
             return
         found = self.shopify.find_by_email(email)
         if found is not None:
+            if deferred and self._s6_email_shared(member, email, key, ref):
+                return
             theirs = phone_member_no(found.phone)[0]
             if (link := self.ledger.link_for_gid(found.gid)) is not None:
                 # The same existing alerts as the phone path.
@@ -2969,7 +3103,23 @@ class SyncEngine:
             self._ac2_done(key, "SKIPPED", "ac2_member_declined_not_created")
             self.summary.count("ac2_member_declined_not_created", ref)
             return
+        if digits is not None and self.config.shopify_create_enabled and any(
+                member_no_key(other.member_no) != key and _phone_hit(other, digits) for other in self.ac2.lookup(digits, [])):
+            self._ac2_done(key, "SKIPPED", "ac2_phone_shared_in_ac2")
+            self.summary.count("ac2_phone_shared_in_ac2", ref)
+            return
         self._create_in_shopify(member, digits, email, key, ref)
+
+    def _s6_email_shared(self, member: Ac2Member, email: str, key: str, ref: str) -> bool:
+        """BF2a: another AutoCount member holds this email (an email-only
+        ``sync-lookup``): the row is SKIPPED (``ac2_email_shared_in_ac2``)."""
+
+        mine = email.casefold()
+        if any(email_key(m.email_address) == mine and member_no_key(m.member_no) != key for m in self.ac2.lookup(None, [], email=email)):
+            self._ac2_done(key, "SKIPPED", "ac2_email_shared_in_ac2")
+            self.summary.count("ac2_email_shared_in_ac2", ref)
+            return True
+        return False
 
     def _ac2_member_by_time(self, row: sqlite3.Row, member: Ac2Member, customer: ShopifyCustomer, key: str, ref: str) -> None:
         """Round 8 (G2 H1): an AC2 member whose MemberNo is exactly the phone
@@ -3046,7 +3196,8 @@ class SyncEngine:
             self.summary.count("shopify_customer_input_invalid", ref)
             return "invalid"
         try:
-            self._spend_write(self.config.shopify_create_enabled, "shopify_create_disabled")
+            self._spend_write(self.config.shopify_create_enabled, "shopify_create_disabled",
+                              self.config.backfill_members_call_cap if backfill else None)
         except WriteRefused as refused:
             self.summary.count(refused.code, ref, "would_create")  # stays PENDING
             if refused.code == "shopify_create_disabled" and not backfill:
@@ -3768,6 +3919,59 @@ def _nearest_rank(ordered: list[int], percent: int) -> int | None:
     return ordered[max(-(-len(ordered) * percent // 100), 1) - 1]
 
 
+BF2_DIGEST_CODES = ("shopify_customer_created", "shopify_create_uncertain", "shopify_create_rejected")
+
+
+def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str, now: datetime, per_hour: Mapping[str, int]) -> dict[str, Any] | None:
+    """#155 BF2b (design 2.12): the ``backfill-members`` calls (run ids
+    ``bf2-``) of the period, apart from the live runs, for the daily
+    summary: calls, their create outcomes (from each call's stored counts),
+    and their writes. A write row does not name its run, so a write belongs
+    to the call whose time span holds its ``created_at`` (from the call's
+    start to its end, or to the next run's start, or now, for a call that
+    did not finish): runs never overlap (they share the ledger lock). None
+    when no call ran in the period."""
+
+    starts = [dl.parse_created_at(row["started_at"]) for row in runs]
+    spans = []
+    outcomes = {code: 0 for code in BF2_DIGEST_CODES}
+    for index, row in enumerate(runs):
+        if not str(row["run_id"]).startswith(BF2_RUN_PREFIX) or starts[index] is None:
+            continue
+        finished = dl.parse_created_at(row["finished_at"]) if row["finished_at"] else None
+        later = [s for s in starts[index + 1:] if s is not None]
+        spans.append((starts[index], finished or (later[0] if later else now)))
+        try:
+            stored = json.loads(row["summary"] or "{}")
+        except (json.JSONDecodeError, RecursionError):
+            stored = {}
+        counts = stored.get("counts") if isinstance(stored, dict) and isinstance(stored.get("counts"), dict) else {}
+        for code in BF2_DIGEST_CODES:
+            number = counts.get(code)
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+                outcomes[code] += number
+    if not spans:
+        return None
+    per_call = [0] * len(spans)
+    backfill_hour: dict[str, int] = {}
+    for (created,) in conn.execute("SELECT created_at FROM writes WHERE created_at >= ?", (since,)):
+        moment = dl.parse_created_at(created)
+        if moment is None:
+            continue
+        for position, (start, end) in enumerate(spans):
+            if start <= moment <= end:
+                per_call[position] += 1
+                hour = moment.astimezone(SGT).strftime("%Y-%m-%dT%H")
+                backfill_hour[hour] = backfill_hour.get(hour, 0) + 1
+                break
+    return {
+        "calls": len(spans), "creates": outcomes["shopify_customer_created"], "uncertain": outcomes["shopify_create_uncertain"],
+        "rejected": outcomes["shopify_create_rejected"], "writes": sum(per_call), "writes_per_call_max": max(per_call),
+        "writes_per_hour_max": max(backfill_hour.values(), default=0),
+        "live_writes_per_hour_max": max((n - backfill_hour.get(hour, 0) for hour, n in per_hour.items()), default=0),
+    }
+
+
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) -> dict[str, Any]:
     """Go-live S7: the read-only daily digest. Opens the ledger read-only
     (no lock, no migration, no write), reads the ``runs`` of the last
@@ -3793,7 +3997,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
             raise dl.DirectLocalError("sync_ledger_not_initialised")
         check_binding(meta, config)
         since = dl.ts(now - timedelta(hours=hours))
-        runs = conn.execute("SELECT started_at, finished_at, summary FROM runs WHERE started_at >= ? ORDER BY started_at", (since,)).fetchall()
+        runs = conn.execute("SELECT run_id, started_at, finished_at, summary FROM runs WHERE started_at >= ? ORDER BY started_at", (since,)).fetchall()
         counts: dict[str, int] = {}
         alerts: dict[str, int] = {}
         refs: list[dict[str, str]] = []
@@ -3849,6 +4053,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
 
         import xb_member_sync_probe as probe  # the probe module reads only its status file here
 
+        backfill = _digest_backfill_members(conn, runs, since=since, now=now, per_hour=per_hour)
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
             "runs": {"completed": len(durations), "unfinished": unfinished,
@@ -3872,6 +4077,9 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
                         "writes_per_hour": dict(sorted(per_hour.items()))},
             "caps": {"create_rate_capped": counts.get("create_rate_capped", 0), "create_rate_capped_alerts": alerts.get("create_rate_capped", 0)},
             "probe": probe.probe_digest(Path(root), since=now - timedelta(hours=hours)),
+            # #155 BF2b: only when a backfill-members call ran in the period,
+            # so a digest without one is exactly as before.
+            **({"backfill_members": backfill} if backfill is not None else {}),
         }
     except sqlite3.Error:
         raise dl.DirectLocalError("sync_ledger_unreadable") from None
@@ -3943,7 +4151,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise dl.DirectLocalError("backfill_members_disabled")
             if args.apply and not config.shopify_create_enabled:
                 raise dl.DirectLocalError("shopify_create_disabled")
-            if not 1 <= args.max_creates <= config.max_writes_per_run:
+            if not 1 <= args.max_creates <= config.backfill_members_call_cap:
                 raise dl.DirectLocalError("backfill_members_max_invalid")
         root = _state_root(config)
         ledger = SyncLedger(root)
