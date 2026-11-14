@@ -1136,6 +1136,15 @@ class TagsLedger:
                                   "AND state = 'DONE'", (customer_gid, tag)).fetchone()[0]
         return None if value is None else dl.parse_ts(value)
 
+    def last_done_op(self, customer_gid: str, tag: str) -> str | None:
+        """The op (``add`` or ``remove``) of this tool's latest DONE write of
+        ``tag`` for this customer, or None if it never wrote it (slice D3,
+        L2: an add followed by this tool's own removal is not current)."""
+
+        row = self.conn.execute("SELECT op FROM tag_writes WHERE customer_gid = ? AND tag = ? AND state = 'DONE' "
+                                "ORDER BY updated_at DESC, rowid DESC LIMIT 1", (customer_gid, tag)).fetchone()
+        return None if row is None else row[0]
+
     def status(self, config: TagsConfig) -> dict[str, Any]:
         self.check_binding(config)
         conn = self.conn
@@ -1501,13 +1510,18 @@ class TagsEngine:
 
     def _month_change(self, gid: str) -> bool:
         """Design 2.4: this tool's last DONE birthday add for the customer was
-        recorded in an earlier Singapore month. It makes a ``bday_month_other``
-        removal a month-change removal (exempt from the volume guard), and
-        takes the tag off in D6 and D7 (fix round 1) and in D9 and D13 with
-        the month cleared or unreadable (slice D2); those are not exempt."""
+        recorded in an earlier Singapore month and is still its latest DONE
+        birthday write (slice D3, L2: an add followed by this tool's own DONE
+        removal does not count, so a tag set again by hand is left). It makes
+        a ``bday_month_other`` removal a month-change removal (exempt from the
+        volume guard), and takes the tag off in D6 and D7 (fix round 1) and
+        in D9 and D13 with the month cleared or unreadable (slice D2); those
+        are not exempt."""
 
         added = self.ledger.last_done_add_at(gid, BDAY_TAG)
         if added is None or self.today is None:
+            return False
+        if self.ledger.last_done_op(gid, BDAY_TAG) != "add":  # L2: this tool's own removal came after its add
             return False
         added_day = added.astimezone(SGT).date()
         return (added_day.year, added_day.month) < (self.today.year, self.today.month)
