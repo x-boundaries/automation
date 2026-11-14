@@ -2703,6 +2703,107 @@ class SectionNineTests(BirthdayBase):
         self.assertNotIn("bday_month_change_removals", result["counts"])
 
 
+class SliceD2Tests(BirthdayBase):
+    """Slice D2 (G2 recheck R1, R2, N23): D9 (Q ``leave``) and D13 (no basis)
+    with the month cleared or unreadable follow ruling 2's D6/D7 rule: off
+    when this tool's last DONE birthday add was in an earlier Singapore month,
+    otherwise left and counted every run. A voided pair keeps its own reason."""
+
+    EARLIER = SectionNineTests.EARLIER
+
+    def bday_removes(self) -> list:
+        return [(r["customer_gid"], r["reason"], r["basis"], r["member_no"]) for r in self.rows()
+                if r["tag"] == BDAY and r["op"] == "remove"]
+
+    def test_q_leave_with_the_month_cleared_or_unreadable_comes_off_after_an_earlier_add(self):
+        # The G2 residual probe, widened to C1 rows 9, 10, 11b, 12 and 3
+        self.member(1, active=None, tags=[TAG, BDAY])                            # row 9, month cleared
+        self.member(2, expiry=None, tags=[TAG, BDAY], birthday=month("march"))  # row 10, month unreadable
+        self.member(3, tags=[BDAY], in_book=False)                               # row 11b, month cleared
+        self.member(4, tags=[BDAY], birthday=month("Nov"))
+        self.book.add(sg(4) + " ", "GUEST")                                       # row 12, month unreadable
+        self.member(5, tags=["Member-Qualified", BDAY])                          # row 3, month cleared
+        self.member(6, active=None, tags=[TAG, BDAY])                            # added this month: left
+        self.member(7, active=None, tags=[TAG, BDAY], birthday=month("march"))  # never added by this tool: left
+        self.member(8, active=None, tags=[TAG, BDAY])                            # only the qualified tag added in October: left
+        self.member(9, active=None, tags=[TAG, BDAY], birthday=NOV)              # this month on record: left
+        self.member(10, active=None, tags=[TAG])                                 # the birthday tag already gone: nothing to send
+        for n in (1, 2, 3, 4, 5, 9, 10):
+            self.done_add(n, BDAY, self.EARLIER)
+        self.done_add(6, BDAY, self.now - timedelta(days=2))
+        self.done_add(8, TAG, self.EARLIER)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3, 4, 5)])
+        self.assertEqual([w for w in self.shopify.writes if w[2] == [TAG]], [])  # Q unchanged
+        self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_added_earlier_month", "sync155", sg(n)) for n in (1, 2, 3, 4, 5)])
+        self.assertEqual(result["counts"]["bday_untag_reason:bday_added_earlier_month"], 5)
+        self.assertNotIn("bday_month_change_removals", result["counts"])  # not exempt from the volume guard
+        self.assertEqual(result["counts"]["bday_left_with_member"], 5)
+        for n in (6, 7, 8, 9):
+            self.assertIn(BDAY, self.shopify.tags(n))
+        self.now += timedelta(hours=1)
+        again = self.run_tool()  # the ones left are counted every run
+        self.assertEqual(len(self.bday_writes()), 5)
+        self.assertEqual(again["counts"]["bday_left_with_member"], 10)
+
+    def test_no_basis_with_the_month_cleared_or_unreadable_comes_off_after_an_earlier_add(self):
+        # The G2 residual probe, widened to the unreadable month
+        self.member(20)  # a link set that is not empty
+        self.shopify.add(1, [TAG, BDAY])                       # month cleared, added in October
+        self.shopify.add(2, [BDAY], birthday=month("march"))  # month unreadable, added in October
+        self.shopify.add(3, [BDAY])                            # month cleared, added this month: left
+        self.shopify.add(4, [BDAY], birthday=NOV)              # this month on record, added in October: left
+        self.shopify.add(5, [BDAY], birthday=month("Nov"))    # never added by this tool: left
+        for n in (1, 2, 4):
+            self.done_add(n, BDAY, self.EARLIER)
+        self.done_add(3, BDAY, self.now - timedelta(days=2))
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+        self.assertEqual(self.shopify.tags(1), [TAG])  # the qualified tag: C2 is off, left with its alert
+        self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_added_earlier_month", None, None) for n in (1, 2)])
+        self.assertNotIn("bday_month_change_removals", result["counts"])
+        self.assertEqual(result["counts"]["bday_tag_without_basis"], 3)
+        self.now += timedelta(hours=1)
+        again = self.run_tool()  # the ones left are counted every run
+        self.assertEqual(len(self.bday_writes()), 2)
+        self.assertEqual(again["counts"]["bday_tag_without_basis"], 3)
+
+    def test_with_the_c2_switch_on_the_earlier_month_reason_comes_first(self):
+        self.member(20)
+        self.shopify.add(1, [BDAY])  # month cleared, added in October
+        self.shopify.add(2, [BDAY])  # month cleared, never added: C2's own reason
+        self.done_add(1, BDAY, self.EARLIER)
+        self.run_tool(remove_unbased_tags_enabled=True)
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY]), ("remove", customer_gid(2), [BDAY])])
+        self.assertEqual([r[1] for r in self.bday_removes()], ["bday_added_earlier_month", "tag_without_basis"])
+
+    def test_r2_n23_a_voided_pair_keeps_its_own_reason_whatever_the_month(self):
+        self.make_core([(1, sg(1)), (2, sg(2))], unlinks=[1, 2])
+        self.book.add(sg(1)), self.book.add(sg(2))
+        self.shopify.add(1, [BDAY], birthday=MAR)  # D12 with another valid month (G2 N07)
+        self.shopify.add(2, [BDAY])                # D12 with the month cleared
+        self.shopify.add(3, [BDAY], birthday=MAR)  # D13 with another valid month (G1 N23)
+        for n in (1, 2, 3):
+            self.done_add(n, BDAY, self.EARLIER)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3)])
+        self.assertEqual(self.bday_removes(), [(customer_gid(1), "link_voided", "voided", None),
+                                               (customer_gid(2), "link_voided", "voided", None),
+                                               (customer_gid(3), "bday_month_other", None, None)])
+        self.assertEqual(result["counts"]["bday_month_change_removals"], 1)  # only D13: a voided pair is never exempt
+
+    def test_the_new_removals_keep_the_switch_and_meet_the_volume_guard(self):
+        for n in range(1, 7):
+            self.member(n, active=None, tags=[TAG, BDAY])
+            self.done_add(n, BDAY, self.EARLIER)
+        result = self.run_tool(bday_tag_enabled=False)
+        self.assertEqual((self.shopify.writes, result["counts"]["would_bday_untag"]), ([], 6))
+        result = self.run_tool(max_bday_removes_per_run=50)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 6)
+        self.assertIn("bday_untag_volume_unexpected", result["alerts"])
+
+
 class BirthdayLaterTests(BirthdayBase):
     """G2 L2 and L3 (fix round 1)."""
 
@@ -2753,6 +2854,10 @@ class BirthdayPrivacyEveryPathTests(BirthdayBase):
         for i in range(12):
             self.shopify.add(300 + i, [BDAY, TAG], birthday=month(months[i]))  # D13 / row 14
         self.shopify.add(320, [BDAY])                                          # D13, no month on record
+        self.member(330, active=None, tags=[BDAY], birthday=month("may"))      # slice D2: D9, unreadable, added earlier
+        self.shopify.add(331, [BDAY], birthday=month("june"))                   # slice D2: D13, unreadable, added earlier
+        for v in (330, 331):
+            self.done_add(v, BDAY, SectionNineTests.EARLIER)
         self.run_tool(apply=False)
         self.run_tool(max_bday_removes_per_run=250, max_bday_adds_per_run=250, max_tag_removes_per_run=50, max_tag_adds_per_run=250)
         self.run_tool(remove_unbased_tags_enabled=True, max_bday_removes_per_run=250, max_tag_removes_per_run=50)

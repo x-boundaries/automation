@@ -93,7 +93,7 @@ TOKEN_CACHE_FILE = "tags_token_cache.bin"
 
 # Every tag this tool may ever send (the ledger CHECK), and the ones it sends.
 # member-bday-month is sent only with bday_tag_enabled (slice D).
-TAG ="member-qualified"
+TAG = "member-qualified"
 TAG_SET = ("member-qualified", "member-bday-month")
 # Slice D: both tags are active. A mutation still carries exactly one of them.
 ACTIVE_TAGS = ("member-qualified", "member-bday-month")
@@ -1423,8 +1423,10 @@ class TagsEngine:
         """Slice D design 2.3, rows D2 to D13 (D1 is handled by the caller,
         D14 and D15 at the send). On only when Q is ``on`` and the month field
         is exactly this Singapore month; off only on a positive fact (another
-        valid month whatever Q is, Q ``off``, a voided pair, or this tool's
-        own add made in an earlier month); everything else is left alone."""
+        valid month whatever Q is, Q ``off``, a voided pair, or, with the
+        month cleared or unreadable, this tool's own add made in an earlier
+        month whatever Q is: D6, D7, and since slice D2 also D9 and D13);
+        everything else is left alone."""
 
         if any(tag != BDAY_TAG and tag.strip().casefold() == BDAY_TAG for tag in state.tags):  # D2
             self._alert_once(summary, "bday_tag_case_variant", ref)
@@ -1445,6 +1447,8 @@ class TagsEngine:
             if other_month:  # D4 (and D9 with another valid month)
                 return PlannedWrite(gid, "remove", "bday_month_other", member_no, basis, BDAY_TAG)
             if desired == LEAVE:  # D9: the C1 alert is already raised
+                if tagged and state.bday_state != BDAY_MONTH and self._month_change(gid):  # D9, month cleared or unreadable (slice D2)
+                    return PlannedWrite(gid, "remove", "bday_added_earlier_month", member_no, basis, BDAY_TAG)
                 summary.count("bday_left_with_member")
                 return None
             if state.bday_state == BDAY_UNREADABLE:  # D7
@@ -1476,6 +1480,8 @@ class TagsEngine:
             return PlannedWrite(gid, "remove", "link_voided", None, "voided", BDAY_TAG)
         if other_month:  # D13 with another valid month (fix round 1)
             return PlannedWrite(gid, "remove", "bday_month_other", None, None, BDAY_TAG)
+        if state.bday_state != BDAY_MONTH and self._month_change(gid):  # D13, month cleared or unreadable (slice D2)
+            return PlannedWrite(gid, "remove", "bday_added_earlier_month", None, None, BDAY_TAG)
         if self.unbased_ok[BDAY_TAG]:  # D13 with the C2 switch (design 2.6)
             return PlannedWrite(gid, "remove", "tag_without_basis", None, None, BDAY_TAG)
         self._alert_once(summary, "bday_tag_without_basis", ref)  # D13 (removal only with the C2 switch)
@@ -1497,7 +1503,8 @@ class TagsEngine:
         """Design 2.4: this tool's last DONE birthday add for the customer was
         recorded in an earlier Singapore month. It makes a ``bday_month_other``
         removal a month-change removal (exempt from the volume guard), and
-        takes the tag off in D6 and D7 (fix round 1; not exempt)."""
+        takes the tag off in D6 and D7 (fix round 1) and in D9 and D13 with
+        the month cleared or unreadable (slice D2); those are not exempt."""
 
         added = self.ledger.last_done_add_at(gid, BDAY_TAG)
         if added is None or self.today is None:
