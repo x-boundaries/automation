@@ -2793,15 +2793,218 @@ class SliceD2Tests(BirthdayBase):
         self.assertEqual(result["counts"]["bday_month_change_removals"], 1)  # only D13: a voided pair is never exempt
 
     def test_the_new_removals_keep_the_switch_and_meet_the_volume_guard(self):
-        for n in range(1, 7):
+        # Slice D3 (G2 L1, Q09): the switch half uses 5 removals, so the
+        # birthday volume guard (more than 5) does not withhold them first
+        for n in range(1, 6):
             self.member(n, active=None, tags=[TAG, BDAY])
             self.done_add(n, BDAY, self.EARLIER)
         result = self.run_tool(bday_tag_enabled=False)
-        self.assertEqual((self.shopify.writes, result["counts"]["would_bday_untag"]), ([], 6))
+        self.assertEqual((self.shopify.writes, result["counts"]["would_bday_untag"]), ([], 5))
+        self.assertEqual(result["counts"]["bday_writes_disabled"], 5)
+        self.assertNotIn("bday_untag_withheld", result["counts"])
+        self.member(6, active=None, tags=[TAG, BDAY])  # the sixth: now the volume guard withholds them all
+        self.done_add(6, BDAY, self.EARLIER)
         result = self.run_tool(max_bday_removes_per_run=50)
         self.assertEqual(self.bday_writes(), [])
         self.assertEqual(result["counts"]["bday_untag_withheld"], 6)
         self.assertIn("bday_untag_volume_unexpected", result["alerts"])
+
+
+class SliceD3Tests(BirthdayBase):
+    """Slice D3 (G2 PR #309 LATER L1 and L2). L1: every guard of ``_write``
+    holds the ``bday_added_earlier_month`` removals (the G2's probe P3; one
+    test per guard, G2 mutants Q08 to Q13). L2: only an add that is still
+    this tool's latest DONE birthday write counts, so a birthday tag set
+    again by hand after this tool's own DONE removal is left (the G2's
+    probe P4, both ways)."""
+
+    EARLIER = SectionNineTests.EARLIER
+
+    def corners(self) -> None:
+        """D9 cleared (1), D9 unreadable (2), D13 cleared (3), D13
+        unreadable (4), each added by this tool in October."""
+
+        self.member(1, active=None, tags=[TAG, BDAY])
+        self.member(2, active=None, tags=[TAG, BDAY], birthday=month("march"))
+        self.member(20, tags=[TAG])  # a link set that is not empty; kept, so no qualified write comes first
+        self.shopify.add(3, [BDAY])
+        self.shopify.add(4, [BDAY], birthday=month("march"))
+        for n in (1, 2, 3, 4):
+            self.done_add(n, BDAY, self.EARLIER)
+
+    def done_write(self, n: int, op: str, at: datetime, state: str = "DONE", tag: str = BDAY) -> None:
+        """A settled write of ``tag`` for customer n recorded at ``at`` (the ledger's clock)."""
+        self.engine()
+        saved, self.now = self.now, at
+        try:
+            write_id = self.ledger.add_intent(run_id="run-old", customer_gid=customer_gid(n), tag=tag, op=op, reason="x",
+                                              member_no=sg(n), basis="sync155")
+            self.ledger.set_outcome(write_id, state, None)
+        finally:
+            self.now = saved
+
+    def bday_removes(self) -> list:
+        return [(r["customer_gid"], r["reason"]) for r in self.rows()
+                if r["tag"] == BDAY and r["op"] == "remove" and r["run_id"] != "run-old"]
+
+    # L1: the guards (fake data, the G2's P3Guards)
+
+    def test_l1_observe_counts_them_and_sends_nothing(self):
+        self.corners()
+        result = self.run_tool(apply=False)
+        self.assertEqual(self.shopify.writes, [])
+        self.assertEqual(result["counts"]["would_bday_untag"], 4)
+        self.assertEqual(result["counts"]["bday_untag_reason:bday_added_earlier_month"], 4)
+
+    def test_l1_q09_the_birthday_switch_off_sends_none_of_them(self):
+        self.corners()
+        result = self.run_tool(bday_tag_enabled=False)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_writes_disabled"], 4)
+
+    def test_l1_the_tags_write_switch_off_refuses_apply(self):
+        self.corners()
+        with self.assertRaises(dl.DirectLocalError):
+            self.run_tool(tags_write_enabled=False)
+        self.assertEqual(self.shopify.writes, [])
+
+    def test_l1_q10_the_pilot_list_holds_them(self):
+        self.corners()
+        result = self.run_tool(bday_only_customers=[customer_gid(2), customer_gid(4)])
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(2), [BDAY]), ("remove", customer_gid(4), [BDAY])])
+        self.assertEqual(result["counts"]["bday_not_in_pilot"], 2)
+
+    def test_l1_q11_the_birthday_remove_cap_holds_them(self):
+        self.corners()
+        result = self.run_tool(max_bday_removes_per_run=1)
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY])])
+        self.assertIn("bday_tag_removes_capped", result["alerts"])
+        self.assertEqual(result["counts"]["bday_tag_removes_capped"], 3)
+
+    def test_l1_q12_the_stop_file_holds_them(self):
+        self.corners()
+        (self.root / mt.STOP_FILE).write_text("stop", encoding="ascii")
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["stopped"], "stop_file_present")
+
+    def test_l1_q13_the_clock_guard_holds_them(self):
+        self.corners()
+        self.book.skew = timedelta(minutes=11)
+        result = self.run_tool()
+        self.assertEqual(self.shopify.writes, [])
+        self.assertIn("clock_mismatch", result["alerts"])
+
+    def test_l1_q08_the_type_count_check_holds_them(self):
+        self.corners()
+        self.book.count_extra = {"MEMBER": 1}
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["untag_withheld_scan_count"], 4)
+
+    def test_l1_the_volume_guard_withholds_six(self):
+        self.corners()
+        self.member(5, active=None, tags=[TAG, BDAY])
+        self.shopify.add(6, [BDAY])
+        for n in (5, 6):
+            self.done_add(n, BDAY, self.EARLIER)
+        result = self.run_tool(max_bday_removes_per_run=50)
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(result["counts"]["bday_untag_withheld"], 6)
+
+    # L2: a hand tag after this tool's own removal
+
+    def l2_fixture(self, *, own_removal: bool) -> None:
+        """D9 cleared (1), D6 cleared (2), D13 cleared (3), D7 unreadable (4)
+        and D13 unreadable (5): this tool added the birthday tag in October
+        and, with ``own_removal``, took it off again in October; the tag is
+        on now (set again by hand) and the month is cleared or unreadable."""
+
+        self.member(1, active=None, tags=[TAG, BDAY])
+        self.member(2, tags=[TAG, BDAY])
+        self.member(20)
+        self.shopify.add(3, [BDAY])
+        self.member(4, tags=[TAG, BDAY], birthday=month("march"))
+        self.shopify.add(5, [BDAY], birthday=month("march"))
+        for n in (1, 2, 3, 4, 5):
+            self.done_add(n, BDAY, self.EARLIER)
+            if own_removal:
+                self.done_write(n, "remove", self.EARLIER + timedelta(days=5))
+
+    def test_l2_a_hand_tag_after_this_tools_own_removal_is_left(self):
+        # The G2's probe P4: it failed at 6a4ef29 by design and passes now
+        self.l2_fixture(own_removal=True)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [])
+        self.assertEqual(self.bday_removes(), [])
+        self.assertNotIn("bday_untag_reason:bday_added_earlier_month", result["counts"])
+        self.assertEqual(result["counts"]["bday_left_with_member"], 1)  # D9: counted every run
+        self.assertEqual(result["counts"]["bday_tag_without_basis"], 2)  # D13: alert once, counted every run
+        self.assertEqual(sorted(set(result["alerts"])), ["bday_month_missing", "bday_month_unreadable", "bday_tag_without_basis",
+                                                          "member_active_unreadable"])  # the last: C1 row 9
+        for n in (1, 2, 3, 4, 5):
+            self.assertIn(BDAY, self.shopify.tags(n))
+        self.now += timedelta(hours=1)
+        again = self.run_tool()  # and on every later run, with D6 and D7 alerted every run
+        self.assertEqual(self.bday_writes(), [])
+        self.assertIn("bday_month_missing", again["alerts"])
+        self.assertIn("bday_month_unreadable", again["alerts"])
+
+    def test_l2_without_the_own_removal_the_earlier_add_still_takes_it_off(self):
+        # The G2's probe P4 the other way: the October add is still this tool's latest write
+        self.l2_fixture(own_removal=False)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2, 3, 4, 5)])
+        self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_added_earlier_month") for n in (1, 2, 3, 4, 5)])
+        self.assertEqual(result["counts"]["bday_untag_reason:bday_added_earlier_month"], 5)
+
+    def test_l2_only_this_tools_latest_done_birthday_write_decides(self):
+        september = self.EARLIER - timedelta(days=30)
+        for n in range(1, 6):
+            self.member(n, active=None, tags=[TAG, BDAY])  # D9, month cleared, the tag on
+        self.done_add(1, BDAY, september)                   # 1: added, removed, added again in October: off
+        self.done_write(1, "remove", september + timedelta(days=1))
+        self.done_add(1, BDAY, self.EARLIER)
+        self.done_add(3, BDAY, self.EARLIER)                # 3: the removal was rejected, not DONE: off
+        self.done_write(3, "remove", self.EARLIER + timedelta(days=1), state="REJECTED")
+        self.done_add(4, BDAY, self.EARLIER)                # 4: only the qualified tag was removed after it: off
+        self.done_write(4, "remove", self.EARLIER + timedelta(days=1), tag=TAG)
+        late = self.EARLIER + timedelta(days=10)            # 2: removed in the same second as the add, recorded
+        self.done_add(2, BDAY, late)                        #    after it: left. It is also the latest DONE
+        self.done_write(2, "remove", late)                  #    birthday write in the ledger (any customer)
+        self.done_add(5, BDAY, self.now - timedelta(days=2))  # 5: added this month, removed, tagged by hand: left
+        self.done_write(5, "remove", self.now - timedelta(days=1))
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 3, 4)])
+        self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_added_earlier_month") for n in (1, 3, 4)])
+        self.assertEqual(result["counts"]["bday_left_with_member"], 2)
+
+    def test_l2_only_the_birthday_tags_own_adds_count(self):
+        # G2 Z05 / G1 N20, no longer caught by the qualified-only test once
+        # L2 reads the latest birthday write: the qualified tag's adds never count
+        self.member(1, active=None, tags=[TAG, BDAY])  # D9 cleared: birthday add in October, qualified add this month: off
+        self.member(2, active=None, tags=[TAG, BDAY])  # D9 cleared: birthday add this month, qualified add in October: left
+        self.done_add(1, BDAY, self.EARLIER)
+        self.done_add(1, TAG, self.now - timedelta(days=2))
+        self.done_add(2, BDAY, self.now - timedelta(days=2))
+        self.done_add(2, TAG, self.EARLIER)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY])])
+        self.assertEqual(self.bday_removes(), [(customer_gid(1), "bday_added_earlier_month")])
+        self.assertEqual(result["counts"]["bday_left_with_member"], 1)
+
+    def test_l2_after_the_own_removal_another_month_is_no_month_change_removal(self):
+        # The exemption reads the same rule: the tag still comes off (another
+        # valid month is a fact), but under the birthday volume guard
+        self.member(1, tags=[TAG, BDAY], birthday=MAR)  # D4: added in October, removed, set again by hand
+        self.member(2, tags=[TAG, BDAY], birthday=MAR)  # D4: added in October, still this tool's latest write
+        for n in (1, 2):
+            self.done_add(n, BDAY, self.EARLIER)
+        self.done_write(1, "remove", self.EARLIER + timedelta(days=5))
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2)])
+        self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_month_other") for n in (1, 2)])
+        self.assertEqual(result["counts"]["bday_month_change_removals"], 1)
 
 
 class BirthdayLaterTests(BirthdayBase):
