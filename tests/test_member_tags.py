@@ -2979,6 +2979,20 @@ class SliceD3Tests(BirthdayBase):
         self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_added_earlier_month") for n in (1, 3, 4)])
         self.assertEqual(result["counts"]["bday_left_with_member"], 2)
 
+    def test_l2_only_the_birthday_tags_own_adds_count(self):
+        # G2 Z05 / G1 N20, no longer caught by the qualified-only test once
+        # L2 reads the latest birthday write: the qualified tag's adds never count
+        self.member(1, active=None, tags=[TAG, BDAY])  # D9 cleared: birthday add in October, qualified add this month: off
+        self.member(2, active=None, tags=[TAG, BDAY])  # D9 cleared: birthday add this month, qualified add in October: left
+        self.done_add(1, BDAY, self.EARLIER)
+        self.done_add(1, TAG, self.now - timedelta(days=2))
+        self.done_add(2, BDAY, self.now - timedelta(days=2))
+        self.done_add(2, TAG, self.EARLIER)
+        result = self.run_tool()
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY])])
+        self.assertEqual(self.bday_removes(), [(customer_gid(1), "bday_added_earlier_month")])
+        self.assertEqual(result["counts"]["bday_left_with_member"], 1)
+
     def test_l2_after_the_own_removal_another_month_is_no_month_change_removal(self):
         # The exemption reads the same rule: the tag still comes off (another
         # valid month is a fact), but under the birthday volume guard
