@@ -1366,6 +1366,91 @@ class Bf2bDecisionTests(SummaryTestCase):
         self.assertEqual(stops, [])
 
 
+class Bf2cUnfinishedBackfillTests(SummaryTestCase):
+    """#155 BF2c (F2): an unfinished backfill-members call is a STOP (unfinished_runs), never a
+    pass, inside a window or not, with or without the BF2b settings."""
+
+    run_with = Bf2bDecisionTests.run_with
+
+    def test_one_unfinished_call_stops_everywhere(self):
+        part = backfill_part(unfinished=1)
+        cases = (  # the Bf2bDecisionTests cases, each now with unfinished_runs first
+            ("window", 41, dict(expected=True, window=dict(WINDOW)), ["unfinished_runs"]),
+            ("window_not_expected", 40, dict(expected=False, window=dict(WINDOW)), ["unfinished_runs"]),
+            ("expected_no_window", 41, dict(expected=True, window=None), ["unfinished_runs", "shopify_write", "writes_over_cap"]),
+        )
+        for name, created, kwargs, stops in cases:
+            with self.subTest(name=name):
+                event = self.run_with(creates_digest(created=created, backfill=part, hour_max=created), **kwargs)
+                self.assertEqual(event["stop_reasons"], stops)
+                self.assertEqual(event["digest"]["alerts"][summary.BACKFILL_SHOWN], 40)
+                self.assertEqual(event["digest"]["runs_unfinished"], 0)  # the event's shape is unchanged
+                summary.check_event(event)
+        # Keys absent (the BF2a rules): it stops too.
+        plain = self.run_daily(runner=FakeRunner(digest=creates_digest(backfill=backfill_part(creates=0, writes=0, writes_per_call_max=0,
+                                                                                                  writes_per_hour_max=0, unfinished=1))))
+        self.assertEqual(plain["stop_reasons"], ["unfinished_runs"])
+        self.assertNotIn(summary.BACKFILL_SHOWN, plain["digest"]["alerts"])
+
+    def test_without_an_unfinished_call_nothing_changes(self):
+        for part in (backfill_part(), backfill_part(unfinished=0)):
+            with self.subTest(part=part):
+                self.assertEqual(self.run_with(creates_digest(created=41, backfill=part, hour_max=41), expected=True, window=dict(WINDOW))["stop_reasons"], [])
+        # One unfinished live run is still no stop (as before); two still are.
+        self.assertEqual(self.run_daily(runner=FakeRunner(digest=digest_fixture(runs={"completed": 90, "unfinished": 1})))["stop_reasons"], [])
+        self.assertEqual(self.run_daily(runner=FakeRunner(digest=digest_fixture(runs={"completed": 90, "unfinished": 2})))["stop_reasons"], ["unfinished_runs"])
+
+    def test_the_reader_is_bounded_and_fails_to_zero(self):
+        for raw, expected in ((None, 0), ({}, 0), ({"backfill_members": None}, 0), ({"backfill_members": {}}, 0),
+                              ({"backfill_members": {"unfinished": "1"}}, 0), ({"backfill_members": {"unfinished": True}}, 0),
+                              ({"backfill_members": {"unfinished": -1}}, 0), ({"backfill_members": {"unfinished": 2}}, 2), ("x", 0)):
+            with self.subTest(raw=raw):
+                self.assertEqual(summary.backfill_unfinished(raw), expected)
+
+    def test_a_digest_that_failed_is_digest_failed_only(self):
+        value = {**self.settings_value(), "shopify_creates_expected": True, "backfill_members_window": dict(WINDOW)}
+        event = self.run_daily(runner=FakeRunner(digest=creates_digest(backfill=backfill_part(unfinished=1)),
+                                                 codes={"digest": 2}), settings=summary.parse_settings(value))
+        self.assertEqual(event["stop_reasons"], ["digest_failed"])
+
+    def test_real_digest_with_a_killed_backfill_call_end_to_end(self):
+        import xb_member_sync as sync
+        import xb_directlocal as dl
+
+        ledger_root = self.temp / "ledger"
+        ledger_root.mkdir()
+        cfg = sync.parse_config({"schema": sync.CONFIG_SCHEMA, "state_root": str(ledger_root), "autocount_book": "AED_TESTINGAPI",
+                                 "shopify": {"store_gid": "gid://shopify/Shop/900000001", "shop_domain": "xb-sync-test.synthetic.invalid",
+                                             "api_version": "2026-07", "auth": {"method": "admin_api_access_token", "token_env": "XB_SHOPIFY_SYNC_TOKEN"}},
+                                 "shopify_cutover_utc": "2026-11-01T00:00:00Z"})
+        ledger = sync.SyncLedger(ledger_root, clock=lambda: NOW, check_custody=False)
+        start = NOW - timedelta(hours=2)
+        try:
+            ledger.init_meta(autocount_book="AED_TESTINGAPI", store_gid=cfg.shopify.store_gid, shop_domain=cfg.shopify.shop_domain)
+            with ledger.tx() as conn:
+                conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('run-1', ?, ?, ?)",
+                             (dl.ts(start), dl.ts(start + timedelta(seconds=30)), json.dumps({"counts": {}, "alerts": [], "refs": []})))
+                # Killed after one create landed and with the next one sent: no end, no counts.
+                conn.execute("INSERT INTO runs(run_id, started_at) VALUES ('bf2-1', ?)", (dl.ts(start + timedelta(minutes=2)),))
+                for i, state in enumerate(("DONE", "INTENT")):
+                    at = start + timedelta(minutes=3)
+                    conn.execute("INSERT INTO writes(write_id, direction, member_no, member_no_key, state, created_at, updated_at) "
+                                 "VALUES (?, 'ac2_to_shopify', ?, ?, ?, ?, ?)", (f"write-{i}", f"M{i}", f"m{i}", state, dl.ts(at), dl.ts(at)))
+                conn.execute("INSERT INTO runs(run_id, started_at, finished_at, summary) VALUES ('run-2', ?, ?, ?)",
+                             (dl.ts(start + timedelta(minutes=15)), dl.ts(start + timedelta(minutes=16)), json.dumps({"counts": {}, "alerts": [], "refs": []})))
+        finally:
+            ledger.close()
+        real = json.loads(json.dumps(sync.ledger_digest(ledger_root, hours=24, now=NOW, config=cfg)))
+        self.assertEqual({k: real["backfill_members"][k] for k in ("calls", "creates", "unfinished", "writes")},
+                         {"calls": 1, "creates": 1, "unfinished": 1, "writes": 2})
+        for kwargs in (dict(expected=True, window=dict(WINDOW)), dict(expected=False, window=None)):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                event = self.run_with(real, config=config_fixture(shopify_create_enabled=True), **kwargs)
+                self.assertIn("unfinished_runs", event["stop_reasons"])
+        event = self.run_with(real, expected=True, window=dict(WINDOW))
+        self.assertEqual((event["stop_reasons"], event["digest"]["alerts"][summary.BACKFILL_SHOWN]), (["unfinished_runs"], 1))
+
+
 # The summary's own golden output (pass bar: with the BF2b keys absent, unchanged). One trace of
 # every case below through daily(): the result line and the whole record. Its SHA-256 was made on
 # the main 3340b03 source of xb_member_sync_daily_summary.py (loaded in place of this one, same

@@ -300,9 +300,15 @@ against Shopify split and whole (stayed separate).
    3) and counts `changelog_row_unparsed_skipped`. The member of a skipped
    row is not queued for S6; the backfill re-sweep (`backfill-members`)
    finds them. Bounded: at most `CHANGELOG_UNPARSED_SKIP_MAX` (5) rows are
-   skipped in one run; the next one stops the read as before (the
-   watermark stays before it, later rows wait for the next run, which
-   starts a fresh bound). The daily summary reads the alert as
+   skipped in one run, and (#155 BF2c, G2 F4) at most 5 in any rolling 24
+   hours across runs. The next one stops the read as before: the watermark
+   stays before it, later rows wait, and every run that meets it alerts
+   again. A skip is allowed again only once the oldest of the last five
+   skips is 24 hours old. The times of the skips are kept in the watermark
+   `changelog_unparsed_skipped_at` (times only, no member data), written
+   with the skip; an unreadable value skips nothing (the read stops). So a
+   systematic parse failure (for example an XML shape change) skips at most
+   5 members a day, not 5 a run. The daily summary reads the alert as
    `alert_unexpected` (STOP): a person looks at the VM.
 4. A highest ID below the watermark (numbering went backwards) is refused:
    alert and count `changelog_id_reset_detected`, nothing processed, the
@@ -1223,6 +1229,15 @@ phone for the probe (design 6.1).
    cap). End each sitting with headroom (the live run's own creates count in
    the same hour). Digest after each sitting. Without the caps set, the BF2a
    caps apply (`--max 5`, 20 writes an hour).
+   **Never kill a call** (no Ctrl+C, no closing the window, no VM restart
+   while a call runs); to end a sitting early, create the stop file and let
+   the call stop before its next member. A call that an error or a Ctrl+C
+   ends still stores its counts (#155 BF2c: `stopped`
+   `bf2_call_interrupted`, a non-zero exit). **If a call ends without an
+   exit code, or with any exit other than 0 or 3:** run `digest --hours 24`
+   and `status` at once, compare the `backfill_members` part's `creates`
+   and `writes`, and treat it as a stop until the Controller says. The next
+   daily summary stops on it too (`unfinished_runs`).
    **Any exit 3: stop and look.**
    - `bf2_create_uncertain`: never re-sent; the next call (or live run)
      settles it by email (above). Do not edit that member's email.
@@ -1605,7 +1620,7 @@ prove each (`tests/test_member_sync_daily_summary.py`).
 | `config_unexpected` | `shopify_create_enabled` is not exactly false (missing counts; #155 BF2b: with `shopify_creates_expected: true`, true is expected too), the member type is not `expected_member_type` (GUEST), or the live config's `state_root` is not the `sync_state_root` in the summary settings (the email line says `state_root_as_in_settings=no`) |
 | `digest_failed` | `digest` refused or did not answer |
 | `no_runs` | No completed run in 24 hours, with the digest readable. A dead sync must not read CLEAN. |
-| `unfinished_runs` | More than 1 unfinished run in 24 hours |
+| `unfinished_runs` | More than 1 unfinished run in 24 hours, or (#155 BF2c) any `backfill-members` call that did not end normally (the digest's `backfill_members.unfinished`: killed before it stored its end, or ended by an error or an interrupt), with or without the settings below |
 | `shopify_write` | Any Shopify write: every outcome code of the sync's one Shopify mutation that means a create was sent (`shopify_customer_created`, `shopify_create_uncertain`; #155 BF2a removed the "without phone" code with its path). A test reads `xb_member_sync.py` and fails if it counts a create outcome that is not on this list. #155 BF2b, with creates expected or a backfill window in effect (below): an uncertain or rejected create, a create while the config says off, or a backfill write outside a declared window |
 | `uncertain_writes` | Uncertain writes open |
 | `possible_duplicate_member` | The alert, any count |
@@ -1634,8 +1649,11 @@ exactly as before (a pinned golden output of the summary proves it):
   effect for a morning's summary when its 24 hours (yesterday and today)
   touch those dates. Then the backfill calls' creates (the digest's
   `backfill_members` part: calls whose run id starts `bf2-`, their stored
-  create outcomes, and the writes made while each call ran) are counted
-  apart; an uncertain or rejected backfill create stops (`shopify_write`),
+  create outcomes, and the writes made while each call ran; #155 BF2c: a
+  call's creates are never fewer than the Shopify create rows that landed
+  (`DONE`) while it ran, so a killed call that stored no counts still
+  shows them, and `unfinished` counts the calls that did not end
+  normally) are counted apart; an uncertain or rejected backfill create stops (`shopify_write`),
   and more writes in one call or one clock hour than declared is
   `writes_over_cap`. Live creates during the window follow
   `shopify_creates_expected`.
@@ -1915,7 +1933,13 @@ python directlocal\xb_member_sync.py backfill-members --config <config> [--apply
 `backfill-members` (#155 slice BF2a) is described in "Backfill of AutoCount
 members to Shopify" above. It exits 0, or 3 when an operator must look
 before the next call (`bf2_create_uncertain`, `bf2_create_rejected`,
-`bf2_read_incomplete`), or 2 when refused.
+`bf2_read_incomplete`), or 2 when refused. #155 BF2c: an applied call that
+an error or an interrupt (Ctrl+C) ends stores its end and its counts so far
+(`stopped` `bf2_call_interrupted`) and exits non-zero (2 for a refusal
+code, otherwise Python's own non-zero exit); the digest counts it in
+`backfill_members.unfinished`. A process kill stores nothing; the digest
+then counts the call as unfinished and its creates from the landed write
+rows.
 
 `backfill-registrations` and `coverage` (#155 slice BF1) are described in
 "Backfill of older sign-ups" above. `backfill-registrations` exits 0, or 3
