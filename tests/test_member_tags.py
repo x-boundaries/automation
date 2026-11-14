@@ -3037,8 +3037,8 @@ class SliceD3Tests(BirthdayBase):
         self.now = NOW
         result = self.run_tool()                               # November: D6
         self.assertEqual(result["counts"]["write_settled_not_written"], 1)
-        self.assertEqual(self.bday_rows()[-2][1:4], ("remove", "bday_month_other", "NOT_WRITTEN"))
-        self.assertEqual(self.bday_rows()[-1][1:4], ("remove", "bday_added_earlier_month", "DONE"))
+        self.assertEqual([r[1:4] for r in self.bday_rows()], [("remove", "bday_month_other", "NOT_WRITTEN"),
+                                                             ("remove", "bday_added_earlier_month", "DONE")])
         self.assertNotIn(BDAY, self.shopify.tags(1))
 
     def test_l4_an_own_removal_that_landed_then_a_hand_tag_before_the_settle_is_not_written_and_off(self):
@@ -3055,8 +3055,8 @@ class SliceD3Tests(BirthdayBase):
         result = self.run_tool()
         self.assertEqual(result["counts"]["write_settled_not_written"], 1)
         self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY])] * 2)
-        self.assertEqual(self.bday_rows()[-2][1:4], ("remove", "bday_month_other", "NOT_WRITTEN"))
-        self.assertEqual(self.bday_rows()[-1][1:4], ("remove", "bday_added_earlier_month", "DONE"))
+        self.assertEqual([r[1:4] for r in self.bday_rows()], [("remove", "bday_month_other", "NOT_WRITTEN"),
+                                                             ("remove", "bday_added_earlier_month", "DONE")])
         self.assertNotIn(BDAY, self.shopify.tags(1))
 
     def test_l4_a_settled_removal_and_a_re_add_in_the_same_second_leave_the_add_current(self):
