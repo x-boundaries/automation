@@ -76,11 +76,11 @@ Alerts of rows 1 to 3, 5, 9 to 11b, 12, 14 and 16 are raised once per customer (
 | D6 | Q `on`, month missing, `B` | off when this tool's last `DONE` birthday add for the customer was in an earlier Singapore month (its month has passed) and no `DONE` birthday removal by this tool came after it (slice D3); else leave alone (a cleared field is not taken as a fact) | `bday_untag_reason:bday_added_earlier_month` / `bday_month_missing` (alert **every run**) |
 | D7 | Q `on`, month unreadable | `B`: as D6; not `B`: leave alone | `bday_untag_reason:bday_added_earlier_month` / `bday_month_unreadable` (alert every run when `B`, once when not) |
 | D8 | Q `off` (positive fact) | off with the same reason; if not `B`, nothing | `bday_untag_reason:member_inactive`, `..._member_expired`, `..._member_not_member` |
-| D9 | Q `leave`, and the month is not another valid month (D4) | `B` with the month missing or unreadable: as D6 (off when this tool's add was in an earlier month; slice D2); otherwise leave alone, both ways | `bday_untag_reason:bday_added_earlier_month` / `bday_left_with_member` (counted every run; the row's alert is already raised) |
+| D9 | Q `leave`, and the month is not another valid month (D4) | `B` with the month missing or unreadable: as D6 (off when this tool's add was in an earlier month and no `DONE` birthday removal by this tool came after it; slices D2 and D3); otherwise leave alone, both ways | `bday_untag_reason:bday_added_earlier_month` / `bday_left_with_member` (counted every run; the row's alert is already raised) |
 | D10 | add path: `member-mg` (any case or spaces) and no `membership.start_date` | no add | `flow_dates_guard` (alert) |
 | D11 | add path: two `DONE` birthday adds in the last 24 hours and the tag gone again | no add | `bday_tag_keeps_disappearing` (alert) |
 | D12 | `B`, no basis, a voided pair for the customer | off | `bday_untag_reason:link_voided` |
-| D13 | `B`, no basis, no voided pair, and the month is not another valid month (D4) | month missing or unreadable: as D6 (off when this tool's add was in an earlier month; slice D2, before the C2 switch); otherwise leave alone; off only with the C2 switch (section 4) | `bday_untag_reason:bday_added_earlier_month` / `bday_tag_without_basis` (alert once, counted every run) / `bday_untag_reason:tag_without_basis` |
+| D13 | `B`, no basis, no voided pair, and the month is not another valid month (D4) | month missing or unreadable: as D6 (off when this tool's add was in an earlier month and no `DONE` birthday removal by this tool came after it; slices D2 and D3, before the C2 switch); otherwise leave alone; off only with the C2 switch (section 4) | `bday_untag_reason:bday_added_earlier_month` / `bday_tag_without_basis` (alert once, counted every run) / `bday_untag_reason:tag_without_basis` |
 | D14 | `bday_tag_enabled` false | decide and count as above, send nothing, even in `apply` | `bday_writes_disabled` (count of birthday writes not sent) |
 | D15 | `bday_only_customers` not empty and the customer not in it | decide and count, send nothing for that customer | `bday_not_in_pilot` |
 
@@ -88,7 +88,7 @@ Alerts of rows 1 to 3, 5, 9 to 11b, 12, 14 and 16 are raised once per customer (
 
 A voided pair (D12) keeps its own reason `link_voided` whatever the month field says, and is never a month-change removal.
 
-Every birthday removal of these rows (D4 whatever Q is, D6, D7, D9, D12, D13) stays under the birthday remove cap, the birthday volume guard (only a `bday_month_other` removal can be a month-change removal; `bday_added_earlier_month` never is), the stop file, the clock guard, the type-count check and `bday_tag_enabled`. The `member-qualified` decision is unchanged by any of them.
+Every birthday removal of these rows (D4 whatever Q is, D6, D7, D8, D9, D12, D13) stays under the birthday remove cap, the birthday volume guard (only a `bday_month_other` removal can be a month-change removal; `bday_added_earlier_month` never is), the stop file, the clock guard, the type-count check and `bday_tag_enabled`. The `member-qualified` decision is unchanged by any of them.
 
 **Order inside a run:** every `member-qualified` write first (adds, then removals), then the birthday writes (adds, then removals), each by customer number ascending.
 
