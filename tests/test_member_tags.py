@@ -2816,7 +2816,10 @@ class SliceD3Tests(BirthdayBase):
     test per guard, G2 mutants Q08 to Q13). L2: only an add that is still
     this tool's latest DONE birthday write counts, so a birthday tag set
     again by hand after this tool's own DONE removal is left (the G2's
-    probe P4, both ways)."""
+    probe P4, both ways). Slice D3b (G2 PR #312 LATER L4): a NOT_WRITTEN
+    own removal never counts, and a same-second tie with the add recorded
+    after a settled removal leaves the add current (the G2's probes R1b,
+    R1c and R2a; mutants V01, V02 and V04)."""
 
     EARLIER = SectionNineTests.EARLIER
 
@@ -2970,8 +2973,8 @@ class SliceD3Tests(BirthdayBase):
         self.done_add(4, BDAY, self.EARLIER)                # 4: only the qualified tag was removed after it: off
         self.done_write(4, "remove", self.EARLIER + timedelta(days=1), tag=TAG)
         late = self.EARLIER + timedelta(days=10)            # 2: removed in the same second as the add, recorded
-        self.done_add(2, BDAY, late)                        #    after it: left. It is also the latest DONE
-        self.done_write(2, "remove", late)                  #    birthday write in the ledger (any customer)
+        self.done_add(2, BDAY, late)                        #    after it: left (the rowid breaks the tie). The
+        self.done_write(2, "remove", late)                  #    other tie direction: the L4 same-second test
         self.done_add(5, BDAY, self.now - timedelta(days=2))  # 5: added this month, removed, tagged by hand: left
         self.done_write(5, "remove", self.now - timedelta(days=1))
         result = self.run_tool()
@@ -3005,6 +3008,75 @@ class SliceD3Tests(BirthdayBase):
         self.assertEqual(self.bday_writes(), [("remove", customer_gid(n), [BDAY]) for n in (1, 2)])
         self.assertEqual(self.bday_removes(), [(customer_gid(n), "bday_month_other") for n in (1, 2)])
         self.assertEqual(result["counts"]["bday_month_change_removals"], 1)
+
+    # L4 (slice D3b, G2 PR #312): the edges of the new read through real runs
+    # (the G2's probes R1b, R1c and R2a; G2 mutants V01, V02 and V04)
+
+    def bday_rows(self) -> list:
+        """This tool's own birthday rows (not the fixture's), in record order:
+        (customer, op, reason, state, updated_at)."""
+
+        return [(r["customer_gid"], r["op"], r["reason"], r["state"], r["updated_at"]) for r in self.rows()
+                if r["tag"] == BDAY and r["run_id"] != "run-old"]
+
+    def own_removal_in_october(self, answer: str) -> None:
+        """Customer 1: Q on, the tag on, March on record; this tool added the
+        tag on 1 Oct. The 20 Oct run sends a D4 removal that gets ``answer``."""
+
+        self.member(1, tags=[TAG, BDAY], birthday=MAR)
+        self.done_add(1, BDAY, self.EARLIER - timedelta(days=19))
+        self.now = self.EARLIER
+        self.shopify.answers = {customer_gid(1): [answer]}
+
+    def test_l4_an_own_removal_that_did_not_land_settles_not_written_and_the_tag_comes_off(self):
+        # G2 R1b: the removal is UNCERTAIN, the read shows the tag still on, so it
+        # settles NOT_WRITTEN; the October add stays this tool's latest DONE write
+        self.own_removal_in_october("uncertain_unapplied")
+        self.assertEqual(self.run_tool()["stopped"], "write_uncertain")
+        self.shopify.customers_by_gid[customer_gid(1)]["birthday"] = None  # staff clear the field
+        self.now = NOW
+        result = self.run_tool()                               # November: D6
+        self.assertEqual(result["counts"]["write_settled_not_written"], 1)
+        self.assertEqual(self.bday_rows()[-2][1:4], ("remove", "bday_month_other", "NOT_WRITTEN"))
+        self.assertEqual(self.bday_rows()[-1][1:4], ("remove", "bday_added_earlier_month", "DONE"))
+        self.assertNotIn(BDAY, self.shopify.tags(1))
+
+    def test_l4_an_own_removal_that_landed_then_a_hand_tag_before_the_settle_is_not_written_and_off(self):
+        # G2 R1c (V01, V02): the removal landed, but the tag is set again by hand
+        # before the next run, so the read settles it NOT_WRITTEN; a NOT_WRITTEN
+        # removal never counts, so the October add is current and the tag comes
+        # off (the stricter side)
+        self.own_removal_in_october("uncertain_applied")
+        self.run_tool()
+        self.assertNotIn(BDAY, self.shopify.tags(1))
+        self.shopify.tags(1).append(BDAY)                      # set again by hand before the next run
+        self.shopify.customers_by_gid[customer_gid(1)]["birthday"] = None
+        self.now = NOW
+        result = self.run_tool()
+        self.assertEqual(result["counts"]["write_settled_not_written"], 1)
+        self.assertEqual(self.bday_writes(), [("remove", customer_gid(1), [BDAY])] * 2)
+        self.assertEqual(self.bday_rows()[-2][1:4], ("remove", "bday_month_other", "NOT_WRITTEN"))
+        self.assertEqual(self.bday_rows()[-1][1:4], ("remove", "bday_added_earlier_month", "DONE"))
+        self.assertNotIn(BDAY, self.shopify.tags(1))
+
+    def test_l4_a_settled_removal_and_a_re_add_in_the_same_second_leave_the_add_current(self):
+        # G2 R2a (V04): a settle-by-read and a new write in one run share one
+        # second (the fake clock is frozen in a run); the add is recorded after
+        # the removal, so the rowid makes the add the latest DONE write. The
+        # other tie direction is customer 2 of the "latest DONE write" test
+        self.own_removal_in_october("uncertain_applied")
+        self.run_tool()                                        # D4 removal, uncertain (landed)
+        self.shopify.customers_by_gid[customer_gid(1)]["birthday"] = month("October")  # staff fix the month
+        self.now = self.EARLIER + timedelta(hours=2)
+        self.run_tool()                                        # settle DONE, then a D3 add DONE, same second
+        rows = self.bday_rows()
+        self.assertEqual([(r[1], r[3]) for r in rows[-2:]], [("remove", "DONE"), ("add", "DONE")])
+        self.assertEqual(rows[-2][4], rows[-1][4])             # a real same-second tie
+        self.shopify.customers_by_gid[customer_gid(1)]["birthday"] = None
+        self.now = NOW
+        self.run_tool()                                        # November, cleared: the October add is current: off
+        self.assertEqual(self.bday_rows()[-1][1:4], ("remove", "bday_added_earlier_month", "DONE"))
+        self.assertNotIn(BDAY, self.shopify.tags(1))
 
 
 class BirthdayLaterTests(BirthdayBase):
