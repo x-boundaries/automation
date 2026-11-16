@@ -1,5 +1,10 @@
 param(
   [string]$WorkflowDir = "n8n-workflows",
+  [string]$PortableCredentialsFile = "n8n-workflows/toolkit/portable-credentials.json",
+  [string]$DeploymentPolicyFile = "n8n-workflows/toolkit/deployment-policy.json",
+  [string]$ResourceBindingsFile = ".n8n-local/n8n-resource-bindings.json",
+  [string]$WorkflowIdentityFile = ".n8n-local/n8n-workflow-identities.json",
+  [string]$ReportsDir = ".n8n-local/reports",
   [string]$BindingsFile = ".n8n-local\n8n-credential-bindings.json",
   [string]$Container,
   [string]$ContainerName,
@@ -16,22 +21,40 @@ param(
   [switch]$AllowMissingCredentialBindings,
   [switch]$SkipCredentialBindingRefresh,
   [switch]$RestartContainerAfterImport,
+  [switch]$RequireConfirmation,
   [switch]$ForceImport,
-  [switch]$ConfirmLiveImport,
   [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+$DeploymentPolicyFileWasExplicit = $PSBoundParameters.ContainsKey("DeploymentPolicyFile")
+$script:PortablePolicyPreflightPassed = -not $DeploymentPolicyFileWasExplicit
 
 trap {
+  $failure = $_
+  if ((Get-Variable -Name credentialMetadataFile -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath $credentialMetadataFile -PathType Leaf)) {
+    Remove-Item -LiteralPath $credentialMetadataFile -Force -ErrorAction SilentlyContinue
+  }
+  try {
+    if ($script:PortablePolicyPreflightPassed -and -not $script:OperationReportWritten -and (Get-Variable -Name ReportsDirPath -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath $PreparedDirPath -PathType Container)) {
+      $failureCode = "N8N_INTERNAL_ERROR"
+      $failurePhase = "internal"
+      if ($failure.Exception.Message -match '^(N8N_[A-Z_]+):') {
+        $failureCode = $Matches[1]
+        $failurePhase = if ($failureCode -eq "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE" -or $failureCode -eq "N8N_CREDENTIAL_CLEANUP_FAILED") { "discover-target-credential-metadata" } else { "internal" }
+      }
+      $reportWorkflows = if (Get-Variable -Name preflight -ErrorAction SilentlyContinue) { @($preflight.PlannedImports) } else { @() }
+      $reportCredentials = if (Get-Variable -Name preflight -ErrorAction SilentlyContinue) { @($preflight.ReportCredentials) } else { @() }
+      Write-N8nOperationReport "FAILED" $failureCode $failurePhase ([bool]$script:MutationAttempted) ([bool]$script:MutationPerformed) $reportWorkflows $reportCredentials "MAP_FROM_FAILURE_CODE" "Use the deterministic supported action for this failure code." "unknown"
+    }
+  } catch {
+    Write-Host "N8N_INTERNAL_ERROR: sanitized failure report could not be written." -ForegroundColor Red
+  }
   Write-Host ""
   Write-Host "== " -NoNewline -ForegroundColor DarkGray
   Write-Host "Import failed" -NoNewline -ForegroundColor Red
   Write-Host " ==" -ForegroundColor DarkGray
-  Write-Host ($_.Exception.Message) -ForegroundColor Red
-  if (Get-Command Remove-DryRunPlanningDirectory -ErrorAction SilentlyContinue) {
-    Remove-DryRunPlanningDirectory
-  }
+  Write-Host ($failure.Exception.Message) -ForegroundColor Red
   exit 1
 }
 
@@ -58,6 +81,15 @@ function Test-RepoRootPathIsUnsafe($Path) {
   return $fullPath -eq $trimmedRoot
 }
 
+function Assert-StrictRepoChildPath($Path, $Label) {
+  $repoFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+  $candidateFull = [System.IO.Path]::GetFullPath($Path)
+  $prefix = $repoFull + [System.IO.Path]::DirectorySeparatorChar
+  if (-not $candidateFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "N8N_POLICY_VALIDATION_FAILED: $Label must remain inside the resolved repository root."
+  }
+}
+
 function Test-N8nRepoRootCandidate($Path) {
   if (Test-RepoRootPathIsUnsafe $Path) {
     return $false
@@ -66,8 +98,8 @@ function Test-N8nRepoRootCandidate($Path) {
   $hasGit = Test-Path -LiteralPath (Join-Path $Path ".git")
   $hasWorkflowDir = Test-Path -LiteralPath (Join-Path $Path "n8n-workflows") -PathType Container
   $hasToolkitMarkers = (
-    (Test-Path -LiteralPath (Join-Path $Path "repo/scripts/sync-toolkit-projects.cjs") -PathType Leaf) -and
-    (Test-Path -LiteralPath (Join-Path $Path "_projects/n8n/workflow-toolkit/toolkit.project.json") -PathType Leaf)
+    (Test-Path -LiteralPath (Join-Path $Path "repo/scripts/validate-toolkit.cjs") -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $Path "repo/contracts") -PathType Container)
   )
 
   return ($hasGit -and $hasWorkflowDir) -or ($hasGit -and $hasToolkitMarkers)
@@ -167,45 +199,24 @@ function Write-CommandOutput($Lines, [string]$DefaultStatus = "INFO") {
   }
 }
 
-function Read-LiveImportChoice($Prompt) {
-  while ($true) {
-    $choice = Read-Host $Prompt
-    if ([string]::IsNullOrWhiteSpace($choice)) {
-      return $false
-    }
-
-    $normalized = $choice.Trim().Substring(0, 1).ToUpperInvariant()
-    if ($normalized -eq "I") { return $true }
-    if ($normalized -eq "E") { return $false }
-    Write-Step "WARN" "Invalid choice. Press I to import into live n8n or E to exit without changes."
-  }
-}
-
-function Read-RestartContainerChoice($Prompt) {
-  if ([Console]::IsInputRedirected) {
-    Write-Step "WARN" "Input is non-interactive; skipping container restart. Rerun interactively and choose R if a restart is needed."
-    return $false
-  }
-
-  while ($true) {
-    $choice = Read-Host $Prompt
-    if ([string]::IsNullOrWhiteSpace($choice)) {
-      return $false
-    }
-
-    $normalized = $choice.Trim().Substring(0, 1).ToUpperInvariant()
-    if ($normalized -eq "R") { return $true }
-    if ($normalized -eq "E") { return $false }
-    Write-Step "WARN" "Invalid choice. Press R to restart now or E to skip restart."
-  }
+function ConvertTo-NativeArgument([string]$Value) {
+  if ($null -eq $Value) { $Value = "" }
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+  $escaped = [regex]::Replace($Value, '(\\*)"', {
+    param($match)
+    return (-join ('\' * (($match.Groups[1].Value.Length * 2) + 1))) + '"'
+  })
+  $escaped = [regex]::Replace($escaped, '(\\+)$', {
+    param($match)
+    return $match.Value + $match.Value
+  })
+  return '"' + $escaped + '"'
 }
 
 function Invoke-CapturedCommand($Command, [string[]]$Arguments) {
   $process = [System.Diagnostics.Process]::new()
   $process.StartInfo.FileName = $Command
-  $process.StartInfo.Arguments = ($Arguments | ForEach-Object {
-    '"' + ($_ -replace '\\', '\\' -replace '"', '\"') + '"'
-  }) -join " "
+  $process.StartInfo.Arguments = ($Arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join " "
   $process.StartInfo.RedirectStandardOutput = $true
   $process.StartInfo.RedirectStandardError = $true
   $process.StartInfo.UseShellExecute = $false
@@ -379,6 +390,97 @@ function Assert-RunDirectoryPathHasNoUnsafeLinks($Path, $TmpRoot) {
   throw "Refusing to clear unsafe run directory because its path components could not be verified under .tmp/: $resolvedPath"
 }
 
+function Assert-RepoFilePathHasNoUnsafeLinks($Path, $Label) {
+  $resolvedPath = Get-NormalizedFullPath $Path
+  $resolvedRepoRoot = Get-NormalizedFullPath $RepoRoot
+  $comparison = Get-PathStringComparison
+  $current = $resolvedPath
+
+  while (-not [string]::IsNullOrWhiteSpace($current)) {
+    if (Test-Path -LiteralPath $current) {
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+      if (Test-PathItemIsUnsafeLink $item) {
+        throw "N8N_POLICY_VALIDATION_FAILED: $Label contains a symlink, junction, or redirected path."
+      }
+    }
+    if ($current.Equals($resolvedRepoRoot, $comparison)) {
+      return
+    }
+    $parent = Split-Path -Parent $current
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent.Equals($current, $comparison)) {
+      break
+    }
+    $current = Get-NormalizedFullPath $parent
+  }
+
+  throw "N8N_POLICY_VALIDATION_FAILED: $Label could not be verified inside the repository boundary."
+}
+
+function Get-ByteSha256($Bytes) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "")
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Read-SafeDeploymentPolicySnapshot {
+  Assert-StrictRepoChildPath $DeploymentPolicyFilePath "Deployment policy"
+  Assert-RepoFilePathHasNoUnsafeLinks $DeploymentPolicyFilePath "Deployment policy"
+  try {
+    $itemBefore = Get-Item -LiteralPath $DeploymentPolicyFilePath -Force -ErrorAction Stop
+    if (
+      $itemBefore -is [System.IO.FileInfo] -and
+      -not $itemBefore.PSIsContainer -and
+      -not (Test-PathItemIsUnsafeLink $itemBefore)
+    ) {
+      $bytes = [System.IO.File]::ReadAllBytes($DeploymentPolicyFilePath)
+    } else {
+      throw "not a safe regular file"
+    }
+    $itemAfter = Get-Item -LiteralPath $DeploymentPolicyFilePath -Force -ErrorAction Stop
+  } catch {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy is unavailable or unreadable."
+  }
+  if (
+    -not ($itemAfter -is [System.IO.FileInfo]) -or
+    $itemAfter.PSIsContainer -or
+    (Test-PathItemIsUnsafeLink $itemAfter) -or
+    $itemBefore.FullName -ne $itemAfter.FullName -or
+    $itemBefore.Length -ne $itemAfter.Length -or
+    $itemBefore.CreationTimeUtc.Ticks -ne $itemAfter.CreationTimeUtc.Ticks -or
+    $itemBefore.LastWriteTimeUtc.Ticks -ne $itemAfter.LastWriteTimeUtc.Ticks
+  ) {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy changed identity while it was read."
+  }
+  $text = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+  try {
+    $null = $text | ConvertFrom-Json
+  } catch {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy is invalid JSON."
+  }
+  return [PSCustomObject]@{
+    Content = $text
+    Hash = Get-ByteSha256 $bytes
+    Length = [long]$itemAfter.Length
+    CreationTimeUtcTicks = [long]$itemAfter.CreationTimeUtc.Ticks
+    LastWriteTimeUtcTicks = [long]$itemAfter.LastWriteTimeUtc.Ticks
+  }
+}
+
+function Assert-DeploymentPolicySnapshotCurrent($Snapshot) {
+  $current = Read-SafeDeploymentPolicySnapshot
+  if (
+    $current.Hash -ne $Snapshot.Hash -or
+    $current.Length -ne $Snapshot.Length -or
+    $current.CreationTimeUtcTicks -ne $Snapshot.CreationTimeUtcTicks -or
+    $current.LastWriteTimeUtcTicks -ne $Snapshot.LastWriteTimeUtcTicks
+  ) {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy changed after validation."
+  }
+}
+
 function Get-DisplayPath($Path) {
   $resolvedPath = Get-NormalizedFullPath $Path
   $rootPrefix = (Get-NormalizedFullPath $RepoRoot) + [System.IO.Path]::DirectorySeparatorChar
@@ -511,22 +613,6 @@ function Invoke-ProjectWorkflowHook($HookName, [hashtable]$Context) {
   }
 }
 
-function Remove-DryRunPlanningDirectory {
-  if ([string]::IsNullOrWhiteSpace($script:DryRunPlanningDirPath)) {
-    return
-  }
-
-  try {
-    $resolvedPath = Get-NormalizedFullPath $script:DryRunPlanningDirPath
-    $tmpRoot = Get-NormalizedFullPath (Join-Path $RepoRoot ".tmp")
-    if ((Test-PathIsStrictChild $resolvedPath $tmpRoot) -and (Test-Path -LiteralPath $resolvedPath)) {
-      Remove-Item -LiteralPath $resolvedPath -Recurse -Force
-    }
-  } catch {
-    Write-Step "WARN" "Could not remove temporary dry-run planning directory: $(Get-DisplayPath $script:DryRunPlanningDirPath)"
-  }
-}
-
 function Initialize-RunDirectory($Path) {
   $resolvedPath = Get-NormalizedFullPath $Path
   $tmpRoot = Get-NormalizedFullPath (Join-Path $RepoRoot ".tmp")
@@ -551,7 +637,153 @@ function Resolve-WorkflowDirPath {
 }
 
 function Test-MissingLiveWorkflow($CommandResult) {
-  return (($CommandResult.Output -join "`n") -match "No workflows found with specified filters")
+  return (($CommandResult.Output -join "`n") -match "No workflows found with specified filters|No workflows with published versions found")
+}
+
+function Get-N8nCliLogArguments {
+  # n8n prints export:workflow output through its own log. Pin the log settings for this one call so a
+  # container set to a quieter level, file-only output or JSON log lines still prints a readable list.
+  return @("-e", "N8N_LOG_LEVEL=info", "-e", "N8N_LOG_OUTPUT=console", "-e", "N8N_LOG_FORMAT=text", "-e", "NO_COLOR=1")
+}
+
+function Invoke-CliWorkflowJson([string[]]$Arguments, $FailureMessage) {
+  # Workflow JSON is parsed and written by Node only. PowerShell 6+ rewrites date-like strings in the
+  # machine's time zone and every edition rejects keys that differ only by case, so a PowerShell
+  # round trip could change or break a workflow depending on the machine.
+  $result = Invoke-CapturedCommand "node" (@((Join-Path $HelperScriptDir "n8n-cli-workflow-json.cjs")) + $Arguments)
+  if ($result.ExitCode -ne 0) {
+    throw "$FailureMessage`n$($result.Output -join "`n")"
+  }
+}
+
+function Get-LiveWorkflowListDir {
+  $tmpDir = Join-Path $RepoRoot ".tmp"
+  $listDir = Join-Path $tmpDir "n8n-live-workflow-list"
+  foreach ($path in @($tmpDir, $listDir)) {
+    if ((Test-Path -LiteralPath $path) -and (Test-PathItemIsUnsafeLink (Get-Item -LiteralPath $path -Force))) {
+      throw "Refusing to store the live workflow list through a link: $path. Remove the link and rerun."
+    }
+  }
+  New-Item -ItemType Directory -Force -Path $listDir | Out-Null
+  return $listDir
+}
+
+function Get-SafeLiveWorkflowListDir {
+  # Returns the list folder only when it exists and neither it nor .tmp is a link, so clean-up never
+  # deletes anything outside the repository's own folder.
+  $tmpDir = Join-Path $RepoRoot ".tmp"
+  $listDir = Join-Path $tmpDir "n8n-live-workflow-list"
+  if (-not (Test-Path -LiteralPath $listDir -PathType Container)) {
+    return $null
+  }
+  foreach ($path in @($tmpDir, $listDir)) {
+    if (Test-PathItemIsUnsafeLink (Get-Item -LiteralPath $path -Force)) {
+      return $null
+    }
+  }
+  return $listDir
+}
+
+function New-LiveWorkflowListToken {
+  # Each helper file name starts with this run's process id, so a later run can tell which files a
+  # killed run left behind.
+  return ("{0}-{1}" -f $PID, [guid]::NewGuid().ToString("N"))
+}
+
+function Read-LiveWorkflowList($CommandResult) {
+  $listDir = Get-LiveWorkflowListDir
+  $token = New-LiveWorkflowListToken
+  $rawPath = Join-Path $listDir "$token.n8n-output.txt"
+  $storePath = Join-Path $listDir "$token.workflows.json"
+  $summaryPath = Join-Path $listDir "$token.summary.json"
+  Write-Utf8NoBomText -Path $rawPath -Text (($CommandResult.StdOut -join "`n") + "`n")
+  try {
+    Invoke-CliWorkflowJson @("list", "--input", $rawPath, "--store", $storePath, "--summary", $summaryPath) "Could not read the live workflow list from container $Container."
+  } finally {
+    Remove-Item -LiteralPath $rawPath -Force -ErrorAction SilentlyContinue
+  }
+  if (-not [string]::IsNullOrWhiteSpace($script:LiveWorkflowStorePath) -and $script:LiveWorkflowStorePath -ne $storePath) {
+    Remove-Item -LiteralPath $script:LiveWorkflowStorePath -Force -ErrorAction SilentlyContinue
+  }
+  $script:LiveWorkflowStorePath = $storePath
+  try {
+    $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+  } finally {
+    Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+  }
+  return @($summary | Where-Object { $null -ne $_ })
+}
+
+function Remove-LiveWorkflowList {
+  # The stored list holds every live workflow, so this run removes it when it finishes or fails.
+  if (-not [string]::IsNullOrWhiteSpace($script:LiveWorkflowStorePath)) {
+    Remove-Item -LiteralPath $script:LiveWorkflowStorePath -Force -ErrorAction SilentlyContinue
+    $script:LiveWorkflowStorePath = $null
+  }
+  $listDir = Get-SafeLiveWorkflowListDir
+  if ($null -ne $listDir -and -not (Get-ChildItem -LiteralPath $listDir -Force | Select-Object -First 1)) {
+    Remove-Item -LiteralPath $listDir -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Clear-StaleLiveWorkflowList {
+  # A killed run (window closed, task killed, power loss) never reaches its finally block. The next run
+  # removes a helper file unless a process with its id is running and started before the file was
+  # written, so a reused process id does not keep a killed run's list. Older files with no process id
+  # go too. It touches only the helpers' own file names, and nothing when the folder or .tmp is a link.
+  $listDir = Get-SafeLiveWorkflowListDir
+  if ($null -eq $listDir) {
+    return
+  }
+  $helperFile = '^(?:([0-9]{1,9})-)?[0-9a-f]{32}\.(?:workflows\.json|n8n-output\.txt|summary\.json|file-summary\.json)$'
+  foreach ($file in @(Get-ChildItem -LiteralPath $listDir -File -Force)) {
+    if ($file.Name -notmatch $helperFile) {
+      continue
+    }
+    if ($Matches[1]) {
+      $owner = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+      if ($null -ne $owner) {
+        # A start time that cannot be read keeps the file, as the owner may still be using it.
+        $started = $null
+        try { $started = $owner.StartTime.ToUniversalTime() } catch { }
+        if ($null -eq $started -or $started -le $file.LastWriteTimeUtc) {
+          continue
+        }
+      }
+    }
+    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Write-LiveWorkflowJsonFile($Workflow, $Path) {
+  Invoke-CliWorkflowJson @("write", "--store", $script:LiveWorkflowStorePath, "--id", [string]$Workflow.id, "--output", $Path) "Could not write the live workflow file $Path."
+}
+
+function Read-WorkflowFileSummary($Path) {
+  $summaryPath = Join-Path (Get-LiveWorkflowListDir) ("{0}.file-summary.json" -f (New-LiveWorkflowListToken))
+  try {
+    Invoke-CliWorkflowJson @("file-summary", "--input", $Path, "--summary", $summaryPath) "Workflow file $Path could not be read as one workflow JSON object."
+    return (Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json)
+  } finally {
+    Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Assert-HelperSetReady {
+  if ($null -eq (Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+    throw "N8N_HELPER_SET_INVALID: Node.js was not found on PATH. Install Node.js 18 or newer, then rerun."
+  }
+  $setCheck = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "n8n-helper-set.cjs"), "check", "--dir", $HelperScriptDir)
+  foreach ($line in $setCheck.Output) {
+    if ($line -match '^(FAIL|WARN|INFO|OK):\s*(.*)$') {
+      Write-Step $Matches[1] $Matches[2]
+    } else {
+      Write-Host $line
+    }
+  }
+  if ($setCheck.ExitCode -ne 0) {
+    throw "N8N_HELPER_SET_INVALID: this helper folder is not one complete, matching helper set. Run check-n8n-helper-machine.cjs for a full report."
+  }
 }
 
 function Get-FirstOutputLine($CommandResult) {
@@ -564,7 +796,7 @@ function Get-FirstOutputLine($CommandResult) {
 }
 
 function Read-RepoWorkflowInfo($WorkflowFile) {
-  $workflow = Get-Content -Raw -Path $WorkflowFile.FullName | ConvertFrom-Json
+  $workflow = Read-WorkflowFileSummary $WorkflowFile.FullName
   $workflowId = [string]$workflow.id
   $workflowName = [string]$workflow.name
   if ([string]::IsNullOrWhiteSpace($workflowName)) {
@@ -603,7 +835,7 @@ function Invoke-LivePreflight {
 }
 
 function Get-LiveWorkflows {
-  $result = Invoke-CapturedCommand "docker" @("exec", $Container, "n8n", "export:workflow", "--all", "--pretty")
+  $result = Invoke-CapturedCommand "docker" (@("exec") + (Get-N8nCliLogArguments) + @($Container, "n8n", "export:workflow", "--all", "--pretty"))
   if ($result.ExitCode -ne 0) {
     if (Test-MissingLiveWorkflow $result) {
       return @()
@@ -611,17 +843,177 @@ function Get-LiveWorkflows {
     throw "Failed to list live workflows from container $Container.`n$($result.Output -join "`n")"
   }
 
-  $exportText = ($result.StdOut -join "`n").Trim()
-  if ([string]::IsNullOrWhiteSpace($exportText)) {
-    return @()
-  }
+  return @(Read-LiveWorkflowList $result)
+}
 
-  $workflows = $exportText | ConvertFrom-Json
-  if ($workflows -isnot [array]) {
-    $workflows = @($workflows)
-  }
+function Test-NoCredentialsExportResult($CommandResult) {
+  return (($CommandResult.Output -join "`n") -match "No credentials found")
+}
 
-  return @($workflows)
+function Get-SafeCredentialMetadata {
+  Write-Section "Credential Metadata Discovery"
+  $operationToken = ([Guid]::NewGuid().ToString("N"))
+  $containerRoot = "$ContainerDir/ai-agent-toolkit-n8n"
+  $containerOperationDir = "$containerRoot/$operationToken"
+  $containerHelper = "$ContainerDir/ai-agent-toolkit-n8n-metadata-$operationToken.cjs"
+  $encryptedExport = "$containerOperationDir/credentials.encrypted.json"
+  $containerMetadata = "$containerOperationDir/credential-metadata.json"
+  $localMetadata = Join-Path $PreparedDirPath "credential-metadata-$operationToken.json"
+  $helperSource = Join-Path $HelperScriptDir "n8n-credential-metadata.cjs"
+  $operationCreated = $false
+  $cleanupFailure = $null
+
+  try {
+    $stageCheckScript = "const fs=require('node:fs'),path=require('node:path');const p=path.resolve(process.argv[1]),base=path.resolve(process.argv[2]);const s=fs.lstatSync(base);if(s.isSymbolicLink()||fs.realpathSync.native(base)!==base||fs.existsSync(p))process.exit(1);"
+    $stageCheckResult = Invoke-CapturedCommand "docker" @("exec", $Container, "node", "-e", $stageCheckScript, $containerHelper, $ContainerDir)
+    if ($stageCheckResult.ExitCode -ne 0) {
+      throw "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE: Could not prove a safe target-local helper staging path."
+    }
+
+    $copyHelperResult = Invoke-CapturedCommand "docker" @("cp", $helperSource, "${Container}:$containerHelper")
+    if ($copyHelperResult.ExitCode -ne 0) {
+      throw "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE: Could not stage the credential-metadata extractor in the target container."
+    }
+
+    $initResult = Invoke-CapturedCommand "docker" @("exec", $Container, "node", $containerHelper, "init", $containerOperationDir, $containerRoot)
+    if ($initResult.ExitCode -ne 0) {
+      throw "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE: Toolkit-owned credential-metadata storage failed its path-safety checks."
+    }
+    $operationCreated = $true
+
+    # Official n8n server CLI exports encrypted credential data by default. It stays
+    # inside this restrictive target-local directory; only id, name, and type leave it.
+    $exportResult = Invoke-CapturedCommand "docker" @("exec", $Container, "n8n", "export:credentials", "--all", "--output=$encryptedExport")
+    if ($exportResult.ExitCode -eq 0) {
+      $extractResult = Invoke-CapturedCommand "docker" @("exec", $Container, "node", $containerHelper, "extract", $encryptedExport, $containerMetadata, $containerOperationDir)
+    } elseif (Test-NoCredentialsExportResult $exportResult) {
+      $extractResult = Invoke-CapturedCommand "docker" @("exec", $Container, "node", $containerHelper, "empty", $containerMetadata, $containerOperationDir)
+    } else {
+      throw "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE: The supported encrypted credential export was unavailable. No database or undocumented API fallback was attempted."
+    }
+    if ($extractResult.ExitCode -ne 0) {
+      throw "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE: Credential metadata extraction failed its safety checks."
+    }
+
+    $copyMetadataResult = Invoke-CapturedCommand "docker" @("cp", "${Container}:$containerMetadata", $localMetadata)
+    if ($copyMetadataResult.ExitCode -ne 0) {
+      throw "N8N_CREDENTIAL_DISCOVERY_UNAVAILABLE: Could not copy sanitized credential metadata from the target container."
+    }
+
+    $metadata = Get-Content -LiteralPath $localMetadata -Raw | ConvertFrom-Json
+    Write-Step "SAFE" "Discovered metadata for $(@($metadata).Count) credential(s); encrypted values and target IDs were not printed."
+    return $localMetadata
+  } finally {
+    if ($operationCreated) {
+      $cleanupResult = Invoke-CapturedCommand "docker" @("exec", $Container, "node", $containerHelper, "cleanup", $containerOperationDir, $containerRoot)
+      if ($cleanupResult.ExitCode -ne 0) {
+        $cleanupFailure = "N8N_CREDENTIAL_CLEANUP_FAILED: Encrypted credential metadata temporary cleanup did not complete; import is blocked."
+      }
+    }
+    $removeHelperScript = "const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){const s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink())process.exit(1);fs.rmSync(p,{force:false});}"
+    $null = Invoke-CapturedCommand "docker" @("exec", $Container, "node", "-e", $removeHelperScript, $containerHelper)
+    if ($null -ne $cleanupFailure) {
+      throw $cleanupFailure
+    }
+  }
+}
+
+function Assert-PortableDocumentsReadable {
+  foreach ($document in @($PortableCredentialsFilePath, $DeploymentPolicyFilePath)) {
+    if (Test-Path -LiteralPath $document -PathType Leaf) {
+      try {
+        $null = Get-Content -LiteralPath $document -Raw | ConvertFrom-Json
+      } catch {
+        throw "N8N_POLICY_VALIDATION_FAILED: portable credential or deployment policy document is invalid JSON."
+      }
+    }
+  }
+}
+
+function Get-LocalWorkflowIdentityId($WorkflowFile, $WorkflowName) {
+  $resultFile = Join-Path $PreparedDirPath "$($WorkflowFile.BaseName).identity-result.json"
+  Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+  $result = Invoke-CapturedCommand "node" @(
+    (Join-Path $HelperScriptDir "n8n-workflow-identity.cjs"),
+    "resolve",
+    "--state", $WorkflowIdentityFilePath,
+    "--repo-root", $RepoRoot,
+    "--workflow-file", $WorkflowFile.Name,
+    "--workflow-name", $WorkflowName,
+    "--result", $resultFile
+  )
+  if ($result.ExitCode -ne 0) {
+    throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity could not be resolved safely."
+  }
+  $identity = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+  Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+  if (-not [string]::IsNullOrWhiteSpace([string]$identity.targetWorkflowId)) {
+    if (-not [string]::Equals([string]$identity.workflowFile, [string]$WorkflowFile.Name, [System.StringComparison]::Ordinal)) {
+      throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity does not match the exact canonical workflow file."
+    }
+    if (-not [string]::Equals([string]$identity.workflowName, [string]$WorkflowName, [System.StringComparison]::Ordinal)) {
+      throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity does not match the intended workflow name."
+    }
+  }
+  return [string]$identity.targetWorkflowId
+}
+
+function Save-LocalWorkflowIdentity($PlannedImport) {
+  $result = Invoke-CapturedCommand "node" @(
+    (Join-Path $HelperScriptDir "n8n-workflow-identity.cjs"),
+    "record",
+    "--state", $WorkflowIdentityFilePath,
+    "--repo-root", $RepoRoot,
+    "--workflow-file", $PlannedImport.File,
+    "--workflow-name", $PlannedImport.WorkflowName,
+    "--target-workflow-id", $PlannedImport.TargetId
+  )
+  if ($result.ExitCode -ne 0) {
+    throw "N8N_POSTCONDITION_FAILED: unpublished import succeeded but dedicated local target workflow identity could not be recorded safely."
+  }
+  Write-Step "IDENTITY" "$($PlannedImport.File) target identity was recorded locally without printing its ID."
+}
+
+function Test-PortableTargetResolution($WorkflowFiles, $LiveWorkflows) {
+  $blocked = @()
+  foreach ($workflowFile in $WorkflowFiles) {
+    $workflowInfo = Read-RepoWorkflowInfo $workflowFile
+    $localWorkflowId = Get-LocalWorkflowIdentityId $workflowFile $workflowInfo.Name
+    $workflowId = $localWorkflowId
+    if ([string]::IsNullOrWhiteSpace($workflowId)) { $workflowId = $workflowInfo.Id }
+    $workflowName = $workflowInfo.Name
+    $target = $null
+    $matchedByCanonicalId = $false
+
+    if (-not [string]::IsNullOrWhiteSpace($workflowId)) {
+      $idMatches = @($LiveWorkflows | Where-Object { [string]$_.id -eq $workflowId })
+      if ($idMatches.Count -gt 1) {
+        $blocked += [PSCustomObject]@{ File = $workflowFile.Name; WorkflowName = $workflowName; Reason = "N8N_WORKFLOW_MATCH_AMBIGUOUS: multiple target workflows matched the canonical workflow ID."; Kind = "N8N_WORKFLOW_MATCH_AMBIGUOUS" }
+        continue
+      }
+      if ($idMatches.Count -eq 1) { $target = $idMatches[0]; $matchedByCanonicalId = $true }
+      if ($idMatches.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($localWorkflowId)) {
+        $blocked += [PSCustomObject]@{ File = $workflowFile.Name; WorkflowName = $workflowName; Reason = "N8N_POLICY_VALIDATION_FAILED: dedicated local target identity no longer exists; refusing a same-name fallback."; Kind = "N8N_POLICY_VALIDATION_FAILED" }
+        continue
+      }
+    }
+    if ($null -eq $target) {
+      $nameResolution = Resolve-LiveWorkflowByName $workflowName $workflowFile.Name $LiveWorkflows
+      if ($nameResolution.Status -eq "Blocked") {
+        $blocked += [PSCustomObject]@{ File = $workflowFile.Name; WorkflowName = $workflowName; Reason = "N8N_WORKFLOW_MATCH_AMBIGUOUS: $($nameResolution.Reason)"; Kind = "N8N_WORKFLOW_MATCH_AMBIGUOUS" }
+        continue
+      }
+      if ($nameResolution.Status -eq "Found" -or $nameResolution.Status -eq "FoundArchived") {
+        $target = $nameResolution.Workflow
+      }
+    }
+    if ($null -ne $target -and $target.active -eq $true) {
+      $blocked += [PSCustomObject]@{ File = $workflowFile.Name; WorkflowName = $workflowName; Reason = "N8N_POLICY_VALIDATION_FAILED: target workflow is published (active), so an unpublished import cannot guarantee that no scheduled execution persists. Unpublish it in n8n first."; Kind = "N8N_POLICY_VALIDATION_FAILED" }
+    } elseif ($null -ne $target -and $target.isArchived -eq $true -and -not $matchedByCanonicalId -and $ArchivedByNameMode -eq "Block") {
+      $blocked += [PSCustomObject]@{ File = $workflowFile.Name; WorkflowName = $workflowName; Reason = "N8N_POLICY_VALIDATION_FAILED: archived target workflow is blocked by ArchivedByNameMode."; Kind = "N8N_POLICY_VALIDATION_FAILED" }
+    }
+  }
+  return @($blocked)
 }
 
 function Get-RootWorkflowFiles($WorkflowDirPath) {
@@ -635,6 +1027,17 @@ function Get-RootWorkflowFiles($WorkflowDirPath) {
   }
 
   return $workflowFiles
+}
+
+function Assert-NoCaseFoldedWorkflowFileCollisions($WorkflowFiles) {
+  $seen = New-Object 'System.Collections.Generic.Dictionary[string,string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($workflowFile in @($WorkflowFiles)) {
+    $name = [string]$workflowFile.Name
+    if ($seen.ContainsKey($name) -and -not [string]::Equals($seen[$name], $name, [System.StringComparison]::Ordinal)) {
+      throw "N8N_WORKFLOW_MATCH_AMBIGUOUS: case-folded workflow filename collision must be resolved before target lookup."
+    }
+    $seen[$name] = $name
+  }
 }
 
 function Resolve-LiveWorkflowByName($WorkflowName, $WorkflowFileName, $LiveWorkflows) {
@@ -659,7 +1062,7 @@ function Resolve-LiveWorkflowByName($WorkflowName, $WorkflowFileName, $LiveWorkf
 
   if ($archivedMatches.Count -eq 1) {
     if ($ArchivedByNameMode -eq "CreateNew") {
-      Write-Step "ARCHIVE" "$WorkflowFileName only matched archived live workflow '$WorkflowName' as $($archivedMatches[0].id). CreateNew mode will create a new inactive workflow instead."
+      Write-Step "ARCHIVE" "$WorkflowFileName only matched archived live workflow '$WorkflowName' as $($archivedMatches[0].id). CreateNew mode will create a new unpublished workflow instead."
       return [PSCustomObject]@{ Status = "ArchivedCreateNew"; Workflow = $archivedMatches[0]; Reason = "Only archived workflow matched by name; creating new by mode." }
     }
     if ($ArchivedByNameMode -eq "UpdateArchived") {
@@ -670,7 +1073,7 @@ function Resolve-LiveWorkflowByName($WorkflowName, $WorkflowFileName, $LiveWorkf
   }
 
   if ($ArchivedByNameMode -eq "CreateNew") {
-    Write-Step "ARCHIVE" "$WorkflowFileName matched $($archivedMatches.Count) archived same-name workflows and no non-archived workflow. CreateNew mode will create a new inactive workflow."
+    Write-Step "ARCHIVE" "$WorkflowFileName matched $($archivedMatches.Count) archived same-name workflows and no non-archived workflow. CreateNew mode will create a new unpublished workflow."
     return [PSCustomObject]@{ Status = "ArchivedCreateNew"; Workflow = $null; Reason = "Multiple archived workflows matched by name; creating new by mode." }
   }
 
@@ -682,7 +1085,7 @@ function Resolve-LiveWorkflowByName($WorkflowName, $WorkflowFileName, $LiveWorkf
 }
 
 function Write-WorkflowJson($Workflow, $Path) {
-  Write-Utf8NoBomText -Path $Path -Text (($Workflow | ConvertTo-Json -Depth 100) + "`n")
+  Write-LiveWorkflowJsonFile $Workflow $Path
 }
 
 function Set-PreparedWorkflowId($PreparedFile, $WorkflowId) {
@@ -690,13 +1093,7 @@ function Set-PreparedWorkflowId($PreparedFile, $WorkflowId) {
     return
   }
 
-  $preparedWorkflow = Get-Content -Raw -Path $PreparedFile | ConvertFrom-Json
-  if ($preparedWorkflow.PSObject.Properties.Name -contains "id") {
-    $preparedWorkflow.id = $WorkflowId
-  } else {
-    $preparedWorkflow | Add-Member -MemberType NoteProperty -Name "id" -Value $WorkflowId
-  }
-  Write-Utf8NoBomText -Path $PreparedFile -Text (($preparedWorkflow | ConvertTo-Json -Depth 100) + "`n")
+  Invoke-CliWorkflowJson @("set-id", "--file", $PreparedFile, "--id", $WorkflowId) "Could not set the target workflow id in $PreparedFile."
 }
 
 function Test-WorkflowHasScheduleTrigger($Workflow) {
@@ -773,12 +1170,13 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
   Write-Section "Workflow Check"
 
   foreach ($workflowFile in $WorkflowFiles) {
-    $preparedFile = Join-Path $RunPreparedDirPath "$($workflowFile.BaseName).live-import.json"
-    $liveCompareFile = Join-Path $RunPreparedDirPath "$($workflowFile.BaseName).live-compare.json"
+    $preparedFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).live-import.json"
+    $liveCompareFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).live-compare.json"
     $containerFile = "$ContainerDir/$($workflowFile.BaseName).live-import.json"
     $workflowInfo = Read-RepoWorkflowInfo $workflowFile
     $repoWorkflow = $workflowInfo.Workflow
-    $workflowId = $workflowInfo.Id
+    $workflowId = Get-LocalWorkflowIdentityId $workflowFile $workflowInfo.Name
+    if ([string]::IsNullOrWhiteSpace($workflowId)) { $workflowId = $workflowInfo.Id }
     $workflowName = $workflowInfo.Name
     $workflowStatus = "ComparisonFailed"
     $liveWorkflowForCredentialCheck = $null
@@ -866,10 +1264,10 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
         if ($liveWorkflowByName.Status -eq "ArchivedCreateNew" -or -not $hasWorkflowId) {
           $generatedWorkflowIdForImport = New-WorkflowId
           $targetLiveId = $generatedWorkflowIdForImport
-          Write-Step "CREATE" "$(Get-WorkflowCheckLabel $workflowFile $workflowId) will be imported as a new inactive workflow with generated id $generatedWorkflowIdForImport."
+          Write-Step "CREATE" "$(Get-WorkflowCheckLabel $workflowFile $workflowId) will be imported as a new unpublished workflow with generated id $generatedWorkflowIdForImport."
         } else {
           $targetLiveId = $workflowId
-          Write-Step "CREATE" "$(Get-WorkflowCheckLabel $workflowFile $workflowId) does not exist in live n8n; it will be imported as a new inactive workflow."
+          Write-Step "CREATE" "$(Get-WorkflowCheckLabel $workflowFile $workflowId) does not exist in live n8n; it will be imported as a new unpublished workflow."
         }
 
         if (-not $BindingsFileExists) {
@@ -883,9 +1281,9 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
       if ($liveWorkflowForCredentialCheck.active -eq $true -or (Test-WorkflowHasScheduleTrigger $repoWorkflow) -or (Test-WorkflowHasScheduleTrigger $liveWorkflowForCredentialCheck)) {
         $requiresRestartWarning = $true
         $restartWarningCount += 1
-        Write-Step "WARN" "This import updates a previously active or scheduled workflow."
+        Write-Step "WARN" "This import updates a previously published or scheduled workflow."
         Write-Step "WARN" "On non multi-main n8n instances, cron triggers may keep running until n8n is restarted."
-        Write-Step "WARN" "Restart the n8n container after import before trusting activation state."
+        Write-Step "WARN" "Restart the n8n container after import before trusting the published state."
       }
     }
 
@@ -1006,6 +1404,261 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
   }
 }
 
+function Get-PlannedTargetUniquenessBlockers($PlannedImports) {
+  $blockers = @()
+  $duplicateGroups = @(
+    $PlannedImports |
+      Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.TargetId) } |
+      Group-Object -Property TargetId |
+      Where-Object { $_.Count -gt 1 }
+  )
+  foreach ($group in $duplicateGroups) {
+    foreach ($planned in @($group.Group)) {
+      $blockers += [PSCustomObject]@{
+        File = [string]$planned.File
+        Reason = "N8N_WORKFLOW_MATCH_AMBIGUOUS: multiple canonical workflows resolve to one target workflow."
+        Kind = "N8N_WORKFLOW_MATCH_AMBIGUOUS"
+      }
+    }
+  }
+  return @($blockers)
+}
+
+function Invoke-PortableWorkflowPreflight($WorkflowFiles, $LiveWorkflows, $CredentialMetadataFile) {
+  $plannedImports = @()
+  $resolvedTargetPlans = @()
+  $blockedWorkflows = @()
+  $requiredCredentialMisses = @()
+  $optionalCredentialMisses = @()
+  $unsafeCredentialFailures = @()
+  $skippedCount = 0
+  $missingLiveWorkflowCount = 0
+  $nameMatchedWorkflowCount = 0
+
+  Write-Section "Portable Workflow Preparation"
+
+  foreach ($workflowFile in $WorkflowFiles) {
+    $preparedFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).live-import.json"
+    $resultFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).prepare-result.json"
+    $liveCompareFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).live-compare.json"
+    $containerFile = "$ContainerDir/$($workflowFile.BaseName).live-import.json"
+    $workflowInfo = Read-RepoWorkflowInfo $workflowFile
+    $repoWorkflow = $workflowInfo.Workflow
+    $workflowId = Get-LocalWorkflowIdentityId $workflowFile $workflowInfo.Name
+    if ([string]::IsNullOrWhiteSpace($workflowId)) { $workflowId = $workflowInfo.Id }
+    $workflowName = $workflowInfo.Name
+    $targetWorkflow = $null
+    $targetWorkflowId = $null
+    $plannedAction = "Create new"
+    $updatesArchivedWorkflow = $false
+    $matchedByCanonicalId = $false
+
+    Write-Step "CHECK" "$($workflowFile.Name) (portable selector; target identity kept internal)"
+
+    if (-not [string]::IsNullOrWhiteSpace($workflowId)) {
+      $idMatches = @($LiveWorkflows | Where-Object { [string]$_.id -eq $workflowId })
+      if ($idMatches.Count -gt 1) {
+        $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "N8N_WORKFLOW_MATCH_AMBIGUOUS: multiple target workflows matched the canonical workflow ID."; Kind = "N8N_WORKFLOW_MATCH_AMBIGUOUS" }
+        continue
+      }
+      if ($idMatches.Count -eq 1) {
+        $targetWorkflow = $idMatches[0]
+        $matchedByCanonicalId = $true
+        $targetWorkflowId = [string]$targetWorkflow.id
+        $plannedAction = "Update by canonical workflow ID"
+      }
+    }
+
+    if ($null -eq $targetWorkflow) {
+      $nameResolution = Resolve-LiveWorkflowByName $workflowName $workflowFile.Name $LiveWorkflows
+      if ($nameResolution.Status -eq "Blocked") {
+        $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "N8N_WORKFLOW_MATCH_AMBIGUOUS: $($nameResolution.Reason)"; Kind = "N8N_WORKFLOW_MATCH_AMBIGUOUS" }
+        continue
+      }
+      if ($nameResolution.Status -eq "Found" -or $nameResolution.Status -eq "FoundArchived") {
+        $targetWorkflow = $nameResolution.Workflow
+        $targetWorkflowId = [string]$targetWorkflow.id
+        $nameMatchedWorkflowCount += 1
+        $plannedAction = if ($nameResolution.Status -eq "FoundArchived") { "Update archived by unique workflow name" } else { "Update by unique workflow name" }
+      } else {
+        $missingLiveWorkflowCount += 1
+        $targetWorkflowId = New-WorkflowId
+      }
+    }
+
+    if ($null -ne $targetWorkflow) {
+      $updatesArchivedWorkflow = $targetWorkflow.isArchived -eq $true
+      if ($targetWorkflow.active -eq $true) {
+        $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "N8N_POLICY_VALIDATION_FAILED: target workflow is published (active), so an unpublished import cannot guarantee that no scheduled execution persists. Unpublish it in n8n first."; Kind = "N8N_POLICY_VALIDATION_FAILED" }
+        continue
+      }
+      if ($updatesArchivedWorkflow -and -not $matchedByCanonicalId -and $ArchivedByNameMode -eq "Block") {
+        $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Archived target workflow is blocked by ArchivedByNameMode."; Kind = "N8N_POLICY_VALIDATION_FAILED" }
+        continue
+      }
+      if ($updatesArchivedWorkflow -and -not $matchedByCanonicalId -and $ArchivedByNameMode -eq "CreateNew") {
+        $targetWorkflow = $null
+        $targetWorkflowId = New-WorkflowId
+        $updatesArchivedWorkflow = $false
+        $plannedAction = "Create new beside archived name match"
+        $missingLiveWorkflowCount += 1
+      }
+    }
+
+    $resolvedTargetPlans += [PSCustomObject]@{
+      File = $workflowFile.Name
+      WorkflowName = $workflowName
+      TargetId = $targetWorkflowId
+      Action = $plannedAction
+    }
+
+    if ($null -ne $targetWorkflow) {
+      Write-WorkflowJson $targetWorkflow $liveCompareFile
+    } elseif (Test-Path -LiteralPath $liveCompareFile -PathType Leaf) {
+      Remove-Item -LiteralPath $liveCompareFile -Force
+    }
+
+    $prepareArgs = @(
+      (Join-Path $HelperScriptDir "prepare-n8n-live-import.cjs"),
+      "--portable",
+      "--workflow", $workflowFile.FullName,
+      "--output", $preparedFile,
+      "--result", $resultFile,
+      "--credential-metadata", $CredentialMetadataFile,
+      "--target-workflow-id", $targetWorkflowId
+    )
+    if ($null -eq $targetWorkflow) {
+      $prepareArgs += "--allow-unresolved-import"
+    }
+    if (Test-Path -LiteralPath $PortableCredentialsFilePath -PathType Leaf) {
+      $prepareArgs += @("--portable-credentials", $PortableCredentialsFilePath)
+    }
+    if (Test-Path -LiteralPath $EffectiveDeploymentPolicyFilePath -PathType Leaf) {
+      $prepareArgs += @("--deployment-policy", $EffectiveDeploymentPolicyFilePath)
+    }
+    if (Test-Path -LiteralPath $ResourceBindingsFilePath -PathType Leaf) {
+      $prepareArgs += @("--resource-bindings", $ResourceBindingsFilePath)
+    }
+    if ($null -ne $targetWorkflow) {
+      $prepareArgs += @("--live-workflow", $liveCompareFile)
+    }
+
+    $prepareResult = Invoke-CapturedCommand "node" $prepareArgs
+    if ($prepareResult.ExitCode -ne 0) {
+      $preparation = if (Test-Path -LiteralPath $resultFile -PathType Leaf) { Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json } else { $null }
+      $code = if ($null -ne $preparation -and $preparation.code) { [string]$preparation.code } else { "N8N_INTERNAL_ERROR" }
+      foreach ($requirement in @($preparation.details.credentials)) {
+        $credentialIssue = [PSCustomObject]@{
+          WorkflowFile = $workflowFile.Name
+          NodeName = [string]$requirement.nodeName
+          NodeType = [string]$requirement.nodeType
+          LogicalName = [string]$requirement.logicalName
+          CredentialType = [string]$requirement.credentialType
+          Required = if ($null -eq $requirement.required) { $true } else { [bool]$requirement.required }
+          MatchCount = [int]$requirement.matchCount
+          Code = if ($requirement.code) { [string]$requirement.code } else { $code }
+        }
+        if (-not $credentialIssue.Required -and $credentialIssue.Code -eq "N8N_CREDENTIAL_MISSING") {
+          $optionalCredentialMisses += $credentialIssue
+        } elseif ($credentialIssue.Required -and $credentialIssue.Code -eq "N8N_CREDENTIAL_MISSING") {
+          $requiredCredentialMisses += $credentialIssue
+        } else {
+          $unsafeCredentialFailures += $credentialIssue
+        }
+      }
+      $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "$code`: portable preparation failed. Inspect the sanitized operation report."; Kind = $code }
+      continue
+    }
+
+    $preparation = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+    foreach ($requirement in @($preparation.credentialResolution.blockingRequirements)) {
+      $requiredCredentialMisses += [PSCustomObject]@{
+        WorkflowFile = $workflowFile.Name
+        NodeName = [string]$requirement.nodeName
+        NodeType = [string]$requirement.nodeType
+        LogicalName = [string]$requirement.logicalName
+        CredentialType = [string]$requirement.credentialType
+        Required = if ($null -eq $requirement.required) { $true } else { [bool]$requirement.required }
+        MatchCount = [int]$requirement.matchCount
+        Code = [string]$requirement.code
+      }
+    }
+    foreach ($requirement in @($preparation.credentialResolution.optionalRequirements)) {
+      $optionalCredentialMisses += [PSCustomObject]@{
+        WorkflowFile = $workflowFile.Name
+        NodeName = [string]$requirement.nodeName
+        NodeType = [string]$requirement.nodeType
+        LogicalName = [string]$requirement.logicalName
+        CredentialType = [string]$requirement.credentialType
+        Required = $false
+        MatchCount = [int]$requirement.matchCount
+        Code = [string]$requirement.code
+      }
+    }
+    foreach ($requirement in @($preparation.credentialResolution.unsafeRequirements)) {
+      $unsafeCredentialFailures += [PSCustomObject]@{
+        WorkflowFile = $workflowFile.Name
+        NodeName = [string]$requirement.nodeName
+        NodeType = [string]$requirement.nodeType
+        LogicalName = [string]$requirement.logicalName
+        CredentialType = [string]$requirement.credentialType
+        Required = if ($null -eq $requirement.required) { $true } else { [bool]$requirement.required }
+        MatchCount = [int]$requirement.matchCount
+        Code = [string]$requirement.code
+      }
+    }
+
+    $shouldImport = $true
+    if ($null -ne $targetWorkflow) {
+      $comparisonResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "should-import-n8n-workflow.cjs"), $preparedFile, $liveCompareFile)
+      if ($comparisonResult.ExitCode -ne 0) {
+        throw "N8N_INTERNAL_ERROR: effective prepared/live comparison failed for $($workflowFile.Name)."
+      }
+      if ($comparisonResult.StdOut -contains "UNCHANGED" -and -not $ForceImport) {
+        $shouldImport = $false
+        $skippedCount += 1
+        Write-Step "SKIP" "$($workflowFile.Name) effective prepared payload is unchanged."
+      }
+    }
+
+    if ($shouldImport) {
+      Write-Step "READY" "$($workflowFile.Name) passed canonical, credential, resource, validation, invariant, and comparison gates."
+      $plannedImports += [PSCustomObject]@{
+        File = $workflowFile.Name
+        WorkflowName = $workflowName
+        PreparedFile = $preparedFile
+        PreparedHash = (Get-FileHash -LiteralPath $preparedFile -Algorithm SHA256).Hash
+        ContainerFile = $containerFile
+        TargetId = $targetWorkflowId
+        UpdatesArchivedWorkflow = $updatesArchivedWorkflow
+        Action = $plannedAction
+        RequiredCredentialMisses = @($preparation.credentialResolution.blockingRequirements)
+        OptionalCredentialMisses = @($preparation.credentialResolution.optionalRequirements)
+      }
+    }
+  }
+
+  $targetUniquenessBlockers = Get-PlannedTargetUniquenessBlockers $resolvedTargetPlans
+  if ($targetUniquenessBlockers.Count -gt 0) {
+    $blockedWorkflows += $targetUniquenessBlockers
+    $plannedImports = @()
+  }
+
+  return [PSCustomObject]@{
+    PlannedImports = @($plannedImports)
+    BlockedWorkflows = @($blockedWorkflows)
+    RequiredCredentialMisses = @($requiredCredentialMisses)
+    OptionalCredentialMisses = @($optionalCredentialMisses)
+    UnsafeCredentialFailures = @($unsafeCredentialFailures)
+    ReportCredentials = @($requiredCredentialMisses) + @($optionalCredentialMisses) + @($unsafeCredentialFailures)
+    SkippedCount = $skippedCount
+    ComparisonWarningCount = 0
+    MissingLiveWorkflowCount = $missingLiveWorkflowCount
+    NameMatchedWorkflowCount = $nameMatchedWorkflowCount
+    RestartWarningCount = 0
+  }
+}
+
 function Write-BlockedSummary($PreflightResult) {
   Write-Section "Summary"
   Write-Host ("Ready       : {0}" -f $PreflightResult.PlannedImports.Count)
@@ -1019,10 +1672,8 @@ function Write-BlockedSummary($PreflightResult) {
   }
 
   Write-Section "Next Action Steps"
-  Write-Host "1. Confirm Docker and the n8n container are reachable."
-  Write-Host "2. Run this helper folder's export-n8n-workflows-live.ps1 if you want to refresh repo JSON and credential bindings together."
-  Write-Host "3. Use -AllowMissingCredentialBindings only if you intentionally want changed workflows imported without restored credentials."
-  Write-Host "4. Deleting archived workflows is not supported by these CLI helper scripts yet."
+  Write-Host "1. Run the menu's Explain last n8n failure action or inspect the sanitized latest report."
+  Write-Host "2. Follow its one supported next action, then rerun this unchanged command."
 }
 
 function Write-WorkflowActionSummary($PlannedImports, $StatusLabel) {
@@ -1035,8 +1686,7 @@ function Write-WorkflowActionSummary($PlannedImports, $StatusLabel) {
   foreach ($item in $PlannedImports) {
     Write-Step $StatusLabel $item.File
     Write-Host ("  Action          : {0}" -f $item.Action)
-    Write-Host ("  Target          : {0}" -f $item.TargetId)
-    Write-Host ("  Restart warning : {0}" -f $item.RequiresRestartWarning)
+    Write-Host "  Target          : resolved internally"
 
     if (-not [string]::IsNullOrWhiteSpace($item.Note)) {
       Write-Host ("  Note            : {0}" -f $item.Note)
@@ -1046,40 +1696,85 @@ function Write-WorkflowActionSummary($PlannedImports, $StatusLabel) {
   }
 }
 
+function Write-N8nOperationReport($Result, $Code, $Phase, [bool]$Attempted, [bool]$Performed, $Workflows, $Credentials, $NextActionCode, $NextActionMessage, $ActiveState) {
+  if ([string]::IsNullOrWhiteSpace($ReportsDirPath)) { return }
+  $reportInput = Join-Path $PreparedDirPath "operation-report-input.json"
+  $safeWorkflows = @($Workflows | ForEach-Object {
+    [ordered]@{ workflowFile = [string]$_.File; workflowName = [string]$_.WorkflowName }
+  })
+  $safeCredentials = @($Credentials | ForEach-Object {
+    [ordered]@{
+      logicalName = [string]$_.LogicalName
+      credentialType = [string]$_.CredentialType
+      required = if ($null -eq $_.Required) { $true } else { [bool]$_.Required }
+      matchCount = [int]$_.MatchCount
+      nodeName = [string]$_.NodeName
+      nodeType = [string]$_.NodeType
+    }
+  })
+  $document = [ordered]@{
+    operationType = "import"
+    result = $Result
+    code = $Code
+    phase = $Phase
+    workflows = $safeWorkflows
+    credentials = $safeCredentials
+    resources = @()
+    mutation = [ordered]@{ attempted = $Attempted; performed = $Performed }
+    activeState = $ActiveState
+    executionState = "not_executed"
+    nextAction = [ordered]@{ code = $NextActionCode; message = $NextActionMessage }
+    unchangedScope = @("activation", "execution", "credentials", "secrets", "production configuration")
+  }
+  Write-Utf8NoBomText $reportInput (($document | ConvertTo-Json -Depth 8) + "`n")
+  $reportResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "n8n-workflow-operation-report.cjs"), "write", "--report-root", $ReportsDirPath, "--input", $reportInput)
+  Remove-Item -LiteralPath $reportInput -Force -ErrorAction SilentlyContinue
+  if ($reportResult.ExitCode -ne 0) {
+    throw "N8N_INTERNAL_ERROR: Failed to write the sanitized operation report."
+  }
+  $script:OperationReportWritten = $true
+}
+
 $WorkflowDirPath = Resolve-WorkflowDirPath
 $BindingsFilePath = Join-Path $RepoRoot $BindingsFile
+$PortableCredentialsFilePath = Join-Path $RepoRoot $PortableCredentialsFile
+$DeploymentPolicyFilePath = Join-Path $RepoRoot $DeploymentPolicyFile
+$ResourceBindingsFilePath = Join-Path $RepoRoot $ResourceBindingsFile
+$WorkflowIdentityFilePath = Join-Path $RepoRoot $WorkflowIdentityFile
+$ReportsDirPath = Join-Path $RepoRoot $ReportsDir
 $PreparedDirPath = Join-Path $RepoRoot $PreparedDir
 $CredentialExportDirPath = Join-Path $RepoRoot $CredentialExportDir
-
-# Dry run must never touch the configured persistent prepared dir: it plans into
-# an isolated temporary directory instead, which is removed again before exit.
-$script:DryRunPlanningDirPath = $null
-$RunPreparedDirPath = $PreparedDirPath
-if ($DryRun) {
-  $script:DryRunPlanningDirPath = Join-Path $RepoRoot (".tmp/n8n-live-import-dryrun-" + [guid]::NewGuid().ToString("N"))
-  $RunPreparedDirPath = $script:DryRunPlanningDirPath
+Assert-StrictRepoChildPath $WorkflowIdentityFilePath "Workflow identity state"
+$deploymentPolicySnapshot = $null
+if ($DeploymentPolicyFileWasExplicit) {
+  $deploymentPolicySnapshot = Read-SafeDeploymentPolicySnapshot
 }
 
 Write-Section "n8n workflow import"
 Write-Host ("Repo root        : {0}" -f $RepoRoot)
 Write-Host ("Workflow dir     : {0}" -f (Get-DisplayPath $WorkflowDirPath))
 Write-Host ("Prepared dir     : {0}" -f (Get-DisplayPath $PreparedDirPath))
-if ($DryRun) {
-  Write-Host ("Dry-run plan dir : {0}" -f (Get-DisplayPath $RunPreparedDirPath))
-}
-Write-Host ("Bindings file    : {0}" -f (Get-DisplayPath $BindingsFilePath))
+Write-Host ("Credentials      : {0}" -f (Get-DisplayPath $PortableCredentialsFilePath))
+Write-Host ("Resource policy  : {0}" -f (Get-DisplayPath $DeploymentPolicyFilePath))
+Write-Host ("Local resources  : {0}" -f (Get-DisplayPath $ResourceBindingsFilePath))
+Write-Host ("Local identity   : {0}" -f (Get-DisplayPath $WorkflowIdentityFilePath))
 Write-Host ("Docker target    : {0}" -f ($(if ([string]::IsNullOrWhiteSpace($Container) -and [string]::IsNullOrWhiteSpace($ContainerName) -and [string]::IsNullOrWhiteSpace($ContainerId) -and [string]::IsNullOrWhiteSpace($ComposeProject) -and [string]::IsNullOrWhiteSpace($ComposeService)) { "auto-detect or prompt" } else { "explicit override requested" })))
 Write-Host ("Mode             : {0}" -f ($(if ($DryRun) { "Dry run" } else { "Import" })))
 Write-Host ("Archived by name : {0}" -f $ArchivedByNameMode)
 Write-Host ("ProjectId        : {0}" -f ($(if ([string]::IsNullOrWhiteSpace($ProjectId)) { "(not set)" } else { $ProjectId })))
 Write-Host ("UserId           : {0}" -f ($(if ([string]::IsNullOrWhiteSpace($UserId)) { "(not set)" } else { $UserId })))
-Write-Host ("Restart warning  : {0}" -f ($(if ($RestartContainerAfterImport) { "Restart container after successful import when needed" } else { "Warn only" })))
+Write-Host "Unpublished      : Required; publishing, execution, and container restart are out of scope"
 Write-Host ("Force import     : {0}" -f ($(if ($ForceImport) { "Yes" } else { "No" })))
 
-$bindingsFileExists = Test-Path -Path $BindingsFilePath -PathType Leaf
-if (-not $bindingsFileExists) {
-  Write-Step "WARN" "Credential bindings file is missing. Existing live credentials cannot be restored unless live workflows are exportable first."
+if ($RestartContainerAfterImport) {
+  throw "N8N_POLICY_VALIDATION_FAILED: -RestartContainerAfterImport is no longer supported. This helper never restarts n8n."
 }
+
+# A run that finishes or fails, including on an error, removes its stored live workflow list in the
+# finally block below; a killed run's leftovers are removed by the next run's first step.
+try {
+Clear-StaleLiveWorkflowList
+Assert-HelperSetReady
 
 if (-not $DryRun) {
   Invoke-ProjectWorkflowHook "before-import-validation" @{
@@ -1093,7 +1788,12 @@ if (-not $DryRun) {
   }
 }
 
+if ($DeploymentPolicyFileWasExplicit) {
+  Assert-DeploymentPolicySnapshotCurrent $deploymentPolicySnapshot
+}
+
 $workflowFiles = Get-RootWorkflowFiles $WorkflowDirPath
+Assert-NoCaseFoldedWorkflowFileCollisions $workflowFiles
 
 Write-Section "Workflow JSON Validation"
 $validationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), $WorkflowDirPath)
@@ -1102,32 +1802,52 @@ if ($validationResult.ExitCode -ne 0) {
 }
 Write-CommandOutput $validationResult.StdOut "VALID"
 
+Assert-PortableDocumentsReadable
+
+$transportResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "n8n-workflow-transport.cjs"), "capabilities", "docker-server-cli")
+if ($transportResult.ExitCode -ne 0) {
+  throw "N8N_POLICY_VALIDATION_FAILED: supported Docker/server CLI transport contract is unavailable."
+}
+Write-Step "TRANSPORT" "Selected supported Docker/server CLI transport; helper preparation and validation remain mandatory."
+
 Invoke-LivePreflight
 $liveWorkflows = Get-LiveWorkflows
 Write-Step "LIVE" "Read $($liveWorkflows.Count) workflow(s) from live n8n."
 
-Initialize-RunDirectory $RunPreparedDirPath
-
-$preflight = Invoke-WorkflowPreflight $workflowFiles $bindingsFileExists $liveWorkflows
-
-$missingCredentialBlockers = @($preflight.BlockedWorkflows | Where-Object { $_.Kind -eq "MissingCredentialBindings" })
-if (
-  $missingCredentialBlockers.Count -gt 0 -and
-  -not $SkipCredentialBindingRefresh -and
-  -not $DryRun
-) {
-  if (Export-CredentialBindingsOnly $workflowFiles $liveWorkflows) {
-    $bindingsFileExists = Test-Path -Path $BindingsFilePath -PathType Leaf
-    if ($bindingsFileExists) {
-      Write-Step "RETRY" "Credential bindings are now available; rerunning workflow check."
-      $preflight = Invoke-WorkflowPreflight $workflowFiles $bindingsFileExists $liveWorkflows
-    }
-  }
+if ($DeploymentPolicyFileWasExplicit) {
+  Assert-DeploymentPolicySnapshotCurrent $deploymentPolicySnapshot
+  $script:PortablePolicyPreflightPassed = $true
 }
+Initialize-RunDirectory $PreparedDirPath
+$EffectiveDeploymentPolicyFilePath = $DeploymentPolicyFilePath
+if ($DeploymentPolicyFileWasExplicit) {
+  $EffectiveDeploymentPolicyFilePath = Join-Path $PreparedDirPath "deployment-policy.snapshot.json"
+  Write-Utf8NoBomText $EffectiveDeploymentPolicyFilePath ($deploymentPolicySnapshot.Content.TrimEnd() + "`n")
+}
+$targetResolutionBlockers = Test-PortableTargetResolution $workflowFiles $liveWorkflows
+if ($targetResolutionBlockers.Count -gt 0) {
+  $targetGate = [PSCustomObject]@{
+    PlannedImports = @()
+    BlockedWorkflows = @($targetResolutionBlockers)
+    RequiredCredentialMisses = @()
+    OptionalCredentialMisses = @()
+    UnsafeCredentialFailures = @()
+    ReportCredentials = @()
+    SkippedCount = 0
+  }
+  Write-N8nOperationReport "BLOCKED" ([string]$targetResolutionBlockers[0].Kind) "resolve-target-workflow-and-node" $false $false $targetResolutionBlockers @() "MAP_FROM_FAILURE_CODE" "Use the deterministic supported action for this failure code." "unchanged"
+  Write-BlockedSummary $targetGate
+  exit 1
+}
+$credentialMetadataFile = Get-SafeCredentialMetadata
+
+$preflight = Invoke-PortableWorkflowPreflight $workflowFiles $liveWorkflows $credentialMetadataFile
+Remove-Item -LiteralPath $credentialMetadataFile -Force -ErrorAction SilentlyContinue
 
 if ($preflight.BlockedWorkflows.Count -gt 0) {
+  $firstBlockCode = [string]$preflight.BlockedWorkflows[0].Kind
+  Write-N8nOperationReport "BLOCKED" $firstBlockCode "prepare" $false $false $preflight.BlockedWorkflows $preflight.ReportCredentials "MAP_FROM_FAILURE_CODE" "Use the deterministic supported action for this failure code." "unchanged"
   Write-BlockedSummary $preflight
-  Remove-DryRunPlanningDirectory
   exit 1
 }
 
@@ -1139,7 +1859,6 @@ if ($DryRun) {
   Write-Host ("New live          : {0}" -f $preflight.MissingLiveWorkflowCount)
   Write-Host ("Restart warnings  : {0}" -f $preflight.RestartWarningCount)
   Write-Host "Live n8n was not changed."
-  Write-Host ("The configured prepared dir was not read, cleared, created, or modified: {0}" -f (Get-DisplayPath $PreparedDirPath))
 
   Write-WorkflowActionSummary $preflight.PlannedImports "Planned"
 
@@ -1147,14 +1866,10 @@ if ($DryRun) {
   if ($preflight.PlannedImports.Count -gt 0) {
     Write-Host "1. Review the planned imports above."
     Write-Host "2. Run this import command again without -DryRun when ready."
-    if (-not $bindingsFileExists) {
-      Write-Host "3. Reattach credentials in n8n after import if any imported nodes need them."
-    }
   } else {
     Write-Host "1. No import is needed right now."
   }
-  Write-Host "Deleting archived workflows is not supported by these CLI helper scripts yet."
-  Remove-DryRunPlanningDirectory
+  Write-N8nOperationReport "DRY_RUN" "N8N_IMPORT_NO_CHANGES" "plan" $false $false $preflight.PlannedImports $preflight.ReportCredentials "RERUN_WITHOUT_DRY_RUN" "Rerun this unchanged command without -DryRun when ready." "unchanged"
   exit 0
 }
 
@@ -1167,26 +1882,15 @@ if ($preflight.PlannedImports.Count -eq 0) {
   Write-Host ("Restart warnings  : {0}" -f $preflight.RestartWarningCount)
   Write-Host "Live n8n was not changed."
 
+  if ($preflight.RequiredCredentialMisses.Count -gt 0) {
+    Write-N8nOperationReport "ACTION_REQUIRED" "N8N_CREDENTIAL_MISSING" "credential-resolution" $false $false @() $preflight.RequiredCredentialMisses "CREATE_CREDENTIALS_AND_RERUN" "Create each reported logical credential name and type, then rerun this unchanged command." "inactive"
+  } else {
+    Write-N8nOperationReport "SUCCESS" "N8N_IMPORT_NO_CHANGES" "effective-comparison" $false $false @() $preflight.OptionalCredentialMisses "NONE" "No action is required; the effective unpublished payload is unchanged." "inactive"
+  }
+
   Write-Section "Next Action Steps"
   Write-Host "1. No import is needed right now."
-  Write-Host "Deleting archived workflows is not supported by these CLI helper scripts yet."
   exit 0
-}
-
-if (-not $ConfirmLiveImport) {
-  Write-Section "Live Import Confirmation"
-  Write-WorkflowActionSummary $preflight.PlannedImports "Planned"
-  Write-Host "This will mutate live n8n workflows in container '$Container'."
-  Write-Host "Use -DryRun to preview without changes, or pass -ConfirmLiveImport to pre-approve this step."
-
-  if ([Console]::IsInputRedirected) {
-    throw "Live import requires explicit confirmation. Input is non-interactive, so rerun with -ConfirmLiveImport (after reviewing a -DryRun preview) or run interactively and answer the prompt. Live n8n was not changed."
-  }
-
-  if (-not (Read-LiveImportChoice ("Import {0} workflow(s) into live n8n now? Press I to import or E to exit" -f $preflight.PlannedImports.Count))) {
-    Write-Step "STOP" "Live import cancelled before any change. Live n8n was not changed."
-    exit 0
-  }
 }
 
 Invoke-ProjectWorkflowHook "before-live-import" @{
@@ -1199,8 +1903,18 @@ Invoke-ProjectWorkflowHook "before-live-import" @{
   "workflow-dir" = $WorkflowDirPath
 }
 
+foreach ($plannedImport in $preflight.PlannedImports) {
+  if (-not (Test-Path -LiteralPath $plannedImport.PreparedFile -PathType Leaf)) {
+    throw "N8N_CANONICAL_INVARIANT_FAILED: before-live-import hook removed a prepared workflow payload."
+  }
+  $currentPreparedHash = (Get-FileHash -LiteralPath $plannedImport.PreparedFile -Algorithm SHA256).Hash
+  if (-not [string]::Equals([string]$plannedImport.PreparedHash, [string]$currentPreparedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "N8N_CANONICAL_INVARIANT_FAILED: before-live-import hook changed a prepared workflow after canonical invariant validation."
+  }
+}
+
 Write-Section "Prepared Workflow Re-Validation"
-$preparedValidationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), "--mode", "prepared-import", $RunPreparedDirPath)
+$preparedValidationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), "--mode", "prepared-import", $PreparedDirPath)
 if ($preparedValidationResult.ExitCode -ne 0) {
   throw "Prepared workflow JSON validation failed after before-live-import hook.`n$($preparedValidationResult.Output -join "`n")"
 }
@@ -1215,43 +1929,34 @@ foreach ($plannedImport in $preflight.PlannedImports) {
     throw "Failed to copy $($plannedImport.PreparedFile) into container $Container.`n$($copyResult.Output -join "`n")"
   }
 
-  $importArgs = @("exec", $Container, "n8n", "import:workflow", "--input=$($plannedImport.ContainerFile)")
+  $importArgs = @("exec", $Container, "n8n", "import:workflow", "--input=$($plannedImport.ContainerFile)", "--activeState=false")
   if (-not [string]::IsNullOrWhiteSpace($ProjectId)) {
     $importArgs += "--projectId=$ProjectId"
   } elseif (-not [string]::IsNullOrWhiteSpace($UserId)) {
     $importArgs += "--userId=$UserId"
   }
 
+  $script:MutationAttempted = $true
   $importResult = Invoke-CapturedCommand "docker" $importArgs
   if ($importResult.ExitCode -ne 0) {
     throw "Failed to import $($plannedImport.PreparedFile) into container $Container.`n$($importResult.Output -join "`n")"
   }
 
   $importedCount += 1
-  Write-Step "IMPORT" "$($plannedImport.File) imported into live n8n."
+  $script:MutationPerformed = $true
+  Write-Step "IMPORT" "$($plannedImport.File) imported unpublished."
   if ($plannedImport.UpdatesArchivedWorkflow) {
     Write-Step "ARCHIVE" "$($plannedImport.File) updated an archived live workflow. Unarchive it in n8n if you want it active/usable."
   }
-}
 
-$warningImports = @($preflight.PlannedImports | Where-Object { $_.RequiresRestartWarning })
-if ($importedCount -gt 0 -and $warningImports.Count -gt 0) {
-  if ($RestartContainerAfterImport) {
-    Write-Section "Container Restart"
-    Write-Step "WARN" "$($warningImports.Count) imported workflow(s) were previously active or scheduled."
-    Write-Step "WARN" "Restart the n8n container before trusting activation state."
-    if (Read-RestartContainerChoice "Press R to restart n8n container now or E to skip") {
-      $restartResult = Invoke-CapturedCommand "docker" @("restart", $Container)
-      if ($restartResult.ExitCode -ne 0) {
-        throw "Imports succeeded, but docker restart $Container failed.`n$($restartResult.Output -join "`n")"
-      }
-      Write-Step "RESTART" "Ran docker restart $Container because $($warningImports.Count) imported workflow(s) were previously active or scheduled."
-    } else {
-      Write-Step "WARN" "Skipped container restart. Restart n8n manually before trusting activation state."
-    }
-  } else {
-    Write-Step "WARN" "$($warningImports.Count) imported workflow(s) were previously active or scheduled. Restart the n8n container before trusting activation state."
+  $postImportWorkflows = Get-LiveWorkflows
+  $postconditionMatches = @($postImportWorkflows | Where-Object { [string]$_.id -eq [string]$plannedImport.TargetId })
+  if ($postconditionMatches.Count -ne 1 -or $postconditionMatches[0].active -ne $false) {
+    Write-N8nOperationReport "FAILED" "N8N_POSTCONDITION_FAILED" "verify-postcondition" $true $true @($plannedImport) $preflight.ReportCredentials "STOP_AND_ESCALATE" "Do not publish or execute the workflow; inspect the sanitized report and escalate the Toolkit defect." "unknown"
+    throw "N8N_POSTCONDITION_FAILED: imported workflow was not uniquely observable as unpublished."
   }
+  Write-Step "VERIFY" "$($plannedImport.File) postcondition is unpublished; no workflow was executed."
+  Save-LocalWorkflowIdentity $plannedImport
 }
 
 Write-Section "Summary"
@@ -1259,19 +1964,25 @@ Write-Host ("Imported          : {0}" -f $importedCount)
 Write-Host ("Skipped           : {0}" -f $preflight.SkippedCount)
 Write-Host ("Name matched      : {0}" -f $preflight.NameMatchedWorkflowCount)
 Write-Host ("New live          : {0}" -f $preflight.MissingLiveWorkflowCount)
-Write-Host ("Restart warnings  : {0}" -f $preflight.RestartWarningCount)
-Write-Host "n8n may leave imported workflows inactive."
+Write-Host "Postcondition     : every imported workflow is unpublished"
 
 Write-WorkflowActionSummary $preflight.PlannedImports "Done"
 
 Write-Section "Next Action Steps"
 if ($importedCount -gt 0) {
-  Write-Host "1. Open n8n and confirm imported workflows still have the expected credential assignments."
-  Write-Host "2. Activate only the workflows you intentionally want published."
-  if (@($preflight.PlannedImports | Where-Object { $_.UpdatesArchivedWorkflow }).Count -gt 0) {
-    Write-Host "3. One or more archived workflows were updated; unarchive them in n8n if you want to use them."
+  if ($preflight.RequiredCredentialMisses.Count -gt 0) {
+    Write-Host "Create the following credentials with exactly these logical names and types, then rerun this unchanged command:"
+    foreach ($credential in $preflight.RequiredCredentialMisses) {
+      Write-Host ("- {0} ({1})" -f $credential.LogicalName, $credential.CredentialType)
+    }
+    Write-N8nOperationReport "ACTION_REQUIRED" "N8N_CREDENTIAL_MISSING" "postcondition" $true $true $preflight.PlannedImports $preflight.RequiredCredentialMisses "CREATE_CREDENTIALS_AND_RERUN" "Create each reported logical credential name and type, then rerun this unchanged command." "inactive"
+  } else {
+    Write-Host "No further import action is required. Publishing remains a separate operator decision outside this helper."
+    Write-N8nOperationReport "SUCCESS" "N8N_IMPORT_SUCCESS" "receipt" $true $true $preflight.PlannedImports $preflight.OptionalCredentialMisses "NONE" "No further import action is required." "inactive"
   }
 } else {
   Write-Host "1. No live workflow changes were imported."
 }
-Write-Host "Deleting archived workflows is not supported by these CLI helper scripts yet."
+} finally {
+  Remove-LiveWorkflowList
+}

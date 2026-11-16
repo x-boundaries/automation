@@ -3,20 +3,8 @@
 
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
-const readline = require('node:readline/promises');
 
 const N8N_IMAGE_REPOSITORY = 'n8nio/n8n';
-
-function isN8nImage(image) {
-  if (typeof image !== 'string' || image === '') return false;
-  // Accept any tag or digest of the official n8nio/n8n image, e.g.
-  // n8nio/n8n, n8nio/n8n:stable, n8nio/n8n:1.99.1, n8nio/n8n@sha256:...
-  const withoutDigest = image.split('@')[0];
-  const lastSlash = withoutDigest.lastIndexOf('/');
-  const tagSeparator = withoutDigest.indexOf(':', lastSlash + 1);
-  const repository = tagSeparator === -1 ? withoutDigest : withoutDigest.slice(0, tagSeparator);
-  return repository === N8N_IMAGE_REPOSITORY;
-}
 const DEFAULT_SERVICE = 'n8n';
 
 function parseArgs(args = []) {
@@ -183,6 +171,33 @@ function findByComposeLabels(allRunning, options) {
   });
 }
 
+// The official image is published as n8nio/n8n on Docker Hub and as docker.n8n.io/n8nio/n8n, under
+// any tag (stable, latest, a version) or digest. Match those registries and the repository path, not
+// one exact reference; an image from any other registry needs an explicit target.
+const N8N_IMAGE_REGISTRIES = Object.freeze(['', 'docker.io', 'index.docker.io', 'registry-1.docker.io', 'docker.n8n.io']);
+
+function imageRegistry(image) {
+  const parts = String(image || '').trim().toLowerCase().split('@')[0].split('/');
+  return parts.length > 1 && (parts[0].includes('.') || parts[0].includes(':') || parts[0] === 'localhost') ? parts[0] : '';
+}
+
+function imageRepository(image) {
+  let reference = String(image || '').trim().toLowerCase();
+  const digestAt = reference.indexOf('@');
+  if (digestAt >= 0) reference = reference.slice(0, digestAt);
+  const lastSlash = reference.lastIndexOf('/');
+  const tagColon = reference.lastIndexOf(':');
+  if (tagColon > lastSlash) reference = reference.slice(0, tagColon);
+  const parts = reference.split('/');
+  if (parts.length > 1 && (parts[0].includes('.') || parts[0].includes(':') || parts[0] === 'localhost')) parts.shift();
+  if (parts[0] === 'library') parts.shift();
+  return parts.join('/');
+}
+
+function isN8nImage(image) {
+  return N8N_IMAGE_REGISTRIES.includes(imageRegistry(image)) && imageRepository(image) === N8N_IMAGE_REPOSITORY;
+}
+
 function findByImageFallback(allRunning) {
   return allRunning.filter((candidate) => isN8nImage(candidate.image));
 }
@@ -219,7 +234,7 @@ function overrideGuidance() {
 function missingTargetMessage() {
   return [
     'No running n8n Docker container was detected.',
-    'Detection tried explicit CLI/env target, docker compose ps, Compose labels, and n8nio/n8n image fallback.',
+    'Detection tried explicit CLI/env target, docker compose ps, Compose labels, and any n8nio/n8n image (Docker Hub or docker.n8n.io, any tag).',
     overrideGuidance(),
   ].join('\n');
 }
@@ -253,6 +268,7 @@ async function chooseCandidate(candidates, io) {
     throw new Error(`Multiple running n8n candidates require an explicit target in non-interactive mode.\n${overrideGuidance()}`);
   }
 
+  const readline = require('node:readline/promises');
   const rl = readline.createInterface({ input, output, terminal: true });
   let answer = '';
   try {
@@ -354,6 +370,7 @@ module.exports = {
   findByComposeLabels,
   findByImageFallback,
   formatCandidateList,
+  imageRepository,
   invalidSelectionMessage,
   isN8nImage,
   missingTargetMessage,
