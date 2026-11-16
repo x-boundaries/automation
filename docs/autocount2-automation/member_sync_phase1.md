@@ -306,10 +306,15 @@ against Shopify split and whole (stayed separate).
    again. A skip is allowed again only once the oldest of the last five
    skips is 24 hours old. The times of the skips are kept in the watermark
    `changelog_unparsed_skipped_at` (times only, no member data), written
-   with the skip; an unreadable value skips nothing (the read stops). So a
+   with the skip; an unreadable value skips nothing (the read stops), and a
+   time ahead of the clock counts until 24 hours after that time. So a
    systematic parse failure (for example an XML shape change) skips at most
    5 members a day, not 5 a run. The daily summary reads the alert as
-   `alert_unexpected` (STOP): a person looks at the VM.
+   `alert_unexpected` (STOP): a person looks at the VM. **Repair (#155
+   BF2d, G2 F5):** when the stored value is unreadable or holds a time
+   ahead of the clock, the bound holds until a person acts: after the cause
+   is fixed, a person deletes the watermark `changelog_unparsed_skipped_at`
+   (a VM step, with the owner's approval); the next run starts a new list.
 4. A highest ID below the watermark (numbering went backwards) is refused:
    alert and count `changelog_id_reset_detected`, nothing processed, the
    watermark never reset automatically.
@@ -1659,7 +1664,11 @@ exactly as before (a pinned golden output of the summary proves it):
   `shopify_creates_expected`.
 - **Shown apart:** whenever either setting is in use and a backfill call
   ran, the email's alert line carries `backfill_members_creates=N` (the
-  backfill's creates; the `Shopify writes=` figure stays the total). The
+  backfill's creates; the `Shopify writes=` figure stays the total: #155
+  BF2d, G2 F1, the digest's `shopify_customer_created` count also holds
+  each call's landed creates that its stored counts miss, `max(0, landed -
+  stored)` a call, so a killed call, or one interrupted between its `DONE`
+  row and its count, is in that figure too, never twice). The
   event's closed shape and the n8n workflow are unchanged; the record file
   also keeps the split as `creates` (counts, dates and caps only).
 

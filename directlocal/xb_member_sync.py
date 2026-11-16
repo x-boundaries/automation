@@ -3969,7 +3969,8 @@ def _nearest_rank(ordered: list[int], percent: int) -> int | None:
 BF2_DIGEST_CODES = ("shopify_customer_created", "shopify_create_uncertain", "shopify_create_rejected")
 
 
-def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str, now: datetime, per_hour: Mapping[str, int]) -> dict[str, Any] | None:
+def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str, now: datetime, per_hour: Mapping[str, int],
+                             live_counts: dict[str, int]) -> dict[str, Any] | None:
     """#155 BF2b (design 2.12): the ``backfill-members`` calls (run ids
     ``bf2-``) of the period, apart from the live runs, for the daily
     summary: calls, their create outcomes (from each call's stored counts),
@@ -3981,7 +3982,14 @@ def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str
     BF2c (F2): a call's creates are never fewer than the Shopify create
     rows (``ac2_to_shopify``, DONE) in its span, so a call killed before it
     stored its counts still shows them; ``unfinished``: the calls with no
-    stored end (killed) or that an error or an interrupt ended."""
+    stored end (killed) or that an error or an interrupt ended.
+    BF2d (PR #311 G2 F1): ``live_counts`` is the digest's counts, which
+    hold only the stored counts of runs with a stored end. Each call's
+    landed creates that its stored counts miss (``max(0, landed -
+    stored)``: a process kill stores nothing, an interrupt between the DONE
+    row and the count stores one fewer) are added to its
+    ``shopify_customer_created``, so the email's ``Shopify writes=`` is the
+    total. Never subtracted, never added twice; untouched when no call ran."""
 
     starts = [dl.parse_created_at(row["started_at"]) for row in runs]
     spans = []
@@ -4025,6 +4033,9 @@ def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str
                 hour = moment.astimezone(SGT).strftime("%Y-%m-%dT%H")
                 backfill_hour[hour] = backfill_hour.get(hour, 0) + 1
                 break
+    missed = sum(max(0, m - n) for n, m in zip(stored_creates, landed))
+    if missed > 0:
+        live_counts["shopify_customer_created"] = live_counts.get("shopify_customer_created", 0) + missed
     return {
         "calls": len(spans), "creates": sum(max(n, m) for n, m in zip(stored_creates, landed)), "unfinished": unfinished,
         "uncertain": outcomes["shopify_create_uncertain"],
@@ -4115,7 +4126,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
 
         import xb_member_sync_probe as probe  # the probe module reads only its status file here
 
-        backfill = _digest_backfill_members(conn, runs, since=since, now=now, per_hour=per_hour)
+        backfill = _digest_backfill_members(conn, runs, since=since, now=now, per_hour=per_hour, live_counts=counts)  # BF2d: may add to counts
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
             "runs": {"completed": len(durations), "unfinished": unfinished,
