@@ -42,5 +42,8 @@
   "shopify_create_member_types": ["MEMBER", "GUEST"],
   "backfill_members_lookups_per_call": 50,
   "backfill_members_max_per_call": null,
-  "backfill_members_max_per_hour": null
+  "backfill_members_max_per_hour": null,
+  "forms_watch_enabled": false,
+  "forms_watch_since": null,
+  "forms_watch_max_pages": 4
 }

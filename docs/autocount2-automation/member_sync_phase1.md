@@ -528,12 +528,16 @@ Unknown keys, at the top level or nested, are refused.
 | `backfill_members_max_per_call` | `null` | #155 BF2b (design 2.7): 1-25 customers a `backfill-members` call may create (`--max` 1 to this). `null`: `max_writes_per_run`, the BF2a cap. Used only by the backfill (S6 keeps `max_writes_per_run`). Not more than `backfill_members_max_per_hour` |
 | `backfill_members_max_per_hour` | `null` | #155 BF2b: 1-60 writes (all kinds, from the ledger) in any 60 minutes that a backfill call may reach before it stops (`backfill_hour_cap_reached`). `null`: 4 x `max_writes_per_run` (20), the BF2a cap. Set both in the backfill's own config copy for a sitting, with the daily summary's `backfill_members_window` declaring the same caps and dates (a backfill create outside a declared window, or over its caps, stops the next summary) |
 | `member_core_state_root` | `null` | #155 slice BF1: the member core's (#268) state root. When set, the backfill and `coverage` read its active claim links read-only (its ledger version must be 2, the one this module knows, else `member_core_ledger_version_unknown` before any decision; its meta must be the member core's, bound to the same book and store); a member is then linked if either ledger says so. A pair staff unlinked there is never linked by the backfill. `null`: not read, and the output says `"member_core_ledger": "not_configured"`. Must not be this sync's own `state_root` |
+| `forms_watch_enabled` | `false` | #155 slice FH1: the forms watch (section "Forms watch" below): each run, after both directions, reads the copy records of customers tagged `xb-form-signup` and counts them. Reads only: no Shopify, AutoCount or n8n write, no new scope |
+| `forms_watch_since` | `null` | #155 FH1: a Singapore date `YYYY-MM-DD`, required when the watch is on (`sync_config_forms_watch_since_required`); records of customers updated before it are never read |
+| `forms_watch_max_pages` | `4` | #155 FH1: 1-20 pages of 50 customers per run; also bounds the K6 email reads (pages x 50 a run) |
 
 Neither BF1 key is printed by `check-config` while it is absent or off, so
 its output is unchanged; when set it adds `backfill_registrations_enabled:
 true` or `member_core_state_root_set: true` (never the path). The three BF2a
 keys likewise appear only when set to something other than their default,
-and the two BF2b caps only when not `null`.
+and the two BF2b caps only when not `null`. The three FH1 keys likewise
+appear only when not their default.
 None of them is needed in the 15-minute task's live config (an older commit
 refuses unknown keys).
 
@@ -557,6 +561,9 @@ example) is `membership.birthday_month` / `single_line_text_field` (13 Nov
   overnight only with the BF2b daily summary and its setting
   `shopify_creates_expected: true` (Controller Q2). The Forms "attached but not applied" alert Flow is a
   separate owner-approved item (Controller Q3).
+- #155 FH1: `forms_watch_enabled` (and the summary's `forms_watch_expected`)
+  until the owner's copy Flow is built and tested and FH1 is on the live
+  task's commit.
 
 ## Write safety
 
@@ -1304,6 +1311,124 @@ that lookup succeeding:
 5. Never edit ledger rows. The pending row stays `SKIPPED`; the link is the
    record. A customer that stays held is safe: the sync fails closed and
    never creates a second member.
+
+### Forms watch: website sign-ups attached to an existing account (#155 slice FH1)
+
+**The problem.** When someone signs up on the website with a phone our
+Shopify store already holds, Shopify Forms attaches the sign-up to that
+existing customer and drops the typed email and the member tags (the
+person still sees "you're registered"). Design: #155 G0 of 17 Nov 2026
+(shared phones and forms auto-heal), sections B8, B9, B12.
+
+**FH1 writes nothing.** It reads, classifies and counts. No Shopify,
+AutoCount, n8n or Gmail write; no new Shopify scope (the session check is
+unchanged); no new mutation; ledger schema 3 unchanged. The heal itself
+is a later slice (FH2), off by default, with its own owner OK.
+
+**What the owner's copy Flow writes** (design section 6.1, "XB member
+sign-up copy (no alert)"; trigger "Metaobject entry created" on the
+sign-up form's entries, a 5-minute wait, then two "Send Admin API
+request" actions on the entry's "Submitted by" customer):
+
+| Written on the customer | Value |
+|---|---|
+| metafield `xb_form.submission_id` (`single_line_text_field`) | the entry's Submission id |
+| metafield `xb_form.submitted_at` | Submitted at (RFC 3339 with an offset, for example `2026-12-01T10:00:00Z`) |
+| metafield `xb_form.email` | the email typed on the form |
+| metafield `xb_form.phone` | the phone typed on the form |
+| metafield `xb_form.first_name` | the first name typed on the form |
+| metafield `xb_form.birthday_month` | the birthday month typed (may be empty) |
+| tag `xb-form-signup` | added by `tagsAdd` |
+
+The namespace, the six keys and the tag are constants in the code, not
+settings: the Flow must use exactly these names. A record that is not
+exactly these six text values is counted `forms_record_invalid`.
+
+**The switch.** In the sync config: `forms_watch_enabled: true` and
+`forms_watch_since: "<YYYY-MM-DD>"` (the day the Flow went on; earlier
+records are never read); `forms_watch_max_pages` 1-20 (default 4). In the
+daily summary settings: `forms_watch_expected: true`. Only after the
+owner's Flow is built and tested (design 6.2) and the live task runs a
+commit with FH1 (an older commit refuses the keys). Off: set both back
+to `false` (or remove them); nothing else changes.
+
+**What a run does** (after both directions, inside the same lock; a run
+refused earlier reads nothing):
+
+1. Prunes its seen-marks older than 120 days.
+2. Reads `customers(query: "tag:'xb-form-signup' AND
+   updated_at:>='<day>'")`, oldest update first, at most
+   `forms_watch_max_pages` pages. `<day>` is the day before the last clean
+   read (whole-day filter, so that day is read again), never before
+   `forms_watch_since`. A customer whose tags lack the exact tag (trimmed,
+   any case) is dropped.
+3. Parses each record strictly, skips any submission already seen (one
+   seen-mark per submission in the ledger's `watermarks` table: name
+   `forms_seen:` + a keyed digest of the submission id; value
+   `<code>|<time>`; nothing the person typed is stored), and skips records
+   submitted more than 120 days ago.
+4. Classifies the rest (below) and counts.
+5. Moves its read day only after a clean read of every page. A read
+   failure, the page cap reached, or the K6 read budget spent: count
+   `forms_read_incomplete`, the read day stays, and the records not yet
+   classified are read again next run.
+
+**The codes** (counts in the run summary and the digest; never an alert;
+keyed `c-` refs only where a person may want to look):
+
+| Case (C: the customer; E, P, F: the typed email, phone, first name) | Code |
+|---|---|
+| K1 C's email is E and C has `member-mg` | `forms_ok` (a normal sign-up) |
+| K2 C's email is E, `member-mg` missing | `forms_same_email_tags_missing`, then `forms_would_heal_tags` (unused) or `forms_left_used` |
+| K3 C's phone is P, the words of F are all words of C's name | `forms_attached_by_phone`, then `forms_would_heal` (unused) or `forms_left_used` |
+| K4 as K3, but a word of F is not in C's name | `forms_other_person` (ref) |
+| K5 as K3, but C's name or F has no word | `forms_held_name_unclear` (ref) |
+| K6 K3, unused, and E is on another Shopify customer (one `customerByIdentifier` read; at most pages x 50 a run) | `forms_held_email_elsewhere` (ref) |
+| K7 C's phone is not P and C's email is not E | `forms_unclassified` (ref) |
+| K9 the record cannot be read | `forms_record_invalid` |
+
+Also `forms_records_seen` (records read) and `forms_records_new` (records
+classified this run; equals the sum of the outcome codes). Emails compare
+trimmed and case-folded, phones by their digits, names by words.
+
+**"Unused"** (design B9) means all four of: `numberOfOrders` "0",
+`amountSpent` zero, `canDelete` true, `state` `DISABLED` (never signed
+in). Anything missing, null, unreadable or different (`ENABLED`,
+`INVITED`, `DECLINED`) is used: fail safe. Whether in-store (POS) orders
+count in `numberOfOrders` is not documented (FH2 test H0).
+
+**The digest** gets a `forms` block only when the watch is on or a run of
+the period counted a `forms_` code: each code's count, `not_healed`
+(`forms_left_used` + `forms_held_*` + `forms_other_person` +
+`forms_unclassified`), `would_heal` (`forms_would_heal` +
+`forms_would_heal_tags`), `last_record_at` (newest seen-mark) and
+`last_sign_up_at` (the last time a run saw a new sign-up row in the
+ledger's `shopify_pending` table). Counts and times only.
+
+**The daily email** (with `forms_watch_expected`): the summary builds the
+line `Website sign-ups on an existing account (24h): not healed N (account
+used N, held N) | would heal N | other person N` ("held" = the
+`forms_held_*` codes and `forms_unclassified`). The email's event shape is
+closed (the n8n workflow is unchanged), so the counts show in the email's
+"Alerts 24h (runs)" line as `forms_not_healed`, `forms_account_used`,
+`forms_held`, `forms_would_heal`, `forms_other_person`; they are figures,
+not alerts, and never change CLEAN or STOP. The full line is in the VM
+record (`daily_summary_<date>.json`, key `forms`).
+
+**The WARN `forms_flow_silent`**: a new sign-up was seen in the last 72
+hours and it is more than 6 hours newer than the newest copy record (or
+there is no record at all): the Flow is probably off or failing. It shows
+as `forms_flow_silent=1` in the alert line, in the record's `forms.warn`
+and in the printed answer's `forms_warn`. No STOP. What to do: open the
+Flow in Shopify admin (Apps > Flow), check it is on and its recent runs
+succeeded.
+
+**How to read the counts.** "Not healed" is the one number for the
+Controller: sign-ups that landed on an existing account and stay as they
+are (used accounts, held cases, another person on a shared phone).
+"Would heal" is what FH2 would fix (never-used accounts only); FH1 fixes
+nothing. A steady `forms_record_invalid` means the Flow writes another
+shape (check its inputs against the table above).
 
 ### UAT checklist
 

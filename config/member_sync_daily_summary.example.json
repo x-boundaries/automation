@@ -8,6 +8,7 @@
   "child_timeout_seconds": 40,
   "shopify_creates_expected": false,
   "backfill_members_window": null,
+  "forms_watch_expected": false,
   "member_tools": {
     "member_core": {
       "enabled": false,
