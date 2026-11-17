@@ -500,8 +500,3 @@ workflows were activated; C7 (54 of 54 public variants refused) and C1 were re-p
 Task `\XB\EnergyGrid Daily Bills Native` was registered disabled, one attended `daily` ran (IDLE, latch
 `GOOGLE_SHA256_REQUIRED` written, real monitor report accepted), then the task was enabled at 11:30 SGT.
 From here on, recovery is native-only fix-forward (section 9.2); the old route is never resumed.
-
-Re-import of `EnergyGrid - Owner Email` (#316, 17 Nov 2026): the export now ships its two Google endpoints as
-placeholders, `REPLACE_WITH_DRIVE_FILE_LINK_BASE_URL` and `REPLACE_WITH_OPENID_USERINFO_URL`. Any future import
-(step 4 of section 10) fills both, with the existing three, in the local import copy; see the
-[n8n-workflows README](../../n8n-workflows/README.md) entry. The live workflow activated above is unchanged by this.

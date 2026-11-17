@@ -39,13 +39,6 @@ DID = "egd-" + "2" * 32
 NONCE = "0123456789abcdef0123456789abcdef"
 GMAIL = "Send Owner Email"
 SCHEMA = "energygrid.owner_email.response.v1"
-# #316: the two Google endpoints ship as placeholders, filled in the local import copy. The Drive link base is
-# taken from the Core's own drive_link(), so the fill value the render test proves is the Core's exact prefix.
-DRIVE_BASE_PLACEHOLDER = "REPLACE_WITH_DRIVE_FILE_LINK_BASE_URL"
-USERINFO_PLACEHOLDER = "REPLACE_WITH_OPENID_USERINFO_URL"
-DRIVE_BASE, DRIVE_SUFFIX = notify.drive_link("{file_id}").split("{file_id}")
-# Hosts allowed to appear as literal http(s) URLs in the export. Empty: every endpoint is a placeholder.
-ALLOWED_URL_HOSTS: frozenset[str] = frozenset()
 
 HARNESS = r"""
 const fs = require('fs');
@@ -237,23 +230,10 @@ class StaticContractTests(unittest.TestCase):
     def test_probe_identity_uses_the_sender_credential_type(self) -> None:
         node = self.nodes["Get Sender Identity"]
         params = node["parameters"]
-        self.assertEqual(("GET", USERINFO_PLACEHOLDER, "gmailOAuth2"),
+        self.assertEqual(("GET", "https://openidconnect.googleapis.com/v1/userinfo", "gmailOAuth2"),
                          (params["method"], params["url"], params["nodeCredentialType"]))
         self.assertIs(False, params["options"]["redirect"]["redirect"]["followRedirects"])
         self.assertEqual((True, 3, 5000), (node["retryOnFail"], node["maxTries"], node["waitBetweenTries"]))
-
-    def test_no_literal_url_host_outside_the_allowed_set(self) -> None:
-        hosts = set(re.findall(r"(?i)https?://([^/\s\"'`\\]*)", self.raw))
-        self.assertEqual(set(), hosts - ALLOWED_URL_HOSTS)
-
-    def test_each_endpoint_placeholder_appears_exactly_once_where_it_is_read(self) -> None:
-        for placeholder in (DRIVE_BASE_PLACEHOLDER, USERINFO_PLACEHOLDER):
-            with self.subTest(placeholder=placeholder):
-                self.assertEqual(1, self.raw.count(placeholder))
-        code = self.nodes["Validate Email Request"]["parameters"]["jsCode"]
-        self.assertIn(f"const DRIVE_FILE_LINK_BASE = '{DRIVE_BASE_PLACEHOLDER}';", code)
-        self.assertIn("Google Drive: ${DRIVE_FILE_LINK_BASE}${body.drive_file_id}" + DRIVE_SUFFIX, code)
-        self.assertEqual(USERINFO_PLACEHOLDER, self.nodes["Get Sender Identity"]["parameters"]["url"])
 
     def test_every_path_ends_in_a_response_with_an_explicit_code(self) -> None:
         responders = {name for name, node in self.nodes.items() if node["type"] == "n8n-nodes-base.respondToWebhook"}
@@ -267,48 +247,16 @@ class StaticContractTests(unittest.TestCase):
 
 
 class CodeNodeTests(unittest.TestCase):
-    replace = {"REPLACE_WITH_SUBJECT_PREFIX": PREFIX, "REPLACE_WITH_OWNER_RECIPIENT": RECIPIENT,
-               DRIVE_BASE_PLACEHOLDER: DRIVE_BASE}
+    replace = {"REPLACE_WITH_SUBJECT_PREFIX": PREFIX, "REPLACE_WITH_OWNER_RECIPIENT": RECIPIENT}
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.nodes = {node["name"]: node for node in json.loads(WORKFLOW.read_text(encoding="utf-8"))["nodes"]}
 
-    def validate(self, bodies: list, headers=None, replace=None) -> list[dict]:
-        replace = self.replace if replace is None else replace
-        cases = [{"node": "Validate Email Request", "input": [webhook_item(body, headers)], "replace": replace}
+    def validate(self, bodies: list, headers=None) -> list[dict]:
+        cases = [{"node": "Validate Email Request", "input": [webhook_item(body, headers)], "replace": self.replace}
                  for body in bodies]
         return [output[0]["json"] for output in run_nodes(cases)]
-
-    def test_unfilled_or_non_https_drive_link_base_refuses_every_request(self) -> None:
-        probe = {"schema": notify.EMAIL_REQUEST_SCHEMA, "mode": "PROBE", "nonce": NONCE}
-        send = notify.email_request(CFG, SUCCESS)
-        unfilled = {k: v for k, v in self.replace.items() if k != DRIVE_BASE_PLACEHOLDER}
-        bad_values = {"unfilled placeholder": None, "other placeholder": "REPLACE_WITH_SOMETHING_URL",
-                      "http": "http://example.com/file/d/", "no scheme": "example.com/file/d/", "empty": "",
-                      "ftp": "ftp://example.com/file/d/", "scheme only": "https://", "host only": "https://example.com",
-                      "space": "https://example.com/file d/", "javascript": "javascript:alert(1)//"}
-        expected = {"route": "REFUSED", "response_code": 422, "response": {
-            "schema": SCHEMA, "mode": None, "notification_id": None, "dispatch_id": None, "outcome": "REFUSED",
-            "reason": "EG_EMAIL_CONFIG_INVALID"}}
-        for name, value in bad_values.items():
-            replace = unfilled if value is None else {**unfilled, DRIVE_BASE_PLACEHOLDER: value}
-            with self.subTest(value=name):
-                self.assertEqual([expected, expected], self.validate([probe, send], replace=replace))
-        with self.subTest(value="proxy-marked request stays not found"):
-            self.assertEqual([{"route": "NOT_FOUND"}], self.validate([send], {"cf-ray": "1"}, replace=unfilled))
-
-    def test_a_filled_https_drive_link_base_is_accepted_and_rendered(self) -> None:
-        fake_base = "https://example.com/file/d/"
-        replace = {**self.replace, DRIVE_BASE_PLACEHOLDER: fake_base}
-        request = notify.email_request(CFG, SUCCESS)
-        probe, send = self.validate([{"schema": notify.EMAIL_REQUEST_SCHEMA, "mode": "PROBE", "nonce": NONCE}, request],
-                                    replace=replace)
-        self.assertEqual("PROBE", probe["route"])
-        self.assertEqual("SEND", send["route"])
-        self.assertIn(f"Google Drive: {fake_base}{SUCCESS['drive_file_id']}{DRIVE_SUFFIX}\n", send["text"])
-        # A base other than the Core's renders different bytes, so Render Matches refuses it before any send.
-        self.assertNotEqual(request["render_sha256"], hashlib.sha256(send["canonical"].encode("utf-8")).hexdigest())
 
     def test_the_workflow_renders_exactly_what_the_core_expects_for_every_template(self) -> None:
         sources = (SUCCESS, FAILURE, RELEASED)
