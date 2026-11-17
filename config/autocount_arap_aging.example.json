@@ -1,0 +1,52 @@
+{
+  "timezone": "Asia/Singapore",
+  "schedule": {
+    "frequency": "hourly",
+    "run_minute": 30,
+    "logon_type": "S4U"
+  },
+  "stale_after_minutes": 70,
+  "source": {
+    "server": "EXAMPLE-SQL-HOST\\EXAMPLE",
+    "odbc_driver": "ODBC Driver 17 for SQL Server",
+    "expected_database": "AED_EXAMPLE_BOOK",
+    "allowed_databases": ["AED_EXAMPLE_BOOK"],
+    "encrypt": false,
+    "trust_server_certificate": false
+  },
+  "identity": {
+    "auth_mode": "windows_integrated",
+    "sql_login": null,
+    "credential_target": null,
+    "allow_privileged_identity": false
+  },
+  "read": {
+    "lock_timeout_ms": 5000,
+    "query_timeout_seconds": 60,
+    "max_attempts": 3,
+    "retry_backoff_seconds": 2
+  },
+  "output": {
+    "archive_root": "C:\\EXAMPLE\\automation\\autocount_outputs\\arap_aging",
+    "delivery_root": null
+  },
+  "aging": {
+    "boundaries": [0, 30, 60, 90, 120]
+  },
+  "parties": {
+    "online_shop_debtor_codes": ["DEBT-WEB"]
+  },
+  "knockoff_target_types": {
+    "ar": {"RI": "IV"},
+    "ap": {}
+  },
+  "guess_sources": {
+    "ar_debit_notes": false,
+    "ap_debit_notes": false,
+    "ar_deposits": false,
+    "ap_deposits": false,
+    "payment_home_rate": false,
+    "payment_handover_date": false
+  },
+  "reconciled_on": null
+}

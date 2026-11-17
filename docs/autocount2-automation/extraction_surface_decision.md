@@ -172,7 +172,9 @@ surfaces until they reconcile to AutoCount UI/report outputs.
 
 | Candidate object | Evidence from safe summary | Decision | Notes |
 | --- | --- | --- | --- |
-| Not selected | No AC2 AR/AP extraction surface is approved in this phase | `Unknown` | Later phase; sensitive financial data handling required. |
+| `dbo.ARInvoice`, `dbo.ARCN`, `dbo.ARPayment` and their `*KnockOff` tables, `dbo.ARAPContra`, `dbo.Debtor` | Read-only AR/AP check (#321); stored outstanding consistent with knock-offs | `Needs reconciliation` | #321 slice A1 hourly latest-snapshot export (`docs/autocount2-automation/arap_aging_runbook.md`); proven against the Debtor Aging Report at V3 before use. |
+| `dbo.APInvoice`, `dbo.APCN`, `dbo.APPayment` and their `*KnockOff` tables, `dbo.Creditor` | Read-only AR/AP check (#321) | `Needs reconciliation` | Same export; proven against the Creditor Aging Report at V3. AP payments are not recorded in AC2 yet (`ap_payments_recorded`). |
+| `dbo.ARDN`, `dbo.APDN`, `dbo.ARDeposit`, `dbo.APDeposit` | Column roles are guesses in the check | `Unknown` | Read by the export but not exported until their `guess_sources` setting is turned on after V3. |
 
 ### GL/Account/Journal
 

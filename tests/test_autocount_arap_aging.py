@@ -1,0 +1,1203 @@
+"""Offline tests for the AC2 AR/AP aging export, latest snapshot only (#321 slice A1).
+
+In-memory fakes and temporary folders only. No SQL Server, AutoCount, Drive, n8n or Task
+Scheduler is touched. Every identity, host, party code, name, document number and amount here is
+synthetic (codes like DEBT-A01 / CRED-B02, names like "Example Trading A").
+"""
+
+import contextlib
+import copy
+import csv
+import gzip
+import hashlib
+import io
+import json
+import re
+import shutil
+import sys
+import tempfile
+import unittest
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+from unittest import mock
+from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+
+import autocount_arap_aging as arap  # noqa: E402
+
+SGT = ZoneInfo("Asia/Singapore")
+FIXED_NOW = datetime(2026, 11, 17, 14, 30, 5, tzinfo=SGT)
+SQL_NOW = datetime(2026, 11, 17, 14, 30, 6, tzinfo=SGT)
+AS_AT = date(2026, 11, 17)
+FIXTURE_PATH = ROOT / "tests" / "fixtures" / "arap_dashboard_feed.fake.json"
+FIXTURE_RUN_ID = "0" * 32
+
+FAKE_DB = "AED_EXAMPLE_BOOK"
+FAKE_LOGIN = "fake_reader_login"
+FAKE_USER = "fake_reader_user"
+FAKE_SERVER = "FAKE-SQL-HOST\\FAKEINST"
+ENV = {
+    "AUTOCOUNT_EXPECTED_SQL_LOGIN": FAKE_LOGIN,
+    "AUTOCOUNT_EXPECTED_SQL_USER": FAKE_USER,
+    "AUTOCOUNT_EXPECTED_SQL_DATABASE": FAKE_DB,
+}
+
+# Pinned query hashes: a changed query text must be reviewed (G2) and this table updated with it.
+PINNED_QUERY_SHA256 = {
+    "ap_credit_note": "caf2dcfbeb625d74ca253ba8952adee785259dee4abdc6bd3640000dda552b34",
+    "ap_debit_note": "9b358b3cc5a0678735c4889728bf9d5a3f207cf7108b1a52afd99778a6c5411b",
+    "ap_deposit": "5390c6f6c329619a0def1a5b2fd0650795e73ef0faced80ee57c39141bd5f1c5",
+    "ap_invoice": "238695d1b62894080fe8757b3cb36bb75e88bf94c4d2b3d6273cbd3bf92e7bf1",
+    "ap_knockoffs": "faf9b9e5e3781503901e6f69278bd9d7790f6471fd54c1aad8f26285c225579b",
+    "ap_parties": "b5a32a02792bae7de2567b8bec6fcd522298e1d263de2e778fb0acdfba5490f0",
+    "ap_payment": "4321022ad7464e248786ef9f5d6deecffa7fa56c2083bcb419b239b0934fe54d",
+    "ar_credit_note": "1078bb384f091a373bedb680d5660acf39154d9e6ec75dd4c23523bfd5042381",
+    "ar_debit_note": "74536231e5649d75a150adf146667033e43697835761e26146438e752afaf0ec",
+    "ar_deposit": "12a4bf2f5a68bfa12d1a0a783d6dfd9ceea6ac8ac67f5590b271d94b27e7299b",
+    "ar_invoice": "32d555d06fbdec868dfc9368da928ce9bc17e3e559cc30ba65e59c36f1cd4e6d",
+    "ar_knockoffs": "945ff326f8841cf94b3cc447ed57c7ba60040189210a982766ae8119cc2a75d0",
+    "ar_parties": "052ba916fb6f6be4815e9a6a38c600a6261746689ffcb7c19bd6b1489fc82f78",
+    "ar_payment": "a28ab6e2f2d6e0aa5ff014e29ef2ce329414f9d2ad5ee594dfc30160511d7d90",
+    "change_count": "3850a407d60499abce7344bd47075ba967e771eef5d5b0c86a30b66c7100493a",
+    "identity": "5429df38941a267a8ece8d3c8e3a6b4b9543974ee4e11d13d0386b1d17ba36f6",
+    "sql_time": "55ea2791766679fd010ed952b66c92c99af438d8d8b1f972a256b83a251217bd",
+}
+
+D = Decimal
+
+
+def dt(value):
+    return datetime.fromisoformat(value) if value else None
+
+
+# ---------------------------------------------------------------------------------------------
+# Fake rows (column names are the SQL aliases of the exporter's queries)
+# ---------------------------------------------------------------------------------------------
+
+
+def party(code, name, active="T", ptype="FAKE-TYPE", terms="C.O.D.", ccy="SGD", limit=None, aging="I"):
+    return {
+        "PartyCode": code, "PartyName": name, "PartyType": ptype, "AreaCode": "FAKE-AREA", "Agent": "FAKE-AGENT",
+        "DisplayTerm": terms, "CurrencyCode": ccy, "CreditLimit": None if limit is None else D(limit),
+        "IsActive": active, "AgingOn": aging,
+    }
+
+
+def debit(key, code, doc_date, due, net, out=None, ccy="SGD", rate="1", cancelled="F", prefix="IV", terms="C.O.D."):
+    net = D(net)
+    out = net if out is None else D(out)
+    rate = D(rate)
+    paid = net - out
+    return {
+        "DocKey": key, "DocNo": "%s-%04d" % (prefix, key), "PartyCode": code, "DocDate": dt(doc_date),
+        "DueDate": dt(due), "DisplayTerm": terms, "CurrencyCode": ccy, "CurrencyRate": rate,
+        "OriginalAmt": net, "LocalOriginalAmt": (net * rate).quantize(D("0.01")),
+        "KnockedOffAmt": paid, "LocalKnockedOffAmt": (paid * rate).quantize(D("0.01")),
+        "Outstanding": out, "Cancelled": cancelled, "Agent": "FAKE-AGENT",
+        "Description": "Example order %d" % key, "RefText": "REF-%d" % key,
+    }
+
+
+def payment(key, code, doc_date, amount, ko="0", refund="0", local_unapplied=None, cancelled="F", handover=None):
+    amount, ko, refund = D(amount), D(ko), D(refund)
+    unapplied = amount - ko - refund
+    return {
+        "DocKey": key, "DocNo": "PM-%04d" % key, "PartyCode": code, "DocDate": dt(doc_date), "CurrencyCode": "SGD",
+        "CurrencyRate": D("1"), "OriginalAmt": amount, "LocalOriginalAmt": amount, "KnockOffAmt": ko,
+        "RefundAmt": refund, "LocalUnappliedAmount": unapplied if local_unapplied is None else D(local_unapplied),
+        "HandOverDate": dt(handover), "Cancelled": cancelled, "Description": "Example receipt", "RefText": "",
+    }
+
+
+def credit_note(key, code, doc_date, net, ko="0", refund="0", cancelled="F", ccy="SGD", rate="1"):
+    net, rate = D(net), D(rate)
+    return {
+        "DocKey": key, "DocNo": "CN-%04d" % key, "PartyCode": code, "DocDate": dt(doc_date), "CurrencyCode": ccy,
+        "CurrencyRate": rate, "OriginalAmt": net, "LocalOriginalAmt": (net * rate).quantize(D("0.01")),
+        "KnockOffAmt": D(ko), "RefundAmt": D(refund), "Cancelled": cancelled,
+        "Description": "Example return", "RefText": "RET-%d" % key,
+    }
+
+
+def deposit(key, code, doc_date, amount, outstanding, cancelled="F"):
+    return {
+        "DocKey": key, "DocNo": "DP-%04d" % key, "PartyCode": code, "DocDate": dt(doc_date), "CurrencyCode": "SGD",
+        "CurrencyRate": D("1"), "OriginalAmt": D(amount), "TransferedAmt": D(amount) - D(outstanding),
+        "Outstanding": D(outstanding), "Cancelled": cancelled, "Description": "Example deposit",
+    }
+
+
+def knockoff(target_type, target_key, amount, payer_date, discount="0", payer="PM"):
+    return {
+        "PayerType": payer, "KnockOffDocType": target_type, "KnockOffDocKey": target_key,
+        "Amount": D(amount), "DiscountAmt": D(discount), "PayerDate": dt(payer_date),
+    }
+
+
+def empty_data():
+    return {key: [] for key in arap.BUSINESS_QUERY_KEYS}
+
+
+def fixture_data():
+    """The rich fake book behind tests/fixtures/arap_dashboard_feed.fake.json (as at 17 Nov 2026).
+
+    AR: open invoices in several buckets, a part-paid invoice, unapplied payments and a credit
+    note, an old-dated (January) invoice and payment, an inactive zero-balance debtor and the
+    online-shop debtor. AP: supplier invoices only (no payments), in JPY, USD and SGD, one of them
+    old-dated, due across every schedule band.
+    """
+    data = empty_data()
+    data["ar_parties"] = [
+        party("DEBT-A01", "Example Trading A", limit="5000"),
+        party("DEBT-A02", "Example Outdoor Club B", terms="Net 30 days"),
+        party("DEBT-A03", "Example School C", active="F"),
+        party("DEBT-A04", "Example Retail D"),
+        party("DEBT-WEB", "Example Online Shop"),
+    ]
+    data["ar_invoice"] = [
+        debit(101, "DEBT-A01", "2026-10-01", "2026-10-31", "1200.00", terms="Net 30 days"),
+        debit(102, "DEBT-A01", "2026-08-10", "2026-08-10", "450.00", out="250.00"),
+        debit(103, "DEBT-A02", "2026-11-10", "2026-12-10", "800.00", terms="Net 30 days"),
+        debit(104, "DEBT-A04", "2026-01-15", "2026-01-15", "300.00"),
+        debit(105, "DEBT-A02", "2026-09-01", "2026-10-01", "640.00", out="0", terms="Net 30 days"),
+        debit(106, "DEBT-WEB", "2026-11-16", "2026-11-16", "95.50"),
+        debit(107, "DEBT-A01", "2026-11-01", "2026-11-01", "999.00", cancelled="T"),
+    ]
+    data["ar_payment"] = [
+        payment(201, "DEBT-A01", "2026-09-15", "200.00", ko="200.00"),
+        payment(202, "DEBT-A02", "2026-10-05", "700.00", ko="640.00"),
+        payment(203, "DEBT-WEB", "2026-11-17", "120.00"),
+        payment(204, "DEBT-A04", "2026-02-01", "50.00"),
+    ]
+    data["ar_credit_note"] = [credit_note(301, "DEBT-A01", "2026-11-02", "80.00")]
+    data["ar_knockoffs"] = [
+        knockoff("RI", 102, "200.00", "2026-09-15"),
+        knockoff("RI", 105, "640.00", "2026-10-05"),
+    ]
+    data["ap_parties"] = [
+        party("CRED-B01", "Example Supplier Japan", ccy="JPY", terms="Net 45 days"),
+        party("CRED-B02", "Example Supplier US", ccy="USD", terms="Net 45 days"),
+        party("CRED-B03", "Example Supplier Local"),
+        party("CRED-B04", "Example Freight E", active="F"),
+    ]
+    data["ap_invoice"] = [
+        debit(501, "CRED-B01", "2026-09-20", "2026-11-04", "150000", ccy="JPY", rate="0.0089", prefix="PI"),
+        debit(502, "CRED-B02", "2026-11-01", "2026-12-16", "2400.00", ccy="USD", rate="1.3", prefix="PI"),
+        debit(503, "CRED-B03", "2026-11-14", "2026-11-20", "560.00", prefix="PI"),
+        debit(504, "CRED-B03", "2026-11-17", "2026-11-24", "210.00", prefix="PI"),
+        debit(505, "CRED-B02", "2026-03-05", "2026-04-19", "500.00", ccy="USD", rate="1.34", prefix="PI"),
+    ]
+    return data
+
+
+# ---------------------------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------------------------
+
+
+def full_counters(value=5):
+    return [(name, value) for name in arap.CHANGE_COUNT_TABLES]
+
+
+class FakeSession:
+    def __init__(self, data_seq, identity=None, counters=None, lock_timeout=False):
+        self.data_seq = data_seq
+        self.identity = identity or {
+            "login": FAKE_LOGIN, "user": FAKE_USER, "database": FAKE_DB, "is_sysadmin": 0, "is_db_owner": 0,
+        }
+        self.counters = list(counters) if counters is not None else None
+        self.lock_timeout = lock_timeout
+        self.business_reads = -1
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+    def read_identity(self):
+        return self.identity
+
+    def read_change_counts(self):
+        if self.counters is None:
+            return full_counters()
+        return self.counters.pop(0)
+
+    def read_sql_time(self):
+        return SQL_NOW
+
+    def read_rows(self, key):
+        if self.lock_timeout:
+            raise arap.SourceLockTimeout("lock")
+        if key == arap.BUSINESS_QUERY_KEYS[0]:
+            self.business_reads += 1
+        data = self.data_seq[min(self.business_reads, len(self.data_seq) - 1)]
+        return copy.deepcopy(data.get(key, []))
+
+
+class FakeSource:
+    def __init__(self, data=None, sessions=None):
+        self.sessions = sessions
+        self.data = data
+        self.opened = 0
+
+    def open_session(self):
+        self.opened += 1
+        if self.sessions is not None:
+            return self.sessions.pop(0)
+        return FakeSession([self.data])
+
+
+class TempDirTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="arap_test_"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def settings(self, delivery=False, **overrides):
+        raw = {
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {
+                "archive_root": str(self.tmp / "archive"),
+                "delivery_root": str(self.tmp / "drive") if delivery else None,
+            },
+            "parties": {"online_shop_debtor_codes": ["DEBT-WEB"]},
+        }
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(raw.get(key), dict):
+                raw[key].update(value)
+            else:
+                raw[key] = value
+        return arap.validate_settings(raw)
+
+    def run_export(self, data=None, settings=None, source=None, **kwargs):
+        settings = settings or self.settings()
+        source = source or FakeSource(data if data is not None else fixture_data())
+        with contextlib.redirect_stdout(io.StringIO()):
+            return arap.run_once(settings, source=source, environ=ENV, clock=lambda: FIXED_NOW,
+                                 sleep=lambda _s: None, **kwargs)
+
+    def view(self, data, settings=None):
+        return arap.build_view(data, settings or self.settings(), AS_AT)
+
+
+def read_csv(path):
+    return list(csv.DictReader(io.StringIO(Path(path).read_text(encoding="utf-8-sig"))))
+
+
+def item(view, side, doc_no):
+    return next(i for i in view[side]["items"] if i["doc_no"] == doc_no)
+
+
+def fixture_feed(settings):
+    view = arap.build_view(fixture_data(), settings, AS_AT)
+    return arap.build_feed(settings, view, FIXTURE_RUN_ID, FIXED_NOW, SQL_NOW.isoformat())
+
+
+# ---------------------------------------------------------------------------------------------
+# AC1 read safety
+# ---------------------------------------------------------------------------------------------
+
+
+class QueryContractTests(unittest.TestCase):
+    def test_every_query_is_one_read_only_select(self):
+        for name, text in arap.all_query_texts().items():
+            self.assertTrue(text.lstrip().upper().startswith("SELECT"), name)
+            self.assertIsNone(arap.FORBIDDEN_SQL_RE.search(text), name)
+            self.assertNotIn("NOLOCK", text.upper(), name)
+            self.assertNotIn("?", text, name)
+
+    def test_forbidden_pattern_catches_writes_ddl_into_exec_separators_and_comments(self):
+        for bad in (
+            "SELECT 1; SELECT 2", "SELECT a INTO t FROM b", "EXEC sp_who", "SELECT 1 -- note", "SELECT /* x */ 1",
+            "UPDATE dbo.ARInvoice SET Outstanding = 0", "DELETE FROM x", "INSERT INTO x VALUES (1)", "DROP TABLE x",
+            "ALTER TABLE x ADD y int", "CREATE TABLE x (y int)", "MERGE x USING y ON 1 = 1", "TRUNCATE TABLE x",
+            "SELECT * FROM OPENROWSET(1)", "WAITFOR DELAY '0:0:1'", "DECLARE @x int",
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNotNone(arap.FORBIDDEN_SQL_RE.search(bad))
+                with self.assertRaises(arap.ConfigError):
+                    arap.assert_read_only(bad)
+
+    def test_column_names_containing_keywords_are_not_flagged(self):
+        arap.assert_read_only("SELECT x.LastUpdate, x.TransferedAmt, x.Description FROM dbo.Debtor AS x")
+
+    def test_session_setup_is_isolation_and_lock_timeout_only(self):
+        self.assertEqual(arap.SESSION_SETUP, ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET LOCK_TIMEOUT %d"))
+
+        class Cursor:
+            def __init__(self, log):
+                self.log = log
+                self.description = []
+
+            def execute(self, sql):
+                self.log.append(sql)
+
+            def fetchall(self):
+                return []
+
+        class Connection:
+            def __init__(self):
+                self.log = []
+                self.timeout = None
+
+            def cursor(self):
+                return Cursor(self.log)
+
+        connection = Connection()
+        settings = arap.validate_settings({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": "C:\\EXAMPLE\\archive"},
+        })
+        arap.SqlServerSession(connection, settings, RuntimeError)
+        self.assertEqual(connection.log, ["SET TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET LOCK_TIMEOUT 5000"])
+        self.assertEqual(connection.timeout, 60)
+
+    def test_query_hashes_pinned(self):
+        self.assertEqual(arap.queries_sha256(), PINNED_QUERY_SHA256)
+
+    def test_knockoff_reads_exclude_cancelled_paying_documents(self):
+        for side in ("ar", "ap"):
+            text = arap.QUERIES["%s_knockoffs" % side]
+            self.assertEqual(text.count("Cancelled = N'F'"), 3)
+            self.assertEqual(text.count("UNION ALL"), 2)
+
+    def test_connection_string_never_carries_sa_and_names_this_job(self):
+        settings = arap.validate_settings({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": "C:\\EXAMPLE\\archive"},
+        })
+        text = arap.build_connection_string(settings)
+        self.assertIn("APP=xb_ac2_arap_aging", text)
+        self.assertIn("Trusted_Connection=yes", text)
+
+
+class IdentityTests(TempDirTestCase):
+    def failing_identity(self, **identity):
+        base = {"login": FAKE_LOGIN, "user": FAKE_USER, "database": FAKE_DB, "is_sysadmin": 0, "is_db_owner": 0}
+        base.update(identity)
+        source = FakeSource(sessions=[FakeSession([fixture_data()], identity=base)])
+        return self.run_export(source=source)
+
+    def test_sa_login_refused(self):
+        result = self.failing_identity(login="sa")
+        self.assertEqual(result["failure_class"], "identity_refused")
+
+    def test_wrong_database_refused(self):
+        result = self.failing_identity(database="AED_OTHER_BOOK")
+        self.assertEqual(result["failure_class"], "identity_refused")
+
+    def test_privileged_identity_needs_the_setting(self):
+        result = self.failing_identity(is_sysadmin=1)
+        self.assertEqual(result["failure_class"], "identity_refused")
+        settings = self.settings(identity={"allow_privileged_identity": True})
+        source = FakeSource(sessions=[FakeSession([fixture_data()], identity={
+            "login": FAKE_LOGIN, "user": FAKE_USER, "database": FAKE_DB, "is_sysadmin": 1, "is_db_owner": 0})])
+        result = self.run_export(settings=settings, source=source)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(any("Privileged" in w for w in result["_warnings"]))
+
+
+# ---------------------------------------------------------------------------------------------
+# AC9 settings
+# ---------------------------------------------------------------------------------------------
+
+
+class SettingsTests(TempDirTestCase):
+    def test_example_config_is_valid_and_fake(self):
+        raw = json.loads((ROOT / "config" / "autocount_arap_aging.example.json").read_text(encoding="utf-8"))
+        settings = arap.validate_settings(raw)
+        self.assertEqual(settings["schedule"]["run_minute"], 30)
+        self.assertEqual(settings["stale_after_minutes"], 70)
+        self.assertIsNone(settings["output"]["delivery_root"])
+        self.assertIsNone(settings["reconciled_on"])
+        self.assertIn("EXAMPLE", settings["source"]["expected_database"])
+
+    def test_defaults(self):
+        settings = self.settings()
+        self.assertEqual(settings["schedule"]["run_minute"], 30)
+        self.assertEqual(settings["stale_after_minutes"], 70)
+        self.assertEqual(settings["aging"]["boundaries"], [0, 30, 60, 90, 120])
+        self.assertIsNone(settings["output"]["delivery_root"])
+        self.assertFalse(any(settings["guess_sources"].values()))
+        self.assertEqual(settings["knockoff_target_types"], {"ar": {"RI": "IV"}, "ap": {}})
+
+    def assert_invalid(self, **overrides):
+        with self.assertRaises(arap.ConfigError):
+            self.settings(**overrides)
+
+    def test_unknown_keys_fail(self):
+        self.assert_invalid(extra_setting=1)
+        self.assert_invalid(output={"retention_days": 7})
+        self.assert_invalid(read={"nolock": True})
+
+    def test_no_history_retention_or_start_date_settings(self):
+        # Latest snapshot only (owner, 17 Nov) and start dates live in the tracker page (owner, 17 Nov).
+        for key in ("retention", "daily_close", "history", "ar_start_date", "ap_start_date"):
+            self.assertNotIn(key, arap.DEFAULT_SETTINGS)
+            with self.subTest(key=key):
+                self.assert_invalid(**{key: None})
+
+    def test_missing_expected_database_fails(self):
+        with self.assertRaises(arap.ConfigError):
+            arap.validate_settings({"source": {"server": FAKE_SERVER}, "output": {"archive_root": str(self.tmp)}})
+
+    def test_schedule_must_be_hourly(self):
+        self.assert_invalid(schedule={"frequency": "daily"})
+        self.assert_invalid(schedule={"run_minute": 60})
+
+    def test_bad_values_fail(self):
+        self.assert_invalid(aging={"boundaries": [30, 60]})
+        self.assert_invalid(aging={"boundaries": [0, 60, 30]})
+        self.assert_invalid(aging={"boundaries": [0, True]})
+        self.assert_invalid(aging={"boundaries": []})
+        self.assert_invalid(parties={"online_shop_debtor_codes": "DEBT-WEB"})
+        self.assert_invalid(knockoff_target_types={"ar": {"RI": "PI"}})
+        self.assert_invalid(knockoff_target_types={"ap": {"bad code": "PI"}})
+        self.assert_invalid(guess_sources={"ar_deposits": "yes"})
+        self.assert_invalid(reconciled_on="17/11/2026")
+        self.assert_invalid(stale_after_minutes=0)
+        self.assert_invalid(read={"max_attempts": 0})
+
+    def test_sa_and_logon_pairs(self):
+        self.assert_invalid(identity={"auth_mode": "sql_login", "sql_login": "sa", "credential_target": "FAKE"},
+                            schedule={"logon_type": "Password"})
+        self.assert_invalid(schedule={"logon_type": "Password"})
+
+    def test_delivery_root_must_be_separate(self):
+        archive = str(self.tmp / "archive")
+        with self.assertRaises(arap.ConfigError):
+            arap.validate_settings({"source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+                                    "output": {"archive_root": archive, "delivery_root": archive}})
+        with self.assertRaises(arap.ConfigError):
+            arap.validate_settings({"source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+                                    "output": {"archive_root": archive, "delivery_root": archive + "\\drive"}})
+
+    def test_reconciled_on_reaches_the_feed(self):
+        settings = self.settings(reconciled_on="2026-11-20")
+        self.assertEqual(fixture_feed(settings)["reconciled_on"], "2026-11-20")
+        self.assertIsNone(fixture_feed(self.settings())["reconciled_on"])
+
+    def test_invalid_settings_fail_before_any_read(self):
+        config = self.tmp / "settings.json"
+        config.write_text(json.dumps({
+            "schedule": {"frequency": "daily"},
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": str(self.tmp / "archive")},
+        }), encoding="utf-8")
+        source = FakeSource(fixture_data())
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = arap.main(["--config", str(config)], source=source, environ=ENV, clock=lambda: FIXED_NOW)
+        self.assertEqual(code, arap.EXIT_FAILED)
+        self.assertEqual(source.opened, 0)
+        status = json.loads((self.tmp / "archive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(status["failure_class"], "config_invalid")
+        self.assertEqual(sorted(p.name for p in (self.tmp / "archive").iterdir()), [arap.LAST_RUN_STATUS_NAME])
+
+    def test_dry_run_config(self):
+        config = self.tmp / "settings.json"
+        config.write_text(json.dumps({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": str(self.tmp / "archive")},
+        }), encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = arap.main(["--config", str(config), "--dry-run-config"])
+        self.assertEqual(code, arap.EXIT_OK)
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed["status"], "valid")
+        self.assertEqual(printed["run_minute"], 30)
+        self.assertFalse((self.tmp / "archive").exists())
+
+
+# ---------------------------------------------------------------------------------------------
+# AC3 / AC4 open items, knock-offs, buckets, flags
+# ---------------------------------------------------------------------------------------------
+
+
+class BucketTests(TempDirTestCase):
+    def test_labels(self):
+        self.assertEqual(arap.bucket_labels([0, 30, 60, 90, 120]),
+                         ["current", "1-30", "31-60", "61-90", "91-120", "over_120"])
+        self.assertEqual(arap.bucket_labels([0]), ["current", "over_0"])
+
+    def test_every_boundary_edge_on_both_bases(self):
+        expected = {
+            -1: "current", 0: "current", 1: "1-30", 30: "1-30", 31: "31-60", 60: "31-60", 61: "61-90",
+            90: "61-90", 91: "91-120", 120: "91-120", 121: "over_120", 400: "over_120",
+        }
+        data = empty_data()
+        data["ar_parties"] = [party("DEBT-A01", "Example Trading A")]
+        rows = []
+        for index, days in enumerate(sorted(expected)):
+            when = date.fromordinal(AS_AT.toordinal() - days).isoformat()
+            # Due basis: due date "days" ago, document dated 200 days earlier than that.
+            doc_day = date.fromordinal(AS_AT.toordinal() - days - 200).isoformat()
+            rows.append(debit(1000 + index, "DEBT-A01", doc_day, when, "10.00"))
+            # Document basis: document "days" ago (future-dated for -1), due on the same day.
+            rows.append(debit(2000 + index, "DEBT-A01", when, when, "10.00"))
+        data["ar_invoice"] = rows
+        view = self.view(data)
+        for index, days in enumerate(sorted(expected)):
+            with self.subTest(days=days):
+                due_item = item(view, "ar", "IV-%04d" % (1000 + index))
+                doc_item = item(view, "ar", "IV-%04d" % (2000 + index))
+                self.assertEqual(due_item["days_past_due"], days)
+                self.assertEqual(due_item["bucket_due"], expected[days])
+                self.assertEqual(doc_item["days_since_doc"], days)
+                self.assertEqual(doc_item["bucket_doc"], expected[days])
+
+    def test_custom_boundaries_are_a_settings_change_only(self):
+        settings = self.settings(aging={"boundaries": [0, 7, 14]})
+        feed = fixture_feed(settings)
+        self.assertEqual(feed["aging"]["bucket_labels"], ["current", "1-7", "8-14", "over_14"])
+        self.assertEqual(len(feed["ar"]["totals"]["by_bucket_due"]), 4)
+        result = self.run_export(settings=settings)
+        self.assertEqual(result["status"], "success")
+        header = read_csv(self.tmp / "archive" / arap.AR_PARTIES_NAME)[0]
+        self.assertIn("due_8_14", header)
+        self.assertIn("doc_over_14", header)
+
+
+class OpenItemTests(TempDirTestCase):
+    def test_knockoffs_outstanding_and_last_knockoff_date(self):
+        data = empty_data()
+        data["ar_parties"] = [party("DEBT-A01", "Example Trading A")]
+        data["ar_invoice"] = [debit(1, "DEBT-A01", "2026-10-01", "2026-10-31", "100.00", out="30.00")]
+        data["ar_payment"] = [payment(11, "DEBT-A01", "2026-10-20", "60.00", ko="60.00")]
+        data["ar_credit_note"] = [credit_note(12, "DEBT-A01", "2026-11-03", "10.00", ko="10.00")]
+        data["ar_knockoffs"] = [
+            knockoff("RI", 1, "55.00", "2026-10-20", discount="5.00"),
+            knockoff("RI", 1, "10.00", "2026-11-03", payer="CN"),
+        ]
+        view = self.view(data)
+        row = item(view, "ar", "IV-0001")
+        self.assertEqual(row["outstanding_doc"], D("30.00"))
+        self.assertEqual(row["knocked_off_doc"], D("70.00"))  # 55 paid + 5 discount + 10 credit note
+        self.assertEqual(row["last_knockoff_date"], date(2026, 11, 3))
+        self.assertEqual(len(view["ar"]["items"]), 1)  # the fully applied payment and CN are not open
+        self.assertEqual(view["checks"]["ar"]["outstanding_mismatch"], 0)
+
+    def test_stored_outstanding_mismatch_fails_and_publishes_nothing(self):
+        data = fixture_data()
+        data["ar_invoice"][1]["Outstanding"] = D("249.00")
+        with self.assertRaises(arap.RunFailure) as ctx:
+            self.view(data)
+        self.assertEqual(ctx.exception.failure_class, "outstanding_mismatch")
+        result = self.run_export(data)
+        self.assertEqual(result["failure_class"], "outstanding_mismatch")
+        self.assertFalse((self.tmp / "archive" / arap.LATEST_MANIFEST_NAME).exists())
+        self.assertNotIn("249", result["message"])
+
+    def test_orphan_knockoff_fails(self):
+        data = fixture_data()
+        data["ar_knockoffs"].append(knockoff("RI", 9999, "1.00", "2026-11-01"))
+        with self.assertRaises(arap.RunFailure) as ctx:
+            self.view(data)
+        self.assertEqual(ctx.exception.failure_class, "outstanding_mismatch")
+
+    def test_unknown_knockoff_target_type_fails(self):
+        data = fixture_data()
+        data["ap_knockoffs"] = [knockoff("PI", 501, "1.00", "2026-11-01")]  # AP mapping is empty by default
+        with self.assertRaises(arap.RunFailure) as ctx:
+            self.view(data)
+        self.assertEqual(ctx.exception.failure_class, "unknown_knockoff_target")
+
+    def test_foreign_currency_keeps_document_and_local_amounts(self):
+        view = self.view(fixture_data())
+        jpy = item(view, "ap", "PI-0501")
+        self.assertEqual(jpy["currency"], "JPY")
+        self.assertEqual(jpy["outstanding_doc"], D("150000"))
+        self.assertEqual(jpy["outstanding_local"], D("1335.00"))
+        self.assertEqual(jpy["currency_rate"], D("0.0089"))
+        usd = item(view, "ap", "PI-0502")
+        self.assertEqual(usd["outstanding_local"], D("3120.00"))
+        feed_doc = next(d for d in fixture_feed(self.settings())["ap"]["docs"] if d["doc_no"] == "PI-0501")
+        self.assertEqual(feed_doc["outstanding_doc"], 150000.0)
+        self.assertEqual(feed_doc["outstanding"], 1335.0)
+
+    def test_unapplied_payments_and_credit_notes_are_their_own_credit_rows(self):
+        view = self.view(fixture_data())
+        pm = item(view, "ar", "PM-0202")
+        self.assertTrue(pm["unapplied"])
+        self.assertEqual(pm["outstanding_doc"], D("-60.00"))
+        self.assertEqual(pm["outstanding_local"], D("-60.00"))
+        self.assertEqual(pm["bucket_due"], "unapplied")
+        self.assertIsNone(pm["days_past_due"])
+        cn = item(view, "ar", "CN-0301")
+        self.assertEqual(cn["outstanding_local"], D("-80.00"))
+        totals = view["ar"]["totals"]
+        self.assertEqual(totals["unapplied"], D("-310.00"))  # -60 -120 -50 -80
+        self.assertEqual(sum(totals["by_bucket_due"]) + totals["unapplied"], totals["outstanding"])
+        # Never netted: DEBT-A01 keeps its invoices and its credit note as separate rows.
+        a01 = [i["doc_no"] for i in view["ar"]["items"] if i["party_code"] == "DEBT-A01"]
+        self.assertEqual(sorted(a01), ["CN-0301", "IV-0101", "IV-0102"])
+
+    def test_credit_note_larger_than_invoices(self):
+        data = empty_data()
+        data["ar_parties"] = [party("DEBT-A01", "Example Trading A")]
+        data["ar_invoice"] = [debit(1, "DEBT-A01", "2026-11-01", "2026-11-01", "100.00")]
+        data["ar_credit_note"] = [credit_note(2, "DEBT-A01", "2026-11-05", "300.00")]
+        view = self.view(data)
+        totals = view["ar"]["parties"]["DEBT-A01"]["totals"]
+        self.assertEqual(totals["outstanding"], D("-200.00"))
+        self.assertEqual(totals["unapplied"], D("-300.00"))
+        self.assertEqual(totals["overdue"], D("100.00"))
+        result = self.run_export(data)
+        self.assertEqual(result["status"], "success")
+
+    def test_post_dated_payment_is_a_flag_not_a_filter(self):
+        data = fixture_data()
+        data["ar_payment"].append(payment(205, "DEBT-A02", "2026-11-20", "40.00", handover="2026-11-21"))
+        view = self.view(data)
+        row = item(view, "ar", "PM-0205")
+        self.assertTrue(row["post_dated"])
+        self.assertIsNone(row["cheque_date"])  # HandOverDate is a guess column: off by default
+        self.assertEqual(view["counts"]["ar"]["post_dated"], 1)
+        view = self.view(data, self.settings(guess_sources={"payment_handover_date": True}))
+        self.assertEqual(item(view, "ar", "PM-0205")["cheque_date"], date(2026, 11, 21))
+
+    def test_payment_home_rate_only_with_its_setting(self):
+        self.assertIsNone(item(self.view(fixture_data()), "ar", "PM-0203")["currency_rate"])
+        view = self.view(fixture_data(), self.settings(guess_sources={"payment_home_rate": True}))
+        self.assertEqual(item(view, "ar", "PM-0203")["currency_rate"], D("1"))
+
+    def test_due_date_before_document_date(self):
+        data = fixture_data()
+        data["ar_invoice"].append(debit(108, "DEBT-A02", "2026-11-10", "2026-11-01", "70.00"))
+        view = self.view(data)
+        row = item(view, "ar", "IV-0108")
+        self.assertEqual(row["days_past_due"], 16)
+        self.assertEqual(row["days_since_doc"], 7)
+        self.assertEqual(view["counts"]["ar"]["due_before_doc_date"], 1)
+        self.assertTrue(any("due date before the document date" in w for w in view["warnings"]))
+
+    def test_cancelled_documents_ignored(self):
+        data = fixture_data()
+        data["ar_invoice"][6]["Outstanding"] = D("1.23")  # a cancelled invoice is never checked or exported
+        data["ar_payment"].append(payment(206, "DEBT-A01", "2026-11-01", "77.00", cancelled="T"))
+        view = self.view(data)
+        numbers = [i["doc_no"] for i in view["ar"]["items"]]
+        self.assertNotIn("IV-0107", numbers)
+        self.assertNotIn("PM-0206", numbers)
+        self.assertEqual(view["counts"]["ar"]["cancelled_skipped"], 2)
+
+    def test_unexpected_flag_value_fails(self):
+        data = fixture_data()
+        data["ar_invoice"][0]["Cancelled"] = None
+        with self.assertRaises(arap.RunFailure) as ctx:
+            self.view(data)
+        self.assertEqual(ctx.exception.failure_class, "source_error")
+
+    def test_guess_sources_off_are_counted_not_exported(self):
+        data = fixture_data()
+        data["ar_debit_note"] = [debit(401, "DEBT-A01", "2026-11-01", "2026-11-15", "30.00", prefix="DN")]
+        data["ar_deposit"] = [deposit(402, "DEBT-A02", "2026-11-01", "100.00", "100.00")]
+        view = self.view(data)
+        numbers = [i["doc_no"] for i in view["ar"]["items"]]
+        self.assertNotIn("DN-0401", numbers)
+        self.assertNotIn("DP-0402", numbers)
+        self.assertEqual(view["counts"]["ar"]["guess_rows_skipped"], 2)
+        self.assertTrue(any("guess_sources" in w for w in view["warnings"]))
+        settings = self.settings(guess_sources={"ar_debit_notes": True, "ar_deposits": True},
+                                 knockoff_target_types={"ar": {"RI": "IV", "RD": "DN"}})
+        view = self.view(data, settings)
+        self.assertEqual(item(view, "ar", "DN-0401")["outstanding_local"], D("30.00"))
+        self.assertEqual(item(view, "ar", "DP-0402")["outstanding_local"], D("-100.00"))
+        self.assertTrue(item(view, "ar", "DP-0402")["unapplied"])
+
+    def test_every_item_carries_what_the_page_needs_for_start_dates(self):
+        # Start dates are a tracker-page setting: items carry side, type, dates, currency, amounts.
+        feed = fixture_feed(self.settings())
+        for side in ("ar", "ap"):
+            for doc in feed[side]["docs"]:
+                for key in ("side", "type", "doc_date", "due_date", "currency", "outstanding"):
+                    self.assertIn(key, doc)
+                self.assertEqual(doc["side"], side)
+        old = [d for d in feed["ar"]["docs"] + feed["ap"]["docs"] if d["doc_date"] < "2026-04-01"]
+        self.assertGreaterEqual(len(old), 3)  # old-dated items stay in, and in every total
+        self.assertIn(-50.0, [d["outstanding"] for d in feed["ar"]["docs"]])
+
+
+class PartyTests(TempDirTestCase):
+    def test_every_party_present_with_flags(self):
+        view = self.view(fixture_data())
+        parties = view["ar"]["parties"]
+        self.assertEqual(sorted(parties), ["DEBT-A01", "DEBT-A02", "DEBT-A03", "DEBT-A04", "DEBT-WEB"])
+        self.assertFalse(parties["DEBT-A03"]["active"])
+        self.assertEqual(parties["DEBT-A03"]["totals"]["docs_open"], 0)
+        self.assertEqual(parties["DEBT-A03"]["totals"]["outstanding"], D(0))
+        self.assertTrue(parties["DEBT-WEB"]["online_shop"])
+        self.assertFalse(parties["DEBT-A01"]["online_shop"])
+        self.assertFalse(view["ap"]["parties"]["CRED-B04"]["active"])
+        self.assertEqual(view["ar"]["totals"]["parties_open"], 4)
+
+    def test_last_payment_date_and_amount(self):
+        data = fixture_data()
+        data["ar_payment"].append(payment(207, "DEBT-A01", "2026-09-15", "15.00", ko="0", cancelled="F"))
+        parties = self.view(data)["ar"]["parties"]
+        self.assertEqual(parties["DEBT-A01"]["last_payment_date"], date(2026, 9, 15))
+        self.assertEqual(parties["DEBT-A01"]["last_payment_amount"], D("215.00"))
+        self.assertIsNone(parties["DEBT-A03"]["last_payment_date"])
+
+    def test_item_naming_a_missing_party_fails_closed(self):
+        data = fixture_data()
+        data["ar_invoice"].append(debit(109, "DEBT-ZZ9", "2026-11-01", "2026-11-01", "5.00"))
+        with self.assertRaises(arap.RunFailure) as ctx:
+            self.view(data)
+        self.assertEqual(ctx.exception.failure_class, "self_check_failed")
+
+
+class ApTests(TempDirTestCase):
+    def test_ap_payments_recorded_false_without_payments_or_knockoffs(self):
+        view = self.view(fixture_data())
+        self.assertFalse(view["ap_payments_recorded"])
+        self.assertFalse(fixture_feed(self.settings())["ap_payments_recorded"])
+        self.assertEqual(item(view, "ap", "PI-0501")["outstanding_doc"], D("150000"))  # stored figure
+
+    def test_ap_payments_recorded_true_with_a_payment(self):
+        data = fixture_data()
+        data["ap_payment"] = [payment(601, "CRED-B03", "2026-11-16", "100.00")]
+        view = self.view(data)
+        self.assertTrue(view["ap_payments_recorded"])
+        self.assertEqual(item(view, "ap", "PM-0601")["outstanding_local"], D("-100.00"))
+        self.assertEqual(item(view, "ap", "PM-0601")["doc_type"], "PV")
+
+    def test_ap_payments_recorded_true_with_knockoffs_only(self):
+        data = fixture_data()
+        data["ap_invoice"][2] = debit(503, "CRED-B03", "2026-11-14", "2026-11-20", "560.00", out="500.00", prefix="PI")
+        data["ap_knockoffs"] = [knockoff("PX", 503, "60.00", "2026-11-15", payer="CN")]
+        view = self.view(data, self.settings(knockoff_target_types={"ap": {"PX": "PI"}}))
+        self.assertTrue(view["ap_payments_recorded"])
+        self.assertEqual(item(view, "ap", "PI-0503")["outstanding_local"], D("500.00"))
+
+    def test_ap_payments_recorded_ignores_cancelled_payments(self):
+        data = fixture_data()
+        data["ap_payment"] = [payment(602, "CRED-B03", "2026-11-16", "100.00", cancelled="T")]
+        self.assertFalse(self.view(data)["ap_payments_recorded"])
+
+    def test_schedule_weeks_are_monday_to_sunday(self):
+        self.assertEqual(AS_AT.weekday(), 1)  # Tuesday 17 Nov 2026
+        schedule = self.view(fixture_data())["ap"]["schedule"]
+        self.assertEqual(schedule["week_starts"], date(2026, 11, 16))
+        bands = {name: band["total"] for name, band in schedule["bands"].items()}
+        self.assertEqual(bands["overdue"], D("1335.00") + D("670.00"))
+        self.assertEqual(bands["this_week"], D("560.00"))
+        self.assertEqual(bands["next_week"], D("210.00"))
+        self.assertEqual(bands["later"], D("3120.00"))
+
+
+# ---------------------------------------------------------------------------------------------
+# AC2 stable read
+# ---------------------------------------------------------------------------------------------
+
+
+class StableReadTests(TempDirTestCase):
+    def test_counter_window_moves_then_settles(self):
+        moved = FakeSession([fixture_data()], counters=[full_counters(5), full_counters(6)])
+        settled = FakeSession([fixture_data()], counters=[full_counters(6), full_counters(6)])
+        source = FakeSource(sessions=[moved, settled])
+        result = self.run_export(source=source)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_manifest"]["attempts"], 2)
+        self.assertEqual(result["_manifest"]["read_mode"], "change_count")
+        self.assertEqual(source.opened, 2)
+
+    def test_unstable_on_every_attempt_fails(self):
+        sessions = [FakeSession([fixture_data()], counters=[full_counters(i), full_counters(i + 1)]) for i in range(3)]
+        result = self.run_export(source=FakeSource(sessions=sessions))
+        self.assertEqual(result["failure_class"], "unstable_snapshot")
+        self.assertFalse((self.tmp / "archive" / arap.LATEST_MANIFEST_NAME).exists())
+
+    def test_missing_counter_rows_use_the_double_read(self):
+        partial = full_counters()[:-1]
+        stable = FakeSession([fixture_data()], counters=[partial, partial])
+        result = self.run_export(source=FakeSource(sessions=[stable]))
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_manifest"]["read_mode"], "double_read")
+        changed = fixture_data()
+        changed["ar_payment"][2]["OriginalAmt"] = D("121.00")
+        sessions = [FakeSession([fixture_data(), changed], counters=[partial, partial]) for _ in range(3)]
+        result = self.run_export(source=FakeSource(sessions=sessions))
+        self.assertEqual(result["failure_class"], "unstable_snapshot")
+
+    def test_duplicate_counter_rows_are_not_usable(self):
+        rows = full_counters() + [("ARInvoice", 5)]
+        self.assertIsNone(arap.counters_usable(rows))
+        self.assertIsNotNone(arap.counters_usable(full_counters()))
+
+    def test_lock_timeout_retries_then_fails(self):
+        sessions = [FakeSession([fixture_data()], lock_timeout=True) for _ in range(3)]
+        result = self.run_export(source=FakeSource(sessions=sessions))
+        self.assertEqual(result["failure_class"], "lock_timeout")
+
+
+# ---------------------------------------------------------------------------------------------
+# AC5 feed contract and the committed fake fixture
+# ---------------------------------------------------------------------------------------------
+
+
+EXPECTED_FEED_KEYS = {
+    "schema", "schema_version", "job", "run_id", "as_at_local", "generated_at", "timezone", "cadence_minutes",
+    "next_run_local", "stale_after_minutes", "currency_local", "aging", "reconciled_on", "ap_payments_recorded",
+    "ar", "ap", "health",
+}
+EXPECTED_TOTALS_KEYS = {"outstanding", "overdue", "unapplied", "by_bucket_due", "by_bucket_doc", "parties_open", "docs_open"}
+EXPECTED_PARTY_KEYS = {
+    "code", "name", "type", "terms", "currency", "credit_limit", "flags", "outstanding", "overdue", "unapplied",
+    "by_bucket_due", "by_bucket_doc", "docs_open", "oldest_open_doc_date", "oldest_overdue_days",
+    "last_payment_date", "last_payment_amount",
+}
+EXPECTED_DOC_KEYS = {
+    "side", "party", "type", "doc_no", "doc_date", "due_date", "currency", "original_doc", "outstanding_doc",
+    "outstanding", "days_past_due", "days_since_doc", "bucket_due", "bucket_doc", "flags",
+}
+
+
+def assert_feed_contract(test, feed):
+    test.assertEqual(set(feed), EXPECTED_FEED_KEYS)
+    test.assertEqual(feed["schema"], "xb.ac2.arap_dashboard_feed")
+    test.assertEqual(feed["schema_version"], 1)
+    test.assertEqual(feed["cadence_minutes"], 60)
+    test.assertEqual(feed["currency_local"], "SGD")
+    test.assertEqual(set(feed["aging"]), {"bases", "boundaries", "bucket_labels"})
+    test.assertEqual(feed["aging"]["bases"], ["due_date", "document_date"])
+    test.assertIsInstance(feed["ap_payments_recorded"], bool)
+    labels = feed["aging"]["bucket_labels"]
+    test.assertEqual(set(feed["ar"]), {"totals", "parties", "docs"})
+    test.assertEqual(set(feed["ap"]), {"totals", "parties", "docs", "schedule"})
+    test.assertEqual(set(feed["ap"]["schedule"]), {"week_starts", "overdue", "this_week", "next_week", "later"})
+    for band in ("overdue", "this_week", "next_week", "later"):
+        test.assertEqual(set(feed["ap"]["schedule"][band]), {"total", "parties"})
+        for entry in feed["ap"]["schedule"][band]["parties"]:
+            test.assertEqual(set(entry), {"code", "amount"})
+    test.assertEqual(set(feed["health"]), {"status", "failure_class", "self_checks", "counts"})
+    for side in ("ar", "ap"):
+        totals = feed[side]["totals"]
+        test.assertEqual(set(totals), EXPECTED_TOTALS_KEYS)
+        for basis in ("by_bucket_due", "by_bucket_doc"):
+            test.assertEqual(len(totals[basis]), len(labels))
+            test.assertAlmostEqual(sum(totals[basis]) + totals["unapplied"], totals["outstanding"], places=2)
+        test.assertAlmostEqual(sum(d["outstanding"] for d in feed[side]["docs"]), totals["outstanding"], places=2)
+        test.assertAlmostEqual(sum(p["outstanding"] for p in feed[side]["parties"]), totals["outstanding"], places=2)
+        for party_entry in feed[side]["parties"]:
+            test.assertEqual(set(party_entry), EXPECTED_PARTY_KEYS)
+            test.assertEqual(set(party_entry["flags"]), {"active", "online_shop"})
+        for doc in feed[side]["docs"]:
+            test.assertEqual(set(doc), EXPECTED_DOC_KEYS)
+            test.assertEqual(set(doc["flags"]), {"post_dated", "unapplied"})
+            test.assertIn(doc["bucket_due"], labels + ["unapplied"])
+    for forbidden in ("history", "closed_since_prev", "ar_start_date", "ap_start_date", "before_start_date"):
+        test.assertNotIn(forbidden, json.dumps(feed))
+
+
+class FeedContractTests(TempDirTestCase):
+    def test_built_feed_has_exactly_the_contract_keys(self):
+        assert_feed_contract(self, fixture_feed(self.settings()))
+
+    def test_committed_fixture_passes_the_contract(self):
+        assert_feed_contract(self, json.loads(FIXTURE_PATH.read_text(encoding="utf-8")))
+
+    def test_committed_fixture_is_this_exporters_output(self):
+        built = json.loads(json.dumps(fixture_feed(self.settings()), sort_keys=True, default=str))
+        self.assertEqual(json.loads(FIXTURE_PATH.read_text(encoding="utf-8")), built)
+
+    def test_fixture_is_fake_and_rich_enough_for_the_tracker(self):
+        feed = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        codes = [p["code"] for p in feed["ar"]["parties"] + feed["ap"]["parties"]]
+        self.assertTrue(all(re.match(r"\A(DEBT|CRED)-[A-Z0-9]{2,3}\Z", c) for c in codes), codes)
+        self.assertTrue(all(p["name"].startswith("Example ") for p in feed["ar"]["parties"] + feed["ap"]["parties"]))
+        self.assertFalse(feed["ap_payments_recorded"])
+        self.assertTrue(any(d["flags"]["unapplied"] for d in feed["ar"]["docs"]))
+        self.assertEqual({d["currency"] for d in feed["ap"]["docs"]}, {"JPY", "USD", "SGD"})
+        self.assertTrue(any(d["doc_date"] < "2026-04-01" for d in feed["ar"]["docs"]))
+        self.assertTrue(any(d["doc_date"] < "2026-04-01" for d in feed["ap"]["docs"]))
+
+    def test_published_feed_matches_the_csvs(self):
+        result = self.run_export()
+        self.assertEqual(result["status"], "success")
+        archive = self.tmp / "archive"
+        feed = json.loads(gzip.decompress((archive / arap.FEED_NAME).read_bytes()))
+        assert_feed_contract(self, feed)
+        items = read_csv(archive / arap.AR_ITEMS_NAME)
+        self.assertEqual(len(items), feed["ar"]["totals"]["docs_open"])
+        total = sum(D(r["outstanding_local"]) for r in items)
+        self.assertEqual(total, D(str(feed["ar"]["totals"]["outstanding"])).quantize(D("0.01")))
+
+
+# ---------------------------------------------------------------------------------------------
+# AC7 self-checks
+# ---------------------------------------------------------------------------------------------
+
+
+class SelfCheckTests(TempDirTestCase):
+    def assert_self_check_failure(self, name, **patches):
+        archive = self.tmp / "archive"
+        self.assertEqual(self.run_export()["status"], "success")
+        before = {n: (archive / n).read_bytes() for n in arap.PUBLISHED_FILES}
+        with contextlib.ExitStack() as stack:
+            for target, replacement in patches.items():
+                stack.enter_context(mock.patch.object(arap, target, replacement))
+            result = self.run_export()
+        self.assertEqual(result["failure_class"], "self_check_failed")
+        self.assertIn(name, result["message"])
+        self.assertEqual({n: (archive / n).read_bytes() for n in arap.PUBLISHED_FILES}, before)
+
+    def test_csv_missing_a_row(self):
+        real = arap.render_open_items
+
+        def drop_last(items, as_at_local):
+            return real(items[:-1], as_at_local)
+
+        self.assert_self_check_failure("feed_matches_csv", render_open_items=drop_last)
+
+    def test_party_totals_disagree(self):
+        real = arap.summarise
+
+        def skewed(items, labels):
+            result = real(items, labels)
+            if items and items[0]["party_code"] == "DEBT-A01" and len({i["party_code"] for i in items}) == 1:
+                result["outstanding"] += D("0.01")
+            return result
+
+        self.assert_self_check_failure("party_totals", summarise=skewed)
+
+    def test_buckets_disagree(self):
+        real = arap.summarise
+
+        def skewed(items, labels):
+            result = real(items, labels)
+            result["by_bucket_doc"][0] += D("1.00")
+            return result
+
+        self.assert_self_check_failure("buckets", summarise=skewed)
+
+    def test_ap_schedule_disagrees(self):
+        real = arap.ap_schedule
+
+        def skewed(items, as_at_date):
+            result = real(items, as_at_date)
+            result["bands"]["later"]["total"] += D("1.00")
+            return result
+
+        self.assert_self_check_failure("ap_schedule", ap_schedule=skewed)
+
+
+# ---------------------------------------------------------------------------------------------
+# AC6 latest only, publish, delivery
+# ---------------------------------------------------------------------------------------------
+
+
+class PublishTests(TempDirTestCase):
+    def test_success_writes_exactly_the_latest_set_and_status(self):
+        result = self.run_export()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["delivery_status"], "not_configured")
+        names = sorted(p.name for p in (self.tmp / "archive").iterdir())
+        self.assertEqual(names, sorted(list(arap.PUBLISHED_FILES) + [arap.LAST_RUN_STATUS_NAME]))
+        self.assertFalse(any(p.is_dir() for p in (self.tmp / "archive").iterdir()))
+        manifest = json.loads((self.tmp / "archive" / arap.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"))
+        for name, meta in manifest["files"].items():
+            data = (self.tmp / "archive" / name).read_bytes()
+            self.assertEqual(hashlib.sha256(data).hexdigest(), meta["sha256"])
+        self.assertEqual(manifest["source"]["queries_sha256"], arap.queries_sha256())
+
+    def test_next_run_replaces_the_set_without_extra_files(self):
+        self.run_export()
+        data = fixture_data()
+        data["ar_payment"].append(payment(208, "DEBT-A02", "2026-11-17", "10.00"))
+        self.run_export(data)
+        names = sorted(p.name for p in (self.tmp / "archive").iterdir())
+        self.assertEqual(names, sorted(list(arap.PUBLISHED_FILES) + [arap.LAST_RUN_STATUS_NAME]))
+        self.assertIn("PM-0208", [r["doc_no"] for r in read_csv(self.tmp / "archive" / arap.AR_ITEMS_NAME)])
+
+    def test_failed_run_keeps_the_previous_set_and_records_the_failure(self):
+        settings = self.settings(delivery=True)
+        self.assertEqual(self.run_export(settings=settings)["status"], "success")
+        roots = [self.tmp / "archive", self.tmp / "drive"]
+        before = {(r, n): (r / n).read_bytes() for r in roots for n in arap.PUBLISHED_FILES}
+        bad = fixture_data()
+        bad["ar_invoice"][0]["Outstanding"] = D("1.00")
+        result = self.run_export(bad, settings=settings)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual({(r, n): (r / n).read_bytes() for r in roots for n in arap.PUBLISHED_FILES}, before)
+        for root in roots:
+            status = json.loads((root / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(status["failure_class"], "outstanding_mismatch")
+            self.assertEqual(status["run_id"], result["run_id"])
+
+    def test_delivery_gets_the_same_verified_set(self):
+        result = self.run_export(settings=self.settings(delivery=True))
+        self.assertEqual(result["delivery_status"], "handed_to_drive_sync_folder")
+        for name in arap.PUBLISHED_FILES:
+            self.assertEqual((self.tmp / "drive" / name).read_bytes(), (self.tmp / "archive" / name).read_bytes())
+        names = sorted(p.name for p in (self.tmp / "drive").iterdir())
+        self.assertEqual(names, sorted(list(arap.PUBLISHED_FILES) + [arap.LAST_RUN_STATUS_NAME]))
+
+    def test_bad_delivery_copy_keeps_the_previous_drive_set(self):
+        settings = self.settings(delivery=True)
+        self.run_export(settings=settings)
+        before = {n: (self.tmp / "drive" / n).read_bytes() for n in arap.PUBLISHED_FILES}
+        real = arap.stock.copy_bytes_exclusive
+
+        def corrupt_drive(path, data):
+            real(path, data + b"x" if "drive" in str(path) and path.name.startswith(".ar_parties") else data)
+
+        data = fixture_data()
+        data["ar_payment"].append(payment(209, "DEBT-A02", "2026-11-17", "10.00"))
+        with mock.patch.object(arap.stock, "copy_bytes_exclusive", corrupt_drive):
+            result = self.run_export(data, settings=settings)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["delivery_status"], "verify_failed")
+        self.assertEqual({n: (self.tmp / "drive" / n).read_bytes() for n in arap.PUBLISHED_FILES}, before)
+        self.assertFalse(any(p.name.endswith(".tmp") for p in (self.tmp / "drive").iterdir()))
+
+    def test_archive_publish_failure_fails_the_run_and_skips_delivery(self):
+        settings = self.settings(delivery=True)
+
+        def refuse(path, data):
+            raise OSError("disk full")
+
+        with mock.patch.object(arap.stock, "copy_bytes_exclusive", refuse):
+            result = self.run_export(settings=settings)
+        self.assertEqual(result["failure_class"], "latest_publish_failed")
+        self.assertFalse((self.tmp / "drive" / arap.LATEST_MANIFEST_NAME).exists())
+        status = json.loads((self.tmp / "drive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(status["failure_class"], "latest_publish_failed")
+
+    def test_never_deletes_in_delivery_root(self):
+        settings = self.settings(delivery=True)
+        drive = self.tmp / "drive"
+        drive.mkdir(parents=True)
+        (drive / "owner_notes.txt").write_text("keep", encoding="utf-8")
+        (drive / "ar_open_items_2026-11-01.csv").write_text("old", encoding="utf-8")
+        self.run_export(settings=settings)
+        self.assertEqual((drive / "owner_notes.txt").read_text(encoding="utf-8"), "keep")
+        self.assertTrue((drive / "ar_open_items_2026-11-01.csv").exists())
+
+    def test_lock_held_gives_already_running(self):
+        archive = self.tmp / "archive"
+        archive.mkdir(parents=True)
+        (archive / arap.LOCK_NAME).write_text(json.dumps(
+            {"run_id": "f" * 32, "pid": 4242, "started_at": FIXED_NOW.isoformat()}), encoding="utf-8")
+        result = self.run_export()
+        self.assertEqual(result["failure_class"], "already_running")
+        self.assertTrue((archive / arap.LOCK_NAME).exists())
+
+
+class CheckLatestTests(TempDirTestCase):
+    def check(self, now):
+        return arap.check_latest(self.settings(), clock=lambda: now)
+
+    def test_fresh_stale_missing_and_tampered(self):
+        self.assertEqual(self.check(FIXED_NOW)[0], arap.EXIT_MISSING)
+        self.run_export()
+        self.assertEqual(self.check(FIXED_NOW)[0], arap.EXIT_OK)
+        self.assertEqual(self.check(datetime(2026, 11, 17, 15, 40, 6, tzinfo=SGT))[0], arap.EXIT_OK)  # 70 minutes
+        later = datetime(2026, 11, 17, 15, 41, 6, tzinfo=SGT)  # 71 minutes
+        code, result = self.check(later)
+        self.assertEqual((code, result["status"]), (arap.EXIT_STALE, "stale"))
+        (self.tmp / "archive" / arap.AP_ITEMS_NAME).write_bytes(b"tampered")
+        self.assertEqual(self.check(FIXED_NOW)[0], arap.EXIT_MISSING)
+
+
+# ---------------------------------------------------------------------------------------------
+# AC8 CSV safety and privacy
+# ---------------------------------------------------------------------------------------------
+
+
+class CsvAndPrivacyTests(TempDirTestCase):
+    def test_csv_cells_are_formula_safe_and_amounts_numeric(self):
+        data = fixture_data()
+        data["ar_parties"][0]["PartyName"] = "=HYPERLINK(\"http://example.com\")"
+        data["ar_invoice"][0]["Description"] = "+cmd"
+        self.run_export(data)
+        archive = self.tmp / "archive"
+        parties = {r["code"]: r for r in read_csv(archive / arap.AR_PARTIES_NAME)}
+        self.assertTrue(parties["DEBT-A01"]["name"].startswith("'="))
+        items = read_csv(archive / arap.AR_ITEMS_NAME)
+        first = next(r for r in items if r["doc_no"] == "IV-0101")
+        self.assertEqual(first["description"], "'+cmd")
+        self.assertEqual(first["party_name"], "'=HYPERLINK(\"http://example.com\")")
+        credit = next(r for r in items if r["doc_no"] == "PM-0202")
+        self.assertEqual(credit["outstanding_local"], "-60.00")
+        self.assertEqual(credit["unapplied"], "true")
+        self.assertEqual(list(items[0]), list(arap.OPEN_ITEM_COLUMNS))
+
+    def test_status_manifest_and_console_carry_no_names_codes_documents_or_amounts(self):
+        config = self.tmp / "settings.json"
+        config.write_text(json.dumps({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": str(self.tmp / "archive"), "delivery_root": str(self.tmp / "drive")},
+            "parties": {"online_shop_debtor_codes": ["DEBT-WEB"]},
+        }), encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = arap.main(["--config", str(config)], source=FakeSource(fixture_data()), environ=ENV,
+                             clock=lambda: FIXED_NOW)
+        self.assertEqual(code, arap.EXIT_OK)
+        texts = [
+            out.getvalue(),
+            (self.tmp / "archive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"),
+            (self.tmp / "archive" / arap.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"),
+        ]
+        forbidden = ["DEBT-", "CRED-", "Example ", "IV-0", "PI-0", "PM-0", "CN-0", "1200", "1335", "150000", "95.5",
+                     FAKE_SERVER, "FAKE-SQL-HOST", FAKE_LOGIN, "Trusted_Connection"]
+        for text in texts:
+            for value in forbidden:
+                self.assertNotIn(value, text)
+
+    def test_failure_messages_carry_counts_only(self):
+        data = fixture_data()
+        data["ar_invoice"][0]["Outstanding"] = D("1199.99")
+        result = self.run_export(data)
+        self.assertRegex(result["message"], r"\AAR stored outstanding disagrees with the knock-offs: 1 document")
+        self.assertNotIn("1199", result["message"])
+        self.assertNotIn("DEBT", result["message"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Live-check SQL template and repo hygiene
+# ---------------------------------------------------------------------------------------------
+
+
+class LiveCheckSqlTests(unittest.TestCase):
+    def setUp(self):
+        self.text = (ROOT / "sql" / "autocount2" / "arap_aging_live_check.readonly.template.sql").read_text(encoding="utf-8")
+
+    def test_read_only(self):
+        body = re.sub(r"/\*.*?\*/", "", self.text, flags=re.S)
+        body = re.sub(r"--[^\n]*", "", body)
+        self.assertIsNone(re.search(
+            r"\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|EXEC|EXECUTE|TRUNCATE|GRANT|INTO|DBCC)\b", body, re.I))
+        self.assertNotIn("NOLOCK", body.upper())
+        self.assertIn("IF DB_NAME() <> N'$(ExpectedDb)'", body)
+        self.assertIn("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", body)
+
+    def test_aggregates_only(self):
+        body = re.sub(r"/\*.*?\*/", "", self.text, flags=re.S)
+        for column in ("CompanyName", "DocNo", "Description", "Note", "Address", "Phone", "EmailAddress"):
+            self.assertNotIn(column, body)
+
+
+class RepoHygieneTests(unittest.TestCase):
+    def test_runbook_names_every_failure_class_and_proof_step(self):
+        text = (ROOT / "docs" / "autocount2-automation" / "arap_aging_runbook.md").read_text(encoding="utf-8")
+        for needle in ("outstanding_mismatch", "unknown_knockoff_target", "self_check_failed", "unstable_snapshot",
+                       "latest_publish_failed", "V1", "V2", "V3", "ap_payments_recorded", "Debtor Aging Report",
+                       "Creditor Aging Report", "knockoff_target_types"):
+            self.assertIn(needle, text)
+
+    def test_new_files_are_ascii(self):
+        for rel in ("scripts/autocount_arap_aging.py", "config/autocount_arap_aging.example.json",
+                    "sql/autocount2/arap_aging_live_check.readonly.template.sql",
+                    "docs/autocount2-automation/arap_aging_runbook.md"):
+            (ROOT / rel).read_bytes().decode("ascii")
+
+
+if __name__ == "__main__":
+    unittest.main()
