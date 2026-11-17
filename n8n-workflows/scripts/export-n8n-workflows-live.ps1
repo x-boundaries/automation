@@ -11,14 +11,18 @@ param(
   [string]$ComposeService,
   [string]$ExportDir = ".tmp/n8n-live-exports",
   [string]$BindingsFile = ".n8n-local\n8n-credential-bindings.json",
+  [string]$WorkflowIdentityFile = ".n8n-local/n8n-workflow-identities.json",
+  [string]$PortableCredentialsFile = "n8n-workflows/toolkit/portable-credentials.json",
+  [string]$DeploymentPolicyFile = "n8n-workflows/toolkit/deployment-policy.json",
   [switch]$IncludeArchived,
   [switch]$PublishedOnly,
   [switch]$PreserveTags,
-  [switch]$ConfirmLiveExport,
+  [switch]$ReviewedSourceUpdate,
   [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+$DeploymentPolicyFileWasExplicit = $PSBoundParameters.ContainsKey("DeploymentPolicyFile")
 
 trap {
   Write-Host ""
@@ -56,8 +60,8 @@ function Test-N8nRepoRootCandidate($Path) {
   $hasGit = Test-Path -LiteralPath (Join-Path $Path ".git")
   $hasWorkflowDir = Test-Path -LiteralPath (Join-Path $Path "n8n-workflows") -PathType Container
   $hasToolkitMarkers = (
-    (Test-Path -LiteralPath (Join-Path $Path "repo/scripts/sync-toolkit-projects.cjs") -PathType Leaf) -and
-    (Test-Path -LiteralPath (Join-Path $Path "_projects/n8n/workflow-toolkit/toolkit.project.json") -PathType Leaf)
+    (Test-Path -LiteralPath (Join-Path $Path "repo/scripts/validate-toolkit.cjs") -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $Path "repo/contracts") -PathType Container)
   )
 
   return ($hasGit -and $hasWorkflowDir) -or ($hasGit -and $hasToolkitMarkers)
@@ -157,12 +161,24 @@ function Write-CommandOutput($Lines, [string]$DefaultStatus = "INFO") {
   }
 }
 
+function ConvertTo-NativeArgument([string]$Value) {
+  if ($null -eq $Value) { $Value = "" }
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+  $escaped = [regex]::Replace($Value, '(\\*)"', {
+    param($match)
+    return (-join ('\' * (($match.Groups[1].Value.Length * 2) + 1))) + '"'
+  })
+  $escaped = [regex]::Replace($escaped, '(\\+)$', {
+    param($match)
+    return $match.Value + $match.Value
+  })
+  return '"' + $escaped + '"'
+}
+
 function Invoke-CapturedCommand($Command, [string[]]$Arguments) {
   $process = [System.Diagnostics.Process]::new()
   $process.StartInfo.FileName = $Command
-  $process.StartInfo.Arguments = ($Arguments | ForEach-Object {
-    '"' + ($_ -replace '\\', '\\' -replace '"', '\"') + '"'
-  }) -join " "
+  $process.StartInfo.Arguments = ($Arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join " "
   $process.StartInfo.RedirectStandardOutput = $true
   $process.StartInfo.RedirectStandardError = $true
   $process.StartInfo.UseShellExecute = $false
@@ -493,25 +509,230 @@ function Resolve-WorkflowDirPath {
 }
 
 function Test-MissingLiveWorkflow($CommandResult) {
-  return (($CommandResult.Output -join "`n") -match "No workflows found with specified filters")
+  return (($CommandResult.Output -join "`n") -match "No workflows found with specified filters|No workflows with published versions found")
+}
+
+function Get-N8nCliLogArguments {
+  # n8n prints export:workflow output through its own log. Pin the log settings for this one call so a
+  # container set to a quieter level, file-only output or JSON log lines still prints a readable list.
+  return @("-e", "N8N_LOG_LEVEL=info", "-e", "N8N_LOG_OUTPUT=console", "-e", "N8N_LOG_FORMAT=text", "-e", "NO_COLOR=1")
+}
+
+function Invoke-CliWorkflowJson([string[]]$Arguments, $FailureMessage) {
+  # Workflow JSON is parsed and written by Node only. PowerShell 6+ rewrites date-like strings in the
+  # machine's time zone and every edition rejects keys that differ only by case, so a PowerShell
+  # round trip could change or break a workflow depending on the machine.
+  $result = Invoke-CapturedCommand "node" (@((Join-Path $HelperScriptDir "n8n-cli-workflow-json.cjs")) + $Arguments)
+  if ($result.ExitCode -ne 0) {
+    throw "$FailureMessage`n$($result.Output -join "`n")"
+  }
+}
+
+function Get-LiveWorkflowListDir {
+  $tmpDir = Join-Path $RepoRoot ".tmp"
+  $listDir = Join-Path $tmpDir "n8n-live-workflow-list"
+  foreach ($path in @($tmpDir, $listDir)) {
+    if ((Test-Path -LiteralPath $path) -and (Test-PathItemIsUnsafeLink (Get-Item -LiteralPath $path -Force))) {
+      throw "Refusing to store the live workflow list through a link: $path. Remove the link and rerun."
+    }
+  }
+  New-Item -ItemType Directory -Force -Path $listDir | Out-Null
+  return $listDir
+}
+
+function Get-SafeLiveWorkflowListDir {
+  # Returns the list folder only when it exists and neither it nor .tmp is a link, so clean-up never
+  # deletes anything outside the repository's own folder.
+  $tmpDir = Join-Path $RepoRoot ".tmp"
+  $listDir = Join-Path $tmpDir "n8n-live-workflow-list"
+  if (-not (Test-Path -LiteralPath $listDir -PathType Container)) {
+    return $null
+  }
+  foreach ($path in @($tmpDir, $listDir)) {
+    if (Test-PathItemIsUnsafeLink (Get-Item -LiteralPath $path -Force)) {
+      return $null
+    }
+  }
+  return $listDir
+}
+
+function New-LiveWorkflowListToken {
+  # Each helper file name starts with this run's process id, so a later run can tell which files a
+  # killed run left behind.
+  return ("{0}-{1}" -f $PID, [guid]::NewGuid().ToString("N"))
+}
+
+function Read-LiveWorkflowList($CommandResult) {
+  $listDir = Get-LiveWorkflowListDir
+  $token = New-LiveWorkflowListToken
+  $rawPath = Join-Path $listDir "$token.n8n-output.txt"
+  $storePath = Join-Path $listDir "$token.workflows.json"
+  $summaryPath = Join-Path $listDir "$token.summary.json"
+  Write-Utf8NoBomText -Path $rawPath -Text (($CommandResult.StdOut -join "`n") + "`n")
+  try {
+    Invoke-CliWorkflowJson @("list", "--input", $rawPath, "--store", $storePath, "--summary", $summaryPath) "Could not read the live workflow list from container $Container."
+  } finally {
+    Remove-Item -LiteralPath $rawPath -Force -ErrorAction SilentlyContinue
+  }
+  if (-not [string]::IsNullOrWhiteSpace($script:LiveWorkflowStorePath) -and $script:LiveWorkflowStorePath -ne $storePath) {
+    Remove-Item -LiteralPath $script:LiveWorkflowStorePath -Force -ErrorAction SilentlyContinue
+  }
+  $script:LiveWorkflowStorePath = $storePath
+  try {
+    $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+  } finally {
+    Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+  }
+  return @($summary | Where-Object { $null -ne $_ })
+}
+
+function Remove-LiveWorkflowList {
+  # The stored list holds every live workflow, so this run removes it when it finishes or fails.
+  if (-not [string]::IsNullOrWhiteSpace($script:LiveWorkflowStorePath)) {
+    Remove-Item -LiteralPath $script:LiveWorkflowStorePath -Force -ErrorAction SilentlyContinue
+    $script:LiveWorkflowStorePath = $null
+  }
+  $listDir = Get-SafeLiveWorkflowListDir
+  if ($null -ne $listDir -and -not (Get-ChildItem -LiteralPath $listDir -Force | Select-Object -First 1)) {
+    Remove-Item -LiteralPath $listDir -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Clear-StaleLiveWorkflowList {
+  # A killed run (window closed, task killed, power loss) never reaches its finally block. The next run
+  # removes a helper file unless a process with its id is running and started before the file was
+  # written, so a reused process id does not keep a killed run's list. Older files with no process id
+  # go too. It touches only the helpers' own file names, and nothing when the folder or .tmp is a link.
+  $listDir = Get-SafeLiveWorkflowListDir
+  if ($null -eq $listDir) {
+    return
+  }
+  $helperFile = '^(?:([0-9]{1,9})-)?[0-9a-f]{32}\.(?:workflows\.json|n8n-output\.txt|summary\.json|file-summary\.json)$'
+  foreach ($file in @(Get-ChildItem -LiteralPath $listDir -File -Force)) {
+    if ($file.Name -notmatch $helperFile) {
+      continue
+    }
+    if ($Matches[1]) {
+      $owner = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+      if ($null -ne $owner) {
+        # A start time that cannot be read keeps the file, as the owner may still be using it.
+        $started = $null
+        try { $started = $owner.StartTime.ToUniversalTime() } catch { }
+        if ($null -eq $started -or $started -le $file.LastWriteTimeUtc) {
+          continue
+        }
+      }
+    }
+    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Write-LiveWorkflowJsonFile($Workflow, $Path) {
+  Invoke-CliWorkflowJson @("write", "--store", $script:LiveWorkflowStorePath, "--id", [string]$Workflow.id, "--output", $Path) "Could not write the live workflow file $Path."
+}
+
+function Read-WorkflowFileSummary($Path) {
+  $summaryPath = Join-Path (Get-LiveWorkflowListDir) ("{0}.file-summary.json" -f (New-LiveWorkflowListToken))
+  try {
+    Invoke-CliWorkflowJson @("file-summary", "--input", $Path, "--summary", $summaryPath) "Workflow file $Path could not be read as one workflow JSON object."
+    return (Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json)
+  } finally {
+    Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Assert-HelperSetReady {
+  if ($null -eq (Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+    throw "N8N_HELPER_SET_INVALID: Node.js was not found on PATH. Install Node.js 18 or newer, then rerun."
+  }
+  $setCheck = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "n8n-helper-set.cjs"), "check", "--dir", $HelperScriptDir)
+  foreach ($line in $setCheck.Output) {
+    if ($line -match '^(FAIL|WARN|INFO|OK):\s*(.*)$') {
+      Write-Step $Matches[1] $Matches[2]
+    } else {
+      Write-Host $line
+    }
+  }
+  if ($setCheck.ExitCode -ne 0) {
+    throw "N8N_HELPER_SET_INVALID: this helper folder is not one complete, matching helper set. Run check-n8n-helper-machine.cjs for a full report."
+  }
+}
+
+function Assert-WorkflowIdentityStateReadable {
+  $result = Invoke-CapturedCommand "node" @(
+    (Join-Path $HelperScriptDir "n8n-workflow-identity.cjs"),
+    "validate",
+    "--state", $WorkflowIdentityFilePath,
+    "--repo-root", $RepoRoot
+  )
+  if ($result.ExitCode -ne 0) {
+    throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity could not be validated safely."
+  }
+}
+
+function Get-LocalWorkflowIdentity($WorkflowFile, $WorkflowName) {
+  $result = Invoke-CapturedCommand "node" @(
+    (Join-Path $HelperScriptDir "n8n-workflow-identity.cjs"),
+    "resolve-export",
+    "--state", $WorkflowIdentityFilePath,
+    "--repo-root", $RepoRoot,
+    "--workflow-file", $WorkflowFile.Name,
+    "--workflow-name", $WorkflowName
+  )
+  if ($result.ExitCode -ne 0) {
+    throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity could not be resolved safely."
+  }
+
+  try {
+    $identity = (($result.StdOut -join "`n").Trim() | ConvertFrom-Json)
+  } catch {
+    throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity returned an invalid internal result."
+  }
+  if (-not [string]::IsNullOrWhiteSpace([string]$identity.targetWorkflowId)) {
+    if (-not [string]::Equals([string]$identity.workflowFile, [string]$WorkflowFile.Name, [System.StringComparison]::Ordinal)) {
+      throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity does not match the exact canonical workflow file."
+    }
+    if (-not [string]::Equals([string]$identity.workflowName, [string]$WorkflowName, [System.StringComparison]::Ordinal)) {
+      throw "N8N_POLICY_VALIDATION_FAILED: local target workflow identity does not match the intended canonical workflow name."
+    }
+  }
+  return $identity
 }
 
 function Read-RepoWorkflowInfo($WorkflowFile) {
-  $workflow = Get-Content -Raw -Path $WorkflowFile.FullName | ConvertFrom-Json
-  $workflowId = [string]$workflow.id
+  $workflow = Read-WorkflowFileSummary $WorkflowFile.FullName
+  $canonicalWorkflowId = [string]$workflow.id
   $workflowName = [string]$workflow.name
   if ([string]::IsNullOrWhiteSpace($workflowName)) {
     throw "Workflow file $($WorkflowFile.FullName) does not contain a top-level name."
+  }
+  $identity = Get-LocalWorkflowIdentity $WorkflowFile $workflowName
+  $dedicatedWorkflowId = [string]$identity.targetWorkflowId
+  if (
+    -not [string]::IsNullOrWhiteSpace($canonicalWorkflowId) -and
+    -not [string]::IsNullOrWhiteSpace($dedicatedWorkflowId) -and
+    -not [string]::Equals($canonicalWorkflowId, $dedicatedWorkflowId, [System.StringComparison]::Ordinal)
+  ) {
+    throw "N8N_POLICY_VALIDATION_FAILED: canonical and dedicated local target workflow identities disagree."
+  }
+  $workflowId = if (-not [string]::IsNullOrWhiteSpace($dedicatedWorkflowId)) {
+    $dedicatedWorkflowId
+  } else {
+    $canonicalWorkflowId
   }
 
   [PSCustomObject]@{
     File = $WorkflowFile
     Id = $workflowId
     Name = $workflowName
+    HasDedicatedIdentity = -not [string]::IsNullOrWhiteSpace($dedicatedWorkflowId)
   }
 }
 
-function Get-WorkflowCheckLabel($WorkflowFile, $WorkflowId) {
+function Get-WorkflowCheckLabel($WorkflowFile, $WorkflowId, [bool]$HasDedicatedIdentity) {
+  if ($HasDedicatedIdentity) {
+    return "$($WorkflowFile.Name) (dedicated local target identity)"
+  }
   if ([string]::IsNullOrWhiteSpace($WorkflowId)) {
     return "$($WorkflowFile.Name) (id: not set, matching by name)"
   }
@@ -531,7 +752,7 @@ function Invoke-LivePreflight {
 }
 
 function Get-LiveWorkflows {
-  $arguments = @("exec", $Container, "n8n", "export:workflow", "--all", "--pretty")
+  $arguments = @("exec") + (Get-N8nCliLogArguments) + @($Container, "n8n", "export:workflow", "--all", "--pretty")
   if ($PublishedOnly) {
     $arguments += "--published"
   }
@@ -544,17 +765,7 @@ function Get-LiveWorkflows {
     throw "Failed to list live workflows from container $Container.`n$($result.Output -join "`n")"
   }
 
-  $exportText = ($result.StdOut -join "`n").Trim()
-  if ([string]::IsNullOrWhiteSpace($exportText)) {
-    return @()
-  }
-
-  $workflows = $exportText | ConvertFrom-Json
-  if ($workflows -isnot [array]) {
-    $workflows = @($workflows)
-  }
-
-  return @($workflows)
+  return @(Read-LiveWorkflowList $result)
 }
 
 function Get-RootWorkflowFiles($WorkflowDirPath, [bool]$RequireExisting) {
@@ -584,13 +795,20 @@ function Resolve-LiveMatch($RepoWorkflow, $LiveWorkflows) {
   if (-not [string]::IsNullOrWhiteSpace($id)) {
     $idMatches = @($LiveWorkflows | Where-Object { [string]$_.id -eq $id })
     if ($idMatches.Count -gt 1) {
-      return [PSCustomObject]@{ Status = "Duplicate"; Workflow = $null; Message = "Multiple live workflows matched id $id." }
+      return [PSCustomObject]@{ Status = "Duplicate"; Workflow = $null; Message = "Multiple live workflows matched the selected target identity." }
     }
     if ($idMatches.Count -eq 1) {
       if ($idMatches[0].isArchived -eq $true -and -not $IncludeArchived) {
         return [PSCustomObject]@{ Status = "Archived"; Workflow = $idMatches[0]; Message = "Matched by id, but live workflow is archived." }
       }
       return [PSCustomObject]@{ Status = "Found"; Workflow = $idMatches[0]; Message = "Matched by id." }
+    }
+    if ($RepoWorkflow.HasDedicatedIdentity) {
+      $message = "Dedicated local target workflow identity no longer exists; refusing a same-name fallback."
+      if ($PublishedOnly) {
+        $message = "Dedicated local target workflow identity was not returned by the published-only query; refusing a same-name fallback."
+      }
+      return [PSCustomObject]@{ Status = "Missing"; Workflow = $null; Message = $message }
     }
   }
 
@@ -625,14 +843,13 @@ function Resolve-LiveMatch($RepoWorkflow, $LiveWorkflows) {
 }
 
 function Get-SafeWorkflowFileBase($Name, $Id) {
-  # Local repo convention: new exports use lowercase snake_case *.workflow.json names.
-  $base = ([string]$Name).ToLowerInvariant() -replace '[^a-z0-9]+', '_'
-  $base = $base.Trim('_')
+  $base = ([string]$Name).ToLowerInvariant() -replace '[^a-z0-9]+', '-'
+  $base = $base.Trim('-')
   if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "workflow"
   }
   if ($base.Length -gt 80) {
-    $base = $base.Substring(0, 80).Trim('_')
+    $base = $base.Substring(0, 80).Trim('-')
   }
   if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "workflow"
@@ -652,49 +869,42 @@ function Get-StableIdSuffix($Id) {
 }
 
 function Write-LiveWorkflowExportFile($Workflow, $ExportFile) {
-  Write-Utf8NoBomText -Path $ExportFile -Text (($Workflow | ConvertTo-Json -Depth 100) + "`n")
-}
-
-function Read-LiveExportChoice($Prompt) {
-  while ($true) {
-    $choice = Read-Host $Prompt
-    if ([string]::IsNullOrWhiteSpace($choice)) {
-      return $false
-    }
-
-    $normalized = $choice.Trim().Substring(0, 1).ToUpperInvariant()
-    if ($normalized -eq "X") { return $true }
-    if ($normalized -eq "E") { return $false }
-    Write-Step "WARN" "Invalid choice. Press X to export and sync or E to exit without changes."
-  }
-}
-
-function Invoke-LiveExportConfirmationGate([int]$PlannedCount) {
-  if ($ConfirmLiveExport) { return }
-
-  Write-Section "Live Export Confirmation"
-  Write-Host "This will write raw live exports under '$(Get-DisplayPath $ExportDirPath)', replace or create tracked workflow JSON under '$(Get-DisplayPath $WorkflowDirPath)', and refresh credential bindings under .n8n-local."
-  Write-Host "Use -DryRun to preview without changes, or pass -ConfirmLiveExport to pre-approve this step."
-
-  if ([Console]::IsInputRedirected) {
-    throw "Live export sync requires explicit confirmation. Input is non-interactive, so rerun with -ConfirmLiveExport (after reviewing a -DryRun preview) or run interactively and answer the prompt. No files were changed."
-  }
-
-  if (-not (Read-LiveExportChoice ("Export and sync {0} workflow(s) from live n8n into the repository now? Press X to export and sync or E to exit" -f $PlannedCount))) {
-    Write-Step "STOP" "Live export cancelled before any change. No files were changed."
-    exit 0
-  }
+  Write-LiveWorkflowJsonFile $Workflow $ExportFile
 }
 
 $WorkflowDirPath = Resolve-WorkflowDirPath
 $ExportDirPath = Join-Path $RepoRoot $ExportDir
 $BindingsFilePath = Join-Path $RepoRoot $BindingsFile
+$WorkflowIdentityFilePath = Join-Path $RepoRoot $WorkflowIdentityFile
+$PortableCredentialsFilePath = Join-Path $RepoRoot $PortableCredentialsFile
+$DeploymentPolicyFilePath = Join-Path $RepoRoot $DeploymentPolicyFile
+if ($DeploymentPolicyFileWasExplicit) {
+  try {
+    $deploymentPolicyIsFile = Test-Path -LiteralPath $DeploymentPolicyFilePath -PathType Leaf
+    $deploymentPolicyItem = if ($deploymentPolicyIsFile) {
+      Get-Item -LiteralPath $DeploymentPolicyFilePath -Force
+    } else {
+      $null
+    }
+  } catch {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy is unavailable."
+  }
+  if (-not $deploymentPolicyIsFile -or $null -eq $deploymentPolicyItem) {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy is unavailable."
+  }
+  if (Test-PathItemIsUnsafeLink $deploymentPolicyItem) {
+    throw "N8N_POLICY_VALIDATION_FAILED: the explicitly configured deployment policy is not a safe regular file."
+  }
+}
 
 Write-Section "n8n workflow export"
 Write-Host ("Repo root        : {0}" -f $RepoRoot)
 Write-Host ("Workflow dir     : {0}" -f (Get-DisplayPath $WorkflowDirPath))
 Write-Host ("Export dir       : {0}" -f (Get-DisplayPath $ExportDirPath))
 Write-Host ("Bindings file    : {0}" -f (Get-DisplayPath $BindingsFilePath))
+Write-Host ("Local identity   : {0}" -f (Get-DisplayPath $WorkflowIdentityFilePath))
+Write-Host ("Credential spec  : {0}" -f (Get-DisplayPath $PortableCredentialsFilePath))
+Write-Host ("Resource policy  : {0}" -f (Get-DisplayPath $DeploymentPolicyFilePath))
 Write-Host ("Docker target    : {0}" -f ($(if ([string]::IsNullOrWhiteSpace($Container) -and [string]::IsNullOrWhiteSpace($ContainerName) -and [string]::IsNullOrWhiteSpace($ContainerId) -and [string]::IsNullOrWhiteSpace($ComposeProject) -and [string]::IsNullOrWhiteSpace($ComposeService)) { "auto-detect or prompt" } else { "explicit override requested" })))
 Write-Host ("Mode             : {0}" -f $Mode)
 Write-Host ("Dry run          : {0}" -f ([bool]$DryRun))
@@ -707,6 +917,20 @@ if ($Mode -eq "RepoTrackedOnly") {
   Write-Host "Missing live     : Not used in AllLive mode."
 }
 
+# A run that finishes or fails, including on an error, removes its stored live workflow list in the
+# finally block below; a killed run's leftovers are removed by the next run's first step.
+try {
+Clear-StaleLiveWorkflowList
+Assert-HelperSetReady
+Assert-WorkflowIdentityStateReadable
+$workflowFiles = Get-RootWorkflowFiles $WorkflowDirPath ($Mode -eq "RepoTrackedOnly")
+if ($Mode -eq "RepoTrackedOnly" -and -not $workflowFiles) {
+  throw "No root-level workflow JSON files found in $(Get-DisplayPath $WorkflowDirPath)."
+}
+$repoWorkflowInfos = @()
+foreach ($workflowFile in $workflowFiles) {
+  $repoWorkflowInfos += Read-RepoWorkflowInfo $workflowFile
+}
 Invoke-LivePreflight
 $liveWorkflows = Get-LiveWorkflows
 Write-Step "LIVE" "Read $($liveWorkflows.Count) workflow(s) from live n8n."
@@ -716,21 +940,16 @@ if ($PublishedOnly) {
 Write-DuplicateNameReport $liveWorkflows
 
 if ($Mode -eq "RepoTrackedOnly") {
-  $workflowFiles = Get-RootWorkflowFiles $WorkflowDirPath $true
-  if (-not $workflowFiles) {
-    throw "No root-level workflow JSON files found in $(Get-DisplayPath $WorkflowDirPath)."
-  }
-
   $plannedExports = @()
   $missingCount = 0
   $duplicateCount = 0
   $archivedCount = 0
 
   Write-Section "Repo-tracked workflow check"
-  foreach ($workflowFile in $workflowFiles) {
-    $workflowInfo = Read-RepoWorkflowInfo $workflowFile
+  foreach ($workflowInfo in $repoWorkflowInfos) {
+    $workflowFile = $workflowInfo.File
     $match = Resolve-LiveMatch $workflowInfo $liveWorkflows
-    Write-Step "CHECK" (Get-WorkflowCheckLabel $workflowFile $workflowInfo.Id)
+    Write-Step "CHECK" (Get-WorkflowCheckLabel $workflowFile $workflowInfo.Id $workflowInfo.HasDedicatedIdentity)
 
     if ($match.Status -eq "Found") {
       $exportFile = Join-Path $ExportDirPath "$($workflowFile.BaseName).live-export.json"
@@ -741,7 +960,7 @@ if ($Mode -eq "RepoTrackedOnly") {
         Action = "Export"
         Note = $match.Message
       }
-      Write-Step "FOUND" "$($workflowFile.Name) -> live id $($match.Workflow.id). $($match.Message)"
+      Write-Step "FOUND" "$($workflowFile.Name) matched one live workflow. $($match.Message)"
       continue
     }
 
@@ -790,7 +1009,7 @@ if ($Mode -eq "RepoTrackedOnly") {
 
     Write-Section "Summary"
     Write-Host ("Would export : {0}" -f $plannedExports.Count)
-    Write-Host "No workflow files or credential bindings were changed."
+    Write-Host "No workflow files or portable credential declarations were changed."
     exit 0
   }
 
@@ -800,13 +1019,6 @@ if ($Mode -eq "RepoTrackedOnly") {
     Write-Host "No live exports were written and no workflow files were changed."
     exit 0
   }
-
-  Write-Section "Planned Actions"
-  foreach ($planned in $plannedExports) {
-    Write-Step "PLAN" "$($planned.RepoFile.Name) -> $(Get-DisplayPath $planned.ExportFile)"
-  }
-
-  Invoke-LiveExportConfirmationGate $plannedExports.Count
 
   Initialize-RunDirectory $ExportDirPath
   foreach ($planned in $plannedExports) {
@@ -824,6 +1036,13 @@ if ($Mode -eq "RepoTrackedOnly") {
   }
 
   $syncArgs = @((Join-Path $HelperScriptDir "sync-n8n-live-exports.cjs"), $ExportDirPath, $WorkflowDirPath, $BindingsFilePath, "--sync-exported-only")
+  $syncArgs += "--portable-credentials=$PortableCredentialsFilePath"
+  if ($DeploymentPolicyFileWasExplicit) {
+    $syncArgs += "--deployment-policy=$DeploymentPolicyFilePath"
+  }
+  if ($ReviewedSourceUpdate) {
+    $syncArgs += "--reviewed-source-update"
+  }
   if ($PreserveTags) {
     $syncArgs += "--preserve-tags"
   }
@@ -845,25 +1064,27 @@ if ($Mode -eq "RepoTrackedOnly") {
 
   Write-Section "Summary"
   Write-Host ("Exported : {0}" -f $plannedExports.Count)
-  Write-Host "Credential bindings were refreshed under .n8n-local."
+  Write-Host "Canonical workflows and portable credential declarations were updated; compatibility bindings remain local."
   Write-Section "Next Action Steps"
   Write-Host "1. Review workflow JSON changes before committing."
   Write-Host "2. Keep .n8n-local and .tmp uncommitted."
   exit 0
 }
 
-$existingFiles = Get-RootWorkflowFiles $WorkflowDirPath $false
+$existingFiles = @($workflowFiles)
 $existingById = @{}
 $existingNameGroups = @{}
-foreach ($workflowFile in $existingFiles) {
-  $workflowInfo = Read-RepoWorkflowInfo $workflowFile
+foreach ($workflowInfo in $repoWorkflowInfos) {
+  $workflowFile = $workflowInfo.File
   if (-not [string]::IsNullOrWhiteSpace($workflowInfo.Id) -and -not $existingById.ContainsKey($workflowInfo.Id)) {
     $existingById[$workflowInfo.Id] = $workflowFile
   }
-  if (-not $existingNameGroups.ContainsKey($workflowInfo.Name)) {
-    $existingNameGroups[$workflowInfo.Name] = @()
+  if (-not $workflowInfo.HasDedicatedIdentity) {
+    if (-not $existingNameGroups.ContainsKey($workflowInfo.Name)) {
+      $existingNameGroups[$workflowInfo.Name] = @()
+    }
+    $existingNameGroups[$workflowInfo.Name] += $workflowFile
   }
-  $existingNameGroups[$workflowInfo.Name] += $workflowFile
 }
 
 $liveForExport = @($liveWorkflows | Where-Object { $IncludeArchived -or $_.isArchived -ne $true })
@@ -888,16 +1109,14 @@ foreach ($workflow in $liveForExport) {
 
   if ($null -eq $targetFile) {
     $baseName = Get-SafeWorkflowFileBase $workflow.name $workflow.id
-    # Collision keys include the .workflow suffix so they compare against
-    # existing repo file base names, which keep .workflow after .json is stripped.
-    if ($usedBaseNames.ContainsKey("$baseName.workflow")) {
-      $baseName = "${baseName}_$(Get-StableIdSuffix $workflow.id)"
+    if ($usedBaseNames.ContainsKey($baseName)) {
+      $baseName = "$baseName-$(Get-StableIdSuffix $workflow.id)"
     }
-    while ($usedBaseNames.ContainsKey("$baseName.workflow")) {
-      $baseName = "${baseName}_$(Get-StableIdSuffix $workflow.id)"
+    while ($usedBaseNames.ContainsKey($baseName)) {
+      $baseName = "$baseName-$(Get-StableIdSuffix $workflow.id)"
     }
-    $usedBaseNames["$baseName.workflow"] = $true
-    $targetFile = Join-Path $WorkflowDirPath "$baseName.workflow.json"
+    $usedBaseNames[$baseName] = $true
+    $targetFile = Join-Path $WorkflowDirPath "$baseName.json"
   } else {
     $existingBaseName = [System.IO.Path]::GetFileNameWithoutExtension([System.IO.Path]::GetFileName([string]$targetFile))
     $usedBaseNames[$existingBaseName] = $true
@@ -915,7 +1134,7 @@ foreach ($workflow in $liveForExport) {
 
 Write-Section "All live workflow plan"
 foreach ($planned in $plannedAllLive) {
-  Write-Step "PLAN" "$($planned.Workflow.name) ($($planned.Workflow.id)) -> $(Get-DisplayPath $planned.RepoFile). $($planned.Note)"
+  Write-Step "PLAN" "$($planned.Workflow.name) -> $(Get-DisplayPath $planned.RepoFile). $($planned.Note)"
 }
 if ($skippedArchived -gt 0) {
   Write-Step "ARCHIVE" "Skipped $skippedArchived archived workflow(s). Use -IncludeArchived to include them."
@@ -925,7 +1144,7 @@ if ($DryRun) {
   Write-Section "Summary"
   Write-Host ("Would export : {0}" -f $plannedAllLive.Count)
   Write-Host ("Skipped archived : {0}" -f $skippedArchived)
-  Write-Host "No workflow files or credential bindings were changed."
+  Write-Host "No workflow files or portable credential declarations were changed."
   exit 0
 }
 
@@ -936,8 +1155,6 @@ if ($plannedAllLive.Count -eq 0) {
   Write-Host "No live exports were written and no workflow files were changed."
   exit 0
 }
-
-Invoke-LiveExportConfirmationGate $plannedAllLive.Count
 
 New-Item -ItemType Directory -Force -Path $WorkflowDirPath | Out-Null
 Initialize-RunDirectory $ExportDirPath
@@ -956,6 +1173,13 @@ Invoke-ProjectWorkflowHook "before-export-sync" @{
 }
 
 $syncAllArgs = @((Join-Path $HelperScriptDir "sync-n8n-live-exports.cjs"), $ExportDirPath, $WorkflowDirPath, $BindingsFilePath, "--create-missing-workflows", "--sync-exported-only")
+$syncAllArgs += "--portable-credentials=$PortableCredentialsFilePath"
+if ($DeploymentPolicyFileWasExplicit) {
+  $syncAllArgs += "--deployment-policy=$DeploymentPolicyFilePath"
+}
+if ($ReviewedSourceUpdate) {
+  $syncAllArgs += "--reviewed-source-update"
+}
 if ($PreserveTags) {
   $syncAllArgs += "--preserve-tags"
 }
@@ -978,9 +1202,12 @@ Invoke-ProjectWorkflowHook "after-export-sync" @{
 Write-Section "Summary"
 Write-Host ("Exported          : {0}" -f $plannedAllLive.Count)
 Write-Host ("Skipped archived  : {0}" -f $skippedArchived)
-Write-Host "Credential bindings were refreshed under .n8n-local."
+Write-Host "Canonical workflows and portable credential declarations were updated; compatibility bindings remain local."
 
 Write-Section "Next Action Steps"
 Write-Host "1. Review all workflow JSON changes before committing."
 Write-Host "2. Keep .n8n-local and .tmp uncommitted."
 Write-Host "3. Historical version export is intentionally unsupported by this helper."
+} finally {
+  Remove-LiveWorkflowList
+}
