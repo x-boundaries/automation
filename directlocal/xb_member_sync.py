@@ -1470,7 +1470,15 @@ FORMS_KEYS = ("submission_id", "submitted_at", "email", "phone", "first_name", "
 FORMS_TAG = "xb-form-signup"
 FORMS_WATERMARK = "forms_watch_updated_day"  # the Singapore date of the last clean read
 FORMS_SEEN_PREFIX = "forms_seen:"  # + keyed digest of the submission id; value "<code>|<decided time>"
-FORMS_SEEN_DAYS = 120  # seen-marks older than this are pruned; older records are never classified
+FORMS_SEEN_DAYS = 120  # seen-marks older than this are pruned (never a K9 mark: see forms_watch)
+# #155 FH1b (G2 L5): a submitted_at more than this ahead of the run is refused (K9), and a valid
+# record is skipped once older than FORMS_SEEN_DAYS - FORMS_FUTURE_DAYS, so its mark (made at most
+# this much before its submitted_at) is always still there while the record can be classified.
+FORMS_FUTURE_DAYS = 1
+FORMS_SKIP_DAYS = FORMS_SEEN_DAYS - FORMS_FUTURE_DAYS
+# #155 FH1b (G2 L1): the read position inside a read day, kept across runs: JSON
+# {"day": <read day>, "after": <the cursor of the last customer fully processed>}.
+FORMS_CURSOR_MARK = "forms_watch_cursor"
 # The sign-up signal for the daily summary's forms_flow_silent WARN (no
 # schema change): the number of sign-up rows in shopify_pending at the last
 # forms step, and the time the forms step last saw that number grow.
@@ -2037,66 +2045,124 @@ class SyncEngine:
     # -- #155 FH1: the forms watch (reads only; design B8, B9, B12) ----------------------
     def forms_watch(self) -> None:
         """Read the copy records of customers tagged ``xb-form-signup``
-        updated since the day before the last clean read (never before
+        updated since the day before the last complete read (never before
         ``forms_watch_since``), classify each submission not seen before and
         count. Writes only this ledger's watermarks rows: one seen-mark per
         submission (``forms_seen:`` + keyed digest; the code and the time,
-        nothing the person typed), the read day, and the sign-up signal.
-        A read failure, the page cap or the K6 read budget leaves the read
-        day where it was (``forms_read_incomplete``); unmarked records are
-        read again next run."""
+        nothing the person typed), the read day, the read position and the
+        sign-up signal.
+
+        #155 FH1b (G2 L1), progress: the read is oldest update first, in
+        Shopify's cursor order (updatedAt, then id, so ties have one order).
+        After every customer fully processed (classified and marked, or
+        skipped) the run holds that customer's cursor; when the run stops
+        before the end (page cap, read failure, K6 budget or K6 read
+        failure) the position is kept with its read day
+        (``forms_watch_cursor``) and the next run goes on after it. Nothing
+        before the position is unprocessed, so nothing is skipped; a customer
+        updated again after being passed moves behind the position and is
+        read again, and its seen-mark stops a second count. Only a complete
+        read moves the read day (then the position is cleared). Every run
+        that stops before the end counts ``forms_read_incomplete``; one that
+        also made no progress counts ``forms_read_stalled``."""
 
         now = self.ledger.now()
-        horizon = now - timedelta(days=FORMS_SEEN_DAYS)
         with self.ledger.tx() as conn:
-            conn.execute("DELETE FROM watermarks WHERE substr(name, 1, ?) = ? AND updated_at < ?",
-                         (len(FORMS_SEEN_PREFIX), FORMS_SEEN_PREFIX, dl.ts(horizon)))
+            # G2 L5: a K9 (unreadable) mark is never pruned: its name is the digest of the raw
+            # values, so it stays as long as they are unchanged and stops a second count.
+            conn.execute("DELETE FROM watermarks WHERE substr(name, 1, ?) = ? AND updated_at < ? AND substr(value, 1, ?) != ?",
+                         (len(FORMS_SEEN_PREFIX), FORMS_SEEN_PREFIX, dl.ts(now - timedelta(days=FORMS_SEEN_DAYS)),
+                          len("forms_record_invalid|"), "forms_record_invalid|"))
         self._forms_track_sign_ups()
-        seen = new = 0
-        try:
-            customers, complete = self.shopify.forms_sign_ups(forms_search(self._forms_read_day()), self.config.forms_watch_max_pages)
-        except direct.ShopifyDirectError:
-            customers, complete = [], False
-        email_reads_left = self.config.forms_watch_max_pages * SHOPIFY_PAGE_SIZE
-        for customer in customers:
-            if not has_tag(customer.tags, FORMS_TAG):
-                continue  # the tag search is only a candidate list
-            seen += 1
-            record = parse_forms_record(customer.metafields)
-            if record is not None and record.submitted_at < horizon:
-                continue  # older than any seen-mark is kept: never classified (no double count)
-            mark = FORMS_SEEN_PREFIX + self._forms_key(customer, record)
-            if self.ledger.watermark(mark) is not None:
-                continue  # classified before: never counted twice
-            decision = FormsDecision("forms_record_invalid") if record is None else decide_forms(customer, record)
-            outcome = decision.outcome
-            if decision.email_check:
-                # K6: one customerByIdentifier read of the typed email (the
-                # existing read path); another customer holding it is held.
-                if email_reads_left <= 0:
-                    complete = False
+        day = self._forms_read_day()
+        search = forms_search(day)
+        start = self._forms_saved_cursor(day)
+        after, complete, failed, counts = start, False, False, {"seen": 0, "new": 0}
+        budget = [self.config.forms_watch_max_pages * SHOPIFY_PAGE_SIZE]  # K6 reads left this run
+        for _ in range(self.config.forms_watch_max_pages):
+            try:
+                items, has_next = self.shopify.forms_page(search, after)
+            except direct.ShopifyDirectError:
+                failed = True
+                break
+            stopped = False
+            for customer, cursor in items:
+                if not self._forms_one(customer, now, budget, counts):
+                    stopped = True
                     break
-                email_reads_left -= 1
-                try:
-                    found = self.shopify.find_by_email(record.email)
-                except direct.ShopifyDirectError:
-                    complete = False
-                    break
-                if found is not None and found.gid != customer.gid:
-                    outcome = "forms_held_email_elsewhere"
-            new += 1
-            if decision.class_code is not None:
-                self.summary.count(decision.class_code)
-            self.summary.count(outcome, self.ledger.ref("c", customer.gid) if outcome in FORMS_REF_CODES else None)
-            with self.ledger.tx() as conn:
-                self.ledger.set_watermark(conn, mark, f"{outcome}|{dl.ts(self.ledger.now())}")
-        for code, number in (("forms_records_seen", seen), ("forms_records_new", new)):
-            self.summary.counts[code] = self.summary.counts.get(code, 0) + number
+                after = cursor  # this customer is done: the next run starts after it
+            if stopped:
+                break
+            if not has_next:
+                complete = True
+                break
+        for code, key in (("forms_records_seen", "seen"), ("forms_records_new", "new")):
+            self.summary.counts[code] = self.summary.counts.get(code, 0) + counts[key]
+        with self.ledger.tx() as conn:
+            if complete:
+                self.ledger.set_watermark(conn, FORMS_WATERMARK, now.astimezone(SGT).strftime("%Y-%m-%d"))
+                conn.execute("DELETE FROM watermarks WHERE name = ?", (FORMS_CURSOR_MARK,))
+            elif after != start:
+                self.ledger.set_watermark(conn, FORMS_CURSOR_MARK, json.dumps({"day": day, "after": after}, sort_keys=True))
+            elif failed and start is not None:
+                # No step from a kept position: it may no longer be valid, so the next run
+                # starts the day again (seen-marks stop a second count).
+                conn.execute("DELETE FROM watermarks WHERE name = ?", (FORMS_CURSOR_MARK,))
         if not complete:
             self.summary.count("forms_read_incomplete")
-            return
+            if after == start:
+                self.summary.count("forms_read_stalled")
+
+    def _forms_one(self, customer: FormsCustomer, now: datetime, budget: list[int], counts: dict[str, int]) -> bool:
+        """One customer of the forms read. False: stop the run here (the K6
+        budget is spent or its read failed); the customer is not done."""
+
+        if not has_tag(customer.tags, FORMS_TAG):
+            return True  # the tag search is only a candidate list
+        counts["seen"] += 1
+        record = parse_forms_record(customer.metafields)
+        if record is not None and record.submitted_at > now + timedelta(days=FORMS_FUTURE_DAYS):
+            record = None  # G2 L5: a submission time ahead of the run is not readable (K9)
+        if record is not None and record.submitted_at < now - timedelta(days=FORMS_SKIP_DAYS):
+            return True  # older than its seen-mark can be: never classified (no double count)
+        mark = FORMS_SEEN_PREFIX + self._forms_key(customer, record)
+        if self.ledger.watermark(mark) is not None:
+            return True  # classified before: never counted twice
+        decision = FormsDecision("forms_record_invalid") if record is None else decide_forms(customer, record)
+        outcome = decision.outcome
+        if decision.email_check:
+            # K6: one customerByIdentifier read of the typed email (the existing read path);
+            # another customer holding it is held.
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
+            try:
+                found = self.shopify.find_by_email(record.email)
+            except direct.ShopifyDirectError:
+                return False
+            if found is not None and found.gid != customer.gid:
+                outcome = "forms_held_email_elsewhere"
+        counts["new"] += 1
+        if decision.class_code is not None:
+            self.summary.count(decision.class_code)
+        self.summary.count(outcome, self.ledger.ref("c", customer.gid) if outcome in FORMS_REF_CODES else None)
         with self.ledger.tx() as conn:
-            self.ledger.set_watermark(conn, FORMS_WATERMARK, now.astimezone(SGT).strftime("%Y-%m-%d"))
+            self.ledger.set_watermark(conn, mark, f"{outcome}|{dl.ts(self.ledger.now())}")
+        return True
+
+    def _forms_saved_cursor(self, day: str) -> str | None:
+        """The kept read position, only when it was made for this read day
+        (a new day or another ``forms_watch_since`` starts from the day's
+        beginning). Anything unreadable: None."""
+
+        raw = self.ledger.watermark(FORMS_CURSOR_MARK)
+        try:
+            value = json.loads(raw) if raw is not None else None
+        except (json.JSONDecodeError, RecursionError):
+            return None
+        if not isinstance(value, dict) or value.get("day") != day or not _forms_cursor_ok(value.get("after")):
+            return None
+        return value["after"]
 
     def _forms_read_day(self) -> str:
         """The day before the last clean read (whole-day ``updated_at``
@@ -3671,15 +3737,18 @@ CUSTOMER_CREATE_MUTATION = """mutation XbMemberSyncCustomerCreate($input: Custom
 }"""
 # #155 FH1 (design B8, B9): the forms watch's one read (read_customers): the
 # customers carrying the copy Flow's tag, the B9 "unused" fields and the six
-# copy-record metafields, oldest update first, in cursor pages.
+# copy-record metafields, oldest update first, in cursor pages. FH1b (G2 L1):
+# each customer comes with its own cursor, so a run can stop after any
+# customer and the next run goes on from exactly there.
 FORMS_QUERY = """query XbMemberSyncFormsWatch($first: Int!, $after: String, $search: String!) {
   customers(first: $first, after: $after, sortKey: UPDATED_AT, query: $search) {
-    pageInfo { hasNextPage endCursor }
-    nodes { id firstName lastName defaultEmailAddress { emailAddress } defaultPhoneNumber { phoneNumber } tags
+    pageInfo { hasNextPage }
+    edges { cursor node { id firstName lastName defaultEmailAddress { emailAddress } defaultPhoneNumber { phoneNumber } tags
       numberOfOrders amountSpent { amount } canDelete state
-      metafields(namespace: "xb_form", first: 10) { nodes { key value } } }
+      metafields(namespace: "xb_form", first: 10) { nodes { key value } } } }
   }
 }"""
+FORMS_CURSOR_MAX = 1024
 FORMS_SEARCH_RE = re.compile(r"^tag:'xb-form-signup' AND updated_at:>='[0-9]{4}-[0-9]{2}-[0-9]{2}'$")
 SYNC_READ_QUERIES = frozenset({direct.SESSION_QUERY, REGISTRATIONS_QUERY, CUSTOMER_QUERY, PHONE_LOOKUP_QUERY, EMAIL_LOOKUP_QUERY, FORMS_QUERY})
 
@@ -3692,6 +3761,12 @@ def forms_search(day: str) -> str:
     if not _is_date(day) or not FORMS_SEARCH_RE.fullmatch(search):
         raise dl.DirectLocalError("forms_search_invalid")
     return search
+
+
+def _forms_cursor_ok(value: Any) -> bool:
+    """An opaque Shopify cursor: printable ASCII, bounded (it is kept in the ledger)."""
+
+    return isinstance(value, str) and 0 < len(value) <= FORMS_CURSOR_MAX and value.isascii() and value.isprintable()
 
 
 def _forms_customer_from_node(node: Any) -> FormsCustomer:
@@ -3780,29 +3855,31 @@ class SyncShopifyClient(direct.ShopifyDirectClient):
                 raise direct.ShopifyDirectError("shopify_response_shape_invalid")
         return customers, False
 
-    def forms_sign_ups(self, search: str, max_pages: int) -> tuple[list[FormsCustomer], bool]:
-        """#155 FH1: the forms read, at most ``max_pages`` pages; ``True``
-        only when the last page was reached. Reads only."""
+    def forms_page(self, search: str, after: str | None) -> tuple[list[tuple[FormsCustomer, str]], bool]:
+        """#155 FH1b: one page of the forms read after ``after`` (None: from
+        the start): each customer with its own cursor, and whether a next
+        page exists. Reads only."""
 
         if not isinstance(search, str) or not FORMS_SEARCH_RE.fullmatch(search):
             raise dl.DirectLocalError("forms_search_invalid")
-        customers: list[FormsCustomer] = []
-        after = None
-        for _ in range(max_pages):
-            data = self.execute(FORMS_QUERY, {"first": SHOPIFY_PAGE_SIZE, "after": after, "search": search})
-            page = data.get("customers")
-            if not isinstance(page, dict) or not isinstance(page.get("nodes"), list) or not isinstance(page.get("pageInfo"), dict):
+        if after is not None and not _forms_cursor_ok(after):
+            raise dl.DirectLocalError("forms_cursor_invalid")
+        data = self.execute(FORMS_QUERY, {"first": SHOPIFY_PAGE_SIZE, "after": after, "search": search})
+        page = data.get("customers")
+        if not isinstance(page, dict) or not isinstance(page.get("edges"), list) or not isinstance(page.get("pageInfo"), dict):
+            raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+        items = []
+        for edge in page["edges"]:
+            if not isinstance(edge, dict) or not _forms_cursor_ok(edge.get("cursor")):
                 raise direct.ShopifyDirectError("shopify_response_shape_invalid")
-            customers.extend(_forms_customer_from_node(node) for node in page["nodes"])
-            if not page["pageInfo"].get("hasNextPage"):
-                return customers, True
-            after = page["pageInfo"].get("endCursor")
-            if not isinstance(after, str) or not after:
-                raise direct.ShopifyDirectError("shopify_response_shape_invalid")
-        return customers, False
+            items.append((_forms_customer_from_node(edge.get("node")), edge["cursor"]))
+        has_next = page["pageInfo"].get("hasNextPage")
+        if not isinstance(has_next, bool) or (has_next and not items):
+            raise direct.ShopifyDirectError("shopify_response_shape_invalid")  # a next page after nothing would never move
+        return items, has_next
 
     def customer(self, gid: str, birthday: Mapping[str, str]) -> ShopifyCustomer | None:
-        data = self.execute(CUSTOMER_QUERY,{"id": gid, "birthdayNamespace": birthday["namespace"], "birthdayKey": birthday["key"]})
+        data = self.execute(CUSTOMER_QUERY, {"id": gid, "birthdayNamespace": birthday["namespace"], "birthdayKey": birthday["key"]})
         node = data.get("customer")
         return None if node is None else _customer_from_node(node)
 
@@ -4420,7 +4497,7 @@ def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str
     }
 
 
-FORMS_DIGEST_CODES = ("forms_records_seen", "forms_records_new", "forms_read_incomplete") + FORMS_CLASS_CODES + FORMS_OUTCOME_CODES
+FORMS_DIGEST_CODES = ("forms_records_seen", "forms_records_new", "forms_read_incomplete", "forms_read_stalled") + FORMS_CLASS_CODES + FORMS_OUTCOME_CODES
 
 
 def _digest_forms(conn: sqlite3.Connection, counts: Mapping[str, int]) -> dict[str, Any]:
