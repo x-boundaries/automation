@@ -1,0 +1,776 @@
+{
+  "aging": {
+    "bases": [
+      "due_date",
+      "document_date"
+    ],
+    "boundaries": [
+      0,
+      30,
+      60,
+      90,
+      120
+    ],
+    "bucket_labels": [
+      "current",
+      "1-30",
+      "31-60",
+      "61-90",
+      "91-120",
+      "over_120"
+    ]
+  },
+  "ap": {
+    "docs": [
+      {
+        "bucket_doc": "31-60",
+        "bucket_due": "1-30",
+        "currency": "JPY",
+        "days_past_due": 13,
+        "days_since_doc": 58,
+        "doc_date": "2026-09-20",
+        "doc_no": "PI-0501",
+        "due_date": "2026-11-04",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 150000.0,
+        "outstanding": 1335.0,
+        "outstanding_doc": 150000.0,
+        "party": "CRED-B01",
+        "side": "ap",
+        "type": "PI"
+      },
+      {
+        "bucket_doc": "over_120",
+        "bucket_due": "over_120",
+        "currency": "USD",
+        "days_past_due": 212,
+        "days_since_doc": 257,
+        "doc_date": "2026-03-05",
+        "doc_no": "PI-0505",
+        "due_date": "2026-04-19",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 500.0,
+        "outstanding": 670.0,
+        "outstanding_doc": 500.0,
+        "party": "CRED-B02",
+        "side": "ap",
+        "type": "PI"
+      },
+      {
+        "bucket_doc": "1-30",
+        "bucket_due": "current",
+        "currency": "USD",
+        "days_past_due": -29,
+        "days_since_doc": 16,
+        "doc_date": "2026-11-01",
+        "doc_no": "PI-0502",
+        "due_date": "2026-12-16",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 2400.0,
+        "outstanding": 3120.0,
+        "outstanding_doc": 2400.0,
+        "party": "CRED-B02",
+        "side": "ap",
+        "type": "PI"
+      },
+      {
+        "bucket_doc": "1-30",
+        "bucket_due": "current",
+        "currency": "SGD",
+        "days_past_due": -3,
+        "days_since_doc": 3,
+        "doc_date": "2026-11-14",
+        "doc_no": "PI-0503",
+        "due_date": "2026-11-20",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 560.0,
+        "outstanding": 560.0,
+        "outstanding_doc": 560.0,
+        "party": "CRED-B03",
+        "side": "ap",
+        "type": "PI"
+      },
+      {
+        "bucket_doc": "current",
+        "bucket_due": "current",
+        "currency": "SGD",
+        "days_past_due": -7,
+        "days_since_doc": 0,
+        "doc_date": "2026-11-17",
+        "doc_no": "PI-0504",
+        "due_date": "2026-11-24",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 210.0,
+        "outstanding": 210.0,
+        "outstanding_doc": 210.0,
+        "party": "CRED-B03",
+        "side": "ap",
+        "type": "PI"
+      }
+    ],
+    "parties": [
+      {
+        "by_bucket_doc": [
+          0.0,
+          0.0,
+          1335.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          0.0,
+          1335.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "code": "CRED-B01",
+        "credit_limit": null,
+        "currency": "JPY",
+        "docs_open": 1,
+        "flags": {
+          "active": true,
+          "online_shop": false
+        },
+        "last_payment_amount": null,
+        "last_payment_date": null,
+        "name": "Example Supplier Japan",
+        "oldest_open_doc_date": "2026-09-20",
+        "oldest_overdue_days": 13,
+        "outstanding": 1335.0,
+        "overdue": 1335.0,
+        "terms": "Net 45 days",
+        "type": "FAKE-TYPE",
+        "unapplied": 0.0
+      },
+      {
+        "by_bucket_doc": [
+          0.0,
+          3120.0,
+          0.0,
+          0.0,
+          0.0,
+          670.0
+        ],
+        "by_bucket_due": [
+          3120.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          670.0
+        ],
+        "code": "CRED-B02",
+        "credit_limit": null,
+        "currency": "USD",
+        "docs_open": 2,
+        "flags": {
+          "active": true,
+          "online_shop": false
+        },
+        "last_payment_amount": null,
+        "last_payment_date": null,
+        "name": "Example Supplier US",
+        "oldest_open_doc_date": "2026-03-05",
+        "oldest_overdue_days": 212,
+        "outstanding": 3790.0,
+        "overdue": 670.0,
+        "terms": "Net 45 days",
+        "type": "FAKE-TYPE",
+        "unapplied": 0.0
+      },
+      {
+        "by_bucket_doc": [
+          210.0,
+          560.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          770.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "code": "CRED-B03",
+        "credit_limit": null,
+        "currency": "SGD",
+        "docs_open": 2,
+        "flags": {
+          "active": true,
+          "online_shop": false
+        },
+        "last_payment_amount": null,
+        "last_payment_date": null,
+        "name": "Example Supplier Local",
+        "oldest_open_doc_date": "2026-11-14",
+        "oldest_overdue_days": null,
+        "outstanding": 770.0,
+        "overdue": 0.0,
+        "terms": "C.O.D.",
+        "type": "FAKE-TYPE",
+        "unapplied": 0.0
+      },
+      {
+        "by_bucket_doc": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "code": "CRED-B04",
+        "credit_limit": null,
+        "currency": "SGD",
+        "docs_open": 0,
+        "flags": {
+          "active": false,
+          "online_shop": false
+        },
+        "last_payment_amount": null,
+        "last_payment_date": null,
+        "name": "Example Freight E",
+        "oldest_open_doc_date": null,
+        "oldest_overdue_days": null,
+        "outstanding": 0.0,
+        "overdue": 0.0,
+        "terms": "C.O.D.",
+        "type": "FAKE-TYPE",
+        "unapplied": 0.0
+      }
+    ],
+    "schedule": {
+      "later": {
+        "parties": [
+          {
+            "amount": 3120.0,
+            "code": "CRED-B02"
+          }
+        ],
+        "total": 3120.0
+      },
+      "next_week": {
+        "parties": [
+          {
+            "amount": 210.0,
+            "code": "CRED-B03"
+          }
+        ],
+        "total": 210.0
+      },
+      "overdue": {
+        "parties": [
+          {
+            "amount": 1335.0,
+            "code": "CRED-B01"
+          },
+          {
+            "amount": 670.0,
+            "code": "CRED-B02"
+          }
+        ],
+        "total": 2005.0
+      },
+      "this_week": {
+        "parties": [
+          {
+            "amount": 560.0,
+            "code": "CRED-B03"
+          }
+        ],
+        "total": 560.0
+      },
+      "week_starts": "2026-11-16"
+    },
+    "totals": {
+      "by_bucket_doc": [
+        210.0,
+        3680.0,
+        1335.0,
+        0.0,
+        0.0,
+        670.0
+      ],
+      "by_bucket_due": [
+        3890.0,
+        1335.0,
+        0.0,
+        0.0,
+        0.0,
+        670.0
+      ],
+      "docs_open": 5,
+      "outstanding": 5895.0,
+      "overdue": 2005.0,
+      "parties_open": 3,
+      "unapplied": 0.0
+    }
+  },
+  "ap_payments_recorded": false,
+  "ar": {
+    "docs": [
+      {
+        "bucket_doc": "91-120",
+        "bucket_due": "91-120",
+        "currency": "SGD",
+        "days_past_due": 99,
+        "days_since_doc": 99,
+        "doc_date": "2026-08-10",
+        "doc_no": "IV-0102",
+        "due_date": "2026-08-10",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 450.0,
+        "outstanding": 250.0,
+        "outstanding_doc": 250.0,
+        "party": "DEBT-A01",
+        "side": "ar",
+        "type": "IV"
+      },
+      {
+        "bucket_doc": "31-60",
+        "bucket_due": "1-30",
+        "currency": "SGD",
+        "days_past_due": 17,
+        "days_since_doc": 47,
+        "doc_date": "2026-10-01",
+        "doc_no": "IV-0101",
+        "due_date": "2026-10-31",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 1200.0,
+        "outstanding": 1200.0,
+        "outstanding_doc": 1200.0,
+        "party": "DEBT-A01",
+        "side": "ar",
+        "type": "IV"
+      },
+      {
+        "bucket_doc": "unapplied",
+        "bucket_due": "unapplied",
+        "currency": "SGD",
+        "days_past_due": null,
+        "days_since_doc": 15,
+        "doc_date": "2026-11-02",
+        "doc_no": "CN-0301",
+        "due_date": null,
+        "flags": {
+          "post_dated": false,
+          "unapplied": true
+        },
+        "original_doc": -80.0,
+        "outstanding": -80.0,
+        "outstanding_doc": -80.0,
+        "party": "DEBT-A01",
+        "side": "ar",
+        "type": "CN"
+      },
+      {
+        "bucket_doc": "unapplied",
+        "bucket_due": "unapplied",
+        "currency": "SGD",
+        "days_past_due": null,
+        "days_since_doc": 43,
+        "doc_date": "2026-10-05",
+        "doc_no": "PM-0202",
+        "due_date": null,
+        "flags": {
+          "post_dated": false,
+          "unapplied": true
+        },
+        "original_doc": -700.0,
+        "outstanding": -60.0,
+        "outstanding_doc": -60.0,
+        "party": "DEBT-A02",
+        "side": "ar",
+        "type": "PM"
+      },
+      {
+        "bucket_doc": "1-30",
+        "bucket_due": "current",
+        "currency": "SGD",
+        "days_past_due": -23,
+        "days_since_doc": 7,
+        "doc_date": "2026-11-10",
+        "doc_no": "IV-0103",
+        "due_date": "2026-12-10",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 800.0,
+        "outstanding": 800.0,
+        "outstanding_doc": 800.0,
+        "party": "DEBT-A02",
+        "side": "ar",
+        "type": "IV"
+      },
+      {
+        "bucket_doc": "over_120",
+        "bucket_due": "over_120",
+        "currency": "SGD",
+        "days_past_due": 306,
+        "days_since_doc": 306,
+        "doc_date": "2026-01-15",
+        "doc_no": "IV-0104",
+        "due_date": "2026-01-15",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 300.0,
+        "outstanding": 300.0,
+        "outstanding_doc": 300.0,
+        "party": "DEBT-A04",
+        "side": "ar",
+        "type": "IV"
+      },
+      {
+        "bucket_doc": "unapplied",
+        "bucket_due": "unapplied",
+        "currency": "SGD",
+        "days_past_due": null,
+        "days_since_doc": 289,
+        "doc_date": "2026-02-01",
+        "doc_no": "PM-0204",
+        "due_date": null,
+        "flags": {
+          "post_dated": false,
+          "unapplied": true
+        },
+        "original_doc": -50.0,
+        "outstanding": -50.0,
+        "outstanding_doc": -50.0,
+        "party": "DEBT-A04",
+        "side": "ar",
+        "type": "PM"
+      },
+      {
+        "bucket_doc": "1-30",
+        "bucket_due": "1-30",
+        "currency": "SGD",
+        "days_past_due": 1,
+        "days_since_doc": 1,
+        "doc_date": "2026-11-16",
+        "doc_no": "IV-0106",
+        "due_date": "2026-11-16",
+        "flags": {
+          "post_dated": false,
+          "unapplied": false
+        },
+        "original_doc": 95.5,
+        "outstanding": 95.5,
+        "outstanding_doc": 95.5,
+        "party": "DEBT-WEB",
+        "side": "ar",
+        "type": "IV"
+      },
+      {
+        "bucket_doc": "unapplied",
+        "bucket_due": "unapplied",
+        "currency": "SGD",
+        "days_past_due": null,
+        "days_since_doc": 0,
+        "doc_date": "2026-11-17",
+        "doc_no": "PM-0203",
+        "due_date": null,
+        "flags": {
+          "post_dated": false,
+          "unapplied": true
+        },
+        "original_doc": -120.0,
+        "outstanding": -120.0,
+        "outstanding_doc": -120.0,
+        "party": "DEBT-WEB",
+        "side": "ar",
+        "type": "PM"
+      }
+    ],
+    "parties": [
+      {
+        "by_bucket_doc": [
+          0.0,
+          0.0,
+          1200.0,
+          0.0,
+          250.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          0.0,
+          1200.0,
+          0.0,
+          0.0,
+          250.0,
+          0.0
+        ],
+        "code": "DEBT-A01",
+        "credit_limit": 5000.0,
+        "currency": "SGD",
+        "docs_open": 3,
+        "flags": {
+          "active": true,
+          "online_shop": false
+        },
+        "last_payment_amount": 200.0,
+        "last_payment_date": "2026-09-15",
+        "name": "Example Trading A",
+        "oldest_open_doc_date": "2026-08-10",
+        "oldest_overdue_days": 99,
+        "outstanding": 1370.0,
+        "overdue": 1450.0,
+        "terms": "C.O.D.",
+        "type": "FAKE-TYPE",
+        "unapplied": -80.0
+      },
+      {
+        "by_bucket_doc": [
+          0.0,
+          800.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          800.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "code": "DEBT-A02",
+        "credit_limit": null,
+        "currency": "SGD",
+        "docs_open": 2,
+        "flags": {
+          "active": true,
+          "online_shop": false
+        },
+        "last_payment_amount": 700.0,
+        "last_payment_date": "2026-10-05",
+        "name": "Example Outdoor Club B",
+        "oldest_open_doc_date": "2026-10-05",
+        "oldest_overdue_days": null,
+        "outstanding": 740.0,
+        "overdue": 0.0,
+        "terms": "Net 30 days",
+        "type": "FAKE-TYPE",
+        "unapplied": -60.0
+      },
+      {
+        "by_bucket_doc": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "code": "DEBT-A03",
+        "credit_limit": null,
+        "currency": "SGD",
+        "docs_open": 0,
+        "flags": {
+          "active": false,
+          "online_shop": false
+        },
+        "last_payment_amount": null,
+        "last_payment_date": null,
+        "name": "Example School C",
+        "oldest_open_doc_date": null,
+        "oldest_overdue_days": null,
+        "outstanding": 0.0,
+        "overdue": 0.0,
+        "terms": "C.O.D.",
+        "type": "FAKE-TYPE",
+        "unapplied": 0.0
+      },
+      {
+        "by_bucket_doc": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          300.0
+        ],
+        "by_bucket_due": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          300.0
+        ],
+        "code": "DEBT-A04",
+        "credit_limit": null,
+        "currency": "SGD",
+        "docs_open": 2,
+        "flags": {
+          "active": true,
+          "online_shop": false
+        },
+        "last_payment_amount": 50.0,
+        "last_payment_date": "2026-02-01",
+        "name": "Example Retail D",
+        "oldest_open_doc_date": "2026-01-15",
+        "oldest_overdue_days": 306,
+        "outstanding": 250.0,
+        "overdue": 300.0,
+        "terms": "C.O.D.",
+        "type": "FAKE-TYPE",
+        "unapplied": -50.0
+      },
+      {
+        "by_bucket_doc": [
+          0.0,
+          95.5,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "by_bucket_due": [
+          0.0,
+          95.5,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "code": "DEBT-WEB",
+        "credit_limit": null,
+        "currency": "SGD",
+        "docs_open": 2,
+        "flags": {
+          "active": true,
+          "online_shop": true
+        },
+        "last_payment_amount": 120.0,
+        "last_payment_date": "2026-11-17",
+        "name": "Example Online Shop",
+        "oldest_open_doc_date": "2026-11-16",
+        "oldest_overdue_days": 1,
+        "outstanding": -24.5,
+        "overdue": 95.5,
+        "terms": "C.O.D.",
+        "type": "FAKE-TYPE",
+        "unapplied": -120.0
+      }
+    ],
+    "totals": {
+      "by_bucket_doc": [
+        0.0,
+        895.5,
+        1200.0,
+        0.0,
+        250.0,
+        300.0
+      ],
+      "by_bucket_due": [
+        800.0,
+        1295.5,
+        0.0,
+        0.0,
+        250.0,
+        300.0
+      ],
+      "docs_open": 9,
+      "outstanding": 2335.5,
+      "overdue": 1845.5,
+      "parties_open": 4,
+      "unapplied": -310.0
+    }
+  },
+  "as_at_local": "2026-11-17T14:30:06+08:00",
+  "cadence_minutes": 60,
+  "currency_local": "SGD",
+  "generated_at": "2026-11-17T14:30:05+08:00",
+  "health": {
+    "counts": {
+      "ap": {
+        "cancelled_skipped": 0,
+        "credit_rows": 0,
+        "docs_open": 5,
+        "documents_read": 5,
+        "due_before_doc_date": 0,
+        "guess_rows_skipped": 0,
+        "parties": 4,
+        "parties_open": 3,
+        "post_dated": 0
+      },
+      "ar": {
+        "cancelled_skipped": 1,
+        "credit_rows": 4,
+        "docs_open": 9,
+        "documents_read": 12,
+        "due_before_doc_date": 0,
+        "guess_rows_skipped": 0,
+        "parties": 5,
+        "parties_open": 4,
+        "post_dated": 0
+      }
+    },
+    "failure_class": null,
+    "self_checks": {
+      "ap_schedule": "pass",
+      "buckets": "pass",
+      "feed_matches_csv": "pass",
+      "party_totals": "pass",
+      "row_identity": "pass"
+    },
+    "status": "success"
+  },
+  "job": "ac2_arap_aging",
+  "next_run_local": "2026-11-17T15:30:00+08:00",
+  "reconciled_on": null,
+  "run_id": "00000000000000000000000000000000",
+  "schema": "xb.ac2.arap_dashboard_feed",
+  "schema_version": 1,
+  "stale_after_minutes": 70,
+  "timezone": "Asia/Singapore"
+}
