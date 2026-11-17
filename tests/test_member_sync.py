@@ -8126,5 +8126,652 @@ class Bf2dUnparsedTests(SyncTestCase):
         self.assertEqual(self.ledger.watermark("ac2_changelog_id"), str(ids[0]))
 
 
+
+# -- #155 slice FH1: the forms watch (count only; design B8, B9, B12) ---------------------------
+# Fake data only: phones from the reserved fake range (sg(n)), emails at example.com, the fake
+# names used everywhere in this file. FORMS_SINCE is a fixed Singapore date before T0.
+
+FORMS_SINCE = "2026-10-01"
+FORMS_ON = {"forms_watch_enabled": True, "forms_watch_since": FORMS_SINCE}
+
+
+def fe(n: int) -> str:
+    """The email typed on the form by person n (fake)."""
+
+    return f"typed{n:02d}@example.com"
+
+
+def forms_record(n: int, **overrides) -> tuple:
+    """The six copy-record metafields the owner's Flow writes (design 6.1), as (key, value) pairs.
+    A value of None leaves the key out."""
+
+    values = {"submission_id": f"sub-{n:04d}", "submitted_at": dl.ts(T0), "email": fe(n), "phone": plus(sg(n)),
+              "first_name": "Alpha", "birthday_month": "March"}
+    values.update(overrides)
+    return tuple((key, value) for key, value in values.items() if value is not None)
+
+
+def forms_customer(n: int, *, first="Alpha", last="Tester", email=None, phone="sg", tags=("xb-form-signup",), orders="0",
+                   amount="default", can_delete=True, state="DISABLED", record=None, metafields="record") -> sync.FormsCustomer:
+    """The customer a form entry was attached to (fake). Unused by default (design B9)."""
+
+    return sync.FormsCustomer(
+        gid=gid(n), first_name=first, last_name=last, email=email, phone=plus(sg(n)) if phone == "sg" else phone, tags=tuple(tags),
+        number_of_orders=orders, amount_spent={"amount": "0.0"} if amount == "default" else amount, can_delete=can_delete, state=state,
+        metafields=(forms_record(n, **(record or {})) if metafields == "record" else metafields),
+    )
+
+
+class FormsShopify(FakeShopify):
+    """FakeShopify plus the forms read. ``forms`` is what the tag search returns (a candidate list:
+    tests put look-alike tags in it); ``forms_complete`` False is the page cap reached."""
+
+    def __init__(self):
+        super().__init__()
+        self.forms: list[sync.FormsCustomer] = []
+        self.forms_searches: list[tuple[str, int]] = []
+        self.forms_complete = True
+        self.forms_error = False
+
+    def forms_sign_ups(self, search, max_pages):
+        self.forms_searches.append((search, max_pages))
+        if self.forms_error:
+            raise direct.ShopifyDirectError("shopify_transport_failed")
+        return list(self.forms), self.forms_complete
+
+
+class FormsTestCase(SyncTestCase):
+    def setUp(self):
+        super().setUp()
+        self.shopify = FormsShopify()
+
+    def forms_engine(self, **overrides) -> sync.SyncEngine:
+        return self.engine(**{**FORMS_ON, **overrides})
+
+    def watch(self, **overrides) -> dict:
+        """One forms step on its own; returns the run summary's counts."""
+
+        engine = self.forms_engine(**overrides)
+        engine.forms_watch()
+        self.last_summary = engine.summary
+        return dict(engine.summary.counts)
+
+    def outcome(self, item: sync.FormsCustomer, **overrides) -> dict:
+        self.shopify.forms = [item]
+        counts = self.watch(**overrides)
+        return {code: n for code, n in counts.items() if code in sync.FORMS_OUTCOME_CODES or code in sync.FORMS_CLASS_CODES}
+
+    def marks(self) -> dict:
+        return {row["name"]: row["value"] for row in self.ledger.conn.execute(
+            "SELECT name, value FROM watermarks WHERE substr(name, 1, ?) = ?", (len(sync.FORMS_SEEN_PREFIX), sync.FORMS_SEEN_PREFIX))}
+
+
+class FormsConfigTests(unittest.TestCase):
+    def test_defaults_are_off(self):
+        config = make_config()
+        self.assertEqual((config.forms_watch_enabled, config.forms_watch_since, config.forms_watch_max_pages), (False, None, 4))
+        self.assertEqual(make_config().summary(), make_config(forms_watch_enabled=False, forms_watch_max_pages=4).summary())
+        self.assertFalse(any(key.startswith("forms_") for key in make_config().summary()))
+
+    def test_since_is_required_when_on_and_must_be_a_real_date(self):
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            make_config(forms_watch_enabled=True)
+        self.assertEqual(caught.exception.code, "sync_config_forms_watch_since_required")
+        for bad in ("2026-13-01", "2026-02-30", "2026/10/01", "20261001", " 2026-10-01", 20261001, True, ""):
+            with self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(forms_watch_since=bad)
+            self.assertEqual(caught.exception.code, "sync_config_forms_watch_since_invalid", bad)
+        self.assertEqual(make_config(**FORMS_ON).forms_watch_since, FORMS_SINCE)
+        self.assertEqual(make_config(forms_watch_since=FORMS_SINCE).forms_watch_enabled, False)  # a date alone switches nothing on
+
+    def test_switch_and_page_bounds(self):
+        for bad in ("true", 1, None):
+            with self.assertRaises(dl.DirectLocalError):
+                make_config(forms_watch_enabled=bad)
+        for bad in (0, 21, True, "4", None, 4.0):
+            with self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(forms_watch_max_pages=bad)
+            self.assertEqual(caught.exception.code, "sync_config_forms_watch_max_pages_invalid")
+        self.assertEqual((make_config(forms_watch_max_pages=1).forms_watch_max_pages, make_config(forms_watch_max_pages=20).forms_watch_max_pages), (1, 20))
+
+    def test_check_config_prints_the_keys_only_when_set(self):
+        summary = make_config(**FORMS_ON, forms_watch_max_pages=2).summary()
+        self.assertEqual((summary["forms_watch_enabled"], summary["forms_watch_since"], summary["forms_watch_max_pages"]), (True, FORMS_SINCE, 2))
+
+    def test_unknown_keys_are_still_refused(self):
+        for key in ("forms_watch_namespace", "forms_watch_tag", "forms_heal_enabled"):
+            with self.assertRaises(dl.DirectLocalError) as caught:
+                make_config(**{key: "xb_form"})
+            self.assertEqual(caught.exception.code, "sync_config_keys_invalid")
+
+    def test_the_sync_example_carries_the_keys_at_their_defaults_and_the_live_example_never(self):
+        example = json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8"))
+        self.assertEqual((example["forms_watch_enabled"], example["forms_watch_since"], example["forms_watch_max_pages"]), (False, None, 4))
+        self.assertEqual(sync.parse_config(example).summary(), sync.parse_config({k: v for k, v in example.items() if not k.startswith("forms_")}).summary())
+        live = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        self.assertFalse(any(key.startswith("forms_") for key in live))  # the live task at an older commit refuses unknown keys
+
+    def test_constants_are_the_flow_contract(self):
+        self.assertEqual(sync.FORMS_NAMESPACE, "xb_form")
+        self.assertEqual(sync.FORMS_KEYS, ("submission_id", "submitted_at", "email", "phone", "first_name", "birthday_month"))
+        self.assertEqual(sync.FORMS_TAG, "xb-form-signup")
+        self.assertIn('metafields(namespace: "xb_form", first: 10) { nodes { key value } }', sync.FORMS_QUERY)
+
+
+class FormsDefaultsOffTests(unittest.TestCase):
+    def test_golden_trace_with_the_keys_absent_or_written_out_at_their_defaults(self):
+        for settings in (None, {"forms_watch_enabled": False}, {"forms_watch_enabled": False, "forms_watch_max_pages": 4},
+                         {"forms_watch_enabled": False, "forms_watch_since": FORMS_SINCE, "forms_watch_max_pages": 20}):
+            trace = defaults_off_trace(sync, settings)
+            self.assertEqual(trace_digest(trace), GOLDEN_TRACE_SHA256, settings)
+
+
+class FormsSwitchTests(FormsTestCase):
+    def test_switch_off_or_absent_reads_nothing_and_counts_nothing(self):
+        self.shopify.forms = [forms_customer(1)]
+        for overrides in ({}, {"forms_watch_enabled": False, "forms_watch_since": FORMS_SINCE}):
+            result = self.run_sync(**overrides)
+            self.assertEqual(self.shopify.forms_searches, [])
+            self.assertFalse(any(code.startswith("forms_") for code in result["counts"]))
+        self.assertEqual(self.marks(), {})
+        self.assertIsNone(self.ledger.watermark(sync.FORMS_WATERMARK))
+
+    def test_on_the_run_reads_after_both_directions_and_counts(self):
+        self.shopify.forms = [forms_customer(1)]
+        result = self.run_sync(**FORMS_ON)
+        self.assertEqual(len(self.shopify.forms_searches), 1)
+        self.assertEqual((result["counts"]["forms_records_seen"], result["counts"]["forms_records_new"], result["counts"]["forms_would_heal"]), (1, 1, 1))
+        self.assertEqual((result["status"], result["alerts"], result["writes"]), ("completed", [], 0))
+        stored = json.loads(self.ledger.conn.execute("SELECT summary FROM runs").fetchone()[0])
+        self.assertEqual(stored["counts"]["forms_would_heal"], 1)
+
+    def test_one_direction_only_still_runs_the_watch(self):
+        self.shopify.forms = [forms_customer(1)]
+        self.run_sync("ac2_to_shopify", **FORMS_ON)
+        self.assertEqual(len(self.shopify.forms_searches), 1)
+
+    def test_a_refused_run_reads_nothing(self):
+        self.shopify.forms = [forms_customer(1)]
+
+        def refused(*args):
+            raise dl.DirectLocalError("shopify_token_missing")
+
+        self.shopify.registrations = refused
+        with self.assertRaises(dl.DirectLocalError):
+            self.run_sync(**FORMS_ON)
+        self.assertEqual(self.shopify.forms_searches, [])
+        self.assertEqual(self.marks(), {})
+
+    def test_the_watch_writes_nothing_outside_the_ledger(self):
+        self.shopify.forms = [forms_customer(n) for n in (1, 2, 3)]
+        self.shopify.add(customer(3, email=fe(3), tags=()))  # K6: the typed email is on another customer
+        self.run_sync(**FORMS_ON)
+        self.assertEqual((self.shopify.created, self.ac2.creates), ([], []))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM links").fetchone()[0], 0)
+
+
+class FormsClassificationTests(FormsTestCase):
+    """One test per row of design B8 (FH1 column), K1-K7 and K9."""
+
+    def test_k1_same_email_with_member_mg_is_ok(self):
+        item = forms_customer(1, email=fe(1), tags=("xb-form-signup", "member", "member-mg"))
+        self.assertEqual(self.outcome(item), {"forms_ok": 1})
+        self.assertEqual(self.shopify.email_reads, [])
+
+    def test_k1_emails_compare_trimmed_and_case_folded(self):
+        item = forms_customer(1, email="  TYPED01@Example.COM ", tags=("xb-form-signup", "member-mg"))
+        self.assertEqual(self.outcome(item), {"forms_ok": 1})
+
+    def test_k1_a_different_email_is_not_the_same_email(self):
+        item = forms_customer(1, email="typed01x@example.com", tags=("xb-form-signup", "member-mg"))
+        self.assertEqual(self.outcome(item), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+
+    def test_k2_same_email_tags_missing_unused_would_heal_tags(self):
+        self.assertEqual(self.outcome(forms_customer(1, email=fe(1))), {"forms_same_email_tags_missing": 1, "forms_would_heal_tags": 1})
+        self.assertEqual(self.shopify.email_reads, [])
+
+    def test_k2_same_email_tags_missing_used_is_left(self):
+        self.assertEqual(self.outcome(forms_customer(1, email=fe(1), orders="2")), {"forms_same_email_tags_missing": 1, "forms_left_used": 1})
+
+    def test_k3_attached_by_phone_unused_would_heal_after_one_email_read(self):
+        self.assertEqual(self.outcome(forms_customer(1, email=None)), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+        self.assertEqual(self.shopify.email_reads, [fe(1)])
+
+    def test_k3_attached_by_phone_with_another_email_on_the_customer(self):
+        self.assertEqual(self.outcome(forms_customer(1, email="old01@example.com")), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+
+    def test_k3_first_name_words_inside_a_longer_name(self):
+        item = forms_customer(1, first="Mary Ann", last="Lee", record={"first_name": "ann  MARY"})
+        self.assertEqual(self.outcome(item), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+
+    def test_k3_used_is_left_and_needs_no_read(self):
+        self.assertEqual(self.outcome(forms_customer(1, state="ENABLED")), {"forms_attached_by_phone": 1, "forms_left_used": 1})
+        self.assertEqual(self.shopify.email_reads, [])
+
+    def test_k4_another_first_name_is_another_person(self):
+        item = forms_customer(1, record={"first_name": "Bravo"})
+        self.assertEqual(self.outcome(item), {"forms_other_person": 1})
+        self.assertEqual(self.shopify.email_reads, [])
+        self.assertEqual([r["code"] for r in self.last_summary.refs], ["forms_other_person"])
+        self.assertTrue(self.last_summary.refs[0]["ref"].startswith("c-"))
+
+    def test_k4_one_extra_word_is_enough(self):
+        self.assertEqual(self.outcome(forms_customer(1, record={"first_name": "Alpha Bravo"})), {"forms_other_person": 1})
+
+    def test_k4_holds_for_a_used_account_too(self):
+        self.assertEqual(self.outcome(forms_customer(1, orders="3", record={"first_name": "Bravo"})), {"forms_other_person": 1})
+
+    def test_k5_no_name_words_on_either_side_is_held(self):
+        for first, last, typed in ((None, None, "Alpha"), ("", " ", "Alpha"), ("--", ".", "Alpha"), ("Alpha", "Tester", "-.-")):
+            with self.subTest(first=first, last=last, typed=typed):
+                with self.ledger.tx() as conn:
+                    conn.execute("DELETE FROM watermarks WHERE substr(name, 1, 11) = 'forms_seen:'")
+                item = forms_customer(1, first=first, last=last, record={"first_name": typed})
+                self.assertEqual(self.outcome(item), {"forms_held_name_unclear": 1})
+                self.assertEqual(self.last_summary.refs[-1]["code"], "forms_held_name_unclear")
+
+    def test_k6_the_typed_email_on_another_customer_is_held(self):
+        self.shopify.add(customer(2, email=fe(1).upper(), tags=()))
+        self.assertEqual(self.outcome(forms_customer(1)), {"forms_attached_by_phone": 1, "forms_held_email_elsewhere": 1})
+        self.assertEqual(self.shopify.email_reads, [fe(1)])
+        self.assertEqual(self.last_summary.refs[0]["code"], "forms_held_email_elsewhere")
+
+    def test_k6_the_read_finding_the_customer_itself_is_not_elsewhere(self):
+        self.shopify.add(customer(1, email=fe(1), tags=()))  # the index still has C under E (a stale answer)
+        self.assertEqual(self.outcome(forms_customer(1)), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+
+    def test_k6_a_failed_read_leaves_the_record_unmarked_and_the_day_unmoved(self):
+        self.shopify.email_read_error = True
+        counts = self.outcome(forms_customer(1))
+        self.assertEqual(counts, {})
+        self.assertEqual(self.watch_counts_incomplete(), 1)
+        self.assertEqual(self.marks(), {})
+        self.assertIsNone(self.ledger.watermark(sync.FORMS_WATERMARK))
+        self.shopify.email_read_error = False
+        self.assertEqual(self.outcome(forms_customer(1)), {"forms_attached_by_phone": 1, "forms_would_heal": 1})  # next run decides
+
+    def watch_counts_incomplete(self) -> int:
+        return self.last_summary.counts.get("forms_read_incomplete", 0)
+
+    def test_k7_neither_phone_nor_email_is_unclassified(self):
+        item = forms_customer(1, phone=plus(sg(9)))
+        self.assertEqual(self.outcome(item), {"forms_unclassified": 1})
+        self.assertEqual(self.outcome(forms_customer(2, phone=None)), {"forms_unclassified": 1})
+        self.assertEqual([r["code"] for r in self.last_summary.refs], ["forms_unclassified"])
+
+    def test_k7_phones_compare_by_digits_only(self):
+        item = forms_customer(1, phone="+65 " + local(1)[:4] + "-" + local(1)[4:], record={"phone": local(1)})
+        self.assertEqual(self.outcome(item), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+
+    def test_k9_an_unreadable_record_is_invalid(self):
+        self.assertEqual(self.outcome(forms_customer(1, record={"email": "not-an-email"})), {"forms_record_invalid": 1})
+        self.assertEqual(self.outcome(forms_customer(2, metafields=None)), {"forms_record_invalid": 1})
+        self.assertEqual(self.last_summary.refs, [])  # invalid: counted, no ref
+
+    def test_k8_does_not_occur_and_no_alert_code_ever(self):
+        self.shopify.add(customer(6, email=fe(5), tags=()))
+        self.shopify.forms = [
+            forms_customer(1, email=fe(1), tags=("xb-form-signup", "member-mg")), forms_customer(2, email=fe(2)),
+            forms_customer(3, email=fe(3), orders="1"), forms_customer(4), forms_customer(5), forms_customer(7, record={"first_name": "Bravo"}),
+            forms_customer(8, first=None, last=None), forms_customer(9, phone=None), forms_customer(10, record={"phone": "12"}),
+        ]
+        result = self.run_sync(**FORMS_ON)
+        self.assertEqual((result["alerts"], result["status"]), ([], "completed"))
+        outcomes = {code: n for code, n in result["counts"].items() if code in sync.FORMS_OUTCOME_CODES}
+        self.assertEqual(outcomes, {"forms_ok": 1, "forms_would_heal_tags": 1, "forms_left_used": 1, "forms_would_heal": 1,
+                                    "forms_held_email_elsewhere": 1, "forms_other_person": 1, "forms_held_name_unclear": 1,
+                                    "forms_unclassified": 1, "forms_record_invalid": 1})
+        self.assertEqual(sum(outcomes.values()), result["counts"]["forms_records_new"])
+        self.assertNotIn("forms_left_healed_before", result["counts"])
+        self.assertEqual({r["code"] for r in result["refs"]}, set(sync.FORMS_REF_CODES))
+        self.assertTrue(all(r["ref"].startswith("c-") and r["action"] == "skip" and "member_no_masked" not in r for r in result["refs"]))
+
+
+class FormsUnusedTests(unittest.TestCase):
+    """Design B9: unused only when all four fields say so; anything else is used (fail safe)."""
+
+    def unused(self, **overrides) -> bool:
+        return sync.forms_unused(forms_customer(1, **overrides))
+
+    def test_the_unused_shape(self):
+        self.assertTrue(self.unused())
+        self.assertTrue(self.unused(orders=0, amount={"amount": "0"}))
+        self.assertTrue(self.unused(amount={"amount": "0.00"}))
+        self.assertTrue(self.unused(amount={"amount": 0}))
+
+    def test_number_of_orders(self):
+        for value in (None, "1", 1, "00", " 0", "0.0", 0.0, False, "", [], {"count": 0}):
+            self.assertFalse(self.unused(orders=value), value)
+
+    def test_amount_spent(self):
+        for value in (None, {}, {"amount": None}, {"amount": "0.01"}, {"amount": "1"}, {"amount": "abc"}, {"amount": False},
+                      {"amount": 0.0}, {"amount": ""}, {"amount": " 0"}, "0.0", 0, [], {"amount": "NaN"}):
+            self.assertFalse(self.unused(amount=value), value)
+
+    def test_can_delete(self):
+        for value in (None, False, "true", "True", 1, 0):
+            self.assertFalse(self.unused(can_delete=value), value)
+
+    def test_state(self):
+        for value in ("ENABLED", "INVITED", "DECLINED", "disabled", " DISABLED", None, "", 0):
+            self.assertFalse(self.unused(state=value), value)
+
+
+class FormsRecordParseTests(unittest.TestCase):
+    def parse(self, **overrides):
+        return sync.parse_forms_record(forms_record(1, **overrides))
+
+    def test_the_record(self):
+        record = self.parse()
+        self.assertEqual((record.submission_id, record.submitted_at, record.email, record.phone_digits, record.first_name, record.birthday_month),
+                         ("sub-0001", T0, fe(1), sg(1), "Alpha", 3))
+        self.assertEqual(repr(record), "FormsRecord()")
+        self.assertIsNone(self.parse(birthday_month="").birthday_month)
+        self.assertEqual(self.parse(birthday_month="12").birthday_month, 12)
+
+    def test_each_key_missing(self):
+        for key in sync.FORMS_KEYS:
+            self.assertIsNone(self.parse(**{key: None}), key)
+
+    def test_extra_or_repeated_keys_and_wrong_types(self):
+        self.assertIsNone(sync.parse_forms_record(forms_record(1) + (("note", "x"),)))
+        self.assertIsNone(sync.parse_forms_record(forms_record(1) + (("email", fe(1)),)))
+        self.assertIsNone(sync.parse_forms_record(None))
+        self.assertIsNone(sync.parse_forms_record(()))
+        for key in sync.FORMS_KEYS:
+            self.assertIsNone(self.parse(**{key: 7}), key)
+
+    def test_each_value_too_long(self):
+        for key in sync.FORMS_KEYS:
+            self.assertIsNone(self.parse(**{key: "x" * (sync.FORMS_VALUE_MAX + 1)}), key)
+        self.assertIsNone(self.parse(submission_id="s" * 65))
+        self.assertIsNotNone(self.parse(submission_id="s" * 64))
+        self.assertIsNone(self.parse(first_name="A" * 101))
+        self.assertIsNotNone(self.parse(first_name="A" * 100))
+
+    def test_bad_values(self):
+        for overrides in ({"submission_id": ""}, {"submission_id": "sub 1"}, {"submission_id": "sub-é"}, {"submission_id": "sub\n1"},
+                          {"submitted_at": "2026-10-21 02:00:00"}, {"submitted_at": "2026-10-21T02:00:00"}, {"submitted_at": "yesterday"},
+                          {"submitted_at": ""}, {"email": "typed01example.com"}, {"email": "tÿped@example.com"}, {"email": ""},
+                          {"phone": ""}, {"phone": "12"}, {"phone": "+65 1234"}, {"phone": "phone"},
+                          {"first_name": ""}, {"birthday_month": "Smarch"}, {"birthday_month": "13"}):
+            self.assertIsNone(self.parse(**overrides), overrides)
+
+    def test_accepted_shapes(self):
+        self.assertEqual(self.parse(submitted_at="2026-10-21T10:00:00+08:00").submitted_at, T0)
+        self.assertIsNotNone(self.parse(submitted_at="2026-10-21T02:00:00.123Z"))
+        self.assertEqual(self.parse(phone=local(1)).phone_digits, sg(1))
+        self.assertEqual(self.parse(email=" " + fe(1) + " ").email, fe(1))
+
+
+class FormsReadTests(FormsTestCase):
+    def test_the_first_read_starts_at_since_and_a_clean_read_moves_the_day(self):
+        self.shopify.forms = [forms_customer(1)]
+        self.watch()
+        self.assertEqual(self.shopify.forms_searches, [(f"tag:'xb-form-signup' AND updated_at:>='{FORMS_SINCE}'", 4)])
+        today = self.now.astimezone(sync.SGT).strftime("%Y-%m-%d")
+        self.assertEqual(self.ledger.watermark(sync.FORMS_WATERMARK), today)
+        self.watch(forms_watch_max_pages=7)
+        yesterday = (self.now.astimezone(sync.SGT) - timedelta(days=1)).strftime("%Y-%m-%d")
+        self.assertEqual(self.shopify.forms_searches[-1], (f"tag:'xb-form-signup' AND updated_at:>='{yesterday}'", 7))
+
+    def test_the_day_never_goes_before_since(self):
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_WATERMARK, FORMS_SINCE)
+        self.watch()
+        self.assertEqual(self.shopify.forms_searches[-1][0], f"tag:'xb-form-signup' AND updated_at:>='{FORMS_SINCE}'")
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_WATERMARK, "2026-10-12")
+        self.watch(forms_watch_since="2026-10-15")
+        self.assertEqual(self.shopify.forms_searches[-1][0], "tag:'xb-form-signup' AND updated_at:>='2026-10-15'")
+        for broken in ("", "2026-10-xx", "garbage"):
+            with self.ledger.tx() as conn:
+                self.ledger.set_watermark(conn, sync.FORMS_WATERMARK, broken)
+            self.watch()
+            self.assertEqual(self.shopify.forms_searches[-1][0], f"tag:'xb-form-signup' AND updated_at:>='{FORMS_SINCE}'")
+
+    def test_a_read_failure_counts_and_leaves_the_day(self):
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_WATERMARK, "2026-10-10")
+        self.shopify.forms = [forms_customer(1)]
+        self.shopify.forms_error = True
+        counts = self.watch()
+        self.assertEqual((counts["forms_read_incomplete"], counts["forms_records_seen"], counts["forms_records_new"]), (1, 0, 0))
+        self.assertEqual(self.ledger.watermark(sync.FORMS_WATERMARK), "2026-10-10")
+        self.assertEqual(self.marks(), {})
+
+    def test_the_page_cap_counts_classifies_what_was_read_and_leaves_the_day(self):
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_WATERMARK, "2026-10-10")
+        self.shopify.forms = [forms_customer(1)]
+        self.shopify.forms_complete = False
+        counts = self.watch()
+        self.assertEqual((counts["forms_read_incomplete"], counts["forms_would_heal"]), (1, 1))
+        self.assertEqual(self.ledger.watermark(sync.FORMS_WATERMARK), "2026-10-10")
+        self.shopify.forms_complete = True
+        counts = self.watch()
+        self.assertNotIn("forms_read_incomplete", counts)
+        self.assertNotIn("forms_would_heal", counts)  # seen-marked: never counted twice
+        self.assertNotEqual(self.ledger.watermark(sync.FORMS_WATERMARK), "2026-10-10")
+
+    def test_only_the_exact_tag_is_read(self):
+        self.shopify.forms = [forms_customer(1, tags=("xb-form-signup-old",)), forms_customer(2, tags=("xb-form", "signup")),
+                              forms_customer(3, tags=()), forms_customer(4, tags=(" XB-Form-Signup ", "member"))]
+        counts = self.watch()
+        self.assertEqual((counts["forms_records_seen"], counts["forms_records_new"]), (1, 1))
+        self.assertEqual(len(self.marks()), 1)
+
+    def test_the_email_read_budget_is_pages_times_fifty(self):
+        self.shopify.forms = [forms_customer(n) for n in range(1, 52)]  # 51 records that each need the K6 read
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual((len(self.shopify.email_reads), counts["forms_would_heal"], counts["forms_read_incomplete"]), (50, 50, 1))
+        self.assertEqual(len(self.marks()), 50)
+        self.assertIsNone(self.ledger.watermark(sync.FORMS_WATERMARK))
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual((len(self.shopify.email_reads), counts["forms_would_heal"]), (51, 1))
+        self.assertNotIn("forms_read_incomplete", counts)
+
+
+class FormsSeenMarkTests(FormsTestCase):
+    def test_a_seen_submission_is_never_classified_again(self):
+        self.shopify.forms = [forms_customer(1), forms_customer(2, record={"first_name": "Bravo"})]
+        first = self.watch()
+        self.assertEqual((first["forms_records_new"], first["forms_would_heal"], first["forms_other_person"]), (2, 1, 1))
+        second = self.watch()
+        self.assertEqual((second["forms_records_seen"], second["forms_records_new"]), (2, 0))
+        self.assertFalse(set(second) & set(sync.FORMS_OUTCOME_CODES))
+        self.assertEqual(len(self.shopify.email_reads), 1)  # the K6 read is not repeated either
+
+    def test_the_mark_holds_a_keyed_digest_the_code_and_the_time_only(self):
+        self.shopify.forms = [forms_customer(1)]
+        self.watch()
+        ((name, value),) = self.marks().items()
+        self.assertRegex(name, r"^forms_seen:[0-9a-f]{64}$")
+        self.assertEqual(value, f"forms_would_heal|{dl.ts(self.now)}")
+        self.assertNotIn("sub-0001", name)
+
+    def test_a_new_submission_on_the_same_customer_is_new(self):
+        self.shopify.forms = [forms_customer(1)]
+        self.watch()
+        self.shopify.forms = [forms_customer(1, record={"submission_id": "sub-0099", "first_name": "Bravo"})]
+        self.assertEqual(self.watch()["forms_other_person"], 1)
+
+    def test_an_unreadable_record_is_counted_once(self):
+        self.shopify.forms = [forms_customer(1, record={"submission_id": "bad id"})]
+        self.assertEqual(self.watch()["forms_record_invalid"], 1)
+        self.assertNotIn("forms_record_invalid", self.watch())
+        self.shopify.forms = [forms_customer(1, record={"submission_id": "bad id", "first_name": "Bravo"})]  # changed: new
+        self.assertEqual(self.watch()["forms_record_invalid"], 1)
+
+    def test_marks_older_than_120_days_are_pruned_at_the_start(self):
+        old, kept = "forms_seen:" + "a" * 64, "forms_seen:" + "b" * 64
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO watermarks(name, value, updated_at) VALUES (?, ?, ?)",
+                         (old, "forms_ok|x", dl.ts(self.now - timedelta(days=120, seconds=1))))
+            conn.execute("INSERT INTO watermarks(name, value, updated_at) VALUES (?, ?, ?)",
+                         (kept, "forms_ok|x", dl.ts(self.now - timedelta(days=119))))
+            self.ledger.set_watermark(conn, "hold_since:shopify:x", dl.ts(self.now - timedelta(days=300)))  # not ours: kept
+        self.shopify.forms_error = True  # pruning happens even when the read fails
+        self.watch()
+        self.assertEqual(set(self.marks()), {kept})
+        self.assertIsNotNone(self.ledger.watermark("hold_since:shopify:x"))
+
+    def test_a_record_older_than_the_marks_is_never_classified(self):
+        self.shopify.forms = [forms_customer(1, record={"submitted_at": dl.ts(self.now - timedelta(days=121))})]
+        counts = self.watch()
+        self.assertEqual((counts["forms_records_seen"], counts["forms_records_new"]), (1, 0))
+        self.assertEqual(self.marks(), {})
+
+
+class FormsSignUpSignalTests(FormsTestCase):
+    def pending(self, n: int, code: str = "waiting_for_staff") -> None:
+        with self.ledger.tx() as conn:
+            conn.execute("INSERT INTO shopify_pending(customer_gid, state, code, checks, updated_at) VALUES (?, 'PENDING', ?, 0, ?)",
+                         (gid(n), code, dl.ts(self.now)))
+
+    def test_the_first_step_only_counts_and_a_new_row_later_is_a_sign_up(self):
+        self.pending(1)
+        self.watch()
+        self.assertEqual(self.ledger.watermark(sync.FORMS_SIGN_UPS_MARK), "1")
+        self.assertIsNone(self.ledger.watermark(sync.FORMS_LAST_SIGN_UP_MARK))
+        self.now += timedelta(minutes=15)
+        self.pending(2)
+        self.watch()
+        self.assertEqual(self.ledger.watermark(sync.FORMS_LAST_SIGN_UP_MARK), dl.ts(self.now))
+        before = self.now
+        self.now += timedelta(minutes=15)
+        self.watch()  # nothing new: the time stays
+        self.assertEqual(self.ledger.watermark(sync.FORMS_LAST_SIGN_UP_MARK), dl.ts(before))
+
+    def test_an_old_customer_updated_is_not_a_sign_up(self):
+        self.watch()
+        self.pending(3, "registered_before_cutover")
+        self.pending(4, "registration_tag_absent")
+        self.watch()
+        self.assertIsNone(self.ledger.watermark(sync.FORMS_LAST_SIGN_UP_MARK))
+
+    def test_a_real_sign_up_through_the_run(self):
+        self.run_sync(**FORMS_ON)
+        self.now += timedelta(minutes=15)
+        self.shopify.add(customer(5))
+        self.run_sync(**FORMS_ON)
+        self.assertEqual(self.ledger.watermark(sync.FORMS_LAST_SIGN_UP_MARK), dl.ts(self.now))
+
+
+class FormsDigestTests(FormsTestCase):
+    def digest(self, **overrides) -> dict:
+        return sync.ledger_digest(self.temp, hours=24, now=self.now, config=make_config(**overrides))
+
+    def test_absent_when_off_and_nothing_counted(self):
+        self.run_sync()
+        self.assertNotIn("forms", self.digest())
+
+    def test_present_when_on_even_with_nothing_counted(self):
+        self.assertEqual(self.digest(**FORMS_ON)["forms"], {
+            "counts": {code: 0 for code in sync.FORMS_DIGEST_CODES}, "not_healed": 0, "would_heal": 0,
+            "last_record_at": None, "last_sign_up_at": None})
+
+    def test_present_when_a_run_of_the_period_counted_a_forms_code(self):
+        self.shopify.add(customer(2, email=fe(4), tags=()))
+        self.shopify.forms = [forms_customer(1, email=fe(1)), forms_customer(3, orders="1"), forms_customer(4),
+                              forms_customer(5, record={"first_name": "Bravo"}), forms_customer(6, phone=None),
+                              forms_customer(7, first=None, last=None), forms_customer(8)]
+        self.run_sync(**FORMS_ON)
+        block = self.digest()["forms"]  # the switch is off now: the period's counts still show
+        self.assertEqual((block["not_healed"], block["would_heal"]), (5, 2))
+        self.assertEqual((block["counts"]["forms_records_new"], block["counts"]["forms_left_used"]), (7, 1))
+        self.assertEqual(block["last_record_at"], dl.ts(self.now))
+        self.assertIsNone(block["last_sign_up_at"])
+        later = sync.ledger_digest(self.temp, hours=24, now=self.now + timedelta(hours=25), config=make_config())
+        self.assertNotIn("forms", later)  # out of the period, switch off
+
+    def test_last_sign_up_at(self):
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_LAST_SIGN_UP_MARK, dl.ts(T0))
+        self.assertEqual(self.digest(**FORMS_ON)["forms"]["last_sign_up_at"], dl.ts(T0))
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_LAST_SIGN_UP_MARK, "not a time")
+        self.assertIsNone(self.digest(**FORMS_ON)["forms"]["last_sign_up_at"])
+
+
+class FormsPrivacyTests(FormsTestCase):
+    def test_no_typed_or_customer_value_in_any_output_stored_summary_mark_or_digest(self):
+        self.shopify.add(customer(6, email=fe(2), tags=()))
+        self.shopify.forms = [forms_customer(1, email=fe(1), tags=("xb-form-signup", "member-mg")), forms_customer(2),
+                              forms_customer(3, record={"first_name": "Bravo"}), forms_customer(4, phone=None),
+                              forms_customer(5, first=None, last=None), forms_customer(7, record={"email": "x"})]
+        result = self.run_sync(**FORMS_ON)
+        stored = [row[0] for row in self.ledger.conn.execute("SELECT summary FROM runs")]
+        marks = [[*row] for row in self.ledger.conn.execute("SELECT name, value FROM watermarks")]
+        digest = sync.ledger_digest(self.temp, hours=24, now=self.now, config=make_config(**FORMS_ON))
+        for value in (result, stored, marks, digest):
+            self.assert_no_pii(value)
+            text = json.dumps(value)
+            for needle in ("gid://", "@", "Alpha", "Bravo", "March", "sub-000", "typed0", "8000"):
+                self.assertNotIn(needle, text)
+        self.assertEqual(repr(forms_customer(1)), "FormsCustomer()")
+
+
+class FormsClientTests(unittest.TestCase):
+    client = SyncShopifyClientTests.client
+
+    def node(self, n: int, **overrides) -> dict:
+        value = {"id": gid(n), "firstName": "Alpha", "lastName": "Tester", "defaultEmailAddress": None,
+                 "defaultPhoneNumber": {"phoneNumber": plus(sg(n))}, "tags": ["xb-form-signup"], "numberOfOrders": "0",
+                 "amountSpent": {"amount": "0.0"}, "canDelete": True, "state": "DISABLED",
+                 "metafields": {"nodes": [{"key": k, "value": v} for k, v in forms_record(n)]}}
+        value.update(overrides)
+        return value
+
+    def test_the_read_is_pinned_paged_and_reads_only(self):
+        search = sync.forms_search("2026-10-01")
+        pages = [
+            _graphql({"customers": {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [self.node(1)]}}),
+            _graphql({"customers": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [self.node(2, metafields=None)]}}),
+        ]
+        client, sent = self.client(pages, create_enabled=False)
+        customers, complete = client.forms_sign_ups(search, 4)
+        self.assertTrue(complete)
+        self.assertEqual([s["query"] for s in sent], [sync.FORMS_QUERY, sync.FORMS_QUERY])
+        self.assertEqual([s["variables"] for s in sent], [{"first": 50, "after": None, "search": search}, {"first": 50, "after": "c1", "search": search}])
+        self.assertEqual(sync.decide_forms(customers[0], sync.parse_forms_record(customers[0].metafields)).outcome, "forms_would_heal")
+        self.assertIsNone(customers[1].metafields)
+        self.assertIn(sync.FORMS_QUERY, sync.SYNC_READ_QUERIES)
+        self.assertTrue(sync.FORMS_QUERY.startswith("query ") and "mutation" not in sync.FORMS_QUERY)
+
+    def test_the_page_cap_returns_incomplete(self):
+        page = _graphql({"customers": {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [self.node(1)]}})
+        client, sent = self.client([page], create_enabled=False)
+        customers, complete = client.forms_sign_ups(sync.forms_search("2026-10-01"), 1)
+        self.assertEqual((len(customers), complete, len(sent)), (1, False, 1))
+
+    def test_shapes_and_searches_refused(self):
+        for bad in ("tag:'member-mg' AND updated_at:>='2026-10-01'", "tag:'xb-form-signup'", "tag:'xb-form-signup' AND updated_at:>='2026-10-01' OR id:1"):
+            client, sent = self.client([], create_enabled=False)
+            with self.assertRaises(dl.DirectLocalError):
+                client.forms_sign_ups(bad, 1)
+            self.assertEqual(sent, [])
+        for answer in ({"customers": None}, {"customers": {"nodes": [{"id": "x"}], "pageInfo": {"hasNextPage": False}}},
+                       {"customers": {"pageInfo": {"hasNextPage": True, "endCursor": ""}, "nodes": []}}):
+            client, _ = self.client([_graphql(answer)], create_enabled=False)
+            with self.assertRaises(direct.ShopifyDirectError):
+                client.forms_sign_ups(sync.forms_search("2026-10-01"), 2)
+        with self.assertRaises(dl.DirectLocalError):
+            sync.forms_search("2026-10-1")
+
+
+class FormsLedgerTests(FormsTestCase):
+    def test_marks_are_ordinary_watermarks_rows_and_the_schema_is_unchanged(self):
+        self.shopify.forms = [forms_customer(1)]
+        self.run_sync(**FORMS_ON)
+        self.assertEqual(self.ledger.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        tables = {row[0] for row in self.ledger.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertEqual(tables, {"meta", "links", "writes", "changelog_seen", "watermarks", "member_snapshots", "ac2_pending", "shopify_pending", "runs"})
+        result = self.run_sync()  # the switch off again: the rows stay and change nothing
+        self.assertFalse(any(code.startswith("forms_") for code in result["counts"]))
+        self.assertEqual(len(self.marks()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

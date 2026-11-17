@@ -2283,5 +2283,131 @@ class WiringContractTests(WiringTestCase):
             self.assertIn('parser.add_argument("--hours", type=int, default=24', text)
 
 
+# ------------------------------------------------------------------------------------------------
+# #155 slice FH1: the forms line and the forms_flow_silent WARN (design B12). Counts only.
+# ------------------------------------------------------------------------------------------------
+
+def hours_ago(hours: float) -> str:
+    return (NOW - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def forms_block(*, sign_up=None, record=None, not_healed=None, would_heal=None, **counts):
+    """The sync digest's ``forms`` block (fake counts)."""
+
+    value = {code: 0 for code in ("forms_records_seen", "forms_records_new", "forms_read_incomplete", "forms_same_email_tags_missing",
+                                  "forms_attached_by_phone", "forms_ok", "forms_would_heal_tags", "forms_would_heal", "forms_left_used",
+                                  "forms_other_person", "forms_held_name_unclear", "forms_held_email_elsewhere", "forms_unclassified",
+                                  "forms_record_invalid")}
+    value.update(counts)
+    not_healed_codes = ("forms_left_used", "forms_held_name_unclear", "forms_held_email_elsewhere", "forms_other_person", "forms_unclassified")
+    return {"counts": value, "not_healed": sum(value[c] for c in not_healed_codes) if not_healed is None else not_healed,
+            "would_heal": value["forms_would_heal"] + value["forms_would_heal_tags"] if would_heal is None else would_heal,
+            "last_record_at": record, "last_sign_up_at": sign_up}
+
+
+FORMS_COUNTS = {"forms_left_used": 2, "forms_held_name_unclear": 1, "forms_held_email_elsewhere": 1, "forms_unclassified": 1,
+                "forms_other_person": 3, "forms_would_heal": 4, "forms_would_heal_tags": 1}
+
+
+class FormsSummaryTests(SummaryTestCase):
+    def daily_with(self, block, *, expected=True):
+        value = digest_fixture() if block is None else digest_fixture(forms=block)
+        return self.run_daily(runner=FakeRunner(digest=value), settings=self.settings(forms_watch_expected=expected))
+
+    def warn(self) -> list:
+        return self.record["forms"]["warn"]
+
+    def test_setting_defaults_off_and_must_be_a_bool(self):
+        self.assertFalse(self.settings()["forms_watch_expected"])
+        self.assertIs(json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))["forms_watch_expected"], False)
+        value = self.settings_value()
+        del value["forms_watch_expected"]
+        self.assertFalse(summary.parse_settings(value)["forms_watch_expected"])
+        self.assertTrue(self.settings(forms_watch_expected=True)["forms_watch_expected"])
+        for bad in ("true", 1, None):
+            with self.assertRaises(summary.SummaryError) as caught:
+                self.settings(forms_watch_expected=bad)
+            self.assertEqual(caught.exception.code, "settings_forms_watch_expected_invalid")
+
+    def test_not_expected_changes_nothing_even_with_a_forms_block(self):
+        plain = self.run_daily(runner=FakeRunner(digest=digest_fixture()))
+        plain_record, plain_result = dict(self.record), dict(self.result)
+        for settings in (self.settings(), self.settings(forms_watch_expected=False)):
+            event = self.run_daily(runner=FakeRunner(digest=digest_fixture(forms=forms_block(sign_up=hours_ago(1), **FORMS_COUNTS))),
+                                   settings=settings)
+            self.assertEqual(event, plain)
+            self.assertEqual(self.record, plain_record)
+            self.assertEqual(self.result, plain_result)
+            self.assertNotIn("forms", self.record)
+            self.assertNotIn("forms_warn", self.result)
+
+    def test_the_line_and_the_counts_in_the_alert_line(self):
+        event = self.daily_with(forms_block(sign_up=hours_ago(2), record=hours_ago(2), **FORMS_COUNTS))
+        self.assertEqual(self.record["forms"]["line"], "Website sign-ups on an existing account (24h): not healed 8 "
+                                                       "(account used 2, held 3) | would heal 5 | other person 3")
+        self.assertEqual({k: v for k, v in event["digest"]["alerts"].items() if k.startswith("forms_")},
+                         {"forms_not_healed": 8, "forms_account_used": 2, "forms_held": 3, "forms_would_heal": 5, "forms_other_person": 3})
+        self.assertEqual((event["result"], event["stop_reasons"], event["schema"]), ("CLEAN", [], summary.EVENT_SCHEMA))
+        self.assertEqual((self.warn(), self.result["forms_warn"]), ([], []))
+        self.assertEqual(self.poster.calls[0]["body"], event)
+
+    def test_never_a_stop(self):
+        base = self.daily_with(None, expected=False)
+        event = self.daily_with(forms_block(sign_up=hours_ago(1), record=None, **FORMS_COUNTS))
+        self.assertEqual((event["result"], event["stop_reasons"], event["auto_off_reasons"]),
+                         (base["result"], base["stop_reasons"], base["auto_off_reasons"]))
+        self.assertEqual(self.result["forms_warn"], ["forms_flow_silent"])
+        self.assertEqual(event["digest"]["alerts"]["forms_flow_silent"], 1)
+
+    def test_warn_edges_on_the_72_hours(self):
+        for hours, warn in ((71, True), (72, True), (72.001, False), (73, False)):
+            event = self.daily_with(forms_block(sign_up=hours_ago(hours), record=None))
+            self.assertEqual(self.warn(), ["forms_flow_silent"] if warn else [], hours)
+            self.assertEqual("forms_flow_silent" in event["digest"]["alerts"], warn, hours)
+
+    def test_warn_edges_on_the_6_hours(self):
+        for lag, warn in ((5, False), (6, False), (6.001, True), (7, True)):
+            event = self.daily_with(forms_block(sign_up=hours_ago(1), record=hours_ago(1 + lag)))
+            self.assertEqual(self.warn(), ["forms_flow_silent"] if warn else [], lag)
+            self.assertEqual("forms_flow_silent" in event["digest"]["alerts"], warn, lag)
+
+    def test_no_sign_up_no_warn_and_a_newer_record_no_warn(self):
+        for sign_up, record in ((None, None), (None, hours_ago(1)), (hours_ago(10), hours_ago(1)), ("not a time", None)):
+            self.daily_with(forms_block(sign_up=sign_up, record=record))
+            self.assertEqual(self.warn(), [], (sign_up, record))
+
+    def test_the_pure_rule(self):
+        self.assertTrue(summary.forms_flow_silent(NOW - timedelta(hours=72), None, NOW))
+        self.assertFalse(summary.forms_flow_silent(NOW - timedelta(hours=72, seconds=1), None, NOW))
+        self.assertFalse(summary.forms_flow_silent(NOW, NOW - timedelta(hours=6), NOW))
+        self.assertTrue(summary.forms_flow_silent(NOW, NOW - timedelta(hours=6, seconds=1), NOW))
+        self.assertFalse(summary.forms_flow_silent(None, None, NOW))
+
+    def test_no_block_or_no_digest_says_not_available(self):
+        for runner in (FakeRunner(digest=digest_fixture()), FakeRunner(codes={"digest": 2}, digest="not json")):
+            event = self.run_daily(runner=runner, settings=self.settings(forms_watch_expected=True))
+            self.assertFalse(self.record["forms"]["available"])
+            self.assertIn("not available", self.record["forms"]["line"])
+            self.assertEqual(self.result["forms_warn"], [])
+            self.assertFalse(any(code.startswith("forms_") for code in (event["digest"]["alerts"] or {})))
+
+    def test_counts_are_bounded_and_unreadable_ones_are_zero(self):
+        self.daily_with(forms_block(not_healed=-1, would_heal="5", forms_left_used=True, forms_other_person=10 ** 12))
+        forms = self.record["forms"]
+        self.assertEqual((forms["forms_not_healed"], forms["forms_would_heal"], forms["forms_account_used"], forms["forms_other_person"]),
+                         (0, 0, 0, summary.COUNT_MAX))
+
+    def test_privacy_of_the_record_and_the_event(self):
+        event = self.daily_with(forms_block(sign_up=hours_ago(1), **FORMS_COUNTS))
+        summary.check_event(event)
+        self.assertNotIn("@", json.dumps(self.record))
+        self.assertIsNone(re.search(r"[0-9]{6,}", json.dumps(self.record["forms"])))
+
+    def test_the_n8n_event_shape_is_unchanged(self):
+        event = self.daily_with(forms_block(sign_up=hours_ago(1), **FORMS_COUNTS))
+        self.assertEqual(tuple(event), summary.EVENT_KEYS)
+        self.assertNotIn("forms_", WORKFLOW.read_text(encoding="utf-8"))  # FH1 does not touch the n8n workflow
+
+
 if __name__ == "__main__":
     unittest.main()

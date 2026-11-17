@@ -90,7 +90,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
@@ -308,6 +308,16 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     # outside a declared window, or over its caps, stops the next summary.
     "backfill_members_max_per_call": None,
     "backfill_members_max_per_hour": None,
+    # #155 slice FH1 (G0 17 Nov 2026, design B8, B12): the forms watch. It
+    # reads the copy records the owner's Flow writes on a customer a form
+    # entry was attached to, classifies and counts them; it writes nothing to
+    # Shopify or AutoCount. Off by default; like the BF keys, never added to
+    # the live task's config while that task runs an older commit.
+    "forms_watch_enabled": False,
+    # A Singapore date (YYYY-MM-DD), required when the watch is on: the
+    # records of customers updated before it are never read.
+    "forms_watch_since": None,
+    "forms_watch_max_pages": 4,
 }
 # #155 BF2b: the bounds of the backfill's own caps (design 2.7).
 BACKFILL_MEMBERS_MAX_PER_CALL_LIMIT = 25
@@ -327,6 +337,7 @@ _BOUNDS = {
     "max_creates_per_day": (1, 720),
     "probe_max_wakes_per_day": (1, 240),
     "backfill_members_lookups_per_call": (1, 200),
+    "forms_watch_max_pages": (1, 20),
 }
 
 
@@ -384,6 +395,9 @@ class SyncConfig:
     backfill_members_lookups_per_call: int = 50
     backfill_members_max_per_call: int | None = None
     backfill_members_max_per_hour: int | None = None
+    forms_watch_enabled: bool = False
+    forms_watch_since: str | None = None
+    forms_watch_max_pages: int = 4
 
     @property
     def backfill_members_call_cap(self) -> int:
@@ -434,6 +448,11 @@ class SyncConfig:
             # #155 BF2b: likewise printed only when set.
             **({"backfill_members_max_per_call": self.backfill_members_max_per_call} if self.backfill_members_max_per_call is not None else {}),
             **({"backfill_members_max_per_hour": self.backfill_members_max_per_hour} if self.backfill_members_max_per_hour is not None else {}),
+            # #155 FH1: likewise printed only when not the default.
+            **({"forms_watch_enabled": True} if self.forms_watch_enabled else {}),
+            **({"forms_watch_since": self.forms_watch_since} if self.forms_watch_since is not None else {}),
+            **({"forms_watch_max_pages": self.forms_watch_max_pages}
+               if self.forms_watch_max_pages != _CONFIG_DEFAULTS["forms_watch_max_pages"] else {}),
         }
 
 
@@ -557,6 +576,13 @@ def parse_config(value: Any) -> SyncConfig:
         caps[key] = number
     if None not in caps.values() and caps["backfill_members_max_per_call"] > caps["backfill_members_max_per_hour"]:
         raise dl.DirectLocalError("sync_config_backfill_members_max_per_call_invalid")
+    forms_enabled = _bool(merged["forms_watch_enabled"], "forms_watch_enabled")
+    forms_since = merged["forms_watch_since"]
+    if forms_since is not None and not _is_date(forms_since):
+        raise dl.DirectLocalError("sync_config_forms_watch_since_invalid")
+    if forms_enabled and forms_since is None:
+        # #155 FH1: the watch never reads back to the beginning of time.
+        raise dl.DirectLocalError("sync_config_forms_watch_since_required")
     return SyncConfig(
         state_root=merged["state_root"], autocount_book=book, shopify=shopify, shopify_cutover_utc=cutover,
         ac2_create_enabled=_bool(merged["ac2_create_enabled"], "ac2_create_enabled"),
@@ -571,7 +597,20 @@ def parse_config(value: Any) -> SyncConfig:
         member_core_state_root=core_root,
         backfill_members_enabled=_bool(merged["backfill_members_enabled"], "backfill_members_enabled"),
         shopify_create_member_types=tuple(member_types), **numbers, **caps,
+        forms_watch_enabled=forms_enabled, forms_watch_since=forms_since,
     )
+
+
+def _is_date(value: Any) -> bool:
+    """A real calendar date written exactly as YYYY-MM-DD."""
+
+    if not isinstance(value, str) or not DATE_RE.fullmatch(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def create_tag_refused(tag: str) -> bool:
@@ -1417,6 +1456,175 @@ def parse_changelog_member(xml_text: Any) -> Ac2Member | None:
 
 
 # --------------------------------------------------------------------------
+# #155 slice FH1: the forms watch (count only; design B8, B9, B12)
+# --------------------------------------------------------------------------
+# Shopify Forms attaches a sign-up to an existing customer by phone and drops
+# the typed email and the member tags. The owner's copy Flow (design section
+# 6.1) writes what was typed onto that customer as six text metafields plus a
+# tag; the sync reads them, classifies each new submission and counts. FH1
+# writes nothing to Shopify or AutoCount. These names are constants, not
+# settings: the Flow and this code must agree on them.
+
+FORMS_NAMESPACE = "xb_form"
+FORMS_KEYS = ("submission_id", "submitted_at", "email", "phone", "first_name", "birthday_month")
+FORMS_TAG = "xb-form-signup"
+FORMS_WATERMARK = "forms_watch_updated_day"  # the Singapore date of the last clean read
+FORMS_SEEN_PREFIX = "forms_seen:"  # + keyed digest of the submission id; value "<code>|<decided time>"
+FORMS_SEEN_DAYS = 120  # seen-marks older than this are pruned; older records are never classified
+# The sign-up signal for the daily summary's forms_flow_silent WARN (no
+# schema change): the number of sign-up rows in shopify_pending at the last
+# forms step, and the time the forms step last saw that number grow.
+FORMS_SIGN_UPS_MARK = "forms_sign_up_rows"
+FORMS_LAST_SIGN_UP_MARK = "forms_last_sign_up_at"
+# shopify_pending rows that are not a new sign-up (an old customer updated).
+FORMS_NOT_SIGN_UP_CODES = ("registered_before_cutover", "registration_tag_absent")
+FORMS_VALUE_MAX = 254  # every metafield value (a usable email is at most 254)
+FORMS_SUBMISSION_ID_RE = re.compile(r"^[!-~]{1,64}$")  # printable ASCII, no space
+FORMS_FIRST_NAME_MAX = 100
+# Outcome codes: exactly one per new record (they add up to forms_records_new).
+FORMS_OUTCOME_CODES = ("forms_ok", "forms_would_heal_tags", "forms_would_heal", "forms_left_used", "forms_other_person",
+                       "forms_held_name_unclear", "forms_held_email_elsewhere", "forms_unclassified", "forms_record_invalid")
+# Class codes counted beside the outcome (K2, K3 of the design's table).
+FORMS_CLASS_CODES = ("forms_same_email_tags_missing", "forms_attached_by_phone")
+# Counted with a keyed c- ref (a person may want to look): never an alert.
+FORMS_REF_CODES = frozenset({"forms_held_name_unclear", "forms_held_email_elsewhere", "forms_other_person", "forms_unclassified"})
+# Design B12: the one number for the Controller ("not healed").
+FORMS_NOT_HEALED_CODES = ("forms_left_used", "forms_held_name_unclear", "forms_held_email_elsewhere", "forms_other_person", "forms_unclassified")
+FORMS_WOULD_HEAL_CODES = ("forms_would_heal", "forms_would_heal_tags")
+
+
+def has_tag(tags: Iterable[Any], tag: str) -> bool:
+    """The exact tag, compared trimmed and case-insensitively (Shopify's tag
+    search is only a candidate list: its exactness is not documented)."""
+
+    wanted = tag.strip().casefold()
+    return any(isinstance(t, str) and t.strip().casefold() == wanted for t in tags)
+
+
+@dataclass(frozen=True)
+class FormsCustomer:
+    """One customer of the forms read: the fields of the pinned query as
+    read (the unused fields raw, so the test below can fail safe)."""
+
+    gid: str
+    first_name: Any
+    last_name: Any
+    email: Any
+    phone: Any
+    tags: tuple[str, ...]
+    number_of_orders: Any
+    amount_spent: Any
+    can_delete: Any
+    state: Any
+    metafields: tuple[tuple[Any, Any], ...] | None  # (key, value) pairs; None when the list was not readable
+
+    def __repr__(self) -> str:  # never render customer data
+        return "FormsCustomer()"
+
+
+@dataclass(frozen=True)
+class FormsRecord:
+    submission_id: str
+    submitted_at: datetime
+    email: str
+    phone_digits: str
+    first_name: str
+    birthday_month: int | None
+
+    def __repr__(self) -> str:  # never render what the person typed
+        return "FormsRecord()"
+
+
+@dataclass(frozen=True)
+class FormsDecision:
+    outcome: str  # one of FORMS_OUTCOME_CODES
+    class_code: str | None = None  # FORMS_CLASS_CODES, counted beside the outcome
+    email_check: bool = False  # K3 on an unused customer: the K6 read decides
+
+
+def parse_forms_record(metafields: tuple[tuple[Any, Any], ...] | None) -> FormsRecord | None:
+    """The copy record, strictly: exactly the six keys, each once, each a
+    string of at most FORMS_VALUE_MAX characters; ``submission_id`` 1-64
+    printable ASCII; ``submitted_at`` an RFC 3339 instant with an offset;
+    ``email`` usable; ``phone`` a phone ``phone_member_no`` accepts;
+    ``first_name`` 1-100 characters; ``birthday_month`` empty or a month
+    ``birthday_month`` reads. Anything else is None (``forms_record_invalid``)."""
+
+    if metafields is None:
+        return None
+    values: dict[str, str] = {}
+    for key, value in metafields:
+        if key not in FORMS_KEYS or key in values or not isinstance(value, str) or len(value) > FORMS_VALUE_MAX:
+            return None
+        values[key] = value
+    if set(values) != set(FORMS_KEYS):
+        return None
+    submitted_at = dl.parse_created_at(values["submitted_at"])
+    email = usable_email(values["email"])
+    digits, phone_status = phone_member_no(values["phone"])
+    month_text = values["birthday_month"]
+    month = birthday_month(month_text) if month_text.strip() else None
+    if (not FORMS_SUBMISSION_ID_RE.fullmatch(values["submission_id"]) or submitted_at is None or email is None or phone_status != "ok"
+            or not 1 <= len(values["first_name"]) <= FORMS_FIRST_NAME_MAX or (month_text.strip() and month is None)):
+        return None
+    return FormsRecord(values["submission_id"], submitted_at, email, digits, values["first_name"], month)
+
+
+def _zero_count(value: Any) -> bool:
+    return (isinstance(value, str) and value == "0") or (isinstance(value, int) and not isinstance(value, bool) and value == 0)
+
+
+def _zero_amount(value: Any) -> bool:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 0
+    return isinstance(value, str) and re.fullmatch(r"-?0+(?:\.0+)?", value) is not None
+
+
+def forms_unused(customer: FormsCustomer) -> bool:
+    """Design B9: the account was never used only when every field says so:
+    ``numberOfOrders`` "0", ``amountSpent.amount`` zero, ``canDelete`` true
+    and ``state`` DISABLED (never signed in). Any field missing, null,
+    unreadable or with another value means used (fail safe)."""
+
+    amount = customer.amount_spent.get("amount") if isinstance(customer.amount_spent, dict) else None
+    return (_zero_count(customer.number_of_orders) and _zero_amount(amount) and customer.can_delete is True
+            and customer.state == "DISABLED")
+
+
+def decide_forms(customer: FormsCustomer, record: FormsRecord) -> FormsDecision:
+    """Design B8 (FH1 column) for one new record on customer C (E, P, F: the
+    typed email, phone and first name). Emails compare only by ``email_key``;
+    phones only by ``phone_member_no`` digits; names only by ``name_words``.
+
+    K1 C's email is E and C has member-mg: ``forms_ok``.
+    K2 C's email is E, member-mg missing: unused -> ``forms_would_heal_tags``, else ``forms_left_used``.
+    K7 C's phone is not P (and C's email is not E): ``forms_unclassified``.
+    K5 C's full name or F has no word: ``forms_held_name_unclear``.
+    K4 a word of F is not a word of C's full name: ``forms_other_person``.
+    K3 otherwise: used -> ``forms_left_used``; unused -> ``forms_would_heal``
+       unless the K6 read (``email_check``) finds E on another customer."""
+
+    unused = forms_unused(customer)
+    customer_email = email_key(customer.email)
+    if customer_email is not None and customer_email == email_key(record.email):
+        if has_tag(customer.tags, REGISTRATION_TAG):
+            return FormsDecision("forms_ok")
+        return FormsDecision("forms_would_heal_tags" if unused else "forms_left_used", "forms_same_email_tags_missing")
+    customer_digits = phone_member_no(customer.phone)[0]
+    if customer_digits is None or customer_digits != record.phone_digits:
+        return FormsDecision("forms_unclassified")
+    typed = name_words(record.first_name)
+    held = name_words(shopify_full_name(customer.first_name, customer.last_name))
+    if not typed or not held:
+        return FormsDecision("forms_held_name_unclear")
+    if not typed <= held:
+        return FormsDecision("forms_other_person")
+    if not unused:
+        return FormsDecision("forms_left_used", "forms_attached_by_phone")
+    return FormsDecision("forms_would_heal", "forms_attached_by_phone", email_check=True)
+
+
+# --------------------------------------------------------------------------
 # Sync ledger
 # --------------------------------------------------------------------------
 
@@ -1805,6 +2013,10 @@ class SyncEngine:
         if direction in ("both", "ac2_to_shopify"):
             self._resolve_uncertain("ac2_to_shopify")
             self.ac2_to_shopify()
+        if self.config.forms_watch_enabled:
+            # #155 FH1: after the directions, inside the same lock; a run
+            # refused above never gets here. Reads only.
+            self.forms_watch()
         result = {
             "schema": SUMMARY_SCHEMA, "status": "completed_with_alerts" if self.summary.alerts else "completed", "direction": direction,
             "alerts": list(self.summary.alerts),
@@ -1821,6 +2033,108 @@ class SyncEngine:
         with self.ledger.tx() as conn:
             conn.execute("UPDATE runs SET finished_at = ?, summary = ? WHERE run_id = ?", (dl.ts(self.ledger.now()), json.dumps(stored, sort_keys=True), run_id))
         return result
+
+    # -- #155 FH1: the forms watch (reads only; design B8, B9, B12) ----------------------
+    def forms_watch(self) -> None:
+        """Read the copy records of customers tagged ``xb-form-signup``
+        updated since the day before the last clean read (never before
+        ``forms_watch_since``), classify each submission not seen before and
+        count. Writes only this ledger's watermarks rows: one seen-mark per
+        submission (``forms_seen:`` + keyed digest; the code and the time,
+        nothing the person typed), the read day, and the sign-up signal.
+        A read failure, the page cap or the K6 read budget leaves the read
+        day where it was (``forms_read_incomplete``); unmarked records are
+        read again next run."""
+
+        now = self.ledger.now()
+        horizon = now - timedelta(days=FORMS_SEEN_DAYS)
+        with self.ledger.tx() as conn:
+            conn.execute("DELETE FROM watermarks WHERE substr(name, 1, ?) = ? AND updated_at < ?",
+                         (len(FORMS_SEEN_PREFIX), FORMS_SEEN_PREFIX, dl.ts(horizon)))
+        self._forms_track_sign_ups()
+        seen = new = 0
+        try:
+            customers, complete = self.shopify.forms_sign_ups(forms_search(self._forms_read_day()), self.config.forms_watch_max_pages)
+        except direct.ShopifyDirectError:
+            customers, complete = [], False
+        email_reads_left = self.config.forms_watch_max_pages * SHOPIFY_PAGE_SIZE
+        for customer in customers:
+            if not has_tag(customer.tags, FORMS_TAG):
+                continue  # the tag search is only a candidate list
+            seen += 1
+            record = parse_forms_record(customer.metafields)
+            if record is not None and record.submitted_at < horizon:
+                continue  # older than any seen-mark is kept: never classified (no double count)
+            mark = FORMS_SEEN_PREFIX + self._forms_key(customer, record)
+            if self.ledger.watermark(mark) is not None:
+                continue  # classified before: never counted twice
+            decision = FormsDecision("forms_record_invalid") if record is None else decide_forms(customer, record)
+            outcome = decision.outcome
+            if decision.email_check:
+                # K6: one customerByIdentifier read of the typed email (the
+                # existing read path); another customer holding it is held.
+                if email_reads_left <= 0:
+                    complete = False
+                    break
+                email_reads_left -= 1
+                try:
+                    found = self.shopify.find_by_email(record.email)
+                except direct.ShopifyDirectError:
+                    complete = False
+                    break
+                if found is not None and found.gid != customer.gid:
+                    outcome = "forms_held_email_elsewhere"
+            new += 1
+            if decision.class_code is not None:
+                self.summary.count(decision.class_code)
+            self.summary.count(outcome, self.ledger.ref("c", customer.gid) if outcome in FORMS_REF_CODES else None)
+            with self.ledger.tx() as conn:
+                self.ledger.set_watermark(conn, mark, f"{outcome}|{dl.ts(self.ledger.now())}")
+        for code, number in (("forms_records_seen", seen), ("forms_records_new", new)):
+            self.summary.counts[code] = self.summary.counts.get(code, 0) + number
+        if not complete:
+            self.summary.count("forms_read_incomplete")
+            return
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, FORMS_WATERMARK, now.astimezone(SGT).strftime("%Y-%m-%d"))
+
+    def _forms_read_day(self) -> str:
+        """The day before the last clean read (whole-day ``updated_at``
+        filter, so the overlap re-reads that day), never before
+        ``forms_watch_since``; ``forms_watch_since`` when there is none."""
+
+        since = self.config.forms_watch_since
+        mark = self.ledger.watermark(FORMS_WATERMARK)
+        if since is None:
+            raise dl.DirectLocalError("sync_config_forms_watch_since_required")  # parse_config refuses this first
+        if mark is None or not _is_date(mark):
+            return since
+        return max((date.fromisoformat(mark) - timedelta(days=1)).isoformat(), since)
+
+    def _forms_key(self, customer: FormsCustomer, record: FormsRecord | None) -> str:
+        """The keyed digest (the ledger's ref key) a seen-mark is named by:
+        of the submission id, or, for a record that cannot be read, of the
+        customer and the raw values as read (a new submission changes it)."""
+
+        body = f"submission:{record.submission_id}" if record is not None else "unreadable:" + json.dumps(
+            [customer.gid, None if customer.metafields is None else [list(pair) for pair in customer.metafields]], ensure_ascii=True)
+        return hmac.new(bytes.fromhex(self.ledger.meta()["ref_key"]), f"forms:{body}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _forms_track_sign_ups(self) -> None:
+        """The sign-up signal for the summary's ``forms_flow_silent`` WARN,
+        from this ledger only (no schema change): when the number of
+        sign-up rows in ``shopify_pending`` (rows are never deleted) has grown
+        since the last forms step, a sign-up was seen: its time is kept."""
+
+        rows = int(self.ledger.conn.execute(
+            "SELECT COUNT(*) FROM shopify_pending WHERE code IS NULL OR code NOT IN (%s)" % ", ".join("?" * len(FORMS_NOT_SIGN_UP_CODES)),
+            FORMS_NOT_SIGN_UP_CODES).fetchone()[0])
+        before = self.ledger.watermark(FORMS_SIGN_UPS_MARK)
+        with self.ledger.tx() as conn:
+            if before is not None and before.isdigit() and rows > int(before):
+                self.ledger.set_watermark(conn, FORMS_LAST_SIGN_UP_MARK, dl.ts(self.ledger.now()))
+            if before != str(rows):
+                self.ledger.set_watermark(conn, FORMS_SIGN_UPS_MARK, str(rows))
 
     def initial_link(self, *, apply: bool) -> dict[str, Any]:
         """Round 7c (Owner): link the Shopify customers made before the
@@ -3355,7 +3669,47 @@ EMAIL_LOOKUP_QUERY = """query XbMemberSyncEmailLookup($email: String!) {
 CUSTOMER_CREATE_MUTATION = """mutation XbMemberSyncCustomerCreate($input: CustomerInput!) {
   customerCreate(input: $input) { customer { id } userErrors { field message } }
 }"""
-SYNC_READ_QUERIES = frozenset({direct.SESSION_QUERY, REGISTRATIONS_QUERY, CUSTOMER_QUERY, PHONE_LOOKUP_QUERY, EMAIL_LOOKUP_QUERY})
+# #155 FH1 (design B8, B9): the forms watch's one read (read_customers): the
+# customers carrying the copy Flow's tag, the B9 "unused" fields and the six
+# copy-record metafields, oldest update first, in cursor pages.
+FORMS_QUERY = """query XbMemberSyncFormsWatch($first: Int!, $after: String, $search: String!) {
+  customers(first: $first, after: $after, sortKey: UPDATED_AT, query: $search) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id firstName lastName defaultEmailAddress { emailAddress } defaultPhoneNumber { phoneNumber } tags
+      numberOfOrders amountSpent { amount } canDelete state
+      metafields(namespace: "xb_form", first: 10) { nodes { key value } } }
+  }
+}"""
+FORMS_SEARCH_RE = re.compile(r"^tag:'xb-form-signup' AND updated_at:>='[0-9]{4}-[0-9]{2}-[0-9]{2}'$")
+SYNC_READ_QUERIES = frozenset({direct.SESSION_QUERY, REGISTRATIONS_QUERY, CUSTOMER_QUERY, PHONE_LOOKUP_QUERY, EMAIL_LOOKUP_QUERY, FORMS_QUERY})
+
+
+def forms_search(day: str) -> str:
+    """The forms read's search: the exact tag, customers updated on or after
+    ``day`` (a whole-day filter)."""
+
+    search = f"tag:'{FORMS_TAG}' AND updated_at:>='{day}'"
+    if not _is_date(day) or not FORMS_SEARCH_RE.fullmatch(search):
+        raise dl.DirectLocalError("forms_search_invalid")
+    return search
+
+
+def _forms_customer_from_node(node: Any) -> FormsCustomer:
+    if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not dl.GID_RE.fullmatch(node["id"]):
+        raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+    phone = node.get("defaultPhoneNumber") if isinstance(node.get("defaultPhoneNumber"), dict) else {}
+    email = node.get("defaultEmailAddress") if isinstance(node.get("defaultEmailAddress"), dict) else {}
+    tags = node.get("tags") if isinstance(node.get("tags"), list) else []
+    fields = node.get("metafields")
+    nodes = fields.get("nodes") if isinstance(fields, dict) else None
+    metafields = None
+    if isinstance(nodes, list) and all(isinstance(item, dict) for item in nodes):
+        metafields = tuple((item.get("key"), item.get("value")) for item in nodes)
+    return FormsCustomer(
+        gid=node["id"], first_name=node.get("firstName"), last_name=node.get("lastName"), email=email.get("emailAddress"),
+        phone=phone.get("phoneNumber"), tags=tuple(t for t in tags if isinstance(t, str)), number_of_orders=node.get("numberOfOrders"),
+        amount_spent=node.get("amountSpent"), can_delete=node.get("canDelete"), state=node.get("state"), metafields=metafields,
+    )
 CUSTOMER_INPUT_KEYS = frozenset({"firstName", "phone", "email", "tags", "metafields"})
 
 
@@ -3426,8 +3780,29 @@ class SyncShopifyClient(direct.ShopifyDirectClient):
                 raise direct.ShopifyDirectError("shopify_response_shape_invalid")
         return customers, False
 
+    def forms_sign_ups(self, search: str, max_pages: int) -> tuple[list[FormsCustomer], bool]:
+        """#155 FH1: the forms read, at most ``max_pages`` pages; ``True``
+        only when the last page was reached. Reads only."""
+
+        if not isinstance(search, str) or not FORMS_SEARCH_RE.fullmatch(search):
+            raise dl.DirectLocalError("forms_search_invalid")
+        customers: list[FormsCustomer] = []
+        after = None
+        for _ in range(max_pages):
+            data = self.execute(FORMS_QUERY, {"first": SHOPIFY_PAGE_SIZE, "after": after, "search": search})
+            page = data.get("customers")
+            if not isinstance(page, dict) or not isinstance(page.get("nodes"), list) or not isinstance(page.get("pageInfo"), dict):
+                raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+            customers.extend(_forms_customer_from_node(node) for node in page["nodes"])
+            if not page["pageInfo"].get("hasNextPage"):
+                return customers, True
+            after = page["pageInfo"].get("endCursor")
+            if not isinstance(after, str) or not after:
+                raise direct.ShopifyDirectError("shopify_response_shape_invalid")
+        return customers, False
+
     def customer(self, gid: str, birthday: Mapping[str, str]) -> ShopifyCustomer | None:
-        data = self.execute(CUSTOMER_QUERY, {"id": gid, "birthdayNamespace": birthday["namespace"], "birthdayKey": birthday["key"]})
+        data = self.execute(CUSTOMER_QUERY,{"id": gid, "birthdayNamespace": birthday["namespace"], "birthdayKey": birthday["key"]})
         node = data.get("customer")
         return None if node is None else _customer_from_node(node)
 
@@ -4045,6 +4420,33 @@ def _digest_backfill_members(conn: sqlite3.Connection, runs: list, *, since: str
     }
 
 
+FORMS_DIGEST_CODES = ("forms_records_seen", "forms_records_new", "forms_read_incomplete") + FORMS_CLASS_CODES + FORMS_OUTCOME_CODES
+
+
+def _digest_forms(conn: sqlite3.Connection, counts: Mapping[str, int]) -> dict[str, Any]:
+    """#155 FH1 (design B12): the forms watch's counts of the period (each
+    code, then the "not healed" and "would heal" sums), the newest seen-mark
+    time and the newest time the forms step saw a new sign-up. Counts and
+    times only: no ref, email, name or GID."""
+
+    def number(code: str) -> int:
+        return counts.get(code, 0)
+
+    def instant(value: Any) -> str | None:
+        parsed = dl.parse_created_at(value) if isinstance(value, str) else None
+        return None if parsed is None else dl.ts(parsed)
+
+    last_record = conn.execute("SELECT MAX(updated_at) FROM watermarks WHERE substr(name, 1, ?) = ?",
+                               (len(FORMS_SEEN_PREFIX), FORMS_SEEN_PREFIX)).fetchone()[0]
+    last_sign_up = conn.execute("SELECT value FROM watermarks WHERE name = ?", (FORMS_LAST_SIGN_UP_MARK,)).fetchone()
+    return {
+        "counts": {code: number(code) for code in FORMS_DIGEST_CODES},
+        "not_healed": sum(number(code) for code in FORMS_NOT_HEALED_CODES),
+        "would_heal": sum(number(code) for code in FORMS_WOULD_HEAL_CODES),
+        "last_record_at": instant(last_record), "last_sign_up_at": instant(last_sign_up[0] if last_sign_up else None),
+    }
+
+
 def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) -> dict[str, Any]:
     """Go-live S7: the read-only daily digest. Opens the ledger read-only
     (no lock, no migration, no write), reads the ``runs`` of the last
@@ -4127,6 +4529,9 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
         import xb_member_sync_probe as probe  # the probe module reads only its status file here
 
         backfill = _digest_backfill_members(conn, runs, since=since, now=now, per_hour=per_hour, live_counts=counts)  # BF2d: may add to counts
+        # #155 FH1: only when the watch is on or a run of the period counted
+        # a forms code, so a digest without either is exactly as before.
+        forms = _digest_forms(conn, counts) if config.forms_watch_enabled or any(code.startswith("forms_") for code in counts) else None
         return {
             "schema": DIGEST_SCHEMA, "status": "ok", "autocount_book": meta["autocount_book"], "hours": hours,
             "runs": {"completed": len(durations), "unfinished": unfinished,
@@ -4153,6 +4558,7 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: SyncConfig) 
             # #155 BF2b: only when a backfill-members call ran in the period,
             # so a digest without one is exactly as before.
             **({"backfill_members": backfill} if backfill is not None else {}),
+            **({"forms": forms} if forms is not None else {}),
         }
     except sqlite3.Error:
         raise dl.DirectLocalError("sync_ledger_unreadable") from None

@@ -156,7 +156,19 @@ _SETTINGS_KEYS = {"schema", "sync_config_path", "sync_state_root", "output_dir",
 # backfill_members_window (default null): the dates (Singapore, inclusive) of the attended
 # backfill-members sittings and the caps declared for them; backfill creates are judged against
 # it, and are a stop outside it.
-_SETTINGS_OPTIONAL = {"shopify_creates_expected", "backfill_members_window", "member_tools"}  # member_tools: #288 wiring
+_SETTINGS_OPTIONAL = {"shopify_creates_expected", "backfill_members_window", "member_tools",  # member_tools: #288 wiring
+                      "forms_watch_expected"}  # #155 FH1
+# #155 slice FH1 (design B12): with ``forms_watch_expected`` (default false: nothing changes) the
+# sync's forms watch is on, and the summary shows its counts and one WARN. The n8n event is closed
+# (no new key, no WARN word for the sync): the figures are shown in the email's alert line, added
+# after the decision (as BACKFILL_SHOWN), and the full line and the WARN go to the record and the
+# printed answer. Never a STOP.
+FORMS_LINE_PREFIX = "Website sign-ups on an existing account (24h): "
+FORMS_SHOWN = ("forms_not_healed", "forms_account_used", "forms_held", "forms_would_heal", "forms_other_person")
+FORMS_FLOW_SILENT = "forms_flow_silent"
+FORMS_SIGN_UP_RECENT = timedelta(hours=72)  # a sign-up seen in the last 72 hours ...
+FORMS_RECORD_LAG = timedelta(hours=6)       # ... and more than 6 hours newer than the newest copy record
+FORMS_HELD_CODES = ("forms_held_name_unclear", "forms_held_email_elsewhere", "forms_unclassified")
 _WINDOW_KEYS = {"from", "to", "max_per_call", "max_per_hour"}
 BACKFILL_WINDOW_MAX_DAYS = 14
 BACKFILL_MAX_PER_CALL = 25  # the sync's own bounds (design 2.7)
@@ -292,6 +304,7 @@ def parse_settings(value: Any) -> dict[str, Any]:
         "shopify_creates_expected": _bool(value.get("shopify_creates_expected", False), "settings_shopify_creates_expected_invalid"),
         "backfill_members_window": _window(value.get("backfill_members_window")),
         "member_tools": _member_tools(value["member_tools"]) if "member_tools" in value else None,
+        "forms_watch_expected": _bool(value.get("forms_watch_expected", False), "settings_forms_watch_expected_invalid"),
     }
     # The summary never writes into the sync's private state: the record folder is checked
     # against the state root named here, not against the live sync config (a broken live config
@@ -804,6 +817,57 @@ def backfill_unfinished(raw: Mapping[str, Any] | None) -> int:
     return (_count(part.get("unfinished")) or 0) if isinstance(part, dict) else 0
 
 
+def _instant(value: Any) -> datetime | None:
+    """A ``YYYY-MM-DDTHH:MM:SSZ`` time from the digest, else None."""
+
+    if not isinstance(value, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value) is None:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def forms_flow_silent(last_sign_up_at: datetime | None, last_record_at: datetime | None, now: datetime) -> bool:
+    """#155 FH1 (design B12): the copy Flow looks off or broken when a sign-up was seen in the
+    last 72 hours (inclusive) and it is more than 6 hours newer than the newest copy record, or
+    there is no record at all."""
+
+    if last_sign_up_at is None or now - last_sign_up_at > FORMS_SIGN_UP_RECENT:
+        return False
+    return last_record_at is None or last_sign_up_at - last_record_at > FORMS_RECORD_LAG
+
+
+def forms_section(raw: Mapping[str, Any] | None, *, expected: bool, now: datetime) -> dict[str, Any] | None:
+    """#155 FH1: None (nothing changes) unless ``forms_watch_expected``. Otherwise the digest's
+    ``forms`` block as counts only, the email line and the WARN list; ``available`` false (the
+    line says so, no WARN) when the digest has no such block (the sync's watch is off) or could
+    not be read."""
+
+    if not expected:
+        return None
+    part = raw.get("forms") if isinstance(raw, dict) else None
+    if not isinstance(part, dict) or not isinstance(part.get("counts"), dict):
+        return {"available": False, "line": FORMS_LINE_PREFIX + "not available (forms watch off or digest failed)", "warn": [],
+                **{code: None for code in FORMS_SHOWN}}
+    counts = part["counts"]
+
+    def number(code: str) -> int:
+        return _count(counts.get(code)) or 0
+
+    shown = {
+        "forms_not_healed": _count(part.get("not_healed")) or 0,
+        "forms_account_used": number("forms_left_used"),
+        "forms_held": min(sum(number(code) for code in FORMS_HELD_CODES), COUNT_MAX),
+        "forms_would_heal": _count(part.get("would_heal")) or 0,
+        "forms_other_person": number("forms_other_person"),
+    }
+    warn = [FORMS_FLOW_SILENT] if forms_flow_silent(_instant(part.get("last_sign_up_at")), _instant(part.get("last_record_at")), now) else []
+    line = (FORMS_LINE_PREFIX + f"not healed {shown['forms_not_healed']} (account used {shown['forms_account_used']}, held {shown['forms_held']})"
+            f" | would heal {shown['forms_would_heal']} | other person {shown['forms_other_person']}")
+    return {"available": True, "line": line, "warn": warn, **shown}
+
+
 def _bounded(alerts: Mapping[str, int] | None) -> dict[str, int] | None:
     """At most MAX_ALERT_CODES entries in the email; the rest are summed as other_alert_codes."""
 
@@ -1045,9 +1109,11 @@ def _create_stops(creates: Mapping[str, Any], config: Mapping[str, Any], auto_of
 def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any],
                 members: Mapping[str, Any], new_members: Mapping[str, Any], first_create: bool,
                 expected_member_type: str, creates: Mapping[str, Any] | None = None, unfinished_backfill: int = 0,
-                member_tools: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                member_tools: Mapping[str, Any] | None = None, forms: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """``member_tools`` (#288 wiring, ``tools_part``): None gives the v1 event exactly; otherwise
-    the v2 event, the same 15 keys plus ``member_tools`` last. The sync's decision never reads it."""
+    the v2 event, the same 15 keys plus ``member_tools`` last. The sync's decision never reads it.
+    ``forms`` (#155 FH1, ``forms_section``): None changes nothing; otherwise its counts (and the
+    WARN code, with 1) are shown in the email's alert line, added after the decision."""
 
     stops, auto_off = decide(task, config, digest, expected_member_type, creates, unfinished_backfill)
     local = now.astimezone(SGT)
@@ -1060,6 +1126,9 @@ def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, 
         # BF2b: the backfill's creates shown apart in the email (its alert line; the event's
         # shape and the n8n validator are unchanged). Added after the decision: not an alert.
         alerts = {**alerts, BACKFILL_SHOWN: creates["backfill"]["creates"]}
+    if forms is not None and forms["available"] and alerts is not None:
+        # #155 FH1: likewise shown, never decided on (no STOP); the WARN as its code with 1.
+        alerts = {**alerts, **{code: forms[code] for code in FORMS_SHOWN}, **{code: 1 for code in forms["warn"]}}
     event = {
         "schema": EVENT_SCHEMA if member_tools is None else EVENT_SCHEMA_V2,
         "event": EVENT_NAME,
@@ -1182,17 +1251,19 @@ def read_history(out_dir: Path, today: str) -> tuple[int | None, bool]:
 
 
 def write_record(out_dir: Path, event: Mapping[str, Any], send_status: str, http_status: int | None, send_error: str | None,
-                 creates: Mapping[str, Any] | None = None) -> None:
+                 creates: Mapping[str, Any] | None = None, forms: Mapping[str, Any] | None = None) -> None:
     """Writes daily_summary_<date>.json inside the output folder only (temp file, then replace).
     #155 BF2b: with creates expected or a backfill window in effect, the split the decision used
-    (counts, dates and caps only) is kept as ``creates``; otherwise the record is as before."""
+    (counts, dates and caps only) is kept as ``creates``; otherwise the record is as before.
+    #155 FH1: with ``forms_watch_expected``, the forms line, counts and WARN list as ``forms``."""
 
     _require(send_status in SEND_STATUSES, "record_status_invalid")
     target = record_path(out_dir, event["summary_date"])
     _require(target.parent == out_dir, "record_path_invalid")
     temp = target.with_name(target.name + ".tmp")
     record = {"schema": RECORD_SCHEMA, "email_status": send_status, "http_status": http_status, "send_error": send_error,
-              "event": event, **({"creates": dict(creates)} if creates is not None else {})}
+              "event": event, **({"creates": dict(creates)} if creates is not None else {}),
+              **({"forms": dict(forms)} if forms is not None else {})}
     try:
         temp.unlink(missing_ok=True)
         with open(temp, "x", encoding="utf-8") as handle:
@@ -1324,6 +1395,7 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
     creates = creates_section(raw_digest, expected=settings["shopify_creates_expected"], window=window)
     # #288 wiring: the member core, then tags (each only when switched on), before the SQL part.
     member_tools = tools_part(settings, runner)
+    forms = forms_section(raw_digest, expected=settings["forms_watch_expected"], now=now)  # #155 FH1: None when not expected
     if config["available"] and config["autocount_book"] is not None:
         members, new_members = sql_reader(settings["sql"], config["autocount_book"])
     else:
@@ -1331,19 +1403,21 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
     first_create = bool(digest["available"] and digest["ac2_creates"] > 0 and not seen_create and not settings["first_create_already_seen"])
     event = build_event(now=now, task=task, config=config, digest=digest, members=members, new_members=new_members,
                         first_create=first_create, expected_member_type=settings["expected_member_type"], creates=creates,
-                        unfinished_backfill=backfill_unfinished(raw_digest), member_tools=member_tools)
+                        unfinished_backfill=backfill_unfinished(raw_digest), member_tools=member_tools, forms=forms)
     check_event(event)
 
-    write_record(out_dir, event, "pending", None, None, creates)
+    write_record(out_dir, event, "pending", None, None, creates, forms)
     if no_send:
         status, http_status, error = "not_sent_check_only", None, None
     else:
         status, http_status, error = send_event(event, settings["send"], cred_reader=cred_reader, poster=poster)
-    write_record(out_dir, event, status, http_status, error, creates)
+    write_record(out_dir, event, status, http_status, error, creates, forms)
     answer = {"status": "ok", "result": event["result"], "stop_reasons": event["stop_reasons"], "auto_off": event["auto_off"],
               "email_status": status, "http_status": http_status, "record": record_path(out_dir, today).name}
     if member_tools is not None:
         answer["overall"] = overall_word(event["result"], member_tools)  # #288 wiring: v2 only, the subject word
+    if forms is not None:
+        answer["forms_warn"] = list(forms["warn"])  # #155 FH1: only with forms_watch_expected
     return answer
 
 
