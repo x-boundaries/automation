@@ -20,6 +20,14 @@ AC2 VM, as the sync's task account. It automates the manual daily check of the m
 An email failure never fails the task: it exits 0 and the record says ``send_failed``. The event
 carries counts, closed codes, booleans and MemberNo refs masked to their last 3 characters only.
 Standard library only (pyodbc is imported only when the SQL lines are enabled).
+
+#288 member email wiring (design mailbox 288 G0, 14 Nov 2026): the optional settings key
+``member_tools`` switches on, one by one (default off), the ``digest --hours 24`` of the member
+core (``xb_member_benefits.py``) and of the tags tool (``xb_member_tags.py``), the sibling files
+of this one, as two more child processes. Each tool gets its own CLEAN, WARN or STOP from a closed
+reason list; it never changes the sync's ``result``, ``stop_reasons`` or ``auto_off``. With both
+switches off (or the key absent) the event is the v1 event, byte for byte; with at least one on it
+is ``xb.member_sync.daily_summary.v2``: the same 15 keys plus ``member_tools``.
 """
 
 from __future__ import annotations
@@ -148,7 +156,7 @@ _SETTINGS_KEYS = {"schema", "sync_config_path", "sync_state_root", "output_dir",
 # backfill_members_window (default null): the dates (Singapore, inclusive) of the attended
 # backfill-members sittings and the caps declared for them; backfill creates are judged against
 # it, and are a stop outside it.
-_SETTINGS_OPTIONAL = {"shopify_creates_expected", "backfill_members_window"}
+_SETTINGS_OPTIONAL = {"shopify_creates_expected", "backfill_members_window", "member_tools"}  # member_tools: #288 wiring
 _WINDOW_KEYS = {"from", "to", "max_per_call", "max_per_hour"}
 BACKFILL_WINDOW_MAX_DAYS = 14
 BACKFILL_MAX_PER_CALL = 25  # the sync's own bounds (design 2.7)
@@ -163,6 +171,58 @@ SHOPIFY_REJECTED = "shopify_create_rejected"
 BACKFILL_SHOWN = "backfill_members_creates"
 _SQL_KEYS = {"enabled", "server", "odbc_driver", "encrypt", "trust_server_certificate", "allow_privileged_identity",
              "timeout_seconds"}
+
+# #288 member email wiring. The optional settings key ``member_tools`` (absent: as before).
+EVENT_SCHEMA_V2 = "xb.member_sync.daily_summary.v2"
+TOOL_NAMES = ("member_core", "tags")  # the order of the children, the event and the email
+# The tool scripts are always the sibling files of this one (never a configured command).
+TOOL_SCRIPTS = {
+    "member_core": Path(__file__).resolve().parent / "xb_member_benefits.py",
+    "tags": Path(__file__).resolve().parent / "xb_member_tags.py",
+}
+# The only tool command this script may start (read-only: a mode=ro ledger open, no lock or login).
+TOOL_COMMANDS = ("digest",)
+_TOOL_KEYS = {"enabled", "config_path", "state_root", "timeout_seconds"}
+TOOL_TIMEOUT_MIN, TOOL_TIMEOUT_MAX = 10, 60
+TOOL_STATUSES = ("CLEAN", "WARN", "STOP")  # worst last
+# A tool section that could not be read: the tool's own refusal code passes through when it is a
+# plain code word; otherwise one of these.
+TOOL_FAILURES = ("timed_out", "no_answer", "exit_code", "email_block_invalid", "digest_schema_unknown", "unreadable_refusal")
+# Tags (design 2.1): the digest's fixed ``email`` block only, exactly these keys.
+TAGS_COUNT_KEYS = ("runs_completed", "runs_unfinished", "tagged_now", "bday_tagged_now", "would_tag", "would_untag",
+                   "would_bday_tag", "would_bday_untag", "open_writes")
+TAGS_EMAIL_KEYS = frozenset(TAGS_COUNT_KEYS) | {"alerts", "stale_month"}
+TAGS_MAX_ALERTS = 20  # the block's own cap (sorted, then cut): a full list may hide a STOP code
+TAGS_FIELDS = ("runs_completed", "runs_unfinished", "tagged_now", "bday_tagged_now", "would_tag", "would_untag",
+               "would_bday_tag", "would_bday_untag", "stale_month", "open_writes", "alerts")
+TAGS_STOP_REASONS = ("digest_failed", "no_runs", "unfinished_runs", "open_writes", "write_alert", "alerts_at_cap")
+TAGS_WARN_REASONS = ("open_writes_run_in_progress", "stale_month", "alerts")
+TAGS_STOP_ALERTS = ("write_uncertain", "write_unresolved")
+# Shown, never a status change. Empty: the tags runbook says of no alert in words that it needs
+# no action (G1 check, 17 Nov 2026).
+TAGS_INFO_ALERTS: tuple[str, ...] = ()
+# Member core (design 2.2): the existing digest, these keys only, under its own schema value.
+CORE_DIGEST_SCHEMA = "xb.directlocal.member_benefits.digest.v1"
+CORE_PINNED = (
+    ("rule_settings_match", ("rule_settings_match",)),
+    ("runs_completed", ("runs", "completed")),
+    ("runs_unfinished", ("runs", "unfinished")),
+    ("uncertain_writes", ("open", "uncertain_writes")),
+    ("held_writes", ("open", "held_writes")),
+    ("waiting_member", ("open", "waiting_member")),
+    ("would_upgrade", ("shadow", "would_upgrade")),
+    ("would_extend", ("shadow", "would_extend")),
+)
+CORE_FIELDS = tuple(field for field, _ in CORE_PINNED) + ("alerts",)
+CORE_STOP_REASONS = ("digest_failed", "rule_settings_mismatch", "no_runs", "unfinished_runs", "uncertain_writes")
+CORE_WARN_REASONS = ("uncertain_writes_run_in_progress", "held_writes", "alerts")
+# The member core runbook, section 8: these "need no staff action on their own".
+CORE_INFO_ALERTS = ("orders_read_incomplete", "member_reads_capped")
+TOOL_RULES = {
+    "member_core": (CORE_STOP_REASONS, CORE_WARN_REASONS, CORE_FIELDS),
+    "tags": (TAGS_STOP_REASONS, TAGS_WARN_REASONS, TAGS_FIELDS),
+}
+TOOL_SECTION_HEAD = ("status", "reasons", "available", "refusal")
 _SEND_KEYS = {"enabled", "webhook_url", "auth_header_name", "secret_credential_target", "timeout_seconds"}
 
 
@@ -231,11 +291,14 @@ def parse_settings(value: Any) -> dict[str, Any]:
         "child_timeout_seconds": _int(value["child_timeout_seconds"], 10, 600, "settings_child_timeout_invalid"),
         "shopify_creates_expected": _bool(value.get("shopify_creates_expected", False), "settings_shopify_creates_expected_invalid"),
         "backfill_members_window": _window(value.get("backfill_members_window")),
+        "member_tools": _member_tools(value["member_tools"]) if "member_tools" in value else None,
     }
     # The summary never writes into the sync's private state: the record folder is checked
     # against the state root named here, not against the live sync config (a broken live config
     # must still give a STOP email, not a refusal before anything is read).
     _require(not _written_inside(settings["output_dir"], settings["sync_state_root"]), "output_dir_inside_sync_state")
+    # Nor into a member tool's private state (each tool's root as written, whether on or off).
+    _require(not any(_written_inside(settings["output_dir"], root) for root in tool_state_roots(settings)), "output_dir_inside_tool_state")
     expected = value["expected_member_type"]
     _require(isinstance(expected, str) and MEMBER_TYPE_RE.fullmatch(expected) is not None, "settings_expected_member_type_invalid")
     settings["expected_member_type"] = expected
@@ -297,6 +360,35 @@ def _window(value: Any) -> dict[str, Any] | None:
     return {"from": days[0].isoformat(), "to": days[1].isoformat(), "max_per_call": per_call, "max_per_hour": per_hour}
 
 
+def _member_tools(value: Any) -> dict[str, dict[str, Any]]:
+    """#288 wiring (design 1.1): both tools, each with exactly ``enabled``, ``config_path``
+    (absolute), ``state_root`` (absolute folder, no ``..``) and ``timeout_seconds`` (10-60)."""
+
+    _require(isinstance(value, dict) and set(value) == set(TOOL_NAMES), "settings_member_tools_invalid")
+    tools = {}
+    for name in TOOL_NAMES:
+        code = "settings_member_tools_%s_invalid" % name
+        tool = value[name]
+        _require(isinstance(tool, dict) and set(tool) == _TOOL_KEYS, code)
+        tools[name] = {
+            "enabled": _bool(tool["enabled"], code),
+            "config_path": _absolute(tool["config_path"], code),
+            "state_root": _folder(tool["state_root"], code),
+            "timeout_seconds": _int(tool["timeout_seconds"], TOOL_TIMEOUT_MIN, TOOL_TIMEOUT_MAX, code),
+        }
+    return tools
+
+
+def tool_state_roots(settings: Mapping[str, Any]) -> list[str]:
+    tools = settings.get("member_tools")
+    return [] if tools is None else [tools[name]["state_root"] for name in TOOL_NAMES]
+
+
+def enabled_tools(settings: Mapping[str, Any]) -> tuple[str, ...]:
+    tools = settings.get("member_tools")
+    return () if tools is None else tuple(name for name in TOOL_NAMES if tools[name]["enabled"])
+
+
 def window_in_effect(window: Mapping[str, Any] | None, today: str) -> bool:
     """The 24 hours before this morning's summary (yesterday and today, Singapore) touch the
     declared window."""
@@ -308,10 +400,12 @@ def window_in_effect(window: Mapping[str, Any] | None, today: str) -> bool:
 
 
 def worst_case_seconds(settings: Mapping[str, Any]) -> int:
-    """The longest one run can wait: every child, the SQL part (when enabled) and the POST."""
+    """The longest one run can wait: every child (with each enabled member tool's own timeout),
+    the SQL part (when enabled) and the POST."""
 
     sql = settings["sql"]["timeout_seconds"] * SQL_WAITS if settings["sql"]["enabled"] else 0
-    return settings["child_timeout_seconds"] * CHILD_COUNT + sql + settings["send"]["timeout_seconds"]
+    tools = sum(settings["member_tools"][name]["timeout_seconds"] for name in enabled_tools(settings))
+    return settings["child_timeout_seconds"] * CHILD_COUNT + tools + sql + settings["send"]["timeout_seconds"]
 
 
 def load_settings(path: str | Path) -> dict[str, Any]:
@@ -334,6 +428,7 @@ def check_output_dir(settings: Mapping[str, Any]) -> Path:
     _require(out.is_dir(), "output_dir_missing")
     resolved = out.resolve()
     _require(not _resolved_inside(resolved, Path(settings["sync_state_root"]).resolve()), "output_dir_inside_sync_state")
+    _require(not any(_resolved_inside(resolved, Path(root).resolve()) for root in tool_state_roots(settings)), "output_dir_inside_tool_state")
     return resolved
 
 
@@ -394,6 +489,34 @@ def run_sync(command: str, settings: Mapping[str, Any], runner: Callable[[list[s
     if code != 0 or not isinstance(answer, dict) or answer.get("status") != "ok":
         return None
     return answer
+
+
+def run_tool(name: str, command: str, settings: Mapping[str, Any],
+             runner: Callable[[list[str], int], tuple[int, str]]) -> tuple[dict[str, Any] | None, str | None]:
+    """#288 wiring (design 1.2): runs one member tool's allowlisted command, the tool's sibling
+    script with a pinned argv and the tool's own timeout. Returns (answer, None) for an ``ok``
+    answer with exit 0, else (None, refusal): the tool's own refusal code when it is a plain code
+    word, else a closed TOOL_FAILURES code. Never raises for a failed child."""
+
+    if command not in TOOL_COMMANDS or name not in TOOL_NAMES:
+        raise SummaryError("tool_command_not_allowed")
+    tool = settings["member_tools"][name]
+    argv = [sys.executable, str(TOOL_SCRIPTS[name]), command, "--config", tool["config_path"], "--hours", str(DIGEST_HOURS)]
+    try:
+        code, out = runner(argv, tool["timeout_seconds"])
+    except subprocess.TimeoutExpired:
+        return None, "timed_out"
+    except (OSError, subprocess.SubprocessError):
+        return None, "no_answer"
+    answer = _last_json_line(out)
+    if isinstance(answer, dict) and answer.get("status") == "refused":
+        refusal = answer.get("code")
+        return None, refusal if _safe_code(refusal, CODE_RE) else "unreadable_refusal"
+    if code != 0:
+        return None, "exit_code"
+    if not isinstance(answer, dict) or answer.get("status") != "ok":
+        return None, "no_answer"
+    return answer, None
 
 
 def read_task_state(settings: Mapping[str, Any], runner: Callable[[list[str], int], tuple[int, str]]) -> dict[str, Any] | None:
@@ -696,6 +819,137 @@ def _alert_is_expected(code: str) -> bool:
     return code in EXPECTED_ALERTS or code.startswith(EXPECTED_ALERT_PREFIXES)
 
 
+# --------------------------------------------------------------------------------------------
+# #288 wiring: the member tools' sections (design 1.3, 2.1, 2.2). A tool never changes the sync's
+# decision; each gets its own status from its own closed reason lists.
+# --------------------------------------------------------------------------------------------
+
+def _tool_verdict(name: str, stops: set[str], warns: set[str]) -> tuple[str, list[str]]:
+    stop_order, warn_order, _ = TOOL_RULES[name]
+    reasons = [c for c in stop_order if c in stops] + [c for c in warn_order if c in warns]
+    return ("STOP" if stops else "WARN" if warns else "CLEAN"), reasons
+
+
+def tool_failed(name: str, refusal: str) -> dict[str, Any]:
+    """An enabled tool that could not be read: STOP for that tool (never hidden, never guessed)."""
+
+    _, _, fields = TOOL_RULES[name]
+    return {"status": "STOP", "reasons": ["digest_failed"], "available": False, "refusal": refusal, **{f: None for f in fields}}
+
+
+def tags_section(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The tags digest's fixed ``email`` block, read alone and exactly (any missing, extra or
+    wrong-typed key: digest_failed with email_block_invalid; nothing is guessed from the rest)."""
+
+    email = raw.get("email") if isinstance(raw, dict) else None
+    if not isinstance(email, dict) or set(email) != TAGS_EMAIL_KEYS:
+        return tool_failed("tags", "email_block_invalid")
+    values: dict[str, Any] = {key: _count(email[key]) for key in TAGS_COUNT_KEYS}
+    listed = email["alerts"]
+    if (any(value is None for value in values.values()) or not isinstance(email["stale_month"], bool)
+            or not isinstance(listed, list) or len(listed) > TAGS_MAX_ALERTS or not all(isinstance(code, str) for code in listed)):
+        return tool_failed("tags", "email_block_invalid")
+    # A code the summary's own check refuses (a colon, a phone-length digit run, an @) is shown
+    # as unreadable_alert_code: never passed on, still counted as an alert.
+    alerts = sorted({code if _safe_code(code, CODE_RE) else UNREADABLE_ALERT for code in listed})
+    values.update(stale_month=email["stale_month"], alerts=alerts)
+    unfinished, open_writes = values["runs_unfinished"], values["open_writes"]
+    stops, warns = set(), set()
+    if values["runs_completed"] == 0:
+        stops.add("no_runs")
+    if unfinished > 1:
+        stops.add("unfinished_runs")
+    if open_writes > 0 and unfinished == 0:
+        stops.add("open_writes")
+    if any(code in TAGS_STOP_ALERTS for code in alerts):
+        stops.add("write_alert")
+    if len(listed) >= TAGS_MAX_ALERTS:
+        stops.add("alerts_at_cap")  # the block cut its sorted list: a STOP code may be cut off
+    if open_writes > 0 and unfinished == 1:
+        warns.add("open_writes_run_in_progress")
+    if values["stale_month"]:
+        warns.add("stale_month")
+    if any(code not in TAGS_STOP_ALERTS and code not in TAGS_INFO_ALERTS for code in alerts):
+        warns.add("alerts")
+    status, reasons = _tool_verdict("tags", stops, warns)
+    return {"status": status, "reasons": reasons, "available": True, "refusal": None, **{f: values[f] for f in TAGS_FIELDS}}
+
+
+def core_section(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The member core's existing digest: the pinned keys only, under its own schema value (any
+    other value, or a pinned key missing or wrong-typed: digest_failed with digest_schema_unknown).
+    Its alert refs, receipts, counts, gift card part and book are never read."""
+
+    if not isinstance(raw, dict) or raw.get("schema") != CORE_DIGEST_SCHEMA:
+        return tool_failed("member_core", "digest_schema_unknown")
+    values: dict[str, Any] = {}
+    for field, path in CORE_PINNED:
+        value: Any = raw
+        for part in path:
+            value = value.get(part) if isinstance(value, dict) else None
+        if field == "rule_settings_match":
+            value = value if isinstance(value, bool) else None
+        else:
+            value = _count(value)
+        if value is None:
+            return tool_failed("member_core", "digest_schema_unknown")
+        values[field] = value
+    listed = raw.get("alerts")
+    if not isinstance(listed, dict) or any(_count(number) is None for number in listed.values()):
+        return tool_failed("member_core", "digest_schema_unknown")
+    alerts: dict[str, int] = {}
+    for code, number in sorted(listed.items()):
+        key = code if _safe_code(code, CODE_RE) else UNREADABLE_ALERT
+        alerts[key] = min(alerts.get(key, 0) + _count(number), COUNT_MAX)
+    unfinished, uncertain = values["runs_unfinished"], values["uncertain_writes"]
+    stops, warns = set(), set()
+    if values["rule_settings_match"] is False:
+        stops.add("rule_settings_mismatch")
+    if values["runs_completed"] == 0:
+        stops.add("no_runs")
+    if unfinished > 1:
+        stops.add("unfinished_runs")
+    if uncertain > 0 and unfinished == 0:
+        stops.add("uncertain_writes")
+    if uncertain > 0 and unfinished == 1:
+        warns.add("uncertain_writes_run_in_progress")  # the 06:37 run's INTENT row, still running
+    if values["held_writes"] > 0:
+        warns.add("held_writes")
+    if any(code not in CORE_INFO_ALERTS for code in alerts):
+        warns.add("alerts")
+    status, reasons = _tool_verdict("member_core", stops, warns)
+    # Decided on every code; the email list is bounded as the sync's (other_alert_codes).
+    values["alerts"] = _bounded(alerts)
+    return {"status": status, "reasons": reasons, "available": True, "refusal": None, **{f: values[f] for f in CORE_FIELDS}}
+
+
+TOOL_SECTIONS = {"member_core": core_section, "tags": tags_section}
+
+
+def tools_part(settings: Mapping[str, Any], runner: Callable[[list[str], int], tuple[int, str]]) -> dict[str, Any] | None:
+    """The event's ``member_tools``: None when no tool is enabled (the v1 event); else each tool's
+    section, or None for a tool that is off. A disabled tool is never started."""
+
+    enabled = enabled_tools(settings)
+    if not enabled:
+        return None
+    part: dict[str, Any] = {}
+    for name in TOOL_NAMES:
+        if name not in enabled:
+            part[name] = None
+            continue
+        answer, refusal = run_tool(name, "digest", settings, runner)
+        part[name] = tool_failed(name, refusal) if answer is None else TOOL_SECTIONS[name](answer)
+    return part
+
+
+def overall_word(result: str, member_tools: Mapping[str, Any] | None) -> str:
+    """The subject word: the worst of the sync's result and each enabled tool's status."""
+
+    words = [result] + [section["status"] for section in (member_tools or {}).values() if section is not None]
+    return max(words, key=TOOL_STATUSES.index)
+
+
 def decide(task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any], expected_member_type: str,
            creates: Mapping[str, Any] | None = None, unfinished_backfill: int = 0) -> tuple[list[str], list[str]]:
     """Returns (stop_reasons, auto_off_reasons), each in the pinned order of its closed list.
@@ -790,7 +1044,11 @@ def _create_stops(creates: Mapping[str, Any], config: Mapping[str, Any], auto_of
 
 def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, Any], digest: Mapping[str, Any],
                 members: Mapping[str, Any], new_members: Mapping[str, Any], first_create: bool,
-                expected_member_type: str, creates: Mapping[str, Any] | None = None, unfinished_backfill: int = 0) -> dict[str, Any]:
+                expected_member_type: str, creates: Mapping[str, Any] | None = None, unfinished_backfill: int = 0,
+                member_tools: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """``member_tools`` (#288 wiring, ``tools_part``): None gives the v1 event exactly; otherwise
+    the v2 event, the same 15 keys plus ``member_tools`` last. The sync's decision never reads it."""
+
     stops, auto_off = decide(task, config, digest, expected_member_type, creates, unfinished_backfill)
     local = now.astimezone(SGT)
     new_members = dict(new_members)
@@ -802,8 +1060,8 @@ def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, 
         # BF2b: the backfill's creates shown apart in the email (its alert line; the event's
         # shape and the n8n validator are unchanged). Added after the decision: not an alert.
         alerts = {**alerts, BACKFILL_SHOWN: creates["backfill"]["creates"]}
-    return {
-        "schema": EVENT_SCHEMA,
+    event = {
+        "schema": EVENT_SCHEMA if member_tools is None else EVENT_SCHEMA_V2,
         "event": EVENT_NAME,
         "summary_date": local.strftime("%Y-%m-%d"),
         "generated_at": local.strftime("%Y-%m-%dT%H:%M+08:00"),
@@ -819,16 +1077,61 @@ def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, 
         "first_create": first_create,
         "owner_session": "not_checked",
     }
+    if member_tools is not None:
+        event["member_tools"] = {name: None if member_tools[name] is None else dict(member_tools[name]) for name in TOOL_NAMES}
+    return event
 
 
 EVENT_KEYS = ("schema", "event", "summary_date", "generated_at", "result", "stop_reasons", "auto_off", "auto_off_reasons",
               "task", "config", "digest", "members_per_type", "new_members_24h", "first_create", "owner_session")
+EVENT_KEYS_V2 = EVENT_KEYS + ("member_tools",)
+
+
+def _check_tools(part: Any) -> None:
+    """#288 wiring: the v2 event's ``member_tools``: exact keys and closed values per tool."""
+
+    code = "event_member_tools_invalid"
+    _require(isinstance(part, dict) and tuple(part) == TOOL_NAMES and any(part[name] is not None for name in TOOL_NAMES), code)
+    for name in TOOL_NAMES:
+        section = part[name]
+        if section is None:
+            continue
+        stop_order, warn_order, fields = TOOL_RULES[name]
+        _require(isinstance(section, dict) and tuple(section) == TOOL_SECTION_HEAD + fields, code)
+        reasons = section["reasons"]
+        _require(isinstance(reasons, list) and all(isinstance(r, str) for r in reasons), code)
+        pinned = stop_order + warn_order
+        _require(all(r in pinned for r in reasons) and [r for r in pinned if r in reasons] == reasons, code)
+        has_stop = any(r in stop_order for r in reasons)
+        expected = "STOP" if has_stop else "WARN" if reasons else "CLEAN"
+        _require(section["status"] == expected, code)
+        if section["available"] is False:
+            _require(reasons == ["digest_failed"] and _safe_code(section["refusal"], CODE_RE)
+                     and all(section[f] is None for f in fields), code)
+            continue
+        _require(section["available"] is True and section["refusal"] is None and "digest_failed" not in reasons, code)
+        for field in fields:
+            value = section[field]
+            if field == "alerts":
+                if name == "tags":
+                    _require(isinstance(value, list) and len(value) <= TAGS_MAX_ALERTS and value == sorted(set(value))
+                             and all(_safe_code(c, CODE_RE) for c in value), code)
+                else:
+                    _require(isinstance(value, dict) and len(value) <= MAX_ALERT_CODES
+                             and all(_safe_code(c, CODE_RE) and _count(n) == n for c, n in value.items()), code)
+            elif field in ("stale_month", "rule_settings_match"):
+                _require(isinstance(value, bool), code)
+            else:
+                _require(_count(value) == value and value is not None, code)
 
 
 def check_event(event: Mapping[str, Any]) -> None:
     """Last guard before the POST: the closed shape, and no value that could be personal data."""
 
-    _require(tuple(event) == EVENT_KEYS, "event_keys_invalid")
+    v2 = event.get("schema") == EVENT_SCHEMA_V2
+    _require(tuple(event) == (EVENT_KEYS_V2 if v2 else EVENT_KEYS), "event_keys_invalid")
+    if v2:
+        _check_tools(event["member_tools"])
     _require(event["result"] in ("CLEAN", "STOP") and (event["result"] == "STOP") == bool(event["stop_reasons"]), "event_result_invalid")
     _require(all(code in STOP_CODES for code in event["stop_reasons"]), "event_stop_reason_invalid")
     _require(event["auto_off"] in AUTO_OFF_MODES and all(code in AUTO_OFF_CODES for code in event["auto_off_reasons"]), "event_auto_off_invalid")
@@ -1019,6 +1322,8 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
     digest = digest_section(raw_digest, links_yesterday)
     window = settings["backfill_members_window"] if window_in_effect(settings["backfill_members_window"], today) else None
     creates = creates_section(raw_digest, expected=settings["shopify_creates_expected"], window=window)
+    # #288 wiring: the member core, then tags (each only when switched on), before the SQL part.
+    member_tools = tools_part(settings, runner)
     if config["available"] and config["autocount_book"] is not None:
         members, new_members = sql_reader(settings["sql"], config["autocount_book"])
     else:
@@ -1026,7 +1331,7 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
     first_create = bool(digest["available"] and digest["ac2_creates"] > 0 and not seen_create and not settings["first_create_already_seen"])
     event = build_event(now=now, task=task, config=config, digest=digest, members=members, new_members=new_members,
                         first_create=first_create, expected_member_type=settings["expected_member_type"], creates=creates,
-                        unfinished_backfill=backfill_unfinished(raw_digest))
+                        unfinished_backfill=backfill_unfinished(raw_digest), member_tools=member_tools)
     check_event(event)
 
     write_record(out_dir, event, "pending", None, None, creates)
@@ -1035,8 +1340,11 @@ def daily(settings: Mapping[str, Any], *, now: datetime, no_send: bool = False,
     else:
         status, http_status, error = send_event(event, settings["send"], cred_reader=cred_reader, poster=poster)
     write_record(out_dir, event, status, http_status, error, creates)
-    return {"status": "ok", "result": event["result"], "stop_reasons": event["stop_reasons"], "auto_off": event["auto_off"],
-            "email_status": status, "http_status": http_status, "record": record_path(out_dir, today).name}
+    answer = {"status": "ok", "result": event["result"], "stop_reasons": event["stop_reasons"], "auto_off": event["auto_off"],
+              "email_status": status, "http_status": http_status, "record": record_path(out_dir, today).name}
+    if member_tools is not None:
+        answer["overall"] = overall_word(event["result"], member_tools)  # #288 wiring: v2 only, the subject word
+    return answer
 
 
 def _emit(value: Mapping[str, Any]) -> None:
@@ -1052,7 +1360,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings(args.settings)
         if args.command == "check-settings":
-            _emit({"status": "ok", "send_enabled": settings["send"]["enabled"], "sql_enabled": settings["sql"]["enabled"]})
+            enabled = enabled_tools(settings)
+            _emit({"status": "ok", "send_enabled": settings["send"]["enabled"], "sql_enabled": settings["sql"]["enabled"],
+                   "member_core_enabled": "member_core" in enabled, "tags_enabled": "tags" in enabled})
             return 0
         _emit(daily(settings, now=datetime.now(timezone.utc), no_send=args.no_send))
         return 0

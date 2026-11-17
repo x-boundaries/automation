@@ -5,9 +5,23 @@
   "output_dir": "C:\\XB\\example\\member_sync_daily_summary",
   "expected_member_type": "GUEST",
   "first_create_already_seen": false,
-  "child_timeout_seconds": 60,
+  "child_timeout_seconds": 40,
   "shopify_creates_expected": false,
   "backfill_members_window": null,
+  "member_tools": {
+    "member_core": {
+      "enabled": false,
+      "config_path": "C:\\XB\\example\\member_benefits_live.json",
+      "state_root": "C:\\XB\\example\\member_benefits_state",
+      "timeout_seconds": 20
+    },
+    "tags": {
+      "enabled": false,
+      "config_path": "C:\\XB\\example\\member_tags_live.json",
+      "state_root": "C:\\XB\\example\\member_tags_state",
+      "timeout_seconds": 20
+    }
+  },
   "sql": {
     "enabled": true,
     "server": "localhost\\EXAMPLE",

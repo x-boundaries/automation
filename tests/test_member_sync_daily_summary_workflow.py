@@ -99,8 +99,9 @@ process.stdout.write(JSON.stringify(results));
 """
 
 
-def build(task=None, config=None, digest=None, members=None, new_members=None, first_create=False):
-    """An event exactly as the VM script builds it, from fake child answers."""
+def build(task=None, config=None, digest=None, members=None, new_members=None, first_create=False, member_tools=None):
+    """An event exactly as the VM script builds it, from fake child answers. ``member_tools``
+    (#288 wiring): None gives the v1 event; else the two tool sections (None: that tool off)."""
 
     task = summary.task_section({"state": "Ready", "last_run": "2026-11-07T06:30", "last_result": 0,
                                  "next_run": "2026-11-07T06:45", "missed_runs": 0} if task is None else task)
@@ -120,7 +121,7 @@ def build(task=None, config=None, digest=None, members=None, new_members=None, f
     members = members or summary.members_section([("GUEST", 12), ("MEMBER", 2000), (None, 1)], None)
     new_members = new_members or summary.new_members_section(3, None, None)
     event = summary.build_event(now=NOW, task=task, config=config, digest=digest, members=members, new_members=new_members,
-                                first_create=first_create, expected_member_type="GUEST")
+                                first_create=first_create, expected_member_type="GUEST", member_tools=member_tools)
     summary.check_event(event)
     return json.loads(json.dumps(event))
 
@@ -243,7 +244,7 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
         return results
 
-    def assert_sent(self, result, subject):
+    def assert_sent(self, result, subject, subject_re=SUBJECT_RE):
         (item,) = result["out"]
         self.assertIs(item["json"]["valid"], True, item)
         self.assertEqual(set(item["json"]), {"valid", "severity", "short", "lines"})
@@ -253,7 +254,7 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
         self.assertIsNone(plan["json"]["held_outcome"])
         mail = plan["json"]["mail"]
         self.assertEqual(mail["subject"], subject)
-        self.assertRegex(mail["subject"], SUBJECT_RE)
+        self.assertRegex(mail["subject"], subject_re)
         self.assertEqual(plan["json"]["mail_row"]["key"], "daily_summary")
         self.assertNotRegex(mail["text"], r"AC2-STOCK|ENERGYGRID", "one app per email")
         self.assertNotIn("FAKE-SECRET", json.dumps(result))
@@ -488,6 +489,380 @@ class Bf2bWorkflowTests(unittest.TestCase):
         text = self.assert_sent(result, "[XB daily] MEMBER-SYNC CLEAN 2026-11-07")
         for line in ("shopify_create=yes", "Shopify writes=41", "backfill_members_creates=40", "No stop condition found."):
             self.assertIn(line, text)
+
+
+# ------------------------------------------------------------------------------------------------
+# #288 member email wiring: the v2 event (member core and tags) in the same Code node
+# ------------------------------------------------------------------------------------------------
+
+SUBJECT_V2_RE = re.compile(r"^\[XB daily\] MEMBER-SYNC (CLEAN|WARN|STOP) \d{4}-\d{2}-\d{2}$")
+FAKE_AT = "x@example.com"
+MORE_RE = re.compile(r"\+\d+ more \(see the VM record\)")
+# SHA-256 of the Code node's output for every body of v1_golden_bodies(), made with the
+# main 8222aed export of this workflow (scripted, #288 wiring G1): a v1 event renders exactly as before.
+V1_LINES_GOLDEN_SHA256 = "da9c0ef40da2d42eea8b80932df7598784057c5b55e408864cb40a7fd328057b"
+# SHA-256 of this export with the Validate Summary Event jsCode blanked. Made on main 8222aed
+# (8a77d55f...), then re-made at fix 1 (G2 LATER 1) after the Start Here sticky's Input and Subject
+# bullets and its height (400 -> 460) changed: no other node, connection, setting or note changed.
+WORKFLOW_REST_SHA256 = "29f9b7b1cb747d05ee6afdbf49afaca6fbb08d2f415250235118fc0c70d6158e"
+
+
+def core_raw(alerts=None, runs=None, opened=None, **overrides):
+    value = {"schema": summary.CORE_DIGEST_SCHEMA, "status": "ok", "rule_settings_match": True,
+             "runs": {"completed": 96, "unfinished": 0, **(runs or {})}, "alerts": dict(alerts or {}),
+             "shadow": {"would_upgrade": 3, "would_extend": 1},
+             "open": {"uncertain_writes": 0, "held_writes": 0, "waiting_member": 2, **(opened or {})}}
+    value.update(overrides)
+    return value
+
+
+def tags_raw(**email):
+    block = {"runs_completed": 12, "runs_unfinished": 0, "tagged_now": 812, "bday_tagged_now": 40, "would_tag": 3, "would_untag": 0,
+             "would_bday_tag": 2, "would_bday_untag": 0, "alerts": [], "stale_month": False, "open_writes": 0}
+    block.update(email)
+    return {"status": "ok", "email": block}
+
+
+CORE_CASES = {
+    "CLEAN": lambda: summary.core_section(core_raw(alerts={"orders_read_incomplete": 1})),
+    "WARN": lambda: summary.core_section(core_raw(opened={"held_writes": 1})),
+    "STOP": lambda: summary.core_section(core_raw(rule_settings_match=False)),
+    "failed": lambda: summary.tool_failed("member_core", "benefits_ledger_missing"),
+}
+TAGS_CASES = {
+    "CLEAN": lambda: summary.tags_section(tags_raw()),
+    "WARN": lambda: summary.tags_section(tags_raw(stale_month=True)),
+    "STOP": lambda: summary.tags_section(tags_raw(alerts=["write_uncertain"])),
+    "failed": lambda: summary.tool_failed("tags", "tags_ledger_missing"),
+}
+
+
+def stop_sync_task():
+    return {"state": "Disabled", "last_run": "2026-11-07T06:30", "last_result": 1, "next_run": "2026-11-07T06:45", "missed_runs": 0}
+
+
+def worst_v1_parts():
+    """The sync's worst case (every list at its bound, codes at 64 characters, counts at COUNT_MAX)."""
+
+    alerts = {("memberno_" + "x" * 53 + "%02d" % n): summary.COUNT_MAX for n in range(60)}
+    alerts.update({"possible_duplicate_member": 1, "member_type_unknown": 1, "autocount_" + "z" * 54: 1, "q" * 64: 1})
+    refs = [{"ref": "m-%02x" % n, "code": "memberno_" + "y" * 55, "member_no_masked": "*******%03d" % n} for n in range(40)]
+    return dict(task={"state": "Disabled", "last_run": "2026-11-07T06:30", "last_result": 2147942402, "next_run": "2026-11-07T06:45",
+                      "missed_runs": summary.COUNT_MAX},
+                config={"status": "ok", "autocount_book": "AED_XBOUNDARIES", "ac2_create_enabled": True, "shopify_create_enabled": False,
+                        "max_writes_per_run": 1, "max_creates_per_hour": 6, "ac2_create_member_type": "X" * 20, "immediate_create_enabled": True},
+                digest={"runs": {"completed": 0, "unfinished": summary.COUNT_MAX, "duration_seconds_max": summary.COUNT_MAX,
+                                 "duration_seconds_median": summary.COUNT_MAX},
+                        "counts": {"ac2_member_created": summary.COUNT_MAX, "created_immediately": summary.COUNT_MAX,
+                                   "created_after_wait": summary.COUNT_MAX, "shopify_customer_created": summary.COUNT_MAX},
+                        "alerts": alerts, "alert_refs": refs,
+                        "open": {"uncertain_writes": summary.COUNT_MAX, "links": summary.COUNT_MAX, "ac2_pending": summary.COUNT_MAX,
+                                 "ac2_pending_would_create": summary.COUNT_MAX, "shopify_pending": summary.COUNT_MAX},
+                        "creates": {"writes_per_hour_max": summary.COUNT_MAX}},
+                members=summary.members_section([("T" + "z" * 17 + "%02d" % n, summary.COUNT_MAX) for n in range(30)], None),
+                new_members=summary.new_members_section(summary.COUNT_MAX, None, None), first_create=True)
+
+
+def worst_tools():
+    """Each tool's worst valid section: every reason it can show at once, counts at COUNT_MAX and 20
+    alert codes of 64 characters (accepted by the VM's own check_event)."""
+
+    core = {"status": "STOP", "reasons": [r for r in summary.CORE_STOP_REASONS + summary.CORE_WARN_REASONS if r != "digest_failed"],
+            "available": True, "refusal": None, "rule_settings_match": False,
+            **{f: summary.COUNT_MAX for f in summary.CORE_FIELDS if f not in ("rule_settings_match", "alerts")},
+            "alerts": {("c" * 62 + "%02d" % n): summary.COUNT_MAX for n in range(20)}}
+    tags = {"status": "STOP", "reasons": [r for r in summary.TAGS_STOP_REASONS + summary.TAGS_WARN_REASONS if r != "digest_failed"],
+            "available": True, "refusal": None, **{f: summary.COUNT_MAX for f in summary.TAGS_FIELDS if f not in ("stale_month", "alerts")},
+            "stale_month": True, "alerts": ["t" * 62 + "%02d" % n for n in range(20)]}
+    core = {k: core[k] for k in summary.TOOL_SECTION_HEAD + summary.CORE_FIELDS}
+    tags = {k: tags[k] for k in summary.TOOL_SECTION_HEAD + summary.TAGS_FIELDS}
+    return core, tags
+
+
+def v1_golden_bodies():
+    """v1 bodies for the golden email lines: clean, first create, each sync stop shape, the worst case."""
+
+    stop_digest = {"runs": {"completed": 4, "unfinished": 0}, "counts": {"shopify_customer_created": 1}, "alerts": {"possible_duplicate_member": 1},
+                   "alert_refs": [], "open": {"uncertain_writes": 1}, "creates": {"writes_per_hour_max": 1}}
+    return [
+        build(), build(first_create=True), build(digest=stop_digest), build(task=stop_sync_task()),
+        build(task=None, config=None, digest=None, members=summary.members_section(None, "permission_denied"),
+              new_members=summary.new_members_section(None, None, "permission_denied")),
+        json.loads(json.dumps(_digest_failed_event())), build(**worst_v1_parts()),
+    ]
+
+
+def _digest_failed_event():
+    event = summary.build_event(now=NOW, task=summary.task_section(None), config=summary.config_section(None, None),
+                                digest=summary.digest_section(None, None), members=summary.members_section(None, "config_unavailable"),
+                                new_members=summary.new_members_section(None, None, "config_unavailable"), first_create=False,
+                                expected_member_type="GUEST")
+    summary.check_event(event)
+    return event
+
+
+def lines_digest(results):
+    import hashlib  # noqa: PLC0415
+    return hashlib.sha256(json.dumps([r["out"] for r in results], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def workflow_rest_digest(path):
+    import hashlib  # noqa: PLC0415
+    workflow = json.loads(Path(path).read_text(encoding="utf-8"))
+    for node in workflow["nodes"]:
+        if node["name"] == CODE_NODE:
+            node["parameters"]["jsCode"] = ""
+    return hashlib.sha256(json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+class WiringWorkflowShapeTests(unittest.TestCase):
+    """W5: only the Code node changed (the existing structural tests above still pin the graph)."""
+
+    def test_nothing_but_the_code_node_changed_since_main(self):
+        self.assertEqual(workflow_rest_digest(WORKFLOW), WORKFLOW_REST_SHA256)
+
+    def test_the_start_here_note_describes_v1_v2_and_the_warn_subject(self):
+        workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        note = next(n for n in workflow["nodes"] if n["name"] == "Start Here")
+        content = note["parameters"]["content"]
+        self.assertTrue(content.isascii())
+        for text in ("`xb.member_sync.daily_summary.v1` (both member tools off on the VM)", "`xb.member_sync.daily_summary.v2`",
+                     "`member_tools`", "`... WARN <date>`", "WARN comes only from a tool"):
+            self.assertIn(text, content)
+        self.assertEqual(note["parameters"]["height"], 460)
+
+    def test_the_code_node_lists_match_the_vm_script(self):
+        code = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        code = next(n for n in code["nodes"] if n["name"] == CODE_NODE)["parameters"]["jsCode"]
+        self.assertIn("'%s'" % summary.EVENT_SCHEMA_V2, code)
+        for name in summary.TOOL_NAMES:
+            stop, warn, fields = summary.TOOL_RULES[name]
+            for values in (stop, warn, fields):
+                self.assertIn(json.dumps(list(values)).replace('"', "'"), code)
+        self.assertIn("const TOOL_NAMES = %s;" % json.dumps(list(summary.TOOL_NAMES)).replace('"', "'"), code)
+        self.assertIn("const TOOL_HEAD = %s;" % json.dumps(list(summary.TOOL_SECTION_HEAD)).replace('"', "'"), code)
+        for reader in (".headers", "['headers']", '["headers"]'):
+            self.assertNotIn(reader, code)
+
+
+@unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code nodes")
+class WiringWorkflowTests(unittest.TestCase):
+    run_cases = WorkflowCodeExecutionTests.run_cases
+    assert_sent = WorkflowCodeExecutionTests.assert_sent
+
+    def sent_v2(self, result, word):
+        text = self.assert_sent(result, "[XB daily] MEMBER-SYNC %s 2026-11-07" % word, SUBJECT_V2_RE)
+        self.assertEqual(result["out"][0]["json"]["severity"], "INFO" if word == "CLEAN" else "WARN")
+        return text
+
+    # -- W1 -----------------------------------------------------------------------------------
+    def test_v1_events_give_exactly_mains_email_lines(self):
+        results = self.run_cases(v1_golden_bodies())
+        self.assertEqual(lines_digest(results), V1_LINES_GOLDEN_SHA256)
+        for result in results:
+            self.assertNotRegex("\n".join(result["out"][0]["json"]["lines"]), MORE_RE)
+
+    # -- W2 -----------------------------------------------------------------------------------
+    def test_the_subject_word_is_the_worst_of_sync_and_tools(self):
+        bodies, expected = [], []
+        for sync_word, task in (("CLEAN", None), ("STOP", stop_sync_task())):
+            for core_name in [None, *CORE_CASES]:
+                for tags_name in [None, *TAGS_CASES]:
+                    if core_name is None and tags_name is None:
+                        continue
+                    core = CORE_CASES[core_name]() if core_name else None
+                    tags = TAGS_CASES[tags_name]() if tags_name else None
+                    body = build(task=task, member_tools={"member_core": core, "tags": tags})
+                    self.assertEqual(body["result"], sync_word)
+                    words = [sync_word] + [s["status"] for s in (core, tags) if s is not None]
+                    bodies.append(body)
+                    expected.append((max(words, key=summary.TOOL_STATUSES.index), sync_word, core, tags))
+        self.assertEqual(len(bodies), 48)
+        for (word, sync_word, core, tags), result in zip(expected, self.run_cases(bodies)):
+            with self.subTest(word=word, sync=sync_word, core=core and core["status"], tags=tags and tags["status"]):
+                text = self.sent_v2(result, word)
+                lines = text.splitlines()
+                parts = ["sync " + sync_word] + (["member core " + core["status"]] if core else []) + (["tags " + tags["status"]] if tags else [])
+                self.assertIn("MEMBER-SYNC daily summary 2026-11-07: %s (%s)" % (word, ", ".join(parts)), lines)
+                if sync_word == "STOP":
+                    self.assertIn("Sync STOP: task_last_result, task_disabled (check the sync now; the off switch is in the runbook)", lines)
+                else:
+                    self.assertIn("Sync: no stop condition found.", lines)
+                for label, section, failed in (("Member core", core, "benefits_ledger_missing"), ("Tags", tags, "tags_ledger_missing")):
+                    if section is None:
+                        self.assertFalse(any(line.startswith(label + ":") for line in lines), label)
+                    elif not section["available"]:
+                        self.assertIn("%s: STOP (digest_failed: %s)" % (label, failed), lines)
+                        self.assertFalse(any(line.startswith(label + " alerts") for line in lines))
+                    else:
+                        head = label + ": " + section["status"] + (" (%s)" % ", ".join(section["reasons"]) if section["reasons"] else "") + " runs="
+                        self.assertTrue(any(line.startswith(head) for line in lines), head)
+                # A tool's problem never reads as the sync's, and the sync part is the v1 text.
+                self.assertIn("Owner AutoCount session: not checked (manual glance)", lines)
+
+    def test_the_v2_layout(self):
+        core = summary.core_section(core_raw(alerts={"claim_needs_review": 2, "orders_read_incomplete": 1}))
+        tags = summary.tags_section(tags_raw(stale_month=True))
+        (result,) = self.run_cases([build(member_tools={"member_core": core, "tags": tags})])
+        lines = self.sent_v2(result, "WARN").splitlines()
+        start = lines.index("Owner AutoCount session: not checked (manual glance)")
+        self.assertEqual(lines[start + 1:start + 9], [
+            "",
+            "Member core: WARN (alerts) runs=96 unfinished=0 rule_settings_match=yes",
+            "Member core open: uncertain_writes=0 held_writes=0 waiting_member=2 would_upgrade=3 would_extend=1 (would_* = ready receipts, all time)",
+            "Member core alerts 24h (runs): claim_needs_review=2, orders_read_incomplete=1 (refs: digest on the VM)",
+            "Tags: WARN (stale_month) runs=12 unfinished=0 tagged_now=812 bday_tagged_now=40 stale_month=yes open_writes=0",
+            "Tags latest run: would_tag=3 would_untag=0 would_bday_tag=2 would_bday_untag=0",
+            "Tags alerts 24h: none",
+            "",
+        ])
+        self.assertEqual(lines[0], "MEMBER-SYNC daily summary 2026-11-07: WARN (sync CLEAN, member core WARN, tags WARN)")
+        self.assertEqual(lines[1], "Sync: no stop condition found.")
+        self.assertTrue(result["out"][0]["json"]["lines"][-1].startswith("Runbook: "))
+
+    # -- W3 -----------------------------------------------------------------------------------
+    def test_validator_rejections(self):
+        base = build(member_tools={"member_core": CORE_CASES["WARN"](), "tags": TAGS_CASES["WARN"]()})
+        v1 = build()
+
+        def changed(fn, body=None):
+            value = copy.deepcopy(base if body is None else body)
+            fn(value)
+            return value
+
+        def tool(name, **changes):
+            return changed(lambda b: b["member_tools"][name].update(changes))
+
+        cases = {
+            "MS_SUMMARY_SCHEMA": [changed(lambda b: b.update(member_tools=copy.deepcopy(base["member_tools"])), v1),
+                                  changed(lambda b: b.pop("member_tools"))],
+            "MS_SUMMARY_KEYS": [changed(lambda b: b.update(note="x"))],
+            "MS_SUMMARY_TOOLS": [
+                changed(lambda b: b.update(member_tools=None)), changed(lambda b: b.update(member_tools=[])),
+                changed(lambda b: b.update(member_tools={"member_core": None, "tags": None})),
+                changed(lambda b: b["member_tools"].update(sync=None)), changed(lambda b: b["member_tools"].pop("tags")),
+                tool("tags", status="CLEAN"), tool("tags", status="STOP"), tool("tags", status="OK"), tool("member_core", status="WARN ") ,
+                tool("tags", reasons=["alerts", "stale_month"]), tool("tags", reasons=["stale_month", "stale_month"]),
+                tool("tags", reasons=["made_up"]), tool("tags", reasons=["held_writes"]), tool("tags", reasons="stale_month"),
+                tool("tags", open_writes=-1), tool("tags", open_writes=summary.COUNT_MAX + 1), tool("tags", open_writes=1.5),
+                tool("tags", open_writes=None), tool("tags", open_writes=True), tool("tags", stale_month="no"),
+                tool("member_core", held_writes=-1), tool("member_core", rule_settings_match=None),
+                tool("tags", alerts=["code_%02d" % n for n in range(21)]), tool("tags", alerts=["b_code", "a_code"]),
+                tool("tags", alerts=["a_code", "a_code"]), tool("tags", alerts=["Bad Code"]), tool("tags", alerts={"a_code": 1}),
+                tool("member_core", alerts={"code_%02d" % n: 1 for n in range(21)}), tool("member_core", alerts={"Bad Code": 1}),
+                tool("member_core", alerts={"a_code": -1}), tool("member_core", alerts=["a_code"]),
+                tool("member_core", available=False), tool("member_core", refusal="timed_out"), tool("member_core", available="yes"),
+                tool("member_core", status="STOP", reasons=["digest_failed", "held_writes"]),
+                tool("tags", extra=1),
+                changed(lambda b: b["member_tools"]["tags"].pop("alerts")),
+                # available false with figures present, or with no refusal, or another reason
+                changed(lambda b: b["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"), "runs_completed": 3})),
+                changed(lambda b: b["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"), "alerts": []})),
+                changed(lambda b: b["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"), "refusal": None})),
+                changed(lambda b: b["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"), "refusal": "Bad Code"})),
+                changed(lambda b: b["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"),
+                                                                 "reasons": ["digest_failed", "stale_month"]})),
+            ],
+            "MS_SUMMARY_PERSONAL_DATA": [tool("tags", alerts=["x_" + FAKE_PHONE]), tool("member_core", alerts={FAKE_AT: 1}),
+                                         changed(lambda b: b["member_tools"].update(tags=summary.tool_failed("tags", FAKE_AT))),
+                                         changed(lambda b: b["member_tools"]["tags"].update({"x_" + FAKE_PHONE: 1}))],
+        }
+        flat = [(reason, body) for reason, bodies in cases.items() for body in bodies]
+        for (reason, body), result in zip(flat, self.run_cases([body for _, body in flat])):
+            with self.subTest(reason=reason, tools=json.dumps(body.get("member_tools"))[:160]):
+                (item,) = result["out"]
+                self.assertEqual(item["json"], {"valid": False, "reason": reason})
+                self.assertIsNone(result["sub"])
+        # And the base itself, and a v1 body, pass.
+        for result in self.run_cases([base, v1]):
+            self.assertIs(result["out"][0]["json"]["valid"], True)
+
+    # -- W4 -----------------------------------------------------------------------------------
+    def test_the_worst_case_fits_for_all_four_switch_combinations(self):
+        core, tags = worst_tools()
+        combos = {"off/off": None, "core/off": {"member_core": core, "tags": None}, "off/tags": {"member_core": None, "tags": tags},
+                  "core/tags": {"member_core": core, "tags": tags}}
+        bodies = [build(**worst_v1_parts(), member_tools=tools) for tools in combos.values()]
+        self.measured = {}
+        for (name, tools), result in zip(combos.items(), self.run_cases(bodies)):
+            with self.subTest(combo=name):
+                lines = result["out"][0]["json"]["lines"]
+                self.assertLessEqual(len(lines), 30)
+                self.assertTrue(all(len(line) <= 300 for line in lines), max(len(line) for line in lines))
+                self.assertLessEqual(len("\n".join(lines)), 4000)
+                word = "STOP"
+                text = self.assert_sent(result, "[XB daily] MEMBER-SYNC %s 2026-11-07" % word, SUBJECT_V2_RE)
+                # The never-cut lines are whole.
+                self.assertTrue(lines[0].startswith("MEMBER-SYNC daily summary 2026-11-07: STOP"))
+                self.assertTrue(lines[1].startswith("STOP reasons: " if tools is None else "Sync STOP: "))
+                self.assertTrue(lines[1].endswith("(check the sync now; the off switch is in the runbook)"))
+                self.assertTrue(lines[2].startswith("Auto off (observe mode, nothing was switched): would switch"))
+                for prefix in ("Sync task: ", "Config: ", "Runs 24h: ", "Writes 24h: ", "Possible duplicates=", "Open: ", "New AC2 members 24h: ",
+                               "Owner AutoCount session", "Generated ", "Runbook: "):
+                    self.assertEqual(sum(line.startswith(prefix) for line in lines), 1, prefix)
+                if tools and tools["member_core"]:
+                    self.assertIn("Member core: STOP (rule_settings_mismatch, no_runs, unfinished_runs, uncertain_writes, "
+                                  "uncertain_writes_run_in_progress, held_writes, alerts) runs=1000000000 unfinished=1000000000 "
+                                  "rule_settings_match=no", lines)
+                    self.assertTrue(any(line.startswith("Member core open: ") and line.endswith("(would_* = ready receipts, all time)") for line in lines))
+                    self.assertEqual(sum(line.startswith("Member core alerts 24h (runs): ") for line in lines), 1)
+                if tools and tools["tags"]:
+                    self.assertTrue(any(line.startswith("Tags: STOP (no_runs, unfinished_runs, open_writes, write_alert, alerts_at_cap, "
+                                                        "open_writes_run_in_progress, stale_month, alerts) runs=") for line in lines))
+                    self.assertTrue(any(line.startswith("Tags latest run: would_tag=") for line in lines))
+                    self.assertEqual(sum(line.startswith("Tags alerts 24h: ") for line in lines), 1)
+                if tools is not None:
+                    self.assertRegex(text, MORE_RE)  # something was cut, and says so
+                self.measured[name] = (len(lines), len("\n".join(lines)), max(len(line) for line in lines))
+        # G1 measurement (lines, characters, longest line): off/off 25, 3773, 281; core/off 27, 3952, 273;
+        # off/tags 27, 3936, 273; core/tags 30, 3928, 273.
+        self.assertEqual(set(self.measured), set(combos))
+
+    def test_a_normal_day_is_never_cut(self):
+        core = summary.core_section(core_raw(alerts={"claim_needs_review": 2, "orders_read_incomplete": 1}))
+        tags = summary.tags_section(tags_raw(alerts=["tag_removes_capped", "untag_volume_unexpected"]))
+        (result,) = self.run_cases([build(member_tools={"member_core": core, "tags": tags})])
+        text = self.sent_v2(result, "WARN")
+        self.assertNotRegex(text, MORE_RE)
+        self.assertIn("Tags alerts 24h: tag_removes_capped, untag_volume_unexpected", text)
+        self.assertIn("Alert refs: memberno_conflict ***042", text)
+
+    def test_a_long_tool_alert_list_alone_cuts_only_itself(self):
+        """G2 LATER 5 (kills G2-J4): only one tool's alert list is long, everything else is a normal
+        day. The one-line list keeps what fits on its line; no other list is cut."""
+
+        long_tags = summary.tags_section(tags_raw(alerts=["t" * 62 + "%02d" % n for n in range(19)]))
+        long_core = summary.core_section(core_raw(alerts={"c" * 62 + "%02d" % n: 3 for n in range(20)}))
+        bodies = [build(member_tools={"member_core": summary.core_section(core_raw()), "tags": long_tags}),
+                  build(member_tools={"member_core": long_core, "tags": summary.tags_section(tags_raw())})]
+        for (label, other), result in zip((("Tags alerts 24h: ", "Member core alerts 24h (runs): "),
+                                           ("Member core alerts 24h (runs): ", "Tags alerts 24h: ")), self.run_cases(bodies)):
+            with self.subTest(long=label):
+                lines = result["out"][0]["json"]["lines"]
+                self.assertIn("Members per type: -=1, GUEST=12, MEMBER=2000", lines)
+                self.assertIn("Alert refs: memberno_conflict ***042", lines)
+                self.assertIn("Alerts 24h (runs): created_after_wait=1, waiting_for_staff=2", lines)
+                cut = [line for line in lines if MORE_RE.search(line)]
+                self.assertEqual(len(cut), 1, cut)
+                self.assertTrue(cut[0].startswith(label) and cut[0].endswith(" more (see the VM record)" + (
+                    " (refs: digest on the VM)" if label.startswith("Member core") else "")), cut[0])
+                self.assertLessEqual(len(cut[0]), 300)
+                self.assertFalse(any(line.startswith(other) and MORE_RE.search(line) for line in lines))
+                self.assert_sent(result, "[XB daily] MEMBER-SYNC WARN 2026-11-07", SUBJECT_V2_RE)
+
+    def test_the_cut_order_is_members_refs_tags_core_then_sync_alerts(self):
+        core, tags = worst_tools()
+        (result,) = self.run_cases([build(**worst_v1_parts(), member_tools={"member_core": core, "tags": tags})])
+        lines = result["out"][0]["json"]["lines"]
+        members = next(line for line in lines if line.startswith("Members per type: "))
+        refs = next(line for line in lines if line.startswith("Alert refs: "))
+        self.assertRegex(members, r"^Members per type: \+12 more \(see the VM record\)$")
+        self.assertRegex(refs, r"^Alert refs: \+5 more \(see the VM record\)$")
+        # A one-line tool list keeps what fits on its line first.
+        for prefix in ("Tags alerts 24h: ", "Member core alerts 24h (runs): "):
+            line = next(line for line in lines if line.startswith(prefix))
+            self.assertRegex(line, MORE_RE)
+            self.assertLessEqual(len(line), 300)
 
 
 if __name__ == "__main__":

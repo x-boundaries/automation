@@ -1580,7 +1580,9 @@ A separate read-only task, `\XB\XB-MemberSync-DailySummary`, runs once a day
 at 06:40 SGT (after the 06:00 deferred-create run and the 06:15 and 06:30
 runs) as the sync's own task account, and emails one summary that replaces
 the manual daily check: `[XB daily] MEMBER-SYNC CLEAN <date>` or
-`[XB daily] MEMBER-SYNC STOP <date>`. Design: #288 G0 sections 3, 4 and 6.
+`[XB daily] MEMBER-SYNC STOP <date>` (and `WARN` once a member tool is
+switched on: see "Member tools in the email" below). Design: #288 G0
+sections 3, 4 and 6.
 Script `directlocal/xb_member_sync_daily_summary.py`, settings
 `config/member_sync_daily_summary.example.json`, installer
 `scripts/install_member_sync_summary_task.ps1`, n8n workflow
@@ -1704,9 +1706,11 @@ BF2b settings above. No secret value is in any
 file. `check-settings` checks the file without any network, child process or
 SQL, and without reading any other file: it refuses an output folder inside
 `sync_state_root`, and timeouts that cannot fit the task's 5-minute limit
-(three children at `child_timeout_seconds`, five SQL waits at
-`sql.timeout_seconds` when SQL is on, and the POST must total 285 seconds
-or less; the example uses 60, 15 and 20). `sql.timeout_seconds` is both the
+(three children at `child_timeout_seconds`, each switched-on member tool at
+its own `timeout_seconds`, five SQL waits at `sql.timeout_seconds` when SQL
+is on, and the POST must total 285 seconds or less; the example uses 40, 20
+and 20 for the tools, 15 and 20, so 255 seconds with both tools on).
+`sql.timeout_seconds` is both the
 login timeout and the query timeout of every statement. `daily --no-send`
 builds and records the summary without posting it.
 
@@ -1747,6 +1751,174 @@ does any of them):
 
 Off switch: `Disable-ScheduledTask -TaskPath '\XB\' -TaskName
 'XB-MemberSync-DailySummary'` (by hand; it touches only the summary task).
+
+#### Member tools in the email (#288 member email wiring)
+
+The summary can also show the member core (`xb_member_benefits.py`, #268)
+and the tags tool (`xb_member_tags.py`, #268 slice D), **each behind its own
+switch, default off**. With both off, or the key absent, the event, the
+record, the stdout line and the email are exactly as before (pinned golden
+tests). Design: mailbox 288 G0 "member email wiring" (14 Nov 2026), with the
+Controller's six answers (all as recommended).
+
+**Settings.** Optional key `member_tools` (the settings schema stays v1):
+
+```json
+"member_tools": {
+  "member_core": {"enabled": false, "config_path": "C:\\XB\\example\\member_benefits_live.json",
+                  "state_root": "C:\\XB\\example\\member_benefits_state", "timeout_seconds": 20},
+  "tags":        {"enabled": false, "config_path": "C:\\XB\\example\\member_tags_live.json",
+                  "state_root": "C:\\XB\\example\\member_tags_state", "timeout_seconds": 20}
+}
+```
+
+Both tools are required when the key is present, each with exactly these
+four keys (`config_path` absolute; `state_root` an absolute folder with no
+`..`; `timeout_seconds` 10 to 60). Refusals: `settings_member_tools_invalid`,
+`settings_member_tools_member_core_invalid`, `settings_member_tools_tags_invalid`,
+`output_dir_inside_tool_state` (the output folder inside either tool's state
+root, as written and resolved, whether the tool is on or off), and the
+existing `settings_timeouts_exceed_task_limit` (each enabled tool's timeout
+counts). `check-settings` also prints `member_core_enabled` and
+`tags_enabled`.
+
+**How a tool is read.** Only when switched on, after the three sync children
+and before the SQL part (member core first, then tags), the summary runs the
+tool's sibling script with a pinned argument list: `<python>
+xb_member_benefits.py|xb_member_tags.py digest --config <config_path> --hours
+24`, with the tool's own timeout. `digest` is the only tool command it may
+start; no script path or command is configurable. The answer is the last
+JSON line, accepted only with exit 0 and `status: ok`. A `digest` opens the
+tool's ledger read-only and takes no lock and no sign-in (the member core's
+state-root check also makes sure its claims folder exists, which `init`
+already did; SQLite may leave `-wal`/`-shm` side files). Both tools check
+that their state root is private to the current user, so the summary task
+must run as the **same Windows account** that owns each tool's state root.
+
+- **Tags:** only the digest's fixed `email` block, exactly its 11 keys
+  (counts, `alerts` as at most 20 sorted codes, `stale_month`). Any missing,
+  extra or wrong-typed key: the tool is unreadable (`email_block_invalid`).
+- **Member core:** only these keys of the existing digest, under its own
+  `schema` value `xb.directlocal.member_benefits.digest.v1` (any other value,
+  or a key missing or wrong-typed: `digest_schema_unknown`):
+  `rule_settings_match`, `runs.completed`, `runs.unfinished`,
+  `open.uncertain_writes`, `open.held_writes`, `open.waiting_member`,
+  `shadow.would_upgrade`, `shadow.would_extend` (ready receipts, all time)
+  and `alerts`. Never its alert refs, receipts, counts, gift card part or
+  book. The email says `refs: digest on the VM`.
+- An alert code that fails the summary's own check (a colon, 6 digits in a
+  row, an `@`) is shown as `unreadable_alert_code` and still counts as an
+  alert.
+
+**Each tool's status** is its own CLEAN, WARN or STOP, from closed reason
+lists (shown in this order). A tool **never** changes the sync's `result`,
+`stop_reasons` or `auto_off`, and never stops the email.
+
+| Tool | Status | Reason | When |
+|---|---|---|---|
+| both | STOP | `digest_failed` | Switched on but not readable: the tool refused (its code is shown, for example `tags_ledger_missing`, `benefits_ledger_missing` or a state-root custody code), `timed_out`, `no_answer`, `exit_code`, `email_block_invalid`, `digest_schema_unknown` or `unreadable_refusal` |
+| tags | STOP | `no_runs` | No completed run in 24 hours (tags run every 2 hours) |
+| tags | STOP | `unfinished_runs` | More than 1 unfinished run (1 may be the run in progress) |
+| tags | STOP | `open_writes` | Open writes and no unfinished run |
+| tags | STOP | `write_alert` | Alert `write_uncertain` or `write_unresolved` |
+| tags | STOP | `alerts_at_cap` | 20 alert codes: the block cuts its sorted list, so a STOP code may be hidden |
+| tags | WARN | `open_writes_run_in_progress` | Open writes with exactly 1 unfinished run (a running apply's INTENT row) |
+| tags | WARN | `stale_month` | The month changed and the tags have not |
+| tags | WARN | `alerts` | Any other alert (no tags alert is "no action needed" in the tags runbook, so none is ignored) |
+| member core | STOP | `rule_settings_mismatch` | `rule_settings_match` false |
+| member core | STOP | `no_runs` | No completed run in 24 hours (it runs every 15 minutes) |
+| member core | STOP | `unfinished_runs` | More than 1 unfinished run |
+| member core | STOP | `uncertain_writes` | Uncertain writes (INTENT or UNCERTAIN) and no unfinished run |
+| member core | WARN | `uncertain_writes_run_in_progress` | Uncertain writes with exactly 1 unfinished run (the 06:37 run can still be running at 06:40) |
+| member core | WARN | `held_writes` | Held writes not released (owner action: `release-held`) |
+| member core | WARN | `alerts` | Any alert other than `orders_read_incomplete` and `member_reads_capped` (member core runbook section 8: no staff action on their own) |
+
+**Event.** Both off: `xb.member_sync.daily_summary.v1`, unchanged. At least
+one on: `xb.member_sync.daily_summary.v2`, the same 15 keys plus
+`member_tools` (`member_core` and `tags`, `null` for a tool that is off).
+Each section has `status`, `reasons`, `available`, `refusal` and the figures
+above; an unreadable tool has `reasons: ["digest_failed"]`, its refusal code
+and every figure `null`. The member core's alerts are bounded to 20 codes as
+the sync's (`other_alert_codes`). The record keeps the event as sent;
+`daily` prints `overall` (the subject word) for a v2 event.
+
+**Email (v2).** Subject `[XB daily] MEMBER-SYNC <WORD> <date>`, where WORD is
+the worst of the sync's result and each enabled tool's status (STOP, then
+WARN, then CLEAN); severity `WARN` for STOP or WARN, `INFO` for CLEAN. Line 1
+names each part, so a tool problem never reads as a sync problem:
+
+```
+MEMBER-SYNC daily summary 2026-11-19: WARN (sync CLEAN, member core CLEAN, tags WARN)
+Sync: no stop condition found.          (a sync stop: "Sync STOP: <codes> (check the sync now; ...)")
+Auto off (observe mode, nothing was switched): no action
+... the sync lines, unchanged ...
+Owner AutoCount session: not checked (manual glance)
+
+Member core: CLEAN runs=96 unfinished=0 rule_settings_match=yes
+Member core open: uncertain_writes=0 held_writes=0 waiting_member=2 would_upgrade=3 would_extend=1 (would_* = ready receipts, all time)
+Member core alerts 24h (runs): claim_needs_review=2, orders_read_incomplete=1 (refs: digest on the VM)
+Tags: WARN (stale_month) runs=12 unfinished=0 tagged_now=812 bday_tagged_now=40 stale_month=yes open_writes=0
+Tags latest run: would_tag=3 would_untag=0 would_bday_tag=2 would_bday_untag=0
+Tags alerts 24h: none
+
+Generated ... SGT. Record: daily_summary_<date>.json on the VM.
+```
+
+An unreadable tool is one line: `Tags: STOP (digest_failed: tags_ledger_missing)`.
+The shared `XB Ops Alert Email` sub-workflow refuses more than 30 lines, a
+line over 300 characters or 4,000 characters in all, so the Code node fits
+the email deterministically: each tool's alert list is one line and keeps
+only the codes that fit on it; then, while the email does not fit, it cuts
+members per type, sync alert refs, tags alerts, member core alerts and sync
+alert codes, in that order, each ending with `+K more (see the VM record)`.
+Nothing else is ever cut. The email is always within 30 lines, 300
+characters a line and 4,000 in all; the reachable worst case is exactly
+4,000. A normal day is never cut.
+
+**VM steps, in order, each with its own owner OK** (prerequisites: this
+slice merged; the member core installed and run for a day before it is
+switched on; tags installed before tags are switched on):
+
+1. **n8n first.** Re-import `Member Sync - Daily Summary` at the merge commit
+   through the reviewed import route (only the `Validate Summary Event` Code
+   node changed). It accepts v1 exactly as before, so the next morning's
+   email must be identical: compare the subject and line count with the day
+   before. Keep the previous export for rollback.
+2. **VM script.** Check which checkout each task runs from (the sync, the
+   summary, the member core, tags). The summary always runs the tools'
+   `digest` from **its own** folder (the sibling files), not from the tools'
+   task clones. If one clone serves all four, pulling this merge also moves
+   the sync (`xb_member_sync.py`) and both tools: do it only at a commit
+   their install already uses, or with the Controller's OK. If the clones
+   differ, the summary clone's `xb_member_benefits.py` and `xb_member_tags.py`
+   must match the installed tools' ledger schema (`SCHEMA_VERSION`) and
+   digest schema, or that tool is STOP with a `*_ledger_not_recognised`
+   refusal. Record the previous pin, then pull to the merge commit.
+3. **VM settings.** Back up the summary settings file. Add `member_tools`
+   with both `enabled: false`; set `child_timeout_seconds` to 40. Run
+   `check-settings` (must answer `ok`, both switches false), then `daily
+   --no-send`: the record must be v1 with no `member_tools`.
+4. **Member core on** (after it has run for a day): `member_core.enabled:
+   true`, `check-settings`, `daily --no-send`. The record must show
+   `member_tools.member_core.available: true`. `available: false` with a
+   custody or `benefits_ledger_*` refusal means the account or a path is
+   wrong: switch it back off and report. Then let the 06:40 run send, and
+   check the next email: the subject word, the member core lines, the sync
+   lines unchanged.
+5. **Tags on** (after the tags install), the same way.
+
+**Rollback** (each step undoes alone):
+
+- A tool: set its `enabled: false` (settings only; with both off the next
+  email is v1 again).
+- The VM script, in this order: switch both off; restore the settings
+  backup (no `member_tools`: the previous script refuses that key, so a
+  script-only rollback would leave the 06:40 task refusing and send no
+  email); then check out the previous summary file; run `check-settings`
+  and `daily --no-send`.
+- n8n: re-import the previous export, **only after both switches are off**
+  (the old validator answers 400 to a v2 event: the VM records
+  `send_failed` and no email arrives).
 
 ### Known risks
 

@@ -820,7 +820,9 @@ class SendTests(SummaryTestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             code = summary.main(["check-settings", "--settings", str(EXAMPLE_SETTINGS)])
-        self.assertEqual((code, json.loads(out.getvalue())), (0, {"status": "ok", "send_enabled": False, "sql_enabled": True}))
+        # #288 wiring: both member tool switches are printed too (off in the example).
+        self.assertEqual((code, json.loads(out.getvalue())), (0, {"status": "ok", "send_enabled": False, "sql_enabled": True,
+                                                                  "member_core_enabled": False, "tags_enabled": False}))
 
     def test_output_dir_inside_the_sync_state_is_refused(self):
         with self.assertRaises(summary.SummaryError) as caught:
@@ -866,11 +868,13 @@ class SendTests(SummaryTestCase):
         self.assertIn("<ExecutionTimeLimit>PT%dM</ExecutionTimeLimit>" % (summary.TASK_TIME_LIMIT_SECONDS // 60),
                       INSTALLER.read_text(encoding="utf-8"))
         example = summary.parse_settings(json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8")))
-        self.assertEqual(example["child_timeout_seconds"], 60)
-        self.assertEqual(summary.worst_case_seconds(example), 3 * 60 + 5 * 15 + 20)
+        # #288 wiring (Controller Q2): 40 s per child leaves room for both member tools at 20 s.
+        self.assertEqual(example["child_timeout_seconds"], 40)
+        self.assertEqual(summary.worst_case_seconds(example), 3 * 40 + 5 * 15 + 20)
         self.assertLessEqual(summary.worst_case_seconds(example), 285)
-        for change in ({"child_timeout_seconds": 120}, {"child_timeout_seconds": 64}, {"sql": {"timeout_seconds": 20}},
-                       {"send": {"timeout_seconds": 31}}):
+        # (#288 wiring: recalibrated for the example's 40 s children; each change is just over 285 s.)
+        for change in ({"child_timeout_seconds": 120}, {"child_timeout_seconds": 64}, {"sql": {"timeout_seconds": 35}},
+                       {"child_timeout_seconds": 60, "send": {"timeout_seconds": 31}}):
             with self.subTest(change=change), self.assertRaises(summary.SummaryError) as caught:
                 self.settings(**change)
             self.assertEqual(caught.exception.code, "settings_timeouts_exceed_task_limit")
@@ -1514,6 +1518,769 @@ class SummaryGoldenTests(SummaryTestCase):
     def test_a_window_that_is_not_in_effect_changes_nothing_while_creates_are_not_expected(self):
         value = {**self.base_value(), "backfill_members_window": {**WINDOW, "from": "2026-11-20", "to": "2026-11-21"}}
         self.assertEqual(summary_trace_digest(summary_golden_trace(summary, value, self.out)), SUMMARY_GOLDEN_SHA256)
+
+
+# ------------------------------------------------------------------------------------------------
+# #288 member email wiring (design mailbox 288 G0, 14 Nov 2026): the member core and tags digests
+# ------------------------------------------------------------------------------------------------
+
+CORE_SCRIPT = ROOT / "directlocal" / "xb_member_benefits.py"
+TAGS_SCRIPT = ROOT / "directlocal" / "xb_member_tags.py"
+FAKE_AT = "x@example.com"
+
+
+def tags_digest(**email):
+    """A tags ``digest`` answer: the fixed email block plus parts the summary must never read."""
+
+    block = {"runs_completed": 12, "runs_unfinished": 0, "tagged_now": 812, "bday_tagged_now": 40, "would_tag": 3, "would_untag": 0,
+             "would_bday_tag": 2, "would_bday_untag": 0, "alerts": [], "stale_month": False, "open_writes": 0}
+    block.update(email)
+    return {"status": "ok", "command": "digest", "hours": 24, "runs": {"completed": 12, "unfinished": 0}, "counts": {"tag_added": 3},
+            "alerts": {code: 1 for code in block["alerts"] if isinstance(code, str)} if isinstance(block["alerts"], list) else {},
+            "alert_refs": [{"ref": "c-" + "1" * 20, "code": "tag_not_written", "member_no_masked": "*******042"}],
+            "open": {"uncertain_writes": 0, "intent_writes": 0}, "shadow": {}, "tagged_now": 812, "carriers_total": 900,
+            "bday_tagged_now": 40, "bday_carriers_total": 41, "stale_month": False, "email": block}
+
+
+def core_digest(alerts=None, runs=None, opened=None, shadow=None, **overrides):
+    """A member core ``digest`` answer (the shape of its ledger_digest), fake figures only."""
+
+    value = {"schema": summary.CORE_DIGEST_SCHEMA, "status": "ok", "autocount_book": "AED_XBOUNDARIES", "hours": 24,
+             "rule_settings_match": True, "runs": {"completed": 96, "unfinished": 0, **(runs or {})},
+             "counts": {"orders_read": 40}, "alerts": dict(alerts or {}),
+             "alert_refs": [{"ref": "o-" + "123456" + "ab", "code": "claim_needs_review", "member_no_masked": "*******042"}],
+             "receipts": {"ready": 4, "waiting_member": 2}, "shadow": {"would_upgrade": 3, "would_extend": 1, **(shadow or {})},
+             "gift_cards": {"receipts_paid_by_gift_card": 1, "gateways_seen": {"gift_card": 1}},
+             "open": {"uncertain_writes": 0, "held_writes": 0, "waiting_member": 2, "claim_links": 5, "claim_links_voided": 0, **(opened or {})}}
+    value.update(overrides)
+    return value
+
+
+class ToolRunner(FakeRunner):
+    """FakeRunner plus the two member tools, answered by their script name. ``log`` is shared with
+    the SQL reader and the poster, so the order of every step can be checked."""
+
+    def __init__(self, core=None, tags=None, tool_codes=None, log=None, **kwargs):
+        super().__init__(**kwargs)
+        self.tools = {"xb_member_benefits.py": core_digest() if core is None else core,
+                      "xb_member_tags.py": tags_digest() if tags is None else tags}
+        self.tool_codes = tool_codes or {}
+        self.timeouts: list[int] = []
+        self.log = log if log is not None else []
+
+    def __call__(self, argv, timeout):
+        script = Path(argv[1]).name if len(argv) > 1 else ""
+        self.timeouts.append(timeout)
+        if script not in self.tools:
+            self.log.append("task-state" if argv[0].lower().endswith("powershell.exe") else argv[2])
+            return super().__call__(argv, timeout)
+        self.log.append(script)
+        self.calls.append(list(argv))
+        answer = self.tools[script]
+        if isinstance(answer, BaseException):
+            raise answer
+        text = answer if isinstance(answer, str) else json.dumps(answer)
+        return self.tool_codes.get(script, 0), "tool noise line\n" + text + "\n"
+
+
+class WiringTestCase(SummaryTestCase):
+    def setUp(self):
+        super().setUp()
+        self.core_root = self.temp / "core-state"
+        self.tags_root = self.temp / "tags-state"
+        for root in (self.core_root, self.tags_root):
+            root.mkdir()
+
+    def tools_value(self, core_on=False, tags_on=False, **changes):
+        """``changes``: per tool name (member_core, tags), the keys to change in that tool's part."""
+
+        value = {"member_core": {"enabled": core_on, "config_path": str(self.temp / "member_benefits_live.json"), "state_root": str(self.core_root),
+                                 "timeout_seconds": 20},
+                 "tags": {"enabled": tags_on, "config_path": str(self.temp / "member_tags_live.json"), "state_root": str(self.tags_root),
+                          "timeout_seconds": 20}}
+        for name, item in changes.items():
+            value[name] = {**value[name], **item}
+        return value
+
+    def raw(self, tools, **overrides):
+        """The settings file with member_tools set exactly as given (never merged)."""
+
+        value = self.settings_value(**overrides)
+        value["member_tools"] = tools
+        return value
+
+    def wired(self, core_on=False, tags_on=False, **changes):
+        return summary.parse_settings(self.raw(self.tools_value(core_on, tags_on, **changes)))
+
+    def run_wired(self, core=False, tags=False, runner=None, **kwargs):
+        return self.run_daily(runner=runner or ToolRunner(), settings=self.wired(core, tags), **kwargs)
+
+    def logged_run(self, core, tags, runner=None):
+        """daily() with one log for the children, the SQL part and the send."""
+
+        log: list[str] = []
+        runner = runner or ToolRunner(log=log)
+        runner.log = log
+        connection = FakeConnection()
+        reader = sql_reader_for(connection)
+
+        def sql_reader(sql, book):
+            log.append("sql")
+            return reader(sql, book)
+
+        def poster(url, headers, body, timeout):
+            log.append("send")
+            return 200
+
+        self.runner = runner
+        result = summary.daily(self.wired(core, tags), now=NOW, runner=runner, sql_reader=sql_reader,
+                               cred_reader=lambda target: "FAKE-SECRET-0001", poster=poster)
+        return log, result
+
+
+class WiringGoldenTests(WiringTestCase):
+    """T1: both switches off, and the key absent, give main's event, record and stdout exactly."""
+
+    def test_absent_and_both_off_match_the_main_golden_output(self):
+        absent = self.settings_value()
+        absent.pop("member_tools")
+        both_off = self.raw(self.tools_value(False, False))
+        for value in (absent, both_off, self.settings_value()):
+            with self.subTest(member_tools=value.get("member_tools")):
+                self.assertEqual(summary_trace_digest(summary_golden_trace(summary, value, self.out)), SUMMARY_GOLDEN_SHA256)
+
+    def test_both_off_starts_no_tool_and_sends_a_v1_event(self):
+        log, result = self.logged_run(False, False)
+        self.assertEqual(log, ["task-state", "check-config", "digest", "sql", "send"])
+        record = json.loads((self.out / f"daily_summary_{TODAY}.json").read_text(encoding="utf-8"))
+        self.assertEqual(tuple(record["event"]), summary.EVENT_KEYS)
+        self.assertEqual(record["event"]["schema"], summary.EVENT_SCHEMA)
+        self.assertNotIn("overall", result)
+
+
+class WiringSettingsTests(WiringTestCase):
+    """T2: settings accept and refuse."""
+
+    def refused(self, value):
+        with self.assertRaises(summary.SummaryError) as caught:
+            summary.parse_settings(value)
+        return caught.exception.code
+
+    def test_the_example_has_both_tools_off_with_placeholder_paths(self):
+        example = json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))
+        tools = example["member_tools"]
+        self.assertEqual(list(tools), ["member_core", "tags"])
+        for name, tool in tools.items():
+            self.assertEqual(set(tool), {"enabled", "config_path", "state_root", "timeout_seconds"})
+            self.assertIs(tool["enabled"], False, name)
+            self.assertTrue(tool["config_path"].startswith("C:\\XB\\example\\") and tool["state_root"].startswith("C:\\XB\\example\\"))
+            self.assertEqual(tool["timeout_seconds"], 20)
+        parsed = summary.parse_settings(example)
+        self.assertEqual(summary.enabled_tools(parsed), ())
+        # Both on: 3 x 40 + 20 + 20 + 5 x 15 + 20 = 255 s, inside 285 (Controller Q2).
+        on = json.loads(json.dumps(example))
+        for tool in on["member_tools"].values():
+            tool["enabled"] = True
+        self.assertEqual(summary.worst_case_seconds(summary.parse_settings(on)), 255)
+
+    def test_every_key_and_bound_is_checked(self):
+        self.assertEqual(self.wired(True, True)["member_tools"]["tags"]["timeout_seconds"], 20)
+        for bad in (None, [], {}, {"member_core": self.tools_value()["member_core"]},
+                    {**self.tools_value(), "sync": self.tools_value()["tags"]}):
+            with self.subTest(member_tools=bad):
+                self.assertEqual(self.refused(self.raw(bad)), "settings_member_tools_invalid")
+        for name in summary.TOOL_NAMES:
+            code = "settings_member_tools_%s_invalid" % name
+            changes = [{"enabled": "yes"}, {"enabled": 1}, {"enabled": None},
+                       {"config_path": "relative\\member.json"}, {"config_path": ""}, {"config_path": 5}, {"config_path": " C:\\x.json"},
+                       {"state_root": "relative\\state"}, {"state_root": str(self.temp / "a" / ".." / "b")}, {"state_root": None},
+                       {"timeout_seconds": 9}, {"timeout_seconds": 61}, {"timeout_seconds": True}, {"timeout_seconds": "20"},
+                       {"timeout_seconds": 20.0}]
+            for change in changes:
+                with self.subTest(tool=name, change=change):
+                    value = self.raw(self.tools_value(**{name: change}))
+                    self.assertEqual(self.refused(value), code)
+            for broken in ("extra", "missing"):
+                tools = self.tools_value()
+                if broken == "extra":
+                    tools[name]["command"] = "digest"  # a command is never configurable
+                else:
+                    del tools[name]["timeout_seconds"]
+                with self.subTest(tool=name, broken=broken):
+                    self.assertEqual(self.refused(self.raw(tools)), code)
+            with self.subTest(tool=name, kind="not a dict"):
+                self.assertEqual(self.refused(self.raw({**self.tools_value(), name: True})), code)
+        for timeout in (10, 60):
+            self.assertEqual(self.wired(member_core={"timeout_seconds": timeout})["member_tools"]["member_core"]["timeout_seconds"], timeout)
+
+    def test_the_time_budget_adds_each_enabled_tool_only(self):
+        settings = self.wired(False, False, member_core={"timeout_seconds": 60}, tags={"timeout_seconds": 60})
+        self.assertEqual(summary.worst_case_seconds(settings), 3 * 40 + 5 * 15 + 20)  # off: not counted
+        self.assertEqual(summary.worst_case_seconds(self.wired(True, False)), 3 * 40 + 20 + 5 * 15 + 20)
+        self.assertEqual(summary.worst_case_seconds(self.wired(True, True)), 255)
+        self.assertEqual(summary.worst_case_seconds(self.wired(True, True, tags={"timeout_seconds": 50})), 285)
+        for core, tags, changes in ((True, True, {"tags": {"timeout_seconds": 51}}),
+                                    (True, False, {"member_core": {"timeout_seconds": 60}, "child_timeout_seconds": 50})):
+            with self.subTest(core=core, tags=tags, changes=changes):
+                child = changes.pop("child_timeout_seconds", 40)
+                value = self.raw(self.tools_value(core, tags, **changes), child_timeout_seconds=child)
+                # The same file with every tool off fits: only an enabled tool counts.
+                summary.parse_settings(self.raw(self.tools_value(False, False, **changes), child_timeout_seconds=child))
+                self.assertEqual(self.refused(value), "settings_timeouts_exceed_task_limit")
+
+    def test_output_dir_inside_a_tool_state_root_is_refused_written_and_resolved(self):
+        for name in summary.TOOL_NAMES:
+            root = self.core_root if name == "member_core" else self.tags_root
+            for folder in (root, root / "reports"):
+                for enabled in (False, True):  # whether on or off: the record never goes into a tool's state
+                    with self.subTest(tool=name, folder=folder, enabled=enabled):
+                        value = self.raw(self.tools_value(enabled, enabled), output_dir=str(folder))
+                        self.assertEqual(self.refused(value), "output_dir_inside_tool_state")
+        # The resolved check itself (check-settings never gets this far with such a file).
+        settings = self.wired(True, True)
+        settings["member_tools"]["tags"]["state_root"] = str(self.out)
+        with self.assertRaises(summary.SummaryError) as caught:
+            summary.check_output_dir(settings)
+        self.assertEqual(caught.exception.code, "output_dir_inside_tool_state")
+        link = self.temp / "tags-link"
+        try:
+            os.symlink(self.out, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return  # no symlink right on this machine: the written check above still holds
+        settings = self.wired(True, True)
+        settings["member_tools"]["tags"]["state_root"] = str(link)
+        with self.assertRaises(summary.SummaryError) as caught:
+            summary.check_output_dir(settings)
+        self.assertEqual(caught.exception.code, "output_dir_inside_tool_state")
+
+    def test_check_settings_prints_both_switches(self):
+        path = self.temp / "settings.json"
+        for core, tags in ((False, False), (True, False), (False, True), (True, True)):
+            path.write_text(json.dumps(self.raw(self.tools_value(core, tags))), encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = summary.main(["check-settings", "--settings", str(path)])
+            answer = json.loads(out.getvalue())
+            self.assertEqual((code, answer["member_core_enabled"], answer["tags_enabled"]), (0, core, tags))
+        absent = self.settings_value()
+        absent.pop("member_tools")
+        path.write_text(json.dumps(absent), encoding="utf-8")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            summary.main(["check-settings", "--settings", str(path)])
+        answer = json.loads(out.getvalue())
+        self.assertEqual((answer["status"], answer["member_core_enabled"], answer["tags_enabled"]), ("ok", False, False))
+
+
+class WiringChildrenTests(WiringTestCase):
+    """T3: pinned argv per tool, the order, and a disabled tool is never started."""
+
+    def test_argv_order_and_timeouts(self):
+        log, result = self.logged_run(True, True)
+        self.assertEqual(log, ["task-state", "check-config", "digest", "xb_member_benefits.py", "xb_member_tags.py", "sql", "send"])
+        tool_calls = self.runner.calls[-2:]
+        self.assertEqual(tool_calls, [
+            [sys.executable, str(CORE_SCRIPT), "digest", "--config", str(self.temp / "member_benefits_live.json"), "--hours", "24"],
+            [sys.executable, str(TAGS_SCRIPT), "digest", "--config", str(self.temp / "member_tags_live.json"), "--hours", "24"],
+        ])
+        self.assertEqual(self.runner.timeouts, [40, 40, 40, 20, 20])
+        self.assertEqual(result["overall"], "CLEAN")
+
+    def test_a_disabled_tool_is_never_started(self):
+        for core, tags, started in ((True, False, ["xb_member_benefits.py"]), (False, True, ["xb_member_tags.py"])):
+            with self.subTest(core=core, tags=tags):
+                log, _ = self.logged_run(core, tags)
+                self.assertEqual([step for step in log if step.endswith(".py")], started)
+                event = json.loads((self.out / f"daily_summary_{TODAY}.json").read_text(encoding="utf-8"))["event"]
+                self.assertEqual(event["schema"], summary.EVENT_SCHEMA_V2)
+                self.assertEqual([name for name, part in event["member_tools"].items() if part is None],
+                                 ["tags"] if core else ["member_core"])
+
+    def test_any_other_tool_command_is_refused_before_a_process_starts(self):
+        runner = ToolRunner()
+        settings = self.wired(True, True)
+        for name in summary.TOOL_NAMES:
+            for command in ("observe", "apply", "init", "status", "check-config", "resolve", "index", "release-held", "unlink",
+                            "claim-links", "digest --apply"):
+                with self.subTest(tool=name, command=command), self.assertRaises(summary.SummaryError) as caught:
+                    summary.run_tool(name, command, settings, runner)
+                self.assertEqual(caught.exception.code, "tool_command_not_allowed")
+        with self.assertRaises(summary.SummaryError):
+            summary.run_tool("sync", "digest", settings, runner)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(summary.TOOL_COMMANDS, ("digest",))
+
+    def test_static_only_digest_and_only_the_sibling_scripts(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run_tool"]
+        self.assertEqual([(type(call.args[1]).__name__, call.args[1].value) for call in calls], [("Constant", "digest")])
+        constants = {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+        for word in ("observe", "apply", "resolve", "index", "release-held", "unlink", "claim-links", "--apply", "--write"):
+            self.assertNotIn(word, constants, word)
+        here = SOURCE.resolve().parent
+        self.assertEqual(summary.TOOL_SCRIPTS, {"member_core": here / "xb_member_benefits.py", "tags": here / "xb_member_tags.py"})
+        self.assertIn('"member_core": Path(__file__).resolve().parent / "xb_member_benefits.py"', source)
+        self.assertIn('"tags": Path(__file__).resolve().parent / "xb_member_tags.py"', source)
+        # A tool's settings name no script, command, interpreter or argument.
+        self.assertEqual(summary._TOOL_KEYS, {"enabled", "config_path", "state_root", "timeout_seconds"})
+        # The tools are child processes only: never imported, never their ledgers.
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+        self.assertFalse({"xb_member_benefits", "xb_member_tags", "xb_directlocal"} & imported)
+
+
+class WiringTagsRuleTests(WiringTestCase):
+    """T4: the tags rule table, every reason and CLEAN."""
+
+    def verdict(self, **email):
+        section = summary.tags_section(tags_digest(**email))
+        return section["status"], section["reasons"]
+
+    def test_clean_and_every_reason(self):
+        self.assertEqual(self.verdict(), ("CLEAN", []))
+        cases = [
+            (dict(runs_completed=0), ("STOP", ["no_runs"])),
+            (dict(runs_unfinished=1), ("CLEAN", [])),  # the run that may be in progress
+            (dict(runs_unfinished=2), ("STOP", ["unfinished_runs"])),
+            (dict(runs_unfinished=0, open_writes=1), ("STOP", ["open_writes"])),
+            (dict(runs_unfinished=1, open_writes=1), ("WARN", ["open_writes_run_in_progress"])),
+            (dict(runs_unfinished=2, open_writes=1), ("STOP", ["unfinished_runs"])),
+            (dict(alerts=["write_uncertain"]), ("STOP", ["write_alert"])),
+            (dict(alerts=["tag_removes_capped", "write_unresolved"]), ("STOP", ["write_alert", "alerts"])),
+            (dict(alerts=["tag_removes_capped"]), ("WARN", ["alerts"])),
+            (dict(stale_month=True), ("WARN", ["stale_month"])),
+            (dict(alerts=["code_%02d" % n for n in range(19)]), ("WARN", ["alerts"])),
+            (dict(alerts=["code_%02d" % n for n in range(20)]), ("STOP", ["alerts_at_cap", "alerts"])),
+            (dict(runs_completed=0, runs_unfinished=1, open_writes=1, alerts=["write_uncertain"], stale_month=True),
+             ("STOP", ["no_runs", "write_alert", "open_writes_run_in_progress", "stale_month"])),
+        ]
+        for email, expected in cases:
+            with self.subTest(email=email):
+                self.assertEqual(self.verdict(**email), expected)
+        self.assertEqual(summary.TAGS_INFO_ALERTS, ())
+
+    def test_an_unreadable_code_is_shown_as_unreadable_and_still_counts(self):
+        for code in ("bday_untag_reason:tag_without_basis", "code_" + "123456", "phone_" + FAKE_PHONE, FAKE_AT, "Bad Code"):
+            with self.subTest(code=code):
+                section = summary.tags_section(tags_digest(alerts=[code, "tag_removes_capped"]))
+                self.assertEqual(section["alerts"], ["tag_removes_capped", summary.UNREADABLE_ALERT])
+                self.assertEqual((section["status"], section["reasons"]), ("WARN", ["alerts"]))
+                self.assertNotIn(code, json.dumps(section))
+        both = summary.tags_section(tags_digest(alerts=["a:b", "c:d"]))
+        self.assertEqual(both["alerts"], [summary.UNREADABLE_ALERT])
+
+    def test_a_bad_email_block_is_digest_failed(self):
+        bad_blocks = []
+        missing = tags_digest()
+        del missing["email"]
+        bad_blocks.append(missing)
+        for change in ({"extra": 1}, {"runs_completed": "12"}, {"open_writes": True}, {"open_writes": -1}, {"stale_month": 1},
+                       {"stale_month": None}, {"alerts": "write_uncertain"}, {"alerts": [1]}, {"alerts": None},
+                       {"alerts": ["code_%02d" % n for n in range(21)]}, {"tagged_now": 1.5}):
+            bad_blocks.append(tags_digest(**change))
+        no_alerts = tags_digest()
+        del no_alerts["email"]["alerts"]
+        bad_blocks += [no_alerts, {**tags_digest(), "email": None}, {**tags_digest(), "email": []}]
+        for raw in bad_blocks:
+            with self.subTest(email=raw.get("email")):
+                section = summary.tags_section(raw)
+                self.assertEqual(section, summary.tool_failed("tags", "email_block_invalid"))
+                self.assertEqual((section["status"], section["reasons"], section["available"]), ("STOP", ["digest_failed"], False))
+
+    def test_counts_are_capped_and_the_other_digest_parts_are_never_read(self):
+        section = summary.tags_section(tags_digest(tagged_now=10 ** 12))
+        self.assertEqual(section["tagged_now"], summary.COUNT_MAX)
+        raw = tags_digest()
+        raw["alerts"] = {"write_uncertain": 9}  # outside the email block: not read
+        raw["open"] = {"uncertain_writes": 9, "intent_writes": 9}
+        self.assertEqual(summary.tags_section(raw)["status"], "CLEAN")
+        self.assertEqual(list(summary.tags_section(raw)), list(summary.TOOL_SECTION_HEAD + summary.TAGS_FIELDS))
+
+    def test_child_failures(self):
+        refused = {"status": "refused", "code": "tags_ledger_missing"}
+        cases = [
+            (dict(tags=refused, tool_codes={"xb_member_tags.py": 2}), "tags_ledger_missing"),
+            (dict(tags={"status": "refused", "code": "state_root_acl_unsafe"}, tool_codes={"xb_member_tags.py": 2}), "state_root_acl_unsafe"),
+            (dict(tags={"status": "refused", "code": "Bad Code"}, tool_codes={"xb_member_tags.py": 2}), "unreadable_refusal"),
+            (dict(tags={"status": "refused", "code": "x_" + FAKE_PHONE}, tool_codes={"xb_member_tags.py": 2}), "unreadable_refusal"),
+            (dict(tags={"status": "refused", "code": FAKE_AT}, tool_codes={"xb_member_tags.py": 2}), "unreadable_refusal"),
+            (dict(tags={"status": "refused", "code": 7}, tool_codes={"xb_member_tags.py": 2}), "unreadable_refusal"),
+            (dict(tags=subprocess.TimeoutExpired(["x"], 20)), "timed_out"),
+            (dict(tags=OSError("no python")), "no_answer"),
+            (dict(tags=tags_digest(), tool_codes={"xb_member_tags.py": 3}), "exit_code"),
+            (dict(tags="Traceback (most recent call last):", tool_codes={"xb_member_tags.py": 1}), "exit_code"),
+            (dict(tags="no json at all"), "no_answer"),
+            (dict(tags={"status": "other"}), "no_answer"),
+        ]
+        for runner_args, refusal in cases:
+            with self.subTest(refusal=refusal, args=str(runner_args)[:60]):
+                event = self.run_wired(False, True, runner=ToolRunner(**runner_args))
+                section = event["member_tools"]["tags"]
+                self.assertEqual(section, summary.tool_failed("tags", refusal))
+                self.assertEqual(self.result["overall"], "STOP")
+                self.assertEqual(event["result"], "CLEAN")  # the sync's own result is untouched
+                self.assertEqual(self.record["email_status"], "sent")
+
+
+class WiringCoreRuleTests(WiringTestCase):
+    """T5: the member core rule table."""
+
+    def verdict(self, raw):
+        section = summary.core_section(raw)
+        return section["status"], section["reasons"]
+
+    def test_clean_and_every_reason(self):
+        self.assertEqual(self.verdict(core_digest()), ("CLEAN", []))
+        cases = [
+            (core_digest(rule_settings_match=False), ("STOP", ["rule_settings_mismatch"])),
+            (core_digest(runs={"completed": 0}), ("STOP", ["no_runs"])),
+            (core_digest(runs={"unfinished": 1}), ("CLEAN", [])),
+            (core_digest(runs={"unfinished": 2}), ("STOP", ["unfinished_runs"])),
+            (core_digest(opened={"uncertain_writes": 1}), ("STOP", ["uncertain_writes"])),
+            (core_digest(opened={"uncertain_writes": 1}, runs={"unfinished": 1}), ("WARN", ["uncertain_writes_run_in_progress"])),
+            (core_digest(opened={"uncertain_writes": 1}, runs={"unfinished": 2}), ("STOP", ["unfinished_runs"])),
+            (core_digest(opened={"held_writes": 1}), ("WARN", ["held_writes"])),
+            (core_digest(alerts={"orders_read_incomplete": 2, "member_reads_capped": 1}), ("CLEAN", [])),  # INFO: no status change
+            (core_digest(alerts={"orders_read_incomplete": 2, "claim_needs_review": 1}), ("WARN", ["alerts"])),
+            (core_digest(alerts={"bad:code": 1}), ("WARN", ["alerts"])),
+            (core_digest(rule_settings_match=False, runs={"completed": 0, "unfinished": 1}, opened={"uncertain_writes": 1, "held_writes": 2},
+                         alerts={"claim_needs_review": 1}),
+             ("STOP", ["rule_settings_mismatch", "no_runs", "uncertain_writes_run_in_progress", "held_writes", "alerts"])),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw["runs"], opened=raw["open"], alerts=raw["alerts"]):
+                self.assertEqual(self.verdict(raw), expected)
+        self.assertEqual(summary.CORE_INFO_ALERTS, ("orders_read_incomplete", "member_reads_capped"))
+
+    def test_a_wrong_schema_or_pinned_key_is_digest_failed(self):
+        bad = [core_digest(schema="xb.directlocal.member_benefits.digest.v2"), {k: v for k, v in core_digest().items() if k != "schema"},
+               core_digest(rule_settings_match="yes"), core_digest(rule_settings_match=None), core_digest(runs={"completed": True}),
+               core_digest(runs={"unfinished": -1}), core_digest(opened={"held_writes": "0"}), core_digest(shadow={"would_extend": None}),
+               core_digest(alerts={"claim_needs_review": "2"}), core_digest(alerts={"claim_needs_review": True}),
+               {**core_digest(), "alerts": []}, {**core_digest(), "alerts": None}, core_digest(open=None)]
+        missing = core_digest()
+        del missing["shadow"]["would_upgrade"]
+        bad.append(missing)
+        no_alerts = core_digest()
+        del no_alerts["alerts"]
+        bad.append(no_alerts)
+        for raw in bad:
+            with self.subTest(raw=json.dumps(raw)[:200]):
+                self.assertEqual(summary.core_section(raw), summary.tool_failed("member_core", "digest_schema_unknown"))
+
+    def test_more_than_twenty_alerts_keep_the_sync_bound(self):
+        alerts = {"code_%02d" % n: n + 1 for n in range(25)}
+        section = summary.core_section(core_digest(alerts=alerts))
+        self.assertEqual(len(section["alerts"]), summary.MAX_ALERT_CODES)
+        self.assertEqual(section["alerts"][summary.OTHER_ALERTS], sum(range(20, 26)))
+        self.assertEqual((section["status"], section["reasons"]), ("WARN", ["alerts"]))
+        # Only INFO codes, more than 20 of them in all, is still CLEAN: the decision reads every code.
+        self.assertEqual(self.verdict(core_digest(alerts={"orders_read_incomplete": 1})), ("CLEAN", []))
+
+    def test_only_the_pinned_keys_are_read(self):
+        section = summary.core_section(core_digest(open={"uncertain_writes": 0, "held_writes": 0, "waiting_member": 2},
+                                                   gift_cards={"gateways_seen": {"x_" + FAKE_PHONE: 1}}, receipts=None, counts=None,
+                                                   alert_refs="not read", autocount_book="OTHER"))
+        self.assertEqual(section["status"], "CLEAN")
+        self.assertEqual(list(section), list(summary.TOOL_SECTION_HEAD + summary.CORE_FIELDS))
+        self.assertEqual({k: section[k] for k in ("waiting_member", "would_upgrade", "would_extend", "rule_settings_match")},
+                         {"waiting_member": 2, "would_upgrade": 3, "would_extend": 1, "rule_settings_match": True})
+
+    def test_child_failures(self):
+        for runner_args, refusal in ((dict(core={"status": "refused", "code": "benefits_ledger_missing"},
+                                           tool_codes={"xb_member_benefits.py": 2}), "benefits_ledger_missing"),
+                                     (dict(core=subprocess.TimeoutExpired(["x"], 20)), "timed_out"),
+                                     (dict(core=core_digest(schema="other")), "digest_schema_unknown")):
+            with self.subTest(refusal=refusal):
+                event = self.run_wired(True, False, runner=ToolRunner(**runner_args))
+                self.assertEqual(event["member_tools"]["member_core"], summary.tool_failed("member_core", refusal))
+                self.assertIsNone(event["member_tools"]["tags"])
+
+
+class WiringNeverChangesTheSyncTests(WiringTestCase):
+    """T6: for every tool status, the sync's part of the event is the event with the tools off."""
+
+    def test_the_sync_part_is_unchanged(self):
+        syncs = {
+            "clean": dict(),
+            "stop": dict(digest=digest_fixture(counts={"shopify_customer_created": 1}, opened={"uncertain_writes": 1},
+                                               alerts={"possible_duplicate_member": 1})),
+            "task": dict(task=task_fixture(state="Disabled", last_result=1)),
+        }
+        tools = {
+            "clean": dict(core=core_digest(), tags=tags_digest()),
+            "warn": dict(core=core_digest(opened={"held_writes": 1}), tags=tags_digest(stale_month=True)),
+            "stop": dict(core=core_digest(rule_settings_match=False), tags=tags_digest(alerts=["write_uncertain"])),
+            "failed": dict(core={"status": "refused", "code": "benefits_ledger_missing"}, tags=subprocess.TimeoutExpired(["x"], 20),
+                           tool_codes={"xb_member_benefits.py": 2}),
+        }
+        for sync_name, sync in syncs.items():
+            off = self.run_daily(runner=FakeRunner(**sync), settings=self.wired(False, False))
+            off_result = dict(self.result)
+            for tool_name, outcome in tools.items():
+                for core, tags in ((True, False), (False, True), (True, True)):
+                    with self.subTest(sync=sync_name, tools=tool_name, core=core, tags=tags):
+                        event = self.run_wired(core, tags, runner=ToolRunner(**sync, **outcome))
+                        self.assertEqual({k: v for k, v in event.items() if k not in ("schema", "member_tools")},
+                                         {k: v for k, v in off.items() if k != "schema"})
+                        for key in ("result", "stop_reasons", "auto_off", "auto_off_reasons"):
+                            self.assertEqual(event[key], off[key], key)
+                        self.assertEqual({k: v for k, v in self.result.items() if k != "overall"}, off_result)
+                        words = [event["result"]] + [part["status"] for part in event["member_tools"].values() if part]
+                        self.assertEqual(self.result["overall"], max(words, key=summary.TOOL_STATUSES.index))
+
+    def test_decide_never_reads_the_tools(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        decide = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "decide")
+        self.assertNotIn("member_tools", ast.get_source_segment(source, decide))
+        self.assertNotIn("member_tools", [arg.arg for arg in decide.args.args + decide.args.kwonlyargs])
+
+
+class WiringPrivacyTests(WiringTestCase):
+    """T7: fake personal data in each tool field is dropped or refused on the VM; no ref passes."""
+
+    def test_fake_phone_and_email_never_reach_the_event(self):
+        bad = ["x_" + FAKE_PHONE, FAKE_AT, FAKE_NAME]
+        runs = [
+            dict(core=core_digest(alerts={code: 1 for code in bad}, extra_contact={FAKE_AT: FAKE_PHONE}),
+                 tags=tags_digest(alerts=bad)),
+            dict(core={"status": "refused", "code": "x_" + FAKE_PHONE}, tags={"status": "refused", "code": FAKE_AT},
+                 tool_codes={"xb_member_benefits.py": 2, "xb_member_tags.py": 2}),
+            dict(core=core_digest(**{"x_" + FAKE_PHONE: 1}), tags={**tags_digest(), "email": {**tags_digest()["email"], FAKE_AT: 1}}),
+        ]
+        for n, outcome in enumerate(runs):
+            with self.subTest(run=n):
+                self.run_wired(True, True, runner=ToolRunner(**outcome))
+                text = json.dumps(self.poster.calls[0]["body"]) + json.dumps(self.record)
+                for word in (FAKE_PHONE, FAKE_AT, "@", "example.com", FAKE_NAME, "o-123456", "c-1111"):
+                    self.assertNotIn(word, text)
+        # The refs and the gift card names of a real-shaped digest are never carried.
+        self.run_wired(True, True)
+        text = json.dumps(self.record["event"]["member_tools"])
+        for word in ("alert_refs", "member_no", "gateways", "gift_card", "o-", "c-", "***"):
+            self.assertNotIn(word, text)
+
+    def test_check_event_refuses_a_tool_section_with_personal_data(self):
+        self.run_wired(True, True)
+        good = self.record["event"]
+        summary.check_event(good)
+        cases = []
+        for path, value in ((("tags", "alerts"), ["x_" + FAKE_PHONE]), (("tags", "alerts"), [FAKE_AT]),
+                            (("member_core", "alerts"), {"x_" + FAKE_PHONE: 1})):
+            event = json.loads(json.dumps(good))
+            event["member_tools"][path[0]][path[1]] = value
+            cases.append(event)
+        failed = json.loads(json.dumps(good))
+        failed["member_tools"]["tags"] = summary.tool_failed("tags", "x_" + FAKE_PHONE)
+        cases.append(failed)
+        failed = json.loads(json.dumps(good))
+        failed["member_tools"]["tags"] = summary.tool_failed("tags", FAKE_AT)
+        cases.append(failed)
+        for event in cases:
+            with self.subTest(event=json.dumps(event["member_tools"])[:120]), self.assertRaises(summary.SummaryError) as caught:
+                summary.check_event(event)
+            self.assertIn(caught.exception.code, ("event_member_tools_invalid", "event_personal_data_like"))
+
+
+class WiringEventShapeTests(WiringTestCase):
+    """check_event covers v2: exact keys and closed values per tool."""
+
+    def good(self):
+        self.run_wired(True, True, runner=ToolRunner(core=core_digest(opened={"held_writes": 1}), tags=tags_digest(stale_month=True)))
+        return self.record["event"]
+
+    def test_v2_shape(self):
+        event = self.good()
+        self.assertEqual(tuple(event), summary.EVENT_KEYS_V2)
+        self.assertEqual(event["schema"], "xb.member_sync.daily_summary.v2")
+        self.assertEqual(tuple(event["member_tools"]), summary.TOOL_NAMES)
+        self.assertEqual(tuple(event["member_tools"]["tags"]), summary.TOOL_SECTION_HEAD + summary.TAGS_FIELDS)
+        self.assertEqual(tuple(event["member_tools"]["member_core"]), summary.TOOL_SECTION_HEAD + summary.CORE_FIELDS)
+        self.assertEqual(self.result["overall"], "WARN")
+
+    def test_check_event_refusals(self):
+        good = self.good()
+
+        def changed(fn):
+            event = json.loads(json.dumps(good))
+            fn(event)
+            return event
+
+        def tool(name, **changes):
+            return lambda e: e["member_tools"][name].update(changes)
+
+        cases = {
+            "event_keys_invalid": [changed(lambda e: e.pop("member_tools")), changed(lambda e: e.update(schema=summary.EVENT_SCHEMA))],
+            "event_member_tools_invalid": [
+                changed(lambda e: e.update(member_tools={"member_core": None, "tags": None})),
+                changed(lambda e: e["member_tools"].update(sync=None)),
+                changed(lambda e: e.update(member_tools={"tags": e["member_tools"]["tags"], "member_core": e["member_tools"]["member_core"]})),
+                changed(tool("tags", status="CLEAN")), changed(tool("tags", status="STOP")), changed(tool("tags", status="OK")),
+                changed(tool("tags", reasons=["alerts", "stale_month"])), changed(tool("tags", reasons=["stale_month", "stale_month"])),
+                changed(tool("tags", reasons=["held_writes"])), changed(tool("member_core", reasons=["held_writes", "made_up"])),
+                changed(tool("tags", open_writes=-1)), changed(tool("tags", open_writes=summary.COUNT_MAX + 1)),
+                changed(tool("tags", open_writes=True)), changed(tool("tags", stale_month=0)),
+                changed(tool("tags", alerts=["b_code", "a_code"])), changed(tool("tags", alerts=["code_%02d" % n for n in range(21)])),
+                changed(tool("member_core", alerts={"code_%02d" % n: 1 for n in range(21)})),
+                changed(tool("member_core", alerts={"Bad Code": 1})), changed(tool("member_core", rule_settings_match=None)),
+                changed(tool("member_core", available=False)), changed(tool("member_core", refusal="timed_out")),
+                changed(tool("member_core", status="STOP", reasons=["digest_failed", "held_writes"])),
+                changed(lambda e: e["member_tools"]["tags"].update(extra=1)),
+                changed(lambda e: e["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"), "runs_completed": 3})),
+                changed(lambda e: e["member_tools"].update(tags={**summary.tool_failed("tags", "timed_out"), "refusal": None})),
+            ],
+        }
+        for code, events in cases.items():
+            for event in events:
+                with self.subTest(code=code, tools=json.dumps(event.get("member_tools"))[:160]), \
+                        self.assertRaises(summary.SummaryError) as caught:
+                    summary.check_event(event)
+                self.assertEqual(caught.exception.code, code)
+
+
+class WiringContractTests(WiringTestCase):
+    """T8: each real tool's digest gives exactly the keys and types the summary reads.
+
+    Route: each tool's own ``ledger_digest`` in-process, on a temp ledger made by that tool's own
+    ``init`` (its Ledger class and its example config) with one run row stored the way the tools'
+    own tests store one. Not the CLI child: the CLI's state root check needs a private-ACL folder
+    owned by the current user, which a CI temp folder is not; the CLI prints exactly this function's
+    answer (``_emit(ledger_digest(...))``). The JSON of that answer is then fed through daily() as
+    the child's output, so the full path is the real digest's."""
+
+    @classmethod
+    def setUpClass(cls):
+        import xb_directlocal as dl  # noqa: PLC0415 - test-only imports of the real tools
+        import xb_member_benefits as bm
+        import xb_member_tags as mt
+        cls.dl, cls.bm, cls.mt = dl, bm, mt
+
+    def setUp(self):
+        super().setUp()
+        self.now = NOW
+
+    def store_run(self, ledger_file, run_summary):
+        import sqlite3  # noqa: PLC0415
+        conn = sqlite3.connect(ledger_file)
+        try:
+            conn.execute("INSERT INTO runs(run_id, command, started_at, finished_at, summary) VALUES ('run-x', 'observe', ?, ?, ?)",
+                         (self.dl.ts(self.now - timedelta(minutes=3)), self.dl.ts(self.now - timedelta(minutes=2)), json.dumps(run_summary)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def real_tags_digest(self):
+        cfg = self.mt.parse_config(json.loads((ROOT / "config" / "member_tags.example.json").read_text(encoding="utf-8")))
+        root = self.tags_root
+        ledger = self.mt.TagsLedger(root, clock=lambda: self.now)
+        try:
+            ledger.init_meta(cfg)
+        finally:
+            ledger.close()
+        self.store_run(root / self.mt.LEDGER_FILE, {"counts": {"would_tag": 3, "would_bday_tag": 1}, "alerts": ["tag_removes_capped", "write_uncertain"],
+                                                     "tagged_now": 5, "bday_tagged_now": 2, "bday_month_now": "November"})
+        return self.mt.ledger_digest(root, hours=24, now=self.now, config=cfg)
+
+    def real_core_digest(self):
+        cfg = self.bm.load_config(ROOT / "config" / "member_benefits.example.json")
+        root = self.core_root
+        ledger = self.bm.BenefitsLedger(root, clock=lambda: self.now)
+        try:
+            ledger.init_meta(cfg)
+        finally:
+            ledger.close()
+        self.store_run(root / self.bm.LEDGER_FILE, {"counts": {"orders_read": 4}, "alerts": ["orders_read_incomplete", "claim_needs_review"]})
+        return self.bm.ledger_digest(root, hours=24, now=self.now, config=cfg)
+
+    def test_tags_email_block(self):
+        digest = self.real_tags_digest()
+        email = digest["email"]
+        self.assertEqual(set(email), set(summary.TAGS_EMAIL_KEYS))
+        for key in summary.TAGS_COUNT_KEYS:
+            self.assertIs(type(email[key]), int, key)
+        self.assertIs(type(email["stale_month"]), bool)
+        self.assertIsInstance(email["alerts"], list)
+        self.assertEqual(self.mt.EMAIL_MAX_ALERTS, summary.TAGS_MAX_ALERTS)
+        section = summary.tags_section(json.loads(json.dumps(digest)))
+        self.assertIs(section["available"], True)
+        self.assertEqual((section["runs_completed"], section["tagged_now"], section["would_tag"], section["alerts"]),
+                         (1, 5, 3, ["tag_removes_capped", "write_uncertain"]))
+        self.assertEqual((section["status"], section["reasons"]), ("STOP", ["write_alert", "alerts"]))
+
+    def test_core_pinned_keys(self):
+        digest = self.real_core_digest()
+        self.assertEqual(digest["schema"], summary.CORE_DIGEST_SCHEMA)
+        self.assertEqual(self.bm.DIGEST_SCHEMA, summary.CORE_DIGEST_SCHEMA)
+        for field, path in summary.CORE_PINNED:
+            value = digest
+            for part in path:
+                value = value[part]
+            self.assertIs(type(value), bool if field == "rule_settings_match" else int, field)
+        self.assertIsInstance(digest["alerts"], dict)
+        section = summary.core_section(json.loads(json.dumps(digest)))
+        self.assertIs(section["available"], True)
+        self.assertEqual(section["alerts"], {"claim_needs_review": 1, "orders_read_incomplete": 1})
+        self.assertEqual((section["status"], section["reasons"]), ("WARN", ["alerts"]))
+
+    def test_both_real_digests_through_daily(self):
+        runner = ToolRunner(core=self.real_core_digest(), tags=self.real_tags_digest())
+        event = self.run_wired(True, True, runner=runner)
+        self.assertEqual(event["member_tools"]["member_core"]["status"], "WARN")
+        self.assertEqual(event["member_tools"]["tags"]["status"], "STOP")
+        self.assertEqual(self.result["overall"], "STOP")
+
+    def cli_digest(self, module, example, root, **roots):
+        """G2 LATER 4: the tool's own ``main(["digest", "--config", <file>, "--hours", "24"])`` in-process,
+        on a ledger made by its own ``init`` through the same ``main``, with the state-root ACL check
+        (``dl.verify_private_state``) a no-op and %LOCALAPPDATA% elsewhere, as the tools' own CLI tests
+        do. Returns (exit code, stdout)."""
+
+        value = json.loads((ROOT / "config" / example).read_text(encoding="utf-8"))
+        value.update(state_root=str(root), **{key: str(path) for key, path in roots.items()})
+        path = self.temp / ("cli_" + example)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        elsewhere = self.temp / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(elsewhere)}), \
+                mock.patch.object(self.dl, "verify_private_state", lambda folder: None):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(module.main(["init", "--config", str(path)], clock=lambda: self.now), 0)
+            ledger = root / module.LEDGER_FILE
+            self.store_run(ledger, {"counts": {}, "alerts": ["write_uncertain" if module is self.mt else "claim_needs_review"],
+                                    "tagged_now": 5, "bday_month_now": "November"})
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = module.main(["digest", "--config", str(path), "--hours", "24"], clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def test_each_tools_cli_digest_reads_as_the_summary_reads_a_child(self):
+        cases = (
+            (self.mt, "member_tags.example.json", self.tags_root,
+             {"member_sync_state_root": self.state_root, "member_core_state_root": self.core_root}, summary.tags_section, "STOP"),
+            (self.bm, "member_benefits.example.json", self.core_root, {"member_sync_state_root": self.state_root}, summary.core_section, "WARN"),
+        )
+        for module, example, root, roots, section_of, status in cases:
+            with self.subTest(tool=module.__name__):
+                code, stdout = self.cli_digest(module, example, root, **roots)
+                self.assertEqual(code, 0, stdout)  # a non-zero digest exit is exit_code in the summary
+                lines = stdout.strip().splitlines()
+                self.assertEqual(len(lines), 1, "the digest answer is one JSON line")
+                answer = summary._last_json_line(stdout)
+                self.assertIsInstance(answer, dict)
+                self.assertEqual(answer.get("status"), "ok")
+                section = section_of(answer)
+                self.assertIs(section["available"], True, section)
+                self.assertEqual(section["runs_completed"], 1)
+                self.assertEqual(section["status"], status)
+
+    def test_the_tools_own_digest_commands_take_these_arguments(self):
+        for module in (self.mt, self.bm):
+            self.assertIn("digest", module.COMMANDS)
+            text = Path(module.__file__).read_text(encoding="utf-8")
+            self.assertIn('parser.add_argument("--config", required=True)', text)
+            self.assertIn('parser.add_argument("--hours", type=int, default=24', text)
 
 
 if __name__ == "__main__":
