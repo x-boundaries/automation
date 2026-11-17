@@ -8163,21 +8163,40 @@ def forms_customer(n: int, *, first="Alpha", last="Tester", email=None, phone="s
 
 
 class FormsShopify(FakeShopify):
-    """FakeShopify plus the forms read. ``forms`` is what the tag search returns (a candidate list:
-    tests put look-alike tags in it); ``forms_complete`` False is the page cap reached."""
+    """FakeShopify plus the forms read, paged like Shopify: customers in (updatedAt, id) order,
+    each with a cursor naming its own position, ``page_size`` per page. ``forms`` is what the tag
+    search returns (a candidate list: tests put look-alike tags in it), in list order unless
+    ``touch`` moved a customer to the end (updated again). ``updated`` sets an explicit sort value
+    (equal values: a tie, ordered by id). ``forms_error`` True fails every page; an int fails
+    only that call (1-based)."""
 
     def __init__(self):
         super().__init__()
         self.forms: list[sync.FormsCustomer] = []
-        self.forms_searches: list[tuple[str, int]] = []
-        self.forms_complete = True
-        self.forms_error = False
+        self.updated: dict[str, float] = {}
+        self.forms_searches: list[tuple[str, str | None]] = []
+        self.forms_error: bool | int = False
+        self.page_size = 50
 
-    def forms_sign_ups(self, search, max_pages):
-        self.forms_searches.append((search, max_pages))
-        if self.forms_error:
+    def touch(self, *gids: str) -> None:
+        top = max([self.updated.get(c.gid, i) for i, c in enumerate(self.forms)] + [0])
+        for step, value in enumerate(gids, 1):
+            self.updated[value] = top + step
+
+    def ordered(self) -> list:
+        return sorted(((float(self.updated.get(c.gid, i)), c.gid, c) for i, c in enumerate(self.forms)), key=lambda e: (e[0], e[1]))
+
+    def forms_page(self, search, after):
+        self.forms_searches.append((search, after))
+        error = self.forms_error
+        if error is True or (not isinstance(error, bool) and error == len(self.forms_searches)):
             raise direct.ShopifyDirectError("shopify_transport_failed")
-        return list(self.forms), self.forms_complete
+        entries = self.ordered()
+        if after is not None:
+            key, value = after.split("|")
+            entries = [e for e in entries if (e[0], e[1]) > (float(key), value)]
+        page = entries[:self.page_size]
+        return [(c, f"{k}|{g}") for k, g, c in page], len(entries) > self.page_size
 
 
 class FormsTestCase(SyncTestCase):
@@ -8509,12 +8528,12 @@ class FormsReadTests(FormsTestCase):
     def test_the_first_read_starts_at_since_and_a_clean_read_moves_the_day(self):
         self.shopify.forms = [forms_customer(1)]
         self.watch()
-        self.assertEqual(self.shopify.forms_searches, [(f"tag:'xb-form-signup' AND updated_at:>='{FORMS_SINCE}'", 4)])
+        self.assertEqual(self.shopify.forms_searches, [(f"tag:'xb-form-signup' AND updated_at:>='{FORMS_SINCE}'", None)])
         today = self.now.astimezone(sync.SGT).strftime("%Y-%m-%d")
         self.assertEqual(self.ledger.watermark(sync.FORMS_WATERMARK), today)
         self.watch(forms_watch_max_pages=7)
         yesterday = (self.now.astimezone(sync.SGT) - timedelta(days=1)).strftime("%Y-%m-%d")
-        self.assertEqual(self.shopify.forms_searches[-1], (f"tag:'xb-form-signup' AND updated_at:>='{yesterday}'", 7))
+        self.assertEqual(self.shopify.forms_searches[-1], (f"tag:'xb-form-signup' AND updated_at:>='{yesterday}'", None))
 
     def test_the_day_never_goes_before_since(self):
         with self.ledger.tx() as conn:
@@ -8544,15 +8563,14 @@ class FormsReadTests(FormsTestCase):
     def test_the_page_cap_counts_classifies_what_was_read_and_leaves_the_day(self):
         with self.ledger.tx() as conn:
             self.ledger.set_watermark(conn, sync.FORMS_WATERMARK, "2026-10-10")
-        self.shopify.forms = [forms_customer(1)]
-        self.shopify.forms_complete = False
-        counts = self.watch()
-        self.assertEqual((counts["forms_read_incomplete"], counts["forms_would_heal"]), (1, 1))
+        self.shopify.forms = [forms_customer(n) for n in range(1, 53)]  # 52: two pages
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual((counts["forms_read_incomplete"], counts["forms_would_heal"]), (1, 50))
+        self.assertNotIn("forms_read_stalled", counts)  # it made progress
         self.assertEqual(self.ledger.watermark(sync.FORMS_WATERMARK), "2026-10-10")
-        self.shopify.forms_complete = True
-        counts = self.watch()
+        counts = self.watch(forms_watch_max_pages=1)
         self.assertNotIn("forms_read_incomplete", counts)
-        self.assertNotIn("forms_would_heal", counts)  # seen-marked: never counted twice
+        self.assertEqual(counts["forms_would_heal"], 2)  # the rest only: the first 50 were never read again
         self.assertNotEqual(self.ledger.watermark(sync.FORMS_WATERMARK), "2026-10-10")
 
     def test_only_the_exact_tag_is_read(self):
@@ -8563,6 +8581,7 @@ class FormsReadTests(FormsTestCase):
         self.assertEqual(len(self.marks()), 1)
 
     def test_the_email_read_budget_is_pages_times_fifty(self):
+        self.shopify.page_size = 60  # a longer page than asked for: the K6 budget still holds
         self.shopify.forms = [forms_customer(n) for n in range(1, 52)]  # 51 records that each need the K6 read
         counts = self.watch(forms_watch_max_pages=1)
         self.assertEqual((len(self.shopify.email_reads), counts["forms_would_heal"], counts["forms_read_incomplete"]), (50, 50, 1))
@@ -8724,39 +8743,45 @@ class FormsClientTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def page(self, items, has_next):
+        return _graphql({"customers": {"pageInfo": {"hasNextPage": has_next}, "edges": [{"cursor": c, "node": n} for c, n in items]}})
+
     def test_the_read_is_pinned_paged_and_reads_only(self):
         search = sync.forms_search("2026-10-01")
-        pages = [
-            _graphql({"customers": {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [self.node(1)]}}),
-            _graphql({"customers": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [self.node(2, metafields=None)]}}),
-        ]
-        client, sent = self.client(pages, create_enabled=False)
-        customers, complete = client.forms_sign_ups(search, 4)
-        self.assertTrue(complete)
+        client, sent = self.client([self.page([("c1", self.node(1))], True), self.page([("c2", self.node(2, metafields=None))], False)],
+                                   create_enabled=False)
+        first, more = client.forms_page(search, None)
+        second, last = client.forms_page(search, first[-1][1])
+        self.assertEqual((more, last, [c for _, c in first + second]), (True, False, ["c1", "c2"]))
         self.assertEqual([s["query"] for s in sent], [sync.FORMS_QUERY, sync.FORMS_QUERY])
         self.assertEqual([s["variables"] for s in sent], [{"first": 50, "after": None, "search": search}, {"first": 50, "after": "c1", "search": search}])
-        self.assertEqual(sync.decide_forms(customers[0], sync.parse_forms_record(customers[0].metafields)).outcome, "forms_would_heal")
-        self.assertIsNone(customers[1].metafields)
+        customer = first[0][0]
+        self.assertEqual(sync.decide_forms(customer, sync.parse_forms_record(customer.metafields)).outcome, "forms_would_heal")
+        self.assertIsNone(second[0][0].metafields)
         self.assertIn(sync.FORMS_QUERY, sync.SYNC_READ_QUERIES)
         self.assertTrue(sync.FORMS_QUERY.startswith("query ") and "mutation" not in sync.FORMS_QUERY)
+        self.assertIn("edges { cursor node {", sync.FORMS_QUERY)
 
-    def test_the_page_cap_returns_incomplete(self):
-        page = _graphql({"customers": {"pageInfo": {"hasNextPage": True, "endCursor": "c1"}, "nodes": [self.node(1)]}})
-        client, sent = self.client([page], create_enabled=False)
-        customers, complete = client.forms_sign_ups(sync.forms_search("2026-10-01"), 1)
-        self.assertEqual((len(customers), complete, len(sent)), (1, False, 1))
-
-    def test_shapes_and_searches_refused(self):
+    def test_shapes_searches_and_cursors_refused(self):
         for bad in ("tag:'member-mg' AND updated_at:>='2026-10-01'", "tag:'xb-form-signup'", "tag:'xb-form-signup' AND updated_at:>='2026-10-01' OR id:1"):
             client, sent = self.client([], create_enabled=False)
             with self.assertRaises(dl.DirectLocalError):
-                client.forms_sign_ups(bad, 1)
+                client.forms_page(bad, None)
             self.assertEqual(sent, [])
-        for answer in ({"customers": None}, {"customers": {"nodes": [{"id": "x"}], "pageInfo": {"hasNextPage": False}}},
-                       {"customers": {"pageInfo": {"hasNextPage": True, "endCursor": ""}, "nodes": []}}):
+        for cursor in ("", "x" * 1025, "c\n1", "cé1", 7):
+            client, sent = self.client([], create_enabled=False)
+            with self.assertRaises(dl.DirectLocalError):
+                client.forms_page(sync.forms_search("2026-10-01"), cursor)
+            self.assertEqual(sent, [])
+        for answer in ({"customers": None}, {"customers": {"edges": [{"cursor": "c1", "node": {"id": "x"}}], "pageInfo": {"hasNextPage": False}}},
+                       {"customers": {"edges": [{"cursor": "", "node": self.node(1)}], "pageInfo": {"hasNextPage": False}}},
+                       {"customers": {"edges": [{"node": self.node(1)}], "pageInfo": {"hasNextPage": False}}},
+                       {"customers": {"edges": [], "pageInfo": {"hasNextPage": True}}},
+                       {"customers": {"edges": [], "pageInfo": {}}},
+                       {"customers": {"nodes": [self.node(1)], "pageInfo": {"hasNextPage": False}}}):
             client, _ = self.client([_graphql(answer)], create_enabled=False)
-            with self.assertRaises(direct.ShopifyDirectError):
-                client.forms_sign_ups(sync.forms_search("2026-10-01"), 2)
+            with self.assertRaises(direct.ShopifyDirectError, msg=answer):
+                client.forms_page(sync.forms_search("2026-10-01"), None)
         with self.assertRaises(dl.DirectLocalError):
             sync.forms_search("2026-10-1")
 
@@ -8771,6 +8796,155 @@ class FormsLedgerTests(FormsTestCase):
         result = self.run_sync()  # the switch off again: the rows stay and change nothing
         self.assertFalse(any(code.startswith("forms_") for code in result["counts"]))
         self.assertEqual(len(self.marks()), 1)
+
+
+# -- #155 slice FH1b: progress after the page cap (G2 L1), L5, L6 -----------------------------------
+
+class FormsProgressTests(FormsTestCase):
+    """G2 L1: a read stopped before the end (page cap, read failure, K6 budget) goes on next run from
+    the last customer fully processed: nothing is skipped, nothing is counted twice, and the read
+    day moves once a read completes."""
+
+    def cursor(self):
+        raw = self.ledger.watermark(sync.FORMS_CURSOR_MARK)
+        return None if raw is None else json.loads(raw)
+
+    def test_the_g2_reproducer_new_sign_ups_are_counted_within_the_next_runs(self):
+        self.shopify.forms = [forms_customer(n) for n in (1, 2, 3)]
+        counts = self.watch()
+        self.assertEqual((counts["forms_records_new"], self.ledger.watermark(sync.FORMS_WATERMARK)), (3, "2026-10-22"))
+        # 210 tagged customers updated after the read day (a bulk edit, say), each with an old
+        # submission already seen elsewhere or new, then three new sign-ups.
+        bulk = [forms_customer(n % 99 + 1, record={"submission_id": f"bulk-{n:04d}"}) for n in range(210)]
+        bulk = [replace(item, gid=f"gid://shopify/Customer/{800000 + n}") for n, item in enumerate(bulk)]
+        fresh = [forms_customer(n, record={"submission_id": f"new-{n:04d}", "first_name": "Bravo"}) for n in (4, 5, 6)]
+        self.shopify.forms = self.shopify.forms + bulk + fresh
+        self.shopify.touch(*[c.gid for c in bulk + fresh])
+        totals = {"forms_other_person": 0}
+        runs = 0
+        while runs < 3:
+            self.now += timedelta(minutes=15)
+            counts = self.watch()
+            runs += 1
+            totals["forms_other_person"] += counts.get("forms_other_person", 0)
+            self.assertNotIn("forms_read_stalled", counts)
+            if "forms_read_incomplete" not in counts:
+                break
+        self.assertEqual(runs, 2)  # 213 to read from the read day: 200, then the rest
+        self.assertEqual(totals["forms_other_person"], 3)  # the three new sign-ups, once each
+        self.assertIsNone(self.cursor())
+        counts = self.watch()  # nothing new: nothing counted again
+        self.assertEqual(counts["forms_records_new"], 0)
+
+    def test_a_capped_run_keeps_its_position_with_its_day_and_counts_incomplete(self):
+        self.shopify.forms = [forms_customer(n) for n in range(1, 56)]
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual((counts["forms_read_incomplete"], counts["forms_records_new"]), (1, 50))
+        self.assertEqual(self.cursor(), {"day": FORMS_SINCE, "after": self.shopify.forms_searches and "49.0|" + gid(50)})
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual(self.shopify.forms_searches[-1][1], "49.0|" + gid(50))
+        self.assertEqual((counts["forms_records_new"], counts.get("forms_read_incomplete")), (5, None))
+
+    def test_a_stop_inside_a_page_resumes_at_the_first_customer_not_done(self):
+        self.shopify.email_read_error = True
+        self.shopify.forms = [forms_customer(1, email=fe(1), tags=("xb-form-signup", "member-mg")), forms_customer(2), forms_customer(3)]
+        counts = self.watch()
+        self.assertEqual((counts["forms_ok"], counts["forms_records_new"], counts["forms_read_incomplete"]), (1, 1, 1))
+        self.assertEqual(self.cursor()["after"], "0.0|" + gid(1))  # customer 2 (its K6 read failed) is not done
+        self.shopify.email_read_error = False
+        counts = self.watch()
+        self.assertEqual(self.shopify.forms_searches[-1][1], "0.0|" + gid(1))
+        self.assertEqual((counts["forms_would_heal"], counts["forms_records_new"]), (2, 2))  # customers 2 and 3
+
+    def test_a_tie_on_updated_at_resumes_between_the_tied_customers(self):
+        self.shopify.page_size = 60
+        self.shopify.forms = [forms_customer(n) for n in range(1, 52)]
+        self.shopify.updated = {gid(50): 49.0, gid(51): 49.0}  # 50 and 51 share one updatedAt
+        counts = self.watch(forms_watch_max_pages=1)  # the K6 budget (50) stops between them
+        self.assertEqual(counts["forms_would_heal"], 50)
+        self.assertEqual(self.cursor()["after"], "49.0|" + gid(50))
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual(counts["forms_would_heal"], 1)  # 51, the other half of the tie
+        self.assertEqual(len(self.marks()), 51)
+
+    def test_a_customer_updated_again_after_being_passed_is_read_again_but_counted_once(self):
+        self.shopify.forms = [forms_customer(n) for n in range(1, 56)]
+        self.watch(forms_watch_max_pages=1)
+        self.shopify.touch(gid(3))  # passed already; moves behind the position
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual((counts["forms_records_seen"], counts["forms_records_new"]), (6, 5))
+
+    def test_a_failure_with_no_step_from_a_kept_position_starts_the_day_again(self):
+        self.shopify.forms = [forms_customer(n) for n in range(1, 56)]
+        self.watch(forms_watch_max_pages=1)
+        self.shopify.forms_error = True
+        counts = self.watch(forms_watch_max_pages=1)
+        self.assertEqual((counts["forms_read_incomplete"], counts["forms_read_stalled"]), (1, 1))
+        self.assertIsNone(self.cursor())
+        self.shopify.forms_error = False
+        counts = self.watch(forms_watch_max_pages=2)
+        self.assertEqual((counts["forms_records_seen"], counts["forms_records_new"]), (55, 5))  # read again from the start, counted once
+
+    def test_a_failure_after_some_pages_keeps_the_progress(self):
+        self.shopify.page_size = 20
+        self.shopify.forms = [forms_customer(n) for n in range(1, 60)]
+        self.shopify.forms_error = 2  # the second page fails
+        counts = self.watch()
+        self.assertEqual((counts["forms_records_new"], counts["forms_read_incomplete"]), (20, 1))
+        self.assertNotIn("forms_read_stalled", counts)
+        self.assertEqual(self.cursor()["after"], "19.0|" + gid(20))
+
+    def test_a_position_from_another_day_is_not_used(self):
+        self.shopify.forms = [forms_customer(n) for n in range(1, 56)]
+        with self.ledger.tx() as conn:
+            self.ledger.set_watermark(conn, sync.FORMS_CURSOR_MARK, json.dumps({"day": "2026-10-02", "after": "49.0|" + gid(50)}))
+        before = len(self.shopify.forms_searches)
+        self.watch()
+        self.assertEqual(self.shopify.forms_searches[before][1], None)
+        for broken in ("not json", "[]", json.dumps({"day": FORMS_SINCE}), json.dumps({"day": FORMS_SINCE, "after": ""}), "[" * 50000):
+            with self.ledger.tx() as conn:
+                self.ledger.set_watermark(conn, sync.FORMS_CURSOR_MARK, broken)
+            with self.ledger.tx() as conn:
+                conn.execute("DELETE FROM watermarks WHERE name = ?", (sync.FORMS_WATERMARK,))
+            before = len(self.shopify.forms_searches)
+            self.watch()
+            self.assertEqual(self.shopify.forms_searches[before][1], None, broken[:20])
+
+    def test_stalled_and_incomplete_reach_the_digest(self):
+        self.shopify.forms_error = True
+        self.run_sync(**FORMS_ON)
+        block = sync.ledger_digest(self.temp, hours=24, now=self.now, config=make_config(**FORMS_ON))["forms"]
+        self.assertEqual((block["counts"]["forms_read_incomplete"], block["counts"]["forms_read_stalled"]), (1, 1))
+
+
+class FormsFh1bRecordTests(FormsTestCase):
+    def test_a_submission_time_more_than_a_day_ahead_is_unreadable(self):
+        ahead = self.now + timedelta(days=1, seconds=1)
+        self.assertEqual(self.outcome(forms_customer(1, record={"submitted_at": dl.ts(ahead)})), {"forms_record_invalid": 1})
+        just = self.now + timedelta(days=1)
+        self.assertEqual(self.outcome(forms_customer(2, record={"submitted_at": dl.ts(just)})), {"forms_attached_by_phone": 1, "forms_would_heal": 1})
+
+    def test_an_unreadable_mark_is_never_pruned(self):
+        self.shopify.forms = [forms_customer(1, record={"submission_id": "bad id"})]
+        self.assertEqual(self.watch()["forms_record_invalid"], 1)
+        self.now += timedelta(days=400)
+        self.assertNotIn("forms_record_invalid", self.watch())  # the same raw values: never counted again
+        self.assertEqual(len(self.marks()), 1)
+
+    def test_a_readable_mark_is_pruned_and_its_record_then_skipped_by_age(self):
+        self.shopify.forms = [forms_customer(1, record={"submitted_at": dl.ts(self.now + timedelta(days=1))})]  # the latest allowed
+        self.assertEqual(self.watch()["forms_would_heal"], 1)
+        self.now += timedelta(days=120, seconds=1)  # the mark goes; the record is 119 days and 1 second old
+        counts = self.watch()
+        self.assertEqual((len(self.marks()), counts["forms_records_new"]), (0, 0))
+
+    def test_a_foreign_phone_sharing_the_last_8_digits_is_unclassified(self):
+        foreign = "+44 20 " + local(1)  # the same last 8 digits, another country
+        self.assertEqual(self.outcome(forms_customer(1, phone=foreign)), {"forms_unclassified": 1})
+
+    def test_tag_member_alone_is_not_member_mg(self):
+        item = forms_customer(1, email=fe(1), tags=("member", "xb-form-signup"))
+        self.assertEqual(self.outcome(item), {"forms_same_email_tags_missing": 1, "forms_would_heal_tags": 1})
 
 
 if __name__ == "__main__":

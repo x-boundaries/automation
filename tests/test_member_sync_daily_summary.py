@@ -2353,7 +2353,7 @@ class FormsSummaryTests(SummaryTestCase):
 
     def test_never_a_stop(self):
         base = self.daily_with(None, expected=False)
-        event = self.daily_with(forms_block(sign_up=hours_ago(1), record=None, **FORMS_COUNTS))
+        event = self.daily_with(forms_block(sign_up=hours_ago(7), record=None, forms_read_incomplete=3, forms_read_stalled=2, **FORMS_COUNTS))
         self.assertEqual((event["result"], event["stop_reasons"], event["auto_off_reasons"]),
                          (base["result"], base["stop_reasons"], base["auto_off_reasons"]))
         self.assertEqual(self.result["forms_warn"], ["forms_flow_silent"])
@@ -2365,11 +2365,23 @@ class FormsSummaryTests(SummaryTestCase):
             self.assertEqual(self.warn(), ["forms_flow_silent"] if warn else [], hours)
             self.assertEqual("forms_flow_silent" in event["digest"]["alerts"], warn, hours)
 
-    def test_warn_edges_on_the_6_hours(self):
-        for lag, warn in ((5, False), (6, False), (6.001, True), (7, True)):
-            event = self.daily_with(forms_block(sign_up=hours_ago(1), record=hours_ago(1 + lag)))
-            self.assertEqual(self.warn(), ["forms_flow_silent"] if warn else [], lag)
-            self.assertEqual("forms_flow_silent" in event["digest"]["alerts"], warn, lag)
+    def test_warn_edges_on_the_6_hour_age(self):
+        # FH1b (Controller Q2): never right after a sign-up; from 6 hours on (inclusive).
+        for age, warn in ((5, False), (5.999, False), (6, True), (7, True)):
+            event = self.daily_with(forms_block(sign_up=hours_ago(age), record=None))
+            self.assertEqual(self.warn(), ["forms_flow_silent"] if warn else [], age)
+            self.assertEqual("forms_flow_silent" in event["digest"]["alerts"], warn, age)
+
+    def test_warn_edges_on_the_record_margin(self):
+        # A record at or after the sign-up minus 30 minutes counts as "after it".
+        for before, warn in ((0, False), (-1, False), (0.5, False), (0.501, True), (20, True)):
+            self.daily_with(forms_block(sign_up=hours_ago(7), record=hours_ago(7 + before)))
+            self.assertEqual(self.warn(), ["forms_flow_silent"] if warn else [], before)
+
+    def test_no_warn_right_after_a_sign_up_after_a_quiet_night(self):
+        # The G2's case: a sign-up 10 minutes ago, the newest record 20 hours ago.
+        self.daily_with(forms_block(sign_up=hours_ago(1 / 6), record=hours_ago(20)))
+        self.assertEqual(self.warn(), [])
 
     def test_no_sign_up_no_warn_and_a_newer_record_no_warn(self):
         for sign_up, record in ((None, None), (None, hours_ago(1)), (hours_ago(10), hours_ago(1)), ("not a time", None)):
@@ -2379,9 +2391,23 @@ class FormsSummaryTests(SummaryTestCase):
     def test_the_pure_rule(self):
         self.assertTrue(summary.forms_flow_silent(NOW - timedelta(hours=72), None, NOW))
         self.assertFalse(summary.forms_flow_silent(NOW - timedelta(hours=72, seconds=1), None, NOW))
-        self.assertFalse(summary.forms_flow_silent(NOW, NOW - timedelta(hours=6), NOW))
-        self.assertTrue(summary.forms_flow_silent(NOW, NOW - timedelta(hours=6, seconds=1), NOW))
+        self.assertTrue(summary.forms_flow_silent(NOW - timedelta(hours=6), None, NOW))
+        self.assertFalse(summary.forms_flow_silent(NOW - timedelta(hours=6) + timedelta(seconds=1), None, NOW))
+        sign_up = NOW - timedelta(hours=8)
+        self.assertFalse(summary.forms_flow_silent(sign_up, sign_up - timedelta(minutes=30), NOW))
+        self.assertTrue(summary.forms_flow_silent(sign_up, sign_up - timedelta(minutes=30, seconds=1), NOW))
+        self.assertFalse(summary.forms_flow_silent(sign_up, sign_up + timedelta(hours=1), NOW))
         self.assertFalse(summary.forms_flow_silent(None, None, NOW))
+        self.assertFalse(summary.forms_flow_silent(NOW - timedelta(minutes=10), NOW - timedelta(hours=20), NOW))
+
+    def test_an_incomplete_or_stalled_read_is_shown(self):
+        event = self.daily_with(forms_block(sign_up=None, forms_read_incomplete=4, forms_read_stalled=1, **FORMS_COUNTS))
+        self.assertTrue(self.record["forms"]["line"].endswith(" | read incomplete 4 runs (stalled 1)"))
+        self.assertEqual((event["digest"]["alerts"]["forms_read_incomplete"], event["digest"]["alerts"]["forms_read_stalled"]), (4, 1))
+        self.assertEqual((event["result"], event["stop_reasons"]), ("CLEAN", []))
+        event = self.daily_with(forms_block(sign_up=None, **FORMS_COUNTS))  # a normal day: not shown
+        self.assertNotIn("read incomplete", self.record["forms"]["line"])
+        self.assertFalse({"forms_read_incomplete", "forms_read_stalled"} & set(event["digest"]["alerts"]))
 
     def test_no_block_or_no_digest_says_not_available(self):
         for runner in (FakeRunner(digest=digest_fixture()), FakeRunner(codes={"digest": 2}, digest="not json")):

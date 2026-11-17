@@ -166,8 +166,16 @@ _SETTINGS_OPTIONAL = {"shopify_creates_expected", "backfill_members_window", "me
 FORMS_LINE_PREFIX = "Website sign-ups on an existing account (24h): "
 FORMS_SHOWN = ("forms_not_healed", "forms_account_used", "forms_held", "forms_would_heal", "forms_other_person")
 FORMS_FLOW_SILENT = "forms_flow_silent"
-FORMS_SIGN_UP_RECENT = timedelta(hours=72)  # a sign-up seen in the last 72 hours ...
-FORMS_RECORD_LAG = timedelta(hours=6)       # ... and more than 6 hours newer than the newest copy record
+# #155 FH1b (G2 L2, Controller Q2; design B12): the newest sign-up is inside the last 72 hours, at
+# least 6 hours old, and no copy record was seen at or after it. The margin: the sign-up time and the
+# record time both come from the sync's own clock, but a run may see the copy record one or two runs
+# (15 minutes each) before it first sees the sign-up row (the sign-up read is budgeted, the forms
+# read is not), so a record up to 30 minutes before the sign-up still counts as "after it".
+FORMS_SIGN_UP_RECENT = timedelta(hours=72)
+FORMS_SIGN_UP_MIN_AGE = timedelta(hours=6)
+FORMS_RECORD_MARGIN = timedelta(minutes=30)
+# #155 FH1b (G2 L1): shown in the email's forms figures only on a day they happened.
+FORMS_READ_SHOWN = ("forms_read_incomplete", "forms_read_stalled")
 FORMS_HELD_CODES = ("forms_held_name_unclear", "forms_held_email_elsewhere", "forms_unclassified")
 _WINDOW_KEYS = {"from", "to", "max_per_call", "max_per_hour"}
 BACKFILL_WINDOW_MAX_DAYS = 14
@@ -829,13 +837,16 @@ def _instant(value: Any) -> datetime | None:
 
 
 def forms_flow_silent(last_sign_up_at: datetime | None, last_record_at: datetime | None, now: datetime) -> bool:
-    """#155 FH1 (design B12): the copy Flow looks off or broken when a sign-up was seen in the
-    last 72 hours (inclusive) and it is more than 6 hours newer than the newest copy record, or
-    there is no record at all."""
+    """#155 FH1b (design B12, Controller Q2): the copy Flow looks off or broken when the newest
+    sign-up is at most 72 hours and at least 6 hours old (both inclusive) and no copy record was
+    seen at or after it (minus FORMS_RECORD_MARGIN), or none at all. Never right after a sign-up."""
 
-    if last_sign_up_at is None or now - last_sign_up_at > FORMS_SIGN_UP_RECENT:
+    if last_sign_up_at is None:
         return False
-    return last_record_at is None or last_sign_up_at - last_record_at > FORMS_RECORD_LAG
+    age = now - last_sign_up_at
+    if age > FORMS_SIGN_UP_RECENT or age < FORMS_SIGN_UP_MIN_AGE:
+        return False
+    return last_record_at is None or last_record_at < last_sign_up_at - FORMS_RECORD_MARGIN
 
 
 def forms_section(raw: Mapping[str, Any] | None, *, expected: bool, now: datetime) -> dict[str, Any] | None:
@@ -849,7 +860,7 @@ def forms_section(raw: Mapping[str, Any] | None, *, expected: bool, now: datetim
     part = raw.get("forms") if isinstance(raw, dict) else None
     if not isinstance(part, dict) or not isinstance(part.get("counts"), dict):
         return {"available": False, "line": FORMS_LINE_PREFIX + "not available (forms watch off or digest failed)", "warn": [],
-                **{code: None for code in FORMS_SHOWN}}
+                "read": {}, **{code: None for code in FORMS_SHOWN}}
     counts = part["counts"]
 
     def number(code: str) -> int:
@@ -865,7 +876,12 @@ def forms_section(raw: Mapping[str, Any] | None, *, expected: bool, now: datetim
     warn = [FORMS_FLOW_SILENT] if forms_flow_silent(_instant(part.get("last_sign_up_at")), _instant(part.get("last_record_at")), now) else []
     line = (FORMS_LINE_PREFIX + f"not healed {shown['forms_not_healed']} (account used {shown['forms_account_used']}, held {shown['forms_held']})"
             f" | would heal {shown['forms_would_heal']} | other person {shown['forms_other_person']}")
-    return {"available": True, "line": line, "warn": warn, **shown}
+    # FH1b (G2 L1): runs whose read stopped before the end (the page cap, a read failure), and
+    # those that also made no progress: the counts above may then be behind.
+    read = {code: number(code) for code in FORMS_READ_SHOWN if number(code) > 0}
+    if read:
+        line += f" | read incomplete {read.get('forms_read_incomplete', 0)} runs (stalled {read.get('forms_read_stalled', 0)})"
+    return {"available": True, "line": line, "warn": warn, "read": read, **shown}
 
 
 def _bounded(alerts: Mapping[str, int] | None) -> dict[str, int] | None:
@@ -1128,7 +1144,7 @@ def build_event(*, now: datetime, task: Mapping[str, Any], config: Mapping[str, 
         alerts = {**alerts, BACKFILL_SHOWN: creates["backfill"]["creates"]}
     if forms is not None and forms["available"] and alerts is not None:
         # #155 FH1: likewise shown, never decided on (no STOP); the WARN as its code with 1.
-        alerts = {**alerts, **{code: forms[code] for code in FORMS_SHOWN}, **{code: 1 for code in forms["warn"]}}
+        alerts = {**alerts, **{code: forms[code] for code in FORMS_SHOWN}, **forms["read"], **{code: 1 for code in forms["warn"]}}
     event = {
         "schema": EVENT_SCHEMA if member_tools is None else EVENT_SCHEMA_V2,
         "event": EVENT_NAME,

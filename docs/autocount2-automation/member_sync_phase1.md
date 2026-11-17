@@ -1332,8 +1332,8 @@ request" actions on the entry's "Submitted by" customer):
 
 | Written on the customer | Value |
 |---|---|
-| metafield `xb_form.submission_id` (`single_line_text_field`) | the entry's Submission id |
-| metafield `xb_form.submitted_at` | Submitted at (RFC 3339 with an offset, for example `2026-12-01T10:00:00Z`) |
+| metafield `xb_form.submission_id` (`single_line_text_field`) | the entry's Submission id: 1-64 printable ASCII characters, no space |
+| metafield `xb_form.submitted_at` | Submitted at: RFC 3339 with an offset (`2026-12-01T10:00:00Z` or `2026-12-01T18:00:00+08:00`, an optional fraction of a second); not more than one day ahead of the run |
 | metafield `xb_form.email` | the email typed on the form |
 | metafield `xb_form.phone` | the phone typed on the form |
 | metafield `xb_form.first_name` | the first name typed on the form |
@@ -1342,7 +1342,10 @@ request" actions on the entry's "Submitted by" customer):
 
 The namespace, the six keys and the tag are constants in the code, not
 settings: the Flow must use exactly these names. A record that is not
-exactly these six text values is counted `forms_record_invalid`.
+exactly these six text values is counted `forms_record_invalid`. The
+owner's Flow test T1 records the raw shape of Submission id and Submitted
+at; if either differs from the table, every record is `forms_record_invalid`
+until the code or the Flow is changed.
 
 **The switch.** In the sync config: `forms_watch_enabled: true` and
 `forms_watch_since: "<YYYY-MM-DD>"` (the day the Flow went on; earlier
@@ -1352,26 +1355,44 @@ owner's Flow is built and tested (design 6.2) and the live task runs a
 commit with FH1 (an older commit refuses the keys). Off: set both back
 to `false` (or remove them); nothing else changes.
 
+**Rollback order.** Before the sync task or the daily summary task is moved
+back to a commit older than FH1, remove the three sync keys
+(`forms_watch_enabled`, `forms_watch_since`, `forms_watch_max_pages`) from
+the live sync config and `forms_watch_expected` from the summary settings
+first: an older commit refuses unknown keys, so the next run (or summary)
+would refuse. The ledger rows the watch wrote (`forms_*` in `watermarks`)
+may stay; older commits ignore them.
+
 **What a run does** (after both directions, inside the same lock; a run
 refused earlier reads nothing):
 
-1. Prunes its seen-marks older than 120 days.
+1. Prunes its seen-marks older than 120 days (never the mark of an
+   unreadable record, see below).
 2. Reads `customers(query: "tag:'xb-form-signup' AND
-   updated_at:>='<day>'")`, oldest update first, at most
-   `forms_watch_max_pages` pages. `<day>` is the day before the last clean
-   read (whole-day filter, so that day is read again), never before
-   `forms_watch_since`. A customer whose tags lack the exact tag (trimmed,
-   any case) is dropped.
+   updated_at:>='<day>'")`, oldest update first (Shopify's order: update
+   time, then customer id), at most `forms_watch_max_pages` pages of 50.
+   `<day>` is the day before the last complete read (whole-day filter, so
+   that day is read again), never before `forms_watch_since`. A customer
+   whose tags lack the exact tag (trimmed, any case) is dropped.
 3. Parses each record strictly, skips any submission already seen (one
    seen-mark per submission in the ledger's `watermarks` table: name
    `forms_seen:` + a keyed digest of the submission id; value
    `<code>|<time>`; nothing the person typed is stored), and skips records
-   submitted more than 120 days ago.
+   submitted more than 119 days ago.
 4. Classifies the rest (below) and counts.
-5. Moves its read day only after a clean read of every page. A read
-   failure, the page cap reached, or the K6 read budget spent: count
-   `forms_read_incomplete`, the read day stays, and the records not yet
-   classified are read again next run.
+5. **Progress (#155 FH1b).** Each customer read comes with its own Shopify
+   cursor. A run that stops before the end (the page cap, a read failure,
+   the K6 read budget or a failed K6 read) keeps the cursor of the last
+   customer it fully processed, with its read day, in the `watermarks` row
+   `forms_watch_cursor`; the next run goes on from there. So a large batch
+   of updated tagged customers (a bulk edit, the backfill) takes a few runs
+   but never stops the counting, nothing is skipped, and the seen-marks stop
+   a second count of anything read again. Only a complete read moves the
+   read day (the cursor is then cleared). A cursor from another read day is
+   not used; a read that fails without moving from a kept cursor clears it
+   (the next run reads the day again from its start).
+6. A run that stops before the end counts `forms_read_incomplete`; one that
+   also made no progress at all counts `forms_read_stalled`.
 
 **The codes** (counts in the run summary and the digest; never an alert;
 keyed `c-` refs only where a person may want to look):
@@ -1387,9 +1408,21 @@ keyed `c-` refs only where a person may want to look):
 | K7 C's phone is not P and C's email is not E | `forms_unclassified` (ref) |
 | K9 the record cannot be read | `forms_record_invalid` |
 
-Also `forms_records_seen` (records read) and `forms_records_new` (records
-classified this run; equals the sum of the outcome codes). Emails compare
-trimmed and case-folded, phones by their digits, names by words.
+Also `forms_records_seen` (records read, each run) and `forms_records_new`
+(records classified this run; equals the sum of the outcome codes). In the
+digest `forms_records_seen` is the sum over the period's runs, so a record
+read again by the overlap day counts again there: it is reads, not distinct
+records. Emails compare trimmed and case-folded, phones by their digits
+(all of them, country code included), names by words.
+
+**Unreadable records and time limits** (#155 FH1b). A `submitted_at` more
+than one day ahead of the run is unreadable (`forms_record_invalid`). The
+seen-mark of an unreadable record is named by a keyed digest of the customer
+and the raw values, and is never pruned, so the same unreadable record is
+counted once however long it stays; a new submission changes the values and
+is counted as new. A readable record's mark is pruned after 120 days, and a
+readable record older than 119 days is never classified, so a pruned mark
+can never lead to a second count.
 
 **"Unused"** (design B9) means all four of: `numberOfOrders` "0",
 `amountSpent` zero, `canDelete` true, `state` `DISABLED` (never signed
@@ -1415,20 +1448,31 @@ closed (the n8n workflow is unchanged), so the counts show in the email's
 not alerts, and never change CLEAN or STOP. The full line is in the VM
 record (`daily_summary_<date>.json`, key `forms`).
 
-**The WARN `forms_flow_silent`**: a new sign-up was seen in the last 72
-hours and it is more than 6 hours newer than the newest copy record (or
-there is no record at all): the Flow is probably off or failing. It shows
-as `forms_flow_silent=1` in the alert line, in the record's `forms.warn`
-and in the printed answer's `forms_warn`. No STOP. What to do: open the
-Flow in Shopify admin (Apps > Flow), check it is on and its recent runs
-succeeded.
+A day with an incomplete read also shows `forms_read_incomplete` (and
+`forms_read_stalled`, if any) in the alert line, and the line ends `| read
+incomplete N runs (stalled N)`; a normal day shows neither.
+
+**The WARN `forms_flow_silent`** (#155 FH1b, design B12): the newest
+sign-up is between 6 and 72 hours old (both inclusive) and no copy record
+was seen at or after it (a record up to 30 minutes before it still counts:
+the sync can see the copy record a run or two before it first reads the
+sign-up), or there is no record at all. Never right after a sign-up. It
+shows as `forms_flow_silent=1` in the alert line, in the record's
+`forms.warn` and in the printed answer's `forms_warn`. No STOP. What to do:
+first look for `forms_read_incomplete` or `forms_read_stalled` in the same
+email (the cap, not the Flow: see below); if neither, open the Flow in
+Shopify admin (Apps > Flow), check it is on and its recent runs succeeded.
 
 **How to read the counts.** "Not healed" is the one number for the
 Controller: sign-ups that landed on an existing account and stay as they
 are (used accounts, held cases, another person on a shared phone).
 "Would heal" is what FH2 would fix (never-used accounts only); FH1 fixes
 nothing. A steady `forms_record_invalid` means the Flow writes another
-shape (check its inputs against the table above).
+shape (check its inputs against the table above). A steady
+`forms_read_incomplete` (every run, day after day) or any
+`forms_read_stalled` means the reads cannot keep up or keep failing: raise
+`forms_watch_max_pages` (up to 20) and check the run's errors before
+blaming the Flow; the counts may be behind until it clears.
 
 ### UAT checklist
 
