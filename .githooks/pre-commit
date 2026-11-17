@@ -1,0 +1,23 @@
+#!/bin/sh
+# Personal-data guard (pre-commit). Blocks a commit whose staged additions contain
+# a likely email address or phone number that the tracked allowlist does not cover.
+#
+# Git cannot enable a tracked hook by itself. One-time setup per clone:
+#   git config core.hooksPath .githooks
+#
+# Fails closed: no usable Python 3.9+ interpreter, a missing scanner or any scanner
+# error blocks the commit. Bypassing with --no-verify does not bypass CI, which
+# scans every commit of a pull request.
+repo_root="$(git rev-parse --show-toplevel)" || exit 1
+scanner="$repo_root/scripts/pii_guard.py"
+if [ ! -f "$scanner" ]; then
+  echo "pii-guard: $scanner is missing; commit blocked (fail closed)." >&2
+  exit 1
+fi
+for candidate in python3 python py; do
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" >/dev/null 2>&1; then
+    exec "$candidate" "$scanner" --staged --show-values
+  fi
+done
+echo "pii-guard: no Python 3.9+ interpreter found; commit blocked (fail closed)." >&2
+exit 1

@@ -36,7 +36,19 @@ permissions:
 
 jobs:
   synthetic-windows:
+    # #211: one leg per run_project_suite.py shard, under the same job id so the hosted
+    # supervisor custody binding (GITHUB_JOB) is unchanged. Every leg proves the literal
+    # head; the one-off checks and the summary artifact run on the rest leg only.
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - runtime-launcher
+          - portal-hardening
+          - supervisor-http-daily
+          - bridge-state-orchestration
+          - rest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,6 +108,7 @@ jobs:
         working-directory: energygrid-bill-downloader
         run: python -m playwright install chromium
       - name: PowerShell parse-only check
+        if: matrix.shard == 'rest'
         shell: pwsh
         run: |
           $errors = $null
@@ -145,27 +158,30 @@ jobs:
         working-directory: energygrid-bill-downloader
         run: |
           if ('${{ steps.supervisor_custody.outputs.applicable }}' -eq 'true') {
-            python -m unittest discover -s tests -v
+            python tests/run_project_suite.py --shard ${{ matrix.shard }}
           } else {
-            python tests/run_project_suite.py --exclude-module test_one_shot_supervisor
+            python tests/run_project_suite.py --shard ${{ matrix.shard }} --exclude-module test_one_shot_supervisor
           }
           exit $LASTEXITCODE
       - name: EnergyGrid one-shot supervisor focused test suite
-        if: steps.supervisor_custody.outputs.applicable == 'true'
+        if: matrix.shard == 'rest' && steps.supervisor_custody.outputs.applicable == 'true'
         shell: powershell
         run: python -m unittest discover -s energygrid-bill-downloader/tests -p "test_one_shot_supervisor.py" -v
       - name: EnergyGrid n8n error handler focused test
+        if: matrix.shard == 'rest'
         # The project suite above discovers only energygrid-bill-downloader/tests, so the
         # root-level focused test needs its own step. Standard library plus the runner's
         # Node, which executes the committed n8n expressions offline; no n8n instance.
         shell: pwsh
         run: python -m unittest discover -s tests -p "test_energygrid_n8n_error_handler.py" -v
       - name: EnergyGrid n8n invoice delivery focused offline test
+        if: matrix.shard == 'rest'
         # Root-level export coverage runs the committed Code-node JavaScript with Node;
         # it does not import, activate, or execute an n8n workflow.
         shell: pwsh
         run: python -m unittest discover -s tests -p "test_energygrid_invoice_delivery_workflow.py" -v
       - name: EnergyGrid n8n Drive upload and destination setup focused offline tests
+        if: matrix.shard == 'rest'
         # #226 G3: Node executes the committed Code-node JavaScript with mocked Google
         # responses and the Python core verifies the answers; no n8n or Google contact.
         shell: pwsh
@@ -175,6 +191,7 @@ jobs:
           python -m unittest discover -s tests -p "test_energygrid_drive_destination_setup_workflow.py" -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: EnergyGrid n8n Drive Verify and Owner Email focused offline tests
+        if: matrix.shard == 'rest'
         # #226 V3 G1 Claude-free daily run: Node executes the committed Code nodes and Respond expressions,
         # and the Python Core checks the answers and the render digest; no n8n, Google or Gmail contact.
         shell: pwsh
@@ -184,6 +201,7 @@ jobs:
           python -m unittest discover -s tests -p "test_energygrid_owner_email_workflow.py" -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Scope and whitespace check
+        if: matrix.shard == 'rest'
         shell: pwsh
         run: |
           $base = (git merge-base HEAD origin/main).Trim()
@@ -235,7 +253,7 @@ jobs:
             }
           }
       - name: Write bounded supervisor synthetic summary
-        if: always()
+        if: always() && matrix.shard == 'rest'
         shell: powershell
         run: |
           $summary = Join-Path $env:RUNNER_TEMP 'energygrid-supervisor-summary.txt'
@@ -249,7 +267,7 @@ jobs:
             throw "Supervisor summary exceeded its bound."
           }
       - name: Upload supervisor synthetic summary
-        if: always()
+        if: always() && matrix.shard == 'rest'
         uses: actions/upload-artifact@v4
         with:
           name: energygrid-supervisor-synthetic-summary

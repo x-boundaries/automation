@@ -1,0 +1,2 @@
+# The tracked pre-commit hook is a POSIX shell script; CRLF would break it on Windows checkouts.
+/.githooks/** text eol=lf

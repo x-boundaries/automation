@@ -1,6 +1,6 @@
 <!--
 Curated AI-facing source.
-Project: development.ai-coding-agent-rules
+Source: repo/contracts/agent-rules/repo-local
 Review rule: Preserve safety constraints from preserved source. Do not weaken credential, .env, .tmp, .n8n-local, live n8n action, approval, attribution, or local-only rules.
 -->
 
@@ -202,11 +202,13 @@ Do not run live n8n, Docker, import/export, sync, activation, execution, publish
 
 ## Repository Appendix (outside Toolkit-managed blocks)
 
+Repository-local rules. Toolkit defines no marker for repository-local text, so these rules sit in this one section after the Toolkit-managed blocks, and a Toolkit refresh leaves them unchanged. Generic rules that a Toolkit-managed block or a `docs/agent-playbooks/` playbook already states are not repeated here.
+
 ### n8n workflow export naming
 
 - This repository's established n8n workflow export convention is lowercase snake_case with the suffix `*.workflow.json`.
 - Existing Gate workflow filenames are canonical and must not be renamed during unrelated work.
-- For this repository, the generic hyphenated filename example in the portable playbook is illustrative only and does not override the established local convention.
+- For this repository, the hyphenated filename guidance in `docs/agent-playbooks/n8n-workflows.md` (for example `member-intake-small-batch.json`) is illustrative only and does not override the established local convention.
 - `n8n-workflows/README.md` is the directory-level source of truth for workflow names and their associated runbooks.
 
 ### n8n local runtime state
@@ -214,7 +216,6 @@ Do not run live n8n, Docker, import/export, sync, activation, execution, publish
 - `.n8n/` and `.n8n-local/` are local n8n runtime state. They may contain databases, credentials, configuration, execution history, or other private operational data.
 - They must never be committed, staged for publication, copied into workflow exports, or treated as source-controlled workflow definitions.
 - Agents must not inspect or print their contents unless a separate explicit current-turn request safely authorises a bounded local diagnostic.
-- Source-controlled workflow definitions belong only under `n8n-workflows/`.
 
 ### n8n skill routing
 

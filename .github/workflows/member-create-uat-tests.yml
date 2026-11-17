@@ -5,7 +5,8 @@ name: member-create-uat-tests
 # Windows is the authoritative target: the laptop development machine, the physical
 # host, and the AutoCount VM are all Windows, and the runner's exclusive-create
 # locking and PowerShell behaviour are Windows-oriented. Windows therefore runs the
-# full repository suite plus a PowerShell parse check. Ubuntu runs only the portable
+# full repository suite, as parallel shards, plus a PowerShell parse check on every
+# shard. Ubuntu runs only the portable
 # focused create-UAT tests (pure Python plus the platform-neutral PowerShell library
 # via pwsh) to prove cross-platform correctness of the portable components. No CI job
 # contacts AutoCount, n8n, Google, or any live environment; the runner's AutoCount
@@ -78,11 +79,59 @@ on:
       - "scripts/autocount_stock_extract.py"
       - "tests/test_autocount_stock_extract.py"
       - "docs/autocount_stock_extraction.md"
+      # AC2 hourly stock balance export (#245). The Windows job's full-repository suite
+      # exercises tests/test_autocount_stock_balance_hourly.py (including the installer parse
+      # check and the read-only live-check SQL assertions), so a pull request confined to the
+      # exporter, its test, installer, example settings, runbook or live-check SQL must still
+      # trigger this workflow. Exact entries, not globs, for the same reason as #140 and #149.
+      - "scripts/autocount_stock_balance_hourly.py"
+      - "tests/test_autocount_stock_balance_hourly.py"
+      - "scripts/install_autocount_stock_balance_hourly_task.ps1"
+      - "config/autocount_stock_balance_hourly.example.json"
+      - "docs/autocount2-automation/stock_balance_hourly_runbook.md"
+      - "sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql"
+      # Its nightly buying-analysis builders (#292 S2) and their offline test (`rest` shard).
+      - "scripts/autocount_stock_analysis.py"
+      - "tests/test_autocount_stock_analysis.py"
+      # The one-off AC1 sales history build for the Buying tab (#292), its offline test
+      # (`rest` shard) and its runbook. Exact entries, not globs.
+      - "scripts/ac1_sales_history_build.py"
+      - "tests/test_ac1_sales_history_build.py"
+      - "docs/autocount2-automation/ac1_sales_history_runbook.md"
+      # Its error-alert n8n workflow and that workflow's offline contract test, which also reads
+      # the n8n-workflows README entry.
+      - "n8n-workflows/ac2_stock_alert.workflow.json"
+      - "tests/test_ac2_stock_alert_workflow.py"
+      - "n8n-workflows/README.md"
+      # The shared ops alert email sub-workflow that the alert workflow calls (#288), its offline
+      # contract test (run by the Windows job's full-repository suite, `rest` shard) and the
+      # Data Table schema doc that test reads. Exact entries, not globs.
+      - "n8n-workflows/ops_alert_email.workflow.json"
+      - "tests/test_ops_alert_email_workflow.py"
+      - "docs/ops_alert_email_log.md"
+      # Weekly read-only Drive mirror of main (#273). The Windows job's full-repository suite
+      # exercises tests/test_mirror_main_to_drive.py (offline, temp folders and a local
+      # throwaway git repo only), so a pull request confined to the mirror script, its
+      # installer, example settings, test or runbook must still trigger this workflow.
+      # Exact entries, not globs.
+      - "scripts/mirror_main_to_drive.py"
+      - "scripts/install_mirror_main_to_drive_task.ps1"
+      - "config/mirror_main_to_drive.example.json"
+      - "tests/test_mirror_main_to_drive.py"
+      - "docs/drive_mirror_runbook.md"
   workflow_dispatch: {}
 
 jobs:
+  # The full repository suite runs as four parallel whole-module shards on the same
+  # asserted exact head (#211). `rest` is the complement of the named groups in
+  # tests/_run_ci_full_suite.py, and tests/test_member_create_uat_ci.py proves the
+  # legs equal the runner's shards and partition the accepted set test by test.
   windows-full-suite:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [focused, mg-deployment, bounded-import, rest]
     steps:
       # Check out the LITERAL head commit, never the synthetic pull-request merge ref, so the
       # tree under test is exactly the reviewed commit. On workflow_dispatch the pull_request
@@ -130,15 +179,11 @@ jobs:
             }
           }
           if ($failed) { exit 1 }
-      - name: Focused create UAT tests
-        shell: pwsh
-        run: |
-          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps tests.test_ac2_member_expiry_capability_probe
-      - name: Full repository test suite (excludes the Docker/n8n live-import module)
+      - name: Full repository test suite shard (excludes the Docker/n8n live-import module)
         shell: pwsh
         # The n8n live-import dry-run module needs a Docker/n8n environment absent on
         # stock CI; it and the complete suite are validated locally on the dev/VM host.
-        run: python tests/_run_ci_full_suite.py
+        run: python tests/_run_ci_full_suite.py --shard ${{ matrix.shard }}
 
   ubuntu-focused:
     runs-on: ubuntu-latest

@@ -146,7 +146,7 @@ class BridgeFailureCodeTests(unittest.TestCase):
         # reviewed into the allowlist (or stays generic by design).
         import re
         found = set()
-        for name in ("ac2_directlocal_member_bridge.ps1", "ac2_directlocal_book_guard.ps1", "ac2_member_gateway_autocount_adapter.ps1"):
+        for name in ("ac2_directlocal_member_bridge.ps1", "ac2_directlocal_book_guard.ps1", "ac2_member_gateway_autocount_adapter.ps1", "ac2_member_sync_member.ps1"):
             text = (ROOT / "scripts" / name).read_text(encoding="utf-8")
             found |= set(re.findall(r'(?:throw|return)\s+"([a-z0-9_]{1,64})"', text))
         self.assertEqual(found, set(dl.BRIDGE_CHILD_ERROR_CODES))

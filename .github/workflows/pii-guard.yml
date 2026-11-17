@@ -1,0 +1,48 @@
+name: pii-guard
+
+# Personal-data guard (#211 CI hygiene). This repository is public, so a value in
+# ANY pushed commit is published even if a later commit removes it. This job scans
+# every commit of the pull request (base..head), not just the final diff, for
+# likely email addresses and phone numbers that config/pii_guard_allowlist.json
+# does not cover. It runs on every pull request with no path filter and fails
+# closed: a hit, a missing or empty range, an unknown commit or a parse error all
+# fail the job. Matched values are redacted in the log. No secret, credential or
+# live system is used. tests/test_pii_guard.py pins this file and rejects drift.
+
+on:
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  scan-pr-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "expected: ${EXPECTED_SHA}"
+          echo "actual:   ${ACTUAL_SHA}"
+          test -n "${EXPECTED_SHA}"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan every commit in the pull-request range
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/pii_guard.py --range "${BASE_SHA}..${HEAD_SHA}"
+      - name: Scanner, hook and workflow drift guards
+        shell: bash
+        run: python -m unittest tests.test_pii_guard -v

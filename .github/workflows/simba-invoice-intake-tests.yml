@@ -1,0 +1,48 @@
+name: simba-invoice-intake-tests
+
+on:
+  pull_request:
+    paths:
+      # SIMBA invoice intake (#244): the inactive export, its focused offline test, its runbook,
+      # and the offline validator it is checked with. Exact entries keep the trigger surface owned.
+      - "n8n-workflows/simba_invoice_intake.workflow.json"
+      - "tests/test_simba_invoice_intake_workflow.py"
+      - "docs/simba_invoice_intake.md"
+      - "n8n-workflows/scripts/validate-n8n-workflows.cjs"
+      - ".github/workflows/simba-invoice-intake-tests.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate repository n8n exports offline
+        shell: bash
+        run: node n8n-workflows/scripts/validate-n8n-workflows.cjs
+      - name: Run SIMBA intake offline contracts (Node executes the committed Code nodes)
+        shell: bash
+        run: python -m unittest tests.test_simba_invoice_intake_workflow -v
+      - name: Whitespace check
+        shell: bash
+        run: git diff --check "$(git merge-base HEAD origin/main)" HEAD
