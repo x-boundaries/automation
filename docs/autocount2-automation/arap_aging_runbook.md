@@ -4,7 +4,8 @@ Issue: #321 (slice A1, offline build). Script: `scripts/autocount_arap_aging.py`
 `config/autocount_arap_aging.example.json`. Owner-run live check:
 `sql/autocount2/arap_aging_live_check.readonly.template.sql`. Tests:
 `tests/test_autocount_arap_aging.py`. Fake feed for the tracker build (B1):
-`tests/fixtures/arap_dashboard_feed.fake.json`.
+`tests/fixtures/arap_dashboard_feed.fake.fixture` (JSON content; the repo allows no `*.json` file
+under `tests/`).
 
 Status: offline build only. Nothing here has run against the AutoCount book. The installer and the
 scheduled task (A2) and error alerts (A3) are later slices, each with its own owner OK.

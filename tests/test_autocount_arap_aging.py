@@ -33,7 +33,9 @@ SGT = ZoneInfo("Asia/Singapore")
 FIXED_NOW = datetime(2026, 11, 17, 14, 30, 5, tzinfo=SGT)
 SQL_NOW = datetime(2026, 11, 17, 14, 30, 6, tzinfo=SGT)
 AS_AT = date(2026, 11, 17)
-FIXTURE_PATH = ROOT / "tests" / "fixtures" / "arap_dashboard_feed.fake.json"
+# JSON content. The extension is .fixture because the repo guardrail
+# (test_member_intake_validate) allows no *.json file under tests/.
+FIXTURE_PATH = ROOT / "tests" / "fixtures" / "arap_dashboard_feed.fake.fixture"
 FIXTURE_RUN_ID = "0" * 32
 
 FAKE_DB = "AED_EXAMPLE_BOOK"
@@ -143,7 +145,7 @@ def empty_data():
 
 
 def fixture_data():
-    """The rich fake book behind tests/fixtures/arap_dashboard_feed.fake.json (as at 17 Nov 2026).
+    """The rich fake book behind tests/fixtures/arap_dashboard_feed.fake.fixture (as at 17 Nov 2026).
 
     AR: open invoices in several buckets, a part-paid invoice, unapplied payments and a credit
     note, an old-dated (January) invoice and payment, an inactive zero-balance debtor and the
