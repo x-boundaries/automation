@@ -2231,6 +2231,50 @@ class WiringContractTests(WiringTestCase):
         self.assertEqual(event["member_tools"]["tags"]["status"], "STOP")
         self.assertEqual(self.result["overall"], "STOP")
 
+    def cli_digest(self, module, example, root, **roots):
+        """G2 LATER 4: the tool's own ``main(["digest", "--config", <file>, "--hours", "24"])`` in-process,
+        on a ledger made by its own ``init`` through the same ``main``, with the state-root ACL check
+        (``dl.verify_private_state``) a no-op and %LOCALAPPDATA% elsewhere, as the tools' own CLI tests
+        do. Returns (exit code, stdout)."""
+
+        value = json.loads((ROOT / "config" / example).read_text(encoding="utf-8"))
+        value.update(state_root=str(root), **{key: str(path) for key, path in roots.items()})
+        path = self.temp / ("cli_" + example)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        elsewhere = self.temp / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(elsewhere)}), \
+                mock.patch.object(self.dl, "verify_private_state", lambda folder: None):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(module.main(["init", "--config", str(path)], clock=lambda: self.now), 0)
+            ledger = root / module.LEDGER_FILE
+            self.store_run(ledger, {"counts": {}, "alerts": ["write_uncertain" if module is self.mt else "claim_needs_review"],
+                                    "tagged_now": 5, "bday_month_now": "November"})
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = module.main(["digest", "--config", str(path), "--hours", "24"], clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def test_each_tools_cli_digest_reads_as_the_summary_reads_a_child(self):
+        cases = (
+            (self.mt, "member_tags.example.json", self.tags_root,
+             {"member_sync_state_root": self.state_root, "member_core_state_root": self.core_root}, summary.tags_section, "STOP"),
+            (self.bm, "member_benefits.example.json", self.core_root, {"member_sync_state_root": self.state_root}, summary.core_section, "WARN"),
+        )
+        for module, example, root, roots, section_of, status in cases:
+            with self.subTest(tool=module.__name__):
+                code, stdout = self.cli_digest(module, example, root, **roots)
+                self.assertEqual(code, 0, stdout)  # a non-zero digest exit is exit_code in the summary
+                lines = stdout.strip().splitlines()
+                self.assertEqual(len(lines), 1, "the digest answer is one JSON line")
+                answer = summary._last_json_line(stdout)
+                self.assertIsInstance(answer, dict)
+                self.assertEqual(answer.get("status"), "ok")
+                section = section_of(answer)
+                self.assertIs(section["available"], True, section)
+                self.assertEqual(section["runs_completed"], 1)
+                self.assertEqual(section["status"], status)
+
     def test_the_tools_own_digest_commands_take_these_arguments(self):
         for module in (self.mt, self.bm):
             self.assertIn("digest", module.COMMANDS)

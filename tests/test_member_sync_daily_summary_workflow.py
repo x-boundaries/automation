@@ -501,9 +501,10 @@ MORE_RE = re.compile(r"\+\d+ more \(see the VM record\)")
 # SHA-256 of the Code node's output for every body of v1_golden_bodies(), made with the
 # main 8222aed export of this workflow (scripted, #288 wiring G1): a v1 event renders exactly as before.
 V1_LINES_GOLDEN_SHA256 = "da9c0ef40da2d42eea8b80932df7598784057c5b55e408864cb40a7fd328057b"
-# SHA-256 of this export with the Validate Summary Event jsCode blanked, made on main 8222aed: no
-# other node, connection, setting or note changed.
-WORKFLOW_REST_SHA256 = "8a77d55f926e3ed7f353045e68102dfad4c8d4172255587de8f86ee050f4ce06"
+# SHA-256 of this export with the Validate Summary Event jsCode blanked. Made on main 8222aed
+# (8a77d55f...), then re-made at fix 1 (G2 LATER 1) after the Start Here sticky's Input and Subject
+# bullets and its height (400 -> 460) changed: no other node, connection, setting or note changed.
+WORKFLOW_REST_SHA256 = "29f9b7b1cb747d05ee6afdbf49afaca6fbb08d2f415250235118fc0c70d6158e"
 
 
 def core_raw(alerts=None, runs=None, opened=None, **overrides):
@@ -619,6 +620,16 @@ class WiringWorkflowShapeTests(unittest.TestCase):
 
     def test_nothing_but_the_code_node_changed_since_main(self):
         self.assertEqual(workflow_rest_digest(WORKFLOW), WORKFLOW_REST_SHA256)
+
+    def test_the_start_here_note_describes_v1_v2_and_the_warn_subject(self):
+        workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        note = next(n for n in workflow["nodes"] if n["name"] == "Start Here")
+        content = note["parameters"]["content"]
+        self.assertTrue(content.isascii())
+        for text in ("`xb.member_sync.daily_summary.v1` (both member tools off on the VM)", "`xb.member_sync.daily_summary.v2`",
+                     "`member_tools`", "`... WARN <date>`", "WARN comes only from a tool"):
+            self.assertIn(text, content)
+        self.assertEqual(note["parameters"]["height"], 460)
 
     def test_the_code_node_lists_match_the_vm_script(self):
         code = json.loads(WORKFLOW.read_text(encoding="utf-8"))
@@ -815,6 +826,29 @@ class WiringWorkflowTests(unittest.TestCase):
         self.assertNotRegex(text, MORE_RE)
         self.assertIn("Tags alerts 24h: tag_removes_capped, untag_volume_unexpected", text)
         self.assertIn("Alert refs: memberno_conflict ***042", text)
+
+    def test_a_long_tool_alert_list_alone_cuts_only_itself(self):
+        """G2 LATER 5 (kills G2-J4): only one tool's alert list is long, everything else is a normal
+        day. The one-line list keeps what fits on its line; no other list is cut."""
+
+        long_tags = summary.tags_section(tags_raw(alerts=["t" * 62 + "%02d" % n for n in range(19)]))
+        long_core = summary.core_section(core_raw(alerts={"c" * 62 + "%02d" % n: 3 for n in range(20)}))
+        bodies = [build(member_tools={"member_core": summary.core_section(core_raw()), "tags": long_tags}),
+                  build(member_tools={"member_core": long_core, "tags": summary.tags_section(tags_raw())})]
+        for (label, other), result in zip((("Tags alerts 24h: ", "Member core alerts 24h (runs): "),
+                                           ("Member core alerts 24h (runs): ", "Tags alerts 24h: ")), self.run_cases(bodies)):
+            with self.subTest(long=label):
+                lines = result["out"][0]["json"]["lines"]
+                self.assertIn("Members per type: -=1, GUEST=12, MEMBER=2000", lines)
+                self.assertIn("Alert refs: memberno_conflict ***042", lines)
+                self.assertIn("Alerts 24h (runs): created_after_wait=1, waiting_for_staff=2", lines)
+                cut = [line for line in lines if MORE_RE.search(line)]
+                self.assertEqual(len(cut), 1, cut)
+                self.assertTrue(cut[0].startswith(label) and cut[0].endswith(" more (see the VM record)" + (
+                    " (refs: digest on the VM)" if label.startswith("Member core") else "")), cut[0])
+                self.assertLessEqual(len(cut[0]), 300)
+                self.assertFalse(any(line.startswith(other) and MORE_RE.search(line) for line in lines))
+                self.assert_sent(result, "[XB daily] MEMBER-SYNC WARN 2026-11-07", SUBJECT_V2_RE)
 
     def test_the_cut_order_is_members_refs_tags_core_then_sync_alerts(self):
         core, tags = worst_tools()

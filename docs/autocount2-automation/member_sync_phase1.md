@@ -1871,9 +1871,9 @@ the email deterministically: each tool's alert list is one line and keeps
 only the codes that fit on it; then, while the email does not fit, it cuts
 members per type, sync alert refs, tags alerts, member core alerts and sync
 alert codes, in that order, each ending with `+K more (see the VM record)`.
-Nothing else is ever cut. The worst case of every list and figure fits in
-all four switch combinations (30 lines and 3,928 characters with both on);
-a normal day is never cut.
+Nothing else is ever cut. The email is always within 30 lines, 300
+characters a line and 4,000 in all; the reachable worst case is exactly
+4,000. A normal day is never cut.
 
 **VM steps, in order, each with its own owner OK** (prerequisites: this
 slice merged; the member core installed and run for a day before it is
@@ -1884,11 +1884,16 @@ switched on; tags installed before tags are switched on):
    node changed). It accepts v1 exactly as before, so the next morning's
    email must be identical: compare the subject and line count with the day
    before. Keep the previous export for rollback.
-2. **VM script.** Check which checkout each task runs from (the sync and
-   summary; the member core; tags). If one clone serves them all, pulling
-   this merge also moves the member core and tags code: do it only at a
-   commit their install already uses, or with the Controller's OK. Then pull
-   to the merge commit.
+2. **VM script.** Check which checkout each task runs from (the sync, the
+   summary, the member core, tags). The summary always runs the tools'
+   `digest` from **its own** folder (the sibling files), not from the tools'
+   task clones. If one clone serves all four, pulling this merge also moves
+   the sync (`xb_member_sync.py`) and both tools: do it only at a commit
+   their install already uses, or with the Controller's OK. If the clones
+   differ, the summary clone's `xb_member_benefits.py` and `xb_member_tags.py`
+   must match the installed tools' ledger schema (`SCHEMA_VERSION`) and
+   digest schema, or that tool is STOP with a `*_ledger_not_recognised`
+   refusal. Record the previous pin, then pull to the merge commit.
 3. **VM settings.** Back up the summary settings file. Add `member_tools`
    with both `enabled: false`; set `child_timeout_seconds` to 40. Run
    `check-settings` (must answer `ok`, both switches false), then `daily
@@ -1902,12 +1907,18 @@ switched on; tags installed before tags are switched on):
    lines unchanged.
 5. **Tags on** (after the tags install), the same way.
 
-**Rollback** (each step undoes alone): a tool: set its `enabled: false`
-(settings only; with both off the next email is v1 again). The VM script:
-switch both off first, then check out the previous summary file or restore
-the settings backup. n8n: re-import the previous export, **only after both
-switches are off** (the old validator answers 400 to a v2 event: the VM
-records `send_failed` and no email arrives).
+**Rollback** (each step undoes alone):
+
+- A tool: set its `enabled: false` (settings only; with both off the next
+  email is v1 again).
+- The VM script, in this order: switch both off; restore the settings
+  backup (no `member_tools`: the previous script refuses that key, so a
+  script-only rollback would leave the 06:40 task refusing and send no
+  email); then check out the previous summary file; run `check-settings`
+  and `daily --no-send`.
+- n8n: re-import the previous export, **only after both switches are off**
+  (the old validator answers 400 to a v2 event: the VM records
+  `send_failed` and no email arrives).
 
 ### Known risks
 
