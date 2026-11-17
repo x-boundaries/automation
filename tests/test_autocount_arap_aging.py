@@ -1201,5 +1201,282 @@ class RepoHygieneTests(unittest.TestCase):
             (ROOT / rel).read_bytes().decode("ascii")
 
 
+# ---------------------------------------------------------------------------------------------
+# Fix round 1 (G2 on PR #322): blockers 1-5 and LATER L1-L3
+# ---------------------------------------------------------------------------------------------
+
+
+class ReadOnlyContractFix1Tests(unittest.TestCase):
+    """L1: every keyword on its own (R04), the SELECT-start rule (R05), the import-time check (R06)."""
+
+    KEYWORDS = (
+        "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "TRUNCATE", "GRANT", "REVOKE", "DENY",
+        "EXEC", "EXECUTE", "INTO", "BACKUP", "RESTORE", "DBCC", "SHUTDOWN", "KILL", "OPENROWSET", "OPENQUERY",
+        "OPENDATASOURCE", "WAITFOR", "DECLARE", "SET", "USE", "WRITETEXT", "UPDATETEXT", "ENABLE TRIGGER",
+        "DISABLE TRIGGER", "NEXT VALUE FOR", "RECEIVE", "END CONVERSATION", "RECONFIGURE", "CHECKPOINT",
+        "SETUSER", "BEGIN TRAN", "BEGIN TRANSACTION", "XLOCK", "TABLOCKX", "UPDLOCK", "HOLDLOCK", "NOLOCK",
+    )
+
+    def test_each_keyword_is_rejected_on_its_own(self):
+        for keyword in self.KEYWORDS:
+            for probe in ("SELECT a FROM b %s c" % keyword, "SELECT a FROM b %s" % keyword.lower()):
+                with self.subTest(probe=probe):
+                    self.assertIsNotNone(arap.FORBIDDEN_SQL_RE.search(probe))
+                    with self.assertRaises(arap.ConfigError):
+                        arap.assert_read_only(probe)
+
+    def test_g2_slip_through_forms_are_rejected(self):
+        for probe in (
+            "SELECT 1 FROM x WITH (XLOCK)", "SELECT 1 FROM x WITH (TABLOCKX)", "SELECT 1 FROM x WITH (UPDLOCK)",
+            "SELECT 1 FROM x WITH (HOLDLOCK)", "SELECT NEXT VALUE FOR dbo.Seq", "WRITETEXT x.y @p 'z'",
+            "UPDATETEXT x.y @p 0 0 'z'", "SELECT 1 BEGIN TRANSACTION", "SELECT 1 RECEIVE TOP (1) * FROM q",
+            "SELECT 1 END CONVERSATION @h", "SELECT 1 RECONFIGURE", "SELECT 1 CHECKPOINT", "SELECT 1 SETUSER",
+            "SELECT 1 DISABLE TRIGGER t ON x", "SELECT 1 ENABLE  TRIGGER t ON x",
+        ):
+            with self.subTest(probe=probe):
+                with self.assertRaises(arap.ConfigError):
+                    arap.assert_read_only(probe)
+
+    def test_update_statement_without_set_is_rejected(self):
+        # R04: no SET in the probe, so only the UPDATE keyword can catch it.
+        self.assertIsNotNone(arap.FORBIDDEN_SQL_RE.search("UPDATE STATISTICS dbo.ARInvoice"))
+
+    def test_non_select_start_is_rejected(self):
+        # R05: no forbidden word, so only the SELECT-start rule rejects it.
+        probe = "WITH c AS (SELECT 1 AS a) SELECT a FROM c"
+        self.assertIsNone(arap.FORBIDDEN_SQL_RE.search(probe))
+        with self.assertRaises(arap.ConfigError):
+            arap.assert_read_only(probe)
+        with self.assertRaises(arap.ConfigError):
+            arap.assert_read_only("  VALUES (1)")
+
+    def test_the_17_pinned_query_texts_still_pass_the_stricter_check(self):
+        texts = arap.all_query_texts()
+        self.assertEqual(len(texts), 17)
+        self.assertEqual(set(texts), set(PINNED_QUERY_SHA256))
+        for name, text in texts.items():
+            with self.subTest(name=name):
+                arap.assert_read_only(text)
+
+    def test_import_time_check_rejects_a_bad_query_text(self):
+        # R06: the module checks every query text when it is imported.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("arap_import_check", ROOT / "scripts" / "autocount_arap_aging.py")
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(arap.stock, "IDENTITY_QUERY", "SELECT SUSER_SNAME() UPDATE STATISTICS dbo.Debtor"):
+            with self.assertRaises(arap.ConfigError):
+                spec.loader.exec_module(module)
+
+    def test_connection_string_pins_the_database(self):
+        # L2 (R12).
+        settings = arap.validate_settings({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": "C:\\EXAMPLE\\archive"},
+        })
+        parts = arap.build_connection_string(settings).split(";")
+        self.assertIn("DATABASE=%s" % FAKE_DB, parts)
+        self.assertIn("SERVER=%s" % FAKE_SERVER, parts)
+
+
+class MoneyFix1Tests(TempDirTestCase):
+    """Blockers 1-3: refunds, foreign-currency local amounts, due-today and week edges."""
+
+    def base(self):
+        data = empty_data()
+        data["ar_parties"] = [party("DEBT-A01", "Example Trading A"), party("DEBT-A02", "Example Outdoor Club B")]
+        data["ap_parties"] = [party("CRED-B01", "Example Supplier US", ccy="USD"), party("CRED-B02", "Example Supplier Local")]
+        return data
+
+    def test_refund_reduces_unapplied_payments_and_credit_notes(self):
+        # Blocker 1 (B04).
+        data = self.base()
+        data["ar_payment"] = [payment(1, "DEBT-A01", "2026-11-02", "100.00", ko="30.00", refund="20.00")]
+        data["ar_credit_note"] = [credit_note(2, "DEBT-A01", "2026-11-03", "200.00", ko="50.00", refund="30.00",
+                                              ccy="USD", rate="1.35")]
+        view = self.view(data)
+        pm = item(view, "ar", "PM-0001")
+        self.assertEqual((pm["original_doc"], pm["knocked_off_doc"], pm["outstanding_doc"]),
+                         (D("-100.00"), D("-50.00"), D("-50.00")))
+        self.assertEqual(pm["outstanding_local"], D("-50.00"))
+        cn = item(view, "ar", "CN-0002")
+        self.assertEqual((cn["original_doc"], cn["knocked_off_doc"], cn["outstanding_doc"]),
+                         (D("-200.00"), D("-80.00"), D("-120.00")))
+        self.assertEqual(cn["outstanding_local"], D("-162.00"))  # cents(120 x 1.35)
+        self.assertEqual(view["ar"]["totals"]["unapplied"], D("-212.00"))
+
+    def test_foreign_currency_local_amounts(self):
+        # Blocker 2 (B05, B06, B07, B15).
+        data = self.base()
+        invoice = debit(11, "CRED-B01", "2026-10-01", "2026-11-15", "1000.00", out="600.00", ccy="USD", rate="1.30",
+                        prefix="PI")
+        invoice["LocalKnockedOffAmt"] = D("528.00")  # paid 400 USD at 1.32, not at the invoice rate
+        data["ap_invoice"] = [invoice]
+        data["ap_knockoffs"] = [knockoff("PX", 11, "400.00", "2026-10-20")]
+        data["ap_credit_note"] = [credit_note(12, "CRED-B01", "2026-11-05", "50.00", ccy="USD", rate="1.40")]
+        pay = payment(13, "CRED-B01", "2026-11-06", "500.00", ko="100.00", local_unapplied="536.00")
+        pay.update(CurrencyCode="USD", LocalOriginalAmt=D("675.00"))
+        data["ap_payment"] = [pay]
+        view = self.view(data, self.settings(knockoff_target_types={"ap": {"PX": "PI"}}))
+        pi = item(view, "ap", "PI-0011")
+        self.assertEqual((pi["original_local"], pi["knocked_off_local"], pi["outstanding_local"]),
+                         (D("1300.00"), D("528.00"), D("772.00")))
+        self.assertEqual(pi["outstanding_doc"], D("600.00"))
+        sc = item(view, "ap", "CN-0012")
+        self.assertEqual(sc["doc_type"], "SC")
+        self.assertEqual((sc["original_local"], sc["knocked_off_local"], sc["outstanding_local"]),
+                         (D("-70.00"), D("0.00"), D("-70.00")))
+        pv = item(view, "ap", "PM-0013")
+        self.assertEqual(pv["doc_type"], "PV")
+        self.assertEqual((pv["original_local"], pv["knocked_off_local"], pv["outstanding_local"]),
+                         (D("-675.00"), D("-139.00"), D("-536.00")))
+        self.assertEqual(pv["outstanding_doc"], D("-400.00"))
+        self.assertEqual(view["ap"]["totals"]["outstanding"], D("772.00") - D("70.00") - D("536.00"))
+
+    def test_due_today_is_current_and_not_overdue(self):
+        # Blocker 3 (B03).
+        data = self.base()
+        data["ar_invoice"] = [debit(21, "DEBT-A01", "2026-11-17", "2026-11-17", "40.00"),
+                              debit(22, "DEBT-A02", "2026-11-16", "2026-11-16", "15.00")]
+        view = self.view(data)
+        today = item(view, "ar", "IV-0021")
+        self.assertEqual((today["days_past_due"], today["bucket_due"]), (0, "current"))
+        self.assertEqual(view["ar"]["parties"]["DEBT-A01"]["totals"]["overdue"], D(0))
+        self.assertIsNone(view["ar"]["parties"]["DEBT-A01"]["totals"]["oldest_overdue_days"])
+        self.assertEqual(view["ar"]["totals"]["overdue"], D("15.00"))
+
+    def test_ap_schedule_edges(self):
+        # Blocker 3 (B12, B13): this week Mon 16 - Sun 22 Nov, next week Mon 23 - Sun 29 Nov.
+        data = self.base()
+        data["ap_invoice"] = [
+            debit(31, "CRED-B02", "2026-11-01", "2026-11-16", "1.00", prefix="PI"),   # yesterday: overdue
+            debit(32, "CRED-B02", "2026-11-01", "2026-11-17", "2.00", prefix="PI"),   # today: this week
+            debit(33, "CRED-B02", "2026-11-01", "2026-11-22", "4.00", prefix="PI"),   # Sunday: this week
+            debit(34, "CRED-B02", "2026-11-01", "2026-11-23", "8.00", prefix="PI"),   # Monday: next week
+            debit(35, "CRED-B02", "2026-11-01", "2026-11-29", "16.00", prefix="PI"),  # next Sunday: next week
+            debit(36, "CRED-B02", "2026-11-01", "2026-11-30", "32.00", prefix="PI"),  # Monday after: later
+        ]
+        bands = {name: band["total"] for name, band in self.view(data)["ap"]["schedule"]["bands"].items()}
+        self.assertEqual(bands, {"overdue": D("1.00"), "this_week": D("6.00"), "next_week": D("24.00"),
+                                 "later": D("32.00")})
+
+
+class SelfCheckFix1Tests(TempDirTestCase):
+    def test_over_applied_payment_fails_row_identity_and_publishes_nothing(self):
+        # Blocker 4 (C03).
+        archive = self.tmp / "archive"
+        self.assertEqual(self.run_export()["status"], "success")
+        before = {n: (archive / n).read_bytes() for n in arap.PUBLISHED_FILES}
+        data = fixture_data()
+        data["ar_payment"].append(payment(220, "DEBT-A02", "2026-11-12", "100.00", ko="120.00"))
+        result = self.run_export(data)
+        self.assertEqual(result["failure_class"], "self_check_failed")
+        self.assertIn("row_identity", result["message"])
+        self.assertEqual({n: (archive / n).read_bytes() for n in arap.PUBLISHED_FILES}, before)
+
+    def test_party_csv_amounts_are_checked_against_the_feed(self):
+        # L3 (C02): same row count, one party amount off by a cent.
+        archive = self.tmp / "archive"
+        self.assertEqual(self.run_export()["status"], "success")
+        before = {n: (archive / n).read_bytes() for n in arap.PUBLISHED_FILES}
+        real = arap.render_parties
+
+        def skewed(parties, side, labels, as_at_local):
+            parties = copy.deepcopy(parties)
+            first = sorted(parties)[0]
+            parties[first]["totals"]["outstanding"] += D("0.01")
+            return real(parties, side, labels, as_at_local)
+
+        with mock.patch.object(arap, "render_parties", skewed):
+            result = self.run_export()
+        self.assertEqual(result["failure_class"], "self_check_failed")
+        self.assertIn("feed_matches_csv", result["message"])
+        self.assertEqual({n: (archive / n).read_bytes() for n in arap.PUBLISHED_FILES}, before)
+
+
+PRIVATE_VALUES = (
+    # Amounts with their decimal point: bare digit runs also occur inside hex hashes and run ids.
+    "DEBT-", "CRED-", "Example ", "IV-0", "PI-0", "PM-0", "CN-0", "DN-0", "DP-0", "REF-", "4321.0", "8765.4",
+    "1234.5", "1200.0", "1335.0", "150000.0", "95.5", FAKE_SERVER, "FAKE-SQL-HOST", FAKE_LOGIN, FAKE_USER,
+    "Trusted_Connection",
+)
+
+
+class PrivacyFix1Tests(TempDirTestCase):
+    """Blocker 5 (V04, V07, V08): every warning and every count-only failure carries no private value."""
+
+    def assert_clean(self, *texts):
+        for text in texts:
+            for value in PRIVATE_VALUES:
+                self.assertNotIn(value, text)
+
+    def warning_data(self):
+        data = fixture_data()
+        data["ar_invoice"].append(debit(111, "DEBT-A02", "2026-11-10", "2026-11-01", "4321.09"))   # due before doc
+        data["ar_invoice"].append(debit(112, "DEBT-A02", "2026-11-01", "2026-11-30", "100.00", out="60.00"))
+        data["ar_knockoffs"].append(knockoff("RI", 112, "40.00", "2026-11-25"))                      # payer after run
+        data["ar_knockoffs"].append(knockoff("RI", 107, "8765.43", "2026-11-02"))                    # cancelled target
+        data["ar_debit_note"] = [debit(113, "DEBT-A01", "2026-11-01", "2026-11-15", "1234.56", prefix="DN")]  # guess off
+        data["ar_payment"].append(payment(214, "DEBT-A02", "2026-11-10", "30.00", local_unapplied="0"))  # disagree
+        return data
+
+    def test_every_warning_path_is_counts_only(self):
+        config = self.tmp / "settings.json"
+        config.write_text(json.dumps({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "identity": {"allow_privileged_identity": True},
+            "output": {"archive_root": str(self.tmp / "archive"), "delivery_root": str(self.tmp / "drive")},
+            "parties": {"online_shop_debtor_codes": ["DEBT-WEB"]},
+        }), encoding="utf-8")
+        privileged = {"login": FAKE_LOGIN, "user": FAKE_USER, "database": FAKE_DB, "is_sysadmin": 1, "is_db_owner": 0}
+        source = FakeSource(sessions=[FakeSession([self.warning_data()], identity=privileged)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = arap.main(["--config", str(config)], source=source, environ=ENV, clock=lambda: FIXED_NOW)
+        self.assertEqual(code, arap.EXIT_OK)
+        manifest_text = (self.tmp / "archive" / arap.LATEST_MANIFEST_NAME).read_text(encoding="utf-8")
+        warnings = json.loads(manifest_text)["warnings"]
+        for needle in ("Privileged", "due date before the document date", "guess_sources", "cancelled document",
+                       "dated after the run date", "disagree on zero"):
+            self.assertTrue(any(needle in w for w in warnings), needle)
+        status_texts = [(root / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8")
+                        for root in (self.tmp / "archive", self.tmp / "drive")]
+        self.assert_clean(out.getvalue(), manifest_text, json.dumps(warnings), *status_texts)
+
+    def test_view_warnings_are_counts_only(self):
+        view = self.view(self.warning_data())
+        self.assertGreaterEqual(len(view["warnings"]), 5)
+        self.assert_clean(json.dumps(view["warnings"]), json.dumps(view["checks"]), json.dumps(view["counts"]))
+
+    def failing_runs(self):
+        missing = fixture_data()
+        missing["ar_invoice"].append(debit(115, "DEBT-ZZ9", "2026-11-01", "2026-11-01", "4321.09"))
+        orphan = fixture_data()
+        orphan["ar_knockoffs"].append(knockoff("RI", 9999, "8765.43", "2026-11-01"))
+        unknown = fixture_data()
+        unknown["ap_knockoffs"] = [knockoff("PI", 501, "8765.43", "2026-11-01")]
+        mismatch = fixture_data()
+        mismatch["ar_invoice"][0]["Outstanding"] = D("4321.09")
+        unstable = [FakeSession([fixture_data()], counters=[full_counters(i), full_counters(i + 1)]) for i in range(3)]
+        return {
+            "self_check_failed": FakeSource(missing),
+            "outstanding_mismatch": FakeSource(orphan),
+            "unknown_knockoff_target": FakeSource(unknown),
+            "outstanding_mismatch ": FakeSource(mismatch),
+            "unstable_snapshot": FakeSource(sessions=unstable),
+        }
+
+    def test_every_count_only_failure_path(self):
+        for expected, source in self.failing_runs().items():
+            with self.subTest(failure=expected.strip()):
+                settings = self.settings(delivery=True)
+                result = self.run_export(settings=settings, source=source)
+                self.assertEqual(result["failure_class"], expected.strip())
+                texts = [json.dumps({k: v for k, v in result.items() if k != "_manifest"})]
+                for root in (self.tmp / "archive", self.tmp / "drive"):
+                    texts.append((root / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+                self.assert_clean(*texts)
+
+
 if __name__ == "__main__":
     unittest.main()

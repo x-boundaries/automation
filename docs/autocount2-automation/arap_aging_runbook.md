@@ -92,6 +92,22 @@ AP invoice reads unpaid. The feed and the manifest carry `ap_payments_recorded`:
 When it turns `true`: check the AP knock-off codes (`knockoff_target_types.ap`), then run a V3 compare
 of the creditor side before relying on AP figures. The tracker shows a banner while it is `false`.
 
+**In plain words: what happens when staff start keying supplier payments.**
+
+- The first supplier payment that is knocked off against an invoice in AutoCount **stops the whole
+  export, AR included**. Every run then fails `unknown_knockoff_target`, publishes nothing, and the
+  AR/AP page keeps showing the last good hour (it goes stale).
+- It stays stopped until a short VM step, **with the owner's OK**, maps the one new knock-off code
+  in `knockoff_target_types.ap`:
+  1. VM Claude runs step 2 of the live-check SQL (read-only) and sees which code the new AP
+     knock-off lines use.
+  2. VM Claude adds that code to the VM's local settings.
+  3. VM Claude reruns V1 and V2.
+- Because the run that first sees an AP knock-off publishes nothing, **`ap_payments_recorded` is
+  published `true` only after that mapping**.
+- A supplier payment keyed without a knock-off does not stop the export. It shows as an unapplied
+  AP credit and turns `ap_payments_recorded` true on the next run.
+
 ## Settings
 
 Copy the example to `config/autocount_arap_aging.local.json` on the VM (gitignored, never committed).
