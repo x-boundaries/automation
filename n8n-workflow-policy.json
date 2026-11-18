@@ -2,6 +2,7 @@
   "allowedEmailDomains": ["my.simba.sg"],
   "allowedLiteralValues": [
     "https://drive.google.com/file/d/${body.drive_file_id}/view\\n`;",
-    "https://openidconnect.googleapis.com/v1/userinfo"
+    "https://openidconnect.googleapis.com/v1/userinfo",
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/"
   ]
 }

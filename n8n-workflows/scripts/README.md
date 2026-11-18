@@ -51,7 +51,7 @@ python -m unittest tests.test_member_gateway_bounded_import_security -v
 
 ## Included Helpers
 
-Toolkit helper set `a831f7fd41c3`, 20 files stamped in `n8n-helper-set.json`. Every live helper checks the stamp first and refuses, before any Docker call, when a stamped file is missing or edited (`n8n-helper-set.cjs check`):
+Toolkit helper set `138973e49d70` (Toolkit 3.146.1, #323; it replaced `a831f7fd41c3` from #316), 20 files stamped in `n8n-helper-set.json`. Every live helper checks the stamp first and refuses, before any Docker call, when a stamped file is missing or edited (`n8n-helper-set.cjs check`):
 
 - `export-n8n-workflows-live.ps1`, `import-n8n-workflows-live.ps1`, `n8n-workflow-sync-menu.ps1`
 - `_export-n8n-workflows-live.cmd`, `_import-n8n-workflows-live.cmd`
@@ -71,16 +71,17 @@ The `.cmd` wrappers invoke their co-located PowerShell scripts with `%~dp0<name>
 
 This repository now runs Toolkit's import design unchanged. The earlier local deviations (an `I` confirmation gate with `-ConfirmLiveImport`, an isolated dry-run directory, and an `X` export gate with `-ConfirmLiveExport`) are gone; the owner accepted that on 17 Nov 2026 (#316, PR #315).
 
-- A plain import run, including a double-click on `_import-n8n-workflows-live.cmd` (it passes no flags), validates, reads live n8n and then imports every changed or new repository workflow **unpublished, with no prompt** (`import-n8n-workflows-live.ps1:1926-1960`).
-- `-RequireConfirmation` is read only by `n8n-workflow-sync-menu.ps1`: started with it, the menu asks before a real import (`:576-581`, prompt at `:625-636`). The menu always asks before a real export. `import-n8n-workflows-live.ps1` declares the switch (`:24`) but never reads it.
+- A plain import run, including a double-click on `_import-n8n-workflows-live.cmd` (it passes no flags), validates, reads live n8n and then imports every changed or new repository workflow **unpublished, with no prompt** (`import-n8n-workflows-live.ps1:1932-1966`).
+- `-RequireConfirmation` is read only by `n8n-workflow-sync-menu.ps1`: started with it, the menu asks before a real import (`:576-581`, prompt at `:625-636`). The menu always asks before a real export. `import-n8n-workflows-live.ps1` refuses `-RequireConfirmation`, and `-SkipCredentialBindingRefresh`, with `N8N_POLICY_VALIDATION_FAILED` before any Docker call (`:1772-1777`; since set `138973e49d70`, which no longer accepts and ignores them). The menu never passes either switch to the import script.
 - `-RestartContainerAfterImport` now stops the run with an error (`:1769-1771`); the helpers never restart n8n. Restarting after an import stays an operator action.
 
 ## What still protects live n8n
 
-- The stamp check refuses an edited or incomplete helper set before any Docker call (`Assert-HelperSetReady`, `:1777`).
-- The workflow validator must pass first, with the repo-root `n8n-workflow-policy.json` (`:1798-1802`).
-- A published (active) live target blocks **the whole run** before any import: "Unpublish it in n8n first" (`:1489-1493`; any blocked workflow ends the run at `:1847-1852`). Note: under Windows PowerShell 5.1 the earlier copy of this check (`:1010-1011`) is skipped when it finds exactly one blocker (`:1828` reads `.Count` of a single object), so the run stops at the later check instead, after the credential-metadata step; reported to Toolkit, no local edit.
-- Every import uses `n8n import:workflow --activeState=false` (`:1932`), and each is followed by a postcondition read that the workflow is unpublished (`:1952-1958`). The helpers never publish, execute, test-run or restart.
+- The stamp check refuses an edited or incomplete helper set before any Docker call (`Assert-HelperSetReady`, `:1783`).
+- The workflow validator must pass first, with the repo-root `n8n-workflow-policy.json` (`:1804-1808`).
+- A published (active) live target blocks **the whole run** before any import: "Unpublish it in n8n first" (early gate `:1010-1011`, ending the run at `:1833-1846` before the credential-metadata step; preparation checks again at `:1489-1493`, and any blocked workflow ends the run at `:1853-1858`). Since set `138973e49d70` the early gate also counts a single blocker under Windows PowerShell 5.1 (`@(...)` at `:1833`); set `a831f7fd41c3` skipped it there.
+- A local target identity recorded in `.n8n-local/n8n-workflow-identities.json` that no longer exists in live n8n blocks the whole run at the early gate, with no same-name fallback (`:995-997`); under Windows PowerShell 5.1 this holds for a single blocker since set `138973e49d70`.
+- Every import uses `n8n import:workflow --activeState=false` (`:1938`), and each is followed by a postcondition read that the workflow is unpublished (`:1958-1964`). The helpers never publish, execute, test-run or restart.
 - Preparation refuses a live target whose nodes carry a credential that the repository export does not declare (`n8n-portable-workflow.cjs:897-914`); this repository's exports are credential-free and it has no `n8n-workflows/toolkit/portable-credentials.json`, so a live workflow with bound credentials is refused rather than stripped.
 - 16 of the 17 exports carry a template top-level `id`. The declaration built from the export carries that id (`prepare-n8n-live-import.cjs:259-263`, `n8n-portable-workflow.cjs:31-36`), so preparation refuses a target whose id differs, including every brand-new workflow, which gets a fresh id (`n8n-portable-workflow.cjs:496-520`; import `:1485`). One refusal ends the whole run.
 - Agents still never run a live import, export or sync without explicit current-turn owner approval naming the target and the operation (root `AGENTS.md`).
@@ -95,13 +96,13 @@ An unpublished live workflow that matches a repository export by id (or by uniqu
 
 `-DryRun` performs no `n8n import:workflow` and prints "Live n8n was not changed." Like a real run it:
 
-- clears and repopulates `.tmp/n8n-live-import` (`Initialize-RunDirectory`, `:1821`);
-- stages the credential-metadata helper in the container's `/tmp`, runs `n8n export:credentials --all` into a Toolkit-owned folder there (encrypted, as n8n exports it), copies out only credential id, name and type, then removes the folder and the helper; a failed clean-up blocks the run (`Get-SafeCredentialMetadata`, `:853-919`). n8n's own data is not changed;
-- writes a sanitized operation report under `.n8n-local/reports/` (a real import also records workflow identities in `.n8n-local/n8n-workflow-identities.json`, `:1959`).
+- clears and repopulates `.tmp/n8n-live-import` (`Initialize-RunDirectory`, `:1827`);
+- once the early target checks pass (`:1833-1846`), stages the credential-metadata helper in the container's `/tmp`, runs `n8n export:credentials --all` into a Toolkit-owned folder there (encrypted, as n8n exports it), copies out only credential id, name and type, then removes the folder and the helper; a failed clean-up blocks the run (`Get-SafeCredentialMetadata`, `:853-919`). n8n's own data is not changed;
+- writes a sanitized operation report under `.n8n-local/reports/` (a real import also records workflow identities in `.n8n-local/n8n-workflow-identities.json`, `:1965`).
 
 ## Export
 
-`export-n8n-workflows-live.ps1` (and `_export-n8n-workflows-live.cmd`) rewrites tracked workflow JSON with no prompt. Canonical protected values are kept unless `-ReviewedSourceUpdate` is passed (`sync-n8n-live-exports.cjs:1162-1163`). In `AllLive` mode a live workflow with no repository file is written as `<lower-case-hyphenated-name>.json` (`export-n8n-workflows-live.ps1:845-858, 1110-1119`), not this repository's `*.workflow.json` convention; rename such a file before committing it. `-DryRun` writes nothing.
+`export-n8n-workflows-live.ps1` (and `_export-n8n-workflows-live.cmd`) rewrites tracked workflow JSON with no prompt. Canonical protected values are kept unless `-ReviewedSourceUpdate` is passed (`sync-n8n-live-exports.cjs:1162-1163`). In `AllLive` mode a live workflow with no repository file is named after the folder's own convention (`export-n8n-workflows-live.ps1:845-898, 1121-1141`, since set `138973e49d70`): every root file here ends `.workflow.json` and the names use `_` and never `-`, so a new file is `<lower_case_name>.workflow.json`; a taken name gets a short workflow-id suffix. Check the name before committing it. `-DryRun` writes nothing.
 
 ## Intended Scoped Writes
 
