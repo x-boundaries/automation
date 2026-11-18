@@ -1,4 +1,4 @@
-"""Offline contract tests for import-n8n-workflows-live.ps1 (Toolkit helper set 138973e49d70).
+"""Offline contract tests for import-n8n-workflows-live.ps1 (Toolkit helper set 35defa821c2b).
 
 Rewritten for #316 (PR #315) after the helper refresh. The owner accepted Toolkit's design on
 17 Nov 2026: a plain import run imports changed and new repository workflows as unpublished with
@@ -13,11 +13,13 @@ no confirmation prompt. These tests pin the protections that remain:
 (e) under Windows PowerShell 5.1, exactly one early blocker (a recorded local identity that no
     longer exists in live n8n) stops the whole run at the early gate, with no same-name fallback
     (Toolkit 3.146.1 fix; set a831f7fd41c3 skipped that gate for a single blocker);
-(f) the import script refuses -RequireConfirmation and -SkipCredentialBindingRefresh before any
-    Docker call (Toolkit 3.146.1; earlier sets accepted and ignored them).
+(f) the import script refuses -RequireConfirmation and -SkipCredentialBindingRefresh (Toolkit
+    3.146.1), and -AllowMissingCredentialBindings and -CredentialExportDir (Toolkit 3.146.3), before
+    any Docker call; earlier sets accepted and ignored them.
 
 Refreshed for the Toolkit 3.146.1 helper set (#323): (b) now also pins that one published target
-is caught at the early gate, before the credential-metadata step.
+is caught at the early gate, before the credential-metadata step. Refreshed again for Toolkit
+3.146.4 (set 35defa821c2b): (f) also covers the two switches refused since 3.146.3.
 
 How it runs: the real PowerShell helper runs end to end inside a throwaway fixture repository
 holding copies of the committed workflow exports, the helper folder and the repo-root
@@ -367,9 +369,16 @@ class ImportHelperOfflineContractTest(unittest.TestCase):
     def test_f_unused_import_switches_are_refused_before_any_docker_call(self):
         self._set_live([UNRELATED_LIVE] + live_copies_of(self.workflow_files))
 
-        for switch in ("-RequireConfirmation", "-SkipCredentialBindingRefresh"):
+        refused = (
+            ["-RequireConfirmation"],
+            ["-SkipCredentialBindingRefresh"],
+            ["-AllowMissingCredentialBindings"],
+            ["-CredentialExportDir", ".tmp/stub-credential-exports"],
+        )
+        for args in refused:
+            switch = args[0]
             with self.subTest(switch=switch):
-                result = self._run_import([switch])
+                result = self._run_import(args)
                 output = result.stdout + result.stderr
                 self.assertNotEqual(result.returncode, 0, output)
                 self.assertIn("N8N_POLICY_VALIDATION_FAILED", output)
