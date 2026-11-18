@@ -10,7 +10,7 @@ Every example value in this guide is fake (`FAKE-0201`, `LOC-A`, `C-001`, `Examp
 2. **All of it is under `My Drive/Automation/Report`** in the owner's Drive, in two folders:
    - `AC2 Stock Balance (daily)`: stock, sales units, buying analysis, purchasing units, and the one-off AC1 sales history;
    - `AC2 ARAP Aging (latest)`: what customers owe us (AR) and what we owe suppliers (AP).
-3. **You can only read what has been shared with you.** Today both folders sit in the owner's My Drive and are not shared. If your agent cannot find them, ask the owner for access; do not ask anyone to make them public. See [Access](#access).
+3. **You can only read what has been shared with you.** Both folders sit in the owner's My Drive; the owner decides who they are shared with. If your agent cannot find them, ask the owner for access; do not ask anyone to make them public. See [Access](#access).
 4. **Check freshness first, every time.** Each folder has a `last_run_status.json`. Read it before you answer. See [How an agent should read the files](#how-an-agent-should-read-the-files).
 5. **It is confidential.** Stock, sales, vendor and AR/AP data is company business data. Keep it inside company tools. See [Privacy](#privacy).
 
@@ -203,7 +203,7 @@ Full technical detail lives in the runbooks; this guide summarises them:
 **Traps:**
 
 - **AP reads as unpaid.** `ap_payments_recorded: false` means AutoCount holds supplier invoices but no supplier payments yet, so **every AP invoice shows as unpaid**, including invoices already paid by bank. Say this whenever you quote an AP figure. It turns `true` once supplier payments are keyed. If the first supplier payment is knocked off against an invoice, the whole AR/AP export (AR too) pauses and goes stale until a short, owner-approved step on the server maps it.
-- **Our buckets are not AutoCount's menu buckets.** AutoCount's Debtor and Creditor Aging reports age by **document date in calendar months** (current month, then 1, 2, 3, 4 months, then 5 and over) with credits **netted into** the buckets. These files use 30-day steps with credits kept apart. Totals per party match; bucket columns will not. To match the menu, recompute from the open-item rows: bucket each row by the calendar month of `doc_date` and include credit rows. Whether the files should also carry month buckets is an open owner decision.
+- **Our buckets are not AutoCount's menu buckets.** AutoCount's Debtor and Creditor Aging reports age by **document date in calendar months** (current month, then 1, 2, 3, 4 months, then 5 and over) with credits **netted into** the buckets. These files use 30-day steps with credits kept apart. Totals per party match; bucket columns will not. To match the menu, recompute from the open-item rows: bucket each row (credits included) by the calendar month of its `doc_date` against the month of `as_at_local`: same month = current, then 1, 2, 3, 4 months back, then 5 months and over. Compare per party in the party's own currency (`outstanding_doc`). This is the rule the 18 Nov 2026 reconciliation used and the owner's AR/AP tracker page follows in its by-month view; the files themselves carry only the 30-day columns.
 - **Unapplied credits** (customer receipts and credit notes not yet matched to an invoice) are their own negative rows (`unapplied = true`). They are never netted against an invoice. A customer's `outstanding` already includes them; `overdue` does not.
 - **Online-shop customer.** The online-shop debtor account(s) carry `online_shop = true` (feed: `flags.online_shop`). It is a flag, not a filter: totals include it. Say whether you included it.
 - **Post-dated.** `post_dated = true` marks a payment dated after the run date. None exist today; it is a flag, not a filter.
@@ -253,7 +253,7 @@ Always check freshness first and quote the "as of" time. Folder **S** = `AC2 Sto
 
 ## Access
 
-- Both folders are in the owner's **My Drive** and are **not shared** today. A staff member's agent can read only what is shared with that staff member's own Google account.
+- Both folders are in the owner's **My Drive**. A staff member's agent can read only what the owner has shared with that staff member's own Google account (they appear under "Shared with me", or as a shortcut the staff member adds to their own My Drive).
 - Who gets access, and to which folder, is the **owner's decision**. The AR/AP folder holds customer and supplier names and amounts and is more sensitive than the stock folder. Ask the owner; do not change sharing yourself, and never use "anyone with the link".
 
 ## Privacy
