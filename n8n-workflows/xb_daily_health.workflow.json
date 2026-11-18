@@ -524,7 +524,7 @@
               "id": "00000000-0000-4000-8325-000000000024",
               "name": "code",
               "type": "string",
-              "value": "={{ typeof $json.code === 'string' && /^[a-z0-9_]{1,40}$/.test($json.code) ? $json.code : '' }}"
+              "value": "={{ typeof $json.code === 'string' && /^[A-Za-z0-9_]{1,40}$/.test($json.code) ? $json.code : '' }}"
             }
           ]
         },
@@ -727,7 +727,7 @@
       "retryOnFail": false,
       "parameters": {
         "chatId": "REPLACE_WITH_OWNER_TELEGRAM_CHAT_ID",
-        "text": "={{ 'XB health email could not be sent on ' + $('Email Plan').first().json.row.date + ' (n8n email step: ' + $('Collect Send Outcome').first().json.outcome + '). Worst: ' + $('Email Plan').first().json.mail.short.split(' ').slice(0, 3).join(' ') + '. Check the n8n Gmail credential, then XB Daily Health.' }}",
+        "text": "={{ 'XB health email could not be sent on ' + $('Email Plan').first().json.row.date + ' (n8n email step: ' + $('Collect Send Outcome').first().json.outcome + '). Worst: ' + $('Email Plan').first().json.mail.short.split(' ').slice(0, 3).join(' ') + '. ' + ($('Collect Send Outcome').first().json.outcome === 'send_failed' ? 'Check the n8n Gmail credential, then XB Daily Health.' : 'Check XB Daily Health and XB Ops Alert Email in n8n.') }}",
         "additionalFields": {
           "appendAttribution": false
         }

@@ -30,7 +30,7 @@ The Gmail filter is `[XB health]`. The subject carries the date, so a FAIL never
    - its own records of the last 14 days.
 2. It judges each job (section "Rules"), writes `health_<date>.json` (codes, counts and dates only) into `record_dir`, and POSTs one `xb.daily_health.v1` event to `http://127.0.0.1:5678/webhook/<private path>` with the Header Auth secret from Windows Credential Manager. One POST, 10 s timeout, no retry, no proxy, no redirect. It always exits 0; only broken settings exit 2.
 3. **n8n, `XB Daily Health`.** Header Auth on the webhook; a request carrying Cloudflare or proxy headers gets 404; the Code node checks the closed schema (anything else: 400 with a `HEALTH_*` code) and answers 200 `accepted`. Then it reads, with the n8n API credential, the workflow list and the error runs of the last 24 h; reads today's `MEMBER-SYNC` `daily_summary` row in `xb_alert_email_log`; reads recent `xb_health_runs` rows; judges the n8n-side jobs; writes every line from fixed English templates; calls `XB Ops Alert Email` when the result is not OK or it is Monday; and writes one `xb_health_runs` row.
-4. **Email failed** (Gmail down or the credential expired; the sender returns `send_failed`, it never throws): one fixed Telegram line through the existing Telegram credential, for example `XB health email could not be sent on 2026-11-19 (n8n email step: send_failed). Worst: FAIL 2 jobs. ...`. The row in `xb_health_runs` records the failure.
+4. **Email not sent** (`send_failed` when Gmail is down or the credential expired; also `rejected`, `error`, `call_failed` or an unknown answer from the sender): one fixed Telegram line through the existing Telegram credential, for example `XB health email could not be sent on 2026-11-19 (n8n email step: send_failed). Worst: FAIL 2 jobs. Check the n8n Gmail credential, then XB Daily Health.` Only `send_failed` names the Gmail credential; the other outcomes say `Check XB Daily Health and XB Ops Alert Email in n8n.` Nothing is sent to Telegram for `sent` or `not_due` (an OK weekday). The row in `xb_health_runs` records the outcome and the sender's code (for example `gmail_error` or `OPS_ALERT_SHORT`).
 5. **08:15, n8n dead-man.** If `xb_health_runs` has no `check` row for today, n8n mails `[XB health] FAIL 1 jobs <date>`: "the health checker did not report today".
 
 Python never sends Telegram or Gmail itself: that would copy a credential out of n8n.
@@ -142,7 +142,7 @@ python scripts\xb_daily_health.py check-settings --config config\daily_health.lo
 python scripts\xb_daily_health.py run --config config\daily_health.local.json --no-send
 ```
 
-`--no-send` judges and writes today's record (send status `not_sent`) and prints one codes-only summary line; it posts nothing.
+`--no-send` judges and writes today's record (send status `not_sent`) and prints one codes-only summary line; it posts nothing. `run` exits 0 in every case except broken settings (2): a record that cannot be written prints `{"ok": false, "code": "record_write_failed"}`, and any unexpected error prints `{"ok": false, "code": "internal_error"}` with no detail. The 08:15 dead-man then reports the missing check.
 
 ## n8n Data Table `xb_health_runs`
 
@@ -187,15 +187,15 @@ Then deactivate `XB Daily Health` in n8n (or the dead-man mails a FAIL at 08:15 
 
 Each step needs its own owner OK; server PC and n8n only, nothing on the VM. All n8n calls use the local API `http://127.0.0.1:5678/api/v1`. Prerequisite: `XB Ops Alert Email` and `xb_alert_email_log` are live (#288 slice 1).
 
-| # | Step | OK words |
-| --- | --- | --- |
-| L1 | Re-import the updated `XB Ops Alert Email` (system `HEALTH`) from the merged export, keeping its private values (local `.tmp` copy, read back). | "HEALTH SENDER UPDATE" |
-| L2 | Create Data Table `xb_health_runs` (columns above); create a new n8n API key and its `n8nApi` credential; create a new Header Auth credential (and the matching Credential Manager entry). | "HEALTH CREDENTIALS" |
-| L3 | Import `XB Daily Health` inactive; set the webhook path, the `WATCH` workflow IDs, both table IDs, the sender workflow ID and the Telegram chat; bind Header Auth, `n8nApi` and the existing Telegram credential; read the workflow back. | "HEALTH N8N IMPORT" |
-| L4 | Server: write the private settings, then `check-settings` and `run --no-send` once. | none (read-only) |
-| L5 | One test send: activate `XB Daily Health`, then run the checker once by hand. Sends one email to the owner. | "HEALTH TEST EMAIL" |
-| L6 | Register `\XB\XB-DailyHealth` (installer dry run first). | "HEALTH TASK" |
-| L7 | Observe 7 mornings and the first Monday heartbeat; then retire the desktop reminder for the manual #155 check. | none (records) |
+| # | Step | OK words | Rollback |
+| --- | --- | --- | --- |
+| L1 | Re-import the updated `XB Ops Alert Email` (system `HEALTH`) from the merged export, keeping its private values (local `.tmp` copy, read back). Before the update, back up the live workflow and diff it node by node against the pre-PR export: any drift beyond the known private values (recipient, table ID, Gmail credential binding) stops the step. | "HEALTH SENDER UPDATE" | Re-apply the backup taken from the live read; read back. |
+| L2 | Create Data Table `xb_health_runs` (columns above); create a new n8n API key and its `n8nApi` credential; create a new Header Auth credential (and the matching Credential Manager entry). | "HEALTH CREDENTIALS" | Delete the empty `xb_health_runs` table; delete the new `n8nApi` and Header Auth credentials; revoke the new API key; the owner deletes the Credential Manager entry. |
+| L3 | Import `XB Daily Health` inactive; set the webhook path, the `WATCH` workflow IDs, both table IDs, the sender workflow ID and the Telegram chat; bind Header Auth, `n8nApi` and the existing Telegram credential; read the workflow back, including `List Workflows` and `List Error Runs` in the editor. Also one read-only GET of `/api/v1/workflows` on the local API: published workflows must report `active: true` on this n8n version (the judge reads that field; otherwise every watched workflow shows FAIL `workflow_inactive`). | "HEALTH N8N IMPORT" | Archive or delete the inactive `XB Daily Health` (never active; nothing calls it). |
+| L4 | Server: write the private settings, then `check-settings` and `run --no-send` once. | none (read-only) | Delete `config\daily_health.local.json` and the one `health_<date>.json` record if wanted. |
+| L5 | One test send: activate `XB Daily Health`, then run the checker once by hand. An all-OK weekday sends no email by design, so run it on a Monday (heartbeat) or expect only an `xb_health_runs` row. Read back through the local API that `XB Daily Health` now reports `active: true`. Activation also arms the 08:15 dead-man: do L6 in the same sitting, or deactivate again. | "HEALTH TEST EMAIL" | Deactivate `XB Daily Health`. The one test email cannot be recalled. |
+| L6 | Register `\XB\XB-DailyHealth` (installer dry run first). | "HEALTH TASK" | `Disable-ScheduledTask` (off switch), or `Unregister-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-DailyHealth'` with the owner's OK. |
+| L7 | Observe 7 mornings and the first Monday heartbeat; then retire the desktop reminder for the manual #155 check. | none (records) | None (records only). |
 
 ## Privacy
 

@@ -440,7 +440,10 @@ class ValidateTests(unittest.TestCase):
             "HEALTH_FIGURES": [changed(lambda e: job(e, "checker").update(age_min=-1)),
                                changed(lambda e: job(e, "checker").update(exit=1.5)),
                                changed(lambda e: job(e, "checker").update(count="2")),
-                               changed(lambda e: job(e, "checker").update(exit=2 ** 32))],
+                               changed(lambda e: job(e, "checker").update(exit=2 ** 32)),
+                               # G2 F3 (mutation M7): each upper bound, one past it.
+                               changed(lambda e: job(e, "checker").update(count=10001)),
+                               changed(lambda e: job(e, "checker").update(age_min=1000001))],
             "HEALTH_REASONS": [changed(lambda e: job(e, "checker").update(reasons=["free text note"],
                                                                            verdict="WARN", since="2026-11-19")),
                                changed(lambda e: job(e, "checker").update(reasons=["folder_missing"],
@@ -683,11 +686,72 @@ class ExpressionTests(unittest.TestCase):
 
     def test_collect_send_outcome_is_closed(self):
         cases = [{"ok": True, "outcome": "sent", "code": ""}, {"ok": False, "outcome": "send_failed", "code": "gmail_error"},
-                 {"ok": False, "outcome": "rejected", "code": ""}, {"error": "Workflow does not exist"},
-                 {"send": False, "mail": {}, "row": {}}, {"outcome": "Something <b>odd</b>", "code": "Free Text!"}]
+                 {"ok": False, "outcome": "rejected", "code": "OPS_ALERT_SHORT"}, {"error": "Workflow does not exist"},
+                 {"send": False, "mail": {}, "row": {}}, {"outcome": "Something <b>odd</b>", "code": "Free Text!"},
+                 {"ok": False, "outcome": "error", "code": "x" * 41}]
         self.assertEqual(self.evaluate("Collect Send Outcome", "outcome", cases),
-                         ["sent", "send_failed", "rejected", "call_failed", "not_due", "unknown"])
-        self.assertEqual(self.evaluate("Collect Send Outcome", "code", cases), ["", "gmail_error", "", "", "", ""])
+                         ["sent", "send_failed", "rejected", "call_failed", "not_due", "unknown", "error"])
+        # G2 L1: the sender's uppercase OPS_ALERT_* codes are kept; free text and over-long codes are not.
+        self.assertEqual(self.evaluate("Collect Send Outcome", "code", cases),
+                         ["", "gmail_error", "OPS_ALERT_SHORT", "", "", "", ""])
+
+    def evaluate_with_outcome(self, node, field, outcomes, path):
+        """Evaluate one expression of `node` with $('Collect Send Outcome') and $('Email Plan') stubbed."""
+
+        params = next(n for n in load()["nodes"] if n["name"] == node)["parameters"]
+        expression = path(params)
+        self.assertTrue(expression.startswith("={{ ") and expression.endswith(" }}"), field)
+        plan = {"row": {"date": "2026-11-19"}, "mail": {"short": "FAIL 2 jobs 2026-11-19"}}
+        script = ("const outcomes = %s; const plan = %s; process.stdout.write(JSON.stringify(outcomes.map((outcome) => {"
+                  " const $ = (name) => ({ first: () => ({ json: name === 'Collect Send Outcome' ? { outcome, code: '' }"
+                  " : (name === 'Email Plan' ? plan : (() => { throw new Error('unexpected ' + name); })()) }) });"
+                  " return (%s); })));") % (json.dumps(outcomes), json.dumps(plan), expression[4:-3])
+        done = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)
+
+    def test_telegram_fallback_fires_exactly_when_a_due_email_did_not_go_out(self):
+        # G2 F1 (mutations M8, M16, M17): the Email Failed condition itself, not only its wiring.
+        fires = ["send_failed", "rejected", "error", "call_failed", "unknown"]
+        quiet = ["sent", "not_due", "folded", "folded_flood"]
+        result = self.evaluate_with_outcome(
+            "Email Failed", "condition", fires + quiet,
+            lambda p: p["conditions"]["conditions"][0]["leftValue"])
+        self.assertEqual(result, [True] * len(fires) + [False] * len(quiet))
+        condition = next(n for n in load()["nodes"] if n["name"] == "Email Failed")["parameters"]["conditions"]
+        self.assertEqual((condition["combinator"], len(condition["conditions"])), ("and", 1))
+        self.assertEqual(condition["conditions"][0]["rightValue"], True)
+        self.assertEqual(condition["conditions"][0]["operator"], {"type": "boolean", "operation": "equals"})
+        # Its true output, and only that, reaches the fallback; the false output ends the run.
+        self.assertEqual(load()["connections"]["Email Failed"],
+                         {"main": [[{"node": "Send Telegram Fallback", "type": "main", "index": 0}]]})
+
+    def test_end_to_end_outcomes_decide_the_fallback(self):
+        # The real chain: what reaches Collect Send Outcome -> its outcome -> the Email Failed condition.
+        inputs = [{"ok": True, "outcome": "sent", "code": ""},                       # email sent
+                  {"ok": False, "outcome": "send_failed", "code": "gmail_error"},    # Gmail down
+                  {"ok": False, "outcome": "rejected", "code": "OPS_ALERT_SHORT"},   # sender refused
+                  {"error": "Workflow does not exist"},                              # sender call failed
+                  {"send": False, "mail": {}, "row": {}}]                            # OK weekday: not due
+        outcomes = self.evaluate("Collect Send Outcome", "outcome", inputs)
+        self.assertEqual(outcomes, ["sent", "send_failed", "rejected", "call_failed", "not_due"])
+        fired = self.evaluate_with_outcome("Email Failed", "condition", outcomes,
+                                           lambda p: p["conditions"]["conditions"][0]["leftValue"])
+        self.assertEqual(fired, [False, True, True, True, False])
+
+    def test_fallback_text_names_gmail_only_for_send_failed(self):
+        # G2 L6: a neutral line for the outcomes that are not a Gmail failure.
+        outcomes = ["send_failed", "rejected", "error", "call_failed", "unknown"]
+        texts = self.evaluate_with_outcome("Send Telegram Fallback", "text", outcomes, lambda p: p["text"])
+        self.assertEqual(texts[0], "XB health email could not be sent on 2026-11-19 (n8n email step: send_failed). "
+                                   "Worst: FAIL 2 jobs. Check the n8n Gmail credential, then XB Daily Health.")
+        for outcome, text in zip(outcomes[1:], texts[1:]):
+            self.assertEqual(text, "XB health email could not be sent on 2026-11-19 (n8n email step: %s). Worst: FAIL 2 "
+                                   "jobs. Check XB Daily Health and XB Ops Alert Email in n8n." % outcome)
+            self.assertNotIn("Gmail", text)
+        for text in texts:
+            self.assertRegex(text, r"^[\x20-\x7E]+$")
+            self.assertLessEqual(len(text), 300)
 
 
 GOLDEN_TEXT = "\n".join([

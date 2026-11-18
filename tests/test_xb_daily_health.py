@@ -11,10 +11,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -552,6 +556,151 @@ class RunTests(unittest.TestCase):
         with redirect_stdout(out):
             code = health.main(["check-settings", "--config", str(Path(self.tmp) / "missing.json")], now=NOW)
         self.assertEqual((code, json.loads(out.getvalue())), (2, {"ok": False, "code": "settings_unreadable"}))
+
+
+class PostTests(unittest.TestCase):
+    """G2 F2 (mutation M14): the real post_event, not a fake poster: the timeout reaches the socket,
+    there is one attempt only, and no proxy or redirect is followed."""
+
+    URL = "http://127.0.0.1:5678/webhook/test-health-path-0001"
+
+    def fake_opener(self, answer):
+        calls = []
+
+        class Response:
+            status = 202
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, *args, **kwargs):
+                calls.append({"args": args, "kwargs": kwargs, "url": request.full_url, "method": request.get_method()})
+                if isinstance(answer, BaseException):
+                    raise answer
+                return Response()
+
+        handlers = []
+
+        def build_opener(*given):
+            handlers.extend(given)
+            return Opener()
+
+        return build_opener, calls, handlers
+
+    def post(self, answer, timeout=10):
+        build, calls, handlers = self.fake_opener(answer)
+        with mock.patch.object(health.urllib.request, "build_opener", build):
+            try:
+                result = health.post_event(self.URL, {"X-XB-Health-Auth": SECRET}, b"{}", timeout)
+            except OSError as exc:
+                result = exc
+        return result, calls, handlers
+
+    def test_the_timeout_reaches_the_one_open_call(self):
+        for timeout in (5, 10):
+            result, calls, handlers = self.post(None, timeout)
+            self.assertEqual(result, 202)
+            self.assertEqual(len(calls), 1, "exactly one attempt")
+            self.assertEqual(calls[0]["kwargs"], {"timeout": timeout})
+            self.assertEqual(calls[0]["args"], ())
+            self.assertEqual((calls[0]["url"], calls[0]["method"]), (self.URL, "POST"))
+            # No proxy (an empty ProxyHandler) and redirects refused.
+            proxies = [h for h in handlers if isinstance(h, health.urllib.request.ProxyHandler)]
+            self.assertEqual(len(proxies), 1)
+            self.assertEqual(proxies[0].proxies, {})
+            self.assertTrue(any(isinstance(h, health._RefuseRedirect) for h in handlers))
+
+    def test_no_answer_is_one_attempt_and_an_oserror(self):
+        for error in (health.urllib.error.URLError("timed out"), TimeoutError("timed out"), ConnectionRefusedError()):
+            result, calls, _ = self.post(error)
+            self.assertIsInstance(result, OSError)
+            self.assertEqual(len(calls), 1, "no retry")
+
+    def test_the_run_posts_once_with_the_design_timeout_even_when_n8n_does_not_answer(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        parsed = health.parse_settings(raw_settings(tmp), NOW)
+        self.assertEqual(parsed["send"]["timeout_seconds"], 10)  # design: 10 s
+        build, calls, _ = self.fake_opener(health.urllib.error.URLError("timed out"))
+        with mock.patch.object(health.urllib.request, "build_opener", build):
+            result = health.run(parsed, NOW, no_send=False, observer=lambda s: healthy_obs(),
+                                cred_reader=lambda target: SECRET)
+        self.assertEqual((result["send_status"], result["send_error"]), ("failed", "no_answer"))
+        self.assertEqual(len(calls), 1, "one POST, no retry")
+        self.assertEqual(calls[0]["kwargs"], {"timeout": 10})
+
+    def test_the_timeout_cannot_be_raised_past_the_design_value(self):
+        for value in (11, 30, 0, 4, True, "10"):
+            raw = raw_settings("C:\\fake-root")
+            raw["send"]["timeout_seconds"] = value
+            with self.assertRaises(health.SettingsError, msg=value) as caught:
+                health.parse_settings(raw, NOW)
+            self.assertEqual(caught.exception.code, "settings_send_timeout_invalid")
+        example = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.assertEqual(example["send"]["timeout_seconds"], 10)
+
+    def test_a_silent_loopback_server_is_cut_off_by_the_timeout(self):
+        # A real socket on 127.0.0.1 that accepts and never answers: without the timeout the call
+        # would hang until the server closes; with it, an OSError comes back in about one second.
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+        accepted = []
+
+        def accept():
+            try:
+                conn, _ = server.accept()
+                accepted.append(conn)
+                time.sleep(6)
+                conn.close()
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+        url = "http://127.0.0.1:%d/webhook/test-health-path-0001" % server.getsockname()[1]
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            health.post_event(url, {"X-XB-Health-Auth": SECRET}, b"{}", 1)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(len(accepted), 1, "one connection, no retry")
+
+
+class FailSafeTests(unittest.TestCase):
+    """G2 L5: an unexpected error in a run still exits 0 with one closed code and no detail."""
+
+    def test_unexpected_error_exits_0_with_internal_error(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        config = Path(tmp) / "daily_health.local.json"
+        config.write_text(json.dumps(raw_settings(tmp)), encoding="utf-8")
+
+        def broken(settings):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "FAKE detail C:\\private\\path")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = health.main(["run", "--config", str(config)], now=NOW, observer=broken)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"ok": False, "code": "internal_error"})
+        self.assertNotIn("private", out.getvalue())
+        for error in (KeyError("x"), ValueError("x"), RuntimeError("x")):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = health.main(["run", "--config", str(config)], now=NOW,
+                                   observer=lambda s, error=error: (_ for _ in ()).throw(error))
+            self.assertEqual((code, json.loads(out.getvalue())), (0, {"ok": False, "code": "internal_error"}))
+        # A record folder that cannot be written keeps its own code.
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.object(health, "write_record", side_effect=PermissionError()):
+            code = health.main(["run", "--config", str(config), "--no-send"], now=NOW,
+                               observer=lambda s: healthy_obs())
+        self.assertEqual((code, json.loads(out.getvalue())), (0, {"ok": False, "code": "record_write_failed"}))
 
 
 class StaticTests(unittest.TestCase):

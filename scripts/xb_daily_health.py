@@ -771,6 +771,12 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None, **hooks:
         # reports a missing check at 08:15.
         print(json.dumps({"ok": False, "code": "record_write_failed"}))
         return EXIT_OK
+    except Exception:  # noqa: BLE001 - fail safe: a bug never fails the task or prints a traceback
+        # Anything unexpected (for example odd PowerShell output) still exits 0 with one closed code
+        # and no detail, so no path or message reaches the task log. The dead-man reports the missing
+        # check at 08:15.
+        print(json.dumps({"ok": False, "code": "internal_error"}))
+        return EXIT_OK
     print(summary_line(record))
     return EXIT_OK
 
