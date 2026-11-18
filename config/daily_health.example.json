@@ -1,0 +1,57 @@
+{
+  "_comment": "Copy to config/daily_health.local.json (gitignored) on the server PC and replace every REPLACE value privately. Fake example values only. See docs/daily_health_check.md.",
+  "schema": "xb.daily_health.settings.v1",
+  "record_dir": "C:\\XB\\daily_health\\records",
+  "drive_root": "G:\\My Drive\\REPLACE-WITH-REPORT-FOLDER",
+  "stock_folder": "G:\\My Drive\\REPLACE-WITH-REPORT-FOLDER\\REPLACE-WITH-STOCK-FOLDER",
+  "arap_folder": "G:\\My Drive\\REPLACE-WITH-REPORT-FOLDER\\REPLACE-WITH-ARAP-FOLDER",
+  "mirror_log_dir": "C:\\XB\\drive_mirror\\logs",
+  "task_path": "\\XB\\",
+  "tasks": {
+    "energygrid_daily_bills": "REPLACE-WITH-ENERGYGRID-BILLS-TASK",
+    "energygrid_retention": "REPLACE-WITH-ENERGYGRID-RETENTION-TASK",
+    "drive_mirror": "XB Drive Mirror of main (weekly)",
+    "checker": "XB-DailyHealth"
+  },
+  "known_tasks": [],
+  "expected": {
+    "member_sync_summary": "not_installed",
+    "member_tags": "not_installed",
+    "ac2_stock_export": "on",
+    "stock_alert_route": "on",
+    "arap_export": "on",
+    "energygrid_daily_bills": "on",
+    "energygrid_retention": "on",
+    "drive_mirror": "on",
+    "n8n_workflows": "on",
+    "simba_intake": "not_installed",
+    "server_tasks": "on",
+    "checker": "on",
+    "drive_folder": "on"
+  },
+  "thresholds": {
+    "stock_warn_age": 70,
+    "stock_fail_age": 180,
+    "stock_manifest_fail_age": 180,
+    "stock_warn_run_seconds": 450,
+    "stock_fail_run_seconds": 720,
+    "arap_warn_age": 90,
+    "arap_fail_age": 180,
+    "arap_manifest_fail_age": 180,
+    "vm_down_similar_age": 90,
+    "energygrid_bills_warn_age": 1560,
+    "energygrid_bills_fail_age": 3000,
+    "energygrid_retention_warn_age": 1560,
+    "energygrid_retention_fail_age": 3000,
+    "mirror_warn_age": 11520,
+    "mirror_fail_age": 21600
+  },
+  "pauses": [],
+  "send": {
+    "enabled": true,
+    "webhook_url": "http://127.0.0.1:5678/webhook/REPLACE-WITH-PRIVATE-PATH",
+    "auth_header_name": "X-XB-Health-Auth",
+    "secret_credential_target": "REPLACE-WITH-CREDENTIAL-TARGET",
+    "timeout_seconds": 10
+  }
+}

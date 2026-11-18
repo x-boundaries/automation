@@ -131,6 +131,19 @@ on:
       - "config/mirror_main_to_drive.example.json"
       - "tests/test_mirror_main_to_drive.py"
       - "docs/drive_mirror_runbook.md"
+      # Daily health check (#325 H1). The Windows job's full-repository suite (`rest` shard)
+      # exercises tests/test_xb_daily_health.py (including the installer's Windows PowerShell 5.1
+      # -DryRun tests) and tests/test_xb_daily_health_workflow.py (the n8n export and the golden
+      # email through the shared sender above), so a pull request confined to the checker, its
+      # installer, example settings, runbook, workflow export or tests must still trigger this
+      # workflow. Exact entries, not globs.
+      - "scripts/xb_daily_health.py"
+      - "scripts/install_daily_health_task.ps1"
+      - "config/daily_health.example.json"
+      - "docs/daily_health_check.md"
+      - "n8n-workflows/xb_daily_health.workflow.json"
+      - "tests/test_xb_daily_health.py"
+      - "tests/test_xb_daily_health_workflow.py"
   workflow_dispatch: {}
 
 jobs:
