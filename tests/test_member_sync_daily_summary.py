@@ -2224,6 +2224,23 @@ class WiringContractTests(WiringTestCase):
         self.assertEqual(section["alerts"], {"claim_needs_review": 1, "orders_read_incomplete": 1})
         self.assertEqual((section["status"], section["reasons"]), ("WARN", ["alerts"]))
 
+    def test_core_member_no_unsupported_alert_is_a_warn_not_a_refusal(self):
+        # Slice NF2 (#268): the member core's new hold alert is an open alert
+        # code (CODE_RE), so no closed list changes: it reads as WARN (alerts),
+        # needing staff action, and never as digest_failed.
+        cfg = self.bm.load_config(ROOT / "config" / "member_benefits.example.json")
+        ledger = self.bm.BenefitsLedger(self.core_root, clock=lambda: self.now)
+        try:
+            ledger.init_meta(cfg)
+        finally:
+            ledger.close()
+        self.store_run(self.core_root / self.bm.LEDGER_FILE, {"counts": {"member_no_unsupported": 1}, "alerts": [self.bm.MEMBER_NO_UNSUPPORTED]})
+        digest = self.bm.ledger_digest(self.core_root, hours=24, now=self.now, config=cfg)
+        section = summary.core_section(json.loads(json.dumps(digest)))
+        self.assertEqual((section["available"], section["status"], section["reasons"]), (True, "WARN", ["alerts"]))
+        self.assertEqual(section["alerts"], {"member_no_unsupported": 1})
+        self.assertNotIn("member_no_unsupported", summary.CORE_INFO_ALERTS)
+
     def test_both_real_digests_through_daily(self):
         runner = ToolRunner(core=self.real_core_digest(), tags=self.real_tags_digest())
         event = self.run_wired(True, True, runner=runner)
