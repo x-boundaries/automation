@@ -2,6 +2,8 @@
 
 For people, and for their Claude Code or other AI agents. Point your agent at this file (or install it as a skill, see [Use it as a Claude Code skill](#use-it-as-a-claude-code-skill)) before you ask it about stock, sales, buying, purchasing, or what customers owe us and what we owe suppliers.
 
+A copy of this guide lives at the top of the Drive `Automation/Report` folder as `README - for AI agents.md`. The repository version (`docs/autocount2-automation/AC2_DATA_GUIDE.md` in the automation repository) is the source; if the two differ, the repository wins.
+
 Every example value in this guide is fake (`FAKE-0201`, `LOC-A`, `C-001`, `Example Vendor`). This repository is public: never add real figures, names, codes or folder IDs to it.
 
 ## Start here
@@ -10,7 +12,7 @@ Every example value in this guide is fake (`FAKE-0201`, `LOC-A`, `C-001`, `Examp
 2. **All of it is under `My Drive/Automation/Report`** in the owner's Drive, in two folders:
    - `AC2 Stock Balance (daily)`: stock, sales units, buying analysis, purchasing units, and the one-off AC1 sales history;
    - `AC2 ARAP Aging (latest)`: what customers owe us (AR) and what we owe suppliers (AP).
-3. **You can only read what has been shared with you.** Both folders sit in the owner's My Drive; the owner decides who they are shared with. If your agent cannot find them, ask the owner for access; do not ask anyone to make them public. See [Access](#access).
+3. **You can only read what has been shared with you.** The owner shares the folders with the staff who need them. If your agent cannot see a folder, ask the owner; do not ask anyone to make it public. See [Access](#access).
 4. **Check freshness first, every time.** Each folder has a `last_run_status.json`. Read it before you answer. See [How an agent should read the files](#how-an-agent-should-read-the-files).
 5. **It is confidential.** Stock, sales, vendor and AR/AP data is company business data. Keep it inside company tools. See [Privacy](#privacy).
 
@@ -37,9 +39,9 @@ Full technical detail lives in the runbooks; this guide summarises them:
 
 ### Getting at the files
 
-- **Google Drive connector** (for example Claude's Google Drive connector): search for the folder by its name (`AC2 Stock Balance (daily)` or `AC2 ARAP Aging (latest)`), then for the file by its exact name. The jobs replace each file in place, so there is one current copy of each name. Do not rely on a folder or file ID from an old chat.
+- **Google Drive connector** (for example Claude's Google Drive connector): search for the folder by its name (`AC2 Stock Balance (daily)` or `AC2 ARAP Aging (latest)`), then for the file by its exact name inside it. Find files by name on every read and never reuse a file ID from an earlier chat: the jobs replace the files every hour. If more than one copy turns up, take the newest by modified time and say so. Claude's connector returns a downloaded file's content as base64: decode it first (then gunzip a `.json.gz`).
 - **Google Drive for desktop** on your own PC: the same folders appear as local files. The local path depends on how the folder was shared with you (a shortcut in your My Drive, or under "Shared with me"); find it by folder name.
-- **`.json.gz` files are gzip-compressed JSON.** Download them and decompress (for example Python `gzip.open(path, "rt", encoding="utf-8")` then `json.load`). If your tool can only read text and cannot decompress gzip, use the CSV files instead, or the local Drive for desktop copy. *Unverified:* whether a given Drive connector can read gzip directly; test it before relying on it.
+- **`.json.gz` files are gzip-compressed JSON.** Download them and decompress (for example Python `gzip.open(path, "rt", encoding="utf-8")` then `json.load`). If your tool can only read text and cannot decompress gzip, use the CSV files instead, or the local Drive for desktop copy.
 - **CSV files** are UTF-8 with a header row. The stock CSVs have no byte-order mark; the AR/AP CSVs have one (read them as `utf-8-sig`, or strip the mark from the first header name). Text cells that started with `=`, `+`, `-` or `@` were made safe with a leading quote; numbers are plain numbers (negative quantities stay negative).
 
 ### Rules for reading
@@ -203,7 +205,14 @@ Full technical detail lives in the runbooks; this guide summarises them:
 **Traps:**
 
 - **AP reads as unpaid.** `ap_payments_recorded: false` means AutoCount holds supplier invoices but no supplier payments yet, so **every AP invoice shows as unpaid**, including invoices already paid by bank. Say this whenever you quote an AP figure. It turns `true` once supplier payments are keyed. If the first supplier payment is knocked off against an invoice, the whole AR/AP export (AR too) pauses and goes stale until a short, owner-approved step on the server maps it.
-- **Our buckets are not AutoCount's menu buckets.** AutoCount's Debtor and Creditor Aging reports age by **document date in calendar months** (current month, then 1, 2, 3, 4 months, then 5 and over) with credits **netted into** the buckets. These files use 30-day steps with credits kept apart. Totals per party match; bucket columns will not. To match the menu, recompute from the open-item rows: bucket each row (credits included) by the calendar month of its `doc_date` against the month of `as_at_local`: same month = current, then 1, 2, 3, 4 months back, then 5 months and over. Compare per party in the party's own currency (`outstanding_doc`). This is the rule the 18 Nov 2026 reconciliation used and the owner's AR/AP tracker page follows in its by-month view; the files themselves carry only the 30-day columns.
+- **Our buckets are not AutoCount's menu buckets.** AutoCount's Debtor and Creditor Aging reports age by **document date in calendar months** (current month, then 1, 2, 3, 4 months, then 5 and over) with credits **netted into** the buckets. These files use 30-day steps with credits kept apart. Totals per party match; bucket columns will not. The files carry only the 30-day columns.
+- **AutoCount-style ageing ("By month (as AutoCount)").** When someone asks for ageing as AutoCount shows it, compute it from the per-document rows (the open-items CSV or the feed's `docs[]`), the same way the owner's AR/AP tracker page does:
+  - months = (year x 12 + month of `as_at_local`) minus (year x 12 + month of `doc_date`), clamped to 0..5: 0 = current (the as-at month), then 1, 2, 3, 4 months, 5 = 5 months and over. A missing or future `doc_date` counts as 0.
+  - Add **every** open row, credits included (they net into the month they are dated): `outstanding_local` (feed: `outstanding`) for an SGD view, `outstanding_doc` grouped by `currency` for the per-currency view AutoCount prints.
+  - Check: the month buckets add up to the side's total outstanding in SGD, and each currency's buckets to that currency's sum of `outstanding_doc`.
+  - AutoCount's "Total Over Due" = invoices whose due date is before the as-at date (the same as `overdue`).
+  - This is the rule the 18 Nov 2026 reconciliation proved to the cent. Whether the export itself should carry month buckets is an open owner decision.
+- **"Today" is `as_at_local`**, never your own clock, for overdue days, week bands and month buckets.
 - **Unapplied credits** (customer receipts and credit notes not yet matched to an invoice) are their own negative rows (`unapplied = true`). They are never netted against an invoice. A customer's `outstanding` already includes them; `overdue` does not.
 - **Online-shop customer.** The online-shop debtor account(s) carry `online_shop = true` (feed: `flags.online_shop`). It is a flag, not a filter: totals include it. Say whether you included it.
 - **Post-dated.** `post_dated = true` marks a payment dated after the run date. None exist today; it is a flag, not a filter.
@@ -246,15 +255,15 @@ Always check freshness first and quote the "as of" time. Folder **S** = `AC2 Sto
 - [ ] AC1 history kept as its own series; gaps are not zero.
 - [ ] Purchasing used only if `analysis_manifest.json` lists it.
 - [ ] AP figures: `ap_payments_recorded` false = every supplier invoice reads unpaid.
-- [ ] AR/AP buckets are 30-day steps, not AutoCount's calendar months; credits kept apart.
+- [ ] AR/AP buckets are 30-day steps, not AutoCount's calendar months; credits kept apart. For AutoCount-style ageing, use the by-month rule (credits netted, per currency) with `as_at_local` as today.
 - [ ] Online-shop customer flag and foreign-currency amounts stated.
 - [ ] No cost, price, margin or sales-value answers from these files (they hold none).
 - [ ] Nothing written, moved or deleted; nothing pasted publicly.
 
 ## Access
 
-- Both folders are in the owner's **My Drive**. A staff member's agent can read only what the owner has shared with that staff member's own Google account (they appear under "Shared with me", or as a shortcut the staff member adds to their own My Drive).
-- Who gets access, and to which folder, is the **owner's decision**. The AR/AP folder holds customer and supplier names and amounts and is more sensitive than the stock folder. Ask the owner; do not change sharing yourself, and never use "anyone with the link".
+- Both folders are in the owner's **My Drive**. The owner shares them with the staff who need them; a staff member's agent can read only what is shared with that staff member's own Google account (the folders appear under "Shared with me", or as a shortcut the staff member adds to their own My Drive).
+- If your agent cannot see a folder, ask the owner. Who gets access, and to which folder, is the **owner's decision**. The AR/AP folder holds customer and supplier names and amounts and is more sensitive than the stock folder. Ask the owner; do not change sharing yourself, and never use "anyone with the link".
 
 ## Privacy
 
