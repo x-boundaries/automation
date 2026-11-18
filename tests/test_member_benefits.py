@@ -203,6 +203,10 @@ class FakeBook:
         self.reads += 1
         if self.fail_read:
             raise dl.BridgeError(self.fail_read)
+        if not isinstance(member_no, str) or not dl.MEMBER_NO_RE.fullmatch(member_no):
+            # Slice NF2: as the real child (Assert-XbTmMemberNo in
+            # ac2_member_type_move.ps1, called by benefit-member).
+            raise dl.BridgeError("bridge_read_failed:member_no_invalid")
         m = self.members.get(member_no)
         if m is None:
             return bm.MemberRead(False)
@@ -4938,6 +4942,175 @@ class B2NoReinitGuardTests(unittest.TestCase):
             with self.subTest(name=name):
                 value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
                 self.assertEqual(bm.parse_config(value).rule_fingerprint(), self.EXAMPLE_FINGERPRINT)
+
+
+def nf2_shapes(n: int = 1) -> dict[str, str]:
+    """Slice NF2: MemberNos outside dl.MEMBER_NO_RE, in the shapes left in
+    the book after the 18 Nov clean-up and the ones the brief names. Fake,
+    built in code (never a literal number)."""
+    digits = local(n)
+    return {
+        "plus_and_spaces": "+65 " + digits[:4] + " " + digits[4:],
+        "plus": "+" + sg(n),
+        "leading_space": " " + sg(n),
+        "tab": sg(n)[:4] + "\t" + sg(n)[4:],
+        "brackets": "(" + digits + ")",
+        "email": f"member{n}@example.com",
+    }
+
+
+class NF2MemberNoGuardTests(Base):
+    """Slice NF2 (#268, G0 member-number clean-up 5.3, C8): a linked member
+    whose MemberNo is outside dl.MEMBER_NO_RE never reaches the AutoCount
+    child (which refuses it, member_no_invalid, and so failed the run). The
+    receipt is held ``member_no_unsupported`` with one alert whose ref
+    carries no MemberNo; no bridge call, no write; the run goes on."""
+
+    run_main = CliTests.run_main
+
+    def linked_odd_member(self, n: int, member_no: str, **order) -> None:
+        self.book.members[member_no] = fake_member(member_no, name=f"Fake Member {n}")
+        self.link(n, member_no)
+        self.shopify.add(order_node(n, **order))
+
+    def assert_held_unsupported(self, n: int, member_no: str | None, link_source: str | None) -> None:
+        row = self.receipt(n)
+        self.assertEqual((row["state"], row["code"], row["member_no"], row["link_source"], row["waiting_since"]),
+                         ("held", "member_no_unsupported", member_no, link_source, None))
+
+    def test_red_first_a_linked_plus_member_with_a_qualifying_order_is_held_not_a_failed_run(self):
+        member_no = nf2_shapes()["plus_and_spaces"]
+        self.linked_odd_member(1, member_no)
+        out = self.engine().run(apply=False)  # before NF2: dl.BridgeError bridge_read_failed:member_no_invalid
+        self.assertIsNone(out["stopped"])
+        self.assertEqual(out["alerts"], ["member_no_unsupported"])
+        self.assertEqual(out["counts"], {"orders_read": 1, "receipt_ready": 1, "member_no_unsupported": 1})
+        self.assertEqual(len(out["refs"]), 1)
+        self.assertEqual(set(out["refs"][0]), {"ref", "code"})  # the ref only: no MemberNo, not even masked
+        self.assertEqual(out["refs"][0]["code"], "member_no_unsupported")
+        self.assertEqual((self.book.reads, self.book.saves, self.engine().reads), (0, 0, 0))
+        self.assert_held_unsupported(1, member_no, "sync155")
+
+    def every_shape_run(self, *, apply: bool) -> None:
+        shapes = {n: list(nf2_shapes(n).values())[n - 1] for n in range(1, len(nf2_shapes()) + 1)}  # one shape per customer
+        for n, member_no in shapes.items():
+            self.linked_odd_member(n, member_no)
+        out = self.engine().run(apply=apply)
+        self.assertEqual((out["stopped"], out["alerts"], out["saves"]), (None, ["member_no_unsupported"], 0))
+        self.assertEqual(out["counts"]["member_no_unsupported"], len(shapes))
+        self.assertTrue(all(set(entry) == {"ref", "code"} for entry in out["refs"]))
+        self.assertEqual((self.book.reads, self.book.saves, self.book.payloads), (0, 0, []))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0)
+        for n, member_no in shapes.items():
+            with self.subTest(member_no=bm.mask(member_no)):
+                self.assert_held_unsupported(n, member_no, "sync155")
+
+    def test_every_shape_is_held_on_observe_with_no_bridge_call(self):
+        self.every_shape_run(apply=False)
+
+    def test_every_shape_is_held_on_apply_with_no_bridge_call_and_no_write(self):
+        self.every_shape_run(apply=True)
+
+    def test_the_hold_is_decided_once_no_second_alert_and_no_read_later(self):
+        member_no = nf2_shapes()["leading_space"]
+        self.linked_odd_member(1, member_no)
+        engine = self.engine()
+        self.assertEqual(engine.run(apply=True)["alerts"], ["member_no_unsupported"])
+        self.advance(minutes=15)
+        out = engine.run(apply=True)
+        self.assertEqual((out["alerts"], out["counts"].get("member_no_unsupported")), ([], None))
+        self.assertEqual((self.book.reads, self.book.saves), (0, 0))
+        self.assert_held_unsupported(1, member_no, "sync155")
+
+    def test_other_receipts_in_the_same_run_still_apply(self):
+        self.linked_odd_member(1, nf2_shapes(1)["plus"])
+        normal = self.guest_with_order(2)
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["stopped"], out["alerts"], out["saves"]), (None, ["member_no_unsupported"], 1))
+        self.assertEqual(self.receipt(2)["state"], "applied")
+        self.assertEqual(self.book.members[normal]["type"], "MEMBER")
+        self.assertEqual([p["member_no"] for p in self.book.payloads], [normal])
+        self.assert_held_unsupported(1, nf2_shapes(1)["plus"], "sync155")
+
+    def test_a_claim_link_to_an_odd_member_is_held_too(self):
+        # A claim link the index made from an AutoCount row (e.g. a trailing tab
+        # that sync.member_no_key strips): the claim-link path, no claim read.
+        member_no = sg(1) + "\t"
+        self.book.members[member_no] = fake_member(member_no)
+        self.shopify.add(order_node(1))
+        self.engine()
+        self.ledger.add_claim(customer_gid(1), member_no, "index", "phone_and_name_match")
+        out = self.engine().run(apply=True)
+        self.assertEqual((out["stopped"], out["alerts"], out["saves"], self.book.reads), (None, ["member_no_unsupported"], 0, 0))
+        self.assert_held_unsupported(1, member_no, "claim")
+
+    def test_the_claim_read_path_never_sends_an_odd_form_to_the_bridge(self):
+        # The claim path reads AutoCount by the phone's MemberNo forms (digits
+        # today). Should a form ever fall outside the pattern, it is held as
+        # the receipt path is: no bridge call, no claim link.
+        odd = nf2_shapes()["plus"]
+        self.book.members[odd] = fake_member(odd)
+        self.shopify.add(order_node(1))
+        with mock.patch.object(bm, "phone_forms", return_value=(sg(1), {odd})):
+            out = self.engine().run(apply=True)
+        self.assertEqual((out["stopped"], out["alerts"], out["saves"], self.book.reads), (None, ["member_no_unsupported"], 0, 0))
+        self.assertEqual(self.ledger.active_claims(), [])
+        self.assert_held_unsupported(1, None, None)
+
+    def test_the_cli_exits_3_and_the_digest_shows_the_alert_with_the_ref_only(self):
+        self.linked_odd_member(1, nf2_shapes()["email"])
+        self.assertEqual(self.run_main("init")[0], 0)
+        code, out, _ = self.run_main("observe")
+        self.assertEqual((code, out["alerts"]), (3, ["member_no_unsupported"]))
+        code, digest, _ = self.run_main("digest", "--hours", "24")
+        self.assertEqual(code, 0)
+        self.assertEqual(digest["alerts"], {"member_no_unsupported": 1})
+        self.assertEqual(digest["alert_refs"], [{"ref": out["refs"][0]["ref"], "code": "member_no_unsupported"}])
+        self.assertEqual(digest["receipts"], {"held": 1})
+
+    # -- masking (brief step 3): every shape, every place that masks ----------
+    def test_mask_never_crashes_and_shows_the_last_three_only(self):
+        for name, member_no in nf2_shapes().items():
+            with self.subTest(shape=name):
+                masked = bm.mask(member_no)
+                self.assertEqual(masked, "*" * (len(member_no) - 3) + member_no[-3:])
+                self.assertNotIn(member_no, masked)
+                self.assertRegex(masked, self.PRIVATE_MASK_RE)
+                summary = bm.RunSummary("observe")
+                summary.alert("claim_needs_review", "o-" + "0" * 20, member_no)
+                self.assertEqual(summary.refs, [{"ref": "o-" + "0" * 20, "code": "claim_needs_review", "member_no_masked": masked}])
+                self.assertNotIn(member_no, json.dumps(summary.result("run-1")))
+        self.assertEqual((bm.mask(None), bm.mask("")), ("", ""))
+
+    def test_claim_links_listing_masks_every_shape(self):
+        shapes = list(nf2_shapes().values())
+        engine = self.engine()
+        for n, member_no in enumerate(shapes, start=1):
+            engine.ledger.add_claim(customer_gid(n), member_no, "index", "phone_and_name_match")
+        code, out, text = self.run_main("claim-links")
+        self.assertEqual((code, out["active"]), (0, len(shapes)))
+        self.assertEqual(sorted(e["member_no_masked"] for e in out["links"]), sorted(bm.mask(m) for m in shapes))
+        for member_no in shapes:
+            self.assertNotIn(member_no, text)
+            self.assertNotIn(json.dumps(member_no)[1:-1], text)  # nor its JSON-escaped form (the tab)
+
+    def test_unlink_last3_of_every_shape_works_or_is_refused_with_a_code(self):
+        # _LAST3_RE takes the pattern's characters only: a shape whose last 3
+        # hold a tab, a space or a bracket is refused (unlink_arguments_invalid),
+        # never a crash and never an echo of the value.
+        for n, (name, member_no) in enumerate(nf2_shapes().items(), start=1):
+            with self.subTest(shape=name):
+                engine = self.engine()
+                engine.ledger.add_claim(customer_gid(n), member_no, "index", "phone_and_name_match")
+                ref = self.ledger.ref("c", customer_gid(n))
+                last3 = member_no[-3:]
+                call = lambda: engine.unlink(customer_ref=ref, member_last3=last3, reason="other", accept_applied=False, apply=False)
+                if bm._LAST3_RE.fullmatch(last3):
+                    out = call()
+                    self.assertEqual(out["command"], "unlink_dry_run")
+                    self.assertNotIn(member_no, json.dumps(out))
+                else:
+                    self.assertEqual(self.code(call), "unlink_arguments_invalid")
 
 
 class ClassifySaveTests(unittest.TestCase):
