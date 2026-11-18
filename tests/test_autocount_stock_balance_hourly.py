@@ -36,6 +36,12 @@ from scripts import autocount_stock_balance_hourly as hourly  # noqa: E402
 SGT = ZoneInfo("Asia/Singapore")
 FIXED_NOW = datetime(2026, 10, 23, 14, 0, 5, tzinfo=SGT)
 SQL_NOW = datetime(2026, 10, 23, 14, 0, 6, tzinfo=SGT)
+HEX_ID = re.compile(r"[0-9a-f]{32,}")
+
+
+def without_hex_ids(text):
+    """Blank out run ids and sha256 hashes: a digit check must not match inside a random hex id."""
+    return HEX_ID.sub("<hex>", text)
 
 FAKE_DB = "AED_EXAMPLE_BOOK"
 FAKE_LOGIN = "fake_reader_login"
@@ -1170,7 +1176,7 @@ class LargeBalanceTests(TempDirTestCase):
         self.assertEqual((checked["status"], checked["large_balance_count"]), ("fresh", 1))
         for text in (out.getvalue(), out2.getvalue()):
             self.assertNotIn("FAKE-0301", text)
-            self.assertNotIn("987654321", text)
+            self.assertNotIn("987654321", without_hex_ids(text))
         status = json.loads((self.delivery / hourly.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
         self.assertEqual(status["large_balance_count"], 1)
 
@@ -1973,9 +1979,10 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.text.count("GetNetworkCredential()"), 1)
 
     def test_v7_supervised_run_is_named(self):
-        self.assertIn("Start-ScheduledTask", self.text)
+        # Both cmdlets need -TaskName; the name has spaces, so the hint quotes it for copy-paste.
+        self.assertIn("Start-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' now", self.text)
         self.assertIn("last_run_status.json", self.text)
-        self.assertIn("Disable-ScheduledTask", self.text)
+        self.assertIn("Disable-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' and report", self.text)
 
     def test_powershell_parse_only(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")
@@ -3315,7 +3322,7 @@ class AlertRunTests(TempDirTestCase):
         (call,) = transport.calls
         self.assertEqual((call["body"]["conditions"], call["body"]["large_balance_count"]), (["large_balance"], 1))
         self.assertNotIn(CANARY_ITEM, call["raw"].decode("ascii"))
-        self.assertNotIn("123456789", call["raw"].decode("ascii"))
+        self.assertNotIn("123456789", without_hex_ids(call["raw"].decode("ascii")))
 
     def test_same_problem_alerts_once_a_day_then_again_after_recovery(self):
         settings = self.settings()

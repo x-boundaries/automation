@@ -8,9 +8,9 @@ Issue: #321 (slice A1, offline build). Script: `scripts/autocount_arap_aging.py`
 under `tests/`).
 
 Status: A1 (exporter) merged; its first VM run passed on 18 Nov 2026, with the Drive folder and
-`delivery_root` set. A2 adds the Task Scheduler installer `scripts/install_autocount_arap_aging_task.ps1`
-(see "A2: hourly task"); registering the task on the VM needs its own owner OK. Error alerts (A3) are a
-later slice.
+`delivery_root` set. A2 (the Task Scheduler installer `scripts/install_autocount_arap_aging_task.ps1`,
+see "A2: hourly task") merged, and the task was registered on the VM on 18 Nov 2026. V3 passed
+(`reconciled_on` 2026-11-18). Error alerts (A3) are a later slice. See "What happens next".
 
 ## What it does
 
@@ -246,7 +246,9 @@ and run time in the private mailbox only. Then run `--check-latest` (expect 0).
 currency option), and save them (Excel or PDF) privately on the VM. Run the live-check SQL once (V3 OK
 covers it). VM Claude compares to the cent, on the matching basis (`due_*` or `doc_*` columns) and
 filters (online-shop flag, zero balance, post-dated): per debtor and per creditor total outstanding
-and each bucket, unapplied totals, plus 10 sample documents each side. Private mailbox record only.
+and each bucket, unapplied totals, plus 10 sample documents each side. The menu buckets are calendar
+months by document date with credits netted in, not the export's 30-day columns: recompute them from
+the item rows on the compare side (see "What happens next"). Private mailbox record only.
 Pass: set `reconciled_on` to that date. One fix round; if it still does not match, write the r1
 A1-b fallback note (AutoCount's own aging classes, nightly) for the Controller.
 
@@ -269,7 +271,12 @@ What the installer registers:
 - It refuses if a task with the same name is already in `\XB\` or in the Task Scheduler root. It never
   replaces, moves or removes a task.
 
-**Schedule on the VM.** The member core runs at :07/:22/:37/:52; stock at :00; ARAP at :30.
+**Schedule on the VM.** `\XB\XB-MemberSync` runs at :00/:15/:30/:45; the member core at
+:07/:22/:37/:52; stock at :00; ARAP at :30.
+
+The :30 overlap with MemberSync is fine: the two jobs hold separate locks, ARAP only reads (direct
+SQL) and fails closed on `lock_timeout` / `unstable_snapshot`, and a failed run keeps the previous
+published set. Stock has shared :00 with MemberSync the same way.
 
 ### VM steps (VM Claude; elevated Windows PowerShell 5.1, no transcript, from the clone root)
 
@@ -297,10 +304,11 @@ What the installer registers:
    `LastRunTime`, `LastTaskResult` 0, and the task is no longer running (at most 15 minutes).
    Pass only if `last_run_status.json` is newer than the noted value and shows `status: success`
    and `delivery_status: handed_to_drive_sync_folder`, in the archive root and in `delivery_root`.
-5. **Freshness check.**
+5. **Freshness check.** Use the task's own full `python.exe` path (the `-PythonExe` value), not bare
+   `python`: a `PATH` Python without `tzdata` gives a false exit 3.
 
    ```
-   python scripts\autocount_arap_aging.py --config config\autocount_arap_aging.local.json --check-latest
+   <full path to python.exe> scripts\autocount_arap_aging.py --config config\autocount_arap_aging.local.json --check-latest
    ```
 
    Pass: exit 0 (fresh). Record the result, counts only, in the private mailbox.
@@ -311,6 +319,20 @@ What the installer registers:
 and keeps the task and the last published set (`Enable-ScheduledTask` turns it back on). If step 4
 fails, disable the task straight away and report the `failure_class`. Removing the task
 (`Unregister-ScheduledTask`) is a separate owner-approved step.
+
+## What happens next
+
+- **Done (18 Nov 2026):** the hourly task `\XB\AC2 ARAP Aging` is registered on the VM, and V3 passed
+  with `reconciled_on` 2026-11-18.
+- **V3 finding, month buckets.** AutoCount's Debtor and Creditor Aging menus age by **document date in
+  calendar months** (current month, then 1, 2, 3, 4 months, then 5 and over), with credits (receipts,
+  credit notes) netted into the buckets. The export's own bucket columns (`due_*`, `doc_*`) are
+  30-day steps (`aging.boundaries`) with unapplied credits kept apart, so they cannot equal the menu
+  buckets. V3 compared buckets by recomputing month buckets from the export's item rows, on the
+  compare side only. No code or settings changed.
+- **Open owner decision:** whether the exporter or the tracker should also give month buckets that
+  match the menus. Not built; until then a V3 rerun compares buckets the same way.
+- **A3:** error alerts (below).
 
 ## Not in this slice
 

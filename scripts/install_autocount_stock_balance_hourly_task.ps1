@@ -191,4 +191,4 @@ else {
 
 Write-Host "Registered scheduled task: $TaskPath$TaskName"
 Write-Host "Runs hourly at minute $RunMinute, IgnoreNew, 15 minute limit, RunLevel Limited, LogonType $logonType ($authMode)."
-Write-Host "Next (runbook V7): Start-ScheduledTask -TaskPath $TaskPath now, wait for it to finish, and confirm last_run_status.json shows success for that run before leaving the task enabled. If it does not, run Disable-ScheduledTask -TaskPath $TaskPath and report."
+Write-Host "Next (runbook V7): Start-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' now, wait for it to finish, and confirm last_run_status.json shows success for that run before leaving the task enabled. If it does not, run Disable-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' and report."
