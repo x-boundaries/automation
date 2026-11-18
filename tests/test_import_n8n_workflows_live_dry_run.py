@@ -1,4 +1,4 @@
-"""Offline contract tests for import-n8n-workflows-live.ps1 (Toolkit helper set a831f7fd41c3).
+"""Offline contract tests for import-n8n-workflows-live.ps1 (Toolkit helper set 35defa821c2b).
 
 Rewritten for #316 (PR #315) after the helper refresh. The owner accepted Toolkit's design on
 17 Nov 2026: a plain import run imports changed and new repository workflows as unpublished with
@@ -9,7 +9,17 @@ no confirmation prompt. These tests pin the protections that remain:
 (b) a published (active) live target blocks the whole run before any import;
 (c) an import run calls `n8n import:workflow` only with `--activeState=false`, never restarts,
     publishes or executes, and its unpublished postcondition holds;
-(d) every run refuses before any Docker call when a stamped helper file has been edited.
+(d) every run refuses before any Docker call when a stamped helper file has been edited;
+(e) under Windows PowerShell 5.1, exactly one early blocker (a recorded local identity that no
+    longer exists in live n8n) stops the whole run at the early gate, with no same-name fallback
+    (Toolkit 3.146.1 fix; set a831f7fd41c3 skipped that gate for a single blocker);
+(f) the import script refuses -RequireConfirmation and -SkipCredentialBindingRefresh (Toolkit
+    3.146.1), and -AllowMissingCredentialBindings and -CredentialExportDir (Toolkit 3.146.3), before
+    any Docker call; earlier sets accepted and ignored them.
+
+Refreshed for the Toolkit 3.146.1 helper set (#323): (b) now also pins that one published target
+is caught at the early gate, before the credential-metadata step. Refreshed again for Toolkit
+3.146.4 (set 35defa821c2b): (f) also covers the two switches refused since 3.146.3.
 
 How it runs: the real PowerShell helper runs end to end inside a throwaway fixture repository
 holding copies of the committed workflow exports, the helper folder and the repo-root
@@ -237,6 +247,9 @@ class ImportHelperOfflineContractTest(unittest.TestCase):
     def _imports(self):
         return [call for call in self._docker_calls() if "import:workflow" in call]
 
+    def _copies_into_container(self):
+        return [call for call in self._docker_calls() if call[0] == "cp" and call[2].startswith(STUB_CONTAINER_ID + ":")]
+
     def _assert_never_publishes_executes_or_restarts(self):
         for call in self._docker_calls():
             joined = " ".join(call)
@@ -257,10 +270,10 @@ class ImportHelperOfflineContractTest(unittest.TestCase):
         self.assertIn("Live n8n was not changed.", result.stdout)
         self.assertIn("Would import", result.stdout)
         self.assertEqual([], self._imports(), "a dry run must never call n8n import:workflow")
-        # New contract (Toolkit a831f7fd41c3): the dry run clears the configured PreparedDir and
+        # Contract since Toolkit a831f7fd41c3: the dry run clears the configured PreparedDir and
         # stages only the credential-metadata helper in the container's /tmp, then cleans up.
         self.assertFalse(sentinel.exists(), "the configured PreparedDir is cleared on every run")
-        copies_in = [call for call in self._docker_calls() if call[0] == "cp" and call[2].startswith(STUB_CONTAINER_ID + ":")]
+        copies_in = self._copies_into_container()
         self.assertEqual(1, len(copies_in), copies_in)
         self.assertRegex(copies_in[0][2], r":/tmp/ai-agent-toolkit-n8n-metadata-[0-9a-f]{32}\.cjs$")
         self.assertTrue(any("cleanup" in call for call in self._docker_calls()), "credential staging must be cleaned up")
@@ -278,12 +291,11 @@ class ImportHelperOfflineContractTest(unittest.TestCase):
         self.assertIn("is published (active)", output)
         self.assertIn("Unpublish it in n8n first", output)
         self.assertEqual([], self._imports(), "no workflow may be imported while any target is published")
-        # Under Windows PowerShell 5.1 a single early target-resolution blocker is not counted
-        # (import-n8n-workflows-live.ps1:1828 reads .Count of one PSCustomObject), so the run stops
-        # at the preparation gate (:1491-1493) instead, after the credential-metadata step. Either
-        # way only that helper is ever copied into the container and no workflow payload is.
-        copies_in = [call for call in self._docker_calls() if call[0] == "cp" and call[2].startswith(STUB_CONTAINER_ID + ":")]
-        self.assertTrue(all(":/tmp/ai-agent-toolkit-n8n-metadata-" in call[2] for call in copies_in), copies_in)
+        # One published target is one early target-resolution blocker. Toolkit 3.146.1 wraps the
+        # result in @() (import-n8n-workflows-live.ps1:1833), so Windows PowerShell 5.1 counts it and
+        # the early gate stops the run before the credential-metadata step: nothing is copied into
+        # the container at all.
+        self.assertEqual([], self._copies_into_container())
         live = json.loads((self.state / "live.json").read_text(encoding="utf-8"))
         self.assertEqual(initial, live)
         self._assert_never_publishes_executes_or_restarts()
@@ -319,6 +331,59 @@ class ImportHelperOfflineContractTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, output)
                 self.assertIn("should-import-n8n-workflow.cjs", output)
                 self.assertEqual([], self._docker_calls(), "the stamp check runs before any Docker call")
+
+    def test_e_one_missing_local_identity_blocks_without_same_name_fallback(self):
+        # The one export without a template id is the only one a same-name fallback could reach.
+        monitor_file = next(f for f in self.workflow_files if f.name == "energygrid_local_failure_monitor.workflow.json")
+        monitor = json.loads(monitor_file.read_text(encoding="utf-8"))
+        self.assertNotIn("id", monitor, "the monitor export is expected to carry no template id")
+        identity_dir = self.repo / ".n8n-local"
+        identity_dir.mkdir()
+        (identity_dir / "n8n-workflow-identities.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "workflows": [{
+                "workflowFile": monitor_file.name,
+                "workflowName": monitor["name"],
+                "targetWorkflowId": "StubGoneTarget01",
+            }],
+        }), encoding="utf-8")
+        # Every export has an unpublished live copy; the monitor's copy sits under a different id,
+        # so the recorded identity is gone and only a same-name workflow remains.
+        initial = [UNRELATED_LIVE] + live_copies_of(self.workflow_files)
+        same_name = [entry for entry in initial if entry["name"] == monitor["name"]]
+        self.assertEqual(1, len(same_name))
+        same_name[0]["id"] = "StubSameName0001"
+        self._set_live(initial)
+
+        result = self._run_import([])
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("dedicated local target identity no longer exists; refusing a same-name fallback", output)
+        self.assertEqual([], self._imports(), "one early blocker must stop the whole run")
+        self.assertEqual([], self._copies_into_container(), "the early gate stops before any container staging")
+        live = json.loads((self.state / "live.json").read_text(encoding="utf-8"))
+        self.assertEqual(initial, live)
+        self._assert_never_publishes_executes_or_restarts()
+
+    def test_f_unused_import_switches_are_refused_before_any_docker_call(self):
+        self._set_live([UNRELATED_LIVE] + live_copies_of(self.workflow_files))
+
+        refused = (
+            ["-RequireConfirmation"],
+            ["-SkipCredentialBindingRefresh"],
+            ["-AllowMissingCredentialBindings"],
+            ["-CredentialExportDir", ".tmp/stub-credential-exports"],
+        )
+        for args in refused:
+            switch = args[0]
+            with self.subTest(switch=switch):
+                result = self._run_import(args)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("N8N_POLICY_VALIDATION_FAILED", output)
+                self.assertIn(switch, output)
+                self.assertEqual([], self._docker_calls(), "the switch is refused before any Docker call")
 
 
 if __name__ == "__main__":
