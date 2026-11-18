@@ -10,9 +10,9 @@ n8n adds `id`, `createdAt` and `updatedAt` to every Data Table by itself. Do not
 
 | Column | Type | Value |
 | --- | --- | --- |
-| `system` | string | `AC2-STOCK`, `ENERGYGRID` or `MEMBER-SYNC`. Every row, including a flood notice, belongs to exactly one system. |
-| `key` | string | The caller's stable condition key, for example `run_failed:ledger_mismatch`; `alert_flood` for a system's flood notice (reserved: a caller cannot use it); `daily_summary` for a daily summary (slice 3). Fold matching uses `system` + `key`. |
-| `severity` | string | `ERROR`, `WARN` or `INFO` (the flood notice is `WARN`; a daily summary is `INFO` for CLEAN and `WARN` for STOP). |
+| `system` | string | `AC2-STOCK`, `ENERGYGRID`, `MEMBER-SYNC` or `HEALTH` (the daily health check, #325 H1). Every row, including a flood notice, belongs to exactly one system. |
+| `key` | string | The caller's stable condition key, for example `run_failed:ledger_mismatch`; `alert_flood` for a system's flood notice (reserved: a caller cannot use it); `daily_summary` for a daily summary (slice 3); `daily_health` for the daily health email (system `HEALTH` only). Fold matching uses `system` + `key`. |
+| `severity` | string | `ERROR`, `WARN` or `INFO` (the flood notice is `WARN`; a daily summary is `INFO` for CLEAN and `WARN` for STOP; a daily health email is `INFO` for OK, `WARN` for WARN and `ERROR` for FAIL). |
 | `outcome` | string | `sent`, `folded`, `folded_flood` or `send_failed`. |
 | `code` | string | Empty when nothing went wrong. `send_failed` rows: usually `gmail_error` (a Gmail 2.1 error item is `{ error: <message> }`), or `http_<status>` (for example `http_429`) only when that message carries a 4xx or 5xx status. `log_read_failed` when the log could not be read before the decision. Never an error message, an address or a token. |
 | `folded_count` | number | On a `sent` or `send_failed` row of an alert: how many `folded` and `folded_flood` rows of the same `system:key` came since its previous `sent` row (the k in "(+k folded since HH:MM)"). A `send_failed` row does not reset that count, so the next successful send reports the same rows again. `0` on `folded`, `folded_flood` and flood-notice rows. |
@@ -27,6 +27,7 @@ Rejected requests (`OPS_ALERT_*` reason codes) and unexpected errors are not log
 - **Read failure:** decided once on an empty history (no fold, no flood), and the row it logs carries `log_read_failed`. If the table itself is missing, no row can be written; the email still goes once.
 - **Flood, per system:** 10 or more `sent` rows of the request's `system` (not counting its `alert_flood` rows) in the last 60 minutes: the new alert is logged `folded_flood`. If that system has no `alert_flood` row `sent` in the last 60 minutes, one `[XB alert] <SYSTEM> WARN alert_flood` email goes out for it and gets its own row with that `system`. A flood notice that failed (`send_failed`) does not count, so the next held-back alert tries the notice again. Other systems keep sending normally.
 - **Daily summary (slice 3):** a `daily_summary` row is always `sent` or `send_failed`: it is never folded, never held back by a flood, and `daily_summary` rows never count toward the flood cap.
+- **Daily health (#325 H1):** a `HEALTH` / `daily_health` row is handled the same way: always `sent` or `send_failed`, never folded, never held back, never counted. The health workflow `XB Daily Health` reads this table back for today's `MEMBER-SYNC` `daily_summary` row (did the member-sync summary go out); it keeps its own run log in a separate Data Table, `xb_health_runs` ([daily_health_check.md](daily_health_check.md)).
 - The read and the insert are not one atomic step. Two calls in the same second can both decide to send: one duplicate email at worst (accepted in the G0 design). More than 500 calls of one system in one hour can hide that system's older rows from the read, so its count can come out low and let an extra email through. Another system's volume never does.
 
 ## Housekeeping

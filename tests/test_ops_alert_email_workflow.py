@@ -295,8 +295,10 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
         self.assertIn("ops_alert_email.workflow.json", readme)
         self.assertIn(RECIPIENT_PLACEHOLDER, readme)
         self.assertIn("[XB daily]", readme)
+        self.assertIn("[XB health]", readme)
+        self.assertIn("HEALTH", notes)
         doc = TABLE_DOC.read_text(encoding="utf-8")
-        for column in LOG_COLUMNS + ["xb_alert_email_log", "folded_flood", "send_failed"]:
+        for column in LOG_COLUMNS + ["xb_alert_email_log", "folded_flood", "send_failed", "daily_health", "HEALTH"]:
             self.assertIn(column, doc)
 
 
@@ -683,6 +685,72 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         (other,) = self.validate(request(system="MEMBER-SYNC", key="daily_summary", short="CLEAN 2026-11-07",
                                          lines=["see AC2-STOCK"]))
         self.assertEqual(other, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"})
+
+    # ---- daily health path (#325 H1) ---- #
+    def health(self, **overrides):
+        value = {"system": "HEALTH", "severity": "ERROR", "key": "daily_health", "short": "FAIL 3 jobs 2026-11-19",
+                 "lines": ["XB daily health check, Thu 19 Nov 2026 07:30 SGT: 3 of 10 watched jobs need a look.",
+                           "", "FAIL  AC2 hourly stock export: no new run for 8 h (last 23:00), since 19 Nov."]}
+        value.update(overrides)
+        return value
+
+    def test_daily_health_is_accepted_only_in_its_closed_form(self):
+        for word, severity in (("OK", "INFO"), ("WARN", "WARN"), ("FAIL", "ERROR")):
+            for count in ("1", "10", "999"):
+                body = self.health(severity=severity, short="%s %s jobs 2026-11-23" % (word, count))
+                (out,) = self.validate(body)
+                self.assertEqual(out, {"valid": True, **body}, body["short"])
+        bad = {
+            # HEALTH and daily_health come only together.
+            "OPS_ALERT_KEY": [self.health(key="run_failed"), self.health(key="daily_summary", short="CLEAN 2026-11-19"),
+                              request(key="daily_health", short="FAIL 3 jobs 2026-11-19"),
+                              request(system="MEMBER-SYNC", key="daily_health", short="OK 3 jobs 2026-11-19",
+                                      severity="INFO")],
+            "OPS_ALERT_SHORT": [self.health(short=s) for s in (
+                "FAIL 3 jobs", "FAIL 0 jobs 2026-11-19", "FAIL 1000 jobs 2026-11-19", "fail 3 jobs 2026-11-19",
+                "STOP 3 jobs 2026-11-19", "FAIL 3 job 2026-11-19", "FAIL  3 jobs 2026-11-19", "FAIL 03 jobs 2026-11-19",
+                "FAIL 3 jobs 2026-11-19 x", "FAIL_3_jobs_2026-11-19", "CLEAN 2026-11-19")],
+            # The severity follows the subject word, so the log row and the subject never disagree.
+            "OPS_ALERT_SEVERITY": [self.health(severity="WARN"), self.health(severity="INFO"),
+                                   self.health(short="OK 9 jobs 2026-11-23", severity="ERROR"),
+                                   self.health(short="WARN 1 jobs 2026-11-23", severity="INFO")],
+            # A health email names no other system code either.
+            "OPS_ALERT_OTHER_SYSTEM": [self.health(lines=["see AC2-STOCK"]), self.health(lines=["MEMBER-SYNC late"])],
+        }
+        for reason, bodies in bad.items():
+            for body, out in zip(bodies, self.validate(*bodies)):
+                with self.subTest(reason=reason, short=body["short"], key=body["key"]):
+                    self.assertEqual(out, {"valid": False, "reason": reason})
+        # The other systems' alerts may not name HEALTH (one system per email, both ways).
+        (out,) = self.validate(request(lines=["HEALTH check said so"]))
+        self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"})
+
+    def test_daily_health_subject_and_footer(self):
+        plan = self.decide([], {"valid": True, **self.health()})
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB health] FAIL 3 jobs 2026-11-19")
+        self.assertEqual(plan["mail_row"], {"system": "HEALTH", "key": "daily_health", "severity": "ERROR",
+                                            "folded_count": 0, "code": "", "sent_at": "2026-11-06T06:30:00.000Z"})
+        text = plan["mail"]["text"]
+        self.assertTrue(text.startswith("\n".join(self.health()["lines"]) + "\n\n--\n"), text)
+        self.assertIn("System: HEALTH | Daily health check", text)
+        self.assertIn("Daily health emails are never folded", text)
+        plan = self.decide([], {"valid": True, **self.health(severity="INFO", short="OK 10 jobs 2026-11-23")})
+        self.assertEqual(plan["mail"]["subject"], "[XB health] OK 10 jobs 2026-11-23")
+
+    def test_daily_health_is_never_folded_never_held_and_never_counted(self):
+        same = [row(m, system="HEALTH", key="daily_health") for m in (1, 5, 30)]
+        flood = [row(m, system="HEALTH", key="k%d" % m) for m in range(1, 12)]
+        for rows in (same, flood, flood + [row(3, system="HEALTH", key="alert_flood")]):
+            plan = self.decide(rows, {"valid": True, **self.health()})
+            self.assertIsNone(plan["held_outcome"])
+            self.assertEqual(plan["mail"]["subject"], "[XB health] FAIL 3 jobs 2026-11-19")
+            self.assertEqual(plan["mail_row"]["folded_count"], 0)
+        # Health rows are their own system and never push another system's alerts into a flood.
+        health_rows = [row(m, system="HEALTH", key="daily_health") for m in range(1, 12)]
+        plan = self.decide(health_rows)
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR run_failed:ledger_mismatch")
 
 
 if __name__ == "__main__":
