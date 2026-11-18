@@ -48,5 +48,14 @@
     "payment_home_rate": false,
     "payment_handover_date": false
   },
-  "reconciled_on": null
+  "reconciled_on": null,
+  "alert": {
+    "webhook_enabled": false,
+    "webhook_url": null,
+    "auth_header_name": "X-XB-Alert-Token",
+    "secret_env_var": null,
+    "secret_credential_target": null,
+    "timeout_seconds": 10,
+    "repeat_hours": 24
+  }
 }

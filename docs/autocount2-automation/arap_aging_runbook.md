@@ -10,7 +10,8 @@ under `tests/`).
 Status: A1 (exporter) merged; its first VM run passed on 18 Nov 2026, with the Drive folder and
 `delivery_root` set. A2 (the Task Scheduler installer `scripts/install_autocount_arap_aging_task.ps1`,
 see "A2: hourly task") merged, and the task was registered on the VM on 18 Nov 2026. V3 passed
-(`reconciled_on` 2026-11-18). Error alerts (A3) are a later slice. See "What happens next".
+(`reconciled_on` 2026-11-18). Error alerts (A3) are built offline, off by default; their live
+steps are in "A3: error alerts". See "What happens next".
 
 ## What it does
 
@@ -128,6 +129,7 @@ Unknown keys, bad values, a missing `source.expected_database`, or `schedule.fre
 | `knockoff_target_types` | `{"ar": {"RI": "IV"}, "ap": {}}` | See above. |
 | `guess_sources.*` | all `false` | See above. |
 | `reconciled_on` | `null` | Date the last V3 compare passed; the tracker shows "not yet proven" while null. |
+| `alert.*` | off | Error alerts (A3): same keys, defaults and checks as the stock export's `alert` block. See "A3: error alerts". |
 
 ## Outputs (all replaced together, every successful run)
 
@@ -208,8 +210,8 @@ Delivery results (`delivery_status`): `not_configured`, `handed_to_drive_sync_fo
   connector and is owner-only.
 - Console output, `latest_manifest.json` and `last_run_status.json` carry counts, hashes and flags
   only: no party names or codes, no document numbers, no amounts.
-- Never emailed, never sent to an API, never committed. Alerts (A3) will carry failure classes and
-  counts only.
+- Never emailed, never sent to an API, never committed. Alerts (A3) carry closed codes only (failure
+  class, delivery status, condition names and the `ap_payments_recorded` flag).
 
 ## Read identity
 
@@ -320,6 +322,138 @@ and keeps the task and the last published set (`Enable-ScheduledTask` turns it b
 fails, disable the task straight away and report the `failure_class`. Removing the task
 (`Unregister-ScheduledTask`) is a separate owner-approved step.
 
+## A3: error alerts
+
+Built offline, **off by default** (`alert.webhook_enabled: false`); the n8n workflow ships inactive.
+A copy of the stock export's alert path ([stock runbook, "Error alerts"](stock_balance_hourly_runbook.md#error-alerts-email-through-n8n)):
+the same settings, secret handling, de-duplication rule, one bounded POST and `alert_status` values,
+reusing the stock exporter's helpers. Every live step below needs its own owner OK.
+
+How it works:
+
+1. At the end of every run, just before `last_run_status.json` is written (still under the lock), the
+   exporter works out which conditions the run raises, from the same values it writes to the status.
+2. With alerts on, it checks the shared secret is readable (every run; nothing is sent for that) and,
+   if the de-duplication rule says so, POSTs **one** sanitized `xb.ac2.arap_alert.v1` event to
+   `alert.webhook_url`: one attempt, `alert.timeout_seconds` per socket operation, no proxy, no
+   redirect, the secret in the `alert.auth_header_name` header, `User-Agent: xb-ac2-arap-alert/1`.
+   Only the answer's status is used.
+3. The n8n workflow `AC2 ARAP Export - Error Alert`
+   ([`n8n-workflows/ac2_arap_alert.workflow.json`](../../n8n-workflows/ac2_arap_alert.workflow.json))
+   checks its own Header Auth secret, rejects any event outside the strict schema (400, `ARAP_ALERT_*`),
+   and calls the shared `XB Ops Alert Email` sub-workflow with system **`AC2-ARAP`** (its own system,
+   apart from `AC2-STOCK`: its own fold keys and flood cap). Answers: 200 sent or folded, 400
+   rejected, 403 wrong or missing secret, 404 inactive or wrong path, 500 unexpected error, 502 email
+   send failed.
+4. The outcome is written as `alert_status` and `alert_http_status` (the answer's HTTP status, or
+   `null` when no POST was made or there was no usable answer) in `last_run_status.json`, in the
+   archive root and in `delivery_root`. **An alert, sent or lost, never changes the run's status,
+   exit code or the latest set.** There are no hourly folders, so there is no per-run alert record:
+   `last_run_status.json` shows the latest run only.
+
+### Conditions
+
+| Condition | Raised when (in `last_run_status.json`) | Severity | Repeat |
+| --- | --- | --- | --- |
+| `run_failed` | `status: failed`, any `failure_class`. A failed run raises only this one. | ERROR | daily while it lasts |
+| `delivery_failed` | `delivery_status: verify_failed` or `copy_failed` (Drive kept the previous set) | ERROR | daily while it lasts |
+| `ap_payments_recorded` | `ap_payments_recorded: true` on a successful run (see "`ap_payments_recorded`") | WARN | **once**: a notice, never repeated daily |
+
+`run_failed` is keyed by its failure class, so a different failure is a new alert. Not alerted
+(accepted gaps, as for stock): a run that never starts (VM off, task disabled: the daily health check
+and the tracker's stale badge show it); `config_invalid` and `timezone_unavailable` from loading the
+settings (`alert_status: skipped_config_invalid`); `--check-latest` and `--dry-run-config`.
+
+The AP notice: the first knock-off of a supplier payment fails the run `unknown_knockoff_target`
+(a `run_failed` alert, daily until the code is mapped). A supplier payment keyed without a knock-off,
+or the first successful run after the mapping, turns `ap_payments_recorded` true and sends the WARN
+notice once. It is not repeated while the flag stays true; if the flag ever turns false and back,
+it is sent again.
+
+### De-duplication rule (the stock rule)
+
+- State: `alert_state.json` in `archive_root` (schema `xb.ac2.arap_alert_state.v1`, local only, never
+  in Drive). It appears only once alerts are on; with alerts off the archive root holds only the latest
+  set, `last_run_status.json` and the lock, as before.
+- **Send** when an active key is new, or was last sent `alert.repeat_hours` (24) or more ago (except
+  the AP notice, above). The email lists every active condition and every active key's time is reset.
+- **Suppress** otherwise (`alert_status: suppressed`). A cleared key is dropped, so a recurrence is new;
+  recovery sends nothing. A failed run keeps `delivery_failed` and the AP notice with their times.
+- A failed send leaves the state as it was: the next hour tries again (at most one POST an hour).
+
+### Event (schema `xb.ac2.arap_alert.v1`)
+
+Exactly these keys: `schema`, `event` (`ac2_arap_alert`), `run_id`, `run_hour_local` (the run's hour,
+for example `2026-11-19T14:00:00+08:00`), `alert_kind` (`new` or `repeat`), `status`, `failure_class`
+(`null` on success, `unknown` for a class outside the list), `conditions`, `delivery_status`,
+`ap_payments_recorded` (`true`/`false` on success, `null` on a failed run). **No party name or code,
+document number, amount, count, path, message, host or login.** Example email (fake values):
+
+```text
+Subject: [XB alert] AC2-ARAP ERROR run_failed:outstanding_mismatch
+
+AC2 AR/AP export: ERROR
+
+- Hourly AR/AP export FAILED: outstanding_mismatch (nothing new published; Drive keeps the last good set)
+
+Hour: 2026-11-19 14:00 (UTC+08:00)
+Run: 0123abcd
+Details: last_run_status.json in the Drive folder; runbook docs/autocount2-automation/arap_aging_runbook.md, section "Failure classes".
+
+--
+System: AC2-ARAP | Severity: ERROR | Key: run_failed:outstanding_mismatch
+Times are SGT (UTC+08:00). Repeats of one system:key within 60 minutes are folded; at most 10 alert emails per system per 60 minutes.
+Log: n8n Data Table xb_alert_email_log. Contract: n8n-workflows/README.md, ops_alert_email.workflow.json.
+```
+
+`alert_status` values are the stock export's: `disabled`, `no_alert`, `suppressed`, `sent`,
+`send_failed`, `secret_unavailable`, `error`, `skipped_config_invalid` (meanings in the stock runbook,
+"alert_status values").
+
+### The secret on the VM: an environment variable, not Credential Manager
+
+The task `\XB\AC2 ARAP Aging` runs with logon type **S4U** (pair `windows_integrated`), and an S4U
+task cannot read Windows Credential Manager. The settings check therefore refuses
+`alert.secret_credential_target` with S4U (the stock rule). The secret goes in a **user environment
+variable** of the task's Windows account, `XB_AC2_ARAP_ALERT_SECRET`, exactly as the stock alert's
+`XB_AC2_STOCK_ALERT_SECRET`. Use a **new** secret: never the stock alert's. A Credential Manager
+target applies only if the task ever moves to the `Password` pair.
+
+### Live steps (E1-E6)
+
+Each step needs its own owner OK, given with its OK words. n8n steps run on the server PC through the
+local API `http://127.0.0.1:5678/api/v1` only; VM steps run as the task's Windows account. Results go
+to the private mailbox only: never the secret, the webhook path or the operations inbox address.
+Prerequisite: `XB Ops Alert Email` and `xb_alert_email_log` are live (#288).
+
+| # | Step | OK words | Rollback |
+| --- | --- | --- | --- |
+| E1 | **Re-import the sender** `XB Ops Alert Email` (system `AC2-ARAP`) from the merged export, keeping its private values (local `.tmp` copy, read back). Before the update, back up the live workflow and diff it node by node against the export it was last imported from (the #325 H1 version): any drift beyond the known private values (recipient, table ID, Gmail credential binding) stops the step. Read back: `'AC2-ARAP'` is in `Validate Alert Request`, and the workflow is still published. | "ARAP SENDER UPDATE" | Re-apply the backup taken from the live read; read back. |
+| E2 | **Secret and credential.** The owner generates a new random secret and keeps it (never in chat, the repo or a mailbox file). On the server PC: create a new Header Auth credential, header name `X-XB-Alert-Token`, value = that secret. On the VM, signed in as the task's account, store it without echoing it (paste with a **right-click**; Ctrl+V at `Read-Host` stores a control character): `$s = Read-Host -AsSecureString "Alert secret"` then `[Environment]::SetEnvironmentVariable("XB_AC2_ARAP_ALERT_SECRET", [System.Net.NetworkCredential]::new("", $s).Password, "User")`. | "ARAP ALERT SECRET" | Delete the new Header Auth credential; `[Environment]::SetEnvironmentVariable("XB_AC2_ARAP_ALERT_SECRET", $null, "User")` on the VM. |
+| E3 | **Import inactive** `ac2_arap_alert.workflow.json` as a new workflow. In the local import copy only: replace `REPLACE_WITH_ARAP_ALERT_WEBHOOK_PATH` with a new private, unguessable path (not the stock alert's) and `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the sender's ID; bind the E2 Header Auth credential on the webhook. Read back: inactive, MCP off, no saved executions, the path and IDs set, the credential bound. | "ARAP N8N IMPORT" | Archive or delete the inactive `AC2 ARAP Export - Error Alert` (never active; nothing calls it). |
+| E4 | **Test event** (sends one email). In the editor, listen for a test event; from the server PC POST the fake event below to `http://127.0.0.1:5678/webhook-test/<private path>` with the secret header. Pass: one email `[XB alert] AC2-ARAP ERROR run_failed:internal_error` reading "AC2 AR/AP export: ERROR ... Run: 00000000", one `sent` row with system `AC2-ARAP` in `xb_alert_email_log`; the same event with an extra key answers 400 and sends nothing; without the header 403. | "ARAP TEST EMAIL" | None needed (nothing is active). The one test email cannot be recalled. |
+| E5 | **Activate** `AC2 ARAP Export - Error Alert`; read back `active: true` through the local API. | "ARAP ALERT ACTIVATE" | Deactivate it. The VM then gets 404 and records `send_failed` for any problem hour; runs and exit codes are unchanged. |
+| E6 | **VM: update the clone and switch alerts on.** At a minute clear of :30, `git pull` the merged `main` in the VM clone the task runs from (the task action is unchanged). Add `"alert": {"webhook_enabled": true, "webhook_url": "https://<n8n host>/webhook/<private path>", "secret_env_var": "XB_AC2_ARAP_ALERT_SECRET"}` to `config\autocount_arap_aging.local.json` (other keys default), open a **new** PowerShell window and run `--dry-run-config` with the task's `python.exe` (pass: `"status": "valid"`). Then wait for the next scheduled :30 run. Pass: `last_run_status.json` shows `status: success` and `alert_status: no_alert` with `alert_http_status: null`. Because the secret is checked on every run, `no_alert` proves the S4U task sees the variable; `secret_unavailable` means it does not. | "ARAP ALERTS ON" | Set `alert.webhook_enabled` back to `false` (the next run shows `disabled`); optionally delete `alert_state.json` in the archive root. To roll the code back as well, first remove the `alert` block from the local settings (the older version refuses it as an unknown key), then check out the previous commit in the VM clone. |
+
+Fake test event for E4:
+
+```json
+{"schema": "xb.ac2.arap_alert.v1", "event": "ac2_arap_alert", "run_id": "00000000000000000000000000000000", "run_hour_local": "2026-11-19T14:00:00+08:00", "alert_kind": "new", "status": "failed", "failure_class": "internal_error", "conditions": ["run_failed"], "delivery_status": "skipped_failed_run", "ap_payments_recorded": null}
+```
+
+Optional, with its own OK ("ARAP FORCED FAILURE"): one forced-failure run, as the stock A4. In a new
+window as the task's account, at a minute clear of :30, set only that window's
+`$env:AUTOCOUNT_EXPECTED_SQL_DATABASE = "ALERT_TEST_WRONG_BOOK"` and run the normal command. It stops
+at the identity check before any business query (`identity_refused`), keeps the published set, and
+writes a failed `last_run_status.json` (Drive shows `failed` until the next hourly run). Pass: one
+email `[XB alert] AC2-ARAP ERROR run_failed:identity_refused` and `alert_status: sent`,
+`alert_http_status: 200`. The next scheduled run must read `success` and `no_alert`.
+
+If a send fails: a 403 from Cloudflare (not n8n) means its bot protection blocked the request; n8n's
+own 403 means a missing or wrong secret; 404 means the workflow is inactive or the path is wrong; 502
+means the email send failed (the `send_failed` row in `xb_alert_email_log` has the code); 500 with no
+log row means the sub-workflow call failed (for example it lacks `AC2-ARAP`: redo E1).
+
 ## What happens next
 
 - **Done (18 Nov 2026):** the hourly task `\XB\AC2 ARAP Aging` is registered on the VM, and V3 passed
@@ -332,9 +466,10 @@ fails, disable the task straight away and report the `failure_class`. Removing t
   compare side only. No code or settings changed.
 - **Open owner decision:** whether the exporter or the tracker should also give month buckets that
   match the menus. Not built; until then a V3 rerun compares buckets the same way.
-- **A3:** error alerts (below).
+- **A3:** error alerts, built offline (above). Live steps E1-E6 each need the owner's OK.
 
 ## Not in this slice
 
-Error alerts through the shared ops alert sub-workflow (A3). POST_SHIP: move the helpers shared with
-the stock exporter (connection string builder, lock) into one module.
+A daily health check job for the ARAP alert route (the stock route has `stock_alert_route`; #325).
+POST_SHIP: move the helpers shared with the stock exporter (connection string builder, lock, alert
+step) into one module.
