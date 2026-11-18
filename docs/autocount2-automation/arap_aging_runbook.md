@@ -7,8 +7,10 @@ Issue: #321 (slice A1, offline build). Script: `scripts/autocount_arap_aging.py`
 `tests/fixtures/arap_dashboard_feed.fake.fixture` (JSON content; the repo allows no `*.json` file
 under `tests/`).
 
-Status: offline build only. Nothing here has run against the AutoCount book. The installer and the
-scheduled task (A2) and error alerts (A3) are later slices, each with its own owner OK.
+Status: A1 (exporter) merged; its first VM run passed on 18 Nov 2026, with the Drive folder and
+`delivery_root` set. A2 adds the Task Scheduler installer `scripts/install_autocount_arap_aging_task.ps1`
+(see "A2: hourly task"); registering the task on the VM needs its own owner OK. Error alerts (A3) are a
+later slice.
 
 ## What it does
 
@@ -248,8 +250,69 @@ and each bucket, unapplied totals, plus 10 sample documents each side. Private m
 Pass: set `reconciled_on` to that date. One fix round; if it still does not match, write the r1
 A1-b fallback note (AutoCount's own aging classes, nightly) for the Controller.
 
+## A2: hourly task
+
+Task `\XB\AC2 ARAP Aging`, registered by `scripts/install_autocount_arap_aging_task.ps1` (a copy of
+the stock installer pattern). Not run by the build.
+
+What the installer registers:
+
+- One trigger: a one-time start at 00:00 + `schedule.run_minute` (default 30) that repeats every hour
+  with no end. No daily trigger, so no minute is started twice.
+- `MultipleInstances IgnoreNew`, 15 minute limit (the shared lock rules assume it), `RunLevel Limited`,
+  start when available.
+- The action runs `scripts\autocount_arap_aging.py --config <settings>` with the full `python.exe` path
+  given, in the clone the installer sits in.
+- The minute and the logon type come from the exporter's own `--dry-run-config`, run with that same
+  `python.exe`: `windows_integrated` gives `S4U` (no stored password), `sql_login` gives `Password`
+  (Windows password prompt). Any other pair, or invalid settings, is refused before anything is built.
+- It refuses if a task with the same name is already in `\XB\` or in the Task Scheduler root. It never
+  replaces, moves or removes a task.
+
+**Schedule on the VM.** The member core runs at :07/:22/:37/:52; stock at :00; ARAP at :30.
+
+### VM steps (VM Claude; elevated Windows PowerShell 5.1, no transcript, from the clone root)
+
+1. **Dry run (reads no data, registers nothing).** Check that the `AUTOCOUNT_EXPECTED_SQL_LOGIN` /
+   `_USER` / `_DATABASE` environment values are set for the task's Windows account (user or machine
+   level); the job fails closed without them. If it is the account that runs the stock task, they are
+   already set.
+
+   ```
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_autocount_arap_aging_task.ps1 -UserId <Windows account> -ConfigPath <full path to config\autocount_arap_aging.local.json> -PythonExe <full path to python.exe> -DryRun
+   ```
+
+   Pass: `Dry run: would register \XB\AC2 ARAP Aging`, `minute 30`, the expected logon type,
+   `Trigger: one trigger, starts 00:30, repeats every PT1H, no end`, `Nothing was registered.`
+   It checks `pyodbc` and runs `--dry-run-config`; it reads no data and asks for no password.
+2. **Register (needs the owner's OK).** Run the same command without `-DryRun`, at a minute clear
+   of :30. For the `Password` pair it then prompts for the Windows password.
+3. **Check what was registered.**
+   `Get-ScheduledTask -TaskPath "\XB\" -TaskName "AC2 ARAP Aging"` shows it `Ready`, and
+   `(Get-ScheduledTask -TaskPath "\XB\" -TaskName "AC2 ARAP Aging").Triggers[0].Repetition` shows
+   `Interval PT1H` and an empty `Duration`.
+4. **First run.** Note `finished_at` in `<archive_root>\last_run_status.json`, then either wait for the
+   next :30 or run `Start-ScheduledTask -TaskPath "\XB\" -TaskName "AC2 ARAP Aging"` at once. Wait
+   until `Get-ScheduledTaskInfo -TaskPath "\XB\" -TaskName "AC2 ARAP Aging"` shows a new
+   `LastRunTime`, `LastTaskResult` 0, and the task is no longer running (at most 15 minutes).
+   Pass only if `last_run_status.json` is newer than the noted value and shows `status: success`
+   and `delivery_status: handed_to_drive_sync_folder`, in the archive root and in `delivery_root`.
+5. **Freshness check.**
+
+   ```
+   python scripts\autocount_arap_aging.py --config config\autocount_arap_aging.local.json --check-latest
+   ```
+
+   Pass: exit 0 (fresh). Record the result, counts only, in the private mailbox.
+
+### Off switch
+
+`Disable-ScheduledTask -TaskPath "\XB\" -TaskName "AC2 ARAP Aging"` stops the hourly runs at once
+and keeps the task and the last published set (`Enable-ScheduledTask` turns it back on). If step 4
+fails, disable the task straight away and report the `failure_class`. Removing the task
+(`Unregister-ScheduledTask`) is a separate owner-approved step.
+
 ## Not in this slice
 
-Installer and scheduled task `\XB\AC2 ARAP Aging` (A2), the Drive folder and `delivery_root` (A2),
-error alerts through the shared ops alert sub-workflow (A3). POST_SHIP: move the helpers shared with
+Error alerts through the shared ops alert sub-workflow (A3). POST_SHIP: move the helpers shared with
 the stock exporter (connection string builder, lock) into one module.

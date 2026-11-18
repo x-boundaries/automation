@@ -90,6 +90,18 @@ on:
       - "config/autocount_stock_balance_hourly.example.json"
       - "docs/autocount2-automation/stock_balance_hourly_runbook.md"
       - "sql/autocount2/stock_balance_hourly_live_check.readonly.template.sql"
+      # AC2 AR/AP aging export (#321). The Windows job's full-repository suite (`rest` shard)
+      # exercises tests/test_autocount_arap_aging.py, including the A2 installer's parse check and
+      # its Windows PowerShell 5.1 -DryRun tests, so a pull request confined to the exporter, its
+      # test, fake feed fixture, installer, example settings, runbook or live-check SQL must still
+      # trigger this workflow. Exact entries, not globs.
+      - "scripts/autocount_arap_aging.py"
+      - "tests/test_autocount_arap_aging.py"
+      - "tests/fixtures/arap_dashboard_feed.fake.fixture"
+      - "scripts/install_autocount_arap_aging_task.ps1"
+      - "config/autocount_arap_aging.example.json"
+      - "docs/autocount2-automation/arap_aging_runbook.md"
+      - "sql/autocount2/arap_aging_live_check.readonly.template.sql"
       # Its nightly buying-analysis builders (#292 S2) and their offline test (`rest` shard).
       - "scripts/autocount_stock_analysis.py"
       - "tests/test_autocount_stock_analysis.py"

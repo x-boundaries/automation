@@ -12,8 +12,10 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1476,6 +1478,311 @@ class PrivacyFix1Tests(TempDirTestCase):
                 for root in (self.tmp / "archive", self.tmp / "drive"):
                     texts.append((root / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
                 self.assert_clean(*texts)
+
+
+# ---------------------------------------------------------------------------------------------
+# Slice A2: Task Scheduler installer for \XB\AC2 ARAP Aging (copy of the stock installer pattern)
+# ---------------------------------------------------------------------------------------------
+
+INSTALLER_PATH = ROOT / "scripts" / "install_autocount_arap_aging_task.ps1"
+STOCK_INSTALLER_PATH = ROOT / "scripts" / "install_autocount_stock_balance_hourly_task.ps1"
+
+
+def strip_ps_comments(text):
+    code = re.sub(r"<#.*?#>", "", text, flags=re.S)
+    return "\n".join(line for line in code.splitlines() if not line.lstrip().startswith("#"))
+
+
+class ArapInstallerStaticTests(unittest.TestCase):
+    def setUp(self):
+        self.text = INSTALLER_PATH.read_text(encoding="utf-8")
+        self.code = strip_ps_comments(self.text)
+
+    def test_ascii(self):
+        INSTALLER_PATH.read_bytes().decode("ascii")
+
+    def test_task_name_folder_and_script(self):
+        self.assertRegex(self.text, r'\[string\]\$TaskName = "AC2 ARAP Aging"\s*,')
+        self.assertRegex(self.text, r'\[string\]\$TaskPath = "\\XB\\"\s*,')
+        self.assertIn('Join-Path $RepoRoot "scripts\\autocount_arap_aging.py"', self.code)
+        self.assertNotIn("stock_balance_hourly.py", self.code)
+        self.assertIn("separate owner OK", self.text)
+
+    def test_static_contract(self):
+        self.assertIn("-MultipleInstances IgnoreNew", self.code)
+        self.assertNotIn("-Force", self.text)
+        self.assertIn("-ExecutionTimeLimit (New-TimeSpan -Minutes 15)", self.code)
+        self.assertEqual(self.code.count("-RunLevel Limited"), 2, "both registration paths")
+        self.assertIn("-RepetitionInterval (New-TimeSpan -Hours 1)", self.code)
+        self.assertNotIn("GetCurrent()", self.text, "no default Windows user")
+        self.assertRegex(self.text, r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$UserId")
+        self.assertRegex(self.text, r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$ConfigPath")
+        self.assertRegex(self.text, r"\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$PythonExe\s*,")
+        self.assertIn("[System.IO.Path]::IsPathRooted($PythonExe)", self.code)
+        self.assertIn("Test-Path -LiteralPath $PythonExe -PathType Leaf", self.code)
+
+    def test_execution_limit_matches_the_shared_lock_rules(self):
+        limit = re.search(r"-ExecutionTimeLimit \(New-TimeSpan -Minutes (\d+)\)", self.code)
+        self.assertEqual(int(limit.group(1)), arap.stock.TASK_EXECUTION_LIMIT_MINUTES)
+        self.assertGreater(arap.stock.LOCK_STALE_AFTER_MINUTES, arap.stock.TASK_EXECUTION_LIMIT_MINUTES)
+
+    def test_single_hourly_trigger_without_daily_start(self):
+        self.assertEqual(self.code.count("New-ScheduledTaskTrigger"), 1, "exactly one trigger")
+        self.assertIn(
+            "$trigger = New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1)\n",
+            self.code,
+        )
+        self.assertIn("$trigger.Repetition.StopAtDurationEnd = $false", self.code)
+        for forbidden in ("-Daily", "-RepetitionDuration", "MaxValue", "StopAtDurationEnd = $true"):
+            self.assertNotIn(forbidden, self.code)
+        self.assertEqual(self.code.count("-Trigger $trigger "), 2, "both registration paths use the one trigger")
+        self.assertLess(self.code.index('$repeatEvery -cne "PT1H"'), self.code.index("if ($DryRun) {"))
+
+    def test_run_minute_and_logon_type_come_from_the_arap_settings_check(self):
+        self.assertIn("& $PythonExe $scriptPath --config $ConfigPath --dry-run-config", self.code)
+        self.assertIn("$RunMinute = $validated.run_minute", self.code)
+        self.assertIn("$RunMinute -lt 0 -or $RunMinute -gt 59", self.code)
+        self.assertIn("AddMinutes($RunMinute)", self.code)
+        self.assertNotIn("$LogonType =", self.text, "no free LogonType parameter")
+        self.assertNotIn("[int]$RunMinute", self.text.split("$ErrorActionPreference", 1)[0], "no RunMinute parameter")
+        self.assertIn("$validated.scheduled_logon_type", self.code)
+        self.assertIn('($authMode -ceq "windows_integrated") -and ($logonType -ceq "S4U")', self.code)
+        self.assertIn('($authMode -ceq "sql_login") -and ($logonType -ceq "Password")', self.code)
+        self.assertIn("-LogonType S4U", self.code)
+        self.assertEqual(sorted(arap.SUPPORTED_LOGON_PAIRS.items()), [("sql_login", "Password"), ("windows_integrated", "S4U")])
+
+    def test_password_logon_prompts_and_never_echoes(self):
+        self.assertIn("Get-Credential -UserName $UserId", self.code)
+        self.assertIn("-User $UserId", self.code)
+        self.assertIn("-Password $credential.GetNetworkCredential().Password", self.code)
+        for forbidden in ("ConvertFrom-SecureString", "Out-File", "Set-Content", "Add-Content", "Export-Clixml",
+                          "Start-Transcript", "Write-Output", "-Verbose"):
+            self.assertNotIn(forbidden, self.text)
+        for line in self.text.splitlines():
+            if "Write-Host" in line:
+                self.assertNotIn("$credential", line)
+                self.assertNotIn("Password", line.replace("LogonType Password", ""))
+        self.assertEqual(self.text.count("GetNetworkCredential()"), 1)
+
+    def test_repo_root_is_worked_out_in_the_body(self):
+        # $PSScriptRoot is empty in param() defaults under Windows PowerShell 5.1.
+        block = re.search(r"^param\((.*?)^\)", self.text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(block)
+        self.assertNotIn("$PSScriptRoot", block.group(1))
+        self.assertRegex(block.group(1), r'\[string\]\$RepoRoot = ""\s*,')
+        body = self.text[block.end():]
+        self.assertIn("if ([string]::IsNullOrWhiteSpace($RepoRoot)) {", body)
+        self.assertIn('$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path', body)
+
+    def test_refuses_same_name_in_folder_or_root(self):
+        folder = 'Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue'
+        root = 'Get-ScheduledTask -TaskName $TaskName -TaskPath "\\" -ErrorAction SilentlyContinue'
+        self.assertIn(folder, self.code)
+        self.assertIn(root, self.code)
+        after_root = self.code[self.code.index(root):]
+        self.assertLess(after_root.index("throw \"Refusing:"), after_root.index("& $PythonExe"))
+        self.assertNotIn("Write-Warning", self.code, "a root task is refused, not warned about")
+        self.assertNotIn("Unregister-ScheduledTask", self.code)
+        self.assertEqual(self.text.count("Register-ScheduledTask `"), 2)
+        self.assertEqual(self.text.count("-TaskPath $TaskPath `"), 2, "both registrations use the folder")
+
+    def test_dry_run_stops_before_prompt_and_register(self):
+        dry = self.text.index("if ($DryRun) {")
+        self.assertLess(self.text.index("--dry-run-config"), dry)
+        self.assertLess(dry, self.text.index("Get-Credential -UserName"))
+        self.assertLess(dry, self.text.index("Register-ScheduledTask `"))
+        self.assertIn("Nothing was registered.", self.text[dry:self.text.index("Register-ScheduledTask `")])
+
+    def test_supervised_run_and_off_switch_are_named(self):
+        self.assertIn("Start-ScheduledTask", self.text)
+        self.assertIn("last_run_status.json", self.text)
+        self.assertIn("Disable-ScheduledTask", self.text)
+
+    def test_differs_from_the_stock_installer_only_where_intended(self):
+        # Every executable line of the stock installer is kept, except the named differences.
+        stock = [line.strip() for line in strip_ps_comments(STOCK_INSTALLER_PATH.read_text(encoding="utf-8")).splitlines()]
+        mine = {line.strip() for line in self.code.splitlines()}
+        intended = ("$TaskName", "$scriptPath = Join-Path", "Write-Warning", "$description =", "Write-Host \"Next")
+        dropped = [line for line in stock if line and line not in mine and not any(k in line for k in intended)]
+        self.assertEqual(dropped, [])
+
+    def test_powershell_parse_only(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            self.skipTest("Neither pwsh nor powershell is available for the parse-only check")
+        command = (
+            "$errs = $null; "
+            "[System.Management.Automation.Language.Parser]::ParseFile('%s', [ref]$null, [ref]$errs) | Out-Null; "
+            "if (@($errs).Count -gt 0) { $errs | ForEach-Object { Write-Output $_.Message }; exit 1 } else { exit 0 }"
+        ) % str(INSTALLER_PATH).replace("'", "''")
+        result = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_runbook_has_the_a2_section(self):
+        text = (ROOT / "docs" / "autocount2-automation" / "arap_aging_runbook.md").read_text(encoding="utf-8")
+        section = text.split("## A2: hourly task", 1)[1].split("\n## ", 1)[0]
+        for needle in ("install_autocount_arap_aging_task.ps1", "-DryRun", "\\XB\\", "AC2 ARAP Aging",
+                       "Start-ScheduledTask", "--check-latest", "Disable-ScheduledTask", ":07/:22/:37/:52",
+                       "owner"):
+            self.assertIn(needle, section)
+
+
+class ArapInstallerPowerShell51Tests(TempDirTestCase):
+    """Runs the installer under Windows PowerShell 5.1 with -File and -DryRun only.
+
+    -DryRun stops before the password prompt and Register-ScheduledTask, and the task name is a
+    test-only name, so nothing is ever registered. No stand-in for any ScheduledTasks command is
+    used (Windows PowerShell 5.1 autoloads the real module over a stand-in). The refusal tests
+    only read Task Scheduler (Get-ScheduledTask) to borrow the name of a task that already exists.
+    A stub pyodbc module on PYTHONPATH stands in for the driver (the installer only imports it).
+    Fake user name and fake settings only.
+    """
+
+    TASK_NAME = "XB AC2 ARAP installer test (never registered)"
+
+    def setUp(self):
+        super().setUp()
+        if sys.platform != "win32":
+            self.skipTest("Windows PowerShell 5.1 runs only on Windows")
+        self.shell = shutil.which("powershell")
+        if self.shell is None:
+            self.skipTest("Windows PowerShell is not installed")
+        stub = self.tmp / "stub"
+        stub.mkdir()
+        (stub / "pyodbc.py").write_text("# test stub: the installer only imports pyodbc\n", encoding="utf-8")
+        # Keep any PYTHONPATH already set (a local tzdata copy, for example) after the stub.
+        self.env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (str(stub), os.environ.get("PYTHONPATH")) if p))
+        self.config = self.write_config()
+
+    def write_config(self, name="settings.local.json", **overrides):
+        raw = {
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": str(self.tmp / "archive"), "delivery_root": None},
+        }
+        for key, value in overrides.items():
+            raw.setdefault(key, {}).update(value)
+        path = self.tmp / name
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        return path
+
+    def run_installer(self, *extra, config=None, task_name=None, python_exe=None):
+        args = [self.shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", str(INSTALLER_PATH), "-UserId", "EXAMPLE-PC\\example-user",
+                "-ConfigPath", str(config or self.config), "-PythonExe", python_exe or sys.executable,
+                "-TaskName", task_name or self.TASK_NAME, "-DryRun", *extra]
+        done = subprocess.run(args, capture_output=True, text=True, timeout=180, env=self.env, cwd=str(self.tmp))
+        return done.returncode, done.stdout + done.stderr
+
+    def existing_task(self, where):
+        """Path and name of a task that already exists on this host (read-only lookup), or None."""
+        command = (
+            "Get-ScheduledTask -TaskPath '%s' -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.TaskPath -cmatch '\\A(\\\\[A-Za-z0-9_-]+)*\\\\\\z' -and "
+            "$_.TaskName -cmatch '\\A[A-Za-z0-9_-][A-Za-z0-9 ._-]*\\z' } | "
+            "Select-Object -First 1 | ForEach-Object { $_.TaskPath + '|' + $_.TaskName }"
+        ) % where
+        done = subprocess.run([self.shell, "-NoProfile", "-NonInteractive", "-Command", command],
+                              capture_output=True, text=True, timeout=180)
+        line = done.stdout.strip()
+        return tuple(line.split("|", 1)) if "|" in line else None
+
+    def test_runs_under_windows_powershell_5_1(self):
+        done = subprocess.run([self.shell, "-NoProfile", "-NonInteractive", "-Command",
+                               "$PSVersionTable.PSVersion.Major"],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.stdout.strip(), "5", done.stdout + done.stderr)
+
+    def test_dry_run_default_settings(self):
+        code, out = self.run_installer()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Dry run: would register \\XB\\" + self.TASK_NAME, out)
+        self.assertIn("Repo root: " + str(ROOT), out)
+        self.assertIn("Runs hourly at minute 30, IgnoreNew, 15 minute limit, RunLevel Limited, "
+                      "LogonType S4U (windows_integrated).", out)
+        # The trigger object is really built on this host: one trigger, hourly from 00:30, no end.
+        self.assertIn("Trigger: one trigger, starts 00:30, repeats every PT1H, no end", out)
+        self.assertIn("Nothing was registered.", out)
+
+    def test_dry_run_with_empty_repo_root_finds_this_clone(self):
+        code, out = self.run_installer("-RepoRoot", "")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Repo root: " + str(ROOT), out)
+
+    def test_dry_run_takes_the_minute_from_the_settings(self):
+        config = self.write_config("minute.local.json", schedule={"run_minute": 45})
+        code, out = self.run_installer(config=config)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Runs hourly at minute 45,", out)
+        self.assertIn("starts 00:45, repeats every PT1H", out)
+
+    def test_dry_run_password_pair_never_prompts(self):
+        # Windows PowerShell 5.1 does not make Get-Credential fail under -NonInteractive: it waits
+        # on the prompt. A regression past the dry run shows as a timeout, not a quick failure.
+        config = self.write_config(
+            "sql.local.json",
+            identity={"auth_mode": "sql_login", "sql_login": "fake_sql_reader", "credential_target": "FAKE-CRED-TARGET"},
+            schedule={"logon_type": "Password"},
+        )
+        code, out = self.run_installer(config=config)
+        self.assertEqual(code, 0, out)
+        self.assertIn("LogonType Password (sql_login)", out)
+        self.assertIn("Nothing was registered.", out)
+
+    def test_bad_settings_are_refused(self):
+        cases = {
+            "minute": {"schedule": {"run_minute": 75}},
+            "pair_sql_s4u": {"identity": {"auth_mode": "sql_login", "sql_login": "fake_sql_reader",
+                                          "credential_target": "FAKE-CRED-TARGET"}},
+            "pair_windows_password": {"schedule": {"logon_type": "Password"}},
+            "frequency": {"schedule": {"frequency": "daily"}},
+            "no_database": {"source": {"expected_database": ""}},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(case=label):
+                config = self.write_config(label + ".local.json", **overrides)
+                code, out = self.run_installer(config=config)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("The settings are not valid for this python.exe", out)
+                self.assertNotIn("Dry run:", out)
+
+    def test_missing_settings_file_and_relative_python_are_refused(self):
+        code, out = self.run_installer(config=self.tmp / "missing.local.json")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("Local settings file not found.", out)
+        code, out = self.run_installer(python_exe="python.exe")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("PythonExe must be the full path", out)
+        self.assertNotIn("Dry run:", out)
+
+    def test_bad_task_path_is_refused(self):
+        for bad in ("", "\\", "XB", "\\XB", "XB\\", "\\XB\\\\", "\\X;B\\", "\\..\\", "\\XB/\\", "\\ XB\\"):
+            with self.subTest(task_path=bad):
+                code, out = self.run_installer("-TaskPath", bad)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn("TaskPath must look like", out)
+                self.assertNotIn("Dry run:", out)
+
+    def test_existing_task_name_in_the_folder_is_refused(self):
+        # Borrow a task Windows itself ships (read-only lookup); the dry run refuses before any check.
+        found = self.existing_task("\\Microsoft\\Windows\\*")
+        if found is None:
+            self.skipTest("No built-in Windows task with a plain folder and name found on this host")
+        path, name = found
+        code, out = self.run_installer("-TaskPath", path, task_name=name)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("Refusing: a scheduled task with this name already exists in " + path, out)
+        self.assertNotIn("Dry run:", out)
+
+    def test_existing_task_name_in_the_root_is_refused(self):
+        found = self.existing_task("\\")
+        if found is None:
+            self.skipTest("No task in the Task Scheduler root on this host")
+        _path, name = found
+        code, out = self.run_installer("-TaskPath", "\\XB ARAP installer test never created\\", task_name=name)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("already exists in the Task Scheduler root", out)
+        self.assertNotIn("Dry run:", out)
 
 
 if __name__ == "__main__":
