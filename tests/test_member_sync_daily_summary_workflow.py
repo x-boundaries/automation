@@ -700,6 +700,16 @@ class WiringWorkflowTests(unittest.TestCase):
                 # A tool's problem never reads as the sync's, and the sync part is the v1 text.
                 self.assertIn("Owner AutoCount session: not checked (manual glance)", lines)
 
+    def test_the_member_no_unsupported_core_alert_passes_the_code_node(self):
+        # Slice NF2 (#268): the member core's new hold alert is accepted by the
+        # n8n Code node (no MS_SUMMARY_TOOLS refusal) and listed as any alert.
+        core = summary.core_section(core_raw(alerts={"member_no_unsupported": 1}))
+        self.assertEqual((core["status"], core["reasons"]), ("WARN", ["alerts"]))
+        (result,) = self.run_cases([build(member_tools={"member_core": core, "tags": None})])
+        lines = self.sent_v2(result, "WARN").splitlines()
+        self.assertIn("Member core: WARN (alerts) runs=96 unfinished=0 rule_settings_match=yes", lines)
+        self.assertIn("Member core alerts 24h (runs): member_no_unsupported=1 (refs: digest on the VM)", lines)
+
     def test_the_v2_layout(self):
         core = summary.core_section(core_raw(alerts={"claim_needs_review": 2, "orders_read_incomplete": 1}))
         tags = summary.tags_section(tags_raw(stale_month=True))

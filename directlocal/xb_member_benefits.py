@@ -165,6 +165,12 @@ CLAIM_SETTLE_CODES = frozenset({ORDER_NO_LONGER_QUALIFIES, REFUND_UNATTRIBUTED, 
 ORDER_CUSTOMER_CHANGED = "order_customer_changed_after_upgrade"
 CLAIM_HOLD_SETTLED_UNCLEAR = "claim_hold_settled_unclear"
 RECEIPT_PAST_READ_WINDOW = "receipt_past_read_window"  # B2-4: review subject aged:<order>
+# Slice NF2 (G0 member-number clean-up 5.3, C8): a linked member whose
+# MemberNo is outside dl.MEMBER_NO_RE (a leading space, a "+" number, an email
+# form). The AutoCount child refuses such a value (member_no_invalid), so it
+# is never sent: the receipt is held with this code (terminal; staff extend by
+# hand from the digest) and one alert names the order ref only.
+MEMBER_NO_UNSUPPORTED = "member_no_unsupported"
 # The replayed states that settle a claim hold silently: positive facts only
 # (a cancellation; an amount measured below the threshold). A move or a
 # removed customer is the other positive fact (checked apart).
@@ -1684,6 +1690,10 @@ class _Budget(Exception):
     """The run's AutoCount read budget is spent."""
 
 
+class _MemberNoUnsupported(Exception):
+    """Slice NF2: a MemberNo outside dl.MEMBER_NO_RE; never sent to the bridge."""
+
+
 class BenefitsEngine:
     """One bounded run. ``shopify`` provides ``verify_session``, ``orders``,
     ``customer`` and ``find_by_phone``; ``ac2`` provides ``member``, ``scan``
@@ -1713,6 +1723,10 @@ class BenefitsEngine:
         return (self.ledger.root / STOP_FILE).exists()
 
     def _read_member(self, member_no: str) -> MemberRead:
+        # Slice NF2: the one way to the bridge's member read for the receipt
+        # path and the claim path; checked before the budget and the call.
+        if not isinstance(member_no, str) or not dl.MEMBER_NO_RE.fullmatch(member_no):
+            raise _MemberNoUnsupported()
         if self.reads >= self.config.max_member_reads_per_run:
             raise _Budget()
         self.reads += 1
@@ -2194,6 +2208,17 @@ class BenefitsEngine:
             self.ledger.update_receipt(row["order_gid"], state="held", code=HELD_WRITE_RELEASED)
         summary.count("release_receipt_settled_late", ref, released["member_no"])
 
+    def _hold_member_no_unsupported(self, order_gid: str, summary: RunSummary, ref: str, *, member_no: str | None = None,
+                                    link_source: str | None = None) -> bool:
+        """Slice NF2: the receipt is held (decided; no bridge call, no write)
+        and one alert carries the order ref only, never the MemberNo, not even
+        masked. The run goes on (False: not a stop)."""
+
+        self.ledger.update_receipt(order_gid, state="held", code=MEMBER_NO_UNSUPPORTED, member_no=member_no, link_source=link_source,
+                                   waiting_since=None)
+        summary.alert(MEMBER_NO_UNSUPPORTED, ref)
+        return False
+
     def _decide_one(self, row: sqlite3.Row, summary: RunSummary, *, run_id: str, apply: bool) -> bool:
         """True stops the run (an unclear write)."""
 
@@ -2220,7 +2245,10 @@ class BenefitsEngine:
             self.ledger.update_receipt(order_gid, state="held", code="link_conflict")
             summary.alert("link_conflict", ref)
             return False
-        member_no, source, read, hold_code = self._link(row, summary)
+        try:
+            member_no, source, read, hold_code = self._link(row, summary)
+        except _MemberNoUnsupported:  # slice NF2, claim path: a phone form outside the pattern
+            return self._hold_member_no_unsupported(order_gid, summary, ref)
         if member_no is None and hold_code is not None:
             # G2 B2: a claim review, a member out of scope or no phone settles
             # the receipt; it re-opens only when a link appears.
@@ -2236,7 +2264,10 @@ class BenefitsEngine:
             summary.alert("link_conflict", ref, member_no)
             return False
         if read is None:
-            read = self._read_member(member_no)
+            try:
+                read = self._read_member(member_no)
+            except _MemberNoUnsupported:  # slice NF2, receipt path: a #155 or claim link to an odd MemberNo
+                return self._hold_member_no_unsupported(order_gid, summary, ref, member_no=member_no, link_source=source)
         verdict = decide(read, date.fromisoformat(row["order_date_sgt"]))
         common = dict(member_no=member_no, link_source=source, waiting_since=None)
         if verdict.action == "not_in_scope":

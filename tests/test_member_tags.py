@@ -1612,6 +1612,42 @@ class EngineBase(Base):
         self.assertEqual(self.shopify.writes, [])
 
 
+class NF2OddMemberNoTests(EngineBase):
+    """Slice NF2 (#268, G0 member-number clean-up 5.3): a linked member whose
+    MemberNo is outside dl.MEMBER_NO_RE (a "+", a space, a tab) is tagged by
+    its type like any other. No per-member pattern check exists here; this
+    pins today's behaviour. Fake numbers, built in code."""
+
+    def odd_member(self, n: int, member_no: str, *, member_type: str, tags=(), link="sync") -> None:
+        self.book.add(member_no, member_type)
+        if link == "sync":
+            self.make_sync([(n, member_no)])
+        else:
+            self.make_core([(n, member_no)])
+        self.shopify.add(n, list(tags), True, None)
+        self.private |= {member_no, customer_gid(n)}
+
+    def test_odd_member_numbers_are_tagged_and_untagged_by_type(self):
+        digits = sg(1)[2:]
+        shapes = {1: "+" + sg(1), 2: " " + sg(2), 3: sg(3)[:4] + "\t" + sg(3)[4:], 4: "+65 " + digits[:4] + " " + digits[4:]}
+        self.odd_member(1, shapes[1], member_type="MEMBER")
+        self.odd_member(2, shapes[2], member_type="MEMBER", link="claim")
+        self.odd_member(3, shapes[3], member_type="MEMBER")
+        self.odd_member(4, shapes[4], member_type="GUEST", tags=[TAG])
+        result = self.run_tool()
+        self.assertEqual(result["stopped"], None)
+        self.assertEqual(sorted(self.shopify.writes),
+                         sorted([("add", customer_gid(1), [TAG]), ("add", customer_gid(2), [TAG]), ("add", customer_gid(3), [TAG]),
+                                 ("remove", customer_gid(4), [TAG])]))
+        self.assertEqual((result["counts"]["tagged"], result["counts"]["untag_reason:member_not_member"]), (3, 1))
+        stored = {row["customer_gid"]: (row["op"], row["state"], row["member_no"]) for row in self.rows()}
+        self.assertEqual(stored, {customer_gid(1): ("add", "DONE", shapes[1]), customer_gid(2): ("add", "DONE", shapes[2]),
+                                  customer_gid(3): ("add", "DONE", shapes[3]), customer_gid(4): ("remove", "DONE", shapes[4])})
+        for entry in result["refs"]:
+            if "member_no_masked" in entry:
+                self.assertIn(entry["member_no_masked"], {mt.mask(m) for m in shapes.values()})
+
+
 class DecisionTableTests(EngineBase):
     """Design 1.6: one test per row 1 to 16."""
 

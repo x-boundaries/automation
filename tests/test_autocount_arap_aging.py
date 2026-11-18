@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -39,6 +40,15 @@ AS_AT = date(2026, 11, 17)
 # (test_member_intake_validate) allows no *.json file under tests/.
 FIXTURE_PATH = ROOT / "tests" / "fixtures" / "arap_dashboard_feed.fake.fixture"
 FIXTURE_RUN_ID = "0" * 32
+# A run id that contains the fixture amounts 1200, 1335 and 150000 as hex digits. The privacy test pins
+# it, so a check that matched amounts inside the run id or a hash would fail every time, not 0.1% of runs.
+AMOUNT_LIKE_RUN_ID = "1200133515000000000000000000abcd"
+HEX_ID = re.compile(r"[0-9a-f]{32,}")
+
+
+def without_hex_ids(text):
+    """Blank out run ids and sha256 hashes: their digit runs are not amounts."""
+    return HEX_ID.sub("<hex>", text)
 
 FAKE_DB = "AED_EXAMPLE_BOOK"
 FAKE_LOGIN = "fake_reader_login"
@@ -1140,7 +1150,8 @@ class CsvAndPrivacyTests(TempDirTestCase):
             "parties": {"online_shop_debtor_codes": ["DEBT-WEB"]},
         }), encoding="utf-8")
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(arap.uuid, "uuid4", return_value=uuid.UUID(hex=AMOUNT_LIKE_RUN_ID)):
             code = arap.main(["--config", str(config)], source=FakeSource(fixture_data()), environ=ENV,
                              clock=lambda: FIXED_NOW)
         self.assertEqual(code, arap.EXIT_OK)
@@ -1149,11 +1160,15 @@ class CsvAndPrivacyTests(TempDirTestCase):
             (self.tmp / "archive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"),
             (self.tmp / "archive" / arap.LATEST_MANIFEST_NAME).read_text(encoding="utf-8"),
         ]
+        # The pinned run id really is in the status, so the masking below is exercised on every run.
+        self.assertIn(AMOUNT_LIKE_RUN_ID, texts[1])
         forbidden = ["DEBT-", "CRED-", "Example ", "IV-0", "PI-0", "PM-0", "CN-0", "1200", "1335", "150000", "95.5",
                      FAKE_SERVER, "FAKE-SQL-HOST", FAKE_LOGIN, "Trusted_Connection"]
         for text in texts:
+            # Mask only the run id and hashes; any amount anywhere else still fails.
+            masked = without_hex_ids(text)
             for value in forbidden:
-                self.assertNotIn(value, text)
+                self.assertNotIn(value, masked)
 
     def test_failure_messages_carry_counts_only(self):
         data = fixture_data()
@@ -1594,9 +1609,10 @@ class ArapInstallerStaticTests(unittest.TestCase):
         self.assertIn("Nothing was registered.", self.text[dry:self.text.index("Register-ScheduledTask `")])
 
     def test_supervised_run_and_off_switch_are_named(self):
-        self.assertIn("Start-ScheduledTask", self.text)
+        # Both cmdlets need -TaskName; the name has spaces, so the hint quotes it for copy-paste.
+        self.assertIn("Start-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' now", self.text)
         self.assertIn("last_run_status.json", self.text)
-        self.assertIn("Disable-ScheduledTask", self.text)
+        self.assertIn("Disable-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' and report", self.text)
 
     def test_differs_from_the_stock_installer_only_where_intended(self):
         # Every executable line of the stock installer is kept, except the named differences.
