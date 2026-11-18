@@ -4981,14 +4981,15 @@ class NF2MemberNoGuardTests(Base):
     def test_red_first_a_linked_plus_member_with_a_qualifying_order_is_held_not_a_failed_run(self):
         member_no = nf2_shapes()["plus_and_spaces"]
         self.linked_odd_member(1, member_no)
-        out = self.engine().run(apply=False)  # before NF2: dl.BridgeError bridge_read_failed:member_no_invalid
+        engine = self.engine()
+        out = engine.run(apply=False)  # before NF2: dl.BridgeError bridge_read_failed:member_no_invalid
         self.assertIsNone(out["stopped"])
         self.assertEqual(out["alerts"], ["member_no_unsupported"])
         self.assertEqual(out["counts"], {"orders_read": 1, "receipt_ready": 1, "member_no_unsupported": 1})
         self.assertEqual(len(out["refs"]), 1)
         self.assertEqual(set(out["refs"][0]), {"ref", "code"})  # the ref only: no MemberNo, not even masked
         self.assertEqual(out["refs"][0]["code"], "member_no_unsupported")
-        self.assertEqual((self.book.reads, self.book.saves, self.engine().reads), (0, 0, 0))
+        self.assertEqual((self.book.reads, self.book.saves, engine.reads), (0, 0, 0))  # no read spent from the run's budget
         self.assert_held_unsupported(1, member_no, "sync155")
 
     def every_shape_run(self, *, apply: bool) -> None:
@@ -5097,7 +5098,9 @@ class NF2MemberNoGuardTests(Base):
     def test_unlink_last3_of_every_shape_works_or_is_refused_with_a_code(self):
         # _LAST3_RE takes the pattern's characters only: a shape whose last 3
         # hold a tab, a space or a bracket is refused (unlink_arguments_invalid),
-        # never a crash and never an echo of the value.
+        # never a crash and never an echo of the value. Written out per shape
+        # (never taken from _LAST3_RE), so a change to that rule is seen here.
+        refused = {"brackets"}  # last 3 "nn)"; every other shape here ends in pattern characters
         for n, (name, member_no) in enumerate(nf2_shapes().items(), start=1):
             with self.subTest(shape=name):
                 engine = self.engine()
@@ -5105,7 +5108,10 @@ class NF2MemberNoGuardTests(Base):
                 ref = self.ledger.ref("c", customer_gid(n))
                 last3 = member_no[-3:]
                 call = lambda: engine.unlink(customer_ref=ref, member_last3=last3, reason="other", accept_applied=False, apply=False)
-                if bm._LAST3_RE.fullmatch(last3):
+                for probe in ("\t12", " 12", "1)"):  # a tab, a space, a bracket: always refused
+                    self.assertEqual(self.code(lambda: engine.unlink(customer_ref=ref, member_last3=probe, reason="other",
+                                                                     accept_applied=False, apply=False)), "unlink_arguments_invalid")
+                if name not in refused:
                     out = call()
                     self.assertEqual(out["command"], "unlink_dry_run")
                     self.assertNotIn(member_no, json.dumps(out))
