@@ -9,8 +9,8 @@ Before answering, read `AC2_DATA_GUIDE.md` in this same folder and follow it. It
 
 Always:
 
-1. Find the files in Google Drive by folder name (`AC2 Stock Balance (daily)` or `AC2 ARAP Aging (latest)`, under `My Drive/Automation/Report`), through the Google Drive connector or the local Drive for desktop folder. If you cannot see them, say the folder has not been shared with this account and stop; do not ask anyone to make it public.
-2. Read `last_run_status.json` first. Quote the data's "as of" time (`as_of_local` for stock, `as_at_local` for AR/AP), and say so if the last run failed or the data is more than about 70 minutes old.
+1. Find the files in Google Drive by folder name (`AC2 Stock Balance (daily)` or `AC2 ARAP Aging (latest)`), through the Google Drive connector or the local Drive for desktop folder. They live in the owner's `My Drive/Automation/Report`; a staff member usually sees them under "Shared with me". If you cannot see them, say the folder has not been shared with this account and stop; do not ask anyone to make it public.
+2. Judge freshness from the published data, not from the status file. Read the folder's `latest_manifest.json` first and quote its as-of time (`as_of_local` for stock, `as_at_local` for AR/AP). Say the data is stale if that time is more than 70 minutes old. Then read `last_run_status.json` only to explain why: if `status` is not `success`, or `delivery_status` is not `handed_to_drive_sync_folder`, Drive may still hold an older set. Never quote the status file's own `as_of_local` / `as_at_local`: it is the latest attempt's read time, not the data's.
 3. Read JSON fields by name from each file's own field list; decode indexes and day offsets.
 4. Never invent a field, figure or period the files do not hold. Say what is missing.
 5. Never edit, move, rename or delete anything in those folders.
