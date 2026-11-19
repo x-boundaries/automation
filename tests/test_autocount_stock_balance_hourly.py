@@ -36,7 +36,9 @@ from scripts import autocount_stock_balance_hourly as hourly  # noqa: E402
 SGT = ZoneInfo("Asia/Singapore")
 FIXED_NOW = datetime(2026, 10, 23, 14, 0, 5, tzinfo=SGT)
 SQL_NOW = datetime(2026, 10, 23, 14, 0, 6, tzinfo=SGT)
-HEX_ID = re.compile(r"[0-9a-f]{32,}")
+# Only a standalone run id (32 hex) or sha256 (64 hex) is masked, so an amount glued to an id
+# with no separator still shows (PR #327 G2 L-a).
+HEX_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{32})(?![0-9a-f])")
 
 
 def without_hex_ids(text):
@@ -1980,9 +1982,9 @@ class InstallerTests(unittest.TestCase):
 
     def test_v7_supervised_run_is_named(self):
         # Both cmdlets need -TaskName; the name has spaces, so the hint quotes it for copy-paste.
-        self.assertIn("Start-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' now", self.text)
+        self.assertIn("Start-ScheduledTask -TaskPath '$TaskPath' -TaskName '$TaskName' now", self.text)
         self.assertIn("last_run_status.json", self.text)
-        self.assertIn("Disable-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' and report", self.text)
+        self.assertIn("Disable-ScheduledTask -TaskPath '$TaskPath' -TaskName '$TaskName' and report", self.text)
 
     def test_powershell_parse_only(self):
         shell = shutil.which("pwsh") or shutil.which("powershell")

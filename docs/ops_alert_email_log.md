@@ -10,7 +10,7 @@ n8n adds `id`, `createdAt` and `updatedAt` to every Data Table by itself. Do not
 
 | Column | Type | Value |
 | --- | --- | --- |
-| `system` | string | `AC2-STOCK`, `ENERGYGRID`, `MEMBER-SYNC` or `HEALTH` (the daily health check, #325 H1). Every row, including a flood notice, belongs to exactly one system. |
+| `system` | string | `AC2-STOCK`, `AC2-ARAP` (the AR/AP aging export's alerts, #321 A3), `ENERGYGRID`, `MEMBER-SYNC` or `HEALTH` (the daily health check, #325 H1). Every row, including a flood notice, belongs to exactly one system. |
 | `key` | string | The caller's stable condition key, for example `run_failed:ledger_mismatch`; `alert_flood` for a system's flood notice (reserved: a caller cannot use it); `daily_summary` for a daily summary (slice 3); `daily_health` for the daily health email (system `HEALTH` only). Fold matching uses `system` + `key`. |
 | `severity` | string | `ERROR`, `WARN` or `INFO` (the flood notice is `WARN`; a daily summary is `INFO` for CLEAN and `WARN` for STOP; a daily health email is `INFO` for OK, `WARN` for WARN and `ERROR` for FAIL). |
 | `outcome` | string | `sent`, `folded`, `folded_flood` or `send_failed`. |

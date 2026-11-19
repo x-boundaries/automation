@@ -58,8 +58,8 @@ EXPECTED_EDGES = {
     ("Classify Send Error", 0, "Log Send Failed"),
     ("Log Send Failed", 0, "Return Send Failed"),
 }
-SYSTEMS = ("AC2-STOCK", "ENERGYGRID", "MEMBER-SYNC")
-SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|ENERGYGRID|MEMBER-SYNC) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
+SYSTEMS = ("AC2-STOCK", "AC2-ARAP", "ENERGYGRID", "MEMBER-SYNC")
+SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|AC2-ARAP|ENERGYGRID|MEMBER-SYNC) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 CANARY = "CANARY-NOTE-0001-XYZ"
 # 6 Nov 2026 14:30:00 SGT, a fixed clock for every Decide run.
@@ -297,8 +297,11 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
         self.assertIn("[XB daily]", readme)
         self.assertIn("[XB health]", readme)
         self.assertIn("HEALTH", notes)
+        self.assertIn("AC2-ARAP", notes)
+        self.assertIn("`AC2-ARAP`", readme)
         doc = TABLE_DOC.read_text(encoding="utf-8")
-        for column in LOG_COLUMNS + ["xb_alert_email_log", "folded_flood", "send_failed", "daily_health", "HEALTH"]:
+        for column in LOG_COLUMNS + ["xb_alert_email_log", "folded_flood", "send_failed", "daily_health", "HEALTH",
+                                     "AC2-ARAP"]:
             self.assertIn(column, doc)
 
 
@@ -335,7 +338,7 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
     def test_valid_request_passes_only_the_allowlisted_fields(self):
         (out,) = self.validate(request())
         self.assertEqual(out, validated())
-        for system in ("AC2-STOCK", "ENERGYGRID", "MEMBER-SYNC"):
+        for system in SYSTEMS:
             for severity in ("ERROR", "WARN", "INFO"):
                 (out,) = self.validate(request(system=system, severity=severity))
                 self.assertIs(out["valid"], True, (system, severity))
@@ -685,6 +688,49 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         (other,) = self.validate(request(system="MEMBER-SYNC", key="daily_summary", short="CLEAN 2026-11-07",
                                          lines=["see AC2-STOCK"]))
         self.assertEqual(other, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"})
+
+    # ---- AC2-ARAP (#321 A3): its own system, apart from AC2-STOCK ---- #
+    def arap(self, **overrides):
+        value = request(system="AC2-ARAP", key="run_failed:outstanding_mismatch",
+                        short="run_failed:outstanding_mismatch",
+                        lines=["AC2 AR/AP export: ERROR", "", "- Hourly AR/AP export FAILED: outstanding_mismatch",
+                               "Run: 01234567"])
+        value.update(overrides)
+        return value
+
+    def test_ac2_arap_is_an_ordinary_alert_system(self):
+        (out,) = self.validate(self.arap())
+        self.assertEqual(out, {"valid": True, **self.arap()})
+        plan = self.decide([], {"valid": True, **self.arap()})
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-ARAP ERROR run_failed:outstanding_mismatch")
+        self.assertRegex(plan["mail"]["subject"], SUBJECT_RE)
+        self.assertIn("System: AC2-ARAP | Severity: ERROR | Key: run_failed:outstanding_mismatch", plan["mail"]["text"])
+        self.assertEqual(plan["mail_row"]["system"], "AC2-ARAP")
+        # The reserved keys stay reserved for it too.
+        bad = {"OPS_ALERT_KEY": [self.arap(key="alert_flood"), self.arap(key="daily_health", short="FAIL 1 jobs 2026-11-19")]}
+        for reason, bodies in bad.items():
+            for body, out in zip(bodies, self.validate(*bodies)):
+                self.assertEqual(out, {"valid": False, "reason": reason}, body["key"])
+
+    def test_ac2_arap_and_ac2_stock_never_name_or_fold_into_each_other(self):
+        bodies = [self.arap(lines=["see AC2-STOCK"]), self.arap(short="AC2-STOCK"),
+                  request(lines=["see AC2-ARAP"]), request(key="AC2-ARAP:x")]
+        for body, out in zip(bodies, self.validate(*bodies)):
+            self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"}, body)
+        # The same key sent for AC2-STOCK 5 minutes ago, plus a stock flood, never folds or holds
+        # back an AC2-ARAP alert, and the other way round.
+        same_key = "run_failed:internal_error"
+        stock_rows = [row(5 * i + 1, key="k%d" % i) for i in range(11)] + [row(5, key=same_key),
+                                                                           row(4, key="alert_flood")]
+        plan = self.decide(stock_rows, {"valid": True, **self.arap(key=same_key, short=same_key)})
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-ARAP ERROR " + same_key)
+        self.assertNotIn("folded since", plan["mail"]["text"])
+        arap_rows = [row(5 * i + 1, system="AC2-ARAP", key="k%d" % i) for i in range(11)]
+        arap_rows += [row(5, system="AC2-ARAP", key=same_key)]
+        plan = self.decide(arap_rows, validated(key=same_key, short=same_key))
+        self.assertIsNone(plan["held_outcome"])
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR " + same_key)
 
     # ---- daily health path (#325 H1) ---- #
     def health(self, **overrides):

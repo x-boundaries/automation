@@ -20,7 +20,7 @@ import sys
 import tempfile
 import unittest
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -43,7 +43,9 @@ FIXTURE_RUN_ID = "0" * 32
 # A run id that contains the fixture amounts 1200, 1335 and 150000 as hex digits. The privacy test pins
 # it, so a check that matched amounts inside the run id or a hash would fail every time, not 0.1% of runs.
 AMOUNT_LIKE_RUN_ID = "1200133515000000000000000000abcd"
-HEX_ID = re.compile(r"[0-9a-f]{32,}")
+# Only a standalone run id (32 hex) or sha256 (64 hex) is masked, so an amount glued to an id
+# with no separator still shows (PR #327 G2 L-a).
+HEX_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{32})(?![0-9a-f])")
 
 
 def without_hex_ids(text):
@@ -1609,10 +1611,11 @@ class ArapInstallerStaticTests(unittest.TestCase):
         self.assertIn("Nothing was registered.", self.text[dry:self.text.index("Register-ScheduledTask `")])
 
     def test_supervised_run_and_off_switch_are_named(self):
-        # Both cmdlets need -TaskName; the name has spaces, so the hint quotes it for copy-paste.
-        self.assertIn("Start-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' now", self.text)
+        # Both cmdlets need -TaskName; the name has spaces and the path may (PR #327 G2 L-b), so the hint
+        # quotes both for copy-paste.
+        self.assertIn("Start-ScheduledTask -TaskPath '$TaskPath' -TaskName '$TaskName' now", self.text)
         self.assertIn("last_run_status.json", self.text)
-        self.assertIn("Disable-ScheduledTask -TaskPath $TaskPath -TaskName '$TaskName' and report", self.text)
+        self.assertIn("Disable-ScheduledTask -TaskPath '$TaskPath' -TaskName '$TaskName' and report", self.text)
 
     def test_differs_from_the_stock_installer_only_where_intended(self):
         # Every executable line of the stock installer is kept, except the named differences.
@@ -1799,6 +1802,366 @@ class ArapInstallerPowerShell51Tests(TempDirTestCase):
         self.assertNotEqual(code, 0, out)
         self.assertIn("already exists in the Task Scheduler root", out)
         self.assertNotIn("Dry run:", out)
+
+
+# ---------------------------------------------------------------------------------------------
+# A3 error alerts (#321): settings, conditions, daily repeat, event privacy, run hook
+# ---------------------------------------------------------------------------------------------
+
+ALERT_URL = "https://n8n.example.com/webhook/fake-arap-alert-path"
+ALERT_ENV_VAR = "XB_FAKE_ARAP_ALERT_SECRET"
+ALERT_SECRET = "FAKE-ALERT-SECRET-0001"
+ALERT_ON = {"webhook_enabled": True, "webhook_url": ALERT_URL, "secret_env_var": ALERT_ENV_VAR}
+ALERT_ENV = dict(ENV, **{ALERT_ENV_VAR: ALERT_SECRET})
+
+
+class FakeTransport:
+    """Records each POST and answers with the next code (an exception instance is raised)."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers) or [200]
+        self.calls = []
+
+    def __call__(self, url, headers, body, timeout):
+        self.calls.append({"url": url, "headers": dict(headers), "raw": body, "body": json.loads(body),
+                           "timeout": timeout})
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+def outstanding_mismatch_data():
+    data = fixture_data()
+    data["ar_invoice"][0]["Outstanding"] = D("1199.99")
+    return data
+
+
+def ap_payment_data():
+    data = fixture_data()
+    data["ap_payment"] = [payment(601, "CRED-B03", "2026-11-16", "100.00")]
+    return data
+
+
+class AlertSettingsTests(TempDirTestCase):
+    def test_off_by_default_and_in_the_example(self):
+        self.assertEqual(self.settings()["alert"], arap.stock.DEFAULT_SETTINGS["alert"])
+        self.assertIs(self.settings()["alert"]["webhook_enabled"], False)
+        raw = json.loads((ROOT / "config" / "autocount_arap_aging.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw["alert"], arap.stock.DEFAULT_SETTINGS["alert"])
+
+    def test_the_stock_alert_checks_apply(self):
+        self.assertTrue(self.settings(alert=ALERT_ON)["alert"]["webhook_enabled"])
+        bad = [
+            {"webhook_enabled": True},
+            {"webhook_enabled": True, "webhook_url": ALERT_URL},
+            {"webhook_enabled": "yes"},
+            {"webhook_url": "http://n8n.example.com/webhook/x"},
+            {"webhook_url": "https://user:pw@n8n.example.com/webhook/x"},
+            {"webhook_url": ALERT_URL + "?token=x"},
+            {"secret_env_var": "not a name"},
+            {"auth_header_name": "Content-Type"},
+            {"timeout_seconds": 0},
+            {"repeat_hours": 0},
+            {"secret_env_var": ALERT_ENV_VAR, "secret_credential_target": "FAKE-TARGET"},
+            {"secret": ALERT_SECRET},
+        ]
+        for alert in bad:
+            with self.subTest(alert=alert), self.assertRaises(arap.ConfigError) as caught:
+                self.settings(alert=alert)
+            self.assertNotIn(ALERT_SECRET, str(caught.exception))
+
+    def test_credential_manager_target_needs_the_password_logon(self):
+        # The live task is S4U, which cannot read Credential Manager: the secret is an env var.
+        target = dict(ALERT_ON, secret_env_var=None, secret_credential_target="FAKE-ARAP-ALERT-TARGET")
+        with self.assertRaises(arap.ConfigError):
+            self.settings(alert=target)
+        settings = self.settings(alert=target, schedule={"logon_type": "Password"},
+                                 identity={"auth_mode": "sql_login", "sql_login": FAKE_LOGIN,
+                                           "credential_target": "FAKE-SQL-TARGET"})
+        self.assertEqual(settings["alert"]["secret_credential_target"], "FAKE-ARAP-ALERT-TARGET")
+
+
+class AlertConditionTests(unittest.TestCase):
+    def test_conditions(self):
+        ok = {"status": "success", "failure_class": None, "delivery_status": "handed_to_drive_sync_folder",
+              "ap_payments_recorded": False}
+        cases = [
+            (ok, []),
+            (dict(ok, delivery_status="not_configured"), []),
+            (dict(ok, delivery_status="verify_failed"), ["delivery_failed"]),
+            (dict(ok, delivery_status="copy_failed", ap_payments_recorded=True), ["delivery_failed", "ap_payments_recorded"]),
+            (dict(ok, ap_payments_recorded=True), ["ap_payments_recorded"]),
+            (dict(ok, ap_payments_recorded="true"), []),
+            ({"status": "failed", "failure_class": "outstanding_mismatch", "delivery_status": "copy_failed",
+              "ap_payments_recorded": True}, ["run_failed:outstanding_mismatch"]),
+            ({"status": "failed", "failure_class": "free text DEBT-A01"}, ["run_failed:unknown"]),
+            ({"status": "failed", "failure_class": None}, ["run_failed:unknown"]),
+        ]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertEqual(arap.alert_conditions(status), expected)
+
+    def test_every_recorded_failure_class_is_in_the_closed_list(self):
+        classes = {value for name, value in vars(arap).items() if name.startswith("FAILURE_") and isinstance(value, str)}
+        # Plus the two the shared stock checks raise (identity pin, missing time zone data).
+        self.assertEqual(set(arap.ALERT_FAILURE_CLASSES) - classes, {"identity_refused", "timezone_unavailable"})
+        self.assertLessEqual(classes, set(arap.ALERT_FAILURE_CLASSES))
+        runbook = (ROOT / "docs" / "autocount2-automation" / "arap_aging_runbook.md").read_text(encoding="utf-8")
+        for failure_class in arap.ALERT_FAILURE_CLASSES:
+            self.assertIn("`%s`" % failure_class, runbook)
+
+
+class AlertRepeatRuleTests(unittest.TestCase):
+    T0 = datetime(2026, 11, 19, 14, 30, 5, tzinfo=SGT)
+
+    def at(self, hours):
+        return self.T0 + timedelta(hours=hours)
+
+    def test_new_then_suppressed_then_daily_repeat(self):
+        active = ["delivery_failed"]
+        self.assertEqual(arap.plan_alert({}, active, self.T0, 24), ("new", {}))
+        sent = {"delivery_failed": self.T0.isoformat()}
+        self.assertEqual(arap.plan_alert(sent, active, self.at(23.9), 24), (None, sent))
+        self.assertEqual(arap.plan_alert(sent, active, self.at(24), 24), ("repeat", sent))
+        # A different failure class is a new alert.
+        failed = {"run_failed:lock_timeout": self.T0.isoformat()}
+        self.assertEqual(arap.plan_alert(failed, ["run_failed:source_error"], self.at(1), 24)[0], "new")
+
+    def test_cleared_keys_are_dropped_so_a_recurrence_is_new(self):
+        sent = {"delivery_failed": self.T0.isoformat()}
+        self.assertEqual(arap.plan_alert(sent, [], self.at(1), 24), (None, {}))
+        self.assertEqual(arap.plan_alert({}, ["delivery_failed"], self.at(2), 24)[0], "new")
+
+    def test_ap_notice_is_sent_once_and_never_repeated_daily(self):
+        self.assertEqual(arap.plan_alert({}, ["ap_payments_recorded"], self.T0, 24)[0], "new")
+        sent = {"ap_payments_recorded": self.T0.isoformat()}
+        for hours in (1, 24, 48, 24 * 30):
+            self.assertEqual(arap.plan_alert(sent, ["ap_payments_recorded"], self.at(hours), 24), (None, sent))
+        # It stays recorded through failed runs and does not hold back a real failure.
+        kind, kept = arap.plan_alert(sent, ["run_failed:source_error"], self.at(2), 24)
+        self.assertEqual(kind, "new")
+        self.assertEqual(kept, sent)
+        # Another condition still repeats daily next to it.
+        both = dict(sent, delivery_failed=self.T0.isoformat())
+        self.assertEqual(arap.plan_alert(both, ["delivery_failed", "ap_payments_recorded"], self.at(24), 24)[0],
+                         "repeat")
+        # Cleared, then back: a new notice.
+        self.assertEqual(arap.plan_alert(sent, [], self.at(3), 24), (None, {}))
+
+    def test_failed_runs_keep_success_side_keys(self):
+        sent = {"delivery_failed": self.T0.isoformat(), "run_failed:lock_timeout": self.T0.isoformat()}
+        kind, kept = arap.plan_alert(sent, ["run_failed:lock_timeout"], self.at(1), 24)
+        self.assertIsNone(kind)
+        self.assertEqual(kept, sent)
+
+
+class AlertRunTests(TempDirTestCase):
+    def alert_settings(self, delivery=False, **alert):
+        return self.settings(delivery=delivery, alert=dict(ALERT_ON, **alert))
+
+    def run_alert(self, data=None, settings=None, transport=None, environ=ALERT_ENV, clock=FIXED_NOW, **kwargs):
+        transport = transport or FakeTransport(200)
+        settings = settings or self.alert_settings()
+        source = FakeSource(data if data is not None else fixture_data())
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = arap.run_once(settings, source=source, environ=environ, clock=lambda: clock,
+                                   sleep=lambda _s: None, alert_transport=transport, **kwargs)
+        return result, transport
+
+    def state(self):
+        path = self.tmp / "archive" / arap.ALERT_STATE_NAME
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def test_disabled_sends_nothing_and_writes_no_state(self):
+        transport = FakeTransport(200)
+        result = self.run_export(outstanding_mismatch_data(), alert_transport=transport)
+        self.assertEqual((result["alert_status"], result["alert_http_status"]), ("disabled", None))
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(self.state())
+        status = json.loads((self.tmp / "archive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["alert_status"], status["alert_http_status"]), ("disabled", None))
+
+    def test_failed_run_sends_one_closed_event(self):
+        result, transport = self.run_alert(outstanding_mismatch_data(), settings=self.alert_settings(delivery=True))
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual((result["alert_status"], result["alert_http_status"]), ("sent", 200))
+        (call,) = transport.calls
+        self.assertEqual(call["url"], ALERT_URL)
+        self.assertEqual(call["timeout"], 10)
+        self.assertEqual(call["headers"], {"Content-Type": "application/json", "User-Agent": "xb-ac2-arap-alert/1",
+                                           "X-XB-Alert-Token": ALERT_SECRET})
+        body = call["body"]
+        self.assertEqual(tuple(body), arap.ALERT_PAYLOAD_KEYS)
+        self.assertEqual(body, {
+            "schema": "xb.ac2.arap_alert.v1", "event": "ac2_arap_alert", "run_id": result["run_id"],
+            "run_hour_local": "2026-11-17T14:00:00+08:00", "alert_kind": "new", "status": "failed",
+            "failure_class": "outstanding_mismatch", "conditions": ["run_failed"],
+            "delivery_status": "skipped_failed_run", "ap_payments_recorded": None,
+        })
+        self.assertEqual(self.state(), {"schema": "xb.ac2.arap_alert_state.v1",
+                                        "alerted": {"run_failed:outstanding_mismatch": FIXED_NOW.isoformat()}})
+        for root in ("archive", "drive"):
+            status = json.loads((self.tmp / root / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+            self.assertEqual((status["alert_status"], status["alert_http_status"]), ("sent", 200))
+        # The state lives in the archive root only, never in Drive.
+        self.assertFalse((self.tmp / "drive" / arap.ALERT_STATE_NAME).exists())
+
+    def test_event_and_status_carry_no_party_document_amount_or_path(self):
+        cases = [outstanding_mismatch_data(), ap_payment_data()]
+        bad = fixture_data()
+        bad["ar_payment"].append(payment(209, "DEBT-A02", "2026-11-17", "10.00"))
+        for data in cases:
+            with mock.patch.object(arap.uuid, "uuid4", return_value=uuid.UUID(hex=AMOUNT_LIKE_RUN_ID)):
+                result, transport = self.run_alert(data)
+            (call,) = transport.calls
+            texts = [call["raw"].decode("ascii"),
+                     (self.tmp / "archive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"),
+                     (self.tmp / "archive" / arap.ALERT_STATE_NAME).read_text(encoding="utf-8")]
+            self.assertIn(AMOUNT_LIKE_RUN_ID, texts[0])
+            forbidden = ["DEBT-", "CRED-", "Example ", "IV-0", "PI-0", "PM-0", "CN-0", "1200", "1335", "150000",
+                         "1199", "100.00", FAKE_SERVER, "FAKE-SQL-HOST", FAKE_LOGIN, str(self.tmp), "archive",
+                         ALERT_SECRET, ALERT_URL]
+            for text in texts[:1] + texts[2:]:
+                masked = without_hex_ids(text)
+                for value in forbidden:
+                    self.assertNotIn(value, masked)
+            # The status file keeps its existing fields; only the secret and URL are new risks.
+            for value in (ALERT_SECRET, ALERT_URL, ALERT_ENV_VAR):
+                self.assertNotIn(value, texts[1])
+            shutil.rmtree(self.tmp / "archive")
+
+    def test_delivery_failure_and_ap_notice_events(self):
+        settings = self.alert_settings(delivery=True)
+        real = arap.stock.copy_bytes_exclusive
+
+        def corrupt_drive(path, data):
+            real(path, data + b"x" if "drive" in str(path) and path.name.startswith(".ar_parties") else data)
+
+        with mock.patch.object(arap.stock, "copy_bytes_exclusive", corrupt_drive):
+            result, transport = self.run_alert(ap_payment_data(), settings=settings)
+        self.assertEqual((result["status"], result["delivery_status"]), ("success", "verify_failed"))
+        (call,) = transport.calls
+        self.assertEqual(call["body"]["conditions"], ["delivery_failed", "ap_payments_recorded"])
+        self.assertEqual((call["body"]["failure_class"], call["body"]["ap_payments_recorded"]), (None, True))
+        self.assertEqual(call["body"]["delivery_status"], "verify_failed")
+        # Next hour, delivery fixed: the AP notice is not sent again, and nothing is pending.
+        result, transport = self.run_alert(ap_payment_data(), settings=settings, clock=FIXED_NOW + timedelta(hours=1))
+        self.assertEqual((result["alert_status"], result["alert_http_status"]), ("suppressed", None))
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(sorted(self.state()["alerted"]), ["ap_payments_recorded"])
+        # Two days later it is still quiet.
+        result, transport = self.run_alert(ap_payment_data(), settings=settings, clock=FIXED_NOW + timedelta(hours=49))
+        self.assertEqual(result["alert_status"], "suppressed")
+        self.assertEqual(transport.calls, [])
+
+    def test_clean_run_is_no_alert_and_still_checks_the_secret(self):
+        result, transport = self.run_alert()
+        self.assertEqual((result["status"], result["alert_status"], result["alert_http_status"]),
+                         ("success", "no_alert", None))
+        self.assertEqual(transport.calls, [])
+        result, transport = self.run_alert(environ=ENV)
+        self.assertEqual((result["status"], result["alert_status"]), ("success", "secret_unavailable"))
+        result, transport = self.run_alert(outstanding_mismatch_data(), environ=dict(ENV, **{ALERT_ENV_VAR: "a\x16b"}))
+        self.assertEqual(result["alert_status"], "secret_unavailable")
+        self.assertEqual(transport.calls, [])
+
+    def test_daily_repeat_through_real_runs(self):
+        bad = outstanding_mismatch_data()
+        self.assertEqual(self.run_alert(bad)[0]["alert_status"], "sent")
+        result, transport = self.run_alert(bad, clock=FIXED_NOW + timedelta(hours=1))
+        self.assertEqual(result["alert_status"], "suppressed")
+        self.assertEqual(transport.calls, [])
+        result, transport = self.run_alert(bad, clock=FIXED_NOW + timedelta(hours=24))
+        self.assertEqual(result["alert_status"], "sent")
+        self.assertEqual(transport.calls[0]["body"]["alert_kind"], "repeat")
+        # Recovery sends nothing and clears the key; the next failure is new.
+        result, transport = self.run_alert(clock=FIXED_NOW + timedelta(hours=25))
+        self.assertEqual((result["alert_status"], transport.calls), ("no_alert", []))
+        self.assertEqual(self.state()["alerted"], {})
+        result, transport = self.run_alert(bad, clock=FIXED_NOW + timedelta(hours=26))
+        self.assertEqual(transport.calls[0]["body"]["alert_kind"], "new")
+
+    def test_failed_send_keeps_the_state_and_retries_next_hour(self):
+        bad = outstanding_mismatch_data()
+        for answer, http_status in ((502, 502), (403, 403), (OSError("refused"), None), (304, 304), (True, None)):
+            with self.subTest(answer=answer):
+                result, transport = self.run_alert(bad, transport=FakeTransport(answer))
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual((result["alert_status"], result["alert_http_status"]), ("send_failed", http_status))
+                self.assertIsNone(self.state())
+        result, _ = self.run_alert(bad, clock=FIXED_NOW + timedelta(hours=1))
+        self.assertEqual(result["alert_status"], "sent")
+
+    def test_an_alert_never_changes_the_run_result_or_exit_code(self):
+        config = self.tmp / "settings.json"
+        config.write_text(json.dumps({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": str(self.tmp / "archive")},
+            "parties": {"online_shop_debtor_codes": ["DEBT-WEB"]},
+            "alert": ALERT_ON,
+        }), encoding="utf-8")
+        for data, expected in ((fixture_data(), arap.EXIT_OK), (outstanding_mismatch_data(), arap.EXIT_FAILED)):
+            for answer in (200, 502, OSError("down"), RuntimeError("bug")):
+                with self.subTest(expected=expected, answer=repr(answer)):
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        code = arap.main(["--config", str(config)], source=FakeSource(data), environ=ALERT_ENV,
+                                         clock=lambda: FIXED_NOW, alert_transport=FakeTransport(answer))
+                    self.assertEqual(code, expected)
+                    printed = json.loads(out.getvalue())
+                    self.assertIn(printed["alert_status"], ("sent", "send_failed", "error", "no_alert", "suppressed"))
+                    self.assertNotIn(ALERT_SECRET, out.getvalue())
+                    if (self.tmp / "archive" / arap.ALERT_STATE_NAME).exists():
+                        os.remove(self.tmp / "archive" / arap.ALERT_STATE_NAME)
+        # A broken alert step (here the state read) is recorded as error and nothing else changes.
+        with mock.patch.object(arap, "load_alert_state", side_effect=RuntimeError("bug")):
+            result, transport = self.run_alert()
+        self.assertEqual((result["status"], result["alert_status"]), ("success", "error"))
+
+    def test_lock_refused_run_alerts_already_running(self):
+        archive = self.tmp / "archive"
+        archive.mkdir(parents=True)
+        (archive / arap.LOCK_NAME).write_bytes(arap.stock.json_bytes(
+            {"run_id": "f" * 32, "pid": os.getpid(), "started_at": FIXED_NOW.isoformat()}))
+        result, transport = self.run_alert()
+        self.assertEqual(result["failure_class"], "already_running")
+        self.assertEqual(transport.calls[0]["body"]["failure_class"], "already_running")
+        self.assertTrue((archive / arap.LOCK_NAME).exists(), "the other run's lock is kept")
+
+    def test_invalid_settings_record_skipped_config_invalid(self):
+        config = self.tmp / "settings.json"
+        config.write_text(json.dumps({
+            "source": {"server": FAKE_SERVER, "expected_database": FAKE_DB},
+            "output": {"archive_root": str(self.tmp / "archive")},
+            "alert": {"webhook_enabled": True},
+        }), encoding="utf-8")
+        transport = FakeTransport(200)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = arap.main(["--config", str(config)], source=FakeSource(fixture_data()), environ=ALERT_ENV,
+                             clock=lambda: FIXED_NOW, alert_transport=transport)
+        self.assertEqual(code, arap.EXIT_FAILED)
+        self.assertEqual(transport.calls, [])
+        status = json.loads((self.tmp / "archive" / arap.LAST_RUN_STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["failure_class"], status["alert_status"], status["alert_http_status"]),
+                         ("config_invalid", "skipped_config_invalid", None))
+
+    def test_payload_builder_closes_every_value(self):
+        status = {"run_id": "not-hex", "status": "failed", "failure_class": "free text DEBT-A01",
+                  "delivery_status": "C:\\fake\\path", "ap_payments_recorded": True, "message": "DEBT-A01 1200.00"}
+        body = arap.build_alert_payload(status, arap.alert_conditions(status), "cleared", FIXED_NOW)
+        self.assertEqual(body["run_id"], "unknown")
+        self.assertEqual(body["alert_kind"], "new")
+        self.assertEqual(body["failure_class"], "unknown")
+        self.assertIsNone(body["delivery_status"])
+        self.assertIsNone(body["ap_payments_recorded"])
+        self.assertEqual(body["conditions"], ["run_failed"])
+        self.assertNotIn("DEBT", json.dumps(body))
+        ok = {"run_id": "a" * 32, "status": "success", "failure_class": "lock_timeout",
+              "delivery_status": "copy_failed", "ap_payments_recorded": True}
+        body = arap.build_alert_payload(ok, arap.alert_conditions(ok), "repeat", FIXED_NOW)
+        self.assertEqual((body["failure_class"], body["ap_payments_recorded"], body["alert_kind"]), (None, True, "repeat"))
+        self.assertEqual(body["conditions"], ["delivery_failed", "ap_payments_recorded"])
 
 
 if __name__ == "__main__":

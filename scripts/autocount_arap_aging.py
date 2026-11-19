@@ -26,6 +26,11 @@ Safety contract (see docs/autocount2-automation/arap_aging_runbook.md):
   CSVs) fail closed: nothing is published and only counts are recorded.
 * Console output, the manifest and last_run_status.json carry counts, hashes and flags only:
   never a party name or code, a document number or an amount.
+* Error alerts (#321 A3) are off by default. When on, a failed run, a failed Drive delivery or the
+  first sight of AP payments POSTs at most one sanitized xb.ac2.arap_alert.v1 event (closed codes
+  only) to an n8n webhook, which emails it through the shared XB Ops Alert Email sub-workflow. A
+  still-open problem repeats at most once a day. The outcome is recorded as alert_status and
+  alert_http_status in last_run_status.json and never changes the run's result or exit code.
 
 pyodbc is imported only inside SqlServerSource so the tests run without it.
 """
@@ -34,6 +39,7 @@ import argparse
 import copy
 import csv
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -104,6 +110,61 @@ DELIVERY_HANDED = stock.DELIVERY_HANDED
 DELIVERY_VERIFY_FAILED = stock.DELIVERY_VERIFY_FAILED
 DELIVERY_COPY_FAILED = stock.DELIVERY_COPY_FAILED
 DELIVERY_SKIPPED = stock.DELIVERY_SKIPPED
+
+# Error alerts (#321 A3): email through the n8n webhook "AC2 ARAP Export - Error Alert" and the
+# shared "XB Ops Alert Email" sub-workflow (system AC2-ARAP). No heartbeat, no success message.
+# The secret, settings checks, de-dup rule and the POST itself are the stock exporter's helpers.
+ALERT_STATE_NAME = "alert_state.json"
+ALERT_STATE_SCHEMA = "xb.ac2.arap_alert_state.v1"
+ALERT_SCHEMA = "xb.ac2.arap_alert.v1"
+ALERT_EVENT = "ac2_arap_alert"
+ALERT_USER_AGENT = "xb-ac2-arap-alert/1"
+# The only keys a payload may carry, in this order. No party, document, amount, path or message.
+ALERT_PAYLOAD_KEYS = (
+    "schema",
+    "event",
+    "run_id",
+    "run_hour_local",
+    "alert_kind",
+    "status",
+    "failure_class",
+    "conditions",
+    "delivery_status",
+    "ap_payments_recorded",
+)
+ALERT_CONDITIONS = ("run_failed", "delivery_failed", "ap_payments_recorded")
+# Notices are sent once when they appear and never repeated daily: there is nothing to retry,
+# only a one-time owner action (runbook "ap_payments_recorded").
+ALERT_NOTICE_CONDITIONS = ("ap_payments_recorded",)
+ALERT_KINDS = stock.ALERT_KINDS
+# Every failure class run_once and its settings path can record (runbook "Failure classes").
+ALERT_FAILURE_CLASSES = (
+    FAILURE_CONFIG,
+    stock.FAILURE_TIMEZONE,
+    FAILURE_ALREADY_RUNNING,
+    FAILURE_STALE_LOCK,
+    stock.FAILURE_IDENTITY,
+    FAILURE_CREDENTIAL,
+    FAILURE_LOCK_TIMEOUT,
+    FAILURE_UNSTABLE,
+    FAILURE_SOURCE,
+    FAILURE_OUTSTANDING,
+    FAILURE_UNKNOWN_KNOCKOFF,
+    FAILURE_SELF_CHECK,
+    FAILURE_LATEST,
+    FAILURE_INTERNAL,
+)
+ALERT_DELIVERY_STATUSES = stock.ALERT_DELIVERY_STATUSES
+ALERT_DELIVERY_FAILURES = (DELIVERY_VERIFY_FAILED, DELIVERY_COPY_FAILED)
+# alert_status in last_run_status.json (same values and meanings as the stock export).
+ALERT_DISABLED = stock.ALERT_DISABLED
+ALERT_NONE = stock.ALERT_NONE
+ALERT_SUPPRESSED = stock.ALERT_SUPPRESSED
+ALERT_SENT = stock.ALERT_SENT
+ALERT_SEND_FAILED = stock.ALERT_SEND_FAILED
+ALERT_SECRET_UNAVAILABLE = stock.ALERT_SECRET_UNAVAILABLE
+ALERT_ERROR = stock.ALERT_ERROR
+ALERT_SKIPPED_CONFIG = stock.ALERT_SKIPPED_CONFIG
 
 AUTH_MODES = stock.AUTH_MODES
 LOGON_TYPES = stock.LOGON_TYPES
@@ -319,9 +380,13 @@ DEFAULT_SETTINGS = {
     },
     # Date of the last passed menu reconciliation (runbook V3); null until it passes.
     "reconciled_on": None,
+    # Error alerts (A3). Off by default. Same keys and checks as the stock export's alert block:
+    # the shared secret is never a setting, only the name of the variable or target holding it.
+    "alert": copy.deepcopy(stock.DEFAULT_SETTINGS["alert"]),
 }
 CLOSED_SECTIONS = (
     "schedule", "source", "identity", "read", "output", "aging", "parties", "knockoff_target_types", "guess_sources",
+    "alert",
 )
 
 _require_str = stock._require_str
@@ -447,6 +512,11 @@ def validate_settings(raw):
     reconciled = settings["reconciled_on"]
     if reconciled is not None and not _iso_date_ok(reconciled):
         raise ConfigError("reconciled_on must be null or a date as YYYY-MM-DD")
+
+    # The stock export's check, unchanged: https URL without credentials, query or fragment; a
+    # plain header name; exactly one secret source when enabled; Credential Manager only with
+    # the Password logon (an S4U task cannot read it).
+    stock._validate_alert_settings(settings["alert"], schedule["logon_type"])
     return settings
 
 
@@ -1379,10 +1449,13 @@ def acquire_lock(archive_root, run_id, now, warnings):
 # ---------------------------------------------------------------------------------------------
 
 
-def run_once(settings, source=None, environ=None, clock=None, sleep=time.sleep):
+def run_once(settings, source=None, environ=None, clock=None, sleep=time.sleep, alert_transport=None,
+             credential_reader=None):
     """One export. Returns the run status dict (also written as last_run_status.json).
 
     The manifest of a successful run is under the "_manifest" key (not written to the status).
+    alert_transport and credential_reader replace the real POST and Credential Manager read in
+    the offline tests only.
     """
     tz = stock.load_zone(settings["timezone"])
     run_id = uuid.uuid4().hex
@@ -1491,6 +1564,12 @@ def run_once(settings, source=None, environ=None, clock=None, sleep=time.sleep):
         status["docs_open"] = None
     status["warning_count"] = len(warnings)
     status["finished_at"] = stock._now(tz, clock).isoformat()
+    # Last step before the status file, still under the lock: the alert reads the final status, and
+    # its own outcome is recorded beside it. It never changes the status, the exit code or a file
+    # of the latest set.
+    status["alert_status"], status["alert_http_status"] = send_run_alert(
+        settings, archive_root, status, started, run_id, environ, alert_transport, credential_reader
+    )
     for root in (archive_root, delivery_root):
         if root is None:
             continue
@@ -1505,6 +1584,149 @@ def run_once(settings, source=None, environ=None, clock=None, sleep=time.sleep):
     result["_manifest"] = manifest if status["status"] == "success" else None
     result["_warnings"] = warnings
     return result
+
+
+# ---------------------------------------------------------------------------------------------
+# Error alerts (A3). Errors and the one-time AP notice only; never changes a run's outcome.
+# ---------------------------------------------------------------------------------------------
+
+
+def alert_conditions(status):
+    """The alert condition keys a last_run_status dict raises. Pure.
+
+    A failed run raises only run_failed, keyed by its failure class so a different failure is a
+    new condition. A successful run can raise delivery_failed and the ap_payments_recorded notice.
+    """
+    if status.get("status") != "success":
+        failure_class = status.get("failure_class")
+        return ["run_failed:%s" % (failure_class if failure_class in ALERT_FAILURE_CLASSES else "unknown")]
+    keys = []
+    if status.get("delivery_status") in ALERT_DELIVERY_FAILURES:
+        keys.append("delivery_failed")
+    if status.get("ap_payments_recorded") is True:
+        keys.append("ap_payments_recorded")
+    return keys
+
+
+def plan_alert(alerted, active, now, repeat_hours):
+    """De-duplication rule. Pure. Returns (alert_kind or None, state to keep if nothing is sent).
+
+    The stock export's rule (stock.plan_alert): send when a key is new or was last sent
+    repeat_hours or more ago, drop keys a successful run saw cleared, and keep the success-side
+    keys through failed runs. One addition: a notice key that was already sent is left out of
+    the decision, so it is never repeated daily, but is kept in the state while it stays active.
+    """
+    quiet = [key for key in active if key in ALERT_NOTICE_CONDITIONS and key in alerted]
+    kind, kept = stock.plan_alert(alerted, [key for key in active if key not in quiet], now, repeat_hours)
+    kept.update((key, alerted[key]) for key in quiet)
+    return kind, kept
+
+
+def load_alert_state(archive_root):
+    """The alert de-dup state ({condition key: last sent time}); empty when missing or unreadable."""
+    try:
+        raw = json.loads(Path(archive_root, ALERT_STATE_NAME).read_text(encoding="utf-8"))
+        if raw.get("schema") != ALERT_STATE_SCHEMA or not isinstance(raw.get("alerted"), dict):
+            return {}
+        return {str(k): v for k, v in raw["alerted"].items() if isinstance(v, str)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_alert_state(archive_root, alerted, tag):
+    stock.replace_atomic(
+        Path(archive_root) / ALERT_STATE_NAME,
+        stock.json_bytes({"schema": ALERT_STATE_SCHEMA, "alerted": dict(sorted(alerted.items()))}),
+        tag,
+    )
+
+
+def _keep_alert_state(archive_root, kept, alerted, tag):
+    """Drop cleared conditions when nothing was sent. A write error is ignored: stale entries only
+    make a recurrence look like a repeat instead of new."""
+    if kept != alerted:
+        try:
+            save_alert_state(archive_root, kept, tag)
+        except OSError:
+            pass
+
+
+def build_alert_payload(status, active, kind, started):
+    """The sanitized event. Closed keys and closed values only: no party, document, amount,
+    path, message or host, whatever the status dict holds."""
+    run_id = status.get("run_id")
+    succeeded = status.get("status") == "success"
+    failure_class = status.get("failure_class")
+    ap_recorded = status.get("ap_payments_recorded")
+    return {
+        "schema": ALERT_SCHEMA,
+        "event": ALERT_EVENT,
+        "run_id": run_id if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) else "unknown",
+        "run_hour_local": started.replace(minute=0, second=0, microsecond=0).isoformat(),
+        "alert_kind": kind if kind in ALERT_KINDS else "new",
+        "status": "success" if succeeded else "failed",
+        # A failed run always names a class (unknown when it is outside the closed set).
+        "failure_class": None if succeeded else (
+            failure_class if failure_class in ALERT_FAILURE_CLASSES else "unknown"
+        ),
+        "conditions": [c for c in ALERT_CONDITIONS if c in {key.split(":", 1)[0] for key in active}],
+        "delivery_status": stock._alert_enum(status.get("delivery_status"), ALERT_DELIVERY_STATUSES),
+        "ap_payments_recorded": ap_recorded if succeeded and isinstance(ap_recorded, bool) else None,
+    }
+
+
+def send_run_alert(settings, archive_root, status, started, run_id, environ=None, transport=None,
+                   credential_reader=None):
+    """Alert step of one run: one bounded POST at most. Returns (alert_status, http_status).
+
+    The stock export's step with this job's event (stock.send_run_alert): the secret is checked
+    on every enabled run, a failed send leaves the de-dup state as it was so the next hour tries
+    again, and http_status is the answer's status or None. Never raises and never returns the
+    URL, headers, secret or body.
+    """
+    alert = settings["alert"]
+    if not alert["webhook_enabled"]:
+        return ALERT_DISABLED, None
+    http_status = None
+    tag = run_id[:8]
+    try:
+        active = alert_conditions(status)
+        alerted = load_alert_state(archive_root)
+        kind, kept = plan_alert(alerted, active, started, alert["repeat_hours"])
+        secret = stock.read_alert_secret(alert, environ, credential_reader)
+        if secret is None:
+            _keep_alert_state(archive_root, kept, alerted, tag)
+            return ALERT_SECRET_UNAVAILABLE, None
+        if kind is None:
+            _keep_alert_state(archive_root, kept, alerted, tag)
+            return (ALERT_NONE if not active else ALERT_SUPPRESSED), None
+        payload = build_alert_payload(status, active, kind, started)
+        if tuple(payload) != ALERT_PAYLOAD_KEYS:
+            return ALERT_ERROR, None
+        body = json.dumps(payload, ensure_ascii=True).encode("ascii")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": ALERT_USER_AGENT,
+            alert["auth_header_name"]: secret,
+        }
+        try:
+            code = (transport or stock.post_alert)(alert["webhook_url"], headers, body, alert["timeout_seconds"])
+        except (OSError, ValueError, http.client.HTTPException):
+            code = None
+        http_status = stock._http_status(code)
+        if http_status is None or not 200 <= http_status < 300:
+            _keep_alert_state(archive_root, kept, alerted, tag)
+            return ALERT_SEND_FAILED, http_status
+        sent_at = started.isoformat()
+        sent_state = dict(kept)
+        sent_state.update((key, sent_at) for key in active)
+        try:
+            save_alert_state(archive_root, sent_state, tag)
+        except OSError:
+            pass  # The alert went out; without the state the next hour may repeat it once.
+        return ALERT_SENT, http_status
+    except Exception:  # noqa: BLE001 - an alert bug must never change the run's result.
+        return ALERT_ERROR, http_status
 
 
 def check_latest(settings, clock=None):
@@ -1560,6 +1782,8 @@ def config_failure_status(raw, message, failure_class, clock=None):
         "message": "%s (run %s)" % (message, run_id[:8]), "started_at": now.isoformat(),
         "finished_at": now.isoformat(), "as_at_local": None, "timezone": tz_name,
         "delivery_status": DELIVERY_SKIPPED, "ap_payments_recorded": None, "docs_open": None,
+        # The alert settings cannot be trusted when the settings are invalid: no alert is attempted.
+        "alert_status": ALERT_SKIPPED_CONFIG, "alert_http_status": None,
     }
     roots = [root]
     delivery = output.get("delivery_root")
@@ -1574,7 +1798,7 @@ def config_failure_status(raw, message, failure_class, clock=None):
     return status
 
 
-def main(argv=None, source=None, environ=None, clock=None):
+def main(argv=None, source=None, environ=None, clock=None, alert_transport=None, credential_reader=None):
     parser = argparse.ArgumentParser(description="Hourly read-only AC2 AR/AP aging export, latest snapshot only (#321).")
     parser.add_argument("--config", required=True, help="Local settings JSON (config/*.local.json, never committed).")
     mode = parser.add_mutually_exclusive_group()
@@ -1623,12 +1847,14 @@ def main(argv=None, source=None, environ=None, clock=None):
         _print(result)
         return code
 
-    result = run_once(settings, source=source, environ=environ, clock=clock)
+    result = run_once(settings, source=source, environ=environ, clock=clock, alert_transport=alert_transport,
+                      credential_reader=credential_reader)
     _print({key: value for key, value in result.items() if not key.startswith("_")})
     if result["status"] != "success":
         return EXIT_FAILED
     if result["delivery_status"] not in (DELIVERY_HANDED, DELIVERY_NOT_CONFIGURED):
         return EXIT_FAILED
+    # alert_status is deliberately not read: an alert outcome never changes the exit code.
     return EXIT_OK
 
 
