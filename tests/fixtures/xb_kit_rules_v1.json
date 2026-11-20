@@ -1,0 +1,538 @@
+{
+  "slots": {
+    "merino_base": {
+      "any": [
+        {
+          "vendor": [
+            "Icebreaker",
+            "Smartwool"
+          ],
+          "not_type": [
+            "Socks",
+            "Dress",
+            "Skirt",
+            "Bra",
+            "Underwear"
+          ]
+        },
+        {
+          "tag": [
+            "Base Layer",
+            "MerinoLOFT",
+            "ZEO-LINE"
+          ]
+        }
+      ]
+    },
+    "cool_layer": {
+      "any": [
+        {
+          "tag": [
+            "Keep Cool",
+            "Quick Dry",
+            "UV Protection",
+            "Breathable"
+          ],
+          "type": [
+            "T-Shirt",
+            "T-shirt",
+            "Shirt",
+            "Pants",
+            "Shorts",
+            "Arm Cover",
+            "Hat",
+            "Cap",
+            "Headwear"
+          ]
+        }
+      ]
+    },
+    "insulation": {
+      "any": [
+        {
+          "tag": [
+            "Down",
+            "Down Jacket",
+            "Insulated Jacket",
+            "Synthetic Insulation",
+            "PrimaLoft",
+            "EXCELOFT",
+            "Insulation",
+            "Realfleece"
+          ],
+          "type": [
+            "Jacket",
+            "Vest",
+            "Coat"
+          ]
+        }
+      ]
+    },
+    "light_insul": {
+      "any": [
+        {
+          "tag": [
+            "EXCELOFT",
+            "Realfleece",
+            "Synthetic Insulation",
+            "Soft Shell"
+          ],
+          "type": [
+            "Jacket",
+            "Vest",
+            "Sweatshirt"
+          ]
+        },
+        {
+          "tag": [
+            "Down"
+          ],
+          "title": [
+            "superior",
+            "ex light",
+            "plasma",
+            "u.l."
+          ]
+        }
+      ]
+    },
+    "shell": {
+      "any": [
+        {
+          "tag": [
+            "Rain Jacket",
+            "Waterproof Shell",
+            "GORE-TEX",
+            "Rain Gear",
+            "Rain Gears",
+            "Rain Pants",
+            "DRY-TEC"
+          ]
+        },
+        {
+          "type": [
+            "Rain Coat",
+            "Rain Pants",
+            "Rain Poncho",
+            "Backpack Rain Cover"
+          ]
+        }
+      ]
+    },
+    "warm_acc": {
+      "any": [
+        {
+          "type": [
+            "Gloves",
+            "Beanie"
+          ]
+        },
+        {
+          "tag": [
+            "Balaclava",
+            "Keep Warm"
+          ],
+          "type": [
+            "Gloves",
+            "Beanie",
+            "Headwear",
+            "Accessories",
+            "Accessory"
+          ]
+        },
+        {
+          "vendor": [
+            "Hothands"
+          ]
+        }
+      ]
+    },
+    "socks": {
+      "any": [
+        {
+          "type": [
+            "Socks"
+          ]
+        }
+      ]
+    },
+    "poles": {
+      "any": [
+        {
+          "type": [
+            "Trekking Poles",
+            "Hiking Pole"
+          ]
+        },
+        {
+          "tag": [
+            "Trekking Poles",
+            "Hiking Pole"
+          ]
+        }
+      ]
+    },
+    "light": {
+      "any": [
+        {
+          "type": [
+            "Headlamp",
+            "Lights"
+          ]
+        },
+        {
+          "tag": [
+            "Headlamp",
+            "Torch Light",
+            "Lanterns"
+          ]
+        }
+      ]
+    },
+    "tool_trail": {
+      "any": [
+        {
+          "vendor": [
+            "Leatherman"
+          ],
+          "tag": [
+            "lm-multi-tool",
+            "lm-keychain"
+          ]
+        }
+      ]
+    },
+    "tool_edc": {
+      "any": [
+        {
+          "vendor": [
+            "Leatherman"
+          ],
+          "tag": [
+            "lm-edc",
+            "lm-keychain"
+          ]
+        }
+      ]
+    },
+    "power": {
+      "any": [
+        {
+          "vendor": [
+            "BioLite"
+          ]
+        }
+      ]
+    },
+    "sleep": {
+      "any": [
+        {
+          "type": [
+            "Sleeping Bag",
+            "Sleeping Bag Liners",
+            "Sleeping",
+            "Sleep",
+            "Travel Pillow"
+          ]
+        }
+      ]
+    },
+    "pack_day": {
+      "any": [
+        {
+          "type": [
+            "Backpack"
+          ],
+          "tag": [
+            "Daypack",
+            "20-28L",
+            "30L"
+          ]
+        }
+      ]
+    },
+    "pack_trek": {
+      "any": [
+        {
+          "type": [
+            "Backpack"
+          ],
+          "tag": [
+            "30L",
+            "40L",
+            "50-55L",
+            "60-65L"
+          ]
+        },
+        {
+          "tag": [
+            "Luggage and Duffle"
+          ]
+        }
+      ]
+    },
+    "hydration": {
+      "any": [
+        {
+          "type": [
+            "Bottle",
+            "Water Pack",
+            "Water Tube",
+            "Bottle Accessories"
+          ]
+        },
+        {
+          "tag": [
+            "Hydration"
+          ]
+        }
+      ]
+    },
+    "kolon": {
+      "any": [
+        {
+          "vendor": [
+            "Kolon Sport"
+          ]
+        }
+      ]
+    },
+    "travel": {
+      "any": [
+        {
+          "type": [
+            "Travel Accessories",
+            "Travel accessories",
+            "Wallet",
+            "Lock",
+            "Travel Pillow",
+            "Bags"
+          ]
+        },
+        {
+          "tag": [
+            "Travel kit",
+            "Travel/Packable",
+            "Travel / Packable",
+            "packable"
+          ],
+          "type": [
+            "Jacket",
+            "Bags",
+            "Shirt",
+            "Pants",
+            "Travel Accessories"
+          ]
+        }
+      ]
+    },
+    "alpine": {
+      "any": [
+        {
+          "tag": [
+            "Alpine",
+            "Expedition",
+            "Climbing"
+          ]
+        },
+        {
+          "type": [
+            "Crampon",
+            "Ice Axe",
+            "Climbing Accessories",
+            "Helmet",
+            "Carabiner"
+          ]
+        }
+      ]
+    },
+    "water": {
+      "any": [
+        {
+          "tag": [
+            "Water Sport",
+            "Diving",
+            "Sandals"
+          ]
+        },
+        {
+          "type": [
+            "Towel"
+          ]
+        }
+      ]
+    },
+    "bike": {
+      "any": [
+        {
+          "tag": [
+            "Cycling",
+            "Bicycle",
+            "Bicycle Accessories"
+          ]
+        },
+        {
+          "type": [
+            "Bicycle Accessories",
+            "Bicycle Tools",
+            "Helmet"
+          ]
+        }
+      ]
+    },
+    "footwear": {
+      "any": [
+        {
+          "type": [
+            "Footwear",
+            "Shoes"
+          ],
+          "not_tag": [
+            "Sandals"
+          ]
+        },
+        {
+          "tag": [
+            "Shoes"
+          ],
+          "not_tag": [
+            "Sandals"
+          ]
+        }
+      ]
+    }
+  },
+  "profiles": {
+    "tropical": {
+      "slots": [
+        "cool_layer",
+        "shell",
+        "socks",
+        "poles",
+        "light",
+        "tool_trail",
+        "hydration",
+        "pack_day",
+        "footwear"
+      ]
+    },
+    "hut": {
+      "slots": [
+        "merino_base",
+        "light_insul",
+        "shell",
+        "socks",
+        "poles",
+        "light",
+        "tool_trail",
+        "pack_day",
+        "hydration",
+        "kolon",
+        "footwear"
+      ]
+    },
+    "himalaya": {
+      "slots": [
+        "merino_base",
+        "insulation",
+        "shell",
+        "warm_acc",
+        "socks",
+        "poles",
+        "light",
+        "tool_trail",
+        "sleep",
+        "pack_trek",
+        "hydration",
+        "power",
+        "kolon"
+      ]
+    },
+    "expedition": {
+      "slots": [
+        "merino_base",
+        "insulation",
+        "shell",
+        "warm_acc",
+        "socks",
+        "light",
+        "tool_trail",
+        "sleep",
+        "pack_trek",
+        "power",
+        "alpine"
+      ]
+    },
+    "winter": {
+      "slots": [
+        "merino_base",
+        "insulation",
+        "shell",
+        "warm_acc",
+        "socks",
+        "light",
+        "power",
+        "kolon",
+        "footwear"
+      ]
+    },
+    "travel": {
+      "slots": [
+        "travel",
+        "cool_layer",
+        "merino_base",
+        "shell",
+        "socks",
+        "tool_edc",
+        "kolon",
+        "pack_day"
+      ]
+    },
+    "island": {
+      "slots": [
+        "water",
+        "cool_layer",
+        "hydration",
+        "tool_edc",
+        "pack_day"
+      ]
+    },
+    "ride": {
+      "slots": [
+        "bike",
+        "cool_layer",
+        "shell",
+        "tool_trail",
+        "light",
+        "hydration"
+      ]
+    }
+  },
+  "exclude": {
+    "title_words": [
+      "kid",
+      "kids",
+      "kid's",
+      "kids'",
+      "junior",
+      "toddler",
+      "baby",
+      "baby's",
+      "boxer",
+      "boxers",
+      "brief",
+      "briefs",
+      "bikini",
+      "thong",
+      "bra",
+      "bralette",
+      "hipster",
+      "panty",
+      "panties"
+    ],
+    "types": [
+      "Underwear",
+      "Bra"
+    ]
+  }
+}

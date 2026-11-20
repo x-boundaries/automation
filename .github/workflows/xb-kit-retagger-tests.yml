@@ -1,0 +1,51 @@
+name: xb-kit-retagger-tests
+
+on:
+  pull_request:
+    paths:
+      # XB Kit Re-tagger (#269): the inactive export, its focused offline test, its rules fixture,
+      # its runbook, the shared sender whose validator the test runs, and the offline validator.
+      # Exact entries keep the trigger surface owned.
+      - "n8n-workflows/xb_kit_retagger.workflow.json"
+      - "tests/test_xb_kit_retagger_workflow.py"
+      - "tests/fixtures/xb_kit_rules_v1.json"
+      - "docs/xb_kit_retagger.md"
+      - "n8n-workflows/ops_alert_email.workflow.json"
+      - "n8n-workflows/scripts/validate-n8n-workflows.cjs"
+      - ".github/workflows/xb-kit-retagger-tests.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate repository n8n exports offline
+        shell: bash
+        run: node n8n-workflows/scripts/validate-n8n-workflows.cjs
+      - name: Run kit re-tagger offline contracts (Node executes the committed Code nodes)
+        shell: bash
+        run: python -m unittest tests.test_xb_kit_retagger_workflow -v
+      - name: Whitespace check
+        shell: bash
+        run: git diff --check "$(git merge-base HEAD origin/main)" HEAD
