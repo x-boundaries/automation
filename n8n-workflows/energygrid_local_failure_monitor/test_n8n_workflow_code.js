@@ -107,8 +107,14 @@ const senderAccepts=(alert)=>{
   const out=vm.runInNewContext('(function(){'+validateCode+'\n})()',{$input:{all:()=>[{json:call}],first:()=>({json:call})},Array,Object,String,RegExp,Number,JSON});
   assert.equal(out.length,1);return out[0].json;
 };
-const otherSystems=vm.runInNewContext(validateCode.match(/const SYSTEMS = (\[[^\]]*\]);/)[1]).filter(s=>s!=='ENERGYGRID');
-assert.deepEqual(otherSystems.slice().sort(),['AC2-ARAP','AC2-STOCK','HEALTH','MEMBER-SYNC']);
+const senderSystems=vm.runInNewContext(validateCode.match(/const SYSTEMS = (\[[^\]]*\]);/)[1]);
+assert.ok(senderSystems.includes('ENERGYGRID'),'the sender accepts system ENERGYGRID');
+const otherSystems=senderSystems.filter(s=>s!=='ENERGYGRID');
+// Superset, not an exact list: other workflows may add their own system to the sender (#341 adds
+// KIT-RETAG) without an EnergyGrid change. The known ones must stay, and every alert below is still
+// checked against all of the sender's other systems, a new one included.
+for(const known of ['AC2-ARAP','AC2-STOCK','HEALTH','MEMBER-SYNC']) assert.ok(otherSystems.includes(known),known);
+assert.equal(new Set(otherSystems).size,otherSystems.length,'no duplicate system');
 // Which reference can reach an alert: only a PENDING row alerts, and the reporter writes exactly one
 // fixed reference on a PENDING row. FAILURE references come from the Core and are recorded, never alerted.
 const reporterSource=fs.readFileSync(path.join(__dirname,'energygrid_monitor_report.py'),'utf8');
