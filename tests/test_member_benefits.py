@@ -5119,6 +5119,152 @@ class NF2MemberNoGuardTests(Base):
                     self.assertEqual(self.code(call), "unlink_arguments_invalid")
 
 
+class NF2LaterTests(Base):
+    """PR #328 G2 LATER items. L1: ``held --code <code>``, a read-only
+    listing of held receipts for the VM screen (full MemberNo, order link and
+    day), never through ``_emit``. L2: ``_MemberNoUnsupported`` reaching
+    ``run()`` from a caller without its own handler stops the run with the
+    run row finished, never a crash that leaves it unfinished."""
+
+    run_main = CliTests.run_main
+    linked_odd_member = NF2MemberNoGuardTests.linked_odd_member
+
+    def run_held(self, *args: str, cfg: dict | None = None) -> tuple[int, str]:
+        path = self.temp / "config.json"
+        path.write_text(json.dumps(raw_config(self.root, self.sync_root, **(cfg or {}))), encoding="utf-8")
+        out = io.StringIO()
+        with private_root_allowed(self.temp / "elsewhere"), contextlib.redirect_stdout(out):
+            code = bm.main(["held", "--config", str(path), *args], clock=lambda: self.now)
+        return code, out.getvalue()
+
+    def tables(self) -> dict:
+        return B2ClaimLinksTests.tables(self)
+
+    def unfinished_runs(self) -> int:
+        return self.ledger.conn.execute("SELECT COUNT(*) FROM runs WHERE finished_at IS NULL").fetchone()[0]
+
+    # -- L2 ----------------------------------------------------------------------
+    def test_l2_the_guard_error_is_a_directlocalerror_with_its_own_code(self):
+        error = bm._MemberNoUnsupported()
+        self.assertIsInstance(error, dl.DirectLocalError)
+        self.assertNotIsInstance(error, dl.BridgeError)  # run() finishes the row and returns; it does not re-raise
+        self.assertEqual(error.code, "member_no_unsupported")
+
+    def test_l2_an_unguarded_caller_stops_the_run_with_the_run_row_finished(self):
+        # A future caller of _read_member without its own handler (here: the
+        # sign-up re-check, patched to read an odd member). Before L2 the plain
+        # Exception escaped run() and left the run row unfinished.
+        odd = nf2_shapes()["plus_and_spaces"]
+        self.book.members[odd] = fake_member(odd)
+        normal = self.guest_with_order(2)
+        engine = self.engine()
+        with mock.patch.object(bm.BenefitsEngine, "_recheck_signups", lambda eng, summary: eng._read_member(odd)):
+            out = engine.run(apply=True)
+        self.assertEqual((out["stopped"], out["alerts"], out["saves"]), ("member_no_unsupported", ["member_no_unsupported"], 0))
+        self.assertEqual((self.book.reads, self.book.saves), (0, 0))  # nothing sent to the bridge
+        self.assertEqual(self.unfinished_runs(), 0)
+        stored = json.loads(self.ledger.conn.execute("SELECT summary FROM runs").fetchone()[0])
+        self.assertEqual(stored["stopped"], "member_no_unsupported")
+        self.assertEqual(self.receipt(2)["state"], "ready")  # not decided in the stopped run; the next run goes on
+        self.advance(minutes=15)
+        out = engine.run(apply=True)
+        self.assertEqual((out["stopped"], out["saves"], self.book.members[normal]["type"]), (None, 1, "MEMBER"))
+
+    def test_l2_the_cli_exits_3_and_the_digest_shows_no_unfinished_run(self):
+        odd = nf2_shapes()["email"]
+        self.book.members[odd] = fake_member(odd)
+        self.assertEqual(self.run_main("init")[0], 0)
+        with mock.patch.object(bm.BenefitsEngine, "_recheck_signups", lambda eng, summary: eng._read_member(odd)):
+            code, out, _ = self.run_main("observe")
+        self.assertEqual((code, out["stopped"], out["alerts"]), (3, "member_no_unsupported", ["member_no_unsupported"]))
+        code, digest, _ = self.run_main("digest", "--hours", "24")
+        self.assertEqual((code, digest["runs"], digest["alerts"]), (0, {"completed": 1, "unfinished": 0}, {"member_no_unsupported": 1}))
+
+    # -- L1 ----------------------------------------------------------------------
+    def test_l1_held_lists_the_code_with_full_member_no_order_link_and_day_on_screen_only(self):
+        shapes = nf2_shapes()
+        self.linked_odd_member(1, shapes["leading_space"])
+        self.linked_odd_member(2, shapes["tab"])
+        self.guest_with_order(3)
+        self.engine()
+        self.ledger.add_claim(customer_gid(4), sg(4), "index", "phone_and_name_match")
+        self.links_by_gid[customer_gid(4)] = sg(5)  # a link conflict: held with another code
+        self.shopify.add(order_node(4))
+        self.assertEqual(sorted(self.engine().run(apply=False)["alerts"]), ["link_conflict", "member_no_unsupported"])
+        self.assertEqual(self.receipt(4)["code"], "link_conflict")
+        _, digest, _ = self.run_main("digest", "--hours", "24")
+        emitted = len(self.emitted)
+        before = self.tables()
+        code, text = self.run_held("--code", "member_no_unsupported")  # self.ledger still holds the lock, as a running task would
+        self.assertEqual(code, 0)
+        self.assertEqual(self.tables(), before)  # read only: no run row, nothing written
+        self.assertEqual(len(self.emitted), emitted)  # never through _emit (the JSON line other tools read)
+        self.assertIn("Held receipts with code member_no_unsupported: 2\n", text)
+        self.assertIn("VM screen only", text)
+        refs = {entry["ref"] for entry in digest["alert_refs"] if entry["code"] == "member_no_unsupported"}
+        for n, member_no in ((1, shapes["leading_space"]), (2, shapes["tab"])):
+            with self.subTest(member_no=bm.mask(member_no)):
+                ref = self.ledger.ref("o", order_gid(n))
+                self.assertIn(ref, refs)  # the ref the digest shows
+                self.assertIn(f"ref {ref}\n", text)
+                self.assertIn(f"https://{SHOP}/admin/orders/{order_number(n)}\n", text)
+                self.assertIn(f"MemberNo: {json.dumps(member_no)}   link: sync155\n", text)
+                self.assertIn(f"Order of {self.receipt(n)['order_date_sgt']} (Singapore day)", text)
+        self.assertIn("\\t", text)  # the tab is shown escaped, never as a raw tab
+        self.assertNotIn("\t", text)
+        for n in (3, 4):  # a ready receipt and a receipt held with another code are not listed
+            self.assertNotIn(str(order_number(n)), text)
+            self.assertNotIn(self.ledger.ref("o", order_gid(n)), text)
+        code, text = self.run_held("--code", "link_conflict")
+        self.assertEqual(code, 0)
+        self.assertIn("Held receipts with code link_conflict: 1\n", text)
+        self.assertIn(f"/admin/orders/{order_number(4)}\n", text)
+
+    def test_l1_a_claim_path_hold_shows_no_member_and_none_held_shows_zero(self):
+        code, text = self.run_held("--code", "member_no_unsupported")
+        self.assertEqual((code, json.loads(text)), (2, {"status": "refused", "code": "benefits_ledger_missing"}))
+        self.engine()
+        code, text = self.run_held("--code", "member_no_unsupported")
+        self.assertEqual((code, text.splitlines()[0]), (0, "Held receipts with code member_no_unsupported: 0"))
+        odd = nf2_shapes()["plus"]
+        self.book.members[odd] = fake_member(odd)
+        self.shopify.add(order_node(1))
+        with mock.patch.object(bm, "phone_forms", return_value=(sg(1), {odd})):
+            self.engine().run(apply=False)
+        code, text = self.run_held("--code", "member_no_unsupported")
+        self.assertEqual(code, 0)
+        self.assertIn("MemberNo: (none recorded)   link: (none)\n", text)
+
+    def test_l1_at_most_500_then_a_count_of_the_rest(self):
+        for n in (1, 2, 3):
+            self.linked_odd_member(n, nf2_shapes(n)["plus"])
+        self.engine().run(apply=False)
+        with mock.patch.object(bm, "HELD_LIST_MAX", 2):
+            code, text = self.run_held("--code", "member_no_unsupported")
+        self.assertEqual(code, 0)
+        self.assertIn("Held receipts with code member_no_unsupported: 3\n", text)
+        self.assertEqual(text.count("Shopify order: "), 2)
+        self.assertIn("... 1 more not shown (at most 2).\n", text)
+        self.assertEqual(bm.HELD_LIST_MAX, 500)
+
+    def test_l1_refusals_are_a_json_code_only(self):
+        self.engine()
+        for args in ((), ("--code", "Member No"), ("--code", "")):
+            with self.subTest(args=args):
+                code, text = self.run_held(*args)
+                self.assertEqual((code, json.loads(text)), (2, {"status": "refused", "code": "held_code_invalid"}))
+        code, text = self.run_held("--code", "member_no_unsupported",
+                                   cfg={"shopify": {**raw_config(self.root, self.sync_root)["shopify"], "store_gid": "gid://shopify/Shop/2"}})
+        self.assertEqual((code, json.loads(text)), (2, {"status": "refused", "code": "benefits_ledger_binding_mismatch"}))
+
+    def test_l1_a_v1_ledger_is_refused_and_left_as_it_is(self):
+        before = make_v1_ledger(self.root)
+        code, text = self.run_held("--code", "member_no_unsupported")
+        self.assertEqual((code, json.loads(text)), (2, {"status": "refused", "code": "benefits_ledger_not_recognised"}))
+        self.assertEqual((self.root / bm.LEDGER_FILE).read_bytes(), before)
+        self.assertFalse((self.root / (bm.LEDGER_FILE + "-wal")).exists())
+
+
 class ClassifySaveTests(unittest.TestCase):
     @staticmethod
     def run_of(value, code=0) -> dl.WriteRun:

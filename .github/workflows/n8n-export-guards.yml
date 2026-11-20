@@ -1,0 +1,46 @@
+name: n8n-export-guards
+
+# Repo-wide n8n export guards (#334 G2 L2, #288 T2, #332 T4). The two guards also run in the
+# member-create-uat-tests `rest` shard, but that workflow triggers on listed paths only, so a pull
+# request that adds or changes an n8n export without touching a listed file skipped them. This job
+# runs both guards on any change under n8n-workflows/. Offline: files only, fake data only; no
+# secret, credential or live system is used. tests/test_n8n_export_guards_ci.py pins this file.
+
+on:
+  pull_request:
+    paths:
+      - "n8n-workflows/**"
+      - "tests/test_no_telegram_nodes.py"
+      - "tests/test_n8n3_always_output_data_guard.py"
+      - "tests/test_n8n_export_guards_ci.py"
+      - ".github/workflows/n8n-export-guards.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "expected: ${EXPECTED_SHA}"
+          echo "actual:   ${ACTUAL_SHA}"
+          test -n "${EXPECTED_SHA}"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: No Telegram node and no Always Output Data on a multi-output node
+        shell: bash
+        run: python -m unittest tests.test_no_telegram_nodes tests.test_n8n3_always_output_data_guard tests.test_n8n_export_guards_ci -v

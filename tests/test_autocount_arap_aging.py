@@ -2101,16 +2101,21 @@ class AlertRunTests(TempDirTestCase):
             "parties": {"online_shop_debtor_codes": ["DEBT-WEB"]},
             "alert": ALERT_ON,
         }), encoding="utf-8")
-        for data, expected in ((fixture_data(), arap.EXIT_OK), (outstanding_mismatch_data(), arap.EXIT_FAILED)):
-            for answer in (200, 502, OSError("down"), RuntimeError("bug")):
+        # Both runs really POST: the success run raises the AP notice (a clean fixture would raise
+        # nothing and never reach the transport), the failed run raises run_failed.
+        answers = ((200, "sent"), (502, "send_failed"), (OSError("down"), "send_failed"), (RuntimeError("bug"), "error"))
+        for data, expected in ((ap_payment_data(), arap.EXIT_OK), (outstanding_mismatch_data(), arap.EXIT_FAILED)):
+            for answer, alert_status in answers:
                 with self.subTest(expected=expected, answer=repr(answer)):
                     out = io.StringIO()
+                    transport = FakeTransport(answer)
                     with contextlib.redirect_stdout(out):
                         code = arap.main(["--config", str(config)], source=FakeSource(data), environ=ALERT_ENV,
-                                         clock=lambda: FIXED_NOW, alert_transport=FakeTransport(answer))
+                                         clock=lambda: FIXED_NOW, alert_transport=transport)
+                    self.assertEqual(len(transport.calls), 1)
                     self.assertEqual(code, expected)
                     printed = json.loads(out.getvalue())
-                    self.assertIn(printed["alert_status"], ("sent", "send_failed", "error", "no_alert", "suppressed"))
+                    self.assertEqual(printed["alert_status"], alert_status)
                     self.assertNotIn(ALERT_SECRET, out.getvalue())
                     if (self.tmp / "archive" / arap.ALERT_STATE_NAME).exists():
                         os.remove(self.tmp / "archive" / arap.ALERT_STATE_NAME)

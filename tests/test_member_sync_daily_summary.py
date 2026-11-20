@@ -794,20 +794,32 @@ class SendTests(SummaryTestCase):
         self.assertEqual((status, seen), (200, [["xb-member-sync-daily-summary/1"]]))
 
     def test_the_headers_are_cleared_after_every_send(self):
-        for status, error in ((200, None), (403, None), (None, OSError("down"))):
-            held = []
+        for status, error, outcome in (
+            (200, None, ("sent", 200, None)),
+            (403, None, ("send_failed", 403, "http_status")),
+            (None, OSError("down"), ("send_failed", None, "no_answer")),
+        ):
+            held, seen = [], []
 
-            def poster(url, headers, body, timeout, status=status, error=error):
+            def poster(url, headers, body, timeout, status=status, error=error, held=held, seen=seen):
+                # Record only: an assert in here would be swallowed by send_event's catch-all
+                # (as no_answer), so every check runs after the send.
                 held.append(headers)
-                self.assertEqual(headers["X-XB-Summary-Token"], "FAKE-SECRET-0001")
+                seen.append(dict(headers))
                 if error is not None:
                     raise error
                 return status
             with self.subTest(status=status, error=error):
                 self.run_daily(poster=poster)
-                # The same dict the poster got is empty after the send: secret and User-Agent gone.
-                (headers,) = held
+                (headers,), (sent,) = held, seen
+                # The poster got the secret and the summary's own User-Agent ...
+                self.assertEqual(sent["X-XB-Summary-Token"], "FAKE-SECRET-0001")
+                self.assertEqual(sent["User-Agent"], summary.USER_AGENT)
+                # ... and the same dict is empty after the send: secret and User-Agent gone.
                 self.assertEqual(headers, {})
+                self.assertEqual((self.record["email_status"], self.record["http_status"], self.record["send_error"]),
+                                 outcome)
+                self.assertEqual(self.result["email_status"], outcome[0])
 
     def test_the_secret_header_name_can_never_be_a_reserved_header(self):
         # HEADER_RE takes X- names only, so the secret header can never replace Content-Type,
