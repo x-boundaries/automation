@@ -536,10 +536,18 @@ scheduled re-entry; the lock covers a manual run overlapping a scheduled one.
 
 ### Failure alert
 
+**Dormant since #288 T1 (20 Nov 2026): it has no consumer.** The n8n alert ingress
+it posted to (`energygrid_alert_ingress.workflow.json`) was retired, and every owner
+notification is now email. Keep the private config's `alert` object unset (the same
+holds for the legacy Claude supervisor's `alert` setting). The live daily path
+(`native_cli daily`) never sends this alert; its failures reach the owner through the
+Core's FAILURE emails and the run monitor (`native_daily_claude_free.md` section 5).
+Removing the feature is a later EnergyGrid code round. The text below records how it
+behaved.
+
 When the private config carries an `alert` object, a failing `run` sends one POST
-to a loopback-only URL (127.0.0.1, localhost or ::1), consumed by the inactive
-`n8n-workflows/energygrid_alert_ingress.workflow.json`, which forwards it to the
-existing Telegram capability. The `energygrid.alert.v1` payload carries only
+to a loopback-only URL (127.0.0.1, localhost or ::1), formerly consumed by the n8n
+alert ingress. The `energygrid.alert.v1` payload carries only
 `schema, event, timestamp, run_id, stage, status, support_ref, exit_code, counts,
 attention_required`. An optional header credential is read from the environment
 variable named by `alert.auth_token_env`; the value is never logged. Delivery is
@@ -573,7 +581,7 @@ decision.
 - Whether Task Scheduler's `ExecutionTimeLimit` also terminates the Python child is
   unverified. An orphaned child would keep the run lock, and later starts would report
   `RUN_IN_PROGRESS` (alerted, without attention required) until it exits.
-- The n8n ingress answers after Telegram (`responseMode: lastNode`); a Telegram send
+- (Historical, the ingress is retired.) The n8n ingress answered after Telegram (`responseMode: lastNode`); a Telegram send
   slower than the runtime's 5-second alert timeout is logged as `alert_failed` although it
   was delivered. The product result is unaffected either way.
 - If the provider ever ages bills out of LIST, `EG_INVENTORY_KNOWN_BILL_MISSING` fails

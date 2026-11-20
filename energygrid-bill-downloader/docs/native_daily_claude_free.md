@@ -17,7 +17,7 @@ The normal daily run uses no model:
            Drive steps: LOCAL_SYNC write by the Core, then Google-side verification through n8n
            owner email: at most one attempt per notification through n8n
            status
-      -> egmonitor.cmd <run folder> (unchanged reporter and unchanged Telegram run monitor)
+      -> egmonitor.cmd <run folder> (unchanged reporter; the run monitor alerts by email, #288 T1)
 
 Everything the Claude host used to decide is already decided by the Core (`native_bridge.py`,
 `native_notify.py`). The daily runner (`native_daily.py`) only drives the same Core functions in a bounded
@@ -249,9 +249,11 @@ sources. Deliberate choices:
 
 ## 5. Failure visibility (C6)
 
-The run monitor and its reporter are byte-unchanged: the monitor alerts on a missing run report by 14:00
-SGT and on a bill still PENDING, and stays silent on FAILURE streams because the Core emails them. The
-daily runner keeps that contract true:
+The reporter is byte-unchanged and the monitor's rules are unchanged: the monitor alerts on a missing run
+report by 14:00 SGT and on a bill still PENDING, and stays silent on FAILURE streams because the Core emails
+them. Since #288 T1 (20 Nov 2026) the monitor sends its alerts by email through the shared `XB Ops Alert
+Email` workflow (system `ENERGYGRID`), not Telegram: `[XB alert] ENERGYGRID ERROR run_report_missing` and
+`[XB alert] ENERGYGRID WARN bill_pending:<stream>`. The daily runner keeps that contract true:
 
 - It **submits** the run report (the PowerShell script runs `egmonitor.cmd` once) only when every FAILURE
   notification this run called for was delivered (SENT).
@@ -259,13 +261,16 @@ daily runner keeps that contract true:
   (`EG_DAILY_FAILURE_NOTICE_UNDELIVERED`: n8n email unavailable, probe failed, ceiling reached), or a
   FAILURE notification became UNKNOWN or HOLD in this run (`EG_DAILY_FAILURE_NOTICE_UNCERTAIN`). It also
   withholds when the run itself failed (refused acquire, unexpected error, deadline). The unchanged monitor
-  then raises its one missed-report Telegram alert at 14:00 SGT. Nothing else sends a second message for
+  then raises its one missed-report email alert at 14:00 SGT. Nothing else sends a second message for
   the same run.
 - An undelivered PENDING notification is retried by the next run (it was never sealed), and the report
   resumes once it is delivered. UNKNOWN and HOLD are never retried.
 - Accepted limit (unchanged owner choice): with the PC off or n8n stopped across 14:00 there is no alert.
 
-This uses the owner-selected email channel. It does not move owner notices to Telegram.
+This uses the owner-selected email channel only: no owner notice goes to Telegram.
+
+If the missed-report email arrives: check Task Scheduler's last result for the 11:30 task and the newest
+run folder's `daily.json` (`withheld_reasons`), then the Core status. Never replay bill effects by hand.
 
 ## 6. Non-public webhooks (C7)
 

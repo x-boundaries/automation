@@ -10,7 +10,7 @@ Gets every new EnergyGrid EB Bill and Tenant Bill into Google Drive, checked aga
 
 - **Where it runs:** one Windows PC with Task Scheduler (the user must be signed in), Google Drive for desktop, and a local n8n.
 - **Daily bills (11:30 SGT):** downloads the newest bills, saves each PDF to Drive, checks Google's copy, and emails the owner. Runbook: [Claude-free daily run](energygrid-bill-downloader/docs/native_daily_claude_free.md).
-- **Run monitor:** a Telegram alert if the daily run has not reported by 14:00 SGT or a bill is still pending. Runbook: [run monitor](n8n-workflows/energygrid_local_failure_monitor/README.md).
+- **Run monitor:** an email alert (through the shared XB Ops Alert Email workflow) if the daily run has not reported by 14:00 SGT or a bill is still pending. Runbook: [run monitor](n8n-workflows/energygrid_local_failure_monitor/README.md).
 - **Log cleanup (19:30 SGT):** keeps 90 days of clean run logs and archives every run that had a problem. Runbook: [run-log retention](energygrid-bill-downloader/docs/run_log_retention.md).
 
 <details>
@@ -24,8 +24,8 @@ n8n-workflows/energygrid_local_failure_monitor/README.md, and
 energygrid-bill-downloader/docs/run_log_retention.md (sections 1 to 6).
 
 I will give you the private values when you ask: the EnergyGrid portal sign-in, the Google Drive
-folder and its account, the owner email address, the n8n header token, and the Telegram bot and
-chat. Never write them into the repo, a commit, or a log.
+folder and its account, the owner email address, the n8n header token, and the ID of the live
+XB Ops Alert Email workflow. Never write them into the repo, a commit, or a log.
 
 Ask me separately before each live action: installing or copying files, changing ACLs, importing
 into n8n, binding credentials, creating the Data Table, activating a workflow, daily-preflight,
@@ -44,8 +44,9 @@ Do these steps in order:
 3. Import into the local n8n as inactive, then bind credentials:
    n8n-workflows/energygrid_drive_verify.workflow.json,
    n8n-workflows/energygrid_owner_email.workflow.json, and
-   n8n-workflows/energygrid_local_failure_monitor.workflow.json (set ENABLE_OWNER_ALERTS to true
-   in the live copy only). Create the email claim Data Table.
+   n8n-workflows/energygrid_local_failure_monitor.workflow.json (in the live copy only, set
+   ENABLE_OWNER_ALERTS to true and the XB Ops Alert Email workflow ID, which must already be
+   published). Create the email claim Data Table.
 4. Prove the Drive Verify and Owner Email webhooks are not reachable from the internet
    (section 6), activate the three workflows, then prove it again.
 5. Run daily-preflight as the signed-in task user.

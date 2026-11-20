@@ -6,13 +6,11 @@ on:
       - "energygrid-bill-downloader/**"
       - "scripts/energygrid_one_shot_supervisor.ps1"
       - ".github/workflows/energygrid-bill-downloader-tests.yml"
-      # EnergyGrid n8n error handler (#141): the source-controlled export, its focused
-      # offline test, and the directory README that documents it. Exact entries, not a
-      # broad n8n-workflows/** or tests/** glob, which would widen the reviewed trigger
-      # surface beyond what this workflow owns.
-      - "n8n-workflows/energygrid_download_error_handler.workflow.json"
-      - "n8n-workflows/energygrid_alert_ingress.workflow.json"
-      - "tests/test_energygrid_n8n_error_handler.py"
+      # EnergyGrid n8n exports and their focused offline tests, with exact entries, not a broad
+      # n8n-workflows/** or tests/** glob, which would widen the reviewed trigger surface beyond
+      # what this workflow owns. Run monitor (#288 T1): the export and its package folder.
+      - "n8n-workflows/energygrid_local_failure_monitor.workflow.json"
+      - "n8n-workflows/energygrid_local_failure_monitor/**"
       # Invoice delivery (#226/#228): inactive sanitized export and focused offline test.
       - "n8n-workflows/energygrid_invoice_delivery.workflow.json"
       - "tests/test_energygrid_invoice_delivery_workflow.py"
@@ -167,13 +165,18 @@ jobs:
         if: matrix.shard == 'rest' && steps.supervisor_custody.outputs.applicable == 'true'
         shell: powershell
         run: python -m unittest discover -s energygrid-bill-downloader/tests -p "test_one_shot_supervisor.py" -v
-      - name: EnergyGrid n8n error handler focused test
+      - name: EnergyGrid n8n run monitor focused offline tests
         if: matrix.shard == 'rest'
-        # The project suite above discovers only energygrid-bill-downloader/tests, so the
-        # root-level focused test needs its own step. Standard library plus the runner's
-        # Node, which executes the committed n8n expressions offline; no n8n instance.
+        # #288 T1: the project suite above discovers only energygrid-bill-downloader/tests, so the
+        # monitor package needs its own step: the reporter unit tests, then Node runs the committed
+        # Code nodes and the XB Ops Alert Email request contract offline; no n8n or Gmail contact.
         shell: pwsh
-        run: python -m unittest discover -s tests -p "test_energygrid_n8n_error_handler.py" -v
+        working-directory: n8n-workflows/energygrid_local_failure_monitor
+        run: |
+          python -m unittest -v test_energygrid_monitor.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node test_n8n_workflow_code.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: EnergyGrid n8n invoice delivery focused offline test
         if: matrix.shard == 'rest'
         # Root-level export coverage runs the committed Code-node JavaScript with Node;
@@ -207,10 +210,14 @@ jobs:
           $base = (git merge-base HEAD origin/main).Trim()
           git diff --check $base HEAD
           $files = @(git diff --name-only $base HEAD)
+          # #288 T1 deleted the download error handler, the alert ingress and their test. Their entries
+          # stay owned so the pull request that deletes them stays in scope; they are inert on main.
           $owned = @($files | Where-Object {
             $_ -match '^energygrid-bill-downloader/' -or
+            $_ -match '^n8n-workflows/energygrid_local_failure_monitor/' -or
             $_ -eq 'scripts/energygrid_one_shot_supervisor.ps1' -or
             $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or
+            $_ -eq 'n8n-workflows/energygrid_local_failure_monitor.workflow.json' -or
             $_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or
             $_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or
             $_ -eq 'tests/test_energygrid_n8n_error_handler.py' -or
@@ -230,8 +237,10 @@ jobs:
           } else {
             foreach ($file in $files) {
               if ($file -notmatch '^energygrid-bill-downloader/' -and
+                  $file -notmatch '^n8n-workflows/energygrid_local_failure_monitor/' -and
                   $file -ne 'scripts/energygrid_one_shot_supervisor.ps1' -and
                   $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
+                  $file -ne 'n8n-workflows/energygrid_local_failure_monitor.workflow.json' -and
                   $file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and
                   $file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and
                   $file -ne 'tests/test_energygrid_n8n_error_handler.py' -and
