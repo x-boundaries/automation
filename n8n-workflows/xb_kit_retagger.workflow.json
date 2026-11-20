@@ -13,7 +13,7 @@
         -620
       ],
       "parameters": {
-        "content": "# START HERE: XB Kit Re-tagger (#269)\n\n- **When:** daily 03:00 SGT (workflow timezone Asia/Singapore), or by hand with Manual Run.\n- **Scope:** every ACTIVE product on the XB Shopify store. Only product tags change: the 30 kit tags `kit-<kit>` (8) and `ks-<slot>` (22) from the XT kit rules v1. `kit-no`, `kit-pin-<kit>`, unknown `kit-`/`ks-` tags and every other tag are never touched.\n- **Flow:** settings -> one access token -> read all active products (100 per page) -> work out the tag changes -> dry run report, cap check or tag writes -> one email through **XB Ops Alert Email** (system `KIT-RETAG`).\n- **Safe by default:** `DRY_RUN` is on: it reads and emails the list but writes nothing. A real run stops before any write when more than `CHANGE_CAP` (25) products would change or more than `REMOVE_CAP` (10) would lose a kit tag (one WARN email). `CAP_OVERRIDE` is the owner's one-run switch.\n- **Emails:** dry run report and real changes (`[XB daily] KIT-RETAG DRYRUN|CHANGED <date>`), over-cap WARN and failures ERROR (`[XB alert] KIT-RETAG ...`). Nothing on a day with no change.\n- **Failures:** a failed token, read, throttle or incomplete read writes nothing and sends one ERROR. Failed writes are listed by product handle; tag writes are safe to repeat, so the next run repairs them.\n- **No saved executions** (the access token is in item data). Recovery: deactivate, run by hand with `DRY_RUN` on, read the list.\n- Rules change only by a reviewed repo PR (`tests/fixtures/xb_kit_rules_v1.fixture`), never fetched at run time. Runbook: `docs/xb_kit_retagger.md`.",
+        "content": "# START HERE: XB Kit Re-tagger (#269)\n\n- **When:** daily 03:00 SGT (workflow timezone Asia/Singapore), or by hand with Manual Run.\n- **Scope:** every ACTIVE product on the XB Shopify store. Only product tags change: the 30 kit tags `kit-<kit>` (8) and `ks-<slot>` (22) from the XT kit rules v1. `kit-no`, `kit-pin-<kit>`, unknown `kit-`/`ks-` tags and every other tag are never touched.\n- **Hands-off (owner, 21 Nov 2026):** no routine email. A good run, a quiet run and a dry run send nothing. The only emails are errors, each one plain-English ERROR through **XB Ops Alert Email** (system `KIT-RETAG`), and the run then ends as failed.\n- **Flow:** settings -> one access token -> read all active products (100 per page) -> work out the tag changes -> tag writes -> check them. Any problem -> one error email -> stop.\n- **Never fights a person:** the workflow keeps a record (workflow static data `kitTagRecord`) of the tags it added or removed. A tag it removed that a person put back is never removed again; a tag it added that a person took off is never added again. Silent. Only scheduled runs keep the record (n8n does not save static data from manual runs).\n- **Removal brake:** when the night's plan would take known tags off more products than normal (more than 10% of the products that carry one, and more than 10), nothing changes that night and one ERROR is sent. Adds are never limited.\n- **Dry run:** `DRY_RUN` is on in this export. A dry run writes nothing and sends nothing: its plan is in the output of **Work Out Kit Tag Changes**, read by Claude at the live steps.\n- **No saved executions** (the access token is in item data). Rules change only by a reviewed repo PR (`tests/fixtures/xb_kit_rules_v1.fixture`), never fetched at run time. Runbook: `docs/xb_kit_retagger.md`.",
         "height": 560,
         "width": 900
       }
@@ -28,7 +28,7 @@
         -620
       ],
       "parameters": {
-        "content": "# Setup (local import copy only)\n\n- Import inactive. **XB Ops Alert Email** must already accept system `KIT-RETAG` (re-imported first).\n- Bind the Shopify app credential on **Get Shopify Access Token** only (type and fields: runbook). No other node has a credential.\n- First real run, activation and any cap override each need their own owner OK.\n\n## Required manual configuration:\n\n- **Run Settings**\n  - `SHOP_DOMAIN`: replace `REPLACE_WITH_SHOPIFY_SHOP_DOMAIN` with the store's myshopify domain (in the local import copy, never in the repo).\n  - `DRY_RUN`: leave `true` until the owner OKs a real run.\n- **Send Kit Alert**\n  - `Workflow`: replace `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the live XB Ops Alert Email workflow id.",
+        "content": "# Setup (local import copy only)\n\n- Import inactive. **XB Ops Alert Email** must already accept system `KIT-RETAG` (re-imported first).\n- Bind the Shopify app credential on **Get Shopify Access Token** only (type and fields: runbook). No other node has a credential.\n- The first real run and activation each need their own owner OK.\n\n## Required manual configuration:\n\n- **Run Settings**\n  - `SHOP_DOMAIN`: replace `REPLACE_WITH_SHOPIFY_SHOP_DOMAIN` with the store's myshopify domain (in the local import copy, never in the repo).\n  - `DRY_RUN`: leave `true` until the owner OKs a real run; `false` at activation.\n- **Send Kit Alert**\n  - `Workflow`: replace `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the live XB Ops Alert Email workflow id.",
         "height": 560,
         "width": 760
       }
@@ -43,7 +43,7 @@
         -40
       ],
       "parameters": {
-        "content": "# Read\n\n- One token per run (client credentials grant, valid 24 h), retried up to 3 times.\n- Active products, 100 per page, 1 s apart, at most 40 pages, plus Shopify's exact count of active products.\n- A failed or throttled page stops the run in the next step: no writes.",
+        "content": "# Read\n\n- One token per run (client credentials grant, valid 24 h), retried up to 3 times.\n- Active products, 100 per page, 1 s apart, at most 40 pages, plus Shopify's exact count of active products.\n- A failed or throttled page or an incomplete read stops the run in the next step: no writes, one error email.",
         "height": 200,
         "width": 640
       }
@@ -58,7 +58,7 @@
         -40
       ],
       "parameters": {
-        "content": "# Decide\n\n- The kit rules are pasted in **Work Out Kit Tag Changes** (logic fields only).\n- Mode: failed, dry_run, no_change (quiet), over_cap (WARN, no writes) or write.\n- An unexpected Code error sends one ERROR (Build Unexpected Alert).",
+        "content": "# Decide\n\n- The kit rules are pasted in **Work Out Kit Tag Changes** (logic fields only).\n- Mode: failed or braked (error email, no writes), dry_run (plan in the output only), no_change (quiet) or write.\n- People's own tag changes are left alone (record in workflow static data).\n- An unexpected Code error sends one error email (Build Unexpected Alert).",
         "height": 200,
         "width": 640
       }
@@ -73,7 +73,7 @@
         -40
       ],
       "parameters": {
-        "content": "# Write\n\n- One GraphQL request per changed product, 1 every 500 ms: `tagsAdd` and/or `tagsRemove` only.\n- Retried up to 3 times (safe to repeat). Any HTTP error, GraphQL error or userErrors is a failed write.\n- Check Write Results sends the CHANGED report or one write_failed ERROR.",
+        "content": "# Write\n\n- One GraphQL request per changed product, 1 every 500 ms: `tagsAdd` and/or `tagsRemove` only.\n- Retried up to 3 times (safe to repeat). Any HTTP error, GraphQL error or userErrors is a failed write.\n- Check Write Results records what went through; all good -> no email; any failure -> one error email.\n- After any error email, **End Run As Failed** stops the run so it counts as a failed run.",
         "height": 200,
         "width": 760
       }
@@ -112,7 +112,7 @@
       "parameters": {}
     },
     {
-      "id": "00000000-0000-4000-8269-000000000014",
+      "id": "00000000-0000-4000-8269-000000000011",
       "name": "Run Settings",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
@@ -131,30 +131,12 @@
             },
             {
               "id": "00000000-0000-4000-8269-000000000009",
-              "name": "CHANGE_CAP",
-              "value": 25,
-              "type": "number"
-            },
-            {
-              "id": "00000000-0000-4000-8269-000000000010",
-              "name": "REMOVE_CAP",
-              "value": 10,
-              "type": "number"
-            },
-            {
-              "id": "00000000-0000-4000-8269-000000000011",
-              "name": "CAP_OVERRIDE",
-              "value": false,
-              "type": "boolean"
-            },
-            {
-              "id": "00000000-0000-4000-8269-000000000012",
               "name": "API_VERSION",
               "value": "2026-10",
               "type": "string"
             },
             {
-              "id": "00000000-0000-4000-8269-000000000013",
+              "id": "00000000-0000-4000-8269-000000000010",
               "name": "SHOP_DOMAIN",
               "value": "REPLACE_WITH_SHOPIFY_SHOP_DOMAIN",
               "type": "string"
@@ -165,7 +147,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8269-000000000015",
+      "id": "00000000-0000-4000-8269-000000000012",
       "name": "Get Shopify Access Token",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -219,7 +201,7 @@
       "executeOnce": true
     },
     {
-      "id": "00000000-0000-4000-8269-000000000016",
+      "id": "00000000-0000-4000-8269-000000000013",
       "name": "Read Active Products",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -285,7 +267,7 @@
       "executeOnce": true
     },
     {
-      "id": "00000000-0000-4000-8269-000000000017",
+      "id": "00000000-0000-4000-8269-000000000014",
       "name": "Work Out Kit Tag Changes",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -295,12 +277,12 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Kit tag plan for XB Kit Re-tagger (#269). Reads only the outputs of earlier nodes; makes no HTTP\n// call, reads no environment value and never sees a secret except to check the token step worked.\n// 1. Refuse (no writes, one ERROR alert) when the token step failed, any product page failed, was\n//    throttled or has no data, the read stopped early, or the products scanned differ from Shopify's\n//    count of active products.\n// 2. For each active product, work out the kit tags it should have from RULES (XT rules v1, logic\n//    fields only; a rules change is a reviewed repo PR, never fetched at run time).\n// 3. Only the 30 known tags (kit-<kit>, ks-<slot>) are ever added or removed. kit-no, kit-pin-<kit>,\n//    unknown kit-/ks- tags and every other tag are never touched.\n// 4. Decide the run mode: failed, dry_run, no_change, over_cap or write (see Run Settings).\n// Partner logic (clause match, exclude words, kit-no, kit-pin-<kit>) is kept unchanged in behaviour.\nconst RULES = {\"slots\":{\"merino_base\":{\"any\":[{\"vendor\":[\"Icebreaker\",\"Smartwool\"],\"not_type\":[\"Socks\",\"Dress\",\"Skirt\",\"Bra\",\"Underwear\"]},{\"tag\":[\"Base Layer\",\"MerinoLOFT\",\"ZEO-LINE\"]}]},\"cool_layer\":{\"any\":[{\"tag\":[\"Keep Cool\",\"Quick Dry\",\"UV Protection\",\"Breathable\"],\"type\":[\"T-Shirt\",\"T-shirt\",\"Shirt\",\"Pants\",\"Shorts\",\"Arm Cover\",\"Hat\",\"Cap\",\"Headwear\"]}]},\"insulation\":{\"any\":[{\"tag\":[\"Down\",\"Down Jacket\",\"Insulated Jacket\",\"Synthetic Insulation\",\"PrimaLoft\",\"EXCELOFT\",\"Insulation\",\"Realfleece\"],\"type\":[\"Jacket\",\"Vest\",\"Coat\"]}]},\"light_insul\":{\"any\":[{\"tag\":[\"EXCELOFT\",\"Realfleece\",\"Synthetic Insulation\",\"Soft Shell\"],\"type\":[\"Jacket\",\"Vest\",\"Sweatshirt\"]},{\"tag\":[\"Down\"],\"title\":[\"superior\",\"ex light\",\"plasma\",\"u.l.\"]}]},\"shell\":{\"any\":[{\"tag\":[\"Rain Jacket\",\"Waterproof Shell\",\"GORE-TEX\",\"Rain Gear\",\"Rain Gears\",\"Rain Pants\",\"DRY-TEC\"]},{\"type\":[\"Rain Coat\",\"Rain Pants\",\"Rain Poncho\",\"Backpack Rain Cover\"]}]},\"warm_acc\":{\"any\":[{\"type\":[\"Gloves\",\"Beanie\"]},{\"tag\":[\"Balaclava\",\"Keep Warm\"],\"type\":[\"Gloves\",\"Beanie\",\"Headwear\",\"Accessories\",\"Accessory\"]},{\"vendor\":[\"Hothands\"]}]},\"socks\":{\"any\":[{\"type\":[\"Socks\"]}]},\"poles\":{\"any\":[{\"type\":[\"Trekking Poles\",\"Hiking Pole\"]},{\"tag\":[\"Trekking Poles\",\"Hiking Pole\"]}]},\"light\":{\"any\":[{\"type\":[\"Headlamp\",\"Lights\"]},{\"tag\":[\"Headlamp\",\"Torch Light\",\"Lanterns\"]}]},\"tool_trail\":{\"any\":[{\"vendor\":[\"Leatherman\"],\"tag\":[\"lm-multi-tool\",\"lm-keychain\"]}]},\"tool_edc\":{\"any\":[{\"vendor\":[\"Leatherman\"],\"tag\":[\"lm-edc\",\"lm-keychain\"]}]},\"power\":{\"any\":[{\"vendor\":[\"BioLite\"]}]},\"sleep\":{\"any\":[{\"type\":[\"Sleeping Bag\",\"Sleeping Bag Liners\",\"Sleeping\",\"Sleep\",\"Travel Pillow\"]}]},\"pack_day\":{\"any\":[{\"type\":[\"Backpack\"],\"tag\":[\"Daypack\",\"20-28L\",\"30L\"]}]},\"pack_trek\":{\"any\":[{\"type\":[\"Backpack\"],\"tag\":[\"30L\",\"40L\",\"50-55L\",\"60-65L\"]},{\"tag\":[\"Luggage and Duffle\"]}]},\"hydration\":{\"any\":[{\"type\":[\"Bottle\",\"Water Pack\",\"Water Tube\",\"Bottle Accessories\"]},{\"tag\":[\"Hydration\"]}]},\"kolon\":{\"any\":[{\"vendor\":[\"Kolon Sport\"]}]},\"travel\":{\"any\":[{\"type\":[\"Travel Accessories\",\"Travel accessories\",\"Wallet\",\"Lock\",\"Travel Pillow\",\"Bags\"]},{\"tag\":[\"Travel kit\",\"Travel/Packable\",\"Travel / Packable\",\"packable\"],\"type\":[\"Jacket\",\"Bags\",\"Shirt\",\"Pants\",\"Travel Accessories\"]}]},\"alpine\":{\"any\":[{\"tag\":[\"Alpine\",\"Expedition\",\"Climbing\"]},{\"type\":[\"Crampon\",\"Ice Axe\",\"Climbing Accessories\",\"Helmet\",\"Carabiner\"]}]},\"water\":{\"any\":[{\"tag\":[\"Water Sport\",\"Diving\",\"Sandals\"]},{\"type\":[\"Towel\"]}]},\"bike\":{\"any\":[{\"tag\":[\"Cycling\",\"Bicycle\",\"Bicycle Accessories\"]},{\"type\":[\"Bicycle Accessories\",\"Bicycle Tools\",\"Helmet\"]}]},\"footwear\":{\"any\":[{\"type\":[\"Footwear\",\"Shoes\"],\"not_tag\":[\"Sandals\"]},{\"tag\":[\"Shoes\"],\"not_tag\":[\"Sandals\"]}]}},\"profiles\":{\"tropical\":{\"slots\":[\"cool_layer\",\"shell\",\"socks\",\"poles\",\"light\",\"tool_trail\",\"hydration\",\"pack_day\",\"footwear\"]},\"hut\":{\"slots\":[\"merino_base\",\"light_insul\",\"shell\",\"socks\",\"poles\",\"light\",\"tool_trail\",\"pack_day\",\"hydration\",\"kolon\",\"footwear\"]},\"himalaya\":{\"slots\":[\"merino_base\",\"insulation\",\"shell\",\"warm_acc\",\"socks\",\"poles\",\"light\",\"tool_trail\",\"sleep\",\"pack_trek\",\"hydration\",\"power\",\"kolon\"]},\"expedition\":{\"slots\":[\"merino_base\",\"insulation\",\"shell\",\"warm_acc\",\"socks\",\"light\",\"tool_trail\",\"sleep\",\"pack_trek\",\"power\",\"alpine\"]},\"winter\":{\"slots\":[\"merino_base\",\"insulation\",\"shell\",\"warm_acc\",\"socks\",\"light\",\"power\",\"kolon\",\"footwear\"]},\"travel\":{\"slots\":[\"travel\",\"cool_layer\",\"merino_base\",\"shell\",\"socks\",\"tool_edc\",\"kolon\",\"pack_day\"]},\"island\":{\"slots\":[\"water\",\"cool_layer\",\"hydration\",\"tool_edc\",\"pack_day\"]},\"ride\":{\"slots\":[\"bike\",\"cool_layer\",\"shell\",\"tool_trail\",\"light\",\"hydration\"]}},\"exclude\":{\"title_words\":[\"kid\",\"kids\",\"kid's\",\"kids'\",\"junior\",\"toddler\",\"baby\",\"baby's\",\"boxer\",\"boxers\",\"brief\",\"briefs\",\"bikini\",\"thong\",\"bra\",\"bralette\",\"hipster\",\"panty\",\"panties\"],\"types\":[\"Underwear\",\"Bra\"]}};\nconst ADD_ONLY = 'mutation KitTagsAdd($id: ID!, $add: [String!]!) { add: tagsAdd(id: $id, tags: $add) { node { id } userErrors { field message } } }';\nconst REMOVE_ONLY = 'mutation KitTagsRemove($id: ID!, $remove: [String!]!) { remove: tagsRemove(id: $id, tags: $remove) { node { id } userErrors { field message } } }';\nconst ADD_AND_REMOVE = 'mutation KitTagsChange($id: ID!, $add: [String!]!, $remove: [String!]!) { add: tagsAdd(id: $id, tags: $add) { node { id } userErrors { field message } } remove: tagsRemove(id: $id, tags: $remove) { node { id } userErrors { field message } } }';\nconst GID_RE = /^gid:\\/\\/shopify\\/Product\\/[0-9]{1,20}$/;\nconst MAX_LIST = 25;\n\nconst settings = $('Run Settings').first().json;\nconst token = $('Get Shopify Access Token').first().json;\nconst pages = $input.all().map((item) => item.json);\nconst sgtDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);\n\nconst norm = (s) => (typeof s === 'string' ? s : '').trim().toLowerCase();\nconst safe = (s) => norm(s).replace(/[^a-z0-9._-]/g, '?').slice(0, 80);\nconst KITS = Object.keys(RULES.profiles);\nconst KNOWN = new Set([...KITS.map((k) => 'kit-' + k), ...Object.keys(RULES.slots).map((s) => 'ks-' + s)]);\nconst managed = (tag) => KNOWN.has(norm(tag));\nconst looksManaged = (tag) => {\n  const x = norm(tag);\n  return (x.startsWith('kit-') || x.startsWith('ks-')) && x !== 'kit-no' && !x.startsWith('kit-pin-');\n};\n\nconst httpCode = (error) => {\n  const text = typeof error === 'string' ? error : JSON.stringify(error || '');\n  const match = /\\b([45][0-9][0-9])\\b/.exec(text);\n  return match ? 'http_' + match[1] : 'request_error';\n};\nconst pageProblem = (page) => {\n  if (!page || typeof page !== 'object') return 'no_page';\n  if (page.error !== undefined) return httpCode(page.error);\n  if (Array.isArray(page.errors) && page.errors.length) {\n    return page.errors.some((e) => e && e.extensions && e.extensions.code === 'THROTTLED') ? 'throttled' : 'graphql_errors';\n  }\n  const products = page.data && page.data.products;\n  if (!products || !Array.isArray(products.nodes) || !products.pageInfo) return 'no_data';\n  return '';\n};\n\nconst failed = (key, lines) => [{ json: { mode: 'failed', writes: [], alert: {\n  severity: 'ERROR', key, short: key,\n  lines: ['Kit re-tagger ' + sgtDate + ': ' + key + '. Nothing was written.', ...lines,\n    'Next: the next daily run tries again. If it repeats, open n8n and run XB Kit Re-tagger by hand with DRY_RUN on.'],\n} } }];\n\n// ---- 1. the token and the read ---- //\nif (!token || token.error !== undefined || typeof token.access_token !== 'string' || token.access_token.length < 10) {\n  return failed('token_failed', ['Token request: ' + (token && token.error !== undefined ? httpCode(token.error) : 'no_token')]);\n}\nif (pages.length === 0) return failed('read_failed', ['Product read: no_page']);\nfor (let i = 0; i < pages.length; i += 1) {\n  const problem = pageProblem(pages[i]);\n  if (problem) return failed('read_failed', ['Product read: ' + problem + ' on page ' + (i + 1) + ' of ' + pages.length]);\n}\nconst last = pages[pages.length - 1].data.products.pageInfo;\nconst count = pages[0].data.productsCount;\nconst products = pages.flatMap((page) => page.data.products.nodes);\nconst ids = new Set(products.map((p) => p && p.id));\nconst incomplete = [];\nif (last.hasNextPage !== false) incomplete.push('read stopped at the page limit (' + pages.length + ' pages)');\nif (!count || typeof count.count !== 'number' || count.precision !== 'EXACT') incomplete.push('no exact active product count');\nelse if (count.count !== products.length) incomplete.push('scanned ' + products.length + ' of ' + count.count + ' active products');\nif (ids.size !== products.length) incomplete.push('duplicate or missing product ids');\nconst bad = products.filter((p) => !p || !GID_RE.test(p.id) || !Array.isArray(p.tags) || p.status !== 'ACTIVE');\nif (bad.length) incomplete.push(bad.length + ' product rows with a bad id, tag list or status');\nif (incomplete.length) return failed('read_incomplete', incomplete.map((reason) => 'Product read: ' + reason));\n\n// ---- 2. desired kit tags (partner logic) ---- //\nfunction clauseMatch(c, v, t, tags, title) {\n  const tg = new Set(tags.map(norm));\n  if (c.vendor && !c.vendor.map(norm).includes(norm(v))) return false;\n  if (c.type && !c.type.map(norm).includes(norm(t))) return false;\n  if (c.not_type && c.not_type.map(norm).includes(norm(t))) return false;\n  if (c.tag && !c.tag.map(norm).some((x) => tg.has(x))) return false;\n  if (c.not_tag && c.not_tag.map(norm).some((x) => tg.has(x))) return false;\n  if (c.title && !c.title.map(norm).some((x) => norm(title).includes(x))) return false;\n  return true;\n}\nfunction excluded(p) {\n  const ex = RULES.exclude || {};\n  if ((ex.types || []).map(norm).includes(norm(p.productType))) return true;\n  const words = (ex.title_words || []).map((w) => w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'));\n  return words.length > 0 && new RegExp(\"(?<![\\\\w'])(\" + words.join('|') + \")(?![\\\\w'])\", 'i').test(p.title || '');\n}\nfunction desired(p) {\n  const tg = new Set(p.tags.map(norm));\n  if (tg.has('kit-no') || p.status !== 'ACTIVE' || excluded(p)) return new Set();\n  const slots = Object.entries(RULES.slots)\n    .filter(([, s]) => s.any.some((c) => clauseMatch(c, p.vendor, p.productType, p.tags, p.title)))\n    .map(([k]) => k);\n  const out = new Set();\n  const used = new Set();\n  for (const [name, prof] of Object.entries(RULES.profiles)) {\n    if (prof.slots.some((s) => slots.includes(s)) || tg.has('kit-pin-' + name)) {\n      out.add('kit-' + name);\n      prof.slots.forEach((s) => used.add(s));\n    }\n  }\n  slots.filter((s) => used.has(s)).forEach((s) => out.add('ks-' + s));\n  return out;\n}\n\nconst changes = [];\nconst unknown = new Set();\nfor (const p of products) {\n  p.tags.filter((t) => looksManaged(t) && !managed(t)).forEach((t) => unknown.add(safe(t)));\n  const want = desired(p);\n  const have = new Set(p.tags.filter(managed).map(norm));\n  const add = [...want].filter((t) => !have.has(t)).sort();\n  const remove = p.tags.filter((t) => managed(t) && !want.has(norm(t)));\n  if (add.length || remove.length) changes.push({ id: p.id, handle: safe(p.handle), add, remove });\n}\n\n// ---- 3. counts, caps and the run mode ---- //\nconst kitRemovals = changes.filter((c) => c.remove.some((t) => norm(t).startsWith('kit-'))).length;\nconst perKit = KITS.map((k) => {\n  const plus = changes.filter((c) => c.add.includes('kit-' + k)).length;\n  const minus = changes.filter((c) => c.remove.some((t) => norm(t) === 'kit-' + k)).length;\n  return plus || minus ? 'kit-' + k + ' +' + plus + ' -' + minus : '';\n}).filter(Boolean);\nconst changeCap = Number(settings.CHANGE_CAP);\nconst removeCap = Number(settings.REMOVE_CAP);\nif (!Number.isInteger(changeCap) || changeCap < 1 || !Number.isInteger(removeCap) || removeCap < 0) {\n  return failed('unexpected', ['Run Settings: CHANGE_CAP and REMOVE_CAP must be whole numbers']);\n}\nconst overCap = changes.length > changeCap || kitRemovals > removeCap;\nconst override = settings.CAP_OVERRIDE === true;\nconst dryRun = settings.DRY_RUN !== false;\n\nconst counts = [\n  'Active products scanned: ' + products.length + '. Products to change: ' + changes.length\n    + ' (cap ' + changeCap + '). Products losing a kit tag: ' + kitRemovals + ' (cap ' + removeCap + ').',\n  'Tags to add: ' + changes.reduce((n, c) => n + c.add.length, 0)\n    + '. Tags to remove: ' + changes.reduce((n, c) => n + c.remove.length, 0) + '.',\n  ...(perKit.length ? ['Per kit: ' + perKit.join(', ')] : []),\n  ...(unknown.size ? ['Unknown kit-/ks- tags left alone: ' + [...unknown].sort().slice(0, 10).join(' ')] : []),\n];\nconst handleLines = (limit) => {\n  const shown = changes.slice(0, limit).map((c) => ('- ' + c.handle + ' ' + [...c.add.map((t) => '+' + t),\n    ...c.remove.map((t) => '-' + norm(t))].join(' ')).slice(0, 300));\n  return changes.length > limit ? [...shown, '... and ' + (changes.length - limit) + ' more'] : shown;\n};\nconst fit = (head, limit, tail) => {\n  for (let n = limit; n >= 0; n -= 1) {\n    const lines = [...head, ...(changes.length ? [''] : []), ...handleLines(n), ...(tail.length ? ['', ...tail] : [])];\n    if (lines.length <= 30 && lines.join('\\n').length <= 4000) return lines;\n  }\n  return [...head, ...tail].slice(0, 30);\n};\nconst writes = changes.map((c) => ({\n  id: c.id,\n  handle: c.handle,\n  query: c.add.length && c.remove.length ? ADD_AND_REMOVE : (c.add.length ? ADD_ONLY : REMOVE_ONLY),\n  variables: { id: c.id, ...(c.add.length ? { add: c.add } : {}), ...(c.remove.length ? { remove: c.remove } : {}) },\n}));\nconst summary = { scanned: products.length, changed: changes.length, kit_removals: kitRemovals };\n\nif (dryRun) {\n  const capNote = overCap\n    ? (override ? 'Over the cap, but CAP_OVERRIDE is on: a real run would write these.' : 'Over the cap: a real run would write nothing and send a change_cap warning.')\n    : 'Within the cap: a real run would write these.';\n  return [{ json: { mode: 'dry_run', summary, writes: [], alert: { severity: 'INFO', key: 'daily_summary',\n    short: 'DRYRUN ' + sgtDate,\n    lines: fit(['Kit re-tagger DRY RUN ' + sgtDate + ': nothing was written.', ...counts, capNote], MAX_LIST,\n      ['To write: set DRY_RUN to false in Run Settings for one manual run (owner OK).']) } } }];\n}\nif (changes.length === 0) return [{ json: { mode: 'no_change', summary, writes: [], alert: null } }];\nif (overCap && !override) {\n  return [{ json: { mode: 'over_cap', summary, writes: [], alert: { severity: 'WARN', key: 'change_cap', short: 'change_cap',\n    lines: fit(['Kit re-tagger ' + sgtDate + ': over the change cap, nothing was written.', ...counts], 20,\n      ['Next: run it by hand with DRY_RUN on and check the list. If it is right, the owner sets CAP_OVERRIDE to true for one manual run.']) } } }];\n}\nreturn [{ json: { mode: 'write', summary, writes, alert: null } }];\n"
+        "jsCode": "// Kit tag plan for XB Kit Re-tagger (#269). Reads only the outputs of earlier nodes and this workflow's\n// own record (workflow static data); makes no HTTP call, reads no environment value and never sees a\n// secret except to check the token step worked. Hands-off (owner, 21 Nov 2026): no routine email.\n// 1. Refuse (no writes, one ERROR alert) when the token step failed, any product page failed, was\n//    throttled or has no data, the read stopped early, or the products scanned differ from Shopify's\n//    count of active products.\n// 2. For each active product, work out the kit tags it should have from RULES (XT rules v1, logic\n//    fields only; a rules change is a reviewed repo PR, never fetched at run time).\n// 3. Only the 30 known tags (kit-<kit>, ks-<slot>) are ever added or removed. kit-no, kit-pin-<kit>,\n//    unknown kit-/ks- tags and every other tag are never touched.\n// 4. Never fight a person: a known tag this workflow removed and a person put back is never removed\n//    again; a known tag this workflow added and a person took off is never added again. Silent.\n// 5. Removal brake: when the night's planned removals are far above normal, change nothing and send\n//    one ERROR alert (the run then ends as failed). Adds are never limited.\n// 6. Mode: failed, braked, dry_run (plan in this node's output only, no email), no_change or write.\n// Partner logic (clause match, exclude words, kit-no, kit-pin-<kit>) is kept unchanged in behaviour.\nconst RULES = {\"slots\":{\"merino_base\":{\"any\":[{\"vendor\":[\"Icebreaker\",\"Smartwool\"],\"not_type\":[\"Socks\",\"Dress\",\"Skirt\",\"Bra\",\"Underwear\"]},{\"tag\":[\"Base Layer\",\"MerinoLOFT\",\"ZEO-LINE\"]}]},\"cool_layer\":{\"any\":[{\"tag\":[\"Keep Cool\",\"Quick Dry\",\"UV Protection\",\"Breathable\"],\"type\":[\"T-Shirt\",\"T-shirt\",\"Shirt\",\"Pants\",\"Shorts\",\"Arm Cover\",\"Hat\",\"Cap\",\"Headwear\"]}]},\"insulation\":{\"any\":[{\"tag\":[\"Down\",\"Down Jacket\",\"Insulated Jacket\",\"Synthetic Insulation\",\"PrimaLoft\",\"EXCELOFT\",\"Insulation\",\"Realfleece\"],\"type\":[\"Jacket\",\"Vest\",\"Coat\"]}]},\"light_insul\":{\"any\":[{\"tag\":[\"EXCELOFT\",\"Realfleece\",\"Synthetic Insulation\",\"Soft Shell\"],\"type\":[\"Jacket\",\"Vest\",\"Sweatshirt\"]},{\"tag\":[\"Down\"],\"title\":[\"superior\",\"ex light\",\"plasma\",\"u.l.\"]}]},\"shell\":{\"any\":[{\"tag\":[\"Rain Jacket\",\"Waterproof Shell\",\"GORE-TEX\",\"Rain Gear\",\"Rain Gears\",\"Rain Pants\",\"DRY-TEC\"]},{\"type\":[\"Rain Coat\",\"Rain Pants\",\"Rain Poncho\",\"Backpack Rain Cover\"]}]},\"warm_acc\":{\"any\":[{\"type\":[\"Gloves\",\"Beanie\"]},{\"tag\":[\"Balaclava\",\"Keep Warm\"],\"type\":[\"Gloves\",\"Beanie\",\"Headwear\",\"Accessories\",\"Accessory\"]},{\"vendor\":[\"Hothands\"]}]},\"socks\":{\"any\":[{\"type\":[\"Socks\"]}]},\"poles\":{\"any\":[{\"type\":[\"Trekking Poles\",\"Hiking Pole\"]},{\"tag\":[\"Trekking Poles\",\"Hiking Pole\"]}]},\"light\":{\"any\":[{\"type\":[\"Headlamp\",\"Lights\"]},{\"tag\":[\"Headlamp\",\"Torch Light\",\"Lanterns\"]}]},\"tool_trail\":{\"any\":[{\"vendor\":[\"Leatherman\"],\"tag\":[\"lm-multi-tool\",\"lm-keychain\"]}]},\"tool_edc\":{\"any\":[{\"vendor\":[\"Leatherman\"],\"tag\":[\"lm-edc\",\"lm-keychain\"]}]},\"power\":{\"any\":[{\"vendor\":[\"BioLite\"]}]},\"sleep\":{\"any\":[{\"type\":[\"Sleeping Bag\",\"Sleeping Bag Liners\",\"Sleeping\",\"Sleep\",\"Travel Pillow\"]}]},\"pack_day\":{\"any\":[{\"type\":[\"Backpack\"],\"tag\":[\"Daypack\",\"20-28L\",\"30L\"]}]},\"pack_trek\":{\"any\":[{\"type\":[\"Backpack\"],\"tag\":[\"30L\",\"40L\",\"50-55L\",\"60-65L\"]},{\"tag\":[\"Luggage and Duffle\"]}]},\"hydration\":{\"any\":[{\"type\":[\"Bottle\",\"Water Pack\",\"Water Tube\",\"Bottle Accessories\"]},{\"tag\":[\"Hydration\"]}]},\"kolon\":{\"any\":[{\"vendor\":[\"Kolon Sport\"]}]},\"travel\":{\"any\":[{\"type\":[\"Travel Accessories\",\"Travel accessories\",\"Wallet\",\"Lock\",\"Travel Pillow\",\"Bags\"]},{\"tag\":[\"Travel kit\",\"Travel/Packable\",\"Travel / Packable\",\"packable\"],\"type\":[\"Jacket\",\"Bags\",\"Shirt\",\"Pants\",\"Travel Accessories\"]}]},\"alpine\":{\"any\":[{\"tag\":[\"Alpine\",\"Expedition\",\"Climbing\"]},{\"type\":[\"Crampon\",\"Ice Axe\",\"Climbing Accessories\",\"Helmet\",\"Carabiner\"]}]},\"water\":{\"any\":[{\"tag\":[\"Water Sport\",\"Diving\",\"Sandals\"]},{\"type\":[\"Towel\"]}]},\"bike\":{\"any\":[{\"tag\":[\"Cycling\",\"Bicycle\",\"Bicycle Accessories\"]},{\"type\":[\"Bicycle Accessories\",\"Bicycle Tools\",\"Helmet\"]}]},\"footwear\":{\"any\":[{\"type\":[\"Footwear\",\"Shoes\"],\"not_tag\":[\"Sandals\"]},{\"tag\":[\"Shoes\"],\"not_tag\":[\"Sandals\"]}]}},\"profiles\":{\"tropical\":{\"slots\":[\"cool_layer\",\"shell\",\"socks\",\"poles\",\"light\",\"tool_trail\",\"hydration\",\"pack_day\",\"footwear\"]},\"hut\":{\"slots\":[\"merino_base\",\"light_insul\",\"shell\",\"socks\",\"poles\",\"light\",\"tool_trail\",\"pack_day\",\"hydration\",\"kolon\",\"footwear\"]},\"himalaya\":{\"slots\":[\"merino_base\",\"insulation\",\"shell\",\"warm_acc\",\"socks\",\"poles\",\"light\",\"tool_trail\",\"sleep\",\"pack_trek\",\"hydration\",\"power\",\"kolon\"]},\"expedition\":{\"slots\":[\"merino_base\",\"insulation\",\"shell\",\"warm_acc\",\"socks\",\"light\",\"tool_trail\",\"sleep\",\"pack_trek\",\"power\",\"alpine\"]},\"winter\":{\"slots\":[\"merino_base\",\"insulation\",\"shell\",\"warm_acc\",\"socks\",\"light\",\"power\",\"kolon\",\"footwear\"]},\"travel\":{\"slots\":[\"travel\",\"cool_layer\",\"merino_base\",\"shell\",\"socks\",\"tool_edc\",\"kolon\",\"pack_day\"]},\"island\":{\"slots\":[\"water\",\"cool_layer\",\"hydration\",\"tool_edc\",\"pack_day\"]},\"ride\":{\"slots\":[\"bike\",\"cool_layer\",\"shell\",\"tool_trail\",\"light\",\"hydration\"]}},\"exclude\":{\"title_words\":[\"kid\",\"kids\",\"kid's\",\"kids'\",\"junior\",\"toddler\",\"baby\",\"baby's\",\"boxer\",\"boxers\",\"brief\",\"briefs\",\"bikini\",\"thong\",\"bra\",\"bralette\",\"hipster\",\"panty\",\"panties\"],\"types\":[\"Underwear\",\"Bra\"]}};\nconst ADD_ONLY = 'mutation KitTagsAdd($id: ID!, $add: [String!]!) { add: tagsAdd(id: $id, tags: $add) { node { id } userErrors { field message } } }';\nconst REMOVE_ONLY = 'mutation KitTagsRemove($id: ID!, $remove: [String!]!) { remove: tagsRemove(id: $id, tags: $remove) { node { id } userErrors { field message } } }';\nconst ADD_AND_REMOVE = 'mutation KitTagsChange($id: ID!, $add: [String!]!, $remove: [String!]!) { add: tagsAdd(id: $id, tags: $add) { node { id } userErrors { field message } } remove: tagsRemove(id: $id, tags: $remove) { node { id } userErrors { field message } } }';\nconst GID_RE = /^gid:\\/\\/shopify\\/Product\\/([0-9]{1,20})$/;\n// Removal brake (internal, not an owner setting): stop when more products would lose a known tag than\n// 10% of the products that carry one now, and never below 10 products.\nconst BRAKE_MIN = 10;\nconst BRAKE_SHARE = 0.1;\n// Record of this workflow's own tag changes: { v: 1, products: { <product number>: { d, t: { tag: 'a'|'r' } } } }.\nconst RECORD_KEY = 'kitTagRecord';\nconst RECORD_MAX_PRODUCTS = 5000;\nconst DATE_RE = /^\\d{4}-\\d{2}-\\d{2}$/;\n\nconst settings = $('Run Settings').first().json;\nconst token = $('Get Shopify Access Token').first().json;\nconst pages = $input.all().map((item) => item.json);\nconst store = $getWorkflowStaticData('global');\n\nconst norm = (s) => (typeof s === 'string' ? s : '').trim().toLowerCase();\nconst safe = (s) => norm(s).replace(/[^a-z0-9._-]/g, '?').slice(0, 80);\nconst KITS = Object.keys(RULES.profiles);\nconst KNOWN = new Set([...KITS.map((k) => 'kit-' + k), ...Object.keys(RULES.slots).map((s) => 'ks-' + s)]);\nconst managed = (tag) => KNOWN.has(norm(tag));\nconst looksManaged = (tag) => {\n  const x = norm(tag);\n  return (x.startsWith('kit-') || x.startsWith('ks-')) && x !== 'kit-no' && !x.startsWith('kit-pin-');\n};\n\nconst httpCode = (error) => {\n  const text = typeof error === 'string' ? error : JSON.stringify(error || '');\n  const match = /\\b([45][0-9][0-9])\\b/.exec(text);\n  return match ? 'http_' + match[1] : 'request_error';\n};\nconst pageProblem = (page) => {\n  if (!page || typeof page !== 'object') return 'no_page';\n  if (page.error !== undefined) return httpCode(page.error);\n  if (Array.isArray(page.errors) && page.errors.length) {\n    return page.errors.some((e) => e && e.extensions && e.extensions.code === 'THROTTLED') ? 'throttled' : 'graphql_errors';\n  }\n  const products = page.data && page.data.products;\n  if (!products || !Array.isArray(products.nodes) || !products.pageInfo) return 'no_data';\n  return '';\n};\n\n// Owner text is plain English; the last line carries closed codes for Claude.\nconst failed = (key, what, detail) => [{ json: { mode: 'failed', writes: [], alert: {\n  severity: 'ERROR', key, short: key,\n  lines: ['Kit tags on the website: ' + what + ' Nothing was changed. Ask Claude to check.', 'Detail for Claude: ' + detail],\n} } }];\n\n// ---- 1. the token and the read ---- //\nif (!token || token.error !== undefined || typeof token.access_token !== 'string' || token.access_token.length < 10) {\n  return failed('could_not_sign_in', \"tonight's run could not sign in to Shopify.\",\n    'access token request ' + (token && token.error !== undefined ? httpCode(token.error) : 'no_token') + '.');\n}\nconst readFailed = (detail) => failed('could_not_read_products', \"tonight's run could not read the product list from Shopify.\", detail);\nif (pages.length === 0) return readFailed('product read no_page.');\nfor (let i = 0; i < pages.length; i += 1) {\n  const problem = pageProblem(pages[i]);\n  if (problem) return readFailed('product read ' + problem + ' on page ' + (i + 1) + ' of ' + pages.length + '.');\n}\nconst last = pages[pages.length - 1].data.products.pageInfo;\nconst count = pages[0].data.productsCount;\nconst products = pages.flatMap((page) => page.data.products.nodes);\nconst ids = new Set(products.map((p) => p && p.id));\nconst incomplete = [];\nif (last.hasNextPage !== false) incomplete.push('read stopped at the page limit (' + pages.length + ' pages)');\nif (!count || typeof count.count !== 'number' || count.precision !== 'EXACT') incomplete.push('no exact active product count');\nelse if (count.count !== products.length) incomplete.push('scanned ' + products.length + ' of ' + count.count + ' active products');\nif (ids.size !== products.length) incomplete.push('duplicate or missing product ids');\nconst bad = products.filter((p) => !p || !GID_RE.test(p.id) || !Array.isArray(p.tags) || p.status !== 'ACTIVE');\nif (bad.length) incomplete.push(bad.length + ' product rows with a bad id, tag list or status');\nif (incomplete.length) {\n  return failed('product_list_incomplete', \"tonight's run got an incomplete product list from Shopify.\",\n    incomplete.join('; ') + '.');\n}\n\n// ---- 2. desired kit tags (partner logic) ---- //\nfunction clauseMatch(c, v, t, tags, title) {\n  const tg = new Set(tags.map(norm));\n  if (c.vendor && !c.vendor.map(norm).includes(norm(v))) return false;\n  if (c.type && !c.type.map(norm).includes(norm(t))) return false;\n  if (c.not_type && c.not_type.map(norm).includes(norm(t))) return false;\n  if (c.tag && !c.tag.map(norm).some((x) => tg.has(x))) return false;\n  if (c.not_tag && c.not_tag.map(norm).some((x) => tg.has(x))) return false;\n  if (c.title && !c.title.map(norm).some((x) => norm(title).includes(x))) return false;\n  return true;\n}\nfunction excluded(p) {\n  const ex = RULES.exclude || {};\n  if ((ex.types || []).map(norm).includes(norm(p.productType))) return true;\n  const words = (ex.title_words || []).map((w) => w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'));\n  return words.length > 0 && new RegExp(\"(?<![\\\\w'])(\" + words.join('|') + \")(?![\\\\w'])\", 'i').test(p.title || '');\n}\nfunction desired(p) {\n  const tg = new Set(p.tags.map(norm));\n  if (tg.has('kit-no') || p.status !== 'ACTIVE' || excluded(p)) return new Set();\n  const slots = Object.entries(RULES.slots)\n    .filter(([, s]) => s.any.some((c) => clauseMatch(c, p.vendor, p.productType, p.tags, p.title)))\n    .map(([k]) => k);\n  const out = new Set();\n  const used = new Set();\n  for (const [name, prof] of Object.entries(RULES.profiles)) {\n    if (prof.slots.some((s) => slots.includes(s)) || tg.has('kit-pin-' + name)) {\n      out.add('kit-' + name);\n      prof.slots.forEach((s) => used.add(s));\n    }\n  }\n  slots.filter((s) => used.has(s)).forEach((s) => out.add('ks-' + s));\n  return out;\n}\n\n// ---- 3. this workflow's record (empty on the first run; anything malformed is dropped) ---- //\nconst readRecord = (raw) => {\n  const clean = {};\n  if (!raw || typeof raw !== 'object' || raw.v !== 1 || !raw.products || typeof raw.products !== 'object') return clean;\n  for (const [num, entry] of Object.entries(raw.products)) {\n    if (!/^[0-9]{1,20}$/.test(num) || !entry || typeof entry !== 'object' || !DATE_RE.test(entry.d)\n      || !entry.t || typeof entry.t !== 'object') continue;\n    const t = {};\n    for (const [tag, did] of Object.entries(entry.t)) if (KNOWN.has(tag) && (did === 'a' || did === 'r')) t[tag] = did;\n    if (Object.keys(t).length) clean[num] = { d: entry.d, t };\n  }\n  return clean;\n};\nconst record = readRecord(store[RECORD_KEY]);\nconst numOf = (id) => GID_RE.exec(id)[1];\n\n// ---- 4. the changes, leaving people's own changes alone ---- //\nconst changes = [];\nconst unknown = new Set();\nlet leftAdds = 0;\nlet leftRemoves = 0;\nlet tagged = 0;\nfor (const p of products) {\n  p.tags.filter((t) => looksManaged(t) && !managed(t)).forEach((t) => unknown.add(safe(t)));\n  const did = (record[numOf(p.id)] || { t: {} }).t;\n  const want = desired(p);\n  const have = new Set(p.tags.filter(managed).map(norm));\n  if (have.size) tagged += 1;\n  const addAll = [...want].filter((t) => !have.has(t)).sort();\n  const removeAll = p.tags.filter((t) => managed(t) && !want.has(norm(t)));\n  const add = addAll.filter((t) => did[t] !== 'a');\n  const remove = removeAll.filter((t) => did[norm(t)] !== 'r');\n  leftAdds += addAll.length - add.length;\n  leftRemoves += removeAll.length - remove.length;\n  if (add.length || remove.length) changes.push({ id: p.id, handle: safe(p.handle), add, remove });\n}\n\n// ---- 5. brake, record upkeep and the run mode ---- //\nconst losing = changes.filter((c) => c.remove.length > 0).length;\nconst brakeAt = Math.max(BRAKE_MIN, Math.ceil(tagged * BRAKE_SHARE));\nconst braked = losing > brakeAt;\nconst dryRun = settings.DRY_RUN !== false;\nconst summary = {\n  scanned: products.length, tagged, changed: changes.length, losing, brake_at: brakeAt, braked,\n  tags_to_add: changes.reduce((n, c) => n + c.add.length, 0),\n  tags_to_remove: changes.reduce((n, c) => n + c.remove.length, 0),\n  left_alone_person_removed: leftAdds, left_alone_person_added: leftRemoves,\n  unknown_tags_left_alone: [...unknown].sort().slice(0, 20),\n};\nconst writes = changes.map((c) => ({\n  id: c.id,\n  handle: c.handle,\n  query: c.add.length && c.remove.length ? ADD_AND_REMOVE : (c.add.length ? ADD_ONLY : REMOVE_ONLY),\n  variables: { id: c.id, ...(c.add.length ? { add: c.add } : {}), ...(c.remove.length ? { remove: c.remove } : {}) },\n}));\n\nif (dryRun) {\n  // Read through the local n8n API at the live steps; never emailed, never written, record untouched.\n  return [{ json: { mode: 'dry_run', summary, writes: [], alert: null,\n    plan: writes.map((w) => ({ handle: w.handle, add: w.variables.add || [], remove: w.variables.remove || [] })) } }];\n}\nif (braked) {\n  return [{ json: { mode: 'braked', summary, writes: [], alert: { severity: 'ERROR', key: 'stopped_unusual_removals',\n    short: 'stopped_unusual_removals',\n    lines: [\"Kit tags on the website: tonight's run stopped itself because it planned to remove more tags than normal. Nothing was changed. Ask Claude to check.\",\n      'Detail for Claude: ' + losing + ' of ' + tagged + ' tagged products would lose kit tags; run it by hand with DRY_RUN on and read the plan.'] } } }];\n}\n// Keep the record to products still in scope, newest first, at most RECORD_MAX_PRODUCTS.\nconst inScope = new Set(products.map((p) => numOf(p.id)));\nconst kept = Object.entries(record).filter(([num]) => inScope.has(num))\n  .sort((a, b) => (a[1].d < b[1].d ? 1 : (a[1].d > b[1].d ? -1 : 0))).slice(0, RECORD_MAX_PRODUCTS);\nstore[RECORD_KEY] = { v: 1, products: Object.fromEntries(kept) };\nif (changes.length === 0) return [{ json: { mode: 'no_change', summary, writes: [], alert: null } }];\nreturn [{ json: { mode: 'write', summary, writes, alert: null } }];\n"
       },
       "onError": "continueErrorOutput"
     },
     {
-      "id": "00000000-0000-4000-8269-000000000019",
+      "id": "00000000-0000-4000-8269-000000000016",
       "name": "Changes To Write",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
@@ -318,7 +300,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8269-000000000018",
+              "id": "00000000-0000-4000-8269-000000000015",
               "leftValue": "={{ $json.mode === 'write' }}",
               "rightValue": true,
               "operator": {
@@ -333,12 +315,12 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8269-000000000021",
-      "name": "Email Is Due",
+      "id": "00000000-0000-4000-8269-000000000018",
+      "name": "Error To Email",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        1440,
+        1680,
         420
       ],
       "parameters": {
@@ -351,7 +333,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8269-000000000020",
+              "id": "00000000-0000-4000-8269-000000000017",
               "leftValue": "={{ $json.alert !== null && typeof $json.alert === 'object' }}",
               "rightValue": true,
               "operator": {
@@ -366,7 +348,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8269-000000000022",
+      "id": "00000000-0000-4000-8269-000000000019",
       "name": "List Writes",
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
@@ -381,7 +363,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8269-000000000023",
+      "id": "00000000-0000-4000-8269-000000000020",
       "name": "Write Tag Changes",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -433,7 +415,7 @@
       "alwaysOutputData": true
     },
     {
-      "id": "00000000-0000-4000-8269-000000000024",
+      "id": "00000000-0000-4000-8269-000000000021",
       "name": "Check Write Results",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -443,12 +425,12 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Check every tag write of this run (#269). One result item per write, in the same order as List\n// Writes (Write Tag Changes continues on its regular output, so a failed request is an item carrying\n// `error` in the same place). A write counts as done only when Shopify answered with data for every\n// part (add, remove) it asked for and no userErrors. HTTP errors, GraphQL errors (THROTTLED included), missing\n// data and any userErrors count as failed, each with a closed code. Output: one alert request, the\n// CHANGED report when all went through, or one write_failed ERROR alert.\nconst writes = $('List Writes').all().map((item) => item.json);\nconst results = $input.all().map((item) => item.json);\nconst sgtDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);\nconst summary = $('Work Out Kit Tag Changes').first().json.summary || {};\n\nconst httpCode = (error) => {\n  const text = typeof error === 'string' ? error : JSON.stringify(error || '');\n  const match = /\\b([45][0-9][0-9])\\b/.exec(text);\n  return match ? 'http_' + match[1] : 'request_error';\n};\nconst problem = (write, result) => {\n  if (!result || typeof result !== 'object') return 'no_result';\n  if (result.error !== undefined) return httpCode(result.error);\n  if (Array.isArray(result.errors) && result.errors.length) {\n    return result.errors.some((e) => e && e.extensions && e.extensions.code === 'THROTTLED') ? 'throttled' : 'graphql_errors';\n  }\n  if (!result.data || typeof result.data !== 'object') return 'no_data';\n  for (const part of ['add', 'remove']) {\n    if (!write.variables || write.variables[part] === undefined) continue;\n    const answer = result.data[part];\n    if (!answer || typeof answer !== 'object') return 'no_data';\n    if (!Array.isArray(answer.userErrors) || answer.userErrors.length) return 'user_errors';\n    if (!answer.node || answer.node.id !== write.id) return 'no_data';\n  }\n  return '';\n};\n\nconst failures = [];\nif (results.length !== writes.length) {\n  failures.push({ handle: 'all', code: 'result_count_' + results.length + '_of_' + writes.length });\n} else {\n  writes.forEach((write, i) => {\n    const code = problem(write, results[i]);\n    if (code) failures.push({ handle: write.handle, code });\n  });\n}\nconst done = results.length === writes.length ? writes.length - failures.length : 0;\nconst head = 'Products changed: ' + done + ' of ' + writes.length + ' (active products scanned: ' + (summary.scanned || 0) + ').';\nconst listed = (items, limit) => items.slice(0, limit).map((x) => ('- ' + x).slice(0, 300))\n  .concat(items.length > limit ? ['... and ' + (items.length - limit) + ' more'] : []);\n// The sender takes at most 30 lines and 4,000 characters: list fewer products until it fits.\nconst fit = (build, limit) => {\n  for (let n = limit; n >= 0; n -= 1) {\n    const lines = build(n);\n    if (lines.length <= 30 && lines.join('\\n').length <= 4000) return lines;\n  }\n  return build(0).slice(0, 30);\n};\n\nif (failures.length === 0) {\n  return [{ json: { alert: { severity: 'INFO', key: 'daily_summary', short: 'CHANGED ' + sgtDate,\n    lines: fit((n) => ['Kit re-tagger ' + sgtDate + ': kit tags written.', head, '',\n      ...listed(writes.map((w) => w.handle + ' ' + [...(w.variables.add || []).map((t) => '+' + t),\n        ...(w.variables.remove || []).map((t) => '-' + String(t).toLowerCase())].join(' ')), n)], 25) } } }];\n}\nreturn [{ json: { alert: { severity: 'ERROR', key: 'write_failed', short: 'write_failed',\n  lines: fit((n) => ['Kit re-tagger ' + sgtDate + ': some tag writes failed.', head, 'Failed: ' + failures.length + '.', '',\n    ...listed(failures.map((f) => f.handle + ' ' + f.code), n), '',\n    'Next: the next daily run retries them (tag writes are safe to repeat). If it repeats, run it by hand with DRY_RUN on.'], 20) } } }];\n"
+        "jsCode": "// Check every tag write of this run (#269). One result item per write, in the same order as List\n// Writes (Write Tag Changes continues on its regular output, so a failed request is an item carrying\n// `error` in the same place). A write counts as done only when Shopify answered with data for every\n// part (add, remove) it asked for, for the same product, and no userErrors. HTTP errors, GraphQL errors\n// (THROTTLED included), missing data and any userErrors count as failed, each with a closed code.\n// Every part Shopify confirmed is added to this workflow's record (so a person's later change to that tag is left\n// alone). All done: no email (hands-off, owner 21 Nov 2026). Otherwise one plain-English ERROR alert.\nconst writes = $('List Writes').all().map((item) => item.json);\nconst results = $input.all().map((item) => item.json);\nconst store = $getWorkflowStaticData('global');\nconst RECORD_KEY = 'kitTagRecord';\nconst sgtDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);\n\nconst httpCode = (error) => {\n  const text = typeof error === 'string' ? error : JSON.stringify(error || '');\n  const match = /\\b([45][0-9][0-9])\\b/.exec(text);\n  return match ? 'http_' + match[1] : 'request_error';\n};\n// Returns the parts (add, remove) Shopify confirmed and the first problem code ('' when none).\nconst outcome = (write, result) => {\n  const asked = ['add', 'remove'].filter((part) => write.variables && write.variables[part] !== undefined);\n  if (!result || typeof result !== 'object') return { ok: [], code: 'no_result' };\n  if (result.error !== undefined) return { ok: [], code: httpCode(result.error) };\n  if (Array.isArray(result.errors) && result.errors.length) {\n    return { ok: [], code: result.errors.some((e) => e && e.extensions && e.extensions.code === 'THROTTLED') ? 'throttled' : 'graphql_errors' };\n  }\n  if (!result.data || typeof result.data !== 'object') return { ok: [], code: 'no_data' };\n  const ok = [];\n  let code = '';\n  for (const part of asked) {\n    const answer = result.data[part];\n    let partCode = '';\n    if (!answer || typeof answer !== 'object') partCode = 'no_data';\n    else if (!Array.isArray(answer.userErrors) || answer.userErrors.length) partCode = 'user_errors';\n    else if (!answer.node || answer.node.id !== write.id) partCode = 'no_data';\n    if (partCode) code = code || partCode;\n    else ok.push(part);\n  }\n  return { ok, code };\n};\n\nconst failures = [];\nconst confirmed = [];\nlet done = 0;\nif (results.length !== writes.length) {\n  failures.push({ handle: 'all', code: 'result_count_' + results.length + '_of_' + writes.length });\n} else {\n  writes.forEach((write, i) => {\n    const { ok, code } = outcome(write, results[i]);\n    ok.forEach((part) => confirmed.push({ write, part }));\n    if (code) failures.push({ handle: write.handle, code });\n    else done += 1;\n  });\n}\n\n// Record what this run changed (Work Out Kit Tag Changes already kept the record in shape).\nconst kept = store[RECORD_KEY] && store[RECORD_KEY].v === 1 && store[RECORD_KEY].products\n  && typeof store[RECORD_KEY].products === 'object' ? store[RECORD_KEY].products : {};\nconst products = { ...kept };\nfor (const { write, part } of confirmed) {\n  const num = /^gid:\\/\\/shopify\\/Product\\/([0-9]{1,20})$/.exec(write.id)[1];\n  const t = { ...((products[num] && products[num].t) || {}) };\n  write.variables[part].forEach((tag) => { t[String(tag).trim().toLowerCase()] = part === 'add' ? 'a' : 'r'; });\n  products[num] = { d: sgtDate, t };\n}\nstore[RECORD_KEY] = { v: 1, products };\n\nif (failures.length === 0) return [{ json: { mode: 'done', changed: done, alert: null } }];\n\nconst listed = (items, limit) => items.slice(0, limit).map((x) => ('- ' + x).slice(0, 300))\n  .concat(items.length > limit ? ['... and ' + (items.length - limit) + ' more'] : []);\n// The sender takes at most 30 lines and 4,000 characters: list fewer products until it fits.\nconst fit = (build, limit) => {\n  for (let n = limit; n >= 0; n -= 1) {\n    const lines = build(n);\n    if (lines.length <= 30 && lines.join('\\n').length <= 4000) return lines;\n  }\n  return build(0).slice(0, 30);\n};\nconst first = done\n  ? \"Kit tags on the website: tonight's run could not update some products. The other products were updated. Ask Claude to check.\"\n  : \"Kit tags on the website: tonight's run could not update the products on its list. Ask Claude to check.\";\nreturn [{ json: { mode: 'write_failed', changed: done, alert: { severity: 'ERROR', key: 'some_updates_failed',\n  short: 'some_updates_failed',\n  lines: fit((n) => [first, 'Detail for Claude: updated ' + done + ' of ' + writes.length + ' products; failed:',\n    ...listed(failures.map((f) => f.handle + ' ' + f.code), n)], 20) } } }];\n"
       },
       "onError": "continueErrorOutput"
     },
     {
-      "id": "00000000-0000-4000-8269-000000000026",
+      "id": "00000000-0000-4000-8269-000000000023",
       "name": "Build Unexpected Alert",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
@@ -460,10 +442,10 @@
         "assignments": {
           "assignments": [
             {
-              "id": "00000000-0000-4000-8269-000000000025",
+              "id": "00000000-0000-4000-8269-000000000022",
               "name": "alert",
               "type": "object",
-              "value": "={{ ({ severity: 'ERROR', key: 'unexpected', short: 'unexpected', lines: ['Kit re-tagger: an unexpected error stopped the run (no saved execution to read).', 'Some tag writes may have gone through; the next daily run repairs kit tags.', 'Next: open n8n and run XB Kit Re-tagger by hand with DRY_RUN on, then read the list.'] }) }}"
+              "value": "={{ ({ severity: 'ERROR', key: 'unexpected_error', short: 'unexpected_error', lines: ['Kit tags on the website: the run tonight stopped on an unexpected error. Some products may already have been updated. Ask Claude to check.', 'Detail for Claude: a Code node failed; executions are not saved, so run it by hand with DRY_RUN on and read the plan.'] }) }}"
             }
           ]
         },
@@ -471,7 +453,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8269-000000000027",
+      "id": "00000000-0000-4000-8269-000000000024",
       "name": "Send Kit Alert",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
@@ -557,6 +539,20 @@
         }
       },
       "onError": "continueRegularOutput"
+    },
+    {
+      "id": "00000000-0000-4000-8269-000000000025",
+      "name": "End Run As Failed",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        2440,
+        420
+      ],
+      "parameters": {
+        "errorType": "errorMessage",
+        "errorMessage": "Kit re-tagger stopped after an error email (system KIT-RETAG). Nothing more runs."
+      }
     }
   ],
   "connections": {
@@ -644,14 +640,14 @@
         ],
         [
           {
-            "node": "Email Is Due",
+            "node": "Error To Email",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Email Is Due": {
+    "Error To Email": {
       "main": [
         [
           {
@@ -689,7 +685,7 @@
       "main": [
         [
           {
-            "node": "Send Kit Alert",
+            "node": "Error To Email",
             "type": "main",
             "index": 0
           }
@@ -713,6 +709,17 @@
           }
         ]
       ]
+    },
+    "Send Kit Alert": {
+      "main": [
+        [
+          {
+            "node": "End Run As Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
@@ -729,6 +736,6 @@
     "templateCredsSetupCompleted": false
   },
   "nodeGroups": [],
-  "versionId": "00000000-0000-4000-8269-000000001000",
+  "versionId": "00000000-0000-4000-8269-000000001001",
   "sourceWorkflowId": null
 }

@@ -742,22 +742,23 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
             (out,) = self.validate(request(system=system))
             self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_SYSTEM"}, system)
 
-    def test_kit_retag_alerts_and_reports_pass_and_stay_separate(self):
-        alert = request(system="KIT-RETAG", severity="WARN", key="change_cap", short="change_cap",
-                        lines=["Kit re-tagger: over the change cap, nothing written.", "changed 31 / cap 25",
-                               "+ fake-product-handle-001 +kit-hut +ks-socks"])
+    def test_kit_retag_error_alerts_pass_and_stay_separate(self):
+        # Hands-off (owner, 21 Nov 2026): the re-tagger sends plain-English ERROR alerts only.
+        alert = request(system="KIT-RETAG", severity="ERROR", key="stopped_unusual_removals",
+                        short="stopped_unusual_removals",
+                        lines=["Kit tags on the website: tonight's run stopped itself because it planned to remove more "
+                               "tags than normal. Nothing was changed. Ask Claude to check.",
+                               "Detail for Claude: 30 of 30 tagged products would lose kit tags."])
         (out,) = self.validate(alert)
         self.assertEqual(out, {"valid": True, **alert})
         plan = self.decide([], {"valid": True, **alert})
-        self.assertEqual(plan["mail"]["subject"], "[XB alert] KIT-RETAG WARN change_cap")
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] KIT-RETAG ERROR stopped_unusual_removals")
         self.assertRegex(plan["mail"]["subject"], SUBJECT_RE)
-        report = request(system="KIT-RETAG", severity="INFO", key="daily_summary", short="DRYRUN 2026-11-21",
-                         lines=["Kit re-tagger DRY RUN: 3 products would change.", "+ fake-product-handle-002 +kit-ride"])
-        (out,) = self.validate(report)
-        self.assertEqual(out, {"valid": True, **report})
-        plan = self.decide([], {"valid": True, **report})
-        self.assertEqual(plan["mail"]["subject"], "[XB daily] KIT-RETAG DRYRUN 2026-11-21")
-        self.assertIsNone(plan["held_outcome"])
+        failed = request(system="KIT-RETAG", severity="ERROR", key="some_updates_failed", short="some_updates_failed",
+                         lines=["Kit tags on the website: tonight's run could not update some products.",
+                                "- fake-product-handle-002 user_errors"])
+        (out,) = self.validate(failed)
+        self.assertEqual(out, {"valid": True, **failed})
         # It may not name another system, and no other system may name it.
         bodies = [request(system="KIT-RETAG", key="read_failed", short="read_failed", lines=["see AC2-STOCK"]),
                   request(lines=["see KIT-RETAG"]), request(system="MEMBER-SYNC", key="KIT-RETAG:x", short="x")]
