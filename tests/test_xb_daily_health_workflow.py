@@ -53,7 +53,8 @@ EXPECTED_EDGES = {
     ("List Workflows", 0, "List Error Runs"),
     ("List Error Runs", 0, "Read Alert Log"),
     ("Read Alert Log", 0, "Read Failed Alert Emails"),
-    ("Read Failed Alert Emails", 0, "Read Health Runs"),
+    ("Read Failed Alert Emails", 0, "Read Monitor Error Log"),
+    ("Read Monitor Error Log", 0, "Read Health Runs"),
     ("Read Health Runs", 0, JUDGE),
     (JUDGE, 0, "Email Plan"),
     (JUDGE, 1, BROKEN),
@@ -69,8 +70,8 @@ EXPECTED_EDGES = {
     ("Send Health Email", 1, "Collect Send Outcome"),
     ("Collect Send Outcome", 0, "Log Health Run"),
 }
-READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Failed Alert Emails", "Read Health Runs",
-              "Read Today Runs")
+READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Failed Alert Emails", "Read Monitor Error Log",
+              "Read Health Runs", "Read Today Runs")
 SEND_FAILURES = ["send_failed", "rejected", "error", "call_failed", "unknown"]
 RUN_COLUMNS = ["date", "kind", "verdict", "watched", "problems", "fail_jobs", "warn_jobs", "email", "code", "logged_at"]
 
@@ -148,15 +149,17 @@ def validate(*bodies, now_ms=NOW_MS):
 
 WORKFLOWS_OK = [{"id": "wfStockAlert01", "name": "fake", "active": True},
                 {"id": "wfOpsEmail0001", "name": "fake", "active": True}]
-WORKFLOWS_ALL = WORKFLOWS_OK + [{"id": "wfEgMonitor001", "name": "fake", "active": True}]
+WORKFLOWS_ALL = WORKFLOWS_OK + [{"id": "wfEgMonitor001", "name": "fake", "active": True},
+                                {"id": "wfEgErrorLog01", "name": "fake", "active": True}]
 
 
-def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, failed_alerts=None):
+def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, failed_alerts=None, error_log=None):
     return {
         "List Workflows": WORKFLOWS_ALL if workflows is None else workflows,
         "List Error Runs": [{}] if error_runs is None else error_runs,
         "Read Alert Log": [{}] if alert_log is None else alert_log,
         "Read Failed Alert Emails": [{}] if failed_alerts is None else failed_alerts,
+        "Read Monitor Error Log": [{}] if error_log is None else error_log,
         "Read Health Runs": [{}] if runs is None else runs,
     }
 
@@ -180,6 +183,7 @@ CONFIGURED = {
     "REPLACE_WITH_STOCK_ALERT_WORKFLOW_ID": "wfStockAlert01",
     "REPLACE_WITH_ARAP_ALERT_WORKFLOW_ID": "",
     "REPLACE_WITH_ENERGYGRID_MONITOR_WORKFLOW_ID": "wfEgMonitor001",
+    "REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID": "wfEgErrorLog01",
     "REPLACE_WITH_ENERGYGRID_OWNER_EMAIL_WORKFLOW_ID": "",
     "REPLACE_WITH_ENERGYGRID_DRIVE_VERIFY_WORKFLOW_ID": "",
     "REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID": "wfOpsEmail0001",
@@ -361,7 +365,13 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual((failed["orderByColumn"], failed["orderByDirection"], failed["limit"]), ("id", "DESC", 250))
         tables = {n["parameters"]["dataTableId"]["value"] for n in self.workflow["nodes"]
                   if n["type"] == "n8n-nodes-base.dataTable"}
-        self.assertEqual(tables, {"REPLACE_WITH_ALERT_LOG_TABLE_ID", "REPLACE_WITH_HEALTH_RUNS_TABLE_ID"})
+        self.assertEqual(tables, {"REPLACE_WITH_ALERT_LOG_TABLE_ID", "REPLACE_WITH_HEALTH_RUNS_TABLE_ID",
+                                  "REPLACE_WITH_MONITOR_ERROR_LOG_TABLE_ID"})
+        # #288 option (c): the run monitor's failure rows, newest first, read only; the judge filters by workflow.
+        error_log = self.nodes["Read Monitor Error Log"]["parameters"]
+        self.assertEqual(error_log, {"resource": "row", "operation": "get", "dataTableId": {
+            "__rl": True, "value": "REPLACE_WITH_MONITOR_ERROR_LOG_TABLE_ID", "mode": "id"}, "returnAll": False,
+            "limit": 250, "orderBy": True, "orderByColumn": "id", "orderByDirection": "DESC"})
         writes = [n["name"] for n in self.workflow["nodes"] if n["type"] == "n8n-nodes-base.dataTable"
                   and n["parameters"]["operation"] != "get"]
         self.assertEqual(writes, ["Log Health Run"], "the alert log is only read")
@@ -593,14 +603,42 @@ class JudgeTests(unittest.TestCase):
         plan, lines = n8n_line(workflows=[{"id": "wfStockAlert01", "active": False}, {"id": "wfOpsEmail0001",
                                                                                       "active": True}])
         self.assertTrue(lines[0].startswith("FAIL  n8n workflows: inactive: stock alert; not found: EnergyGrid run "
-                                            "monitor, since 19 Nov."), lines)
+                                            "monitor, EnergyGrid monitor error log, since 19 Nov."), lines)
+        # #288 option (c): the run monitor saves no failed executions, so saved error runs are not counted for
+        # it (`errors: false`); its error workflow's rows in energygrid_monitor_error_log are.
         errors = [{"id": "e%d" % n, "workflowId": "wfEgMonitor001", "status": "error",
                    "startedAt": "2026-11-18T%02d:00:00.000Z" % n} for n in (1, 2, 3)]
-        errors += [{"id": "old", "workflowId": "wfEgMonitor001", "status": "error", "startedAt": "2026-11-17T20:00:00.000Z"},
-                   {"id": "other", "workflowId": "wfStockAlert01", "status": "error", "startedAt": "2026-11-18T22:00:00.000Z"}]
-        plan, lines = n8n_line(workflows=WORKFLOWS_OK + [{"id": "wfEgMonitor001", "active": True}], error_runs=errors)
+        errors.append({"id": "other", "workflowId": "wfStockAlert01", "status": "error",
+                       "startedAt": "2026-11-18T22:00:00.000Z"})
+        plan, lines = n8n_line(error_runs=errors)
+        self.assertEqual((plan["row"]["verdict"], lines), ("OK", []))
+
+        def row(at, workflow_id="wfEgMonitor001", code="EG_MONITOR_SCHEMA"):
+            return {"id": 1, "workflow_id": workflow_id, "execution_id": "4711", "failed_node": "Validate Both Streams "
+                    "and Classify", "code": code, "mode": "webhook", "failed_at": at, "createdAt": at, "updatedAt": at}
+
+        log = [row("2026-11-18T%02d:00:00.000Z" % n) for n in (1, 2)]
+        log += [row("2026-11-18T03:05:00.000Z", code="EG_MONITOR_TRIGGER_FAILED"),
+                row("2026-11-17T20:00:00.000Z"),  # older than 24 h before the 07:30 check
+                row("2026-11-18T22:00:00.000Z", workflow_id="wfStockAlert01"),  # not the monitor
+                row("not a date")]
+        plan, lines = n8n_line(error_log=log, error_runs=errors)
         self.assertTrue(lines[0].startswith("WARN  n8n workflows: 3 failed run(s) in the last 24 h, since 19 Nov."),
                         lines)
+        self.assertEqual(plan["row"]["warn_jobs"], "n8n_workflows")
+        self.assertNotIn("EG_MONITOR", "\n".join(plan["mail"]["lines"]), "only a count reaches the email")
+        plan, lines = n8n_line(error_log={"raw": [{"json": {"error": "table not found"}}]})
+        self.assertTrue(lines[0].startswith("WARN  n8n workflows: the monitor error log could not be read, since 19 Nov."),
+                        lines)
+        # SIMBA keeps its failed executions (`errors: true`): those are still counted from the n8n API.
+        simba = [{"id": "s1", "workflowId": "wfSimbaIntake1", "status": "error", "startedAt": "2026-11-18T22:00:00.000Z"}]
+        plan = judge_plan(checker_event(expected=dict(json.loads((ROOT / "config" / "daily_health.example.json")
+                                                             .read_text(encoding="utf-8"))["expected"],
+                                                      simba_intake="on")),
+                          judge_reads(workflows=WORKFLOWS_ALL + [{"id": "wfSimbaIntake1", "active": True}],
+                                      error_runs=simba), workflow=workflow)
+        line = next(l for l in plan["mail"]["lines"] if "SIMBA intake:" in l)
+        self.assertTrue(line.startswith("WARN  SIMBA intake: 1 failed run(s) in the last 24 h"), line)
         plan, lines = n8n_line(workflows={"raw": [{"json": {"error": "401 unauthorized"}}]})
         self.assertIn("the n8n API could not be read", lines[0])
         # The unconfigured export says so instead of guessing.
@@ -646,7 +684,8 @@ class JudgeTests(unittest.TestCase):
                                     "fail_jobs": "", "warn_jobs": ""}]
         plan = judge_plan(event, judge_reads(workflows={"raw": [{"json": {"error": "x"}}]},
                                              alert_log={"raw": [{"json": {"error": "x"}}]},
-                                             failed_alerts={"raw": [{"json": {"error": "x"}}]}, runs=runs))
+                                             failed_alerts={"raw": [{"json": {"error": "x"}}]},
+                                             error_log={"raw": [{"json": {"error": "x"}}]}, runs=runs))
         self.assertIn("Yesterday's health email could not be sent (send_failed at 07:30, call_failed at 08:15).",
                       plan["mail"]["lines"])
         self.assertLessEqual(len(plan["mail"]["lines"]), 30)
@@ -664,7 +703,7 @@ class JudgeTests(unittest.TestCase):
                 self.assertRegex(code, r"\n  %s: " % reason, reason)
         for reason in ("summary_missing", "summary_send_failed", "log_read_failed", "workflow_inactive",
                        "workflow_missing", "error_runs", "n8n_api_failed", "not_configured", "alert_email_failed",
-                       "alert_log_read_failed"):
+                       "alert_log_read_failed", "error_log_read_failed"):
             self.assertRegex(code, r"\n  %s: " % reason, reason)
         for job in health.JOBS:
             self.assertIn(" %s: '" % job, code, job)
