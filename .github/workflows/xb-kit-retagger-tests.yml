@@ -8,7 +8,7 @@ on:
       # Exact entries keep the trigger surface owned.
       - "n8n-workflows/xb_kit_retagger.workflow.json"
       - "tests/test_xb_kit_retagger_workflow.py"
-      - "tests/fixtures/xb_kit_rules_v1.json"
+      - "tests/fixtures/xb_kit_rules_v1.fixture"
       - "docs/xb_kit_retagger.md"
       - "n8n-workflows/ops_alert_email.workflow.json"
       - "n8n-workflows/scripts/validate-n8n-workflows.cjs"

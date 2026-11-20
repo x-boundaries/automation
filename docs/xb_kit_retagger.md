@@ -71,7 +71,7 @@ The first real run (L6) is gated on L5, including the answer about another tagge
 ## Rules
 
 - The rules are pasted into the Code node `Work Out Kit Tag Changes` as `RULES` (logic fields only: `slots[*].any`, `profiles[*].slots`, `exclude.title_words`, `exclude.types`). The display fields of the partner file (`_about`, labels, titles, `xt_url`, `pitch`) are not needed and are left out.
-- [`tests/fixtures/xb_kit_rules_v1.json`](../tests/fixtures/xb_kit_rules_v1.json) holds the same subset of the XT partner pack `XB_kit_rules.json` v1 (22 Oct 2026, sha256 `55bec65ee29fe1bdc4425920d85358cfa321f2c050a01f04d2c121bde4b6e1f5`). The test fails if the pasted table and the fixture differ.
+- [`tests/fixtures/xb_kit_rules_v1.fixture`](../tests/fixtures/xb_kit_rules_v1.fixture) holds the same subset of the XT partner pack `XB_kit_rules.json` v1 (22 Oct 2026, sha256 `55bec65ee29fe1bdc4425920d85358cfa321f2c050a01f04d2c121bde4b6e1f5`). The test fails if the pasted table and the fixture differ.
 - A rules change comes from XT as a new JSON file and lands only through a reviewed repo PR that updates the fixture and the pasted table together. The workflow never fetches rules at run time.
 - Matching (unchanged from the partner logic): case-insensitive, trimmed; a product gets `kit-<kit>` when it matches any slot of that kit, plus `ks-<slot>` for each matching slot that one of its kits uses; title words such as `kids`, `baby`, `brief` and the types `Underwear` and `Bra` keep a product out of every kit.
 

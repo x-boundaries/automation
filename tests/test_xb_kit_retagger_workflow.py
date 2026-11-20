@@ -3,7 +3,7 @@
 No n8n instance, Shopify store or email account is contacted. The committed Code nodes, the
 pagination expressions and the shared sender's own `Validate Alert Request` node are executed with
 the local Node runtime against synthetic Shopify pages. Every product, handle and id here is fake.
-The rules fixture `tests/fixtures/xb_kit_rules_v1.json` is the logic subset (slots[*].any,
+The rules fixture `tests/fixtures/xb_kit_rules_v1.fixture` is the logic subset (slots[*].any,
 profiles[*].slots, exclude.title_words, exclude.types) of the XT partner pack `XB_kit_rules.json`
 v1 (22 Oct 2026, sha256 55bec65ee29fe1bdc4425920d85358cfa321f2c050a01f04d2c121bde4b6e1f5).
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "n8n-workflows" / "xb_kit_retagger.workflow.json"
 SENDER = ROOT / "n8n-workflows" / "ops_alert_email.workflow.json"
-RULES_FIXTURE = ROOT / "tests" / "fixtures" / "xb_kit_rules_v1.json"
+RULES_FIXTURE = ROOT / "tests" / "fixtures" / "xb_kit_rules_v1.fixture"
 README = ROOT / "n8n-workflows" / "README.md"
 RUNBOOK = ROOT / "docs" / "xb_kit_retagger.md"
 CI = ROOT / ".github" / "workflows" / "xb-kit-retagger-tests.yml"
@@ -348,7 +348,7 @@ class KitRetaggerShapeTests(KitRetaggerBase):
             self.assertIn(word, runbook)
         ci = CI.read_text(encoding="utf-8")
         for path in ("n8n-workflows/xb_kit_retagger.workflow.json", "tests/test_xb_kit_retagger_workflow.py",
-                     "tests/fixtures/xb_kit_rules_v1.json", "docs/xb_kit_retagger.md",
+                     "tests/fixtures/xb_kit_rules_v1.fixture", "docs/xb_kit_retagger.md",
                      "n8n-workflows/ops_alert_email.workflow.json", ".github/workflows/xb-kit-retagger-tests.yml"):
             self.assertIn('- "%s"' % path, ci)
         self.assertNotIn("**", ci)
