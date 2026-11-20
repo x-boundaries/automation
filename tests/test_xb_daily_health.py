@@ -236,6 +236,42 @@ class RuleTests(unittest.TestCase):
             obs["stock_status"]["alert_status"] = status
             self.assertEqual(entry(judge(obs), "stock_alert_route")["verdict"], "OK", status)
 
+    def test_arap_alert_route_rules(self):
+        # #321 L3: the same closed rule as the stock route, read from the AR/AP status file only.
+        for status, reason in (("send_failed", "alert_send_failed"), ("secret_unavailable", "alert_secret_unavailable"),
+                               ("error", "alert_error")):
+            obs = healthy_obs()
+            obs["arap_status"]["alert_status"] = status
+            e = entry(judge(obs), "arap_alert_route")
+            self.assertEqual((e["verdict"], e["reasons"], e["since"]), ("WARN", [reason], "2026-11-19"))
+            # An AR/AP alert outcome never reaches the stock route.
+            self.assertEqual(entry(judge(obs), "stock_alert_route")["verdict"], "OK")
+        obs = healthy_obs()
+        obs["stock_status"]["alert_status"] = "send_failed"
+        self.assertEqual(entry(judge(obs), "arap_alert_route")["verdict"], "OK")
+        # `suppressed` is the steady state after the one-time AP notice: fine (PR #331 G2 note).
+        for status in ("no_alert", "sent", "suppressed", "disabled", "skipped_config", None):
+            obs = healthy_obs()
+            obs["arap_status"]["alert_status"] = status
+            self.assertEqual(entry(judge(obs), "arap_alert_route")["verdict"], "OK", status)
+        # A missing AR/AP status file is the export's FAIL, never a second line for the alert route.
+        obs = healthy_obs()
+        obs["arap_status"] = None
+        self.assertEqual(entry(judge(obs), "arap_export")["verdict"], "FAIL")
+        self.assertEqual(entry(judge(obs), "arap_alert_route")["verdict"], "OK")
+        # Switched off in the settings, it is not judged.
+        obs = healthy_obs()
+        obs["arap_status"]["alert_status"] = "error"
+        expected = dict(json.loads(EXAMPLE.read_text(encoding="utf-8"))["expected"], arap_alert_route="off")
+        e = entry(health.judge(settings(expected=expected), obs, {}, NOW), "arap_alert_route")
+        self.assertEqual((e["state"], e["verdict"], e["reasons"]), ("off", "NA", []))
+
+    def test_job_list_puts_the_arap_route_right_after_the_arap_export(self):
+        jobs = list(health.JOBS)
+        self.assertEqual(len(jobs), 14)
+        self.assertEqual(jobs.index("arap_alert_route"), jobs.index("arap_export") + 1)
+        self.assertEqual(health.REASONS["arap_alert_route"], health.REASONS["stock_alert_route"])
+
     def test_arap_export_rules(self):
         cases = [
             ({"finished_at": "2026-11-19T05:50:00+08:00"}, "WARN", ["last_run_old"]),

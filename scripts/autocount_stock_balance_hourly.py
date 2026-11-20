@@ -33,11 +33,12 @@ Safety contract (see docs/autocount2-automation/stock_balance_hourly_runbook.md)
   rows its CSV already holds.
 * Error alerts are off by default. When on, a failed or flagged run POSTs at most one sanitized
   event (closed keys and values: run id, hour, failure class, condition names, statuses and two
-  counts; never an item, quantity, location, path or message) to an n8n webhook, which sends it
-  to Telegram. The shared secret comes from an environment variable or Credential Manager at
-  runtime. An alert failure is recorded as alert_status and never changes the run's result.
-  Every run also keeps its alert_status and the webhook's HTTP status in alert_record.json in
-  its own hourly folder (written once after the alert, local only, pruned with the folder).
+  counts; never an item, quantity, location, path or message) to an n8n webhook, which emails it
+  through the shared XB Ops Alert Email sub-workflow. The shared secret comes from an environment
+  variable or Credential Manager at runtime. An alert failure is recorded as alert_status and
+  never changes the run's result. Every run also keeps its alert_status and the webhook's HTTP
+  status in alert_record.json in its own hourly folder (written once after the alert, local
+  only, pruned with the folder).
 
 pyodbc is imported only inside SqlServerSource so the tests run without it.
 """
@@ -229,7 +230,7 @@ DELIVERY_SKIPPED = "skipped_failed_run"
 # Written into the run manifest before delivery; the result is in last_run_status.json.
 DELIVERY_PENDING = "pending_see_last_run_status"
 
-# Error alerts (Telegram through an n8n webhook). Errors only: no heartbeat, no success message.
+# Error alerts (email through an n8n webhook). Errors only: no heartbeat, no success message.
 ALERT_STATE_NAME = "alert_state.json"
 ALERT_STATE_SCHEMA = "xb.ac2.stock_alert_state.v1"
 # One per run, beside the manifest: the manifest is written (and hashed) before the alert runs.
@@ -3263,7 +3264,7 @@ def publish_latest(root, run_dir, manifest, run_id):
 
 
 # ---------------------------------------------------------------------------------------------
-# Error alerts (Telegram through an n8n webhook). Errors only; never changes a run's outcome.
+# Error alerts (email through an n8n webhook). Errors only; never changes a run's outcome.
 # ---------------------------------------------------------------------------------------------
 
 

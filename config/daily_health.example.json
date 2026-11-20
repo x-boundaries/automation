@@ -20,6 +20,7 @@
     "ac2_stock_export": "on",
     "stock_alert_route": "on",
     "arap_export": "on",
+    "arap_alert_route": "on",
     "energygrid_daily_bills": "on",
     "energygrid_retention": "on",
     "drive_mirror": "on",

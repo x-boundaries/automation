@@ -1,6 +1,8 @@
 # Daily health check (#325)
 
-One email when any scheduled job fails silently. A read-only checker on the server PC runs at 07:30 SGT, judges every watched job OK, WARN or FAIL, and posts one codes-only event on loopback to the n8n workflow `XB Daily Health`. That workflow adds the n8n facts and mails the owner through the shared sender `XB Ops Alert Email`. No email when all is well, except the Monday heartbeat.
+One email when any scheduled job fails silently. A read-only checker on the server PC runs at 07:30 SGT, judges every watched job OK, WARN or FAIL, and posts one codes-only event on loopback to the n8n workflow `XB Daily Health`. That workflow adds the n8n facts and mails the owner through the shared sender `XB Ops Alert Email`. No email when all is well, except the Monday heartbeat and the morning after a health email that could not be sent.
+
+**Email only** (#288, owner 19 Nov 2026: "remove all telegram notifications"). Nothing in the health check uses Telegram.
 
 - Checker: [`scripts/xb_daily_health.py`](../scripts/xb_daily_health.py) (read-only).
 - Settings: `config/daily_health.local.json` on the server PC (git-ignored), copied from [`config/daily_health.example.json`](../config/daily_health.example.json).
@@ -29,11 +31,15 @@ The Gmail filter is `[XB health]`. The subject carries the date, so a FAIL never
    - the Drive mirror's `last_run_status.json` in its log folder;
    - its own records of the last 14 days.
 2. It judges each job (section "Rules"), writes `health_<date>.json` (codes, counts and dates only) into `record_dir`, and POSTs one `xb.daily_health.v1` event to `http://127.0.0.1:5678/webhook/<private path>` with the Header Auth secret from Windows Credential Manager. One POST, 10 s timeout, no retry, no proxy, no redirect. It always exits 0; only broken settings exit 2.
-3. **n8n, `XB Daily Health`.** Header Auth on the webhook; a request carrying Cloudflare or proxy headers gets 404; the Code node checks the closed schema (anything else: 400 with a `HEALTH_*` code) and answers 200 `accepted`. Then it reads, with the n8n API credential, the workflow list and the error runs of the last 24 h; reads today's `MEMBER-SYNC` `daily_summary` row in `xb_alert_email_log`; reads recent `xb_health_runs` rows; judges the n8n-side jobs; writes every line from fixed English templates; calls `XB Ops Alert Email` when the result is not OK or it is Monday; and writes one `xb_health_runs` row.
-4. **Email not sent** (`send_failed` when Gmail is down or the credential expired; also `rejected`, `error`, `call_failed` or an unknown answer from the sender): one fixed Telegram line through the existing Telegram credential, for example `XB health email could not be sent on 2026-11-19 (n8n email step: send_failed). Worst: FAIL 2 jobs. Check the n8n Gmail credential, then XB Daily Health.` Only `send_failed` names the Gmail credential; the other outcomes say `Check XB Daily Health and XB Ops Alert Email in n8n.` Nothing is sent to Telegram for `sent` or `not_due` (an OK weekday). The row in `xb_health_runs` records the outcome and the sender's code (for example `gmail_error` or `OPS_ALERT_SHORT`).
-5. **08:15, n8n dead-man.** If `xb_health_runs` has no `check` row for today, n8n mails `[XB health] FAIL 1 jobs <date>`: "the health checker did not report today".
+3. **n8n, `XB Daily Health`.** Header Auth on the webhook; a request carrying Cloudflare or proxy headers gets 404; the Code node checks the closed schema (anything else: 400 with a `HEALTH_*` code) and answers 200 `accepted`. Then it reads, with the n8n API credential, the workflow list and the error runs of the last 24 h; reads today's `MEMBER-SYNC` `daily_summary` row and the `send_failed` rows of every system from the last 24 h in `xb_alert_email_log`; reads recent `xb_health_runs` rows; judges the n8n-side jobs; writes every line from fixed English templates; calls `XB Ops Alert Email` when the result is not OK, on a Monday, or when yesterday's health email could not be sent; and writes one `xb_health_runs` row.
+4. **Email not sent** (`send_failed` when Gmail is down or the credential expired; also `rejected`, `error`, `call_failed` or an unknown answer from the sender): the `xb_health_runs` row records the outcome and the sender's code (for example `gmail_error` or `OPS_ALERT_SHORT`). Nothing else happens at 07:30.
+5. **08:15, n8n dead-man and retry.**
+   - No `check` row for today in `xb_health_runs`: n8n mails `[XB health] FAIL 1 jobs <date>`: "the health checker did not report today".
+   - Today's due email was not sent (every `check` row today has one of the failed outcomes above) and there is no `retry` row yet: n8n sends it **once** more, `[XB health] <verdict> <n> jobs <date>`, rebuilt from the row: `The 07:30 health email could not be sent (send_failed). This is the 08:15 retry.`, the FAIL and WARN job labels, and `Full detail: health_<date>.json on the server PC.` It logs a `retry` row. Never for `sent` or `not_due` (an OK weekday), and never twice.
+6. **Next morning.** If yesterday's email went out neither at 07:30 nor at the 08:15 retry, today's email is sent even on an OK weekday, with the line `Yesterday's health email could not be sent (send_failed at 07:30 and 08:15).` (or `... at 07:30; the 08:15 retry did not run).`). It is not retried again.
+7. **Health check broken.** If `Judge And Build Email` or `Decide Dead-Man` itself fails, `Build Broken-Check Email` (fixed values) sends `[XB health] FAIL 1 jobs <date>`: "the health check could not be built today" and "n8n XB Daily Health failed before the email". Its row has `kind: check` from the 07:30 path (so the dead-man does not mail twice) and `kind: deadman` from the 08:15 path. Only a Code step is broken, not Gmail, so this email normally goes out.
 
-Python never sends Telegram or Gmail itself: that would copy a credential out of n8n.
+Python never sends email itself: that would copy a credential out of n8n.
 
 ## Jobs
 
@@ -46,10 +52,11 @@ Python never sends Telegram or Gmail itself: that would copy a credential out of
 | `ac2_stock_export` | AC2 hourly stock export | checker: stock status pair on Drive | `on` |
 | `stock_alert_route` | Stock alert route | checker: `alert_status` in the stock status file | `on` |
 | `arap_export` | AR/AP export | checker: AR/AP status pair on Drive | `on` |
+| `arap_alert_route` | AR/AP alert route | checker: `alert_status` in the AR/AP status file (#321 L3) | `on` |
 | `energygrid_daily_bills` | EnergyGrid daily bills | checker: its server task (liveness only) | `on` |
 | `energygrid_retention` | EnergyGrid retention | checker: its server task (liveness only) | `on` |
 | `drive_mirror` | Drive mirror | checker: its server task and status file | `on` |
-| `n8n_workflows` | n8n workflows | n8n: expected workflows active, error runs | `on` |
+| `n8n_workflows` | n8n workflows | n8n: expected workflows active, error runs, alert emails not sent | `on` |
 | `simba_intake` | SIMBA intake | n8n: the SIMBA workflows active, error runs | `not_installed` |
 | `server_tasks` | Server task list | checker: tasks in `\XB\` that the settings do not name | `on` |
 | `checker` | Health checker | checker: yesterday's POST; n8n dead-man | `on` |
@@ -67,6 +74,7 @@ The check runs at 07:30 SGT; ages are measured at check time. Thresholds are in 
 | --- | --- | --- |
 | AC2 hourly stock export | last run over 70 min ago (`last_run_old`); last run failed but the last good `latest_manifest.json` is under 3 h old (`run_failed`); `delivery_status` `verify_failed` or `copy_failed` (`delivery_failed`); `daily_close_status` `failed` (`daily_close_failed`); `analysis_failure_class` set (`analysis_failed`); run over 7.5 min (`run_slow`) | last run over 3 h ago (`last_run_too_old`); failed and the good manifest over 3 h old or missing (`manifest_too_old`, `manifest_missing`); run over 12 min, 80 % of `PT15M` (`run_too_slow`); status file missing or unreadable (`status_missing`) |
 | Stock alert route | `alert_status` `send_failed`, `secret_unavailable` or `error` | none |
+| AR/AP alert route | `alert_status` `send_failed`, `secret_unavailable` or `error` (the same values; `suppressed`, the steady state after the one-time AP notice, is fine) | none |
 | AR/AP export | last run over 90 min ago; failed with a good manifest under 3 h old; delivery `verify_failed` or `copy_failed` | last run over 3 h ago; good manifest over 3 h old or missing; status file missing |
 | EnergyGrid daily bills | last result not 0 (`task_result_nonzero`); last run over 26 h ago | task Disabled without a pause (`task_disabled`); last run over 50 h ago; task missing |
 | EnergyGrid retention | exit 20 (`retention_held`) or 64 (`retention_refused`); other non-zero result; last run over 26 h ago | Disabled without a pause; last run over 50 h ago; task missing |
@@ -76,12 +84,13 @@ The check runs at 07:30 SGT; ages are measured at check time. Thresholds are in 
 | Drive folder | none | the Drive report folder is not reachable on the server PC (`folder_missing`) |
 | Member sync daily summary | `xb_alert_email_log` could not be read (`log_read_failed`) | no `daily_summary` row for today (`summary_missing`); only `send_failed` rows today (`summary_send_failed`) |
 | n8n workflows, SIMBA intake | error runs in the last 24 h for workflows that keep them (`error_runs`); the n8n API could not be read (`n8n_api_failed`); a workflow ID still a placeholder (`not_configured`) | an expected workflow inactive (`workflow_inactive`) or not found (`workflow_missing`) |
+| n8n workflows only | `send_failed` rows of any system in `xb_alert_email_log` in the 24 h before the check (`alert_email_failed`, with a count): a real-time alert (stock, AR/AP, EnergyGrid) or a health email that could not be sent shows the next morning; the log could not be read (`alert_log_read_failed`) | none |
 
 - Task Scheduler results 0x41300-0x41303 (ready, running, disabled, not run yet) are states, not failed runs. A task that has never run counts as "last run too old".
 - If Task Scheduler cannot be read at all, the task jobs and the server task list get WARN `task_query_failed`.
 - **VM or Drive down:** when the stock and AR/AP exports are both stale by more than 3 h with ages within 90 min of each other, the email adds one line: "Together: the AC2 VM or its Google Drive sync looks down". It is a note, not an extra job.
 - **Repeats:** a problem that lasts is mailed every morning until it clears. Each line says "since <date>": the checker works it out from its own last 14 records, n8n from `xb_health_runs` for the n8n-side jobs.
-- The existing real-time alerts (the stock alert, the EnergyGrid monitor) are not replaced and still fire as before.
+- The existing real-time alerts (the stock alert, the AR/AP alert, the EnergyGrid monitor) are not replaced and still fire as before, by email.
 
 ## Pauses
 
@@ -104,15 +113,15 @@ A planned stop that lasts past 07:30 goes into `pauses` in the settings file:
 
 1. **Monday heartbeat.** Every Monday the 07:30 run sends an email even when all is well. It lists the jobs watched, the jobs not watched, and how many of the last 7 daily checks ran (from `xb_health_runs`). If Monday already has a WARN or FAIL, that email is the heartbeat and carries the same week line.
 2. **Dead-man, 08:15.** No `check` row for today in `xb_health_runs`: `[XB health] FAIL 1 jobs <date>`. It covers a dead checker task, a sleeping PC or a broken webhook while n8n is up.
-3. **Gmail down:** the Telegram fallback line (above).
-4. **n8n or the server PC down:** nothing can send, and the dead-man cannot run either. The checker records `send_status: failed` and reports `previous_send_failed` the next day. Detection is the missing Monday email: at worst 7 days. This is the accepted limit (owner, 18 Nov 2026, Q4).
+3. **Gmail or the sender down for a short while:** the 08:15 retry, then the next-morning line ("How it works", items 5 and 6). A failed real-time alert shows the next morning as `alert_email_failed`.
+4. **Blind spot (email only, accepted):** every email leaves through one n8n workflow (`XB Ops Alert Email`), one Gmail credential, n8n and the server PC. If any of these **stays** broken (OAuth consent revoked, token expired, the sender broken, a Google outage longer than a day, n8n down, the PC off), **nothing arrives at all**: no health email, no stock, AR/AP, EnergyGrid or member alert, and no retry. The only signal is the **missing Monday `[XB health]` email**: up to 7 days (about 8 if the failure starts just after a Monday email). The owner kept the Monday-only heartbeat (#288 Q3 = (i), 20 Nov 2026; first set 18 Nov 2026, #325 Q4): the OK email is not sent daily. Before #288, Telegram covered the Gmail-only case; that cover is gone by the owner's choice.
 5. **VM down:** the stock and AR/AP exports go stale and the member-sync summary is missing: FAIL lines plus the "AC2 VM or Google Drive sync looks down" line, all sent from the server.
 
 ## Event (checker to n8n)
 
 `xb.daily_health.v1`, closed. Keys exactly `schema`, `date` (SGT), `checked_at` (`YYYY-MM-DDTHH:MM+08:00`, at most 60 min from n8n's clock), `jobs`, `notes`.
 
-- `jobs`: all 13 jobs, in the order of the Jobs table, each with exactly `job`, `state` (`on`, `off`, `not_installed`, `paused`), `verdict` (`OK`, `WARN`, `FAIL`; `N8N` for an n8n-judged job that is `on`; `NA` when not `on`), `reasons` (0-6 closed codes of that job; the verdict must equal their worst level), `since` (a date for WARN and FAIL, else `null`), `until` and `pause_reason` (paused jobs only), `age_min`, `exit`, `count` (whole numbers or `null`).
+- `jobs`: all 14 jobs, in the order of the Jobs table, each with exactly `job`, `state` (`on`, `off`, `not_installed`, `paused`), `verdict` (`OK`, `WARN`, `FAIL`; `N8N` for an n8n-judged job that is `on`; `NA` when not `on`), `reasons` (0-6 closed codes of that job; the verdict must equal their worst level), `since` (a date for WARN and FAIL, else `null`), `until` and `pause_reason` (paused jobs only), `age_min`, `exit`, `count` (whole numbers or `null`).
 - `notes`: `[]` or `["vm_or_drive_down"]`.
 
 No task name, path, host name, message, address or business value is in the event. n8n refuses any other key or value.
@@ -130,7 +139,7 @@ No task name, path, host name, message, address or business value is in the even
 | `task_path` | `\XB\`. |
 | `tasks` | The Task Scheduler names of `energygrid_daily_bills`, `energygrid_retention`, `drive_mirror` and `checker`. |
 | `known_tasks` | Other task names in `\XB\` that are known and not watched (not `unknown_task`). |
-| `expected` | `on`, `off` or `not_installed` for each of the 13 jobs. |
+| `expected` | `on`, `off` or `not_installed` for each of the 14 jobs. |
 | `thresholds` | Optional overrides, minutes (see the example for names and defaults). |
 | `pauses` | Planned pauses (above). |
 | `send` | `enabled`; `webhook_url` (`http://127.0.0.1:<port>/webhook/<path>` only: the request carries the secret, so it never leaves the PC); `auth_header_name` (the Header Auth credential's header name); `secret_credential_target` (the Windows Credential Manager generic credential that holds the secret); `timeout_seconds` (5-10). |
@@ -146,12 +155,12 @@ python scripts\xb_daily_health.py run --config config\daily_health.local.json --
 
 ## n8n Data Table `xb_health_runs`
 
-One row per check and per dead-man email. n8n adds `id`, `createdAt` and `updatedAt` itself.
+One row per check, per dead-man email and per 08:15 retry. n8n adds `id`, `createdAt` and `updatedAt` itself.
 
 | Column | Type | Value |
 | --- | --- | --- |
 | `date` | string | The check date, SGT, `YYYY-MM-DD`. |
-| `kind` | string | `check` (the 07:30 event) or `deadman` (the 08:15 email). |
+| `kind` | string | `check` (the 07:30 event, or the broken-check email from that path), `deadman` (the 08:15 email) or `retry` (the 08:15 retry of a failed 07:30 email). |
 | `verdict` | string | `OK`, `WARN` or `FAIL`. |
 | `watched` | number | Jobs `on` or paused. |
 | `problems` | number | Jobs WARN or FAIL. |
@@ -160,7 +169,7 @@ One row per check and per dead-man email. n8n adds `id`, `createdAt` and `update
 | `code` | string | The sender's closed code (for example `gmail_error`), or empty. |
 | `logged_at` | string | ISO-8601 UTC. |
 
-The table grows by one or two rows a day. No clean-up is built.
+The table grows by one to three rows a day. No clean-up is built.
 
 ## Off switch
 
@@ -191,16 +200,25 @@ Each step needs its own owner OK; server PC and n8n only, nothing on the VM. All
 | --- | --- | --- | --- |
 | L1 | Re-import the updated `XB Ops Alert Email` (system `HEALTH`) from the merged export, keeping its private values (local `.tmp` copy, read back). Before the update, back up the live workflow and diff it node by node against the pre-PR export: any drift beyond the known private values (recipient, table ID, Gmail credential binding) stops the step. | "HEALTH SENDER UPDATE" | Re-apply the backup taken from the live read; read back. |
 | L2 | Create Data Table `xb_health_runs` (columns above); create a new n8n API key and its `n8nApi` credential; create a new Header Auth credential (and the matching Credential Manager entry). | "HEALTH CREDENTIALS" | Delete the empty `xb_health_runs` table; delete the new `n8nApi` and Header Auth credentials; revoke the new API key; the owner deletes the Credential Manager entry. |
-| L3 | Import `XB Daily Health` inactive; set the webhook path, the `WATCH` workflow IDs, both table IDs, the sender workflow ID and the Telegram chat; bind Header Auth, `n8nApi` and the existing Telegram credential; read the workflow back, including `List Workflows` and `List Error Runs` in the editor. Also one read-only GET of `/api/v1/workflows` on the local API: published workflows must report `active: true` on this n8n version (the judge reads that field; otherwise every watched workflow shows FAIL `workflow_inactive`). | "HEALTH N8N IMPORT" | Archive or delete the inactive `XB Daily Health` (never active; nothing calls it). |
+| L3 | Import `XB Daily Health` inactive; set the webhook path, the `WATCH` workflow IDs, both table IDs and the sender workflow ID; bind Header Auth and `n8nApi`; read the workflow back, including `List Workflows` and `List Error Runs` in the editor. Also one read-only GET of `/api/v1/workflows` on the local API: published workflows must report `active: true` on this n8n version (the judge reads that field; otherwise every watched workflow shows FAIL `workflow_inactive`). | "HEALTH N8N IMPORT" | Archive or delete the inactive `XB Daily Health` (never active; nothing calls it). |
 | L4 | Server: write the private settings, then `check-settings` and `run --no-send` once. | none (read-only) | Delete `config\daily_health.local.json` and the one `health_<date>.json` record if wanted. |
 | L5 | One test send: activate `XB Daily Health`, then run the checker once by hand. An all-OK weekday sends no email by design, so run it on a Monday (heartbeat) or expect only an `xb_health_runs` row. Read back through the local API that `XB Daily Health` now reports `active: true`. Activation also arms the 08:15 dead-man: do L6 in the same sitting, or deactivate again. | "HEALTH TEST EMAIL" | Deactivate `XB Daily Health`. The one test email cannot be recalled. |
 | L6 | Register `\XB\XB-DailyHealth` (installer dry run first). | "HEALTH TASK" | `Disable-ScheduledTask` (off switch), or `Unregister-ScheduledTask -TaskPath '\XB\' -TaskName 'XB-DailyHealth'` with the owner's OK. |
 | L7 | Observe 7 mornings and the first Monday heartbeat; then retire the desktop reminder for the manual #155 check. | none (records) | None (records only). |
 
+### Email-only update of the live workflow (#288 step H1)
+
+The live `XB Daily Health` was installed with two Telegram nodes; this export (#288 T2 and #321 L3) replaces them. It also changes the event: the checker now sends **14** jobs (the new `arap_alert_route`), and `Validate Health Event` accepts only 14. So the server checker, its settings and the n8n workflow change **in one sitting**, between 08:15 and the next 07:30. Otherwise the old workflow refuses the new event (`HEALTH_JOBS`, 400) or the new checker refuses the old settings (`settings_expected_keys`, exit 2); either way no `check` row is written and the 08:15 dead-man mails a FAIL.
+
+| # | Step | OK words | Rollback |
+| --- | --- | --- | --- |
+| H1 | Back up the live `XB Daily Health` and diff it node by node against the pre-PR export: drift beyond the known private values stops the step. Update it in place from the merged export through the local API, keeping every private value (local `.tmp` copy): the webhook path, both table IDs (`Read Failed Alert Emails` uses the alert log table), the sender workflow ID and the `WATCH` IDs, including the new `REPLACE_WITH_ARAP_ALERT_WORKFLOW_ID` (`AC2 ARAP Export - Error Alert`) and the member sync summary. The Telegram nodes and their binding go. Publish and read back. In the same sitting: bring the clone the task runs from to the merged main, add `"arap_alert_route": "on"` to `expected` in `config\daily_health.local.json`, then `check-settings` and `run --no-send`. | "HEALTH NO TELEGRAM" | Re-apply the backup and return the clone and the settings to the previous version, together. |
+| H2 | Observe the next Monday heartbeat, and a `retry` row only if a failure happens. | none (records) | None. |
+
 ## Privacy
 
 - Event and records: job ids, closed codes, whole numbers and dates only. No names, phones, emails, member numbers, customer ids, paths, host names, item codes or amounts.
 - Email lines are written in n8n from fixed templates; the only other text is the fixed workflow labels in the `WATCH` settings of `Judge And Build Email`.
-- Credentials: Gmail stays in `XB Ops Alert Email` (reused, never copied; the health workflow has no Gmail node). Telegram is the existing credential, bound in n8n only. The n8n API key lives only in an n8n `n8nApi` credential. The webhook secret is a Header Auth credential in n8n and a Credential Manager entry on the server PC.
+- Credentials: Gmail stays in `XB Ops Alert Email` (reused, never copied; the health workflow has no Gmail node). No Telegram node or credential. The n8n API key lives only in an n8n `n8nApi` credential. The webhook secret is a Header Auth credential in n8n and a Credential Manager entry on the server PC.
 - `XB Daily Health` saves no executions (the webhook item holds the Header Auth secret).
 - The recipient is set only in `XB Ops Alert Email`, privately, at #288 slice 1.

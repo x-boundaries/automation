@@ -2985,7 +2985,7 @@ class RepoHygieneTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
-# Error alerts (Telegram through an n8n webhook). Fake URL, fake secret, fake transport only.
+# Error alerts (email through an n8n webhook). Fake URL, fake secret, fake transport only.
 # ---------------------------------------------------------------------------------------------
 
 FAKE_ALERT_URL = "https://alerts.example.com/webhook/fake-alert-path"

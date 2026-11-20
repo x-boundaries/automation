@@ -8,7 +8,7 @@ Buying analysis (#292 slice S2, owner "Yes, accept all", 8 Nov 2026): behind `an
 
 Purchasing and vendors (#292 slice S4, owner 10 Nov 2026): behind `analysis.purchasing.enabled` (**default off**, and it needs `analysis.enabled` too), the nightly analysis set also carries `analysis_purchasing.json.gz`: open PO units, goods received by month, supplier lead days, vendor names and the ordered vs received size split. Units only; vendor **names** are shown (owner Q1), never creditor codes, PO/GR numbers, prices or amounts. A purchasing failure never blocks the buying files or the hourly files. See [Purchasing file](#purchasing-file-292-s4).
 
-Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one email to the operations inbox through the shared `XB Ops Alert Email` sub-workflow (6 Nov 2026, #288: email replaces Telegram; no dual-send). Off by default and shipped inactive; see [Error alerts](#error-alerts-email-through-n8n).
+Error alerts (29 Oct 2026, owner: errors only, no heartbeat): a failed or flagged run can POST one sanitized event to an n8n webhook, which sends one email to the operations inbox through the shared `XB Ops Alert Email` sub-workflow (6 Nov 2026, #288: email replaces Telegram; no dual-send. 19 Nov 2026, #288 slice T: email only, Telegram is retired everywhere; the live workflow still ran the older Telegram build until step S1 updates it from this export). Off by default and shipped inactive; see [Error alerts](#error-alerts-email-through-n8n).
 
 Round 6 (accepted design, owner "Accept all", 27 Oct 2026): a daily 00:00 close rebuilt from the stock ledger, a backfill from 1 Aug 2026, one latest pair in Drive (no hourly folders in Drive), local retention, and a compact dashboard feed. File, setting and task names keep the word "hourly" (the job still runs hourly); only the Drive folder is renamed to "daily".
 
@@ -606,7 +606,7 @@ Log: n8n Data Table xb_alert_email_log. Contract: n8n-workflows/README.md, ops_a
 
 ### Alert go-live steps (A1-A5)
 
-Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run with email (the 29 Oct A1/A2 attempt was with Telegram, which this route replaces). Results go to the private mailbox only (never the secret, the operations inbox address or the webhook path).
+Each step **needs a separate owner OK**; the Controller runs A1, A2 and A4 on the server PC and VM Claude runs A3 and A5. Nothing here has been run with email (the 29 Oct A1/A2 attempt was with Telegram, which this route replaces; Telegram is retired, #288 slice T). Results go to the private mailbox only (never the secret, the operations inbox address or the webhook path).
 
 **Before A1:** the shared sub-workflow `XB Ops Alert Email` must be live first (#288 slice 1, each its own owner OK): the Data Table `xb_alert_email_log` created, the sub-workflow imported inactive through the local API `http://127.0.0.1:5678/api/v1`, its Gmail credential bound, the operations inbox set privately in the local import copy, one test email sent, then published so other workflows can call it. See [n8n-workflows/README.md](../../n8n-workflows/README.md) (ops_alert_email.workflow.json).
 
