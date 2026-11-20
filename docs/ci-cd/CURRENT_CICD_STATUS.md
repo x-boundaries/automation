@@ -78,5 +78,14 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   needs the one-time `git config core.hooksPath .githooks` per clone; see
   `docs/data_policy.md`.
 
+- n8n export guards (#334 G2 L2) add `.github/workflows/n8n-export-guards.yml`.
+  The repo-wide guards `tests/test_no_telegram_nodes.py` (#288 T2) and
+  `tests/test_n8n3_always_output_data_guard.py` (#332 T4) also run in the
+  member-create-uat-tests `rest` shard, but that workflow triggers on listed
+  paths only. This job runs both on any pull request that changes
+  `n8n-workflows/**`, on the literal head, with no secret or live system.
+  `tests/test_n8n_export_guards_ci.py` pins the trigger and the run line and
+  rejects masked exits and conditions.
+
 This status file records CI shape only; it is not a deployment approval or a
 claim that a remote check has passed before the branch is published.
