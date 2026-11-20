@@ -7,14 +7,26 @@
 #   synthetic: -SessionFactory returning a binding marked
 #     XbDirectLocalSyntheticFake, whose UserSession, DBSetting and every
 #     MemberCommand are not AutoCount types. -TargetBook is refused with it.
-#   real: -TargetBook naming a book this source authorises (AED_TESTINGAPI
-#     only). New-XbDlRealSession (ac2_directlocal_book_guard.ps1) checks host,
+#   real: -TargetBook naming a book this source authorises (AED_TESTINGAPI;
+#     go-live: AED_XBOUNDARIES only for sync-lookup, sync-changelog and
+#     write-once with profile sync_p1, checked before stdin and again once
+#     the payload is read, before any session or claim).
+#     New-XbDlRealSession (ac2_directlocal_book_guard.ps1) checks host,
 #     assembly pins, pins the book for this process, proves the authenticated
 #     book identity, vendor telemetry off and empty outbound queues before any
 #     member operation. Credentials come only from the process environment,
 #     which only the Owner console procedure supplies.
 # With neither, the bridge refuses (autocount_real_bridge_disabled) before
 # stdin is read, whatever flags, fence ids or AutoCount environment exist.
+#
+# #155 phase 1 sync adds two read-only operations, sync-lookup and
+# sync-changelog (parameterised SELECTs through the guarded DBSetting), and
+# (#155 BF2a) a third, sync-member-scan (one keyset page of every member with
+# the scope columns and the 0/1 decline flag; the Note text is never read
+# out), and
+# a sync_p1 payload profile for write-once (ac2_member_sync_member.ps1; the
+# pinned gateway adapter is unchanged). Their stdout carries member rows for
+# the parent process only; the parent never prints them.
 #
 # write-once is the only path that reaches SaveMember. It additionally needs a
 # fence id bound to the stdin payload, a payload digest match, an unexpired
@@ -23,7 +35,7 @@
 # without SaveMember. Claim and outcome files are never deleted here.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once")][string]$Operation,
+    [Parameter(Mandatory)][ValidateSet("book-check", "pos-sync-status", "legacy-precheck", "next-member-no", "probe", "reconcile", "write-once", "sync-lookup", "sync-changelog", "sync-member-scan")][string]$Operation,
     [switch]$EnableProductionAdapter,
     [string]$FenceId,
     [string]$ClaimDirectory,
@@ -37,6 +49,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "ac2_member_gateway_autocount_adapter.ps1")
 . (Join-Path $PSScriptRoot "ac2_directlocal_book_guard.ps1")
+. (Join-Path $PSScriptRoot "ac2_member_sync_member.ps1")
 
 $script:XbDirectLocalMemberNoPattern = '^[A-Za-z0-9][A-Za-z0-9._/-]{0,19}$'
 
@@ -105,8 +118,9 @@ function New-XbDirectLocalSyntheticSession {
 }
 
 function New-XbDirectLocalSession {
+    param([AllowNull()][AllowEmptyString()][string]$PayloadProfile)
     if ($null -ne $SessionFactory) { return (New-XbDirectLocalSyntheticSession) }
-    return (New-XbDlRealSession -Book $TargetBook -AcRoot $AcRoot)
+    return (New-XbDlRealSession -Book $TargetBook -AcRoot $AcRoot -Operation $Operation -PayloadProfile $PayloadProfile)
 }
 
 function Assert-XbDirectLocalMemberNo {
@@ -136,6 +150,104 @@ function Invoke-XbDirectLocalLegacyPrecheck {
     return [ordered]@{ outcome = $outcome; phone_member_no_hit = $phoneMemberNo; mobile_phone_hit = $mobile; email_hit = $emailHit; lookups = $results.Count }
 }
 
+function ConvertFrom-XbDirectLocalJsonRows {
+    # FOR JSON PATH text -> array of rows (ConvertFrom-Json in Windows
+    # PowerShell 5.1 emits a JSON array as one object; foreach enumerates it).
+    param([AllowNull()][string]$Json)
+    $rows = @()
+    if ([string]::IsNullOrWhiteSpace($Json)) { return ,$rows }
+    foreach ($row in (ConvertFrom-Json -InputObject $Json)) { $rows += $row }
+    return ,$rows
+}
+
+function Invoke-XbDirectLocalSyncLookup {
+    # Read-only: members whose MemberNo or MobilePhone is the phone, whose
+    # MemberNo embeds the Singapore 8 digits, or whose MemberNo equals one of
+    # the given numbers (trimmed, case-insensitive). #155 BF2a: or, alone,
+    # whose EmailAddress is exactly one email (trimmed, case-insensitive),
+    # for S6's AutoCount-side shared-email check; never mixed with the others.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
+    $phone = $Request.phone_digits
+    $local = $Request.sg_local
+    $numbers = @($Request.member_nos | Where-Object { $null -ne $_ })
+    $email = if ($null -ne $Request.PSObject.Properties["email_address"]) { $Request.email_address } else { $null }
+    if ($null -ne $email) {
+        if ($email -isnot [string] -or $email.Length -gt 254 -or $email -cnotmatch '\A[^@\s]+@[^@\s]+\.[^@\s]+\z' -or $email -cmatch '[^\x21-\x7E]' -or
+            $null -ne $phone -or $null -ne $local -or $numbers.Count -gt 0) { throw "phone_keys_invalid" }  # the lookup's key-shape code (existing)
+    }
+    if ($null -ne $phone -and [string]$phone -cnotmatch '^[0-9]{8,15}$') { throw "phone_keys_invalid" }
+    if ($null -ne $local -and [string]$local -cnotmatch '^[0-9]{8}$') { throw "phone_keys_invalid" }
+    if ($numbers.Count -gt 20) { throw "member_no_invalid" }
+    foreach ($number in $numbers) {
+        if ([string]::IsNullOrWhiteSpace([string]$number) -or ([string]$number).Length -gt 40) { throw "member_no_invalid" }
+    }
+    $keyExpr = "UPPER(LTRIM(RTRIM(MemberNo)))"
+    $mobileExpr = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ISNULL(MobilePhone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', ''), '.', '')"
+    $conditions = @()
+    $params = @()
+    if ($null -ne $phone) {
+        $conditions += "$keyExpr = ?"; $params += [string]$phone
+        $conditions += "$mobileExpr = ?"; $params += [string]$phone
+    }
+    if ($null -ne $local) {
+        $conditions += "$keyExpr = ?"; $params += [string]$local
+        $conditions += "$mobileExpr = ?"; $params += [string]$local
+        $conditions += "CHARINDEX(?, MemberNo) > 0"; $params += [string]$local
+    }
+    foreach ($number in $numbers) {
+        $conditions += "$keyExpr = UPPER(LTRIM(RTRIM(?)))"; $params += [string]$number
+    }
+    if ($null -ne $email) { $conditions += "LOWER(LTRIM(RTRIM(EmailAddress))) = LOWER(?)"; $params += [string]$email }
+    if ($conditions.Count -eq 0) { return [ordered]@{ members = @() } }
+    # BF2a: MemberType, IsActive, ExpiryDate and the decline flag (computed
+    # here; the Note text itself is never selected).
+    $sql = "SELECT (SELECT TOP 50 MemberNo AS member_no, Name AS name, MobilePhone AS mobile_phone, EmailAddress AS email_address, " +
+        "CONVERT(varchar(10), DOB, 23) AS dob, CONVERT(varchar(23), CreatedTime, 126) AS created_time, " +
+        "MemberType AS member_type, IsActive AS is_active, CONVERT(varchar(10), ExpiryDate, 23) AS expiry_date, " +
+        "CASE WHEN CHARINDEX('XB-NO-SHOPIFY', UPPER(ISNULL(CAST(Note AS nvarchar(max)), ''))) > 0 THEN 1 ELSE 0 END AS no_shopify FROM Member WHERE " +
+        ($conditions -join " OR ") + " ORDER BY MemberNo FOR JSON PATH, INCLUDE_NULL_VALUES)"
+    try { $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params $params) } catch { throw "sync_lookup_failed" }
+    return [ordered]@{ members = (ConvertFrom-XbDirectLocalJsonRows -Json $json) }
+}
+
+function Invoke-XbDirectLocalSyncMemberScan {
+    # #155 BF2a, read-only: one page (TOP 1000) of every member after a
+    # MemberNo cursor ("" for the first page), in MemberNo order, with the
+    # scope columns and the decline flag computed in the pinned SQL (the
+    # Note text is never selected). The only variable is the cursor, a
+    # parameter.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
+    $after = if ($null -ne $Request.PSObject.Properties["after_member_no"]) { $Request.after_member_no } else { $null }
+    if ($after -isnot [string] -or $after.Length -gt 40 -or $after -cmatch '[\x00-\x1F\x7F]') { throw "member_no_invalid" }  # the cursor is a MemberNo (existing code)
+    try { $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.sync_member_scan -Params @($after)) }
+    catch { throw "sync_lookup_failed" }  # existing code: BRIDGE_CHILD_ERROR_CODES is not in this slice
+    return [ordered]@{ members = (ConvertFrom-XbDirectLocalJsonRows -Json $json) }
+}
+
+function Invoke-XbDirectLocalSyncChangeLog {
+    # Read-only: Member insert rows of HQ ChangeLog after an ID watermark
+    # (inserts carry the full row as XML; IDs have gaps), plus the current
+    # highest ID. VM facts r5 (2026-10-21): ID bigint IDENTITY(1,1),
+    # TableName 'Member', insert ChangeType 'I', XML in Content (configured).
+    # AutoCount rewrites every "?" in the text into a parameter, so the SQL
+    # text holds no literal "?" other than the one placeholder.
+    param([Parameter(Mandatory)]$DBSetting, [Parameter(Mandatory)]$Request)
+    $column = [string]$Request.xml_column
+    if ($column -cnotmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$') { throw "sync_changelog_request_invalid" }
+    $afterId = $Request.after_id
+    $limit = $Request.limit
+    if ($afterId -isnot [int] -and $afterId -isnot [long]) { throw "sync_changelog_request_invalid" }
+    if ($limit -isnot [int] -or $limit -lt 1 -or $limit -gt 1000 -or $afterId -lt -1) { throw "sync_changelog_request_invalid" }
+    $sql = "SELECT (SELECT TOP ($limit) ID AS id, CAST([$column] AS nvarchar(max)) AS xml FROM ChangeLog " +
+        "WHERE TableName = 'Member' AND ChangeType = 'I' AND ID > ? ORDER BY ID FOR JSON PATH)"
+    try {
+        $json = [string](Get-XbDlScalar -DBSetting $DBSetting -Sql $sql -Params @([long]$afterId))
+        $maxId = [long](Get-XbDlScalar -DBSetting $DBSetting -Sql $script:XbDlSqlText.changelog_max_id)
+    }
+    catch { throw "sync_changelog_failed" }
+    return [ordered]@{ rows = (ConvertFrom-XbDirectLocalJsonRows -Json $json); max_id = $maxId }
+}
+
 function Invoke-XbDirectLocalWriteOnce {
     param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ClaimPath)
     if ([string]$Request.fence_id -cne $FenceId) { throw "fence_binding_mismatch" }
@@ -145,16 +257,44 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     Assert-XbDirectLocalMemberNo -MemberNo ([string]$Request.member_no)
     $payload = $payloadText | ConvertFrom-Json
-    $member = @{
-        MemberNo = [string]$Request.member_no
-        Name = [string]$payload.name
-        RegisterDate = [string]$payload.register_date
-        ExpiryDate = [string]$payload.expiry_date
+    # A payload without "profile" is the original Shopify M1 create.
+    $profile = if ($null -ne $payload.PSObject.Properties["profile"]) { [string]$payload.profile } else { "shopify_m1" }
+    if ($profile -ceq "sync_p1") {
+        $member = @{
+            MemberNo = [string]$Request.member_no
+            Name = [string]$payload.name
+            RegisterDate = [string]$payload.register_date
+        }
+        if ($null -ne $payload.dob) { $member.DOB = [string]$payload.dob }
+        # Round 6: the configured member type, checked before any session.
+        if ($null -eq $payload.PSObject.Properties["member_type"] -or $null -eq $payload.member_type) { throw "member_field_required" }
+        $memberType = [string]$payload.member_type
+        Assert-XbSyncMemberType -MemberType $memberType
     }
+    elseif ($profile -ceq "shopify_m1") {
+        $member = @{
+            MemberNo = [string]$Request.member_no
+            Name = [string]$payload.name
+            RegisterDate = [string]$payload.register_date
+            ExpiryDate = [string]$payload.expiry_date
+        }
+    }
+    else { throw "member_field_not_allowed" }
+    # Go-live R4: the live book takes only the sync_p1 profile; checked now
+    # the payload is read, before any session, login or claim.
+    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook -Operation $Operation -PayloadProfile $profile }
     if ($null -ne $payload.mobile_phone) { $member.MobilePhone = [string]$payload.mobile_phone }
     if ($null -ne $payload.email_address) { $member.EmailAddress = [string]$payload.email_address }
     # A login, identity or outbound-queue failure here stops before the claim.
-    $session = New-XbDirectLocalSession
+    $session = New-XbDirectLocalSession -PayloadProfile $profile
+    if ($profile -ceq "sync_p1") {
+        # VM fact r5-6: SaveMember and the member API check no access right,
+        # so the write limits are ours. A number already held is refused
+        # here, before the claim (proven not written), never left to SaveMember.
+        if ($null -ne (Get-XbAutoCountMember -Session $session -MemberNo $member.MemberNo)) { throw "member_no_taken" }
+        # Go-live R7 (Owner Q7): the member type must exist in this book.
+        Assert-XbDlMemberTypeExists -DBSetting $session.DBSetting -MemberType $memberType
+    }
 
     # Exclusive claim immediately before the sole SaveMember path.
     try {
@@ -171,8 +311,14 @@ function Invoke-XbDirectLocalWriteOnce {
     }
     finally { $stream.Dispose() }
 
-    $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile "shopify_m1"
-    $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile "shopify_m1"
+    if ($profile -ceq "sync_p1") {
+        $created = New-XbSyncAutoCountMember -Session $session -Member $member -MemberType $memberType -EnableProductionAdapter:$EnableProductionAdapter
+        $check = Compare-XbSyncMemberReadBack -Expected $created.Expected -Actual $created.ReadBack
+    }
+    else {
+        $created = New-XbAutoCountMember -Session $session -Member $member -EnableProductionAdapter:$EnableProductionAdapter -FieldProfile "shopify_m1"
+        $check = Compare-XbAutoCountMemberReadBack -Expected $created.Expected -Actual $created.ReadBack -FieldProfile "shopify_m1"
+    }
     $outboundChanged = if ($null -ne $SessionFactory) { $false } else { Test-XbDlOutboundChanged -DBSetting $session.DBSetting }
     $result = [ordered]@{
         save_invocation_count = [int]$created.SaveInvocationCount
@@ -196,7 +342,8 @@ try {
     # Session source decided before stdin, claims or any adapter call.
     if ($null -eq $SessionFactory -and [string]::IsNullOrEmpty($TargetBook)) { throw "autocount_real_bridge_disabled" }
     if ($null -ne $SessionFactory -and -not [string]::IsNullOrEmpty($TargetBook)) { throw "synthetic_session_with_target_book" }
-    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook }
+    # Go-live R4: the operation is known here; a write-once profile is not yet.
+    if ($null -eq $SessionFactory) { Assert-XbDlAuthorisedBook -Book $TargetBook -Operation $Operation -ProfileNotYetRead:($Operation -ceq "write-once") }
     if ($Operation -eq "write-once") {
         if ($FenceId -cnotmatch '^fence-[0-9a-f]{32}$') { throw "fence_id_invalid" }
         if ([string]::IsNullOrWhiteSpace($ClaimDirectory) -or -not (Test-Path -LiteralPath $ClaimDirectory -PathType Container)) { throw "claim_directory_invalid" }
@@ -230,6 +377,9 @@ try {
                 try { $result = Get-XbDlPosSyncState -DBSetting $session.DBSetting } catch { throw "pos_sync_state_unreadable" }
             }
             "legacy-precheck" { $result = Invoke-XbDirectLocalLegacyPrecheck -Session $session -Request $request }
+            "sync-lookup" { $result = Invoke-XbDirectLocalSyncLookup -DBSetting $session.DBSetting -Request $request }
+            "sync-changelog" { $result = Invoke-XbDirectLocalSyncChangeLog -DBSetting $session.DBSetting -Request $request }
+            "sync-member-scan" { $result = Invoke-XbDirectLocalSyncMemberScan -DBSetting $session.DBSetting -Request $request }
             "next-member-no" { $result = [ordered]@{ member_no = (Get-XbAutoCountNextMemberNo -Session $session) } }
             "probe" {
                 Assert-XbDirectLocalMemberNo -MemberNo ([string]$request.member_no)

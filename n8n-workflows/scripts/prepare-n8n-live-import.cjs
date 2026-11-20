@@ -1,8 +1,16 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  N8nPortableWorkflowError,
+  assertTargetInstanceSettings,
+  buildPortableCredentialDeclaration,
+  keepTargetInstanceSettings,
+  preparePortableWorkflow,
+} = require('./n8n-portable-workflow.cjs');
 
 function usage() {
-  console.error('Usage: node scripts/prepare-n8n-live-import.cjs <repo-workflow.json> [bindings.json] [output.json] [live-workflow.json]');
+  console.error('Usage: node prepare-n8n-live-import.cjs <repo-workflow.json> [legacy-bindings.json] [output.json] [live-workflow.json]');
+  console.error('   or: node prepare-n8n-live-import.cjs --portable --workflow <file> --output <file> --result <file> [--portable-credentials <file>] [--deployment-policy <file>] [--credential-metadata <file>] [--resource-bindings <file>] [--live-workflow <file>] [--target-workflow-id <id>] [--allow-unresolved-import]');
   process.exit(1);
 }
 
@@ -104,25 +112,33 @@ function selectBindingsWithMeta(bindings, workflow, workflowPath) {
     const pathMatches = bindings.workflows.filter((entry) =>
       entry.workflowFile && expectedPaths.has(normalisePath(entry.workflowFile))
     );
-    const pathSelection = uniqueSelection(pathMatches, 'workflowFile');
+    const selectConsistent = (matches, label) => {
+      const conflicting = matches.filter((entry) =>
+        (entry.workflowId && workflow.id && entry.workflowId !== workflow.id) ||
+        (entry.workflowName && workflow.name && entry.workflowName !== workflow.name)
+      );
+      if (conflicting.length > 0) return blockedWorkflowBinding(`Conflicting ${label} credential binding selector metadata.`);
+      return uniqueSelection(matches, label);
+    };
+    const pathSelection = selectConsistent(pathMatches, 'workflowFile');
     if (pathSelection) return pathSelection;
 
     const idMatches = bindings.workflows.filter((entry) =>
       entry.workflowId && workflow.id && entry.workflowId === workflow.id
     );
-    const idSelection = uniqueSelection(idMatches, 'workflowId');
+    const idSelection = selectConsistent(idMatches, 'workflowId');
     if (idSelection) return idSelection;
 
     const basenameMatches = bindings.workflows.filter((entry) =>
       entry.workflowFile && path.basename(entry.workflowFile).toLowerCase() === workflowBaseName
     );
-    const basenameSelection = uniqueSelection(basenameMatches, 'workflow file basename');
+    const basenameSelection = selectConsistent(basenameMatches, 'workflow file basename');
     if (basenameSelection) return basenameSelection;
 
     const nameMatches = bindings.workflows.filter((entry) =>
       entry.workflowName && workflow.name && entry.workflowName === workflow.name
     );
-    const nameSelection = uniqueSelection(nameMatches, 'workflowName');
+    const nameSelection = selectConsistent(nameMatches, 'workflowName');
     if (nameSelection) return nameSelection;
 
     console.warn(`No workflow-specific credential binding found for ${workflow.name || workflowPath}.`);
@@ -178,6 +194,110 @@ function migrationAllowsBinding(binding, node, migrationMap) {
   );
 }
 
+function readOptionalJson(filePath, fallback) {
+  return filePath && fs.existsSync(filePath) ? readJson(filePath) : fallback;
+}
+
+function parsePortableArgs(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === '--portable' || argument === '--allow-unresolved-import') {
+      options[argument.slice(2)] = true;
+      continue;
+    }
+    if (!argument.startsWith('--')) usage();
+    const key = argument.slice(2);
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) usage();
+    options[key] = value;
+    index += 1;
+  }
+  return options;
+}
+
+// An import replaces the whole workflow, settings included, so say exactly what the payload carries
+// for the two instance-only settings.
+function instanceSettingsLine(dropped, kept, hasTarget) {
+  const parts = [];
+  if (kept.length > 0) parts.push(`kept the target's own ${kept.join(', ')}`);
+  if (dropped.length > 0) parts.push(`left out Git's ${dropped.join(', ')}`);
+  const outcome = hasTarget
+    ? 'MCP exposure and the error workflow end up exactly as the target has them.'
+    : 'The new workflow gets no MCP exposure or error workflow.';
+  if (parts.length === 0) return `Instance-only settings: none on the target or in Git. ${outcome}`;
+  return `Instance-only settings: ${parts.join('; ')}. ${outcome}`;
+}
+
+function safePortableResult(result) {
+  return {
+    schemaVersion: 1,
+    phases: result.phases,
+    credentialResolution: {
+      resolvedCount: result.credentialResult.resolvedCount,
+      unresolvedImport: result.credentialResult.unresolvedImport,
+      requirements: result.credentialResult.issues,
+      blockingRequirements: result.credentialResult.requiredMissing,
+      optionalRequirements: result.credentialResult.optionalMissing,
+      unsafeRequirements: result.credentialResult.unsafe,
+    },
+    resourceBindingCount: result.resourceBindingCount,
+    restoredWebhookIdCount: result.restoredWebhookIds,
+    canonicalInvariant: result.invariant,
+    canImport: result.credentialResult.blocking.length === 0,
+  };
+}
+
+function writeJson(filePath, value) {
+  fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+function preparePortableImport(options) {
+  if (!options.workflow || !options.output || !options.result) usage();
+  const canonicalWorkflow = readWorkflow(options.workflow);
+  const fallbackDeclaration = {
+    schemaVersion: 1,
+    workflows: [buildPortableCredentialDeclaration(canonicalWorkflow, options.workflow)],
+  };
+  const credentialDeclarations = readOptionalJson(options['portable-credentials'], fallbackDeclaration);
+  const deploymentPolicy = readOptionalJson(options['deployment-policy'], { schemaVersion: 1, workflows: [] });
+  const resourceBindings = readOptionalJson(options['resource-bindings'], { schemaVersion: 1, workflows: [] });
+  const liveWorkflow = readOptionalJson(options['live-workflow'], null);
+  const credentialMetadata = options['credential-metadata']
+    ? readOptionalJson(options['credential-metadata'], null)
+    : null;
+
+  try {
+    const result = preparePortableWorkflow({
+      canonicalWorkflow,
+      workflowFile: options.workflow,
+      credentialDeclarations,
+      deploymentPolicy,
+      resourceBindings,
+      liveWorkflow: liveWorkflow ? (Array.isArray(liveWorkflow) ? liveWorkflow[0] : liveWorkflow.workflow || liveWorkflow) : null,
+      credentialMetadata,
+      targetWorkflowId: options['target-workflow-id'],
+      allowUnresolvedImport: options['allow-unresolved-import'] === true,
+    });
+    writeJson(options.output, result.preparedWorkflow);
+    writeJson(options.result, { result: 'PASS', code: 'N8N_IMPORT_READY', ...safePortableResult(result) });
+    console.log(`Prepared unpublished portable import payload: ${options.output}`);
+    console.log(instanceSettingsLine(result.droppedSettings, result.keptTargetSettings, Boolean(liveWorkflow)));
+    console.log(`Credential resolution: ${result.credentialResult.resolvedCount} resolved, ${result.credentialResult.issues.length} unresolved.`);
+    return result;
+  } catch (error) {
+    const known = error instanceof N8nPortableWorkflowError;
+    writeJson(options.result, {
+      result: 'BLOCKED',
+      code: known ? error.code : 'N8N_INTERNAL_ERROR',
+      phase: 'prepare-portable-import',
+      details: known ? error.details : {},
+    });
+    throw error;
+  }
+}
+
 function isStaleNodeIdBinding(binding, node) {
   return Boolean(
     binding &&
@@ -185,9 +305,6 @@ function isStaleNodeIdBinding(binding, node) {
     binding.nodeId &&
     node.id &&
     binding.nodeId === node.id &&
-    binding.nodeName &&
-    node.name &&
-    binding.nodeName !== node.name &&
     binding.nodeType &&
     node.type &&
     binding.nodeType !== node.type
@@ -254,7 +371,12 @@ function restoreCredentials(workflow, workflowBindings, migrationMap) {
     let allowTypeMigration = false;
     const idBinding = singleMatch(bindingsById.get(node.id), 'node ID', node.name || node.id || '(unknown node)');
 
-    if (idBinding && !isStaleNodeIdBinding(idBinding, node)) {
+    if (idBinding && isStaleNodeIdBinding(idBinding, node)) {
+      throw new Error(
+        `Credential restore blocked for node "${node.name || node.id || '(unknown node)'}". Stable node ID resolves to a conflicting node type.`
+      );
+    }
+    if (idBinding) {
       binding = idBinding;
     }
 
@@ -299,7 +421,11 @@ function buildUniqueNodeIndex(nodes) {
   const byNameType = new Map();
 
   for (const node of nodes || []) {
-    if (node.id) byId.set(node.id, node);
+    if (node.id) {
+      const idEntries = byId.get(node.id) || [];
+      idEntries.push(node);
+      byId.set(node.id, idEntries);
+    }
 
     const key = nodeKey(node);
     const entries = byNameType.get(key) || [];
@@ -311,6 +437,9 @@ function buildUniqueNodeIndex(nodes) {
 }
 
 function restoreLiveWebhookIds(workflow, liveWorkflow) {
+  for (const node of workflow.nodes || []) {
+    delete node.webhookId;
+  }
   if (!liveWorkflow || !Array.isArray(liveWorkflow.nodes)) {
     return 0;
   }
@@ -319,13 +448,13 @@ function restoreLiveWebhookIds(workflow, liveWorkflow) {
   let restored = 0;
 
   for (const node of workflow.nodes || []) {
-    let liveNode = node.id ? byId.get(node.id) : null;
-
-    if (liveNode && nodeKey(liveNode) !== nodeKey(node)) {
-      // A reused node id with a different name/type is a changed node identity.
-      // Restoring its old webhookId could attach an unrelated live endpoint.
-      console.warn(`Ignored id-only webhookId match for node "${node.name || node.id || '(unknown)'}": the live node with the same id has a different name/type. Use an explicit migration if this endpoint must carry over.`);
-      liveNode = null;
+    const idMatches = node.id ? byId.get(node.id) || [] : [];
+    if (idMatches.length > 1) {
+      throw new Error(`Webhook ID restore blocked for node "${node.name || node.id || '(unknown)'}": stable node ID is ambiguous.`);
+    }
+    let liveNode = idMatches[0] || null;
+    if (liveNode && node.type && liveNode.type && node.type !== liveNode.type) {
+      throw new Error(`Webhook ID restore blocked for node "${node.name || node.id || '(unknown)'}": stable node ID resolves to a conflicting node type.`);
     }
 
     if (!liveNode) {
@@ -333,7 +462,7 @@ function restoreLiveWebhookIds(workflow, liveWorkflow) {
       if (matches.length === 1) {
         liveNode = matches[0];
       } else if (matches.length > 1) {
-        console.warn(`Skipped webhookId restore for node "${node.name || node.id || '(unknown)'}": live node name/type match is ambiguous.`);
+        throw new Error(`Webhook ID restore blocked for node "${node.name || node.id || '(unknown)'}": live node name/type match is ambiguous.`);
       }
     }
 
@@ -347,6 +476,9 @@ function restoreLiveWebhookIds(workflow, liveWorkflow) {
 }
 
 function main() {
+  if (process.argv.includes('--portable')) {
+    return preparePortableImport(parsePortableArgs(process.argv.slice(2)));
+  }
   const workflowPath = process.argv[2];
   const bindingsPath = process.argv[3] || path.join('.n8n-local', 'n8n-credential-bindings.json');
   const outputPath = process.argv[4] || path.join('.tmp', `${workflowFileName(workflowPath || 'workflow')}.live-import.json`);
@@ -361,11 +493,14 @@ function main() {
   const { restored, missed } = restoreCredentials(workflow, workflowBindings, migrationMap);
   const liveWorkflow = liveWorkflowPath && fs.existsSync(liveWorkflowPath) ? readWorkflow(liveWorkflowPath) : null;
   const restoredWebhookIds = restoreLiveWebhookIds(workflow, liveWorkflow);
+  const instanceSettings = keepTargetInstanceSettings(workflow, liveWorkflow);
+  assertTargetInstanceSettings(workflow, liveWorkflow);
 
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, JSON.stringify(workflow, null, 2) + '\n');
 
   console.log(`Prepared ${outputPath} with ${restored} credential binding(s) and ${restoredWebhookIds} live webhookId(s) restored.`);
+  console.log(instanceSettingsLine(instanceSettings.dropped.filter((key) => !instanceSettings.kept.includes(key)), instanceSettings.kept, Boolean(liveWorkflow)));
   if (missed.length) {
     console.warn(`Skipped ${missed.length} binding(s) with no matching node: ${missed.join(', ')}`);
   }
@@ -380,6 +515,9 @@ module.exports = {
   selectBindingsWithMeta,
   restoreCredentials,
   restoreLiveWebhookIds,
+  instanceSettingsLine,
   isStaleNodeIdBinding,
+  preparePortableImport,
+  parsePortableArgs,
   prepareLiveImport: main,
 };

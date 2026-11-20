@@ -1,0 +1,13 @@
+{
+  "schema": "xb.directlocal.member_type_move.config.v1",
+  "state_root": "C:\\XB\\xb268-type-move-live",
+  "autocount_book": "AED_XBOUNDARIES",
+  "type_move_enabled": false,
+  "rollback_enabled": false,
+  "max_moves_per_run": 10,
+  "max_move_runs_per_day": 2,
+  "write_deadline_seconds": 120,
+  "ac2_credential_target": "XB-AC2-MemberSync",
+  "ac2_login_mode": "owner_shared",
+  "ac2_refused_user_ids": []
+}

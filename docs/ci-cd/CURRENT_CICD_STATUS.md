@@ -28,6 +28,11 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   jobs stay in the Windows full suite. `tests/test_member_gateway_ci.py` proves
   the skip list equals those jobs' module lists and that the targeted shard
   plus the remainder equals the accepted test set.
+- `tests/_run_ci_full_suite.py` is in both member-gateway path filters, so a
+  runner change triggers the workflow (#211). The workflow also runs every job
+  weekly on main (`cron: "17 14 * * 0"`, Sunday 22:17 SGT) and on manual
+  dispatch, so modules outside the path filters still get a full run.
+  `tests/test_member_gateway_ci.py` pins the path entries and the single cron.
 - The member-create-uat workflow's `windows-full-suite` job is a four-leg
   `fail-fast: false` matrix (#211): `focused`, `mg-deployment`,
   `bounded-import` and `rest`, each running
@@ -54,16 +59,22 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   author or committer identities), for likely email addresses and phone numbers outside
   `config/pii_guard_allowlist.json`. Diffs are forced to text; binary files are
   never skipped whole (printable text runs always, BOM text decoded, zips
-  found by signature and expanded up to three levels, binary types checked
+  found by signature and expanded up to three levels, zips appended to a
+  reviewed binary expanded, Office XML runs joined, PDF FlateDecode streams
+  decompressed, legacy `.xls` numeric cells decoded, binary types checked
   against their signature, other archives and anything unrecognised fail
-  closed). It fails
+  closed; #270). It fails
   closed on a hit, a missing or empty range, an unknown commit or a parse error,
   and it redacts matched values in the log. Scope is email addresses and phone
   numbers only; merge-time commits on `main` and commit identities are not
   scanned. `tests/test_pii_guard.py` pins the trigger,
   checkout, exact run lines and allowlist, and rejects `continue-on-error`,
   `|| true`, `if:` conditions, path filters, a dropped or narrowed range and
-  report-only or value-printing flags. The tracked `.githooks/pre-commit` hook
+  report-only or value-printing flags. Its seeded fuzz differential compares
+  the scanner with `main`'s scanner from before #270 (`4a73583`, read from the
+  full-history checkout; the shallow full-suite shards skip it) on 1,000
+  generated inputs and fails if any input `main` flags or fails closed passes
+  clean (#270). The tracked `.githooks/pre-commit` hook
   needs the one-time `git config core.hooksPath .githooks` per clone; see
   `docs/data_policy.md`.
 
