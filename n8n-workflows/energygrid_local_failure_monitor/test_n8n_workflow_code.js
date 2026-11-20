@@ -28,7 +28,11 @@ assert.equal(report(s,'2026-10-16T03:49:00Z',good(),bad('EG_TENANT_AUTH_FAILED')
 // A bill still PENDING after a finished run is what the Core cannot report: one alert per incident.
 let o=report(s,'2026-10-16T03:50:00Z',pend(),good());
 assert.equal(o.length,1);assert.equal(o[0].json.dedupe_key,'eg-monitor:EB_BILL:2');
-assert.match(o[0].json.subject,/^EnergyGrid: EB Bill incomplete \(EG_MONITOR_PENDING_AFTER_RUN\)$/);
+assert.deepEqual(Object.keys(o[0].json),['dedupe_key','severity','key','short','lines']);
+assert.equal(o[0].json.severity,'WARN');assert.equal(o[0].json.key,'bill_pending:EB_BILL');assert.equal(o[0].json.short,'bill_pending:EB_BILL');
+assert.deepEqual(o[0].json.lines,['EnergyGrid needs attention: EB Bill is still PENDING after a finished run.',
+  'Reference: EG_MONITOR_PENDING_AFTER_RUN','Run: 12345678-1234-1234-1234-123456789abc','Observed (UTC): 2026-10-16T03:50:00Z',
+  "Review EnergyGrid's local status. Do not retry uncertain uploads or emails."]);
 // Unresolved repeat keeps the same key, so Remove Duplicates drops it.
 assert.equal(report(s,'2026-10-16T03:55:00Z',pend(),good())[0].json.dedupe_key,o[0].json.dedupe_key);
 assert.equal(report(s,'2026-10-16T04:00:00Z',good(),good()).length,0);
@@ -52,7 +56,14 @@ assert.equal(event.length,0);
 // Monitor continuously online before the usual scheduled check (11:10 SGT == 03:10 UTC).
 const armed={};for(let m=0;m<=180;m+=5){const tm=at('2026-10-16T03:10:00Z')+m*60*1000;event=run('Check Missing Run (PC-On Only)',[{json:{}}],armed,tm);if(m<170) assert.equal(event.length,0);}
 assert.equal(event.length,1);assert.equal(event[0].json.dedupe_key,'eg-monitor:missed:2026-10-16');
-assert.match(event[0].json.message,/did not run, stopped early, or its report was refused/);
+assert.deepEqual(Object.keys(event[0].json),['dedupe_key','severity','key','short','lines']);
+assert.equal(event[0].json.severity,'ERROR');assert.equal(event[0].json.key,'run_report_missing');assert.equal(event[0].json.short,'run_report_missing');
+assert.deepEqual(event[0].json.lines,['EnergyGrid did not submit a completed EB + Tenant run report by 14:00 SGT on 2026-10-16.',
+  'The daily native task (11:30) did not run, stopped early, withheld its report, or the report was refused.',
+  'n8n was running before the usual check, so this is not a PC-off case.',
+  'Next: check Task Scheduler and the run logs (runbook: energygrid-bill-downloader/docs/native_daily_claude_free.md, section 5).',
+  'If the PC was shut down briefly, this may be a false alarm. Do not replay bill effects.']);
+assert.ok(!/Claude/.test(find('Check Missing Run (PC-On Only)').parameters.jsCode),'no stale Claude-task wording');
 // User instruction: no missed-run alert when the PC/n8n was off for 20 min across the run.
 const down={};run('Check Missing Run (PC-On Only)',[{json:{}}],down,at('2026-10-16T03:15:00Z'));
 run('Check Missing Run (PC-On Only)',[{json:{}}],down,at('2026-10-16T03:40:00Z'));
@@ -66,17 +77,75 @@ const done={};for(let m=0;m<=170;m+=5){const time=at('2026-10-16T03:10:00Z')+m*6
 // Explicit send gate OFF even when connected (no real emails possible from this artifact).
 assert.equal(run('Alerts Disabled Until Qualified',[{json:{message:'fail'}}],{},at('2026-10-16T04:00:00Z')).length,0);
 assert.equal(workflow.active,false);
-const sender=find('Send Owner Telegram Alert');
-assert.equal(sender.type,'n8n-nodes-base.telegram');assert.equal(sender.retryOnFail,false);assert.equal(sender.continueOnFail,true);
-assert.equal(sender.parameters.chatId,'REPLACE_WITH_OWNER_TELEGRAM_CHAT_ID');assert.equal(sender.parameters.additionalFields.appendAttribution,false);
+// #288 T1: alerts go by email through the shared XB Ops Alert Email sender, never Telegram.
+assert.ok(!workflow.nodes.some(n=>n.type==='n8n-nodes-base.telegram'),'no Telegram node');
+assert.doesNotMatch(JSON.stringify(workflow),/telegram|chat_?id/i);
+const sender=find('Send Owner Alert Email');
+assert.equal(sender.type,'n8n-nodes-base.executeWorkflow');assert.equal(sender.typeVersion,1.2);
+assert.equal(sender.retryOnFail,false);assert.equal(sender.onError,'continueRegularOutput');
+for(const key of ['continueOnFail','maxTries','waitBetweenTries','alwaysOutputData']) assert.ok(!(key in sender),key);
+assert.deepEqual(sender.parameters.workflowId,{__rl:true,value:'REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID',mode:'id'});
+assert.equal(sender.parameters.source,'database');
+// One sender execution per alert: the sender refuses more than one item, and a report can raise two.
+assert.equal(sender.parameters.mode,'each');assert.equal(sender.parameters.options.waitForSubWorkflow,true);
+const inputs=sender.parameters.workflowInputs;
+assert.deepEqual(inputs.value,{system:'ENERGYGRID',severity:'={{ $json.severity }}',key:'={{ $json.key }}',short:'={{ $json.short }}',lines:'={{ $json.lines }}'});
+assert.equal(inputs.convertFieldsToString,false,'lines must stay an array');
+const opsPath=path.join(__dirname,'..','ops_alert_email.workflow.json');
+const ops=JSON.parse(fs.readFileSync(opsPath,'utf8'));
+const opsTrigger=ops.nodes.find(n=>n.type==='n8n-nodes-base.executeWorkflowTrigger');
+assert.deepEqual(inputs.schema.map(f=>[f.id,f.type]),opsTrigger.parameters.workflowInputs.values.map(v=>[v.name,v.type]));
 assert.ok(!workflow.nodes.some(n=>n.credentials),'no credentials in the source export');
-assert.equal(workflow.connections['One Attempt Per Incident'].main[0][0].node,'Send Owner Telegram Alert');
-// The node's default is Markdown (Legacy), which eats the underscores in EG_ references and rejects an
-// unpaired one. HTML mode shows the text literally because alerts never contain <, > or &.
-assert.equal(sender.parameters.additionalFields.parse_mode,'HTML');
-const html={};const pendingAlert=report(html,'2026-10-16T04:30:00Z',pend('EG_MONITOR_PENDING_AFTER_RUN','bill-0123456789abcdef01234567'),pend())[0].json;
-let missed=[];const tick={};for(let m=0;m<=180;m+=5){missed=run('Check Missing Run (PC-On Only)',[{json:{}}],tick,at('2026-10-16T03:10:00Z')+m*60*1000);}
-for(const alert of [pendingAlert,missed[0].json]){assert.doesNotMatch(alert.subject+alert.message,/[<>&]/);}
-assert.match(pendingAlert.subject,/EG_MONITOR_PENDING_AFTER_RUN/);
+assert.equal(workflow.connections['One Attempt Per Incident'].main[0][0].node,'Send Owner Alert Email');
+assert.equal(Object.keys(workflow.connections).length,6);
+assert.ok(!workflow.connections['Send Owner Alert Email'],'the email call is the last node');
+// Cross-contract: every alert the Code nodes can emit passes the sender's own Validate Alert Request code,
+// mapped exactly as the call node maps it, and names no other system.
+const validateCode=ops.nodes.find(n=>n.name==='Validate Alert Request').parameters.jsCode;
+const senderAccepts=(alert)=>{
+  const call={system:'ENERGYGRID',severity:alert.severity,key:alert.key,short:alert.short,lines:alert.lines};
+  const out=vm.runInNewContext('(function(){'+validateCode+'\n})()',{$input:{all:()=>[{json:call}],first:()=>({json:call})},Array,Object,String,RegExp,Number,JSON});
+  assert.equal(out.length,1);return out[0].json;
+};
+const otherSystems=vm.runInNewContext(validateCode.match(/const SYSTEMS = (\[[^\]]*\]);/)[1]).filter(s=>s!=='ENERGYGRID');
+assert.deepEqual(otherSystems.slice().sort(),['AC2-ARAP','AC2-STOCK','HEALTH','MEMBER-SYNC']);
+// Which reference can reach an alert: only a PENDING row alerts, and the reporter writes exactly one
+// fixed reference on a PENDING row. FAILURE references come from the Core and are recorded, never alerted.
+const reporterSource=fs.readFileSync(path.join(__dirname,'energygrid_monitor_report.py'),'utf8');
+assert.deepEqual([...reporterSource.matchAll(/"PENDING",\s*([^\n]+)/g)].map(m=>m[1].trim()),['"EG_MONITOR_PENDING_AFTER_RUN"']);
+// Every EG_ reference the reporter or the Core can put in a report.
+const repoRoot=path.join(__dirname,'..','..');
+const sources=[path.join(__dirname,'energygrid_monitor_report.py')];
+const corePkg=path.join(repoRoot,'energygrid-bill-downloader','energygrid_bill_downloader');
+for(const name of fs.readdirSync(corePkg)) if(name.endsWith('.py')) sources.push(path.join(corePkg,name));
+const scanned=new Set(['EG_MONITOR_PENDING_AFTER_RUN']);
+for(const file of sources) for(const m of fs.readFileSync(file,'utf8').matchAll(/\bEG_[A-Z0-9_]+\b/g)) if(/^EG_[A-Z0-9_]{4,72}$/.test(m[0])) scanned.add(m[0]);
+assert.ok(scanned.size>50,'the reference scan found the Core references');
+// A reference naming another system would be refused by the sender (OPS_ALERT_OTHER_SYSTEM): no email.
+// The one known Core reference of that kind is a run-level FAILURE reason ("UNHEALTHY" contains HEALTH),
+// which never reaches an alert. A new one fails here so it is reviewed before it ships.
+const namesOther=(text)=>otherSystems.some(other=>text.includes(other));
+assert.deepEqual([...scanned].filter(namesOther),['EG_DAILY_N8N_UNHEALTHY']);
+assert.ok(!namesOther('EG_MONITOR_PENDING_AFTER_RUN'));
+assert.equal(report({},'2026-10-16T04:29:00Z',bad('EG_DAILY_N8N_UNHEALTHY'),bad('EG_DAILY_N8N_UNHEALTHY')).length,0);
+// Defence in depth: every other reference, even used as a PENDING reference, still makes a valid email.
+const refs=new Set([...scanned].filter(ref=>!namesOther(ref)));
+const emitted=[];
+let refIndex=0;
+for(const ref of refs){
+  const st={};const iso=new Date(at('2026-10-16T04:30:00Z')+(refIndex++)*1000).toISOString().replace('.000Z','Z');
+  emitted.push(...run('Validate Both Streams and Classify',[{json:{body:payload(iso,pend(ref,'bill-0123456789abcdef01234567'),pend(ref))}}],st,at(iso)).map(x=>x.json));
+}
+let missed=[];const tick={};for(let m=0;m<=180;m+=5){missed=run('Check Missing Run (PC-On Only)',[{json:{}}],tick,at('2026-12-31T03:10:00Z')+m*60*1000);}
+emitted.push(missed[0].json);
+assert.equal(emitted.length,refs.size*2+1);
+for(const alert of emitted){
+  const verdict=senderAccepts(alert);
+  assert.equal(verdict.valid,true,JSON.stringify({alert,verdict}));
+  assert.equal(verdict.system,'ENERGYGRID');
+  for(const other of otherSystems) assert.ok(![alert.key,alert.short,...alert.lines].join('\n').includes(other));
+}
+// The sender's refusal is real: the same alert naming another system is refused.
+assert.equal(senderAccepts({...emitted[0],lines:[...emitted[0].lines,'see HEALTH']}).reason,'OPS_ALERT_OTHER_SYSTEM');
 assert.equal(workflow.settings.availableInMCP,false);
-console.log('PASS: n8n Code nodes, PENDING-only alerts, incident lifecycle, missed-run PC-off policy, injection, and disabled alert gate');
+console.log('PASS: n8n Code nodes, PENDING-only alerts, incident lifecycle, missed-run PC-off policy, injection, disabled alert gate, and the XB Ops Alert Email contract');

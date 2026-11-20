@@ -413,13 +413,11 @@ class CliTests(unittest.TestCase):
                 '      - "energygrid-bill-downloader/**"',
                 '      - "scripts/energygrid_one_shot_supervisor.ps1"',
                 '      - ".github/workflows/energygrid-bill-downloader-tests.yml"',
-                "      # EnergyGrid n8n error handler (#141): the source-controlled export, its focused",
-                "      # offline test, and the directory README that documents it. Exact entries, not a",
-                "      # broad n8n-workflows/** or tests/** glob, which would widen the reviewed trigger",
-                "      # surface beyond what this workflow owns.",
-                '      - "n8n-workflows/energygrid_download_error_handler.workflow.json"',
-                '      - "n8n-workflows/energygrid_alert_ingress.workflow.json"',
-                '      - "tests/test_energygrid_n8n_error_handler.py"',
+                "      # EnergyGrid n8n exports and their focused offline tests, with exact entries, not a broad",
+                "      # n8n-workflows/** or tests/** glob, which would widen the reviewed trigger surface beyond",
+                "      # what this workflow owns. Run monitor (#288 T1): the export and its package folder.",
+                '      - "n8n-workflows/energygrid_local_failure_monitor.workflow.json"',
+                '      - "n8n-workflows/energygrid_local_failure_monitor/**"',
                 "      # Invoice delivery (#226/#228): inactive sanitized export and focused offline test.",
                 '      - "n8n-workflows/energygrid_invoice_delivery.workflow.json"',
                 '      - "tests/test_energygrid_invoice_delivery_workflow.py"',
@@ -438,6 +436,15 @@ class CliTests(unittest.TestCase):
                 '      - ".gitignore"',
             ],
         )
+        for retired in ("energygrid_download_error_handler.workflow.json", "energygrid_alert_ingress.workflow.json",
+                        "test_energygrid_n8n_error_handler.py"):
+            self.assertNotIn(retired, "\n".join(pull_request), "#288 T1: retired paths no longer trigger")
+        self.assertNotIn('-p "test_energygrid_n8n_error_handler.py"', workflow, "#288 T1: the retired test step is gone")
+        self.assertNotIn("- name: EnergyGrid n8n error handler focused test", workflow)
+        monitor_step = block_for(job_lines, "- name: EnergyGrid n8n run monitor focused offline tests", 6)
+        self.assertIn("        working-directory: n8n-workflows/energygrid_local_failure_monitor", monitor_step)
+        self.assertIn("          python -m unittest -v test_energygrid_monitor.py", monitor_step)
+        self.assertIn("          node test_n8n_workflow_code.js", monitor_step)
         invoice_delivery_step = block_for(
             job_lines, "- name: EnergyGrid n8n invoice delivery focused offline test", 6
         )
@@ -450,10 +457,18 @@ class CliTests(unittest.TestCase):
         scope_text = "\n".join(scope_guard)
         self.assertIn("$file -notmatch '^energygrid-bill-downloader/'", scope_text)
         self.assertEqual(
+            [line.strip() for line in scope_guard if "$file -notmatch " in line],
+            [
+                "if ($file -notmatch '^energygrid-bill-downloader/' -and",
+                "$file -notmatch '^n8n-workflows/energygrid_local_failure_monitor/' -and",
+            ],
+        )
+        self.assertEqual(
             [line.strip() for line in scope_guard if "$file -ne " in line],
             [
                 "$file -ne 'scripts/energygrid_one_shot_supervisor.ps1' -and",
                 "$file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and",
+                "$file -ne 'n8n-workflows/energygrid_local_failure_monitor.workflow.json' -and",
                 "$file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and",
                 "$file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and",
                 "$file -ne 'tests/test_energygrid_n8n_error_handler.py' -and",
@@ -486,8 +501,10 @@ class CliTests(unittest.TestCase):
             [
                 "$owned = @($files | Where-Object {",
                 "$_ -match '^energygrid-bill-downloader/' -or",
+                "$_ -match '^n8n-workflows/energygrid_local_failure_monitor/' -or",
                 "$_ -eq 'scripts/energygrid_one_shot_supervisor.ps1' -or",
                 "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or",
+                "$_ -eq 'n8n-workflows/energygrid_local_failure_monitor.workflow.json' -or",
                 "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or",
                 "$_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or",
                 "$_ -eq 'tests/test_energygrid_n8n_error_handler.py' -or",
@@ -643,26 +660,52 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
 
-    # ---- #141: the n8n error handler arm of the same ownership rule ---- #
+    # ---- #288 T1: the run monitor arm of the same ownership rule ---- #
 
-    def test_n8n_error_handler_change_with_its_test_and_directory_readme_is_accepted(self) -> None:
-        """The three authorised handler paths must not become false out-of-scope failures."""
+    def test_run_monitor_change_with_its_package_and_directory_readme_is_accepted(self) -> None:
+        """The run monitor export and its package folder are EnergyGrid-owned paths."""
         result = self._run_scope_case([
-            "n8n-workflows/energygrid_download_error_handler.workflow.json",
-            "tests/test_energygrid_n8n_error_handler.py",
+            "n8n-workflows/energygrid_local_failure_monitor.workflow.json",
+            "n8n-workflows/energygrid_local_failure_monitor/test_n8n_workflow_code.js",
+            "n8n-workflows/energygrid_local_failure_monitor/README.md",
             "n8n-workflows/README.md",
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
+        self.assertNotIn("not applicable", result.stdout)
 
-    def test_n8n_error_handler_change_with_an_unrelated_path_still_fails_closed(self) -> None:
-        """The new ownership arm arms the guard just as the subtree arm does."""
+    def test_run_monitor_change_with_an_unrelated_path_still_fails_closed(self) -> None:
+        """The monitor arm arms the guard just as the subtree arm does, for either monitor path."""
+        for owned in ("n8n-workflows/energygrid_local_failure_monitor.workflow.json",
+                      "n8n-workflows/energygrid_local_failure_monitor/energygrid_monitor_report.py"):
+            with self.subTest(owned=owned):
+                result = self._run_scope_case([owned, "n8n-workflows/xb_daily_health.workflow.json"])
+                self.assertNotEqual(result.returncode, 0, "an out-of-scope path must fail closed")
+                self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    def test_monitor_lookalike_paths_are_not_owned(self) -> None:
+        """Only the exact export and the package folder are owned, not a same-prefix sibling."""
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_local_failure_monitor_copy.workflow.json",
+            "n8n-workflows/energygrid_local_failure_monitorx/README.md",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not applicable", result.stdout)
+
+    def test_deleting_the_retired_handler_and_ingress_stays_in_scope(self) -> None:
+        """#288 T1's own shape: the retired exports and tests are deleted next to the monitor change."""
         result = self._run_scope_case([
             "n8n-workflows/energygrid_download_error_handler.workflow.json",
-            "scripts/member_create_uat_approval.py",
+            "n8n-workflows/energygrid_alert_ingress.workflow.json",
+            "tests/test_energygrid_n8n_error_handler.py",
+            "energygrid-bill-downloader/tests/test_alert_ingress_workflow.py",
+            "n8n-workflows/energygrid_local_failure_monitor.workflow.json",
+            "tests/test_energygrid_owner_email_workflow.py",
+            "n8n-workflows/README.md",
+            "README.md",
         ])
-        self.assertNotEqual(result.returncode, 0, "an out-of-scope path must fail closed")
-        self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
 
     def test_n8n_invoice_delivery_change_with_test_and_directory_readme_is_accepted(self) -> None:
         result = self._run_scope_case([
@@ -900,11 +943,16 @@ class CliTests(unittest.TestCase):
             '        run: python -m unittest discover -s energygrid-bill-downloader/tests'
             ' -p "test_one_shot_supervisor.py" -v',
         ],
-        "- name: EnergyGrid n8n error handler focused test": [
-            "      - name: EnergyGrid n8n error handler focused test",
+        "- name: EnergyGrid n8n run monitor focused offline tests": [
+            "      - name: EnergyGrid n8n run monitor focused offline tests",
             "        if: matrix.shard == 'rest'",
             "        shell: pwsh",
-            '        run: python -m unittest discover -s tests -p "test_energygrid_n8n_error_handler.py" -v',
+            "        working-directory: n8n-workflows/energygrid_local_failure_monitor",
+            "        run: |",
+            "          python -m unittest -v test_energygrid_monitor.py",
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "          node test_n8n_workflow_code.js",
+            "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
         ],
         "- name: EnergyGrid n8n invoice delivery focused offline test": [
             "      - name: EnergyGrid n8n invoice delivery focused offline test",
@@ -1163,9 +1211,13 @@ class CliTests(unittest.TestCase):
             "PS 5.1 custody ; exit 0": (
                 '-p "test_one_shot_supervisor.py" -v\n', '-p "test_one_shot_supervisor.py" -v; exit 0\n',
             ),
-            "n8n error handler ; exit 0": (
-                '-p "test_energygrid_n8n_error_handler.py" -v\n',
-                '-p "test_energygrid_n8n_error_handler.py" -v; exit 0\n',
+            "run monitor node ; exit 0": (
+                "          node test_n8n_workflow_code.js\n",
+                "          node test_n8n_workflow_code.js; exit 0\n",
+            ),
+            "run monitor step dropped to every leg": (
+                "      - name: EnergyGrid n8n run monitor focused offline tests\n        if: matrix.shard == 'rest'\n",
+                "      - name: EnergyGrid n8n run monitor focused offline tests\n        if: false\n",
             ),
             "continue-on-error on the suite step": (
                 "      - name: Project synthetic test suite\n",

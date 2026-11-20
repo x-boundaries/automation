@@ -1,6 +1,10 @@
-"""Privacy-minimal terminal-failure alert (DL-XB-199 G3-101).
+"""Privacy-minimal terminal-failure alert (DL-XB-199 G3-101). DORMANT: no consumer.
 
-runtime -> loopback n8n ingress -> existing Telegram capability -> Owner.
+#288 T1 (20 Nov 2026) retired the n8n alert ingress this module posted to, and the owner
+moved every notification to email. Nothing receives this POST any more: keep the private
+config's `alert` block unset. The live daily path (`native_cli daily`) never calls it; only
+the legacy direct-HTTP `run` command does. Removing the feature (this module, `AlertSettings`
+and the example config) is a later EnergyGrid code round, because it changes config validation.
 
 The payload is built only from closed, validated values: a fixed event name,
 a UTC timestamp, the run UUID, a closed stage, the result status, a bounded

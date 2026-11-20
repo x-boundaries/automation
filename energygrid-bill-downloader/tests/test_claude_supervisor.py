@@ -843,48 +843,5 @@ class EnvelopeStaticTests(unittest.TestCase):
         self.assertEqual("0", completed.stdout.strip())
 
 
-
-class SupervisorAlertCompatibilityTests(unittest.TestCase):
-    """G2: the accepted alert-ingress workflow stays unchanged only if its committed
-    validator accepts the supervisor's energygrid.alert.v1 values. Node executes it."""
-
-    def test_committed_ingress_validator_accepts_every_supervisor_alert(self) -> None:
-        node = shutil.which("node")
-        if node is None:
-            self.skipTest("Node is required to execute the committed Code node")
-        workflow = PROJECT.parent / "n8n-workflows" / "energygrid_alert_ingress.workflow.json"
-        supervisor = SUPERVISOR.read_text(encoding="utf-8")
-        for literal in ("schema = 'energygrid.alert.v1'", "event = 'energygrid_run_failed'", "stage = 'run'",
-                        "status = 'ACTION_REQUIRED'", "support_ref = ('EG_SUPERVISOR_EXIT_' + $ExitCode)",
-                        "attention_required = $true", "ToString('yyyy-MM-ddTHH:mm:ssZ')"):
-            self.assertIn(literal, supervisor)
-        payloads = [{
-            "schema": "energygrid.alert.v1", "event": "energygrid_run_failed", "timestamp": "2026-10-06T00:00:00Z",
-            "run_id": "00000000-0000-4000-8000-000000000001", "stage": "run", "status": "ACTION_REQUIRED",
-            "support_ref": f"EG_SUPERVISOR_EXIT_{code}", "exit_code": code,
-            "counts": {"inventory": 0, "downloaded": 0, "present": 0, "failure": 0}, "attention_required": True,
-        } for code in (81, 82, 83, 84, 85, 86, 87, 88, 89)]
-        harness = r"""
-const fs = require('fs');
-const [workflowPath, payloadsPath] = process.argv.slice(2);
-const wf = JSON.parse(fs.readFileSync(workflowPath, 'utf8'));
-const code = wf.nodes.find((n) => n.name === 'Validate Alert Payload').parameters.jsCode;
-const results = [];
-for (const body of JSON.parse(fs.readFileSync(payloadsPath, 'utf8'))) {
-  try { new Function('$input', code)({ all: () => [{ json: { body } }] }); results.push('ok'); }
-  catch (error) { results.push(String(error.message)); }
-}
-process.stdout.write(JSON.stringify(results));
-"""
-        with tempfile.TemporaryDirectory() as temp:
-            script = Path(temp) / "h.js"
-            script.write_text(harness, encoding="utf-8")
-            data = Path(temp) / "p.json"
-            data.write_text(json.dumps(payloads), encoding="utf-8")
-            completed = subprocess.run([node, str(script), str(workflow), str(data)], capture_output=True, text=True, timeout=60)
-        self.assertEqual(0, completed.returncode, completed.stderr)
-        self.assertEqual(["ok"] * 9, json.loads(completed.stdout))
-
-
 if __name__ == "__main__":
     unittest.main()
