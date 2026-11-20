@@ -198,9 +198,9 @@
         -10
       ],
       "parameters": {
-        "content": "# EnergyGrid local run monitor\n- Alerts only for what the EnergyGrid daily native task (11:30 SGT) cannot report itself: no completed run report by 14:00 SGT (task missed, crashed, report withheld or refused), or a bill still PENDING after a finished run.\n- Bill success and failure emails stay with the EnergyGrid Core (single sender). Reported FAILURE streams are recorded here, never re-sent.\n- Reports come only from egmonitor.cmd after the daily run, with the X-EnergyGrid-Monitor-Key header.\n- Alerts are emailed through the shared XB Ops Alert Email workflow (system ENERGYGRID), one call per alert, no retry. Remove Duplicates allows one attempt per incident.\n- PC shut down / n8n stopped: intentionally no alert.\n- ENABLE_OWNER_ALERTS stays false in this source export; it is set true only on the qualified live copy.\n\n## Required manual configuration:\n\n- **Send Owner Alert Email**\n  - `Workflow ID`: the live XB Ops Alert Email workflow.",
+        "content": "# EnergyGrid local run monitor\n- Alerts only for what the EnergyGrid daily native task (11:30 SGT) cannot report itself: no completed run report by 14:00 SGT (task missed, crashed, report withheld or refused), or a bill still PENDING after a finished run.\n- Bill success and failure emails stay with the EnergyGrid Core (single sender). Reported FAILURE streams are recorded here, never re-sent.\n- Reports come only from egmonitor.cmd after the daily run, with the X-EnergyGrid-Monitor-Key header.\n- Alerts are emailed through the shared XB Ops Alert Email workflow (system ENERGYGRID), one call per alert, no retry. Remove Duplicates allows one attempt per incident.\n- PC shut down / n8n stopped: intentionally no alert.\n- Failed runs are never saved (a rejected report would keep the header token). n8n calls the error workflow EnergyGrid - Monitor Error Log instead, which writes one closed-code row that XB Daily Health counts (#288 option (c)).\n- ENABLE_OWNER_ALERTS stays false in this source export; it is set true only on the qualified live copy.\n\n## Required manual configuration:\n\n- **Send Owner Alert Email**\n  - `Workflow ID`: the live XB Ops Alert Email workflow.\n- **Workflow settings**\n  - `Error workflow`: the live EnergyGrid - Monitor Error Log (export placeholder REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID).",
         "width": 660,
-        "height": 285
+        "height": 345
       }
     }
   ],
@@ -278,7 +278,8 @@
     "saveManualExecutions": false,
     "saveDataErrorExecution": "none",
     "saveDataSuccessExecution": "none",
-    "availableInMCP": false
+    "availableInMCP": false,
+    "errorWorkflow": "REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID"
   },
   "staticData": null,
   "pinData": {},

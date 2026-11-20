@@ -418,6 +418,9 @@ class CliTests(unittest.TestCase):
                 "      # what this workflow owns. Run monitor (#288 T1): the export and its package folder.",
                 '      - "n8n-workflows/energygrid_local_failure_monitor.workflow.json"',
                 '      - "n8n-workflows/energygrid_local_failure_monitor/**"',
+                "      # Monitor error log (#288 option (c)): the monitor's error workflow and its focused test.",
+                '      - "n8n-workflows/energygrid_monitor_error_log.workflow.json"',
+                '      - "tests/test_energygrid_monitor_error_log_workflow.py"',
                 "      # Invoice delivery (#226/#228): inactive sanitized export and focused offline test.",
                 '      - "n8n-workflows/energygrid_invoice_delivery.workflow.json"',
                 '      - "tests/test_energygrid_invoice_delivery_workflow.py"',
@@ -445,6 +448,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("        working-directory: n8n-workflows/energygrid_local_failure_monitor", monitor_step)
         self.assertIn("          python -m unittest -v test_energygrid_monitor.py", monitor_step)
         self.assertIn("          node test_n8n_workflow_code.js", monitor_step)
+        error_log_step = block_for(job_lines, "- name: EnergyGrid n8n monitor error log focused offline test", 6)
+        self.assertIn(
+            '        run: python -m unittest discover -s tests -p "test_energygrid_monitor_error_log_workflow.py" -v',
+            error_log_step,
+        )
         invoice_delivery_step = block_for(
             job_lines, "- name: EnergyGrid n8n invoice delivery focused offline test", 6
         )
@@ -469,6 +477,8 @@ class CliTests(unittest.TestCase):
                 "$file -ne 'scripts/energygrid_one_shot_supervisor.ps1' -and",
                 "$file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and",
                 "$file -ne 'n8n-workflows/energygrid_local_failure_monitor.workflow.json' -and",
+                "$file -ne 'n8n-workflows/energygrid_monitor_error_log.workflow.json' -and",
+                "$file -ne 'tests/test_energygrid_monitor_error_log_workflow.py' -and",
                 "$file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and",
                 "$file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and",
                 "$file -ne 'tests/test_energygrid_n8n_error_handler.py' -and",
@@ -505,6 +515,8 @@ class CliTests(unittest.TestCase):
                 "$_ -eq 'scripts/energygrid_one_shot_supervisor.ps1' -or",
                 "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or",
                 "$_ -eq 'n8n-workflows/energygrid_local_failure_monitor.workflow.json' -or",
+                "$_ -eq 'n8n-workflows/energygrid_monitor_error_log.workflow.json' -or",
+                "$_ -eq 'tests/test_energygrid_monitor_error_log_workflow.py' -or",
                 "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or",
                 "$_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or",
                 "$_ -eq 'tests/test_energygrid_n8n_error_handler.py' -or",
