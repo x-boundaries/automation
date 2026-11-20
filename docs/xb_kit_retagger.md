@@ -75,12 +75,14 @@ Executions are not saved (success and error both `none`, manual runs not saved),
 
 ## Reading a dry run (Claude)
 
-A dry run sends no email. Its plan is the output item of `Work Out Kit Tag Changes`: `mode: "dry_run"`, `summary` (scanned, tagged, changed, losing, brake_at, braked, tags to add and remove, people's changes left alone, unknown tags) and `plan` (handle, add, remove per product). Because the export saves no executions, a dry run at a live step is read like this, as one owner-approved step:
+A dry run sends no email and saves no execution. Its plan is the output item of `Work Out Kit Tag Changes`: `mode: "dry_run"`, `summary` (scanned, tagged, changed, losing, brake_at, braked, tags to add and remove, people's changes left alone, unknown tags) and `plan` (handle, add, remove per product). The same item is the output of the last node that runs, `Error To Email` (false branch). Controller ruling, 21 Nov 2026: it is read in the open n8n editor, never through a saved execution.
 
-1. In the live copy only, turn on "Save manual executions" for this workflow.
-2. Run it once by hand with `DRY_RUN` on.
-3. Read that execution through the local n8n API (`http://127.0.0.1:5678/api/v1/executions/<id>?includeData=true`), only the `Work Out Kit Tag Changes` output.
-4. Delete that one execution through the local API (it holds a 24-hour access token) and turn "Save manual executions" off again.
+1. On the server, Claude opens the workflow in the n8n editor in Chrome (`DRY_RUN` on in the live copy).
+2. Claude clicks "Test workflow" (`Manual Run`) once.
+3. Claude opens the output of `Work Out Kit Tag Changes` (or `Error To Email`) in the editor and reads `summary` and `plan` there.
+4. Claude reports only counts and closed codes (and, if needed, a few product handles). Nothing is copied out of the editor: the token step's output stays in the editor and is gone when the tab closes.
+
+The export stays no-save: "Save manual executions" is never switched on, and no execution holding the token is saved or read through the API.
 
 ## Live path
 
@@ -90,18 +92,18 @@ A dry run sends no email. Its plan is the output item of `Work Out Kit Tag Chang
 | L1 | Owner | Create the Custom Auth credential in the n8n UI (above). | (owner action) |
 | L2 | Work Claude | Back up and re-import `XB Ops Alert Email` with `KIT-RETAG`, re-publish. | "OK re-import XB Ops Alert Email with KIT-RETAG" |
 | L3 | Work Claude | Import `XB Kit Re-tagger` INACTIVE through the local API, set `SHOP_DOMAIN` and the alert workflow id privately, bind the credential. | "OK import kit re-tagger inactive" |
-| L4 | Work Claude | One manual dry run, read through the local API as above: reads Shopify, writes nothing, sends nothing. Report the summary (and whether the brake would stop it) to the Controller. | "OK kit re-tagger dry run" |
+| L4 | Work Claude | One manual dry run in the open n8n editor (Chrome on the server), read there as above: reads Shopify, writes nothing, sends nothing, saves no execution. Report the summary (and whether the brake would stop it) to the Controller. | "OK kit re-tagger dry run" |
 | L5 | Controller / owner | Review the dry-run plan. Before the first real run, confirm with staff that no other tool or person maintains kit tags in bulk (the 13 Nov product that got kit tags by itself): a second tagger would trip the brake or be left alone. | "OK kit re-tagger real run" |
 | L6 | Work Claude | One manual run with `DRY_RUN` off; spot-check 2-3 changed products in Shopify admin and in their kit collections. A brake or error sends its email as it would at night. | (from L5) |
 | L7 | G2 / owner | G2 review of the exact head; owner merges. | owner merge |
 | L8 | Work Claude | Re-import the merged export if it differs from what ran, set `DRY_RUN` to `false` in the live copy, activate. | "OK activate kit re-tagger" |
-| L9 | LATER (Controller) | Daily health entry for the re-tagger (below). | separate |
+| L9 | PR #340 fix round | Daily health entry for the re-tagger (below). | (with #340) |
 
 The first real run (L6) is gated on L5, including the answer about another tagger. If the L4 plan already trips the brake, stop at L5 and hand it to the Controller.
 
-## Daily health (LATER for the Controller)
+## Daily health (in PR #340's fix round)
 
-`XB Daily Health` does not watch this workflow today, and this PR does not edit it. Its `error_runs` count (`errors: true`) needs saved failed executions, which this workflow does not keep (the access token is in item data). What would be needed, in a separate daily health slice:
+`XB Daily Health` does not watch this workflow yet, and this PR does not edit it. Controller ruling, 21 Nov 2026: the daily health entry for the re-tagger is folded into PR #340's fix round. Its `error_runs` count (`errors: true`) needs saved failed executions, which this workflow does not keep (the access token is in item data), so that fix round adds:
 
 - a `WATCH.n8n_workflows` entry `{ id: 'REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID', label: 'kit re-tagger', errors: false }`, so an inactive or missing re-tagger shows; and
 - a count of `xb_alert_email_log` rows with `system` `KIT-RETAG` and `severity` `ERROR` in the 24 hours before the check (every error path here, the brake included, sends exactly one such alert), shown under the n8n workflows job like `alert_email_failed`.
@@ -119,7 +121,7 @@ Every error path already ends the run as failed (`End Run As Failed`), so if fai
 
 - Stop: deactivate the workflow. Nothing else runs it.
 - A wrong run: deactivate, then do a dry run (above) to see what it would change now; tags can be restored by a corrected run or by hand. A tag restored by hand is then left alone by the workflow.
-- Brake email: dry run (above), read the plan, hand it to the Controller.
+- Brake email: dry run in the editor (above), read the plan, hand it to the Controller.
 
 ## Tests
 

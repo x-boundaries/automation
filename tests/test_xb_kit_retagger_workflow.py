@@ -418,10 +418,12 @@ class KitRetaggerShapeTests(KitRetaggerBase):
         self.assertIn("### xb_kit_retagger.workflow.json", readme)
         runbook = RUNBOOK.read_text(encoding="utf-8")
         for word in ("Custom Auth", "httpCustomAuth", "client_id", "client_secret", "L0", "L4", "L6", "L8",
-                     "OK kit re-tagger dry run", "another tagger", "execution", "kitTagRecord", "LATER"):
+                     "OK kit re-tagger dry run", "another tagger", "open n8n editor", "kitTagRecord", "#340"):
             self.assertIn(word, runbook)
-        for gone in ("CHANGE_CAP", "REMOVE_CAP", "CAP_OVERRIDE", "DRYRUN"):
+        for gone in ("CHANGE_CAP", "REMOVE_CAP", "CAP_OVERRIDE", "DRYRUN", "includeData", "/api/v1/executions"):
             self.assertNotIn(gone, runbook)
+        # Controller ruling, 21 Nov 2026: a dry run is read in the editor, never from a saved execution.
+        self.assertIn('"Save manual executions" is never switched on', runbook)
         # The owner's part of the runbook is plain English.
         owner = runbook.split("## For the owner", 1)[1].split("\n## ", 1)[0]
         self.assertIsNone(JARGON.search(owner), owner)
