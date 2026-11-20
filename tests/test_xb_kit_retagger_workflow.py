@@ -46,6 +46,8 @@ RECORD = "kitTagRecord"
 NOW_MS = int(datetime(2026, 11, 20, 19, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 TODAY = "2026-11-21"
 FAKE_TOKEN = "fake-access-token-0000000000"
+OUTSIDE_LINE = ("Kit tags on the website: many kit tags were changed outside the re-tagger since last night, so "
+                "nothing was changed tonight. Ask Claude to check.")
 BRAKE_LINE = ("Kit tags on the website: tonight's run stopped itself because it planned to remove more tags than "
               "normal. Nothing was changed. Ask Claude to check.")
 # Words the owner never sees in an email (owner, 21 Nov 2026).
@@ -103,7 +105,8 @@ const results = cases.map((c) => {
   Date.now = () => (c.now_ms === undefined ? realNow() : c.now_ms);
   try {
     if (c.kind === 'expr') {
-      return { ok: true, out: new Function('$response', '$json', 'return (' + inner(c.expr) + ');')(c.response, c.json) };
+      const ran = (name) => ({ isExecuted: (c.executed || []).includes(name) });
+      return { ok: true, out: new Function('$response', '$json', '$', 'return (' + inner(c.expr) + ');')(c.response, c.json, ran) };
     }
     const w = c.workflow === 'sender' ? sender : wf;
     const code = nodeOf(w, c.node).parameters.jsCode;
@@ -412,13 +415,18 @@ class KitRetaggerShapeTests(KitRetaggerBase):
                      "REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID", "DRY_RUN", "KIT-RETAG", "kit-no", "kit-pin-<kit>",
                      "03:00 SGT", "docs/xb_kit_retagger.md", "kitTagRecord", "Hands-off", "End Run As Failed"):
             self.assertIn(word, notes)
-        for gone in ("CHANGE_CAP", "REMOVE_CAP", "CAP_OVERRIDE", "DRYRUN", "CHANGED"):
+        for gone in ("CHANGE_CAP", "REMOVE_CAP", "CAP_OVERRIDE", "DRYRUN", "CHANGED", "Retried up to 3 times"):
             self.assertNotIn(gone, notes)
+        # G2 L-6 and L-7: what n8n really retries, and what the stops are for.
+        for word in ("first write fails", "re-runs every write", "put right the next night", "store-wide anomalies",
+                     "one vendor or type rename usually stays under them", "Outside changes"):
+            self.assertIn(word, notes)
         readme = README.read_text(encoding="utf-8")
         self.assertIn("### xb_kit_retagger.workflow.json", readme)
         runbook = RUNBOOK.read_text(encoding="utf-8")
         for word in ("Custom Auth", "httpCustomAuth", "client_id", "client_secret", "L0", "L4", "L6", "L8",
-                     "OK kit re-tagger dry run", "another tagger", "open n8n editor", "kitTagRecord", "#340"):
+                     "OK kit re-tagger dry run", "Another tagger", "open n8n editor", "kitTagRecord", "#340",
+                     "stopped_outside_changes", "store-wide anomalies", "one vendor or type rename usually stays under"):
             self.assertIn(word, runbook)
         for gone in ("CHANGE_CAP", "REMOVE_CAP", "CAP_OVERRIDE", "DRYRUN", "includeData", "/api/v1/executions"):
             self.assertNotIn(gone, runbook)
@@ -434,6 +442,71 @@ class KitRetaggerShapeTests(KitRetaggerBase):
             self.assertIn('- "%s"' % path, ci)
         self.assertNotIn("**", ci)
         self.assertIn("python -m unittest tests.test_xb_kit_retagger_workflow -v", ci)
+
+
+class KitRetaggerRunbookTests(KitRetaggerBase):
+    """G2 L-1, L-2, L-4, L-5 and G0 Q5: the live steps, re-imports and rules changes, pinned in the runbook."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    def section(self, title):
+        return self.runbook.split("## " + title, 1)[1].split("\n## ", 1)[0]
+
+    def rows(self):
+        rows = {}
+        for line in self.section("Live path").splitlines():
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if re.fullmatch(r"L[0-9]", cells[0]):
+                rows[cells[0]] = cells
+        return rows
+
+    def test_every_live_step_has_a_rollback(self):
+        self.assertIn("| Step | Who | What | Owner OK words | Rollback |", self.section("Live path"))
+        rows = self.rows()
+        self.assertEqual(set(rows), {"L%d" % i for i in range(10)})
+        for step, cells in rows.items():
+            self.assertEqual(len(cells), 5, step)
+            self.assertTrue(all(cells), step)
+        self.assertIn("Uninstall the app", rows["L0"][4])
+        self.assertIn("Delete the credential", rows["L1"][4])
+        self.assertIn("Archive the imported workflow", rows["L3"][4])
+        self.assertIn("corrected run or by hand", rows["L6"][4])
+        self.assertIn("Deactivate", rows["L8"][4])
+
+    def test_the_sender_update_runs_after_the_merge_by_the_house_procedure(self):
+        order = list(self.rows())
+        self.assertLess(order.index("L7"), order.index("L2"))
+        self.assertLess(order.index("L2"), order.index("L8"))
+        l2 = self.rows()["L2"]
+        for word in ("After L7, before L8", "**merged** export", "docs/daily_health_check.md", "node by node",
+                     "stop on any drift", "recipient, table ID, Gmail credential binding", "read back"):
+            self.assertIn(word, l2[2])
+        self.assertIn("Re-apply the backup", l2[4])
+
+    def test_every_re_import_keeps_the_record(self):
+        steps = self.section("Re-importing this workflow (keeps the record)")
+        for word in ("`staticData`", "kitTagRecord", "same product count", "403", "Any difference stops the step",
+                     "127.0.0.1:5678/api/v1", "Rollback: re-apply the whole backup"):
+            self.assertIn(word, steps)
+        self.assertIn("back up `staticData` first", self.rows()["L8"][2])
+        rules = self.section("Rules")
+        self.assertIn("re-import procedure above (record kept)", rules)
+
+    def test_a_rules_change_is_dry_run_first_and_never_brakes_on_the_owner(self):
+        rules = self.section("Rules")
+        for word in ("never gets an anomaly email for a planned change", "One editor dry run with the merged rules",
+                     "reviewed one-run PR"):
+            self.assertIn(word, rules)
+
+    def test_another_tagger_is_a_note_not_a_gate(self):
+        l5 = self.rows()["L5"]
+        self.assertIn("Note (not a gate)", l5[2])
+        self.assertIn("never routed to the owner", l5[2])
+        self.assertNotIn("gated on L5", self.runbook)
+        self.assertNotIn("Before the first real run, confirm with staff", self.runbook)
 
 
 class KitRetaggerRulesTests(KitRetaggerBase):
@@ -599,21 +672,27 @@ class KitRetaggerQuietTests(KitRetaggerBase):
 
 
 class KitRetaggerBrakeTests(KitRetaggerBase):
-    def losing(self, steady, losing, **plan_args):
-        """`steady` tagged products that keep their tags, plus `losing` products that would lose kit-hut."""
-        products = [socks(i, tags=SOCK_TAGS) for i in range(steady)] + [mug(1000 + i) for i in range(losing)]
+    def losing(self, steady, losing, untagged=0, **plan_args):
+        """`steady` tagged products that keep their tags, `losing` products that would each lose two known tags,
+        and `untagged` products with no known tag (they never count towards the brake)."""
+        products = ([socks(i, tags=SOCK_TAGS) for i in range(steady)]
+                    + [mug(1000 + i, tags=("kit-hut", "ks-socks")) for i in range(losing)]
+                    + [product(3000 + i, title="Fake Plain Mug %d" % i, ptype="Mug") for i in range(untagged)])
         plan_args.setdefault("DRY_RUN", False)
         return self.plan_full(pages_of(products), **plan_args)
 
     def test_just_under_at_and_over_the_brake(self):
-        # 200 steady + k losing: the brake is 10% of the tagged products, rounded up.
-        under, _ = self.losing(200, 22)   # 22 of 222 tagged, brake at 23
-        at, _ = self.losing(200, 23)      # 23 of 223, brake at 23: still allowed
-        over, _ = self.losing(200, 24)    # 24 of 224, brake at 23
+        # 200 steady + k losing (+ 300 untagged): the brake is 10% of the products carrying a known tag,
+        # rounded up, and counts products, not tags (each loser loses two tags).
+        under, _ = self.losing(200, 22, untagged=300)   # 22 of 222 tagged, brake at 23
+        at, _ = self.losing(200, 23, untagged=300)      # 23 of 223, brake at 23: still allowed
+        over, _ = self.losing(200, 24, untagged=300)    # 24 of 224, brake at 23 (not 53 of all 524)
         self.assertEqual((under["mode"], len(under["writes"])), ("write", 22))
         self.assertEqual((at["mode"], len(at["writes"])), ("write", 23))
         self.assertEqual(at["summary"]["brake_at"], 23)
         self.assertEqual((over["mode"], over["writes"]), ("braked", []))
+        self.assertEqual((over["summary"]["tagged"], over["summary"]["losing"], over["summary"]["tags_to_remove"]),
+                         (224, 24, 48))
 
     def test_never_below_ten_products(self):
         ten, _ = self.losing(0, 10)
@@ -644,6 +723,85 @@ class KitRetaggerBrakeTests(KitRetaggerBase):
         self.assertEqual((dry["mode"], dry["alert"], dry["summary"]["braked"]), ("dry_run", None, True))
 
 
+class KitRetaggerOutsideChangesTests(KitRetaggerBase):
+    """L-3: many tags this workflow set, undone outside it since the last run, stop the night (one ERROR)."""
+
+    def undone(self, steady, k, kind="removed", extra=(), untagged=0, static=None, **plan_args):
+        """`steady` tagged products, `k` products where someone undid this workflow's kit-hut change, plus
+        `extra` products and `untagged` products with no known tag."""
+        if kind == "removed":   # it added kit-hut, someone took it off
+            changed = [socks(500 + i, tags=[t for t in SOCK_TAGS if t != "kit-hut"]) for i in range(k)]
+            did = "a"
+        else:                   # it removed kit-hut, someone put it back
+            changed = [mug(500 + i, tags=("kit-hut",)) for i in range(k)]
+            did = "r"
+        products = ([socks(i, tags=SOCK_TAGS) for i in range(steady)] + changed + list(extra)
+                    + [product(3000 + i, title="Fake Plain Mug %d" % i, ptype="Mug") for i in range(untagged)])
+        if static is None:
+            static = record({num(500 + i): {"d": "2026-11-20", "t": {"kit-hut": did}} for i in range(k)})
+        plan_args.setdefault("DRY_RUN", False)
+        before = copy.deepcopy(static)
+        plan, after = self.plan_full(pages_of(products), static=static, **plan_args)
+        return plan, after, before
+
+    def test_just_under_at_and_over(self):
+        for kind in ("removed", "added"):
+            with self.subTest(kind=kind):
+                # 200 steady + k undone (+ 300 untagged): the stop is 10% of the products carrying a known tag.
+                under, _, _ = self.undone(200, 22, kind, untagged=300)
+                at, _, _ = self.undone(200, 23, kind, untagged=300)
+                over, after, before = self.undone(200, 24, kind, untagged=300, extra=[mug(900)])
+                self.assertEqual((under["mode"], under["summary"]["held"]), ("no_change", False))
+                self.assertEqual((at["mode"], at["summary"]["held"], at["summary"]["brake_at"]),
+                                 ("no_change", False, 23))
+                self.assertEqual((over["mode"], over["writes"], over["summary"]["held"]), ("held", [], True))
+                self.assertEqual(over["summary"]["new_person_" + kind], 24)
+                self.assertEqual(after, before)  # record untouched
+                alert = over["alert"]
+                self.assertEqual((alert["key"], alert["lines"][0]), ("stopped_outside_changes", OUTSIDE_LINE))
+                self.assertNotIn("10", " ".join(alert["lines"]))
+                self.assert_owner_alert(alert)
+                self.assertEqual(self.route(over), (False, True))
+
+    def test_never_below_ten_products_and_counts_products(self):
+        ten, _, _ = self.undone(0, 10, "added")
+        eleven, _, _ = self.undone(0, 11, "added")
+        self.assertEqual((ten["mode"], ten["summary"]["brake_at"]), ("no_change", 10))
+        self.assertEqual(eleven["mode"], "held")
+        # Two undone tags on one product count once.
+        start = record({num(500 + i): {"d": "2026-11-20", "t": {"kit-hut": "r", "ks-socks": "r"}} for i in range(11)})
+        products = [mug(500 + i, tags=("kit-hut", "ks-socks")) for i in range(11)]
+        plan, _ = self.plan_full(pages_of(products), static=start, DRY_RUN=False)
+        self.assertEqual((plan["mode"], plan["summary"]["new_person_added"], plan["summary"]["brake_at"]),
+                         ("held", 11, 10))
+        start = record({num(500 + i): {"d": "2026-11-20", "t": {"kit-hut": "r", "ks-socks": "r"}} for i in range(10)})
+        plan, _ = self.plan_full(pages_of(products[:10]), static=start, DRY_RUN=False)
+        self.assertEqual((plan["mode"], plan["summary"]["new_person_added"]), ("no_change", 10))
+
+    def test_a_dry_run_shows_it_without_email(self):
+        dry, after, before = self.undone(0, 30, DRY_RUN=True)
+        self.assertEqual((dry["mode"], dry["alert"], dry["summary"]["held"]), ("dry_run", None, True))
+        self.assertEqual(after, before)
+        self.assertEqual(self.route(dry), (False, False))
+
+    def test_each_outside_change_counts_once(self):
+        # Night 1: 23 undone, at the limit: allowed, and marked as seen.
+        first, after, _ = self.undone(200, 23)
+        self.assertEqual(first["mode"], "no_change")
+        self.assertEqual({e["t"]["kit-hut"] for e in after[RECORD]["products"].values()}, {"na"})
+        # Night 2: 23 more undone; only the new ones count, so it still runs; nothing is re-added.
+        after[RECORD]["products"].update({num(700 + i): {"d": "2026-11-21", "t": {"kit-hut": "a"}} for i in range(23)})
+        extra = [socks(700 + i, tags=[t for t in SOCK_TAGS if t != "kit-hut"]) for i in range(23)]
+        second, _, _ = self.undone(200, 23, extra=extra, static=after)
+        self.assertEqual((second["mode"], second["summary"]["new_person_removed"],
+                          second["summary"]["left_alone_person_removed"]), ("no_change", 23, 46))
+
+    def test_the_brake_wins_when_both_fire(self):
+        plan, _, _ = self.undone(0, 30, extra=[mug(900 + i, tags=("kit-hut",)) for i in range(30)])
+        self.assertEqual((plan["mode"], plan["summary"]["braked"], plan["summary"]["held"]), ("braked", True, True))
+        self.assertEqual(plan["alert"]["key"], "stopped_unusual_removals")
+
+
 class KitRetaggerPeopleTests(KitRetaggerBase):
     """Never fight a person: tags a person put back or took off are left alone, silently."""
 
@@ -653,15 +811,34 @@ class KitRetaggerPeopleTests(KitRetaggerBase):
         plan, after = self.plan_full(pages_of(products), static=mine, DRY_RUN=False)
         (write,) = plan["writes"]
         self.assertEqual(write["variables"], {"id": products[0]["id"], "remove": ["kit-ride"]})
-        self.assertEqual((plan["summary"]["left_alone_person_added"], plan["alert"]), (2, None))
-        self.assertEqual(after[RECORD]["products"][num(1)]["t"], {"kit-hut": "r", "ks-socks": "r"})
+        # Counted in products, not tags; the run marks it as seen ('nr'), so it is not new again tomorrow.
+        summary = plan["summary"]
+        self.assertEqual((summary["left_alone_person_added"], summary["new_person_added"], plan["alert"]), (1, 1, None))
+        self.assertEqual(after[RECORD]["products"][num(1)], {"d": TODAY, "t": {"kit-hut": "nr", "ks-socks": "nr"}})
+        again, after2 = self.plan_full(pages_of(products), static=after, DRY_RUN=False)
+        self.assertEqual((again["summary"]["left_alone_person_added"], again["summary"]["new_person_added"]), (1, 0))
+        self.assertEqual(again["writes"], plan["writes"])
+        self.assertEqual(after2, after)
+
+    def test_a_mixed_case_tag_it_removed_and_a_person_put_back_stays(self):
+        products = [mug(1, tags=["Kit-Hut", "Sale"])]
+        plan, store = self.plan_full(pages_of(products), DRY_RUN=False)
+        (write,) = plan["writes"]
+        self.assertEqual(write["variables"], {"id": products[0]["id"], "remove": ["Kit-Hut"]})
+        out, store = self.check_full(plan["writes"], [self.ok(write)], static=store)
+        self.assertIsNone(out["alert"])
+        self.assertEqual(store[RECORD]["products"], {num(1): {"d": TODAY, "t": {"kit-hut": "r"}}})
+        products[0]["tags"] = ["Sale", "KIT-HUT"]
+        again, _ = self.plan_full(pages_of(products), static=store, DRY_RUN=False)
+        self.assertEqual((again["mode"], again["writes"], again["summary"]["left_alone_person_added"]),
+                         ("no_change", [], 1))
 
     def test_a_tag_a_person_took_off_is_never_added_again(self):
         mine = record({num(1): {"d": "2026-11-20", "t": {"kit-hut": "a"}}})
         products = [socks(1, tags=[t for t in SOCK_TAGS if t != "kit-hut"])]
         plan, _ = self.plan_full(pages_of(products), static=mine, DRY_RUN=False)
         self.assertEqual((plan["mode"], plan["writes"], plan["alert"]), ("no_change", [], None))
-        self.assertEqual(plan["summary"]["left_alone_person_removed"], 1)
+        self.assertEqual((plan["summary"]["left_alone_person_removed"], plan["summary"]["new_person_removed"]), (1, 1))
 
     def test_its_own_earlier_changes_do_not_block_later_rule_changes(self):
         # It removed kit-hut earlier and the rules want it now: add it. It added kit-ride and the rules no
@@ -712,7 +889,8 @@ class KitRetaggerRecordTests(KitRetaggerBase):
                         num(2): {"d": "yesterday", "t": {"kit-hut": "a"}},
                         num(3): {"d": "2026-11-20", "t": {}}})
         plan, after = self.plan_full(pages_of(products + [socks(2), socks(3)]), static=mixed, DRY_RUN=False)
-        self.assertEqual(after[RECORD]["products"], {num(1): {"d": "2026-11-20", "t": {"kit-ride": "r"}}})
+        # kit-ride: a person put it back; this run saw it, so it is now 'nr' with today's date.
+        self.assertEqual(after[RECORD]["products"], {num(1): {"d": TODAY, "t": {"kit-ride": "nr"}}})
         self.assertEqual([w["handle"] for w in plan["writes"]], ["fake-product-001", "fake-product-002", "fake-product-003"])
         self.assertNotIn("remove", plan["writes"][0]["variables"])  # kit-ride: a person put it back
 
@@ -756,6 +934,7 @@ class KitRetaggerReadFailureTests(KitRetaggerBase):
         self.assert_failed(pages, "could_not_sign_in", "access token request request_error.",
                            token={"error": {"message": "connect ETIMEDOUT"}})
         self.assert_failed(pages, "could_not_sign_in", "access token request no_token.", token={"scope": "read_products"})
+        self.assert_failed(pages, "could_not_sign_in", "access token request no_token.", token={"access_token": "fake-shrt"})
 
     def test_page_failures(self):
         good = pages_of([socks(i) for i in range(150)])
@@ -871,9 +1050,15 @@ class KitRetaggerAlertShapeTests(KitRetaggerBase):
     def test_unexpected_alert_expression_passes(self):
         value = self.nodes[UNEXPECTED]["parameters"]["assignments"]["assignments"][0]
         self.assertEqual((value["name"], value["type"]), ("alert", "object"))
-        (alert,) = self.run_cases([{"kind": "expr", "expr": value["value"], "response": {}}])
-        self.assertEqual(alert["key"], "unexpected_error")
-        self.assert_owner_alert(alert)
+        before, after = self.run_cases([{"kind": "expr", "expr": value["value"], "executed": [PLAN]},
+                                        {"kind": "expr", "expr": value["value"], "executed": [PLAN, WRITE, CHECK]}])
+        for alert in (before, after):
+            self.assertEqual(alert["key"], "unexpected_error")
+            self.assert_owner_alert(alert)
+        # Before any write it says so; once Write Tag Changes has run it keeps the safe wording.
+        self.assertIn("before it changed anything. Nothing was changed.", before["lines"][0])
+        self.assertIn("Some products may already have been updated.", after["lines"][0])
+        self.assertNotIn("Nothing was changed", after["lines"][0])
 
     def test_no_alert_names_another_system(self):
         # Handles are lower-cased, so an odd handle can never put another system's name in a line.
