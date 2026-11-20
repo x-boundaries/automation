@@ -7,7 +7,7 @@
       "id": "00000000-0000-4244-8000-000000000001",
       "name": "Watch Mailbox For SIMBA Emails",
       "type": "n8n-nodes-base.gmailTrigger",
-      "typeVersion": 1.2,
+      "typeVersion": 1.4,
       "position": [
         0,
         400
@@ -21,6 +21,7 @@
           ]
         },
         "simple": true,
+        "maxResults": 10,
         "filters": {
           "q": "(from:bills@my.simba.sg OR subject:\"SIMBA Invoice\") -in:sent"
         },

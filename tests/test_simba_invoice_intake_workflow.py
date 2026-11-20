@@ -248,11 +248,14 @@ class StaticContractTests(unittest.TestCase):
     def test_trigger_polls_for_direct_mail_and_forwards(self) -> None:
         trigger = self.nodes["Watch Mailbox For SIMBA Emails"]
         self.assertEqual("n8n-nodes-base.gmailTrigger", trigger["type"])
+        # v1.4 is what n8n 3.0 runs every older Gmail Trigger as (#332); it caps each poll at maxResults.
+        self.assertEqual(1.4, trigger["typeVersion"])
+        self.assertEqual(10, trigger["parameters"]["maxResults"])
         self.assertEqual([{"mode": "everyMinute"}], trigger["parameters"]["pollTimes"]["item"])
         query = trigger["parameters"]["filters"]["q"]
         self.assertIn("from:bills@my.simba.sg", query)
         self.assertIn('subject:"SIMBA Invoice"', query)
-        # Gmail Trigger v1.2 also lists sent mail; the mailbox's own replies are skipped.
+        # Keep -in:sent: v1.4 only skips sent mail that is not also in INBOX; the mailbox's own replies are skipped.
         self.assertTrue(query.endswith(" -in:sent"), query)
 
     def test_http_nodes_are_bounded_and_never_call_the_tracker(self) -> None:
