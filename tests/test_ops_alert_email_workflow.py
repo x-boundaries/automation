@@ -58,8 +58,8 @@ EXPECTED_EDGES = {
     ("Classify Send Error", 0, "Log Send Failed"),
     ("Log Send Failed", 0, "Return Send Failed"),
 }
-SYSTEMS = ("AC2-STOCK", "AC2-ARAP", "ENERGYGRID", "MEMBER-SYNC")
-SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|AC2-ARAP|ENERGYGRID|MEMBER-SYNC) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
+SYSTEMS = ("AC2-STOCK", "AC2-ARAP", "ENERGYGRID", "MEMBER-SYNC", "KIT-RETAG")
+SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|AC2-ARAP|ENERGYGRID|MEMBER-SYNC|KIT-RETAG) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 CANARY = "CANARY-NOTE-0001-XYZ"
 # 6 Nov 2026 14:30:00 SGT, a fixed clock for every Decide run.
@@ -299,9 +299,11 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
         self.assertIn("HEALTH", notes)
         self.assertIn("AC2-ARAP", notes)
         self.assertIn("`AC2-ARAP`", readme)
+        self.assertIn("KIT-RETAG", notes)
+        self.assertIn("`KIT-RETAG`", readme)
         doc = TABLE_DOC.read_text(encoding="utf-8")
         for column in LOG_COLUMNS + ["xb_alert_email_log", "folded_flood", "send_failed", "daily_health", "HEALTH",
-                                     "AC2-ARAP"]:
+                                     "AC2-ARAP", "KIT-RETAG"]:
             self.assertIn(column, doc)
 
 
@@ -731,6 +733,43 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         plan = self.decide(arap_rows, validated(key=same_key, short=same_key))
         self.assertIsNone(plan["held_outcome"])
         self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR " + same_key)
+
+    # ---- KIT-RETAG (#269): the kit re-tagger, an ordinary system ---- #
+    def test_validator_allows_exactly_the_six_systems(self):
+        code = self.nodes_code()
+        self.assertIn("const SYSTEMS = ['AC2-STOCK', 'AC2-ARAP', 'ENERGYGRID', 'MEMBER-SYNC', 'HEALTH', 'KIT-RETAG'];", code)
+        for system in ("KIT-RETAG ", "kit-retag", "KIT_RETAG", "KIT-RETAGGER", "SHOPIFY"):
+            (out,) = self.validate(request(system=system))
+            self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_SYSTEM"}, system)
+
+    def test_kit_retag_alerts_and_reports_pass_and_stay_separate(self):
+        alert = request(system="KIT-RETAG", severity="WARN", key="change_cap", short="change_cap",
+                        lines=["Kit re-tagger: over the change cap, nothing written.", "changed 31 / cap 25",
+                               "+ fake-product-handle-001 +kit-hut +ks-socks"])
+        (out,) = self.validate(alert)
+        self.assertEqual(out, {"valid": True, **alert})
+        plan = self.decide([], {"valid": True, **alert})
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] KIT-RETAG WARN change_cap")
+        self.assertRegex(plan["mail"]["subject"], SUBJECT_RE)
+        report = request(system="KIT-RETAG", severity="INFO", key="daily_summary", short="DRYRUN 2026-11-21",
+                         lines=["Kit re-tagger DRY RUN: 3 products would change.", "+ fake-product-handle-002 +kit-ride"])
+        (out,) = self.validate(report)
+        self.assertEqual(out, {"valid": True, **report})
+        plan = self.decide([], {"valid": True, **report})
+        self.assertEqual(plan["mail"]["subject"], "[XB daily] KIT-RETAG DRYRUN 2026-11-21")
+        self.assertIsNone(plan["held_outcome"])
+        # It may not name another system, and no other system may name it.
+        bodies = [request(system="KIT-RETAG", key="read_failed", short="read_failed", lines=["see AC2-STOCK"]),
+                  request(lines=["see KIT-RETAG"]), request(system="MEMBER-SYNC", key="KIT-RETAG:x", short="x")]
+        for body, out in zip(bodies, self.validate(*bodies)):
+            self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"}, body)
+        # HEALTH's reserved key stays reserved.
+        (out,) = self.validate(request(system="KIT-RETAG", key="daily_health", short="FAIL 1 jobs 2026-11-19"))
+        self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_KEY"})
+
+    def nodes_code(self):
+        workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        return next(n for n in workflow["nodes"] if n["name"] == VALIDATE)["parameters"]["jsCode"]
 
     # ---- daily health path (#325 H1) ---- #
     def health(self, **overrides):
