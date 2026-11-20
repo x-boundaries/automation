@@ -251,6 +251,8 @@ class StaticContractTests(unittest.TestCase):
         # v1.4 is what n8n 3.0 runs every older Gmail Trigger as (#332); it caps each poll at maxResults.
         self.assertEqual(1.4, trigger["typeVersion"])
         self.assertEqual(10, trigger["parameters"]["maxResults"])
+        # Simplified output (format=metadata); Fetch Full Email reads the full message itself.
+        self.assertIs(True, trigger["parameters"]["simple"])
         self.assertEqual([{"mode": "everyMinute"}], trigger["parameters"]["pollTimes"]["item"])
         query = trigger["parameters"]["filters"]["q"]
         self.assertIn("from:bills@my.simba.sg", query)
