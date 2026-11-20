@@ -148,6 +148,10 @@ on:
       - "n8n-workflows/xb_daily_health.workflow.json"
       - "tests/test_xb_daily_health.py"
       - "tests/test_xb_daily_health_workflow.py"
+      # Repo-wide n8n export guards (#288 T2 no Telegram, #332 T4 Always Output Data on a multi-output
+      # node). Both run in the same full-repository suite (`rest` shard). Exact entries, not globs.
+      - "tests/test_no_telegram_nodes.py"
+      - "tests/test_n8n3_always_output_data_guard.py"
   workflow_dispatch: {}
 
 jobs:

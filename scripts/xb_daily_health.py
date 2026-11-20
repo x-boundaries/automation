@@ -60,6 +60,7 @@ JOBS = (
     "ac2_stock_export",
     "stock_alert_route",
     "arap_export",
+    "arap_alert_route",
     "energygrid_daily_bills",
     "energygrid_retention",
     "drive_mirror",
@@ -91,6 +92,10 @@ REASONS: dict[str, dict[str, str]] = {
     "arap_export": {
         "pause_expired": FAIL, "status_missing": FAIL, "last_run_too_old": FAIL, "manifest_missing": FAIL,
         "manifest_too_old": FAIL, "last_run_old": WARN, "run_failed": WARN, "delivery_failed": WARN,
+    },
+    # #321 L3: the AR/AP alert route, judged exactly like the stock alert route.
+    "arap_alert_route": {
+        "pause_expired": FAIL, "alert_send_failed": WARN, "alert_secret_unavailable": WARN, "alert_error": WARN,
     },
     "energygrid_daily_bills": {
         "pause_expired": FAIL, "task_missing": FAIL, "task_disabled": FAIL, "last_run_too_old": FAIL,
@@ -147,8 +152,10 @@ TASK_INFO_RESULTS = (
 RETENTION_HELD, RETENTION_REFUSED = 20, 64
 MIRROR_WARN_EXITS = {4: "mirror_fetch_failed", 7: "mirror_locked"}
 MIRROR_FAIL_EXITS = (1, 2, 3, 5, 6)
-STOCK_ALERT_REASONS = {"send_failed": "alert_send_failed", "secret_unavailable": "alert_secret_unavailable",
-                       "error": "alert_error"}
+# alert_status values that mean an alert did not reach n8n. The stock and the AR/AP exporters write the
+# same values (`suppressed`, `no_alert`, `sent`, `disabled` and `skipped_config` are fine).
+ALERT_REASONS = {"send_failed": "alert_send_failed", "secret_unavailable": "alert_secret_unavailable",
+                 "error": "alert_error"}
 DELIVERY_FAILURES = ("verify_failed", "copy_failed")
 STATUS_FILE = "last_run_status.json"
 MANIFEST_FILE = "latest_manifest.json"
@@ -465,12 +472,12 @@ def judge_export(job: str, status: Mapping[str, Any] | None, manifest: Mapping[s
     return _judged(job, reasons, age=age)
 
 
-def judge_alert_route(status: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The stock alert route, from ``alert_status`` in the stock status file. A missing file is the
-    export's FAIL, not this job's."""
+def judge_alert_route(job: str, status: Mapping[str, Any] | None) -> dict[str, Any]:
+    """An export's alert route (``stock_alert_route`` or ``arap_alert_route``), from ``alert_status`` in
+    that export's status file. A missing file is the export's FAIL, not this job's."""
 
-    reason = STOCK_ALERT_REASONS.get((status or {}).get("alert_status"))
-    return _judged("stock_alert_route", [reason] if reason else [])
+    reason = ALERT_REASONS.get((status or {}).get("alert_status"))
+    return _judged(job, [reason] if reason else [])
 
 
 def _find_task(tasks: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
@@ -556,8 +563,9 @@ def judge(settings: Mapping[str, Any], obs: Mapping[str, Any], records: Mapping[
     judged = {
         "ac2_stock_export": judge_export("ac2_stock_export", obs["stock_status"], obs["stock_manifest"], now,
                                          limits, "stock"),
-        "stock_alert_route": judge_alert_route(obs["stock_status"]),
+        "stock_alert_route": judge_alert_route("stock_alert_route", obs["stock_status"]),
         "arap_export": judge_export("arap_export", obs["arap_status"], obs["arap_manifest"], now, limits, "arap"),
+        "arap_alert_route": judge_alert_route("arap_alert_route", obs["arap_status"]),
         "energygrid_daily_bills": judge_task("energygrid_daily_bills", names["energygrid_daily_bills"], tasks, now,
                                              limits["energygrid_bills_warn_age"], limits["energygrid_bills_fail_age"]),
         "energygrid_retention": judge_task("energygrid_retention", names["energygrid_retention"], tasks, now,

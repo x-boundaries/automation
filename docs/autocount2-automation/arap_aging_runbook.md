@@ -470,6 +470,6 @@ log row means the sub-workflow call failed (for example it lacks `AC2-ARAP`: red
 
 ## Not in this slice
 
-A daily health check job for the ARAP alert route (the stock route has `stock_alert_route`; #325).
+The daily health check job for the ARAP alert route is built separately: `arap_alert_route` (#321 L3, in the daily health check PR for #288 T2; see docs/daily_health_check.md). It goes live with the health step H1.
 POST_SHIP: move the helpers shared with the stock exporter (connection string builder, lock, alert
 step) into one module.

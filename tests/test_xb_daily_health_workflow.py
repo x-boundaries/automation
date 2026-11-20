@@ -1,6 +1,6 @@
 """Offline contract of the inactive "XB Daily Health" n8n workflow (#325 H1), and the golden email.
 
-No n8n instance, n8n API, Data Table, Gmail or Telegram is contacted. The committed Code nodes are
+No n8n instance, n8n API, Data Table or Gmail is contacted. The committed Code nodes are
 executed with the local Node runtime against events made by the real checker code
 (scripts/xb_daily_health.py) from fake observations, and against synthetic n8n reads. The golden
 email is then passed through the committed XB Ops Alert Email Code nodes. Every value here is fake.
@@ -31,6 +31,7 @@ RUNBOOK = ROOT / "docs" / "daily_health_check.md"
 VALIDATE = "Validate Health Event"
 JUDGE = "Judge And Build Email"
 DEADMAN = "Decide Dead-Man"
+BROKEN = "Build Broken-Check Email"
 SGT = health.SGT
 NOW = datetime(2026, 11, 19, 7, 30, tzinfo=SGT)
 NOW_MS = int(NOW.timestamp() * 1000)
@@ -38,7 +39,7 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 ALLOWED_TYPES = {
     "n8n-nodes-base.webhook", "n8n-nodes-base.if", "n8n-nodes-base.respondToWebhook", "n8n-nodes-base.code",
     "n8n-nodes-base.n8n", "n8n-nodes-base.dataTable", "n8n-nodes-base.scheduleTrigger", "n8n-nodes-base.noOp",
-    "n8n-nodes-base.executeWorkflow", "n8n-nodes-base.set", "n8n-nodes-base.telegram", "n8n-nodes-base.stickyNote",
+    "n8n-nodes-base.executeWorkflow", "n8n-nodes-base.set", "n8n-nodes-base.stickyNote",
 }
 EXPECTED_EDGES = {
     ("Health Check Webhook", 0, "Request Came Through Proxy"),
@@ -51,24 +52,26 @@ EXPECTED_EDGES = {
     ("Respond Event Accepted", 0, "List Workflows"),
     ("List Workflows", 0, "List Error Runs"),
     ("List Error Runs", 0, "Read Alert Log"),
-    ("Read Alert Log", 0, "Read Health Runs"),
+    ("Read Alert Log", 0, "Read Failed Alert Emails"),
+    ("Read Failed Alert Emails", 0, "Read Health Runs"),
     ("Read Health Runs", 0, JUDGE),
     (JUDGE, 0, "Email Plan"),
-    (JUDGE, 1, "Telegram Check Broken"),
+    (JUDGE, 1, BROKEN),
     ("Dead-Man Check 08:15", 0, "Read Today Runs"),
     ("Read Today Runs", 0, DEADMAN),
     (DEADMAN, 0, "Email Plan"),
-    (DEADMAN, 1, "Telegram Check Broken"),
+    (DEADMAN, 1, BROKEN),
+    (BROKEN, 0, "Email Plan"),
     ("Email Plan", 0, "Email Is Due"),
     ("Email Is Due", 0, "Send Health Email"),
     ("Email Is Due", 1, "Collect Send Outcome"),
     ("Send Health Email", 0, "Collect Send Outcome"),
     ("Send Health Email", 1, "Collect Send Outcome"),
     ("Collect Send Outcome", 0, "Log Health Run"),
-    ("Log Health Run", 0, "Email Failed"),
-    ("Email Failed", 0, "Send Telegram Fallback"),
 }
-READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Health Runs", "Read Today Runs")
+READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Failed Alert Emails", "Read Health Runs",
+              "Read Today Runs")
+SEND_FAILURES = ["send_failed", "rejected", "error", "call_failed", "unknown"]
 RUN_COLUMNS = ["date", "kind", "verdict", "watched", "problems", "fail_jobs", "warn_jobs", "email", "code", "logged_at"]
 
 HARNESS = r"""
@@ -148,11 +151,12 @@ WORKFLOWS_OK = [{"id": "wfStockAlert01", "name": "fake", "active": True},
 WORKFLOWS_ALL = WORKFLOWS_OK + [{"id": "wfEgMonitor001", "name": "fake", "active": True}]
 
 
-def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None):
+def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, failed_alerts=None):
     return {
         "List Workflows": WORKFLOWS_ALL if workflows is None else workflows,
         "List Error Runs": [{}] if error_runs is None else error_runs,
         "Read Alert Log": [{}] if alert_log is None else alert_log,
+        "Read Failed Alert Emails": [{}] if failed_alerts is None else failed_alerts,
         "Read Health Runs": [{}] if runs is None else runs,
     }
 
@@ -174,6 +178,7 @@ def configured_workflow(watch_ids):
 
 CONFIGURED = {
     "REPLACE_WITH_STOCK_ALERT_WORKFLOW_ID": "wfStockAlert01",
+    "REPLACE_WITH_ARAP_ALERT_WORKFLOW_ID": "",
     "REPLACE_WITH_ENERGYGRID_MONITOR_WORKFLOW_ID": "wfEgMonitor001",
     "REPLACE_WITH_ENERGYGRID_OWNER_EMAIL_WORKFLOW_ID": "",
     "REPLACE_WITH_ENERGYGRID_DRIVE_VERIFY_WORKFLOW_ID": "",
@@ -298,9 +303,15 @@ class ShapeTests(unittest.TestCase):
             self.assertEqual(len(self.workflow["connections"][name]["main"]), 1, name)
         log = self.nodes["Log Health Run"]
         self.assertEqual((log.get("onError"), log.get("alwaysOutputData")), ("continueRegularOutput", True))
-        for name in ("Send Telegram Fallback", "Telegram Check Broken"):
-            self.assertEqual(self.nodes[name].get("onError"), "continueRegularOutput", name)
-            self.assertIs(self.nodes[name].get("retryOnFail"), False, name)
+        self.assertNotIn("Log Health Run", self.workflow["connections"], "the row is the last step")
+        # #288 T2: a broken Judge or Dead-Man step ends in the fixed broken-check email, not a Telegram line.
+        for name in (JUDGE, DEADMAN):
+            self.assertEqual(self.workflow["connections"][name]["main"][1],
+                             [{"node": BROKEN, "type": "main", "index": 0}], name)
+        broken = self.nodes[BROKEN]
+        self.assertEqual((broken["type"], broken["typeVersion"]), ("n8n-nodes-base.set", 3.4))
+        for key in ("onError", "retryOnFail", "alwaysOutputData", "executeOnce"):
+            self.assertNotIn(key, broken)
 
     def test_webhook_is_header_auth_with_a_placeholder_path_and_refuses_proxied_requests(self):
         params = self.nodes["Health Check Webhook"]["parameters"]
@@ -342,6 +353,12 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual((insert["resource"], insert["operation"]), ("row", "insert"))
         self.assertEqual([c["id"] for c in insert["columns"]["schema"]], RUN_COLUMNS)
         self.assertEqual(set(insert["columns"]["value"]), set(RUN_COLUMNS))
+        failed = self.nodes["Read Failed Alert Emails"]["parameters"]
+        self.assertEqual((failed["resource"], failed["operation"], failed["dataTableId"]["value"]),
+                         ("row", "get", "REPLACE_WITH_ALERT_LOG_TABLE_ID"))
+        self.assertEqual(failed["filters"]["conditions"], [
+            {"keyName": "outcome", "condition": "eq", "keyValue": "send_failed"}])
+        self.assertEqual((failed["orderByColumn"], failed["orderByDirection"], failed["limit"]), ("id", "DESC", 250))
         tables = {n["parameters"]["dataTableId"]["value"] for n in self.workflow["nodes"]
                   if n["type"] == "n8n-nodes-base.dataTable"}
         self.assertEqual(tables, {"REPLACE_WITH_ALERT_LOG_TABLE_ID", "REPLACE_WITH_HEALTH_RUNS_TABLE_ID"})
@@ -364,14 +381,14 @@ class ShapeTests(unittest.TestCase):
             self.assertNotIn(key, node)
         self.assertIs(params["options"]["waitForSubWorkflow"], True)
 
-    def test_telegram_lines_are_fixed_and_go_to_the_placeholder_chat(self):
-        for name in ("Send Telegram Fallback", "Telegram Check Broken"):
-            params = self.nodes[name]["parameters"]
-            self.assertEqual(params["chatId"], "REPLACE_WITH_OWNER_TELEGRAM_CHAT_ID")
-            self.assertEqual(params["additionalFields"], {"appendAttribution": False})
-            self.assertNotIn("$json.mail.lines", params["text"])
-        self.assertIn("Check the n8n Gmail credential", self.nodes["Send Telegram Fallback"]["parameters"]["text"])
-        self.assertNotIn("{{", self.nodes["Telegram Check Broken"]["parameters"]["text"])
+    def test_email_only_no_telegram_node_credential_or_placeholder(self):
+        # #288 T2 (owner 19 Nov 2026: email only). The repo-wide guard is tests/test_no_telegram_nodes.py.
+        self.assertNotIn("n8n-nodes-base.telegram", {n["type"] for n in self.workflow["nodes"]})
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("telegramApi", text)
+        self.assertNotIn("TELEGRAM", text)
+        self.assertNotIn("chatId", text)
+        self.assertEqual([n for n in self.nodes if "telegram" in n.lower()], [])
 
     def test_dead_man_runs_at_0815_sgt(self):
         rule = self.nodes["Dead-Man Check 08:15"]["parameters"]["rule"]["interval"]
@@ -386,6 +403,11 @@ class ShapeTests(unittest.TestCase):
                 continue  # the WATCH IDs are covered by one line naming REPLACE_WITH_..._WORKFLOW_ID
             self.assertIn(placeholder, notes)
         self.assertIn("REPLACE_WITH_..._WORKFLOW_ID", notes)
+        self.assertIn("Read Failed Alert Emails", notes)
+        self.assertNotIn("Telegram check", notes)
+        watcher = self.nodes["Who Watches The Watcher"]["parameters"]["content"]
+        for phrase in ("Monday only", "retried once", "nothing arrives at all", "up to 7 days"):
+            self.assertIn(phrase, watcher)
         readme = README.read_text(encoding="utf-8")
         self.assertIn("### xb_daily_health.workflow.json", readme)
         self.assertIn("[XB health]", readme)
@@ -488,7 +510,7 @@ class JudgeTests(unittest.TestCase):
     def test_golden_problem_day_email(self):
         plan = judge_plan(golden_inputs())
         self.assertIs(plan["send"], True)
-        self.assertEqual(plan["row"], {"date": "2026-11-19", "kind": "check", "verdict": "FAIL", "watched": 11,
+        self.assertEqual(plan["row"], {"date": "2026-11-19", "kind": "check", "verdict": "FAIL", "watched": 12,
                                        "problems": 3, "fail_jobs": "member_sync_summary,ac2_stock_export",
                                        "warn_jobs": "drive_mirror"})
         checked, decided = through_sender(plan)
@@ -501,7 +523,7 @@ class JudgeTests(unittest.TestCase):
     def test_ok_weekday_sends_nothing_and_monday_sends_the_heartbeat(self):
         plan = judge_plan(checker_event(), judge_reads())
         self.assertIs(plan["send"], False)
-        self.assertEqual(plan["mail"]["short"], "OK 10 jobs 2026-11-19")
+        self.assertEqual(plan["mail"]["short"], "OK 11 jobs 2026-11-19")
         self.assertEqual(plan["row"]["verdict"], "OK")
         monday = datetime(2026, 11, 23, 7, 30, tzinfo=SGT)
         monday_ms = int(monday.timestamp() * 1000)
@@ -518,15 +540,15 @@ class JudgeTests(unittest.TestCase):
         plan = judge_plan(event, judge_reads(runs=runs), now_ms=monday_ms)
         self.assertIs(plan["send"], True)
         self.assertEqual(plan["mail"]["severity"], "INFO")
-        self.assertEqual(plan["mail"]["short"], "OK 10 jobs 2026-11-23")
-        self.assertEqual(plan["mail"]["lines"][0], "XB weekly health check, Mon 23 Nov 2026 07:30 SGT: all 10 watched "
+        self.assertEqual(plan["mail"]["short"], "OK 11 jobs 2026-11-23")
+        self.assertEqual(plan["mail"]["lines"][0], "XB weekly health check, Mon 23 Nov 2026 07:30 SGT: all 11 watched "
                                                    "jobs OK. 7 of 7 daily checks ran this week; 1 send failures.")
         self.assertIn("Not watched: Member sync daily summary (not live yet), Member tags (not live yet), SIMBA intake "
                       "(not live yet).", plan["mail"]["lines"])
         self.assertEqual(plan["mail"]["lines"][-1],
                          "No [XB health] email on a Monday by 09:00 means the checker is down: tell Claude.")
         checked, decided = through_sender(plan)
-        self.assertEqual(decided["mail"]["subject"], "[XB health] OK 10 jobs 2026-11-23")
+        self.assertEqual(decided["mail"]["subject"], "[XB health] OK 11 jobs 2026-11-23")
         # Two missed days: 5 of 7.
         plan = judge_plan(event, judge_reads(runs=[r for r in runs if r["date"] not in ("2026-11-18", "2026-11-21")]),
                           now_ms=monday_ms)
@@ -619,8 +641,14 @@ class JudgeTests(unittest.TestCase):
                 e["since"] = "2026-11-05"
                 e.update(age_min=1000000, exit=4294967295, count=10000)
         event["notes"] = ["vm_or_drive_down"]
+        runs = [{"date": "2026-11-18", "kind": "check", "verdict": "FAIL", "email": "send_failed", "fail_jobs": "",
+                 "warn_jobs": ""}, {"date": "2026-11-18", "kind": "retry", "verdict": "FAIL", "email": "call_failed",
+                                    "fail_jobs": "", "warn_jobs": ""}]
         plan = judge_plan(event, judge_reads(workflows={"raw": [{"json": {"error": "x"}}]},
-                                             alert_log={"raw": [{"json": {"error": "x"}}]}))
+                                             alert_log={"raw": [{"json": {"error": "x"}}]},
+                                             failed_alerts={"raw": [{"json": {"error": "x"}}]}, runs=runs))
+        self.assertIn("Yesterday's health email could not be sent (send_failed at 07:30, call_failed at 08:15).",
+                      plan["mail"]["lines"])
         self.assertLessEqual(len(plan["mail"]["lines"]), 30)
         for line in plan["mail"]["lines"]:
             self.assertLessEqual(len(line), 300)
@@ -635,10 +663,142 @@ class JudgeTests(unittest.TestCase):
             for reason in reasons:
                 self.assertRegex(code, r"\n  %s: " % reason, reason)
         for reason in ("summary_missing", "summary_send_failed", "log_read_failed", "workflow_inactive",
-                       "workflow_missing", "error_runs", "n8n_api_failed", "not_configured"):
+                       "workflow_missing", "error_runs", "n8n_api_failed", "not_configured", "alert_email_failed",
+                       "alert_log_read_failed"):
             self.assertRegex(code, r"\n  %s: " % reason, reason)
         for job in health.JOBS:
             self.assertIn(" %s: '" % job, code, job)
+
+
+    def test_validate_and_checker_hold_the_same_closed_job_and_reason_lists(self):
+        # #321 L3: the checker event changed, so both closed lists change together.
+        code = next(n for n in load()["nodes"] if n["name"] == VALIDATE)["parameters"]["jsCode"]
+        jobs = code[code.index("const JOBS = ["):code.index("];", code.index("const JOBS = ["))]
+        self.assertEqual(re.findall(r"'([a-z0-9_]+)'", jobs), list(health.JOBS))
+        n8n_jobs = code[code.index("const N8N_JOBS = ["):code.index("];", code.index("const N8N_JOBS = ["))]
+        self.assertEqual(re.findall(r"'([a-z0-9_]+)'", n8n_jobs), list(health.N8N_JOBS))
+        block = code[code.index("const REASONS = {"):code.index("};", code.index("const REASONS = {"))]
+        found = {}
+        for job, body in re.findall(r"\n  ([a-z0-9_]+): \{([^}]*)\}", block):
+            found[job] = {reason: {"F": "FAIL", "W": "WARN"}[level] for reason, level in re.findall(r"([a-z_]+): ([FW])", body)}
+        self.assertEqual(found, health.REASONS)
+
+    def test_ap_alert_route_line(self):
+        obs = healthy_obs()
+        obs["arap_status"]["alert_status"] = "send_failed"
+        plan = judge_plan(checker_event(obs))
+        self.assertIs(plan["send"], True)
+        self.assertEqual(plan["row"]["warn_jobs"], "arap_alert_route")
+        line = next(l for l in plan["mail"]["lines"] if "AR/AP alert route:" in l)
+        self.assertEqual(line, "WARN  AR/AP alert route: the last alert could not be delivered to n8n, since 19 Nov. Next: "
+                               "check the AR/AP alert workflow in n8n and its webhook secret on the VM (runbook: "
+                               "arap_aging_runbook.md, \"A3: error alerts\").")
+        checked, _ = through_sender(plan)
+        self.assertIs(checked["valid"], True, checked)
+        self.assertIn("label: 'AR/AP alert'", next(n for n in load()["nodes"] if n["name"] == JUDGE)["parameters"]["jsCode"])
+
+    def test_alert_email_failed_counts_send_failed_rows_of_every_system_in_the_last_24_h(self):
+        # #288 Q4: under the n8n workflows job; counted, never named (no system name reaches the line).
+        def row(system, at, outcome="send_failed"):
+            return {"system": system, "key": "k", "outcome": outcome, "code": "gmail_error", "sent_at": at}
+
+        rows = [row("AC2-STOCK", "2026-11-18T23:00:00.000Z"),          # 07:00 SGT today: counted
+                row("AC2-ARAP", "2026-11-18T00:00:00.000Z"),           # 08:00 SGT yesterday: counted
+                row("ENERGYGRID", "2026-11-17T23:29:00.000Z"),         # 24 h 1 min before: not counted
+                row("HEALTH", "2026-11-18T08:00:00.000Z"),             # yesterday's failed health email: counted
+                row("MEMBER-SYNC", "2026-11-18T22:40:00.000Z", "sent"),  # not a failure
+                row("AC2-STOCK", "not a date")]
+        plan = judge_plan(checker_event(), judge_reads(failed_alerts=rows))
+        self.assertIs(plan["send"], True)
+        self.assertEqual((plan["row"]["verdict"], plan["row"]["warn_jobs"]), ("WARN", "n8n_workflows"))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("WARN  n8n workflows: 3 alert email(s) could not be sent in the last 24 h (see "
+                                        "xb_alert_email_log), since 19 Nov."), line)
+        checked, _ = through_sender(plan)
+        self.assertIs(checked["valid"], True, checked)
+        # No failed row in the window: nothing; an unreadable log: its own WARN, never a silent OK.
+        plan = judge_plan(checker_event(), judge_reads(failed_alerts=[row("AC2-STOCK", "2026-11-17T20:00:00.000Z")]))
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        plan = judge_plan(checker_event(), judge_reads(failed_alerts={"raw": [{"json": {"error": "Data table not found"}}]}))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertIn("the alert email log could not be read", line)
+        # Only under n8n_workflows: with that job off, a failed alert changes nothing.
+        expected = dict(json.loads((ROOT / "config" / "daily_health.example.json").read_text(encoding="utf-8"))
+                        ["expected"], n8n_workflows="off")
+        plan = judge_plan(checker_event(expected=expected), judge_reads(failed_alerts=rows))
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+
+    def yesterday_plan(self, rows, event=None):
+        return judge_plan(event or checker_event(), judge_reads(runs=rows))
+
+    def test_yesterdays_unsent_email_forces_todays_email_with_one_line(self):
+        def r(kind, email, day="2026-11-18"):
+            return {"date": day, "kind": kind, "verdict": "WARN", "email": email, "fail_jobs": "", "warn_jobs": "drive_mirror"}
+
+        cases = [
+            ([r("check", "send_failed"), r("retry", "send_failed")],
+             "Yesterday's health email could not be sent (send_failed at 07:30 and 08:15)."),
+            ([r("check", "send_failed")],
+             "Yesterday's health email could not be sent (send_failed at 07:30; the 08:15 retry did not run)."),
+            ([r("check", "rejected"), r("retry", "send_failed")],
+             "Yesterday's health email could not be sent (rejected at 07:30, send_failed at 08:15)."),
+            ([r("check", "call_failed"), r("retry", "Free <b>text</b>")],
+             "Yesterday's health email could not be sent (call_failed at 07:30, unknown at 08:15)."),
+        ]
+        for rows, line in cases:
+            with self.subTest(line=line):
+                plan = self.yesterday_plan(rows)
+                # An OK Thursday: sent anyway, and the line comes right after the first line.
+                self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", True))
+                self.assertEqual(plan["mail"]["lines"][1], line)
+                self.assertEqual(sum(1 for l in plan["mail"]["lines"] if l.startswith("Yesterday")), 1)
+                self.assertTrue(through_sender(plan)[0]["valid"])
+        # A problem day carries it under the first line too.
+        plan = self.yesterday_plan(cases[0][0], golden_inputs())
+        self.assertEqual(plan["mail"]["lines"][1], cases[0][1])
+        self.assertEqual(plan["mail"]["lines"][2], "")
+
+    def test_no_yesterday_line_when_it_went_out_or_was_not_due(self):
+        def r(kind, email, day="2026-11-18"):
+            return {"date": day, "kind": kind, "verdict": "OK", "email": email, "fail_jobs": "", "warn_jobs": ""}
+
+        quiet = [
+            [],                                                    # no row for yesterday
+            [r("check", "not_due")],                               # an OK weekday
+            [r("check", "sent")],
+            [r("check", "send_failed"), r("retry", "sent")],       # the retry worked
+            [r("check", "send_failed", day="2026-11-17")],         # the day before yesterday
+            [r("deadman", "send_failed")],                         # not the due 07:30 email
+        ]
+        for rows in quiet:
+            with self.subTest(rows=rows):
+                plan = self.yesterday_plan(rows)
+                self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+                self.assertFalse(any(l.startswith("Yesterday") for l in plan["mail"]["lines"]))
+        # An unreadable run log gives no line (and no guess).
+        plan = self.yesterday_plan({"raw": [{"json": {"error": "x"}}]})
+        self.assertFalse(any(l.startswith("Yesterday") for l in plan["mail"]["lines"]))
+
+    def test_ok_email_stays_monday_only(self):
+        # Owner Q3 = (i), 20 Nov 2026: no daily OK heartbeat. Every weekday of a healthy week but Monday is silent.
+        sends = {}
+        for day in range(17, 24):
+            now = datetime(2026, 11, day, 7, 30, tzinfo=SGT)
+            obs = healthy_obs()
+            for status in ("stock_status", "arap_status"):
+                for key in ("started_at", "finished_at"):
+                    obs[status][key] = obs[status][key].replace("2026-11-19", now.strftime("%Y-%m-%d"))
+            obs["stock_manifest"]["finished_at"] = obs["stock_status"]["finished_at"]
+            obs["arap_manifest"]["finished_at"] = obs["arap_status"]["finished_at"]
+            previous = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            obs["tasks"] = [dict(t, last_run=previous + t["last_run"][10:]) if t["name"] != "XB-DailyHealth"
+                            else dict(t, last_run=now.strftime("%Y-%m-%d") + "T07:30") for t in obs["tasks"]]
+            event = health.judge(settings(), obs, {}, now)
+            plan = judge_plan(event, now_ms=int(now.timestamp() * 1000))
+            self.assertEqual(plan["row"]["verdict"], "OK", (day, plan["mail"]["lines"]))
+            sends[now.strftime("%a")] = plan["send"]
+        self.assertEqual(sends, {"Tue": False, "Wed": False, "Thu": False, "Fri": False, "Sat": False, "Sun": False,
+                                 "Mon": True})
 
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code nodes")
@@ -670,6 +830,80 @@ class DeadManTests(unittest.TestCase):
         (item,) = self.decide({"raw": [{"json": {"error": "Data table not found"}}]})
         self.assertIn("could not be read", item["json"]["mail"]["lines"][2])
 
+    @staticmethod
+    def check(email, **changes):
+        row = {"date": "2026-11-20", "kind": "check", "verdict": "FAIL", "watched": 12, "problems": 3,
+               "fail_jobs": "member_sync_summary,ac2_stock_export", "warn_jobs": "drive_mirror", "email": email}
+        row.update(changes)
+        return row
+
+    def test_a_failed_0730_email_is_retried_once_at_0815(self):
+        # #288 T2: the retry fires exactly when today's due email did not go out.
+        for email in SEND_FAILURES:
+            with self.subTest(email=email):
+                (item,) = self.decide([self.check(email)])
+                plan = item["json"]
+                self.assertIs(plan["send"], True)
+                self.assertEqual(plan["mail"], {"severity": "ERROR", "short": "FAIL 3 jobs 2026-11-20", "lines": [
+                    "The 07:30 health email could not be sent (%s). This is the 08:15 retry." % email,
+                    "",
+                    "FAIL  Member sync daily summary, AC2 hourly stock export.",
+                    "WARN  Drive mirror.",
+                    "",
+                    "Full detail: health_2026-11-20.json on the server PC.",
+                    "No [XB health] email on a Monday by 09:00 means the checker is down: tell Claude.",
+                ]})
+                self.assertEqual(plan["row"], {"date": "2026-11-20", "kind": "retry", "verdict": "FAIL", "watched": 12,
+                                               "problems": 3, "fail_jobs": "member_sync_summary,ac2_stock_export",
+                                               "warn_jobs": "drive_mirror"})
+                checked, decided = through_sender(plan)
+                self.assertIs(checked["valid"], True, checked)
+                self.assertEqual(decided["mail"]["subject"], "[XB health] FAIL 3 jobs 2026-11-20")
+
+    def test_never_for_sent_or_not_due_and_never_twice(self):
+        quiet = [
+            [self.check("sent")],
+            [self.check("not_due", verdict="OK", problems=0, fail_jobs="", warn_jobs="")],
+            [self.check("folded")],
+            # A re-run that went out after a failed one.
+            [self.check("sent"), self.check("send_failed")],
+            # Already retried today (whatever its outcome): never twice.
+            [{"date": "2026-11-20", "kind": "retry", "email": "send_failed"}, self.check("send_failed")],
+            [{"date": "2026-11-20", "kind": "retry", "email": "sent"}, self.check("send_failed")],
+        ]
+        for rows in quiet:
+            with self.subTest(rows=[(r["kind"], r["email"]) for r in rows]):
+                self.assertEqual(self.decide(rows), [])
+        # Yesterday's failed email is the Judge's next-morning line, not an 08:15 retry today.
+        (item,) = self.decide([self.check("send_failed", date="2026-11-19")])
+        self.assertEqual(item["json"]["row"]["kind"], "deadman")
+
+    def test_the_retry_of_a_monday_heartbeat_and_of_a_broken_check(self):
+        (item,) = self.decide([self.check("send_failed", verdict="OK", watched=11, problems=0, fail_jobs="",
+                                          warn_jobs="")])
+        plan = item["json"]
+        self.assertEqual((plan["mail"]["severity"], plan["mail"]["short"]), ("INFO", "OK 11 jobs 2026-11-20"))
+        self.assertEqual(plan["mail"]["lines"][2], "OK    all 11 watched jobs, Fri 20 Nov 2026 08:15 SGT.")
+        self.assertTrue(through_sender(plan)[0]["valid"])
+        (item,) = self.decide([self.check("send_failed", watched=1, problems=1, fail_jobs="checker", warn_jobs="")])
+        self.assertEqual(item["json"]["mail"]["short"], "FAIL 1 jobs 2026-11-20")
+        self.assertIn("FAIL  Health checker.", item["json"]["mail"]["lines"])
+
+    def test_row_values_reach_the_retry_only_as_closed_labels_and_counts(self):
+        (item,) = self.decide([self.check("send_failed", verdict="<b>BAD</b>", watched="12", problems=-4,
+                                          fail_jobs="ac2_stock_export,Free Text Here", warn_jobs=None)])
+        plan = item["json"]
+        self.assertEqual(plan["mail"]["short"], "FAIL 1 jobs 2026-11-20")
+        self.assertEqual(plan["row"], {"date": "2026-11-20", "kind": "retry", "verdict": "FAIL", "watched": 0,
+                                       "problems": 0, "fail_jobs": "ac2_stock_export", "warn_jobs": ""})
+        text = "\n".join(plan["mail"]["lines"])
+        self.assertNotIn("Free Text", text)
+        self.assertNotIn("<b>", text)
+        self.assertTrue(through_sender(plan)[0]["valid"])
+        # A verdict with no readable job ids still says how many.
+        (item,) = self.decide([self.check("send_failed", fail_jobs="", warn_jobs="")])
+        self.assertIn("FAIL  3 job(s); see the record.", item["json"]["mail"]["lines"])
+
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to evaluate the expressions")
 class ExpressionTests(unittest.TestCase):
@@ -695,67 +929,66 @@ class ExpressionTests(unittest.TestCase):
         self.assertEqual(self.evaluate("Collect Send Outcome", "code", cases),
                          ["", "gmail_error", "OPS_ALERT_SHORT", "", "", "", ""])
 
-    def evaluate_with_outcome(self, node, field, outcomes, path):
-        """Evaluate one expression of `node` with $('Collect Send Outcome') and $('Email Plan') stubbed."""
+    def broken_check(self, previous, now):
+        """Evaluate the Build Broken-Check Email assignments with $prevNode and the clock stubbed."""
 
-        params = next(n for n in load()["nodes"] if n["name"] == node)["parameters"]
-        expression = path(params)
-        self.assertTrue(expression.startswith("={{ ") and expression.endswith(" }}"), field)
-        plan = {"row": {"date": "2026-11-19"}, "mail": {"short": "FAIL 2 jobs 2026-11-19"}}
-        script = ("const outcomes = %s; const plan = %s; process.stdout.write(JSON.stringify(outcomes.map((outcome) => {"
-                  " const $ = (name) => ({ first: () => ({ json: name === 'Collect Send Outcome' ? { outcome, code: '' }"
-                  " : (name === 'Email Plan' ? plan : (() => { throw new Error('unexpected ' + name); })()) }) });"
-                  " return (%s); })));") % (json.dumps(outcomes), json.dumps(plan), expression[4:-3])
-        done = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, timeout=60)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        return json.loads(done.stdout)
+        params = next(n for n in load()["nodes"] if n["name"] == BROKEN)["parameters"]
+        values = {a["name"]: a for a in params["assignments"]["assignments"]}
+        self.assertEqual({name: a["type"] for name, a in values.items()},
+                         {"send": "boolean", "mail": "object", "row": "object"})
+        self.assertIs(values["send"]["value"], True)
+        out = {"send": True}
+        for name in ("mail", "row"):
+            expression = values[name]["value"]
+            self.assertTrue(expression.startswith("={{ ") and expression.endswith(" }}"), name)
+            self.assertNotIn("$json", expression)
+            script = ("Date.now = () => %d; const $prevNode = { name: %s };"
+                      " process.stdout.write(JSON.stringify((%s)));") % (
+                int(now.timestamp() * 1000), json.dumps(previous), expression[4:-3])
+            done = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            out[name] = json.loads(done.stdout)
+        return out
 
-    def test_telegram_fallback_fires_exactly_when_a_due_email_did_not_go_out(self):
-        # G2 F1 (mutations M8, M16, M17): the Email Failed condition itself, not only its wiring.
-        fires = ["send_failed", "rejected", "error", "call_failed", "unknown"]
-        quiet = ["sent", "not_due", "folded", "folded_flood"]
-        result = self.evaluate_with_outcome(
-            "Email Failed", "condition", fires + quiet,
-            lambda p: p["conditions"]["conditions"][0]["leftValue"])
-        self.assertEqual(result, [True] * len(fires) + [False] * len(quiet))
-        condition = next(n for n in load()["nodes"] if n["name"] == "Email Failed")["parameters"]["conditions"]
-        self.assertEqual((condition["combinator"], len(condition["conditions"])), ("and", 1))
-        self.assertEqual(condition["conditions"][0]["rightValue"], True)
-        self.assertEqual(condition["conditions"][0]["operator"], {"type": "boolean", "operation": "equals"})
-        # Its true output, and only that, reaches the fallback; the false output ends the run.
-        self.assertEqual(load()["connections"]["Email Failed"],
-                         {"main": [[{"node": "Send Telegram Fallback", "type": "main", "index": 0}]]})
+    def test_broken_check_email_is_fixed_and_passes_the_sender(self):
+        # #288 T2: replaces the old "Telegram Check Broken" line. Row kind `check` from the 07:30 path (so the
+        # 08:15 dead-man does not mail twice), `deadman` from the 08:15 path.
+        at_0730 = datetime(2026, 11, 20, 7, 30, tzinfo=SGT)
+        plan = self.broken_check(JUDGE, at_0730)
+        self.assertEqual(plan["mail"], {"severity": "ERROR", "short": "FAIL 1 jobs 2026-11-20", "lines": [
+            "XB daily health check, Fri 20 Nov 2026: the health check could not be built today.",
+            "",
+            "FAIL  Health checker: n8n XB Daily Health failed before the email. Next: open n8n, check XB Daily Health.",
+            "",
+            "No [XB health] email on a Monday by 09:00 means the checker is down: tell Claude.",
+        ]})
+        self.assertEqual(plan["row"], {"date": "2026-11-20", "kind": "check", "verdict": "FAIL", "watched": 1,
+                                       "problems": 1, "fail_jobs": "checker", "warn_jobs": ""})
+        checked, decided = through_sender(plan)
+        self.assertIs(checked["valid"], True, checked)
+        self.assertEqual(decided["mail"]["subject"], "[XB health] FAIL 1 jobs 2026-11-20")
+        plan = self.broken_check(DEADMAN, datetime(2026, 11, 2, 8, 15, tzinfo=SGT))
+        self.assertEqual(plan["row"]["kind"], "deadman")
+        self.assertEqual(plan["mail"]["short"], "FAIL 1 jobs 2026-11-02")
+        self.assertEqual(plan["mail"]["lines"][0],
+                         "XB daily health check, Mon 2 Nov 2026: the health check could not be built today.")
+        # The SGT date, not the UTC one, just after midnight SGT.
+        plan = self.broken_check(JUDGE, datetime(2026, 11, 21, 0, 5, tzinfo=SGT))
+        self.assertEqual(plan["row"]["date"], "2026-11-21")
 
-    def test_end_to_end_outcomes_decide_the_fallback(self):
-        # The real chain: what reaches Collect Send Outcome -> its outcome -> the Email Failed condition.
-        inputs = [{"ok": True, "outcome": "sent", "code": ""},                       # email sent
-                  {"ok": False, "outcome": "send_failed", "code": "gmail_error"},    # Gmail down
-                  {"ok": False, "outcome": "rejected", "code": "OPS_ALERT_SHORT"},   # sender refused
-                  {"error": "Workflow does not exist"},                              # sender call failed
-                  {"send": False, "mail": {}, "row": {}}]                            # OK weekday: not due
-        outcomes = self.evaluate("Collect Send Outcome", "outcome", inputs)
-        self.assertEqual(outcomes, ["sent", "send_failed", "rejected", "call_failed", "not_due"])
-        fired = self.evaluate_with_outcome("Email Failed", "condition", outcomes,
-                                           lambda p: p["conditions"]["conditions"][0]["leftValue"])
-        self.assertEqual(fired, [False, True, True, True, False])
-
-    def test_fallback_text_names_gmail_only_for_send_failed(self):
-        # G2 L6: a neutral line for the outcomes that are not a Gmail failure.
-        outcomes = ["send_failed", "rejected", "error", "call_failed", "unknown"]
-        texts = self.evaluate_with_outcome("Send Telegram Fallback", "text", outcomes, lambda p: p["text"])
-        self.assertEqual(texts[0], "XB health email could not be sent on 2026-11-19 (n8n email step: send_failed). "
-                                   "Worst: FAIL 2 jobs. Check the n8n Gmail credential, then XB Daily Health.")
-        for outcome, text in zip(outcomes[1:], texts[1:]):
-            self.assertEqual(text, "XB health email could not be sent on 2026-11-19 (n8n email step: %s). Worst: FAIL 2 "
-                                   "jobs. Check XB Daily Health and XB Ops Alert Email in n8n." % outcome)
-            self.assertNotIn("Gmail", text)
-        for text in texts:
-            self.assertRegex(text, r"^[\x20-\x7E]+$")
-            self.assertLessEqual(len(text), 300)
+    def test_the_run_ends_at_the_row_for_every_outcome(self):
+        # No fallback node after the row: a failed email is retried by the 08:15 path instead.
+        inputs = [{"ok": True, "outcome": "sent", "code": ""}, {"ok": False, "outcome": "send_failed", "code": "gmail_error"},
+                  {"error": "Workflow does not exist"}, {"send": False, "mail": {}, "row": {}}]
+        self.assertEqual(self.evaluate("Collect Send Outcome", "outcome", inputs),
+                         ["sent", "send_failed", "call_failed", "not_due"])
+        self.assertEqual(load()["connections"]["Collect Send Outcome"],
+                         {"main": [[{"node": "Log Health Run", "type": "main", "index": 0}]]})
+        self.assertNotIn("Log Health Run", load()["connections"])
 
 
 GOLDEN_TEXT = "\n".join([
-    "XB daily health check, Thu 19 Nov 2026 07:30 SGT: 3 of 11 watched jobs need a look (2 FAIL, 1 WARN).",
+    "XB daily health check, Thu 19 Nov 2026 07:30 SGT: 3 of 12 watched jobs need a look (2 FAIL, 1 WARN).",
     "",
     "FAIL  Member sync daily summary: no email this morning, since 19 Nov. Next: check task "
     "XB-MemberSync-DailySummary on the VM (runbook: member_sync_phase1.md, \"Daily summary email\").",
@@ -765,8 +998,8 @@ GOLDEN_TEXT = "\n".join([
     "WARN  Drive mirror: the last weekly run could not reach GitHub (FETCH_FAILED), since 16 Nov. Next: nothing if the "
     "next Sunday run passes; otherwise see drive_mirror_runbook.md.",
     "",
-    "OK    8 other jobs: Stock alert route, AR/AP export, EnergyGrid daily bills, EnergyGrid retention, n8n workflows, "
-    "Server task list, Health checker, Drive folder.",
+    "OK    9 other jobs: Stock alert route, AR/AP export, AR/AP alert route, EnergyGrid daily bills, EnergyGrid "
+    "retention, n8n workflows, Server task list, Health checker, Drive folder.",
     "Paused: none.",
     "Not watched: Member tags (not live yet), SIMBA intake (not live yet).",
     "",
