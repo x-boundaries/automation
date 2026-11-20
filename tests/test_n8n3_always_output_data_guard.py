@@ -88,11 +88,14 @@ class AlwaysOutputDataGuardTests(unittest.TestCase):
 
     def test_the_exempt_export_is_the_known_case(self):
         # The archived invoice delivery export still holds the pattern; the guard sees it, the exemption hides it.
-        path = EXPORTS / "energygrid_invoice_delivery.workflow.json"
-        if not path.is_file():
-            self.skipTest("export removed; the exemption can go")
-        found = multi_output_always_output_nodes(path.name, json.loads(path.read_text(encoding="utf-8")))
-        self.assertGreaterEqual(len(found), 1)
+        # A stale exemption fails instead of skipping (#334 G2 L3): when the export is removed or no longer
+        # holds the pattern, remove its EXEMPT entry in the same change.
+        for name in EXEMPT:
+            path = EXPORTS / name
+            with self.subTest(name=name):
+                self.assertTrue(path.is_file(), "%s is gone: remove its EXEMPT entry" % name)
+                found = multi_output_always_output_nodes(name, json.loads(path.read_text(encoding="utf-8")))
+                self.assertGreaterEqual(len(found), 1, "%s no longer needs the exemption: remove it" % name)
 
 
 if __name__ == "__main__":

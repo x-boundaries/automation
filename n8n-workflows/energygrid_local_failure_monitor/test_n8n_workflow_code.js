@@ -96,6 +96,15 @@ const ops=JSON.parse(fs.readFileSync(opsPath,'utf8'));
 const opsTrigger=ops.nodes.find(n=>n.type==='n8n-nodes-base.executeWorkflowTrigger');
 assert.deepEqual(inputs.schema.map(f=>[f.id,f.type]),opsTrigger.parameters.workflowInputs.values.map(v=>[v.name,v.type]));
 assert.ok(!workflow.nodes.some(n=>n.credentials),'no credentials in the source export');
+// #333 LATER L1: Remove Duplicates keys on the per-incident dedupe_key, never on `key`, which is constant
+// per alert kind (a slip to $json.key would silently drop every later alert of that kind). Workflow scope
+// keeps the seen keys across executions; the history size bounds that store.
+const dedupe=find('One Attempt Per Incident');
+assert.equal(dedupe.type,'n8n-nodes-base.removeDuplicates');assert.equal(dedupe.typeVersion,2);
+assert.deepEqual(dedupe.parameters,{operation:'removeItemsSeenInPreviousExecutions',dedupeValue:'={{ $json.dedupe_key }}',
+  options:{scope:'workflow',historySize:10000}});
+// #333 LATER L2: the source export carries no runtime state (alert series, open incidents, report day).
+assert.strictEqual(workflow.staticData,null);
 assert.equal(workflow.connections['One Attempt Per Incident'].main[0][0].node,'Send Owner Alert Email');
 assert.equal(Object.keys(workflow.connections).length,6);
 assert.ok(!workflow.connections['Send Owner Alert Email'],'the email call is the last node');

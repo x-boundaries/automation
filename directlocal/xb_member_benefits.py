@@ -1690,8 +1690,17 @@ class _Budget(Exception):
     """The run's AutoCount read budget is spent."""
 
 
-class _MemberNoUnsupported(Exception):
-    """Slice NF2: a MemberNo outside dl.MEMBER_NO_RE; never sent to the bridge."""
+class _MemberNoUnsupported(dl.DirectLocalError):
+    """Slice NF2: a MemberNo outside dl.MEMBER_NO_RE; never sent to the bridge.
+
+    The two call sites of ``_read_member`` catch it and hold the receipt. A
+    ``DirectLocalError`` (PR #328 G2 L2), so a future caller without its own
+    handler stops the run through ``run()``'s handler (``stopped`` and one
+    alert ``member_no_unsupported``, the run row finished), never a crash
+    that leaves the run row unfinished."""
+
+    def __init__(self) -> None:
+        super().__init__(MEMBER_NO_UNSUPPORTED)
 
 
 class BenefitsEngine:
@@ -2785,14 +2794,10 @@ def ledger_digest(root: Path, *, hours: int, now: datetime, config: BenefitsConf
 CLAIM_LINKS_LIST_MAX = 500
 
 
-def claim_links_listing(root: Path, *, config: BenefitsConfig) -> dict[str, Any]:
-    """Slice B2 (B2-11, PR #303 N1): the active claim links, so the owner can
-    name a link (also one the index made for a customer with no order) to
-    ``unlink --customer-ref``. Opened as the digest is (SQLite ``mode=ro``
-    and ``query_only``): no lock, no write, no run row. Keyed ``c-`` refs,
-    MemberNos masked to the last 3, the source and the Singapore day the
-    link was made; sorted by ref, at most ``CLAIM_LINKS_LIST_MAX``. Voided
-    links are counted, never listed."""
+def _open_read_only(root: Path, *, config: BenefitsConfig) -> tuple[sqlite3.Connection, sqlite3.Row]:
+    """The ledger opened as the digest is (SQLite ``mode=ro`` and
+    ``query_only``): no lock, no write, no run row; refused as the digest
+    refuses. Returns the connection (the caller closes it) and the meta row."""
 
     path = Path(root) / LEDGER_FILE
     if not path.is_file():
@@ -2810,6 +2815,26 @@ def claim_links_listing(root: Path, *, config: BenefitsConfig) -> dict[str, Any]
         if meta is None:
             raise dl.DirectLocalError("benefits_ledger_not_initialised")
         BenefitsLedger._check(meta, config)
+        return conn, meta
+    except sqlite3.Error:
+        conn.close()
+        raise dl.DirectLocalError("benefits_ledger_unreadable") from None
+    except BaseException:
+        conn.close()
+        raise
+
+
+def claim_links_listing(root: Path, *, config: BenefitsConfig) -> dict[str, Any]:
+    """Slice B2 (B2-11, PR #303 N1): the active claim links, so the owner can
+    name a link (also one the index made for a customer with no order) to
+    ``unlink --customer-ref``. Opened as the digest is (SQLite ``mode=ro``
+    and ``query_only``): no lock, no write, no run row. Keyed ``c-`` refs,
+    MemberNos masked to the last 3, the source and the Singapore day the
+    link was made; sorted by ref, at most ``CLAIM_LINKS_LIST_MAX``. Voided
+    links are counted, never listed."""
+
+    conn, meta = _open_read_only(root, config=config)
+    try:
         links = []
         for row in conn.execute("SELECT customer_gid, member_no, source, created_at FROM active_claim_links"):
             created = dl.parse_created_at(row["created_at"])
@@ -2824,6 +2849,65 @@ def claim_links_listing(root: Path, *, config: BenefitsConfig) -> dict[str, Any]
         raise dl.DirectLocalError("benefits_ledger_unreadable") from None
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# Held receipts listing (read only, VM screen only; PR #328 G2 L1)
+# --------------------------------------------------------------------------
+
+HELD_LIST_MAX = 500
+_ORDER_ID_RE = re.compile(r"^gid://shopify/Order/([1-9][0-9]{0,19})\Z")
+
+
+def held_listing(root: Path, *, config: BenefitsConfig, code: str) -> dict[str, Any]:
+    """PR #328 G2 L1: the receipts held with ``code`` (for example
+    ``member_no_unsupported``), so staff can act on a digest alert without a
+    ledger query. Opened as the digest is: no lock, no write, no run row.
+
+    Unlike every other output, an entry carries the **full** MemberNo and the
+    Shopify order ID: it is for the VM screen only (``show_held``), never
+    passed to ``_emit``, the digest, the daily email or a log. The ledger keeps
+    no order name (``ORDERS_QUERY`` does not read it), so each entry gives the
+    order's admin link instead, which opens the order and shows its name.
+    Sorted by order time, at most ``HELD_LIST_MAX``."""
+
+    if not isinstance(code, str) or not dl.CODE_RE.fullmatch(code):
+        raise dl.DirectLocalError("held_code_invalid")
+    conn, meta = _open_read_only(root, config=config)
+    try:
+        rows = conn.execute("SELECT order_gid, order_date_sgt, member_no, link_source FROM receipts WHERE state = 'held' AND code = ? "
+                            "ORDER BY order_created_at, order_gid", (code,)).fetchall()
+        entries = []
+        for row in rows[:HELD_LIST_MAX]:
+            match = _ORDER_ID_RE.fullmatch(row["order_gid"])
+            order_id = match.group(1) if match else None
+            entries.append({"ref": keyed_ref(meta["ref_key"], "o", row["order_gid"]), "order_date_sgt": row["order_date_sgt"],
+                            "order_id": order_id,
+                            "order_admin_url": f"https://{meta['shop_domain']}/admin/orders/{order_id}" if order_id else None,
+                            "member_no": row["member_no"], "link_source": row["link_source"]})
+        return {"code": code, "held": entries, "total": len(rows), "truncated": len(rows) > HELD_LIST_MAX}
+    except sqlite3.Error:
+        raise dl.DirectLocalError("benefits_ledger_unreadable") from None
+    finally:
+        conn.close()
+
+
+def show_held(listing: Mapping[str, Any]) -> None:
+    """Plain text for the VM screen (not a JSON line: nothing reads it but a
+    person). The MemberNo is shown in quotes with escapes (``"\\t"``, ``"\\u00e9"``),
+    so a leading space or a tab can be seen and the Windows console never
+    meets a character it cannot print."""
+
+    write = sys.stdout.write
+    write(f"Held receipts with code {listing['code']}: {listing['total']}\n")
+    write("VM screen only: full MemberNos. Do not copy them into email, chat, issues or logs.\n")
+    for number, entry in enumerate(listing["held"], start=1):
+        member = json.dumps(entry["member_no"]) if entry["member_no"] is not None else "(none recorded)"
+        write(f"\n{number}. Order of {entry['order_date_sgt']} (Singapore day), ref {entry['ref']}\n")
+        write(f"   Shopify order: {entry['order_admin_url'] or '(order ID not recognised)'}\n")
+        write(f"   MemberNo: {member}   link: {entry['link_source'] or '(none)'}\n")
+    if listing["truncated"]:
+        write(f"\n... {listing['total'] - len(listing['held'])} more not shown (at most {HELD_LIST_MAX}).\n")
 
 
 # --------------------------------------------------------------------------
@@ -2851,7 +2935,8 @@ def build_real_engine(config: BenefitsConfig, ledger: BenefitsLedger, *, environ
     return BenefitsEngine(config, ledger, shopify=shopify, ac2=ac2)
 
 
-COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink", "claim-links")
+COMMANDS = ("check-config", "init", "status", "observe", "apply", "resolve", "index", "digest", "release-held", "unlink", "claim-links",
+            "held")
 
 
 def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsConfig, BenefitsLedger], BenefitsEngine] | None = None,
@@ -2870,6 +2955,7 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
     parser.add_argument("--reason", help="unlink only: wrong_person, customers_merged, member_renumbered or other")
     parser.add_argument("--accept-applied", action="store_true", help="unlink only: void even when a receipt through the link is applied")
     parser.add_argument("--finding", help="release-held only: as_intended or not_as_intended (what the owner saw in AutoCount)")
+    parser.add_argument("--code", help="held only (required): the hold code to list, for example member_no_unsupported")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -2887,6 +2973,9 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[BenefitsCon
             return 0
         if args.command == "claim-links":  # slice B2 (B2-11): read only, as the digest
             _emit(claim_links_listing(root, config=config))
+            return 0
+        if args.command == "held":  # PR #328 G2 L1: read only, as the digest; plain text for the VM screen
+            show_held(held_listing(root, config=config, code=args.code))
             return 0
         ledger = BenefitsLedger(root, clock=clock)
         try:
