@@ -117,7 +117,12 @@ class DirectHttpSettings:
 
 @dataclass(frozen=True)
 class AlertSettings:
-    """Loopback-only alert ingress. The URL path and any token stay private."""
+    """Loopback-only alert ingress. The URL path and any token stay private.
+
+    DORMANT since #288 T1 (20 Nov 2026): the n8n alert ingress it posted to is retired,
+    so nothing consumes it. Keep the private config's `alert` object unset. Removing it
+    is a later EnergyGrid code round (see `notify.py`).
+    """
 
     url: str = field(repr=False)
     auth_header_name: str | None = field(default=None, repr=False)

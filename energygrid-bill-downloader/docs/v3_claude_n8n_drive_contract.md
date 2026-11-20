@@ -255,7 +255,9 @@ call); 89 final status invalid or incomplete (including Claude exit 0 without a
 valid terminal status). On a non-zero exit it sends the existing
 `energygrid.alert.v1` alert (stage `run`, status `ACTION_REQUIRED`, support
 reference `EG_SUPERVISOR_EXIT_<code>`), which the unchanged alert-ingress
-validator accepts.
+validator accepts. *(Historical: #288 T1 (20 Nov 2026) retired the n8n alert
+ingress, so this alert has no consumer. Keep the supervisor's `alert` setting
+unset; see the runbook's "Failure alert" section.)*
 
 ## 9. Controlled E2E (each step needs its own authority)
 
