@@ -191,14 +191,46 @@ class StaticContractTests(unittest.TestCase):
     def test_only_a_new_claim_after_a_matching_render_reaches_gmail(self) -> None:
         self.assertEqual({("Insert Claim", 0)}, parents(self.workflow, GMAIL))
         self.assertEqual({("Claim Is New", 0)}, parents(self.workflow, "Insert Claim"))
-        self.assertEqual({("Find Existing Claim", 0)}, parents(self.workflow, "Claim Is New"))
+        self.assertEqual({("Claim Lookup Failed", 1)}, parents(self.workflow, "Claim Is New"))
+        self.assertEqual({("Classify Claim Lookup", 0)}, parents(self.workflow, "Claim Lookup Failed"))
+        self.assertEqual({("Find Existing Claim", 0)}, parents(self.workflow, "Classify Claim Lookup"))
         self.assertEqual({("Render Matches", 0)}, parents(self.workflow, "Find Existing Claim"))
         self.assertEqual({("Hash Render", 0)}, parents(self.workflow, "Render Matches"))
-        for source, output in (("Is Probe", 0), ("Render Matches", 1), ("Claim Is New", 1), ("Find Existing Claim", 1),
+        for source, output in (("Is Probe", 0), ("Render Matches", 1), ("Claim Is New", 1), ("Claim Lookup Failed", 0),
                                ("Insert Claim", 1), ("Request Is Refused", 0), ("Request Is Proxied", 0),
                                ("Validate Email Request", 1), ("Hash Render", 1)):
             with self.subTest(branch=(source, output)):
                 self.assertNotIn(GMAIL, downstream(self.workflow, source, output))
+
+    def test_claim_lookup_has_one_output_and_a_single_classified_decision(self) -> None:
+        """#332 T2: the lookup feeds one Code node; failed goes to 422, duplicate to 409, new to Insert."""
+        connections = self.workflow["connections"]
+        self.assertEqual([[{"node": "Classify Claim Lookup", "type": "main", "index": 0}]],
+                         connections["Find Existing Claim"]["main"], "Classify is the only child of the lookup")
+        self.assertEqual([[{"node": "Claim Lookup Failed", "type": "main", "index": 0}]],
+                         connections["Classify Claim Lookup"]["main"])
+        self.assertEqual([[{"node": "Respond Claim Failed", "type": "main", "index": 0}],
+                          [{"node": "Claim Is New", "type": "main", "index": 0}]],
+                         connections["Claim Lookup Failed"]["main"])
+        self.assertEqual({("Claim Lookup Failed", 0), ("Insert Claim", 1)}, parents(self.workflow, "Respond Claim Failed"))
+        self.assertEqual({("Claim Is New", 1)}, parents(self.workflow, "Respond Duplicate"))
+        self.assertEqual({"Respond Claim Failed"}, downstream(self.workflow, "Claim Lookup Failed", 0))
+        self.assertEqual({"Respond Duplicate"}, downstream(self.workflow, "Claim Is New", 1))
+        classify = self.nodes["Classify Claim Lookup"]
+        self.assertEqual(("n8n-nodes-base.code", "runOnceForAllItems"),
+                         (classify["type"], classify["parameters"]["mode"]))
+        for key in ("onError", "alwaysOutputData", "retryOnFail", "continueOnFail"):
+            self.assertNotIn(key, classify, "a broken classifier fails the execution, never a silent send")
+        for name, value in (("Claim Lookup Failed", "failed"), ("Claim Is New", "new")):
+            with self.subTest(node=name):
+                conditions = self.nodes[name]["parameters"]["conditions"]
+                self.assertEqual("and", conditions["combinator"])
+                self.assertEqual("strict", conditions["options"]["typeValidation"])
+                (condition,) = conditions["conditions"]
+                self.assertEqual(("={{ $json.claim_lookup }}", value, {"type": "string", "operation": "equals"}),
+                                 (condition["leftValue"], condition["rightValue"], condition["operator"]))
+        # Nothing downstream of the lookup reads the raw lookup output any more.
+        self.assertNotIn("$('Find Existing Claim')", self.raw)
 
     def test_render_check_compares_the_workflow_digest_with_the_core_digest(self) -> None:
         condition = self.nodes["Render Matches"]["parameters"]["conditions"]["conditions"][0]
@@ -213,7 +245,11 @@ class StaticContractTests(unittest.TestCase):
 
     def test_claim_lookup_uses_the_notification_id_column(self) -> None:
         find = self.nodes["Find Existing Claim"]
-        self.assertTrue(find["alwaysOutputData"], "an empty lookup must still reach Claim Is New")
+        # #332 T1: one regular output plus Always Output Data, so n8n 2.x and 3.0 route it the same way.
+        self.assertEqual("continueRegularOutput", find["onError"],
+                         "a lookup error must not open a second output next to the Always Output Data item")
+        self.assertIs(True, find["alwaysOutputData"], "an empty lookup must still reach Classify Claim Lookup")
+        self.assertNotIn("retryOnFail", find)
         self.assertEqual([{"keyName": "notificationId", "condition": "eq",
                            "keyValue": "={{ $('Validate Email Request').first().json.request.notification_id }}"}],
                          find["parameters"]["filters"]["conditions"])
@@ -323,6 +359,28 @@ class CodeNodeTests(unittest.TestCase):
                           good["response"]["recipient_sha256"]))
         for out in bad:
             self.assertEqual((502, False), (out["response_code"], out["response"]["ready"]))
+
+    def test_claim_lookup_classification_covers_every_lookup_shape(self) -> None:
+        """#332 T3: rows are duplicate, the single empty item is new, every error shape is failed."""
+        claim_row = {"id": 7, "notificationId": NID, "dispatchId": DID, "state": "CLAIMED",
+                     "createdAt": "2026-11-20T03:30:00.000Z", "updatedAt": "2026-11-20T03:30:00.000Z"}
+        echo = {"route": "SEND", "request": {"notification_id": NID, "dispatch_id": DID}, "subject": "s", "text": "t",
+                "canonical": "s\nt", "recipient": RECIPIENT, "render_sha256_actual": "0" * 64}
+        cases = {
+            "one claim row": ([{"json": claim_row}], "duplicate"),
+            "two claim rows": ([{"json": claim_row}, {"json": {**claim_row, "id": 8}}], "duplicate"),
+            "always-output-data empty item": ([{"json": {}}], "new"),
+            "error on json": ([{"json": {"error": {"message": "Data table not found"}}}], "failed"),
+            "error on item": ([{"json": {}, "error": {"message": "Data table not found"}}], "failed"),
+            "request echo with error": ([{"json": {**echo, "error": "Could not get rows"}}], "failed"),
+            "request echo without error": ([{"json": echo}], "failed"),
+            "row next to an error item": ([{"json": claim_row}, {"json": {}, "error": {"message": "x"}}], "failed"),
+            "no items at all": ([], "failed"),
+        }
+        outs = run_nodes([{"node": "Classify Claim Lookup", "input": items} for items, _ in cases.values()])
+        for (name, (_items, expected)), out in zip(cases.items(), outs):
+            with self.subTest(case=name):
+                self.assertEqual([{"json": {"claim_lookup": expected}}], out, "exactly one output item")
 
     def test_sent_answer_never_claims_sent_without_a_message_id(self) -> None:
         cases = [{"node": "Build Sent Answer", "input": [{"json": {}}],

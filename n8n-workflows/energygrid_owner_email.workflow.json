@@ -290,8 +290,55 @@
         "returnAll": false,
         "limit": 2
       },
-      "onError": "continueErrorOutput",
+      "onError": "continueRegularOutput",
       "alwaysOutputData": true
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000031",
+      "name": "Classify Claim Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// #332 slice A: Find Existing Claim continues on its ONE regular output with Always Output Data, so the\n// same rule holds on n8n 2.x and 3.0. This node turns whatever the lookup returned into one decision:\n// - failed: any item carries an error (on the item or on its json), or is the request echo the Data\n//   Table node can return on a failure (it carries the Validate Email Request field `route`). A failed\n//   lookup answers 422 and never reaches Gmail.\n// - duplicate: any item is a claim row (it has notificationId). Answers 409.\n// - new: only the single empty item that Always Output Data adds when no row matched.\n// No items at all cannot be decided and also counts as failed.\nconst items = $input.all();\nconst failed = items.length === 0 || items.some((item) => item.error !== undefined\n  || (item.json && (item.json.error !== undefined || item.json.route !== undefined)));\nlet claim_lookup = 'new';\nif (failed) claim_lookup = 'failed';\nelse if (items.some((item) => item.json && item.json.notificationId)) claim_lookup = 'duplicate';\nreturn [{ json: { claim_lookup } }];\n"
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8402-000000000032",
+      "name": "Claim Lookup Failed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2400,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00000000-0000-4000-8402-000000000033",
+              "leftValue": "={{ $json.claim_lookup }}",
+              "rightValue": "failed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
     },
     {
       "id": "00000000-0000-4000-8402-000000000017",
@@ -299,7 +346,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        2160,
+        2640,
         620
       ],
       "parameters": {
@@ -313,10 +360,10 @@
           "conditions": [
             {
               "id": "00000000-0000-4000-8402-000000000016",
-              "leftValue": "={{ !$('Find Existing Claim').first().json.notificationId }}",
-              "rightValue": true,
+              "leftValue": "={{ $json.claim_lookup }}",
+              "rightValue": "new",
               "operator": {
-                "type": "boolean",
+                "type": "string",
                 "operation": "equals"
               }
             }
@@ -332,7 +379,7 @@
       "type": "n8n-nodes-base.dataTable",
       "typeVersion": 1.1,
       "position": [
-        2400,
+        2880,
         540
       ],
       "parameters": {
@@ -393,7 +440,7 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.1,
       "position": [
-        2640,
+        3120,
         540
       ],
       "parameters": {
@@ -416,7 +463,7 @@
       "type": "n8n-nodes-base.dataTable",
       "typeVersion": 1.1,
       "position": [
-        2880,
+        3360,
         460
       ],
       "parameters": {
@@ -466,7 +513,7 @@
       "type": "n8n-nodes-base.dataTable",
       "typeVersion": 1.1,
       "position": [
-        2880,
+        3360,
         700
       ],
       "parameters": {
@@ -516,7 +563,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3120,
+        3600,
         460
       ],
       "parameters": {
@@ -531,7 +578,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.3,
       "position": [
-        3120,
+        3600,
         700
       ],
       "parameters": {
@@ -548,7 +595,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.3,
       "position": [
-        2400,
+        2880,
         780
       ],
       "parameters": {
@@ -565,7 +612,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.3,
       "position": [
-        2640,
+        3120,
         860
       ],
       "parameters": {
@@ -616,7 +663,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.3,
       "position": [
-        3360,
+        3840,
         380
       ],
       "parameters": {
@@ -650,12 +697,12 @@
       "typeVersion": 1,
       "position": [
         240,
-        -720
+        -780
       ],
       "parameters": {
-        "content": "# START HERE: What is EnergyGrid - Owner Email?\n\n**Purpose:** Emails the configured owner when the Python automation has processed a bill (with its Google Drive link), or sends a needs-attention notice. It does NOT download or verify PDFs.\n\n**Follow the nodes from left to right:**\n1. **Webhook / Validate / Request Is ...** Accept one authenticated private request; reject invalid requests.\n2. **Is Probe / Get Sender Identity** `PROBE` checks the Gmail sender and recipient without sending anything.\n3. **Hash Render / Render Matches** For `SEND`, build the fixed message and check its digest before Gmail.\n4. **Find Existing Claim / Insert Claim** Check and record the notification id in the Data Table. Python's durable send seal is the primary duplicate guard; the table is a secondary safeguard.\n5. **Send Owner Email / Mark Claim / Respond ...** Attempt one Gmail send, record the outcome and answer Python.\n\n**If Gmail is uncertain, there is NO automatic resend**, to avoid duplicate emails. Investigate the recorded status.\n\n**This workflow does NOT** decide which invoice is the latest, file PDFs or change Google Drive files.\n\n**Maintainer:** keep the fixed owner recipient and subject prefix in **Validate Email Request**; reuse the approved Gmail and Header Auth credentials. Claim table text fields: `notificationId`, `dispatchId`, `state`. Keep the Cloudflare path exclusion. Full contract: `energygrid-bill-downloader/docs/native_daily_claude_free.md` sections 4 and 6.\n\n---\n\n## Maintainer reference\n\n- PROBE answers readiness, the sender account and the recipient hash. It never reaches the Gmail node.\n- SEND renders the fixed templates, refuses a render digest mismatch, checks and writes the claim, then sends once.\n- The claim lookup and insert are NOT one atomic operation: secondary evidence only. The EnergyGrid Core seal is the authority.\n- Gmail has no retry and no attribution. An error or a lost answer is uncertain and is never resent.\n\n## Required manual configuration:\n\n- **Validate Email Request**\n  - `SUBJECT_PREFIX`: the same subject prefix as the private EnergyGrid config.\n  - `RECIPIENT`: the one owner recipient of the private EnergyGrid config.\n- **Find Existing Claim**, **Insert Claim**, **Mark Claim Sent**, **Mark Claim Uncertain**\n  - `Data table`: the EnergyGrid email claim table (string columns notificationId, dispatchId, state).\n- No workflow-level error workflow: every failure answers the Core, which owns owner visibility.",
+        "content": "# START HERE: What is EnergyGrid - Owner Email?\n\n**Purpose:** Emails the configured owner when the Python automation has processed a bill (with its Google Drive link), or sends a needs-attention notice. It does NOT download or verify PDFs.\n\n**Follow the nodes from left to right:**\n1. **Webhook / Validate / Request Is ...** Accept one authenticated private request; reject invalid requests.\n2. **Is Probe / Get Sender Identity** `PROBE` checks the Gmail sender and recipient without sending anything.\n3. **Hash Render / Render Matches** For `SEND`, build the fixed message and check its digest before Gmail.\n4. **Find Existing Claim / Classify Claim Lookup / Insert Claim** Check and record the notification id in the Data Table: a new id goes on, a known id answers 409, a failed lookup answers 422. Python's durable send seal is the primary duplicate guard; the table is a secondary safeguard.\n5. **Send Owner Email / Mark Claim / Respond ...** Attempt one Gmail send, record the outcome and answer Python.\n\n**If Gmail is uncertain, there is NO automatic resend**, to avoid duplicate emails. Investigate the recorded status.\n\n**This workflow does NOT** decide which invoice is the latest, file PDFs or change Google Drive files.\n\n**Maintainer:** keep the fixed owner recipient and subject prefix in **Validate Email Request**; reuse the approved Gmail and Header Auth credentials. Claim table text fields: `notificationId`, `dispatchId`, `state`. Keep the Cloudflare path exclusion. Full contract: `energygrid-bill-downloader/docs/native_daily_claude_free.md` sections 4 and 6.\n\n---\n\n## Maintainer reference\n\n- PROBE answers readiness, the sender account and the recipient hash. It never reaches the Gmail node.\n- SEND renders the fixed templates, refuses a render digest mismatch, checks and writes the claim, then sends once.\n- The claim lookup and insert are NOT one atomic operation: secondary evidence only. The EnergyGrid Core seal is the authority.\n- The claim lookup has one output (n8n 2.x and 3.0 alike): **Classify Claim Lookup** decides new, duplicate or failed, and a failed lookup never reaches Gmail.\n- Gmail has no retry and no attribution. An error or a lost answer is uncertain and is never resent.\n\n## Required manual configuration:\n\n- **Validate Email Request**\n  - `SUBJECT_PREFIX`: the same subject prefix as the private EnergyGrid config.\n  - `RECIPIENT`: the one owner recipient of the private EnergyGrid config.\n- **Find Existing Claim**, **Insert Claim**, **Mark Claim Sent**, **Mark Claim Uncertain**\n  - `Data table`: the EnergyGrid email claim table (string columns notificationId, dispatchId, state).\n- No workflow-level error workflow: every failure answers the Core, which owns owner visibility.",
         "width": 900,
-        "height": 980
+        "height": 1040
       }
     }
   ],
@@ -837,14 +884,36 @@
       "main": [
         [
           {
-            "node": "Claim Is New",
+            "node": "Classify Claim Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Claim Lookup": {
+      "main": [
+        [
+          {
+            "node": "Claim Lookup Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Lookup Failed": {
+      "main": [
+        [
+          {
+            "node": "Respond Claim Failed",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Respond Claim Failed",
+            "node": "Claim Is New",
             "type": "main",
             "index": 0
           }

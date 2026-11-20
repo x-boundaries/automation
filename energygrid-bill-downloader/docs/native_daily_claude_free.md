@@ -229,6 +229,11 @@ sources. Deliberate choices:
   exports: closed-vocabulary checks across many fields plus three templates are not a single expression.
   Small answer builders are expression-driven Respond nodes, and the render check is an IF node.
 - Data Table columns are camelCase (`notificationId`, `dispatchId`, `state`).
+- The claim lookup (`Find Existing Claim`) continues on its one regular output with Always Output Data,
+  so n8n 2.x and 3.0 route it the same way (#332 slice A). The Code node `Classify Claim Lookup`
+  decides `new`, `duplicate` or `failed`; the IF `Claim Lookup Failed` answers 422 for `failed`, and only
+  `new` reaches `Insert Claim` and the Gmail node. Before this, a lookup error could run both the 422
+  answer and the send path on n8n 2.x.
 - Not yet done (needs the instance): `validate_workflow` and `get_workflow_details` through the n8n MCP,
   and the import-time checks of the official lifecycle checklist. These run at the inactive import step.
 
