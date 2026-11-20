@@ -750,9 +750,72 @@ class SendTests(SummaryTestCase):
         self.run_daily()
         (call,) = self.poster.calls
         self.assertEqual(call["url"], "https://n8n.example.com/webhook/example-summary-path")
-        self.assertEqual(call["headers"], {"Content-Type": "application/json", "X-XB-Summary-Token": "FAKE-SECRET-0001"})
+        self.assertEqual(call["headers"], {"Content-Type": "application/json", "User-Agent": "xb-member-sync-daily-summary/1",
+                                           "X-XB-Summary-Token": "FAKE-SECRET-0001"})
         self.assertEqual(call["body"], self.record["event"])
         self.assertNotIn("FAKE-SECRET", json.dumps(self.record))
+
+    def test_the_post_sends_its_own_user_agent(self):
+        # The webhook is behind Cloudflare, which answers 403 to the default Python-urllib
+        # User-Agent (20 Nov first live send). The stock and AR/AP senders send their own too.
+        self.assertEqual(summary.USER_AGENT, "xb-member-sync-daily-summary/1")
+        self.run_daily()
+        (call,) = self.poster.calls
+        agents = [value for name, value in call["headers"].items() if name.lower() == "user-agent"]
+        self.assertEqual(agents, ["xb-member-sync-daily-summary/1"])
+
+    def test_user_agent_reaches_the_wire_through_post_event(self):
+        # A loopback-only listener (no network): urllib must send this User-Agent, not its own.
+        import http.server
+        import threading
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - http.server hook
+                seen.append(self.headers.get_all("User-Agent"))
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status = summary.post_event(f"http://127.0.0.1:{server.server_address[1]}/webhook/example",
+                                        {"Content-Type": "application/json", "User-Agent": summary.USER_AGENT,
+                                         "X-XB-Summary-Token": "FAKE-SECRET-0001"}, b"{}", 5)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual((status, seen), (200, [["xb-member-sync-daily-summary/1"]]))
+
+    def test_the_headers_are_cleared_after_every_send(self):
+        for status, error in ((200, None), (403, None), (None, OSError("down"))):
+            held = []
+
+            def poster(url, headers, body, timeout, status=status, error=error):
+                held.append(headers)
+                self.assertEqual(headers["X-XB-Summary-Token"], "FAKE-SECRET-0001")
+                if error is not None:
+                    raise error
+                return status
+            with self.subTest(status=status, error=error):
+                self.run_daily(poster=poster)
+                # The same dict the poster got is empty after the send: secret and User-Agent gone.
+                (headers,) = held
+                self.assertEqual(headers, {})
+
+    def test_the_secret_header_name_can_never_be_a_reserved_header(self):
+        # HEADER_RE takes X- names only, so the secret header can never replace Content-Type,
+        # User-Agent or Host (the stock sender's ALERT_RESERVED_HEADERS, by construction).
+        for bad in ("User-Agent", "user-agent", "Content-Type", "Content-Length", "Host", "Connection", "Transfer-Encoding"):
+            with self.subTest(bad=bad), self.assertRaises(summary.SummaryError) as caught:
+                self.settings(send={"auth_header_name": bad})
+            self.assertEqual(caught.exception.code, "settings_send_header_invalid")
 
     def test_send_failure_is_recorded_and_never_fails_the_task(self):
         for poster, status, http_status, error in (

@@ -137,7 +137,10 @@ CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 MEMBER_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$")
 MASKED_RE = re.compile(r"^\*{3}[A-Za-z0-9]{1,3}$")
 LOCAL_MINUTE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
-HEADER_RE = re.compile(r"^X-[A-Za-z0-9-]{1,60}$")
+HEADER_RE = re.compile(r"^X-[A-Za-z0-9-]{1,60}$")  # X- only: never a reserved name (Content-Type, User-Agent, Host)
+# The webhook is behind Cloudflare, whose bot protection answers 403 to the default
+# Python-urllib User-Agent; the stock and AR/AP senders also send their own.
+USER_AGENT = "xb-member-sync-daily-summary/1"
 CREDENTIAL_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,127}$")
 SERVER_RE = re.compile(r"^[A-Za-z0-9._-]{1,63}(\\[A-Za-z0-9_$-]{1,63})?(,[0-9]{1,5})?$")
 COUNT_MAX = 10 ** 9
@@ -1367,7 +1370,7 @@ def send_event(event: Mapping[str, Any], send: Mapping[str, Any], *, cred_reader
     except Exception:  # noqa: BLE001 - any credential failure is the same closed outcome
         return "secret_unavailable", None, "credential_unreadable"
     body = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    headers = {"Content-Type": "application/json", send["auth_header_name"]: secret}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT, send["auth_header_name"]: secret}
     try:
         status = poster(send["webhook_url"], headers, body, send["timeout_seconds"])
     except Exception:  # noqa: BLE001 - network, TLS or timeout: no answer from n8n

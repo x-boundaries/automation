@@ -1882,6 +1882,9 @@ and 20 for the tools, 15 and 20, so 255 seconds with both tools on).
 `sql.timeout_seconds` is both the
 login timeout and the query timeout of every statement. `daily --no-send`
 builds and records the summary without posting it.
+The POST sends its own User-Agent (`xb-member-sync-daily-summary/1`),
+because the public webhook is behind Cloudflare, which blocks the default
+Python one with HTTP 403.
 
 **Where to install it.** The summary runs the `xb_member_sync.py` that sits
 next to it. Install the summary task from the same deployed clone as the
