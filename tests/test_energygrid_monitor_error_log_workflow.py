@@ -51,6 +51,59 @@ const results = cases.map((c) => {
 process.stdout.write(JSON.stringify(results));
 """
 
+# How n8n 2.48.5 turns an error thrown in a JavaScript Code node into execution.error.message (B1 of the
+# #339 G2). The Code node always runs in the task runner (Code.node.ts, JsTaskRunnerSandbox). In secure
+# mode js-task-runner.ts runs the code in a vm context wrapped as
+# `module.exports = async function VmCodeWrapper() {<code>\n}()`; an Error made inside the vm is not a host
+# Error, so toExecutionErrorIfNeeded builds an ExecutionError, and execution-error.ts sets
+# message = "<details> [line N]" from the `evalmachine.<anonymous>:N` stack frame
+# ("[line N, for item M]" when an item index is known). This harness runs the monitor's own
+# "Validate Both Streams and Classify" code that way and ports populateFromStack, so the fixtures carry the
+# exact message n8n would hand to the Error Trigger, not the bare code.
+N8N_MESSAGE_HARNESS = r"""
+const fs = require('fs');
+const vm = require('vm');
+const [monitorPath, casesPath] = process.argv.slice(2);
+const monitor = JSON.parse(fs.readFileSync(monitorPath, 'utf8'));
+const code = monitor.nodes.find((n) => n.name === 'Validate Both Streams and Classify').parameters.jsCode;
+const cases = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
+const STACK_HEADER_REGEX = /^(?<errorType>\S.*?): (?<errorDetails>.+)$/;
+const STACK_FRAME_REGEX = /^\s+at\s/;
+const SOURCE_EXCERPT_CARET_REGEX = /^\s*\^+\s*$/;
+function executionErrorMessage(error, itemIndex) {
+  const rows = String(error.stack || '').split(/\r?\n/);
+  let line;
+  const userFn = rows.find((r) => /\(evalmachine\.<anonymous>:\d+:\d+\)/.test(r) && !r.includes('VmCodeWrapper'));
+  if (userFn) line = Number(userFn.match(/evalmachine\.<anonymous>:(\d+):/)[1]);
+  if (line === undefined) {
+    const top = rows.find((r) => r.includes('VmCodeWrapper') && r.includes('evalmachine.<anonymous>'));
+    if (top) line = Number(top.match(/evalmachine\.<anonymous>:(\d+):/)[1]);
+  }
+  const display = line === undefined ? '' : itemIndex === undefined ? `[line ${line}]` : `[line ${line}, for item ${itemIndex}]`;
+  const firstFrame = rows.findIndex((r) => STACK_FRAME_REGEX.test(r));
+  const header = firstFrame === -1 ? rows : rows.slice(0, firstFrame);
+  const excerptEnd = header.reduce((last, r, i) => (SOURCE_EXCERPT_CARET_REGEX.test(r) ? i + 1 : last), 0);
+  const groups = (header.slice(excerptEnd).find((r) => STACK_HEADER_REGEX.test(r)) || '').match(STACK_HEADER_REGEX)?.groups;
+  const details = groups ? groups.errorDetails.trim() || null : null;
+  return `${details ?? (error.message || 'Unknown error')} ${display}`.trim();
+}
+(async () => {
+  const out = [];
+  for (const c of cases) {
+    const context = vm.createContext({ $input: { first: () => ({ json: { body: c.body } }), all: () => [{ json: { body: c.body } }] } });
+    const wrapped = ['globalThis.global = globalThis', 'var module = { exports: {} }',
+      `module.exports = async function VmCodeWrapper() {${code}\n}()`].join('; ');
+    try {
+      await vm.runInContext(wrapped, context);
+      out.push({ thrown: false });
+    } catch (error) {
+      out.push({ thrown: true, hostError: error instanceof Error, message: executionErrorMessage(error, c.item_index ?? undefined) });
+    }
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
 
 def load(path=WORKFLOW):
     return json.loads(path.read_text(encoding="utf-8"))
@@ -83,7 +136,29 @@ def reduce(*items_list, workflow=WORKFLOW):
     return rows
 
 
-def failure(message="EG_MONITOR_SCHEMA", node="Validate Both Streams and Classify", mode="webhook",
+def n8n_messages(*cases):
+    """execution.error.message as n8n 2.48.5 builds it when the monitor's validator rejects each body."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = Path(tmp) / "n8n_message.js"
+        harness.write_text(N8N_MESSAGE_HARNESS, encoding="utf-8")
+        path = Path(tmp) / "cases.json"
+        path.write_text(json.dumps([{"body": body, "item_index": index} for body, index in cases]), encoding="utf-8")
+        done = subprocess.run([shutil.which("node"), str(harness), str(MONITOR), str(path)],
+                              capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise AssertionError(done.stderr)
+    results = json.loads(done.stdout)
+    for result in results:
+        assert result["thrown"] and not result["hostError"], result  # a vm Error, as in n8n's task runner
+    return [result["message"] for result in results]
+
+
+# The real shape of a monitor rejection message at n8n 2.48.5 (see N8N_MESSAGE_HARNESS): code + " [line N]".
+REAL_SCHEMA_MESSAGE = "EG_MONITOR_SCHEMA [line 7]"
+
+
+def failure(message=REAL_SCHEMA_MESSAGE, node="Validate Both Streams and Classify", mode="webhook",
             execution_id="4711", workflow_id="wfEgMonitor001"):
     """An Error Trigger item as n8n 2.48.5 builds it for a failed run, with fake secrets in every free-text spot."""
 
@@ -204,7 +279,12 @@ class MonitorLinkTests(unittest.TestCase):
         self.assertIn("### energygrid_monitor_error_log.workflow.json", readme)
         package = MONITOR_README.read_text(encoding="utf-8")
         for phrase in ("energygrid_monitor_error_log", "errorWorkflow", "Synthetic failure test on a copy",
-                       "n8n@2.48.5", "executeErrorWorkflow"):
+                       "n8n@2.48.5", "executeErrorWorkflow", "execution-error.ts", "[line N]",
+                       # G2 L4-L6: OK words per live step, one project, M4 publish read-back, short M3 window.
+                       '"OK create EG error log table"', '"OK import EG error log workflow"',
+                       '"OK test EG error log once"', '"OK switch EG monitor to error workflow"',
+                       "same n8n project", "workflow:activate", "HTTP 200", "**published**",
+                       "any other row the copy wrote"):
             self.assertIn(phrase, package)
         ci = CI.read_text(encoding="utf-8")
         for path in ("n8n-workflows/energygrid_monitor_error_log.workflow.json",
@@ -226,28 +306,66 @@ class ReduceTests(unittest.TestCase):
         self.assertEqual(row["failed_at"], NOW_ISO)
 
     def test_every_monitor_code_is_kept_as_its_own_closed_code(self):
+        # n8n's real shape: "<code> [line N]" (and "[line N, for item M]"); the bare code is also accepted.
         codes = monitor_codes()
-        rows = reduce(*[[failure(message=code)] for code in codes])
-        for code, row in zip(codes, rows):
+        messages = [("%s [line %d]" % (code, 6 + i), code) for i, code in enumerate(codes)]
+        messages += [("%s [line 28, for item 0]" % code, code) for code in codes]
+        messages += [(code, code) for code in codes]
+        rows = reduce(*[[failure(message=message)] for message, _ in messages])
+        for (message, code), row in zip(messages, rows):
             self.assertClosed(row)
             self.assertEqual(row, {"workflow_id": "wfEgMonitor001", "execution_id": "4711",
                                    "failed_node": "Validate Both Streams and Classify", "code": code,
-                                   "mode": "webhook", "failed_at": NOW_ISO})
+                                   "mode": "webhook", "failed_at": NOW_ISO}, message)
+
+    def test_real_n8n_messages_from_the_monitor_validator_are_classified(self):
+        # The monitor's own validator, run the way n8n 2.48.5's task runner runs it, rejects these bodies;
+        # the resulting messages carry " [line N]", and the reducer must still record the closed code.
+        stamp = "2026-11-19T00:00:00Z"
+        run_id = "00000000-0000-4000-8000-000000000000"
+        cases = [
+            ({}, None, "EG_MONITOR_REPORT_SHAPE"),  # M3's synthetic test body
+            ({"schema": "nope", "run_id": run_id, "observed_at_utc": stamp, "streams": {}}, None, "EG_MONITOR_SCHEMA"),
+            ({"schema": "xb.energygrid.monitor.v1", "run_id": "x", "observed_at_utc": stamp, "streams": {}}, None,
+             "EG_MONITOR_RUN_ID"),
+            ({"schema": "xb.energygrid.monitor.v1", "run_id": run_id, "observed_at_utc": "x", "streams": {}}, None,
+             "EG_MONITOR_TIMESTAMP"),
+            ({"schema": "xb.energygrid.monitor.v1", "run_id": run_id, "observed_at_utc": "2000-01-01T00:00:00Z",
+              "streams": {}}, None, "EG_MONITOR_OLD_REPORT"),
+        ]
+        messages = n8n_messages(*[(body, index) for body, index, _ in cases])
+        for message, (_, index, code) in zip(messages, cases):
+            suffix = r" \[line \d+\]" if index is None else r" \[line \d+, for item %d\]" % index
+            self.assertRegex(message, "^%s%s$" % (code, suffix))  # never the bare code at n8n 2.48.5
+        self.assertEqual(messages[0], "EG_MONITOR_REPORT_SHAPE [line 6]")
+        self.assertEqual(messages[1], REAL_SCHEMA_MESSAGE)
+        rows = reduce(*[[failure(message=message)] for message in messages])
+        self.assertEqual([row["code"] for row in rows], [code for _, _, code in cases])
+        for row in rows:
+            self.assertClosed(row)
 
     def test_message_text_never_reaches_the_row(self):
         messages = [
-            "Unexpected token 'f', \"%s\" is not valid JSON" % SECRETS[0],  # a parse error quoting its input
+            "Unexpected token 'f', \"%s\" is not valid JSON [line 3]" % SECRETS[0],  # a parse error quoting its input
             "EG_MONITOR_SCHEMA " + SECRETS[2],  # a closed code plus data is not a closed code
+            "EG_MONITOR_SCHEMA [line 7] " + SECRETS[2],  # nor is a closed code, the suffix and data
+            "EG_MONITOR_SCHEMA [line 7]" + SECRETS[2],
+            SECRETS[2] + " EG_MONITOR_SCHEMA [line 7]",  # data before the code
+            "EG_MONITOR_SCHEMA [line x]",
+            "EG_MONITOR_SCHEMA [line 7, for item x]",
+            "EG_MONITOR_SCHEMA [line 7] [line 8]",
+            "EG_MONITOR_NOPE [line 1]",  # not one of the monitor's codes
+            "[line 7]",
             SECRETS[0],
-            "eg_monitor_schema",
+            "eg_monitor_schema [line 7]",
             "",
-            "Cannot read properties of undefined (reading 'streams')",
+            "Cannot read properties of undefined (reading 'streams') [line 12]",
         ]
         rows = reduce(*[[failure(message=m)] for m in messages])
-        for row in rows:
+        for message, row in zip(messages, rows):
             self.assertClosed(row)
-            self.assertEqual(row["code"], "EG_MONITOR_UNCLASSIFIED")
-        (row,) = reduce([failure(message="  EG_MONITOR_REF\n")])
+            self.assertEqual(row["code"], "EG_MONITOR_UNCLASSIFIED", message)
+        (row,) = reduce([failure(message="  EG_MONITOR_REF [line 28, for item 0]\n")])
         self.assertEqual(row["code"], "EG_MONITOR_REF")
 
     def test_unknown_node_mode_and_ids_become_fixed_values(self):
