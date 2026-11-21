@@ -1390,7 +1390,12 @@ refused earlier reads nothing):
    a second count of anything read again. Only a complete read moves the
    read day (the cursor is then cleared). A cursor from another read day is
    not used; a read that fails without moving from a kept cursor clears it
-   (the next run reads the day again from its start).
+   (the next run reads the day again from its start). #155 FH1c: so does a
+   kept cursor whose first page comes back empty with no next page.
+   Shopify documents nothing on cursor stability, so that answer is not
+   taken as the end: moving the read day there could skip customers never
+   read. It costs one run (`forms_read_incomplete` and
+   `forms_read_stalled`), and the seen-marks stop a second count.
 6. A run that stops before the end counts `forms_read_incomplete`; one that
    also made no progress at all counts `forms_read_stalled`.
 
@@ -1420,8 +1425,14 @@ than one day ahead of the run is unreadable (`forms_record_invalid`). The
 seen-mark of an unreadable record is named by a keyed digest of the customer
 and the raw values, and is never pruned, so the same unreadable record is
 counted once however long it stays; a new submission changes the values and
-is counted as new. A readable record's mark is pruned after 120 days, and a
-readable record older than 119 days is never classified, so a pruned mark
+is counted as new. #155 FH1c: a record refused only because its
+`submitted_at` is too far ahead is marked under its submission id instead
+(still `forms_record_invalid`, still never pruned). When its time later
+comes within range, the same submission finds that mark and is not counted
+again, so it stays counted once as `forms_record_invalid`. A Flow that
+writes wrong times shows as a steady `forms_record_invalid`; fix the Flow,
+and new submissions are classified normally. A readable record's mark is
+pruned after 120 days, and a readable record older than 119 days is never classified, so a pruned mark
 can never lead to a second count.
 
 **"Unused"** (design B9) means all four of: `numberOfOrders` "0",
