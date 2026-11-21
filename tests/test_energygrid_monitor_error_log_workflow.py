@@ -291,6 +291,26 @@ class MonitorLinkTests(unittest.TestCase):
             self.assertEqual(ci.count(path), 3, path)  # trigger path, owned list, allowed list
         self.assertIn('-p "test_energygrid_monitor_error_log_workflow.py"', ci)
 
+    def test_m3_copy_points_at_live_sender(self):
+        # Live M3 (21 Nov) stopped: n8n 2.48.5 refused to publish the test copy because `Send Owner Alert Email`
+        # still held the export placeholder (a referenced sub-workflow must exist and be published). Controller
+        # ruling option 1: the copy calls the live published sender, as the live monitor does; alerts stay off.
+        package = MONITOR_README.read_text(encoding="utf-8")
+        start = package.index("| M3 |")
+        m3 = package[start:package.index("\n", start)]
+        for phrase in (
+            "**`Send Owner Alert Email` set to the live published `XB Ops Alert Email` workflow ID, the same as the "
+            "live monitor**",
+            "not the export placeholder `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID`",
+            "will not publish a workflow whose referenced sub-workflow is missing or not published",
+            "with `ENABLE_OWNER_ALERTS` false that node is never reached, so no email",
+            "**Each retry makes a new copy**",
+            "`_validateSubWorkflowReferences`",
+            "workflow-validation.service.ts",
+            "Please publish all referenced sub-workflows first",
+        ):
+            self.assertIn(phrase, m3)
+
     def test_m4_wording_matches_n8n_2_48_5(self):
         # G2 recheck L7: at n8n 2.48.5 settings are kept on the workflow row and are not part of a version. M4
         # checks for a draft before the PUT and reads back the row's settings and an unchanged activeVersionId.
