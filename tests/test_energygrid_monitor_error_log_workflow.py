@@ -333,9 +333,22 @@ class MonitorLinkTests(unittest.TestCase):
             "`packages/@n8n/config/src/configs/workflows.config.ts` (`useWorkflowPublicationService` defaults to "
             "`true`)",
             "`_publishViaOutbox`",
+            # G2 #346 survivors E20 and E07: why the wait is needed.
+            "so a POST right after it can answer HTTP 404",
+            "the outbox consumer registers the webhook a moment later",
         ):
             self.assertIn(phrase, m3)
         self.assertNotIn("POST right after activating", package)
+
+    def test_m3_token_is_never_printed(self):
+        # G2 #346 survivor E24: the operator reads the webhook token from its file; nobody prints or pastes it.
+        package = MONITOR_README.read_text(encoding="utf-8")
+        start = package.index("| M3 |")
+        m3 = package[start:package.index("\n", start)]
+        self.assertIn("POST `{}` once on loopback with the header (the operator reads the token file; nobody prints it)",
+                      m3)
+        for stale in ("pastes the token", "prints the token", "token in chat"):
+            self.assertNotIn(stale, package)
 
     def test_live_steps_status_is_recorded(self):
         package = MONITOR_README.read_text(encoding="utf-8")
@@ -344,10 +357,11 @@ class MonitorLinkTests(unittest.TestCase):
     def test_m4_wording_matches_n8n_2_48_5(self):
         # G2 recheck L7: at n8n 2.48.5 settings are kept on the workflow row and are not part of a version. M4
         # checks for a draft before the PUT and reads back the row's settings and an unchanged activeVersionId.
-        # G2 N-2: with publishIfActive=false a 403 comes from the scope checks before the save (nothing saved), but
-        # any other non-200 may leave the settings on the row and the monitor unpublished (a failed re-activation
-        # sets activeVersionId to null). So M4 undoes on any non-200 and stops if activeVersionId is not the
-        # backup's; it reads back an unchanged versionId; and it leaves staticData out of the PUT body.
+        # G2 N-2, as corrected by P-3: with publishIfActive=false a 403 from the scope checks comes before the save
+        # (nothing saved), but a publish-policy 403 can come after the save, and any other non-200 may leave the
+        # settings on the row and, on the old path, the monitor unpublished (a failed re-activation sets
+        # activeVersionId to null). So M4 undoes on every non-200, a 403 included, and stops if activeVersionId is
+        # not the backup's; it reads back an unchanged versionId; and it leaves staticData out of the PUT body.
         package = MONITOR_README.read_text(encoding="utf-8")
         start = package.index("| M4 |")
         m4 = package[start:package.index("\n", start)]
@@ -401,8 +415,21 @@ class MonitorLinkTests(unittest.TestCase):
             "workflow-publication-applier.ts",
             "publication/trigger-diff.ts",
             "policy-violation.error.ts",
-            "| Re-apply the backup's settings with `publishIfActive=false`; read back `settings`, `versionId` and "
-            "`activeVersionId`; if `activeVersionId` is not the backup's, stop and report (Controller's call). |",
+            "| Re-apply the backup's settings with `publishIfActive=false`, and send `errorWorkflow: \"DEFAULT\"` when "
+            "the backup has no `errorWorkflow` (n8n merges sent settings, so a missing key is not removed; `DEFAULT` "
+            "clears it); read back `settings`, `versionId` and `activeVersionId`; if `activeVersionId` is not the "
+            "backup's, stop and report (Controller's call). |",
+            # G2 P-5: n8n merges the sent settings over the stored ones, so the Undo must clear an errorWorkflow the
+            # backup did not have by sending the literal DEFAULT (removeDefaultValues deletes it after the merge).
+            "re-apply the backup's settings at once (Undo, the same PUT with `publishIfActive=false`), and send "
+            "`errorWorkflow: \"DEFAULT\"` when the backup has no `errorWorkflow` (n8n merges sent settings, so a "
+            "missing key is not removed; `DEFAULT` clears it), then read back `settings` and `activeVersionId`",
+            "`packages/cli/src/workflow-helpers.ts` (`removeDefaultValues`",
+            # G2 N-1: the pre-check list is an example list and names dynamic credentials and trigger node IDs.
+            "the activation pre-checks (for example webhook conflict, dynamic credentials, trigger node IDs, node "
+            "validation, sub-workflow references, the activate hook, a publish policy)",
+            # G2 #346 survivor E17: the flag value in the M4 source list.
+            "`packages/@n8n/config/src/configs/workflows.config.ts` (`useWorkflowPublicationService`, default `true`)",
         ):
             self.assertIn(phrase, m4)
         # Inexact wording is gone. L7: settings have no published version. N-2: with the flag a 403 saves nothing,
