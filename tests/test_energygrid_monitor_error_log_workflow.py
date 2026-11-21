@@ -280,17 +280,49 @@ class MonitorLinkTests(unittest.TestCase):
         package = MONITOR_README.read_text(encoding="utf-8")
         for phrase in ("energygrid_monitor_error_log", "errorWorkflow", "Synthetic failure test on a copy",
                        "n8n@2.48.5", "executeErrorWorkflow", "execution-error.ts", "[line N]",
-                       # G2 L4-L6: OK words per live step, one project, M4 publish read-back, short M3 window.
+                       # G2 L4-L6: OK words per live step, one project, short M3 window (M4 below).
                        '"OK create EG error log table"', '"OK import EG error log workflow"',
                        '"OK test EG error log once"', '"OK switch EG monitor to error workflow"',
-                       "same n8n project", "workflow:activate", "HTTP 200", "**published**",
-                       "any other row the copy wrote"):
+                       "same n8n project", "any other row the copy wrote"):
             self.assertIn(phrase, package)
         ci = CI.read_text(encoding="utf-8")
         for path in ("n8n-workflows/energygrid_monitor_error_log.workflow.json",
                      "tests/test_energygrid_monitor_error_log_workflow.py"):
             self.assertEqual(ci.count(path), 3, path)  # trigger path, owned list, allowed list
         self.assertIn('-p "test_energygrid_monitor_error_log_workflow.py"', ci)
+
+    def test_m4_wording_matches_n8n_2_48_5(self):
+        # G2 recheck L7: at n8n 2.48.5 settings are kept on the workflow row and are not part of a version, and a
+        # PUT that is refused publication (403) has already saved them. So M4 checks for a draft before the PUT,
+        # undoes on a 403, and reads back the row's settings and an unchanged activeVersionId.
+        package = MONITOR_README.read_text(encoding="utf-8")
+        start = package.index("| M4 |")
+        m4 = package[start:package.index("\n", start)]
+        for phrase in (
+            '"OK switch EG monitor to error workflow"',
+            "**not part of a version**",
+            "**Before the PUT**, read back that `versionId` equals `activeVersionId`",
+            "if they differ, **stop** and report",
+            "`PUT /workflows/{id}?publishIfActive=false`",
+            "needs only `workflow:update`",
+            "`workflow:activate`",
+            "**On a 403:**",
+            "settings are **already on the row**",
+            "Re-apply the backup's settings at once (Undo), read them back, report",
+            "do not go on to M5",
+            "**HTTP 200**",
+            "a GET shows `settings.errorWorkflow` = the M2 workflow and `settings.saveDataErrorExecution` = `none`",
+            "`activeVersionId` is **unchanged** from the backup",
+            "`n8n@2.48.5`",
+            "workflow-history.ts",
+            "assertMayPublishOnSave",
+            "| Re-apply the backup's settings; read them back. |",
+        ):
+            self.assertIn(phrase, m4)
+        # The wording L7 found inexact is gone: a 403 does change the row, and settings have no published version.
+        for stale in ("nothing changed live", "the old version stays live", "**published** (active) version",
+                      "carries `errorWorkflow`"):
+            self.assertNotIn(stale, package)
 
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code node")
