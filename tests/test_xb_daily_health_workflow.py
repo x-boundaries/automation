@@ -53,7 +53,9 @@ EXPECTED_EDGES = {
     ("List Workflows", 0, "List Error Runs"),
     ("List Error Runs", 0, "Read Alert Log"),
     ("Read Alert Log", 0, "Read Failed Alert Emails"),
-    ("Read Failed Alert Emails", 0, "Read Health Runs"),
+    ("Read Failed Alert Emails", 0, "Read Monitor Error Log"),
+    ("Read Monitor Error Log", 0, "Read Kit Re-tagger Errors"),
+    ("Read Kit Re-tagger Errors", 0, "Read Health Runs"),
     ("Read Health Runs", 0, JUDGE),
     (JUDGE, 0, "Email Plan"),
     (JUDGE, 1, BROKEN),
@@ -69,8 +71,8 @@ EXPECTED_EDGES = {
     ("Send Health Email", 1, "Collect Send Outcome"),
     ("Collect Send Outcome", 0, "Log Health Run"),
 }
-READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Failed Alert Emails", "Read Health Runs",
-              "Read Today Runs")
+READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Failed Alert Emails", "Read Monitor Error Log",
+              "Read Kit Re-tagger Errors", "Read Health Runs", "Read Today Runs")
 SEND_FAILURES = ["send_failed", "rejected", "error", "call_failed", "unknown"]
 RUN_COLUMNS = ["date", "kind", "verdict", "watched", "problems", "fail_jobs", "warn_jobs", "email", "code", "logged_at"]
 
@@ -148,15 +150,22 @@ def validate(*bodies, now_ms=NOW_MS):
 
 WORKFLOWS_OK = [{"id": "wfStockAlert01", "name": "fake", "active": True},
                 {"id": "wfOpsEmail0001", "name": "fake", "active": True}]
-WORKFLOWS_ALL = WORKFLOWS_OK + [{"id": "wfEgMonitor001", "name": "fake", "active": True}]
+# The n8n API list carries each workflow's settings (n8n 2.48.5 workflows.public.controller.ts, getWorkflows).
+MONITOR_LINKED = {"errorWorkflow": "wfEgErrorLog01", "saveDataErrorExecution": "none",
+                  "saveDataSuccessExecution": "none", "executionOrder": "v1"}
+WORKFLOWS_ALL = WORKFLOWS_OK + [{"id": "wfEgMonitor001", "name": "fake", "active": True, "settings": MONITOR_LINKED},
+                                {"id": "wfEgErrorLog01", "name": "fake", "active": True}]
 
 
-def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, failed_alerts=None):
+def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, failed_alerts=None, error_log=None,
+                kit_errors=None):
     return {
         "List Workflows": WORKFLOWS_ALL if workflows is None else workflows,
         "List Error Runs": [{}] if error_runs is None else error_runs,
         "Read Alert Log": [{}] if alert_log is None else alert_log,
         "Read Failed Alert Emails": [{}] if failed_alerts is None else failed_alerts,
+        "Read Monitor Error Log": [{}] if error_log is None else error_log,
+        "Read Kit Re-tagger Errors": [{}] if kit_errors is None else kit_errors,
         "Read Health Runs": [{}] if runs is None else runs,
     }
 
@@ -180,6 +189,7 @@ CONFIGURED = {
     "REPLACE_WITH_STOCK_ALERT_WORKFLOW_ID": "wfStockAlert01",
     "REPLACE_WITH_ARAP_ALERT_WORKFLOW_ID": "",
     "REPLACE_WITH_ENERGYGRID_MONITOR_WORKFLOW_ID": "wfEgMonitor001",
+    "REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID": "wfEgErrorLog01",
     "REPLACE_WITH_ENERGYGRID_OWNER_EMAIL_WORKFLOW_ID": "",
     "REPLACE_WITH_ENERGYGRID_DRIVE_VERIFY_WORKFLOW_ID": "",
     "REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID": "wfOpsEmail0001",
@@ -361,7 +371,18 @@ class ShapeTests(unittest.TestCase):
         self.assertEqual((failed["orderByColumn"], failed["orderByDirection"], failed["limit"]), ("id", "DESC", 250))
         tables = {n["parameters"]["dataTableId"]["value"] for n in self.workflow["nodes"]
                   if n["type"] == "n8n-nodes-base.dataTable"}
-        self.assertEqual(tables, {"REPLACE_WITH_ALERT_LOG_TABLE_ID", "REPLACE_WITH_HEALTH_RUNS_TABLE_ID"})
+        self.assertEqual(tables, {"REPLACE_WITH_ALERT_LOG_TABLE_ID", "REPLACE_WITH_HEALTH_RUNS_TABLE_ID",
+                                  "REPLACE_WITH_MONITOR_ERROR_LOG_TABLE_ID"})
+        # #288 option (c): the run monitor's failure rows, newest first, read only; the judge filters by workflow.
+        error_log = self.nodes["Read Monitor Error Log"]["parameters"]
+        self.assertEqual(error_log, {"resource": "row", "operation": "get", "dataTableId": {
+            "__rl": True, "value": "REPLACE_WITH_MONITOR_ERROR_LOG_TABLE_ID", "mode": "id"}, "returnAll": False,
+            "limit": 250, "orderBy": True, "orderByColumn": "id", "orderByDirection": "DESC"})
+        # #341 fix1 LATER (b): KIT-RETAG ERROR rows of xb_alert_email_log, newest first, read only.
+        kit = self.nodes["Read Kit Re-tagger Errors"]["parameters"]
+        self.assertEqual(kit, dict(failed, filters={"conditions": [
+            {"keyName": "system", "condition": "eq", "keyValue": "KIT-RETAG"},
+            {"keyName": "severity", "condition": "eq", "keyValue": "ERROR"}]}))
         writes = [n["name"] for n in self.workflow["nodes"] if n["type"] == "n8n-nodes-base.dataTable"
                   and n["parameters"]["operation"] != "get"]
         self.assertEqual(writes, ["Log Health Run"], "the alert log is only read")
@@ -593,20 +614,171 @@ class JudgeTests(unittest.TestCase):
         plan, lines = n8n_line(workflows=[{"id": "wfStockAlert01", "active": False}, {"id": "wfOpsEmail0001",
                                                                                       "active": True}])
         self.assertTrue(lines[0].startswith("FAIL  n8n workflows: inactive: stock alert; not found: EnergyGrid run "
-                                            "monitor, since 19 Nov."), lines)
+                                            "monitor, EnergyGrid monitor error log, since 19 Nov."), lines)
+        # #288 option (c): the run monitor saves no failed executions, so saved error runs are not counted for
+        # it (`errors: false`); its error workflow's rows in energygrid_monitor_error_log are.
         errors = [{"id": "e%d" % n, "workflowId": "wfEgMonitor001", "status": "error",
                    "startedAt": "2026-11-18T%02d:00:00.000Z" % n} for n in (1, 2, 3)]
-        errors += [{"id": "old", "workflowId": "wfEgMonitor001", "status": "error", "startedAt": "2026-11-17T20:00:00.000Z"},
-                   {"id": "other", "workflowId": "wfStockAlert01", "status": "error", "startedAt": "2026-11-18T22:00:00.000Z"}]
-        plan, lines = n8n_line(workflows=WORKFLOWS_OK + [{"id": "wfEgMonitor001", "active": True}], error_runs=errors)
-        self.assertTrue(lines[0].startswith("WARN  n8n workflows: 3 failed run(s) in the last 24 h, since 19 Nov."),
+        errors.append({"id": "other", "workflowId": "wfStockAlert01", "status": "error",
+                       "startedAt": "2026-11-18T22:00:00.000Z"})
+        plan, lines = n8n_line(error_runs=errors)
+        self.assertEqual((plan["row"]["verdict"], lines), ("OK", []))
+
+        def row(at, workflow_id="wfEgMonitor001", code="EG_MONITOR_SCHEMA"):
+            return {"id": 1, "workflow_id": workflow_id, "execution_id": "4711", "failed_node": "Validate Both Streams "
+                    "and Classify", "code": code, "mode": "webhook", "failed_at": at, "createdAt": at, "updatedAt": at}
+
+        log = [row("2026-11-18T%02d:00:00.000Z" % n) for n in (1, 2)]
+        log += [row("2026-11-18T03:05:00.000Z", code="EG_MONITOR_TRIGGER_FAILED"),
+                row("2026-11-17T20:00:00.000Z"),  # older than 24 h before the 07:30 check
+                # L1: the table is the monitor's alone, so every row in the window counts, whatever its workflow_id
+                # (the reducer writes 'unknown' when the ID failed its shape check).
+                row("2026-11-18T22:00:00.000Z", workflow_id="unknown"),
+                row("2026-11-18T22:30:00.000Z", workflow_id="wfStockAlert01"),
+                row("not a date")]
+        plan, lines = n8n_line(error_log=log, error_runs=errors)
+        self.assertTrue(lines[0].startswith("WARN  n8n workflows: 5 failed run(s) in the last 24 h, since 19 Nov."),
                         lines)
+        self.assertEqual(plan["row"]["warn_jobs"], "n8n_workflows")
+        self.assertNotIn("EG_MONITOR", "\n".join(plan["mail"]["lines"]), "only a count reaches the email")
+        plan, lines = n8n_line(error_log={"raw": [{"json": {"error": "table not found"}}]})
+        self.assertTrue(lines[0].startswith("WARN  n8n workflows: the monitor error log could not be read, since 19 Nov."),
+                        lines)
+        # SIMBA keeps its failed executions (`errors: true`): those are still counted from the n8n API.
+        simba = [{"id": "s1", "workflowId": "wfSimbaIntake1", "status": "error", "startedAt": "2026-11-18T22:00:00.000Z"}]
+        plan = judge_plan(checker_event(expected=dict(json.loads((ROOT / "config" / "daily_health.example.json")
+                                                             .read_text(encoding="utf-8"))["expected"],
+                                                      simba_intake="on")),
+                          judge_reads(workflows=WORKFLOWS_ALL + [{"id": "wfSimbaIntake1", "active": True}],
+                                      error_runs=simba), workflow=workflow)
+        line = next(l for l in plan["mail"]["lines"] if "SIMBA intake:" in l)
+        self.assertTrue(line.startswith("WARN  SIMBA intake: 1 failed run(s) in the last 24 h"), line)
         plan, lines = n8n_line(workflows={"raw": [{"json": {"error": "401 unauthorized"}}]})
         self.assertIn("the n8n API could not be read", lines[0])
         # The unconfigured export says so instead of guessing.
         plan = judge_plan(event, workflow=str(WORKFLOW))
         line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
         self.assertTrue(line.startswith("WARN  n8n workflows: some workflow IDs are not set in XB Daily Health"), line)
+        self.assertNotIn("no longer linked", line)  # L2 is gated on the error log's WATCH ID being set
+        # 250 rows (the read's limit) are shown as 250: the runbook says that means 250 or more (L3).
+        many = [row("2026-11-18T%02d:%02d:00.000Z" % (n // 60, n % 60)) for n in range(250)]
+        plan, lines = n8n_line(error_log=many)
+        self.assertTrue(lines[0].startswith("WARN  n8n workflows: 250 failed run(s) in the last 24 h"), lines)
+
+    def test_monitor_link_drift_is_an_error_once_the_error_log_is_bound(self):
+        # G2 L2 (gap 3(c)): a re-import or an editor change can clear the monitor's errorWorkflow, or turn
+        # failed-run saving back on; then failures leave no row and health would stay OK. The n8n API list
+        # health already reads carries each workflow's settings, so the Judge checks them.
+        event = checker_event()
+        unlinked = "FAIL  n8n workflows: EnergyGrid monitor is no longer linked to its error log; ask Claude to check"
+
+        def plan_for(settings, workflow=None, **reads):
+            monitor = {"id": "wfEgMonitor001", "name": "fake", "active": True}
+            if settings is not None:
+                monitor["settings"] = settings
+            workflows = WORKFLOWS_OK + [monitor, {"id": "wfEgErrorLog01", "name": "fake", "active": True}]
+            return judge_plan(event, judge_reads(workflows=workflows, **reads), workflow=workflow or configured_path())
+
+        plan = plan_for(MONITOR_LINKED)
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        drifts = {
+            "errorWorkflow cleared": {k: v for k, v in MONITOR_LINKED.items() if k != "errorWorkflow"},
+            "errorWorkflow elsewhere": dict(MONITOR_LINKED, errorWorkflow="wfSomethingEl1"),
+            "failed runs saved again": dict(MONITOR_LINKED, saveDataErrorExecution="all"),
+            "save setting cleared (n8n default all)": {k: v for k, v in MONITOR_LINKED.items()
+                                                       if k != "saveDataErrorExecution"},
+            "no settings at all": None,
+            "settings not an object": "x",
+        }
+        for name, settings in drifts.items():
+            with self.subTest(name):
+                plan = plan_for(settings)
+                lines = [line for line in plan["mail"]["lines"] if "n8n workflows:" in line]
+                self.assertEqual((plan["row"]["verdict"], plan["row"]["fail_jobs"], plan["send"]),
+                                 ("FAIL", "n8n_workflows", True))
+                self.assertTrue(lines[0].startswith(unlinked + ", since 19 Nov."), lines)
+                self.assertEqual(plan["mail"]["severity"], "ERROR")
+                self.assertIs(through_sender(plan)[0]["valid"], True)
+        # Gated: nothing fires while the error log's WATCH ID is '' or still its placeholder (before M5) ...
+        for value in ("", "REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID"):
+            with self.subTest(error_log_id=value):
+                path = configured_workflow(dict(CONFIGURED, REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID=value))
+                self.addCleanup(Path(path).unlink, missing_ok=True)
+                plan = plan_for(None, workflow=path)
+                self.assertNotIn("no longer linked", "\n".join(plan["mail"]["lines"]))
+                self.assertNotIn("n8n_workflows", plan["row"]["fail_jobs"])
+        # ... nor when the monitor itself is missing (that is workflow_missing) or the API failed.
+        plan = judge_plan(event, judge_reads(workflows=WORKFLOWS_OK + [{"id": "wfEgErrorLog01", "active": True}]))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("FAIL  n8n workflows: not found: EnergyGrid run monitor, since"), line)
+        self.assertNotIn("no longer linked", line)
+        plan = judge_plan(event, judge_reads(workflows={"raw": [{"json": {"error": "401"}}]}))
+        self.assertNotIn("no longer linked", "\n".join(plan["mail"]["lines"]))
+
+    def test_kit_retagger_watch_waits_for_its_id_then_watches_it(self):
+        # #341 fix1 LATER (a): the entry ships as a placeholder that is skipped, not reported, until the owner
+        # binds it at the kits live step; then it is watched like any other workflow.
+        code = next(n for n in load()["nodes"] if n["name"] == JUDGE)["parameters"]["jsCode"]
+        self.assertIn("{ id: 'REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID', label: 'kit re-tagger', errors: false, "
+                      "bind_later: true },", code)
+        self.assertNotIn("REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID", CONFIGURED)
+        event = checker_event()
+        plan = judge_plan(event)  # every other ID set, the kit re-tagger still its placeholder
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        path = configured_workflow(dict(CONFIGURED, REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID="wfKitRetag0001"))
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        plan = judge_plan(event, workflow=path)
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("FAIL  n8n workflows: not found: kit re-tagger, since 19 Nov."), line)
+        plan = judge_plan(event, judge_reads(workflows=WORKFLOWS_ALL + [{"id": "wfKitRetag0001", "active": False}]),
+                          workflow=path)
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("FAIL  n8n workflows: inactive: kit re-tagger, since 19 Nov."), line)
+        plan = judge_plan(event, judge_reads(workflows=WORKFLOWS_ALL + [{"id": "wfKitRetag0001", "active": True}]),
+                          workflow=path)
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        # bind_later covers the placeholder only: any other entry left as a placeholder still says not_configured.
+        path = configured_workflow(dict(CONFIGURED, REPLACE_WITH_STOCK_ALERT_WORKFLOW_ID="REPLACE_WITH_STOCK_ALERT_WORKFLOW_ID"))
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        line = next(l for l in judge_plan(event, workflow=path)["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertIn("some workflow IDs are not set in XB Daily Health", line)
+
+    def test_kit_retagger_error_alerts_are_counted_as_a_warn(self):
+        # #341 fix1 LATER (b): each kit re-tagger error path sends exactly one KIT-RETAG ERROR alert; the rows of
+        # the 24 h before the check are counted under the n8n workflows job, as a WARN, never named.
+        def row(at, system="KIT-RETAG", severity="ERROR", outcome="sent"):
+            return {"system": system, "key": "could_not_sign_in", "severity": severity, "outcome": outcome,
+                    "code": "", "folded_count": 0, "sent_at": at}
+
+        rows = [row("2026-11-18T23:00:00.000Z"),                       # 07:00 SGT today: counted
+                row("2026-11-18T00:00:00.000Z", outcome="send_failed"),  # an error that could not be mailed: counted
+                row("2026-11-17T23:29:00.000Z"),                       # 24 h 1 min before: not counted
+                row("2026-11-18T22:00:00.000Z", severity="WARN"),      # not an error
+                row("2026-11-18T22:00:00.000Z", system="AC2-STOCK"),   # not the kit re-tagger
+                row("not a date")]
+        plan = judge_plan(checker_event(), judge_reads(kit_errors=rows))
+        self.assertEqual((plan["row"]["verdict"], plan["row"]["warn_jobs"], plan["send"]), ("WARN", "n8n_workflows", True))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("WARN  n8n workflows: 2 kit re-tagger error alert(s) in the last 24 h (see "
+                                        "xb_alert_email_log), since 19 Nov."), line)
+        self.assertNotIn("could_not_sign_in", "\n".join(plan["mail"]["lines"]), "only a count reaches the email")
+        self.assertIs(through_sender(plan)[0]["valid"], True)
+        # Nothing in the window: OK; an unreadable log: the alert-log WARN, never a silent OK, and only once.
+        plan = judge_plan(checker_event(), judge_reads(kit_errors=[row("2026-11-17T20:00:00.000Z")]))
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        broken = {"raw": [{"json": {"error": "Data table not found"}}]}
+        plan = judge_plan(checker_event(), judge_reads(kit_errors=broken))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("WARN  n8n workflows: the alert email log could not be read, since"), line)
+        plan = judge_plan(checker_event(), judge_reads(kit_errors=broken, failed_alerts=broken))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertEqual(line.count("the alert email log could not be read"), 1, line)
+        self.assertNotIn("more)", line)
+        # Only under n8n_workflows: with that job off, kit errors change nothing.
+        expected = dict(json.loads((ROOT / "config" / "daily_health.example.json").read_text(encoding="utf-8"))
+                        ["expected"], n8n_workflows="off")
+        plan = judge_plan(checker_event(expected=expected), judge_reads(kit_errors=rows))
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
 
     def test_since_for_n8n_jobs_comes_from_the_run_log(self):
         runs = [{"date": d, "kind": "check", "verdict": "FAIL", "fail_jobs": "member_sync_summary,checker",
@@ -646,7 +818,9 @@ class JudgeTests(unittest.TestCase):
                                     "fail_jobs": "", "warn_jobs": ""}]
         plan = judge_plan(event, judge_reads(workflows={"raw": [{"json": {"error": "x"}}]},
                                              alert_log={"raw": [{"json": {"error": "x"}}]},
-                                             failed_alerts={"raw": [{"json": {"error": "x"}}]}, runs=runs))
+                                             failed_alerts={"raw": [{"json": {"error": "x"}}]},
+                                             error_log={"raw": [{"json": {"error": "x"}}]},
+                                             kit_errors={"raw": [{"json": {"error": "x"}}]}, runs=runs))
         self.assertIn("Yesterday's health email could not be sent (send_failed at 07:30, call_failed at 08:15).",
                       plan["mail"]["lines"])
         self.assertLessEqual(len(plan["mail"]["lines"]), 30)
@@ -664,7 +838,7 @@ class JudgeTests(unittest.TestCase):
                 self.assertRegex(code, r"\n  %s: " % reason, reason)
         for reason in ("summary_missing", "summary_send_failed", "log_read_failed", "workflow_inactive",
                        "workflow_missing", "error_runs", "n8n_api_failed", "not_configured", "alert_email_failed",
-                       "alert_log_read_failed"):
+                       "alert_log_read_failed", "error_log_read_failed", "error_log_unlinked", "kit_retag_errors"):
             self.assertRegex(code, r"\n  %s: " % reason, reason)
         for job in health.JOBS:
             self.assertIn(" %s: '" % job, code, job)
