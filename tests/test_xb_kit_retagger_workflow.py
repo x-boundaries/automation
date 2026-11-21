@@ -423,6 +423,10 @@ class KitRetaggerShapeTests(KitRetaggerBase):
             self.assertIn(word, notes)
         readme = README.read_text(encoding="utf-8")
         self.assertIn("### xb_kit_retagger.workflow.json", readme)
+        # G2 T-2: the daily health line describes what #340 shipped.
+        self.assertIn("- Daily health (#340, on main): `XB Daily Health` counts the `KIT-RETAG` `ERROR` rows of "
+                      "`xb_alert_email_log` (`kit_retag_errors` WARN) and has a `bind_later` `WATCH` entry", readme)
+        self.assertNotIn("Not yet watched by `XB Daily Health`", readme)
         runbook = RUNBOOK.read_text(encoding="utf-8")
         for word in ("Custom Auth", "httpCustomAuth", "client_id", "client_secret", "L0", "L4", "L6", "L8",
                      "OK kit re-tagger dry run", "Another tagger", "open n8n editor", "kitTagRecord", "#340", "bind_later",
@@ -489,10 +493,27 @@ class KitRetaggerRunbookTests(KitRetaggerBase):
 
     def test_every_re_import_keeps_the_record(self):
         steps = self.section("Re-importing this workflow (keeps the record)")
-        for word in ("`staticData`", "kitTagRecord", "same product count", "403", "Any difference stops the step",
-                     "127.0.0.1:5678/api/v1", "Rollback: re-apply the whole backup"):
+        for word in ("including its `staticData`", "Re-applies the backed-up `staticData`", "kitTagRecord",
+                     "same product count", "Any difference stops the step", "127.0.0.1:5678/api/v1"):
             self.assertIn(word, steps)
         self.assertIn("back up `staticData` first", self.rows()["L8"][2])
+        self.assertIn("re-apply the backup (nodes, settings, `staticData`) and read back", self.rows()["L8"][4])
+
+    def test_a_403_on_re_import_is_rolled_back_without_publishing(self):
+        # G2 N-1 (checked at n8n@2.48.5): on a 403 the draft, settings and staticData are already saved.
+        steps = self.section("Re-importing this workflow (keeps the record)")
+        for word in ("`workflow:activate` **and** the caller's `workflow:publish` permission",
+                     "**already saved** the new nodes as an unpublished draft and written the sent settings and "
+                     "`staticData`",
+                     "`PUT /workflows/{id}?publishIfActive=false` with the backup's nodes, connections, settings and "
+                     "`staticData`",
+                     "It needs only `workflow:update` and publishes nothing",
+                     "Read back that `activeVersionId` is unchanged",
+                     "not from `activeVersion` (settings and `staticData` are not versioned)",
+                     "re-publishing is the Controller's call", "`n8n@2.48.5`"):
+            self.assertIn(word, steps)
+        self.assertNotIn("Rollback: re-apply the whole backup", steps)
+        self.assertNotIn("stop and report it.", steps)
         rules = self.section("Rules")
         self.assertIn("re-import procedure above (record kept)", rules)
 
@@ -778,6 +799,38 @@ class KitRetaggerOutsideChangesTests(KitRetaggerBase):
         start = record({num(500 + i): {"d": "2026-11-20", "t": {"kit-hut": "r", "ks-socks": "r"}} for i in range(10)})
         plan, _ = self.plan_full(pages_of(products[:10]), static=start, DRY_RUN=False)
         self.assertEqual((plan["mode"], plan["summary"]["new_person_added"]), ("no_change", 10))
+
+    def test_taken_off_tags_count_products_not_tags(self):
+        # Two taken-off tags on one product count once (G2 T-1, L3-07).
+        def night(k):
+            start = record({num(500 + i): {"d": "2026-11-20", "t": {"kit-hut": "a", "kit-tropical": "a"}}
+                            for i in range(k)})
+            products = [socks(500 + i, tags=[t for t in SOCK_TAGS if t not in ("kit-hut", "kit-tropical")])
+                        for i in range(k)]
+            plan, _ = self.plan_full(pages_of(products), static=start, DRY_RUN=False)
+            return plan
+        ten, eleven = night(10), night(11)
+        self.assertEqual((ten["mode"], ten["summary"]["new_person_removed"], ten["summary"]["brake_at"]),
+                         ("no_change", 10, 10))
+        self.assertEqual((eleven["mode"], eleven["summary"]["new_person_removed"]), ("held", 11))
+
+    def test_its_own_changes_never_count(self):
+        # The night after a big write (G2 T-1, L3-16): 50 products keep the tags it added ('a', present) and
+        # 50 stay without the tags it removed ('r', absent). Nothing is an outside change.
+        start = record({**{num(i): {"d": "2026-11-20", "t": {t: "a" for t in SOCK_TAGS}} for i in range(50)},
+                        **{num(100 + i): {"d": "2026-11-20", "t": {"kit-hut": "r", "ks-socks": "r"}}
+                           for i in range(50)}})
+        products = ([socks(i, tags=SOCK_TAGS) for i in range(50)]
+                    + [product(100 + i, title="Fake Plain Mug %d" % i, ptype="Mug") for i in range(50)])
+        before = copy.deepcopy(start)
+        plan, after = self.plan_full(pages_of(products), static=start, DRY_RUN=False)
+        summary = plan["summary"]
+        self.assertEqual((plan["mode"], plan["alert"], summary["held"], summary["braked"]),
+                         ("no_change", None, False, False))
+        self.assertEqual((summary["new_person_removed"], summary["new_person_added"],
+                          summary["left_alone_person_removed"], summary["left_alone_person_added"]), (0, 0, 0, 0))
+        self.assertEqual(summary["brake_at"], 10)
+        self.assertEqual(after, before)  # nothing marked as seen
 
     def test_a_dry_run_shows_it_without_email(self):
         dry, after, before = self.undone(0, 30, DRY_RUN=True)

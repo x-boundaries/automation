@@ -98,10 +98,19 @@ The export has `staticData: null` and the repo import helper sends the repositor
 
 1. Backs up the live workflow through the local API (`http://127.0.0.1:5678/api/v1`), including its `staticData`, to a local `.tmp` file (never committed), and notes the number of products in `staticData.global.kitTagRecord.products`.
 2. Re-imports the merged export, keeping the private values (`SHOP_DOMAIN`, the alert workflow id, the credential binding).
-3. Re-applies the backed-up `staticData` in the same update (a public-API `PUT /workflows/{id}` with the backup's `staticData`). If n8n answers 403 (the API key lacks the `workflow:activate` scope, so the old version stays live), stop and report it.
-4. Reads back: HTTP 200, the published (active) version carries the new nodes, and `staticData.global.kitTagRecord` is present with the same product count as the backup. Any difference stops the step.
+3. Re-applies the backed-up `staticData` in the same update: one public-API `PUT /workflows/{id}` with the new nodes and connections, the private values, and the backup's `staticData`. Not near the 03:00 SGT run.
+   - On an **active** workflow this PUT also re-publishes (`publishIfActive` defaults to `true`), which needs the API key scope `workflow:activate` **and** the caller's `workflow:publish` permission on the project.
+   - **403:** one of the two is missing. The old version stays live, but n8n has **already saved** the new nodes as an unpublished draft and written the sent settings and `staticData` to the workflow. Stop, roll back by the 403 path below, and report.
+   - On an inactive workflow (L8 before activation) nothing is published and a 403 cannot come from publishing.
+4. Reads back with a `GET /workflows/{id}`: the PUT answered HTTP 200; on an active workflow `activeVersionId` changed and `activeVersion` carries the new nodes; and, from the workflow itself, not from `activeVersion` (settings and `staticData` are not versioned), the settings and `staticData.global.kitTagRecord` with the same product count as the backup. Any difference stops the step.
 
-Rollback: re-apply the whole backup (nodes, settings and `staticData`) and read back the same way. Before the first scheduled run the record is empty and steps 1, 3 and 4 have nothing to keep, but they are still run, so the procedure is the same every time.
+Rollback (read back each time with a `GET`, settings and `staticData` from the workflow itself):
+
+- **After a 403 in step 3** (the new version never went live): `PUT /workflows/{id}?publishIfActive=false` with the backup's nodes, connections, settings and `staticData`. It needs only `workflow:update` and publishes nothing. Read back that `activeVersionId` is unchanged (the backup's) and that the settings and the `kitTagRecord` product count equal the backup's.
+- **After a successful re-import that must be undone:** the same PUT without `publishIfActive=false`, so the backup's nodes are published again (the scopes step 3 already had). Read back that `activeVersion` carries the backup's nodes and that the settings and the record count equal the backup's.
+- On any other error answer, or if `activeVersionId` is not what the case above expects (for example a failed re-publication left the workflow unpublished), stop and report: re-publishing is the Controller's call.
+
+Before the first scheduled run the record is empty and steps 1, 3 and 4 have nothing to keep, but they are still run, so the procedure is the same every time. Checked against n8n's source at tag `n8n@2.48.5`: the public `PUT /workflows/{workflowId}` (`workflow:update`; re-publishing also `workflow:activate` and `workflow:publish`), `UpdateWorkflowQueryDto` (`publishIfActive` default `true`) and `WorkflowService.update` (`staticData` and settings are saved before the publish check, which refuses with 403 and keeps the draft).
 
 ## Live path
 
