@@ -10,6 +10,7 @@ then 8000, then 0001-0099); emails use example.com.
 from __future__ import annotations
 
 import gc
+import hashlib
 import io
 import json
 import re
@@ -409,6 +410,28 @@ class ConfigTests(unittest.TestCase):
         config = sync.parse_config(example)
         self.assertEqual(config.autocount_book, TEST_BOOK)
         self.assertFalse(config.ac2_create_enabled or config.shopify_create_enabled)
+
+    def test_an_unqualified_store_is_refused(self):
+        # G2 #347 G-1: member_sync's own proof that a store outside the pin is refused (test_member_tags.py has one
+        # for member_tags). The committed example holds the placeholders and is refused as it stands; so are a
+        # fake *.myshopify.com domain with the pinned GID, and another GID with the pinned domain.
+        raw = (ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8")
+        for gid, domain in (PLACEHOLDER_STORE, (QUALIFIED_GID, "other-store.myshopify.com"),
+                            ("gid://shopify/Shop/2", QUALIFIED_DOMAIN)):
+            value = json.loads(raw)
+            value["shopify"].update(store_gid=gid, shop_domain=domain)
+            with self.subTest(store_gid=gid[-3:]), self.assertRaises(dl.DirectLocalError) as caught:
+                sync.parse_config(value)
+            self.assertEqual(caught.exception.code, "sync_config_store_not_qualified")
+
+    def test_store_pin_tripwire(self):
+        # G2 #347 G-2: the example configs hold placeholders and the tests copy the pin in, so a changed pin would
+        # pass every suite. This hash of the single pinned `gid|domain` pair breaks on any change to it. Change the
+        # hash only together with an approved pin change. The pair itself is never written here.
+        ((gid, domain),) = dl.QUALIFIED_CONNECTOR_STORES.items()
+        digest = hashlib.sha256(f"{gid}|{domain}".encode("utf-8")).hexdigest()
+        self.assertEqual(digest, "f9631df2480cae5dba3bd177b83f52f833da532cfbd97616567146af8a7896bf",
+                         "QUALIFIED_CONNECTOR_STORES changed: update this hash only with an approved pin change")
 
 
 class LedgerTests(unittest.TestCase):
