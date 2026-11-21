@@ -120,7 +120,7 @@ Keeps the "Pack for this trip" gear-kit tags on the Shopify store in line with t
 
 ### Error alerts and daily health check
 
-- **Error alerts by email (#288):** every job sends its errors through one n8n sub-workflow on the server PC, `XB Ops Alert Email`, which holds the only Gmail node and the only recipient, folds repeats and logs each alert. Errors only, no "all is well" messages. Callers: `AC2-STOCK`, `AC2-ARAP`, `ENERGYGRID`, `MEMBER-SYNC`, `HEALTH` and `KIT-RETAG`. Telegram is retired. Docs: [workflow exports](n8n-workflows/README.md) and the [alert log table](docs/ops_alert_email_log.md).
+- **Error alerts by email (#288):** every job sends its errors through one n8n sub-workflow on the server PC, `XB Ops Alert Email`, which holds the only Gmail node for alerts, folds repeats and logs each alert. Errors only, no "all is well" messages. Callers: `AC2-STOCK`, `AC2-ARAP`, `ENERGYGRID`, `MEMBER-SYNC`, `HEALTH` and `KIT-RETAG`. Telegram is retired. Docs: [workflow exports](n8n-workflows/README.md) and the [alert log table](docs/ops_alert_email_log.md).
 - **Daily health check (#325, 07:30 SGT):** a read-only checker on the server PC judges every scheduled job OK, WARN or FAIL and emails the owner only when something needs a look, plus a heartbeat every Monday. **No `[XB health]` email on a Monday by 09:00 means the checker is down.** Runbook: [daily health check](docs/daily_health_check.md).
 
 ### Drive mirror of `main`

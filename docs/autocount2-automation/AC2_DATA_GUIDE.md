@@ -2,7 +2,7 @@
 
 For people, and for their Claude Code or other AI agents. Point your agent at this file (or install it as a skill, see [Use it as a Claude Code skill](#use-it-as-a-claude-code-skill)) before you ask it about stock, sales, buying, purchasing, or what customers owe us and what we owe suppliers.
 
-A copy of this guide lives at the top of the Drive `Automation/Report` folder as `README - for AI agents.md`. The repository version (`docs/autocount2-automation/AC2_DATA_GUIDE.md` in the automation repository) is the source; if the two differ, the repository wins. A PR that changes AC2 data (files, fields, schedules or switches) updates this guide in the same PR, and the Drive copy is replaced after it merges.
+A copy of this guide lives at the top of the Drive `Automation/Report` folder as `README - for AI agents.md`. The repository version (`docs/autocount2-automation/AC2_DATA_GUIDE.md` in the automation repository) is the source; if the two differ, the repository wins. A PR that changes AC2 data (files, fields, schedules or switches) updates this guide in the same PR, and the Drive copy is updated in place after it merges (it is kept, never replaced: it may carry private detail this public file cannot).
 
 **Status (22 Nov 2026):** hourly stock balance, daily close, buying analysis and AR/AP aging are all live. The purchasing file is built but **off** (see [section 4](#4-purchasing-file-292)).
 
