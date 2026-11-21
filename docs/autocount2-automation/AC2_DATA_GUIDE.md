@@ -4,7 +4,7 @@ For people, and for their Claude Code or other AI agents. Point your agent at th
 
 A copy of this guide lives at the top of the Drive `Automation/Report` folder as `README - for AI agents.md`. The repository version (`docs/autocount2-automation/AC2_DATA_GUIDE.md` in the automation repository) is the source; if the two differ, the repository wins. A PR that changes AC2 data (files, fields, schedules or switches) updates this guide in the same PR, and the Drive copy is updated in place after it merges (it is kept, never replaced: it may carry private detail this public file cannot).
 
-**Status (22 Nov 2026):** hourly stock balance, daily close, buying analysis and AR/AP aging are all live. The purchasing file is built but **off** (see [section 4](#4-purchasing-file-292)).
+**Status (22 Nov 2026):** hourly stock balance, daily close, buying analysis, the purchasing file and AR/AP aging are all live. The purchasing file has been on since 22 Nov 2026 (see [section 4](#4-purchasing-file-292)).
 
 Every example value in this guide is fake (`FAKE-0201`, `LOC-A`, `C-001`, `Example Vendor`). This repository is public: never add real figures, names, codes or folder IDs to it.
 
@@ -160,7 +160,7 @@ So an unknown customer's sale counts as `wholesale`, not `other`.
 
 **Where:** `analysis_purchasing.json.gz` in the same folder, built with the buying files.
 
-**Status: only if switched on.** The code is merged but off by default, and it is **off in the live export** (22 Nov 2026): switching it on is an owner-approved step on the AC2 server. **Check `analysis_manifest.json`:** if its `files` list has no `analysis_purchasing.json.gz` (or it has no `purchasing` block with `status: published`), purchasing data is not available; do not read a stray old copy.
+**Status: only if switched on.** The code is off by default; it was **switched on in the live export on 22 Nov 2026**, with the same file name and fields as described here (the first nightly confirmation is due on 23 Nov 2026). It can be switched off again, so still **check `analysis_manifest.json`:** if its `files` list has no `analysis_purchasing.json.gz` (or it has no `purchasing` block with `status: published`), purchasing data is not available; do not read a stray old copy.
 
 **Contents:** `vendors` (names), `items`, `brands` (item brand), `groups`; rows with their own field lists:
 
