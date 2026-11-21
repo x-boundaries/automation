@@ -308,8 +308,38 @@ class MonitorLinkTests(unittest.TestCase):
             "`_validateSubWorkflowReferences`",
             "workflow-validation.service.ts",
             "Please publish all referenced sub-workflows first",
+            # G2 P-4: the copy keeps alerts off and reports to the M2 workflow; old gaps M3-f and M3-j.
+            "`ENABLE_OWNER_ALERTS` false, `errorWorkflow` = the M2 workflow",
+            "never reuse or re-activate an archived copy",
+            "**0** saved executions for the copy",
         ):
             self.assertIn(phrase, m3)
+
+    def test_m3_waits_for_the_async_publication(self):
+        # G2 P-1: at n8n 2.48.5 the default publication service only queues the publication, so the activate call
+        # answers before the copy's webhook exists; live M3 retry 1 POSTed about 0.1 s later and got HTTP 404,
+        # retry 2 waited 5 s and passed. The row records that recipe and its source.
+        package = MONITOR_README.read_text(encoding="utf-8")
+        start = package.index("| M3 |")
+        m3 = package[start:package.index("\n", start)]
+        for phrase in (
+            "activate it; then, after the wait below, POST `{}` once",
+            "**Activation only queues the publication:**",
+            "`N8N_USE_WORKFLOW_PUBLICATION_SERVICE=true`",
+            "the activate call answers before the copy's webhook is registered",
+            "activate, **wait at least 5 s, then POST once**",
+            "**only on HTTP 404** resend, up to 5 more times 3 s apart (on any other answer, do not resend)",
+            "deactivate **within 5 minutes**",
+            "`packages/@n8n/config/src/configs/workflows.config.ts` (`useWorkflowPublicationService` defaults to "
+            "`true`)",
+            "`_publishViaOutbox`",
+        ):
+            self.assertIn(phrase, m3)
+        self.assertNotIn("POST right after activating", package)
+
+    def test_live_steps_status_is_recorded(self):
+        package = MONITOR_README.read_text(encoding="utf-8")
+        self.assertIn("**Status:** M1-M5 were completed live on 21 Nov 2026, each with its owner OK.", package)
 
     def test_m4_wording_matches_n8n_2_48_5(self):
         # G2 recheck L7: at n8n 2.48.5 settings are kept on the workflow row and are not part of a version. M4
@@ -335,12 +365,29 @@ class MonitorLinkTests(unittest.TestCase):
             "**On any answer other than 200:**",
             "the monitor may be **unpublished**",
             "n8n sets `activeVersionId` to null",
-            "Re-apply the backup's settings at once (Undo",
+            # G2 P-4 (M4-i): the in-row Undo is the same PUT with the flag, not a plain PUT.
+            "re-apply the backup's settings at once (Undo, the same PUT with `publishIfActive=false`)",
             "then read back `settings` and `activeVersionId`",
             "If `activeVersionId` is not the backup's, **stop and report**",
             "re-publishing needs `workflow:activate` and is the Controller's call",
             "Do not go on to M5",
-            "a 403 comes from the `workflow:update` scope checks **before the save**, so on a 403 nothing was saved",
+            # G2 P-2: name the publication path each failure explanation applies to.
+            "With n8n 2.48.5's **default publication service** (`N8N_USE_WORKFLOW_PUBLICATION_SERVICE=true`), a "
+            "settings-only change re-registers nothing (the running webhook and schedule stay)",
+            "a non-200 after the save comes from the activation pre-checks",
+            "with `activeVersionId` unchanged",
+            "On the **old path** (`N8N_USE_WORKFLOW_PUBLICATION_SERVICE=false`), the re-activation first takes the "
+            "running monitor out",
+            "On either path, re-apply",
+            # G2 P-3: a publish-policy 403 can come after the save; every 403 is handled like any other non-200.
+            "the `workflow:update` scope checks run **before the save**, so a 403 from them saved nothing",
+            "a **publish-policy 403** (`PolicyViolationError`, only when a publish policy is configured) can come "
+            "**after the save**",
+            "treat every 403 like any other non-200",
+            "If the Undo itself answers non-200, its read-back still decides",
+            # G2 P-4 optional (M4-t, M4-v): the backup keeps versionId; step 3 points errorWorkflow at M2.
+            "keep the answer, including `settings`, `versionId` and `activeVersionId`",
+            "and `errorWorkflow` = the M2 workflow changed",
             "**HTTP 200**",
             "a GET shows `settings.errorWorkflow` = the M2 workflow and `settings.saveDataErrorExecution` = `none`",
             "`activeVersionId` is **unchanged** from the backup",
@@ -351,6 +398,9 @@ class MonitorLinkTests(unittest.TestCase):
             "workflow-entity-mapper.ts",
             "base-workflow-public.dto.ts",
             "@ApiKeyScope('workflow:update')",
+            "workflow-publication-applier.ts",
+            "publication/trigger-diff.ts",
+            "policy-violation.error.ts",
             "| Re-apply the backup's settings with `publishIfActive=false`; read back `settings`, `versionId` and "
             "`activeVersionId`; if `activeVersionId` is not the backup's, stop and report (Controller's call). |",
         ):
@@ -359,7 +409,9 @@ class MonitorLinkTests(unittest.TestCase):
         # undo covers every non-200 (not only a 403), and staticData is left out of the body, not "kept".
         for stale in ("nothing changed live", "the old version stays live", "**published** (active) version",
                       "carries `errorWorkflow`", "keep `staticData`", "n8n saves first and then refuses",
-                      "**On a 403:**", "settings are **already on the row**"):
+                      "**On a 403:**", "settings are **already on the row**",
+                      # P-3: the old claim that every 403 comes before the save.
+                      "so on a 403 nothing was saved"):
             self.assertNotIn(stale, package)
 
 
