@@ -68,13 +68,24 @@ class N8nExportGuardsWorkflowTests(unittest.TestCase):
             "Do not add a cloudflared pin.",
             "the production compose fails closed when `N8N_IMAGE` is missing (`${N8N_IMAGE:?...}`, no `:stable` "
             "fallback)",
-            "the menu's Restart and Start tunnel recreate with `--pull never`, so only Update pulls an image",
+            # G2 #350 L1: which menu actions pull an image.
+            "the menu's Restart and Start tunnel recreate with `--pull never`, so Restart and Start tunnel never pull; "
+            "Update and Restore do (Restore uses the backup's `N8N_IMAGE`, see below)",
+            "plain Start pulls only when the image is missing locally",
             "cloudflared receives only `TUNNEL_TOKEN`, not the whole `.env`",
             "**Never re-copy the setup templates over the live files.**",
             "Re-copying either one would undo these fixes.",
         ):
             self.assertIn(phrase, section)
         self.assertNotIn("CLOUDFLARED_IMAGE", section)
+        self.assertNotIn("so only Update pulls an image", section)
+
+    def test_energygrid_monitor_status_is_email(self):
+        # G2 #350 (pre-existing): the live run monitor moved to email at live step E1 (20 Nov 2026, #288).
+        readme = (ROOT / "n8n-workflows" / "README.md").read_text(encoding="utf-8")
+        self.assertIn("sends its alerts by email through `XB Ops Alert Email` since live step E1 on 20 Nov 2026 (#288); it "
+                      "no longer uses Telegram", readme)
+        self.assertNotIn("still sends by Telegram", readme)
 
     def test_the_guard_modules_exist(self):
         for name in ("test_no_telegram_nodes.py", "test_n8n3_always_output_data_guard.py"):
