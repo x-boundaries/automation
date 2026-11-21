@@ -50,6 +50,21 @@ NEW_EXPIRY = "2028-11-18T00:00:00"
 PAST_DEADLINE = 120 + dl.WRITER_GRACE_SECONDS + 1
 
 
+# The committed example configs carry placeholders, never the real store (as member_tags.live.example.json
+# does, Controller answer 5). A test that needs one to parse copies the qualified store's two values in, as the
+# operator does in the private config.
+PLACEHOLDER_STORE = ("gid://shopify/Shop/1", "example.myshopify.com")
+((QUALIFIED_GID, QUALIFIED_DOMAIN),) = dl.QUALIFIED_CONNECTOR_STORES.items()
+
+
+def example_config(name: str) -> dict:
+    value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+    shopify = value["shopify"]
+    assert (shopify["store_gid"], shopify["shop_domain"]) == PLACEHOLDER_STORE, name
+    shopify.update(store_gid=QUALIFIED_GID, shop_domain=QUALIFIED_DOMAIN)
+    return value
+
+
 def local(n: int) -> str:
     """Eight fake Singapore digits, built in code (never a literal number)."""
     return "9" + f"{n:07d}"
@@ -1736,7 +1751,7 @@ class ConfigTests(Base):
     def test_example_configs_parse_in_observe_mode(self):
         for name in ("member_benefits.example.json", "member_benefits.live.example.json"):
             with self.subTest(name=name):
-                cfg = bm.load_config(ROOT / "config" / name)
+                cfg = bm.parse_config(example_config(name)) if "live" in name else bm.load_config(ROOT / "config" / name)
                 self.assertFalse(cfg.benefits_write_enabled)
                 self.assertEqual((cfg.max_upgrades_per_run, cfg.qualify_threshold_cents, cfg.shopify.api_version), (3, 30000, "2026-10"))
                 self.assertTrue(cfg.amount_before_discounts and cfg.amount_exclude_shipping and cfg.same_day_signup_counts)
@@ -1768,7 +1783,7 @@ class ConfigTests(Base):
                 with self.subTest(extra=extra):
                     self.assertEqual(self.code(lambda: bm.parse_config(raw_config(self.root, self.sync_root, **extra))), code)
         live = raw_config(self.root, self.sync_root, autocount_book="AED_XBOUNDARIES", shopify={
-            "store_gid": "gid://shopify/Shop/48759472277", "shop_domain": "xboundariessg.myshopify.com", "api_version": "2026-10",
+            "store_gid": QUALIFIED_GID, "shop_domain": QUALIFIED_DOMAIN, "api_version": "2026-10",
             "auth": {"method": "client_credentials", "client_id_env": "XB_SHOPIFY_BENEFITS_CLIENT_ID", "client_secret_env": "XB_SHOPIFY_BENEFITS_CLIENT_SECRET"}},
             ac2_credential_target=sync.LIVE_CREDENTIAL_TARGET, ac2_login_mode="owner_shared")
         self.assertEqual(self.code(lambda: bm.parse_config(live)), "benefits_config_type_move_state_root_required")
@@ -4940,7 +4955,7 @@ class B2NoReinitGuardTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), digest)
         for name in ("member_benefits.example.json", "member_benefits.live.example.json"):
             with self.subTest(name=name):
-                value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+                value = example_config(name) if "live" in name else json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
                 self.assertEqual(bm.parse_config(value).rule_fingerprint(), self.EXAMPLE_FINGERPRINT)
 
 

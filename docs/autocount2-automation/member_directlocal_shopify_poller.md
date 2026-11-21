@@ -213,7 +213,7 @@ each named variable is set, without reading it out.
 Owner actions and approvals needed before any live read (none is granted):
 
 1. Create a Shopify app in the Shopify Dev Dashboard, in the same Shopify
-   organisation as `xboundariessg.myshopify.com`, with the single Admin API
+   organisation as the store (its `*.myshopify.com` domain is the qualified store pin), with the single Admin API
    scope `read_customers`, and install it on that store. For profile reads,
    the app also needs protected customer data access for name, email and
    phone; without it Shopify returns `ACCESS_DENIED`. Only if a legacy
