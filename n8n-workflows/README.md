@@ -14,6 +14,9 @@ The production n8n instance runs from a Docker Compose stack outside this reposi
 | `N8N_RUNNERS_TASK_TIMEOUT` | `300` | #332 Q5, 20 Nov 2026: keeps the 2.x Code node task timeout (300 s) after a 3.x upgrade, where the default drops to 60 s. No effect on 2.x. |
 
 - Change `N8N_IMAGE` only on purpose, for a 3.x upgrade, after a backup and an approved G-plan in #332.
+- cloudflared is **not** pinned, on purpose: it stays on `cloudflare/cloudflared:latest` and updates through the menu's Update (owner, 22 Nov 2026). Do not add a cloudflared pin.
+- Hardening (#332 F2, F3, F5, 22 Nov 2026): the production compose fails closed when `N8N_IMAGE` is missing (`${N8N_IMAGE:?...}`, no `:stable` fallback); the menu's Restart and Start tunnel recreate with `--pull never`, so only Update pulls an image; cloudflared receives only `TUNNEL_TOKEN`, not the whole `.env`.
+- **Never re-copy the setup templates over the live files.** The production menu is a copy of the Toolkit `n8n-environment-setup` template, and the production compose is a derivative of that template with local XB changes. Re-copying either one would undo these fixes.
 - **Restoring from an older backup:** backups made before 21 Nov 2026 carry `N8N_IMAGE=docker.n8n.io/n8nio/n8n:stable`, and a restore uses the backup's value (it checks that the image is trusted, not which version it is). After a restore from one, check `N8N_IMAGE` and the running n8n version, and put the pin above back if they differ.
 
 ## Current Workflow Exports

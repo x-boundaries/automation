@@ -62,8 +62,19 @@ class N8nExportGuardsWorkflowTests(unittest.TestCase):
             "Change `N8N_IMAGE` only on purpose, for a 3.x upgrade, after a backup and an approved G-plan in #332.",
             "backups made before 21 Nov 2026 carry `N8N_IMAGE=docker.n8n.io/n8nio/n8n:stable`",
             "After a restore from one, check `N8N_IMAGE` and the running n8n version",
+            # Controller note (hardening report, 22 Nov 2026): cloudflared stays unpinned by owner choice; the
+            # compose and menu fixes; never re-copy the templates over the live files.
+            "cloudflared is **not** pinned, on purpose: it stays on `cloudflare/cloudflared:latest`",
+            "Do not add a cloudflared pin.",
+            "the production compose fails closed when `N8N_IMAGE` is missing (`${N8N_IMAGE:?...}`, no `:stable` "
+            "fallback)",
+            "the menu's Restart and Start tunnel recreate with `--pull never`, so only Update pulls an image",
+            "cloudflared receives only `TUNNEL_TOKEN`, not the whole `.env`",
+            "**Never re-copy the setup templates over the live files.**",
+            "Re-copying either one would undo these fixes.",
         ):
             self.assertIn(phrase, section)
+        self.assertNotIn("CLOUDFLARED_IMAGE", section)
 
     def test_the_guard_modules_exist(self):
         for name in ("test_no_telegram_nodes.py", "test_n8n3_always_output_data_guard.py"):
