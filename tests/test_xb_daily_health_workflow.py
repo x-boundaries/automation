@@ -429,6 +429,18 @@ class ShapeTests(unittest.TestCase):
         watcher = self.nodes["Who Watches The Watcher"]["parameters"]["content"]
         for phrase in ("Monday only", "retried once", "nothing arrives at all", "up to 7 days"):
             self.assertIn(phrase, watcher)
+        # #340 G2 L8 (folded into #341 fix2): the runbook text of fix1 L2, L3 and the M5 rollout note.
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+        for phrase in ("**Link check (fix1 L2).**",
+                       "the judge checks that the monitor has `errorWorkflow` = the error log's `WATCH` ID and "
+                       "`saveDataErrorExecution` = `none`",
+                       "FAIL `n8n workflows: EnergyGrid monitor is no longer linked to its error log; ask Claude to check`",
+                       "so it cannot fire before M5",
+                       "Fix: re-apply M4 (the monitor's two settings), then read back.",
+                       "a count of **250 means 250 or more** (fix1 L3)",
+                       "Read back that the live monitor already has the M4 settings, or the first check will FAIL "
+                       "`error_log_unlinked`."):
+            self.assertIn(phrase, runbook)
         readme = README.read_text(encoding="utf-8")
         self.assertIn("### xb_daily_health.workflow.json", readme)
         self.assertIn("[XB health]", readme)
