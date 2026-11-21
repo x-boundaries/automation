@@ -4,6 +4,18 @@ This directory holds source-controlled n8n workflow export JSON for this reposit
 
 Workflow JSON in this directory is source-controlled evidence of workflow design and UAT scope. It is not proof of deployment, import, activation, or execution on any n8n instance.
 
+## Production n8n instance pins (#332)
+
+The production n8n instance runs from a Docker Compose stack outside this repository. Its `.env` carries two deliberate pins, each set with an owner OK:
+
+| Key | Pinned value | Why |
+| --- | --- | --- |
+| `N8N_IMAGE` | `docker.n8n.io/n8nio/n8n:2.48.5` | #332 Q4, 21 Nov 2026: the stack no longer follows `:stable`, so a pull or an image update cannot move n8n to 3.x by itself. The runbooks in this directory are checked against `n8n@2.48.5`. |
+| `N8N_RUNNERS_TASK_TIMEOUT` | `300` | #332 Q5, 20 Nov 2026: keeps the 2.x Code node task timeout (300 s) after a 3.x upgrade, where the default drops to 60 s. No effect on 2.x. |
+
+- Change `N8N_IMAGE` only on purpose, for a 3.x upgrade, after a backup and an approved G-plan in #332.
+- **Restoring from an older backup:** backups made before 21 Nov 2026 carry `N8N_IMAGE=docker.n8n.io/n8nio/n8n:stable`, and a restore uses the backup's value (it checks that the image is trusted, not which version it is). After a restore from one, check `N8N_IMAGE` and the running n8n version, and put the pin above back if they differ.
+
 ## Current Workflow Exports
 
 ### member_forms_gateway_ingest.workflow.json

@@ -50,6 +50,21 @@ class N8nExportGuardsWorkflowTests(unittest.TestCase):
             self.assertNotIn(masked, self.text, masked)
         self.assertFalse([line for line in self.lines if line.startswith("if:")], "no step or job condition")
 
+    def test_production_instance_pins_are_recorded(self):
+        # #332 F1 and F4: the production instance pins live in one place, n8n-workflows/README.md, which this job
+        # tests on every change under n8n-workflows/. Values only; no private path or setting.
+        readme = (ROOT / "n8n-workflows" / "README.md").read_text(encoding="utf-8")
+        start = readme.index("## Production n8n instance pins (#332)")
+        section = readme[start:readme.index("## Current Workflow Exports", start)]
+        for phrase in (
+            "| `N8N_IMAGE` | `docker.n8n.io/n8nio/n8n:2.48.5` |",
+            "| `N8N_RUNNERS_TASK_TIMEOUT` | `300` |",
+            "Change `N8N_IMAGE` only on purpose, for a 3.x upgrade, after a backup and an approved G-plan in #332.",
+            "backups made before 21 Nov 2026 carry `N8N_IMAGE=docker.n8n.io/n8nio/n8n:stable`",
+            "After a restore from one, check `N8N_IMAGE` and the running n8n version",
+        ):
+            self.assertIn(phrase, section)
+
     def test_the_guard_modules_exist(self):
         for name in ("test_no_telegram_nodes.py", "test_n8n3_always_output_data_guard.py"):
             self.assertTrue((ROOT / "tests" / name).is_file(), name)
