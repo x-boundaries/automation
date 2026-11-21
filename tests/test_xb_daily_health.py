@@ -185,7 +185,16 @@ class RuleTests(unittest.TestCase):
             ({"delivery_status": "verify_failed"}, "WARN", ["delivery_failed"]),
             ({"delivery_status": "copy_failed"}, "WARN", ["delivery_failed"]),
             ({"daily_close_status": "failed"}, "WARN", ["daily_close_failed"]),
-            ({"analysis_failure_class": "purchasing_read_failed"}, "WARN", ["analysis_failed"]),
+            ({"analysis_failure_class": "analysis_read_failed"}, "WARN", ["analysis_failed"]),
+            ({"analysis_failure_class": "analysis_publish_failed"}, "WARN", ["analysis_failed"]),
+            # A purchasing-only failure: the buying files still publish, so analysis_failure_class stays null.
+            ({"analysis_failure_class": None, "analysis_purchasing_status": "failed",
+              "analysis_purchasing_failure_class": "purchasing_read_failed"}, "WARN", ["analysis_failed"]),
+            ({"analysis_failure_class": None, "analysis_purchasing_status": "failed",
+              "analysis_purchasing_failure_class": "purchasing_build_failed"}, "WARN", ["analysis_failed"]),
+            # Both set: one reason, never two.
+            ({"analysis_failure_class": "analysis_read_failed", "analysis_purchasing_status": "failed",
+              "analysis_purchasing_failure_class": "purchasing_read_failed"}, "WARN", ["analysis_failed"]),
             ({"started_at": "2026-11-19T06:55:00+08:00"}, "WARN", ["run_slow"]),  # 8 min 10 s
             ({"started_at": "2026-11-19T06:50:00+08:00"}, "FAIL", ["run_too_slow"]),  # 13 min 10 s
             ({"status": "failed", "finished_at": None, "started_at": "2026-11-19T07:00:05+08:00"}, "WARN", ["run_failed"]),
@@ -197,6 +206,16 @@ class RuleTests(unittest.TestCase):
                 self.assertEqual(e["since"], "2026-11-19")
         e = self.stock(finished_at="2026-11-18T23:30:00+08:00", started_at="2026-11-18T23:27:00+08:00")
         self.assertEqual((e["verdict"], e["reasons"], e["age_min"]), ("FAIL", ["last_run_too_old"], 480))
+
+    def test_stock_purchasing_published_or_off_is_ok(self):
+        # Purchasing published, and purchasing off (no purchasing keys in the status file at all).
+        published = self.stock(analysis_failure_class=None, analysis_purchasing_status="published",
+                               analysis_purchasing_failure_class=None)
+        self.assertEqual((published["verdict"], published["reasons"]), ("OK", []))
+        obs = healthy_obs()
+        self.assertNotIn("analysis_purchasing_status", obs["stock_status"])
+        off = entry(judge(obs), "ac2_stock_export")
+        self.assertEqual((off["verdict"], off["reasons"]), ("OK", []))
 
     def test_stock_failed_run_depends_on_the_last_good_manifest(self):
         obs = healthy_obs()

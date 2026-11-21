@@ -461,7 +461,10 @@ def judge_export(job: str, status: Mapping[str, Any] | None, manifest: Mapping[s
     if prefix == "stock":
         if status.get("daily_close_status") == "failed":
             reasons.append("daily_close_failed")
-        if status.get("analysis_failure_class") not in (None, ""):
+        # The analysis set failed, or only its purchasing block did: a purchasing read or build failure
+        # still publishes the buying files, so it leaves analysis_failure_class null (#292).
+        if (status.get("analysis_failure_class") not in (None, "")
+                or status.get("analysis_purchasing_status") == "failed"):
             reasons.append("analysis_failed")
         if finished is not None and started is not None:
             seconds = (finished - started).total_seconds()
