@@ -2,7 +2,9 @@
 
 For people, and for their Claude Code or other AI agents. Point your agent at this file (or install it as a skill, see [Use it as a Claude Code skill](#use-it-as-a-claude-code-skill)) before you ask it about stock, sales, buying, purchasing, or what customers owe us and what we owe suppliers.
 
-A copy of this guide lives at the top of the Drive `Automation/Report` folder as `README - for AI agents.md`. The repository version (`docs/autocount2-automation/AC2_DATA_GUIDE.md` in the automation repository) is the source; if the two differ, the repository wins.
+A copy of this guide lives at the top of the Drive `Automation/Report` folder as `README - for AI agents.md`. The repository version (`docs/autocount2-automation/AC2_DATA_GUIDE.md` in the automation repository) is the source; if the two differ, the repository wins. A PR that changes AC2 data (files, fields, schedules or switches) updates this guide in the same PR, and the Drive copy is replaced after it merges.
+
+**Status (22 Nov 2026):** hourly stock balance, daily close, buying analysis and AR/AP aging are all live. The purchasing file is built but **off** (see [section 4](#4-purchasing-file-292)).
 
 Every example value in this guide is fake (`FAKE-0201`, `LOC-A`, `C-001`, `Example Vendor`). This repository is public: never add real figures, names, codes or folder IDs to it.
 
@@ -54,6 +56,7 @@ Full technical detail lives in the runbooks; this guide summarises them:
    - Drive may still hold an **older set** when `status` is `failed`, or when `delivery_status` is anything other than `handed_to_drive_sync_folder` (`copy_failed` or `verify_failed`; a failed run shows `skipped_failed_run`). Two real cases:
      - **AR/AP paused.** After the first supplier payment is knocked off against an invoice, every hourly AR/AP run fails with `failure_class: unknown_knockoff_target`. The status file then shows a recent time every hour, while the data stays at its last good hour.
      - **Stock copy failed.** A stock run can be `status: success` with `delivery_status: copy_failed`. The server built a new set, but Drive still holds the previous one.
+   - A failed stock or AR/AP run also emails the operations inbox (`[XB alert] AC2-STOCK` or `AC2-ARAP`), and the daily health check reports a job that stopped running. You do not need to report a stale file you notice; say it is stale in your answer.
 2. **Quote the data's as-of time** (rule 1) with every answer, and say which folder it came from.
 3. **Read fields by name, never by position.** The item index, the analysis files and the purchasing file are compact: rows are arrays, and each file carries its own field list (`fields`, `item_fields`, `stock_fields`, `po_fields` and so on). Look the position up from that list every time; new fields are appended in later versions. The other JSON is ordinary named keys: the manifests and status files are plain objects, and the rows of the stock feed (`negatives`, `low_stock`, `movers`) and of the AR/AP feed (`parties`, `docs`) are named-key objects.
 4. **Decode indexes.** Many values are indexes into a dictionary in the same file (`items`, `locations`, `groups`, `channels`, `vendors`, `brands`). Days are often offsets from `day0` or `history_from`.
@@ -118,7 +121,7 @@ Full technical detail lives in the runbooks; this guide summarises them:
 
 **Updates:** nightly, built by the first run after midnight, from data **up to yesterday** (never today). If the build fails, the previous set stays and the next hourly run retries. `analysis_manifest.json` says which close day the set was built from (`built_from_close_day`) and is written last; `last_run_status.json` shows `analysis_status` (`published`, `not_due`, `failed`, `skipped_failed_run` when the hourly run itself failed, or `disabled`).
 
-**Check it is switched on.** Analysis is off by default in the code. Use these files only when `analysis_status` is not `disabled` and `analysis_manifest.json` exists; otherwise say buying analysis is not available.
+**Check it is switched on.** Analysis is off by default in the code; it is switched on in the live export (22 Nov 2026). Use these files only when `analysis_status` is not `disabled` and `analysis_manifest.json` exists; otherwise say buying analysis is not available.
 
 **Units only.** No price, cost, sales value, customer, or document numbers.
 
@@ -157,7 +160,7 @@ So an unknown customer's sale counts as `wholesale`, not `other`.
 
 **Where:** `analysis_purchasing.json.gz` in the same folder, built with the buying files.
 
-**Status: only if switched on.** The code is merged but off by default. **Check `analysis_manifest.json`:** if its `files` list has no `analysis_purchasing.json.gz` (or it has no `purchasing` block with `status: published`), purchasing data is not available; do not read a stray old copy.
+**Status: only if switched on.** The code is merged but off by default, and it is **off in the live export** (22 Nov 2026): switching it on is an owner-approved step on the AC2 server. **Check `analysis_manifest.json`:** if its `files` list has no `analysis_purchasing.json.gz` (or it has no `purchasing` block with `status: published`), purchasing data is not available; do not read a stray old copy.
 
 **Contents:** `vendors` (names), `items`, `brands` (item brand), `groups`; rows with their own field lists:
 
@@ -303,8 +306,9 @@ When this guide changes in the repository, copy the new version over the old one
 
 ## Out of scope
 
-- Member sync, member benefits and member tags (#155, #268): they write to AutoCount and Shopify, not data extracts for reading.
-- The daily health check (#325): it reads the two `last_run_status.json` files above and emails the operations inbox; it holds no business data.
-- The read-only Drive mirror of this repository, EnergyGrid bills and SIMBA invoices: not AutoCount data.
+- Member sync, member core (member benefits) and member tags (#155, #268): they write to AutoCount and Shopify, not data extracts for reading.
+- The daily health check (#325): it reads the two `last_run_status.json` files above and emails the owner only when something needs a look; it holds no business data.
+- The error alert emails (#288): codes and counts only, no business data.
+- The Shopify kit re-tagger (#269), the read-only Drive mirror of this repository, EnergyGrid bills and SIMBA invoices: not AutoCount data.
 - The older Phase 1 extract and discovery scripts (for example `autocount_stock_extract.py`, `autocount_selected_surface_extract.py`, and the `autocount_inventory_*` and `*_discovery.py` scripts): they write local files on the server only, and nothing from them is in these Drive folders.
 - Money figures for stock and sales (cost, value, margin): not exported; a separate daily money package (#246) is planned.

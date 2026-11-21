@@ -224,6 +224,10 @@ Repository-local rules. Toolkit defines no marker for repository-local text, so 
 - The agent must still stop when no equivalent complete Toolkit n8n safety rules are available.
 - This clarification does not weaken any approval, credential, local-only, import/export, execution, activation, or deployment safety gate.
 
+### Live automation docs stay current
+
+- A PR that ships or changes a live automation updates the root README (and AC2_DATA_GUIDE.md when AC2 data changes) in the same PR.
+
 ### Temporary Toolkit #342 structural-impact compatibility rule
 
 `TEMPORARY TOOLKIT #342 COMPATIBILITY RULE — REMOVE AFTER PROPAGATED TOOLKIT RULE IS VERIFIED`
