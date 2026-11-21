@@ -291,10 +291,33 @@ class MonitorLinkTests(unittest.TestCase):
             self.assertEqual(ci.count(path), 3, path)  # trigger path, owned list, allowed list
         self.assertIn('-p "test_energygrid_monitor_error_log_workflow.py"', ci)
 
+    def test_m3_copy_points_at_live_sender(self):
+        # Live M3 (21 Nov) stopped: n8n 2.48.5 refused to publish the test copy because `Send Owner Alert Email`
+        # still held the export placeholder (a referenced sub-workflow must exist and be published). Controller
+        # ruling option 1: the copy calls the live published sender, as the live monitor does; alerts stay off.
+        package = MONITOR_README.read_text(encoding="utf-8")
+        start = package.index("| M3 |")
+        m3 = package[start:package.index("\n", start)]
+        for phrase in (
+            "**`Send Owner Alert Email` set to the live published `XB Ops Alert Email` workflow ID, the same as the "
+            "live monitor**",
+            "not the export placeholder `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID`",
+            "will not publish a workflow whose referenced sub-workflow is missing or not published",
+            "with `ENABLE_OWNER_ALERTS` false that node is never reached, so no email",
+            "**Each retry makes a new copy**",
+            "`_validateSubWorkflowReferences`",
+            "workflow-validation.service.ts",
+            "Please publish all referenced sub-workflows first",
+        ):
+            self.assertIn(phrase, m3)
+
     def test_m4_wording_matches_n8n_2_48_5(self):
-        # G2 recheck L7: at n8n 2.48.5 settings are kept on the workflow row and are not part of a version, and a
-        # PUT that is refused publication (403) has already saved them. So M4 checks for a draft before the PUT,
-        # undoes on a 403, and reads back the row's settings and an unchanged activeVersionId.
+        # G2 recheck L7: at n8n 2.48.5 settings are kept on the workflow row and are not part of a version. M4
+        # checks for a draft before the PUT and reads back the row's settings and an unchanged activeVersionId.
+        # G2 N-2: with publishIfActive=false a 403 comes from the scope checks before the save (nothing saved), but
+        # any other non-200 may leave the settings on the row and the monitor unpublished (a failed re-activation
+        # sets activeVersionId to null). So M4 undoes on any non-200 and stops if activeVersionId is not the
+        # backup's; it reads back an unchanged versionId; and it leaves staticData out of the PUT body.
         package = MONITOR_README.read_text(encoding="utf-8")
         start = package.index("| M4 |")
         m4 = package[start:package.index("\n", start)]
@@ -304,24 +327,39 @@ class MonitorLinkTests(unittest.TestCase):
             "**Before the PUT**, read back that `versionId` equals `activeVersionId`",
             "if they differ, **stop** and report",
             "`PUT /workflows/{id}?publishIfActive=false`",
+            "**exactly as the backup GET returned them**",
+            "**Leave `staticData` out of the PUT body**",
+            "a field left out is not written, so the dedupe state the 5-minute tick has saved since the backup is kept",
             "needs only `workflow:update`",
             "`workflow:activate`",
-            "**On a 403:**",
-            "settings are **already on the row**",
-            "Re-apply the backup's settings at once (Undo), read them back, report",
-            "do not go on to M5",
+            "**On any answer other than 200:**",
+            "the monitor may be **unpublished**",
+            "n8n sets `activeVersionId` to null",
+            "Re-apply the backup's settings at once (Undo",
+            "then read back `settings` and `activeVersionId`",
+            "If `activeVersionId` is not the backup's, **stop and report**",
+            "re-publishing needs `workflow:activate` and is the Controller's call",
+            "Do not go on to M5",
+            "a 403 comes from the `workflow:update` scope checks **before the save**, so on a 403 nothing was saved",
             "**HTTP 200**",
             "a GET shows `settings.errorWorkflow` = the M2 workflow and `settings.saveDataErrorExecution` = `none`",
             "`activeVersionId` is **unchanged** from the backup",
+            "`versionId` is **unchanged** from the backup",
             "`n8n@2.48.5`",
             "workflow-history.ts",
             "assertMayPublishOnSave",
-            "| Re-apply the backup's settings; read them back. |",
+            "workflow-entity-mapper.ts",
+            "base-workflow-public.dto.ts",
+            "@ApiKeyScope('workflow:update')",
+            "| Re-apply the backup's settings with `publishIfActive=false`; read back `settings`, `versionId` and "
+            "`activeVersionId`; if `activeVersionId` is not the backup's, stop and report (Controller's call). |",
         ):
             self.assertIn(phrase, m4)
-        # The wording L7 found inexact is gone: a 403 does change the row, and settings have no published version.
+        # Inexact wording is gone. L7: settings have no published version. N-2: with the flag a 403 saves nothing,
+        # undo covers every non-200 (not only a 403), and staticData is left out of the body, not "kept".
         for stale in ("nothing changed live", "the old version stays live", "**published** (active) version",
-                      "carries `errorWorkflow`"):
+                      "carries `errorWorkflow`", "keep `staticData`", "n8n saves first and then refuses",
+                      "**On a 403:**", "settings are **already on the row**"):
             self.assertNotIn(stale, package)
 
 
