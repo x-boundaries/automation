@@ -116,16 +116,16 @@ Rollback: re-apply the whole backup (nodes, settings and `staticData`) and read 
 | L7 | G2 / owner | G2 review of the exact head; owner merges. | owner merge | Revert PR. |
 | L2 | Work Claude | After L7, before L8: update the live `XB Ops Alert Email` with `KIT-RETAG` from the **merged** export, by the house procedure (`docs/daily_health_check.md`, #325 L1): back up the live sender, diff it node by node against the pre-PR export and stop on any drift beyond the known private values (recipient, table ID, Gmail credential binding); re-import from the merged export keeping those private values (local `.tmp` copy); re-publish; read back. | "OK re-import XB Ops Alert Email with KIT-RETAG" | Re-apply the backup taken from the live read; read back. |
 | L8 | Work Claude | Re-import the merged export by the procedure above (back up `staticData` first, re-apply, read back) if it differs from what ran, set `DRY_RUN` to `false` in the live copy, activate. | "OK activate kit re-tagger" | Deactivate; if it was re-imported, re-apply the backup (nodes, settings, `staticData`) and read back. |
-| L9 | PR #340 fix round | Daily health entry for the re-tagger (below). | (with #340) | With #340. |
+| L9 | Work Claude | After L8: bind the re-tagger in the live `XB Daily Health` (below): set `REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID` in `WATCH` to the live re-tagger's id by the health workflow's own update procedure (`docs/daily_health_check.md`: back up, diff node by node and stop on drift, keep every private value, publish, read back). | "OK bind kit re-tagger in daily health" | Re-apply the health workflow backup; read back. |
 
 L2 runs after the merge (L7) so that only a merged export goes into the shared, active sender. No email is needed before L8: dry runs send none, and an error at L4 or L6 is seen in the open editor.
 
-## Daily health (in PR #340's fix round)
+## Daily health (added by PR #340, now on main)
 
-`XB Daily Health` does not watch this workflow yet, and this PR does not edit it. Controller ruling, 21 Nov 2026: the daily health entry for the re-tagger is folded into PR #340's fix round. Its `error_runs` count (`errors: true`) needs saved failed executions, which this workflow does not keep (the access token is in item data), so that fix round adds:
+Controller ruling, 21 Nov 2026: the daily health entry for the re-tagger was folded into PR #340, which is merged; this PR does not edit `XB Daily Health`. Its `error_runs` count (`errors: true`) needs saved failed executions, which this workflow does not keep (the access token is in item data), so #340 added (`docs/daily_health_check.md`, "Kit re-tagger"):
 
-- a `WATCH.n8n_workflows` entry `{ id: 'REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID', label: 'kit re-tagger', errors: false }`, so an inactive or missing re-tagger shows; and
-- a count of `xb_alert_email_log` rows with `system` `KIT-RETAG` and `severity` `ERROR` in the 24 hours before the check (every error path here, the brake included, sends exactly one such alert), shown under the n8n workflows job like `alert_email_failed`.
+- a `WATCH.n8n_workflows` entry `{ id: 'REPLACE_WITH_KIT_RETAGGER_WORKFLOW_ID', label: 'kit re-tagger', errors: false, bind_later: true }`. It is skipped while the id is still its placeholder; Work Claude binds it at L9, and from then on an inactive or missing re-tagger is a FAIL; and
+- a count of `xb_alert_email_log` rows with `system` `KIT-RETAG` and `severity` `ERROR` in the 24 hours before the check (every error path here, both anomaly stops included, sends exactly one such alert): WARN `kit_retag_errors` under the n8n workflows job. It needs no id and stays at 0 until the re-tagger runs.
 
 Every error path already ends the run as failed (`End Run As Failed`), so if failed executions are ever kept, `errors: true` would count them too.
 

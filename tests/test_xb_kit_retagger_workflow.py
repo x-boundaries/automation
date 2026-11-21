@@ -425,7 +425,8 @@ class KitRetaggerShapeTests(KitRetaggerBase):
         self.assertIn("### xb_kit_retagger.workflow.json", readme)
         runbook = RUNBOOK.read_text(encoding="utf-8")
         for word in ("Custom Auth", "httpCustomAuth", "client_id", "client_secret", "L0", "L4", "L6", "L8",
-                     "OK kit re-tagger dry run", "Another tagger", "open n8n editor", "kitTagRecord", "#340",
+                     "OK kit re-tagger dry run", "Another tagger", "open n8n editor", "kitTagRecord", "#340", "bind_later",
+                     "OK bind kit re-tagger in daily health",
                      "stopped_outside_changes", "store-wide anomalies", "one vendor or type rename usually stays under"):
             self.assertIn(word, runbook)
         for gone in ("CHANGE_CAP", "REMOVE_CAP", "CAP_OVERRIDE", "DRYRUN", "includeData", "/api/v1/executions"):
