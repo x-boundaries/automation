@@ -517,6 +517,58 @@ class KitRetaggerRunbookTests(KitRetaggerBase):
         rules = self.section("Rules")
         self.assertIn("re-import procedure above (record kept)", rules)
 
+    def test_re_import_wording_is_pinned(self):
+        # G2 K-0 (#344 LATER): the N-1 sentences the first round left unpinned, plus the optional ones.
+        steps = self.section("Re-importing this workflow (keeps the record)")
+        for word in (
+            "(`publishIfActive` defaults to `true`)",
+            "on an active workflow `activeVersionId` changed and `activeVersion` carries the new nodes",
+            "that the settings and the `kitTagRecord` product count equal the backup's",
+            "**After a successful re-import that must be undone:**",
+            "the same PUT without `publishIfActive=false`",
+            "so the backup's nodes are published again",
+            "Not near the 03:00 SGT run",
+            "On an inactive workflow (L8 before activation) nothing is published",
+            "`UpdateWorkflowQueryDto` (`publishIfActive` default `true`)",
+        ):
+            self.assertIn(word, steps)
+
+    def test_re_import_later_wording(self):
+        # G2 L-A..L-D (#344 LATER), checked at n8n@2.48.5.
+        steps = self.section("Re-importing this workflow (keeps the record)")
+        for word in (
+            # L-A: workflow:publish is checked on the workflow (a share counts), not only on the project.
+            "the caller's `workflow:publish` permission on this workflow",
+            "a project role or a share of the workflow both count",
+            # L-B: after the 403 rollback versionId differs from activeVersionId, as expected.
+            "Afterwards `versionId` differs from `activeVersionId`",
+            "That is expected, not an unknown draft",
+            # L-C: default publication path in step 4, and case 3's example is the old path.
+            "`activeVersionId` changes as soon as the publication is queued and the triggers are registered a moment "
+            "later",
+            "a failed registration does not unpublish the workflow",
+            "with `N8N_USE_WORKFLOW_PUBLICATION_SERVICE=false`, a failed re-publication can leave the workflow "
+            "unpublished",
+            # L-D: the undo PUT must not roll back a record saved by a run since the re-import.
+            "first `GET` the workflow and note the current `kitTagRecord` product count",
+            "**without `staticData`** (a field left out is not written, so the current record is kept)",
+            "Send the backup's `staticData` only when the record itself must be undone",
+            "the record count equals the one noted just before the PUT",
+            "workflow-entity-mapper.ts",
+            "publication/trigger-diff.ts",
+        ):
+            self.assertIn(word, steps)
+        self.assertNotIn("on the project.", steps)
+        self.assertNotIn("(for example a failed re-publication left the workflow unpublished)", steps)
+        self.assertNotIn("the settings and the record count equal the backup's", steps)
+
+    def test_runbook_status_and_bound_health_entry(self):
+        # Part A is live (L0-L9 done, 21 Nov 2026); the bound WATCH entry keeps bind_later, which is then inert.
+        self.assertIn("**Status:** live since 21 Nov 2026. Steps L0-L9 are done", self.runbook)
+        health = self.section("Daily health (added by PR #340, now on main)")
+        self.assertIn("the `bind_later` flag can stay: it skips the entry only while the id still starts with "
+                      "`REPLACE_WITH_`", health)
+
     def test_a_rules_change_is_dry_run_first_and_never_brakes_on_the_owner(self):
         rules = self.section("Rules")
         for word in ("never gets an anomaly email for a planned change", "One editor dry run with the merged rules",
@@ -830,6 +882,19 @@ class KitRetaggerOutsideChangesTests(KitRetaggerBase):
         self.assertEqual((summary["new_person_removed"], summary["new_person_added"],
                           summary["left_alone_person_removed"], summary["left_alone_person_added"]), (0, 0, 0, 0))
         self.assertEqual(summary["brake_at"], 10)
+        self.assertEqual(after, before)  # nothing marked as seen
+
+    def test_a_tag_no_longer_wanted_and_taken_off_is_not_an_outside_change(self):
+        # G2 K-0 (T1-c): it added kit-hut to these 11 products; after a rules change they no longer want it, and a
+        # person took it off. Nothing is left to do, so nothing counts as an outside change (11 would hold the run).
+        start = record({num(600 + i): {"d": "2026-11-20", "t": {"kit-hut": "a"}} for i in range(11)})
+        products = [product(600 + i, title="Fake Plain Mug %d" % i, ptype="Mug") for i in range(11)]
+        before = copy.deepcopy(start)
+        plan, after = self.plan_full(pages_of(products), static=start, DRY_RUN=False)
+        summary = plan["summary"]
+        self.assertEqual((plan["mode"], plan["alert"], summary["held"], summary["braked"]),
+                         ("no_change", None, False, False))
+        self.assertEqual((summary["new_person_removed"], summary["left_alone_person_removed"]), (0, 0))
         self.assertEqual(after, before)  # nothing marked as seen
 
     def test_a_dry_run_shows_it_without_email(self):

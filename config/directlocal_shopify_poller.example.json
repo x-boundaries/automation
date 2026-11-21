@@ -1,8 +1,8 @@
 {
   "schema": "xb.directlocal.shopify_poller.config.v1",
   "state_root": "C:\\XB\\xb155-directlocal-poller",
-  "store_gid": "gid://shopify/Shop/48759472277",
-  "shop_domain": "xboundariessg.myshopify.com",
+  "store_gid": "gid://shopify/Shop/1",
+  "shop_domain": "example.myshopify.com",
   "api_version": "2026-07",
   "auth": {
     "method": "client_credentials",

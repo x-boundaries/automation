@@ -44,10 +44,10 @@ or chat.
    ```
 
    Expect `{"private": true, "status": "prepared"}`.
-2. Initialise the connector ledger (development book only):
+2. Initialise the connector ledger (development book only). Use the qualified store's GID and `*.myshopify.com` domain from `QUALIFIED_CONNECTOR_STORES` in `directlocal/xb_directlocal.py`:
 
    ```powershell
-   core init-ledger --mode connector --environment development --store-gid gid://shopify/Shop/48759472277 --shop-domain xboundariessg.myshopify.com
+   core init-ledger --mode connector --environment development --store-gid <store GID> --shop-domain <store domain>
    ```
 
    Expect `"autocount_book": "AED_TESTINGAPI"`.

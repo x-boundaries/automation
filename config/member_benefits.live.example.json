@@ -5,8 +5,8 @@
   "member_sync_state_root": "C:\\XB\\xb155-member-sync-live",
   "orders_start_utc": "2026-12-01T00:00:00Z",
   "shopify": {
-    "store_gid": "gid://shopify/Shop/48759472277",
-    "shop_domain": "xboundariessg.myshopify.com",
+    "store_gid": "gid://shopify/Shop/1",
+    "shop_domain": "example.myshopify.com",
     "api_version": "2026-10",
     "auth": {
       "method": "client_credentials",

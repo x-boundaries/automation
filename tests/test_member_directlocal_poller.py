@@ -306,7 +306,8 @@ class ConfigTests(PollerCase):
         self.assertEqual(config.autocount_write_mode, "none")
         self.assertFalse(config.profile_reads_enabled)
         self.assertEqual(config.full_scan_interval_hours, 24)
-        self.assertEqual((config.store_gid, config.shop_domain), next(iter(dl.QUALIFIED_CONNECTOR_STORES.items())))
+        # Placeholders, never the real store: the operator sets the qualified store's two values privately.
+        self.assertEqual((config.store_gid, config.shop_domain), ("gid://shopify/Shop/1", "example.myshopify.com"))
         text = EXAMPLE.read_text(encoding="utf-8")
         for marker in ("shpat_", "shpca_", "secret\": \"", "token\": \""):
             self.assertNotIn(marker, text)
@@ -474,7 +475,7 @@ class ClientTests(OfflineCase):
 
     def test_real_transport_refuses_non_shopify_hosts_before_any_socket(self):
         transport = direct.UrllibTransport()
-        for url in (f"https://{DOMAIN}/admin/api/{API_VERSION}/graphql.json", "http://xboundariessg.myshopify.com/x", "https://xboundariessg.myshopify.com:8443/x", "https://evil.example/x"):
+        for url in (f"https://{DOMAIN}/admin/api/{API_VERSION}/graphql.json", "http://example.myshopify.com/x", "https://example.myshopify.com:8443/x", "https://evil.example/x"):
             with self.subTest(url=url), self.assertRaises(direct.ShopifyDirectError) as raised:
                 transport(url, b"{}", {}, 5)
             self.assertEqual(raised.exception.code, "shopify_host_not_allowed")

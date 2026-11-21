@@ -38,6 +38,21 @@ TEST_BOOK = "AED_TESTINGAPI"
 PROD_BOOK = "AED_XBOUNDARIES"
 
 
+# The committed example configs carry placeholders, never the real store (as member_tags.live.example.json
+# does, Controller answer 5). A test that needs one to parse copies the qualified store's two values in, as the
+# operator does in the private config.
+PLACEHOLDER_STORE = ("gid://shopify/Shop/1", "example.myshopify.com")
+((QUALIFIED_GID, QUALIFIED_DOMAIN),) = dl.QUALIFIED_CONNECTOR_STORES.items()
+
+
+def example_config(name: str) -> dict:
+    value = json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+    shopify = value["shopify"]
+    assert (shopify["store_gid"], shopify["shop_domain"]) == PLACEHOLDER_STORE, name
+    shopify.update(store_gid=QUALIFIED_GID, shop_domain=QUALIFIED_DOMAIN)
+    return value
+
+
 def sg(n: int) -> str:
     """Reserved fake Singapore number ``65`` + ``8000`` + 4 digits (n 1-99)."""
 
@@ -390,7 +405,7 @@ class ConfigTests(unittest.TestCase):
             sync.parse_config(config_value(shopify_create_tags=["member-mg"]))
 
     def test_example_config_parses_with_writes_off(self):
-        example = json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.example.json")
         config = sync.parse_config(example)
         self.assertEqual(config.autocount_book, TEST_BOOK)
         self.assertFalse(config.ac2_create_enabled or config.shopify_create_enabled)
@@ -3482,7 +3497,7 @@ class GoLiveEngineExtrasTests(GoLiveTestCase):
         self.assertIsNone(sync._bridge_refusal("not json"))
 
     def test_live_example_config_fails_until_its_placeholders_are_set(self):
-        example = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.live.example.json")
         with self.assertRaises(dl.DirectLocalError) as caught:
             sync.parse_config(example)
         self.assertEqual(caught.exception.code, "sync_config_cutover_invalid")
@@ -3493,7 +3508,7 @@ class GoLiveEngineExtrasTests(GoLiveTestCase):
         self.assertEqual((config.autocount_book, config.ac2_create_member_type, config.ac2_credential_target), (PROD_BOOK, "Default", "XB-AC2-MemberSync"))
         self.assertFalse(config.ac2_create_enabled or config.shopify_create_enabled or config.initial_link_enabled or config.ac2_create_without_phone)
         self.assertIsNone(config.changelog_xml_column)
-        test_example = sync.parse_config(json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8")))
+        test_example = sync.parse_config(example_config("member_sync.example.json"))
         self.assertNotEqual(config.state_root, test_example.state_root)
 
 
@@ -3800,7 +3815,7 @@ class ImmediateCreateConfigTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "sync_config_keys_invalid")
 
     def test_live_example_config_allows_all_hours_with_every_switch_off(self):
-        example = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.live.example.json")
         example["shopify_cutover_utc"] = dl.ts(CUTOVER)
         config = sync.parse_config(example)
         self.assertEqual((config.immediate_create_window_local, config.max_creates_per_hour, config.max_creates_per_day), ("all_day", 6, 144))
@@ -5216,7 +5231,7 @@ class BackfillConfigTests(unittest.TestCase):
         self.assertNotIn("xb268", json.dumps(on))  # the path itself is never printed
 
     def test_live_example_config_is_unchanged_and_still_parses(self):
-        example = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.live.example.json")
         self.assertNotIn("backfill_registrations_enabled", example)
         example["shopify_cutover_utc"] = dl.ts(CUTOVER)
         self.assertFalse(sync.parse_config(example).backfill_registrations_enabled)
@@ -7042,7 +7057,7 @@ class Bf2ConfigTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "sync_config_backfill_members_enabled_invalid")
 
     def test_live_example_birthday_field_is_the_live_text_field(self):
-        example = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.live.example.json")
         self.assertEqual(example["birthday_month_metafield"], {"namespace": "membership", "key": "birthday_month", "type": "single_line_text_field"})
         self.assertNotIn("backfill_members_enabled", example)  # not needed in the live config
         self.assertEqual(sync._CONFIG_DEFAULTS["birthday_month_metafield"], {"namespace": "custom", "key": "birthday_month", "type": "number_integer"})
@@ -7093,9 +7108,9 @@ class Bf2bConfigTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "sync_config_backfill_members_max_per_call_invalid")
 
     def test_sync_example_carries_the_caps_at_null_and_the_live_example_never(self):
-        example = json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.example.json")
         self.assertEqual((example["backfill_members_max_per_call"], example["backfill_members_max_per_hour"]), (None, None))
-        live = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        live = example_config("member_sync.live.example.json")
         self.assertNotIn("backfill_members_max_per_call", live)
         self.assertNotIn("backfill_members_max_per_hour", live)
 
@@ -8264,10 +8279,10 @@ class FormsConfigTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "sync_config_keys_invalid")
 
     def test_the_sync_example_carries_the_keys_at_their_defaults_and_the_live_example_never(self):
-        example = json.loads((ROOT / "config" / "member_sync.example.json").read_text(encoding="utf-8"))
+        example = example_config("member_sync.example.json")
         self.assertEqual((example["forms_watch_enabled"], example["forms_watch_since"], example["forms_watch_max_pages"]), (False, None, 4))
         self.assertEqual(sync.parse_config(example).summary(), sync.parse_config({k: v for k, v in example.items() if not k.startswith("forms_")}).summary())
-        live = json.loads((ROOT / "config" / "member_sync.live.example.json").read_text(encoding="utf-8"))
+        live = example_config("member_sync.live.example.json")
         self.assertFalse(any(key.startswith("forms_") for key in live))  # the live task at an older commit refuses unknown keys
 
     def test_constants_are_the_flow_contract(self):

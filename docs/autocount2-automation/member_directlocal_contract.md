@@ -22,7 +22,7 @@ The mode, environment and book are fixed by `init-ledger` and can never change
 | Mode | Environment / book | Bridge accepted | Store |
 |---|---|---|---|
 | `synthetic` | `synthetic` / none | Only the test-only `SYNTHETIC_BRIDGE_TARGET` fake; the real `BridgeClient` is refused (`real_autocount_refused_synthetic_ledger`) before any spawn or state change | `*.synthetic.invalid` |
-| `connector` | `development` / `AED_TESTINGAPI` | Only a real bridge bound to the same book (`bridge_book_binding_mismatch` otherwise), and only while the state root is private | The qualified store pin `gid://shopify/Shop/48759472277` / `xboundariessg.myshopify.com` |
+| `connector` | `development` / `AED_TESTINGAPI` | Only a real bridge bound to the same book (`bridge_book_binding_mismatch` otherwise), and only while the state root is private | The qualified store pin (`QUALIFIED_CONNECTOR_STORES` in `directlocal/xb_directlocal.py`: the store's GID and its `*.myshopify.com` domain) |
 | `connector` | `production` / `AED_XBOUNDARIES` | Refused at init (`production_environment_not_authorised`). Gate E9 needs a separately approved source change | - |
 
 Bridge entrypoint (`ac2_directlocal_member_bridge.ps1`): without
