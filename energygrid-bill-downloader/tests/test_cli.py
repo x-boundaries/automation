@@ -992,6 +992,21 @@ class CliTests(unittest.TestCase):
             '          python -m unittest discover -s tests -p "test_energygrid_owner_email_workflow.py" -v',
             "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
         ],
+        # #316 C2: the offline validator, so a change to the Owner Email export is validated in CI.
+        "- name: EnergyGrid n8n exports offline validator": [
+            "      - name: EnergyGrid n8n exports offline validator",
+            "        if: matrix.shard == 'rest'",
+            "        shell: pwsh",
+            "        run: |",
+            "          $output = @(node n8n-workflows/scripts/validate-n8n-workflows.cjs)",
+            "          $code = $LASTEXITCODE",
+            "          $output | ForEach-Object { Write-Host $_ }",
+            "          if ($code -ne 0) { exit $code }",
+            "          if (-not ($output -match "
+            "'^Checked n8n-workflows[\\\\/]energygrid_owner_email\\.workflow\\.json: ')) {",
+            '            throw "The validator did not check the EnergyGrid Owner Email export."',
+            "          }",
+        ],
     }
     # One-off steps gated to the rest leg; the artifact name must not repeat across legs.
     _CI_REST_ONLY_STEPS = {
@@ -1247,12 +1262,57 @@ class CliTests(unittest.TestCase):
                 "      - name: PowerShell parse-only check\n        if: matrix.shard == 'rest'\n",
                 "      - name: PowerShell parse-only check\n",
             ),
+            # #316 C2: the offline validator step cannot be skipped, masked or narrowed.
+            "validator step on no leg": (
+                "      - name: EnergyGrid n8n exports offline validator\n        if: matrix.shard == 'rest'\n",
+                "      - name: EnergyGrid n8n exports offline validator\n        if: false\n",
+            ),
+            "validator ; exit 0": (
+                "validate-n8n-workflows.cjs)\n", "validate-n8n-workflows.cjs); exit 0\n",
+            ),
+            "validator exit code ignored": ("          if ($code -ne 0) { exit $code }\n", ""),
+            "validator owner email check dropped": (
+                '            throw "The validator did not check the EnergyGrid Owner Email export."\n', "",
+            ),
+            "validator step renamed away": (
+                "      - name: EnergyGrid n8n exports offline validator\n",
+                "      - name: EnergyGrid n8n exports offline check\n",
+            ),
         }
         for label, (old, new) in mutations.items():
             with self.subTest(mutation=label):
                 self.assertEqual(workflow.count(old), 1, label)
                 mutated = workflow.replace(old, new)
                 self.assertNotEqual(self._ci_shard_guard_violations(mutated, runner.SHARDS), [], label)
+
+    def test_owner_email_export_change_runs_the_offline_validator(self) -> None:
+        """#316 C2: a change to the Owner Email export triggers this workflow, and its job runs the
+        offline n8n validator and requires the export to be among the checked files."""
+        import re
+
+        export = "n8n-workflows/energygrid_owner_email.workflow.json"
+        workflow = self._CI_WORKFLOW.read_text(encoding="utf-8")
+        lines = workflow.splitlines()
+        trigger = lines[lines.index("  pull_request:"):lines.index("  workflow_dispatch: {}")]
+        self.assertIn(f'      - "{export}"', trigger)
+        step = self._CI_PINNED_STEPS["- name: EnergyGrid n8n exports offline validator"]
+        self.assertIn("          $output = @(node n8n-workflows/scripts/validate-n8n-workflows.cjs)", step)
+        self.assertEqual(self._ci_shard_guard_violations(workflow, self._load_project_suite_runner().SHARDS), [])
+
+        # The step's check, applied to validator output lines (Windows and POSIX separators).
+        pattern = re.search(r"-match '([^']+)'", "\n".join(step)).group(1)
+        for line in (
+            r"Checked n8n-workflows\energygrid_owner_email.workflow.json: 27 node(s).",
+            "Checked n8n-workflows/energygrid_owner_email.workflow.json: 27 node(s).",
+        ):
+            self.assertRegex(line, pattern)
+        for line in (
+            r"Checked n8n-workflows\energygrid_drive_verify.workflow.json: 12 node(s).",
+            r"Checked n8n-workflows\energygrid_owner_emailXworkflow.json: 27 node(s).",
+            r"Review before any test or run: n8n-workflows\energygrid_owner_email.workflow.json has 5 node(s)",
+            "Summary: workflows checked 19, errors 0, warnings 16, result PASS.",
+        ):
+            self.assertNotRegex(line, pattern)
 
     def test_invalid_cli_returns_contract_exit_code(self) -> None:
         self.assertEqual(main([]), 64)
