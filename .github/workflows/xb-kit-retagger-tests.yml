@@ -4,14 +4,16 @@ on:
   pull_request:
     paths:
       # XB Kit Re-tagger (#269): the inactive export, its focused offline test, its rules fixture,
-      # its runbook, the shared sender whose validator the test runs, and the offline validator.
-      # Exact entries keep the trigger surface owned.
+      # its runbook, the shared sender whose validator the test runs, the offline validator, and
+      # the repo-root policy file that validator reads (#316 G2 L1). Exact entries keep the trigger
+      # surface owned.
       - "n8n-workflows/xb_kit_retagger.workflow.json"
       - "tests/test_xb_kit_retagger_workflow.py"
       - "tests/fixtures/xb_kit_rules_v1.fixture"
       - "docs/xb_kit_retagger.md"
       - "n8n-workflows/ops_alert_email.workflow.json"
       - "n8n-workflows/scripts/validate-n8n-workflows.cjs"
+      - "n8n-workflow-policy.json"
       - ".github/workflows/xb-kit-retagger-tests.yml"
   workflow_dispatch: {}
 

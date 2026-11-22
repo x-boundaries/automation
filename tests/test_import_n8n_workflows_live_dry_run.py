@@ -29,10 +29,15 @@ NODE_OPTIONS --require preload that answers each Docker call the helper makes fr
 folder and logs every call. The preload acts only when the executable is docker.exe, so the
 helper's own node calls are unaffected. The test also removes every other folder holding a
 docker.exe from PATH and points DOCKER_HOST at a pipe that does not exist, so no real Docker
-daemon, n8n instance or credential is reachable.
+daemon, n8n instance or credential is reachable. The helper starts `docker` through .NET
+Process.Start, so Windows CreateProcess looks in the working folder and the system folders before
+PATH: the stub is also copied into the fixture repository root (the helper's working folder), or a
+runner image with docker.exe in System32 would run the real CLI (seen on GitHub's windows-latest).
 
-Not in CI: like before the rewrite, this module is excluded from the CI suites
-(tests/_run_ci_full_suite.py) and is run locally on the Windows server PC:
+CI (#316 G2 L7): the full suites (tests/_run_ci_full_suite.py) still leave this module out. It runs
+in its own windows-latest job, live-import-dry-run in .github/workflows/n8n-export-guards.yml, on any
+change under n8n-workflows/, to n8n-workflow-policy.json or to this file; that job fails if any test
+here is skipped. To run it locally on the Windows server PC:
 
     python -m unittest tests.test_import_n8n_workflows_live_dry_run -v
 """
@@ -220,7 +225,11 @@ class ImportHelperOfflineContractTest(unittest.TestCase):
         return os.pathsep.join([str(self.stub_dir)] + kept)
 
     def _run_import(self, extra_args):
-        env = os.environ.copy()
+        # CreateProcess (the helper's Process.Start) and node's spawn search the working folder before
+        # System32 and PATH, so the stub there wins over any system docker.exe. Keep that search on.
+        shutil.copy(self.stub_dir / "docker.exe", self.repo / "docker.exe")
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() != "NODEFAULTCURRENTDIRECTORYINEXEPATH"}
         env["PATH"] = self._offline_path(env.get("PATH", ""))
         env["DOCKER_HOST"] = DEAD_DOCKER_HOST
         env["DOCKER_STUB_STATE"] = str(self.state)

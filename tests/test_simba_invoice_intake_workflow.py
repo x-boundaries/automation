@@ -590,5 +590,19 @@ class PdfAndUploadTests(unittest.TestCase):
         self.assertFalse(failed_put["ok"])
 
 
+class CiTriggerTests(unittest.TestCase):
+    """#316 G2 L1: the offline validator job reads the repo-root n8n-workflow-policy.json, so a pull
+    request that changes only that file must run this workflow (a narrowed or invalid policy would
+    otherwise go green here and turn main red later). Files only."""
+
+    def test_the_policy_file_and_the_validator_trigger_the_job(self) -> None:
+        text = (REPO_ROOT / ".github" / "workflows" / "simba-invoice-intake-tests.yml").read_text(encoding="utf-8")
+        paths = text.split("\non:\n", 1)[1].split("\n  workflow_dispatch:", 1)[0]
+        listed = re.findall(r'^      - "([^"]+)"$', paths, re.MULTILINE)
+        for path in ("n8n-workflow-policy.json", "n8n-workflows/scripts/validate-n8n-workflows.cjs"):
+            self.assertEqual(listed.count(path), 1, path)
+        self.assertIn("run: node n8n-workflows/scripts/validate-n8n-workflows.cjs", text)
+
+
 if __name__ == "__main__":
     unittest.main()

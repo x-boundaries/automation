@@ -162,6 +162,8 @@ So an unknown customer's sale counts as `wholesale`, not `other`.
 
 **Status: only if switched on.** The code is off by default; it was **switched on in the live export on 22 Nov 2026**, with the same file name and fields as described here (the first nightly confirmation is due on 23 Nov 2026). It can be switched off again, so still **check `analysis_manifest.json`:** if its `files` list has no `analysis_purchasing.json.gz` (or it has no `purchasing` block with `status: published`), purchasing data is not available; do not read a stray old copy.
 
+**If the purchasing build fails:** the buying files are still published, but the status file's `analysis_purchasing_status` is `failed`, and since PR #351 that raises a WARN `analysis_failed` in XB Daily Health, so it shows in the 07:30 morning health email (see [daily_health_check.md](../daily_health_check.md)). The manifest's `purchasing` block then has `status: failed` and its `files` list has no `analysis_purchasing.json.gz`: treat purchasing as unavailable for that night.
+
 **Contents:** `vendors` (names), `items`, `brands` (item brand), `groups`; rows with their own field lists:
 
 - `po_rows` (`item, vendor, po_day, ordered, transferred, open, lines, open_lines, over_lines, age_days, stale, group`): `open` = ordered minus received against the line, never below 0; `stale` = still open more than 60 days after the PO date;

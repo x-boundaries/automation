@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       # SIMBA invoice intake (#244): the inactive export, its focused offline test, its runbook,
-      # and the offline validator it is checked with. Exact entries keep the trigger surface owned.
+      # the offline validator it is checked with, and the repo-root policy file that validator reads
+      # (#316 G2 L1). Exact entries keep the trigger surface owned.
       - "n8n-workflows/simba_invoice_intake.workflow.json"
       - "tests/test_simba_invoice_intake_workflow.py"
       - "docs/simba_invoice_intake.md"
       - "n8n-workflows/scripts/validate-n8n-workflows.cjs"
+      - "n8n-workflow-policy.json"
       - ".github/workflows/simba-invoice-intake-tests.yml"
   workflow_dispatch: {}
 

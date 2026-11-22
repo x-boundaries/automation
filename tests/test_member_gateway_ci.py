@@ -98,6 +98,8 @@ class MemberGatewayCiTests(unittest.TestCase):
             '"schemas/member_gateway_operator_status.v1.schema.json"',
             '"schemas/member_gateway_operator_reconciliation.v1.schema.json"',
             '"member_gateway/migrations/0004_forms_ingest_cursor.sql"',
+            # #316 G2 L1: the validator job reads the repo-root policy file, so a policy-only change runs it.
+            '"n8n-workflow-policy.json"',
         ):
             self.assertEqual(self.text.count(required_path), 2, required_path)
 

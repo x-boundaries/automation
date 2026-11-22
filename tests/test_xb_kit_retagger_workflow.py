@@ -443,7 +443,9 @@ class KitRetaggerShapeTests(KitRetaggerBase):
         ci = CI.read_text(encoding="utf-8")
         for path in ("n8n-workflows/xb_kit_retagger.workflow.json", "tests/test_xb_kit_retagger_workflow.py",
                      "tests/fixtures/xb_kit_rules_v1.fixture", "docs/xb_kit_retagger.md",
-                     "n8n-workflows/ops_alert_email.workflow.json", ".github/workflows/xb-kit-retagger-tests.yml"):
+                     "n8n-workflows/ops_alert_email.workflow.json", ".github/workflows/xb-kit-retagger-tests.yml",
+                     # #316 G2 L1: the validator reads the repo-root policy file, so a policy-only change runs it.
+                     "n8n-workflow-policy.json"):
             self.assertIn('- "%s"' % path, ci)
         self.assertNotIn("**", ci)
         self.assertIn("python -m unittest tests.test_xb_kit_retagger_workflow -v", ci)

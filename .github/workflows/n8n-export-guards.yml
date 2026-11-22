@@ -5,11 +5,18 @@ name: n8n-export-guards
 # request that adds or changes an n8n export without touching a listed file skipped them. This job
 # runs both guards on any change under n8n-workflows/. Offline: files only, fake data only; no
 # secret, credential or live system is used. tests/test_n8n_export_guards_ci.py pins this file.
+#
+# live-import-dry-run (#316 G2 L7): the live-import helper's offline contract test. Docker is a
+# stub (no Docker engine, n8n instance or credential is reached), so it runs on a stock Windows
+# runner. The full suites (tests/_run_ci_full_suite.py) still leave it out; it runs here, on any
+# change to the helpers, the exports or the policy file they are validated with.
 
 on:
   pull_request:
     paths:
       - "n8n-workflows/**"
+      - "n8n-workflow-policy.json"
+      - "tests/test_import_n8n_workflows_live_dry_run.py"
       - "tests/test_no_telegram_nodes.py"
       - "tests/test_n8n3_always_output_data_guard.py"
       - "tests/test_n8n_export_guards_ci.py"
@@ -44,3 +51,32 @@ jobs:
       - name: No Telegram node and no Always Output Data on a multi-output node
         shell: bash
         run: python -m unittest tests.test_no_telegram_nodes tests.test_n8n3_always_output_data_guard tests.test_n8n_export_guards_ci -v
+  live-import-dry-run:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "expected: ${EXPECTED_SHA}"
+          echo "actual:   ${ACTUAL_SHA}"
+          test -n "${EXPECTED_SHA}"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Live-import helper offline contract (Docker stubbed), no test skipped
+        shell: bash
+        run: |
+          python -m unittest tests.test_import_n8n_workflows_live_dry_run -v 2>&1 | tr -d '\r' | tee live-import-dry-run.log
+          grep -qx "OK" live-import-dry-run.log
