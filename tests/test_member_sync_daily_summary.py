@@ -470,6 +470,37 @@ class DecisionTests(SummaryTestCase):
         self.assertEqual(stops, [c for c in summary.STOP_CODES if c not in ("task_state_unavailable", "check_config_failed", "digest_failed")])
         self.assertEqual(auto_off, list(summary.AUTO_OFF_CODES))
 
+    def test_317_an_unreadable_part_never_stops_with_the_codes_it_replaces(self):
+        # PR #317 G2 LATER 6 (carried): the n8n node's fit() cannot shorten the STOP line, and a line with 13 to 15
+        # stop codes is over 300 characters. decide() never gives one: each "could not read" stop replaces the
+        # codes that need that part, so at most 12 codes. tests/test_member_sync_daily_summary_workflow.py checks
+        # that the 12-code line fits.
+        replaces = {
+            "task_state_unavailable": {"task_last_result", "task_disabled"},
+            "check_config_failed": {"config_unexpected", "writes_over_cap"},
+            "digest_failed": {"no_runs", "unfinished_runs", "shopify_write", "uncertain_writes", "possible_duplicate_member",
+                              "member_type_unknown", "login_refused", "writes_over_cap", "alert_unexpected"},
+        }
+        worst_task = summary.task_section(task_fixture(last_result=1, state="Disabled"))
+        worst_config = summary.config_section(config_fixture(ac2_create_member_type="X"), True)
+        worst_digest = summary.digest_section(digest_fixture(runs={"completed": 0, "unfinished": 5}, counts={"shopify_customer_created": 1},
+                                                             opened={"uncertain_writes": 2}, creates={"writes_per_hour_max": 99},
+                                                             alerts={"possible_duplicate_member": 1, "member_type_unknown": 1,
+                                                                     "autocount_x": 1, "zzz_new": 1}), None)
+        for task_ok in (True, False):
+            for config_ok in (True, False):
+                for digest_ok in (True, False):
+                    with self.subTest(task=task_ok, config=config_ok, digest=digest_ok):
+                        stops, _ = summary.decide(worst_task if task_ok else summary.task_section(None),
+                                                  worst_config if config_ok else summary.config_section(None, None),
+                                                  worst_digest if digest_ok else summary.digest_section(None, None), "GUEST")
+                        for code, ok in (("task_state_unavailable", task_ok), ("check_config_failed", config_ok),
+                                         ("digest_failed", digest_ok)):
+                            self.assertEqual(code in stops, not ok, code)
+                            if not ok:
+                                self.assertFalse(replaces[code] & set(stops), code)
+                        self.assertLessEqual(len(stops), 12)
+
 
 # ------------------------------------------------------------------------------------------------
 # Event privacy, history, SQL

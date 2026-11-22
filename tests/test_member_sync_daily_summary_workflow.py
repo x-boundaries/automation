@@ -607,6 +607,38 @@ def v1_golden_bodies():
     ]
 
 
+# The lists fit() may cut, by their id in the n8n node, with the label each one's line starts with.
+CUT_LISTS = {"members": "Members per type: ", "sync_refs": "Alert refs: ", "tags_alerts": "Tags alerts 24h: ",
+             "core_alerts": "Member core alerts 24h (runs): ", "sync_alerts": "Alerts 24h (runs): "}
+
+
+def cut_order_body(sync_alert_codes):
+    """The worst case with both tools on, but only the first ``sync_alert_codes`` sync alert codes (plus the two stop
+    alerts, so the stop line is the same): a smaller sync alert list leaves room, so fit() cuts fewer lists."""
+
+    parts = worst_v1_parts()
+    alerts = parts["digest"]["alerts"]
+    kept = dict(sorted(alerts.items())[:sync_alert_codes])
+    kept.update({code: alerts[code] for code in ("possible_duplicate_member", "member_type_unknown")})
+    parts["digest"]["alerts"] = kept
+    core, tags = worst_tools()
+    return build(**parts, member_tools={"member_core": core, "tags": tags})
+
+
+def list_state(lines, label):
+    """(entries kept, K of "+K more") of one list in the email lines; a list may wrap onto "  " lines."""
+
+    start = next(i for i, line in enumerate(lines) if line.startswith(label))
+    text = lines[start][len(label):]
+    for line in lines[start + 1:]:
+        if not line.startswith("  "):
+            break
+        text += " " + line.strip()
+    entries = [part for part in text.replace(" (refs: digest on the VM)", "").split(", ") if part]
+    more = [int(m.group(1)) for m in [re.fullmatch(r"\+(\d+) more \(see the VM record\)", e) for e in entries] if m]
+    return len(entries) - len(more), (more[0] if more else 0)
+
+
 def _digest_failed_event():
     event = summary.build_event(now=NOW, task=summary.task_section(None), config=summary.config_section(None, None),
                                 digest=summary.digest_section(None, None), members=summary.members_section(None, "config_unavailable"),
@@ -894,6 +926,45 @@ class WiringWorkflowTests(unittest.TestCase):
             line = next(line for line in lines if line.startswith(prefix))
             self.assertRegex(line, MORE_RE)
             self.assertLessEqual(len(line), 300)
+
+    def test_317_the_cut_order_staircase_cuts_each_list_only_after_the_ones_before(self):
+        # PR #317 G2 recheck LATER 2: the worst case cuts every list, so it cannot tell the order apart. These
+        # bodies grow the sync alert list one step at a time, so the partial cut lands on each list in turn:
+        # members, then refs, then tags, then member core, then the sync alerts. Entries are (kept, "+K more").
+        # Before any cut, the two one-line tool lists hold only what fits on their line (3 and 2 codes).
+        staircase = {
+            4: {"members": (12, 0), "sync_refs": (5, 0), "tags_alerts": (3, 17), "core_alerts": (2, 18), "sync_alerts": (5, 0)},
+            8: {"members": (4, 8), "sync_refs": (5, 0), "tags_alerts": (3, 17), "core_alerts": (2, 18), "sync_alerts": (9, 0)},
+            12: {"members": (0, 12), "sync_refs": (2, 3), "tags_alerts": (3, 17), "core_alerts": (2, 18), "sync_alerts": (13, 0)},
+            16: {"members": (0, 12), "sync_refs": (0, 5), "tags_alerts": (1, 19), "core_alerts": (2, 18), "sync_alerts": (17, 0)},
+            17: {"members": (0, 12), "sync_refs": (0, 5), "tags_alerts": (0, 20), "core_alerts": (1, 19), "sync_alerts": (18, 0)},
+            19: {"members": (0, 12), "sync_refs": (0, 5), "tags_alerts": (0, 20), "core_alerts": (0, 20), "sync_alerts": (18, 2)},
+        }
+        results = self.run_cases([cut_order_body(n) for n in staircase])
+        for (n, expected), result in zip(staircase.items(), results):
+            with self.subTest(sync_alert_codes=n):
+                lines = result["out"][0]["json"]["lines"]
+                self.assertLessEqual(len(lines), 30)
+                self.assertLessEqual(len("\n".join(lines)), 4000)
+                self.assertTrue(all(len(line) <= 300 for line in lines))
+                self.assertEqual({name: list_state(lines, label) for name, label in CUT_LISTS.items()}, expected)
+
+    def test_317_the_longest_reachable_stop_line_fits_on_one_line(self):
+        # PR #317 G2 LATER 6 (carried): fit() never cuts the STOP line, so a STOP line over 300 characters would make
+        # it cut every list and still fail. Only 13 to 15 stop codes do that, and decide() gives at most 12
+        # (tests/test_member_sync_daily_summary.py). With the fixed Next added to it (#354), the 12-code line fits.
+        reachable = [c for c in summary.STOP_CODES if c not in ("task_state_unavailable", "check_config_failed", "digest_failed")]
+        core, tags = worst_tools()
+        bodies = [build(**worst_v1_parts()), build(**worst_v1_parts(), member_tools={"member_core": core, "tags": tags})]
+        for body in bodies:
+            self.assertEqual(body["stop_reasons"], reachable)
+        for prefix, result in zip(("STOP reasons: ", "Sync STOP: "), self.run_cases(bodies)):
+            with self.subTest(prefix=prefix):
+                lines = result["out"][0]["json"]["lines"]
+                (line,) = [line for line in lines if line.startswith(prefix)]
+                self.assertEqual(line, prefix + ", ".join(reachable) + ". Next: forward this email to Claude.")
+                self.assertLessEqual(len(line), 300)
+                self.assertTrue(all(len(other) <= 300 for other in lines))
 
 
 class ErrorsOnlyShapeTests(unittest.TestCase):
