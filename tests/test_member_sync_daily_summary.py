@@ -796,6 +796,7 @@ class SendTests(SummaryTestCase):
     def test_the_headers_are_cleared_after_every_send(self):
         for status, error, outcome in (
             (200, None, ("sent", 200, None)),
+            (202, None, ("logged_clean", 202, None)),
             (403, None, ("send_failed", 403, "http_status")),
             (None, OSError("down"), ("send_failed", None, "no_answer")),
         ):
@@ -832,6 +833,9 @@ class SendTests(SummaryTestCase):
     def test_send_failure_is_recorded_and_never_fails_the_task(self):
         for poster, status, http_status, error in (
             (Poster(status=502), "send_failed", 502, "http_status"),
+            # #288 slice 3: only 200 (emailed) and 202 (CLEAN, logged) are answers n8n gives on success.
+            (Poster(status=201), "send_failed", 201, "http_status"),
+            (Poster(status=204), "send_failed", 204, "http_status"),
             (Poster(status=500), "send_failed", 500, "http_status"),
             (Poster(status=400), "send_failed", 400, "http_status"),
             (Poster(error=OSError("unreachable")), "send_failed", None, "no_answer"),
@@ -2524,7 +2528,11 @@ class FormsSummaryTests(SummaryTestCase):
     def test_the_n8n_event_shape_is_unchanged(self):
         event = self.daily_with(forms_block(sign_up=hours_ago(1), **FORMS_COUNTS))
         self.assertEqual(tuple(event), summary.EVENT_KEYS)
-        self.assertNotIn("forms_", WORKFLOW.read_text(encoding="utf-8"))  # FH1 does not touch the n8n workflow
+        # FH1 does not touch the n8n workflow's event handling. #288 slice 3 errors only (owner 22 Nov 2026): its gate
+        # names exactly one forms code, the forms watch's WARN, so a CLEAN morning with that WARN is still emailed.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("'%s'" % summary.FORMS_FLOW_SILENT, text)
+        self.assertNotIn("forms_", text.replace(summary.FORMS_FLOW_SILENT, ""))
 
 
 if __name__ == "__main__":
