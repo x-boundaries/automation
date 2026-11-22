@@ -539,10 +539,14 @@ class KitRetaggerRunbookTests(KitRetaggerBase):
         for word in (
             # L-A: workflow:publish is checked on the workflow (a share counts), not only on the project.
             "the caller's `workflow:publish` permission on this workflow",
-            "a project role or a share of the workflow both count",
+            # Round 2 L-A: an instance-wide (global) role counts too.
+            "an instance-wide (global) role, a project role or a share of the workflow all count",
             # L-B: after the 403 rollback versionId differs from activeVersionId, as expected.
             "Afterwards `versionId` differs from `activeVersionId`",
             "That is expected, not an unknown draft",
+            # Round 2 L-B: the rollback's nodes are the backup's, which may hold a draft.
+            "a new `versionId` whose nodes are the backup's nodes (the live version's only if the backup held no "
+            "unpublished draft)",
             # L-C: default publication path in step 4, and case 3's example is the old path.
             "`activeVersionId` changes as soon as the publication is queued and the triggers are registered a moment "
             "later",
@@ -559,6 +563,29 @@ class KitRetaggerRunbookTests(KitRetaggerBase):
         ):
             self.assertIn(word, steps)
         self.assertNotIn("on the project.", steps)
+        self.assertNotIn("both count", steps)
+        self.assertNotIn("whose nodes equal the live version's", steps)
+
+    def test_re_import_round2_pins(self):
+        # G2 #347 survivors K22, K18, K10, K11, and the P-5 settings-merge rule, checked at n8n@2.48.5.
+        steps = self.section("Re-importing this workflow (keeps the record)")
+        for word in (
+            # K22: the undo-after-success read-back proves the backup's nodes are live again.
+            "Read back that `activeVersion` carries the backup's nodes, that the settings equal the backup's",
+            # K18: step 4's flag value.
+            "With n8n 2.48.5's default publication service (`N8N_USE_WORKFLOW_PUBLICATION_SERVICE=true`), "
+            "`activeVersionId` changes",
+            # K10, K11.
+            "an unchanged Schedule Trigger is not re-registered at all",
+            "a failed registration does not unpublish the workflow (the public API does not show it)",
+            # P-5: sent settings are merged over the stored ones, in both rollbacks.
+            "**Settings are merged, not replaced** (both rollbacks): n8n merges the sent `settings` over the stored "
+            "ones, so a settings key the re-import added and the backup lacks is not removed",
+            "For `errorWorkflow`, send `\"DEFAULT\"` to clear it",
+            "the read-back \"settings equal the backup's\" stops the step: report it",
+            "`removeDefaultValues` deletes a settings key whose value is `DEFAULT`",
+        ):
+            self.assertIn(word, steps)
         self.assertNotIn("(for example a failed re-publication left the workflow unpublished)", steps)
         self.assertNotIn("the settings and the record count equal the backup's", steps)
 

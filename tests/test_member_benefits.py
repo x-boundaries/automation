@@ -1758,6 +1758,27 @@ class ConfigTests(Base):
                 self.assertIs(cfg.amount_exclude_gift_cards, False)
                 self.assertEqual(cfg.gift_card_gateways, ("gift_card",))
 
+    def test_an_unqualified_store_is_refused(self):
+        # G2 #347 G-1: member_benefits' own proof that a store outside the pin is refused (test_member_tags.py has
+        # one for member_tags). The committed live example holds the placeholders and is refused as it stands; so
+        # are a fake *.myshopify.com domain with the pinned GID, and another GID with the pinned domain.
+        raw = (ROOT / "config" / "member_benefits.live.example.json").read_text(encoding="utf-8")
+        for gid, domain in (PLACEHOLDER_STORE, (QUALIFIED_GID, "other-store.myshopify.com"),
+                            ("gid://shopify/Shop/2", QUALIFIED_DOMAIN)):
+            value = json.loads(raw)
+            value["shopify"].update(store_gid=gid, shop_domain=domain)
+            with self.subTest(store_gid=gid[-3:]):
+                self.assertEqual(self.code(lambda: bm.parse_config(value)), "benefits_config_store_not_qualified")
+
+    def test_b0_runbook_says_to_replace_the_store_placeholders(self):
+        # G2 #347 doc note: a re-install from the live example must fill in the two store values first.
+        runbook = (ROOT / "docs" / "autocount2-automation" / "member_benefits_runbook.md").read_text(encoding="utf-8")
+        start = runbook.index("| B0 |")
+        b0 = runbook[start:runbook.index("\n", start)]
+        self.assertIn("Live config from `member_benefits.live.example.json`: replace its two placeholders (`store_gid`, "
+                      "`shop_domain`) with the qualified store's values", b0)
+        self.assertIn("the placeholders are refused, `benefits_config_store_not_qualified`", b0)
+
     def test_other_tools_configs_are_refused_both_ways(self):
         for name in ("member_sync.example.json", "member_type_move.example.json"):
             with self.subTest(name=name):

@@ -50,6 +50,43 @@ class N8nExportGuardsWorkflowTests(unittest.TestCase):
             self.assertNotIn(masked, self.text, masked)
         self.assertFalse([line for line in self.lines if line.startswith("if:")], "no step or job condition")
 
+    def test_production_instance_pins_are_recorded(self):
+        # #332 F1 and F4: the production instance pins live in one place, n8n-workflows/README.md, which this job
+        # tests on every change under n8n-workflows/. Values only; no private path or setting.
+        readme = (ROOT / "n8n-workflows" / "README.md").read_text(encoding="utf-8")
+        start = readme.index("## Production n8n instance pins (#332)")
+        section = readme[start:readme.index("## Current Workflow Exports", start)]
+        for phrase in (
+            "| `N8N_IMAGE` | `docker.n8n.io/n8nio/n8n:2.48.5` |",
+            "| `N8N_RUNNERS_TASK_TIMEOUT` | `300` |",
+            "Change `N8N_IMAGE` only on purpose, for a 3.x upgrade, after a backup and an approved G-plan in #332.",
+            "backups made before 21 Nov 2026 carry `N8N_IMAGE=docker.n8n.io/n8nio/n8n:stable`",
+            "After a restore from one, check `N8N_IMAGE` and the running n8n version",
+            # Controller note (hardening report, 22 Nov 2026): cloudflared stays unpinned by owner choice; the
+            # compose and menu fixes; never re-copy the templates over the live files.
+            "cloudflared is **not** pinned, on purpose: it stays on `cloudflare/cloudflared:latest`",
+            "Do not add a cloudflared pin.",
+            "the production compose fails closed when `N8N_IMAGE` is missing (`${N8N_IMAGE:?...}`, no `:stable` "
+            "fallback)",
+            # G2 #350 L1: which menu actions pull an image.
+            "the menu's Restart and Start tunnel recreate with `--pull never`, so Restart and Start tunnel never pull; "
+            "Update and Restore do (Restore uses the backup's `N8N_IMAGE`, see below)",
+            "plain Start pulls only when the image is missing locally",
+            "cloudflared receives only `TUNNEL_TOKEN`, not the whole `.env`",
+            "**Never re-copy the setup templates over the live files.**",
+            "Re-copying either one would undo these fixes.",
+        ):
+            self.assertIn(phrase, section)
+        self.assertNotIn("CLOUDFLARED_IMAGE", section)
+        self.assertNotIn("so only Update pulls an image", section)
+
+    def test_energygrid_monitor_status_is_email(self):
+        # G2 #350 (pre-existing): the live run monitor moved to email at live step E1 (20 Nov 2026, #288).
+        readme = (ROOT / "n8n-workflows" / "README.md").read_text(encoding="utf-8")
+        self.assertIn("sends its alerts by email through `XB Ops Alert Email` since live step E1 on 20 Nov 2026 (#288); it "
+                      "no longer uses Telegram", readme)
+        self.assertNotIn("still sends by Telegram", readme)
+
     def test_the_guard_modules_exist(self):
         for name in ("test_no_telegram_nodes.py", "test_n8n3_always_output_data_guard.py"):
             self.assertTrue((ROOT / "tests" / name).is_file(), name)

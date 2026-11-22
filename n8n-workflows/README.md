@@ -4,6 +4,21 @@ This directory holds source-controlled n8n workflow export JSON for this reposit
 
 Workflow JSON in this directory is source-controlled evidence of workflow design and UAT scope. It is not proof of deployment, import, activation, or execution on any n8n instance.
 
+## Production n8n instance pins (#332)
+
+The production n8n instance runs from a Docker Compose stack outside this repository. Its `.env` carries two deliberate pins, each set with an owner OK:
+
+| Key | Pinned value | Why |
+| --- | --- | --- |
+| `N8N_IMAGE` | `docker.n8n.io/n8nio/n8n:2.48.5` | #332 Q4, 21 Nov 2026: the stack no longer follows `:stable`, so a pull or an image update cannot move n8n to 3.x by itself. The runbooks in this directory are checked against `n8n@2.48.5`. |
+| `N8N_RUNNERS_TASK_TIMEOUT` | `300` | #332 Q5, 20 Nov 2026: keeps the 2.x Code node task timeout (300 s) after a 3.x upgrade, where the default drops to 60 s. No effect on 2.x. |
+
+- Change `N8N_IMAGE` only on purpose, for a 3.x upgrade, after a backup and an approved G-plan in #332.
+- cloudflared is **not** pinned, on purpose: it stays on `cloudflare/cloudflared:latest` and updates through the menu's Update (owner, 22 Nov 2026). Do not add a cloudflared pin.
+- Hardening (#332 F2, F3, F5, 22 Nov 2026): the production compose fails closed when `N8N_IMAGE` is missing (`${N8N_IMAGE:?...}`, no `:stable` fallback); the menu's Restart and Start tunnel recreate with `--pull never`, so Restart and Start tunnel never pull; Update and Restore do (Restore uses the backup's `N8N_IMAGE`, see below), and plain Start pulls only when the image is missing locally; cloudflared receives only `TUNNEL_TOKEN`, not the whole `.env`.
+- **Never re-copy the setup templates over the live files.** The production menu is a copy of the Toolkit `n8n-environment-setup` template, and the production compose is a derivative of that template with local XB changes. Re-copying either one would undo these fixes.
+- **Restoring from an older backup:** backups made before 21 Nov 2026 carry `N8N_IMAGE=docker.n8n.io/n8nio/n8n:stable`, and a restore uses the backup's value (it checks that the image is trusted, not which version it is). After a restore from one, check `N8N_IMAGE` and the running n8n version, and put the pin above back if they differ.
+
 ## Current Workflow Exports
 
 ### member_forms_gateway_ingest.workflow.json
@@ -273,7 +288,7 @@ The approved n8n import/export helper-script package from the Toolkit source (`a
 
 - Purpose: owner-selected same-PC **run monitor** for the EnergyGrid EB + Tenant daily run (live workflow name `EnergyGrid - Local Run Monitor`). After each daily native run (11:30 SGT), `egmonitor.cmd` reports that run's sanitized `acquire` + final `status` outcome once to the authenticated local webhook. n8n emails the owner only for what the Core cannot report itself: no completed run report by 14:00 SGT while n8n was already running (missed, crashed, withheld or refused run), or a bill still PENDING after a finished run. Bill success and failure emails stay with the EnergyGrid Core (single sender); reported FAILURE streams are recorded but never re-sent. Intentional PC shutdown generates no alert.
 - Email route (#288 T1, owner 19 Nov 2026: email only): `Send Owner Alert Email` is an Execute Workflow call (`mode: each`, one sender execution per alert, no retry, `onError: continueRegularOutput`) to the shared `XB Ops Alert Email` workflow with `system` pinned to `ENERGYGRID`. The Code nodes emit `{severity, key, short, lines}` plus the monitor's own `dedupe_key`: `[XB alert] ENERGYGRID ERROR run_report_missing` and `[XB alert] ENERGYGRID WARN bill_pending:EB_BILL` (or `:TENANT_BILL`). `Remove Duplicates` still allows one attempt per incident; the sender folds a repeat of the same key within 60 minutes. A failed send is logged `send_failed` by the sender and the incident key stays used.
-- Status: the source export stays import-safe: no credentials, addresses or bill identifiers, `ENABLE_OWNER_ALERTS = false`, and the placeholder `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID`. The live copy on the same-PC n8n (first installed 16 October 2026, #226) still sends by Telegram until the separately approved live step E1 updates it from this export; evidence and rollback are in the [package README](energygrid_local_failure_monitor/README.md).
+- Status: the source export stays import-safe: no credentials, addresses or bill identifiers, `ENABLE_OWNER_ALERTS = false`, and the placeholder `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID`. The live copy on the same-PC n8n (first installed 16 October 2026, #226) sends its alerts by email through `XB Ops Alert Email` since live step E1 on 20 Nov 2026 (#288); it no longer uses Telegram. Evidence and rollback are in the [package README](energygrid_local_failure_monitor/README.md).
 - Failed runs (#288 option (c), owner 20 Nov 2026): no execution is saved, success or error, because a rejected report's saved execution would keep the valid webhook token. `settings.errorWorkflow` (placeholder `REPLACE_WITH_ENERGYGRID_MONITOR_ERROR_LOG_WORKFLOW_ID`) names `energygrid_monitor_error_log.workflow.json`, which records one closed-code row per failed run for `XB Daily Health`. The n8n validator warns that the export carries `settings.errorWorkflow`; that is intended here (the value is a placeholder).
 - Retired in #288 T1: the download error handler (`energygrid_download_error_handler.workflow.json`, archived and nobody's error workflow) and the alert ingress (`energygrid_alert_ingress.workflow.json`, never live; its only senders were the legacy direct-HTTP `run` command and the legacy Claude supervisor, both dormant). Both exports and their tests were deleted, not converted.
 - Package: [n8n local monitor package](energygrid_local_failure_monitor/README.md) and the original [one-shot local executor brief](energygrid_local_failure_monitor/LOCAL_EXECUTOR_ONE_SHOT.md) (historical: it describes the first, Telegram install).
