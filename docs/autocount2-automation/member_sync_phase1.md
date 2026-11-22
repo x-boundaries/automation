@@ -1758,11 +1758,29 @@ until S6 is reviewed (#288 G0 Q8).
 
 A separate read-only task, `\XB\XB-MemberSync-DailySummary`, runs once a day
 at 06:40 SGT (after the 06:00 deferred-create run and the 06:15 and 06:30
-runs) as the sync's own task account, and emails one summary that replaces
-the manual daily check: `[XB daily] MEMBER-SYNC CLEAN <date>` or
-`[XB daily] MEMBER-SYNC STOP <date>` (and `WARN` once a member tool is
-switched on: see "Member tools in the email" below). Design: #288 G0
-sections 3, 4 and 6.
+runs) as the sync's own task account, and reports one summary that replaces
+the manual daily check: `[XB daily] MEMBER-SYNC STOP <date>` (and `WARN` once
+a member tool is switched on: see "Member tools in the email" below). Design:
+#288 G0 sections 3, 4 and 6.
+
+**Errors only (owner, 22 Nov 2026: "Yes, errors only").** A CLEAN morning is
+not emailed. The task still POSTs its event every morning, because n8n's
+answer is the proof that the summary ran:
+
+| Morning | n8n `Member Sync - Daily Summary` | Answer | VM record `email_status` | `xb_alert_email_log` row |
+|---|---|---|---|---|
+| WARN or STOP | emails `[XB daily] MEMBER-SYNC WARN/STOP <date>` | 200 | `sent` | `sent` (by `XB Ops Alert Email`) |
+| CLEAN with FIRST CREATE, or with the forms watch's `forms_flow_silent` | emails `[XB daily] MEMBER-SYNC CLEAN <date>` (it asks for an action) | 200 | `sent` | `sent` |
+| any other CLEAN morning | **no email**; `Log Clean Summary` writes one row | 202 | `logged_clean` | `clean_not_sent` (system `MEMBER-SYNC`, key `daily_summary`, severity `INFO`) |
+| email or row failed | none | 502 / 500 | `send_failed` | `send_failed` or none |
+
+The daily health check (`XB Daily Health`, job `member_sync_summary`) reads
+today's `MEMBER-SYNC` `daily_summary` rows: a `sent` or `clean_not_sent` row
+today is OK; only `send_failed` rows is FAIL `summary_send_failed`; no row at
+all is FAIL `summary_missing` ("the summary did not report this morning").
+So a summary that stopped running, a failed POST and a failed row insert all
+reach the owner the next morning ([daily_health_check.md](../daily_health_check.md)).
+The CLEAN email text itself is unchanged; it is simply not sent.
 Script `directlocal/xb_member_sync_daily_summary.py`, settings
 `config/member_sync_daily_summary.example.json`, installer
 `scripts/install_member_sync_summary_task.ps1`, n8n workflow
@@ -1864,9 +1882,12 @@ mornings and its own owner OK.
 **Email failure never fails the task.** The task writes
 `daily_summary_<YYYY-MM-DD>.json` in its own output folder (never inside the
 sync state root) before the POST (`email_status: pending`) and after it
-(`sent`, `send_failed` with `http_status`, `secret_unavailable`, `disabled`
-or `not_sent_check_only`), and exits 0. A missing morning email is itself
-the signal that the email route is down. Exit 2 (no record, no email) only
+(`sent`, `logged_clean` (202: a CLEAN morning logged, no email),
+`send_failed` with `http_status`, `secret_unavailable`, `disabled` or
+`not_sent_check_only`), and exits 0. Since errors only, a missing morning
+email is normal on a CLEAN day; the daily health check's
+`member_sync_summary` job is the signal that the summary or its route is
+down. Exit 2 (no record, no email) only
 when the summary's own set-up is wrong: its settings file is unreadable or
 refused, its output folder is missing or cannot be written, or its output
 folder sits inside the sync state root (the one in the settings, or the one

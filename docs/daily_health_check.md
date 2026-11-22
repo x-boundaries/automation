@@ -70,7 +70,7 @@ Python never sends email itself: that would copy a credential out of n8n.
 
 | Job id | Line label | Judged by | Starts as |
 | --- | --- | --- | --- |
-| `member_sync_summary` | Member sync daily summary | n8n: today's `daily_summary` row in `xb_alert_email_log` | `not_installed` |
+| `member_sync_summary` | Member sync daily summary | n8n: today's `daily_summary` row in `xb_alert_email_log` (`sent`, or `clean_not_sent` for a CLEAN morning that was not emailed, #288 slice 3 errors only) | `not_installed` |
 | `member_tags` | Member tags | the #288 summary (its own email); OK when `on` | `not_installed` |
 | `ac2_stock_export` | AC2 hourly stock export | checker: stock status pair on Drive | `on` |
 | `stock_alert_route` | Stock alert route | checker: `alert_status` in the stock status file | `on` |
@@ -105,7 +105,7 @@ The check runs at 07:30 SGT; ages are measured at check time. Thresholds are in 
 | Server task list | a task in `\XB\` that is neither a job's task nor in `known_tasks` (`unknown_task`, with a count) | none |
 | Health checker | yesterday's own record says its POST failed (`previous_send_failed`) | the 08:15 dead-man found no report today (`checker_missing`) |
 | Drive folder | none | the Drive report folder is not reachable on the server PC (`folder_missing`) |
-| Member sync daily summary | `xb_alert_email_log` could not be read (`log_read_failed`) | no `daily_summary` row for today (`summary_missing`); only `send_failed` rows today (`summary_send_failed`) |
+| Member sync daily summary | `xb_alert_email_log` could not be read (`log_read_failed`) | no `sent` or `clean_not_sent` `daily_summary` row for today (`summary_missing`: the summary did not report, or its row could not be written); only `send_failed` rows today (`summary_send_failed`) |
 | n8n workflows, SIMBA intake | failed runs in the last 24 h (`error_runs`, with a count): saved error runs for workflows that keep them (SIMBA), and for the EnergyGrid run monitor, which keeps none, every row of `energygrid_monitor_error_log` (at most 250 are read, so `250` means 250 or more); that table could not be read (`error_log_read_failed`); the n8n API could not be read (`n8n_api_failed`); a workflow ID still a placeholder (`not_configured`; not for the kit re-tagger before its live step) | an expected workflow inactive (`workflow_inactive`) or not found (`workflow_missing`), including `EnergyGrid - Monitor Error Log` and, once bound, the kit re-tagger; the run monitor no longer linked to its error log (`error_log_unlinked`: its `errorWorkflow` is not the error log or `saveDataErrorExecution` is not `none`; checked only once the error log's `WATCH` ID is set) |
 | n8n workflows only | `send_failed` rows of any system in `xb_alert_email_log` in the 24 h before the check (`alert_email_failed`, with a count): a real-time alert (stock, AR/AP, EnergyGrid) or a health email that could not be sent shows the next morning; `KIT-RETAG` `ERROR` rows in the same window (`kit_retag_errors`, with a count; each kit re-tagger error path sends exactly one); the log could not be read (`alert_log_read_failed`) | none |
 

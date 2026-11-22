@@ -1,4 +1,4 @@
-"""#288 slice 3: the #155 member sync daily summary, one email each morning (read-only).
+"""#288 slice 3: the #155 member sync daily summary, one report each morning (read-only).
 
 Runs once a day as its own scheduled task (\\XB\\XB-MemberSync-DailySummary, 06:40 SGT) on the
 AC2 VM, as the sync's task account. It automates the manual daily check of the member sync:
@@ -16,6 +16,11 @@ AC2 VM, as the sync's task account. It automates the manual daily check of the m
    from a Windows Credential Manager target (name in the settings; the value never leaves memory);
 6. a local record ``daily_summary_<date>.json`` in its own output folder, written before and
    after the send.
+
+Errors only (#288 slice 3, owner 22 Nov 2026: "Yes, errors only"): the event is still POSTed every
+morning, because n8n's answer is the proof that the summary ran (the daily health check reads it).
+n8n emails only a morning that is not CLEAN (or that asks for an action); on a CLEAN morning it logs
+a ``clean_not_sent`` row instead and answers 202, which the record keeps as ``logged_clean``.
 
 An email failure never fails the task: it exits 0 and the record says ``send_failed``. The event
 carries counts, closed codes, booleans and MemberNo refs masked to their last 3 characters only.
@@ -132,7 +137,8 @@ STOP_ALERTS = ("possible_duplicate_member", "member_type_unknown")
 AUTO_OFF_CODES = ("shopify_write_while_disabled", "uncertain_writes", "possible_duplicate_member")
 AUTO_OFF_MODES = ("off", "would_switch")
 
-SEND_STATUSES = ("pending", "sent", "send_failed", "secret_unavailable", "disabled", "not_sent_check_only")
+# logged_clean (#288 slice 3, owner 22 Nov 2026): n8n answered 202, a CLEAN morning logged and not emailed.
+SEND_STATUSES = ("pending", "sent", "logged_clean", "send_failed", "secret_unavailable", "disabled", "not_sent_check_only")
 CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 MEMBER_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$")
 MASKED_RE = re.compile(r"^\*{3}[A-Za-z0-9]{1,3}$")
@@ -1380,6 +1386,8 @@ def send_event(event: Mapping[str, Any], send: Mapping[str, Any], *, cred_reader
         headers.clear()
     if isinstance(status, int) and status == 200:
         return "sent", 200, None
+    if isinstance(status, int) and status == 202:
+        return "logged_clean", 202, None  # #288 slice 3: a CLEAN morning, logged in n8n, no email
     return "send_failed", status if isinstance(status, int) else None, "http_status"
 
 

@@ -603,7 +603,22 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual((plan["row"]["verdict"], lines), ("OK", []))
         yesterday = dict(today_sent, sent_at="2026-11-17T22:40:05.000Z")
         plan, lines = self.summary_line([yesterday])
-        self.assertTrue(lines[0].startswith("FAIL  Member sync daily summary: no email this morning, since 19 Nov."))
+        self.assertTrue(lines[0].startswith("FAIL  Member sync daily summary: the summary did not report this morning, "
+                                            "since 19 Nov."))
+        # #288 slice 3 errors only (owner 22 Nov 2026): a CLEAN morning is logged, not emailed. Today's
+        # clean_not_sent row proves the summary ran; yesterday's does not; no other outcome counts.
+        plan, lines = self.summary_line([dict(today_sent, outcome="clean_not_sent")])
+        self.assertEqual((plan["row"]["verdict"], lines), ("OK", []))
+        plan, lines = self.summary_line([dict(yesterday, outcome="clean_not_sent")])
+        self.assertIn("the summary did not report this morning", lines[0])
+        self.assertEqual(plan["row"]["fail_jobs"], "member_sync_summary")
+        for other in ("folded", "folded_flood", "clean", "not_sent", "CLEAN_NOT_SENT"):
+            plan, lines = self.summary_line([dict(today_sent, outcome=other)])
+            self.assertIn("the summary did not report this morning", lines[0], other)
+        plan, lines = self.summary_line([dict(today_sent, outcome="clean_not_sent", system="AC2-STOCK")])
+        self.assertIn("the summary did not report this morning", lines[0])
+        plan, lines = self.summary_line([dict(today_sent, outcome="clean_not_sent", key="run_failed")])
+        self.assertIn("the summary did not report this morning", lines[0])
         plan, lines = self.summary_line([dict(today_sent, outcome="send_failed")])
         self.assertIn("the email could not be sent this morning", lines[0])
         self.assertEqual(plan["row"]["fail_jobs"], "member_sync_summary")
@@ -1218,7 +1233,8 @@ class OwnerNextTests(unittest.TestCase):
 GOLDEN_TEXT = "\n".join([
     "XB daily health check, Thu 19 Nov 2026 07:30 SGT: 3 of 12 watched jobs need a look (2 FAIL, 1 WARN).",
     "",
-    "FAIL  Member sync daily summary: no email this morning, since 19 Nov. Next: forward this email to Claude.",
+    "FAIL  Member sync daily summary: the summary did not report this morning, since 19 Nov. Next: forward this "
+    "email to Claude.",
     "FAIL  AC2 hourly stock export: no new run for 8 h (last 18 Nov 23:30), since 19 Nov. Next: forward this email "
     "to Claude.",
     "WARN  Drive mirror: the last weekly run could not reach GitHub (FETCH_FAILED), since 16 Nov. Next: forward this "

@@ -36,12 +36,17 @@ ALLOWED_TYPES = {
     "n8n-nodes-base.executeWorkflow",
     "n8n-nodes-base.respondToWebhook",
     "n8n-nodes-base.stickyNote",
+    "n8n-nodes-base.dataTable",  # #288 slice 3 errors only: Log Clean Summary, the one insert
 }
 EXPECTED_EDGES = {
     (WEBHOOK_NODE, 0, CODE_NODE),
     (CODE_NODE, 0, "Event Is Valid"),
     (CODE_NODE, 1, "Respond Internal Error"),
-    ("Event Is Valid", 0, CALL_NODE),
+    ("Event Is Valid", 0, "Email Is Due"),
+    ("Email Is Due", 0, CALL_NODE),
+    ("Email Is Due", 1, "Log Clean Summary"),
+    ("Log Clean Summary", 0, "Respond Clean Logged"),
+    ("Log Clean Summary", 1, "Respond Internal Error"),
     ("Event Is Valid", 1, "Respond Event Rejected"),
     (CALL_NODE, 0, "Email Was Sent"),
     (CALL_NODE, 1, "Respond Internal Error"),
@@ -50,9 +55,10 @@ EXPECTED_EDGES = {
     ("Email Send Failed", 0, "Respond Email Failed"),
     ("Email Send Failed", 1, "Respond Internal Error"),
 }
-# The VM records these as http_status; send_failed for anything but 200.
+# The VM records these as http_status: 200 sent, 202 logged_clean, send_failed for anything else.
 RESPONSE_CODES = {
     "Respond Summary Sent": 200,
+    "Respond Clean Logged": 202,
     "Respond Event Rejected": 400,
     "Respond Internal Error": 500,
     "Respond Email Failed": 502,
@@ -247,7 +253,7 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
     def assert_sent(self, result, subject, subject_re=SUBJECT_RE):
         (item,) = result["out"]
         self.assertIs(item["json"]["valid"], True, item)
-        self.assertEqual(set(item["json"]), {"valid", "severity", "short", "lines"})
+        self.assertEqual(set(item["json"]), {"valid", "email", "severity", "short", "lines"})
         (sub,) = result["sub"]
         self.assertIs(sub["json"]["valid"], True, sub)
         (plan,) = result["plan"]
@@ -504,7 +510,9 @@ V1_LINES_GOLDEN_SHA256 = "da9c0ef40da2d42eea8b80932df7598784057c5b55e408864cb40a
 # SHA-256 of this export with the Validate Summary Event jsCode blanked. Made on main 8222aed
 # (8a77d55f...), then re-made at fix 1 (G2 LATER 1) after the Start Here sticky's Input and Subject
 # bullets and its height (400 -> 460) changed: no other node, connection, setting or note changed.
-WORKFLOW_REST_SHA256 = "29f9b7b1cb747d05ee6afdbf49afaca6fbb08d2f415250235118fc0c70d6158e"
+# #288 slice 3 errors only (22 Nov 2026): re-pinned to the graph with Email Is Due, Log Clean Summary and
+# Respond Clean Logged (and the moved email path); the Code node itself is pinned by the golden digests.
+WORKFLOW_REST_SHA256 = "6a9884327666e5fb26227766a6412ef0d16c766070ea8159b8aa5cc24ec3a3bd"
 
 
 def core_raw(alerts=None, runs=None, opened=None, **overrides):
@@ -603,7 +611,9 @@ def _digest_failed_event():
 
 def lines_digest(results):
     import hashlib  # noqa: PLC0415
-    return hashlib.sha256(json.dumps([r["out"] for r in results], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    # #288 slice 3 errors only: the `email` flag is left out, so the golden digests still pin the unchanged text.
+    out = [[{**o, "json": {k: v for k, v in o["json"].items() if k != "email"}} for o in r["out"]] for r in results]
+    return hashlib.sha256(json.dumps(out, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def workflow_rest_digest(path):
@@ -629,7 +639,7 @@ class WiringWorkflowShapeTests(unittest.TestCase):
         for text in ("`xb.member_sync.daily_summary.v1` (both member tools off on the VM)", "`xb.member_sync.daily_summary.v2`",
                      "`member_tools`", "`... WARN <date>`", "WARN comes only from a tool"):
             self.assertIn(text, content)
-        self.assertEqual(note["parameters"]["height"], 460)
+        self.assertEqual(note["parameters"]["height"], 600)
 
     def test_the_code_node_lists_match_the_vm_script(self):
         code = json.loads(WORKFLOW.read_text(encoding="utf-8"))
@@ -681,6 +691,8 @@ class WiringWorkflowTests(unittest.TestCase):
         for (word, sync_word, core, tags), result in zip(expected, self.run_cases(bodies)):
             with self.subTest(word=word, sync=sync_word, core=core and core["status"], tags=tags and tags["status"]):
                 text = self.sent_v2(result, word)
+                # #288 slice 3 errors only: emailed exactly when the subject word is not CLEAN.
+                self.assertIs(result["out"][0]["json"]["email"], word != "CLEAN")
                 lines = text.splitlines()
                 parts = ["sync " + sync_word] + (["member core " + core["status"]] if core else []) + (["tags " + tags["status"]] if tags else [])
                 self.assertIn("MEMBER-SYNC daily summary 2026-11-07: %s (%s)" % (word, ", ".join(parts)), lines)
@@ -873,6 +885,83 @@ class WiringWorkflowTests(unittest.TestCase):
             line = next(line for line in lines if line.startswith(prefix))
             self.assertRegex(line, MORE_RE)
             self.assertLessEqual(len(line), 300)
+
+
+class ErrorsOnlyShapeTests(unittest.TestCase):
+    """#288 slice 3, owner 22 Nov 2026 ("Yes, errors only"): no email on a CLEAN morning, but a logged row."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        cls.nodes = {node["name"]: node for node in cls.workflow["nodes"]}
+
+    def test_email_is_due_reads_only_the_flag(self):
+        node = self.nodes["Email Is Due"]
+        self.assertEqual(node["type"], "n8n-nodes-base.if")
+        conditions = node["parameters"]["conditions"]
+        self.assertEqual(conditions["options"]["typeValidation"], "strict")
+        self.assertEqual([(c["leftValue"], c["rightValue"], c["operator"]) for c in conditions["conditions"]],
+                         [("={{ $json.email === true }}", True, {"type": "boolean", "operation": "equals"})])
+
+    def test_log_clean_summary_writes_one_closed_row(self):
+        node = self.nodes["Log Clean Summary"]
+        params = node["parameters"]
+        self.assertEqual((node["type"], node["typeVersion"]), ("n8n-nodes-base.dataTable", 1.1))
+        self.assertEqual((params["resource"], params["operation"]), ("row", "insert"))
+        self.assertEqual(params["dataTableId"], {"__rl": True, "value": "REPLACE_WITH_ALERT_LOG_TABLE_ID", "mode": "id"})
+        columns = params["columns"]
+        self.assertEqual(columns["mappingMode"], "defineBelow")
+        self.assertEqual(columns["value"], {"system": "MEMBER-SYNC", "key": "daily_summary", "severity": "INFO",
+                                            "outcome": "clean_not_sent", "code": "", "folded_count": "={{ 0 }}",
+                                            "sent_at": "={{ new Date().toISOString() }}"})
+        # The same columns, in the same order and types, as the sender's own insert into xb_alert_email_log.
+        sub = json.loads(SUB_WORKFLOW.read_text(encoding="utf-8"))
+        sender = next(n for n in sub["nodes"] if n["name"] == "Log Email Sent")["parameters"]
+        self.assertEqual(params["dataTableId"], sender["dataTableId"])
+        self.assertEqual(columns["schema"], sender["columns"]["schema"])
+        # A failed insert must answer 500 (the VM records send_failed, the health check sees no row): never 202.
+        self.assertEqual(node["onError"], "continueErrorOutput")
+        for key in ("alwaysOutputData", "retryOnFail", "executeOnce", "continueOnFail"):
+            self.assertNotIn(key, node)
+        respond = self.nodes["Respond Clean Logged"]["parameters"]
+        self.assertEqual(respond, {"respondWith": "json", "responseBody": "={{ { ok: true, outcome: 'clean_not_sent' } }}",
+                                   "options": {"responseCode": 202}})
+        self.assertEqual(sorted(n["type"] for n in self.workflow["nodes"]).count("n8n-nodes-base.dataTable"), 1)
+
+    def test_notes_name_the_rule_and_the_new_placeholder(self):
+        notes = "\n".join(n["parameters"]["content"] for n in self.workflow["nodes"] if n["type"] == "n8n-nodes-base.stickyNote")
+        for text in ("**Errors only (#288 slice 3, owner 22 Nov 2026):**", "`clean_not_sent`", "answers 202",
+                     "FIRST CREATE", "`forms_flow_silent`", "REPLACE_WITH_ALERT_LOG_TABLE_ID", "- **Log Clean Summary**"):
+            self.assertIn(text, notes)
+
+
+@unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code nodes")
+class ErrorsOnlyCodeTests(unittest.TestCase):
+    run_cases = WorkflowCodeExecutionTests.run_cases
+
+    def flags(self, bodies, rows=None):
+        return [result["out"][0]["json"]["email"] for result in self.run_cases(bodies, rows)]
+
+    def test_only_a_morning_that_needs_a_look_is_emailed(self):
+        clean = build()
+        stop = build(task=stop_sync_task())
+        first = build(first_create=True)
+        silent = copy.deepcopy(clean)
+        silent["digest"]["alerts"]["forms_flow_silent"] = 1
+        counts_only = copy.deepcopy(clean)
+        counts_only["digest"]["alerts"].update({"forms_held": 2, "forms_would_heal": 1})
+        warn = build(member_tools={"member_core": None, "tags": TAGS_CASES["WARN"]()})
+        self.assertEqual((clean["result"], stop["result"], first["result"], warn["result"]), ("CLEAN", "STOP", "CLEAN", "CLEAN"))
+        self.assertEqual(self.flags([clean, stop, first, silent, counts_only, warn]), [False, True, True, True, False, True])
+
+    def test_a_clean_row_never_changes_the_senders_decision(self):
+        # Yesterday's and today's clean_not_sent rows: the STOP summary is still sent, never folded or held.
+        rows = [daily_row(5, outcome="clean_not_sent"), daily_row(60 * 24, outcome="clean_not_sent")]
+        rows += [daily_row(m, key="possible_duplicate_member") for m in range(1, 12)]
+        (result,) = self.run_cases([build(task=stop_sync_task())], rows=rows)
+        (plan,) = result["plan"]
+        self.assertIsNone(plan["json"]["held_outcome"])
+        self.assertEqual(plan["json"]["mail"]["subject"], "[XB daily] MEMBER-SYNC STOP 2026-11-07")
 
 
 if __name__ == "__main__":
