@@ -2064,12 +2064,15 @@ class SyncEngine:
         read again, and its seen-mark stops a second count. Only a complete
         read moves the read day (then the position is cleared). Every run
         that stops before the end counts ``forms_read_incomplete``; one that
-        also made no progress counts ``forms_read_stalled``."""
+        also made no progress counts ``forms_read_stalled``. #155 FH1c (G2
+        LC): a kept position whose first page is empty with no next page is
+        not a complete read; it is cleared like a failure with no step."""
 
         now = self.ledger.now()
         with self.ledger.tx() as conn:
             # G2 L5: a K9 (unreadable) mark is never pruned: its name is the digest of the raw
-            # values, so it stays as long as they are unchanged and stops a second count.
+            # values (or, FH1c LA, of the submission id when only the time is too far ahead), so
+            # it stays as long as they are unchanged and stops a second count.
             conn.execute("DELETE FROM watermarks WHERE substr(name, 1, ?) = ? AND updated_at < ? AND substr(value, 1, ?) != ?",
                          (len(FORMS_SEEN_PREFIX), FORMS_SEEN_PREFIX, dl.ts(now - timedelta(days=FORMS_SEEN_DAYS)),
                           len("forms_record_invalid|"), "forms_record_invalid|"))
@@ -2079,10 +2082,17 @@ class SyncEngine:
         start = self._forms_saved_cursor(day)
         after, complete, failed, counts = start, False, False, {"seen": 0, "new": 0}
         budget = [self.config.forms_watch_max_pages * SHOPIFY_PAGE_SIZE]  # K6 reads left this run
-        for _ in range(self.config.forms_watch_max_pages):
+        for page in range(self.config.forms_watch_max_pages):
             try:
                 items, has_next = self.shopify.forms_page(search, after)
             except direct.ShopifyDirectError:
+                failed = True
+                break
+            if page == 0 and start is not None and not items and not has_next:
+                # #155 FH1c (G2 LC): a kept position answered with "the end" at once is not taken as
+                # a complete read (Shopify documents nothing on cursor stability; moving the read
+                # day here could skip customers never read). Treated as a failure with no step: the
+                # position is cleared and the next run reads the day again (marks stop recounts).
                 failed = True
                 break
             stopped = False
@@ -2121,14 +2131,16 @@ class SyncEngine:
             return True  # the tag search is only a candidate list
         counts["seen"] += 1
         record = parse_forms_record(customer.metafields)
-        if record is not None and record.submitted_at > now + timedelta(days=FORMS_FUTURE_DAYS):
-            record = None  # G2 L5: a submission time ahead of the run is not readable (K9)
+        # G2 L5: a submission time ahead of the run is not readable (K9). #155 FH1c (G2 LA): its
+        # mark is still named by the submission id (and, being K9, never pruned), so once the time
+        # comes within range the same submission finds that mark and is not counted a second time.
+        far_ahead = record is not None and record.submitted_at > now + timedelta(days=FORMS_FUTURE_DAYS)
         if record is not None and record.submitted_at < now - timedelta(days=FORMS_SKIP_DAYS):
             return True  # older than its seen-mark can be: never classified (no double count)
         mark = FORMS_SEEN_PREFIX + self._forms_key(customer, record)
         if self.ledger.watermark(mark) is not None:
             return True  # classified before: never counted twice
-        decision = FormsDecision("forms_record_invalid") if record is None else decide_forms(customer, record)
+        decision = FormsDecision("forms_record_invalid") if record is None or far_ahead else decide_forms(customer, record)
         outcome = decision.outcome
         if decision.email_check:
             # K6: one customerByIdentifier read of the typed email (the existing read path);
@@ -2179,8 +2191,10 @@ class SyncEngine:
 
     def _forms_key(self, customer: FormsCustomer, record: FormsRecord | None) -> str:
         """The keyed digest (the ledger's ref key) a seen-mark is named by:
-        of the submission id, or, for a record that cannot be read, of the
-        customer and the raw values as read (a new submission changes it)."""
+        of the submission id (also for a record refused only because its time
+        is too far ahead, #155 FH1c), or, for a record that cannot be parsed,
+        of the customer and the raw values as read (a new submission changes
+        it)."""
 
         body = f"submission:{record.submission_id}" if record is not None else "unreadable:" + json.dumps(
             [customer.gid, None if customer.metafields is None else [list(pair) for pair in customer.metafields]], ensure_ascii=True)
