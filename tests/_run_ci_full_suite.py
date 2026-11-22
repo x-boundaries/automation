@@ -3,13 +3,14 @@ runtime environment a stock CI runner does not provide.
 
 Underscore-prefixed so unittest discovery (pattern ``test*.py``) never collects it.
 
-Only ``test_import_n8n_workflows_live_dry_run`` is excluded: those tests drive the
-n8n live-import helper against a Docker/n8n environment (container listing, import
-confirmation gate, prepared-dir isolation) that is not available on a stock GitHub
-runner and must not be simulated by running Docker in CI. That module, and the
-complete suite including it, are validated locally on the dev/VM host (where Docker
-and the Windows timezone database are present). Every other test, including all
-create-UAT tests and the repository static guardrails, runs here.
+Only ``test_import_n8n_workflows_live_dry_run`` is excluded: those tests run the real
+n8n live-import helper end to end against a stubbed ``docker`` CLI, need Windows
+PowerShell and node, and take about half a minute. They run in their own
+windows-latest job instead (``live-import-dry-run`` in
+``.github/workflows/n8n-export-guards.yml``, #316 G2 L7), which triggers on the helper
+and export paths and fails on a skipped test; no real Docker engine or n8n instance is
+used there or here. Every other test, including all create-UAT tests and the
+repository static guardrails, runs here.
 
 With ``--skip-member-gateway-targeted`` (used only by the member-gateway workflow's
 ``full-offline-regression`` job, which runs in parallel with the targeted jobs) the

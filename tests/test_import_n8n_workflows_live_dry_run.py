@@ -31,8 +31,10 @@ helper's own node calls are unaffected. The test also removes every other folder
 docker.exe from PATH and points DOCKER_HOST at a pipe that does not exist, so no real Docker
 daemon, n8n instance or credential is reachable.
 
-Not in CI: like before the rewrite, this module is excluded from the CI suites
-(tests/_run_ci_full_suite.py) and is run locally on the Windows server PC:
+CI (#316 G2 L7): the full suites (tests/_run_ci_full_suite.py) still leave this module out. It runs
+in its own windows-latest job, live-import-dry-run in .github/workflows/n8n-export-guards.yml, on any
+change under n8n-workflows/, to n8n-workflow-policy.json or to this file; that job fails if any test
+here is skipped. To run it locally on the Windows server PC:
 
     python -m unittest tests.test_import_n8n_workflows_live_dry_run -v
 """

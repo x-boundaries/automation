@@ -1485,6 +1485,13 @@ shape (check its inputs against the table above). A steady
 `forms_watch_max_pages` (up to 20) and check the run's errors before
 blaming the Flow; the counts may be behind until it clears.
 
+**Switch-on probe (#155 FH1c G2 N1).** If `forms_read_stalled` alternates
+on consecutive runs (one run stalled, the next not) with no read errors and
+no new sign-ups, raise `forms_watch_max_pages` by 1. That pattern is a
+full last page at exactly the page cap, when Shopify still reports a next
+page; it stops at the next tagged update, and the seen-marks stop any
+second count meanwhile.
+
 ### UAT checklist
 
 Per UAT run, before any create switch goes on for good:

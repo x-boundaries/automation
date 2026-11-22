@@ -85,7 +85,20 @@ workflow at `.github/workflows/member-gateway-tests.yml`.
   paths only. This job runs both on any pull request that changes
   `n8n-workflows/**`, on the literal head, with no secret or live system.
   `tests/test_n8n_export_guards_ci.py` pins the trigger and the run line and
-  rejects masked exits and conditions.
+  rejects masked exits and conditions, any permission beyond `contents: read`
+  and any `secrets.` reference (#337 G2 L1).
+- The same workflow's `live-import-dry-run` job (windows-latest, #316 G2 L7)
+  runs `tests/test_import_n8n_workflows_live_dry_run.py`, the live-import
+  helper's offline contract with a stubbed `docker` CLI (no Docker engine, n8n
+  instance or credential), and fails if any of its tests is skipped. The full
+  suites still leave that module out. It also triggers on
+  `n8n-workflow-policy.json` and on the test file.
+- The offline validator jobs in `simba-invoice-intake-tests.yml`,
+  `xb-kit-retagger-tests.yml` and `member-gateway-tests.yml` (pull request and
+  push) also trigger on `n8n-workflow-policy.json`, so a policy-only change
+  runs the validator (#316 G2 L1). `tests/test_simba_invoice_intake_workflow.py`,
+  `tests/test_xb_kit_retagger_workflow.py` and `tests/test_member_gateway_ci.py`
+  pin those entries.
 
 This status file records CI shape only; it is not a deployment approval or a
 claim that a remote check has passed before the branch is published.

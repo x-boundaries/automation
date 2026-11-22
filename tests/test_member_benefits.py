@@ -5300,6 +5300,36 @@ class NF2LaterTests(Base):
         self.assertEqual((self.root / bm.LEDGER_FILE).read_bytes(), before)
         self.assertFalse((self.root / (bm.LEDGER_FILE + "-wal")).exists())
 
+    # -- PR #338 G2 L1: the read-only open --------------------------------------
+    def test_338_l1_the_shared_read_only_open_is_mode_ro_and_query_only(self):
+        # _open_read_only (held and claim-links) opens the ledger as the digest
+        # does. Each guard is pinned on its own: the ?mode=ro URI, query_only on
+        # the returned connection, and mode=ro still refusing a write once
+        # query_only is switched off, so dropping either one fails this test.
+        self.engine()
+        real_connect = sqlite3.connect
+        calls = []
+
+        def spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.object(bm.sqlite3, "connect", spy):
+            conn, _meta = bm._open_read_only(self.root, config=self.cfg())
+        try:
+            self.assertEqual(len(calls), 1)
+            (target,), kwargs = calls[0]
+            self.assertEqual(target, (self.root / bm.LEDGER_FILE).resolve().as_uri() + "?mode=ro")
+            self.assertIs(kwargs.get("uri"), True)
+            self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute("UPDATE meta SET id = id")
+            conn.execute("PRAGMA query_only=OFF")
+            with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                conn.execute("UPDATE meta SET id = id")
+        finally:
+            conn.close()
+
 
 class ClassifySaveTests(unittest.TestCase):
     @staticmethod
