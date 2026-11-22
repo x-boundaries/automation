@@ -212,6 +212,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest discover -s tests -p "test_energygrid_owner_email_workflow.py" -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: EnergyGrid n8n exports offline validator
+        if: matrix.shard == 'rest'
+        # #316 C2: the repository's offline n8n validator, so a change to an EnergyGrid export (the
+        # Owner Email export included) is validated in CI. It checks every committed export and reads
+        # no secret; the step also fails if the output does not name the Owner Email export as checked.
+        shell: pwsh
+        run: |
+          $output = @(node n8n-workflows/scripts/validate-n8n-workflows.cjs)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (-not ($output -match '^Checked n8n-workflows[\\/]energygrid_owner_email\.workflow\.json: ')) {
+            throw "The validator did not check the EnergyGrid Owner Email export."
+          }
       - name: Scope and whitespace check
         if: matrix.shard == 'rest'
         shell: pwsh
