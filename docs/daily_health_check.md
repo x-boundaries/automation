@@ -23,6 +23,29 @@ The Gmail filter is `[XB health]`. The subject carries the date, so a FAIL never
 - `[XB health] WARN 1 jobs 2026-11-19`: 1 job needs a look, nothing has stopped.
 - `[XB health] OK 10 jobs 2026-11-23`: Monday heartbeat, all 10 watched jobs OK.
 
+## When the owner forwards a health email
+
+Owner rule (21 Nov 2026): the owner is emailed only about errors to fix, and the owner's only action is to tell Claude. So every WARN and FAIL line ends with the same fixed `Next: forward this email to Claude.` (#288, 22 Nov 2026). The line keeps its job label, reason text, codes and counts. No line sends the owner to n8n, the server PC, the VM or a runbook. The 08:15 dead-man FAIL and the `Build Broken-Check Email` FAIL end the same way.
+
+Claude's first look per job (these were the email's old `Next:` texts):
+
+| Job id | First look |
+| --- | --- |
+| `member_sync_summary` | Task `XB-MemberSync-DailySummary` on the VM ([member_sync_phase1.md](autocount2-automation/member_sync_phase1.md), "Daily summary email"). |
+| `member_tags` | The member sync daily summary. |
+| `ac2_stock_export` | The AC2 VM is on and signed in, then Task Scheduler "XB AC2 Hourly Stock Balance" ([stock_balance_hourly_runbook.md](autocount2-automation/stock_balance_hourly_runbook.md), "Failure classes"). |
+| `stock_alert_route` | The stock alert workflow in n8n and its webhook secret on the VM ([stock_balance_hourly_runbook.md](autocount2-automation/stock_balance_hourly_runbook.md), "Error alerts"). |
+| `arap_export` | The AC2 VM is on, then its AR/AP aging task ([arap_aging_runbook.md](autocount2-automation/arap_aging_runbook.md)). |
+| `arap_alert_route` | The AR/AP alert workflow in n8n and its webhook secret on the VM ([arap_aging_runbook.md](autocount2-automation/arap_aging_runbook.md), "A3: error alerts"). |
+| `energygrid_daily_bills` | Its task in Task Scheduler on the server PC (EnergyGrid runbook; its own email monitor still runs). |
+| `energygrid_retention` | Its task and retention report on the server PC (EnergyGrid runbook). |
+| `drive_mirror` | Nothing if the next Sunday run passes; otherwise [drive_mirror_runbook.md](drive_mirror_runbook.md). |
+| `n8n_workflows` | The workflows named, through the local n8n API (this runbook, section "Rules"). For `error_runs`, read the `energygrid_monitor_error_log` rows first: a row with workflow `1` and execution `231` is n8n's editor test sample, not a real failure (the #288 editor-sample fix stops writing it once it is live). |
+| `simba_intake` | The SIMBA invoice workflows in n8n ([simba_invoice_intake.md](simba_invoice_intake.md)). |
+| `server_tasks` | Add the task to the daily health settings or remove it (section "Jobs"). |
+| `checker` | The server PC is on, and Task Scheduler "XB-DailyHealth" (section "How it works"). |
+| `drive_folder` | Google Drive for desktop is running and signed in on the server PC. |
+
 ## How it works
 
 1. **07:30, server PC.** Task `\XB\XB-DailyHealth` runs `xb_daily_health.py run`. It reads:
@@ -35,7 +58,7 @@ The Gmail filter is `[XB health]`. The subject carries the date, so a FAIL never
 4. **Email not sent** (`send_failed` when Gmail is down or the credential expired; also `rejected`, `error`, `call_failed` or an unknown answer from the sender): the `xb_health_runs` row records the outcome and the sender's code (for example `gmail_error` or `OPS_ALERT_SHORT`). Nothing else happens at 07:30.
 5. **08:15, n8n dead-man and retry.**
    - No `check` row for today in `xb_health_runs`: n8n mails `[XB health] FAIL 1 jobs <date>`: "the health checker did not report today".
-   - Today's due email was not sent (every `check` row today has one of the failed outcomes above) and there is no `retry` row yet: n8n sends it **once** more, `[XB health] <verdict> <n> jobs <date>`, rebuilt from the row: `The 07:30 health email could not be sent (send_failed). This is the 08:15 retry.`, the FAIL and WARN job labels, and `Full detail: health_<date>.json on the server PC.` It logs a `retry` row. Never for `sent` or `not_due` (an OK weekday), and never twice.
+   - Today's due email was not sent (every `check` row today has one of the failed outcomes above) and there is no `retry` row yet: n8n sends it **once** more, `[XB health] <verdict> <n> jobs <date>`, rebuilt from the row: `The 07:30 health email could not be sent (send_failed). This is the 08:15 retry.`, the FAIL and WARN job labels (each line ending `Next: forward this email to Claude.`), and `Full detail: health_<date>.json on the server PC.` It logs a `retry` row. Never for `sent` or `not_due` (an OK weekday), and never twice.
 6. **Next morning.** If yesterday's email went out neither at 07:30 nor at the 08:15 retry, today's email is sent even on an OK weekday, with the line `Yesterday's health email could not be sent (send_failed at 07:30 and 08:15).` (or `... at 07:30; the 08:15 retry did not run).`). It is not retried again.
 7. **Health check broken.** If `Judge And Build Email` or `Decide Dead-Man` itself fails, `Build Broken-Check Email` (fixed values) sends `[XB health] FAIL 1 jobs <date>`: "the health check could not be built today" and "n8n XB Daily Health failed before the email". Its row has `kind: check` from the 07:30 path (so the dead-man does not mail twice) and `kind: deadman` from the 08:15 path. Only a Code step is broken, not Gmail, so this email normally goes out.
 
@@ -47,7 +70,7 @@ Python never sends email itself: that would copy a credential out of n8n.
 
 | Job id | Line label | Judged by | Starts as |
 | --- | --- | --- | --- |
-| `member_sync_summary` | Member sync daily summary | n8n: today's `daily_summary` row in `xb_alert_email_log` | `not_installed` |
+| `member_sync_summary` | Member sync daily summary | n8n: today's `daily_summary` row in `xb_alert_email_log` (`sent`, or `clean_not_sent` for a CLEAN morning that was not emailed, #288 slice 3 errors only) | `not_installed` |
 | `member_tags` | Member tags | the #288 summary (its own email); OK when `on` | `not_installed` |
 | `ac2_stock_export` | AC2 hourly stock export | checker: stock status pair on Drive | `on` |
 | `stock_alert_route` | Stock alert route | checker: `alert_status` in the stock status file | `on` |
@@ -82,7 +105,7 @@ The check runs at 07:30 SGT; ages are measured at check time. Thresholds are in 
 | Server task list | a task in `\XB\` that is neither a job's task nor in `known_tasks` (`unknown_task`, with a count) | none |
 | Health checker | yesterday's own record says its POST failed (`previous_send_failed`) | the 08:15 dead-man found no report today (`checker_missing`) |
 | Drive folder | none | the Drive report folder is not reachable on the server PC (`folder_missing`) |
-| Member sync daily summary | `xb_alert_email_log` could not be read (`log_read_failed`) | no `daily_summary` row for today (`summary_missing`); only `send_failed` rows today (`summary_send_failed`) |
+| Member sync daily summary | `xb_alert_email_log` could not be read (`log_read_failed`) | no `sent` or `clean_not_sent` `daily_summary` row for today (`summary_missing`: the summary did not report, or its row could not be written); only `send_failed` rows today (`summary_send_failed`; a `sent` or `clean_not_sent` row the same day wins: a later POST got through) |
 | n8n workflows, SIMBA intake | failed runs in the last 24 h (`error_runs`, with a count): saved error runs for workflows that keep them (SIMBA), and for the EnergyGrid run monitor, which keeps none, every row of `energygrid_monitor_error_log` (at most 250 are read, so `250` means 250 or more); that table could not be read (`error_log_read_failed`); the n8n API could not be read (`n8n_api_failed`); a workflow ID still a placeholder (`not_configured`; not for the kit re-tagger before its live step) | an expected workflow inactive (`workflow_inactive`) or not found (`workflow_missing`), including `EnergyGrid - Monitor Error Log` and, once bound, the kit re-tagger; the run monitor no longer linked to its error log (`error_log_unlinked`: its `errorWorkflow` is not the error log or `saveDataErrorExecution` is not `none`; checked only once the error log's `WATCH` ID is set) |
 | n8n workflows only | `send_failed` rows of any system in `xb_alert_email_log` in the 24 h before the check (`alert_email_failed`, with a count): a real-time alert (stock, AR/AP, EnergyGrid) or a health email that could not be sent shows the next morning; `KIT-RETAG` `ERROR` rows in the same window (`kit_retag_errors`, with a count; each kit re-tagger error path sends exactly one); the log could not be read (`alert_log_read_failed`) | none |
 

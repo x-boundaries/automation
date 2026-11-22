@@ -136,6 +136,46 @@ def reduce(*items_list, workflow=WORKFLOW):
     return rows
 
 
+def run_reducer(*items_list, workflow=WORKFLOW):
+    """Run the committed Code node once per input list; return each run's raw output list (it may be empty)."""
+
+    cases = [{"items": items, "now_ms": NOW_MS} for items in items_list]
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = Path(tmp) / "harness.js"
+        harness.write_text(HARNESS, encoding="utf-8")
+        path = Path(tmp) / "cases.json"
+        path.write_text(json.dumps(cases), encoding="utf-8")
+        done = subprocess.run([shutil.which("node"), str(harness), str(workflow), str(path)],
+                              capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise AssertionError(done.stderr)
+    outputs = []
+    for result in json.loads(done.stdout):
+        assert result["ok"], result
+        outputs.append(result["out"])
+    return outputs
+
+
+def editor_sample(execution_id=231):
+    """The item n8n 2.48.5's Error Trigger builds when the error workflow is run by hand in the editor.
+
+    packages/nodes-base/nodes/ErrorTrigger/ErrorTrigger.node.ts, execute(): in manual mode with an empty
+    input item it returns this fixed example (the id is the number 231; the url is built from the REST URL).
+    """
+
+    return {
+        "execution": {
+            "id": execution_id,
+            "url": "http://127.0.0.1:5678/execution/workflow/1/231",
+            "retryOf": "34",
+            "error": {"message": "Example Error Message", "stack": "Stacktrace"},
+            "lastNodeExecuted": "Node With Error",
+            "mode": "manual",
+        },
+        "workflow": {"id": "1", "name": "Example Workflow"},
+    }
+
+
 def n8n_messages(*cases):
     """execution.error.message as n8n 2.48.5 builds it when the monitor's validator rejects each body."""
 
@@ -553,6 +593,87 @@ class ReduceTests(unittest.TestCase):
             self.assertEqual((row["workflow_id"], row["code"], row["mode"]), ("unknown", "EG_MONITOR_TRIGGER_FAILED", "other"))
         for row in rows:
             self.assertClosed(row)
+
+
+@unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code node")
+class EditorSampleTests(unittest.TestCase):
+    """#288 false WARN (22 Nov 2026): an editor test run of this workflow wrote row (1, 231) and the next
+    health email counted it as a failed run. The editor sample now writes no row; a real failure always does."""
+
+    def test_the_editor_sample_writes_no_row(self):
+        outputs = run_reducer([editor_sample()], [editor_sample(execution_id="231")])
+        self.assertEqual(outputs, [[], []])
+
+    def test_a_real_failure_still_writes_its_row(self):
+        (row,) = reduce([failure()])
+        self.assertEqual(row, {"workflow_id": "wfEgMonitor001", "execution_id": "4711",
+                               "failed_node": "Validate Both Streams and Classify", "code": "EG_MONITOR_SCHEMA",
+                               "mode": "webhook", "failed_at": NOW_ISO})
+
+    def test_near_misses_still_write_a_row(self):
+        def sample(execution=None, workflow=None):
+            item = editor_sample()
+            return {"execution": dict(item["execution"], **(execution or {})),
+                    "workflow": dict(item["workflow"], **(workflow or {}))}
+
+        cases = [
+            # execution id 231 with a real workflow id (the brief's near miss)
+            (sample(workflow={"id": "wfEgMonitor001"}), ("wfEgMonitor001", "231", "other")),
+            # workflow '1' with another execution id
+            (sample(execution={"id": 4711}), ("1", "4711", "other")),
+            (sample(execution={"id": 2310}), ("1", "2310", "other")),
+            (sample(execution={"id": 23}), ("1", "23", "other")),
+            (sample(execution={"id": "0231"}), ("1", "0231", "other")),
+            (sample(execution={"id": " 231"}), ("1", "", "other")),
+            # the sample IDs in a real run mode: never dropped
+            (sample(execution={"mode": "webhook"}), ("1", "231", "webhook")),
+            (sample(execution={"mode": "trigger"}), ("1", "231", "trigger")),
+            (sample(execution={"mode": "error"}), ("1", "231", "error")),
+            (sample(execution={"mode": "Manual"}), ("1", "231", "other")),
+            # a workflow id that is not exactly the string '1'
+            (sample(workflow={"id": 1}), ("unknown", "231", "other")),
+            (sample(workflow={"id": "11"}), ("11", "231", "other")),
+            (sample(workflow={"id": "1 "}), ("unknown", "231", "other")),
+        ]
+        rows = reduce(*[[item] for item, _ in cases])
+        for (item, expected), row in zip(cases, rows):
+            self.assertEqual((row["workflow_id"], row["execution_id"], row["mode"]), expected, item)
+            self.assertEqual(row["code"], "EG_MONITOR_UNCLASSIFIED", item)
+            self.assertEqual(row["failed_at"], NOW_ISO)
+        # The sample without its workflow, and a failed trigger carrying the sample's IDs: rows.
+        no_workflow = editor_sample()
+        del no_workflow["workflow"]
+        trigger = {"trigger": {"error": {"message": "Example Error Message"}, "mode": "manual"},
+                   "workflow": {"id": "1", "name": "Example Workflow"}}
+        rows = reduce([no_workflow], [trigger])
+        self.assertEqual((rows[0]["workflow_id"], rows[0]["execution_id"]), ("unknown", "231"))
+        self.assertEqual((rows[1]["workflow_id"], rows[1]["code"]), ("1", "EG_MONITOR_TRIGGER_FAILED"))
+
+    def test_a_real_failure_with_the_sample_texts_still_writes_its_row(self):
+        # Only the IDs and the mode decide; the sample's message and node name in a real run change nothing.
+        (row,) = reduce([failure(message="Example Error Message", node="Node With Error")])
+        self.assertEqual((row["workflow_id"], row["execution_id"], row["code"], row["mode"]),
+                         ("wfEgMonitor001", "4711", "EG_MONITOR_UNCLASSIFIED", "webhook"))
+
+    def test_an_empty_output_stops_the_insert(self):
+        # n8n runs a node only for the items it receives; neither node may turn an empty output into an item.
+        nodes = {node["name"]: node for node in load()["nodes"]}
+        for name in (REDUCE, "Record Failure Row"):
+            self.assertNotIn("alwaysOutputData", nodes[name], name)
+            self.assertNotIn("executeOnce", nodes[name], name)
+        self.assertEqual(edges_of(load()), {("Monitor Run Failed", 0, REDUCE), (REDUCE, 0, "Record Failure Row")})
+
+    def test_docs_name_the_editor_sample(self):
+        package = MONITOR_README.read_text(encoding="utf-8")
+        for phrase in ("**Editor test runs write no row (#288, 22 Nov 2026).**",
+                       "`packages/nodes-base/nodes/ErrorTrigger/ErrorTrigger.node.ts`",
+                       "`dispatchesErrorWorkflow = !isManualMode && ...`",
+                       "any near miss (another workflow ID, another execution ID, another mode) still writes its row"):
+            self.assertIn(phrase, package)
+        self.assertIn("An editor test run (n8n's fixed Error Trigger sample: workflow `1`, execution `231`, mode "
+                      "`manual`) writes no row", README.read_text(encoding="utf-8"))
+        notes = "\n".join(n["parameters"]["content"] for n in load()["nodes"] if n["type"] == "n8n-nodes-base.stickyNote")
+        self.assertIn("that sample writes **no row**", notes)
 
 
 if __name__ == "__main__":
