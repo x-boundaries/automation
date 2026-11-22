@@ -622,6 +622,16 @@ class JudgeTests(unittest.TestCase):
         plan, lines = self.summary_line([dict(today_sent, outcome="send_failed")])
         self.assertIn("the email could not be sent this morning", lines[0])
         self.assertEqual(plan["row"]["fail_jobs"], "member_sync_summary")
+        # #288 fix 1 (G2 survivor): an OK row today wins over a send_failed row today, in either order (a later
+        # POST got through); a send_failed row today beats an OK row from yesterday.
+        failed = dict(today_sent, outcome="send_failed", sent_at="2026-11-18T22:40:01.000Z")
+        for ok in ("sent", "clean_not_sent"):
+            for rows in ([failed, dict(today_sent, outcome=ok)], [dict(today_sent, outcome=ok), failed]):
+                with self.subTest(ok=ok, first=rows[0]["outcome"]):
+                    plan, lines = self.summary_line(rows)
+                    self.assertEqual((plan["row"]["verdict"], lines), ("OK", []))
+            plan, lines = self.summary_line([failed, dict(yesterday, outcome=ok)])
+            self.assertIn("the email could not be sent this morning", lines[0])
         plan, lines = self.summary_line({"raw": [{"json": {"error": "Data table not found"}}]})
         self.assertTrue(lines[0].startswith("WARN  Member sync daily summary: the email log could not be read"))
         # The bare echo of the previous node (a Data Table router failure) is a failed read too.
@@ -1046,8 +1056,8 @@ class DeadManTests(unittest.TestCase):
                 self.assertEqual(plan["mail"], {"severity": "ERROR", "short": "FAIL 3 jobs 2026-11-20", "lines": [
                     "The 07:30 health email could not be sent (%s). This is the 08:15 retry." % email,
                     "",
-                    "FAIL  Member sync daily summary, AC2 hourly stock export.",
-                    "WARN  Drive mirror.",
+                    "FAIL  Member sync daily summary, AC2 hourly stock export. Next: forward this email to Claude.",
+                    "WARN  Drive mirror. Next: forward this email to Claude.",
                     "",
                     "Full detail: health_2026-11-20.json on the server PC.",
                     "No [XB health] email on a Monday by 09:00 means the checker is down: tell Claude.",
@@ -1086,7 +1096,7 @@ class DeadManTests(unittest.TestCase):
         self.assertTrue(through_sender(plan)[0]["valid"])
         (item,) = self.decide([self.check("send_failed", watched=1, problems=1, fail_jobs="checker", warn_jobs="")])
         self.assertEqual(item["json"]["mail"]["short"], "FAIL 1 jobs 2026-11-20")
-        self.assertIn("FAIL  Health checker.", item["json"]["mail"]["lines"])
+        self.assertIn("FAIL  Health checker. Next: forward this email to Claude.", item["json"]["mail"]["lines"])
 
     def test_row_values_reach_the_retry_only_as_closed_labels_and_counts(self):
         (item,) = self.decide([self.check("send_failed", verdict="<b>BAD</b>", watched="12", problems=-4,
@@ -1101,7 +1111,8 @@ class DeadManTests(unittest.TestCase):
         self.assertTrue(through_sender(plan)[0]["valid"])
         # A verdict with no readable job ids still says how many.
         (item,) = self.decide([self.check("send_failed", fail_jobs="", warn_jobs="")])
-        self.assertIn("FAIL  3 job(s); see the record.", item["json"]["mail"]["lines"])
+        self.assertIn("FAIL  3 job(s). Next: forward this email to Claude.", item["json"]["mail"]["lines"])
+        self.assertNotIn("see the record", json.dumps(load()))
 
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to evaluate the expressions")
@@ -1213,7 +1224,9 @@ class OwnerNextTests(unittest.TestCase):
         text = json.dumps(load())
         nexts = re.findall(r"Next: [^'\\\"]*", text)
         self.assertEqual(sorted(set(nexts)), ["Next: ", self.FORWARD])
-        self.assertEqual(text.count(self.FORWARD), 2)  # Decide Dead-Man and Build Broken-Check Email
+        # Decide Dead-Man (the 08:15 dead-man line and, #288 fix 1, the retry's FAIL, WARN and count lines)
+        # and Build Broken-Check Email.
+        self.assertEqual(text.count(self.FORWARD), 5)
         for stale in ("open n8n", "Next: check", "Next: nothing", "Next: see", "Next: add"):
             self.assertNotIn(stale, text)
 

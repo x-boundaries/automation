@@ -1739,18 +1739,36 @@ It never replaces an existing task.
 
 ### Hypercare alerts that need action
 
-`create_rate_capped` (#155 P1: a cap was reached; the held sign-ups wait
-for room or the 06:00 rule; at most one alert per hour), `possible_duplicate_member`, `memberno_exists_outside_window`,
-`memberno_conflict`, `initial_link_member_no_conflict`,
-`customer_held_by_open_write`, `uncertain_write_*`, `ac2_member_hold_stuck`,
-`shopify_pending_backlog`, `no_phone_sign_up_needs_staff` (staff key that
-member by hand; it stays unlinked in phase 1), `member_type_unknown`
-(the configured type is missing in the book; every create is refused until
-fixed), `ac2_pending_would_create_backlog` (expected in shadow; after S6 it
-means the backlog is draining: once `shopify_create_enabled` is true the
-whole AC2 queue is read oldest first by ChangeLog ID, so a new walk-in waits
-behind the older backlog, G2 #281 LATER-1), and any refusal (exit 2), for example
-`ac2_credential_user_refused`. They reach the Owner by email in the daily
+These alert codes need someone to act. This list is, code for code, the
+closed list `ACTION_ALERTS` in `Member Sync - Daily Summary` (a test checks
+that the two match; no prefix match): a CLEAN morning that carries one of
+them is still emailed (#288 fix 1, G2 C1).
+
+- `create_rate_capped`: #155 P1: a cap was reached; the held sign-ups wait
+  for room or the 06:00 rule; at most one alert per hour.
+- `possible_duplicate_member`
+- `memberno_exists_outside_window`
+- `memberno_conflict`
+- `initial_link_member_no_conflict`
+- `customer_held_by_open_write`
+- `ac2_member_hold_stuck`
+- `shopify_pending_backlog`
+- `no_phone_sign_up_needs_staff`: staff key that member by hand; it stays
+  unlinked in phase 1.
+- `member_type_unknown`: the configured type is missing in the book; every
+  create is refused until fixed.
+- `ac2_pending_would_create_backlog`: expected in shadow; after S6 it means
+  the backlog is draining: once `shopify_create_enabled` is true the whole
+  AC2 queue is read oldest first by ChangeLog ID, so a new walk-in waits
+  behind the older backlog (G2 #281 LATER-1).
+
+Also needing action, but not alert codes: an uncertain write (the sync
+counts it under `uncertain_write_*`; the summary's open uncertain writes
+make the morning STOP, `uncertain_writes`) and a refusal (exit 2, for
+example `ac2_credential_user_refused`; the summary makes the morning STOP,
+`task_last_result`, when it is the sync task's last result). A morning whose
+alert list was cut to 20 codes (`other_alert_codes`) is emailed too, since a
+cut code may be one of the above. They reach the Owner by email in the daily
 summary at 06:40 (#288 slice 3, below); there is no real-time push for them
 until S6 is reviewed (#288 G0 Q8).
 
@@ -1770,14 +1788,18 @@ answer is the proof that the summary ran:
 | Morning | n8n `Member Sync - Daily Summary` | Answer | VM record `email_status` | `xb_alert_email_log` row |
 |---|---|---|---|---|
 | WARN or STOP | emails `[XB daily] MEMBER-SYNC WARN/STOP <date>` | 200 | `sent` | `sent` (by `XB Ops Alert Email`) |
-| CLEAN with FIRST CREATE, or with the forms watch's `forms_flow_silent` | emails `[XB daily] MEMBER-SYNC CLEAN <date>` (it asks for an action) | 200 | `sent` | `sent` |
+| CLEAN with FIRST CREATE, the forms watch's `forms_flow_silent`, an action alert ("Hypercare alerts that need action" above) or a cut alert list (`other_alert_codes`) | emails `[XB daily] MEMBER-SYNC CLEAN <date>` (it asks for an action) | 200 | `sent` | `sent` |
 | any other CLEAN morning | **no email**; `Log Clean Summary` writes one row | 202 | `logged_clean` | `clean_not_sent` (system `MEMBER-SYNC`, key `daily_summary`, severity `INFO`) |
 | email or row failed | none | 502 / 500 | `send_failed` | `send_failed` or none |
 
 The daily health check (`XB Daily Health`, job `member_sync_summary`) reads
 today's `MEMBER-SYNC` `daily_summary` rows: a `sent` or `clean_not_sent` row
-today is OK; only `send_failed` rows is FAIL `summary_send_failed`; no row at
+today is OK, even when today also has a `send_failed` row (a later POST got
+through); only `send_failed` rows is FAIL `summary_send_failed`; no row at
 all is FAIL `summary_missing` ("the summary did not report this morning").
+Every email ends its action with "Next: forward this email to Claude." (owner
+rule, 21 Nov 2026): the STOP line and the FIRST CREATE line carry it, and an
+email with neither has it as its last line.
 So a summary that stopped running, a failed POST and a failed row insert all
 reach the owner the next morning ([daily_health_check.md](../daily_health_check.md)).
 The CLEAN email text itself is unchanged; it is simply not sent.
@@ -1944,7 +1966,7 @@ does any of them):
    `daily --no-send` once as the task account and read the record (read
    only). The live settings must set `first_create_already_seen` to `true`
    (S5 creates have run since 5 Nov 2026, before this task existed;
-   otherwise the first email says "FIRST CREATE: run S5 Part B"), and
+   otherwise the first email says "FIRST CREATE: S5 Part B is due"), and
    `sync_state_root` to the `state_root` of the live sync config.
 6. AC2 VM: dry-run the installer, then `-Register` (OK: VM task
    registration). Then one `Start-ScheduledTask` and check the record and
@@ -2053,7 +2075,7 @@ names each part, so a tool problem never reads as a sync problem:
 
 ```
 MEMBER-SYNC daily summary 2026-11-19: WARN (sync CLEAN, member core CLEAN, tags WARN)
-Sync: no stop condition found.          (a sync stop: "Sync STOP: <codes> (check the sync now; ...)")
+Sync: no stop condition found.          (a sync stop: "Sync STOP: <codes>. Next: forward this email to Claude.")
 Auto off (observe mode, nothing was switched): no action
 ... the sync lines, unchanged ...
 Owner AutoCount session: not checked (manual glance)
@@ -2066,6 +2088,8 @@ Tags latest run: would_tag=3 would_untag=0 would_bday_tag=2 would_bday_untag=0
 Tags alerts 24h: none
 
 Generated ... SGT. Record: daily_summary_<date>.json on the VM.
+Runbook: ...
+Next: forward this email to Claude.
 ```
 
 An unreadable tool is one line: `Tags: STOP (digest_failed: tags_ledger_missing)`.

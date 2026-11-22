@@ -355,7 +355,7 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
         clean_result, stop_result = self.run_cases([body, json.loads(json.dumps(event))])
         self.assertIn(" state_root_as_in_settings=yes", self.assert_sent(clean_result, "[XB daily] MEMBER-SYNC CLEAN 2026-11-07"))
         text = self.assert_sent(stop_result, "[XB daily] MEMBER-SYNC STOP 2026-11-07")
-        self.assertIn("STOP reasons: config_unexpected ", text)
+        self.assertIn("STOP reasons: config_unexpected. Next: forward this email to Claude.\n", text)
         self.assertIn(" state_root_as_in_settings=no", text)
 
     def test_would_switch_is_reported_and_nothing_else(self):
@@ -369,7 +369,7 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
     def test_first_create_and_failed_parts(self):
         body = build(first_create=True)
         (result,) = self.run_cases([body])
-        self.assertIn("first create=yes (FIRST CREATE: run S5 Part B)", self.assert_sent(result, "[XB daily] MEMBER-SYNC CLEAN 2026-11-07"))
+        self.assertIn("first create=yes (FIRST CREATE: S5 Part B is due). Next: forward this email to Claude.", self.assert_sent(result, "[XB daily] MEMBER-SYNC CLEAN 2026-11-07"))
 
     def test_a_daily_summary_is_never_folded_and_never_held_by_a_flood(self):
         # A summary sent minutes ago (a manual re-run) and a full alert flood of this system.
@@ -506,13 +506,20 @@ FAKE_AT = "x@example.com"
 MORE_RE = re.compile(r"\+\d+ more \(see the VM record\)")
 # SHA-256 of the Code node's output for every body of v1_golden_bodies(), made with the
 # main 8222aed export of this workflow (scripted, #288 wiring G1): a v1 event renders exactly as before.
-V1_LINES_GOLDEN_SHA256 = "da9c0ef40da2d42eea8b80932df7598784057c5b55e408864cb40a7fd328057b"
+# Re-pinned DELIBERATELY at #288 fix 1 (22 Nov 2026, Controller ruling item 3, owner rule 21 Nov): the owner
+# action text changed and nothing else. "(check the sync now; the off switch is in the runbook)" became
+# ". Next: forward this email to Claude.", "(FIRST CREATE: run S5 Part B)" became "(FIRST CREATE: S5 Part B is
+# due). Next: forward this email to Claude.", and an email with neither line ends with that Next line. The old
+# value was da9c0ef40da2d42eea8b80932df7598784057c5b55e408864cb40a7fd328057b.
+V1_LINES_GOLDEN_SHA256 = "e22df68631580ab204dc649c69b0ccbc44d587b287be00f4c432eecb7a1713c3"
 # SHA-256 of this export with the Validate Summary Event jsCode blanked. Made on main 8222aed
 # (8a77d55f...), then re-made at fix 1 (G2 LATER 1) after the Start Here sticky's Input and Subject
 # bullets and its height (400 -> 460) changed: no other node, connection, setting or note changed.
 # #288 slice 3 errors only (22 Nov 2026): re-pinned to the graph with Email Is Due, Log Clean Summary and
 # Respond Clean Logged (and the moved email path); the Code node itself is pinned by the golden digests.
-WORKFLOW_REST_SHA256 = "6a9884327666e5fb26227766a6412ef0d16c766070ea8159b8aa5cc24ec3a3bd"
+# #288 fix 1: re-pinned after the Start Here sticky's Errors only, Subject and Failures bullets changed
+# (action alerts, the fixed Next, the health check as the signal); no other node or connection changed.
+WORKFLOW_REST_SHA256 = "c4893bf5c4188080548561f0888bda03b30af704188e4bf972b6f2e14c8b9e1f"
 
 
 def core_raw(alerts=None, runs=None, opened=None, **overrides):
@@ -697,7 +704,7 @@ class WiringWorkflowTests(unittest.TestCase):
                 parts = ["sync " + sync_word] + (["member core " + core["status"]] if core else []) + (["tags " + tags["status"]] if tags else [])
                 self.assertIn("MEMBER-SYNC daily summary 2026-11-07: %s (%s)" % (word, ", ".join(parts)), lines)
                 if sync_word == "STOP":
-                    self.assertIn("Sync STOP: task_last_result, task_disabled (check the sync now; the off switch is in the runbook)", lines)
+                    self.assertIn("Sync STOP: task_last_result, task_disabled. Next: forward this email to Claude.", lines)
                 else:
                     self.assertIn("Sync: no stop condition found.", lines)
                 for label, section, failed in (("Member core", core, "benefits_ledger_missing"), ("Tags", tags, "tags_ledger_missing")):
@@ -740,7 +747,9 @@ class WiringWorkflowTests(unittest.TestCase):
         ])
         self.assertEqual(lines[0], "MEMBER-SYNC daily summary 2026-11-07: WARN (sync CLEAN, member core WARN, tags WARN)")
         self.assertEqual(lines[1], "Sync: no stop condition found.")
-        self.assertTrue(result["out"][0]["json"]["lines"][-1].startswith("Runbook: "))
+        # #288 fix 1: a WARN email with no STOP or FIRST CREATE line ends with the one fixed Next.
+        self.assertTrue(result["out"][0]["json"]["lines"][-2].startswith("Runbook: "))
+        self.assertEqual(result["out"][0]["json"]["lines"][-1], "Next: forward this email to Claude.")
 
     # -- W3 -----------------------------------------------------------------------------------
     def test_validator_rejections(self):
@@ -817,7 +826,7 @@ class WiringWorkflowTests(unittest.TestCase):
                 # The never-cut lines are whole.
                 self.assertTrue(lines[0].startswith("MEMBER-SYNC daily summary 2026-11-07: STOP"))
                 self.assertTrue(lines[1].startswith("STOP reasons: " if tools is None else "Sync STOP: "))
-                self.assertTrue(lines[1].endswith("(check the sync now; the off switch is in the runbook)"))
+                self.assertTrue(lines[1].endswith(". Next: forward this email to Claude."))
                 self.assertTrue(lines[2].startswith("Auto off (observe mode, nothing was switched): would switch"))
                 for prefix in ("Sync task: ", "Config: ", "Runs 24h: ", "Writes 24h: ", "Possible duplicates=", "Open: ", "New AC2 members 24h: ",
                                "Owner AutoCount session", "Generated ", "Runbook: "):
@@ -935,6 +944,23 @@ class ErrorsOnlyShapeTests(unittest.TestCase):
             self.assertIn(text, notes)
 
 
+NEXT_LINE = "Next: forward this email to Claude."
+
+
+def action_alerts_in_code():
+    code = next(n for n in json.loads(WORKFLOW.read_text(encoding="utf-8"))["nodes"]
+                if n["name"] == CODE_NODE)["parameters"]["jsCode"]
+    (block,) = re.findall(r"const ACTION_ALERTS = \[\n((?:  '[a-z0-9_]+',\n)+)\];", code)
+    return re.findall(r"'([a-z0-9_]+)'", block)
+
+
+def action_alerts_in_runbook():
+    doc = (ROOT / "docs" / "autocount2-automation" / "member_sync_phase1.md").read_text(encoding="utf-8")
+    start = doc.index("### Hypercare alerts that need action")
+    section = doc[start:doc.index("\n### ", start + 1)]
+    return re.findall(r"^- `([a-z0-9_]+)`", section, flags=re.MULTILINE)
+
+
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code nodes")
 class ErrorsOnlyCodeTests(unittest.TestCase):
     run_cases = WorkflowCodeExecutionTests.run_cases
@@ -953,6 +979,64 @@ class ErrorsOnlyCodeTests(unittest.TestCase):
         warn = build(member_tools={"member_core": None, "tags": TAGS_CASES["WARN"]()})
         self.assertEqual((clean["result"], stop["result"], first["result"], warn["result"]), ("CLEAN", "STOP", "CLEAN", "CLEAN"))
         self.assertEqual(self.flags([clean, stop, first, silent, counts_only, warn]), [False, True, True, True, False, True])
+
+    # -- #288 fix 1 (G2 C1): action alerts on a CLEAN morning ---------------------------------------
+    def with_alerts(self, **alerts):
+        body = build()
+        body["digest"]["alerts"].update(alerts)
+        self.assertEqual(body["result"], "CLEAN")
+        return body
+
+    def test_each_action_alert_on_a_clean_morning_is_emailed(self):
+        codes = action_alerts_in_code()
+        self.assertEqual(len(codes), 11)
+        results = self.run_cases([self.with_alerts(**{code: 1}) for code in codes])
+        for code, result in zip(codes, results):
+            with self.subTest(code=code):
+                self.assertIs(result["out"][0]["json"]["email"], True)
+                lines = result["out"][0]["json"]["lines"]
+                self.assertIn(code + "=1", "\n".join(lines))
+                self.assertEqual(lines[-1], NEXT_LINE)
+                self.assertEqual(sum(line.endswith(NEXT_LINE) for line in lines), 1)
+
+    def test_a_clean_morning_with_only_other_alerts_is_not_emailed(self):
+        # The VM's expected codes, the shown-only codes and near misses of listed codes (no prefix or fuzzy match).
+        others = ["waiting_for_staff", "created_after_wait", "max_writes_per_run_reached", "memberno_other_reason",
+                  "memberno_", "memberno_conflict_old", "xmemberno_conflict", "no_phone_sign_up", "create_rate_capped2",
+                  "possible_duplicate", "forms_held", "forms_would_heal", "backfill_members_creates", "forms_read_stalled"]
+        results = self.run_cases([self.with_alerts(**{code: 1}) for code in others] + [self.with_alerts(**{c: 1 for c in others})])
+        for code, result in zip(others + ["all of them"], results):
+            with self.subTest(code=code):
+                self.assertIs(result["out"][0]["json"]["email"], False)
+                self.assertNotIn(NEXT_LINE, "\n".join(result["out"][0]["json"]["lines"]))
+
+    def test_a_cut_alert_list_is_emailed(self):
+        (result,) = self.run_cases([self.with_alerts(other_alert_codes=3)])
+        self.assertIs(result["out"][0]["json"]["email"], True)
+        self.assertEqual(result["out"][0]["json"]["lines"][-1], NEXT_LINE)
+
+    def test_the_list_in_code_is_the_runbooks_list(self):
+        self.assertEqual(action_alerts_in_code(), action_alerts_in_runbook())
+        self.assertEqual(len(set(action_alerts_in_code())), len(action_alerts_in_code()))
+
+    def test_every_email_ends_its_action_with_the_fixed_next(self):
+        stop = build(task=stop_sync_task())
+        first = build(first_create=True)
+        both = build(task=stop_sync_task(), first_create=True)
+        warn = build(member_tools={"member_core": None, "tags": TAGS_CASES["WARN"]()})
+        clean, stop_r, first_r, both_r, warn_r = self.run_cases([build(), stop, first, both, warn])
+        self.assertNotIn("Next:", "\n".join(clean["out"][0]["json"]["lines"]))
+        self.assertTrue(stop_r["out"][0]["json"]["lines"][1].endswith(". " + NEXT_LINE))
+        self.assertNotEqual(stop_r["out"][0]["json"]["lines"][-1], NEXT_LINE)
+        first_lines = first_r["out"][0]["json"]["lines"]
+        self.assertTrue(any(line.endswith("first create=yes (FIRST CREATE: S5 Part B is due). " + NEXT_LINE) for line in first_lines))
+        self.assertNotEqual(first_lines[-1], NEXT_LINE)
+        self.assertEqual(sum(line.endswith(NEXT_LINE) for line in both_r["out"][0]["json"]["lines"]), 2)
+        self.assertEqual(warn_r["out"][0]["json"]["lines"][-1], NEXT_LINE)
+        code = next(n for n in json.loads(WORKFLOW.read_text(encoding="utf-8"))["nodes"]
+                    if n["name"] == CODE_NODE)["parameters"]["jsCode"]
+        for stale in ("check the sync now", "run S5 Part B", "the off switch is in the runbook"):
+            self.assertNotIn(stale, code)
 
     def test_a_clean_row_never_changes_the_senders_decision(self):
         # Yesterday's and today's clean_not_sent rows: the STOP summary is still sent, never folded or held.
