@@ -23,6 +23,29 @@ The Gmail filter is `[XB health]`. The subject carries the date, so a FAIL never
 - `[XB health] WARN 1 jobs 2026-11-19`: 1 job needs a look, nothing has stopped.
 - `[XB health] OK 10 jobs 2026-11-23`: Monday heartbeat, all 10 watched jobs OK.
 
+## When the owner forwards a health email
+
+Owner rule (21 Nov 2026): the owner is emailed only about errors to fix, and the owner's only action is to tell Claude. So every WARN and FAIL line ends with the same fixed `Next: forward this email to Claude.` (#288, 22 Nov 2026). The line keeps its job label, reason text, codes and counts. No line sends the owner to n8n, the server PC, the VM or a runbook. The 08:15 dead-man FAIL and the `Build Broken-Check Email` FAIL end the same way.
+
+Claude's first look per job (these were the email's old `Next:` texts):
+
+| Job id | First look |
+| --- | --- |
+| `member_sync_summary` | Task `XB-MemberSync-DailySummary` on the VM ([member_sync_phase1.md](autocount2-automation/member_sync_phase1.md), "Daily summary email"). |
+| `member_tags` | The member sync daily summary. |
+| `ac2_stock_export` | The AC2 VM is on and signed in, then Task Scheduler "XB AC2 Hourly Stock Balance" ([stock_balance_hourly_runbook.md](autocount2-automation/stock_balance_hourly_runbook.md), "Failure classes"). |
+| `stock_alert_route` | The stock alert workflow in n8n and its webhook secret on the VM ([stock_balance_hourly_runbook.md](autocount2-automation/stock_balance_hourly_runbook.md), "Error alerts"). |
+| `arap_export` | The AC2 VM is on, then its AR/AP aging task ([arap_aging_runbook.md](autocount2-automation/arap_aging_runbook.md)). |
+| `arap_alert_route` | The AR/AP alert workflow in n8n and its webhook secret on the VM ([arap_aging_runbook.md](autocount2-automation/arap_aging_runbook.md), "A3: error alerts"). |
+| `energygrid_daily_bills` | Its task in Task Scheduler on the server PC (EnergyGrid runbook; its own email monitor still runs). |
+| `energygrid_retention` | Its task and retention report on the server PC (EnergyGrid runbook). |
+| `drive_mirror` | Nothing if the next Sunday run passes; otherwise [drive_mirror_runbook.md](drive_mirror_runbook.md). |
+| `n8n_workflows` | The workflows named, through the local n8n API (this runbook, section "Rules"). For `error_runs`, read the `energygrid_monitor_error_log` rows first: a row with workflow `1` and execution `231` is n8n's editor test sample, not a real failure (the #288 editor-sample fix stops writing it once it is live). |
+| `simba_intake` | The SIMBA invoice workflows in n8n ([simba_invoice_intake.md](simba_invoice_intake.md)). |
+| `server_tasks` | Add the task to the daily health settings or remove it (section "Jobs"). |
+| `checker` | The server PC is on, and Task Scheduler "XB-DailyHealth" (section "How it works"). |
+| `drive_folder` | Google Drive for desktop is running and signed in on the server PC. |
+
 ## How it works
 
 1. **07:30, server PC.** Task `\XB\XB-DailyHealth` runs `xb_daily_health.py run`. It reads:

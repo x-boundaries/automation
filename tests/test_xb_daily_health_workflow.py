@@ -877,8 +877,7 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(plan["row"]["warn_jobs"], "arap_alert_route")
         line = next(l for l in plan["mail"]["lines"] if "AR/AP alert route:" in l)
         self.assertEqual(line, "WARN  AR/AP alert route: the last alert could not be delivered to n8n, since 19 Nov. Next: "
-                               "check the AR/AP alert workflow in n8n and its webhook secret on the VM (runbook: "
-                               "arap_aging_runbook.md, \"A3: error alerts\").")
+                               "forward this email to Claude.")
         checked, _ = through_sender(plan)
         self.assertIs(checked["valid"], True, checked)
         self.assertIn("label: 'AR/AP alert'", next(n for n in load()["nodes"] if n["name"] == JUDGE)["parameters"]["jsCode"])
@@ -1005,8 +1004,7 @@ class DeadManTests(unittest.TestCase):
             plan = item["json"]
             self.assertEqual(plan["mail"]["short"], "FAIL 1 jobs 2026-11-20")
             self.assertEqual(plan["mail"]["lines"][2], "FAIL  Health checker: it did not report today (server task, PC "
-                             "asleep, or webhook), since 20 Nov. Next: check the server PC is on and Task Scheduler "
-                             "\"XB-DailyHealth\" (runbook: daily_health_check.md).")
+                             "asleep, or webhook), since 20 Nov. Next: forward this email to Claude.")
             self.assertEqual(plan["row"], {"date": "2026-11-20", "kind": "deadman", "verdict": "FAIL", "watched": 1,
                                            "problems": 1, "fail_jobs": "checker", "warn_jobs": ""})
             checked, decided = through_sender(plan)
@@ -1144,7 +1142,7 @@ class ExpressionTests(unittest.TestCase):
         self.assertEqual(plan["mail"], {"severity": "ERROR", "short": "FAIL 1 jobs 2026-11-20", "lines": [
             "XB daily health check, Fri 20 Nov 2026: the health check could not be built today.",
             "",
-            "FAIL  Health checker: n8n XB Daily Health failed before the email. Next: open n8n, check XB Daily Health.",
+            "FAIL  Health checker: n8n XB Daily Health failed before the email. Next: forward this email to Claude.",
             "",
             "No [XB health] email on a Monday by 09:00 means the checker is down: tell Claude.",
         ]})
@@ -1173,16 +1171,58 @@ class ExpressionTests(unittest.TestCase):
         self.assertNotIn("Log Health Run", load()["connections"])
 
 
+class OwnerNextTests(unittest.TestCase):
+    """#288 (22 Nov 2026): the owner's only action is to tell Claude. Every WARN and FAIL line the owner reads
+    ends with the same fixed Next; no line sends the owner to n8n, the server PC, the VM or a runbook."""
+
+    FORWARD = "Next: forward this email to Claude."
+
+    def test_every_problem_line_ends_with_forward_to_claude(self):
+        obs = healthy_obs()
+        obs["arap_status"]["alert_status"] = "send_failed"
+        lines = judge_plan(checker_event(obs))["mail"]["lines"]
+        lines += GOLDEN_TEXT.splitlines()
+        problems = [line for line in lines if line.startswith(("WARN  ", "FAIL  "))]
+        self.assertGreaterEqual(len(problems), 4)
+        for line in problems:
+            self.assertTrue(line.endswith(". " + self.FORWARD), line)
+            self.assertEqual(line.count("Next:"), 1, line)
+
+    def test_every_job_gets_the_same_next(self):
+        code = next(n for n in load()["nodes"] if n["name"] == JUDGE)["parameters"]["jsCode"]
+        self.assertIn("const NEXT = 'forward this email to Claude.';", code)
+        self.assertIn("+ '. Next: ' + NEXT);", code)
+        self.assertNotIn("NEXT[", code)
+
+    def test_no_next_sends_the_owner_anywhere_else(self):
+        text = json.dumps(load())
+        nexts = re.findall(r"Next: [^'\\\"]*", text)
+        self.assertEqual(sorted(set(nexts)), ["Next: ", self.FORWARD])
+        self.assertEqual(text.count(self.FORWARD), 2)  # Decide Dead-Man and Build Broken-Check Email
+        for stale in ("open n8n", "Next: check", "Next: nothing", "Next: see", "Next: add"):
+            self.assertNotIn(stale, text)
+
+    def test_runbook_keeps_claudes_first_look(self):
+        doc = (ROOT / "docs" / "daily_health_check.md").read_text(encoding="utf-8")
+        start = doc.index("## When the owner forwards a health email")
+        section = doc[start:doc.index("\n## ", start + 1)]
+        self.assertIn("`Next: forward this email to Claude.`", section)
+        code = next(n for n in load()["nodes"] if n["name"] == JUDGE)["parameters"]["jsCode"]
+        labels = code[code.index("const LABELS = {"):code.index("};", code.index("const LABELS = {"))]
+        jobs = re.findall(r"(\w+): '", labels)
+        self.assertEqual(len(jobs), 14)
+        for job in jobs:
+            self.assertIn("| `%s` |" % job, section)
+
+
 GOLDEN_TEXT = "\n".join([
     "XB daily health check, Thu 19 Nov 2026 07:30 SGT: 3 of 12 watched jobs need a look (2 FAIL, 1 WARN).",
     "",
-    "FAIL  Member sync daily summary: no email this morning, since 19 Nov. Next: check task "
-    "XB-MemberSync-DailySummary on the VM (runbook: member_sync_phase1.md, \"Daily summary email\").",
-    "FAIL  AC2 hourly stock export: no new run for 8 h (last 18 Nov 23:30), since 19 Nov. Next: check the AC2 VM is "
-    "on and signed in, then Task Scheduler \"XB AC2 Hourly Stock Balance\" (runbook: stock_balance_hourly_runbook.md, "
-    "\"Failure classes\").",
-    "WARN  Drive mirror: the last weekly run could not reach GitHub (FETCH_FAILED), since 16 Nov. Next: nothing if the "
-    "next Sunday run passes; otherwise see drive_mirror_runbook.md.",
+    "FAIL  Member sync daily summary: no email this morning, since 19 Nov. Next: forward this email to Claude.",
+    "FAIL  AC2 hourly stock export: no new run for 8 h (last 18 Nov 23:30), since 19 Nov. Next: forward this email "
+    "to Claude.",
+    "WARN  Drive mirror: the last weekly run could not reach GitHub (FETCH_FAILED), since 16 Nov. Next: forward this "
+    "email to Claude.",
     "",
     "OK    9 other jobs: Stock alert route, AR/AP export, AR/AP alert route, EnergyGrid daily bills, EnergyGrid "
     "retention, n8n workflows, Server task list, Health checker, Drive folder.",
