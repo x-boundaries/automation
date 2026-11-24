@@ -396,6 +396,18 @@ def same_stored(a: Any, b: Any) -> bool:
     return pa is not None and pa == pb
 
 
+def refund_is_positive(receipt: Mapping[str, Any], threshold_cents: int) -> bool:
+    """V3 (Q5, G2 fix round 1 F1): money really went back. ``REFUNDED``, or
+    ``PARTIALLY_REFUNDED`` with the measured amount below the threshold. A
+    receipt still ``PAID`` (units removed or an order cancelled with no money
+    refunded yet) or in any other status is never a positive fact."""
+
+    status = receipt["financial_status"]
+    if status == "REFUNDED":
+        return True
+    return status == "PARTIALLY_REFUNDED" and isinstance(receipt["net_cents"], int) and receipt["net_cents"] < threshold_cents
+
+
 def check_save_payload(payload: Mapping[str, Any]) -> None:
     """Python's copy of the child's write-boundary rules, run before the
     INTENT row: MEMBER -> GUEST only, both expected values present, expire
@@ -650,6 +662,9 @@ class RemovalsLedger:
         return self.conn.execute(f"SELECT * FROM removals WHERE member_no = ? AND state IN {_LANDED_OR_OPEN} ORDER BY rowid DESC LIMIT 1",
                                  (member_no,)).fetchone()
 
+    def is_released(self, write_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM write_releases WHERE write_id = ?", (write_id,)).fetchone() is not None
+
     def revoke_recorded(self, order_gid: str) -> bool:
         return self.conn.execute(f"SELECT 1 FROM removals WHERE kind = 'revoke' AND order_gid = ? AND state IN {_LANDED_OR_OPEN} LIMIT 1",
                                  (order_gid,)).fetchone() is not None
@@ -746,7 +761,6 @@ class CoreFacts:
     flagged: list[dict[str, Any]] = field(default_factory=list)  # applied receipts alerted refund_on_basis
     receipts_by_member: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # applied / no_change
     upgrade_writes: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # order_gid -> writes (kind upgrade)
-    released_as_intended: set[str] = field(default_factory=set)  # order_gids with a HELD write released as_intended
     active_claims: set[tuple[str, str]] = field(default_factory=set)  # (customer_gid, member_no_key)
 
 
@@ -785,9 +799,6 @@ def read_member_core(config: RemovalsConfig) -> CoreFacts:
             for row in conn.execute("SELECT write_id, order_gid, kind, member_no, from_type, to_type, new_expiry_local, state, "
                                     "post_last_modified_local FROM writes WHERE kind = 'upgrade' ORDER BY rowid"):
                 facts.upgrade_writes.setdefault(row["order_gid"], []).append(dict(row))
-            for row in conn.execute("SELECT w.order_gid FROM writes w JOIN write_releases r ON r.write_id = w.write_id "
-                                    "WHERE w.state = 'HELD' AND r.finding = 'as_intended'"):
-                facts.released_as_intended.add(row["order_gid"])
             for row in conn.execute("SELECT customer_gid, member_no_key FROM active_claim_links"):
                 facts.active_claims.add((row["customer_gid"], row["member_no_key"]))
         finally:
@@ -1175,6 +1186,22 @@ class RemovalsEngine:
             return True
         return False
 
+    def _removal_open(self, member_no: str, summary: RunSummary, ref: str) -> bool:
+        """The member's latest removal landed or may have landed and is not
+        DONE: never a second send. A HELD removal the owner released stays
+        HELD for ever, so that member is skipped for good: one alert
+        (``removal_held_released``) instead of a silent count (G2 L3); staff
+        decide by hand."""
+
+        recorded = self.ledger.removal_landed_or_open(member_no)
+        if recorded is None or recorded["state"] == "DONE":
+            return False
+        if recorded["state"] == "HELD" and self.ledger.is_released(recorded["removal_id"]):
+            self._review(f"released:{recorded['removal_id']}", "removal_held_released", summary, ref, member_no)
+        else:
+            summary.count("removal_open", ref, member_no)
+        return True
+
     def _due_cap(self, kind: str, summary: RunSummary, saves_this_kind: int) -> bool:
         """True when this kind may not write again this run (per-run cap or
         the per-day cap, counted from the ledger)."""
@@ -1245,9 +1272,7 @@ class RemovalsEngine:
             ref = self.ledger.ref("m", member_no)
             if self._member_blocked(member_no, core, summary, ref):
                 continue
-            recorded = self.ledger.removal_landed_or_open(member_no)
-            if recorded is not None and recorded["state"] != "DONE":
-                summary.count("removal_open", ref, member_no)
+            if self._removal_open(member_no, summary, ref):
                 continue
             if self.ledger.put_back_after_expire(member_no, row.get("expiry_local")):
                 summary.count("put_back_kept", ref, member_no)
@@ -1311,9 +1336,11 @@ class RemovalsEngine:
                     or not isinstance(basis, str) or upgrade["new_expiry_local"] != basis):
                 self._review(f"person:{order_gid}", "revoke_needs_person", summary, ref, member_no)
                 continue
-            if not (receipt["financial_status"] == "REFUNDED"
-                    or (isinstance(receipt["net_cents"], int) and receipt["net_cents"] < self.config.qualify_threshold_cents)):
-                self._review(f"person:{order_gid}", "revoke_needs_person", summary, ref, member_no)  # money-only refund or a non-REFUNDED cancel
+            if not refund_is_positive(receipt, self.config.qualify_threshold_cents):
+                # A refund by money only, a cancellation or unit removal with no money refunded yet (still PAID), or any
+                # other status: a person decides (Q5). The order is read again on every member core run, so a refund
+                # issued later still revokes (the review alerts once).
+                self._review(f"person:{order_gid}", "revoke_needs_person", summary, ref, member_no)
                 continue
             others = [r for r in core.receipts_by_member.get(member_no, []) if r["order_gid"] != order_gid
                       and r["alerted"] != REFUND_ON_BASIS and self._qualifies_now(r)]
@@ -1328,9 +1355,11 @@ class RemovalsEngine:
                 continue
             if self._member_blocked(member_no, core, summary, ref):
                 continue
-            recorded = self.ledger.removal_landed_or_open(member_no)
-            if recorded is not None and recorded["state"] != "DONE":
-                summary.count("removal_open", ref, member_no)
+            if self._removal_open(member_no, summary, ref):
+                continue
+            if write and saves >= self.config.max_revokes_per_run:
+                summary.count("revoke_cap_reached")  # before the read (G2 L7): a backlog never spends the read budget
+                summary.count("would_revoke")
                 continue
             if write and self._stop_requested():
                 summary.stopped = "stop_file_present"
@@ -1355,7 +1384,7 @@ class RemovalsEngine:
                 continue
             payload = {"kind": "revoke", "member_no": member_no, "from_type": FROM_TYPE, "to_type": TO_TYPE,
                        "expected_last_modified_local": read.last_modified_local, "expected_expiry_local": read.expiry_local,
-                       "run_day_local": None, "basis_expiry_local": read.expiry_local, "salt": secrets.token_hex(16)}
+                       "run_day_local": None, "basis_expiry_local": expected_expiry, "salt": secrets.token_hex(16)}
             if self._remove(payload, summary, run_id=run_id, ref=ref, order_gid=order_gid, core_write_id=upgrade["write_id"]):
                 saves += 1
 

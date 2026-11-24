@@ -90,6 +90,7 @@ class FakeBook:
         self.before_save = None  # callable(member_no) run after the parent's read, before the child's re-read
         self.kill_in_save = False
         self.save_changes_expiry = False
+        self.save_changes_name = False
         self.save_raises = False
 
     def add(self, n: int, *, member_type: str = "MEMBER", active: str = "T", expiry: str | None = YESTERDAY, last_modified: str = LM,
@@ -171,6 +172,9 @@ class FakeBook:
         if self.save_changes_expiry:
             m["ExpiryDate"] = "2030-01-01T00:00:00.000"
             assigned.append("ExpiryDate")
+        if self.save_changes_name:
+            m["Name"] = "changed by the fake"
+            assigned.append("Name")
         self._bump(m)
         self.saves.append(("restore" if restore else payload["kind"], no, assigned))
         if self.kill_in_save:
@@ -739,6 +743,37 @@ class ExpireTests(Base):
         second = engine.busy("scheduled")
         self.assertEqual(second["alerts"], ["writer_busy_again"])
 
+    def test_day_cap_counts_a_released_held_removal(self):
+        """G2 L1: a HELD removal landed (or may have): it counts against the day cap after its release too."""
+        first = self.book.add(1)
+        for n in range(2, 5):
+            self.book.add(n)
+        self.book.save_changes_expiry = True
+        self.expire(apply=True, max_removals_per_day=2)
+        self.book.save_changes_expiry = False
+        self.now = NOW + timedelta(seconds=PAST_DEADLINE)
+        ref = self.ledger.ref("r", self.removals()[0]["removal_id"])
+        self.engine().release_held(removal_ref=ref, member_last3=first[-3:], finding="not_as_intended", apply=True)
+        result = self.expire(apply=True, max_removals_per_day=2)
+        self.assertEqual((result["saves"], result["counts"]["day_cap_reached"]), (1, 2))
+
+    def test_member_read_rechecks_the_active_flag_and_last_modified(self):
+        """G2 L2: the parent compares its own read with the scan before any INTENT row."""
+        one, two = self.book.add(1), self.book.add(2)
+        real_member = self.book.member
+
+        def member(member_no, salt):
+            if member_no == one:
+                self.book.members[member_no]["IsActive"] = "F"
+            else:
+                self.book.members[member_no]["LastModified"] = "2026-11-24T11:00:00.000"
+            return real_member(member_no, salt)
+        self.book.member = member
+        result = self.expire(apply=True)
+        self.assertEqual((result["saves"], result["counts"]["changed_since_read"]), (0, 2))
+        self.assertEqual(self.removals(), [])  # no INTENT row
+        self.assertEqual((self.book.members[one]["MemberType"], self.book.members[two]["MemberType"]), ("MEMBER", "MEMBER"))
+
     def test_put_back_after_an_expire_is_kept(self):
         no = self.book.add(1)
         self.assertEqual(self.expire(apply=True)["saves"], 1)
@@ -784,6 +819,28 @@ class RevokeTests(Base):
         self.assertEqual((result["saves"], result["counts"]["revoke_needs_person"]), (0, 2))
         self.assertIn("revoke_needs_person", result["alerts"])
 
+    def test_v03_paid_receipt_with_no_refund_money_needs_a_person(self):
+        """G2 fix round 1 F1: units removed (or a cancellation) with no money refunded is not a positive fact."""
+        no = self.refund_case(status="PAID", net=0)
+        result = self.revoke(apply=True)
+        self.assertEqual((result["saves"], result["alerts"]), (0, ["revoke_needs_person"]))
+        self.assertEqual(self.book.members[no]["MemberType"], "MEMBER")
+        with self.core.conn() as c:  # the refund is issued later: the member core records it on its next read
+            c.execute("UPDATE receipts SET financial_status = 'PARTIALLY_REFUNDED', net_cents = 0 WHERE order_gid = ?", (order_gid(1),))
+        again = self.revoke(apply=True)
+        self.assertEqual((again["saves"], again["alerts"]), (1, []))
+        self.assertEqual(self.book.members[no]["MemberType"], "GUEST")
+
+    def test_v03_other_statuses_are_never_a_positive_fact(self):
+        for n, status in enumerate(("PAID", "AUTHORIZED", "PENDING", "VOIDED", "PARTIALLY_PAID", None), start=1):
+            self.refund_case(n, status=status, net=0)
+        result = self.revoke(apply=True)
+        self.assertEqual((result["saves"], result["counts"]["revoke_needs_person"]), (0, 6))
+        self.assertTrue(mr.refund_is_positive({"financial_status": "REFUNDED", "net_cents": 40_000}, 30_000))
+        self.assertTrue(mr.refund_is_positive({"financial_status": "PARTIALLY_REFUNDED", "net_cents": 29_999}, 30_000))
+        self.assertFalse(mr.refund_is_positive({"financial_status": "PARTIALLY_REFUNDED", "net_cents": 30_000}, 30_000))
+        self.assertFalse(mr.refund_is_positive({"financial_status": "PARTIALLY_REFUNDED", "net_cents": None}, 30_000))
+
     def test_v04_refund_on_an_extend_is_an_alert(self):
         """Mutation target 10 (V1: accepts an extend)."""
         no = self.book.add(1, expiry=BASIS + ".000", last_modified=UPGRADE_POST_LM)
@@ -814,6 +871,63 @@ class RevokeTests(Base):
         self.core.receipt(2, no, state="no_change", code="expiry_already_later", status="PAID", net=31_000, alerted=None, customer=1)
         result = self.revoke(apply=True)
         self.assertEqual((result["saves"], result["counts"]["revoke_other_basis"]), (0, 1))
+
+    def test_v06_a_refunded_other_receipt_is_not_a_basis(self):
+        """G2 L9: another receipt that is itself REFUNDED does not keep the member."""
+        no = self.refund_case()
+        self.core.receipt(2, no, state="no_change", code="expiry_already_later", status="REFUNDED", net=31_000, alerted=None, customer=1)
+        self.assertEqual(self.revoke(apply=True)["saves"], 1)
+
+    def test_v07_open_member_core_write_or_pending_receipt_blocks_a_revoke(self):
+        """G2 fix round 1 F2 (V7): the member core may be writing or about to renew this member."""
+        one = self.refund_case(1)
+        self.core.write(11, one, state="UNCERTAIN")  # another order's write, not settled
+        two = self.refund_case(2)
+        self.core.receipt(12, two, state="ready", code=None, alerted=None, customer=2)
+        result = self.revoke(apply=True)
+        self.assertEqual((result["saves"], result["counts"]["core_write_open"], result["counts"]["renewal_pending"]), (0, 1, 1))
+        self.assertEqual(self.book.reads, [])  # never read for a write
+
+    def test_v07_open_removal_blocks_a_revoke(self):
+        """G2 fix round 1 F2 (V7): an earlier removal of this member is not settled."""
+        no = self.refund_case()
+        ledger = self.open_ledger()
+        with ledger.tx() as conn:
+            conn.execute("INSERT INTO removals(removal_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, "
+                         "expected_expiry_local, day_local, order_gid, core_write_id, salt, state, created_at, updated_at, deadline_at) "
+                         "VALUES (?, 'run-x', 'revoke', ?, 'MEMBER', 'GUEST', ?, ?, ?, ?, 'write-y', 's', 'INTENT', 't', 't', 't')",
+                         ("rm-" + "e" * 32, no, UPGRADE_POST_LM, BASIS + ".000", RUN_DAY.isoformat(), order_gid(99)))
+            conn.execute("UPDATE removals SET state = 'UNCERTAIN'")
+        result = self.revoke()
+        self.assertEqual((result["counts"].get("removal_open"), result["counts"].get("would_revoke")), (1, None))
+
+    def test_v07_inactive_member_is_not_revoked(self):
+        """G2 fix round 1 F2 (V7)."""
+        no = self.refund_case()
+        self.book.members[no]["IsActive"] = "F"
+        result = self.revoke(apply=True)
+        self.assertEqual((result["saves"], result["counts"]["revoke_member_inactive"]), (0, 1))
+        self.assertEqual(self.book.members[no]["MemberType"], "MEMBER")
+
+    def test_revoke_cap_is_checked_before_the_member_read(self):
+        """G2 L7: a revoke backlog never spends the shared read budget."""
+        for n in range(1, 6):
+            self.refund_case(n)
+        result = self.revoke(apply=True, max_revokes_per_run=1)
+        self.assertEqual((result["saves"], len(self.book.reads)), (1, 1))
+
+    def test_revoke_sends_the_upgrade_basis_as_the_basis(self):
+        """G2 L10: the child compares the upgrade's basis with what the parent read."""
+        self.refund_case()
+        seen = []
+        real_save = self.book.save
+
+        def save(payload, **kwargs):
+            seen.append((payload["basis_expiry_local"], payload["expected_expiry_local"]))
+            return real_save(payload, **kwargs)
+        self.book.save = save
+        self.assertEqual(self.revoke(apply=True)["saves"], 1)
+        self.assertEqual(seen, [(BASIS + ".000", BASIS + ".000")])
 
     def test_v07_voided_claim_link(self):
         """Mutation target 10 (V5)."""
@@ -937,6 +1051,37 @@ class UnclearWriteTests(Base):
         done = engine.release_held(removal_ref=ref, member_last3=no[-3:], finding="not_as_intended", apply=True)
         self.assertEqual((done["write_kind"], done["held_writes_left"]), ("removal", 0))
         self.assertEqual(self.expire(apply=True)["saves"], 1)  # latch cleared; the other member
+
+    def test_q21_resolve_needs_the_digest(self):
+        """G2 fix round 1 F3: a killed save that also changed another column resolves HELD, never DONE."""
+        no = self.book.add(1)
+        self.book.add(2)
+        self.book.kill_in_save = True
+        self.book.save_changes_name = True
+        self.assertEqual(self.expire(apply=True)["stopped"], "uncertain:writer_timeout")
+        self.book.kill_in_save = self.book.save_changes_name = False
+        self.now = NOW + timedelta(seconds=PAST_DEADLINE)
+        resolved = self.engine().resolve()
+        self.assertEqual((resolved["resolved"], resolved["alerts"]), ({"removal:HELD:resolved_unclear": 1}, ["resolved_unclear"]))
+        self.assertEqual(self.book.members[no]["MemberType"], "GUEST")  # it did land, with a changed column: a person looks
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            self.expire(apply=True)
+        self.assertEqual(caught.exception.code, "removal_held_rows_present")  # latched
+
+    def test_released_held_member_alerts_once_not_a_silent_skip(self):
+        """G2 L3: after release-held the member's removal stays HELD; the member is skipped with one alert."""
+        no = self.book.add(1)
+        self.book.save_changes_expiry = True
+        self.expire(apply=True)
+        self.book.save_changes_expiry = False
+        self.book.members[no].update(MemberType="MEMBER", ExpiryDate=YESTERDAY)  # staff put it back by hand
+        self.now = NOW + timedelta(seconds=PAST_DEADLINE)
+        ref = self.ledger.ref("r", self.removals()[0]["removal_id"])
+        self.engine().release_held(removal_ref=ref, member_last3=no[-3:], finding="not_as_intended", apply=True)
+        first = self.expire(apply=True)
+        self.assertEqual((first["saves"], first["alerts"]), (0, ["removal_held_released"]))
+        second = self.expire(apply=True)
+        self.assertEqual((second["alerts"], second["counts"]["removal_held_released"]), ([], 1))
 
     def test_transport_failure_is_uncertain(self):
         self.book.add(1)

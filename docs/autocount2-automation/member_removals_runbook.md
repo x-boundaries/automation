@@ -22,7 +22,7 @@ Who made the member does not matter: an expired `MEMBER` is expired (handover ru
 
 - the member core receipt is `applied` with code `upgrade`, and its write is `DONE`, kind `upgrade`, from `GUEST`, same MemberNo, with the receipt's basis expiry;
 - the member core flagged it `refund_on_basis` (the order was refunded or cancelled after the upgrade);
-- the refund is a **positive amount fact**: `REFUNDED`, or the measured amount below the member core's threshold (S$300). A refund by money that leaves the order at S$300 or more by units, or a cancellation that is not `REFUNDED`, is `revoke_needs_person` (alert, no write);
+- the refund is a **positive amount fact**: money went back. `REFUNDED`, or `PARTIALLY_REFUNDED` with the measured amount below the member core's threshold (S$300). Anything else is `revoke_needs_person` (one alert, no write): a refund by money that leaves the order at S$300 or more by units, an order still `PAID` (units removed or the order cancelled with no money refunded yet), or a cancellation that is not `REFUNDED`. The member core reads the order again on every run, so a refund issued later still revokes;
 - no other receipt of the member still qualifies (`revoke_other_basis`, counted);
 - the link the upgrade used is still active (`revoke_link_voided` otherwise);
 - **nobody touched the member since the upgrade**: same `LastModified` and same `ExpiryDate` as the upgrade left. A staff renewal in store is invisible to the tool, so this rule is what keeps it safe (`revoke_member_changed`, one alert).
@@ -66,7 +66,7 @@ Residual gap (Controller, 22 Nov 2026): a refund made more than 60 days after th
 | `type_move_state_root` | `null` | path | Required on the live book once any switch is on: every write takes the type move lock, shared with the member core's `apply` and the type move |
 | `ac2_credential_target` / `ac2_login_mode` | live: `XB-AC2-MemberSync` / `owner_shared` | - | As the member core; AutoCount user ID `sa` is refused; the `sa` login is never used or changed |
 
-Fixed (not configurable): the expiry floor 2020-01-01 and the 10-minute clock tolerance (both the tags tool's constants, pinned by tests). `check-config` prints a rule fingerprint (rule versions, floor, the member core's threshold); a change refuses runs with `removals_rule_settings_changed` until a new state root and `init`.
+Fixed (not configurable): the expiry floor 2020-01-01 and the 10-minute clock tolerance (both the tags tool's constants, pinned by tests). `check-config` prints a rule fingerprint (rule versions, floor, the member core's threshold); a change refuses runs with `removals_rule_settings_changed`. The way on is a new state root and `init` (`init` on the old ledger keeps the old fingerprint). A new ledger has no history: a member that a person put back after an expire under the old ledger (`put_back_kept`) is due again under the new one, so before switching ledgers, run `undo-list --show` on the old one and re-check those members by hand. Revokes stay safe (a restored member has a new `LastModified`, so V6 alerts).
 
 `STOP` file in the state root: no write after the current member.
 
@@ -89,7 +89,7 @@ python directlocal\xb_member_removals.py digest       --config <config> --hours 
 ```
 
 - Without `--apply` every command is observe or a dry run. `--apply` on `expire`, `revoke` or `scheduled` is refused before any login (`removals_write_disabled`) unless the kind's switch is on; in `scheduled --apply` each kind writes only when its own switch is on (the other observes).
-- Exit codes: 0 ok, 3 completed with alerts, 2 refused (nothing written).
+- Exit codes: 0 ok, 3 completed with alerts, 2 refused before any write, or a run stopped by an AutoCount bridge failure. In the second case removals already `DONE` earlier in that run stay recorded: check `status` and `undo-list`.
 - Output: codes, counts, keyed refs (`r-` removal, `m-` member, `o-` order) and MemberNos masked to the last 3 characters. **`undo-list --show`** is the one exception: plain text on the VM screen with the full MemberNo, kind, day and the `ExpiryDate` kept, for a hand undo. Never paste it into email, chat, issues or logs.
 
 ## 5. Alerts and who acts (hands-off rule)
@@ -104,6 +104,7 @@ Every alert is "no write, logged". It reaches people only through the daily summ
 | `clock_mismatch` | VM and AutoCount clocks over 10 minutes apart | Fix the clock; nothing was written |
 | `write_uncertain` / `write_held` | An unclear write; the tool latches | `resolve` after the deadline / `release-held` after a look |
 | `writer_busy_again`, `member_reads_capped` | Capacity | Usually clears next run |
+| `removal_held_released` | A member whose removal was `HELD` and then released (`release-held`) is skipped for good by the tool | Staff set the type by hand if still due |
 
 ## 6. Live steps (each its own owner OK; one VM sitting at a time; never with a tags, member core, index or backfill step)
 
@@ -132,4 +133,5 @@ About 2,700 moved `MEMBER`s carry `ExpiryDate` 2028-06-30 (import date + 24 mont
 - The scan uses one new pinned SQL text (`expiring_members_page`); the server time comes from the book guard's existing `Get-XbDlPosSyncState` read (its pinned texts only, as the type move's counts read), not a second new text. `removal-member` also returns the server time, so a revoke-only run is clock-checked too.
 - The surge stop counts due expires and turns expire writes off for that run; revokes are bounded by their own per-run cap and the shared per-day cap.
 - Added beyond the design: `put_back_kept` (a member put back after an expire is not expired again until its date changes), and `active_flag_unexpected` for an active flag that is neither `T` nor `F`.
+- G2 fix round 1 (24 Nov 2026): V3 needs money back (`REFUNDED`, or `PARTIALLY_REFUNDED` below the threshold); revoke checks its per-run cap before the member read; a revoke sends the upgrade's basis expiry as `basis_expiry_local`, so the child's basis compare is a real second check; a released `HELD` removal alerts once (`removal_held_released`).
 - Not dependent on #155 BF2 or S6 (cancelled 22 Nov 2026): revoke reads the member core's own `sync155`/`claim` links only.
