@@ -152,6 +152,19 @@ on:
       # node). Both run in the same full-repository suite (`rest` shard). Exact entries, not globs.
       - "tests/test_no_telegram_nodes.py"
       - "tests/test_n8n3_always_output_data_guard.py"
+      # Monthly in-store member discount check (#268). The Windows job's full-repository suite
+      # (`rest` shard) exercises tests/test_member_pos_exceptions.py (including the installer's
+      # Windows PowerShell 5.1 -DryRun test) and tests/test_member_pos_exceptions_alert_workflow.py
+      # (the n8n export through the shared sender above), so a pull request confined to the check,
+      # its installer, example settings, runbook, workflow export or tests must still trigger this
+      # workflow. Exact entries, not globs.
+      - "scripts/xb_member_pos_exceptions.py"
+      - "scripts/install_member_pos_exceptions_task.ps1"
+      - "config/member_pos_exceptions.example.json"
+      - "docs/autocount2-automation/member_pos_exceptions_runbook.md"
+      - "n8n-workflows/member_pos_exceptions_alert.workflow.json"
+      - "tests/test_member_pos_exceptions.py"
+      - "tests/test_member_pos_exceptions_alert_workflow.py"
   workflow_dispatch: {}
 
 jobs:
