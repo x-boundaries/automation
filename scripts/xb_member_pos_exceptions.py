@@ -6,8 +6,8 @@ customer whose AutoCount member record does not qualify for it:
 * guest         the member's type today is GUEST (or Default): registered, not qualified;
 * expired       type MEMBER, but the membership ExpiryDate was before the receipt day;
 * same_receipt  type MEMBER, the record changed on or after the receipt day and its ExpiryDate is
-                the receipt day + 24 months (+/- 1 day): the discount went on the receipt that made
-                the customer a member (the rate starts from the next purchase).
+                the receipt day + 24 months (+/- 1 day): the discount may have gone on the receipt
+                that made the customer a member (the rate starts from the next purchase).
 
 Counted, never listed: the member rate with no MemberNo on the receipt (no_member_on_receipt),
 a MemberNo with no member row (member_not_found), a type outside MEMBER/GUEST/Default.
@@ -17,13 +17,14 @@ Facts behind the rule (AutoCount book read-only check of 24 Nov 2026, counts onl
   example "15.00%"); the receipt header has no discount text and member types carry no price
   or discount rule, so any type can get the rate;
 * `Pos.Cancelled` 'T' is a cancelled receipt; there is no cashier column on `Pos`;
-* `Member.LastModified` moves on bulk edits as well as type changes, so a GUEST row changed after
-  the sale is still listed, marked "type changed after the sale" (`changed_after_sale`).
+* `Member.LastModified` moves on any edit (bulk edits too), so it never shows that the type
+  changed. A listed GUEST row only carries a neutral note (`record_note`): the member record was
+  created on the sale day (`Member.CreatedTime`, a till registration), or edited on or after it.
 
 Safety contract (docs/autocount2-automation/member_pos_exceptions_runbook.md):
 
 * Read-only. Fixed SELECT texts with `?` parameters only (no comments, no ";"), pinned by
-  SHA-256 in `check-settings`. READ COMMITTED, SET LOCK_TIMEOUT and a query timeout. No
+  SHA-256 in the tests and shown by `check-settings`. READ COMMITTED, SET LOCK_TIMEOUT and a query timeout. No
   AutoCount sign-in, no SDK, no Shopify, no write of any kind to AutoCount.
 * The stock exporter's identity check on every connection before any business query: the sa
   login is always refused; sysadmin or db_owner only with identity.allow_privileged_identity;
@@ -36,7 +37,9 @@ Safety contract (docs/autocount2-automation/member_pos_exceptions_runbook.md):
 * Email (off by default): one sanitized xb.member.pos_exceptions.v1 event to an n8n webhook,
   which emails it through the shared XB Ops Alert Email sub-workflow (system MEMBER-POS), and
   only when there is something to act on: exceptions, a stale sync, or a failed run. Nothing
-  to report means no email. Each month's outcome is sent once (alert_state.json).
+  to report means no email. Each month's outcome is sent once (alert_state.json); a lock
+  timeout is emailed only when it happens again on a later day, and nothing is sent when the
+  record folder cannot be written (the state could not stop a daily repeat).
 
 pyodbc is imported only inside SqlServerSource so the tests run without it.
 """
@@ -102,7 +105,12 @@ COUNT_KEYS = (
     "member_inactive",
 )
 OUTLET_KEYS = ("outlet",) + BUCKETS + ("no_member_on_receipt",)
-ROW_KEYS = ("doc_no", "outlet", "day", "rate", "reason", "member", "changed_after_sale")
+ROW_KEYS = ("doc_no", "outlet", "day", "rate", "reason", "member", "record_note")
+# What the member record shows next to a listed GUEST row. The check never knows the type changed.
+NOTE_NONE = "none"
+NOTE_CREATED = "created_on_sale_day"
+NOTE_EDITED = "edited_on_or_after_sale_day"
+RECORD_NOTES = (NOTE_NONE, NOTE_CREATED, NOTE_EDITED)
 
 GUEST_TYPES = ("GUEST", "Default")
 MEMBER_TYPE = "MEMBER"
@@ -131,6 +139,8 @@ ALERT_SEND_FAILED = stock.ALERT_SEND_FAILED
 ALERT_SECRET_UNAVAILABLE = stock.ALERT_SECRET_UNAVAILABLE
 ALERT_ERROR = stock.ALERT_ERROR
 ALERT_NOT_SENT = "not_sent_no_send"
+ALERT_RECORD_UNWRITABLE = "not_sent_record_unwritable"
+ALERT_HELD = "held_until_repeat"
 COUNT_MAX = 1000000
 
 # ---------------------------------------------------------------------------------------------
@@ -153,6 +163,7 @@ def receipts_query(terminal_column):
         "SELECT p.DocKey, p.DocNo, p.DocDate, p.Cancelled, "
         "CASE WHEN p.FinalTotal > 0 THEN 1 ELSE 0 END AS IsPositive, "
         "p.MemberNo, t.Outlet, m.MemberNo AS MemberFound, m.MemberType, m.ExpiryDate, m.LastModified, "
+        "m.CreatedTime AS MemberCreated, "
         "m.IsActive, d.Discount "
         "FROM dbo.Pos p "
         "LEFT JOIN dbo.PosTerminal t ON t.TerminalID = p.[%s] "
@@ -454,6 +465,7 @@ def classify(rows, settings):
         member_type = clean(receipt.get("MemberType"))
         changed = as_day(receipt.get("LastModified"))
         changed_after = changed is None or day is None or changed >= day
+        created = as_day(receipt.get("MemberCreated"))
         expiry = as_day(receipt.get("ExpiryDate"))
         if member_type in GUEST_TYPES:
             reason = "guest"
@@ -473,8 +485,10 @@ def classify(rows, settings):
             continue
         counts[reason] += 1
         tally[reason] += 1
+        note = NOTE_NONE
         if reason == "guest" and changed_after:
             counts["changed_after_sale"] += 1
+            note = NOTE_CREATED if created is not None and created == day else NOTE_EDITED
         doc_no = clean(receipt.get("DocNo"))
         listed.append({
             "doc_no": doc_no if DOC_NO_RE.match(doc_no) else "UNREADABLE",
@@ -483,7 +497,7 @@ def classify(rows, settings):
             "rate": rate_label(max(rates)),
             "reason": reason,
             "member": mask_member(member_no),
-            "changed_after_sale": reason == "guest" and changed_after,
+            "record_note": note,
         })
     outlets = [dict({"outlet": code}, **values) for code, values in sorted(per_outlet.items())]
     return counts, outlets, listed
@@ -671,6 +685,24 @@ def needs_alert(result):
     return result["status"] in (STATUS_SYNC_STALE, STATUS_FAILED)
 
 
+def held_until_repeat(result):
+    """A lock timeout on every attempt is usually transient (the next day's run reads fine), so it
+    is emailed only when the month's previous run also ended in a lock timeout on an earlier day."""
+    return (result["status"] == STATUS_FAILED and result["failure_class"] == FAILURE_LOCK_TIMEOUT
+            and not result.get("lock_timeout_repeat"))
+
+
+def previous_lock_timeout_day(settings, month_first, today):
+    """True when this month's last record is a lock timeout from an earlier day."""
+    try:
+        done = json.loads(record_path(settings, month_first).read_text(encoding="utf-8"))
+        finished = datetime.fromisoformat(done["finished_at"]).date()
+        return (done.get("status") == STATUS_FAILED and done.get("failure_class") == FAILURE_LOCK_TIMEOUT
+                and finished < today)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= COUNT_MAX else 0
 
@@ -713,6 +745,8 @@ def send_alert(settings, result, environ=None, transport=None, credential_reader
         return ALERT_DISABLED, None
     if not needs_alert(result):
         return ALERT_NONE, None
+    if held_until_repeat(result):
+        return ALERT_HELD, None
     record_dir = settings["output"]["record_dir"]
     http_status = None
     try:
@@ -720,6 +754,14 @@ def send_alert(settings, result, environ=None, transport=None, credential_reader
         sent = load_alert_state(record_dir)
         if key in sent:
             return ALERT_SUPPRESSED, None
+        state_path = Path(record_dir) / ALERT_STATE_NAME
+        try:
+            # Rewrite the current state first: when the folder cannot be written, the send could not
+            # be remembered and the same email would go out on every daily run, so send nothing.
+            stock.replace_atomic(state_path, stock.json_bytes({"schema": ALERT_STATE_SCHEMA, "sent": dict(sorted(sent.items()))}),
+                                 result["run_id"][:8])
+        except OSError:
+            return ALERT_RECORD_UNWRITABLE, None
         secret = stock.read_alert_secret(alert, environ, credential_reader)
         if secret is None:
             return ALERT_SECRET_UNAVAILABLE, None
@@ -737,13 +779,10 @@ def send_alert(settings, result, environ=None, transport=None, credential_reader
             return ALERT_SEND_FAILED, http_status
         sent[key] = result["finished_at"]
         try:
-            stock.replace_atomic(
-                Path(record_dir) / ALERT_STATE_NAME,
-                stock.json_bytes({"schema": ALERT_STATE_SCHEMA, "sent": dict(sorted(sent.items()))}),
-                result["run_id"][:8],
-            )
+            stock.replace_atomic(state_path, stock.json_bytes({"schema": ALERT_STATE_SCHEMA, "sent": dict(sorted(sent.items()))}),
+                                 result["run_id"][:8])
         except OSError:
-            pass  # The email went out; without the state the next day may send it once more.
+            pass  # Written moments ago, so only a folder that broke mid-run lands here: one repeat at most.
         return ALERT_SENT, http_status
     except Exception:  # noqa: BLE001 - an alert bug must never change the run's result.
         return ALERT_ERROR, http_status
@@ -766,6 +805,7 @@ def run_month(settings, month_first, send=True, source=None, environ=None, clock
         "finished_at": None, "counts": None, "outlets": [], "rows": [], "stale_outlets": [],
         "identity": None, "queries_sha256": queries_sha256(settings["source"]["terminal_column"]),
         "settings_sha256": settings_sha256(settings), "alert_status": None, "alert_http_status": None,
+        "lock_timeout_repeat": False,
     }
     if next_month(month_first) > started.date():
         raise ConfigError("the month has not ended yet")
@@ -786,7 +826,10 @@ def run_month(settings, month_first, send=True, source=None, environ=None, clock
     except Exception:  # noqa: BLE001 - an unexpected error is recorded, never a traceback with data.
         result.update(status=STATUS_FAILED, failure_class=FAILURE_INTERNAL,
                       message="Unexpected error (run %s)" % run_id[:8])
-    result["finished_at"] = stock._now(tz, clock).isoformat()
+    finished = stock._now(tz, clock)
+    result["finished_at"] = finished.isoformat()
+    if result["failure_class"] == FAILURE_LOCK_TIMEOUT:
+        result["lock_timeout_repeat"] = previous_lock_timeout_day(settings, month_first, finished.date())
     try:
         Path(settings["output"]["record_dir"]).mkdir(parents=True, exist_ok=True)
     except OSError:

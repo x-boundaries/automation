@@ -16,15 +16,15 @@ A receipt is read when its `DocDate` is in the month, it is not cancelled (`Pos.
 
 | Reason | When | Listed in the email |
 | --- | --- | --- |
-| `guest` (registered, not qualified) | The member's type today is `GUEST` or `Default` | Yes. Marked "type changed after the sale" when the member record changed on or after the receipt day |
+| `guest` (registered, not qualified) | The member's type today is `GUEST` or `Default` | Yes. With a note when the member record was created on the receipt day ("member record created on the sale day") or last edited on or after it ("member record edited on or after the sale day (check its history)") |
 | `expired` (membership had expired) | Type `MEMBER`, `ExpiryDate` before the receipt day | Yes |
-| `same_receipt` (the receipt that made them a member) | Type `MEMBER`, the record changed on or after the receipt day, and `ExpiryDate` is the receipt day + `rule.expiry_months` (24) months, give or take a day | Yes. Nothing to undo: the rate starts from the next purchase, so this is coaching only |
+| `same_receipt` (may be the receipt that made them a member) | Type `MEMBER`, the record changed on or after the receipt day, and `ExpiryDate` is the receipt day + `rule.expiry_months` (24) months, give or take a day | Yes, worded "may be": see Known limits. Nothing to undo: the rate starts from the next purchase, so this is coaching only |
 | `member_valid` | Type `MEMBER`, not expired, not the same receipt | No (count only) |
 | `no_member_on_receipt` | Member rate, no `MemberNo` on the receipt | No (count, also per outlet) |
 | `member_not_found` | A `MemberNo` with no member row | No (count) |
 | `type_other` | Any other member type | No (count) |
 
-Why "type changed after the sale" is a mark and not a separate, unlisted reason: a member's `LastModified` moves on bulk edits as well as on type changes, so for the receipts seen so far it is on or after the receipt day for every `GUEST` receipt with the member rate. Hiding those would hide every real case. The mark tells the manager to check the member's history before coaching. When the member removals (#268 slice E) are live, a `MEMBER` who was moved back to `GUEST` after the sale also shows here with the mark.
+Why the note says only "created" or "edited", never "type changed": the check reads two dates from the member record. `CreatedTime` on the receipt day means the record was made that day, which is the usual till registration: a new `GUEST` given the member rate on the receipt that registered them, the case this check exists for. `LastModified` moves on any edit (bulk edits and registrations too), so it cannot show that the type changed. For the receipts seen so far it is on or after the receipt day for every `GUEST` receipt with the member rate, so these rows are listed, never hidden; the edited note asks the manager to check the member's history in AutoCount before coaching. When the member removals (#268 slice E) are live, a `MEMBER` moved back to `GUEST` after the sale also shows here with the edited note.
 
 ## Facts it relies on (read-only check of the live book, 24 Nov 2026)
 
@@ -37,14 +37,14 @@ These settled the open questions of the design. Counts only; no business values 
 | Volume (U5, U6) | Most member-rate receipts belong to valid members; a handful a month belong to `GUEST` members; none so far to an expired `MEMBER`; member-rate receipts without a member number still occur (fewer each month) | A short list each month; the list cap (12 rows) is ample |
 | Outlet (U7) | `Pos` has no outlet column; the outlet comes through `PosTerminal.Outlet` | Joined through `source.terminal_column` (`TerminalID`; `LastModifiedTerminalID` is the allowed alternative) |
 | Voids and returns (U8) | `Cancelled` `T` / `F`; returns show as receipts with a total of zero or less | Both skipped and counted |
-| Type history (U9) | `ChangeLog` keeps member updates with old and new values in an XML column | Not read: it would mean reading personal data. The "type changed after the sale" mark is used instead |
+| Type history (U9) | `ChangeLog` keeps member updates with old and new values in an XML column | Not read: it would mean reading personal data. The member record's `CreatedTime` and `LastModified` days give the neutral note instead |
 | Member numbers (U10) | No receipt member number without a member row; a few contain `+` | Masking keeps the last 3 letters or digits only |
 | Cashier (U11) | No cashier column on `Pos` | No staff field anywhere in the output |
 | Sync lag (U12) | `SyncRegistration` has a last finished sync time per outlet; `Pos.DocDate` is a date only | The month is reported only after every listed outlet finished a sync after the month ended |
 
 ## Privacy
 
-- The SQL reads only the columns it needs: receipt key, number, date, cancel flag, the **sign** of the total (decided in SQL), member number, outlet, member type, expiry, last change, active flag and the line discount text. No name, phone, email, address or amount.
+- The SQL reads only the columns it needs: receipt key, number, date, cancel flag, the **sign** of the total (decided in SQL), member number, outlet, member type, expiry, created and last-change times, active flag and the line discount text. No name, phone, email, address or amount.
 - The private record (`output.record_dir/pos_exceptions_<YYYY-MM>.json`, on the AC2 server only) holds counts and the receipt list with member numbers masked to the last 3 characters (`***123`).
 - The console and the task log show counts and codes only (no receipt numbers, no member references).
 - The email carries counts, receipt numbers, outlet codes, days, rates, reasons and masked member numbers. Staff look a receipt up by its number in AutoCount.
@@ -84,7 +84,8 @@ python scripts\xb_member_pos_exceptions.py run --scheduled --config C:\path\to\m
 | `report`, no exceptions | none | nothing |
 | `report` with exceptions | `[XB alert] MEMBER-POS WARN exceptions_<YYYY-MM>` | The shop manager checks each receipt in AutoCount and coaches the outlet |
 | `pos_sync_stale` | `[XB alert] MEMBER-POS WARN pos_sync_stale_<YYYY-MM>`, once a month | Check the till PC of each outlet named is on and its POS sync runs; still waiting after 3 days: forward to Claude |
-| `failed` (`identity_refused`, `credential_unavailable`, `lock_timeout`, `source_error`, `write_failed`, `internal_error`) | `[XB alert] MEMBER-POS ERROR run_failed:<class>`, once per month and class | Forward to Claude |
+| `failed` (`identity_refused`, `credential_unavailable`, `lock_timeout`, `source_error`, `write_failed`, `internal_error`) | `[XB alert] MEMBER-POS ERROR run_failed:<class>`, once per month and class. A `lock_timeout` is emailed only when the month's previous run also ended in one on an earlier day (alert status `held_until_repeat` until then): one busy morning usually clears by the next run | Forward to Claude |
+| `failed` `write_failed` with alert status `not_sent_record_unwritable` | none: the record folder cannot be written, so the check could not remember an email and would repeat it every day | Exit code 1 in the task's Last Run Result; fix the folder's permissions (see Known limits) |
 
 ## Login
 
@@ -98,7 +99,7 @@ Either way the script sends SELECT statements only.
 ## Install (each step needs its own owner OK)
 
 1. **Settings.** On the AC2 server, in the deployed clone at the merged commit: copy the example to a private `member_pos_exceptions.local.json` outside the clone, fill the server, book, outlets and record folder; `alert.webhook_enabled` stays `false`. Run `check-settings`.
-2. **By-hand run.** As the task account: `run --month <last month> --no-send`. Read the console counts and the private record; compare them with the facts check (same month, same counts for cancelled, member rate and GUEST receipts).
+2. **By-hand run.** Before it, confirm read-only on the book: `Pos.TerminalID` exists and is filled on recent receipts (else set `source.terminal_column` to `LastModifiedTerminalID`; a missing column fails the run as `source_error`, an empty one shows every outlet as `UNKNOWN`); `Member.CreatedTime` exists; and `SyncRegistration` has one current row per outlet in `rule.outlets` (compare `TerminalIDList` and `LastAliveTime` per `Location`: the check takes the latest finished sync per `Location`, so a retired or stalled second sync client at an outlet must be noted to the Controller before go-live). Then, as the task account: `run --month <last month> --no-send`. Read the console counts and the private record; compare them with the facts check (same month, same counts for cancelled, member rate and GUEST receipts).
 3. **Email workflow.** Re-import `XB Ops Alert Email` with system `MEMBER-POS` and publish it (its own owner OK; follow the n8n workflows README for live imports), then import `member_pos_exceptions_alert.workflow.json` inactive, set its two placeholders, bind its own Header Auth credential, and activate it (owner OK). Recipient for the first month: the work mailbox only (Controller decision D3); adding the shops' manager is a later owner decision.
 4. **Email on.** Put the shared secret in the task account's environment variable named by `alert.secret_env_var`, set `alert.webhook_url` and `alert.webhook_enabled` `true`, run `check-settings`, then one `run --month <last month>` by hand: an email arrives only if that month had exceptions.
 5. **Task.** `install_member_pos_exceptions_task.ps1 -DryRun` first, then without `-DryRun` (owner OK). Run it once with Start-ScheduledTask and read the record (`already_reported` or `not_due` is normal).
@@ -109,4 +110,7 @@ Either way the script sends SELECT statements only.
 
 - **No daily health watch yet.** `XB Daily Health` reports a failed email (`send_failed` rows of any system) the next morning, but not a task that stopped running. Adding the task to the health check is a follow-up.
 - **Today's type, not the type at the sale.** See "What it flags". Reading the `ChangeLog` history would need personal data and is not done.
+- **"May be the receipt that made them a member".** The same-receipt reason comes from dates (record changed on or after the receipt day, expiry 24 months from it, give or take a day), so it can also list a valid purchase made the day after qualifying when the record was edited later, or an in-store purchase on the day of an online upgrade. Each such row needs nothing undone; the manager checks it like any other.
+- **Latest sync per outlet.** The sync check takes the latest finished sync of each `Location`. If an outlet has two active sync clients and one stalls, the fresher one hides it. Install step 2 checks the rows per outlet.
+- **Record folder must be writable.** When `output.record_dir` cannot be written the check sends nothing (alert status `not_sent_record_unwritable`) and ends `write_failed`, exit code 1, every day until the folder is fixed; without the daily health watch, nobody is emailed about it.
 - **Outlet list is fixed.** A new outlet must be added to `rule.outlets`; receipts of an outlet not listed are still judged, but its sync is not checked.

@@ -37,10 +37,25 @@ ENV = {
 }
 CANARY_MEMBER = "TEST000987"
 
+# Pinned query hashes per terminal column: a changed query text must be reviewed (G2) and this
+# table updated with it.
+PINNED_QUERY_SHA256 = {
+    "TerminalID": {
+        "identity": "5429df38941a267a8ece8d3c8e3a6b4b9543974ee4e11d13d0386b1d17ba36f6",
+        "receipts": "5ff984e96510495ae7d7637239691f7f6f6b4ffc543448d03d1c56d0710b2e1b",
+        "sync": "b0b93832f16f5fd1c3bb1e08c3068a628ca37f3170501a2e2d150526951c7440",
+    },
+    "LastModifiedTerminalID": {
+        "identity": "5429df38941a267a8ece8d3c8e3a6b4b9543974ee4e11d13d0386b1d17ba36f6",
+        "receipts": "58ebb96daec6263d3f886a3aca9d2e152198cd6174f7a083c0fcd432e45fbcd3",
+        "sync": "b0b93832f16f5fd1c3bb1e08c3068a628ca37f3170501a2e2d150526951c7440",
+    },
+}
+
 
 def receipt(doc_no="CS-T0001", day=date(2026, 11, 10), cancelled="F", positive=1, member_no=CANARY_MEMBER,
             outlet="OUT01", found=True, member_type="GUEST", expiry=None, modified=date(2026, 10, 1),
-            active="T", discounts=("15.00%",), key=None):
+            created=date(2026, 1, 5), active="T", discounts=("15.00%",), key=None):
     """Rows of one receipt as receipts_query returns them (one per discounted line)."""
     base = {
         "DocKey": key if key is not None else hash(doc_no) & 0xFFFFFF,
@@ -54,6 +69,7 @@ def receipt(doc_no="CS-T0001", day=date(2026, 11, 10), cancelled="F", positive=1
         "MemberType": member_type if found and member_no else None,
         "ExpiryDate": datetime.combine(expiry, datetime.min.time()) if expiry else None,
         "LastModified": datetime.combine(modified, datetime(2000, 1, 1, 14, 5).time()) if modified else None,
+        "MemberCreated": datetime.combine(created, datetime(2000, 1, 1, 13, 50).time()) if created else None,
         "IsActive": active,
     }
     return [dict(base, Discount=d) for d in discounts] or [dict(base, Discount=None)]
@@ -136,7 +152,7 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(listed[0]["reason"], "guest")
         self.assertEqual(listed[0]["rate"], "15%")
         self.assertEqual(listed[0]["member"], "***987")
-        self.assertFalse(listed[0]["changed_after_sale"])
+        self.assertEqual(listed[0]["record_note"], "none")
         self.assertEqual(outlets, [{"outlet": "OUT01", "guest": 1, "expired": 0, "same_receipt": 0, "no_member_on_receipt": 0}])
 
     def test_default_type_counts_as_guest_and_20_percent_is_a_member_rate(self):
@@ -213,10 +229,27 @@ class RuleTests(unittest.TestCase):
         counts, _, _ = self.judge(receipt(member_type="MEMBER", expiry=date(2028, 11, 10), modified=date(2026, 11, 9)))
         self.assertEqual((counts["same_receipt"], counts["member_valid"]), (0, 1))
 
-    def test_guest_changed_after_the_sale_is_listed_and_marked(self):
-        counts, _, listed = self.judge(receipt(modified=date(2026, 11, 10)))
+    def test_guest_edited_on_or_after_the_sale_is_listed_with_a_neutral_note(self):
+        # LastModified moves on any edit (bulk edits too): the note says only that the record was edited.
+        for modified in (date(2026, 11, 10), date(2026, 11, 20)):
+            counts, _, listed = self.judge(receipt(modified=modified))
+            self.assertEqual((counts["guest"], counts["changed_after_sale"]), (1, 1))
+            self.assertEqual(listed[0]["record_note"], "edited_on_or_after_sale_day")
+        counts, _, listed = self.judge(receipt(modified=date(2026, 11, 9)))
+        self.assertEqual((counts["guest"], counts["changed_after_sale"], listed[0]["record_note"]), (1, 0, "none"))
+
+    def test_guest_registered_on_the_sale_day_is_listed_as_created_that_day(self):
+        # The owner's main case: registered at the till (new GUEST record) and 15% keyed on that receipt.
+        counts, _, listed = self.judge(receipt(created=date(2026, 11, 10), modified=date(2026, 11, 10)))
         self.assertEqual((counts["guest"], counts["changed_after_sale"]), (1, 1))
-        self.assertTrue(listed[0]["changed_after_sale"])
+        self.assertEqual((listed[0]["reason"], listed[0]["record_note"]), ("guest", "created_on_sale_day"))
+        # Created the day before and edited on the sale day: edited, not created.
+        _, _, listed = self.judge(receipt(created=date(2026, 11, 9), modified=date(2026, 11, 10)))
+        self.assertEqual(listed[0]["record_note"], "edited_on_or_after_sale_day")
+        # A note is only ever given to a GUEST row.
+        _, _, listed = self.judge(receipt(member_type="MEMBER", expiry=date(2026, 11, 1),
+                                          created=date(2026, 11, 10), modified=date(2026, 11, 10)))
+        self.assertEqual((listed[0]["reason"], listed[0]["record_note"]), ("expired", "none"))
 
     def test_other_member_type_is_counted_only(self):
         counts, _, listed = self.judge(receipt(member_type="VIP"))
@@ -304,10 +337,16 @@ class SettingsAndSqlTests(unittest.TestCase):
             for name, text in xr.all_query_texts(column).items():
                 with self.subTest(column=column, query=name):
                     xr.assert_read_only(text)
-        for bad in ("SELECT 1; DELETE FROM dbo.Pos", "UPDATE dbo.Pos SET MemberNo = ''", "SELECT 1 -- x",
+        for bad in ("SELECT 1; DELETE FROM dbo.Pos", "SELECT 1; SELECT 2", "UPDATE dbo.Pos SET MemberNo = ''", "SELECT 1 -- x",
                     "SELECT * INTO x FROM dbo.Pos", "EXEC sp_who"):
             with self.assertRaises(xr.ConfigError):
                 xr.assert_read_only(bad)
+
+    def test_query_hashes_pinned(self):
+        # A changed query text must be reviewed (G2) and this table updated with it.
+        for column, pinned in PINNED_QUERY_SHA256.items():
+            with self.subTest(column=column):
+                self.assertEqual(xr.queries_sha256(column), pinned)
 
     def test_receipts_query_reads_no_personal_column_or_amount(self):
         text = xr.receipts_query("TerminalID")
@@ -364,7 +403,7 @@ class RunTests(unittest.TestCase):
         body = call["body"]
         self.assertEqual(tuple(body), xr.ALERT_PAYLOAD_KEYS)
         self.assertEqual(body["rows"], [{"doc_no": "CS-T0001", "outlet": "OUT01", "day": "2026-11-10", "rate": "15%",
-                                         "reason": "guest", "member": "***987", "changed_after_sale": False}])
+                                         "reason": "guest", "member": "***987", "record_note": "none"}])
         self.assertEqual(body["counts"]["no_member_on_receipt"], 1)
         self.assertEqual(body["counts"]["member_valid"], 1)
         # The full member number appears nowhere: event, record, console.
@@ -380,6 +419,32 @@ class RunTests(unittest.TestCase):
         second = self.run_once(receipt(), transport=transport, alert=ALERT_ON)
         self.assertEqual(second["alert_status"], "suppressed")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_each_month_is_sent_on_its_own(self):
+        transport = FakeTransport()
+        self.run_once(receipt(), transport=transport, alert=ALERT_ON)
+        december = FakeSource(receipt(doc_no="CS-T0002", day=date(2026, 12, 15)),
+                              sync=[{"Location": "OUT01", "LastSyncTime": datetime(2027, 1, 1, 11, 0)},
+                                    {"Location": "OUT02", "LastSyncTime": datetime(2027, 1, 2, 8, 0)}])
+        result = xr.run_month(self.settings(alert=ALERT_ON), date(2026, 12, 1), source=december, environ=ENV,
+                              clock=lambda: datetime(2027, 1, 2, 9, 15, tzinfo=SGT), sleep=lambda _s: None,
+                              transport=transport)
+        self.assertEqual(result["alert_status"], "sent")
+        self.assertEqual([c["body"]["month"] for c in transport.calls], ["2026-11", "2026-12"])
+
+    def test_unwritable_record_folder_sends_nothing_and_fails(self):
+        # The state could not remember the send, so the same email would go out every day: send none.
+        blocker = self.tmp / "not_a_folder"
+        blocker.write_text("x", encoding="utf-8")
+        transport = FakeTransport()
+        s = settings(record_dir=str(blocker), alert=ALERT_ON)
+        for _ in range(3):
+            result = xr.run_month(s, MONTH, source=FakeSource(receipt()), environ=ENV, clock=lambda: NOW,
+                                  sleep=lambda _s: None, transport=transport)
+            self.assertEqual((result["status"], result["failure_class"], result["alert_status"]),
+                             ("failed", "write_failed", "not_sent_record_unwritable"))
+            self.assertEqual(xr.exit_code(result), 1)
+        self.assertEqual(transport.calls, [])
 
     def test_failed_send_is_retried_next_run(self):
         failing = FakeTransport(status=502)
@@ -433,6 +498,17 @@ class RunTests(unittest.TestCase):
         allowed = self.run_once(None, source=source, allow_privileged=True)
         self.assertEqual(allowed["status"], "report")
 
+    def test_settings_without_the_privileged_key_refuse_a_privileged_login(self):
+        raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        raw["output"]["record_dir"] = str(self.tmp / "records")
+        del raw["identity"]["allow_privileged_identity"]
+        s = xr.validate_settings(raw)
+        self.assertIs(s["identity"]["allow_privileged_identity"], False)
+        source = FakeSource(receipt(), identity={"login": "EXAMPLE\\reader", "user": "reader", "database": "AED_EXAMPLE_BOOK",
+                                                 "is_sysadmin": 1, "is_db_owner": 0})
+        result = xr.run_month(s, MONTH, send=False, source=source, environ=ENV, clock=lambda: NOW, sleep=lambda _s: None)
+        self.assertEqual((result["failure_class"], source.windows), ("identity_refused", []))
+
     def test_sa_login_is_always_refused(self):
         source = FakeSource(receipt(), identity={"login": "sa", "user": "dbo", "database": "AED_EXAMPLE_BOOK",
                                                  "is_sysadmin": 1, "is_db_owner": 1})
@@ -459,6 +535,29 @@ class RunTests(unittest.TestCase):
 
         result = self.run_once(None, source=Locked(receipt()))
         self.assertEqual((result["status"], result["failure_class"]), ("failed", "lock_timeout"))
+
+    def test_lock_timeout_is_emailed_only_when_it_repeats_on_a_later_day(self):
+        class Locked(FakeSource):
+            def open_session(self):
+                session = FakeSession(self)
+                session.read_sync = lambda: (_ for _ in ()).throw(xr.SourceLockTimeout("lock"))
+                return session
+
+        transport = FakeTransport()
+        for _ in range(2):  # the first day, twice: held
+            first = self.run_once(None, source=Locked(receipt()), transport=transport, alert=ALERT_ON)
+            self.assertEqual((first["failure_class"], first["alert_status"]), ("lock_timeout", "held_until_repeat"))
+            self.assertEqual(xr.exit_code(first), 1)
+        self.assertEqual(transport.calls, [])
+        # A good run the next day replaces the record, so a later single timeout is held again.
+        self.run_once(receipt(), transport=transport, alert=ALERT_ON, clock=NOW + timedelta(days=1))
+        self.assertEqual([c["body"]["status"] for c in transport.calls], ["report"])
+        held = self.run_once(None, source=Locked(receipt()), transport=transport, alert=ALERT_ON, clock=NOW + timedelta(days=2))
+        self.assertEqual(held["alert_status"], "held_until_repeat")
+        # Still failing on the next day: emailed once.
+        again = self.run_once(None, source=Locked(receipt()), transport=transport, alert=ALERT_ON, clock=NOW + timedelta(days=3))
+        self.assertEqual(again["alert_status"], "sent")
+        self.assertEqual(transport.calls[-1]["body"]["failure_class"], "lock_timeout")
 
     def test_list_is_capped_and_the_rest_counted(self):
         rows = [row for i in range(15) for row in receipt(doc_no="CS-T%04d" % i, key=i)]

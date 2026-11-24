@@ -70,18 +70,19 @@ def counts(**values):
     return base
 
 
-def row(n=1, reason="guest", changed=False, day="2026-11-10", rate="15%"):
+def row(n=1, reason="guest", note="none", day="2026-11-10", rate="15%"):
     return {"doc_no": "CS-T%04d" % n, "outlet": "OUT01", "day": day, "rate": rate, "reason": reason,
-            "member": "***987", "changed_after_sale": changed}
+            "member": "***987", "record_note": note}
 
 
 def result(status="report", **overrides):
     value = {
         "run_id": RUN_ID, "month": "2026-11", "status": status, "failure_class": None,
-        "counts": counts(guest=2, expired=1, same_receipt=1, no_member_on_receipt=8, changed_after_sale=1),
-        "outlets": [{"outlet": "OUT01", "guest": 2, "expired": 1, "same_receipt": 0, "no_member_on_receipt": 7},
+        "counts": counts(guest=3, expired=1, same_receipt=1, no_member_on_receipt=8, changed_after_sale=2),
+        "outlets": [{"outlet": "OUT01", "guest": 3, "expired": 1, "same_receipt": 0, "no_member_on_receipt": 7},
                     {"outlet": "OUT02", "guest": 0, "expired": 0, "same_receipt": 1, "no_member_on_receipt": 1}],
-        "rows": [row(1, changed=True), row(2), row(3, "expired", rate="20%"), row(4, "same_receipt")],
+        "rows": [row(1, note="created_on_sale_day"), row(2), row(3, "expired", rate="20%"), row(4, "same_receipt"),
+                 row(5, note="edited_on_or_after_sale_day")],
         "stale_outlets": [], "message": "free text " + CANARY_MEMBER, "finished_at": "2026-12-02T09:15:00+08:00",
     }
     value.update(overrides)
@@ -230,21 +231,47 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
     def test_report_email(self):
         (res,) = self.run_cases([event()])
         lines = self.assert_email(res, "WARN", "exceptions_2026-11", [
-            "In-store member discounts, Nov 2026: 4 receipt(s) to check",
-            "- Registered, not qualified (GUEST): 2",
+            "In-store member discounts, Nov 2026: 5 receipt(s) to check",
+            "- Registered, not qualified (GUEST): 3",
             "- Membership had expired: 1",
-            "- CS-T0001 | OUT01 | 2026-11-10 | 15% | registered, not qualified | member ***987 | type changed after the sale",
-            "- CS-T0003 | OUT01 | 2026-11-10 | 20% | membership had expired | member ***987",
-            "By outlet (registered / expired / same receipt / rate with no member on the receipt): OUT01 2/1/0/7; OUT02 0/0/1/1",
+            "- May be on the receipt that made them a member (the rate starts from the next purchase): 1",
+            "- CS-T0001 | OUT01 | 2026-11-10 | 15% | registered, not qualified | member ***987 | member record created on the sale day",
+            "- CS-T0002 | OUT01 | 2026-11-10 | 15% | registered, not qualified | member ***987\n",
+            "- CS-T0003 | OUT01 | 2026-11-10 | 20% | membership had expired | member ***987\n",
+            "- CS-T0004 | OUT01 | 2026-11-10 | 15% | may be the receipt that made them a member | member ***987\n",
+            "- CS-T0005 | OUT01 | 2026-11-10 | 15% | registered, not qualified | member ***987"
+            " | member record edited on or after the sale day (check its history)",
+            "By outlet (registered / expired / same receipt / rate with no member on the receipt): OUT01 3/1/0/7; OUT02 0/0/1/1",
             "rate with no member on the receipt 8",
             "Read 600 receipts (4 cancelled and 2 returns or zero receipts skipped); 150 had the member rate.",
             "Run: 01234567.",
         ])
         self.assertEqual(res["out"][0]["json"]["key"], "exceptions:2026-11")
-        self.assertNotIn("more, not listed", "\n".join(lines))
+        text = "\n".join(lines)
+        self.assertNotIn("more, not listed", text)
+        # The check knows only when the record was created or last edited, never that its type changed.
+        self.assertNotIn("type changed", text)
+
+    def test_guest_registered_on_the_sale_day_end_to_end(self):
+        # A customer registers at the till (new GUEST record that day) and the member rate is keyed on
+        # that same receipt: the script's own rule and payload, then the committed Code node.
+        rows = [{"DocKey": 1, "DocNo": "CS-T0001", "DocDate": xr.datetime(2026, 11, 10), "Cancelled": "F", "IsPositive": 1,
+                 "MemberNo": CANARY_MEMBER, "Outlet": "OUT01", "MemberFound": CANARY_MEMBER, "MemberType": "GUEST",
+                 "ExpiryDate": None, "LastModified": xr.datetime(2026, 11, 10, 15, 2),
+                 "MemberCreated": xr.datetime(2026, 11, 10, 15, 1), "IsActive": "T", "Discount": "15.00%"}]
+        raw = json.loads((ROOT / "config" / "member_pos_exceptions.example.json").read_text(encoding="utf-8"))
+        raw["output"]["record_dir"] = "C:\\EXAMPLE\\unused"
+        found, outlets, listed = xr.classify(rows, xr.validate_settings(raw))
+        body = xr.build_alert_payload(result(counts=found, outlets=outlets, rows=listed), 12)
+        (res,) = self.run_cases([body])
+        lines = self.assert_email(res, "WARN", "exceptions_2026-11", [
+            "- CS-T0001 | OUT01 | 2026-11-10 | 15% | registered, not qualified | member ***987"
+            " | member record created on the sale day",
+        ])
+        self.assertNotIn("type changed", "\n".join(lines))
 
     def test_full_list_fits_the_sender_limits(self):
-        rows = [row(i, changed=True) for i in range(40)]
+        rows = [row(i, note="edited_on_or_after_sale_day") for i in range(40)]
         body = event(counts=counts(guest=40, changed_after_sale=40), rows=rows,
                      outlets=[{"outlet": "OUT%02d" % i, "guest": 4, "expired": 0, "same_receipt": 0,
                                "no_member_on_receipt": 999999} for i in range(10)])
@@ -273,6 +300,15 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
             body = copy.deepcopy(base)
             body["rows"][0].update(change)
             return body
+
+        def with_row_at(index, **change):
+            body = copy.deepcopy(base)
+            body["rows"][index].update(change)
+            return body
+
+        with_old_mark = copy.deepcopy(base)
+        del with_old_mark["rows"][0]["record_note"]
+        with_old_mark["rows"][0]["changed_after_sale"] = True
 
         def with_counts(**change):
             body = copy.deepcopy(base)
@@ -304,12 +340,15 @@ class WorkflowCodeExecutionTests(unittest.TestCase):
             with_row(day="2026-10-31"),
             with_row(rate="15"),
             with_row(reason="valid"),
-            with_row(changed_after_sale="yes"),
-            {**base, "rows": [dict(base["rows"][2], changed_after_sale=True)]},
+            with_row(record_note="yes"),
+            with_row(record_note=True),
+            with_row_at(2, record_note="created_on_sale_day"),  # a note on an expired row
+            with_row_at(3, record_note="edited_on_or_after_sale_day"),  # a note on a same-receipt row
+            with_old_mark,
             with_row(amount=12.5),
             with_counts(guest=-1),
             with_counts(guest=1.5),
-            with_counts(guest=3),  # list + not listed no longer matches the total
+            with_counts(guest=4),  # list + not listed no longer matches the total
             {**base, "counts": dict.fromkeys(xr.COUNT_KEYS, 0), "rows": [], "outlets": []},  # nothing to act on
             {**base, "rows": base["rows"] * 4},
             {**base, "outlets": [dict(base["outlets"][0], name="x")]},
