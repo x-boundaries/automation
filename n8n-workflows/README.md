@@ -1,6 +1,6 @@
 # n8n Workflow Exports
 
-This directory holds source-controlled n8n workflow export JSON for this repository. Agents must inspect this README before adding or modifying any workflow export here, per the n8n workflows playbook (`docs/agent-playbooks/n8n-workflows.md`).
+This directory holds source-controlled n8n workflow export JSON for this repository. Agents must inspect this README before adding or modifying any workflow export here, per the n8n workflows playbook (installed Toolkit).
 
 Workflow JSON in this directory is source-controlled evidence of workflow design and UAT scope. It is not proof of deployment, import, activation, or execution on any n8n instance.
 
@@ -277,7 +277,7 @@ offline command `python -m unittest tests.test_member_gateway_bounded_import_sec
 An incomplete or ambiguous operation is retained and reconciled by exact
 identity/readback evidence; it is never silently reinitialised or replayed.
 
-The approved n8n import/export helper-script package from the Toolkit source (`ai-agent-toolkit:n8n-workflow-helper-scripts`, project `n8n.workflow-toolkit`) is installed under `scripts/` in this directory, as required by the n8n workflows playbook (`docs/agent-playbooks/n8n-workflows.md`) and the package's own consumer-repo layout.
+The approved n8n import/export helper-script package from the Toolkit source (`ai-agent-toolkit:n8n-workflow-helper-scripts`, project `n8n.workflow-toolkit`) is installed under `scripts/` in this directory, as required by the n8n workflows playbook (installed Toolkit) and the package's own consumer-repo layout.
 
 - Entry points: `scripts/_import-n8n-workflows-live.cmd` and `scripts/_export-n8n-workflows-live.cmd` (manual; they never run automatically). Neither asks for confirmation: a plain import run imports every changed or new repository workflow unpublished, and a plain export rewrites tracked workflow JSON. Only `scripts/n8n-workflow-sync-menu.ps1` asks first (always for a real export; for a real import only when started with `-RequireConfirmation`). The owner accepted this Toolkit design on 17 Nov 2026 (#316, PR #315).
 - The helper files are Toolkit helper set `35defa821c2b` (Toolkit 3.146.4, #323), stamped in `scripts/n8n-helper-set.json`; the helpers refuse to run when a stamped file is edited. This repository carries no local deviation in them: fixes go to Toolkit and arrive with the next set.
