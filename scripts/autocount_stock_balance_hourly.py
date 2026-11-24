@@ -3254,12 +3254,15 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         status["analysis_purchasing_failure_class"] = analysis_result["purchasing_failure_class"]
     if settings["analysis"]["enabled"]:
         # #292: only with the analysis on. written / failed when this run attempted a build,
-        # null otherwise. A failed history write never changes the run's status or exit code.
+        # null otherwise. A failed history line or write never changes the run's status or exit code.
         status["analysis_history_status"] = None
         if analysis_result["status"] in (ANALYSIS_PUBLISHED, ANALYSIS_FAILED):
-            line = build_history_line(status, analysis_result, manifest["source"], run_exit_code(status),
-                                      _now(tz, clock).isoformat())
-            status["analysis_history_status"] = write_build_history(archive_root, line, started, run_id[:8])
+            try:
+                line = build_history_line(status, analysis_result, manifest["source"], run_exit_code(status),
+                                          _now(tz, clock).isoformat())
+                status["analysis_history_status"] = write_build_history(archive_root, line, started, run_id[:8])
+            except Exception:  # noqa: BLE001 - G2 L1: building the line must not stop the status, alert or lock.
+                status["analysis_history_status"] = HISTORY_FAILED
     # Last step before the status file: the alert reads the final status, and its own outcome is
     # recorded beside it. It never changes the status, the exit code or any other file.
     status["alert_status"], status["alert_http_status"] = send_run_alert(

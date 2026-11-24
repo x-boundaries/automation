@@ -4407,6 +4407,22 @@ class AnalysisBuildHistoryTests(AnalysisTestCase):
         self.assertEqual(hourly.write_build_history(missing, {"started_at": "x"}, at(2026, 8, 4), "t"),
                          hourly.HISTORY_FAILED)
 
+    def test_history_line_bug_still_writes_status_runs_alert_and_releases_lock(self):
+        # G2 L1: an exception while building the line (not only while writing it) is caught too.
+        with mock.patch.object(hourly, "build_history_line", side_effect=RuntimeError("line bug")):
+            manifest, _source = self.go_purchasing(at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        for root in (self.archive, self.delivery):
+            status = self.status(root)
+            self.assertEqual((status["analysis_history_status"], status["analysis_status"], status["status"]),
+                             ("failed", "published", "success"))
+            self.assertIn("alert_status", status, "the alert step still ran")
+            self.assertEqual(hourly.run_exit_code(status), hourly.EXIT_OK)
+        record = json.loads((self.archive / manifest["hourly_folder"] / hourly.ALERT_RECORD_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["run_id"], manifest["run_id"])
+        self.assertFalse((self.archive / hourly.LOCK_NAME).exists(), "the run lock is released")
+        self.assertFalse(self.history_path().exists())
+
     def test_history_write_failure_prints_and_still_exits_zero(self):
         path = Path(self.tmp) / "settings.local.json"
         raw_analysis = copy.deepcopy(ANALYSIS_ON)
