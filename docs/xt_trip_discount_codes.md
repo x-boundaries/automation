@@ -18,13 +18,13 @@ Owner rules (24 Nov 2026): the workflow never creates, edits or tags a Shopify c
 
 | Setting | Value |
 | --- | --- |
-| Name | `XT-INV<booking no. digits>`, for example `XT-INV000123`: one code per booking-no. row (layout v2 has no traveller column; F1 option (a), pending the Controller's ruling). If a traveller column is ever added to `SHEET_LAYOUT`, codes become `XT-INV<digits>-<NN>` and traveller 1 also matches the old name `XT-INV<digits>` |
+| Name | `XT-INV<invoice digits>`, for example `XT-INV000123`, for the first row of an invoice; the 2nd, 3rd ... rows with the same invoice, in row order, get `XT-INV000123-02`, `-03` ... (Controller ruling F1, 24 Nov 2026; the sheet has no traveller column). Re-sorting rows can change a later row's number before its code is made; a clash then shows as `CONFLICT` or `CHECK_EMAIL`, never a code for the wrong person. If a traveller column is ever added to `SHEET_LAYOUT`, codes become `XT-INV<digits>-<NN>` and traveller 1 also matches the old name |
 | Discount | 15% off all items (order discount) |
 | Who | only that one customer account (`context.customers`) |
 | Uses | 3 in total (`usageLimit` 3, `appliesOncePerCustomer` false) |
 | Combining | none (order, product and shipping discounts all false), so it never stacks with the member discount |
 | Starts | when it is made |
-| Ends | 23:59:59 SGT on max(deposit date + 12 months, departure date) (`VALIDITY_RULE` `later`); `earlier` takes the min. Deposit + 12 months is the same day next year; 29 Feb becomes 28 Feb |
+| Ends | 23:59:59 SGT on max(deposit date + 12 months, departure date) (`VALIDITY_RULE` `later`, the owner's rule; Controller ruling F2); `earlier` takes the min. Deposit + 12 months is the same day next year; 29 Feb becomes 28 Feb |
 | Tag | `X-Trekkers` (a discount tag, not a customer tag) |
 
 **Adopting existing codes.** A code made by hand before go-live under the row's code name is kept, not remade. The code column the consultant pre-filled is only a hint: Shopify is always asked. When it is locked to exactly the row's customer, has been used at most 3 times and is 15% off, one `discountCodeBasicUpdate` sets only `usageLimit` 3, `endsAt` (the rule above) and `combinesWith` (none); value, items, customer and name stay. When it already has exactly those settings, nothing is written. Anything else (another customer, several customers, more than 3 uses, not 15%, not a simple code, both names present) is `CONFLICT` and nothing changes in Shopify.
@@ -36,7 +36,7 @@ The sheet's `How to use` tab has the consultant's copy of this table.
 | Status | Meaning | Who acts |
 | --- | --- | --- |
 | (empty), or the consultant's old `Active` / `Expired` | Not processed yet (any value not on this list counts as not processed) | Consultant ticks Ready |
-| `CHECK_ROW` | The booking no. format, the deposit date or the departure date (on or after the deposit) is wrong, the email is not an email, or another row has the same booking no.; Message names the field | Consultant fixes the row |
+| `CHECK_ROW` | The invoice format, the deposit date or the departure date (on or after the deposit) is wrong, or the email is not an email; Message names the field. A repeated invoice is not a problem (later rows get `-02` ...) | Consultant fixes the row |
 | `NEEDS_EMAIL` | No email for this traveller | Consultant gets it from the lead booker |
 | `NEEDS_SHOPIFY_ACCOUNT` | No customer with exactly this email yet; checked again every run | Traveller signs up online with this email |
 | `CHECK_EMAIL` | Another row on the same trip already uses this email, or Shopify's account email is not exactly this one | Consultant checks the email |
@@ -77,9 +77,9 @@ The brakes (300 lookups, 30 code writes) are fixed in the Code nodes on purpose:
 - `tab`: the tab name. `last_row`: the last row read (columns A to ZZ). `invoice_pattern`: a regular expression whose first group captures the invoice digits used in the code name.
 - A header the layout names that is missing or appears twice stops the run (`sheet_layout_changed`); a layout that is not valid (a required role empty, two roles on one header, an unknown role) stops it as `settings_invalid`.
 - Renaming a header in the sheet means changing `SHEET_LAYOUT` in a reviewed PR and re-importing; until then runs stop safely.
-- **Layout v2** (`mailbox/355/20261124-1424-xt-sheet-layout-v2.md`, private): tab `Travellers`; read `Ready`, `Booking no. (invoice)`, `Email`, `Trip code`, `Deposit date`, `Departure date`, `Code status`; written `Discount code`, `Code status`, `Code created in Shopify`, `Shopify end date`, `Message`, `Shopify customer ID` (L, M, N, O, S and T today); no traveller and no last-checked column. The workflow never writes the consultant's other columns.
-- **Write rules (v2):** `DONE` and `ADOPTED` write the code, status, created time (`d mmm yyyy hh:mm` SGT, text), end date (a real Sheets date, so the consultant's `Shopify end date check` formula can compare it) and customer ID, and clear the message. Every other status writes only the status and message (and the customer ID when one customer matched), so the consultant's own code, created and end-date values stay until a code is made.
-- **Open (F2):** the consultant's `Code valid until` holds his earlier rule; the workflow ends codes by `VALIDITY_RULE` (later, owner rule) and never writes his columns, so his `Shopify end date check` will say MISMATCH on most rows until the Controller rules.
+- **Layout v2.1** (`mailbox/355/20261124-1430-xt-sheet-layout-v2-1.md`, private): tab `Travellers`; read `Ready`, `Invoice no. (deposit)`, `Email`, `Trip`, `Deposit date`, `Departure date`, `Code status`; written `Discount code`, `Code status`, `Code created in Shopify (SGT)`, `Shopify end date (SGT)`, `Code valid until` (ruling F2), `Message`, `Shopify customer ID` (K, L, M, N, O, S and T today); no traveller and no last-checked column. The workflow never writes the consultant's other columns.
+- **Write rules:** `DONE` and `ADOPTED` write the code, status, created time (`d mmm yyyy hh:mm` SGT, text), the end date into both `Shopify end date (SGT)` and `Code valid until` (real Sheets dates, plain values, so the consultant's `Shopify end date check` shows OK) and the customer ID, and clear the message. Every other status writes only the status and message (and the customer ID when one customer matched), so the consultant's own code, created and end-date values stay until a code is made.
+- **End-date rule (ruling F2):** codes end by the owner's later rule. Old rows keep the consultant's own `Code valid until` (his earlier rule) until the row is processed or adopted; the how-it-works note tells him the rule.
 
 ## Error emails (through `XB Ops Alert Email`, system `XT-CODES`)
 

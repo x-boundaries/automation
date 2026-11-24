@@ -54,10 +54,11 @@ OTHER_SYSTEMS = ("AC2-STOCK", "AC2-ARAP", "ENERGYGRID", "MEMBER-SYNC", "HEALTH",
 # 24 Nov 2026 10:00 SGT, a fixed clock for every Code run.
 NOW_MS = int(datetime(2026, 11, 24, 2, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 FAKE_TOKEN = "fake-access-token-0000000000"
-HEADERS = ["Ready", "No.", "Guest name", "Email", "Trip", "Trip code", "Booking no. (invoice)", "Deposit date",
+# Sheet layout v2.1 (mailbox/355/20261124-1430), columns A-T.
+HEADERS = ["Ready", "Row no.", "Guest name", "Email", "Trip", "Trip code", "Invoice no. (deposit)", "Deposit date",
            "Deposit paid by", "Departure date", "Code valid until", "Discount code", "Code status",
-           "Code created in Shopify", "Shopify end date", "Shopify end date check", "Email sent", "Data check / notes",
-           "Message", "Shopify customer ID"]
+           "Code created in Shopify (SGT)", "Shopify end date (SGT)", "Shopify end date check", "Email sent",
+           "Data check / notes", "Message", "Shopify customer ID"]
 STATUSES = ["CHECK_ROW", "NEEDS_EMAIL", "NEEDS_SHOPIFY_ACCOUNT", "CHECK_EMAIL", "CONFLICT", "HELD", "ERROR", "DONE",
             "ADOPTED", "EXPIRED_NO_ACCOUNT"]
 NODE_TYPES = {
@@ -150,12 +151,12 @@ def layout(**columns):
     return value
 
 
-def row(ready=True, invoice="INV-000123", email="traveller1@example.com", trip_code="FT-01", deposit=None,
+def row(ready=True, invoice="INV-000123", email="traveller1@example.com", trip="Fake Trip", deposit=None,
         departure=None, status="", code="", created="", ends="", pax=None, name="Fake Traveller"):
-    """One fake row in layout v2 order (A-T); `pax` adds a 21st cell for layouts with a traveller column."""
+    """One fake row in layout v2.1 order (A-T); `pax` adds a 21st cell for layouts with a traveller column."""
     deposit = serial(2026, 11, 3) if deposit is None else deposit
     departure = serial(2027, 5, 1) if departure is None else departure
-    cells = [ready, 7, name, email, "Fake Trip", trip_code, invoice, deposit, "Fake Payer", departure,
+    cells = [ready, 7, name, email, trip, "FT-01", invoice, deposit, "Fake Payer", departure,
              departure, code, status, created, ends, "", "No", "", "", ""]
     if pax is not None:
         cells.append(pax)
@@ -349,8 +350,8 @@ class XtShapeTests(XtBase):
         self.assertTrue(layout_expr.startswith("={{ ({") and layout_expr.endswith("}) }}"))
         self.assertEqual(sorted(LAYOUT), ["columns", "invoice_pattern", "last_row", "tab"])
         self.assertEqual(sorted(LAYOUT["columns"]), sorted(["ready", "invoice", "traveller", "email", "trip", "deposit",
-                                                            "departure", "code", "ends", "status", "message",
-                                                            "customer", "checked", "made"]))
+                                                            "departure", "code", "ends", "valid_until", "status",
+                                                            "message", "customer", "checked", "made"]))
         rule = self.nodes["Daily 10:00 SGT"]["parameters"]["rule"]["interval"]
         self.assertEqual(rule, [{"field": "days", "daysInterval": 1, "triggerAtHour": 10, "triggerAtMinute": 0}])
 
@@ -518,18 +519,17 @@ class XtCheckRowsTests(XtBase):
         out = self.check(sheet(
             row(invoice="INV123", deposit="3 Nov 2026", departure=serial(2026, 10, 1), email="not-an-email"),
             row(invoice="INV-000002", deposit=serial(2026, 11, 3), departure=serial(2026, 11, 2), email="t2@example.com"),
-            row(invoice="INV-000003", email="t3@example.com"), row(invoice="INV-000003", email="t3b@example.com", ready=False)))
+            row(invoice="INV-000003", email=""))) # a row without problems in the fields CHECK_ROW checks
         rows = out["updates"]
-        self.assertEqual(self.status_of(rows, 2)["message"], "Check: Booking no. (invoice), Deposit date, Email.")
+        self.assertEqual(self.status_of(rows, 2)["message"], "Check: Invoice no. (deposit), Deposit date, Email.")
         self.assertEqual(self.status_of(rows, 3)["message"], "Check: Departure date (before Deposit date).")
-        self.assertEqual(self.status_of(rows, 4)["message"], "Check: Booking no. (invoice) (same as row 5).")
-        self.assertEqual({r["status"] for r in rows}, {"CHECK_ROW"})
+        self.assertEqual([r["status"] for r in rows], ["CHECK_ROW", "CHECK_ROW", "NEEDS_EMAIL"])
         self.assertEqual(out["lookups"], [])
 
     def test_needs_email_and_same_email_on_the_same_trip(self):
         out = self.check(sheet(row(email=""), row(invoice="INV-000002", email=" Lead@Example.com "),
                                row(invoice="INV-000003", email="lead@example.com"),
-                               row(invoice="INV-000004", email="lead@example.com", trip_code="OTHER-TRIP"),
+                               row(invoice="INV-000004", email="lead@example.com", trip="Other Trip"),
                                row(invoice="INV-000999", email="done@example.com", status="DONE"),
                                row(invoice="INV-000005", email="DONE@example.com")))
         self.assertEqual(out["updates"], [], "rows wait for the lookups, then Decide Code Writes writes them all")
@@ -541,8 +541,23 @@ class XtCheckRowsTests(XtBase):
         self.assertEqual([l["row"] for l in out["lookups"]], [3, 5])
         self.assertEqual(out["lookups"][0]["email"], "lead@example.com")
 
-    def test_one_code_per_booking_row(self):
-        # Layout v2, F1 (a): no traveller column, so the code is XT-INV<digits> and there is no old name.
+    def test_a_second_row_of_the_same_invoice_gets_02_and_so_on(self):
+        # Controller ruling F1 (24 Nov 2026): the first row of an invoice is XT-INV<digits>; the 2nd, 3rd ... rows
+        # with the same invoice, in row order and whatever their state, get -02, -03 ...
+        out = self.check(sheet(row(email="a@example.com"), row(invoice="INV-000999", email="z@example.com"),
+                               row(email="b@example.com", ready=False), row(email="c@example.com"),
+                               row(email="d@example.com", status="DONE"), row(email="e@example.com")))
+        self.assertEqual([(l["row"], l["code"], l["legacy"], l["variables"]["withLegacy"]) for l in out["lookups"]],
+                         [(2, "XT-INV000123", "", False), (3, "XT-INV000999", "", False),
+                          (5, "XT-INV000123-03", "", False), (7, "XT-INV000123-05", "", False)])
+        self.assertEqual(out["decided"], [], "a repeated invoice is not a row problem")
+        out = self.decide(self.check(sheet(row(), row(email="t2@example.com"))),
+                          [answer(customer(7001, "traveller1@example.com")), answer(customer(7002, "t2@example.com"))])
+        self.assertEqual([(w["code"], w["customer"]) for w in out["writes"]],
+                         [("XT-INV000123", "7001"), ("XT-INV000123-02", "7002")])
+
+    def test_one_code_per_invoice_row(self):
+        # No traveller column, so the code is XT-INV<digits> and there is no old name.
         (first,) = self.check(sheet(row()))["lookups"]
         self.assertEqual((first["code"], first["legacy"]), ("XT-INV000123", ""))
         self.assertEqual(first["variables"], {"email": "traveller1@example.com", "code": "XT-INV000123",
@@ -563,7 +578,7 @@ class XtCheckRowsTests(XtBase):
         self.assertEqual(self.check(sheet(row(pax="7"), header=HEADERS + ["Pax no."]), run)["lookups"][0]["code"],
                          "XT-INV000123-07")
         twins = self.check(sheet(row(pax=2), row(pax=2, email="b@example.com"), header=HEADERS + ["Pax no."]), run)
-        self.assertEqual(twins["updates"][0]["message"], "Check: Booking no. (invoice) and Pax no. (same as row 3).")
+        self.assertEqual(twins["updates"][0]["message"], "Check: Invoice no. (deposit) and Pax no. (same as row 3).")
 
     def test_end_date_rule(self):
         def end(deposit, departure, rule="later"):
@@ -784,14 +799,16 @@ class XtSheetTests(XtBase):
         return [(d["range"], d["values"][0][0]) for d in trail["built"]["body"]["data"]]
 
     def test_layout_v2_write_rules(self):
-        # DONE: code, end date (a Sheets date number), status, empty message, customer ID, created time.
+        # DONE: code, end date (a Sheets date number), the same date in "Code valid until" (ruling F2), status, empty
+        # message, customer ID, created time.
         # Any other status: status and message only (plus the customer ID when one matched).
         value = sheet(row(code="XT-INV000123", status="Active"), row(invoice="INV-000002", email="", code="XT-INV000002"))
         trail = self.full_run(value, lambda l: answer(customer(7001, "traveller1@example.com")))
         self.assertEqual(trail["built"]["body"]["valueInputOption"], "RAW")
         self.assertEqual(self.cells(trail), [
             ("'Travellers'!M3", "NEEDS_EMAIL"), ("'Travellers'!S3", "Add this traveller's own email."),
-            ("'Travellers'!L2", "XT-INV000123"), ("'Travellers'!O2", serial(2027, 11, 3)), ("'Travellers'!M2", "DONE"),
+            ("'Travellers'!L2", "XT-INV000123"), ("'Travellers'!O2", serial(2027, 11, 3)),
+            ("'Travellers'!K2", serial(2027, 11, 3)), ("'Travellers'!M2", "DONE"),
             ("'Travellers'!S2", ""), ("'Travellers'!T2", "7001"), ("'Travellers'!N2", "24 Nov 2026 10:00")])
         self.assertEqual(trail["final"]["problems"], [])
         self.assertIs(self.expr(self.nodes[TO_EMAIL]["parameters"]["conditions"]["conditions"][0]["leftValue"],
@@ -912,15 +929,16 @@ class XtLayoutTests(XtBase):
         block = lambda code: code[code.index("// ---- the sheet layout"):code.index("const locate")]
         self.assertEqual(block(both[0]), block(both[1]), "the layout check is the same in both nodes")
 
-    def test_the_export_layout_is_contract_v2(self):
-        self.assertEqual(LAYOUT["tab"], "Travellers")
+    def test_the_export_layout_is_contract_v2_1(self):
+        self.assertEqual((LAYOUT["tab"], LAYOUT["invoice_pattern"]), ("Travellers", "^INV-([0-9]{1,12})$"))
         self.assertEqual(LAYOUT["columns"], {
-            "ready": "Ready", "invoice": "Booking no. (invoice)", "traveller": "", "email": "Email", "trip": "Trip code",
+            "ready": "Ready", "invoice": "Invoice no. (deposit)", "traveller": "", "email": "Email", "trip": "Trip",
             "deposit": "Deposit date", "departure": "Departure date", "code": "Discount code", "status": "Code status",
-            "made": "Code created in Shopify", "ends": "Shopify end date", "message": "Message",
-            "customer": "Shopify customer ID", "checked": ""})
-        written = {v for k, v in LAYOUT["columns"].items() if k in ("code", "status", "made", "ends", "message", "customer")}
-        self.assertEqual(sorted("ABCDEFGHIJKLMNOPQRST"[HEADERS.index(h)] for h in written), list("LMNOST"))
+            "made": "Code created in Shopify (SGT)", "ends": "Shopify end date (SGT)", "valid_until": "Code valid until",
+            "message": "Message", "customer": "Shopify customer ID", "checked": ""})
+        written = {v for k, v in LAYOUT["columns"].items()
+                   if k in ("code", "status", "made", "ends", "valid_until", "message", "customer")}
+        self.assertEqual(sorted("ABCDEFGHIJKLMNOPQRST"[HEADERS.index(h)] for h in written), list("KLMNOST"))
 
 
 class XtAlertTests(XtBase):
@@ -993,7 +1011,9 @@ class XtEndToEndTests(XtBase):
             written.setdefault(int(num), {})[col] = d["values"][0][0]
         self.assertEqual({r: v["M"] for r, v in written.items()},
                          {2: "DONE", 3: "NEEDS_SHOPIFY_ACCOUNT", 4: "NEEDS_EMAIL", 5: "ADOPTED", 6: "CONFLICT"})
-        self.assertEqual((written[5]["L"], written[5]["O"], written[5]["T"]), ("XT-INV000200", serial(2027, 11, 3), "7005"))
+        self.assertEqual((written[5]["L"], written[5]["O"], written[5]["K"], written[5]["T"]),
+                         ("XT-INV000200", serial(2027, 11, 3), serial(2027, 11, 3), "7005"))
+        self.assertNotIn("K", written[3], "his own valid-until stays until a code is made")
         self.assertEqual(trail["final"]["problems"], [])
         self.assertEqual([w["kind"] for w in trail["decide"]["writes"]], ["create", "adopt"])
         # The next morning: the made and adopted rows are final, nothing is written to Shopify again.
