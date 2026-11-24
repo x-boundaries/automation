@@ -1,0 +1,20 @@
+{
+  "schema": "xb.directlocal.member_removals.config.v1",
+  "state_root": "C:\\XB\\xb268-member-removals-test",
+  "autocount_book": "AED_TESTINGAPI",
+  "member_core_config": "C:\\XB\\xb268-member-benefits-test\\member_benefits.json",
+  "expire_write_enabled": false,
+  "revoke_write_enabled": false,
+  "restore_enabled": false,
+  "max_expires_per_run": 3,
+  "max_revokes_per_run": 3,
+  "max_removals_per_day": 20,
+  "max_member_reads_per_run": 30,
+  "surge_stop_count": 100,
+  "surge_ack_until": null,
+  "write_deadline_seconds": 120,
+  "type_move_state_root": null,
+  "ac2_credential_target": null,
+  "ac2_login_mode": null,
+  "ac2_refused_user_ids": []
+}

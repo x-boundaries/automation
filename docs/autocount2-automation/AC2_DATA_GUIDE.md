@@ -308,7 +308,7 @@ When this guide changes in the repository, copy the new version over the old one
 
 ## Out of scope
 
-- Member sync, member core (member benefits) and member tags (#155, #268): they write to AutoCount and Shopify, not data extracts for reading.
+- Member sync, member core (member benefits), member tags and member removals (#155, #268): they write to AutoCount and Shopify, not data extracts for reading. Member removals (slice E) is built and off.
 - The daily health check (#325): it reads the two `last_run_status.json` files above and emails the owner only when something needs a look; it holds no business data.
 - The error alert emails (#288): codes and counts only, no business data.
 - The Shopify kit re-tagger (#269), the read-only Drive mirror of this repository, EnergyGrid bills and SIMBA invoices: not AutoCount data.

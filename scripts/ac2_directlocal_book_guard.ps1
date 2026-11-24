@@ -10,7 +10,9 @@
 #     (#268) the type move's four
 #     type-move-* operations with payload profile type_move_p1, and (#268
 #     member core) the benefits tool's three benefit-* operations with
-#     payload profile benefit_p1. Names,
+#     payload profile benefit_p1, and (#268 slice E) the removals tool's
+#     removal-scan, removal-member and removal-save with payload profile
+#     benefit_x1 and its removal-restore with benefit_x1r. Names,
 #     operations and profiles compare ordinally (a lookalike never passes);
 #   - host DESKTOP-4I042L6 and no XB_AC2_SESSION_FACTORY override;
 #   - the live AutoCount assemblies equal the pins the outbound qualification
@@ -50,6 +52,15 @@ $script:XbDlTypeMoveProfile = "type_move_p1"
 # operation takes that profile, and these operations take no other profile.
 $script:XbDlBenefitOperations = @("benefit-scan", "benefit-member", "benefit-save")
 $script:XbDlBenefitProfile = "benefit_p1"
+# #268 slice E: the removals tool has its own entry point
+# (ac2_member_removals_bridge.ps1). Its removal operations are admitted on the
+# live book only with benefit_x1 (MEMBER -> GUEST only) and its undo only with
+# benefit_x1r (GUEST -> MEMBER, one removal of that tool); no other operation
+# takes either profile, and these operations take no other profile.
+$script:XbDlRemovalOperations = @("removal-scan", "removal-member", "removal-save")
+$script:XbDlRemovalProfile = "benefit_x1"
+$script:XbDlRestoreOperations = @("removal-restore")
+$script:XbDlRestoreProfile = "benefit_x1r"
 # Must equal QUALIFIED_ASSEMBLIES in ac2_directlocal_e7_isolation_check.py.
 $script:XbDlQualifiedAssemblies = [ordered]@{
     "AutoCount.dll" = "8e86273018c01c715e440c7975f759951f4a0e979fc3edb0c281db6696090f93"
@@ -86,6 +97,16 @@ function Assert-XbDlAuthorisedBook {
     if (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlBenefitOperations) {
         # #268 member core: always with benefit_p1; -ProfileNotYetRead never applies.
         if (-not [string]::Equals($PayloadProfile, $script:XbDlBenefitProfile, [StringComparison]::Ordinal)) { throw "production_book_not_authorised" }
+        return
+    }
+    if (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlRemovalOperations) {
+        # #268 slice E: always with benefit_x1; -ProfileNotYetRead never applies.
+        if (-not [string]::Equals($PayloadProfile, $script:XbDlRemovalProfile, [StringComparison]::Ordinal)) { throw "production_book_not_authorised" }
+        return
+    }
+    if (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlRestoreOperations) {
+        # #268 slice E undo: always with benefit_x1r; -ProfileNotYetRead never applies.
+        if (-not [string]::Equals($PayloadProfile, $script:XbDlRestoreProfile, [StringComparison]::Ordinal)) { throw "production_book_not_authorised" }
         return
     }
     if (-not (Test-XbDlOrdinalIn -Value $Operation -Set $script:XbDlLiveBookOperations)) { throw "production_book_not_authorised" }
