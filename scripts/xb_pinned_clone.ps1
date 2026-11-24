@@ -14,12 +14,17 @@
 #   2. git reads its HEAD, and HEAD starts with that sha7;
 #   3. HEAD is detached (no branch checked out), so nothing that pulls or fast-forwards a
 #      branch can move it;
-#   4. no tracked file is changed (untracked files, such as Python caches, are not checked).
+#   4. no tracked file is changed, and none is hidden from git status by assume-unchanged or
+#      skip-worktree (untracked files, such as Python caches, are not checked);
+#   5. its parent folder is exactly GoliveRoot (default C:\XB\golive).
 
 $XbPinnedCloneNamePattern = '\Aautomation-[a-z0-9]+(-[a-z0-9]+)*-([0-9a-f]{7})\z'
 
 function Get-XbPinnedCloneProblem {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$RepoRoot)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RepoRoot,
+        [string]$GoliveRoot = "C:\XB\golive"
+    )
 
     # Windows PowerShell 5.1 turns a native command's stderr into a terminating error under
     # "Stop"; here a git failure must come back as a sentence instead.
@@ -56,6 +61,20 @@ function Get-XbPinnedCloneProblem {
     }
     if (-not [string]::IsNullOrWhiteSpace(($changed | Out-String))) {
         return "$full has changed tracked files."
+    }
+    # ls-files -v marks assume-unchanged files with a lowercase tag and skip-worktree files with
+    # S; git status does not show changes to either.
+    $tags = & git -C $full ls-files -v 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return "git ls-files failed in $full."
+    }
+    if (@($tags | Where-Object { $_ -cmatch '\A[a-zS] ' }).Count -gt 0) {
+        return "$full has tracked files hidden from git status (assume-unchanged or skip-worktree)."
+    }
+    # Checked last, so a clone elsewhere that passes everything else names only this.
+    $root = $GoliveRoot.TrimEnd('\')
+    if (-not [string]::Equals((Split-Path -Parent $full).TrimEnd('\'), $root, [StringComparison]::OrdinalIgnoreCase)) {
+        return "the code folder $full is not in $root."
     }
     return ""
 }
@@ -144,4 +163,68 @@ function Get-XbRepointedAction {
         WorkingDirectory = $newRoot
         Notes            = $notes
     }
+}
+
+# Write-XbTaskBackup saves an Export-ScheduledTask XML text as UTF-16 with a byte order mark,
+# matching its encoding="UTF-16" declaration. It never overwrites a file.
+function Write-XbTaskBackup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$XmlText
+    )
+    if (Test-Path -LiteralPath $Path) {
+        throw "The backup file already exists; nothing changed."
+    }
+    [System.IO.File]::WriteAllText($Path, $XmlText, (New-Object System.Text.UnicodeEncoding($false, $true)))
+}
+
+# Get-XbActionFromTaskBackup reads a backup written by Write-XbTaskBackup and returns the one
+# program action in it (Execute, Arguments, WorkingDirectory), for the rollback. It throws,
+# changing nothing, unless:
+#   - the file's RegistrationInfo/URI names TaskUri (the task being rolled back);
+#   - it has exactly one Exec action, with a Command;
+#   - that Command equals CurrentExecute (the rollback never changes the program).
+# Entity-encoded text such as &quot; comes back as plain characters.
+function Get-XbActionFromTaskBackup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$TaskUri,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CurrentExecute
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "The backup file does not exist."
+    }
+    [xml]$doc = Get-Content -LiteralPath $Path -Raw
+    $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+    $ns.AddNamespace("t", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+    $uriNode = $doc.SelectSingleNode("/t:Task/t:RegistrationInfo/t:URI", $ns)
+    if ($null -eq $uriNode -or [string]::IsNullOrWhiteSpace($uriNode.InnerText)) {
+        throw "The backup has no task URI, so it cannot be matched to a task."
+    }
+    if (-not [string]::Equals($uriNode.InnerText, $TaskUri, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The backup is for $($uriNode.InnerText), not $TaskUri."
+    }
+    $execs = @($doc.SelectNodes("/t:Task/t:Actions/t:Exec", $ns))
+    $others = @($doc.SelectNodes("/t:Task/t:Actions/*", $ns))
+    if ($execs.Count -ne 1 -or $others.Count -ne 1) {
+        throw "The backup must have exactly one action, a program action."
+    }
+    $field = {
+        param([string]$Name)
+        $node = $execs[0].SelectSingleNode("t:$Name", $ns)
+        if ($null -eq $node) { "" } else { [string]$node.InnerText }
+    }
+    $action = [pscustomobject]@{
+        Execute          = & $field "Command"
+        Arguments        = & $field "Arguments"
+        WorkingDirectory = & $field "WorkingDirectory"
+        Notes            = @()
+    }
+    if ([string]::IsNullOrWhiteSpace($action.Execute)) {
+        throw "The backup's action has no program."
+    }
+    if (-not [string]::Equals($action.Execute, $CurrentExecute, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The program would change ($CurrentExecute to $($action.Execute)); the rollback never changes the program."
+    }
+    return $action
 }

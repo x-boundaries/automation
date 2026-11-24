@@ -91,12 +91,12 @@ class StaticRepointTests(unittest.TestCase):
     def test_dry_run_is_the_default_and_stops_before_any_change(self):
         self.assertIn("[switch]$Apply", self.code)
         dry = self.code.index("if (-not $Apply) {")
-        for later in ("Export-ScheduledTask", "Set-ScheduledTask", "Get-Credential", "WriteAllText"):
+        for later in ("Export-ScheduledTask", "Set-ScheduledTask", "Get-Credential", "Write-XbTaskBackup"):
             self.assertLess(dry, self.code.index(later), later)
         self.assertIn('Write-Host "Dry run: nothing changed."', self.code)
 
     def test_backup_before_change_and_never_replace_or_remove(self):
-        self.assertLess(self.code.index("WriteAllText($backupPath"), self.code.index("Set-ScheduledTask"))
+        self.assertLess(self.code.index("Write-XbTaskBackup -Path $backupPath"), self.code.index("Set-ScheduledTask"))
         self.assertLess(self.code.index('"Running"'), self.code.index("Set-ScheduledTask"))
         for forbidden in ("Unregister-ScheduledTask", "Register-ScheduledTask", "-Force", "Disable-ScheduledTask",
                           "Start-ScheduledTask", "Start-Transcript", "ConvertFrom-SecureString", "Out-File"):
@@ -106,6 +106,11 @@ class StaticRepointTests(unittest.TestCase):
         self.assertIn('foreach ($part in @("Triggers", "Principals", "Settings"))', self.code)
         self.assertIn("-RestoreFromXml", self.code)
         self.assertIn("exit 1", self.code)
+
+    def test_restore_takes_its_action_from_the_checked_backup_reader(self):
+        # G2 M1: the restore path uses Get-XbActionFromTaskBackup (tested below), nothing inline.
+        self.assertIn("Get-XbActionFromTaskBackup -Path $RestoreFromXml -TaskUri ($TaskPath + $TaskName) -CurrentExecute", self.code)
+        self.assertNotIn("SelectNodes", self.code.split("if (-not $Apply) {")[0])
 
     def test_new_clone_must_pass_the_pinned_check(self):
         self.assertIn("Get-XbPinnedCloneProblem -RepoRoot $NewRepoRoot", self.code)
@@ -139,7 +144,7 @@ class PowerShellTestCase(unittest.TestCase):
         sha = self.git(work, "rev-parse", "HEAD")
         if detach:
             self.git(work, "checkout", "-q", "--detach", sha)
-        final = self.tmp / golive / (name or f"automation-{purpose}-{sha[:7]}")
+        final = self.tmp / golive / (name or "automation-{purpose}-{sha7}").format(purpose=purpose, sha7=sha[:7], sha8=sha[:8])
         final.parent.mkdir(parents=True, exist_ok=True)
         work.rename(final)
         return final
@@ -150,8 +155,10 @@ class PowerShellTestCase(unittest.TestCase):
                               capture_output=True, text=True, timeout=120, env=self.env)
         return done.returncode, done.stdout.strip(), done.stderr.strip()
 
-    def problem(self, root) -> str:
-        code, out, err = self.ps("Get-XbPinnedCloneProblem -RepoRoot " + ps_quote(root))
+    def problem(self, root, golive_root=None) -> str:
+        # The temporary golive folder stands in for C:\XB\golive unless a test names another root.
+        golive_root = self.tmp / "golive" if golive_root is None else golive_root
+        code, out, err = self.ps("Get-XbPinnedCloneProblem -RepoRoot " + ps_quote(root) + " -GoliveRoot " + ps_quote(golive_root))
         self.assertEqual(code, 0, err)
         return out
 
@@ -195,6 +202,8 @@ class PinnedCheckTests(PowerShellTestCase):
             "not in a golive folder": dict(golive="build"),
             "no purpose in the name": dict(name="automation-abcdef1"),
             "uppercase sha": dict(name="automation-test-ABCDEF1"),
+            "8-character sha (G2 P01)": dict(name="automation-test-{sha8}"),
+            "uppercase purpose (G2 P09)": dict(name="automation-Test-{sha7}"),
         }
         for label, kwargs in cases.items():
             with self.subTest(label):
@@ -206,6 +215,30 @@ class PinnedCheckTests(PowerShellTestCase):
         bare = self.tmp / "golive" / "automation-nogit-abcdef1"
         bare.mkdir(parents=True)
         self.assertIn("git cannot read HEAD", self.problem(bare))
+
+    def test_a_failing_git_status_is_refused(self):
+        # G2 P07: a broken index makes git status fail while HEAD still reads.
+        clone = self.make_clone()
+        (clone / ".git" / "index").write_bytes(b"not an index")
+        self.assertIn("git status failed", self.problem(clone))
+
+    def test_a_change_hidden_by_assume_unchanged_or_skip_worktree_is_refused(self):
+        # G2 L2: git status does not show these changes.
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag):
+                clone = self.make_clone(purpose=flag.strip("-").replace("-", ""))
+                self.git(clone, "update-index", flag, "scripts/example.py")
+                (clone / "scripts" / "example.py").write_text("print('hidden')\n", encoding="utf-8")
+                self.assertIn("hidden from git status", self.problem(clone))
+
+    def test_a_golive_folder_in_another_place_is_refused(self):
+        # G2 L2: the default root is C:\XB\golive; the temporary golive folder is somewhere else.
+        clone = self.make_clone()
+        self.assertEqual(self.problem(clone), "")
+        out = self.problem(clone, golive_root="C:\\XB\\golive")
+        self.assertEqual(out, f"the code folder {clone} is not in C:\\XB\\golive.")
+        code, out, err = self.ps("Get-XbPinnedCloneProblem -RepoRoot " + ps_quote(clone))
+        self.assertEqual(out, f"the code folder {clone} is not in C:\\XB\\golive.", "the default root")
 
     def test_assert_refuses_with_the_reason_and_the_runbook(self):
         code, out, err = self.ps("Assert-XbPinnedClone 'the code folder X is not a pinned clone.'")
@@ -302,15 +335,94 @@ class InstallerDryRunTests(PowerShellTestCase):
         self.assertIn("Pinned clone: NO, so registering would be refused: the code folder", out)
         self.assertIn("Nothing was registered.", out)
 
-    def test_dry_run_from_a_pinned_clone_passes_the_check(self):
+    def test_dry_run_from_a_pinned_clone_passes_every_check_but_the_place(self):
+        # The installer uses the default root C:\XB\golive. A temporary clone that passes the name,
+        # HEAD, detached and clean checks is refused only for its place (checked last), so this
+        # proves the installer reaches the end of the check from a real pinned clone.
         files = {str(p.relative_to(ROOT)).replace("\\", "/"): p.read_text(encoding="utf-8")
                  for p in (ROOT / "scripts").glob("*.py")}
         clone = self.make_clone(purpose="hourly", files=files)
         code, out = self.run_hourly("-RepoRoot", str(clone))
         self.assertEqual(code, 0, out)
         self.assertIn("Repo root: " + str(clone), out)
-        self.assertIn("Pinned clone: yes.", out)
+        self.assertIn(f"Pinned clone: NO, so registering would be refused: the code folder {clone} is not in C:\\XB\\golive.", out)
 
+
+TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    {uri}<Description>Fake task for tests</Description>
+  </RegistrationInfo>
+  <Triggers><TimeTrigger><StartBoundary>2026-11-24T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>
+  <Actions Context="Author">
+    {actions}
+  </Actions>
+</Task>
+"""
+EXEC = ("<Exec><Command>{command}</Command><Arguments>&quot;C:\\XB\\automation\\scripts\\example.py&quot; --config "
+        "&quot;D:\\private\\settings.local.json&quot;</Arguments><WorkingDirectory>C:\\XB\\automation</WorkingDirectory></Exec>")
+PY = "C:\\Python311\\python.exe"
+URI = "<URI>\\XB\\Example Task</URI>"
+
+
+class TaskBackupTests(PowerShellTestCase):
+    """G2 M1: the rollback reads the backup the re-point wrote, Export-ScheduledTask shaped."""
+
+    def write_backup(self, uri=URI, actions=None):
+        source = self.tmp / "source.xml"
+        source.write_text(TASK_XML.format(uri=uri, actions=actions or EXEC.format(command=PY)), encoding="utf-8")
+        backup = self.tmp / ("backup-%d.xml" % len(list(self.tmp.glob("backup-*.xml"))))
+        code, _, err = self.ps("Write-XbTaskBackup -Path %s -XmlText ([System.IO.File]::ReadAllText(%s))" % (ps_quote(backup), ps_quote(source)))
+        self.assertEqual(code, 0, err)
+        return backup
+
+    def read_backup(self, backup, task_uri="\\XB\\Example Task", current=PY):
+        return self.ps("$a = Get-XbActionFromTaskBackup -Path %s -TaskUri %s -CurrentExecute %s; "
+                       "Write-Output $a.Execute; Write-Output $a.Arguments; Write-Output $a.WorkingDirectory"
+                       % (ps_quote(backup), ps_quote(task_uri), ps_quote(current)))
+
+    def test_a_good_backup_round_trips_as_utf16(self):
+        backup = self.write_backup()
+        raw = backup.read_bytes()
+        self.assertEqual(raw[:2], b"\xff\xfe", "UTF-16 little endian with a byte order mark")
+        self.assertIn('encoding="UTF-16"', raw[2:].decode("utf-16-le"))
+        code, out, err = self.read_backup(backup)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines(), [
+            PY,
+            '"C:\\XB\\automation\\scripts\\example.py" --config "D:\\private\\settings.local.json"',
+            "C:\\XB\\automation",
+        ], "&quot; comes back as a plain quote")
+
+    def test_the_task_name_is_matched_without_case(self):
+        code, out, err = self.read_backup(self.write_backup(), task_uri="\\xb\\example task")
+        self.assertEqual(code, 0, err)
+
+    def test_backups_that_would_restore_the_wrong_thing_are_refused(self):
+        cases = {
+            "another task's backup (G2 R08)": (dict(uri="<URI>\\XB\\Other Task</URI>"), {}, "is for \\XB\\Other Task, not \\XB\\Example Task"),
+            "no task URI": (dict(uri=""), {}, "has no task URI"),
+            "two program actions (G2 R09)": (dict(actions=EXEC.format(command=PY) * 2), {}, "exactly one action"),
+            "a program and another action": (dict(actions=EXEC.format(command=PY) + "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>"), {}, "exactly one action"),
+            "no program": (dict(actions="<Exec><Arguments>x</Arguments></Exec>"), {}, "has no program"),
+            "a program change (G2 R10)": (dict(actions=EXEC.format(command="C:\\Other\\python.exe")), {}, "The program would change"),
+        }
+        for label, (write_kwargs, read_kwargs, expected) in cases.items():
+            with self.subTest(label):
+                code, out, err = self.read_backup(self.write_backup(**write_kwargs), **read_kwargs)
+                self.assertNotEqual(code, 0, out)
+                self.assertIn(expected, err)
+
+    def test_a_missing_backup_is_refused_and_an_existing_one_is_never_overwritten(self):
+        code, _, err = self.read_backup(self.tmp / "none.xml")
+        self.assertNotEqual(code, 0)
+        self.assertIn("does not exist", err)
+        backup = self.write_backup()
+        before = backup.read_bytes()
+        code, _, err = self.ps("Write-XbTaskBackup -Path %s -XmlText 'x'" % ps_quote(backup))
+        self.assertNotEqual(code, 0)
+        self.assertIn("already exists", err)
+        self.assertEqual(backup.read_bytes(), before)
 
 @unittest.skipUnless(POWERSHELL, "Windows PowerShell 5.1 is needed")
 class RepointScriptTests(unittest.TestCase):

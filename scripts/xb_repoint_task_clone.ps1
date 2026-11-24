@@ -13,9 +13,11 @@ they were; the script reads them back and stops with a rollback line if any of t
 Steps with -Apply:
 1. Refuses unless the task exists, has exactly one program action, and is not running now.
 2. Re-point: refuses unless -NewRepoRoot passes Get-XbPinnedCloneProblem (scripts\xb_pinned_clone.ps1)
-   and Get-XbRepointedAction can work out the new action. Restore (-RestoreFromXml): takes the
-   program, arguments and working folder from a backup this script wrote for the same task.
-3. Exports the task's current XML to a new file in -BackupDir (never overwrites a file).
+   and Get-XbRepointedAction can work out the new action. Restore (-RestoreFromXml):
+   Get-XbActionFromTaskBackup takes the program, arguments and working folder from a backup this
+   script wrote for the same task, and refuses another task's backup, several actions or a new program.
+3. Exports the task's current XML to a new file in -BackupDir (Write-XbTaskBackup: UTF-16, never
+   overwrites a file).
 4. Set-ScheduledTask -Action. A Password-logon task asks for that account's Windows password
    (Get-Credential; never echoed, logged or saved). An S4U task stores no password.
 5. Reads the task back and compares.
@@ -64,24 +66,8 @@ function Get-XbTaskXmlPart {
 }
 
 if ($restore) {
-    [xml]$backup = Get-Content -LiteralPath $RestoreFromXml -Raw
-    $ns = New-Object System.Xml.XmlNamespaceManager($backup.NameTable)
-    $ns.AddNamespace("t", $taskNs)
-    $uri = [string]$backup.SelectSingleNode("/t:Task/t:RegistrationInfo/t:URI", $ns).InnerText
-    if (-not [string]::Equals($uri, $TaskPath + $TaskName, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "The backup is for $uri, not $TaskPath$TaskName."
-    }
-    $execs = @($backup.SelectNodes("/t:Task/t:Actions/t:Exec", $ns))
-    if ($execs.Count -ne 1) {
-        throw "The backup must have exactly one program action."
-    }
-    $readField = { param($name) $n = $execs[0].SelectSingleNode("t:$name", $ns); if ($null -eq $n) { "" } else { [string]$n.InnerText } }
-    $planned = [pscustomobject]@{
-        Execute          = & $readField "Command"
-        Arguments        = & $readField "Arguments"
-        WorkingDirectory = & $readField "WorkingDirectory"
-        Notes            = @()
-    }
+    # Checks the backup is for this task, has one program action and keeps the program.
+    $planned = Get-XbActionFromTaskBackup -Path $RestoreFromXml -TaskUri ($TaskPath + $TaskName) -CurrentExecute ([string]$current.Execute)
 }
 else {
     $pinProblem = Get-XbPinnedCloneProblem -RepoRoot $NewRepoRoot
@@ -89,13 +75,10 @@ else {
         throw "Refusing: $pinProblem"
     }
     $NewRepoRoot = (Resolve-Path -LiteralPath $NewRepoRoot).Path.TrimEnd('\')
+    # Keeps the program and every other argument; moves only the script path and the folder.
     $planned = Get-XbRepointedAction -Execute ([string]$current.Execute) -Arguments ([string]$current.Arguments) `
         -WorkingDirectory ([string]$current.WorkingDirectory) -NewRepoRoot $NewRepoRoot
 }
-if (-not [string]::Equals([string]$current.Execute, [string]$planned.Execute, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "The program would change; this script never changes the program."
-}
-
 Write-Host "Task: $TaskPath$TaskName (state $($task.State), logon $($task.Principal.LogonType))"
 Write-Host "Program:        $($current.Execute)"
 Write-Host "Now arguments:  $($current.Arguments)"
@@ -117,11 +100,8 @@ if ([string]$task.State -eq "Running") {
 }
 $safeName = ($TaskName -replace '[^A-Za-z0-9_-]', '_')
 $backupPath = Join-Path $BackupDir ("{0}-{1}.xml" -f $safeName, (Get-Date).ToString("yyyyMMdd-HHmmss", [System.Globalization.CultureInfo]::InvariantCulture))
-if (Test-Path -LiteralPath $backupPath) {
-    throw "The backup file already exists; nothing changed."
-}
 $beforeText = Export-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName
-[System.IO.File]::WriteAllText($backupPath, $beforeText, (New-Object System.Text.UnicodeEncoding($false, $true)))
+Write-XbTaskBackup -Path $backupPath -XmlText ($beforeText | Out-String)
 Write-Host "Backup: $backupPath"
 
 $newAction = New-ScheduledTaskAction -Execute $planned.Execute -Argument $planned.Arguments -WorkingDirectory $planned.WorkingDirectory
