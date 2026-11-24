@@ -55,7 +55,8 @@ EXPECTED_EDGES = {
     ("Read Alert Log", 0, "Read Failed Alert Emails"),
     ("Read Failed Alert Emails", 0, "Read Monitor Error Log"),
     ("Read Monitor Error Log", 0, "Read Kit Re-tagger Errors"),
-    ("Read Kit Re-tagger Errors", 0, "Read Health Runs"),
+    ("Read Kit Re-tagger Errors", 0, "Read XT Code Errors"),
+    ("Read XT Code Errors", 0, "Read Health Runs"),
     ("Read Health Runs", 0, JUDGE),
     (JUDGE, 0, "Email Plan"),
     (JUDGE, 1, BROKEN),
@@ -72,7 +73,7 @@ EXPECTED_EDGES = {
     ("Collect Send Outcome", 0, "Log Health Run"),
 }
 READ_NODES = ("List Workflows", "List Error Runs", "Read Alert Log", "Read Failed Alert Emails", "Read Monitor Error Log",
-              "Read Kit Re-tagger Errors", "Read Health Runs", "Read Today Runs")
+              "Read Kit Re-tagger Errors", "Read XT Code Errors", "Read Health Runs", "Read Today Runs")
 SEND_FAILURES = ["send_failed", "rejected", "error", "call_failed", "unknown"]
 RUN_COLUMNS = ["date", "kind", "verdict", "watched", "problems", "fail_jobs", "warn_jobs", "email", "code", "logged_at"]
 
@@ -158,7 +159,7 @@ WORKFLOWS_ALL = WORKFLOWS_OK + [{"id": "wfEgMonitor001", "name": "fake", "active
 
 
 def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, failed_alerts=None, error_log=None,
-                kit_errors=None):
+                kit_errors=None, xt_errors=None):
     return {
         "List Workflows": WORKFLOWS_ALL if workflows is None else workflows,
         "List Error Runs": [{}] if error_runs is None else error_runs,
@@ -166,6 +167,7 @@ def judge_reads(workflows=None, error_runs=None, alert_log=None, runs=None, fail
         "Read Failed Alert Emails": [{}] if failed_alerts is None else failed_alerts,
         "Read Monitor Error Log": [{}] if error_log is None else error_log,
         "Read Kit Re-tagger Errors": [{}] if kit_errors is None else kit_errors,
+        "Read XT Code Errors": [{}] if xt_errors is None else xt_errors,
         "Read Health Runs": [{}] if runs is None else runs,
     }
 
@@ -382,6 +384,11 @@ class ShapeTests(unittest.TestCase):
         kit = self.nodes["Read Kit Re-tagger Errors"]["parameters"]
         self.assertEqual(kit, dict(failed, filters={"conditions": [
             {"keyName": "system", "condition": "eq", "keyValue": "KIT-RETAG"},
+            {"keyName": "severity", "condition": "eq", "keyValue": "ERROR"}]}))
+        # #355: XT-CODES ERROR rows of xb_alert_email_log, the same read for the XT trip discount codes.
+        xt = self.nodes["Read XT Code Errors"]["parameters"]
+        self.assertEqual(xt, dict(failed, filters={"conditions": [
+            {"keyName": "system", "condition": "eq", "keyValue": "XT-CODES"},
             {"keyName": "severity", "condition": "eq", "keyValue": "ERROR"}]}))
         writes = [n["name"] for n in self.workflow["nodes"] if n["type"] == "n8n-nodes-base.dataTable"
                   and n["parameters"]["operation"] != "get"]
@@ -817,6 +824,64 @@ class JudgeTests(unittest.TestCase):
         plan = judge_plan(checker_event(expected=expected), judge_reads(kit_errors=rows))
         self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
 
+    def test_xt_codes_watch_waits_for_its_id_then_watches_it(self):
+        # #355: like the kit re-tagger, the XT trip discount codes entry ships as a skipped placeholder until the
+        # owner binds it at that workflow's activation step; then an inactive or missing workflow is a FAIL.
+        code = next(n for n in load()["nodes"] if n["name"] == JUDGE)["parameters"]["jsCode"]
+        self.assertIn("{ id: 'REPLACE_WITH_XT_CODES_WORKFLOW_ID', label: 'XT trip codes', errors: false, "
+                      "bind_later: true },", code)
+        self.assertNotIn("REPLACE_WITH_XT_CODES_WORKFLOW_ID", CONFIGURED)
+        event = checker_event()
+        plan = judge_plan(event)
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        path = configured_workflow(dict(CONFIGURED, REPLACE_WITH_XT_CODES_WORKFLOW_ID="wfXtCodes00001"))
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        line = next(l for l in judge_plan(event, workflow=path)["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("FAIL  n8n workflows: not found: XT trip codes, since 19 Nov."), line)
+        plan = judge_plan(event, judge_reads(workflows=WORKFLOWS_ALL + [{"id": "wfXtCodes00001", "active": False}]),
+                          workflow=path)
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("FAIL  n8n workflows: inactive: XT trip codes, since 19 Nov."), line)
+        plan = judge_plan(event, judge_reads(workflows=WORKFLOWS_ALL + [{"id": "wfXtCodes00001", "active": True}]),
+                          workflow=path)
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+
+    def test_xt_code_error_alerts_are_counted_as_a_warn(self):
+        # #355: each XT trip discount codes run with a problem sends exactly one XT-CODES ERROR alert; the rows of
+        # the 24 h before the check are counted under the n8n workflows job, as a WARN, never named.
+        def row(at, system="XT-CODES", severity="ERROR", outcome="sent"):
+            return {"system": system, "key": "lookup_failed", "severity": severity, "outcome": outcome,
+                    "code": "", "folded_count": 0, "sent_at": at}
+
+        rows = [row("2026-11-18T23:00:00.000Z"),
+                row("2026-11-18T00:00:00.000Z", outcome="send_failed"),
+                row("2026-11-17T23:29:00.000Z"),
+                row("2026-11-18T22:00:00.000Z", severity="WARN"),
+                row("2026-11-18T22:00:00.000Z", system="KIT-RETAG"),
+                row("not a date")]
+        plan = judge_plan(checker_event(), judge_reads(xt_errors=rows))
+        self.assertEqual((plan["row"]["verdict"], plan["row"]["warn_jobs"], plan["send"]), ("WARN", "n8n_workflows", True))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("WARN  n8n workflows: 2 XT trip code error alert(s) in the last 24 h (see "
+                                        "xb_alert_email_log), since 19 Nov."), line)
+        self.assertNotIn("lookup_failed", "\n".join(plan["mail"]["lines"]), "only a count reaches the email")
+        self.assertIs(through_sender(plan)[0]["valid"], True)
+        # Both kinds at once: one line, both counts, kit first.
+        kit = [dict(r, system="KIT-RETAG") for r in rows[:2]]
+        plan = judge_plan(checker_event(), judge_reads(kit_errors=kit, xt_errors=rows))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertIn("2 kit re-tagger error alert(s) in the last 24 h (see xb_alert_email_log); 2 XT trip code error "
+                      "alert(s)", line)
+        plan = judge_plan(checker_event(), judge_reads(xt_errors=[row("2026-11-17T20:00:00.000Z")]))
+        self.assertEqual((plan["row"]["verdict"], plan["send"]), ("OK", False))
+        broken = {"raw": [{"json": {"error": "Data table not found"}}]}
+        plan = judge_plan(checker_event(), judge_reads(xt_errors=broken, kit_errors=broken, failed_alerts=broken))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertEqual(line.count("the alert email log could not be read"), 1, line)
+        plan = judge_plan(checker_event(), judge_reads(xt_errors=broken))
+        line = next(l for l in plan["mail"]["lines"] if "n8n workflows:" in l)
+        self.assertTrue(line.startswith("WARN  n8n workflows: the alert email log could not be read, since"), line)
+
     def test_since_for_n8n_jobs_comes_from_the_run_log(self):
         runs = [{"date": d, "kind": "check", "verdict": "FAIL", "fail_jobs": "member_sync_summary,checker",
                  "warn_jobs": "", "email": "sent"} for d in ("2026-11-17", "2026-11-18")]
@@ -857,7 +922,8 @@ class JudgeTests(unittest.TestCase):
                                              alert_log={"raw": [{"json": {"error": "x"}}]},
                                              failed_alerts={"raw": [{"json": {"error": "x"}}]},
                                              error_log={"raw": [{"json": {"error": "x"}}]},
-                                             kit_errors={"raw": [{"json": {"error": "x"}}]}, runs=runs))
+                                             kit_errors={"raw": [{"json": {"error": "x"}}]},
+                                             xt_errors={"raw": [{"json": {"error": "x"}}]}, runs=runs))
         self.assertIn("Yesterday's health email could not be sent (send_failed at 07:30, call_failed at 08:15).",
                       plan["mail"]["lines"])
         self.assertLessEqual(len(plan["mail"]["lines"]), 30)
@@ -875,7 +941,8 @@ class JudgeTests(unittest.TestCase):
                 self.assertRegex(code, r"\n  %s: " % reason, reason)
         for reason in ("summary_missing", "summary_send_failed", "log_read_failed", "workflow_inactive",
                        "workflow_missing", "error_runs", "n8n_api_failed", "not_configured", "alert_email_failed",
-                       "alert_log_read_failed", "error_log_read_failed", "error_log_unlinked", "kit_retag_errors"):
+                       "alert_log_read_failed", "error_log_read_failed", "error_log_unlinked", "kit_retag_errors",
+                       "xt_code_errors"):
             self.assertRegex(code, r"\n  %s: " % reason, reason)
         for job in health.JOBS:
             self.assertIn(" %s: '" % job, code, job)

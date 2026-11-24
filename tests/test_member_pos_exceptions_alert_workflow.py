@@ -165,7 +165,9 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(call["workflowInputs"]["value"]["system"], SYSTEM)
         self.assertEqual(call["workflowId"]["value"], "REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID")
         sub = nodes_of(json.loads(SUB_WORKFLOW.read_text(encoding="utf-8")))
-        self.assertIn("'%s'];" % SYSTEM, sub["Validate Alert Request"]["parameters"]["jsCode"])
+        # The sender accepts the system wherever it sits in its closed list (#355 added XT-CODES after it).
+        self.assertRegex(sub["Validate Alert Request"]["parameters"]["jsCode"],
+                         r"\nconst SYSTEMS = \[[^\]\n]*'%s'[^\]\n]*\];\n" % re.escape(SYSTEM))
         self.assertIn(SYSTEM, sub["Start Here"]["parameters"]["content"])
 
     def test_code_allowlist_mirrors_the_script_contract(self):

@@ -135,6 +135,7 @@ Once a week (Sunday 03:00 SGT) the server PC copies this repository's `main` bra
 | Member removals (expired `MEMBER` to `GUEST`, refund revoke, undo) | [#268](https://github.com/x-boundaries/automation/issues/268) | Built, off: every write switch is off and nothing is installed. Waiting for the test-book rehearsal, an observe install and the daily summary block (slice E3), then the owner's OK for each pilot ([member removals runbook](docs/autocount2-automation/member_removals_runbook.md)). |
 | Member tags `member-qualified` and `member-bday-month` | [#268](https://github.com/x-boundaries/automation/issues/268) | Scheduled observe runs, then the owner's OK for the write switches ([member tags runbook](docs/autocount2-automation/member_tags_runbook.md)). |
 | Monthly in-store member discount check (member rate keyed at the till for a member record that does not qualify) | [#268](https://github.com/x-boundaries/automation/issues/268) | Built, switched off. Install on the AC2 server, import its email workflow and switch the email on, each with its own owner OK ([runbook](docs/autocount2-automation/member_pos_exceptions_runbook.md)). Read-only; emails (system `MEMBER-POS`) only when there is something to act on. |
+| XT trip discount codes (15% Shopify code per X-Trekkers traveller, from the intake sheet) | [#355](https://github.com/x-boundaries/automation/issues/355) | Built, off: the n8n workflow is inactive and not imported. Waiting for the owner's Shopify app and Google Sheets credentials, then import, a dry run, a one-row capped run and activation, each with its own owner OK ([runbook](docs/xt_trip_discount_codes.md)). Never creates Shopify customers; errors (system `XT-CODES`) go to the daily health check. |
 | SIMBA invoice intake (email to Drive) | [#244](https://github.com/x-boundaries/automation/issues/244) | On hold until the intake mailbox is set up; redesign in [PR #265](https://github.com/x-boundaries/automation/pull/265). Runbook: [SIMBA intake](docs/simba_invoice_intake.md). |
 
 ## Cancelled
@@ -248,6 +249,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `directlocal/xb_member_type_move.py` (with `scripts/ac2_member_type_move_bridge.ps1` and `scripts/ac2_member_type_move.ps1`): the attended one-off move of existing members from type `Default` to `MEMBER` / `GUEST` (#268); no standing schedule. See [member type move runbook](docs/autocount2-automation/member_type_move_runbook.md).
 - `scripts/xb_daily_health.py` (installer `scripts/install_daily_health_task.ps1`, workflow `n8n-workflows/xb_daily_health.workflow.json`): the read-only daily health check (#325, **live**, 07:30 SGT on the server PC). See [daily health check](docs/daily_health_check.md).
 - `n8n-workflows/xb_kit_retagger.workflow.json`: the daily Shopify kit re-tagger (#269 Part A, **live**, 03:00 SGT in n8n on the server PC). See [kit re-tagger runbook](docs/xb_kit_retagger.md).
+- `n8n-workflows/xt_trip_discount_codes.workflow.json`: the daily XT trip discount codes (#355, **built, off**: inactive, not imported). See [XT trip discount codes runbook](docs/xt_trip_discount_codes.md).
 - `n8n-workflows/ops_alert_email.workflow.json`: the shared alert email sub-workflow `XB Ops Alert Email` (#288, **live**) that every job above sends its errors through. See [n8n-workflows/README.md](n8n-workflows/README.md) and [alert log table](docs/ops_alert_email_log.md).
 - `scripts/mirror_main_to_drive.py`: weekly read-only copy of GitHub `main` into one marked company Drive folder (#273, **live**); no-op when `main` has not moved, never writes outside the marked folder.
 - `scripts/install_mirror_main_to_drive_task.ps1`: registers the Sunday 03:00 mirror task for the signed-in user; registering needs a separate owner OK.
@@ -310,6 +312,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member removals runbook](docs/autocount2-automation/member_removals_runbook.md) (#268 slice E)
 - [Member type move runbook](docs/autocount2-automation/member_type_move_runbook.md) (#268)
 - [Shopify kit re-tagger runbook](docs/xb_kit_retagger.md) (#269)
+- [XT trip discount codes runbook](docs/xt_trip_discount_codes.md) (#355)
 - [Daily health check](docs/daily_health_check.md) (#325)
 - [Ops alert email log table](docs/ops_alert_email_log.md) (#288)
 - [n8n workflow exports](n8n-workflows/README.md)
