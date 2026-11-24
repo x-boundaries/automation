@@ -309,6 +309,7 @@ When this guide changes in the repository, copy the new version over the old one
 ## Out of scope
 
 - Member sync, member core (member benefits), member tags and member removals (#155, #268): they write to AutoCount and Shopify, not data extracts for reading. Member removals (slice E) is built and off.
+- The monthly in-store member discount check (#268, built, switched off): it reads till receipts (`dbo.Pos`, `dbo.PosDtl`, `dbo.PosTerminal`) and member types and record dates (created, last edited) read-only on the AC2 server and keeps its private monthly record there; nothing goes to Drive. Its email (system `MEMBER-POS`) carries counts and receipt numbers with member numbers masked. Facts it relies on: the member discount is keyed by hand on the receipt line as text (`PosDtl.Discount`, for example `15.00%`), member types carry no discount rule, and `Pos.Cancelled` `T` is a cancelled receipt. [Runbook](member_pos_exceptions_runbook.md).
 - The daily health check (#325): it reads the two `last_run_status.json` files above and emails the owner only when something needs a look; it holds no business data.
 - The error alert emails (#288): codes and counts only, no business data.
 - The Shopify kit re-tagger (#269), the read-only Drive mirror of this repository, EnergyGrid bills and SIMBA invoices: not AutoCount data.

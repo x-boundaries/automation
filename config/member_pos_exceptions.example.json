@@ -1,0 +1,47 @@
+{
+  "timezone": "Asia/Singapore",
+  "schedule": {
+    "run_day": 2,
+    "run_time": "09:15",
+    "logon_type": "S4U"
+  },
+  "source": {
+    "server": "EXAMPLE-SQL-HOST\\EXAMPLE",
+    "odbc_driver": "ODBC Driver 17 for SQL Server",
+    "expected_database": "AED_EXAMPLE_BOOK",
+    "allowed_databases": ["AED_EXAMPLE_BOOK"],
+    "encrypt": false,
+    "trust_server_certificate": false,
+    "terminal_column": "TerminalID"
+  },
+  "identity": {
+    "auth_mode": "windows_integrated",
+    "sql_login": null,
+    "credential_target": null,
+    "allow_privileged_identity": false
+  },
+  "read": {
+    "lock_timeout_ms": 5000,
+    "query_timeout_seconds": 60,
+    "max_attempts": 3,
+    "retry_backoff_seconds": 2
+  },
+  "output": {
+    "record_dir": "C:\\EXAMPLE\\automation\\member_pos_exceptions"
+  },
+  "rule": {
+    "member_rates": [15, 20],
+    "outlets": ["OUT01", "OUT02"],
+    "max_listed": 12,
+    "expiry_months": 24
+  },
+  "alert": {
+    "webhook_enabled": false,
+    "webhook_url": null,
+    "auth_header_name": "X-XB-Alert-Token",
+    "secret_env_var": null,
+    "secret_credential_target": null,
+    "timeout_seconds": 10,
+    "repeat_hours": 24
+  }
+}

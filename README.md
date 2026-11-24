@@ -1,6 +1,6 @@
 # X-Boundaries Automation
 
-This page lists the automations that are running today, what is built but waiting for a live step, what is still being built, and what has been retired. Status as of **22 Nov 2026**. Day-to-day progress is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117) and its child issues.
+This page lists the automations that are running today, what is built but waiting for a live step, what is still being built, and what has been retired. Status as of **24 Nov 2026**. Day-to-day progress is tracked on [issue #117](https://github.com/x-boundaries/automation/issues/117) and its child issues.
 
 **Keep this page current: every PR that ships or changes a live automation updates it.**
 
@@ -120,7 +120,7 @@ Keeps the "Pack for this trip" gear-kit tags on the Shopify store in line with t
 
 ### Error alerts and daily health check
 
-- **Error alerts by email (#288):** every job sends its errors through one n8n sub-workflow on the server PC, `XB Ops Alert Email`, which holds the only Gmail node for alerts, folds repeats and logs each alert. Errors only, no "all is well" messages. Callers: `AC2-STOCK`, `AC2-ARAP`, `ENERGYGRID`, `MEMBER-SYNC`, `HEALTH` and `KIT-RETAG`. Telegram is retired. Docs: [workflow exports](n8n-workflows/README.md) and the [alert log table](docs/ops_alert_email_log.md).
+- **Error alerts by email (#288):** every job sends its errors through one n8n sub-workflow on the server PC, `XB Ops Alert Email`, which holds the only Gmail node for alerts, folds repeats and logs each alert. Errors only, no "all is well" messages. Callers: `AC2-STOCK`, `AC2-ARAP`, `ENERGYGRID`, `MEMBER-SYNC`, `HEALTH` and `KIT-RETAG`; `MEMBER-POS` is built, not live yet. Telegram is retired. Docs: [workflow exports](n8n-workflows/README.md) and the [alert log table](docs/ops_alert_email_log.md).
 - **Daily health check (#325, 07:30 SGT):** a read-only checker on the server PC judges every scheduled job OK, WARN or FAIL and emails the owner only when something needs a look, plus a heartbeat every Monday. **No `[XB health]` email on a Monday by 09:00 means the checker is down.** Runbook: [daily health check](docs/daily_health_check.md).
 
 ### Drive mirror of `main`
@@ -134,8 +134,12 @@ Once a week (Sunday 03:00 SGT) the server PC copies this repository's `main` bra
 | Member core upgrades (S$300 order to `MEMBER`) | [#268](https://github.com/x-boundaries/automation/issues/268) | Owner OK to switch AutoCount writes on; runs in observe mode now. |
 | Member removals (expired `MEMBER` to `GUEST`, refund revoke, undo) | [#268](https://github.com/x-boundaries/automation/issues/268) | Built, off: every write switch is off and nothing is installed. Waiting for the test-book rehearsal, an observe install and the daily summary block (slice E3), then the owner's OK for each pilot ([member removals runbook](docs/autocount2-automation/member_removals_runbook.md)). |
 | Member tags `member-qualified` and `member-bday-month` | [#268](https://github.com/x-boundaries/automation/issues/268) | Scheduled observe runs, then the owner's OK for the write switches ([member tags runbook](docs/autocount2-automation/member_tags_runbook.md)). |
-| Member backfill and Shopify creates from AutoCount | [#155](https://github.com/x-boundaries/automation/issues/155) | The backfill and Shopify-create live steps in the [member sync runbook](docs/autocount2-automation/member_sync_phase1.md), each with its own owner OK. |
+| Monthly in-store member discount check (member rate keyed at the till for a member record that does not qualify) | [#268](https://github.com/x-boundaries/automation/issues/268) | Built, switched off. Install on the AC2 server, import its email workflow and switch the email on, each with its own owner OK ([runbook](docs/autocount2-automation/member_pos_exceptions_runbook.md)). Read-only; emails (system `MEMBER-POS`) only when there is something to act on. |
 | SIMBA invoice intake (email to Drive) | [#244](https://github.com/x-boundaries/automation/issues/244) | On hold until the intake mailbox is set up; redesign in [PR #265](https://github.com/x-boundaries/automation/pull/265). Runbook: [SIMBA intake](docs/simba_invoice_intake.md). |
+
+## Cancelled
+
+- **Member backfill and Shopify creates from AutoCount** ([#155](https://github.com/x-boundaries/automation/issues/155), BF2 and S6): cancelled by the owner on 22 Nov 2026. The sync stays one way (Shopify to AutoCount); the code stays in the repository, switched off. Store-only members get the online member code by signing up online with the same mobile number, and the live sync links them.
 
 ## In progress
 
