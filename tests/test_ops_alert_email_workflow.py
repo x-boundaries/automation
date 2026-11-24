@@ -58,8 +58,8 @@ EXPECTED_EDGES = {
     ("Classify Send Error", 0, "Log Send Failed"),
     ("Log Send Failed", 0, "Return Send Failed"),
 }
-SYSTEMS = ("AC2-STOCK", "AC2-ARAP", "ENERGYGRID", "MEMBER-SYNC", "KIT-RETAG", "MEMBER-POS")
-SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|AC2-ARAP|ENERGYGRID|MEMBER-SYNC|KIT-RETAG|MEMBER-POS) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
+SYSTEMS = ("AC2-STOCK", "AC2-ARAP", "ENERGYGRID", "MEMBER-SYNC", "KIT-RETAG", "MEMBER-POS", "XT-CODES")
+SUBJECT_RE = re.compile(r"^\[XB alert\] (AC2-STOCK|AC2-ARAP|ENERGYGRID|MEMBER-SYNC|KIT-RETAG|MEMBER-POS|XT-CODES) (ERROR|WARN|INFO) [A-Za-z0-9_:+.-]{1,120}$")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 CANARY = "CANARY-NOTE-0001-XYZ"
 # 6 Nov 2026 14:30:00 SGT, a fixed clock for every Decide run.
@@ -303,9 +303,11 @@ class OpsAlertEmailShapeTests(unittest.TestCase):
         self.assertIn("`KIT-RETAG`", readme)
         self.assertIn("MEMBER-POS", notes)
         self.assertIn("`MEMBER-POS`", readme)
+        self.assertIn("XT-CODES", notes)
+        self.assertIn("`XT-CODES`", readme)
         doc = TABLE_DOC.read_text(encoding="utf-8")
         for column in LOG_COLUMNS + ["xb_alert_email_log", "folded_flood", "send_failed", "daily_health", "HEALTH",
-                                     "AC2-ARAP", "KIT-RETAG", "MEMBER-POS"]:
+                                     "AC2-ARAP", "KIT-RETAG", "MEMBER-POS", "XT-CODES"]:
             self.assertIn(column, doc)
 
 
@@ -737,10 +739,10 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         self.assertEqual(plan["mail"]["subject"], "[XB alert] AC2-STOCK ERROR " + same_key)
 
     # ---- KIT-RETAG (#269): the kit re-tagger, an ordinary system ---- #
-    def test_validator_allows_exactly_the_seven_systems(self):
+    def test_validator_allows_exactly_the_eight_systems(self):
         code = self.nodes_code()
         self.assertIn("const SYSTEMS = ['AC2-STOCK', 'AC2-ARAP', 'ENERGYGRID', 'MEMBER-SYNC', 'HEALTH', 'KIT-RETAG', "
-                      "'MEMBER-POS'];", code)
+                      "'MEMBER-POS', 'XT-CODES'];", code)
         for system in ("KIT-RETAG ", "kit-retag", "KIT_RETAG", "KIT-RETAGGER", "SHOPIFY"):
             (out,) = self.validate(request(system=system))
             self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_SYSTEM"}, system)
@@ -786,6 +788,23 @@ class OpsAlertEmailCodeTests(unittest.TestCase):
         self.assertRegex(plan["mail"]["subject"], SUBJECT_RE)
         bodies = [request(system="MEMBER-POS", key="run_failed:x", short="x", lines=["see MEMBER-SYNC"]),
                   request(system="MEMBER-SYNC", key="x", short="x", lines=["see MEMBER-POS"])]
+        for body, out in zip(bodies, self.validate(*bodies)):
+            self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"}, body)
+
+    # ---- XT-CODES (#355): the daily XT trip discount codes, an ordinary system ---- #
+    def test_xt_codes_error_alerts_pass_and_stay_separate(self):
+        for system in ("XT-CODES ", "xt-codes", "XT_CODES", "XT-CODE", "XT"):
+            (out,) = self.validate(request(system=system))
+            self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_SYSTEM"}, system)
+        alert = request(system="XT-CODES", severity="ERROR", key="lookup_failed", short="lookup_failed",
+                        lines=["XT trip discount codes: today's run had a problem. Ask Claude to check."])
+        (out,) = self.validate(alert)
+        self.assertEqual(out, {"valid": True, **alert})
+        plan = self.decide([], {"valid": True, **alert})
+        self.assertEqual(plan["mail"]["subject"], "[XB alert] XT-CODES ERROR lookup_failed")
+        self.assertRegex(plan["mail"]["subject"], SUBJECT_RE)
+        bodies = [request(system="XT-CODES", key="x", short="x", lines=["see KIT-RETAG"]),
+                  request(system="KIT-RETAG", key="x", short="x", lines=["see XT-CODES"])]
         for body, out in zip(bodies, self.validate(*bodies)):
             self.assertEqual(out, {"valid": False, "reason": "OPS_ALERT_OTHER_SYSTEM"}, body)
 

@@ -10,7 +10,7 @@ n8n adds `id`, `createdAt` and `updatedAt` to every Data Table by itself. Do not
 
 | Column | Type | Value |
 | --- | --- | --- |
-| `system` | string | `AC2-STOCK`, `AC2-ARAP` (the AR/AP aging export's alerts, #321 A3), `ENERGYGRID`, `MEMBER-SYNC`, `HEALTH` (the daily health check, #325 H1), `KIT-RETAG` (the daily Shopify kit re-tagger, #269) or `MEMBER-POS` (the monthly in-store member discount check, #268). Every row, including a flood notice, belongs to exactly one system. |
+| `system` | string | `AC2-STOCK`, `AC2-ARAP` (the AR/AP aging export's alerts, #321 A3), `ENERGYGRID`, `MEMBER-SYNC`, `HEALTH` (the daily health check, #325 H1), `KIT-RETAG` (the daily Shopify kit re-tagger, #269), `MEMBER-POS` (the monthly in-store member discount check, #268) or `XT-CODES` (the daily XT trip discount codes, #355). Every row, including a flood notice, belongs to exactly one system. |
 | `key` | string | The caller's stable condition key, for example `run_failed:ledger_mismatch`; `alert_flood` for a system's flood notice (reserved: a caller cannot use it); `daily_summary` for a daily summary (slice 3); `daily_health` for the daily health email (system `HEALTH` only). Fold matching uses `system` + `key`. |
 | `severity` | string | `ERROR`, `WARN` or `INFO` (the flood notice is `WARN`; a daily summary is `INFO` for CLEAN and `WARN` for STOP; a daily health email is `INFO` for OK, `WARN` for WARN and `ERROR` for FAIL). |
 | `outcome` | string | `sent`, `folded`, `folded_flood` or `send_failed`; also `clean_not_sent`, written only by `Member Sync - Daily Summary` (not this sub-workflow) for a CLEAN morning it did not email (#288 slice 3 errors only, owner 22 Nov 2026). |
