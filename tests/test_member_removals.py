@@ -933,6 +933,17 @@ class RevokeTests(Base):
         self.assertEqual((row["kind"], row["basis_expiry_local"], row["expected_expiry_local"]), ("revoke", BASIS + ".000", BASIS + ".000"))
         self.assertEqual(seen, [(BASIS + ".000", BASIS + ".000")])
 
+    def test_expire_needs_the_member_core_ledger(self):
+        """Every run reads the member core facts first (V7 skips), expire
+        included: with no member core ledger the run refuses before any
+        AutoCount read (test-book UAT prompt 1220 step order)."""
+        self.book.add(1)
+        (self.core_root / mb.LEDGER_FILE).rename(self.core_root / "moved.sqlite3")
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            self.expire()
+        self.assertEqual((caught.exception.code, self.book.scans, self.book.reads), ("member_core_ledger_missing", 0, []))
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
     def test_l10_expire_row_has_no_basis(self):
         self.book.add(1)
         self.assertEqual(self.expire(apply=True)["saves"], 1)

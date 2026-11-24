@@ -41,7 +41,7 @@ Residual gap (Controller, 22 Nov 2026): a refund made more than 60 days after th
 - Any `ExpiryDate` write, any source type but `MEMBER`, any target type but `GUEST` (restore: the exact reverse, bound to one `DONE` removal).
 - Inactive members, members with an unreadable or placeholder expiry, MemberNos outside the pattern.
 - A revoke for a member the member core did not upgrade itself (staff-made, type-move-made or #155-created members) or only extended.
-- Writes to the member core ledger or the #155 ledger: both are opened read-only (`mode=ro`, `query_only`), never copied. The member core ledger must be version 2 (`member_core_ledger_version_unknown` otherwise). The member core, tags tool, type move and #155 sync are unchanged.
+- Writes to the member core ledger or the #155 ledger: both are opened read-only (`mode=ro`, `query_only`), never copied. The member core ledger must be version 2 (`member_core_ledger_version_unknown` otherwise). Every run reads it first, `expire` included (the open-write and pending-receipt skips need it), so without it every run refuses with `member_core_ledger_missing` before any AutoCount read: set up the member core ledger (or, on the test book, the revoke fixture) before the first `expire`. The member core, tags tool, type move and #155 sync are unchanged.
 - Any customer message.
 
 ### One move only, enforced at the write boundary
