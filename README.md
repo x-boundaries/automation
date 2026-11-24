@@ -6,6 +6,8 @@ This page lists the automations that are running today, what is built but waitin
 
 No runtime below uses an AI model. Every live change (installing, importing, switching on, scheduling) needs the owner's OK for that step, as each runbook says.
 
+Each task on the AC2 server runs its code from its own **pinned clone** (`C:\XB\golive\automation-<purpose>-<sha7>`), updated only by an approved step; the installers refuse any other folder. See [pinned clones runbook](docs/autocount2-automation/vm_pinned_clones_runbook.md). The hourly stock export and AR/AP aging still run from the shared `C:\XB\automation` until their move step (#117).
+
 ## Live automations
 
 | Automation | Where it runs | When | Issue |
@@ -251,6 +253,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `n8n-workflows/ops_alert_email.workflow.json`: the shared alert email sub-workflow `XB Ops Alert Email` (#288, **live**) that every job above sends its errors through. See [n8n-workflows/README.md](n8n-workflows/README.md) and [alert log table](docs/ops_alert_email_log.md).
 - `scripts/mirror_main_to_drive.py`: weekly read-only copy of GitHub `main` into one marked company Drive folder (#273, **live**); no-op when `main` has not moved, never writes outside the marked folder.
 - `scripts/install_mirror_main_to_drive_task.ps1`: registers the Sunday 03:00 mirror task for the signed-in user; registering needs a separate owner OK.
+- `scripts/xb_pinned_clone.ps1` and `scripts/xb_repoint_task_clone.ps1`: the pinned-clone check every AC2 server installer runs before registering, and the tool that re-points an existing task to a new pinned clone (dry run by default; backup, readback and a rollback line). See [pinned clones runbook](docs/autocount2-automation/vm_pinned_clones_runbook.md) (#117).
 - `scripts/pii_guard.py`: CI guard that blocks personal data in added lines (#211, #270).
 
 ## Configuration Templates
@@ -301,6 +304,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [SQL Server local probe runbook](docs/autocount_sql_probe.md)
 - [AutoCount stock extraction runbook](docs/autocount_stock_extraction.md)
 - [AC2 data guide for people and AI agents](docs/autocount2-automation/AC2_DATA_GUIDE.md) (what each AC2 data file is, where, how fresh, traps; #292, #321)
+- [Pinned clones for the AC2 server's scheduled tasks](docs/autocount2-automation/vm_pinned_clones_runbook.md) (#117)
 - [AC2 hourly stock balance export runbook](docs/autocount2-automation/stock_balance_hourly_runbook.md) (#245)
 - [AC1 sales history build runbook](docs/autocount2-automation/ac1_sales_history_runbook.md) (#292)
 - [AC2 AR/AP aging runbook](docs/autocount2-automation/arap_aging_runbook.md) (#321)
