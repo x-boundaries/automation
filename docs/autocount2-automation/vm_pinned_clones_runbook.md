@@ -50,7 +50,7 @@ The server PC's own tasks (daily health check, Drive mirror) are not covered her
 
 Each update needs the owner's OK for that task and that commit. Run in Windows PowerShell 5.1 as administrator, from `C:\XB\vm-work`. Never use the AutoCount `sa` login.
 
-1. **Pick the commit.** Use the merged `main` commit the owner approved. Write down the full SHA and its first 7 characters.
+1. **Pick the commit.** Use the merged `main` commit the owner approved. Write down the full SHA and its first 7 characters. To move a task off a shared folder **without changing its code**, pick the commit that folder holds today: the move then changes only the working folder. Run `xb_repoint_task_clone.ps1` from any clone that has it, for example a tools clone at `main` in `C:\XB\vm-work`.
 
    Also write down the commit the task runs today (OLD). If the task runs from a folder that is not a pinned clone (for example `C:\XB\automation`), make a pinned clone at OLD as well, `C:\XB\golive\automation-<purpose>-<OLD sha7>`, with step 2. It is the rollback target, so a rollback never lands on a folder that moves by itself.
 
