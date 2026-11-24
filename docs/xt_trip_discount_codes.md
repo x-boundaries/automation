@@ -29,7 +29,7 @@ Owner rules (24 Nov 2026): the workflow never creates, edits or tags a Shopify c
 
 **Adopting existing codes.** A code made by hand before go-live, under the new name or the old name `XT-INV<digits>` (traveller 1 only), is kept, not remade. When it is locked to exactly the row's customer, has been used at most 3 times and is 15% off, one `discountCodeBasicUpdate` sets only `usageLimit` 3, `endsAt` (the rule above) and `combinesWith` (none); value, items, customer and name stay. When it already has exactly those settings, nothing is written. Anything else (another customer, several customers, more than 3 uses, not 15%, not a simple code, both names present) is `CONFLICT` and nothing changes in Shopify.
 
-## Row statuses (sheet column N)
+## Row statuses (the status column)
 
 The sheet's `How to use` tab has the consultant's copy of this table.
 
@@ -43,7 +43,7 @@ The sheet's `How to use` tab has the consultant's copy of this table.
 | `CONFLICT` | The code already exists for someone else, or an existing code fails the adopt guard, or the end date passed while a code exists | Consultant tells XB; Claude checks |
 | `HELD` | A brake fired (more than 300 rows to look up, or more than 30 codes to write); nothing was looked up or written for these rows | Automatic retry next run; the run's error email and the health check show it |
 | `ERROR` | Shopify did not answer or did not confirm the code | Automatic retry next run; the run's error email and the health check show it |
-| `DONE` | Code made (columns L and M) | Consultant sends the code |
+| `DONE` | Code made (code and end-date columns) | Consultant sends the code |
 | `ADOPTED` | A code already existed for this customer and now has these settings | Consultant sends it if the traveller does not have it yet |
 | `EXPIRED_NO_ACCOUNT` | The end date passed before the traveller had an account; no code made | none |
 
@@ -58,8 +58,26 @@ Rows that are `DONE`, `ADOPTED` or `EXPIRED_NO_ACCOUNT` are never processed agai
 | `API_VERSION` | `2026-10` | Shopify Admin GraphQL version, the same as the kit re-tagger. |
 | `SHOP_DOMAIN` | `REPLACE_WITH_SHOPIFY_SHOP_DOMAIN` | The store's myshopify domain, set in the local import copy only. |
 | `SHEET_ID` | `REPLACE_WITH_XT_INTAKE_SHEET_ID` | The intake sheet's ID, set in the local import copy only (it is in the private mailbox report, not here). |
+| `SHEET_LAYOUT` | see below | The tab, the last row read, the invoice pattern and the header name of every column the workflow reads or writes. |
 
 The brakes (300 lookups, 30 code writes) are fixed in the Code nodes on purpose: they change only through a reviewed PR.
+
+### Sheet layout (`SHEET_LAYOUT`)
+
+`SHEET_LAYOUT` is the only place the sheet's columns are named (Controller, 24 Nov 2026: the sheet follows the consultant's own layout). Each role maps to the exact header text in row 1; the workflow finds the columns by header at run time, so columns may sit anywhere, in any order, among other columns. No Code node holds a column name or letter (a test checks this).
+
+| Role | Read or written | Required |
+| --- | --- | --- |
+| `ready` (tick box), `invoice`, `traveller`, `email`, `deposit`, `departure` | read | yes |
+| `trip` (rows on one trip share it; else the invoice is used) | read | no |
+| `status` | read and written | yes |
+| `code`, `message` | written | yes |
+| `ends`, `customer`, `checked`, `made` | written | no (`''` = no such column) |
+
+- `tab`: the tab name. `last_row`: the last row read (columns A to ZZ). `invoice_pattern`: a regular expression whose first group captures the invoice digits used in the code name.
+- A header the layout names that is missing or appears twice stops the run (`sheet_layout_changed`); a layout that is not valid (a required role empty, two roles on one header, an unknown role) stops it as `settings_invalid`.
+- Renaming a header in the sheet means changing `SHEET_LAYOUT` in a reviewed PR and re-importing; until then runs stop safely.
+- **Not final:** the export carries the addendum section 6 layout. The sheet is being rebuilt in the consultant's own layout; the v2 layout contract sets the final names before G2.
 
 ## Error emails (through `XB Ops Alert Email`, system `XT-CODES`)
 
@@ -69,7 +87,7 @@ At most one ERROR email per run, built by `Build Error Alert` from fixed English
 | --- | --- | --- |
 | `settings_invalid` | `VALIDITY_RULE` is not `later` or `earlier` | nothing |
 | `sheet_read_failed` | the sheet could not be read after 3 tries | nothing |
-| `sheet_layout_changed` | row 1 is not the agreed 18 headers, or more than 999 rows | nothing |
+| `sheet_layout_changed` | a header `SHEET_LAYOUT` names is missing or appears twice in row 1, or the sheet has more rows than `last_row` | nothing |
 | `token_failed` | the Shopify sign-in failed after 3 tries | nothing |
 | `too_many_rows` | more than 300 rows to look up | those rows `HELD` in the sheet; nothing in Shopify |
 | `too_many_codes` | more than 30 creates plus adopt updates | those rows `HELD`; nothing in Shopify |
@@ -97,9 +115,9 @@ A dry run sends an email only for the first four (the run could not start).
 ## Google Sheets credential (owner step O4)
 
 - **n8n credential:** type **Google Sheets OAuth2 API** (`googleSheetsOAuth2Api`), created by the owner in the n8n UI and signed in with a Google account that can edit `XT discount codes - intake`.
-- Bind it on **Read Intake Sheet**, **Re-read Row Keys** and **Write Back To Sheet** only. The workflow reads `Travellers!A1:R1000` and `Travellers!B1:E1000` and writes only `Travellers!L<row>:R<row>`.
+- Bind it on **Read Intake Sheet**, **Re-read Row Keys** and **Write Back To Sheet** only. The workflow reads the layout's tab (columns A:ZZ, rows 1 to `last_row`) and writes only the cells of its written roles in the rows it decided!L<row>:R<row>`.
 - Reach: an OAuth sign-in can reach every sheet that account can open. To limit it to this one sheet, sign in with a Google account that has only this sheet (or its folder) shared with it; the workflow itself never addresses another file (the sheet ID is fixed in `Run Settings`). Which account to use is the owner's choice at O4.
-- The sheet's column L:R protection is "warning only", so API writes go through; data validation on column N lists every status the workflow writes.
+- Protection on the automation's columns must be "warning only" (or the credential's account an editor of them), so API writes go through; data validation on the status column, if any, must list every status the workflow writes.
 
 ## Reading a dry run (Claude)
 
@@ -139,14 +157,14 @@ Agent UAT after X6 (Controller decides who): checkout tests on an existing staff
 - First look for any email or health WARN: run it by hand with `DRY_RUN` on (above) and read the plan and `problems`.
 - `token_failed`: the Shopify app is uninstalled, its secret was rotated, or the credential shape is wrong (above).
 - `sheet_read_failed` or `sheet_write_failed`: the Google credential lost access, or the sheet moved; check the sheet ID and the account's access.
-- `sheet_layout_changed`: someone renamed, moved or inserted a column. Put the 18 headers back exactly as in addendum section 6.1; the workflow does not guess columns.
+- `sheet_layout_changed`: a header named in `SHEET_LAYOUT` was renamed, deleted or doubled. Put it back, or change `SHEET_LAYOUT` in a reviewed PR; moving or adding other columns is fine. The workflow does not guess columns.
 - `lookup_failed` with `graphql_errors` on every row after a Shopify API change: the lookup query in `Check Intake Rows` needs a reviewed fix; nothing was written meanwhile.
 - `write_failed`: read the row's code in Shopify admin. If it exists, the next run adopts it; if Shopify refused it, the row stays `ERROR` each morning until fixed.
 
 ## Rollback and recovery
 
 - Switch off: deactivate the workflow. Codes already made stay valid and unchanged.
-- A wrong code: change or delete it by hand in Shopify admin, then clear the row's L:R and untick Ready, or fix the row and leave it for the next run.
+- A wrong code: change or delete it by hand in Shopify admin, then clear the row's automation cells and untick Ready, or fix the row and leave it for the next run.
 - Nothing is stored in n8n (no static data, no saved executions): re-importing the workflow loses nothing.
 
 ## Tests

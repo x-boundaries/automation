@@ -13,7 +13,7 @@
         -800
       ],
       "parameters": {
-        "content": "# START HERE: XT Trip Discount Codes (#355)\n\n- **When:** daily 10:00 SGT (workflow timezone Asia/Singapore), or by hand with Manual Run.\n- **Input:** the Google Sheet `XT discount codes - intake`, tab `Travellers`. The X-Trekkers consultant adds one row per traveller and ticks Ready. Rows not ticked, and rows already DONE, ADOPTED or EXPIRED_NO_ACCOUNT, are skipped.\n- **Flow:** settings -> read the sheet -> one Shopify sign-in -> check each row -> look up each good row in Shopify (the customer with exactly this email, and the code) -> decide -> make or adopt codes -> write the result back into the grey columns L:R.\n- **Never creates, edits or tags a Shopify customer** (owner, 24 Nov 2026). A code is made only for an existing customer whose email matches exactly; otherwise the row says why (NEEDS_SHOPIFY_ACCOUNT and the other statuses in the sheet's How to use tab).\n- **Codes:** `XT-INV<invoice digits>-<NN>`, 15% off, locked to that one customer, 3 uses, combines with nothing, ends 23:59 SGT on max(deposit + 12 months, departure) (`VALIDITY_RULE` later). An existing code for the same customer (new name, or the old name `XT-INV<digits>` for traveller 1) is adopted: one update to 3 uses, that end date and no combining; more than 3 uses so far, not 15%, or another customer -> CONFLICT, nothing changes.\n- **Brakes:** more than 300 lookups or more than 30 code writes in one run -> none of them, rows HELD, one error alert.\n- **Errors only:** row problems stay in the sheet for the consultant. Run problems send one plain-English ERROR through **XB Ops Alert Email** (system `XT-CODES`), counted by the daily health check; the run then ends as failed.\n- **Dry run:** `DRY_RUN` is on in this export. A dry run reads the sheet and Shopify but writes nothing anywhere and sends nothing; its plan is the output of **Decide Code Writes** (or **Check Intake Rows** when nothing needs a lookup), read in the open editor.\n- **No saved executions** (the access token and travellers' emails are in item data). Runbook: `docs/xt_trip_discount_codes.md`.",
+        "content": "# START HERE: XT Trip Discount Codes (#355)\n\n- **When:** daily 10:00 SGT (workflow timezone Asia/Singapore), or by hand with Manual Run.\n- **Input:** the Google Sheet `XT discount codes - intake` (tab and columns: `SHEET_LAYOUT` in **Run Settings**, the only place columns are named). The X-Trekkers consultant adds one row per traveller and ticks Ready. Rows not ticked, and rows already DONE, ADOPTED or EXPIRED_NO_ACCOUNT, are skipped.\n- **Flow:** settings -> read the sheet -> one Shopify sign-in -> check each row -> look up each good row in Shopify (the customer with exactly this email, and the code) -> decide -> make or adopt codes -> write the result back into the row's automation columns.\n- **Never creates, edits or tags a Shopify customer** (owner, 24 Nov 2026). A code is made only for an existing customer whose email matches exactly; otherwise the row says why (NEEDS_SHOPIFY_ACCOUNT and the other statuses in the sheet's How to use tab).\n- **Codes:** `XT-INV<invoice digits>-<NN>`, 15% off, locked to that one customer, 3 uses, combines with nothing, ends 23:59 SGT on max(deposit + 12 months, departure) (`VALIDITY_RULE` later). An existing code for the same customer (new name, or the old name `XT-INV<digits>` for traveller 1) is adopted: one update to 3 uses, that end date and no combining; more than 3 uses so far, not 15%, or another customer -> CONFLICT, nothing changes.\n- **Brakes:** more than 300 lookups or more than 30 code writes in one run -> none of them, rows HELD, one error alert.\n- **Errors only:** row problems stay in the sheet for the consultant. Run problems send one plain-English ERROR through **XB Ops Alert Email** (system `XT-CODES`), counted by the daily health check; the run then ends as failed.\n- **Dry run:** `DRY_RUN` is on in this export. A dry run reads the sheet and Shopify but writes nothing anywhere and sends nothing; its plan is the output of **Decide Code Writes** (or **Check Intake Rows** when nothing needs a lookup), read in the open editor.\n- **No saved executions** (the access token and travellers' emails are in item data). Runbook: `docs/xt_trip_discount_codes.md`.",
         "height": 740,
         "width": 960
       }
@@ -28,7 +28,7 @@
         -800
       ],
       "parameters": {
-        "content": "# Setup (local import copy only)\n\n- Import inactive. **XB Ops Alert Email** must already accept system `XT-CODES` (re-imported first).\n- Credentials (owner steps, runbook O2 and O4): the Shopify app on **Get Shopify Access Token** only; the Google Sheets account on **Read Intake Sheet**, **Re-read Row Keys** and **Write Back To Sheet** only. No other node has a credential.\n- The first real run and activation each need their own owner OK.\n\n## Required manual configuration:\n\n- **Run Settings**\n  - `SHOP_DOMAIN`: replace `REPLACE_WITH_SHOPIFY_SHOP_DOMAIN` with the store's myshopify domain (local import copy only).\n  - `SHEET_ID`: replace `REPLACE_WITH_XT_INTAKE_SHEET_ID` with the intake sheet's ID (local import copy only).\n  - `DRY_RUN`: leave `true` until the owner OKs a real run; `false` at the capped first run and activation.\n- **Send XT Alert**\n  - `Workflow`: replace `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the live XB Ops Alert Email workflow id.",
+        "content": "# Setup (local import copy only)\n\n- Import inactive. **XB Ops Alert Email** must already accept system `XT-CODES` (re-imported first).\n- Credentials (owner steps, runbook O2 and O4): the Shopify app on **Get Shopify Access Token** only; the Google Sheets account on **Read Intake Sheet**, **Re-read Row Keys** and **Write Back To Sheet** only. No other node has a credential.\n- The first real run and activation each need their own owner OK.\n\n## Required manual configuration:\n\n- **Run Settings**\n  - `SHOP_DOMAIN`: replace `REPLACE_WITH_SHOPIFY_SHOP_DOMAIN` with the store's myshopify domain (local import copy only).\n  - `SHEET_ID`: replace `REPLACE_WITH_XT_INTAKE_SHEET_ID` with the intake sheet's ID (local import copy only).\n  - `DRY_RUN`: leave `true` until the owner OKs a real run; `false` at the capped first run and activation.\n  - `SHEET_LAYOUT`: the tab name and, for each role, the header name in row 1 (runbook). Change it only with a reviewed PR when the sheet's headers change.\n- **Send XT Alert**\n  - `Workflow`: replace `REPLACE_WITH_OPS_ALERT_EMAIL_WORKFLOW_ID` with the live XB Ops Alert Email workflow id.",
         "height": 740,
         "width": 820
       }
@@ -43,7 +43,7 @@
         -20
       ],
       "parameters": {
-        "content": "# Read and check\n\n- Sheet `Travellers!A1:R1000`, raw values (dates as serial numbers), retried up to 3 times.\n- One Shopify token per run (client credentials grant), retried up to 3 times.\n- A bad header row, an unreadable sheet or a failed sign-in stops the run: nothing written, one error alert.\n- Row checks (CHECK_ROW, NEEDS_EMAIL, CHECK_EMAIL) need no Shopify call.",
+        "content": "# Read and check\n\n- Sheet tab from `SHEET_LAYOUT`, columns A:ZZ, raw values (dates as serial numbers), retried up to 3 times. Columns are found by their header names.\n- One Shopify token per run (client credentials grant), retried up to 3 times.\n- A header the layout names missing or doubled, an unreadable sheet or a failed sign-in stops the run: nothing written, one error alert.\n- Row checks (CHECK_ROW, NEEDS_EMAIL, CHECK_EMAIL) need no Shopify call.",
         "height": 200,
         "width": 760
       }
@@ -73,7 +73,7 @@
         -80
       ],
       "parameters": {
-        "content": "# Write\n\n- Code writes, 1 every 500 ms, never retried by n8n (a repeat create would fail as taken). Any HTTP error, GraphQL error, userErrors, or an answer without 3 uses and the planned end date is ERROR on the row; the next run finds a code that was made after all and adopts it.\n- Sheet write-back: Invoice no., Traveller no. and Email are read again first; a row that moved is not written this run. Only columns L:R, as plain text.\n- Any problem -> **Build Error Alert** -> one email -> **End Run As Failed**.",
+        "content": "# Write\n\n- Code writes, 1 every 500 ms, never retried by n8n (a repeat create would fail as taken). Any HTTP error, GraphQL error, userErrors, or an answer without 3 uses and the planned end date is ERROR on the row; the next run finds a code that was made after all and adopts it.\n- Sheet write-back: the sheet is read again first and the columns found again by header; a row whose invoice, traveller no. or email moved is not written this run. Only the automation's columns (code, end date, status, message, customer ID, checked, made), cell by cell, as plain text.\n- Any problem -> **Build Error Alert** -> one email -> **End Run As Failed**.",
         "height": 260,
         "width": 900
       }
@@ -112,7 +112,7 @@
       "parameters": {}
     },
     {
-      "id": "00000000-0000-4000-8355-000000000013",
+      "id": "00000000-0000-4000-8355-000000000014",
       "name": "Run Settings",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
@@ -152,6 +152,12 @@
               "name": "SHEET_ID",
               "value": "REPLACE_WITH_XT_INTAKE_SHEET_ID",
               "type": "string"
+            },
+            {
+              "id": "00000000-0000-4000-8355-000000000013",
+              "name": "SHEET_LAYOUT",
+              "type": "object",
+              "value": "={{ ({\n  tab: 'Travellers',\n  last_row: 1000,\n  invoice_pattern: '^INV-([0-9]{1,12})$',\n  columns: {\n    ready: 'Ready',\n    invoice: 'Invoice no.',\n    traveller: 'Traveller no.',\n    email: 'Email',\n    trip: 'Trip code',\n    deposit: 'Deposit date',\n    departure: 'Departure date',\n    code: 'Code',\n    ends: 'Code ends (SGT)',\n    status: 'Status',\n    message: 'Message',\n    customer: 'Shopify customer ID',\n    checked: 'Last checked (SGT)',\n    made: 'Code made (SGT)'\n  }\n}) }}"
             }
           ]
         },
@@ -159,7 +165,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000014",
+      "id": "00000000-0000-4000-8355-000000000015",
       "name": "Read Intake Sheet",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -175,7 +181,7 @@
       "executeOnce": true,
       "parameters": {
         "method": "GET",
-        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Run Settings').first().json.SHEET_ID }}/values/Travellers!A1:R1000",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Run Settings').first().json.SHEET_ID }}/values/{{ encodeURIComponent(\"'\" + $('Run Settings').first().json.SHEET_LAYOUT.tab + \"'!A1:ZZ\" + $('Run Settings').first().json.SHEET_LAYOUT.last_row) }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "googleSheetsOAuth2Api",
         "sendQuery": true,
@@ -211,7 +217,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000015",
+      "id": "00000000-0000-4000-8355-000000000016",
       "name": "Get Shopify Access Token",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -265,7 +271,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000016",
+      "id": "00000000-0000-4000-8355-000000000017",
       "name": "Check Intake Rows",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -276,11 +282,11 @@
       "onError": "continueErrorOutput",
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Check the intake sheet rows for XT Trip Discount Codes (#355). Reads only the outputs of earlier\n// nodes; makes no HTTP call, reads no environment value and never sees a secret except to check that\n// the Shopify sign-in step worked. Owner rules (24 Nov 2026): never create a Shopify customer; a code\n// is made only for an existing customer whose email matches exactly; row problems stay in the sheet.\n// 1. Refuse the whole run (nothing written anywhere, one error alert) when the settings are not\n//    valid, the sheet could not be read, its header row is not the agreed 18 columns, or the\n//    Shopify sign-in failed.\n// 2. Skip rows that are not ticked Ready, and rows whose Status is already DONE, ADOPTED or\n//    EXPIRED_NO_ACCOUNT.\n// 3. Check each remaining row: CHECK_ROW names every bad field (invoice, traveller no., dates,\n//    email format, a second row with the same invoice and traveller no.); NEEDS_EMAIL when the email\n//    is empty; CHECK_EMAIL when another row on the same trip already has the same email.\n// 4. For each good row, work out the code (XT-INV<digits>-<NN>, plus the old name XT-INV<digits> for\n//    traveller 1) and the end date (VALIDITY_RULE later = max(deposit + 12 months, departure),\n//    earlier = min; 23:59:59 SGT), and queue one Shopify lookup.\n// 5. Brake: more than 300 lookups waiting -> no lookup at all, those rows HELD, one error alert.\n// 6. DRY_RUN: nothing is written; the plan is this node's (or Decide Code Writes') output.\nconst HEADERS = ['Ready', 'Invoice no.', 'Traveller no.', 'Traveller name', 'Email', 'Trip', 'Trip code',\n  'Deposit date', 'Departure date', 'Paid by', 'Notes', 'Code', 'Code ends (SGT)', 'Status', 'Message',\n  'Shopify customer ID', 'Last checked (SGT)', 'Code made (SGT)'];\nconst COL = { ready: 0, invoice: 1, traveller: 2, email: 4, tripCode: 6, deposit: 7, departure: 8, status: 13 };\nconst FINAL = ['DONE', 'ADOPTED', 'EXPIRED_NO_ACCOUNT'];\nconst LOOKUP_CAP = 300;\nconst MAX_ROWS = 999;\nconst INVOICE_RE = /^INV-([0-9]{1,12})$/;\nconst EMAIL_RE = /^[^\\s@\"\\\\]{1,64}@[^\\s@\"\\\\]{1,190}\\.[^\\s@\"\\\\]{2,63}$/;\nconst SGT_MS = 8 * 3600 * 1000; // Singapore has no daylight saving time.\nconst DAY_MS = 24 * 3600 * 1000;\nconst SERIAL_EPOCH = Date.UTC(1899, 11, 30); // Google Sheets date serial 0\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n// One read per row: the customer with exactly this email (customerByIdentifier, the same exact lookup\n// the member sync uses) and the code under its new name and, for traveller 1, its old name.\nconst LOOKUP_QUERY = 'query XtCodeLookup($email: String!, $code: String!, $legacy: String!, $withLegacy: Boolean!, '\n  + '$withCustomer: Boolean!) { customer: customerByIdentifier(identifier: {emailAddress: $email}) '\n  + '@include(if: $withCustomer) { id defaultEmailAddress { emailAddress } } '\n  + 'code: codeDiscountNodeByCode(code: $code) { ...XtCode } '\n  + 'legacy: codeDiscountNodeByCode(code: $legacy) @include(if: $withLegacy) { ...XtCode } } '\n  + 'fragment XtCode on DiscountCodeNode { id codeDiscount { __typename ... on DiscountCodeBasic { status usageLimit '\n  + 'asyncUsageCount endsAt combinesWith { orderDiscounts productDiscounts shippingDiscounts } '\n  + 'customerGets { value { __typename ... on DiscountPercentage { percentage } } } '\n  + 'context { __typename ... on DiscountCustomers { customers { id } } } } } }';\n\nconst now = Date.now();\nconst stamp = (ms) => {\n  const d = new Date(ms + SGT_MS);\n  return d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()] + ' ' + d.getUTCFullYear() + ' '\n    + String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');\n};\nconst checked = stamp(now);\nconst mask = (email) => {\n  const [user, domain] = String(email).split('@');\n  return (user || '').slice(0, 1) + '***@' + String(domain || '').slice(0, 1) + '***';\n};\nconst failed = (code) => [{ json: { mode: 'failed', dry_run: true, updates: [], lookups: [], plan: [], problems: [{ code, count: 1 }] } }];\n\n// ---- 1. settings, sheet and sign-in ---- //\nconst settings = $('Run Settings').first().json;\nconst dryRun = settings.DRY_RUN !== false;\nif (settings.VALIDITY_RULE !== 'later' && settings.VALIDITY_RULE !== 'earlier') return failed('settings_invalid');\nconst sheet = $('Read Intake Sheet').first().json || {};\nif (sheet.error !== undefined || !Array.isArray(sheet.values) || !sheet.values.every(Array.isArray)) return failed('sheet_read_failed');\nconst header = sheet.values[0] || [];\nif (header.length !== HEADERS.length || HEADERS.some((h, i) => header[i] !== h)) return failed('sheet_layout_changed');\nif (sheet.values.length - 1 > MAX_ROWS) return failed('sheet_layout_changed');\nconst token = $('Get Shopify Access Token').first().json || {};\nif (token.error !== undefined || typeof token.access_token !== 'string' || token.access_token.length < 10) return failed('token_failed');\n\n// ---- 2. and 3. the rows ---- //\nconst toDate = (value) => {\n  if (typeof value !== 'number' || !Number.isFinite(value)) return null;\n  const days = Math.floor(value);\n  if (days < 40000 || days > 80000) return null; // 2009 .. 2119\n  const d = new Date(SERIAL_EPOCH + days * DAY_MS);\n  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate() };\n};\nconst num = (x) => x.y * 10000 + x.m * 100 + x.d;\nconst plusYear = (x) => ({ y: x.y + 1, m: x.m, d: x.m === 2 && x.d === 29 ? 28 : x.d });\nconst travellerOf = (value) => {\n  const text = typeof value === 'number' ? String(value) : String(value === undefined || value === null ? '' : value).trim();\n  return /^[0-9]{1,2}$/.test(text) && Number(text) >= 1 && Number(text) <= 99 ? Number(text) : null;\n};\nconst text = (value) => (value === undefined || value === null ? '' : String(value)).trim();\n\nconst rows = sheet.values.slice(1).map((cells, i) => {\n  const c = cells.concat(Array(HEADERS.length).fill('')).slice(0, HEADERS.length);\n  const invoice = INVOICE_RE.exec(text(c[COL.invoice]));\n  const traveller = travellerOf(c[COL.traveller]);\n  const code = invoice && traveller ? 'XT-INV' + invoice[1] + '-' + String(traveller).padStart(2, '0') : '';\n  const email = text(c[COL.email]).toLowerCase();\n  return { row: i + 2, c, invoice, traveller, code, email, status: text(c[COL.status]).toUpperCase(),\n    trip: text(c[COL.tripCode]) || (invoice ? invoice[0] : ''), ready: c[COL.ready] === true };\n});\nconst todo = rows.filter((r) => r.ready && !FINAL.includes(r.status));\n\nconst decided = [];\nconst lookups = [];\nconst update = (r, status, message) => decided.push({ row: r.row, status, message, code: '', ends: '', customer: '',\n  checked, made: '', key: { invoice: text(r.c[COL.invoice]), traveller: text(r.c[COL.traveller]), email: r.email } });\nfor (const r of todo) {\n  const bad = [];\n  if (!r.invoice) bad.push('Invoice no.');\n  if (!r.traveller) bad.push('Traveller no.');\n  const deposit = toDate(r.c[COL.deposit]);\n  const departure = toDate(r.c[COL.departure]);\n  if (!deposit) bad.push('Deposit date');\n  if (!departure) bad.push('Departure date');\n  else if (deposit && num(departure) < num(deposit)) bad.push('Departure date (before the deposit date)');\n  if (r.email && !EMAIL_RE.test(r.email)) bad.push('Email');\n  const twin = r.code ? rows.find((o) => o.row !== r.row && o.code === r.code) : null;\n  if (twin) bad.push('Invoice no. and Traveller no. (same as row ' + twin.row + ')');\n  if (bad.length) { update(r, 'CHECK_ROW', 'Check: ' + bad.join(', ') + '.'); continue; }\n  if (!r.email) { update(r, 'NEEDS_EMAIL', \"Add this traveller's own email.\"); continue; }\n  const sameEmail = rows.find((o) => o.row !== r.row && o.email === r.email && o.trip === r.trip && o.code !== r.code\n    && (FINAL.includes(o.status) || (o.ready && o.row < r.row)));\n  if (sameEmail) {\n    update(r, 'CHECK_EMAIL', 'Same email as row ' + sameEmail.row + ' on the same trip. Each traveller needs their own email.');\n    continue;\n  }\n  const yearOn = plusYear(deposit);\n  const later = num(yearOn) >= num(departure) ? yearOn : departure;\n  const earlier = num(yearOn) <= num(departure) ? yearOn : departure;\n  const end = settings.VALIDITY_RULE === 'later' ? later : earlier;\n  const endMs = Date.UTC(end.y, end.m - 1, end.d, 15, 59, 59); // 23:59:59 SGT\n  const legacy = r.traveller === 1 ? r.code.replace(/-01$/, '') : '';\n  lookups.push({ row: r.row, code: r.code, legacy, email: r.email, email_masked: mask(r.email),\n    end_iso: new Date(endMs).toISOString(), end_label: end.d + ' ' + MONTHS[end.m - 1] + ' ' + end.y + ' 23:59',\n    expired: endMs < now, checked, key: { invoice: text(r.c[COL.invoice]), traveller: text(r.c[COL.traveller]), email: r.email },\n    query: LOOKUP_QUERY,\n    variables: { email: r.email, code: r.code, legacy: legacy || r.code, withLegacy: legacy !== '', withCustomer: endMs >= now } });\n}\n\n// ---- 5. lookup brake ---- //\nconst problems = [];\nlet queued = lookups;\nif (lookups.length > LOOKUP_CAP) {\n  for (const l of lookups) {\n    decided.push({ row: l.row, status: 'HELD', message: 'Too many rows at once; tried again next morning.', code: '',\n      ends: '', customer: '', checked, made: '', key: l.key });\n  }\n  problems.push({ code: 'too_many_rows', count: lookups.length });\n  queued = [];\n}\n\n// ---- 6. the result ---- //\nconst plan = decided.map((d) => ({ row: d.row, status: d.status, message: d.message }));\nif (dryRun) {\n  return [{ json: { mode: queued.length ? 'lookup' : 'dry_run', dry_run: true, decided, updates: [], lookups: queued,\n    plan, problems: [], summary: { rows: rows.length, ready: todo.length, decided: decided.length, lookups: queued.length,\n      held: queued.length === lookups.length ? 0 : lookups.length } } }];\n}\nreturn [{ json: { mode: queued.length ? 'lookup' : (decided.length ? 'sheet_only' : 'no_change'), dry_run: false, decided,\n  updates: queued.length ? [] : decided, lookups: queued, plan: [], problems,\n  summary: { rows: rows.length, ready: todo.length, decided: decided.length, lookups: queued.length } } }];"
+        "jsCode": "// Check the intake sheet rows for XT Trip Discount Codes (#355). Reads only the outputs of earlier\n// nodes; makes no HTTP call, reads no environment value and never sees a secret except to check that\n// the Shopify sign-in step worked. Owner rules (24 Nov 2026): never create a Shopify customer; a code\n// is made only for an existing customer whose email matches exactly; row problems stay in the sheet.\n// 1. Refuse the whole run (nothing written anywhere, one error alert) when the settings (or the\n//    sheet layout in SHEET_LAYOUT) are not valid, the sheet could not be read, a header the layout\n//    names is missing or appears twice in row 1, or the Shopify sign-in failed.\n// 2. Skip rows that are not ticked Ready, and rows whose Status is already DONE, ADOPTED or\n//    EXPIRED_NO_ACCOUNT.\n// 3. Check each remaining row: CHECK_ROW names every bad field (invoice, traveller no., dates,\n//    email format, a second row with the same invoice and traveller no.); NEEDS_EMAIL when the email\n//    is empty; CHECK_EMAIL when another row on the same trip already has the same email.\n// 4. For each good row, work out the code (XT-INV<digits>-<NN>, plus the old name XT-INV<digits> for\n//    traveller 1) and the end date (VALIDITY_RULE later = max(deposit + 12 months, departure),\n//    earlier = min; 23:59:59 SGT), and queue one Shopify lookup.\n// 5. Brake: more than 300 lookups waiting -> no lookup at all, those rows HELD, one error alert.\n// 6. DRY_RUN: nothing is written; the plan is this node's (or Decide Code Writes') output.\n// ---- the sheet layout: the only place columns come from is Run Settings SHEET_LAYOUT ---- //\n// Roles map to header names (row 1). Columns are found by header at run time, so this node holds no\n// column name or letter. A required role must name a header that appears exactly once in row 1; an\n// optional role may be '' or null (not read or written).\nconst REQUIRED_ROLES = ['ready', 'invoice', 'traveller', 'email', 'deposit', 'departure', 'code', 'status', 'message'];\nconst OPTIONAL_ROLES = ['trip', 'ends', 'customer', 'checked', 'made'];\nconst layoutOf = (raw) => {\n  if (!raw || typeof raw !== 'object' || typeof raw.tab !== 'string' || !/^[^'!]{1,100}$/.test(raw.tab)) return null;\n  if (!Number.isInteger(raw.last_row) || raw.last_row < 2 || raw.last_row > 5000) return null;\n  let invoiceRe;\n  try { invoiceRe = new RegExp(String(raw.invoice_pattern)); } catch (e) { return null; }\n  if (!/\\((?!\\?)/.test(String(raw.invoice_pattern))) return null; // must capture the invoice digits\n  const cols = raw.columns;\n  if (!cols || typeof cols !== 'object') return null;\n  const names = {};\n  for (const role of REQUIRED_ROLES.concat(OPTIONAL_ROLES)) {\n    const name = cols[role] === null || cols[role] === undefined ? '' : cols[role];\n    if (typeof name !== 'string' || name.length > 100) return null;\n    if (!name.trim() && REQUIRED_ROLES.includes(role)) return null;\n    names[role] = name.trim();\n  }\n  if (Object.keys(cols).some((role) => !(role in names))) return null;\n  const used = Object.values(names).filter((n) => n);\n  if (new Set(used).size !== used.length) return null; // two roles on one column\n  return { tab: raw.tab, lastRow: raw.last_row, invoiceRe, names };\n};\nconst locate = (layout, header) => {\n  const cells = (header || []).map((h) => (h === undefined || h === null ? '' : String(h)).trim());\n  const at = {};\n  for (const [role, name] of Object.entries(layout.names)) {\n    if (!name) { at[role] = -1; continue; }\n    const hits = cells.reduce((list, h, i) => (h === name ? list.concat(i) : list), []);\n    if (hits.length !== 1) return null;\n    at[role] = hits[0];\n  }\n  return at;\n};\nconst FINAL = ['DONE', 'ADOPTED', 'EXPIRED_NO_ACCOUNT'];\nconst LOOKUP_CAP = 300;\nconst EMAIL_RE = /^[^\\s@\"\\\\]{1,64}@[^\\s@\"\\\\]{1,190}\\.[^\\s@\"\\\\]{2,63}$/;\nconst SGT_MS = 8 * 3600 * 1000; // Singapore has no daylight saving time.\nconst DAY_MS = 24 * 3600 * 1000;\nconst SERIAL_EPOCH = Date.UTC(1899, 11, 30); // Google Sheets date serial 0\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\n// One read per row: the customer with exactly this email (customerByIdentifier, the same exact lookup\n// the member sync uses) and the code under its new name and, for traveller 1, its old name.\nconst LOOKUP_QUERY = 'query XtCodeLookup($email: String!, $code: String!, $legacy: String!, $withLegacy: Boolean!, '\n  + '$withCustomer: Boolean!) { customer: customerByIdentifier(identifier: {emailAddress: $email}) '\n  + '@include(if: $withCustomer) { id defaultEmailAddress { emailAddress } } '\n  + 'code: codeDiscountNodeByCode(code: $code) { ...XtCode } '\n  + 'legacy: codeDiscountNodeByCode(code: $legacy) @include(if: $withLegacy) { ...XtCode } } '\n  + 'fragment XtCode on DiscountCodeNode { id codeDiscount { __typename ... on DiscountCodeBasic { status usageLimit '\n  + 'asyncUsageCount endsAt combinesWith { orderDiscounts productDiscounts shippingDiscounts } '\n  + 'customerGets { value { __typename ... on DiscountPercentage { percentage } } } '\n  + 'context { __typename ... on DiscountCustomers { customers { id } } } } } }';\n\nconst now = Date.now();\nconst stamp = (ms) => {\n  const d = new Date(ms + SGT_MS);\n  return d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()] + ' ' + d.getUTCFullYear() + ' '\n    + String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');\n};\nconst checked = stamp(now);\nconst mask = (email) => {\n  const [user, domain] = String(email).split('@');\n  return (user || '').slice(0, 1) + '***@' + String(domain || '').slice(0, 1) + '***';\n};\nconst failed = (code) => [{ json: { mode: 'failed', dry_run: true, updates: [], lookups: [], plan: [], problems: [{ code, count: 1 }] } }];\n\n// ---- 1. settings, sheet and sign-in ---- //\nconst settings = $('Run Settings').first().json;\nconst dryRun = settings.DRY_RUN !== false;\nif (settings.VALIDITY_RULE !== 'later' && settings.VALIDITY_RULE !== 'earlier') return failed('settings_invalid');\nconst layout = layoutOf(settings.SHEET_LAYOUT);\nif (!layout) return failed('settings_invalid');\nconst sheet = $('Read Intake Sheet').first().json || {};\nif (sheet.error !== undefined || !Array.isArray(sheet.values) || !sheet.values.every(Array.isArray)) return failed('sheet_read_failed');\nconst COL = locate(layout, sheet.values[0]);\nif (!COL) return failed('sheet_layout_changed');\nif (sheet.values.length > layout.lastRow) return failed('sheet_layout_changed');\nconst label = layout.names; // the sheet's own header names, for CHECK_ROW messages\nconst token = $('Get Shopify Access Token').first().json || {};\nif (token.error !== undefined || typeof token.access_token !== 'string' || token.access_token.length < 10) return failed('token_failed');\n\n// ---- 2. and 3. the rows ---- //\nconst toDate = (value) => {\n  if (typeof value !== 'number' || !Number.isFinite(value)) return null;\n  const days = Math.floor(value);\n  if (days < 40000 || days > 80000) return null; // 2009 .. 2119\n  const d = new Date(SERIAL_EPOCH + days * DAY_MS);\n  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate() };\n};\nconst num = (x) => x.y * 10000 + x.m * 100 + x.d;\nconst plusYear = (x) => ({ y: x.y + 1, m: x.m, d: x.m === 2 && x.d === 29 ? 28 : x.d });\nconst travellerOf = (value) => {\n  const text = typeof value === 'number' ? String(value) : String(value === undefined || value === null ? '' : value).trim();\n  return /^[0-9]{1,2}$/.test(text) && Number(text) >= 1 && Number(text) <= 99 ? Number(text) : null;\n};\nconst text = (value) => (value === undefined || value === null ? '' : String(value)).trim();\n\nconst rows = sheet.values.slice(1).map((cells, i) => {\n  const c = cells;\n  const invoice = layout.invoiceRe.exec(text(c[COL.invoice]));\n  const traveller = travellerOf(c[COL.traveller]);\n  const code = invoice && traveller ? 'XT-INV' + invoice[1] + '-' + String(traveller).padStart(2, '0') : '';\n  const email = text(c[COL.email]).toLowerCase();\n  return { row: i + 2, c, invoice, traveller, code, email, status: text(c[COL.status]).toUpperCase(),\n    trip: (COL.trip >= 0 ? text(c[COL.trip]) : '') || (invoice ? invoice[0] : ''), ready: c[COL.ready] === true };\n});\nconst todo = rows.filter((r) => r.ready && !FINAL.includes(r.status));\n\nconst decided = [];\nconst lookups = [];\nconst update = (r, status, message) => decided.push({ row: r.row, status, message, code: '', ends: '', customer: '',\n  checked, made: '', key: { invoice: text(r.c[COL.invoice]), traveller: text(r.c[COL.traveller]), email: r.email } });\nfor (const r of todo) {\n  const bad = [];\n  if (!r.invoice) bad.push(label.invoice);\n  if (!r.traveller) bad.push(label.traveller);\n  const deposit = toDate(r.c[COL.deposit]);\n  const departure = toDate(r.c[COL.departure]);\n  if (!deposit) bad.push(label.deposit);\n  if (!departure) bad.push(label.departure);\n  else if (deposit && num(departure) < num(deposit)) bad.push(label.departure + ' (before ' + label.deposit + ')');\n  if (r.email && !EMAIL_RE.test(r.email)) bad.push(label.email);\n  const twin = r.code ? rows.find((o) => o.row !== r.row && o.code === r.code) : null;\n  if (twin) bad.push(label.invoice + ' and ' + label.traveller + ' (same as row ' + twin.row + ')');\n  if (bad.length) { update(r, 'CHECK_ROW', 'Check: ' + bad.join(', ') + '.'); continue; }\n  if (!r.email) { update(r, 'NEEDS_EMAIL', \"Add this traveller's own email.\"); continue; }\n  const sameEmail = rows.find((o) => o.row !== r.row && o.email === r.email && o.trip === r.trip && o.code !== r.code\n    && (FINAL.includes(o.status) || (o.ready && o.row < r.row)));\n  if (sameEmail) {\n    update(r, 'CHECK_EMAIL', 'Same email as row ' + sameEmail.row + ' on the same trip. Each traveller needs their own email.');\n    continue;\n  }\n  const yearOn = plusYear(deposit);\n  const later = num(yearOn) >= num(departure) ? yearOn : departure;\n  const earlier = num(yearOn) <= num(departure) ? yearOn : departure;\n  const end = settings.VALIDITY_RULE === 'later' ? later : earlier;\n  const endMs = Date.UTC(end.y, end.m - 1, end.d, 15, 59, 59); // 23:59:59 SGT\n  const legacy = r.traveller === 1 ? r.code.replace(/-01$/, '') : '';\n  lookups.push({ row: r.row, code: r.code, legacy, email: r.email, email_masked: mask(r.email),\n    end_iso: new Date(endMs).toISOString(), end_label: end.d + ' ' + MONTHS[end.m - 1] + ' ' + end.y + ' 23:59',\n    expired: endMs < now, checked, key: { invoice: text(r.c[COL.invoice]), traveller: text(r.c[COL.traveller]), email: r.email },\n    query: LOOKUP_QUERY,\n    variables: { email: r.email, code: r.code, legacy: legacy || r.code, withLegacy: legacy !== '', withCustomer: endMs >= now } });\n}\n\n// ---- 5. lookup brake ---- //\nconst problems = [];\nlet queued = lookups;\nif (lookups.length > LOOKUP_CAP) {\n  for (const l of lookups) {\n    decided.push({ row: l.row, status: 'HELD', message: 'Too many rows at once; tried again next morning.', code: '',\n      ends: '', customer: '', checked, made: '', key: l.key });\n  }\n  problems.push({ code: 'too_many_rows', count: lookups.length });\n  queued = [];\n}\n\n// ---- 6. the result ---- //\nconst plan = decided.map((d) => ({ row: d.row, status: d.status, message: d.message }));\nif (dryRun) {\n  return [{ json: { mode: queued.length ? 'lookup' : 'dry_run', dry_run: true, decided, updates: [], lookups: queued,\n    plan, problems: [], summary: { rows: rows.length, ready: todo.length, decided: decided.length, lookups: queued.length,\n      held: queued.length === lookups.length ? 0 : lookups.length } } }];\n}\nreturn [{ json: { mode: queued.length ? 'lookup' : (decided.length ? 'sheet_only' : 'no_change'), dry_run: false, decided,\n  updates: queued.length ? [] : decided, lookups: queued, plan: [], problems,\n  summary: { rows: rows.length, ready: todo.length, decided: decided.length, lookups: queued.length } } }];"
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000018",
+      "id": "00000000-0000-4000-8355-000000000019",
       "name": "Rows To Look Up",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
@@ -298,7 +304,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8355-000000000017",
+              "id": "00000000-0000-4000-8355-000000000018",
               "leftValue": "={{ Array.isArray($json.lookups) && $json.lookups.length > 0 }}",
               "rightValue": true,
               "operator": {
@@ -313,7 +319,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000019",
+      "id": "00000000-0000-4000-8355-000000000020",
       "name": "List Lookups",
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
@@ -328,7 +334,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000020",
+      "id": "00000000-0000-4000-8355-000000000021",
       "name": "Look Up Shopify",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -380,7 +386,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000021",
+      "id": "00000000-0000-4000-8355-000000000022",
       "name": "Decide Code Writes",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -395,7 +401,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000023",
+      "id": "00000000-0000-4000-8355-000000000024",
       "name": "Codes To Write",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
@@ -413,7 +419,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8355-000000000022",
+              "id": "00000000-0000-4000-8355-000000000023",
               "leftValue": "={{ Array.isArray($json.writes) && $json.writes.length > 0 }}",
               "rightValue": true,
               "operator": {
@@ -428,7 +434,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000024",
+      "id": "00000000-0000-4000-8355-000000000025",
       "name": "List Code Writes",
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
@@ -443,7 +449,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000025",
+      "id": "00000000-0000-4000-8355-000000000026",
       "name": "Write Codes",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -493,7 +499,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000026",
+      "id": "00000000-0000-4000-8355-000000000027",
       "name": "Check Code Writes",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -508,7 +514,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000028",
+      "id": "00000000-0000-4000-8355-000000000029",
       "name": "Rows To Update",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
@@ -526,7 +532,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8355-000000000027",
+              "id": "00000000-0000-4000-8355-000000000028",
               "leftValue": "={{ $json.dry_run === false && Array.isArray($json.updates) && $json.updates.length > 0 }}",
               "rightValue": true,
               "operator": {
@@ -541,7 +547,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000029",
+      "id": "00000000-0000-4000-8355-000000000030",
       "name": "Re-read Row Keys",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -557,7 +563,7 @@
       "executeOnce": true,
       "parameters": {
         "method": "GET",
-        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Run Settings').first().json.SHEET_ID }}/values/Travellers!B1:E1000",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Run Settings').first().json.SHEET_ID }}/values/{{ encodeURIComponent(\"'\" + $('Run Settings').first().json.SHEET_LAYOUT.tab + \"'!A1:ZZ\" + $('Run Settings').first().json.SHEET_LAYOUT.last_row) }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "googleSheetsOAuth2Api",
         "sendQuery": true,
@@ -593,7 +599,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000030",
+      "id": "00000000-0000-4000-8355-000000000031",
       "name": "Build Sheet Update",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -604,11 +610,11 @@
       "onError": "continueErrorOutput",
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Build the write-back to the intake sheet (#355). Only the grey columns L:R (Code, Code ends,\n// Status, Message, Shopify customer ID, Last checked, Code made) of the rows this run decided are\n// written, as plain text (RAW: nothing typed into the sheet is ever run as a formula). Guard: the\n// sheet's Invoice no., Traveller no. and Email are read again just before the write, and a row whose\n// values moved (a row inserted, deleted or edited during the run) is not written; the next run puts\n// it right (a code made this run is then found and adopted, not made twice).\nconst up = $('Rows To Update').first().json;\nconst again = $input.first().json || {};\nconst problems = (up.problems || []).slice();\nconst updates = up.updates || [];\nconst text = (value) => (value === undefined || value === null ? '' : String(value)).trim();\nconst data = [];\nlet moved = 0;\nif (again.error !== undefined || !Array.isArray(again.values)) {\n  problems.push({ code: 'sheet_reread_failed', count: updates.length });\n} else {\n  for (const u of updates) {\n    const cells = again.values[u.row - 1] || [];\n    const same = text(cells[0]) === u.key.invoice && text(cells[1]) === u.key.traveller\n      && text(cells[3]).toLowerCase() === u.key.email;\n    if (!same) { moved += 1; continue; }\n    data.push({ range: 'Travellers!L' + u.row + ':R' + u.row,\n      values: [[u.code, u.ends, u.status, u.message, u.customer, u.checked, u.made].map((v) => String(v))] });\n  }\n  if (moved) problems.push({ code: 'rows_moved', count: moved });\n}\nreturn [{ json: { expected: data.length, body: { valueInputOption: 'RAW', data }, problems,\n  summary: { planned: updates.length, writing: data.length, moved } } }];"
+        "jsCode": "// Build the write-back to the intake sheet (#355). Only the automation's columns of the rows this run\n// decided are written: the roles code, ends, status, message, customer, checked and made in Run Settings\n// SHEET_LAYOUT (an optional role set to '' is skipped), as plain text (RAW: nothing typed into the sheet\n// is ever run as a formula). Guard: the sheet is read again just before the write; the columns are found\n// again by header, and a row whose invoice, traveller no. or email moved (a row inserted, deleted or\n// edited during the run) is not written; the next run puts it right (a code made this run is then found\n// and adopted, not made twice). A header change during the run writes nothing.\n// ---- the sheet layout: the only place columns come from is Run Settings SHEET_LAYOUT ---- //\n// Roles map to header names (row 1). Columns are found by header at run time, so this node holds no\n// column name or letter. A required role must name a header that appears exactly once in row 1; an\n// optional role may be '' or null (not read or written).\nconst REQUIRED_ROLES = ['ready', 'invoice', 'traveller', 'email', 'deposit', 'departure', 'code', 'status', 'message'];\nconst OPTIONAL_ROLES = ['trip', 'ends', 'customer', 'checked', 'made'];\nconst layoutOf = (raw) => {\n  if (!raw || typeof raw !== 'object' || typeof raw.tab !== 'string' || !/^[^'!]{1,100}$/.test(raw.tab)) return null;\n  if (!Number.isInteger(raw.last_row) || raw.last_row < 2 || raw.last_row > 5000) return null;\n  let invoiceRe;\n  try { invoiceRe = new RegExp(String(raw.invoice_pattern)); } catch (e) { return null; }\n  if (!/\\((?!\\?)/.test(String(raw.invoice_pattern))) return null; // must capture the invoice digits\n  const cols = raw.columns;\n  if (!cols || typeof cols !== 'object') return null;\n  const names = {};\n  for (const role of REQUIRED_ROLES.concat(OPTIONAL_ROLES)) {\n    const name = cols[role] === null || cols[role] === undefined ? '' : cols[role];\n    if (typeof name !== 'string' || name.length > 100) return null;\n    if (!name.trim() && REQUIRED_ROLES.includes(role)) return null;\n    names[role] = name.trim();\n  }\n  if (Object.keys(cols).some((role) => !(role in names))) return null;\n  const used = Object.values(names).filter((n) => n);\n  if (new Set(used).size !== used.length) return null; // two roles on one column\n  return { tab: raw.tab, lastRow: raw.last_row, invoiceRe, names };\n};\nconst locate = (layout, header) => {\n  const cells = (header || []).map((h) => (h === undefined || h === null ? '' : String(h)).trim());\n  const at = {};\n  for (const [role, name] of Object.entries(layout.names)) {\n    if (!name) { at[role] = -1; continue; }\n    const hits = cells.reduce((list, h, i) => (h === name ? list.concat(i) : list), []);\n    if (hits.length !== 1) return null;\n    at[role] = hits[0];\n  }\n  return at;\n};\n\nconst WRITTEN = ['code', 'ends', 'status', 'message', 'customer', 'checked', 'made'];\nconst letter = (index) => {\n  let n = index + 1;\n  let out = '';\n  while (n > 0) { const r = (n - 1) % 26; out = String.fromCharCode(65 + r) + out; n = Math.floor((n - 1) / 26); }\n  return out;\n};\nconst up = $('Rows To Update').first().json;\nconst again = $input.first().json || {};\nconst layout = layoutOf($('Run Settings').first().json.SHEET_LAYOUT);\nconst problems = (up.problems || []).slice();\nconst updates = up.updates || [];\nconst text = (value) => (value === undefined || value === null ? '' : String(value)).trim();\nconst data = [];\nlet moved = 0;\nconst at = layout && again.error === undefined && Array.isArray(again.values) ? locate(layout, again.values[0]) : null;\nif (!at) {\n  problems.push({ code: 'sheet_reread_failed', count: updates.length });\n} else {\n  const sheetName = \"'\" + layout.tab + \"'\";\n  for (const u of updates) {\n    const cells = again.values[u.row - 1] || [];\n    const same = text(cells[at.invoice]) === u.key.invoice && text(cells[at.traveller]) === u.key.traveller\n      && text(cells[at.email]).toLowerCase() === u.key.email;\n    if (!same) { moved += 1; continue; }\n    for (const role of WRITTEN) {\n      if (at[role] < 0) continue;\n      data.push({ range: sheetName + '!' + letter(at[role]) + u.row, values: [[String(u[role])]] });\n    }\n  }\n  if (moved) problems.push({ code: 'rows_moved', count: moved });\n}\nconst rowsWritten = updates.length - moved;\nreturn [{ json: { expected: data.length, body: { valueInputOption: 'RAW', data }, problems,\n  summary: { planned: updates.length, writing: at ? rowsWritten : 0, cells: data.length, moved } } }];"
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000032",
+      "id": "00000000-0000-4000-8355-000000000033",
       "name": "Sheet Write Needed",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
@@ -626,7 +632,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8355-000000000031",
+              "id": "00000000-0000-4000-8355-000000000032",
               "leftValue": "={{ $json.expected > 0 }}",
               "rightValue": true,
               "operator": {
@@ -641,7 +647,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000033",
+      "id": "00000000-0000-4000-8355-000000000034",
       "name": "Write Back To Sheet",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -680,7 +686,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000034",
+      "id": "00000000-0000-4000-8355-000000000035",
       "name": "Check Sheet Write",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -691,11 +697,11 @@
       "onError": "continueErrorOutput",
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Check the write-back to the intake sheet (#355): Google must answer with one response per row\n// range sent. Anything else (an HTTP error after retries, a short answer) is one error alert; the\n// next run writes the rows again.\nconst built = $('Build Sheet Update').first().json;\nconst answer = $input.first().json || {};\nconst problems = (built.problems || []).slice();\nconst ok = answer.error === undefined && Array.isArray(answer.responses) && answer.responses.length === built.expected;\nif (!ok) problems.push({ code: 'sheet_write_failed', count: built.expected });\nreturn [{ json: { mode: 'sheet_written', problems, summary: { ...built.summary, written: ok ? built.expected : 0 } } }];"
+        "jsCode": "// Check the write-back to the intake sheet (#355): Google must answer with one response per cell\n// range sent. Anything else (an HTTP error after retries, a short answer) is one error alert; the\n// next run writes the rows again.\nconst built = $('Build Sheet Update').first().json;\nconst answer = $input.first().json || {};\nconst problems = (built.problems || []).slice();\nconst ok = answer.error === undefined && Array.isArray(answer.responses) && answer.responses.length === built.expected;\n// One response per cell range sent; the alert counts rows, not cells.\nif (!ok) problems.push({ code: 'sheet_write_failed', count: built.summary.writing });\nreturn [{ json: { mode: 'sheet_written', problems, summary: { ...built.summary, written: ok ? built.expected : 0 } } }];"
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000036",
+      "id": "00000000-0000-4000-8355-000000000037",
       "name": "Error To Email",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
@@ -713,7 +719,7 @@
           },
           "conditions": [
             {
-              "id": "00000000-0000-4000-8355-000000000035",
+              "id": "00000000-0000-4000-8355-000000000036",
               "leftValue": "={{ Array.isArray($json.problems) && $json.problems.length > 0 }}",
               "rightValue": true,
               "operator": {
@@ -728,7 +734,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000037",
+      "id": "00000000-0000-4000-8355-000000000038",
       "name": "Build Error Alert",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -743,7 +749,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000039",
+      "id": "00000000-0000-4000-8355-000000000040",
       "name": "Build Unexpected Alert",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
@@ -755,7 +761,7 @@
         "assignments": {
           "assignments": [
             {
-              "id": "00000000-0000-4000-8355-000000000038",
+              "id": "00000000-0000-4000-8355-000000000039",
               "name": "alert",
               "type": "object",
               "value": "={{ ({ severity: 'ERROR', key: 'unexpected_error', short: 'unexpected_error', lines: [($('Write Codes').isExecuted === false ? 'XT trip discount codes: the run today stopped on an unexpected error before it made or changed any code. Ask Claude to check.' : 'XT trip discount codes: the run today stopped on an unexpected error. Some codes may already have been made or updated; the sheet may not show them yet. Ask Claude to check.'), 'Detail for Claude: a Code node failed; executions are not saved, so run it by hand with DRY_RUN on and read the plan.'] }) }}"
@@ -766,7 +772,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000040",
+      "id": "00000000-0000-4000-8355-000000000041",
       "name": "Send XT Alert",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
@@ -854,7 +860,7 @@
       }
     },
     {
-      "id": "00000000-0000-4000-8355-000000000041",
+      "id": "00000000-0000-4000-8355-000000000042",
       "name": "End Run As Failed",
       "type": "n8n-nodes-base.stopAndError",
       "typeVersion": 1,

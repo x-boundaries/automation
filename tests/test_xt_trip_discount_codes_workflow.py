@@ -131,10 +131,21 @@ def serial(y, m, d):
     return (date(y, m, d) - date(1899, 12, 30)).days
 
 
+LAYOUT = None  # the export's own SHEET_LAYOUT, evaluated by Node in XtBase.setUpClass
+
+
 def settings(**overrides):
     value = {"DRY_RUN": False, "VALIDITY_RULE": "later", "API_VERSION": "2026-10",
-             "SHOP_DOMAIN": "REPLACE_WITH_SHOPIFY_SHOP_DOMAIN", "SHEET_ID": "REPLACE_WITH_XT_INTAKE_SHEET_ID"}
+             "SHOP_DOMAIN": "REPLACE_WITH_SHOPIFY_SHOP_DOMAIN", "SHEET_ID": "REPLACE_WITH_XT_INTAKE_SHEET_ID",
+             "SHEET_LAYOUT": copy.deepcopy(LAYOUT)}
     value.update(overrides)
+    return value
+
+
+def layout(**columns):
+    """The export layout with some roles renamed ('' for an optional role that is absent)."""
+    value = copy.deepcopy(LAYOUT)
+    value["columns"].update(columns)
     return value
 
 
@@ -189,16 +200,33 @@ def adopt_ok(write):
 
 
 def reread_of(sheet_value):
-    """What Re-read Row Keys returns for a sheet: columns B:E of every row."""
-    return {"range": "Travellers!B1:E1000", "values": [r[1:5] for r in sheet_value["values"]]}
+    """What Re-read Row Keys returns: the same range as Read Intake Sheet, read again."""
+    return copy.deepcopy(sheet_value)
 
 
 @unittest.skipUnless(shutil.which("node"), "a Node runtime is required to execute the committed Code nodes")
 class XtBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        global LAYOUT
         cls.workflow = load(WORKFLOW)
         cls.nodes = {node["name"]: node for node in cls.workflow["nodes"]}
+        value = next(a["value"] for a in cls.nodes[SETTINGS]["parameters"]["assignments"]["assignments"]
+                     if a["name"] == "SHEET_LAYOUT")
+        LAYOUT = cls.expr_raw(value, {})
+
+    @staticmethod
+    def expr_raw(expr, json_value):
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.js"
+            harness.write_text(HARNESS, encoding="utf-8")
+            cases_path = Path(tmp) / "cases.json"
+            cases_path.write_text(json.dumps([{"kind": "expr", "expr": expr, "json": json_value}]), encoding="utf-8")
+            done = subprocess.run([shutil.which("node"), str(harness), str(WORKFLOW), str(SENDER), str(cases_path)],
+                                  capture_output=True, text=True, timeout=300, check=True)
+        (result,) = json.loads(done.stdout)
+        assert result["ok"], result
+        return result["out"]
 
     def run_raw(self, cases):
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,8 +266,8 @@ class XtBase(unittest.TestCase):
         (out,) = self.run_node(CHECK_WRITES, results, {LIST_WRITES: decided["writes"], DECIDE: decided})
         return out["json"]
 
-    def build_sheet(self, upstream, reread):
-        (out,) = self.run_node(BUILD_SHEET, [reread], {TO_UPDATE: upstream})
+    def build_sheet(self, upstream, reread, run=None):
+        (out,) = self.run_node(BUILD_SHEET, [reread], {TO_UPDATE: upstream, SETTINGS: run or settings()})
         return out["json"]
 
     def check_sheet(self, built, response):
@@ -274,7 +302,7 @@ class XtBase(unittest.TestCase):
         trail["to_update"] = self.expr(self.nodes[TO_UPDATE]["parameters"]["conditions"]["conditions"][0]["leftValue"],
                                        upstream)
         if trail["to_update"]:
-            built = trail["built"] = self.build_sheet(upstream, reread or reread_of(sheet_value))
+            built = trail["built"] = self.build_sheet(upstream, reread or reread_of(sheet_value), run)
             upstream = built
             if built["expected"]:
                 response = sheet_response or {"spreadsheetId": "fake", "responses": [{} for _ in built["body"]["data"]]}
@@ -309,9 +337,15 @@ class XtShapeTests(XtBase):
 
     def test_settings_dry_run_rule_and_placeholders(self):
         values = {a["name"]: a["value"] for a in self.nodes[SETTINGS]["parameters"]["assignments"]["assignments"]}
+        layout_expr = values.pop("SHEET_LAYOUT")
         self.assertEqual(values, {"DRY_RUN": True, "VALIDITY_RULE": "later", "API_VERSION": "2026-10",
                                   "SHOP_DOMAIN": "REPLACE_WITH_SHOPIFY_SHOP_DOMAIN",
                                   "SHEET_ID": "REPLACE_WITH_XT_INTAKE_SHEET_ID"})
+        self.assertTrue(layout_expr.startswith("={{ ({") and layout_expr.endswith("}) }}"))
+        self.assertEqual(sorted(LAYOUT), ["columns", "invoice_pattern", "last_row", "tab"])
+        self.assertEqual(sorted(LAYOUT["columns"]), sorted(["ready", "invoice", "traveller", "email", "trip", "deposit",
+                                                            "departure", "code", "ends", "status", "message",
+                                                            "customer", "checked", "made"]))
         rule = self.nodes["Daily 10:00 SGT"]["parameters"]["rule"]["interval"]
         self.assertEqual(rule, [{"field": "days", "daysInterval": 1, "triggerAtHour": 10, "triggerAtMinute": 0}])
 
@@ -337,9 +371,13 @@ class XtShapeTests(XtBase):
 
     def test_sheet_ranges_are_exact(self):
         base = "=https://sheets.googleapis.com/v4/spreadsheets/{{ $('Run Settings').first().json.SHEET_ID }}"
-        self.assertEqual(self.nodes[READ]["parameters"]["url"], base + "/values/Travellers!A1:R1000")
-        self.assertEqual(self.nodes[REREAD]["parameters"]["url"], base + "/values/Travellers!B1:E1000")
+        self.assertEqual(self.nodes[READ]["parameters"]["url"], self.nodes[REREAD]["parameters"]["url"])
+        self.assertTrue(self.nodes[READ]["parameters"]["url"].startswith(base + "/values/{{ encodeURIComponent("))
         self.assertEqual(self.nodes[WRITE_SHEET]["parameters"]["url"], base + "/values:batchUpdate")
+        rng = self.nodes[READ]["parameters"]["url"][len(base + "/values/{{ "):-len(" }}")]
+        (out,) = self.run_raw([{"kind": "expr", "expr": "={{ " + rng.replace("$('Run Settings').first().json", "$json")
+                                + " }}", "json": settings(SHEET_LAYOUT=layout() | {"tab": "XT intake"})}])
+        self.assertEqual(out["out"], "'XT%20intake'!A1%3AZZ1000")  # ' and ! are valid in a URL path
         for name in (READ, REREAD):
             query = {p["name"]: p["value"] for p in self.nodes[name]["parameters"]["queryParameters"]["parameters"]}
             self.assertEqual(query, {"majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE",
@@ -436,6 +474,14 @@ class XtCheckRowsTests(XtBase):
                              ("failed", [], [], [{"code": code, "count": 1}]), code)
         out = self.check({"values": [HEADERS] + [row(traveller=1 + i % 99, invoice="INV-%06d" % i) for i in range(1000)]})
         self.assertEqual(out["problems"], [{"code": "sheet_layout_changed", "count": 1}])
+        doubled = HEADERS + ["Email"]
+        self.assertEqual(self.check(sheet(row(), header=doubled))["problems"][0]["code"], "sheet_layout_changed")
+        bad_layouts = [None, "x", layout(email=""), layout(email="Code"), layout(extra="X"), layout() | {"tab": "a'b"},
+                       layout() | {"last_row": 1}, layout() | {"invoice_pattern": "^INV-[0-9]+$"},
+                       layout() | {"invoice_pattern": "(["}, layout(trip=5)]
+        for bad in bad_layouts:
+            out = self.check(sheet(row()), settings(SHEET_LAYOUT=bad))
+            self.assertEqual(out["problems"], [{"code": "settings_invalid", "count": 1}], bad)
         self.assertEqual(self.check(sheet(row()), token={"access_token": ""})["problems"][0]["code"], "token_failed")
 
     def test_skips_rows_not_ready_and_final_rows(self):
@@ -457,7 +503,7 @@ class XtCheckRowsTests(XtBase):
         rows = out["updates"]
         self.assertEqual(self.status_of(rows, 2)["message"],
                          "Check: Invoice no., Traveller no., Deposit date, Email.")
-        self.assertEqual(self.status_of(rows, 3)["message"], "Check: Departure date (before the deposit date).")
+        self.assertEqual(self.status_of(rows, 3)["message"], "Check: Departure date (before Deposit date).")
         self.assertEqual(self.status_of(rows, 4)["message"],
                          "Check: Invoice no. and Traveller no. (same as row 5).")
         self.assertEqual({r["status"] for r in rows}, {"CHECK_ROW"})
@@ -707,12 +753,15 @@ class XtSheetTests(XtBase):
         trail = self.full_run(value, lambda l: answer(customer(7001, "traveller1@example.com"), with_legacy=True))
         body = trail["built"]["body"]
         self.assertEqual(body["valueInputOption"], "RAW")
-        self.assertEqual(body["data"], [
-            {"range": "Travellers!L3:R3", "values": [["", "", "NEEDS_EMAIL", "Add this traveller's own email.", "",
-                                                     "24 Nov 2026 10:00", ""]]},
-            {"range": "Travellers!L2:R2", "values": [["XT-INV000123-01", "3 Nov 2027 23:59", "DONE",
-                                                     "Code made. Send it to the traveller.", "7001", "24 Nov 2026 10:00",
-                                                     "24 Nov 2026 10:00"]]}])
+        cells = [(d["range"], d["values"]) for d in body["data"]]
+        self.assertEqual(cells, [
+            ("'Travellers'!L3", [[""]]), ("'Travellers'!M3", [[""]]), ("'Travellers'!N3", [["NEEDS_EMAIL"]]),
+            ("'Travellers'!O3", [["Add this traveller's own email."]]), ("'Travellers'!P3", [[""]]),
+            ("'Travellers'!Q3", [["24 Nov 2026 10:00"]]), ("'Travellers'!R3", [[""]]),
+            ("'Travellers'!L2", [["XT-INV000123-01"]]), ("'Travellers'!M2", [["3 Nov 2027 23:59"]]),
+            ("'Travellers'!N2", [["DONE"]]), ("'Travellers'!O2", [["Code made. Send it to the traveller."]]),
+            ("'Travellers'!P2", [["7001"]]), ("'Travellers'!Q2", [["24 Nov 2026 10:00"]]),
+            ("'Travellers'!R2", [["24 Nov 2026 10:00"]])])
         self.assertEqual(trail["final"]["problems"], [])
         self.assertIs(self.expr(self.nodes[TO_EMAIL]["parameters"]["conditions"]["conditions"][0]["leftValue"],
                                 trail["final"]), False)
@@ -720,12 +769,12 @@ class XtSheetTests(XtBase):
     def test_a_row_that_moved_is_not_written(self):
         value = sheet(row(), row(traveller=2, email="t2@example.com"))
         moved = reread_of(value)
-        moved["values"][2][3] = "someone.else@example.com"
+        moved["values"][2][4] = "someone.else@example.com"
         trail = self.full_run(value, lambda l: answer(None, with_legacy=l["variables"]["withLegacy"]), reread=moved)
-        self.assertEqual([d["range"] for d in trail["built"]["body"]["data"]], ["Travellers!L2:R2"])
+        self.assertEqual({d["range"][-1] for d in trail["built"]["body"]["data"]}, {"2"})
         self.assertEqual(trail["final"]["problems"], [{"code": "rows_moved", "count": 1}])
         inserted = reread_of(value)
-        inserted["values"].insert(1, ["INV-000555", 1, "Fake", "new@example.com"])
+        inserted["values"].insert(1, row(invoice="INV-000555", email="new@example.com"))
         trail = self.full_run(value, lambda l: answer(None, with_legacy=l["variables"]["withLegacy"]), reread=inserted)
         self.assertEqual((trail["built"]["expected"], trail["final"]["problems"]), (0, [{"code": "rows_moved", "count": 2}]))
         self.assertIs(self.expr(self.nodes[SHEET_NEEDED]["parameters"]["conditions"]["conditions"][0]["leftValue"],
@@ -734,7 +783,7 @@ class XtSheetTests(XtBase):
     def test_check_rows_keys_survive_the_reread(self):
         value = sheet(row(traveller="abc"), row(traveller=2, email=""))
         trail = self.full_run(value, lambda l: answer(None))
-        self.assertEqual((trail["built"]["expected"], trail["final"]["problems"]), (2, []))
+        self.assertEqual((trail["built"]["summary"]["writing"], trail["final"]["problems"]), (2, []))
 
     def test_reread_and_write_failures(self):
         value = sheet(row(email=""))
@@ -755,8 +804,75 @@ class XtSheetTests(XtBase):
         rows = [row(traveller=i + 1, email="t%d@example.com" % i) for i in range(31)]
         trail = self.full_run(sheet(*rows), lambda l: answer(customer(8000 + l["row"], l["email"]),
                                                              with_legacy=l["variables"]["withLegacy"]))
-        self.assertEqual({d["values"][0][2] for d in trail["built"]["body"]["data"]}, {"HELD"})
+        self.assertEqual({d["values"][0][0] for d in trail["built"]["body"]["data"] if d["range"].startswith("'Travellers'!N")},
+                         {"HELD"})
         self.assertEqual(trail["final"]["problems"], [{"code": "too_many_codes", "count": 31}])
+
+
+class XtLayoutTests(XtBase):
+    """Controller, 24 Nov 2026: the sheet follows the consultant's own layout; columns live only in SHEET_LAYOUT."""
+
+    def own_layout(self):
+        # A fake consultant-style sheet: other names, another order, extra columns, no checked/customer columns.
+        header = ["No.", "Trip", "Lead booker", "Participant", "Invoice", "Pax no.", "Email address", "Deposit paid",
+                  "Departure", "Discount code", "Code status", "Code expiry", "Code created", "Remarks", "Ready",
+                  "Message", "Shopify customer ID"]
+        lay = copy.deepcopy(LAYOUT)
+        lay.update(tab="XT intake", invoice_pattern="^INV-?([0-9]{1,12})$")
+        lay["columns"] = {"ready": "Ready", "invoice": "Invoice", "traveller": "Pax no.", "email": "Email address",
+                          "trip": "Trip", "deposit": "Deposit paid", "departure": "Departure", "code": "Discount code",
+                          "ends": "Code expiry", "status": "Code status", "message": "Message",
+                          "customer": "Shopify customer ID", "checked": "", "made": "Code created"}
+
+        def own_row(invoice="INV000123", pax=1, email="traveller1@example.com", ready=True, status=""):
+            return [7, "Fake Trip", "Fake Lead", "Fake Traveller", invoice, pax, email, serial(2026, 11, 3),
+                    serial(2027, 5, 1), "", status, "", "", "", ready]
+        return header, lay, own_row
+
+    def test_the_consultants_own_layout_reads_and_writes_by_header(self):
+        header, lay, own_row = self.own_layout()
+        value = sheet(own_row(), own_row(pax=2, email=""), own_row(invoice="INV-000124", email="b@example.com",
+                                                                 status="DONE"), header=header)
+        run = settings(SHEET_LAYOUT=lay)
+        trail = self.full_run(value, lambda l: answer(customer(7001, l["email"]), with_legacy=l["variables"]["withLegacy"]),
+                              run=run)
+        self.assertEqual([l["code"] for l in trail["check"]["lookups"]], ["XT-INV000123-01"])
+        cells = {d["range"]: d["values"][0][0] for d in trail["built"]["body"]["data"]}
+        self.assertEqual(cells, {
+            "'XT intake'!J3": "", "'XT intake'!L3": "", "'XT intake'!K3": "NEEDS_EMAIL",
+            "'XT intake'!P3": "Add this traveller's own email.", "'XT intake'!Q3": "", "'XT intake'!M3": "",
+            "'XT intake'!J2": "XT-INV000123-01", "'XT intake'!L2": "3 Nov 2027 23:59", "'XT intake'!K2": "DONE",
+            "'XT intake'!P2": "Code made. Send it to the traveller.", "'XT intake'!Q2": "7001",
+            "'XT intake'!M2": "24 Nov 2026 10:00"})
+        self.assertEqual(trail["final"]["problems"], [])
+        (u,) = [u for u in self.check(sheet(own_row(pax="x"), header=header), run)["updates"]]
+        self.assertEqual(u["message"], "Check: Pax no..")
+
+    def test_a_header_change_during_the_run_writes_nothing(self):
+        header, lay, own_row = self.own_layout()
+        value = sheet(own_row(email=""), header=header)
+        renamed = copy.deepcopy(value)
+        renamed["values"][0][10] = "Status"
+        trail = self.full_run(value, lambda l: None, run=settings(SHEET_LAYOUT=lay), reread=renamed)
+        self.assertEqual((trail["built"]["expected"], trail["final"]["problems"]),
+                         (0, [{"code": "sheet_reread_failed", "count": 1}]))
+
+    def test_columns_beyond_z_get_two_letters(self):
+        header = HEADERS + ["Extra %d" % i for i in range(10)] + ["Message 2"]
+        value = sheet(row(email=""), header=header)
+        trail = self.full_run(value, lambda l: None, run=settings(SHEET_LAYOUT=layout(message="Message 2")))
+        self.assertIn("'Travellers'!AC2", [d["range"] for d in trail["built"]["body"]["data"]])
+
+    def test_no_code_node_names_a_column(self):
+        names = {n for n in LAYOUT["columns"].values() if n} | {LAYOUT["tab"]}
+        for node in CODE_NODES:
+            code = self.nodes[node]["parameters"]["jsCode"]
+            for name in names:
+                self.assertNotIn("'%s'" % name, code, (node, name))
+            self.assertNotRegex(code, r"!\$?[A-Z]{1,2}\$?[0-9]+|[A-Z]{1,2}[0-9]*:[A-Z]{1,2}[0-9]*'", node)
+        both = [self.nodes[n]["parameters"]["jsCode"] for n in (CHECK, BUILD_SHEET)]
+        block = lambda code: code[code.index("// ---- the sheet layout"):code.index("const locate")]
+        self.assertEqual(block(both[0]), block(both[1]), "the layout check is the same in both nodes")
 
 
 class XtAlertTests(XtBase):
@@ -823,7 +939,11 @@ class XtEndToEndTests(XtBase):
                           with_legacy=l["variables"]["withLegacy"])
 
         trail = self.full_run(sheet(*rows), shopify)
-        written = {int(d["range"].split("L")[1].split(":")[0]): d["values"][0] for d in trail["built"]["body"]["data"]}
+        written = {}
+        for d in trail["built"]["body"]["data"]:
+            col, num = re.match(r"'Travellers'!([A-Z]+)([0-9]+)$", d["range"]).groups()
+            written.setdefault(int(num), {})[col] = d["values"][0][0]
+        written = {r: [v[c] for c in "LMNOPQR"] for r, v in written.items()}
         self.assertEqual({r: v[2] for r, v in written.items()},
                          {2: "DONE", 3: "NEEDS_SHOPIFY_ACCOUNT", 4: "NEEDS_EMAIL", 5: "ADOPTED", 6: "CONFLICT"})
         self.assertEqual(written[5][0], "XT-INV000200")
