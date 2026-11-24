@@ -27,6 +27,9 @@ Behaviour:
   ordinally, so the runbook off switch \XB\XB-MemberSync always names this task); name
   -TaskName, default XB-MemberSync. Refuses if a task with that name already exists in that
   folder (never replaced).
+- RepoRoot must be a pinned clone, C:\XB\golive\automation-<purpose>-<sha7> at a detached HEAD
+  with no changed tracked files (scripts\xb_pinned_clone.ps1). Registering from any other folder
+  is refused; the dry run says so. See docs/autocount2-automation/vm_pinned_clones_runbook.md.
 - The printed XML is exactly the XML that -Register registers (Register-ScheduledTask -Xml).
   No password or secret is in it; the Windows password is typed into the Get-Credential
   prompt and goes straight to Task Scheduler. Do not run this inside a transcript.
@@ -97,6 +100,9 @@ if ([string]::IsNullOrWhiteSpace($UserId)) {
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
+# #117: the task must run from a pinned clone, never a shared checkout that something updates.
+. (Join-Path $PSScriptRoot "xb_pinned_clone.ps1")
+$pinProblem = Get-XbPinnedCloneProblem -RepoRoot $RepoRoot
 $scriptPath = Join-Path $RepoRoot "directlocal\xb_member_sync.py"
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
     throw "Sync script not found under the repository root."
@@ -208,11 +214,13 @@ if (-not $Register) {
     else {
         Write-Host "Book $book; every $IntervalMinutes minutes, no end; IgnoreNew; $timeLimit limit; LeastPrivilege; LogonType Password."
     }
+    Write-Host (Format-XbPinnedCloneLine $pinProblem)
     Write-Host "Task XML:"
     Write-Host $taskXml
     Write-Host "Nothing was registered. Registering needs -Register and the owner's OK (go-live step S4; P3 for -Probe)."
     exit 0
 }
+Assert-XbPinnedClone $pinProblem
 
 # Password logon: the account's profile is loaded, so the run can read its Credential Manager
 # entry, DPAPI cache and user environment variables. The Windows password typed here goes

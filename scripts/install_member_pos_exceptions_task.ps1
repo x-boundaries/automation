@@ -26,6 +26,9 @@ Behaviour:
   root (\). It never replaces or moves an existing task.
 - RepoRoot defaults to the clone this script is in (worked out in the body: Windows PowerShell
   5.1 leaves $PSScriptRoot empty inside param() defaults of a script with [Parameter()]).
+- RepoRoot must be a pinned clone, C:\XB\golive\automation-<purpose>-<sha7> at a detached HEAD
+  with no changed tracked files (scripts\xb_pinned_clone.ps1). Registering from any other folder
+  is refused; the dry run says so. See docs/autocount2-automation/vm_pinned_clones_runbook.md.
 - -DryRun runs every check (including pyodbc and check-settings), prints what it would register
   and stops before the password prompt and Register-ScheduledTask. Nothing is registered. The
   tests use it, and only it.
@@ -56,6 +59,9 @@ if ($TaskPath -cnotmatch '\A(\\[A-Za-z0-9_-]([A-Za-z0-9 _-]*[A-Za-z0-9_-])?)+\\\
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
+# #117: the task must run from a pinned clone, never a shared checkout that something updates.
+. (Join-Path $PSScriptRoot "xb_pinned_clone.ps1")
+$pinProblem = Get-XbPinnedCloneProblem -RepoRoot $RepoRoot
 
 $scriptPath = Join-Path $RepoRoot "scripts\xb_member_pos_exceptions.py"
 if (-not (Test-Path -LiteralPath $scriptPath)) {
@@ -119,9 +125,11 @@ if ($DryRun) {
     Write-Host "Dry run: would register $TaskPath$TaskName"
     Write-Host "Repo root: $RepoRoot"
     Write-Host "Runs daily at $runTime (reports the previous month once from day $runDay), IgnoreNew, 30 minute limit, RunLevel Limited, LogonType $logonType ($authMode)."
+    Write-Host (Format-XbPinnedCloneLine $pinProblem)
     Write-Host "Nothing was registered."
     exit 0
 }
+Assert-XbPinnedClone $pinProblem
 
 if ($logonType -ceq "S4U") {
     $principal = New-ScheduledTaskPrincipal `

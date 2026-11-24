@@ -25,6 +25,9 @@ Behaviour:
   already exists (never replaced).
 - PythonExe is the full path to python.exe. The config is validated first with that interpreter
   (check-config: no login, no network, no ledger).
+- RepoRoot must be a pinned clone, C:\XB\golive\automation-<purpose>-<sha7> at a detached HEAD
+  with no changed tracked files (scripts\xb_pinned_clone.ps1). Registering from any other folder
+  is refused; the dry run says so. See docs/autocount2-automation/vm_pinned_clones_runbook.md.
 - The printed XML is exactly the XML that -Register registers. No password or secret is in it.
 
 Windows PowerShell 5.1 compatible. Dry run (the default):
@@ -77,6 +80,9 @@ if ([string]::IsNullOrWhiteSpace($UserId)) {
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
+# #117: the task must run from a pinned clone, never a shared checkout that something updates.
+. (Join-Path $PSScriptRoot "xb_pinned_clone.ps1")
+$pinProblem = Get-XbPinnedCloneProblem -RepoRoot $RepoRoot
 $scriptPath = Join-Path $RepoRoot "directlocal\xb_member_benefits.py"
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
     throw "Benefits script not found under the repository root."
@@ -173,11 +179,13 @@ $taskXml = @"
 if (-not $Register) {
     Write-Host "Dry run (the default): would register $TaskPath$TaskName"
     Write-Host "Mode $Mode. Book $book; every 15 minutes from 00:$($OffsetMinutes.ToString('00')), no end; IgnoreNew; PT10M limit; LeastPrivilege; LogonType Password; enabled $enabled."
+    Write-Host (Format-XbPinnedCloneLine $pinProblem)
     Write-Host "Task XML:"
     Write-Host $taskXml
     Write-Host "Nothing was registered. Registering needs -Register and the owner's OK (runbook step B1, or B4 for -Mode apply)."
     exit 0
 }
+Assert-XbPinnedClone $pinProblem
 
 $credential = Get-Credential -UserName $UserId -Message "Windows password of the scheduled task account"
 if ($null -eq $credential) {

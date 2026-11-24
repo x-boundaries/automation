@@ -11,6 +11,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# #117: the task must run from a pinned clone (C:\XB\golive\automation-<purpose>-<sha7>), never a
+# shared checkout that something updates; anything else is refused before registering. See
+# docs/autocount2-automation/vm_pinned_clones_runbook.md.
+. (Join-Path $PSScriptRoot "xb_pinned_clone.ps1")
+$pinProblem = Get-XbPinnedCloneProblem -RepoRoot $RepoRoot
+Assert-XbPinnedClone $pinProblem
+
 $scriptPath = Join-Path $RepoRoot "scripts\autocount_stock_extract.py"
 
 if (-not (Test-Path -LiteralPath $scriptPath)) {

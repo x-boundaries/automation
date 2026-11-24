@@ -22,6 +22,9 @@ Behaviour:
 - Folder pinned to \XB\ and name pinned to XB-MemberSync-DailySummary (ordinal compare), so
   this installer can never name, replace or change the 15-minute sync task in the same folder.
 - Refuses if a task with that name already exists (never replaced).
+- RepoRoot must be a pinned clone, C:\XB\golive\automation-<purpose>-<sha7> at a detached HEAD
+  with no changed tracked files (scripts\xb_pinned_clone.ps1). Registering from any other folder
+  is refused; the dry run says so. See docs/autocount2-automation/vm_pinned_clones_runbook.md.
 - The printed XML is exactly the XML that -Register registers. No password or secret is in it;
   the Windows password is typed into the Get-Credential prompt and goes straight to Task
   Scheduler. Do not run this inside a transcript.
@@ -71,6 +74,9 @@ if ([string]::IsNullOrWhiteSpace($UserId)) {
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
+# #117: the task must run from a pinned clone, never a shared checkout that something updates.
+. (Join-Path $PSScriptRoot "xb_pinned_clone.ps1")
+$pinProblem = Get-XbPinnedCloneProblem -RepoRoot $RepoRoot
 $scriptPath = Join-Path $RepoRoot "directlocal\xb_member_sync_daily_summary.py"
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
     throw "Summary script not found under the repository root."
@@ -164,11 +170,13 @@ if ($DryRun -or -not $Register) {
     Write-Host "Dry run (the default): would register $TaskPath$TaskName"
     Write-Host "Daily at $StartTime; IgnoreNew; PT5M limit; LeastPrivilege; LogonType Password; send enabled: $($summary.send_enabled)."
     Write-Host "Repo root: $RepoRoot"
+    Write-Host (Format-XbPinnedCloneLine $pinProblem)
     Write-Host "Task XML:"
     Write-Host $taskXml
     Write-Host "Nothing was registered. Registering needs -Register and the owner's OK (#288 slice 3, VM task registration)."
     exit 0
 }
+Assert-XbPinnedClone $pinProblem
 
 # Password logon: the account's profile is loaded, so the run can read its Credential Manager
 # entry and the sync state root. The Windows password typed here goes straight to Task

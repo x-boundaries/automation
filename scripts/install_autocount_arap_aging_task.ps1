@@ -32,6 +32,9 @@ Behaviour:
 - RepoRoot defaults to the clone this script is in. It is worked out in the script body
   because Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults of a
   script with [Parameter()] attributes.
+- RepoRoot must be a pinned clone, C:\XB\golive\automation-<purpose>-<sha7> at a detached HEAD
+  with no changed tracked files (scripts\xb_pinned_clone.ps1). Registering from any other folder
+  is refused; the dry run says so. See docs/autocount2-automation/vm_pinned_clones_runbook.md.
 - -DryRun runs every check (including pyodbc and --dry-run-config), prints what it would
   register and stops before the password prompt and Register-ScheduledTask. Nothing is
   registered. The tests use it, and only it.
@@ -65,6 +68,9 @@ if ($TaskPath -cnotmatch '\A(\\[A-Za-z0-9_-]([A-Za-z0-9 _-]*[A-Za-z0-9_-])?)+\\\
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
+# #117: the task must run from a pinned clone, never a shared checkout that something updates.
+. (Join-Path $PSScriptRoot "xb_pinned_clone.ps1")
+$pinProblem = Get-XbPinnedCloneProblem -RepoRoot $RepoRoot
 
 $scriptPath = Join-Path $RepoRoot "scripts\autocount_arap_aging.py"
 if (-not (Test-Path -LiteralPath $scriptPath)) {
@@ -140,9 +146,11 @@ if ($DryRun) {
     Write-Host "Repo root: $RepoRoot"
     Write-Host "Runs hourly at minute $RunMinute, IgnoreNew, 15 minute limit, RunLevel Limited, LogonType $logonType ($authMode)."
     Write-Host "Trigger: one trigger, starts $($startAt.ToString('HH:mm')), repeats every $repeatEvery, no end (exactly one run per hour; no daily trigger)."
+    Write-Host (Format-XbPinnedCloneLine $pinProblem)
     Write-Host "Nothing was registered."
     exit 0
 }
+Assert-XbPinnedClone $pinProblem
 
 if ($logonType -ceq "S4U") {
     # windows_integrated: S4U stores no password. The task signs in to SQL Server as UserId.
