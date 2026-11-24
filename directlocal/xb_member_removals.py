@@ -82,7 +82,7 @@ LEDGER_FILE = "member_removals.sqlite3"
 LOCK_FILE = "member_removals.lock"
 STOP_FILE = "STOP"
 TOOL = "xb268_member_removals"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: removals keep the upgrade basis (G2 recheck LATER-1); version 1 was never installed
 PROFILE = "benefit_x1"
 RESTORE_PROFILE = "benefit_x1r"
 BRIDGE_SCRIPT = dl.REPO_ROOT / "scripts" / "ac2_member_removals_bridge.ps1"
@@ -466,15 +466,15 @@ CREATE TABLE meta(
 CREATE TABLE removals(
   removal_id TEXT PRIMARY KEY CHECK (removal_id GLOB 'rm-*'), run_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('expire', 'revoke')),
   member_no TEXT NOT NULL, from_type TEXT NOT NULL CHECK (from_type = 'MEMBER'), to_type TEXT NOT NULL CHECK (to_type = 'GUEST'),
-  expected_last_modified_local TEXT NOT NULL, expected_expiry_local TEXT NOT NULL,
+  expected_last_modified_local TEXT NOT NULL, expected_expiry_local TEXT NOT NULL, basis_expiry_local TEXT,
   day_local TEXT NOT NULL CHECK (day_local GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
   order_gid TEXT, core_write_id TEXT, salt TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('INTENT', 'DONE', 'SKIPPED', 'NOT_WRITTEN', 'UNCERTAIN', 'HELD')),
   code TEXT, post_last_modified_local TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   deadline_at TEXT NOT NULL, child_pid INTEGER, child_created TEXT,
   CHECK (kind <> 'expire' OR (substr(expected_expiry_local, 1, 10) < day_local AND substr(expected_expiry_local, 1, 10) >= '2020-01-01'
-                              AND order_gid IS NULL AND core_write_id IS NULL)),
-  CHECK (kind <> 'revoke' OR (order_gid IS NOT NULL AND core_write_id IS NOT NULL)),
+                              AND order_gid IS NULL AND core_write_id IS NULL AND basis_expiry_local IS NULL)),
+  CHECK (kind <> 'revoke' OR (order_gid IS NOT NULL AND core_write_id IS NOT NULL AND basis_expiry_local IS NOT NULL)),
   CHECK (state <> 'DONE' OR post_last_modified_local IS NOT NULL));
 CREATE TABLE restores(
   restore_id TEXT PRIMARY KEY CHECK (restore_id GLOB 'rs-*'), removal_id TEXT NOT NULL REFERENCES removals(removal_id), run_id TEXT NOT NULL,
@@ -497,7 +497,7 @@ CREATE TRIGGER meta_immutable BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'm
 CREATE TRIGGER meta_no_delete BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'meta_immutable'); END;
 CREATE TRIGGER removals_no_delete BEFORE DELETE ON removals BEGIN SELECT RAISE(ABORT, 'removal_immutable'); END;
 CREATE TRIGGER removals_binding_immutable BEFORE UPDATE OF removal_id, run_id, kind, member_no, from_type, to_type,
-  expected_last_modified_local, expected_expiry_local, day_local, order_gid, core_write_id, salt, created_at, deadline_at ON removals
+  expected_last_modified_local, expected_expiry_local, basis_expiry_local, day_local, order_gid, core_write_id, salt, created_at, deadline_at ON removals
   BEGIN SELECT RAISE(ABORT, 'removal_immutable'); END;
 CREATE TRIGGER removals_transition BEFORE UPDATE OF state ON removals
   WHEN NOT ((OLD.state = 'INTENT' AND NEW.state IN ('DONE', 'SKIPPED', 'NOT_WRITTEN', 'UNCERTAIN', 'HELD'))
@@ -665,6 +665,9 @@ class RemovalsLedger:
     def is_released(self, write_id: str) -> bool:
         return self.conn.execute("SELECT 1 FROM write_releases WHERE write_id = ?", (write_id,)).fetchone() is not None
 
+    def reviewed(self, subject: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM reviews WHERE subject = ?", (subject,)).fetchone() is not None
+
     def revoke_recorded(self, order_gid: str) -> bool:
         return self.conn.execute(f"SELECT 1 FROM removals WHERE kind = 'revoke' AND order_gid = ? AND state IN {_LANDED_OR_OPEN} LIMIT 1",
                                  (order_gid,)).fetchone() is not None
@@ -693,10 +696,11 @@ class RemovalsLedger:
         with self.tx() as conn:
             conn.execute(
                 "INSERT INTO removals(removal_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, expected_expiry_local, "
-                "day_local, order_gid, core_write_id, salt, state, created_at, updated_at, deadline_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENT', ?, ?, ?)",
+                "basis_expiry_local, day_local, order_gid, core_write_id, salt, state, created_at, updated_at, deadline_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTENT', ?, ?, ?)",
                 (removal_id, run_id, payload["kind"], payload["member_no"], payload["from_type"], payload["to_type"], payload["expected_last_modified_local"],
-                 payload["expected_expiry_local"], day_local, order_gid, core_write_id, payload["salt"], now, now, dl.ts(deadline)))
+                 payload["expected_expiry_local"], payload["basis_expiry_local"], day_local, order_gid, core_write_id, payload["salt"], now, now,
+                 dl.ts(deadline)))
         return self.conn.execute("SELECT * FROM removals WHERE removal_id = ?", (removal_id,)).fetchone()
 
     def add_restore(self, *, run_id: str, removal: sqlite3.Row, salt: str, deadline: datetime) -> sqlite3.Row:
@@ -724,13 +728,14 @@ class RemovalsLedger:
 
 def removal_payload(row: sqlite3.Row) -> dict[str, Any]:
     """The child's payload, built from the stored row so the ledger and the
-    child always agree."""
+    child always agree. A revoke's basis is the stored upgrade basis (from the
+    member core write), kept apart from the expiry the parent read, so the
+    child's basis compare is a second check on two sources."""
 
     expire = row["kind"] == "expire"
     return {"kind": row["kind"], "member_no": row["member_no"], "from_type": row["from_type"], "to_type": row["to_type"],
             "expected_last_modified_local": row["expected_last_modified_local"], "expected_expiry_local": row["expected_expiry_local"],
-            "run_day_local": row["day_local"] if expire else None, "basis_expiry_local": None if expire else row["expected_expiry_local"],
-            "salt": row["salt"]}
+            "run_day_local": row["day_local"] if expire else None, "basis_expiry_local": row["basis_expiry_local"], "salt": row["salt"]}
 
 
 def restore_payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -1357,7 +1362,12 @@ class RemovalsEngine:
                 continue
             if self._removal_open(member_no, summary, ref):
                 continue
-            if write and saves >= self.config.max_revokes_per_run:
+            if not write and self.ledger.reviewed(f"changed:{order_gid}"):
+                # G2 recheck LATER-2: found changed since the upgrade on an earlier run. LastModified only moves on, so it
+                # stays changed: an observe run spends no member read on it again (a writing run still reads it).
+                summary.count("revoke_member_changed")
+                continue
+            if write and saves >= getattr(self.config, CAP["revoke"]):
                 summary.count("revoke_cap_reached")  # before the read (G2 L7): a backlog never spends the read budget
                 summary.count("would_revoke")
                 continue

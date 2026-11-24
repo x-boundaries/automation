@@ -894,9 +894,9 @@ class RevokeTests(Base):
         ledger = self.open_ledger()
         with ledger.tx() as conn:
             conn.execute("INSERT INTO removals(removal_id, run_id, kind, member_no, from_type, to_type, expected_last_modified_local, "
-                         "expected_expiry_local, day_local, order_gid, core_write_id, salt, state, created_at, updated_at, deadline_at) "
-                         "VALUES (?, 'run-x', 'revoke', ?, 'MEMBER', 'GUEST', ?, ?, ?, ?, 'write-y', 's', 'INTENT', 't', 't', 't')",
-                         ("rm-" + "e" * 32, no, UPGRADE_POST_LM, BASIS + ".000", RUN_DAY.isoformat(), order_gid(99)))
+                         "expected_expiry_local, basis_expiry_local, day_local, order_gid, core_write_id, salt, state, created_at, updated_at, "
+                         "deadline_at) VALUES (?, 'run-x', 'revoke', ?, 'MEMBER', 'GUEST', ?, ?, ?, ?, ?, 'write-y', 's', 'INTENT', 't', 't', 't')",
+                         ("rm-" + "e" * 32, no, UPGRADE_POST_LM, BASIS + ".000", BASIS + ".000", RUN_DAY.isoformat(), order_gid(99)))
             conn.execute("UPDATE removals SET state = 'UNCERTAIN'")
         result = self.revoke()
         self.assertEqual((result["counts"].get("removal_open"), result["counts"].get("would_revoke")), (1, None))
@@ -916,8 +916,10 @@ class RevokeTests(Base):
         result = self.revoke(apply=True, max_revokes_per_run=1)
         self.assertEqual((result["saves"], len(self.book.reads)), (1, 1))
 
-    def test_revoke_sends_the_upgrade_basis_as_the_basis(self):
-        """G2 L10: the child compares the upgrade's basis with what the parent read."""
+    def test_l10_revoke_row_keeps_the_upgrade_basis(self):
+        """G2 recheck LATER-1: the removals row stores the upgrade's basis
+        (from the member core write), apart from the expiry the parent read,
+        and the child's payload takes its basis from that column."""
         self.refund_case()
         seen = []
         real_save = self.book.save
@@ -927,7 +929,29 @@ class RevokeTests(Base):
             return real_save(payload, **kwargs)
         self.book.save = save
         self.assertEqual(self.revoke(apply=True)["saves"], 1)
+        row = self.removals()[0]
+        self.assertEqual((row["kind"], row["basis_expiry_local"], row["expected_expiry_local"]), ("revoke", BASIS + ".000", BASIS + ".000"))
         self.assertEqual(seen, [(BASIS + ".000", BASIS + ".000")])
+
+    def test_l10_expire_row_has_no_basis(self):
+        self.book.add(1)
+        self.assertEqual(self.expire(apply=True)["saves"], 1)
+        row = self.removals()[0]
+        self.assertEqual((row["kind"], row["basis_expiry_local"]), ("expire", None))
+        self.assertIsNone(mr.removal_payload(row)["basis_expiry_local"])
+
+    def test_later2_observe_does_not_read_a_changed_member_again(self):
+        """G2 recheck LATER-2: once a revoke candidate was found changed since
+        the upgrade, observe runs skip its member read (it stays changed:
+        LastModified only moves on); a writing run still reads it."""
+        no = self.refund_case()
+        self.book.members[no]["LastModified"] = "2026-11-22T10:00:00.000"  # staff touched the member
+        first = self.revoke()
+        self.assertEqual((first["alerts"], len(self.book.reads)), (["revoke_member_changed"], 1))
+        second = self.revoke()
+        self.assertEqual((second["alerts"], second["counts"]["revoke_member_changed"], len(self.book.reads)), ([], 1, 1))
+        third = self.revoke(apply=True)
+        self.assertEqual((third["saves"], third["counts"]["revoke_member_changed"], len(self.book.reads)), (0, 1, 2))
 
     def test_v07_voided_claim_link(self):
         """Mutation target 10 (V5)."""
@@ -1170,11 +1194,16 @@ class RestoreTests(Base):
 # Ledger (L01)
 # --------------------------------------------------------------------------
 
+REVOKE_ROW = {"kind": "revoke", "expected_expiry_local": BASIS + ".000", "basis_expiry_local": BASIS + ".000", "order_gid": order_gid(1),
+              "core_write_id": "write-" + "1" * 32}
+
+
 class LedgerTests(Base):
     def insert(self, **changes):
         values = {"removal_id": "rm-" + "1" * 32, "run_id": "run-a", "kind": "expire", "member_no": fake_no(1), "from_type": "MEMBER",
-                  "to_type": "GUEST", "expected_last_modified_local": LM, "expected_expiry_local": YESTERDAY, "day_local": RUN_DAY.isoformat(),
-                  "order_gid": None, "core_write_id": None, "salt": "s", "state": "INTENT", "created_at": "t", "updated_at": "t", "deadline_at": "t"}
+                  "to_type": "GUEST", "expected_last_modified_local": LM, "expected_expiry_local": YESTERDAY, "basis_expiry_local": None,
+                  "day_local": RUN_DAY.isoformat(), "order_gid": None, "core_write_id": None, "salt": "s", "state": "INTENT", "created_at": "t",
+                  "updated_at": "t", "deadline_at": "t"}
         values.update(changes)
         with self.ledger.tx() as conn:
             conn.execute(f"INSERT INTO removals({', '.join(values)}) VALUES ({', '.join('?' for _ in values)})", tuple(values.values()))
@@ -1185,13 +1214,15 @@ class LedgerTests(Base):
         bad = [
             {"to_type": "MEMBER"}, {"to_type": "Default"}, {"from_type": "GUEST"}, {"expected_expiry_local": None},
             {"expected_expiry_local": TODAY}, {"expected_expiry_local": "2000-01-01T00:00:00.000"}, {"kind": "revoke"},
-            {"kind": "move"}, {"state": "DONE"}, {"removal_id": "x-1"},
+            {"kind": "move"}, {"state": "DONE"}, {"removal_id": "x-1"}, {"basis_expiry_local": YESTERDAY},
+            {**REVOKE_ROW, "basis_expiry_local": None}, {**REVOKE_ROW, "order_gid": None},
         ]
         for changes in bad:
             with self.subTest(changes=changes), self.assertRaises(sqlite3.IntegrityError):
                 self.insert(**changes)
         self.insert()
-        for statement in ("UPDATE removals SET member_no = 'x'", "UPDATE removals SET expected_expiry_local = 'x'", "DELETE FROM removals",
+        for statement in ("UPDATE removals SET member_no = 'x'", "UPDATE removals SET expected_expiry_local = 'x'",
+                          "UPDATE removals SET basis_expiry_local = 'x'", "DELETE FROM removals",
                           "UPDATE removals SET state = 'DONE'", "UPDATE meta SET ref_key = 'x'"):
             with self.subTest(statement=statement), self.assertRaises(sqlite3.Error):
                 with self.ledger.tx() as conn:
@@ -1211,6 +1242,28 @@ class LedgerTests(Base):
         with self.assertRaises(sqlite3.Error), self.ledger.tx() as conn:
             conn.execute("INSERT INTO write_releases(write_id, finding, member_read_digest, run_id, created_at) VALUES (?, 'as_intended', ?, 'r', 't')",
                          ("rm-" + "1" * 32, "sha256:" + "0" * 64))
+
+    def test_l10_revoke_basis_is_immutable(self):
+        self.open_ledger()
+        self.insert(**REVOKE_ROW)
+        with self.assertRaises(sqlite3.Error) as caught, self.ledger.tx() as conn:
+            conn.execute("UPDATE removals SET basis_expiry_local = ?", (FUTURE,))
+        self.assertIn("removal_immutable", str(caught.exception))
+
+    def test_l10_child_payload_takes_the_basis_from_the_row(self):
+        """G2 recheck LATER-1: the payload's basis is the stored upgrade basis,
+        never a copy of the expected expiry, so a row whose two values differ
+        is refused by the payload check (as by the child) before any send."""
+        ledger = self.open_ledger()
+        written = {**payload(kind="revoke", run_day_local=None, expected_expiry_local=BASIS + ".000"), "basis_expiry_local": FUTURE}
+        row = ledger.add_removal(run_id="run-a", payload=written, day_local=RUN_DAY.isoformat(), order_gid=order_gid(1),
+                                 core_write_id="write-" + "1" * 32, deadline=NOW)
+        self.assertEqual((row["basis_expiry_local"], row["expected_expiry_local"]), (FUTURE, BASIS + ".000"))
+        sent = mr.removal_payload(row)
+        self.assertEqual((sent["basis_expiry_local"], sent["expected_expiry_local"]), (FUTURE, BASIS + ".000"))
+        with self.assertRaises(dl.DirectLocalError) as caught:
+            mr.check_save_payload(sent)
+        self.assertEqual(caught.exception.code, "removal_request_invalid")
 
     def test_l01_restore_needs_a_done_removal_even_with_matching_values(self):
         """Mutation target 12: the trigger checks the removal's state, not only its values."""
@@ -1239,12 +1292,14 @@ class LedgerTests(Base):
         self.open_ledger()
         self.ledger.close()
         self.ledger = None
-        conn = sqlite3.connect(self.root / mr.LEDGER_FILE)
-        conn.execute("PRAGMA user_version=2")
-        conn.close()
-        with self.assertRaises(dl.DirectLocalError) as caught:
-            mr.RemovalsLedger(self.root)
-        self.assertEqual(caught.exception.code, "removals_ledger_not_recognised")
+        for version in (1, 3):  # 1: the first ledger shape, made before the removals row kept the upgrade basis (G2 recheck LATER-1)
+            conn = sqlite3.connect(self.root / mr.LEDGER_FILE)
+            conn.execute(f"PRAGMA user_version={version}")
+            conn.close()
+            with self.subTest(version=version):
+                with self.assertRaises(dl.DirectLocalError) as caught:
+                    mr.RemovalsLedger(self.root)
+                self.assertEqual(caught.exception.code, "removals_ledger_not_recognised")
 
     def test_rule_settings_change_refuses_runs(self):
         self.open_ledger()
