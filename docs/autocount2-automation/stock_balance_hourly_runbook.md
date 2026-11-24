@@ -519,9 +519,9 @@ The order matters: the code that knows `analysis.purchasing` is pulled **before*
 Needs owner OK; VM Claude runs it after the build history PR is merged. The settings file does not change (no new setting). Results go to the private mailbox only. Never pull or switch branches between :55 and :05.
 
 - **H1 pull and first line** (needs owner OK).
-  - Do: run `--dry-run-config` and record its `settings_sha256` and `git rev-parse HEAD` of the VM clone; pull main into the VM clone; run `--dry-run-config` again. After the next 00:00 run, read `last_run_status.json` and the last line of `analysis_build_history.jsonl` in `archive_root`.
-  - Pass: the same `settings_sha256` before and after the pull; the 00:00 run shows every status as before plus `analysis_history_status: written`; the history file has one line for that run with `built_close_day` = the day before, `analysis_status` and `purchasing_status` `published`, `exit_code` 0, and `manifest_sha256` and each file's `sha256` equal to the Drive copies; the 01:00 run shows `analysis_history_status: null` and adds no line; nothing new in the Drive folder.
-  - Stop if: the hash changed, any earlier status changed, `analysis_history_status` is `failed`, or the line does not match Drive.
+  - Do: run `--dry-run-config` and record its `settings_sha256` and `git rev-parse HEAD` of the VM clone; pull main into the VM clone; run `--dry-run-config` again. Any time after the next 00:00 run (no timed check: the history keeps that run's result), read `analysis_build_history.jsonl` in `archive_root` and the latest `last_run_status.json`.
+  - Pass: the same `settings_sha256` before and after the pull; exactly one history line for the new close day, from the 00:00 run (its `run_id` starts with the 8 characters at the end of the 00:00 hourly folder name), with `built_close_day` = the day before, `run_status` `success`, `analysis_status` and `purchasing_status` `published`, `exit_code` 0, and `manifest_sha256` and each file's `sha256` and `bytes` equal to the archive and Drive copies; the latest status shows every status as before with `analysis_history_status: null` (a not-due run); no history file in the Drive folder.
+  - Stop if: the hash changed, any earlier status changed, the line is missing, a status shows `analysis_history_status: failed`, or the line does not match Drive.
   - Rollback: `git checkout <the recorded HEAD>` in the VM clone (not between :55 and :05). The history file may stay; older code ignores it.
 
 ## Retention
