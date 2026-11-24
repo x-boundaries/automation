@@ -3901,7 +3901,25 @@ def page_build_index(raw):
     return {row[item_pos["code"]]: {k: row[item_pos[k]] for k in PAGE_REQUIRED_ITEM_FIELDS} for row in raw["items"]}
 
 
-class AnalysisRunTests(Round6TestCase):
+class AnalysisTestCase(Round6TestCase):
+    """Shared helpers for the nightly analysis tests."""
+
+    def purchasing_on(self, **overrides):
+        raw = copy.deepcopy(ANALYSIS_ON)
+        raw["purchasing"] = {"enabled": True}
+        return self.settings(analysis=raw, **overrides)
+
+    def purchasing_rows(self):
+        return {
+            "po_lines": [{"ItemCode": "FAKE-A", "VendorName": "Vendor A", "PoDay": date(2026, 7, 20),
+                          "Ordered": Decimal(5), "Transferred": Decimal(2), "OpenQty": Decimal(3),
+                          "OpenLines": 1, "OverLines": 0, "PoLines": 1}],
+            "gr_lines": [{"ItemCode": "FAKE-A", "VendorName": "Vendor A", "GrDay": date(2026, 8, 1), "Linked": 1,
+                          "LeadDays": 12, "Received": Decimal(2), "GrLines": 1},
+                         {"ItemCode": "FAKE-B", "VendorName": "Vendor B", "GrDay": date(2026, 8, 2), "Linked": 0,
+                          "LeadDays": None, "Received": Decimal(1), "GrLines": 1}],
+        }
+
     def on(self, **overrides):
         return self.settings(analysis=copy.deepcopy(ANALYSIS_ON), **overrides)
 
@@ -3924,6 +3942,8 @@ class AnalysisRunTests(Round6TestCase):
     def gz(self, root, name):
         return json.loads(gzip.decompress((Path(root) / name).read_bytes()))
 
+
+class AnalysisRunTests(AnalysisTestCase):
     def test_off_by_default_changes_nothing(self):
         manifest, source = self.go(self.settings(), at(2026, 8, 4))
         self.assertEqual(manifest["status"], "success")
@@ -4069,22 +4089,6 @@ class AnalysisRunTests(Round6TestCase):
                 self.assertNotIn(FAKE_DEBTOR.encode(), data, path.name)
 
     # #292 S4: purchasing --------------------------------------------------------------------
-
-    def purchasing_on(self, **overrides):
-        raw = copy.deepcopy(ANALYSIS_ON)
-        raw["purchasing"] = {"enabled": True}
-        return self.settings(analysis=raw, **overrides)
-
-    def purchasing_rows(self):
-        return {
-            "po_lines": [{"ItemCode": "FAKE-A", "VendorName": "Vendor A", "PoDay": date(2026, 7, 20),
-                          "Ordered": Decimal(5), "Transferred": Decimal(2), "OpenQty": Decimal(3),
-                          "OpenLines": 1, "OverLines": 0, "PoLines": 1}],
-            "gr_lines": [{"ItemCode": "FAKE-A", "VendorName": "Vendor A", "GrDay": date(2026, 8, 1), "Linked": 1,
-                          "LeadDays": 12, "Received": Decimal(2), "GrLines": 1},
-                         {"ItemCode": "FAKE-B", "VendorName": "Vendor B", "GrDay": date(2026, 8, 2), "Linked": 0,
-                          "LeadDays": None, "Received": Decimal(1), "GrLines": 1}],
-        }
 
     def test_purchasing_off_reads_nothing_and_changes_no_output(self):
         settings = self.on(output={"delivery_root": str(self.delivery)})
@@ -4259,6 +4263,202 @@ class AnalysisRunTests(Round6TestCase):
         self.assertEqual(v12["counts"]["items_excluded"], 1)
         self.assertFalse(by_code["FAKE-A"]["excluded"])
         self.assertEqual([r[0] for r in v12["items"]], [r[0] for r in v1["items"]], "no item is dropped")
+
+
+class AnalysisBuildHistoryTests(AnalysisTestCase):
+    """#292: the local per-build history (analysis_build_history.jsonl beside last_run_status.json)."""
+
+    LINE_KEYS = {
+        "schema", "schema_version", "run_id", "started_at", "recorded_at", "run_status", "exit_code",
+        "built_close_day", "analysis_status", "analysis_failure_class", "analysis_seconds", "purchasing_status",
+        "purchasing_failure_class", "files", "manifest_sha256", "settings_sha256", "git_commit",
+        "dropped_unreadable_lines",
+    }
+
+    def history_path(self, root=None):
+        return Path(root or self.archive) / hourly.BUILD_HISTORY_NAME
+
+    def history(self, root=None):
+        text = self.history_path(root).read_text(encoding="utf-8")
+        return [json.loads(raw) for raw in text.splitlines()]
+
+    def seed(self, lines):
+        self.archive.mkdir(parents=True, exist_ok=True)
+        self.history_path().write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+
+    def go_purchasing(self, when, settings=None, **source_kwargs):
+        source_kwargs.setdefault("purchasing_rows", self.purchasing_rows())
+        settings = settings or self.purchasing_on(output={"delivery_root": str(self.delivery)})
+        return self.go(settings, when, self.source(when, **source_kwargs))
+
+    def test_published_build_writes_one_closed_line_in_the_archive_only(self):
+        manifest, _source = self.go_purchasing(at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        [line] = self.history()
+        self.assertEqual(set(line), self.LINE_KEYS)
+        self.assertEqual((line["schema"], line["schema_version"]), ("xb.ac2.analysis_build_history", 1))
+        self.assertEqual((line["run_id"], line["started_at"], line["run_status"], line["exit_code"]),
+                         (manifest["run_id"], manifest["started_at"], "success", hourly.EXIT_OK))
+        self.assertEqual((line["built_close_day"], line["analysis_status"], line["analysis_failure_class"]),
+                         ("2026-08-03", "published", None))
+        self.assertEqual((line["purchasing_status"], line["purchasing_failure_class"]), ("published", None))
+        self.assertEqual(line["dropped_unreadable_lines"], 0)
+        self.assertEqual((line["settings_sha256"], line["git_commit"]),
+                         (manifest["source"]["settings_sha256"], manifest["source"]["git_commit"]))
+        meta_bytes = (self.archive / hourly.analysis.MANIFEST_NAME).read_bytes()
+        self.assertEqual(line["manifest_sha256"], hashlib.sha256(meta_bytes).hexdigest())
+        meta = json.loads(meta_bytes)
+        self.assertEqual(line["files"], [{"name": f["name"], "sha256": f["sha256"], "bytes": f["bytes"]}
+                                         for f in meta["files"]])
+        self.assertIn(hourly.analysis.PURCHASING_NAME, [f["name"] for f in line["files"]])
+        self.assertEqual(self.status()["analysis_history_status"], "written")
+        self.assertEqual(self.status(self.delivery)["analysis_history_status"], "written")
+        self.assertFalse(self.history_path(self.delivery).exists(), "the history never goes to Drive")
+        text = self.history_path().read_text(encoding="utf-8")
+        for private in (str(self.archive), str(self.delivery), "Vendor A", "FAKE-A", FAKE_DEBTOR):
+            self.assertNotIn(private, text)
+        self.assertEqual([p.name for p in self.archive.glob("*.tmp")], [])
+
+    def test_runs_that_build_nothing_add_no_line(self):
+        self.go_purchasing(at(2026, 8, 4))
+        self.go_purchasing(at(2026, 8, 4, 1))
+        self.assertEqual(self.status()["analysis_status"], "not_due")
+        self.assertIsNone(self.status()["analysis_history_status"])
+        self.assertEqual(len(self.history()), 1)
+        self.go_purchasing(at(2026, 8, 5))
+        self.assertEqual([line["built_close_day"] for line in self.history()], ["2026-08-03", "2026-08-04"])
+
+    def test_purchasing_failure_and_its_retry_are_both_kept(self):
+        self.go_purchasing(at(2026, 8, 4), purchasing_error=True)
+        self.go_purchasing(at(2026, 8, 4, 1))
+        failed, retried = self.history()
+        self.assertEqual((failed["analysis_status"], failed["purchasing_status"], failed["purchasing_failure_class"],
+                          failed["exit_code"]), ("published", "failed", "purchasing_read_failed", hourly.EXIT_FAILED))
+        self.assertNotIn(hourly.analysis.PURCHASING_NAME, [f["name"] for f in failed["files"]])
+        self.assertEqual((retried["purchasing_status"], retried["exit_code"]), ("published", hourly.EXIT_OK))
+        self.assertNotEqual(failed["manifest_sha256"], retried["manifest_sha256"])
+
+    def test_analysis_read_failure_is_recorded_with_no_files(self):
+        settings = self.on()
+        self.go(settings, at(2026, 8, 4), self.source(at(2026, 8, 4), analysis_error=True))
+        [line] = self.history()
+        self.assertEqual((line["analysis_status"], line["analysis_failure_class"], line["built_close_day"]),
+                         ("failed", "analysis_read_failed", "2026-08-03"))
+        self.assertEqual((line["files"], line["manifest_sha256"], line["exit_code"]), ([], None, hourly.EXIT_FAILED))
+        self.assertIsNone(line["purchasing_status"], "purchasing off: no purchasing result")
+
+    def test_lines_older_than_the_cap_and_unreadable_lines_are_dropped(self):
+        def old_line(days):
+            started = at(2026, 8, 4) - timedelta(days=days)
+            return json.dumps({"schema": hourly.BUILD_HISTORY_SCHEMA, "started_at": started.isoformat(),
+                               "run_id": "f" * 32, "age_days": days})
+
+        self.seed([old_line(61), old_line(59), "not json", json.dumps({"no": "time"}), "", old_line(1)])
+        self.go_purchasing(at(2026, 8, 4))
+        lines = self.history()
+        self.assertEqual([line.get("age_days") for line in lines], [59, 1, None])
+        self.assertEqual(lines[-1]["dropped_unreadable_lines"], 2)
+        self.assertEqual(hourly.BUILD_HISTORY_KEEP_DAYS, 60)
+
+    def test_line_count_is_capped(self):
+        recent = at(2026, 8, 3, 12).isoformat()
+        self.seed([json.dumps({"started_at": recent, "n": n}) for n in range(hourly.BUILD_HISTORY_MAX_LINES + 20)])
+        manifest, _source = self.go_purchasing(at(2026, 8, 4))
+        lines = self.history()
+        self.assertEqual(len(lines), hourly.BUILD_HISTORY_MAX_LINES)
+        self.assertEqual(lines[0]["n"], 21, "the oldest lines go first")
+        self.assertEqual(lines[-1]["run_id"], manifest["run_id"])
+
+    def test_history_write_failure_is_visible_and_changes_nothing_else(self):
+        real = hourly.replace_atomic
+
+        def refuse_history(path, data, tag):
+            if Path(path).name == hourly.BUILD_HISTORY_NAME:
+                raise PermissionError("history locked")
+            return real(path, data, tag)
+
+        with mock.patch.object(hourly, "replace_atomic", side_effect=refuse_history):
+            manifest, _source = self.go_purchasing(at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        for root in (self.archive, self.delivery):
+            status = self.status(root)
+            self.assertEqual(status["analysis_history_status"], "failed")
+            self.assertEqual((status["status"], status["delivery_status"], status["feed_status"],
+                              status["item_index_status"], status["analysis_status"],
+                              status["analysis_purchasing_status"]),
+                             ("success", "handed_to_drive_sync_folder", "published", "published", "published",
+                              "published"))
+            self.assertEqual(hourly.run_exit_code(status), hourly.EXIT_OK, "the exit code does not change")
+        self.assertFalse(self.history_path().exists())
+        self.assertEqual(sorted(self.files(self.delivery)), sorted(ANALYSIS_FILES))
+        self.assertTrue((self.delivery / hourly.analysis.PURCHASING_NAME).exists())
+        # The next build writes the history again.
+        self.go_purchasing(at(2026, 8, 5))
+        self.assertEqual(self.status()["analysis_history_status"], "written")
+        self.assertEqual(len(self.history()), 1)
+
+    def test_any_history_bug_is_caught_and_keeps_the_previous_file(self):
+        self.seed([json.dumps({"started_at": at(2026, 8, 3).isoformat()})])
+        before = self.history_path().read_bytes()
+        with mock.patch.object(hourly.json, "loads", side_effect=RuntimeError("bug")):
+            result = hourly.write_build_history(self.archive, {"started_at": "x"}, at(2026, 8, 4), "t")
+        self.assertEqual((result, self.history_path().read_bytes()), (hourly.HISTORY_FAILED, before))
+        missing = Path(self.tmp) / "no-such-archive"
+        self.assertEqual(hourly.write_build_history(missing, {"started_at": "x"}, at(2026, 8, 4), "t"),
+                         hourly.HISTORY_FAILED)
+
+    def test_history_line_bug_still_writes_status_runs_alert_and_releases_lock(self):
+        # G2 L1: an exception while building the line (not only while writing it) is caught too.
+        with mock.patch.object(hourly, "build_history_line", side_effect=RuntimeError("line bug")):
+            manifest, _source = self.go_purchasing(at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        for root in (self.archive, self.delivery):
+            status = self.status(root)
+            self.assertEqual((status["analysis_history_status"], status["analysis_status"], status["status"]),
+                             ("failed", "published", "success"))
+            self.assertIn("alert_status", status, "the alert step still ran")
+            self.assertEqual(hourly.run_exit_code(status), hourly.EXIT_OK)
+        record = json.loads((self.archive / manifest["hourly_folder"] / hourly.ALERT_RECORD_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["run_id"], manifest["run_id"])
+        self.assertFalse((self.archive / hourly.LOCK_NAME).exists(), "the run lock is released")
+        self.assertFalse(self.history_path().exists())
+
+    def test_history_write_failure_prints_and_still_exits_zero(self):
+        path = Path(self.tmp) / "settings.local.json"
+        raw_analysis = copy.deepcopy(ANALYSIS_ON)
+        raw_analysis["purchasing"] = {"enabled": True}
+        path.write_text(json.dumps(raw_settings(self.tmp, analysis=raw_analysis)), encoding="utf-8")
+        with mock.patch.object(hourly, "write_build_history", return_value=hourly.HISTORY_FAILED), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hourly.main(["--config", str(path)], source=FakeSource(purchasing_rows=self.purchasing_rows()),
+                               environ=ENV, clock=clock_at())
+        printed = json.loads(out.getvalue())
+        self.assertEqual((printed["analysis_status"], printed["analysis_history_status"]), ("published", "failed"))
+        self.assertEqual(code, hourly.EXIT_OK)
+
+    def test_analysis_off_writes_no_history_and_no_status_field(self):
+        manifest, _source = self.go(self.settings(), at(2026, 8, 4))
+        self.assertEqual(manifest["status"], "success")
+        self.assertNotIn("analysis_history_status", self.status())
+        self.assertFalse(self.history_path().exists())
+
+    def test_existing_readers_ignore_the_new_status_field(self):
+        # The 07:30 daily health check (#288/#351) and the hourly alert event read the status file.
+        from scripts import xb_daily_health as health
+
+        self.go_purchasing(at(2026, 8, 4))
+        status = self.status(self.delivery)
+        without = {k: v for k, v in status.items() if k != "analysis_history_status"}
+        limits = {name: spec[0] for name, spec in health.THRESHOLDS.items()}
+        now = at(2026, 8, 4, 0, 30)
+        for failed in ("written", "failed"):
+            judged = health.judge_export("ac2_stock_export", dict(status, analysis_history_status=failed), None, now,
+                                         limits, "stock")
+            self.assertEqual(judged, health.judge_export("ac2_stock_export", without, None, now, limits, "stock"))
+        started = at(2026, 8, 4)
+        active = {"analysis_failed"}
+        self.assertEqual(hourly.build_alert_payload(dict(status, analysis_history_status="failed"), active, "new", started),
+                         hourly.build_alert_payload(without, active, "new", started))
 
 
 if __name__ == "__main__":

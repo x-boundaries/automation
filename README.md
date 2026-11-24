@@ -88,7 +88,7 @@ Publishes AutoCount 2 stock to Google Drive for the owner's dashboard and for st
 
 - **Where it runs:** the AC2 server, as a Task Scheduler task in `\XB\`, writing into a Drive for desktop folder.
 - **Hourly (:00):** checks AutoCount's stored stock balance against the stock ledger, then replaces one verified latest set in Drive: the stock balance CSV, an item index and a dashboard feed. If the two disagree, nothing new is published that hour.
-- **Just after midnight:** the first run of the day also writes the previous day's stock close (kept from 1 Aug 2026) and rebuilds the nightly buying analysis files (sales units by item, outlet, day and channel; stock-outs; placement; size mix) and the purchasing file (open PO units, goods received, vendor lead days; switched on 22 Nov 2026, first nightly confirmation 23 Nov).
+- **Just after midnight:** the first run of the day also writes the previous day's stock close (kept from 1 Aug 2026) and rebuilds the nightly buying analysis files (sales units by item, outlet, day and channel; stock-outs; placement; size mix) and the purchasing file (open PO units, goods received, vendor lead days; switched on 22 Nov 2026, first nightly confirmation 23 Nov). Each build attempt also adds one line (statuses and file hashes only) to a local history file on the server, kept 60 days, so a past night can still be checked.
 - **Errors:** a failed or flagged run sends one email to the operations inbox through `XB Ops Alert Email` (system `AC2-STOCK`).
 - **Runbooks:** [hourly stock balance export](docs/autocount2-automation/stock_balance_hourly_runbook.md) (set-up, settings, alert steps) and the [AC2 data guide](docs/autocount2-automation/AC2_DATA_GUIDE.md) (what each file is and how to read it).
 

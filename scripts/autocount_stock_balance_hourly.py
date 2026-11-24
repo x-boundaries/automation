@@ -213,6 +213,18 @@ ANALYSIS_NOT_DUE = "not_due"
 ANALYSIS_PUBLISHED = "published"
 ANALYSIS_FAILED = "failed"
 ANALYSIS_SKIPPED = "skipped_failed_run"
+
+# #292: one line per nightly analysis build attempt (published or failed), kept beside
+# last_run_status.json in the local archive only (never Drive), because the status file and the
+# analysis manifest are overwritten. Statuses, failure classes, close day and file hashes only.
+BUILD_HISTORY_NAME = "analysis_build_history.jsonl"
+BUILD_HISTORY_SCHEMA = "xb.ac2.analysis_build_history"
+BUILD_HISTORY_SCHEMA_VERSION = 1
+BUILD_HISTORY_KEEP_DAYS = 60
+# Retries can add more than one line a day; this bounds the file whatever happens.
+BUILD_HISTORY_MAX_LINES = 500
+HISTORY_WRITTEN = "written"
+HISTORY_FAILED = "failed"
 # #292 S4: the purchasing file inside the analysis set. Its failure never stops the buying files.
 FAILURE_PURCHASING_READ = "purchasing_read_failed"
 FAILURE_PURCHASING_BUILD = "purchasing_build_failed"
@@ -2443,7 +2455,8 @@ def read_analysis_rows(source, settings, environ, start, last_day):
 
 def _analysis_result(status, failure_class=None):
     return {"status": status, "failure_class": failure_class, "published_close_day": None, "seconds": None,
-            "purchasing_status": None, "purchasing_failure_class": None}
+            "purchasing_status": None, "purchasing_failure_class": None, "built_close_day": None,
+            "manifest_sha256": None}
 
 
 def run_analysis(settings, source, environ, archive_root, delivery_root, work, run_id, written_at, as_of_local,
@@ -2465,6 +2478,7 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
         result["status"] = ANALYSIS_NOT_DUE
         return result
     result["status"] = ANALYSIS_FAILED
+    result["built_close_day"] = last_day.isoformat()
     ledger = work["ledger"]
     first_day = ledger["counts"]["first_day"]
     first = date.fromisoformat(first_day) if first_day else None
@@ -2535,7 +2549,8 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
             parts = dict(parts, purchasing=purchasing)
             result["purchasing_failure_class"] = purchasing["failure_class"]
         manifest = analysis.manifest_payload(dict(header, built_at=written_at), files, parts)
-        entries.append((analysis.MANIFEST_NAME, json_bytes(manifest)))
+        manifest_data = json_bytes(manifest)
+        entries.append((analysis.MANIFEST_NAME, manifest_data))
     except Exception:  # noqa: BLE001 - a builder bug must not touch the hourly files.
         result["failure_class"] = FAILURE_ANALYSIS_BUILD
         result["purchasing_failure_class"] = FAILURE_PURCHASING_BUILD if purchasing_on else None
@@ -2556,8 +2571,68 @@ def run_analysis(settings, source, environ, archive_root, delivery_root, work, r
         published_close_day=last_day.isoformat(),
         seconds=round(monotonic() - began, 3),
         files=[{"name": f["name"], "sha256": f["sha256"], "bytes": f["bytes"]} for f in files],
+        manifest_sha256=hashlib.sha256(manifest_data).hexdigest(),
     )
     return result
+
+
+def build_history_line(status, analysis_result, source, exit_code, recorded_at):
+    """One closed history entry for a nightly analysis build attempt. No path, message, item,
+    vendor or business figure: statuses, failure classes, the close day and file hashes only."""
+    return {
+        "schema": BUILD_HISTORY_SCHEMA,
+        "schema_version": BUILD_HISTORY_SCHEMA_VERSION,
+        "run_id": status["run_id"],
+        "started_at": status["started_at"],
+        "recorded_at": recorded_at,
+        "run_status": status["status"],
+        "exit_code": exit_code,
+        "built_close_day": analysis_result["built_close_day"],
+        "analysis_status": analysis_result["status"],
+        "analysis_failure_class": analysis_result["failure_class"],
+        "analysis_seconds": analysis_result["seconds"],
+        "purchasing_status": analysis_result["purchasing_status"],
+        "purchasing_failure_class": analysis_result["purchasing_failure_class"],
+        "files": [{"name": f["name"], "sha256": f["sha256"], "bytes": f["bytes"]}
+                  for f in analysis_result.get("files") or []],
+        "manifest_sha256": analysis_result["manifest_sha256"],
+        "settings_sha256": source.get("settings_sha256"),
+        "git_commit": source.get("git_commit"),
+    }
+
+
+def write_build_history(archive_root, line, now, tag):
+    """Add one line to the archive's analysis_build_history.jsonl. Never raises.
+
+    Keeps lines started within BUILD_HISTORY_KEEP_DAYS of now, then the newest
+    BUILD_HISTORY_MAX_LINES, and rewrites the file atomically (temp + replace), so a crash leaves
+    the previous file whole. An unreadable line cannot be dated, so it is dropped and counted in
+    the new line (dropped_unreadable_lines). Returns HISTORY_WRITTEN or HISTORY_FAILED; the caller
+    records that in last_run_status.json, and the run, its files and its exit code go on.
+    """
+    try:
+        path = Path(archive_root) / BUILD_HISTORY_NAME
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = ""
+        cutoff = now - timedelta(days=BUILD_HISTORY_KEEP_DAYS)
+        kept, dropped = [], 0
+        for raw in text.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                if datetime.fromisoformat(json.loads(raw)["started_at"]) >= cutoff:
+                    kept.append(raw)
+            except (ValueError, KeyError, TypeError):
+                dropped += 1
+        line = dict(line, dropped_unreadable_lines=dropped)
+        kept.append(json.dumps(line, sort_keys=True, separators=(",", ":")))
+        data = ("\n".join(kept[-BUILD_HISTORY_MAX_LINES:]) + "\n").encode("utf-8")
+        replace_atomic(path, data, tag)
+        return HISTORY_WRITTEN
+    except Exception:  # noqa: BLE001 - the history must never stop the run; the status file says it failed.
+        return HISTORY_FAILED
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3130,7 +3205,8 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         final_delivery = DELIVERY_SKIPPED
 
     # #292 S2: last, after every hourly file is in place, so the nightly build can never delay or
-    # block them. Its outcome is recorded only in last_run_status.json and analysis_manifest.json.
+    # block them. Its outcome is recorded in last_run_status.json and analysis_manifest.json (both
+    # replaced) and, per build attempt, in the local analysis_build_history.jsonl.
     if not settings["analysis"]["enabled"]:
         analysis_result = _analysis_result(ANALYSIS_DISABLED)
     elif manifest["status"] == "success" and work is not None:
@@ -3176,6 +3252,17 @@ def run_hourly(settings, source=None, environ=None, clock=None, sleep=time.sleep
         # #292 S4: only with purchasing on, so the status file is unchanged while it is off.
         status["analysis_purchasing_status"] = analysis_result["purchasing_status"]
         status["analysis_purchasing_failure_class"] = analysis_result["purchasing_failure_class"]
+    if settings["analysis"]["enabled"]:
+        # #292: only with the analysis on. written / failed when this run attempted a build,
+        # null otherwise. A failed history line or write never changes the run's status or exit code.
+        status["analysis_history_status"] = None
+        if analysis_result["status"] in (ANALYSIS_PUBLISHED, ANALYSIS_FAILED):
+            try:
+                line = build_history_line(status, analysis_result, manifest["source"], run_exit_code(status),
+                                          _now(tz, clock).isoformat())
+                status["analysis_history_status"] = write_build_history(archive_root, line, started, run_id[:8])
+            except Exception:  # noqa: BLE001 - G2 L1: building the line must not stop the status, alert or lock.
+                status["analysis_history_status"] = HISTORY_FAILED
     # Last step before the status file: the alert reads the final status, and its own outcome is
     # recorded beside it. It never changes the status, the exit code or any other file.
     status["alert_status"], status["alert_http_status"] = send_run_alert(
@@ -3699,8 +3786,15 @@ def main(argv=None, source=None, environ=None, clock=None, alert_transport=None,
             "message": manifest["message"],
             **({"analysis_purchasing_status": status["analysis_purchasing_status"]}
                if "analysis_purchasing_status" in status else {}),
+            **({"analysis_history_status": status["analysis_history_status"]}
+               if "analysis_history_status" in status else {}),
         }
     )
+    return run_exit_code(status)
+
+
+def run_exit_code(status):
+    """The process exit code for one run's status. Also recorded in the analysis build history."""
     if status["status"] != "success":
         return EXIT_FAILED
     if status["delivery_status"] not in (DELIVERY_HANDED, DELIVERY_NOT_CONFIGURED):
@@ -3715,7 +3809,8 @@ def main(argv=None, source=None, environ=None, clock=None, alert_transport=None,
     if status.get("analysis_purchasing_status") == ANALYSIS_FAILED:
         # #292 S4: a purchasing failure is visible too; the buying files were still published.
         return EXIT_FAILED
-    # alert_status is deliberately not read: an alert outcome never changes the exit code.
+    # alert_status and analysis_history_status are deliberately not read: neither the alert outcome
+    # nor the local build history ever changes the exit code.
     return EXIT_OK
 
 
