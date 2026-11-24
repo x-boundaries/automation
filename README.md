@@ -132,6 +132,7 @@ Once a week (Sunday 03:00 SGT) the server PC copies this repository's `main` bra
 | What | Issue | Waiting for |
 | --- | --- | --- |
 | Member core upgrades (S$300 order to `MEMBER`) | [#268](https://github.com/x-boundaries/automation/issues/268) | Owner OK to switch AutoCount writes on; runs in observe mode now. |
+| Member removals (expired `MEMBER` to `GUEST`, refund revoke, undo) | [#268](https://github.com/x-boundaries/automation/issues/268) | Built, off: every write switch is off and nothing is installed. Waiting for the test-book rehearsal, an observe install and the daily summary block (slice E3), then the owner's OK for each pilot ([member removals runbook](docs/autocount2-automation/member_removals_runbook.md)). |
 | Member tags `member-qualified` and `member-bday-month` | [#268](https://github.com/x-boundaries/automation/issues/268) | Scheduled observe runs, then the owner's OK for the write switches ([member tags runbook](docs/autocount2-automation/member_tags_runbook.md)). |
 | Monthly in-store member discount check (member rate keyed at the till for a member record that does not qualify) | [#268](https://github.com/x-boundaries/automation/issues/268) | Built, switched off. Install on the AC2 server, import its email workflow and switch the email on, each with its own owner OK ([runbook](docs/autocount2-automation/member_pos_exceptions_runbook.md)). Read-only; emails (system `MEMBER-POS`) only when there is something to act on. |
 | SIMBA invoice intake (email to Drive) | [#244](https://github.com/x-boundaries/automation/issues/244) | On hold until the intake mailbox is set up; redesign in [PR #265](https://github.com/x-boundaries/automation/pull/265). Runbook: [SIMBA intake](docs/simba_invoice_intake.md). |
@@ -242,6 +243,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `scripts/install_autocount_arap_aging_task.ps1`: Task Scheduler installer for the AR/AP aging export (#321 slice A2): task `\XB\AC2 ARAP Aging`, one hourly trigger at `schedule.run_minute` (:30), `-DryRun` by default; each registration needs a separate owner OK.
 - `directlocal/xb_member_sync.py` (with `scripts/ac2_directlocal_member_bridge.ps1`, `scripts/ac2_member_sync_member.ps1` and the installer `scripts/install_member_sync_task.ps1`): the #155 two-way member create sync, **live** on the AC2 server every 15 minutes (AutoCount `GUEST` creates on, Shopify creates off). The daily summary `directlocal/xb_member_sync_daily_summary.py` (installer `scripts/install_member_sync_summary_task.ps1`) runs at 06:40 SGT and, once the #288 errors-only change is live, sends nothing on a clean morning unless it carries an action alert (an alert from the runbook's "Hypercare alerts that need action" list, FIRST CREATE or the forms watch's `forms_flow_silent`); a clean morning is logged for the daily health check instead. See [member sync phase 1](docs/autocount2-automation/member_sync_phase1.md).
 - `directlocal/xb_member_benefits.py` (with `scripts/ac2_member_benefits_bridge.ps1`, `scripts/ac2_member_benefits.ps1` and `scripts/install_member_benefits_task.ps1`): the #268 member core (S$300 online order to `MEMBER`, plus claim links), scheduled on the AC2 server in observe mode; AutoCount writes stay off until the owner approves them. See [member core runbook](docs/autocount2-automation/member_benefits_runbook.md).
+- `directlocal/xb_member_removals.py` (with `scripts/ac2_member_removals_bridge.ps1`, `scripts/ac2_member_removals.ps1` and `scripts/install_member_removals_task.ps1`): the #268 slice E member removals (an expired `MEMBER` back to `GUEST`; a refunded member core upgrade revoked; undo list and restore). Built, off: observe by default, every write switch off, not installed. See [member removals runbook](docs/autocount2-automation/member_removals_runbook.md).
 - `directlocal/xb_member_tags.py` (installer `scripts/install_member_tags_task.ps1`): the #268 Shopify tags `member-qualified` and `member-bday-month`; observe by default, both write switches off. See [member tags runbook](docs/autocount2-automation/member_tags_runbook.md).
 - `directlocal/xb_member_type_move.py` (with `scripts/ac2_member_type_move_bridge.ps1` and `scripts/ac2_member_type_move.ps1`): the attended one-off move of existing members from type `Default` to `MEMBER` / `GUEST` (#268); no standing schedule. See [member type move runbook](docs/autocount2-automation/member_type_move_runbook.md).
 - `scripts/xb_daily_health.py` (installer `scripts/install_daily_health_task.ps1`, workflow `n8n-workflows/xb_daily_health.workflow.json`): the read-only daily health check (#325, **live**, 07:30 SGT on the server PC). See [daily health check](docs/daily_health_check.md).
@@ -268,6 +270,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `config/member_sync.example.json`, `config/member_sync.live.example.json` and `config/member_sync_daily_summary.example.json` (#155 member sync and its daily summary)
 - `config/member_benefits.example.json` and `config/member_benefits.live.example.json` (#268 member core)
 - `config/member_tags.example.json` and `config/member_tags.live.example.json` (#268 member tags)
+- `config/member_removals.example.json` and `config/member_removals.live.example.json` (#268 slice E member removals)
 - `config/member_type_move.example.json` and `config/member_type_move.live.example.json` (#268 member type move)
 - `config/daily_health.example.json` (#325 daily health check)
 
@@ -304,6 +307,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member sync phase 1](docs/autocount2-automation/member_sync_phase1.md) (#155)
 - [Member core runbook](docs/autocount2-automation/member_benefits_runbook.md) (#268)
 - [Member tags runbook](docs/autocount2-automation/member_tags_runbook.md) (#268)
+- [Member removals runbook](docs/autocount2-automation/member_removals_runbook.md) (#268 slice E)
 - [Member type move runbook](docs/autocount2-automation/member_type_move_runbook.md) (#268)
 - [Shopify kit re-tagger runbook](docs/xb_kit_retagger.md) (#269)
 - [Daily health check](docs/daily_health_check.md) (#325)

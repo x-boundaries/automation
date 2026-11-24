@@ -1,0 +1,20 @@
+{
+  "schema": "xb.directlocal.member_removals.config.v1",
+  "state_root": "C:\\XB\\xb268-member-removals-live",
+  "autocount_book": "AED_XBOUNDARIES",
+  "member_core_config": "C:\\XB\\xb268-member-benefits-live\\member_benefits.live.json",
+  "expire_write_enabled": false,
+  "revoke_write_enabled": false,
+  "restore_enabled": false,
+  "max_expires_per_run": 3,
+  "max_revokes_per_run": 3,
+  "max_removals_per_day": 20,
+  "max_member_reads_per_run": 30,
+  "surge_stop_count": 100,
+  "surge_ack_until": null,
+  "write_deadline_seconds": 120,
+  "type_move_state_root": "C:\\XB\\xb268-type-move-live",
+  "ac2_credential_target": "XB-AC2-MemberSync",
+  "ac2_login_mode": "owner_shared",
+  "ac2_refused_user_ids": []
+}
