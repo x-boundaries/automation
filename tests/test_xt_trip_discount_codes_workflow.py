@@ -383,7 +383,8 @@ class XtShapeTests(XtBase):
         rng = self.nodes[READ]["parameters"]["url"][len(base + "/values/{{ "):-len(" }}")]
         (out,) = self.run_raw([{"kind": "expr", "expr": "={{ " + rng.replace("$('Run Settings').first().json", "$json")
                                 + " }}", "json": settings(SHEET_LAYOUT=layout() | {"tab": "XT intake"})}])
-        self.assertEqual(out["out"], "'XT%20intake'!A1%3AZZ1000")  # ' and ! are valid in a URL path
+        # ' and ! are valid in a URL path; G2 L6: one row past last_row is read, so a longer sheet is seen.
+        self.assertEqual(out["out"], "'XT%20intake'!A1%3AZZ1001")
         for name in (READ, REREAD):
             query = {p["name"]: p["value"] for p in self.nodes[name]["parameters"]["queryParameters"]["parameters"]}
             self.assertEqual(query, {"majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE",
@@ -447,6 +448,19 @@ class XtShapeTests(XtBase):
                      "googleSheetsOAuth2Api", "| O2 |", "| O4 |", "| X6 |", "| X7 |", "OK XT CODES ACTIVATE"):
             self.assertIn(text, runbook)
         self.assertNotIn("write_customers` only", runbook)
+        # G2 M1: the runbook names the written columns of the agreed layout, and the X6 rollback never touches the
+        # consultant's own columns; G2 L3: X6 stops when any other row is ticked Ready.
+        self.assertNotRegex(runbook, r"L:R|L<row>|R<row>")
+        x6 = next(line for line in runbook.splitlines() if line.startswith("| X6 |"))
+        for text in ("K, L, M, N, O, S, T", "restore K, L, N and O", "clear M, S and T",
+                     "Never touch the consultant's other columns", "if any other row is ticked Ready",
+                     "for row `<n>` only"):
+            self.assertIn(text, x6)
+        self.assertIn("| `traveller` (`''` today: the number comes from row order within the invoice, ruling F1) | read | no |",
+                      runbook)
+        self.assertIn("`valid_until` (ruling F2: the same end date)", runbook)
+        self.assertIn("Google Sheets API", runbook)
+        self.assertIn("7 days", runbook)
         for status in STATUSES:
             self.assertIn("`%s`" % status, runbook)
         ci = CI.read_text(encoding="utf-8")
@@ -479,8 +493,12 @@ class XtCheckRowsTests(XtBase):
             out = self.check(kw.get("sheet_value", sheet(row())), kw.get("run"), kw.get("token"))
             self.assertEqual((out["mode"], out["updates"], out["lookups"], out["problems"]),
                              ("failed", [], [], [{"code": code, "count": 1}]), code)
-        out = self.check({"values": [HEADERS] + [row(invoice="INV-%06d" % i) for i in range(1000)]})
-        self.assertEqual(out["problems"], [{"code": "sheet_layout_changed", "count": 1}])
+        # G2 L6: last_row 1000 = 999 data rows; the 1000th data row (read because the range runs one row past
+        # last_row) stops the run, never skipped silently.
+        out = self.check({"values": [HEADERS] + [row(invoice="INV-%06d" % i, ready=False) for i in range(1000)]})
+        self.assertEqual(out["problems"], [{"code": "sheet_too_long", "count": 1}])
+        out = self.check({"values": [HEADERS] + [row(invoice="INV-%06d" % i, ready=False) for i in range(999)]})
+        self.assertEqual(out["problems"], [])
         self.assertEqual(self.check(sheet(row(), header=HEADERS + ["Email"]))["problems"][0]["code"],
                          "sheet_layout_changed")
         self.assertEqual(self.check(sheet(row()), token={"access_token": ""})["problems"][0]["code"], "token_failed")
@@ -564,6 +582,8 @@ class XtCheckRowsTests(XtBase):
                                               "legacy": "XT-INV000123", "withLegacy": False, "withCustomer": True})
         self.assertIn("customerByIdentifier(identifier: {emailAddress: $email})", first["query"])
         self.assertNotIn("customers(", first["query"])
+        self.assertEqual(first["siblings"], [])
+        self.assertNotIn("$s1", first["query"])
 
     def test_a_traveller_column_gives_numbered_codes(self):
         run = settings(SHEET_LAYOUT=layout(traveller="Pax no."))
@@ -746,6 +766,68 @@ class XtDecideTests(XtBase):
         self.assertNotIn("example.com", json.dumps(out["plan"]))
 
 
+class XtSecondCodeTests(XtBase):
+    """G2 L1: never a second code for the same traveller when rows of one invoice are renumbered."""
+
+    def test_the_lookup_asks_for_the_other_code_names_of_the_invoice(self):
+        out = self.check(sheet(row(email="a@example.com"), row(email="b@example.com", status="DONE"),
+                               row(invoice="INV-000999", email="z@example.com"), row(email="c@example.com")))
+        first, other, third = out["lookups"]
+        self.assertEqual(first["siblings"], ["XT-INV000123-02", "XT-INV000123-03"])
+        self.assertEqual(third["siblings"], ["XT-INV000123", "XT-INV000123-02"])
+        self.assertEqual(other["siblings"], [])
+        self.assertEqual((third["variables"]["s1"], third["variables"]["s2"]), ("XT-INV000123", "XT-INV000123-02"))
+        self.assertIn(", $s1: String!, $s2: String!) {", third["query"])
+        self.assertIn("s2: codeDiscountNodeByCode(code: $s2) { ...XtCode }", third["query"])
+        expired = self.check(sheet(row(deposit=serial(2025, 1, 2), departure=serial(2025, 3, 1)),
+                                   row(email="b@example.com", deposit=serial(2025, 1, 2), departure=serial(2025, 3, 1))))
+        self.assertEqual([l["siblings"] for l in expired["lookups"]], [[], []])
+        many = self.check(sheet(*[row(email="t%d@example.com" % i) for i in range(25)]))
+        self.assertEqual(len(many["lookups"][0]["siblings"]), 20)
+
+    def test_g2_probe_p5_rows_inserted_above_after_a_failed_write_back(self):
+        # Run 1 made XT-INV000123 for a@ and XT-INV000123-02 for b@, but the sheet write failed. Then a row for c@
+        # was inserted above, so a@ now derives -02 and b@ derives -03. Run 2 must make no code at all.
+        shopify_codes = {"XT-INV000123": code_node(1, owners=(7001,), limit=3, ends="2027-11-03T15:59:59Z"),
+                         "XT-INV000123-02": code_node(2, owners=(7002,), limit=3, ends="2027-11-03T15:59:59Z")}
+        accounts = {"c@example.com": 7003, "a@example.com": 7001, "b@example.com": 7002}
+
+        def shopify(l):
+            data = answer(customer(accounts[l["email"]], l["email"]), shopify_codes.get(l["code"]))
+            for k, name in enumerate(l.get("siblings", [])):
+                data["data"]["s%d" % (k + 1)] = shopify_codes.get(name)
+            return data
+
+        rows = [row(email="c@example.com"), row(email="a@example.com"), row(email="b@example.com")]
+        trail = self.full_run(sheet(*rows), shopify)
+        self.assertEqual(trail["decide"]["writes"], [], "no second code for a@ or b@, and none over c@'s head")
+        got = {u["row"]: (u["status"], u["code"]) for u in trail["decide"]["updates"]}
+        self.assertEqual(got, {2: ("CONFLICT", ""), 3: ("ADOPTED", "XT-INV000123"), 4: ("ADOPTED", "XT-INV000123-02")})
+        self.assertIn("XT-INV000123 already exists and belongs to a different customer",
+                      self.status_of(trail["decide"]["updates"], 2)["message"])
+
+    def test_a_sibling_needing_the_defaults_is_adopted_with_one_update_and_two_are_a_conflict(self):
+        me = customer(7002, "b@example.com")
+        base = self.check(sheet(row(email="a@example.com"), row(email="b@example.com")))
+        lookup = base["lookups"][1]
+        self.assertEqual((lookup["code"], lookup["siblings"]), ("XT-INV000123-02", ["XT-INV000123"]))
+        mine = code_node(1, owners=(7002,))
+        out = self.decide(base, [answer(customer(7001, "a@example.com")),
+                                 answer(me, None) | {"data": {"customer": me, "code": None, "s1": mine}}])
+        adopt = [w for w in out["writes"] if w["row"] == 3]
+        self.assertEqual([(w["kind"], w["code"], w["node_id"]) for w in adopt], [("adopt", "XT-INV000123", mine["id"])])
+        three = self.check(sheet(row(email="a@example.com"), row(email="b@example.com"), row(email="c@example.com")))
+        data = {"customer": customer(7003, "c@example.com"), "code": None,
+                "s1": code_node(1, owners=(7003,)), "s2": code_node(2, owners=(7003,))}
+        out = self.decide(three, [answer(), answer(), {"data": data}])
+        self.assertEqual(self.status_of(out["updates"], 4)["message"],
+                         "Codes XT-INV000123 and XT-INV000123-02 already belong to this customer. Nothing was changed. Tell XB.")
+        theirs = {"customer": customer(7003, "c@example.com"), "code": None, "s1": code_node(1, owners=(7001,)),
+                  "s2": code_node(2, owners=(7001, 7003))}
+        out = self.decide(three, [answer(), answer(), {"data": theirs}])
+        self.assertEqual([w["kind"] for w in out["writes"]], ["create"], "other customers' codes are not adopted")
+
+
 class XtWriteTests(XtBase):
     def decided(self):
         rows = [row(), row(invoice="INV-000124", email="t2@example.com"), row(invoice="INV-000125", email="t3@example.com")]
@@ -912,6 +994,15 @@ class XtLayoutTests(XtBase):
         self.assertEqual((trail["built"]["expected"], trail["final"]["problems"]),
                          (0, [{"code": "sheet_reread_failed", "count": 1}]))
 
+    def test_a_header_doubled_during_the_run_writes_nothing(self):
+        # G2 L2: the write-time header check refuses a header that now appears twice.
+        value = sheet(row(email=""))
+        doubled = copy.deepcopy(value)
+        doubled["values"][0] = HEADERS + ["Code status"]
+        trail = self.full_run(value, lambda l: None, reread=doubled)
+        self.assertEqual((trail["built"]["expected"], trail["final"]["problems"]),
+                         (0, [{"code": "sheet_reread_failed", "count": 1}]))
+
     def test_columns_beyond_z_get_two_letters(self):
         header = HEADERS + ["Extra %d" % i for i in range(10)] + ["Message 2"]
         trail = self.full_run(sheet(row(email=""), header=header), lambda l: None,
@@ -942,7 +1033,7 @@ class XtLayoutTests(XtBase):
 
 
 class XtAlertTests(XtBase):
-    CODES = ("settings_invalid", "sheet_read_failed", "sheet_layout_changed", "token_failed", "too_many_rows",
+    CODES = ("settings_invalid", "sheet_read_failed", "sheet_layout_changed", "sheet_too_long", "token_failed", "too_many_rows",
              "too_many_codes", "lookup_failed", "write_failed", "rows_moved", "sheet_reread_failed", "sheet_write_failed")
 
     def test_every_problem_code_passes_the_sender(self):

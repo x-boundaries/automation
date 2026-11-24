@@ -261,13 +261,13 @@ Live order: the monitor package's steps M1-M4 first (table, error workflow, synt
 
 The XT trip discount codes workflow saves no executions (its token and travellers' emails are in item data), so n8n cannot count its failures. Two checks cover it under the n8n workflows job, the same way as the kit re-tagger:
 
-- `WATCH` entry `{ id: 'REPLACE_WITH_XT_CODES_WORKFLOW_ID', label: 'XT trip codes', errors: false, bind_later: true }`. While the ID is still its placeholder the entry is skipped, like `''`. The owner binds it at that workflow's activation step ([xt_trip_discount_codes.md](xt_trip_discount_codes.md), step X6); from then on an inactive or missing XT trip codes workflow is a FAIL.
+- `WATCH` entry `{ id: 'REPLACE_WITH_XT_CODES_WORKFLOW_ID', label: 'XT trip codes', errors: false, bind_later: true }`. While the ID is still its placeholder the entry is skipped, like `''`. The owner binds it at that workflow's activation step ([xt_trip_discount_codes.md](xt_trip_discount_codes.md), step X7); from then on an inactive or missing XT trip codes workflow is a FAIL.
 - `Read XT Code Errors` reads the `XT-CODES` `ERROR` rows of `xb_alert_email_log` (newest 250, read only; the same table ID as `Read Failed Alert Emails`). Each run with a problem sends exactly one such alert, so the rows of the 24 h before the check are a count of its problem runs: WARN `n8n workflows: N XT trip code error alert(s) in the last 24 h (see xb_alert_email_log)`. A failed read is the existing `alert_log_read_failed` WARN. Row problems for the consultant (`NEEDS_*`, `CHECK_*`, `CONFLICT`) stay in the intake sheet and never count. This needs no ID and stays at 0 until the workflow runs.
 - First look when the owner forwards it: run the workflow by hand with `DRY_RUN` on and read the plan ([xt_trip_discount_codes.md](xt_trip_discount_codes.md), "Troubleshooting").
 
 | # | Step | OK words | Rollback |
 | --- | --- | --- | --- |
-| H-XT | Back up the live `XB Daily Health` and diff it node by node against the pre-PR export: drift beyond the known private values stops the step. Update it in place from the merged export through the local API, keeping every private value (webhook path, table IDs, sender workflow ID, `WATCH` IDs), and set `Read XT Code Errors` -> the `xb_alert_email_log` table ID (the same as `Read Failed Alert Emails`). Leave `REPLACE_WITH_XT_CODES_WORKFLOW_ID` as it is: it is bound at step X6. Publish and read back. The checker event is unchanged. | "HEALTH XT" | Re-apply the backup; read back. |
+| H-XT | Back up the live `XB Daily Health` and diff it node by node against the pre-PR export: drift beyond the known private values stops the step. Update it in place from the merged export through the local API, keeping every private value (webhook path, table IDs, sender workflow ID, `WATCH` IDs), and set `Read XT Code Errors` -> the `xb_alert_email_log` table ID (the same as `Read Failed Alert Emails`). Leave `REPLACE_WITH_XT_CODES_WORKFLOW_ID` as it is: it is bound at step X7. Publish and read back. The checker event is unchanged. | "OK XT CODES SENDER AND HEALTH" (part of step X2) | Re-apply the backup; read back. |
 
 ## Privacy
 

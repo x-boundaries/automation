@@ -18,7 +18,7 @@ Owner rules (24 Nov 2026): the workflow never creates, edits or tags a Shopify c
 
 | Setting | Value |
 | --- | --- |
-| Name | `XT-INV<invoice digits>`, for example `XT-INV000123`, for the first row of an invoice; the 2nd, 3rd ... rows with the same invoice, in row order, get `XT-INV000123-02`, `-03` ... (Controller ruling F1, 24 Nov 2026; the sheet has no traveller column). Re-sorting rows can change a later row's number before its code is made; a clash then shows as `CONFLICT` or `CHECK_EMAIL`, never a code for the wrong person. If a traveller column is ever added to `SHEET_LAYOUT`, codes become `XT-INV<digits>-<NN>` and traveller 1 also matches the old name |
+| Name | `XT-INV<invoice digits>`, for example `XT-INV000123`, for the first row of an invoice; the 2nd, 3rd ... rows with the same invoice, in row order, get `XT-INV000123-02`, `-03` ... (Controller ruling F1, 24 Nov 2026; the sheet has no traveller column). Re-sorting or inserting rows can change a later row's number before its code is made. The lookup also asks for the invoice's other code names (one per sheet row with that invoice, at most 20), so a code this customer already holds under another of those names is adopted, never made twice (G2 L1); a name already held by someone else shows as `CONFLICT`, never a code for the wrong person. If a traveller column is ever added to `SHEET_LAYOUT`, codes become `XT-INV<digits>-<NN>` and traveller 1 also matches the old name |
 | Discount | 15% off all items (order discount) |
 | Who | only that one customer account (`context.customers`) |
 | Uses | 3 in total (`usageLimit` 3, `appliesOncePerCustomer` false) |
@@ -53,7 +53,7 @@ Rows that are `DONE`, `ADOPTED` or `EXPIRED_NO_ACCOUNT` are never processed agai
 
 | Setting | Export value | Notes |
 | --- | --- | --- |
-| `DRY_RUN` | `true` | A dry run reads the sheet and Shopify, writes nothing anywhere and sends no email. `false` only at the capped first run (X6) and activation (X7). |
+| `DRY_RUN` | `true` | A dry run reads the sheet and Shopify and writes nothing anywhere. It emails only when the run cannot start (the first five keys in "Error emails"). `false` only at the capped first run (X6) and activation (X7). |
 | `VALIDITY_RULE` | `later` | `later` or `earlier`; anything else stops the run (`settings_invalid`). |
 | `API_VERSION` | `2026-10` | Shopify Admin GraphQL version, the same as the kit re-tagger. |
 | `SHOP_DOMAIN` | `REPLACE_WITH_SHOPIFY_SHOP_DOMAIN` | The store's myshopify domain, set in the local import copy only. |
@@ -68,17 +68,18 @@ The brakes (300 lookups, 30 code writes) are fixed in the Code nodes on purpose:
 
 | Role | Read or written | Required |
 | --- | --- | --- |
-| `ready` (tick box), `invoice`, `traveller`, `email`, `deposit`, `departure` | read | yes |
+| `ready` (tick box), `invoice`, `email`, `deposit`, `departure` | read | yes |
+| `traveller` (`''` today: the number comes from row order within the invoice, ruling F1) | read | no |
 | `trip` (rows on one trip share it; else the invoice is used) | read | no |
 | `status` | read and written | yes |
 | `code`, `message` | written | yes |
-| `ends`, `customer`, `checked`, `made` | written | no (`''` = no such column) |
+| `ends`, `valid_until` (ruling F2: the same end date), `customer`, `checked`, `made` | written | no (`''` = no such column) |
 
-- `tab`: the tab name. `last_row`: the last row read (columns A to ZZ). `invoice_pattern`: a regular expression whose first group captures the invoice digits used in the code name.
+- `tab`: the tab name. `last_row`: the last sheet row processed (1000 today: 999 data rows). The read covers columns A to ZZ and rows 1 to `last_row` + 1, so a row past `last_row` is seen and stops the run as `sheet_too_long` instead of being skipped (G2 L6); raise `last_row` by a reviewed PR before the sheet gets that long. `invoice_pattern`: a regular expression whose first group captures the invoice digits used in the code name.
 - A header the layout names that is missing or appears twice stops the run (`sheet_layout_changed`); a layout that is not valid (a required role empty, two roles on one header, an unknown role) stops it as `settings_invalid`.
 - Renaming a header in the sheet means changing `SHEET_LAYOUT` in a reviewed PR and re-importing; until then runs stop safely.
 - **Layout v2.1** (`mailbox/355/20261124-1430-xt-sheet-layout-v2-1.md`, private): tab `Travellers`; read `Ready`, `Invoice no. (deposit)`, `Email`, `Trip`, `Deposit date`, `Departure date`, `Code status`; written `Discount code`, `Code status`, `Code created in Shopify (SGT)`, `Shopify end date (SGT)`, `Code valid until` (ruling F2), `Message`, `Shopify customer ID` (K, L, M, N, O, S and T today); no traveller and no last-checked column. The workflow never writes the consultant's other columns.
-- **Write rules:** `DONE` and `ADOPTED` write the code, status, created time (`d mmm yyyy hh:mm` SGT, text), the end date into both `Shopify end date (SGT)` and `Code valid until` (real Sheets dates, plain values, so the consultant's `Shopify end date check` shows OK) and the customer ID, and clear the message. Every other status writes only the status and message (and the customer ID when one customer matched), so the consultant's own code, created and end-date values stay until a code is made.
+- **Write rules:** `DONE` and `ADOPTED` write the code, status, created time (`d mmm yyyy hh:mm` SGT, written as text: a Sheets date-time number would show as a bare number unless the column's format is changed in the sheet, a live sheet edit; the column's warn-only `ISDATE` check therefore marks these cells, G2 L5), the end date into both `Shopify end date (SGT)` and `Code valid until` (real Sheets dates, plain values, so the consultant's `Shopify end date check` shows OK) and the customer ID, and clear the message. Every other status writes only the status and message (and the customer ID when one customer matched), so the consultant's own code, created and end-date values stay until a code is made.
 - **End-date rule (ruling F2):** codes end by the owner's later rule. Old rows keep the consultant's own `Code valid until` (his earlier rule) until the row is processed or adopted; the how-it-works note tells him the rule.
 
 ## Error emails (through `XB Ops Alert Email`, system `XT-CODES`)
@@ -89,7 +90,8 @@ At most one ERROR email per run, built by `Build Error Alert` from fixed English
 | --- | --- | --- |
 | `settings_invalid` | `VALIDITY_RULE` is not `later` or `earlier` | nothing |
 | `sheet_read_failed` | the sheet could not be read after 3 tries | nothing |
-| `sheet_layout_changed` | a header `SHEET_LAYOUT` names is missing or appears twice in row 1, or the sheet has more rows than `last_row` | nothing |
+| `sheet_layout_changed` | a header `SHEET_LAYOUT` names is missing or appears twice in row 1 | nothing |
+| `sheet_too_long` | the sheet has a row past `last_row` | nothing |
 | `token_failed` | the Shopify sign-in failed after 3 tries | nothing |
 | `too_many_rows` | more than 300 rows to look up | those rows `HELD` in the sheet; nothing in Shopify |
 | `too_many_codes` | more than 30 creates plus adopt updates | those rows `HELD`; nothing in Shopify |
@@ -100,7 +102,7 @@ At most one ERROR email per run, built by `Build Error Alert` from fixed English
 | `several_problems` | more than one of the above | as listed in the email |
 | `unexpected_error` | a Code node failed (`Build Unexpected Alert`) | says whether `Write Codes` had run |
 
-A dry run sends an email only for the first four (the run could not start).
+A dry run sends an email only for the first five (the run could not start).
 
 ## Shopify app and n8n credential (owner step O2)
 
@@ -117,7 +119,8 @@ A dry run sends an email only for the first four (the run could not start).
 ## Google Sheets credential (owner step O4)
 
 - **n8n credential:** type **Google Sheets OAuth2 API** (`googleSheetsOAuth2Api`), created by the owner in the n8n UI and signed in with a Google account that can edit `XT discount codes - intake`.
-- Bind it on **Read Intake Sheet**, **Re-read Row Keys** and **Write Back To Sheet** only. The workflow reads the layout's tab (columns A:ZZ, rows 1 to `last_row`) and writes only the cells of its written roles in the rows it decided!L<row>:R<row>`.
+- **Google Cloud project behind n8n's Google OAuth client** (G2 L4): the **Google Sheets API** must be enabled there. If the OAuth consent screen is External and still in **Testing**, Google expires the refresh token after 7 days and the daily run fails with `sheet_read_failed`; publish the consent screen (or use an Internal one) first.
+- Bind it on **Read Intake Sheet**, **Re-read Row Keys** and **Write Back To Sheet** only. The workflow reads the layout's tab (columns A:ZZ, rows 1 to `last_row` + 1) and writes only the cells of the roles `SHEET_LAYOUT` writes (today K, L, M, N, O, S and T), in the rows it decided.
 - Reach: an OAuth sign-in can reach every sheet that account can open. To limit it to this one sheet, sign in with a Google account that has only this sheet (or its folder) shared with it; the workflow itself never addresses another file (the sheet ID is fixed in `Run Settings`). Which account to use is the owner's choice at O4.
 - Protection on the automation's columns must be "warning only" (or the credential's account an editor of them), so API writes go through; data validation on the status column, if any, must list every status the workflow writes.
 
@@ -143,7 +146,7 @@ A dry run sends no email and saves no execution. Its plan is the output item of 
 | X3 | Work Claude | Import `XT Trip Discount Codes` INACTIVE through the local API (`http://127.0.0.1:5678/api/v1`) from a local `.tmp` copy with `SHOP_DOMAIN`, `SHEET_ID` and the alert workflow id set; bind the two credentials (O2 on the token node, O4 on the three sheet nodes); read the nodes back in the editor. | "OK XT CODES IMPORT INACTIVE" | Archive the imported workflow (it never ran). |
 | X4 | Work Claude | One manual dry run in the open editor, read as above: reads the sheet and Shopify, writes nothing, sends nothing, saves no execution. Report the summary and plan (statuses and counts only) to the Controller. | "OK XT CODES DRY RUN" | Nothing to roll back. |
 | X5 | Controller | Review the plan. Stop if the sign-in or the lookup query failed, a brake would fire, or a status looks wrong. | (Controller) | Nothing to roll back. |
-| X6 | Work Claude | Capped first real run: exactly one row ticked Ready that the X4 plan shows as one write (preferably an adopt of a hand-made code, addendum section 3), `DRY_RUN` `false` in the live copy, one manual run. Tick Ready on that one row only if the owner's OK names it. Read back in Shopify admin (the code's uses, end date, combinations and customer) and in the row (L:R). If the dry run just before shows more than one write, stop and ask the Controller. Set `DRY_RUN` back to `true`. | "OK XT CODES CAPPED RUN ROW <n>" | Put the code back by hand in Shopify admin (an adopt) or delete the new code (a create); clear the row's L:R. |
+| X6 | Work Claude | Capped first real run on one row (preferably an adopt of a hand-made code, addendum section 3). Before it: note row `<n>`'s values in the written columns (K, L, M, N, O, S, T today) for the rollback; tick Ready on row `<n>` only if the owner's OK names it. Stop (and untick row `<n>`) if any other row is ticked Ready, or if a dry run just before does not plan exactly one write, for row `<n>` only (G2 L3). Then `DRY_RUN` `false` in the live copy, one manual run, `DRY_RUN` back to `true`. Check the real run decided row `<n>` only; read back in Shopify admin (the code's uses, end date, combinations and customer) and row `<n>`'s written columns. | "OK XT CODES CAPPED RUN ROW <n>" | In Shopify admin, put an adopted code back to its noted settings or delete a new code. In row `<n>`, restore K, L, N and O to the values noted before the run and clear M, S and T. Never touch the consultant's other columns (P, Q, R and the rest). |
 | X7 | Work Claude | Activate: `DRY_RUN` `false` in the live copy, activate, read back that the schedule is registered. Then bind the live `XB Daily Health` `WATCH` entry `REPLACE_WITH_XT_CODES_WORKFLOW_ID` to this workflow's id by the health workflow's own update procedure. Then hand the "how it works" note for the consultant to the Controller (the owner sends it). | "OK XT CODES ACTIVATE" | Deactivate; re-apply the health workflow backup; read back. |
 
 Agent UAT after X6 (Controller decides who): checkout tests on an existing staff test customer account (not logged in with the matching email, logged in, a different email must fail, a 4th use must fail, with the member code must not combine). Owner UAT after X7: the consultant adds a real row, and the next morning its code is in the sheet.
